@@ -15,7 +15,7 @@
 
 //
 // CPU vs GPU parity for 2nd-order AD through decomposed *Backward ops
-// (RmsNorm, LayerNorm, Attention, Conv2d).
+// (RmsNorm, LayerNorm, Attention, Conv2d/3d, MaxPool2d/3d).
 //
 //! ```sh
 //! cargo test -p rlx-runtime --features cpu,apple --test higher_order_decompose_parity
@@ -209,6 +209,48 @@ fn build_maxpool_loss() -> Graph {
         Shape::new(&[1, 1, 2, 2], f),
     );
     let loss = g.reduce(p, ReduceOp::Sum, vec![0, 1, 2, 3], false, Shape::scalar(f));
+    g.set_outputs(vec![loss]);
+    g
+}
+
+fn build_conv3d_loss() -> Graph {
+    let f = DType::F32;
+    let mut g = Graph::new("conv3d_ho");
+    let x = g.input("x", Shape::new(&[1, 1, 4, 4, 4], f));
+    let w = g.input("w", Shape::new(&[1, 1, 3, 3, 3], f));
+    let y = g.conv3d(x, w, [1, 1, 1], [1, 1, 1], [1, 1, 1], 1);
+    let loss = g.reduce(
+        y,
+        ReduceOp::Sum,
+        vec![0, 1, 2, 3, 4],
+        false,
+        Shape::scalar(f),
+    );
+    g.set_outputs(vec![loss]);
+    g
+}
+
+fn build_maxpool3d_loss() -> Graph {
+    let f = DType::F32;
+    let mut g = Graph::new("pool3d_ho");
+    let x = g.input("x", Shape::new(&[1, 1, 4, 4, 4], f));
+    let p = g.add_node(
+        Op::Pool {
+            kind: ReduceOp::Max,
+            kernel_size: vec![2, 2, 2],
+            stride: vec![2, 2, 2],
+            padding: vec![0, 0, 0],
+        },
+        vec![x],
+        Shape::new(&[1, 1, 2, 2, 2], f),
+    );
+    let loss = g.reduce(
+        p,
+        ReduceOp::Sum,
+        vec![0, 1, 2, 3, 4],
+        false,
+        Shape::scalar(f),
+    );
     g.set_outputs(vec![loss]);
     g
 }
@@ -479,6 +521,16 @@ fn maxpool_inputs() -> Vec<f32> {
     (0..16).map(|i| 0.06 * i as f32 - 0.1).collect()
 }
 
+fn conv3d_inputs() -> (Vec<f32>, Vec<f32>) {
+    let x: Vec<f32> = (0..64).map(|i| 0.05 * i as f32 - 0.2).collect();
+    let w: Vec<f32> = (0..27).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+    (x, w)
+}
+
+fn maxpool3d_inputs() -> Vec<f32> {
+    (0..64).map(|i| 0.06 * i as f32 - 0.1).collect()
+}
+
 fn gn_inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let x: Vec<f32> = (0..16).map(|i| 0.1 * i as f32 - 0.5).collect();
     let gamma: Vec<f32> = (0..4).map(|i| 0.8 + 0.05 * i as f32).collect();
@@ -640,6 +692,41 @@ fn second_order_maxpool(device: Device) {
     let x_b = f32_bytes(&x);
     let inputs = [("x", x_b.as_slice(), DType::F32)];
     assert_vec_matches_cpu(device, hg, &inputs, 5e-3, "maxpool 2nd");
+}
+
+fn second_order_conv3d(device: Device) {
+    let forward = build_conv3d_loss();
+    let hg = nth_order_grad(&forward, "x", 2);
+    let (x, w) = conv3d_inputs();
+    let x_b = f32_bytes(&x);
+    let w_b = f32_bytes(&w);
+    let inputs = [
+        ("x", x_b.as_slice(), DType::F32),
+        ("w", w_b.as_slice(), DType::F32),
+    ];
+    assert_vec_matches_cpu(device, hg, &inputs, 1e-2, "conv3d 2nd");
+}
+
+fn second_order_conv3d_w(device: Device) {
+    let forward = build_conv3d_loss();
+    let hg = nth_order_grad(&forward, "w", 2);
+    let (x, w) = conv3d_inputs();
+    let x_b = f32_bytes(&x);
+    let w_b = f32_bytes(&w);
+    let inputs = [
+        ("x", x_b.as_slice(), DType::F32),
+        ("w", w_b.as_slice(), DType::F32),
+    ];
+    assert_vec_matches_cpu(device, hg, &inputs, 1e-2, "conv3d w 2nd");
+}
+
+fn second_order_maxpool3d(device: Device) {
+    let forward = build_maxpool3d_loss();
+    let hg = nth_order_grad(&forward, "x", 2);
+    let x = maxpool3d_inputs();
+    let x_b = f32_bytes(&x);
+    let inputs = [("x", x_b.as_slice(), DType::F32)];
+    assert_vec_matches_cpu(device, hg, &inputs, 5e-3, "maxpool3d 2nd");
 }
 
 fn second_order_group_norm(device: Device) {
@@ -889,6 +976,18 @@ macro_rules! decompose_parity_suite {
             #[test]
             fn maxpool_second_derivative() {
                 second_order_maxpool($device);
+            }
+            #[test]
+            fn conv3d_second_derivative() {
+                second_order_conv3d($device);
+            }
+            #[test]
+            fn conv3d_w_second_derivative() {
+                second_order_conv3d_w($device);
+            }
+            #[test]
+            fn maxpool3d_second_derivative() {
+                second_order_maxpool3d($device);
             }
             #[test]
             fn group_norm_second_derivative() {

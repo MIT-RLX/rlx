@@ -9,6 +9,8 @@
 | [iroh-transport.md](iroh-transport.md) | **NAT-traversing distributed** (`IrohTransport`, feature `iroh`): QUIC + n0 relays + pkarr/DNS discovery — reach peers by `EndpointId` (no `ip:port`/port-forwarding), the per-edge FIFO wire protocol, `connect_discovered` / `process_group_from_env`, the `TOPOLOGY=iroh` launcher topology + `RLX_DEVICE` / `RLX_DETERMINISTIC_REDUCE`, and hybrid GPU+CPU run recipes |
 | [op-coverage.md](op-coverage.md) | **Single source of truth** for every IR op: descriptions, per-backend coverage matrix (CPU/Metal/MLX/WGPU/ANE/CUDA/ROCm/TPU — all **153/`OpKind`**; Vulkan/oneAPI also at 153 as EXTRA backends), and op variations (Activation/Binary/Quant schemes/…) |
 | [gguf-backend-paths.md](gguf-backend-paths.md) | **GGUF / `DequantMatMul` execution paths** — shared scheme ids, per-backend GPU/host/ANE/TPU lowering, Metal fused IQ GEMV, pyrlx convert/load, env toggles, P0–P5 + backlog code map |
+| [mlx-weights.md](mlx-weights.md) | **MLX weight layouts** — mlx-community dirs, `.npz`/`.npy`, affine/mxfp dequant, `import-mlx`, `QuantScheme::Mlx*` |
+| [dduf.md](dduf.md) | **DDUF (`.dduf`)** — HF ZIP of nested safetensors; `import-dduf`, qualified tensor names |
 | [scaled-matmul-fp8.md](scaled-matmul-fp8.md) | **Native low-precision GEMM (`Op::ScaledMatMul`)** — FP8/FP6/FP4 + the parameterized `fNeXmY` minifloat family (all 28 formats), the `ScaledFormat` API/DX, specifying a format across compose-ops / Tensor DSL / `CompileOptions` / pyrlx, per-backend status (CPU/CUDA/ROCm/Metal/Vulkan) + hardware validation |
 | [nan-debugging.md](nan-debugging.md) | **Localizing NaN/Inf** at the compiler/IR level — static lint (`RLX_LINT_NUMERICS`) for provable constant blow-ups + runtime localizer (`RLX_DEBUG_NANS`) that names the culprit op vs a propagator, with provenance and a fix hint; where it lives and how to extend it to a backend |
 | [weight-compute-caching.md](weight-compute-caching.md) | **Computing weight-derived tensors once, not every forward** — compile-time fold (`param_bindings` / offline [`rlx-bake`](../crates/io/rlx-bake/) → `*.rlx`), and runtime hoist (`cache_param_invariant` / `RLX_CACHE_PARAM_INVARIANT`) |
@@ -22,7 +24,7 @@
 | [benchmarks/coreml-training.md](benchmarks/coreml-training.md) | CoreML on-device training: RLX vs native `MLUpdateTask`, compute-unit sweep, overhead- vs compute-bound regimes (why `cpu`≥`ane`, and why the result flips with model size) |
 | [benchmarks/frameworks-and-backends.md](benchmarks/frameworks-and-backends.md) | MNIST-training comparison **matrix**: every framework × backend, verified/rig/candidate status, `torch.compile`/Keras/MPSGraph/ORT runners, and the CUDA runbook |
 
-Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.13**).
+Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.14**).
 
 Related repo docs:
 

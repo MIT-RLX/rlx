@@ -13,9 +13,7 @@
 
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_pkg::{
-    ContainerKind, Package, PackedWeight, StorageTier, WriteOptions, write_package,
-};
+use rlx_pkg::{ContainerKind, Package, PackedWeight, StorageTier, WriteOptions, write_package};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

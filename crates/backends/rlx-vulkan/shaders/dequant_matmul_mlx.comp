@@ -1,0 +1,231 @@
+#version 450
+// MLX affine / mxfp4 / mxfp8 fused dequant-matmul. Weight layout [n,k] along K.
+// kind: 0=affine, 1=mxfp4, 2=mxfp8.
+// One workgroup per (col, row_tile); threads split K + stage X in shared memory.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint k;
+    uint n;
+    uint kind;
+    uint bits;
+    uint group_size;
+    uint x_word;
+    uint w_word;
+    uint scale_word;
+    uint zp_word;
+    uint out_word;
+} pc;
+
+const uint TM = 8u;
+shared float xs[8 * 256];
+shared float smem[8 * 256];
+
+uint rd_byte(uint byte_off) {
+    uint w = arena_load_u(pc.w_word + (byte_off >> 2u));
+    return (w >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+uint rd_scale_byte(uint byte_off) {
+    uint w = arena_load_u(pc.scale_word + (byte_off >> 2u));
+    return (w >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+float fp4_lut(uint nib) {
+    const float lut[16] = float[16](
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+    );
+    return lut[nib & 15u];
+}
+
+float decode_e4m3(uint byte) {
+    uint sign = (byte >> 7u) & 1u;
+    int expv = int((byte >> 3u) & 0xFu);
+    uint mant = byte & 0x7u;
+    if (expv == 0x0f && mant == 0x7u) {
+        // Match host `dequant_scale_fp8_e4m3` — quiet NaN.
+        return uintBitsToFloat(0x7fc00000u);
+    }
+    if (expv == 0) {
+        if (mant == 0u) {
+            return (sign != 0u) ? -0.0 : 0.0;
+        }
+        uint m = mant;
+        int e = -6;
+        while ((m & 0x8u) == 0u) {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x7u;
+        uint bits = (sign << 31) | (uint(e + 127) << 23) | (m << 20);
+        return uintBitsToFloat(bits);
+    }
+    uint bits = (sign << 31) | (uint(expv - 7 + 127) << 23) | (mant << 20);
+    return uintBitsToFloat(bits);
+}
+
+float decode_e8m0(uint s) {
+    if (s == 0u) {
+        return uintBitsToFloat(0x0040u << 16u);
+    }
+    return uintBitsToFloat(s << 23u);
+}
+
+float group_scale(uint s, uint gs) {
+    return (gs == 16u) ? decode_e4m3(s) : decode_e8m0(s);
+}
+
+uint pack_factor(uint bits) {
+    if (bits == 2u || bits == 4u || bits == 8u) return 8u / bits;
+    if (bits == 3u || bits == 5u) return 8u;
+    if (bits == 6u) return 4u;
+    return 1u;
+}
+
+uint bytes_per_pack(uint bits) {
+    if (bits == 2u || bits == 4u || bits == 8u) return 1u;
+    if (bits == 3u || bits == 6u) return 3u;
+    if (bits == 5u) return 5u;
+    return 1u;
+}
+
+float affine_code(uint bits, uint gs, uint n_groups, uint j, uint p) {
+    uint pf = pack_factor(bits);
+    uint bpp = bytes_per_pack(bits);
+    uint packs_in_group = gs / pf;
+    uint g = p / gs;
+    uint local = p % gs;
+    uint row_base = j * n_groups * packs_in_group * bpp + g * packs_in_group * bpp;
+    uint code = 0u;
+    if (bits == 2u || bits == 4u || bits == 8u) {
+        uint pack_idx = local / pf;
+        uint in_pack = local % pf;
+        uint byte = rd_byte(row_base + pack_idx);
+        uint mask = (1u << bits) - 1u;
+        code = (byte >> (in_pack * bits)) & mask;
+    } else if (bits == 3u) {
+        uint pack_idx = local / 8u;
+        uint in_pack = local % 8u;
+        uint bo = row_base + pack_idx * 3u;
+        uint b0 = rd_byte(bo);
+        uint b1 = rd_byte(bo + 1u);
+        uint b2 = rd_byte(bo + 2u);
+        uint codes[8] = uint[8](
+            b0 & 0x7u, (b0 & 0x38u) >> 3u,
+            ((b0 & 0xc0u) >> 6u) + ((b1 & 0x1u) << 2u),
+            (b1 & 0xeu) >> 1u, (b1 & 0x70u) >> 4u,
+            ((b1 & 0x80u) >> 7u) + ((b2 & 0x3u) << 1u),
+            (b2 & 0x1cu) >> 2u, (b2 & 0xe0u) >> 5u
+        );
+        code = codes[in_pack];
+    } else if (bits == 5u) {
+        uint pack_idx = local / 8u;
+        uint in_pack = local % 8u;
+        uint bo = row_base + pack_idx * 5u;
+        uint b0 = rd_byte(bo);
+        uint b1 = rd_byte(bo + 1u);
+        uint b2 = rd_byte(bo + 2u);
+        uint b3 = rd_byte(bo + 3u);
+        uint b4 = rd_byte(bo + 4u);
+        uint codes[8] = uint[8](
+            b0 & 0x1fu,
+            ((b0 & 0xe0u) >> 5u) + ((b1 & 0x3u) << 3u),
+            (b1 & 0x7cu) >> 2u,
+            ((b1 & 0x80u) >> 7u) + ((b2 & 0xfu) << 1u),
+            ((b2 & 0xf0u) >> 4u) + ((b3 & 0x1u) << 4u),
+            (b3 & 0x3eu) >> 1u,
+            ((b3 & 0xc0u) >> 6u) + ((b4 & 0x7u) << 2u),
+            (b4 & 0xf8u) >> 3u
+        );
+        code = codes[in_pack];
+    } else {
+        uint pack_idx = local / 4u;
+        uint in_pack = local % 4u;
+        uint bo = row_base + pack_idx * 3u;
+        uint b0 = rd_byte(bo);
+        uint b1 = rd_byte(bo + 1u);
+        uint b2 = rd_byte(bo + 2u);
+        uint codes[4] = uint[4](
+            b0 & 0x3fu,
+            ((b0 >> 6u) & 0x03u) + ((b1 & 0x0fu) << 2u),
+            ((b1 >> 4u) & 0x0fu) + ((b2 & 0x03u) << 4u),
+            (b2 >> 2u) & 0x3fu
+        );
+        code = codes[in_pack];
+    }
+    return float(code);
+}
+
+void main() {
+    uint tpg = gl_WorkGroupSize.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_row_tiles = (pc.m + TM - 1u) / TM;
+    uint tg = gl_WorkGroupID.x;
+    uint col = tg / n_row_tiles;
+    uint row0 = (tg - col * n_row_tiles) * TM;
+    if (col >= pc.n) return;
+
+    uint gs = pc.group_size;
+    uint n_groups = pc.k / gs;
+    float acc[8];
+    for (uint t = 0u; t < TM; t++) acc[t] = 0.0;
+
+    for (uint p0 = 0u; p0 < pc.k; p0 += tpg) {
+        uint p = p0 + tid;
+        for (uint t = 0u; t < TM; t++) {
+            uint row = row0 + t;
+            float v = 0.0;
+            if (row < pc.m && p < pc.k) {
+                v = arena_load_f(pc.x_word + row * pc.k + p);
+            }
+            xs[t * tpg + tid] = v;
+        }
+        barrier();
+
+        if (p < pc.k) {
+            uint g = p / gs;
+            float w_dq;
+            if (pc.kind == 0u) {
+                float code = affine_code(pc.bits, gs, n_groups, col, p);
+                float s = arena_load_f(pc.scale_word + col * n_groups + g);
+                float b = arena_load_f(pc.zp_word + col * n_groups + g);
+                w_dq = s * code + b;
+            } else if (pc.kind == 1u) {
+                uint bidx = col * (pc.k / 2u) + (p / 2u);
+                uint byte = rd_byte(bidx);
+                uint nib = ((p & 1u) == 0u) ? (byte & 0x0Fu) : (byte >> 4u);
+                uint sb = rd_scale_byte(col * n_groups + g);
+                w_dq = fp4_lut(nib) * group_scale(sb, gs);
+            } else {
+                uint wb = rd_byte(col * pc.k + p);
+                uint sb = rd_scale_byte(col * n_groups + g);
+                w_dq = decode_e4m3(wb) * group_scale(sb, gs);
+            }
+            for (uint t = 0u; t < TM; t++) {
+                acc[t] += xs[t * tpg + tid] * w_dq;
+            }
+        }
+        barrier();
+    }
+
+    for (uint t = 0u; t < TM; t++) smem[t * tpg + tid] = acc[t];
+    barrier();
+    for (uint s = tpg >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            for (uint t = 0u; t < TM; t++) {
+                smem[t * tpg + tid] += smem[t * tpg + tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        for (uint t = 0u; t < TM; t++) {
+            uint row = row0 + t;
+            if (row < pc.m) {
+                arena_store_f(pc.out_word + row * pc.n + col, smem[t * tpg]);
+            }
+        }
+    }
+}

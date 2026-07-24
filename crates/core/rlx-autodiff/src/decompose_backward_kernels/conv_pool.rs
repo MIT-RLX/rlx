@@ -440,6 +440,253 @@ pub fn compose_max_pool2d_backward(
     g.reshape_(flat_dx, vec![n as i64, c as i64, h as i64, w_in as i64])
 }
 
+/// `MaxPool3dBackward` via recompute-argmax (static NCDHW). Non-overlapping
+/// pools use the O(input) upsample+mask path; overlapping/padded stays on
+/// the dense scatter (toy sizes only).
+pub fn compose_max_pool3d_backward(
+    g: &mut Graph,
+    x: NodeId,
+    dy: NodeId,
+    out_shape: &Shape,
+    kernel_size: [usize; 3],
+    stride: [usize; 3],
+    padding: [usize; 3],
+) -> Option<NodeId> {
+    let [n, c, d, h, w_in] = static_dim5(&g.node(x).shape).expect("static NCDHW x");
+    let [n2, c2, d_out, h_out, w_out] = static_dim5(&g.node(dy).shape).expect("static NCDHW dy");
+    assert_eq!((n, c), (n2, c2));
+    let (kd, kh, kw) = (kernel_size[0], kernel_size[1], kernel_size[2]);
+    let (sd, sh, sw) = (stride[0], stride[1], stride[2]);
+    let (pd, ph, pw) = (padding[0], padding[1], padding[2]);
+    let dt = out_shape.dtype();
+
+    if sd == kd && sh == kh && sw == kw && pd == 0 && ph == 0 && pw == 0 {
+        let (cd, ch, cw) = (d_out * kd, h_out * kh, w_out * kw);
+        let pooled = g.add_node(
+            Op::Pool {
+                kind: rlx_ir::op::ReduceOp::Max,
+                kernel_size: vec![kd, kh, kw],
+                stride: vec![sd, sh, sw],
+                padding: vec![0, 0, 0],
+            },
+            vec![x],
+            g.node(dy).shape.clone(),
+        );
+        let pooled_up = nn_upsample_ncdhw(g, pooled, n, c, d_out, h_out, w_out, kd, kh, kw, dt);
+        let dy_up = nn_upsample_ncdhw(g, dy, n, c, d_out, h_out, w_out, kd, kh, kw, dt);
+        let mut x_crop = x;
+        if cd != d {
+            x_crop = g.narrow_(x_crop, 2, 0, cd);
+        }
+        if ch != h {
+            x_crop = g.narrow_(x_crop, 3, 0, ch);
+        }
+        if cw != w_in {
+            x_crop = g.narrow_(x_crop, 4, 0, cw);
+        }
+        let eq = compare_eq(g, x_crop, pooled_up);
+        let zero = f32_tensor_const(vec![0.0], Shape::scalar(dt), g);
+        let mut dx = where_select(g, eq, dy_up, zero);
+        if cd != d {
+            let pad = d - cd;
+            let z = f32_tensor_const(
+                vec![0.0; n * c * pad * ch * cw],
+                Shape::new(&[n, c, pad, ch, cw], dt),
+                g,
+            );
+            dx = g.concat_(vec![dx, z], 2);
+        }
+        if ch != h {
+            let pad = h - ch;
+            let z = f32_tensor_const(
+                vec![0.0; n * c * d * pad * cw],
+                Shape::new(&[n, c, d, pad, cw], dt),
+                g,
+            );
+            dx = g.concat_(vec![dx, z], 3);
+        }
+        if cw != w_in {
+            let pad = w_in - cw;
+            let z = f32_tensor_const(
+                vec![0.0; n * c * d * h * pad],
+                Shape::new(&[n, c, d, h, pad], dt),
+                g,
+            );
+            dx = g.concat_(vec![dx, z], 4);
+        }
+        return Some(dx);
+    }
+
+    // Overlapping / padded: not decomposed — preserve native MaxPool3dBackward.
+    None
+}
+
+/// `Conv3dBackwardWeight` via static im2col3d + matmul (static NCDHW, groups=1
+/// or per-group narrow). Toy / HOAD sizes only.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_conv3d_backward_weight(
+    g: &mut Graph,
+    x: NodeId,
+    dy: NodeId,
+    dw_shape: &Shape,
+    kernel_size: [usize; 3],
+    stride: [usize; 3],
+    padding: [usize; 3],
+    dilation: [usize; 3],
+    groups: usize,
+) -> NodeId {
+    assert!(groups >= 1, "compose_conv3d_backward_weight: groups >= 1");
+    let [n, c_in, _d, _h, _w] = static_dim5(&g.node(x).shape).expect("static NCDHW x");
+    let [n2, c_out, _d_out, _h_out, _w_out] =
+        static_dim5(&g.node(dy).shape).expect("static NCDHW dy");
+    assert_eq!(n, n2, "conv3d_backward_weight: batch mismatch");
+    let [dw_co, dw_ci, kd, kh, kw] = static_dim5(dw_shape).expect("static dw");
+    assert_eq!(
+        (kernel_size[0], kernel_size[1], kernel_size[2]),
+        (kd, kh, kw)
+    );
+    assert_eq!(dw_co, c_out);
+    assert_eq!(
+        dw_ci * groups,
+        c_in,
+        "conv3d_backward_weight: c_in/groups mismatch"
+    );
+
+    if groups == 1 {
+        return compose_conv3d_backward_weight_group(
+            g,
+            x,
+            dy,
+            dw_shape,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+        );
+    }
+    assert_eq!(c_in % groups, 0);
+    assert_eq!(c_out % groups, 0);
+    let c_in_pg = c_in / groups;
+    let c_out_pg = c_out / groups;
+    let dt = dw_shape.dtype();
+    let mut dw_groups: Vec<NodeId> = Vec::with_capacity(groups);
+    for gi in 0..groups {
+        let x_g = g.narrow_(x, 1, gi * c_in_pg, c_in_pg);
+        let dy_g = g.narrow_(dy, 1, gi * c_out_pg, c_out_pg);
+        let dw_g_shape = Shape::new(&[c_out_pg, c_in_pg, kd, kh, kw], dt);
+        dw_groups.push(compose_conv3d_backward_weight_group(
+            g,
+            x_g,
+            dy_g,
+            &dw_g_shape,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+        ));
+    }
+    g.concat_(dw_groups, 0)
+}
+
+fn compose_conv3d_backward_weight_group(
+    g: &mut Graph,
+    x: NodeId,
+    dy: NodeId,
+    dw_shape: &Shape,
+    kernel_size: [usize; 3],
+    stride: [usize; 3],
+    padding: [usize; 3],
+    dilation: [usize; 3],
+) -> NodeId {
+    let [n, c_in, d, h, w_in] = static_dim5(&g.node(x).shape).expect("static NCDHW x");
+    let [n2, c_out, d_out, h_out, w_out] = static_dim5(&g.node(dy).shape).expect("static NCDHW dy");
+    assert_eq!(n, n2);
+    let [dw_co, dw_ci, kd, kh, kw] = static_dim5(dw_shape).expect("static dw");
+    assert_eq!((dw_co, dw_ci), (c_out, c_in));
+    assert_eq!(
+        (kernel_size[0], kernel_size[1], kernel_size[2]),
+        (kd, kh, kw)
+    );
+
+    let m = n * d_out * h_out * w_out;
+    let k = c_in * kd * kh * kw;
+    let flat_n = n * c_in * d * h * w_in;
+    let flat_x = g.reshape_(x, vec![flat_n as i64]);
+    let dt = dw_shape.dtype();
+    let zero = f32_tensor_const(vec![0.0], Shape::new(&[1], dt), g);
+    let dy_r = g.reshape_(dy, vec![c_out as i64, m as i64]);
+    let dw_mat_shape = Shape::new(&[c_out, k], DType::F32);
+
+    let x_col = build_im2col3d_rows(
+        g,
+        flat_x,
+        zero,
+        n,
+        c_in,
+        d,
+        h,
+        w_in,
+        d_out,
+        h_out,
+        w_out,
+        kd,
+        kh,
+        kw,
+        stride[0],
+        stride[1],
+        stride[2],
+        padding[0],
+        padding[1],
+        padding[2],
+        dilation[0],
+        dilation[1],
+        dilation[2],
+        k,
+        0,
+        m,
+    );
+    let prod = g.matmul(dy_r, x_col, dw_mat_shape);
+    g.reshape_(
+        prod,
+        vec![c_out as i64, c_in as i64, kd as i64, kh as i64, kw as i64],
+    )
+}
+
+/// `Conv3dBackwardInput` → `ConvTranspose3d` (adjoint of forward conv).
+pub fn compose_conv3d_backward_input(
+    g: &mut Graph,
+    dy: NodeId,
+    w: NodeId,
+    out_shape: &Shape,
+    kernel_size: [usize; 3],
+    stride: [usize; 3],
+    padding: [usize; 3],
+    dilation: [usize; 3],
+    groups: usize,
+) -> NodeId {
+    let dy_shape = g.node(dy).shape.clone();
+    let out_pad = |axis: usize| -> usize {
+        let in_sz = dy_shape.dim(axis + 2).unwrap_static() as i64;
+        let out = out_shape.dim(axis + 2).unwrap_static() as i64;
+        let base = (in_sz - 1) * stride[axis] as i64
+            + dilation[axis] as i64 * (kernel_size[axis] as i64 - 1)
+            + 1
+            - 2 * padding[axis] as i64;
+        (out - base).max(0) as usize
+    };
+    g.add_node(
+        Op::ConvTranspose3d {
+            stride,
+            padding,
+            dilation,
+            output_padding: [out_pad(0), out_pad(1), out_pad(2)],
+            groups,
+        },
+        vec![dy, w],
+        out_shape.clone(),
+    )
+}
+
 /// `Conv2dBackwardInput` → forward `Conv` (same as autodiff VJP).
 pub fn compose_conv2d_backward_input(
     g: &mut Graph,

@@ -482,6 +482,29 @@ unsafe extern "C" {
         out: *mut *mut mlx_array_t,
     ) -> c_int;
 
+    pub fn rlx_mlx_op_maxpool3d_backward_metal(
+        x: *mut mlx_array_t,
+        dy: *mut mlx_array_t,
+        n: c_int,
+        c: c_int,
+        d: c_int,
+        h: c_int,
+        w: c_int,
+        d_out: c_int,
+        h_out: c_int,
+        w_out: c_int,
+        kd: c_int,
+        kh: c_int,
+        kw: c_int,
+        sd: c_int,
+        sh: c_int,
+        sw: c_int,
+        pd: c_int,
+        ph: c_int,
+        pw: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+
     pub fn rlx_mlx_op_take_along_axis(
         a: *mut mlx_array_t,
         indices: *mut mlx_array_t,
@@ -520,6 +543,7 @@ unsafe extern "C" {
         transpose: c_int,
         group_size: c_int,
         bits: c_int,
+        mode: *const c_char,
         out: *mut *mut mlx_array_t,
     ) -> c_int;
 
@@ -641,6 +665,27 @@ pub type LowerFn = unsafe extern "C" fn(
     out_n_outputs: *mut usize,
 ) -> c_int;
 
-// Silence unused-import lint when c_void isn't referenced elsewhere.
+#[repr(C)]
+pub struct mlx_named_array_list_t {
+    _private: [u8; 0],
+}
+
+unsafe extern "C" {
+    pub fn rlx_mlx_load_safetensors(
+        path: *const c_char,
+        out: *mut *mut mlx_named_array_list_t,
+    ) -> c_int;
+    pub fn rlx_mlx_load_npy(path: *const c_char, out: *mut *mut mlx_array_t) -> c_int;
+    pub fn rlx_mlx_named_list_len(list: *const mlx_named_array_list_t) -> usize;
+    pub fn rlx_mlx_named_list_get(
+        list: *mut mlx_named_array_list_t,
+        index: usize,
+        out_name: *mut *const c_char,
+        out_array: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_named_list_free(list: *mut mlx_named_array_list_t);
+}
+
+/// Silence unused-import lint when c_void isn't referenced elsewhere.
 #[allow(dead_code)]
 const _: *const c_void = std::ptr::null();

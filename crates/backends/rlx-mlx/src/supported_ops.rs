@@ -42,6 +42,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         LayerNorm2d,
         GroupNorm,
         ResizeNearest2x,
+        Interpolate3d,
         RmsNorm,
         Attention,
         Rope,
@@ -131,6 +132,10 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // surface as a clear error from `lower.rs`.
         Conv2dBackwardInput,
         Conv2dBackwardWeight,
+        // 3D training bwd — typed CPU host-eval (no native MLX path yet).
+        Conv3dBackwardInput,
+        Conv3dBackwardWeight,
+        MaxPool3dBackward,
         // Tier 3 — max-pool backward via slice-strided argmax over
         // pool windows + a per-kernel-slot scatter-add, matching
         // the CPU thunk's "first-hit-wins" tiebreaking.

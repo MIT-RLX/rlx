@@ -84,6 +84,20 @@ fn static_dim4(shape: &Shape) -> Option<[usize; 4]> {
     Some(out)
 }
 
+fn static_dim5(shape: &Shape) -> Option<[usize; 5]> {
+    if shape.rank() != 5 {
+        return None;
+    }
+    let mut out = [0usize; 5];
+    for (i, d) in shape.dims().iter().enumerate() {
+        out[i] = match d {
+            Dim::Static(n) => *n,
+            Dim::Dynamic(_) => return None,
+        };
+    }
+    Some(out)
+}
+
 fn gather_flat_f32(g: &mut Graph, flat_x: NodeId, index: usize, dt: DType) -> NodeId {
     let idx = f32_tensor_const(vec![index as f32], Shape::new(&[1], dt), g);
     g.gather_(flat_x, idx, 0)
@@ -509,6 +523,88 @@ fn build_im2col_rows(
     g.concat_(rows, 0)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_im2col3d_rows(
+    g: &mut Graph,
+    flat_x: NodeId,
+    zero: NodeId,
+    n: usize,
+    c_in: usize,
+    d: usize,
+    h: usize,
+    w_in: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    dd: usize,
+    dh: usize,
+    dw_d: usize,
+    k: usize,
+    m_start: usize,
+    m_end: usize,
+) -> NodeId {
+    let mut rows: Vec<NodeId> = Vec::with_capacity(m_end - m_start);
+    let mut flat = 0usize;
+    'outer: for ni in 0..n {
+        for do_ in 0..d_out {
+            for ho in 0..h_out {
+                for wo in 0..w_out {
+                    if flat >= m_end {
+                        break 'outer;
+                    }
+                    if flat >= m_start {
+                        let mut patch: Vec<NodeId> = Vec::with_capacity(k);
+                        for ci in 0..c_in {
+                            for kz in 0..kd {
+                                for ki in 0..kh {
+                                    for kj in 0..kw {
+                                        let di = do_ * sd + kz * dd;
+                                        let hi = ho * sh + ki * dh;
+                                        let wi = wo * sw + kj * dw_d;
+                                        let val = if di < pd
+                                            || hi < ph
+                                            || wi < pw
+                                            || di - pd >= d
+                                            || hi - ph >= h
+                                            || wi - pw >= w_in
+                                        {
+                                            zero
+                                        } else {
+                                            let idx = (((ni * c_in + ci) * d + (di - pd)) * h
+                                                + (hi - ph))
+                                                * w_in
+                                                + (wi - pw);
+                                            gather_flat_f32(
+                                                g,
+                                                flat_x,
+                                                idx,
+                                                g.node(flat_x).shape.dtype(),
+                                            )
+                                        };
+                                        patch.push(val);
+                                    }
+                                }
+                            }
+                        }
+                        rows.push(g.concat_(patch, 0));
+                    }
+                    flat += 1;
+                }
+            }
+        }
+    }
+    g.concat_(rows, 0)
+}
+
 fn compare_eq(g: &mut Graph, lhs: NodeId, rhs: NodeId) -> NodeId {
     let s = shape::compare_shape(&g.node(lhs).shape, &g.node(rhs).shape).expect("compare eq");
     g.add_node(Op::Compare(CmpOp::Eq), vec![lhs, rhs], s)
@@ -610,6 +706,61 @@ fn nn_upsample_nchw(
     g.reshape_(
         ex,
         vec![n as i64, c as i64, (ho * kh) as i64, (wo * kw) as i64],
+    )
+}
+
+/// Nearest-neighbour upsample of an NCDHW tensor by integer factors.
+fn nn_upsample_ncdhw(
+    g: &mut Graph,
+    t: NodeId,
+    n: usize,
+    c: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    dt: rlx_ir::DType,
+) -> NodeId {
+    let r1 = g.reshape_(
+        t,
+        vec![
+            n as i64,
+            c as i64,
+            d_out as i64,
+            1,
+            h_out as i64,
+            1,
+            w_out as i64,
+            1,
+        ],
+    );
+    let ex = g.add_node(
+        Op::Expand {
+            target_shape: vec![
+                n as i64,
+                c as i64,
+                d_out as i64,
+                kd as i64,
+                h_out as i64,
+                kh as i64,
+                w_out as i64,
+                kw as i64,
+            ],
+        },
+        vec![r1],
+        Shape::new(&[n, c, d_out, kd, h_out, kh, w_out, kw], dt),
+    );
+    g.reshape_(
+        ex,
+        vec![
+            n as i64,
+            c as i64,
+            (d_out * kd) as i64,
+            (h_out * kh) as i64,
+            (w_out * kw) as i64,
+        ],
     )
 }
 

@@ -60,7 +60,13 @@ struct WeightCache {
     batch: usize,
 }
 
-fn xy_caps(max_seq: usize, batch: usize, input_size: usize, hidden: usize, dirs: usize) -> (usize, usize, usize) {
+fn xy_caps(
+    max_seq: usize,
+    batch: usize,
+    input_size: usize,
+    hidden: usize,
+    dirs: usize,
+) -> (usize, usize, usize) {
     let x = max_seq * batch * input_size;
     let y = max_seq * dirs * batch * hidden;
     (x, y, x + y)
@@ -113,8 +119,6 @@ fn onnx_r_to_lstm_gate_major(src: &[f32], hidden: usize, h4: usize) -> Vec<f32> 
     permute_gates_iofc_to_ifgo(&tmp, hidden)
 }
 
-
-
 /// Gate-major `[4h, k]` with ONNX order i|o|f|c → PyTorch i|f|g|o.
 fn permute_gates_iofc_to_ifgo(src: &[f32], k: usize) -> Vec<f32> {
     let h = src.len() / (4 * k);
@@ -124,14 +128,14 @@ fn permute_gates_iofc_to_ifgo(src: &[f32], k: usize) -> Vec<f32> {
         out[row * k..(row + 1) * k].copy_from_slice(&src[row * k..(row + 1) * k]);
         // f ← onnx f (block 2)
         let s = (2 * h + row) * k;
-        let d = (1 * h + row) * k;
+        let d = (h + row) * k;
         out[d..d + k].copy_from_slice(&src[s..s + k]);
         // g ← onnx c (block 3)
         let s = (3 * h + row) * k;
         let d = (2 * h + row) * k;
         out[d..d + k].copy_from_slice(&src[s..s + k]);
         // o ← onnx o (block 1)
-        let s = (1 * h + row) * k;
+        let s = (h + row) * k;
         let d = (3 * h + row) * k;
         out[d..d + k].copy_from_slice(&src[s..s + k]);
     }
@@ -160,10 +164,7 @@ fn dtoh_f32(stream: &Arc<CudaStream>, buf: &CudaSlice<f32>, off: u32, n: usize) 
         return host;
     }
     stream
-        .memcpy_dtoh(
-            &buf.slice(off as usize..(off as usize + n)),
-            &mut host,
-        )
+        .memcpy_dtoh(&buf.slice(off as usize..(off as usize + n)), &mut host)
         .expect("dyn_quant_lstm: dtoh f32");
     host
 }
@@ -259,18 +260,30 @@ pub fn try_run(
 
     let cache_key = (*w_off, *r_off);
     let mut caches = weight_caches().lock().unwrap();
-    if !caches.contains_key(&cache_key) {
+    if let std::collections::hash_map::Entry::Vacant(e) = caches.entry(cache_key) {
         let w_i8 = dtoh_i8_packed(stream, arena, *w_off, w_sh.num_elements().unwrap_or(0));
         let r_i8 = dtoh_i8_packed(stream, arena, *r_off, r_sh.num_elements().unwrap_or(0));
         let b = dtoh_f32(stream, arena, *b_off, dirs * 8 * hidden);
-        let w_scale = dtoh_f32(stream, arena, *ws_off, ws_sh.num_elements().unwrap_or(0).max(1));
-        let r_scale = dtoh_f32(stream, arena, *rs_off, rs_sh.num_elements().unwrap_or(0).max(1));
+        let w_scale = dtoh_f32(
+            stream,
+            arena,
+            *ws_off,
+            ws_sh.num_elements().unwrap_or(0).max(1),
+        );
+        let r_scale = dtoh_f32(
+            stream,
+            arena,
+            *rs_off,
+            rs_sh.num_elements().unwrap_or(0).max(1),
+        );
         let w_zp = read_zp_f32_or_i8(stream, arena, *wz_off, wz_sh);
         let r_zp = read_zp_f32_or_i8(stream, arena, *rz_off, rz_sh);
 
         let w_stride = input_size * h4;
         let r_stride = hidden * h4;
-        if w_i8.len() < dirs * w_stride || r_i8.len() < dirs * r_stride || b.len() < dirs * 8 * hidden
+        if w_i8.len() < dirs * w_stride
+            || r_i8.len() < dirs * r_stride
+            || b.len() < dirs * 8 * hidden
         {
             return false;
         }
@@ -280,9 +293,15 @@ pub fn try_run(
         let mut bias_all = Vec::with_capacity(dirs * h4);
         for dir in 0..dirs {
             let ws = w_scale.get(dir).copied().unwrap_or(w_scale[0]);
-            let wz = w_zp.get(dir).copied().unwrap_or(w_zp.first().copied().unwrap_or(0));
+            let wz = w_zp
+                .get(dir)
+                .copied()
+                .unwrap_or(w_zp.first().copied().unwrap_or(0));
             let rs = r_scale.get(dir).copied().unwrap_or(r_scale[0]);
-            let rz = r_zp.get(dir).copied().unwrap_or(r_zp.first().copied().unwrap_or(0));
+            let rz = r_zp
+                .get(dir)
+                .copied()
+                .unwrap_or(r_zp.first().copied().unwrap_or(0));
             let w_f = dequant_i8(&w_i8[dir * w_stride..(dir + 1) * w_stride], ws, wz);
             let r_f = dequant_i8(&r_i8[dir * r_stride..(dir + 1) * r_stride], rs, rz);
             w_all.extend(onnx_w_to_lstm_gate_major(&w_f, input_size, h4));
@@ -296,10 +315,8 @@ pub fn try_run(
         let (x_cap, y_cap, w_base) = xy_caps(max_seq, batch, input_size, hidden, dirs);
         let mut packed = vec![0f32; w_base + w_all.len() + r_all.len() + bias_all.len()];
         packed[w_base..w_base + w_all.len()].copy_from_slice(&w_all);
-        packed[w_base + w_all.len()..w_base + w_all.len() + r_all.len()]
-            .copy_from_slice(&r_all);
-        packed[w_base + w_all.len() + r_all.len()..]
-            .copy_from_slice(&bias_all);
+        packed[w_base + w_all.len()..w_base + w_all.len() + r_all.len()].copy_from_slice(&r_all);
+        packed[w_base + w_all.len() + r_all.len()..].copy_from_slice(&bias_all);
         let _ = (x_cap, y_cap);
         let cudnn_weights = crate::lstm_cudnn::pack_weight_space(
             stream,
@@ -316,21 +333,18 @@ pub fn try_run(
         stream
             .memcpy_htod(&packed, &mut workspace)
             .expect("dyn_quant_lstm: workspace htod");
-        caches.insert(
-            cache_key,
-            WeightCache {
-                workspace,
-                cudnn_weights,
-                max_seq,
-                w_elems: w_all.len(),
-                r_elems: r_all.len(),
-                bias_elems: bias_all.len(),
-                hidden,
-                input_size,
-                dirs,
-                batch,
-            },
-        );
+        e.insert(WeightCache {
+            workspace,
+            cudnn_weights,
+            max_seq,
+            w_elems: w_all.len(),
+            r_elems: r_all.len(),
+            bias_elems: bias_all.len(),
+            hidden,
+            input_size,
+            dirs,
+            batch,
+        });
     }
     let weights = caches.get_mut(&cache_key).unwrap();
     if weights.hidden != hidden
@@ -343,13 +357,7 @@ pub fn try_run(
 
     // Grow X/Y caps if this call needs a longer sequence.
     if seq > weights.max_seq {
-        let (old_x, old_y, old_w_base) = xy_caps(
-            weights.max_seq,
-            batch,
-            input_size,
-            hidden,
-            dirs,
-        );
+        let (old_x, old_y, old_w_base) = xy_caps(weights.max_seq, batch, input_size, hidden, dirs);
         let (_nx, _ny, new_w_base) = xy_caps(seq, batch, input_size, hidden, dirs);
         let wtot = weights.w_elems + weights.r_elems + weights.bias_elems;
         let new_len = new_w_base + wtot;
@@ -357,9 +365,7 @@ pub fn try_run(
             .alloc_zeros::<f32>(new_len.max(1))
             .expect("dyn_quant_lstm: workspace grow");
         {
-            let src = weights
-                .workspace
-                .slice(old_w_base..old_w_base + wtot);
+            let src = weights.workspace.slice(old_w_base..old_w_base + wtot);
             let mut dst = new_ws.slice_mut(new_w_base..new_w_base + wtot);
             stream
                 .memcpy_dtod(&src, &mut dst)
@@ -370,13 +376,7 @@ pub fn try_run(
         weights.max_seq = seq;
     }
 
-    let (x_cap, y_cap, w_base) = xy_caps(
-        weights.max_seq,
-        batch,
-        input_size,
-        hidden,
-        dirs,
-    );
+    let (x_cap, y_cap, w_base) = xy_caps(weights.max_seq, batch, input_size, hidden, dirs);
     let x_elems = seq * batch * input_size;
     let y_elems = seq * dirs * batch * hidden;
     debug_assert!(x_elems <= x_cap && y_elems <= y_cap);

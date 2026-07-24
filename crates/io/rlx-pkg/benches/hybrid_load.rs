@@ -14,9 +14,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_pkg::{
-    ContainerKind, Package, PackedWeight, StorageTier, WriteOptions, write_package,
-};
+use rlx_pkg::{ContainerKind, Package, PackedWeight, StorageTier, WriteOptions, write_package};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 

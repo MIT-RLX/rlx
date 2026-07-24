@@ -87,26 +87,26 @@ edge          = ["cpu", "cortexm", "fpga"]
 all-cpu       = ["cpu", "gguf", "linalg"]
 
 [dependencies]
-rlx-ir      = { path = "../core/rlx-ir",      version = "0.2.13" }
-rlx-tensor  = { path = "../core/rlx-tensor", version = "0.2.13", optional = true }
-rlx-opt     = { path = "../core/rlx-opt",     version = "0.2.13" }
-rlx-driver  = { path = "../core/rlx-driver",  version = "0.2.13" }
-rlx-macros  = { path = "../core/rlx-macros",  version = "0.2.13" }
-rlx-runtime = { path = "../core/rlx-runtime", version = "0.2.13", default-features = false }
-rlx-collectives = { path = "../core/rlx-collectives", version = "0.2.13", optional = true }
-rlx-gguf     = { path = "../io/rlx-gguf",    version = "0.2.13", optional = true }
-rlx-gguf-convert = { path = "../io/rlx-gguf-convert", version = "0.2.13", optional = true }
-rlx-bench   = { path = "../tooling/rlx-bench",   version = "0.2.13", optional = true }
-rlx-sparse  = { path = "../numerics/rlx-sparse",  version = "0.2.13", optional = true }
-rlx-linalg  = { path = "../numerics/rlx-linalg",  version = "0.2.13", optional = true }
-# rlx-splat   = { path = "../rlx-splat",   version = "0.2.13", optional = true, default-features = false, features = ["cpu", "core"] }
-rlx-umap    = { path = "../numerics/rlx-umap",    version = "0.2.13", optional = true, default-features = false, features = ["cpu", "graph"] }
-rlx-optim   = { path = "../core/rlx-optim",   version = "0.2.13", optional = true }
+rlx-ir      = { path = "../core/rlx-ir",      version = "0.2.14" }
+rlx-tensor  = { path = "../core/rlx-tensor", version = "0.2.14", optional = true }
+rlx-opt     = { path = "../core/rlx-opt",     version = "0.2.14" }
+rlx-driver  = { path = "../core/rlx-driver",  version = "0.2.14" }
+rlx-macros  = { path = "../core/rlx-macros",  version = "0.2.14" }
+rlx-runtime = { path = "../core/rlx-runtime", version = "0.2.14", default-features = false }
+rlx-collectives = { path = "../core/rlx-collectives", version = "0.2.14", optional = true }
+rlx-gguf     = { path = "../io/rlx-gguf",    version = "0.2.14", optional = true }
+rlx-gguf-convert = { path = "../io/rlx-gguf-convert", version = "0.2.14", optional = true }
+rlx-bench   = { path = "../tooling/rlx-bench",   version = "0.2.14", optional = true }
+rlx-sparse  = { path = "../numerics/rlx-sparse",  version = "0.2.14", optional = true }
+rlx-linalg  = { path = "../numerics/rlx-linalg",  version = "0.2.14", optional = true }
+# rlx-splat   = { path = "../rlx-splat",   version = "0.2.14", optional = true, default-features = false, features = ["cpu", "core"] }
+rlx-umap    = { path = "../numerics/rlx-umap",    version = "0.2.14", optional = true, default-features = false, features = ["cpu", "graph"] }
+rlx-optim   = { path = "../core/rlx-optim",   version = "0.2.14", optional = true }
 # rlx-cortexm is `no_std` by default; we want the host-side parity
 # kernels (the `std` feature) when re-exported from the prelude.
-rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.13", optional = true, default-features = false, features = ["std"] }
-rlx-fpga    = { path = "../backends/rlx-fpga",    version = "0.2.13", optional = true }
-rlx-onnx    = { path = "../io/rlx-onnx",    version = "0.2.13", optional = true, default-features = true }
+rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.14", optional = true, default-features = false, features = ["std"] }
+rlx-fpga    = { path = "../backends/rlx-fpga",    version = "0.2.14", optional = true }
+rlx-onnx    = { path = "../io/rlx-onnx",    version = "0.2.14", optional = true, default-features = true }
 # `rlx::Result` / `rlx::Error` type aliases. Every workspace crate
 # already pulls anyhow in transitively (rlx-runtime, rlx-gguf), so this
 # adds no real bytes — just makes the alias

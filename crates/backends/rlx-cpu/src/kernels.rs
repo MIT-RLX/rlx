@@ -1427,6 +1427,40 @@ pub fn resize_nearest_2x_nchw(
     }
 }
 
+/// Nearest-neighbor NCDHW resample to `[d_out, h_out, w_out]` spatial size.
+/// Mapping: `src = min(floor(dst * in / out), in - 1)`.
+pub fn interpolate3d_ncdhw(
+    input: &[f32],
+    output: &mut [f32],
+    n: usize,
+    c: usize,
+    d_in: usize,
+    h_in: usize,
+    w_in: usize,
+    d_out: usize,
+    h_out: usize,
+    w_out: usize,
+) {
+    for bn in 0..n {
+        for ch in 0..c {
+            let in_base = (bn * c + ch) * d_in * h_in * w_in;
+            let out_base = (bn * c + ch) * d_out * h_out * w_out;
+            for do_ in 0..d_out {
+                let di = ((do_ * d_in) / d_out).min(d_in.saturating_sub(1));
+                for ho in 0..h_out {
+                    let hi = ((ho * h_in) / h_out).min(h_in.saturating_sub(1));
+                    for wo in 0..w_out {
+                        let wi = ((wo * w_in) / w_out).min(w_in.saturating_sub(1));
+                        let src = in_base + (di * h_in + hi) * w_in + wi;
+                        let dst = out_base + (do_ * h_out + ho) * w_out + wo;
+                        output[dst] = input[src];
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -87,6 +87,20 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RLX_MLX_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=RLX_MLX_JOBS");
 
+    // FetchContent clones fmt into OUT_DIR/build/_deps/fmt-src. A failed or
+    // interrupted prior configure leaves that tree dirty, and CMake's
+    // `git checkout <GIT_TAG>` then aborts ("local changes would be
+    // overwritten"). Drop stale fmt populate dirs before every configure.
+    {
+        let deps = out_dir.join("build").join("_deps");
+        for name in ["fmt-src", "fmt-subbuild", "fmt-build"] {
+            let p = deps.join(name);
+            if p.exists() {
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
+
     let mut mlx_cfg = cmake::Config::new(&mlx_src);
     mlx_cfg
         .profile(cmake_build_type)

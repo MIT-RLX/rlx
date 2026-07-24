@@ -123,9 +123,20 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
     for node in graph.nodes() {
         match &node.op {
             Op::DequantMatMul { scheme }
-                if (scheme.is_gguf() || matches!(scheme, rlx_ir::QuantScheme::Nvfp4Block)) =>
+                if (scheme.is_gguf()
+                    || matches!(scheme, rlx_ir::QuantScheme::Nvfp4Block)
+                    || (!cfg!(feature = "native-mxfp")
+                        && matches!(
+                            scheme,
+                            rlx_ir::QuantScheme::MlxMxfp4 { .. }
+                                | rlx_ir::QuantScheme::MlxMxfp8 { .. }
+                        ))) =>
             {
-                return Some("DequantMatMul[GGUF|NVFP4] (host dequant)");
+                return Some(if scheme.is_mlx() {
+                    "DequantMatMul[MLX mxfp] (host dequant + cache)"
+                } else {
+                    "DequantMatMul[GGUF|NVFP4] (host dequant + cache)"
+                });
             }
             Op::DequantGroupedMatMul { scheme } if scheme.is_gguf() => {
                 return Some("DequantGroupedMatMul[GGUF] (host dequant)");
@@ -226,6 +237,7 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
             | Op::EighBackward
             | Op::EighBatch
             | Op::EighBatchBackward => return Some("SPD/Eigh (host typed)"),
+            Op::Interpolate3d { .. } => return Some("Interpolate3d (host typed)"),
             // Oversized ISTFT-as-conv (legacy decompose path) — MLX's conv1d
             // materializes a c_in·k·out_len im2col. Force Lazy + host naive.
             Op::Conv {
@@ -668,6 +680,9 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::MaxPool2dBackward { .. }
             | Op::Conv2dBackwardInput { .. }
             | Op::Conv2dBackwardWeight { .. }
+            | Op::MaxPool3dBackward { .. }
+            | Op::Conv3dBackwardInput { .. }
+            | Op::Conv3dBackwardWeight { .. }
             | Op::SoftmaxCrossEntropyWithLogits
             | Op::SoftmaxCrossEntropyBackward
             | Op::LayerNormBackwardInput { .. }

@@ -15,11 +15,11 @@ bytemuck = "1"
 half = "2"
 # Pure-Rust ONNX protobuf types (vendored, protoc-free) — replaces the crates.io
 # `onnx` crate whose build.rs invoked the external `protoc` binary.
-rlx-onnx-proto = { path = "../rlx-onnx-proto", version = "0.2.13" }
+rlx-onnx-proto = { path = "../rlx-onnx-proto", version = "0.2.14" }
 protobuf = "1.7"
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13", features = ["serialize"] }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", default-features = false, features = ["cpu"], optional = true }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.13", optional = true }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14", features = ["serialize"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false, features = ["cpu"], optional = true }
+rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14", optional = true }
 safetensors = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -41,6 +41,6 @@ workspace = true
 
 [dev-dependencies]
 anyhow = "1"
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", default-features = false, features = ["cpu"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false, features = ["cpu"] }
 tempfile = "3"
 

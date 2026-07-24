@@ -20,9 +20,7 @@ use crate::specialize_named;
 use anyhow::{Context, Result, bail};
 use rlx_ir::{Dim, Op, hir_to_graph};
 use rlx_onnx_import::{ImportOptions, build_hir_from_onnx_file};
-use rlx_pkg::{
-    BakeWeight, ContainerKind, WriteOptions, package_from_bake,
-};
+use rlx_pkg::{BakeWeight, ContainerKind, WriteOptions, package_from_bake};
 use std::path::Path;
 
 /// Options for [`onnx_to_rlxp`].

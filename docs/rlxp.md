@@ -16,7 +16,10 @@ Crate: [`crates/io/rlx-pkg`](../crates/io/rlx-pkg/).
 | **RLXP flat** | One `mmap`, tiny JSON TOC | GGUF-class packed weights, **no duplex**, no ZIP headers | MIR + hybrid cold/warm |
 | GGUF | One `mmap` | Excellent packed quants | Weights + metadata; no portable MIR graph |
 | safetensors | One `mmap` | Usually f16/bf16/f32 | No GGUF-class block quants |
-| DDUF | ZIP + member seek | safetensors + ZIP overhead | Inspectable; slower/larger than flat |
+| DDUF | ZIP + member seek | safetensors + ZIP overhead | Import via `rlx-pkg import-dduf` / [`docs/dduf.md`](dduf.md) |
+| MLX | dir / safetensors / npz | Dense + affine/mxfp packs | Import via `rlx-pkg import-mlx` / [`docs/mlx-weights.md`](mlx-weights.md) |
+| NeMo | `.nemo` tar + torch ckpt | Dense f32 | `rlx-pkg import-nemo` |
+| PyTorch | `.pt` / `.pth` / `bin` | Dense f32 | `rlx-pkg import-pt` |
 | ONNX | Protobuf parse | Often dense floats + graph | Graph-heavy; not mmap-first for weights |
 
 ## Hybrid tiers

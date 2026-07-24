@@ -277,16 +277,18 @@ fn try_pre_wih_cublas(
         return false;
     };
     let blas = blas.lock().unwrap();
-    if unsafe {
-        cudarc::cublas::result::set_stream(*blas.handle(), stream.cu_stream() as _)
-    }
-    .is_err()
+    if unsafe { cudarc::cublas::result::set_stream(*blas.handle(), stream.cu_stream() as _) }
+        .is_err()
     {
         return false;
     }
     let (arena_ptr, arena_rec) = arena.device_ptr_mut(stream);
     let (scratch_ptr, scratch_rec) = scratch.device_ptr_mut(stream);
-    let x_base = if in_is_scratch { scratch_ptr } else { arena_ptr };
+    let x_base = if in_is_scratch {
+        scratch_ptr
+    } else {
+        arena_ptr
+    };
     let x_dev = x_base + (in_off_f as u64) * 4;
     let wih_dev = scratch_ptr + (wih_t_off as u64) * 4;
     let pre_dev = scratch_ptr + (pre_off as u64) * 4;

@@ -58,15 +58,15 @@ impl RemoteFlat {
         let hdr_toc = http_range(url, 0, toc_end)?;
         let toc_bytes = &hdr_toc[FlatHeader::SIZE..FlatHeader::SIZE + header.toc_len as usize];
         let mut toc: FlatToc = if header.is_bincode_toc() {
-            let wire: crate::flat::FlatTocBin =
-                bincode::deserialize(toc_bytes)?;
+            let wire: crate::flat::FlatTocBin = bincode::deserialize(toc_bytes)?;
             wire.into_toc()?
         } else {
             serde_json::from_slice(toc_bytes)?
         };
         toc.resolve_names()?;
         toc.manifest.validate()?;
-        let data_start = (FlatHeader::SIZE as u64 + header.toc_len + DATA_ALIGN - 1) & !(DATA_ALIGN - 1);
+        let data_start =
+            (FlatHeader::SIZE as u64 + header.toc_len + DATA_ALIGN - 1) & !(DATA_ALIGN - 1);
         Ok(Self {
             url: url.to_string(),
             header,
@@ -88,11 +88,7 @@ impl RemoteFlat {
         let abs1 = abs0 + t.length - 1;
         let stored = http_range(&self.url, abs0, abs1)?;
         if stored.len() as u64 != t.length {
-            bail!(
-                "range length {} != TOC length {}",
-                stored.len(),
-                t.length
-            );
+            bail!("range length {} != TOC length {}", stored.len(), t.length);
         }
         decode_payload(t.codec, &stored)
     }

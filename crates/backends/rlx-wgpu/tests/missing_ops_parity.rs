@@ -109,9 +109,7 @@ fn axial_rope2d_matches_cpu() {
     let x = g.input("x", Shape::new(&[1, seq, hidden], DType::F32));
     let y = g.axial_rope2d(x, end_x, end_y, head_dim, num_heads, 10_000.0, 1);
     g.set_outputs(vec![y]);
-    let xv: Vec<f32> = (0..1 * seq * hidden)
-        .map(|i| (i as f32 * 0.13).sin())
-        .collect();
+    let xv: Vec<f32> = (0..seq * hidden).map(|i| (i as f32 * 0.13).sin()).collect();
     let want = cpu_run(g.clone(), &[("x", &xv)]);
     let got = wgpu_run(g, &[("x", &xv)]);
     assert!(

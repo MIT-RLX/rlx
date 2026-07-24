@@ -52,6 +52,8 @@ build-mlx:
 test-mlx:
     cargo test --release -p rlx-mlx
     cargo test --release -p rlx-runtime --features cpu,mlx --test mlx_attention_parity
+    # Opt-in C++ quantized_matmul path for mxfp (must also pass default host path).
+    cargo test --release -p rlx-mlx --features native-mxfp --test mxfp_path
 
 # Run rlx-cerebras tests (CSL codegen + matmul oracle parity). Pure Rust, no SDK.
 test-cerebras:
@@ -249,6 +251,9 @@ test:
 # GPU backends + runtime feature tests for the host platform.
 # Darwin: Metal, MLX, wgpu, Vulkan (MoltenVK), `cpu,apple` runtime, third-order.
 # Linux: wgpu, Vulkan, optional CUDA/ROCm via `test-third-order-gpu` / `test-rocm`.
+# When `$RLX_HF_CACHE` (or `~/.cache/rlx/hf`) already holds an mlx-community
+# checkout, Metal's `metal_hf_mlx_one_linear` runs without `RLX_HF_MLX=1`.
+# Cold download: `RLX_HF_MLX=1 just test-gpu`.
 test-gpu:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -343,6 +348,16 @@ fmt:
 # Clippy with warnings as errors.
 lint:
     cargo clippy --all-targets -- -D warnings
+
+# Install repo git hooks (auto-fmt + clippy on commit). Safe to re-run.
+install-git-hooks:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT="$(git rev-parse --show-toplevel)"
+    mkdir -p "$ROOT/.git/hooks"
+    ln -sfn ../../scripts/git-hooks/pre-commit "$ROOT/.git/hooks/pre-commit"
+    chmod +x "$ROOT/scripts/git-hooks/pre-commit"
+    echo "installed .git/hooks/pre-commit → scripts/git-hooks/pre-commit"
 
 # Refresh docs/op-coverage.md checkmarks from backend SUPPORTED_OPS claims.
 gen-op-coverage:
@@ -458,7 +473,7 @@ run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
 # Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test lint check-wasm test-pyrlx test-third-order-gpu test-rocm
+ci: build test fmt-check lint check-wasm test-pyrlx test-third-order-gpu test-rocm
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 test-rocm:

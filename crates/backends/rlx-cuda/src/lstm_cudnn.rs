@@ -111,12 +111,7 @@ fn htod_raw(stream: &Arc<CudaStream>, dst_dev: u64, host: &[f32]) -> bool {
     }
     let (src, src_rec) = tmp.device_ptr(stream);
     let ok = unsafe {
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            dst_dev,
-            src,
-            host.len() * 4,
-            stream.cu_stream(),
-        )
+        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(dst_dev, src, host.len() * 4, stream.cu_stream())
     };
     drop(src_rec);
     ok == cudarc::driver::sys::CUresult::CUDA_SUCCESS
@@ -239,7 +234,7 @@ pub fn pack_weight_space(
             return None;
         }
 
-        let mut weight_space = stream.alloc_zeros::<u8>(weight_bytes).ok()?;
+        let weight_space = stream.alloc_zeros::<u8>(weight_bytes).ok()?;
         let (ws_ptr, ws_rec) = weight_space.device_ptr(stream);
 
         let mut m_desc: cudnn_sys::cudnnTensorDescriptor_t = std::ptr::null_mut();
@@ -366,11 +361,8 @@ pub fn forward_workspace(
     let dirs = if bidirectional { 2 } else { 1 };
 
     unsafe {
-        if cudarc::cudnn::result::set_stream(
-            handle,
-            stream.cu_stream() as cudnn_sys::cudaStream_t,
-        )
-        .is_err()
+        if cudarc::cudnn::result::set_stream(handle, stream.cu_stream() as cudnn_sys::cudaStream_t)
+            .is_err()
         {
             return false;
         }

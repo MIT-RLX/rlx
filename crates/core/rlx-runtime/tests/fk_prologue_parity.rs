@@ -1184,9 +1184,7 @@ fn fk_prologue_resize_relu_matches_cpu_rocm() {
         return;
     }
     let g = build_resize_chain_graph();
-    let x: Vec<f32> = (0..1 * 3 * 8 * 8)
-        .map(|i| (i as f32) * 0.01 - 0.5)
-        .collect();
+    let x: Vec<f32> = (0..3 * 8 * 8).map(|i| (i as f32) * 0.01 - 0.5).collect();
     let inputs = &[("x", x.as_slice())];
     let ref_out = run_on(Device::Cpu, g.clone(), &CompileOptions::new(), inputs);
     let fus_out = run_on(

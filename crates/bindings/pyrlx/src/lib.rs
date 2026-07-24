@@ -36,7 +36,8 @@
 //! | Multi-backend | `GraphDevices`, `DeviceRouter`, `DevicePolicy` |
 //! | Transforms | `grad`, `jvp`, `hvp`, `vmap`, `nth_order_grad` |
 //! | GGUF | `quantize`, `dequant`, `load_gguf`, `write_gguf`, `convert_to_gguf`, `GgufFile` |
-//! | RLXP | `load_rlxp`, `convert_gguf_to_rlxp` |
+//! | RLXP | `load_rlxp`, `convert_gguf_to_rlxp`, `convert_mlx_to_rlxp`, `convert_dduf_to_rlxp`, `convert_nemo_to_rlxp`, `convert_pt_to_rlxp` |
+//! | Weights | `load_mlx`, `load_dduf`, `load_nemo`, `load_pt` |
 //!
 //! Graphs are consumed at compile time. Use `pyrlx.set_param` / `pyrlx.run` in
 //! Python for dtype-aware NumPy I/O without manual byte packing.
@@ -57,6 +58,7 @@ mod graph;
 mod graph_devices;
 mod rlxp;
 mod session;
+mod weights_io;
 
 /// Module init — `import pyrlx._pyrlx`.
 #[pymodule]
@@ -95,6 +97,14 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gguf::write_gguf, m)?)?;
     m.add_function(wrap_pyfunction!(rlxp::load_rlxp, m)?)?;
     m.add_function(wrap_pyfunction!(rlxp::convert_gguf_to_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::convert_mlx_to_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::convert_dduf_to_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::convert_nemo_to_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::convert_pt_to_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(weights_io::load_mlx, m)?)?;
+    m.add_function(wrap_pyfunction!(weights_io::load_dduf, m)?)?;
+    m.add_function(wrap_pyfunction!(weights_io::load_nemo, m)?)?;
+    m.add_function(wrap_pyfunction!(weights_io::load_pt, m)?)?;
     #[cfg(feature = "gguf-convert")]
     {
         m.add_function(wrap_pyfunction!(gguf_convert::convert_to_gguf, m)?)?;

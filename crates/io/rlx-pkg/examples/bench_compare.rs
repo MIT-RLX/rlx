@@ -17,9 +17,7 @@
 use rlx_gguf::{GgmlType, GgufFile, GgufWriter};
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_pkg::{
-    ContainerKind, Package, PackedWeight, StorageTier, WriteOptions, write_package,
-};
+use rlx_pkg::{ContainerKind, Package, PackedWeight, StorageTier, WriteOptions, write_package};
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -187,9 +185,13 @@ fn main() {
     .collect();
 
     println!();
-    println!("=== Format compare ({} payload, {} iters) ===", fmt_mib(N_BYTES as u64), ITERS);
+    println!(
+        "=== Format compare ({} payload, {} iters) ===",
+        fmt_mib(N_BYTES as u64),
+        ITERS
+    );
     println!();
-    println!("{:<22} {:>10}  {}", "format", "file size", "notes");
+    println!("{:<22} {:>10}  notes", "format", "file size");
     println!("{}", "-".repeat(72));
     for k in ["rlxp flat", "gguf", "safetensors", "rlxp zip"] {
         println!("{:<22} {:>10}", k, fmt_mib(sizes[k]));
@@ -204,7 +206,12 @@ fn main() {
         let buf = p.tensor_mmap("w").unwrap();
         black_box(touch(buf));
     });
-    println!("{:<42} {:>12} {:>12}", "RLXP flat: open+mmap+touch", fmt_dur(m), fmt_dur(s));
+    println!(
+        "{:<42} {:>12} {:>12}",
+        "RLXP flat: open+mmap+touch",
+        fmt_dur(m),
+        fmt_dur(s)
+    );
 
     let path = gguf.clone();
     let (m, s) = time_it(ITERS, || {
@@ -213,14 +220,24 @@ fn main() {
         let buf = f.tensor_bytes(t).unwrap();
         black_box(touch(buf));
     });
-    println!("{:<42} {:>12} {:>12}", "GGUF: open_mmap+tensor+touch", fmt_dur(m), fmt_dur(s));
+    println!(
+        "{:<42} {:>12} {:>12}",
+        "GGUF: open_mmap+tensor+touch",
+        fmt_dur(m),
+        fmt_dur(s)
+    );
 
     let path = st.clone();
     let (m, s) = time_it(ITERS, || {
         let (map, begin, end) = open_safetensors_mmap(&path);
         black_box(touch(&map[begin..end]));
     });
-    println!("{:<42} {:>12} {:>12}", "safetensors: mmap+hdr+touch", fmt_dur(m), fmt_dur(s));
+    println!(
+        "{:<42} {:>12} {:>12}",
+        "safetensors: mmap+hdr+touch",
+        fmt_dur(m),
+        fmt_dur(s)
+    );
 
     let path = rlxp_zip.clone();
     let (m, s) = time_it(ITERS, || {
@@ -243,13 +260,23 @@ fn main() {
     let (m, s) = time_it(ITERS, || {
         black_box(touch(pack.tensor_mmap("w").unwrap()));
     });
-    println!("{:<42} {:>12} {:>12}", "RLXP flat: mmap touch (held open)", fmt_dur(m), fmt_dur(s));
+    println!(
+        "{:<42} {:>12} {:>12}",
+        "RLXP flat: mmap touch (held open)",
+        fmt_dur(m),
+        fmt_dur(s)
+    );
 
     let (m, s) = time_it(ITERS, || {
         let t = gg.get("w").unwrap();
         black_box(touch(gg.tensor_bytes(t).unwrap()));
     });
-    println!("{:<42} {:>12} {:>12}", "GGUF: mmap touch (held open)", fmt_dur(m), fmt_dur(s));
+    println!(
+        "{:<42} {:>12} {:>12}",
+        "GGUF: mmap touch (held open)",
+        fmt_dur(m),
+        fmt_dur(s)
+    );
 
     let (m, s) = time_it(ITERS, || {
         black_box(touch(&st_map[st_b..st_e]));
@@ -265,8 +292,12 @@ fn main() {
     println!("ONNX (not timed here):");
     println!("  - Full ModelProto protobuf parse + graph walk (ms–tens of ms typical)");
     println!("  - Weights often as initializers inside protobuf or external data");
-    println!("  - Not a GGUF/RLXP-class single mmap weight window unless external data + custom loader");
+    println!(
+        "  - Not a GGUF/RLXP-class single mmap weight window unless external data + custom loader"
+    );
     println!("  - Usually larger on disk when weights are f32/f16 vs GGUF/RLXP packed quants");
     println!();
-    println!("DDUF = ZIP64 STORE of safetensors (+ json). Closest timed proxy: RLXP zip row above.");
+    println!(
+        "DDUF = ZIP64 STORE of safetensors (+ json). Closest timed proxy: RLXP zip row above."
+    );
 }

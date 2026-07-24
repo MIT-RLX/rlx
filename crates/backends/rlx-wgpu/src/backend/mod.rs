@@ -439,6 +439,8 @@ impl WgpuExecutable {
             scratch_off: 0,
             scratch_bytes: 0,
             weight_buffer: None,
+            weight_extra_shards: Vec::new(),
+            weight_shard_size: 0,
             weight_offsets: HashMap::new(),
         };
         Self {
@@ -1702,9 +1704,7 @@ fn arena_off_in_window_or_stage(
             panic!(
                 "rlx-wgpu: cannot stage {} bytes for weight node {:?} \
                  (scratch reserve {} bytes)",
-                len,
-                id,
-                arena.scratch_bytes
+                len, id, arena.scratch_bytes
             );
         }
         if *scratch < stage_begin || scratch.saturating_add(aligned) > stage_end {

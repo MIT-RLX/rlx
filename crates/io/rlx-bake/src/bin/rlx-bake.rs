@@ -20,11 +20,10 @@
 
 use anyhow::{Context, Result, bail};
 use rlx_bake::{
-    BakeOptions, BakeProfile, MemoryMode, bake, convert_rlx_to_rlxp, load_graph,
-    load_safetensors_f32, write_rlx, write_rlxp,
+    BakeOptions, BakeProfile, MemoryMode, WeightLoadPolicy, bake_bundle, convert_rlx_to_rlxp,
+    load_graph, load_weights, write_rlx, write_rlxp,
 };
 use rlx_pkg::ContainerKind;
-use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -41,7 +40,7 @@ fn usage(argv0: &str) -> String {
     {
         format!(
             "usage:\n  {argv0} <graph.json|model.hir.json|bundle-dir> -o <out.rlx|out.rlxp> \\\n\
-             \t\t[--weights path.safetensors] [--password SECRET | --password-env VAR] \\\n\
+             \t\t[--weights path] [--weights-policy f32|packed|auto] \\\n\
              {opt_help}\n\
              \t{argv0} convert <in.rlx> -o <out.rlxp>\n\
              \t{argv0} import-onnx <in.onnx> -o <out.rlxp> [--no-graph] [--container flat|zip|dir]\n\
@@ -52,6 +51,10 @@ fn usage(argv0: &str) -> String {
              \tfold    fold weight-only math; keep dense GEMM\n\
              \texact   lossless skip + ternary + cleanup (default)\n\
              \tsize    exact + Q8_0 pack remaining matmul weights\n\
+             weights-policy:\n\
+             \tf32     f32-first GO — decode all weights to f32 (needed for exact/size)\n\
+             \tpacked  f32-first NO-GO when packs/half exist — keep MLX/DDUF encoding\n\
+             \tauto    NO-GO if MLX packs (or DDUF half) and ternary/quant off; else GO\n\
              memory (--memory):\n\
              \tduplex  weight bytes in graph and table (duplicate)\n\
              \truntime bytes in graph only; table is metadata\n\
@@ -66,7 +69,7 @@ fn usage(argv0: &str) -> String {
     {
         format!(
             "usage: {argv0} <graph.json|model.hir.json|bundle-dir> -o <out.rlx|out.rlxp> \\\n\
-             \t\t[--weights path.safetensors] \\\n\
+             \t\t[--weights path] [--weights-policy f32|packed|auto] \\\n\
              {opt_help}\n\
              \t{argv0} convert <in.rlx> -o <out.rlxp>\n\
              \t{argv0} import-onnx <in.onnx> -o <out.rlxp> [--no-graph]  (needs `--features onnx`)\n\
@@ -76,6 +79,10 @@ fn usage(argv0: &str) -> String {
              \tfold    fold weight-only math; keep dense GEMM\n\
              \texact   lossless skip + ternary + cleanup (default)\n\
              \tsize    exact + Q8_0 pack remaining matmul weights\n\
+             weights-policy:\n\
+             \tf32     f32-first GO — decode all weights to f32 (needed for exact/size)\n\
+             \tpacked  f32-first NO-GO when packs/half exist — keep MLX/DDUF encoding\n\
+             \tauto    NO-GO if MLX packs (or DDUF half) and ternary/quant off; else GO\n\
              memory (--memory):\n\
              \tduplex  weight bytes in graph and table (duplicate)\n\
              \truntime bytes in graph only; table is metadata\n\
@@ -162,6 +169,7 @@ fn run() -> Result<()> {
     #[cfg(feature = "encrypt")]
     let mut password_env: Option<String> = None;
     let mut opts = BakeOptions::default();
+    let mut weights_policy = WeightLoadPolicy::default();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -178,6 +186,13 @@ fn run() -> Result<()> {
                     .get(i)
                     .with_context(|| format!("{} requires a path", args[i - 1]))?;
                 weights = Some(PathBuf::from(p));
+            }
+            "--weights-policy" => {
+                i += 1;
+                let name = args
+                    .get(i)
+                    .with_context(|| "--weights-policy requires f32|packed|auto")?;
+                weights_policy = WeightLoadPolicy::parse(name)?;
             }
             "--format" => {
                 i += 1;
@@ -287,11 +302,24 @@ fn run() -> Result<()> {
 
     let loaded = load_graph(&input)?;
     let weights_path = weights.or(loaded.default_weights.clone());
-    let mut bindings: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut bundle = rlx_bake::WeightBundle::default();
     let had_weights_file = weights_path.is_some();
     if let Some(wp) = &weights_path {
-        bindings = load_safetensors_f32(wp)?;
-        eprintln!("loaded {} tensors from {}", bindings.len(), wp.display());
+        bundle = load_weights(wp, weights_policy, &opts)?;
+        if let Some(v) = &bundle.verdict {
+            let tag = if v.is_go() {
+                "f32-first GO"
+            } else {
+                "f32-first NO-GO"
+            };
+            eprintln!("{tag}: {}", v.reason());
+        }
+        eprintln!(
+            "loaded {} f32 + {} packed/native tensors from {}",
+            bundle.f32.len(),
+            bundle.packed.len(),
+            wp.display()
+        );
     }
 
     eprintln!(
@@ -313,9 +341,13 @@ fn run() -> Result<()> {
         opts.keep_folded_bindings,
     );
 
-    let (file, report) = bake(&loaded.graph, &bindings, &opts);
+    let (file, report) = bake_bundle(&loaded.graph, &bundle, &opts);
 
-    if had_weights_file && report.params_baked == 0 && !bindings.is_empty() {
+    if had_weights_file
+        && report.params_baked == 0
+        && !bundle.f32.is_empty()
+        && bundle.packed.is_empty()
+    {
         bail!(
             "weights file provided but zero params matched graph params (remaining: {:?})",
             report.params_remaining

@@ -30,6 +30,7 @@
 #include "mlx/dtype.h"
 #include "mlx/fast.h"
 #include "mlx/fft.h"
+#include "mlx/io.h"
 #include "mlx/linalg.h"
 #include "mlx/ops.h"
 #include "mlx/random.h"
@@ -1296,6 +1297,151 @@ int rlx_mlx_op_maxpool2d_backward_metal(
     });
 }
 
+const char* kMaxPool3dBackwardKernelSrc = R"(
+    uint idx = thread_position_in_grid.x;
+    uint total = N_T * C_T * D_T * H_T * W_T;
+    if (idx >= total) return;
+
+    uint iw = idx % W_T;
+    uint q1 = idx / W_T;
+    uint ih = q1 % H_T;
+    uint q2 = q1 / H_T;
+    uint id = q2 % D_T;
+    uint q3 = q2 / D_T;
+    uint cc = q3 % C_T;
+    uint nn = q3 / C_T;
+    uint base_nc = (nn * C_T + cc) * D_T * H_T * W_T;
+
+    int do_lo = int(id) + PD_T - KD_T + 1;
+    if (do_lo <= 0) {
+        do_lo = 0;
+    } else {
+        do_lo = (do_lo + SD_T - 1) / SD_T;
+    }
+    int do_hi = (int(id) + PD_T) / SD_T;
+    int ho_lo = int(ih) + PH_T - KH_T + 1;
+    if (ho_lo <= 0) {
+        ho_lo = 0;
+    } else {
+        ho_lo = (ho_lo + SH_T - 1) / SH_T;
+    }
+    int ho_hi = (int(ih) + PH_T) / SH_T;
+    int wo_lo = int(iw) + PW_T - KW_T + 1;
+    if (wo_lo <= 0) {
+        wo_lo = 0;
+    } else {
+        wo_lo = (wo_lo + SW_T - 1) / SW_T;
+    }
+    int wo_hi = (int(iw) + PW_T) / SW_T;
+
+    float acc = 0.0f;
+    for (int do_ = do_lo; do_ <= do_hi && do_ < D_OUT_T; do_++) {
+        int dstart = do_ * SD_T - PD_T;
+        for (int ho = ho_lo; ho <= ho_hi && ho < H_OUT_T; ho++) {
+            int hstart = ho * SH_T - PH_T;
+            for (int wo = wo_lo; wo <= wo_hi && wo < W_OUT_T; wo++) {
+                int wstart = wo * SW_T - PW_T;
+                float best = -INFINITY;
+                int best_idx = -1;
+                for (uint kz = 0; kz < KD_T; kz++) {
+                    int irz = dstart + int(kz);
+                    if (irz < 0 || irz >= D_T) continue;
+                    for (uint i = 0; i < KH_T; i++) {
+                        int ir = hstart + int(i);
+                        if (ir < 0 || ir >= H_T) continue;
+                        for (uint j = 0; j < KW_T; j++) {
+                            int ic = wstart + int(j);
+                            if (ic < 0 || ic >= W_T) continue;
+                            uint id3 = base_nc + (uint(irz) * H_T + uint(ir)) * W_T + uint(ic);
+                            float v = x[id3];
+                            if (v > best) {
+                                best = v;
+                                best_idx = int(id3);
+                            }
+                        }
+                    }
+                }
+                if (best_idx == int(idx)) {
+                    uint dy_i = (((nn * C_T + cc) * D_OUT_T + uint(do_)) * H_OUT_T + uint(ho)) * W_OUT_T + uint(wo);
+                    acc += dy[dy_i];
+                }
+            }
+        }
+    }
+    dx[idx] = acc;
+)";
+
+mfast::CustomKernelFunction& maxpool3d_backward_kernel() {
+    static mfast::CustomKernelFunction k = mfast::metal_kernel(
+        /*name=*/             "rlx_maxpool3d_backward",
+        /*input_names=*/      {"x", "dy"},
+        /*output_names=*/     {"dx"},
+        /*source=*/           kMaxPool3dBackwardKernelSrc,
+        /*header=*/           "",
+        /*ensure_row_contiguous=*/ true,
+        /*atomic_outputs=*/   false);
+    return k;
+}
+
+int rlx_mlx_op_maxpool3d_backward_metal(
+    rlx_mlx_array_t* x,
+    rlx_mlx_array_t* dy,
+    int n, int c, int d, int h, int w,
+    int d_out, int h_out, int w_out,
+    int kd, int kh, int kw,
+    int sd, int sh, int sw,
+    int pd, int ph, int pw,
+    rlx_mlx_array_t** out)
+{
+    return guarded([&] {
+        std::vector<mc::array> inputs = {unwrap(x), unwrap(dy)};
+        std::vector<mc::Shape> output_shapes = {{n, c, d, h, w}};
+        std::vector<mc::Dtype> output_dtypes = {mc::float32};
+
+        int total = n * c * d * h * w;
+        std::tuple<int, int, int> grid{total, 1, 1};
+        int tg = std::min(total, 256);
+        if (tg < 1) tg = 1;
+        std::tuple<int, int, int> threadgroup{tg, 1, 1};
+
+        std::vector<std::pair<std::string, mfast::TemplateArg>> tpl = {
+            {"N_T",      mfast::TemplateArg(int(n))},
+            {"C_T",      mfast::TemplateArg(int(c))},
+            {"D_T",      mfast::TemplateArg(int(d))},
+            {"H_T",      mfast::TemplateArg(int(h))},
+            {"W_T",      mfast::TemplateArg(int(w))},
+            {"D_OUT_T",  mfast::TemplateArg(int(d_out))},
+            {"H_OUT_T",  mfast::TemplateArg(int(h_out))},
+            {"W_OUT_T",  mfast::TemplateArg(int(w_out))},
+            {"KD_T",     mfast::TemplateArg(int(kd))},
+            {"KH_T",     mfast::TemplateArg(int(kh))},
+            {"KW_T",     mfast::TemplateArg(int(kw))},
+            {"SD_T",     mfast::TemplateArg(int(sd))},
+            {"SH_T",     mfast::TemplateArg(int(sh))},
+            {"SW_T",     mfast::TemplateArg(int(sw))},
+            {"PD_T",     mfast::TemplateArg(int(pd))},
+            {"PH_T",     mfast::TemplateArg(int(ph))},
+            {"PW_T",     mfast::TemplateArg(int(pw))},
+        };
+
+        auto outs = maxpool3d_backward_kernel()(
+            inputs,
+            output_shapes,
+            output_dtypes,
+            grid,
+            threadgroup,
+            tpl,
+            /*init_value=*/ std::optional<float>(0.0f),
+            /*verbose=*/    false,
+            mc::StreamOrDevice{});
+        if (outs.size() != 1) {
+            throw std::runtime_error(
+                "maxpool3d_backward_metal: kernel returned wrong number of outputs");
+        }
+        *out = wrap(std::move(outs[0]));
+    });
+}
+
 int rlx_mlx_op_take_along_axis(
     rlx_mlx_array_t* a,
     rlx_mlx_array_t* indices,
@@ -1347,18 +1493,20 @@ int rlx_mlx_op_quantized_matmul(
     int transpose,
     int group_size,
     int bits,
+    const char* mode,
     rlx_mlx_array_t** out)
 {
     return guarded([&] {
         std::optional<mc::array> bias = biases_or_null
             ? std::optional<mc::array>(unwrap(biases_or_null))
             : std::nullopt;
+        const char* m = (mode && mode[0]) ? mode : "affine";
         *out = wrap(mc::quantized_matmul(
             unwrap(x), unwrap(w), unwrap(scales), bias,
             transpose != 0,
             std::optional<int>(group_size),
             std::optional<int>(bits),
-            /*mode=*/"affine"));
+            /*mode=*/std::string(m)));
     });
 }
 
@@ -1718,6 +1866,65 @@ int rlx_mlx_dist_reduce_scatter_array(rlx_mlx_array_t* in, int kind, rlx_mlx_arr
         s_stop[0] = (rank + 1) * chunk;
         *out = wrap(mc::slice(summed, std::move(s_start), std::move(s_stop)));
     });
+}
+
+struct NamedList {
+    std::vector<std::string> names;
+    std::vector<rlx_mlx_array_t*> arrays;
+};
+
+int rlx_mlx_load_safetensors(const char* path, rlx_mlx_named_array_list_t** out) {
+    return guarded([&] {
+        if (!path || !out) throw std::runtime_error("load_safetensors: null arg");
+        auto [map, _meta] = mc::load_safetensors(std::string(path));
+        auto* list = new NamedList();
+        list->names.reserve(map.size());
+        list->arrays.reserve(map.size());
+        for (auto& kv : map) {
+            list->names.push_back(kv.first);
+            list->arrays.push_back(wrap(std::move(kv.second)));
+        }
+        *out = reinterpret_cast<rlx_mlx_named_array_list_t*>(list);
+    });
+}
+
+int rlx_mlx_load_npy(const char* path, rlx_mlx_array_t** out) {
+    return guarded([&] {
+        if (!path || !out) throw std::runtime_error("load_npy: null arg");
+        *out = wrap(mc::load(std::string(path)));
+    });
+}
+
+size_t rlx_mlx_named_list_len(const rlx_mlx_named_array_list_t* list) {
+    if (!list) return 0;
+    return reinterpret_cast<const NamedList*>(list)->names.size();
+}
+
+int rlx_mlx_named_list_get(
+    rlx_mlx_named_array_list_t* list,
+    size_t index,
+    const char** out_name,
+    rlx_mlx_array_t** out_array) {
+    return guarded([&] {
+        if (!list || !out_name || !out_array) {
+            throw std::runtime_error("named_list_get: null arg");
+        }
+        auto* nl = reinterpret_cast<NamedList*>(list);
+        if (index >= nl->names.size()) {
+            throw std::runtime_error("named_list_get: index out of range");
+        }
+        *out_name = nl->names[index].c_str();
+        *out_array = nl->arrays[index];
+    });
+}
+
+void rlx_mlx_named_list_free(rlx_mlx_named_array_list_t* list) {
+    if (!list) return;
+    auto* nl = reinterpret_cast<NamedList*>(list);
+    for (auto* a : nl->arrays) {
+        if (a) rlx_mlx_array_free(a);
+    }
+    delete nl;
 }
 
 } // extern "C"

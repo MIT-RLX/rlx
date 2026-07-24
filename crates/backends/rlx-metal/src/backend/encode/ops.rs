@@ -2495,6 +2495,95 @@ pub(crate) fn encode_dequant_matmul_nvfp4(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Prefill GEMM (`m > 1`): one threadgroup per `(col, row_tile)`;
+/// threads split K and stage an X tile in threadgroup memory.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_dequant_matmul_mlx_gemm(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    m: u32,
+    k: u32,
+    n: u32,
+    kind: u32,
+    bits: u32,
+    group_size: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(3, Some(buffer), zp as u64);
+    enc.set_buffer(4, Some(buffer), dst as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(5, sz, &m as *const u32 as *const _);
+    enc.set_bytes(6, sz, &k as *const u32 as *const _);
+    enc.set_bytes(7, sz, &n as *const u32 as *const _);
+    enc.set_bytes(8, sz, &kind as *const u32 as *const _);
+    enc.set_bytes(9, sz, &bits as *const u32 as *const _);
+    enc.set_bytes(10, sz, &group_size as *const u32 as *const _);
+    let n_row_tiles = m.div_ceil(8);
+    let total = (n * n_row_tiles) as u64;
+    let grid = metal::MTLSize {
+        width: total,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+/// Decode GEMV (`m == 1`): one threadgroup per output column.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_dequant_matmul_mlx_gemv(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    k: u32,
+    n: u32,
+    kind: u32,
+    bits: u32,
+    group_size: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(3, Some(buffer), zp as u64);
+    enc.set_buffer(4, Some(buffer), dst as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(5, sz, &k as *const u32 as *const _);
+    enc.set_bytes(6, sz, &n as *const u32 as *const _);
+    enc.set_bytes(7, sz, &kind as *const u32 as *const _);
+    enc.set_bytes(8, sz, &bits as *const u32 as *const _);
+    enc.set_bytes(9, sz, &group_size as *const u32 as *const _);
+    let tg = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let grid = metal::MTLSize {
+        width: n as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
 pub(crate) fn encode_rope(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -5930,6 +6019,182 @@ pub(crate) fn encode_maxpool2d_backward(
     let tg = metal::MTLSize {
         width: 8.min(w as u64),
         height: 8.min(h as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_maxpool3d_backward(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dx: usize,
+    n: u32,
+    c: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+) {
+    let p0: [u32; 4] = [n, c, d, h];
+    let p1: [u32; 4] = [w, d_out, h_out, w_out];
+    let p2: [u32; 4] = [kd, kh, kw, sd];
+    let p3: [u32; 4] = [sh, sw, pd, ph];
+    enc.set_compute_pipeline_state(&k.maxpool3d_backward);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), dx as u64);
+    enc.set_bytes(3, 16, p0.as_ptr() as *const _);
+    enc.set_bytes(4, 16, p1.as_ptr() as *const _);
+    enc.set_bytes(5, 16, p2.as_ptr() as *const _);
+    enc.set_bytes(6, 16, p3.as_ptr() as *const _);
+    enc.set_bytes(7, 4, (&pw as *const u32) as *const _);
+    let total = (n * c * d * h * w) as u64;
+    let grid = metal::MTLSize {
+        width: total.max(1),
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(total.max(1)),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_conv3d_backward_input(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    dy: usize,
+    w: usize,
+    dx: usize,
+    n: u32,
+    c_in: u32,
+    d: u32,
+    h: u32,
+    w_in: u32,
+    c_out: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+) {
+    let a: [u32; 4] = [n, c_in, d, h];
+    let b: [u32; 4] = [w_in, c_out, d_out, h_out];
+    let cc: [u32; 4] = [w_out, kd, kh, kw];
+    let dd_p: [u32; 4] = [sd, sh, sw, pd];
+    let e: [u32; 4] = [ph, pw, dd, dh];
+    let f: [u32; 2] = [dw, groups];
+    enc.set_compute_pipeline_state(&k.conv3d_backward_input);
+    enc.set_buffer(0, Some(buffer), dy as u64);
+    enc.set_buffer(1, Some(buffer), w as u64);
+    enc.set_buffer(2, Some(buffer), dx as u64);
+    enc.set_bytes(3, 16, a.as_ptr() as *const _);
+    enc.set_bytes(4, 16, b.as_ptr() as *const _);
+    enc.set_bytes(5, 16, cc.as_ptr() as *const _);
+    enc.set_bytes(6, 16, dd_p.as_ptr() as *const _);
+    enc.set_bytes(7, 16, e.as_ptr() as *const _);
+    enc.set_bytes(8, 8, f.as_ptr() as *const _);
+    let total = (n * c_in * d * h * w_in) as u64;
+    let grid = metal::MTLSize {
+        width: total.max(1),
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(total.max(1)),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_conv3d_backward_weight(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    dy: usize,
+    dw: usize,
+    n: u32,
+    c_in: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    c_out: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw_dil: u32,
+    groups: u32,
+) {
+    let a: [u32; 4] = [n, c_in, d, h];
+    let b: [u32; 4] = [w, c_out, d_out, h_out];
+    let cc: [u32; 4] = [w_out, kd, kh, kw];
+    let dd_p: [u32; 4] = [sd, sh, sw, pd];
+    let e: [u32; 4] = [ph, pw, dd, dh];
+    let f: [u32; 2] = [dw_dil, groups];
+    enc.set_compute_pipeline_state(&k.conv3d_backward_weight);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), dy as u64);
+    enc.set_buffer(2, Some(buffer), dw as u64);
+    enc.set_bytes(3, 16, a.as_ptr() as *const _);
+    enc.set_bytes(4, 16, b.as_ptr() as *const _);
+    enc.set_bytes(5, 16, cc.as_ptr() as *const _);
+    enc.set_bytes(6, 16, dd_p.as_ptr() as *const _);
+    enc.set_bytes(7, 16, e.as_ptr() as *const _);
+    enc.set_bytes(8, 8, f.as_ptr() as *const _);
+    let c_in_per_g = c_in / groups.max(1);
+    let total = (c_out * c_in_per_g * kd * kh * kw) as u64;
+    let grid = metal::MTLSize {
+        width: total.max(1),
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(total.max(1)),
+        height: 1,
         depth: 1,
     };
     enc.dispatch_threads(grid, tg);

@@ -15,14 +15,16 @@ use crate::activation_deriv::activation_deriv_wrt_x;
 use crate::compose::broadcast_scalar;
 use crate::decompose_backward_kernels::{
     SCAN_DECOMPOSE_MAX_LENGTH, compose_ada_layer_norm_backward, compose_conv2d_backward_input,
-    compose_conv2d_backward_weight, compose_conv2d_backward_weight_im2col, compose_cumsum_backward,
+    compose_conv2d_backward_weight, compose_conv2d_backward_weight_im2col,
+    compose_conv3d_backward_input, compose_conv3d_backward_weight, compose_cumsum_backward,
     compose_fake_quantize_backward, compose_gated_residual_backward, compose_gather_backward,
     compose_group_norm_backward_beta, compose_group_norm_backward_gamma,
     compose_group_norm_backward_input, compose_layer_norm_backward_gamma,
-    compose_layer_norm_backward_input, compose_max_pool2d_backward, compose_rms_norm_backward_beta,
-    compose_rms_norm_backward_gamma, compose_rms_norm_backward_input, compose_rope_backward,
-    compose_scan_backward, compose_scan_backward_xs, compose_softmax_cross_entropy_backward,
-    conv_di_decompose_eligible, conv_dw_im2col_eligible, emit_attention_backward,
+    compose_layer_norm_backward_input, compose_max_pool2d_backward, compose_max_pool3d_backward,
+    compose_rms_norm_backward_beta, compose_rms_norm_backward_gamma,
+    compose_rms_norm_backward_input, compose_rope_backward, compose_scan_backward,
+    compose_scan_backward_xs, compose_softmax_cross_entropy_backward, conv_di_decompose_eligible,
+    conv_dw_im2col_eligible, emit_attention_backward,
 };
 
 /// Rewrite `*Backward` ops into primitive chains; copy everything else.
@@ -67,6 +69,9 @@ fn contains_training_backward_except(g: &Graph, preserved: &[OpKind]) -> bool {
                 | Op::Conv2dBackwardInput { .. }
                 | Op::Conv2dBackwardWeight { .. }
                 | Op::MaxPool2dBackward { .. }
+                | Op::Conv3dBackwardInput { .. }
+                | Op::Conv3dBackwardWeight { .. }
+                | Op::MaxPool3dBackward { .. }
                 | Op::AttentionBackward { .. }
                 | Op::CumsumBackward { .. }
                 | Op::GatherBackward { .. }
@@ -279,6 +284,66 @@ fn decompose_backward_ops_once_except(g: Graph, preserved: &[OpKind]) -> Graph {
                 let st = [stride[0], stride[1]];
                 let pad = [padding[0], padding[1]];
                 compose_max_pool2d_backward(&mut out, x, dy, &node.shape, ks, st, pad)
+            }
+            Op::MaxPool3dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let [x, dy] = new_inputs[..] else {
+                    panic!("MaxPool3dBackward expects [x, dy]");
+                };
+                let ks = [kernel_size[0], kernel_size[1], kernel_size[2]];
+                let st = [stride[0], stride[1], stride[2]];
+                let pad = [padding[0], padding[1], padding[2]];
+                match compose_max_pool3d_backward(&mut out, x, dy, &node.shape, ks, st, pad) {
+                    Some(id) => id,
+                    None => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+                }
+            }
+            Op::Conv3dBackwardInput {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let [dy, w] = new_inputs[..] else {
+                    panic!("Conv3dBackwardInput expects [dy, w]");
+                };
+                compose_conv3d_backward_input(
+                    &mut out,
+                    dy,
+                    w,
+                    &node.shape,
+                    [kernel_size[0], kernel_size[1], kernel_size[2]],
+                    [stride[0], stride[1], stride[2]],
+                    [padding[0], padding[1], padding[2]],
+                    [dilation[0], dilation[1], dilation[2]],
+                    *groups,
+                )
+            }
+            Op::Conv3dBackwardWeight {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let [x, dy] = new_inputs[..] else {
+                    panic!("Conv3dBackwardWeight expects [x, dy]");
+                };
+                compose_conv3d_backward_weight(
+                    &mut out,
+                    x,
+                    dy,
+                    &node.shape,
+                    [kernel_size[0], kernel_size[1], kernel_size[2]],
+                    [stride[0], stride[1], stride[2]],
+                    [padding[0], padding[1], padding[2]],
+                    [dilation[0], dilation[1], dilation[2]],
+                    *groups,
+                )
             }
             Op::CumsumBackward { axis, exclusive } => {
                 let [dy] = new_inputs[..] else {
@@ -531,6 +596,9 @@ mod tests {
                         | Op::Conv2dBackwardInput { .. }
                         | Op::Conv2dBackwardWeight { .. }
                         | Op::MaxPool2dBackward { .. }
+                        | Op::Conv3dBackwardInput { .. }
+                        | Op::Conv3dBackwardWeight { .. }
+                        | Op::MaxPool3dBackward { .. }
                         | Op::AttentionBackward { .. }
                         | Op::CumsumBackward { .. }
                         | Op::GatherBackward { .. }
@@ -734,6 +802,78 @@ mod tests {
         g.set_outputs(vec![dx]);
         let decomposed = decompose_backward_ops(g);
         assert_input_backward_decomposed(&decomposed);
+    }
+
+    #[test]
+    fn decompose_max_pool3d_backward() {
+        let f = DType::F32;
+        let mut g = Graph::new("maxpool3d_decomp");
+        let x = g.input("x", Shape::new(&[1, 1, 4, 4, 4], f));
+        let dy = g.input("dy", Shape::new(&[1, 1, 2, 2, 2], f));
+        let dx = g.maxpool3d_backward(x, dy, vec![2, 2, 2], vec![2, 2, 2], vec![0, 0, 0]);
+        g.set_outputs(vec![dx]);
+        let decomposed = decompose_backward_ops(g);
+        assert_input_backward_decomposed(&decomposed);
+    }
+
+    #[test]
+    fn decompose_conv3d_backward_input() {
+        let f = DType::F32;
+        let mut g = Graph::new("conv3d_di_decomp");
+        let dy = g.input("dy", Shape::new(&[1, 1, 4, 4, 4], f));
+        let w = g.input("w", Shape::new(&[1, 1, 3, 3, 3], f));
+        let dx = g.conv3d_backward_input(
+            dy,
+            w,
+            Shape::new(&[1, 1, 4, 4, 4], f),
+            vec![3, 3, 3],
+            vec![1, 1, 1],
+            vec![1, 1, 1],
+            vec![1, 1, 1],
+            1,
+        );
+        g.set_outputs(vec![dx]);
+        let decomposed = decompose_backward_ops(g);
+        assert_input_backward_decomposed(&decomposed);
+    }
+
+    #[test]
+    fn decompose_conv3d_backward_weight() {
+        let f = DType::F32;
+        let mut g = Graph::new("conv3d_dw_decomp");
+        let x = g.input("x", Shape::new(&[1, 1, 4, 4, 4], f));
+        let dy = g.input("dy", Shape::new(&[1, 1, 2, 2, 2], f));
+        let dw = g.conv3d_backward_weight(
+            x,
+            dy,
+            Shape::new(&[1, 1, 3, 3, 3], f),
+            vec![3, 3, 3],
+            vec![1, 1, 1],
+            vec![0, 0, 0],
+            vec![1, 1, 1],
+            1,
+        );
+        g.set_outputs(vec![dw]);
+        let decomposed = decompose_backward_ops(g);
+        assert_input_backward_decomposed(&decomposed);
+    }
+
+    #[test]
+    fn max_pool3d_overlapping_preserved() {
+        let f = DType::F32;
+        let mut g = Graph::new("maxpool3d_overlap");
+        let x = g.input("x", Shape::new(&[1, 1, 4, 4, 4], f));
+        let dy = g.input("dy", Shape::new(&[1, 1, 3, 3, 3], f));
+        let dx = g.maxpool3d_backward(x, dy, vec![2, 2, 2], vec![1, 1, 1], vec![0, 0, 0]);
+        g.set_outputs(vec![dx]);
+        let decomposed = decompose_backward_ops(g);
+        assert!(
+            decomposed
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::MaxPool3dBackward { .. })),
+            "overlapping MaxPool3dBackward must be preserved, not panicked"
+        );
     }
 
     #[test]

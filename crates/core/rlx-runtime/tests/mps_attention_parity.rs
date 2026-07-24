@@ -822,8 +822,8 @@ fn cpu_vs_metal_attention_with_padding() {
 
     let diff = max_abs_diff(&cpu_out, &mtl_out);
     eprintln!("[attn-parity NH=2 DH=4 padded] max abs diff = {diff:e}");
-    eprintln!("CPU full: {:?}", &cpu_out);
-    eprintln!("Mtl full: {:?}", &mtl_out);
+    eprintln!("CPU full: {:?}", cpu_out);
+    eprintln!("Mtl full: {:?}", mtl_out);
     // Don't assert — this is the failure case we're investigating.
     // Document the gap so future fixes can confirm convergence.
 }

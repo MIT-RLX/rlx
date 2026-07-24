@@ -20,9 +20,9 @@
 #[cfg(feature = "encrypt")]
 pub mod crypto;
 pub mod export_rlxp;
+pub mod format;
 #[cfg(feature = "onnx")]
 pub mod from_onnx;
-pub mod format;
 pub mod load;
 pub mod memory;
 pub mod optimize;
@@ -35,23 +35,26 @@ pub use crypto::{
     encrypt_bytes, encrypt_bytes_with_params, is_encrypted,
 };
 pub use export_rlxp::{convert_rlx_to_rlxp, write_rlxp};
-#[cfg(feature = "onnx")]
-pub use from_onnx::{OnnxImportOptions, onnx_to_rlxp};
 #[cfg(feature = "mmap")]
 pub use format::read_rlx_mmap;
 pub use format::{RlxFile, RlxIo, RlxMeta, RlxWeight, read_rlx, write_rlx};
 #[cfg(feature = "encrypt")]
 pub use format::{read_rlx_with_password, write_rlx_encrypted};
+#[cfg(feature = "onnx")]
+pub use from_onnx::{OnnxImportOptions, onnx_to_rlxp};
 pub use load::{LoadedGraph, load_graph};
 pub use memory::{MemoryMode, MemoryStats, dedupe_identical_constants, ensure_runtime_ready};
 pub use optimize::{OptimizeStats, WeightEncoding, WeightRewrite, is_ternary_f32};
 pub use profile::BakeProfile;
-pub use weights::load_safetensors_f32;
+pub use weights::{
+    F32FirstVerdict, LoadedWeight, WeightBundle, WeightLoadPolicy, WeightPathKind,
+    WeightSourceInfo, f32_first_verdict, load_safetensors_f32, load_weights, load_weights_f32,
+};
 
 use optimize::optimize_weights;
 use rlx_compile::{AlgebraicSimplify, ConstantFolding, DeadCodeElimination};
 use rlx_fusion::pass::Pass;
-use rlx_ir::{Dim, Graph, NodeId, Op};
+use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
 use std::collections::{HashMap, HashSet};
 
 /// Toggles for the bake pipeline.
@@ -163,6 +166,61 @@ pub struct BakeReport {
 
 /// Specialize params, run weight-aware opts, fold, and build a merged `*.rlx` file.
 pub fn bake(
+    graph: &Graph,
+    bindings: &HashMap<String, Vec<f32>>,
+    opts: &BakeOptions,
+) -> (RlxFile, BakeReport) {
+    bake_bundle(
+        graph,
+        &WeightBundle {
+            f32: bindings.clone(),
+            ..Default::default()
+        },
+        opts,
+    )
+}
+
+/// Like [`bake`], but accepts a [`WeightBundle`] (f32 and/or packed rows).
+///
+/// When `bundle.packed` holds MLX scheme triples, matching dense `MatMul`s are
+/// rewritten to `DequantMatMul` before specialize. Packed rows are merged into
+/// the artifact weight table (space-preserving).
+pub fn bake_bundle(
+    graph: &Graph,
+    bundle: &WeightBundle,
+    opts: &BakeOptions,
+) -> (RlxFile, BakeReport) {
+    let graph = rewrite_matmul_for_mlx_packs(graph, &bundle.packed);
+    let graph = specialize_packed_bytes(&graph, &bundle.packed);
+    let (mut file, mut report) = bake_inner(&graph, &bundle.f32, opts);
+    // Merge packed / native-dtype rows that were not already unfolded.
+    let existing: HashSet<String> = file.weights.iter().map(|w| w.name.clone()).collect();
+    for p in &bundle.packed {
+        if existing.contains(&p.name) {
+            continue;
+        }
+        file.weights.push(RlxWeight {
+            name: p.name.clone(),
+            shape: p.shape.clone(),
+            encoding: p.encoding.clone(),
+            data: p.data.clone(),
+            note: format!(
+                "kept source encoding ({})",
+                bundle
+                    .verdict
+                    .as_ref()
+                    .map(|v| v.reason())
+                    .unwrap_or("packed")
+            ),
+        });
+    }
+    report.weight_count = file.weights.len();
+    report.weight_bytes = file.weights.iter().map(|w| w.data.len()).sum();
+    file.meta.weight_bytes = report.weight_bytes;
+    (file, report)
+}
+
+fn bake_inner(
     graph: &Graph,
     bindings: &HashMap<String, Vec<f32>>,
     opts: &BakeOptions,
@@ -310,6 +368,187 @@ pub fn bake(
     report.nodes_after = file.graph.len();
 
     (file, report)
+}
+
+fn rewrite_matmul_for_mlx_packs(graph: &Graph, packed: &[LoadedWeight]) -> Graph {
+    let schemes: HashMap<String, rlx_ir::quant::QuantScheme> = packed
+        .iter()
+        .filter_map(|w| {
+            let scheme = parse_mlx_scheme(&w.encoding)?;
+            let base = w.name.trim_end_matches(".weight").to_string();
+            Some((base, scheme))
+        })
+        .collect();
+    if schemes.is_empty() {
+        return graph.clone();
+    }
+
+    let mut out = Graph::new(graph.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut param_ids: HashMap<String, NodeId> = HashMap::new();
+
+    let ensure_param = |out: &mut Graph,
+                        param_ids: &mut HashMap<String, NodeId>,
+                        name: &str,
+                        shape: Shape|
+     -> NodeId {
+        if let Some(&id) = param_ids.get(name) {
+            return id;
+        }
+        let id = out.add_node(
+            Op::Param {
+                name: name.to_string(),
+            },
+            vec![],
+            shape,
+        );
+        param_ids.insert(name.to_string(), id);
+        id
+    };
+
+    for node in graph.nodes() {
+        let new_id = match &node.op {
+            Op::MatMul if node.inputs.len() == 2 => {
+                let w_node = graph.node(node.inputs[1]);
+                let w_name = match &w_node.op {
+                    Op::Param { name } => Some(name.as_str()),
+                    _ => w_node.name.as_deref(),
+                };
+                let base = w_name.map(|n| n.trim_end_matches(".weight").to_string());
+                if let Some(base) = base.as_ref() {
+                    if let Some(scheme) = schemes.get(base) {
+                        let x = id_map[&node.inputs[0]];
+                        let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                        let gs = scheme.mlx_group_size() as usize;
+                        let k = {
+                            let xs = &graph.node(node.inputs[0]).shape;
+                            xs.dim(xs.rank() - 1).unwrap_static()
+                        };
+                        let n_groups = (k / gs.max(1)).max(1);
+                        let w = ensure_param(
+                            &mut out,
+                            &mut param_ids,
+                            &format!("{base}.weight"),
+                            Shape::new(&[packed_len(packed, &format!("{base}.weight"))], DType::U8),
+                        );
+                        let sc = ensure_param(
+                            &mut out,
+                            &mut param_ids,
+                            &format!("{base}.scales"),
+                            Shape::new(
+                                &[n, n_groups],
+                                if scheme.has_zero_point() {
+                                    DType::F32
+                                } else {
+                                    DType::U8
+                                },
+                            ),
+                        );
+                        let zp = ensure_param(
+                            &mut out,
+                            &mut param_ids,
+                            &format!("{base}.biases"),
+                            Shape::new(&[n, n_groups], DType::F32),
+                        );
+                        let id = out.add_node(
+                            Op::DequantMatMul { scheme: *scheme },
+                            vec![x, w, sc, zp],
+                            node.shape.clone(),
+                        );
+                        id_map.insert(node.inputs[1], w);
+                        id
+                    } else {
+                        let new_inputs: Vec<NodeId> =
+                            node.inputs.iter().map(|i| id_map[i]).collect();
+                        out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+                    }
+                } else {
+                    let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+                    out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+                }
+            }
+            Op::Param { name } => {
+                if let Some(&id) = param_ids.get(name) {
+                    id
+                } else {
+                    let id = out.add_node(node.op.clone(), vec![], node.shape.clone());
+                    param_ids.insert(name.clone(), id);
+                    id
+                }
+            }
+            _ => {
+                let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+                out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+            }
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(graph.outputs.iter().map(|o| id_map[o]).collect());
+    out
+}
+
+fn parse_mlx_scheme(s: &str) -> Option<rlx_ir::quant::QuantScheme> {
+    use rlx_ir::quant::QuantScheme;
+    if let Some(rest) = s.strip_prefix("mlx_affine/") {
+        let mut it = rest.split('/');
+        let bits: u8 = it.next()?.parse().ok()?;
+        let group_size: u32 = it.next()?.parse().ok()?;
+        return Some(QuantScheme::MlxAffine { bits, group_size });
+    }
+    if let Some(rest) = s.strip_prefix("mlx_mxfp4/") {
+        let group_size: u32 = rest.parse().ok()?;
+        return Some(QuantScheme::MlxMxfp4 { group_size });
+    }
+    if let Some(rest) = s.strip_prefix("mlx_mxfp8/") {
+        let group_size: u32 = rest.parse().ok()?;
+        return Some(QuantScheme::MlxMxfp8 { group_size });
+    }
+    None
+}
+
+fn packed_len(packed: &[LoadedWeight], name: &str) -> usize {
+    packed
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.data.len())
+        .unwrap_or(1)
+}
+
+/// Bind packed / native-dtype rows as named Constants (U8/F32 payloads).
+fn specialize_packed_bytes(graph: &Graph, packed: &[LoadedWeight]) -> Graph {
+    if packed.is_empty() {
+        return graph.clone();
+    }
+    let by_name: HashMap<&str, &LoadedWeight> =
+        packed.iter().map(|p| (p.name.as_str(), p)).collect();
+    let mut out = Graph::new(graph.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in graph.nodes() {
+        let new_id = match &node.op {
+            Op::Param { name } => {
+                if let Some(p) = by_name.get(name.as_str()) {
+                    let id = out.add_node(
+                        Op::Constant {
+                            data: p.data.clone(),
+                        },
+                        vec![],
+                        node.shape.clone(),
+                    );
+                    out.node_mut(id).name = Some(name.clone());
+                    id
+                } else {
+                    out.add_node(node.op.clone(), vec![], node.shape.clone())
+                }
+            }
+            _ => {
+                let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+                out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+            }
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(graph.outputs.iter().map(|o| id_map[o]).collect());
+    out
 }
 
 fn encode_f32_slice(values: &[f32]) -> Vec<u8> {

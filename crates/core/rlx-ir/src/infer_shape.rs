@@ -191,6 +191,23 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                 None
             }
         }
+        Op::Interpolate3d { size } => {
+            let in_s = in_shape(0);
+            if in_s.rank() == 5 && size.len() == 3 {
+                Some(Shape::new(
+                    &[
+                        in_s.dim(0).unwrap_static(),
+                        in_s.dim(1).unwrap_static(),
+                        size[0],
+                        size[1],
+                        size[2],
+                    ],
+                    in_s.dtype(),
+                ))
+            } else {
+                None
+            }
+        }
         Op::Attention { .. } => Some(shape::attention_shape(in_shape(0))),
         Op::Rope { .. } => Some(shape::unary_shape(in_shape(0))),
         Op::AxialRope2d { .. } => Some(shape::unary_shape(in_shape(0))),

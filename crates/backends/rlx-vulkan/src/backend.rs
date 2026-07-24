@@ -134,6 +134,9 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Conv2dBackwardInput,
         Conv2dBackwardWeight,
         MaxPool2dBackward,
+        Conv3dBackwardInput,
+        Conv3dBackwardWeight,
+        MaxPool3dBackward,
         Transpose,
         Narrow,
         Concat,
@@ -145,6 +148,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         ArgMin,
         Pool,
         ResizeNearest2x,
+        Interpolate3d,
         Conv,          // reductions / vision
         GroupedMatMul, // MoE
         SelectiveScan, // SSM / Mamba
@@ -282,6 +286,10 @@ fn is_host_fallback(op: &Op) -> bool {
                 scale_mode: rlx_ir::op::ScaleMode::EMA { .. },
                 ..
             }
+            | Op::Interpolate3d { .. }
+            | Op::MaxPool3dBackward { .. }
+            | Op::Conv3dBackwardInput { .. }
+            | Op::Conv3dBackwardWeight { .. }
     )
 }
 
@@ -2837,7 +2845,7 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     &mut deps,
                     "group_norm",
                     push,
-                    groups1d(n * (*num_groups as usize), 64),
+                    groups1d(n * (*num_groups), 64),
                 );
             }
 
@@ -2870,7 +2878,7 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     &mut deps,
                     "group_norm_backward_input",
                     push,
-                    groups1d(n * (*num_groups as usize), 64),
+                    groups1d(n * (*num_groups), 64),
                 );
             }
 
@@ -4802,8 +4810,8 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 let half = (*n_fft as usize / 2).max(1);
                 let push = Push::default()
                     .u(batch as u32)
-                    .u(*n_fft as u32)
-                    .u(*stage as u32)
+                    .u(*n_fft)
+                    .u(*stage)
                     .u(half as u32)
                     .u(binder.off(arena, state))
                     .u(binder.off(arena, out))
@@ -5121,17 +5129,30 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 let n = *od.last().unwrap_or(&1);
                 let m = numel(&od) / n.max(1);
                 let k = numel(&xd) / m.max(1);
-                let gpu_scheme = match scheme {
-                    QuantScheme::GgufQ4K => Some((0u32, 256usize)),
-                    QuantScheme::GgufQ6K => Some((1u32, 256usize)),
-                    QuantScheme::GgufQ1_0 => Some((2u32, 128usize)),
-                    _ => None,
-                };
-                match gpu_scheme {
-                    // Q1_0 prefill: one tiled GEMM (1-D grid — MoltenVK dropped
-                    // the Y dimension of the earlier 2-D dispatch).
-                    Some((2, blk)) if m > 1 && k.is_multiple_of(blk) && n >= 1 => {
+                if let Some((kind, bits, gs)) = scheme.mlx_gpu_launch() {
+                    // The native SPIR-V `dequant_matmul_mlx` kernel is currently
+                    // wrong (per-layer cos ~0.96 vs CPU; host-delegate is bit-
+                    // exact). Host-delegate MLX dequant by default until the
+                    // kernel is fixed; opt into the native path with
+                    // `RLX_VULKAN_MLX_NATIVE=1`.
+                    if rlx_gpu_host::mlx_dequant_gpu_disabled()
+                        || !rlx_ir::env::flag("RLX_VULKAN_MLX_NATIVE")
+                        || !k.is_multiple_of(gs as usize)
+                        || m < 1
+                        || n < 1
+                    {
+                        steps.push(Step::Host {
+                            op: node.op.clone(),
+                            out: node.id,
+                            out_shape: node.shape.clone(),
+                            inputs: node.inputs.clone(),
+                        });
+                    } else {
                         let w = node.inputs[1];
+                        let scale = node.inputs[2];
+                        let zp = node.inputs[3];
+                        // One workgroup per (col, row_tile); local_size=256
+                        // stages X + splits K (matches Metal/CUDA GEMM).
                         const TM: usize = 8;
                         let n_row_tiles = m.div_ceil(TM);
                         let total = n * n_row_tiles;
@@ -5139,50 +5160,88 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                             .u(m as u32)
                             .u(k as u32)
                             .u(n as u32)
+                            .u(kind)
+                            .u(bits)
+                            .u(gs)
                             .u(binder.off(arena, x))
                             .u(binder.off(arena, w))
+                            .u(binder.off(arena, scale))
+                            .u(binder.off(arena, zp))
                             .u(binder.off(arena, out))
                             .bytes();
                         push_gpu_step(
                             &mut binder,
                             &mut steps,
                             &mut deps,
-                            "dequant_gemm_q1_0",
+                            "dequant_matmul_mlx",
                             push,
-                            groups1d(total, 64),
+                            (total as u32, 1, 1),
                         );
                     }
-                    // Decode (m==1) or Q4_K/Q6_K prefill: row-loop GEMV on-device.
-                    Some((sc, blk)) if k.is_multiple_of(blk) && n >= 1 && m >= 1 => {
-                        let w = node.inputs[1];
-                        let x_base = binder.off(arena, x);
-                        let out_base = binder.off(arena, out);
-                        for r in 0..m {
+                } else {
+                    let gpu_scheme = match scheme {
+                        QuantScheme::GgufQ4K => Some((0u32, 256usize)),
+                        QuantScheme::GgufQ6K => Some((1u32, 256usize)),
+                        QuantScheme::GgufQ1_0 => Some((2u32, 128usize)),
+                        _ => None,
+                    };
+                    match gpu_scheme {
+                        // Q1_0 prefill: one tiled GEMM (1-D grid — MoltenVK dropped
+                        // the Y dimension of the earlier 2-D dispatch).
+                        Some((2, blk)) if m > 1 && k.is_multiple_of(blk) && n >= 1 => {
+                            let w = node.inputs[1];
+                            const TM: usize = 8;
+                            let n_row_tiles = m.div_ceil(TM);
+                            let total = n * n_row_tiles;
                             let push = Push::default()
-                                .u(n as u32)
+                                .u(m as u32)
                                 .u(k as u32)
-                                .u(x_base + (r * k) as u32)
+                                .u(n as u32)
+                                .u(binder.off(arena, x))
                                 .u(binder.off(arena, w))
-                                .u(out_base + (r * n) as u32)
-                                .u(sc)
+                                .u(binder.off(arena, out))
                                 .bytes();
                             push_gpu_step(
                                 &mut binder,
                                 &mut steps,
                                 &mut deps,
-                                "dequant_matmul",
+                                "dequant_gemm_q1_0",
                                 push,
-                                groups1d(n, 64),
+                                groups1d(total, 64),
                             );
                         }
-                    }
-                    _ => {
-                        steps.push(Step::Host {
-                            op: node.op.clone(),
-                            out: node.id,
-                            out_shape: node.shape.clone(),
-                            inputs: node.inputs.clone(),
-                        });
+                        // Decode (m==1) or Q4_K/Q6_K prefill: row-loop GEMV on-device.
+                        Some((sc, blk)) if k.is_multiple_of(blk) && n >= 1 && m >= 1 => {
+                            let w = node.inputs[1];
+                            let x_base = binder.off(arena, x);
+                            let out_base = binder.off(arena, out);
+                            for r in 0..m {
+                                let push = Push::default()
+                                    .u(n as u32)
+                                    .u(k as u32)
+                                    .u(x_base + (r * k) as u32)
+                                    .u(binder.off(arena, w))
+                                    .u(out_base + (r * n) as u32)
+                                    .u(sc)
+                                    .bytes();
+                                push_gpu_step(
+                                    &mut binder,
+                                    &mut steps,
+                                    &mut deps,
+                                    "dequant_matmul",
+                                    push,
+                                    groups1d(n, 64),
+                                );
+                            }
+                        }
+                        _ => {
+                            steps.push(Step::Host {
+                                op: node.op.clone(),
+                                out: node.id,
+                                out_shape: node.shape.clone(),
+                                inputs: node.inputs.clone(),
+                            });
+                        }
                     }
                 }
             }

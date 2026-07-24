@@ -368,6 +368,54 @@ impl<'a> LowerCtx<'a> {
                 }
                 wf
             }
+            QuantScheme::MlxAffine { bits, group_size } => {
+                if node.inputs.len() < 4 {
+                    return Err(CoremlError::Runtime(
+                        "DequantMatMul MlxAffine needs scale+bias inputs".into(),
+                    ));
+                }
+                let gs = group_size as usize;
+                let n_groups = k / gs.max(1);
+                let w_bytes = self.quant_bytes(w_id)?;
+                let scales = self.f32_side_tensor(node.inputs[2], n * n_groups, "scale")?;
+                let biases = self.f32_side_tensor(node.inputs[3], n * n_groups, "bias")?;
+                rlx_mlx_io::dequant_affine_f32(
+                    w_bytes,
+                    &scales,
+                    &biases,
+                    bits as u32,
+                    group_size,
+                    n,
+                    n_groups,
+                )
+                .map_err(|e| CoremlError::Runtime(e.to_string()))?
+            }
+            QuantScheme::MlxMxfp4 { group_size } => {
+                if node.inputs.len() < 3 {
+                    return Err(CoremlError::Runtime(
+                        "DequantMatMul MlxMxfp4 needs scale input".into(),
+                    ));
+                }
+                let gs = group_size as usize;
+                let n_groups = k / gs.max(1);
+                let w_bytes = self.quant_bytes(w_id)?;
+                let scales = self.u8_side_tensor(node.inputs[2], n * n_groups, "scale")?;
+                rlx_mlx_io::dequant_mxfp4_f32(w_bytes, &scales, group_size, n, n_groups)
+                    .map_err(|e| CoremlError::Runtime(e.to_string()))?
+            }
+            QuantScheme::MlxMxfp8 { group_size } => {
+                if node.inputs.len() < 3 {
+                    return Err(CoremlError::Runtime(
+                        "DequantMatMul MlxMxfp8 needs scale input".into(),
+                    ));
+                }
+                let gs = group_size as usize;
+                let n_groups = k / gs.max(1);
+                let w_bytes = self.quant_bytes(w_id)?;
+                let scales = self.u8_side_tensor(node.inputs[2], n * n_groups, "scale")?;
+                rlx_mlx_io::dequant_mxfp8_f32(w_bytes, &scales, group_size, n, n_groups)
+                    .map_err(|e| CoremlError::Runtime(e.to_string()))?
+            }
             _ => dequant_scheme(scheme, self.quant_bytes(w_id)?, k * n)?,
         };
         let x = self.val(x_id);
@@ -426,6 +474,39 @@ impl<'a> LowerCtx<'a> {
             )));
         }
         Ok(floats)
+    }
+
+    /// Raw u8 side tensor (MLX mxfp scales).
+    fn u8_side_tensor(&self, id: NodeId, expect: usize, label: &str) -> Result<Vec<u8>> {
+        let bytes = match &self.graph.node(id).op {
+            Op::Param { name } => {
+                if let Some((bytes, dt)) = self.typed_params.get(name) {
+                    if *dt != DType::U8 && *dt != DType::I8 {
+                        return Err(CoremlError::Runtime(format!(
+                            "{label} param '{name}' has dtype {dt:?}, expected U8"
+                        )));
+                    }
+                    bytes.clone()
+                } else {
+                    return Err(CoremlError::Runtime(format!(
+                        "missing {label} param '{name}'"
+                    )));
+                }
+            }
+            Op::Constant { data } => data.clone(),
+            other => {
+                return Err(CoremlError::Unsupported(format!(
+                    "dequant {label} must be Param/Constant, got {other:?}"
+                )));
+            }
+        };
+        if bytes.len() < expect {
+            return Err(CoremlError::Runtime(format!(
+                "dequant {label} len {} < expected {expect}",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
     }
 
     /// Dequantize packed MoE weights to a plain f32 const (no matmul).

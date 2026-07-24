@@ -92,6 +92,40 @@ impl Graph {
         self.reshape_(out4, vec![n as i64, c_out as i64, l_out as i64])
     }
 
+    /// Nearest-neighbor resample of an NCDHW volume to `size = [D, H, W]`.
+    ///
+    /// Emits native [`Op::Interpolate3d`]. Source index mapping:
+    /// `src = min(floor(dst * in / out), in - 1)`.
+    ///
+    /// Prefer [`Graph::interpolate3d`] (in `ops/conv3d.rs`) for mode/align_corners
+    /// control via a pure transpose/reshape/mm decomposition.
+    pub fn interpolate3d_nearest(&mut self, x: NodeId, size: [usize; 3]) -> NodeId {
+        let xs = self.shape(x).clone();
+        assert_eq!(xs.rank(), 5, "interpolate3d_nearest: NCDHW only");
+        assert!(
+            size.iter().all(|&s| s > 0),
+            "interpolate3d_nearest: size dims must be positive"
+        );
+        let out = crate::Shape::new(
+            &[
+                xs.dim(0).unwrap_static(),
+                xs.dim(1).unwrap_static(),
+                size[0],
+                size[1],
+                size[2],
+            ],
+            xs.dtype(),
+        );
+        self.push(
+            crate::Op::Interpolate3d {
+                size: size.to_vec(),
+            },
+            vec![x],
+            out,
+            None,
+        )
+    }
+
     /// Resample the last axis of `x` from `L_in` to `l_out` samples.
     ///
     /// Works for any rank ≥ 1; leading axes are treated as batch. Uses

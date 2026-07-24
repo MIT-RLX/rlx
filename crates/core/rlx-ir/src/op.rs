@@ -262,6 +262,8 @@ pub enum OpKind {
     BatchNormInference,
     RmsNorm,
     ResizeNearest2x,
+    /// Nearest-neighbor resample of NCDHW spatial dims to an explicit size.
+    Interpolate3d,
     Attention,
     Rope,
     AxialRope2d,
@@ -298,6 +300,9 @@ pub enum OpKind {
     MaxPool2dBackward,
     Conv2dBackwardInput,
     Conv2dBackwardWeight,
+    MaxPool3dBackward,
+    Conv3dBackwardInput,
+    Conv3dBackwardWeight,
     SoftmaxCrossEntropy,
     SoftmaxCrossEntropyWithLogits,
     SoftmaxCrossEntropyBackward,
@@ -795,6 +800,12 @@ pub enum Op {
 
     /// Nearest-neighbor 2× upsample on NCHW (doubles spatial dims 2 and 3).
     ResizeNearest2x,
+
+    /// Nearest-neighbor resample on NCDHW. `size` is `[D_out, H_out, W_out]`.
+    /// Source mapping: `src = min(floor(dst * in / out), in - 1)`.
+    Interpolate3d {
+        size: Vec<usize>,
+    },
 
     /// RMS normalization: input, gamma → normalized output.
     RmsNorm {
@@ -1631,6 +1642,31 @@ pub enum Op {
         groups: usize,
     },
 
+    /// 3D max-pool backward on NCDHW. Inputs: `[x, dy]`. Output: same as `x`.
+    MaxPool3dBackward {
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+    },
+
+    /// 3D conv backward w.r.t. input (NCDHW). Inputs: `[dy, w]`.
+    Conv3dBackwardInput {
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        groups: usize,
+    },
+
+    /// 3D conv backward w.r.t. weight (NCDHW). Inputs: `[x, dy]`.
+    Conv3dBackwardWeight {
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        groups: usize,
+    },
+
     /// Fused softmax + cross-entropy against a **dense** target
     /// distribution (soft labels / one-hot probabilities) — the
     /// companion to the sparse integer-label
@@ -2403,6 +2439,7 @@ impl Op {
             Op::BatchNormInference { .. } => OpKind::BatchNormInference,
             Op::RmsNorm { .. } => OpKind::RmsNorm,
             Op::ResizeNearest2x => OpKind::ResizeNearest2x,
+            Op::Interpolate3d { .. } => OpKind::Interpolate3d,
             Op::Attention { .. } => OpKind::Attention,
             Op::Rope { .. } => OpKind::Rope,
             Op::AxialRope2d { .. } => OpKind::AxialRope2d,
@@ -2451,6 +2488,9 @@ impl Op {
             Op::MaxPool2dBackward { .. } => OpKind::MaxPool2dBackward,
             Op::Conv2dBackwardInput { .. } => OpKind::Conv2dBackwardInput,
             Op::Conv2dBackwardWeight { .. } => OpKind::Conv2dBackwardWeight,
+            Op::MaxPool3dBackward { .. } => OpKind::MaxPool3dBackward,
+            Op::Conv3dBackwardInput { .. } => OpKind::Conv3dBackwardInput,
+            Op::Conv3dBackwardWeight { .. } => OpKind::Conv3dBackwardWeight,
             Op::SoftmaxCrossEntropy => OpKind::SoftmaxCrossEntropy,
             Op::SoftmaxCrossEntropyWithLogits => OpKind::SoftmaxCrossEntropyWithLogits,
             Op::SoftmaxCrossEntropyBackward => OpKind::SoftmaxCrossEntropyBackward,
@@ -2620,7 +2660,8 @@ impl Op {
             | Op::ArgMax { .. }
             | Op::ArgMin { .. }
             | Op::Sample { .. }
-            | Op::ResizeNearest2x => 1,
+            | Op::ResizeNearest2x
+            | Op::Interpolate3d { .. } => 1,
             Op::RngNormal { .. } | Op::RngUniform { .. } => 0, // 0 or 1 — see verify
             // EMA / Fixed scale modes carry a state tensor as a 2nd input;
             // PerBatch (default) doesn't need one.
@@ -2725,6 +2766,9 @@ impl Op {
             Op::MaxPool2dBackward { .. } => 2,               // x, dy
             Op::Conv2dBackwardInput { .. } => 2,             // dy, w
             Op::Conv2dBackwardWeight { .. } => 2,            // x, dy
+            Op::MaxPool3dBackward { .. } => 2,               // x, dy
+            Op::Conv3dBackwardInput { .. } => 2,             // dy, w
+            Op::Conv3dBackwardWeight { .. } => 2,            // x, dy
             Op::SoftmaxCrossEntropy => 2,                    // logits, targets
             Op::SoftmaxCrossEntropyWithLogits => 2,          // logits, labels
             Op::SoftmaxCrossEntropyBackward => 3,            // logits, labels, d_loss
@@ -2850,6 +2894,13 @@ impl std::fmt::Display for Op {
             }
             Op::BatchNormInference { eps } => write!(f, "batch_norm_inference(eps={eps})"),
             Op::ResizeNearest2x => write!(f, "resize_nearest_2x"),
+            Op::Interpolate3d { size } => write!(
+                f,
+                "interpolate3d(size=[{},{},{}])",
+                size.first().copied().unwrap_or(0),
+                size.get(1).copied().unwrap_or(0),
+                size.get(2).copied().unwrap_or(0)
+            ),
             Op::RmsNorm { eps, .. } => write!(f, "rms_norm(eps={eps})"),
             Op::Attention {
                 num_heads,
@@ -3072,6 +3123,15 @@ impl std::fmt::Display for Op {
             }
             Op::Conv2dBackwardWeight { kernel_size, .. } => {
                 write!(f, "conv2d_backward_weight({kernel_size:?})")
+            }
+            Op::MaxPool3dBackward { kernel_size, .. } => {
+                write!(f, "maxpool3d_backward({kernel_size:?})")
+            }
+            Op::Conv3dBackwardInput { kernel_size, .. } => {
+                write!(f, "conv3d_backward_input({kernel_size:?})")
+            }
+            Op::Conv3dBackwardWeight { kernel_size, .. } => {
+                write!(f, "conv3d_backward_weight({kernel_size:?})")
             }
             Op::SoftmaxCrossEntropy => write!(f, "sce"),
             Op::SoftmaxCrossEntropyWithLogits => write!(f, "sce_with_logits"),

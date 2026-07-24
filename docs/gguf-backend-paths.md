@@ -72,6 +72,26 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 Non-GGUF FP8 / NVFP4 block matmul on Metal uses `dequant_matmul_fp8` /
 `dequant_matmul_nvfp4` MSL when no deferred host ops are pending.
 
+## MLX schemes (`MlxAffine` / `MlxMxfp4` / `MlxMxfp8`)
+
+Separate from GGUF: weights are `[n, k]` packed along K (mlx-lm Linear).
+IR still uses 4 inputs (`x`, `w_q`, `scale`, `zp`); mxfp ignores `zp`.
+
+| Backend | Path |
+|---------|------|
+| **CPU** | `Thunk::DequantMatMulMlx` (`rlx-mlx-io`) |
+| **Metal** | MSL GEMV (`m=1`) / tiled GEMM (`m>1`); `scheme.mlx_gpu_launch()` |
+| **CUDA / ROCm** | `dequant_matmul_mlx.cu` (`_gemv` / `_gemm`) |
+| **WGPU** | `dequant_matmul_mlx.wgsl` (tiled TM=8) |
+| **Vulkan** | `dequant_matmul_mlx.comp` — 1-D `gid` (MoltenVK-safe) |
+| **TPU** | Host dequant at HLO emit → `dot_general` |
+| **MLX** | Affine → `quantized_matmul`; mxfp host-dequant + **dequant cache** then on-device `matmul` |
+| **CoreML** | Host-bake `MlxAffine` / `MlxMxfp*` → f32 matmul (same as GGUF off-path) |
+| **QNN** | Host-dequant when w/scale/bias are Constants; Param weights → explicit error |
+
+Disable on-device: `RLX_MLX_DEQUANT_GPU_DISABLE` (or `RLX_METAL_DEQUANT_GPU_DISABLE`).
+See [mlx-weights.md](mlx-weights.md) for loaders / `import-mlx --keep-packed`.
+
 ## P0–P5 deliverables
 
 | Id | What | Primary files |

@@ -25,11 +25,15 @@ encrypt = ["dep:chacha20poly1305", "dep:argon2", "dep:rand_core"]
 remote = ["dep:ureq"]
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13", features = ["serialize"] }
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.13" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14", features = ["serialize"] }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.14" }
+rlx-mlx-io = { path = "../rlx-mlx-io", version = "0.2.14" }
+rlx-dduf = { path = "../rlx-dduf", version = "0.2.14" }
+rlx-nemo = { path = "../rlx-nemo", version = "0.2.14" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 bincode = "1"
 memmap2 = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -44,6 +48,7 @@ ureq = { version = "2", optional = true, default-features = true }
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3"
+safetensors = "0.7"
 
 [[bench]]
 name = "hybrid_load"

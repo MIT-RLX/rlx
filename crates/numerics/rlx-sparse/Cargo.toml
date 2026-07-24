@@ -29,15 +29,15 @@ metal = ["dep:rlx-metal", "cpu"]
 mlx = ["dep:rlx-mlx", "cpu"]
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.13", optional = true }
-rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.13", optional = true }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14", optional = true }
+rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.14", optional = true }
 
 # rlx-metal is an Apple-only backend (Metal is an Apple API); make it a
 # dependency solely on Apple targets (excluding watchOS — no Metal compute) so
 # the `metal` feature only pulls it where the backend exists — no non-Apple stub.
 [target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
-rlx-metal = { path = "../../backends/rlx-metal", version = "0.2.13", optional = true }
+rlx-metal = { path = "../../backends/rlx-metal", version = "0.2.14", optional = true }
 
 [lints]
 workspace = true

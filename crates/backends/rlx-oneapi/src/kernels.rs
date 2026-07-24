@@ -105,7 +105,7 @@ impl Drop for Kernels {
     fn drop(&mut self) {
         if let Some(dev) = oneapi_device() {
             unsafe {
-                for (_, &k) in self.kernels.iter() {
+                for &k in self.kernels.values() {
                     let _ = (dev.lib.kernel_destroy)(k);
                 }
                 for &m in &self.modules {

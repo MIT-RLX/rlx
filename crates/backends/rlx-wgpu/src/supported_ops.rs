@@ -41,6 +41,7 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::LayerNorm2d,
     OpKind::GroupNorm,
     OpKind::ResizeNearest2x,
+    OpKind::Interpolate3d,
     OpKind::RmsNorm,
     OpKind::Attention,
     OpKind::AttentionBackward,
@@ -65,6 +66,9 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     // Weight-grad + input-grad together = full multi-conv CNN training.
     OpKind::Conv2dBackwardWeight,
     OpKind::Conv2dBackwardInput,
+    OpKind::Conv3dBackwardWeight,
+    OpKind::Conv3dBackwardInput,
+    OpKind::MaxPool3dBackward,
     OpKind::Rope,
     OpKind::Reshape,
     OpKind::Transpose,

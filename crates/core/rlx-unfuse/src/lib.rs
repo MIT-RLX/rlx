@@ -133,7 +133,7 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|&id| id_map[&id]).collect();
 
         let new_id = match &node.op {
-            Op::FusedSwiGLU { cast_to: _, .. } => {
+            Op::FusedSwiGLU { .. } => {
                 expand_swiglu(&mut out, &graph, node.inputs[0], &new_inputs, &node.shape)
             }
             Op::LoraMatMul { scale } => expand_lora(

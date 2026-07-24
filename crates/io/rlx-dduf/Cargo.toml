@@ -1,0 +1,28 @@
+[package]
+name = "rlx-dduf"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX — load HuggingFace DDUF (.dduf) ZIP packages of nested safetensors + JSON."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[dependencies]
+anyhow = "1"
+half = { version = "2", features = ["bytemuck"] }
+safetensors = "0.7"
+serde_json = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+bytemuck = "1"
+
+[lints]
+workspace = true

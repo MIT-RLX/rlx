@@ -27,7 +27,6 @@
 //! relies on; pointing `RLX_PARITY_DEVICE=cuda` additionally exercises the
 //! decomposition-op kernels end-to-end.
 
-use rlx_ir::infer::GraphExt;
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available};

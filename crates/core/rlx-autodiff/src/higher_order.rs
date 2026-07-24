@@ -204,6 +204,57 @@ mod tests {
     }
 
     #[test]
+    fn maxpool3d_second_order_is_zero_not_panic() {
+        use rlx_ir::op::ReduceOp;
+        let f = DType::F32;
+        let mut g = Graph::new("pool3d_ho");
+        let x = g.input("x", Shape::new(&[1, 1, 4, 4, 4], f));
+        let p = g.add_node(
+            Op::Pool {
+                kind: ReduceOp::Max,
+                kernel_size: vec![2, 2, 2],
+                stride: vec![2, 2, 2],
+                padding: vec![0, 0, 0],
+            },
+            vec![x],
+            Shape::new(&[1, 1, 2, 2, 2], f),
+        );
+        let loss = g.reduce(
+            p,
+            ReduceOp::Sum,
+            vec![0, 1, 2, 3, 4],
+            false,
+            Shape::scalar(f),
+        );
+        g.set_outputs(vec![loss]);
+        let hg = nth_order_grad(&g, "x", 2);
+        assert_eq!(hg.outputs.len(), 1);
+        assert!(matches!(hg.node(hg.outputs[0]).op, Op::Constant { .. }));
+    }
+
+    #[test]
+    fn conv3d_second_order_builds() {
+        use rlx_ir::op::ReduceOp;
+        let f = DType::F32;
+        let mut g = Graph::new("conv3d_ho");
+        let x = g.input("x", Shape::new(&[1, 1, 4, 4, 4], f));
+        let w = g.input("w", Shape::new(&[1, 1, 3, 3, 3], f));
+        let y = g.conv3d(x, w, [1, 1, 1], [1, 1, 1], [1, 1, 1], 1);
+        let loss = g.reduce(
+            y,
+            ReduceOp::Sum,
+            vec![0, 1, 2, 3, 4],
+            false,
+            Shape::scalar(f),
+        );
+        g.set_outputs(vec![loss]);
+        let hx = nth_order_grad(&g, "x", 2);
+        let hw = nth_order_grad(&g, "w", 2);
+        assert_eq!(hx.outputs.len(), 1);
+        assert_eq!(hw.outputs.len(), 1);
+    }
+
+    #[test]
     fn nth_order_x_cubed_graph_shape() {
         let mut g = Graph::new("x3");
         let x = g.input("x", Shape::scalar(DType::F64));

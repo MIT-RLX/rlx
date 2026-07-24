@@ -59,6 +59,9 @@ pub const SOFTMAX_WGSL: &str = include_str!("softmax.wgsl");
 pub const SOFTMAX_CROSS_ENTROPY_WGSL: &str = include_str!("softmax_cross_entropy.wgsl");
 pub const SOFTMAX_CROSS_ENTROPY_BWD_WGSL: &str = include_str!("softmax_cross_entropy_bwd.wgsl");
 pub const MAXPOOL2D_BWD_WGSL: &str = include_str!("maxpool2d_backward.wgsl");
+pub const MAXPOOL3D_BWD_WGSL: &str = include_str!("maxpool3d_backward.wgsl");
+pub const CONV3D_BWD_INPUT_WGSL: &str = include_str!("conv3d_backward_input.wgsl");
+pub const CONV3D_BWD_WEIGHT_WGSL: &str = include_str!("conv3d_backward_weight.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
 pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
@@ -120,6 +123,7 @@ pub const MAMBA2_WGSL: &str = include_str!("mamba2.wgsl");
 pub const GRU_WGSL: &str = include_str!("gru.wgsl");
 pub const RNN_WGSL: &str = include_str!("rnn.wgsl");
 pub const DEQUANT_MATMUL_WGSL: &str = include_str!("dequant_matmul.wgsl");
+pub const DEQUANT_MATMUL_MLX_WGSL: &str = include_str!("dequant_matmul_mlx.wgsl");
 pub const DEQUANT_GGUF_WGSL: &str = include_str!("dequant_gguf.wgsl");
 pub const DEQUANT_GEMV_GGUF_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
 pub const DEQUANT_GEMM_Q1_0_WGSL: &str = include_str!("dequant_gemm_q1_0.wgsl");
@@ -330,6 +334,104 @@ pub struct MaxPool2dBwdParams {
     pub dy_off: u32,
     pub dx_off: u32,
     pub _p0: u32,
+}
+
+/// Layout for MaxPool3d backward. 96 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct MaxPool3dBwdParams {
+    pub n: u32,
+    pub c: u32,
+    pub d: u32,
+    pub h: u32,
+    pub w: u32,
+    pub d_out: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kd: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub sd: u32,
+    pub sh: u32,
+    pub sw: u32,
+    pub pd: u32,
+    pub ph: u32,
+    pub pw: u32,
+    pub x_off: u32,
+    pub dy_off: u32,
+    pub dx_off: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+}
+
+/// Layout for Conv3d BackwardInput. 112 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Conv3dBwdInputParams {
+    pub n: u32,
+    pub c_in: u32,
+    pub d: u32,
+    pub h: u32,
+    pub w: u32,
+    pub c_out: u32,
+    pub d_out: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kd: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub sd: u32,
+    pub sh: u32,
+    pub sw: u32,
+    pub pd: u32,
+    pub ph: u32,
+    pub pw: u32,
+    pub dd: u32,
+    pub dh: u32,
+    pub dw: u32,
+    pub groups: u32,
+    pub dy_off: u32,
+    pub w_off: u32,
+    pub dx_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
+/// Layout for Conv3d BackwardWeight. 112 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Conv3dBwdWeightParams {
+    pub n: u32,
+    pub c_in: u32,
+    pub d: u32,
+    pub h: u32,
+    pub w: u32,
+    pub c_out: u32,
+    pub d_out: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kd: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub sd: u32,
+    pub sh: u32,
+    pub sw: u32,
+    pub pd: u32,
+    pub ph: u32,
+    pub pw: u32,
+    pub dd: u32,
+    pub dh: u32,
+    pub dw: u32,
+    pub groups: u32,
+    pub x_off: u32,
+    pub dy_off: u32,
+    pub dw_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
 }
 
 /// Layout for GroupNorm (NCHW) backward. 48 bytes. Shared by dx/dgamma/dbeta
@@ -1108,6 +1210,24 @@ pub struct DequantMatmulParams {
     pub out_off: u32,
     pub _p0: u32,
     pub _p1: u32,
+}
+
+/// Layout for MLX DequantMatMul. 48 bytes (12 u32s).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DequantMatmulMlxParams {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub kind: u32,
+    pub bits: u32,
+    pub group_size: u32,
+    pub x_byte_off: u32,
+    pub w_byte_off: u32,
+    pub scale_byte_off: u32,
+    pub zp_byte_off: u32,
+    pub out_byte_off: u32,
+    pub _pad: u32,
 }
 
 /// Layout for FusedResidualLN-Tee. 48 bytes (12 u32s).
@@ -2007,6 +2127,9 @@ static SOFTMAX_CROSS_ENTROPY: OnceLock<Kernel> = OnceLock::new();
 static SOFTMAX_CROSS_ENTROPY_WITH_LOGITS: OnceLock<Kernel> = OnceLock::new();
 static SOFTMAX_CROSS_ENTROPY_BWD: OnceLock<Kernel> = OnceLock::new();
 static MAXPOOL2D_BWD: OnceLock<Kernel> = OnceLock::new();
+static MAXPOOL3D_BWD: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_BWD_WEIGHT: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM_BWD_GAMMA: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM_BWD_BETA: OnceLock<Kernel> = OnceLock::new();
@@ -2077,6 +2200,7 @@ static MAMBA2: OnceLock<Kernel> = OnceLock::new();
 static GRU: OnceLock<Kernel> = OnceLock::new();
 static RNN: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_MATMUL_MLX: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMV_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
@@ -2518,6 +2642,36 @@ pub fn maxpool2d_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu maxpool2d_backward",
             MAXPOOL2D_BWD_WGSL,
             "maxpool2d_backward",
+        )
+    })
+}
+pub fn maxpool3d_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
+    MAXPOOL3D_BWD.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu maxpool3d_backward",
+            MAXPOOL3D_BWD_WGSL,
+            "maxpool3d_backward",
+        )
+    })
+}
+pub fn conv3d_backward_input_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_BWD_INPUT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_backward_input",
+            CONV3D_BWD_INPUT_WGSL,
+            "conv3d_backward_input",
+        )
+    })
+}
+pub fn conv3d_backward_weight_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_BWD_WEIGHT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_backward_weight",
+            CONV3D_BWD_WEIGHT_WGSL,
+            "conv3d_backward_weight",
         )
     })
 }
@@ -3047,6 +3201,16 @@ pub fn dequant_matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_matmul",
             DEQUANT_MATMUL_WGSL,
             "dequant_matmul",
+        )
+    })
+}
+pub fn dequant_matmul_mlx_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_MATMUL_MLX.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu dequant_matmul_mlx",
+            DEQUANT_MATMUL_MLX_WGSL,
+            "dequant_matmul_mlx",
         )
     })
 }

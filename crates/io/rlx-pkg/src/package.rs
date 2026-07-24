@@ -20,7 +20,9 @@ use crate::flat::{self, FlatView};
 use crate::manifest::{Manifest, SidecarRef};
 use crate::placement::Placement;
 use crate::store_zip::{self, MemberRange};
-use crate::tier::{Codec, StorageTier, decode_payload, decode_payload_parallel, decode_zstd_block_at};
+use crate::tier::{
+    Codec, StorageTier, decode_payload, decode_payload_parallel, decode_zstd_block_at,
+};
 use crate::weights_index::{WeightEntry, WeightsIndex};
 use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
@@ -85,7 +87,8 @@ impl Package {
         }
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: read-only map of a local package file for the Package lifetime.
-        let map = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+        let map =
+            unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
         if flat::is_flat_magic(&map) {
             Self::open_flat(path, map)
         } else if map.len() >= 4 && &map[..2] == b"PK" {
@@ -501,8 +504,7 @@ impl Package {
             MemberSource::Flat { .. } => false,
             MemberSource::Dir { root, .. } => root.join(rel).exists(),
             MemberSource::Zip { ranges, .. } => {
-                ranges.contains_key(rel)
-                    || ranges.keys().any(|k| k.starts_with(&format!("{rel}/")))
+                ranges.contains_key(rel) || ranges.keys().any(|k| k.starts_with(&format!("{rel}/")))
             }
         }
     }
@@ -547,6 +549,42 @@ fn fill_constant(g: &mut Graph, name: &str, bytes: Vec<u8>) {
                 *data = bytes.clone();
             }
         }
+    }
+}
+
+/// Map RLXP `scheme` strings to a host bind dtype for `set_param_typed`.
+pub fn dtype_for_weight_scheme(scheme: &str) -> rlx_ir::DType {
+    use rlx_ir::DType;
+    if scheme == "f32" || scheme.starts_with("f32") {
+        return DType::F32;
+    }
+    if scheme == "f16" || scheme == "bf16" {
+        return DType::F16;
+    }
+    if scheme == "u8" || scheme.starts_with("mlx_") || scheme.starts_with("gguf_") || scheme == "i8"
+    {
+        return DType::U8;
+    }
+    DType::F32
+}
+
+impl Package {
+    /// Yield `(name, bytes, dtype)` for every weight — used to
+    /// `CompiledGraph::set_param_typed` after compile (Param path).
+    pub fn typed_weight_bindings(&self) -> Result<Vec<(String, Vec<u8>, rlx_ir::DType)>> {
+        let Some(idx) = &self.weights else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(idx.tensors.len());
+        for entry in &idx.tensors {
+            let bytes = self.tensor_bytes(&entry.name)?;
+            out.push((
+                entry.name.clone(),
+                bytes,
+                dtype_for_weight_scheme(&entry.scheme),
+            ));
+        }
+        Ok(out)
     }
 }
 

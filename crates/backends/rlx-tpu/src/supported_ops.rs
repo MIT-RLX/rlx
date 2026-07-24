@@ -150,6 +150,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         GatherBackward,
         AttentionBackward,
         // Vision / scan / custom / scaled.
+        // Interpolate3d / Conv3dBackward* / MaxPool3dBackward: not lowered on
+        // TPU yet — omit from SUPPORTED_OPS (use CPU/GPU or im2col decompose).
         ResizeNearest2x,
         Scan,
         ScanBackward,

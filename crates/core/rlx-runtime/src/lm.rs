@@ -179,14 +179,37 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 pub enum WeightFormat {
     Safetensors,
     Gguf,
+    /// MLX / mlx-community layouts (dir, `.safetensors`, `.npz`, `.npy`).
+    Mlx,
+    /// HuggingFace DDUF (`.dduf` ZIP of nested safetensors).
+    Dduf,
 }
 
 impl WeightFormat {
-    /// Infer format from a path extension.
+    /// Infer format from a path extension (or mlx-community directory).
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
+        if path.is_dir() {
+            if path.join("config.json").is_file()
+                && (path.join("model.safetensors").is_file()
+                    || path.join("model.safetensors.index.json").is_file()
+                    || std::fs::read_dir(path)?.any(|e| {
+                        e.ok()
+                            .and_then(|e| e.path().extension().map(|x| x == "safetensors"))
+                            .unwrap_or(false)
+                    }))
+            {
+                return Ok(Self::Mlx);
+            }
+            return Err(anyhow::anyhow!(
+                "directory {:?} is not an mlx-community weight dir (need config.json + safetensors)",
+                path
+            ));
+        }
         match path.extension().and_then(|s| s.to_str()) {
             Some("safetensors") => Ok(Self::Safetensors),
             Some("gguf") => Ok(Self::Gguf),
+            Some("npz") | Some("npy") => Ok(Self::Mlx),
+            Some("dduf") => Ok(Self::Dduf),
             other => Err(anyhow::anyhow!(
                 "cannot autodetect weight format from extension {:?} on {:?}",
                 other,
@@ -195,12 +218,16 @@ impl WeightFormat {
         }
     }
 
-    /// Parse CLI `--format` values (`safetensors` | `gguf`).
+    /// Parse CLI `--format` values (`safetensors` | `gguf` | `mlx` | `dduf`).
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "safetensors" => Ok(Self::Safetensors),
             "gguf" => Ok(Self::Gguf),
-            other => Err(anyhow::anyhow!("expected safetensors|gguf, got {other}")),
+            "mlx" | "npz" => Ok(Self::Mlx),
+            "dduf" => Ok(Self::Dduf),
+            other => Err(anyhow::anyhow!(
+                "expected safetensors|gguf|mlx|dduf, got {other}"
+            )),
         }
     }
 }

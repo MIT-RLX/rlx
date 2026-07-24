@@ -175,7 +175,12 @@ kernel_cache!(
     RNG_PHILOX_CU,
     "rng_uniform_philox"
 );
-kernel_cache!(RNG_FILL_ZERO, rng_fill_zero_kernel, RNG_PHILOX_CU, "rng_fill_zero");
+kernel_cache!(
+    RNG_FILL_ZERO,
+    rng_fill_zero_kernel,
+    RNG_PHILOX_CU,
+    "rng_fill_zero"
+);
 kernel_cache!(GRU, gru_kernel, GRU_CU, "gru");
 kernel_cache!(RNN, rnn_kernel, RNN_CU, "rnn");
 kernel_cache!(MAMBA2, mamba2_kernel, MAMBA2_CU, "mamba2");
@@ -470,12 +475,35 @@ kernel_cache!(
     SCATTER_ADD_CU,
     "scatter_add_acc"
 );
-kernel_cache!(SCATTER_ND, scatter_nd_kernel, SCATTER_ND_CU, "scatter_nd_f32");
+kernel_cache!(
+    SCATTER_ND,
+    scatter_nd_kernel,
+    SCATTER_ND_CU,
+    "scatter_nd_f32"
+);
 kernel_cache!(
     DEQUANT_MATMUL,
     dequant_matmul_kernel,
     DEQUANT_MATMUL_CU,
     "dequant_matmul"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_MLX,
+    dequant_matmul_mlx_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_matmul_mlx"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_MLX_GEMV,
+    dequant_matmul_mlx_gemv_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_matmul_mlx_gemv"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_MLX_GEMM,
+    dequant_matmul_mlx_gemm_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_matmul_mlx_gemm"
 );
 kernel_cache!(
     DEQUANT_GGUF,
@@ -516,6 +544,12 @@ kernel_cache!(
     MAXPOOL2D_BACKWARD_CU,
     "maxpool2d_backward"
 );
+kernel_cache!(
+    MAXPOOL3D_BWD,
+    maxpool3d_backward_kernel,
+    MAXPOOL3D_BACKWARD_CU,
+    "maxpool3d_backward"
+);
 kernel_cache!(POOL3D, pool3d_kernel, POOL3D_CU, "pool3d");
 kernel_cache!(CONV1D, conv1d_kernel, CONV1D_CU, "conv1d");
 kernel_cache!(CONV2D, conv2d_kernel, CONV2D_CU, "conv2d");
@@ -533,6 +567,18 @@ kernel_cache!(
 );
 kernel_cache!(IM2COL, im2col_kernel, IM2COL_CU, "im2col");
 kernel_cache!(CONV3D, conv3d_kernel, CONV3D_CU, "conv3d");
+kernel_cache!(
+    CONV3D_BACKWARD_INPUT,
+    conv3d_backward_input_kernel,
+    CONV3D_BACKWARD_INPUT_CU,
+    "conv3d_backward_input"
+);
+kernel_cache!(
+    CONV3D_BACKWARD_WEIGHT,
+    conv3d_backward_weight_kernel,
+    CONV3D_BACKWARD_WEIGHT_CU,
+    "conv3d_backward_weight"
+);
 kernel_cache!(
     CONV_TRANSPOSE3D,
     conv_transpose3d_kernel,
@@ -611,6 +657,12 @@ kernel_cache!(
     resize_nearest_2x_kernel,
     RESIZE_NEAREST_2X_CU,
     "resize_nearest_2x"
+);
+kernel_cache!(
+    INTERPOLATE3D,
+    interpolate3d_kernel,
+    INTERPOLATE3D_CU,
+    "interpolate3d"
 );
 kernel_cache!(
     ELEMENTWISE_REGION,

@@ -383,6 +383,17 @@ impl MetalExecutable {
                 k: usize,
                 n: usize,
             },
+            DequantMatMulMlx {
+                x: usize,
+                w_q: usize,
+                scale: usize,
+                zp: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                scheme: rlx_ir::quant::QuantScheme,
+            },
             ScaledMatMul {
                 lhs: usize,
                 rhs: usize,
@@ -913,6 +924,21 @@ impl MetalExecutable {
                                 k,
                                 n,
                                 arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantMatMulMlx {
+                            x,
+                            w_q,
+                            scale,
+                            zp,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            scheme,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_matmul_mlx_f32(
+                                x, w_q, scale, zp, dst, m, k, n, scheme, arena_ptr,
                             );
                         },
                         DeferredHostOp::ScaledMatMul {
@@ -3582,6 +3608,182 @@ impl MetalExecutable {
                             }
                         }
                     }
+                }
+                Thunk::MaxPool3dBackward {
+                    x,
+                    dy,
+                    dx,
+                    n,
+                    c,
+                    d,
+                    h,
+                    w,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                } => {
+                    let n_eff = scale(*n);
+                    if n_eff == 0 {
+                        continue;
+                    }
+                    encode_maxpool3d_backward(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *dy,
+                        *dx,
+                        n_eff,
+                        *c,
+                        *d,
+                        *h,
+                        *w,
+                        *d_out,
+                        *h_out,
+                        *w_out,
+                        *kd,
+                        *kh,
+                        *kw,
+                        *sd,
+                        *sh,
+                        *sw,
+                        *pd,
+                        *ph,
+                        *pw,
+                    );
+                }
+                Thunk::Conv3dBackwardInput {
+                    dy,
+                    w,
+                    dx,
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w_in,
+                    c_out,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_conv3d_backward_input(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *dy,
+                        *w,
+                        *dx,
+                        n,
+                        *c_in,
+                        *d,
+                        *h,
+                        *w_in,
+                        *c_out,
+                        *d_out,
+                        *h_out,
+                        *w_out,
+                        *kd,
+                        *kh,
+                        *kw,
+                        *sd,
+                        *sh,
+                        *sw,
+                        *pd,
+                        *ph,
+                        *pw,
+                        *dd,
+                        *dh,
+                        *dw,
+                        *groups,
+                    );
+                }
+                Thunk::Conv3dBackwardWeight {
+                    x,
+                    dy,
+                    dw,
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w,
+                    c_out,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw_dil,
+                    groups,
+                } => {
+                    let n = scale(*n);
+                    if n == 0 {
+                        continue;
+                    }
+                    encode_conv3d_backward_weight(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *x,
+                        *dy,
+                        *dw,
+                        n,
+                        *c_in,
+                        *d,
+                        *h,
+                        *w,
+                        *c_out,
+                        *d_out,
+                        *h_out,
+                        *w_out,
+                        *kd,
+                        *kh,
+                        *kw,
+                        *sd,
+                        *sh,
+                        *sw,
+                        *pd,
+                        *ph,
+                        *pw,
+                        *dd,
+                        *dh,
+                        *dw_dil,
+                        *groups,
+                    );
                 }
                 Thunk::Attention {
                     q,
@@ -6566,6 +6768,74 @@ impl MetalExecutable {
                         });
                     }
                 }
+
+                Thunk::DequantMatMulMlx {
+                    x,
+                    w_q,
+                    scale,
+                    zp,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                    scheme,
+                } => {
+                    let (kind, bits, group_size) = scheme.mlx_gpu_launch().unwrap_or_else(|| {
+                        panic!("rlx-metal DequantMatMulMlx: unexpected {scheme:?}")
+                    });
+                    let use_gpu = deferred_host.is_empty()
+                        && !crate::runtime_config().dequant_gpu_disable
+                        && !rlx_gpu_host::mlx_dequant_gpu_disabled();
+                    if use_gpu {
+                        if *m == 1 {
+                            encode_dequant_matmul_mlx_gemv(
+                                e!(),
+                                &k.dequant_matmul_mlx_gemv,
+                                &self.arena.buffer,
+                                *x,
+                                *w_q,
+                                *scale,
+                                *zp,
+                                *dst,
+                                *kk,
+                                *n,
+                                kind,
+                                bits,
+                                group_size,
+                            );
+                        } else {
+                            encode_dequant_matmul_mlx_gemm(
+                                e!(),
+                                &k.dequant_matmul_mlx_gemm,
+                                &self.arena.buffer,
+                                *x,
+                                *w_q,
+                                *scale,
+                                *zp,
+                                *dst,
+                                *m,
+                                *kk,
+                                *n,
+                                kind,
+                                bits,
+                                group_size,
+                            );
+                        }
+                    } else {
+                        deferred_host.push(DeferredHostOp::DequantMatMulMlx {
+                            x: *x,
+                            w_q: *w_q,
+                            scale: *scale,
+                            zp: *zp,
+                            dst: *dst,
+                            m: *m as usize,
+                            k: *kk as usize,
+                            n: *n as usize,
+                            scheme: *scheme,
+                        });
+                    }
+                }
+
                 // Native low-precision GEMM + quantize: Apple GPUs have no FP8
                 // matrix HW, so these always run as the host decode-and-accumulate
                 // reference on unified memory (ordered after GPU compute).

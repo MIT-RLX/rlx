@@ -11,6 +11,7 @@ fn read_f16_le(b: &[u8]) -> f32 {
 }
 
 /// Reference dot for one output row — GGML Q4_0 nibble order (lows 0..15, highs 16..31).
+#[allow(dead_code)] // kept as an explicit scalar reference next to the fused kernel path
 fn q4_0_mv_row_ref(x: &[f32], row_packed: &[u8], k: usize) -> f32 {
     let nblocks = k / 32;
     let mut acc = 0.0f32;

@@ -24,13 +24,13 @@ onnx = ["dep:rlx-onnx-import"]
 pt = ["dep:rlx-nemo"]
 
 [dependencies]
-rlx-gguf = { path = "../rlx-gguf", version = "0.2.13" }
+rlx-gguf = { path = "../rlx-gguf", version = "0.2.14" }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 safetensors = { version = "0.7", optional = true }
-rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.13", optional = true, default-features = false }
-rlx-nemo = { path = "../rlx-nemo", version = "0.2.13", optional = true }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.14", optional = true, default-features = false }
+rlx-nemo = { path = "../rlx-nemo", version = "0.2.14", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

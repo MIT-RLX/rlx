@@ -1428,10 +1428,10 @@ pub fn lower_with_env(
                     let x = lookup(&env, node.inputs[0])?;
                     let w = lookup(&env, node.inputs[1])?;
                     let g = (*groups).max(1) as i32;
-                    let c_in = w_shape[0] as i32;
-                    let c_out_per_g = w_shape[1] as i32;
-                    let kh = w_shape[2] as i32;
-                    let kw = w_shape[3] as i32;
+                    let c_in = w_shape[0];
+                    let c_out_per_g = w_shape[1];
+                    let kh = w_shape[2];
+                    let kw = w_shape[3];
                     let c_out = c_out_per_g * g;
                     let c_in_per_g = c_in / g;
                     let s = |i: usize| stride.get(i).copied().unwrap_or(1) as i32;
@@ -1904,16 +1904,109 @@ pub fn lower_with_env(
                         .map(|d| d.unwrap_static())
                         .collect();
                     Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+                } else if matches!(
+                    scheme,
+                    rlx_ir::QuantScheme::MlxMxfp4 { .. } | rlx_ir::QuantScheme::MlxMxfp8 { .. }
+                ) {
+                    let x = lookup(&env, node.inputs[0])?;
+                    let wq = lookup(&env, node.inputs[1])?;
+                    let sc = lookup(&env, node.inputs[2])?;
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    let m = total / n.max(1);
+                    let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                    let k = x_total / m.max(1);
+                    #[cfg(feature = "native-mxfp")]
+                    {
+                        // Opt-in MLX C++ `quantized_matmul` (mode=mxfp4/mxfp8/nvfp4).
+                        let (bits, gs, mode) = quant_scheme_to_mlx(scheme)?;
+                        let packed_cols = k * bits as usize / 32;
+                        let wq_u32 =
+                            Array::from_bytes(&wq.to_bytes()?, &[n, packed_cols], DType::U32)?;
+                        let scales_u8 = Array::from_bytes(
+                            &sc.to_bytes()?,
+                            &[n, k / gs as usize],
+                            DType::U8,
+                        )?;
+                        ops::quantized_matmul_mode(
+                            x,
+                            &wq_u32,
+                            &scales_u8,
+                            None,
+                            /*transpose=*/ true,
+                            gs,
+                            bits,
+                            mode,
+                        )?
+                    }
+                    #[cfg(not(feature = "native-mxfp"))]
+                    {
+                        // First-class Rust path: same dequant as CPU/Metal kernels,
+                        // then MLX matmul (with Param-keyed cache).
+                        let w_bytes = wq.to_bytes()?;
+                        let scale_bytes = sc.to_bytes()?;
+                        let w_node = graph.node(node.inputs[1]);
+                        let cache_key = match &w_node.op {
+                            rlx_ir::Op::Param { name } => Some(mlx_mxfp_cache_key(
+                                name,
+                                k,
+                                n,
+                                scheme,
+                                &w_bytes,
+                                &scale_bytes,
+                            )),
+                            _ => None,
+                        };
+                        let w_kn = if let Some(ref key) = cache_key {
+                            if let Some(arr) = mlx_dequant_cache_get(key)? {
+                                arr
+                            } else {
+                                let arr =
+                                    build_mlx_mxfp_kn(&w_bytes, &scale_bytes, k, n, scheme)?;
+                                let to_store = arr.clone_handle()?;
+                                mlx_dequant_cache_put(key.clone(), to_store, k * n * 4);
+                                arr
+                            }
+                        } else {
+                            build_mlx_mxfp_kn(&w_bytes, &scale_bytes, k, n, scheme)?
+                        };
+                        ops::matmul(x, &w_kn)?
+                    }
                 } else {
                     // Inputs: [x, w_q, scale, zp]. Map to MLX's
-                    // quantized_matmul. The bit-width and group-size come
-                    // from the rlx QuantScheme.
+                    // quantized_matmul (Int4/Int8/MlxAffine).
                     let x = lookup(&env, node.inputs[0])?;
                     let wq = lookup(&env, node.inputs[1])?;
                     let s = lookup(&env, node.inputs[2])?;
                     let zp = lookup(&env, node.inputs[3])?;
-                    let (bits, gs) = quant_scheme_to_mlx(scheme)?;
-                    ops::quantized_matmul(x, wq, s, Some(zp), /*transpose=*/ true, gs, bits)?
+                    let (bits, gs, mode) = quant_scheme_to_mlx(scheme)?;
+                    // MLX `quantized_matmul` needs the packed weight as uint32
+                    // `[n, k*bits/32]`. The MlxAffine param arrives as flat U8
+                    // bytes (shared byte layout with the CPU/Metal kernels), so
+                    // reinterpret the bytes as u32 for MLX.
+                    let wq_u32;
+                    let wq = if matches!(scheme, rlx_ir::QuantScheme::MlxAffine { .. }) {
+                        let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                        let total = node.shape.num_elements().unwrap();
+                        let m = total / n.max(1);
+                        let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                        let k = x_total / m.max(1);
+                        let packed_cols = k * bits as usize / 32;
+                        wq_u32 = Array::from_bytes(&wq.to_bytes()?, &[n, packed_cols], DType::U32)?;
+                        &wq_u32
+                    } else {
+                        wq
+                    };
+                    ops::quantized_matmul_mode(
+                        x,
+                        wq,
+                        s,
+                        Some(zp),
+                        /*transpose=*/ true,
+                        gs,
+                        bits,
+                        mode,
+                    )?
                 }
             }
             Op::LoraMatMul { scale } => {
@@ -3395,6 +3488,232 @@ pub fn lower_with_env(
                 ops::contiguous(&dw)?
             }
 
+            Op::MaxPool3dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                if kernel_size.len() != 3 || stride.len() != 3 || padding.len() != 3 {
+                    return Err(MlxError("MaxPool3dBackward on MLX: 3D pool only".into()));
+                }
+                let x = lookup(&env, node.inputs[0])?;
+                let dy = lookup(&env, node.inputs[1])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let dy_shape = node_input_shape(graph, node.inputs[1]);
+                if x_shape.len() != 5 || dy_shape.len() != 5 {
+                    return Err(MlxError(
+                        "MaxPool3dBackward on MLX: 3D pool expects rank-5 tensors".into(),
+                    ));
+                }
+                ops::maxpool3d_backward_metal(
+                    x,
+                    dy,
+                    x_shape[0],
+                    x_shape[1],
+                    x_shape[2],
+                    x_shape[3],
+                    x_shape[4],
+                    dy_shape[2],
+                    dy_shape[3],
+                    dy_shape[4],
+                    kernel_size[0] as i32,
+                    kernel_size[1] as i32,
+                    kernel_size[2] as i32,
+                    stride[0] as i32,
+                    stride[1] as i32,
+                    stride[2] as i32,
+                    padding[0] as i32,
+                    padding[1] as i32,
+                    padding[2] as i32,
+                )?
+            }
+
+            Op::Conv3dBackwardInput {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                if kernel_size.len() != 3 {
+                    return Err(MlxError("Conv3dBackwardInput on MLX: 3D conv only".into()));
+                }
+                let dy = lookup(&env, node.inputs[0])?;
+                let w = lookup(&env, node.inputs[1])?;
+                let dy_shape = node_input_shape(graph, node.inputs[0]);
+                let w_shape = node_input_shape(graph, node.inputs[1]);
+                let dx_shape: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                if dy_shape.len() != 5 || w_shape.len() != 5 || dx_shape.len() != 5 {
+                    return Err(MlxError(
+                        "Conv3dBackwardInput on MLX: 3D conv expects rank-5 tensors".into(),
+                    ));
+                }
+
+                let g = *groups as i32;
+                let c_in = dx_shape[1];
+                let c_out = dy_shape[1];
+                if c_in % g != 0 || c_out % g != 0 {
+                    return Err(MlxError(format!(
+                        "Conv3dBackwardInput: groups ({g}) must divide \
+                         C_in ({c_in}) and C_out ({c_out})"
+                    )));
+                }
+                let c_in_per_g = c_in / g;
+                let c_out_per_g = c_out / g;
+                let dep = dx_shape[2];
+                let h = dx_shape[3];
+                let w_in = dx_shape[4];
+                let d_out = dy_shape[2];
+                let h_out = dy_shape[3];
+                let w_out = dy_shape[4];
+                let kd = w_shape[2];
+                let kh = w_shape[3];
+                let kw = w_shape[4];
+                let s = |i: usize| stride.get(i).copied().unwrap_or(1) as i32;
+                let p = |i: usize| padding.get(i).copied().unwrap_or(0) as i32;
+                let d = |i: usize| dilation.get(i).copied().unwrap_or(1) as i32;
+
+                let pad_lo: Vec<i32> = vec![
+                    d(0) * (kd - 1) - p(0),
+                    d(1) * (kh - 1) - p(1),
+                    d(2) * (kw - 1) - p(2),
+                ];
+                let pad_hi: Vec<i32> = vec![
+                    dep - 1 - s(0) * (d_out - 1) + p(0),
+                    h - 1 - s(1) * (h_out - 1) + p(1),
+                    w_in - 1 - s(2) * (w_out - 1) + p(2),
+                ];
+
+                let dy_ndhwc = ops::transpose(dy, &[0, 2, 3, 4, 1])?;
+
+                let w_t = if g == 1 {
+                    ops::transpose(w, &[1, 2, 3, 4, 0])?
+                } else {
+                    let split = ops::reshape(w, &[g, c_out_per_g, c_in_per_g, kd, kh, kw])?;
+                    let perm = ops::transpose(&split, &[0, 2, 3, 4, 5, 1])?;
+                    ops::reshape(&perm, &[c_in, kd, kh, kw, c_out_per_g])?
+                };
+
+                let raw = ops::conv_general(
+                    &dy_ndhwc,
+                    &w_t,
+                    &[1, 1, 1],
+                    &pad_lo,
+                    &pad_hi,
+                    &[d(0), d(1), d(2)],
+                    &[s(0), s(1), s(2)],
+                    g,
+                    true,
+                )?;
+
+                let needs_slice = pad_lo.iter().chain(pad_hi.iter()).any(|&p| p < 0);
+                let adjusted = if needs_slice {
+                    let cur: Vec<i32> = raw.shape()?.iter().map(|&d| d as i32).collect();
+                    let mut start = vec![0i32; cur.len()];
+                    let mut stop = cur.clone();
+                    for i in 0..3 {
+                        if pad_lo[i] < 0 {
+                            start[1 + i] = -pad_lo[i];
+                        }
+                        if pad_hi[i] < 0 {
+                            stop[1 + i] += pad_hi[i];
+                        }
+                    }
+                    ops::slice(&raw, &start, &stop)?
+                } else {
+                    raw
+                };
+
+                let ncdhw = ops::transpose(&adjusted, &[0, 4, 1, 2, 3])?;
+                ops::contiguous(&ncdhw)?
+            }
+
+            Op::Conv3dBackwardWeight {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                if kernel_size.len() != 3 {
+                    return Err(MlxError("Conv3dBackwardWeight on MLX: 3D conv only".into()));
+                }
+                let x = lookup(&env, node.inputs[0])?;
+                let dy = lookup(&env, node.inputs[1])?;
+                let x_shape = node_input_shape(graph, node.inputs[0]);
+                let dy_shape = node_input_shape(graph, node.inputs[1]);
+                let dw_shape: Vec<i32> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as i32)
+                    .collect();
+                if x_shape.len() != 5 || dy_shape.len() != 5 || dw_shape.len() != 5 {
+                    return Err(MlxError(
+                        "Conv3dBackwardWeight on MLX: 3D conv expects rank-5 tensors".into(),
+                    ));
+                }
+                let g = *groups as i32;
+                let n_batch = x_shape[0];
+                let c_in = x_shape[1];
+                let c_out = dy_shape[1];
+                if c_in % g != 0 || c_out % g != 0 {
+                    return Err(MlxError(format!(
+                        "Conv3dBackwardWeight: groups ({g}) must divide \
+                         C_in ({c_in}) and C_out ({c_out})"
+                    )));
+                }
+                let c_in_per_g = c_in / g;
+                let dep = x_shape[2];
+                let h = x_shape[3];
+                let w_in = x_shape[4];
+                let d_out = dy_shape[2];
+                let h_out = dy_shape[3];
+                let w_out = dy_shape[4];
+                let kd = dw_shape[2];
+                let kh = dw_shape[3];
+                let kw = dw_shape[4];
+                let s = |i: usize| stride.get(i).copied().unwrap_or(1) as i32;
+                let p = |i: usize| padding.get(i).copied().unwrap_or(0) as i32;
+                let d = |i: usize| dilation.get(i).copied().unwrap_or(1) as i32;
+
+                let pad_lo: Vec<i32> = vec![p(0), p(1), p(2)];
+                let pad_hi: Vec<i32> = vec![
+                    s(0) * (d_out - 1) + 1 - dep + d(0) * (kd - 1) + 1 - p(0) - 1,
+                    s(1) * (h_out - 1) + 1 - h + d(1) * (kh - 1) + 1 - p(1) - 1,
+                    s(2) * (w_out - 1) + 1 - w_in + d(2) * (kw - 1) + 1 - p(2) - 1,
+                ];
+
+                let cotan_trans = ops::transpose(dy, &[1, 2, 3, 4, 0])?;
+
+                let in_trans = if g == 1 {
+                    ops::transpose(x, &[1, 2, 3, 4, 0])?
+                } else {
+                    let split = ops::reshape(x, &[n_batch, g, c_in_per_g, dep, h, w_in])?;
+                    let perm = ops::transpose(&split, &[2, 3, 4, 5, 1, 0])?;
+                    ops::reshape(&perm, &[c_in_per_g, dep, h, w_in, g * n_batch])?
+                };
+
+                let grad_trans = ops::conv_general(
+                    &in_trans,
+                    &cotan_trans,
+                    &[d(0), d(1), d(2)],
+                    &pad_lo,
+                    &pad_hi,
+                    &[s(0), s(1), s(2)],
+                    &[1, 1, 1],
+                    g,
+                    false,
+                )?;
+                let dw = ops::transpose(&grad_trans, &[4, 0, 1, 2, 3])?;
+                ops::contiguous(&dw)?
+            }
+
             Op::LayerNormBackwardGamma { eps, axis: _ } => {
                 // axis = -1 only. dgamma = sum_over_outer(dy · x̂).
                 let x = lookup(&env, node.inputs[0])?;
@@ -3583,7 +3902,7 @@ pub fn lower_with_env(
                 }
             }
 
-            Op::RmsNormBackwardBeta { axis: _, .. } => {
+            Op::RmsNormBackwardBeta { .. } => {
                 let dy = lookup(&env, node.inputs[3])?;
                 let x_shape = node_input_shape(graph, node.inputs[0]);
                 let last = (x_shape.len() - 1) as i32;

@@ -12,6 +12,10 @@
 //! rlx-pkg verify <path>
 //! rlx-pkg tier <path> -o <out.rlxp> [--warm SUBSTR...] [--hot NAME...]
 //! rlx-pkg import-gguf <model.gguf> -o <out.rlxp> [--no-graph] [--no-auto-tier]
+//! rlx-pkg import-mlx <dir|file> -o <out.rlxp> [--no-graph] [--no-auto-tier]
+//! rlx-pkg import-dduf <model.dduf> -o <out.rlxp> [--no-graph] [--no-auto-tier]
+//! rlx-pkg import-nemo <model.nemo> -o <out.rlxp> [--no-graph] [--no-auto-tier]
+//! rlx-pkg import-pt <model.pt|pth|bin> -o <out.rlxp> [--no-graph] [--no-auto-tier]
 //! rlx-pkg convert <in> -o <out> [--container flat|zip|dir]
 //! ```
 //!
@@ -20,9 +24,13 @@
 use anyhow::{Context, Result, bail};
 use rlx_pkg::{
     AutoTierOptions, ContainerKind, Package, PackedWeight, StorageTier, WriteOptions,
-    apply_auto_tier, gguf_to_rlxp, infer_container, verify_package, write_package,
+    apply_auto_tier, dduf_to_rlxp, gguf_to_rlxp, infer_container, mlx_to_rlxp, nemo_to_rlxp,
+    pt_to_rlxp, verify_package, write_package,
 };
-use rlx_pkg::{GgufImportOptions, MaterializeMode};
+use rlx_pkg::{
+    DdufImportOptions, GgufImportOptions, MaterializeMode, MlxImportOptions, NemoImportOptions,
+    PtImportOptions,
+};
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
@@ -35,6 +43,10 @@ fn usage(argv0: &str) -> String {
   {argv0} verify <path>
   {argv0} tier <path> -o <out> [--warm SUB]... [--hot NAME]... [--warm-min-mib N]
   {argv0} import-gguf <model.gguf> -o <out.rlxp> [--no-graph] [--no-auto-tier] [--container flat|zip|dir]
+  {argv0} import-mlx <dir|safetensors|npz|npy> -o <out.rlxp> [--no-graph] [--no-auto-tier] [--keep-packed] [--container flat|zip|dir]
+  {argv0} import-dduf <model.dduf> -o <out.rlxp> [--no-graph] [--no-auto-tier] [--container flat|zip|dir]
+  {argv0} import-nemo <model.nemo> -o <out.rlxp> [--no-graph] [--no-auto-tier] [--container flat|zip|dir]
+  {argv0} import-pt <model.pt|pth|bin> -o <out.rlxp> [--no-graph] [--no-auto-tier] [--container flat|zip|dir]
   {argv0} convert <in> -o <out> [--container flat|zip|dir]
 
 ONNX → RLXP (optional graph): rlx-bake --features onnx -- import-onnx …
@@ -65,6 +77,10 @@ fn run() -> Result<()> {
         "verify" => cmd_verify(&args)?,
         "tier" => cmd_tier(&args)?,
         "import-gguf" => cmd_import_gguf(&args)?,
+        "import-mlx" => cmd_import_mlx(&args)?,
+        "import-dduf" => cmd_import_dduf(&args)?,
+        "import-nemo" => cmd_import_nemo(&args)?,
+        "import-pt" => cmd_import_pt(&args)?,
         "convert" => cmd_convert(&args)?,
         "-h" | "--help" | "help" => print!("{}", usage(&argv0)),
         other => bail!("unknown command {other}\n{}", usage(&argv0)),
@@ -77,7 +93,10 @@ fn cmd_inspect(args: &[String]) -> Result<()> {
     let pack = Package::open(path)?;
     let m = pack.manifest();
     println!("name: {}", m.name);
-    println!("format: {} v{} (compat {})", m.format, m.format_version, m.compat_version);
+    println!(
+        "format: {} v{} (compat {})",
+        m.format, m.format_version, m.compat_version
+    );
     println!("producer: {}", m.producer.as_deref().unwrap_or("-"));
     println!("features: {}", m.features.join(", "));
     println!("graph: {} ({})", m.graph.path, m.graph.encoding);
@@ -128,10 +147,7 @@ fn cmd_verify(args: &[String]) -> Result<()> {
     let report = verify_package(&pack)?;
     println!(
         "ok: tensors {}/{} (unchecked {}) sidecars {}",
-        report.tensors_ok,
-        report.tensors_checked,
-        report.tensors_unchecked,
-        report.sidecars_ok
+        report.tensors_ok, report.tensors_checked, report.tensors_unchecked, report.sidecars_ok
     );
     Ok(())
 }
@@ -257,6 +273,93 @@ fn cmd_import_gguf(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_import_mlx(args: &[String]) -> Result<()> {
+    let mut args = args.to_vec();
+    let out = take_opt(&mut args, "-o").context("import-mlx requires -o")?;
+    let no_graph = take_bool(&mut args, "--no-graph");
+    let no_auto = take_bool(&mut args, "--no-auto-tier");
+    let keep_packed = take_bool(&mut args, "--keep-packed");
+    let container = take_opt(&mut args, "--container")
+        .map(|s| parse_container(&s))
+        .transpose()?
+        .unwrap_or(ContainerKind::Flat);
+    let path = args.first().context("import-mlx <dir|file>")?;
+    let opts = MlxImportOptions {
+        container,
+        include_graph: !no_graph,
+        compress_sidecars: true,
+        auto_tier: !no_auto,
+        dequant_to_f32: !keep_packed,
+        ..Default::default()
+    };
+    mlx_to_rlxp(path, &out, &opts)?;
+    println!("wrote {out}");
+    Ok(())
+}
+
+fn cmd_import_dduf(args: &[String]) -> Result<()> {
+    let mut args = args.to_vec();
+    let out = take_opt(&mut args, "-o").context("import-dduf requires -o")?;
+    let no_graph = take_bool(&mut args, "--no-graph");
+    let no_auto = take_bool(&mut args, "--no-auto-tier");
+    let container = take_opt(&mut args, "--container")
+        .map(|s| parse_container(&s))
+        .transpose()?
+        .unwrap_or(ContainerKind::Flat);
+    let path = args.first().context("import-dduf <model.dduf>")?;
+    let opts = DdufImportOptions {
+        container,
+        include_graph: !no_graph,
+        compress_sidecars: true,
+        auto_tier: !no_auto,
+    };
+    dduf_to_rlxp(path, &out, &opts)?;
+    println!("wrote {out}");
+    Ok(())
+}
+
+fn cmd_import_nemo(args: &[String]) -> Result<()> {
+    let mut args = args.to_vec();
+    let out = take_opt(&mut args, "-o").context("import-nemo requires -o")?;
+    let no_graph = take_bool(&mut args, "--no-graph");
+    let no_auto = take_bool(&mut args, "--no-auto-tier");
+    let container = take_opt(&mut args, "--container")
+        .map(|s| parse_container(&s))
+        .transpose()?
+        .unwrap_or(ContainerKind::Flat);
+    let path = args.first().context("import-nemo <model.nemo>")?;
+    let opts = NemoImportOptions {
+        container,
+        include_graph: !no_graph,
+        compress_sidecars: true,
+        auto_tier: !no_auto,
+    };
+    nemo_to_rlxp(path, &out, &opts)?;
+    println!("wrote {out}");
+    Ok(())
+}
+
+fn cmd_import_pt(args: &[String]) -> Result<()> {
+    let mut args = args.to_vec();
+    let out = take_opt(&mut args, "-o").context("import-pt requires -o")?;
+    let no_graph = take_bool(&mut args, "--no-graph");
+    let no_auto = take_bool(&mut args, "--no-auto-tier");
+    let container = take_opt(&mut args, "--container")
+        .map(|s| parse_container(&s))
+        .transpose()?
+        .unwrap_or(ContainerKind::Flat);
+    let path = args.first().context("import-pt <model.pt|pth|bin>")?;
+    let opts = PtImportOptions {
+        container,
+        include_graph: !no_graph,
+        compress_sidecars: true,
+        auto_tier: !no_auto,
+    };
+    pt_to_rlxp(path, &out, &opts)?;
+    println!("wrote {out}");
+    Ok(())
+}
+
 fn cmd_convert(args: &[String]) -> Result<()> {
     let mut args = args.to_vec();
     let out = take_opt(&mut args, "-o").context("convert requires -o")?;
@@ -295,8 +398,11 @@ fn cmd_convert(args: &[String]) -> Result<()> {
         ..WriteOptions::default()
     };
     for sc in &pack.manifest().sidecars {
-        opts.sidecars
-            .push((sc.id.clone(), sc.media_type.clone().unwrap_or_default(), pack.sidecar(&sc.id)?));
+        opts.sidecars.push((
+            sc.id.clone(),
+            sc.media_type.clone().unwrap_or_default(),
+            pack.sidecar(&sc.id)?,
+        ));
     }
     if let Some(pl) = pack.placement() {
         opts.placement = Some(pl.clone());

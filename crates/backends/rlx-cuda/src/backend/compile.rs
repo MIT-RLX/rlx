@@ -2015,6 +2015,24 @@ impl CudaExecutable {
                             QuantScheme::Fp8E4m3 => (1, 3u32),
                             QuantScheme::Fp8E5m2 => (1, 4u32),
                             QuantScheme::Nvfp4Block => (rlx_ir::NVFP4_GROUP_SIZE as u32, 5u32),
+                            QuantScheme::MlxAffine { .. }
+                            | QuantScheme::MlxMxfp4 { .. }
+                            | QuantScheme::MlxMxfp8 { .. } => {
+                                let scale_id = node.inputs[2];
+                                let zp_id = node.inputs[3];
+                                schedule.push(Step::DequantMatmulMlx {
+                                    m,
+                                    k,
+                                    n,
+                                    scheme: *scheme,
+                                    x_byte_off: arena.offset(x_id) as u64,
+                                    w_byte_off: arena.offset(w_id) as u64,
+                                    scale_byte_off: arena.offset(scale_id) as u64,
+                                    zp_byte_off: arena.offset(zp_id) as u64,
+                                    out_byte_off: arena.offset(node.id) as u64,
+                                });
+                                continue;
+                            }
                             other => panic!("rlx-cuda DequantMatMul: unsupported scheme {other:?}"),
                         };
                         let scale_id = node.inputs[2];
@@ -3488,6 +3506,21 @@ impl CudaExecutable {
                         w: in_shape.dim(3).unwrap_static() as u32,
                     });
                 }
+                Op::Interpolate3d { size } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::Interpolate3d {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        d_in: in_shape.dim(2).unwrap_static() as u32,
+                        h_in: in_shape.dim(3).unwrap_static() as u32,
+                        w_in: in_shape.dim(4).unwrap_static() as u32,
+                        d_out: size[0] as u32,
+                        h_out: size[1] as u32,
+                        w_out: size[2] as u32,
+                    });
+                }
                 Op::Conv {
                     kernel_size,
                     stride,
@@ -3912,6 +3945,110 @@ impl CudaExecutable {
                     } else {
                         panic!("rlx-cuda: MaxPool2dBackward expects 2-D pool on NCHW tensors");
                     }
+                }
+                Op::MaxPool3dBackward {
+                    kernel_size,
+                    stride,
+                    padding,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    schedule.push(Step::MaxPool3dBackward {
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dy_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dx_byte_off: arena.offset(node.id) as u64,
+                        n: x_shape.dim(0).unwrap_static() as u32,
+                        c: x_shape.dim(1).unwrap_static() as u32,
+                        d: x_shape.dim(2).unwrap_static() as u32,
+                        h: x_shape.dim(3).unwrap_static() as u32,
+                        w: x_shape.dim(4).unwrap_static() as u32,
+                        d_out: dy_shape.dim(2).unwrap_static() as u32,
+                        h_out: dy_shape.dim(3).unwrap_static() as u32,
+                        w_out: dy_shape.dim(4).unwrap_static() as u32,
+                        kd: kernel_size[0] as u32,
+                        kh: kernel_size[1] as u32,
+                        kw: kernel_size[2] as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                    });
+                }
+                Op::Conv3dBackwardInput {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let out_shape = &node.shape;
+                    schedule.push(Step::Conv3dBackwardInput {
+                        dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                        w_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dx_byte_off: arena.offset(node.id) as u64,
+                        n: out_shape.dim(0).unwrap_static() as u32,
+                        c_in: out_shape.dim(1).unwrap_static() as u32,
+                        d: out_shape.dim(2).unwrap_static() as u32,
+                        h: out_shape.dim(3).unwrap_static() as u32,
+                        w_in: out_shape.dim(4).unwrap_static() as u32,
+                        c_out: dy_shape.dim(1).unwrap_static() as u32,
+                        d_out: dy_shape.dim(2).unwrap_static() as u32,
+                        h_out: dy_shape.dim(3).unwrap_static() as u32,
+                        w_out: dy_shape.dim(4).unwrap_static() as u32,
+                        kd: kernel_size[0] as u32,
+                        kh: kernel_size[1] as u32,
+                        kw: kernel_size[2] as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                        dd: dilation[0] as u32,
+                        dh: dilation[1] as u32,
+                        dw: dilation[2] as u32,
+                        groups: *groups as u32,
+                    });
+                }
+                Op::Conv3dBackwardWeight {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    schedule.push(Step::Conv3dBackwardWeight {
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dy_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dw_byte_off: arena.offset(node.id) as u64,
+                        n: x_shape.dim(0).unwrap_static() as u32,
+                        c_in: x_shape.dim(1).unwrap_static() as u32,
+                        d: x_shape.dim(2).unwrap_static() as u32,
+                        h: x_shape.dim(3).unwrap_static() as u32,
+                        w: x_shape.dim(4).unwrap_static() as u32,
+                        c_out: dy_shape.dim(1).unwrap_static() as u32,
+                        d_out: dy_shape.dim(2).unwrap_static() as u32,
+                        h_out: dy_shape.dim(3).unwrap_static() as u32,
+                        w_out: dy_shape.dim(4).unwrap_static() as u32,
+                        kd: kernel_size[0] as u32,
+                        kh: kernel_size[1] as u32,
+                        kw: kernel_size[2] as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                        dd: dilation[0] as u32,
+                        dh: dilation[1] as u32,
+                        dw_dil: dilation[2] as u32,
+                        groups: *groups as u32,
+                    });
                 }
                 // Native batched symmetric eigendecomposition: `Op::Eigh` /
                 // `Op::EighBatch` (n ≤ 32) run on-device via cuSOLVER

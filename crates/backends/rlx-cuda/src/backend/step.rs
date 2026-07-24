@@ -513,6 +513,18 @@ pub(crate) enum Step {
         w_byte_off: u64,
         out_byte_off: u64,
     },
+    /// MLX affine / mxfp — on-device `dequant_matmul_mlx`.
+    DequantMatmulMlx {
+        m: u32,
+        k: u32,
+        n: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        zp_byte_off: u64,
+        out_byte_off: u64,
+    },
     DequantGroupedMatmulGguf {
         m: u32,
         k: u32,
@@ -1136,6 +1148,82 @@ pub(crate) enum Step {
         dw_dil: u32,
         groups: u32,
     },
+    MaxPool3dBackward {
+        x_byte_off: u64,
+        dy_byte_off: u64,
+        dx_byte_off: u64,
+        n: u32,
+        c: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+    },
+    Conv3dBackwardInput {
+        dy_byte_off: u64,
+        w_byte_off: u64,
+        dx_byte_off: u64,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+    Conv3dBackwardWeight {
+        x_byte_off: u64,
+        dy_byte_off: u64,
+        dw_byte_off: u64,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw_dil: u32,
+        groups: u32,
+    },
     Pool1d {
         n: u32,
         c: u32,
@@ -1579,6 +1667,19 @@ pub(crate) enum Step {
         h: u32,
         w: u32,
     },
+    /// Nearest-neighbor NCDHW resample to an explicit size.
+    Interpolate3d {
+        src_off: u32,
+        dst_off: u32,
+        n: u32,
+        c: u32,
+        d_in: u32,
+        h_in: u32,
+        w_in: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+    },
     /// Standalone complex `Op::Cast` on the simulated-complex f32-lane arena
     /// (`complex_cast.cu`). `mode` picks one of six pure lane-move directions
     /// (real↔C64, real↔C128, C64↔C128); `n` is the complex-element count.
@@ -1725,6 +1826,7 @@ impl Step {
                 | Step::GatedDeltaNet { .. }
                 | Step::SelectiveScan { .. }
                 | Step::DequantMatmulGguf { .. }
+                | Step::DequantMatmulMlx { .. }
                 | Step::DequantGroupedMatmulGguf { .. }
                 | Step::Narrow { .. }
                 | Step::Concat { .. }
@@ -1939,6 +2041,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScatterAddAcc { .. } => "rlx::ScatterAdd::acc",
         Step::DequantMatmul { .. } => "rlx::DequantMatmul",
         Step::DequantMatmulGguf { .. } => "rlx::DequantMatmulGguf",
+        Step::DequantMatmulMlx { .. } => "rlx::DequantMatmulMlx",
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
         Step::Sample { .. } => "rlx::Sample",
         Step::RngNormal { .. } => "rlx::RngNormal",
@@ -1988,6 +2091,9 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::MaxPool2dBackward { .. } => "rlx::MaxPool2dBackward",
         Step::Conv2dBackwardInput { .. } => "rlx::Conv2dBackwardInput",
         Step::Conv2dBackwardWeight { .. } => "rlx::Conv2dBackwardWeight",
+        Step::MaxPool3dBackward { .. } => "rlx::MaxPool3dBackward",
+        Step::Conv3dBackwardInput { .. } => "rlx::Conv3dBackwardInput",
+        Step::Conv3dBackwardWeight { .. } => "rlx::Conv3dBackwardWeight",
         Step::Pool1d { .. } => "rlx::Pool1d",
         Step::Pool2d { .. } => "rlx::Pool2d",
         Step::Pool3d { .. } => "rlx::Pool3d",
@@ -2019,6 +2125,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::FakeQuantizeLsqBwdScale { .. } => "rlx::FakeQuantizeLsqBwdScale",
         Step::FakeQuantizeBackward { .. } => "rlx::FakeQuantizeBackward",
         Step::ResizeNearest2x { .. } => "rlx::ResizeNearest2x",
+        Step::Interpolate3d { .. } => "rlx::Interpolate3d",
         Step::ComplexCast { .. } => "rlx::ComplexCast",
         Step::BinaryC64 { .. } => "rlx::BinaryC64",
         Step::ComplexNormSq { .. } => "rlx::ComplexNormSq",
@@ -2520,6 +2627,22 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![(*x_byte_off / 4) as u32, (*w_byte_off / 4) as u32],
             vec![(*out_byte_off / 4) as u32],
         ),
+        Step::DequantMatmulMlx {
+            x_byte_off,
+            w_byte_off,
+            scale_byte_off,
+            zp_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![
+                (*x_byte_off / 4) as u32,
+                (*w_byte_off / 4) as u32,
+                (*scale_byte_off / 4) as u32,
+                (*zp_byte_off / 4) as u32,
+            ],
+            vec![(*out_byte_off / 4) as u32],
+        ),
         Step::DequantGroupedMatmulGguf {
             x_byte_off,
             w_byte_off,
@@ -2825,7 +2948,6 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             sh_coeffs_len: _,
             meta_off,
             dst_off,
-            dst_len: _,
             ..
         } => (
             vec![
@@ -2856,7 +2978,6 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             d_loss_off,
             d_loss_len: _,
             packed_off,
-            packed_len: _,
             ..
         } => (
             vec![
@@ -2969,6 +3090,33 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![(*dx_byte_off / 4) as u32],
         ),
         Step::Conv2dBackwardWeight {
+            x_byte_off,
+            dy_byte_off,
+            dw_byte_off,
+            ..
+        } => (
+            vec![(*x_byte_off / 4) as u32, (*dy_byte_off / 4) as u32],
+            vec![(*dw_byte_off / 4) as u32],
+        ),
+        Step::MaxPool3dBackward {
+            x_byte_off,
+            dy_byte_off,
+            dx_byte_off,
+            ..
+        } => (
+            vec![(*x_byte_off / 4) as u32, (*dy_byte_off / 4) as u32],
+            vec![(*dx_byte_off / 4) as u32],
+        ),
+        Step::Conv3dBackwardInput {
+            dy_byte_off,
+            w_byte_off,
+            dx_byte_off,
+            ..
+        } => (
+            vec![(*dy_byte_off / 4) as u32, (*w_byte_off / 4) as u32],
+            vec![(*dx_byte_off / 4) as u32],
+        ),
+        Step::Conv3dBackwardWeight {
             x_byte_off,
             dy_byte_off,
             dw_byte_off,
@@ -3156,6 +3304,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (vec![*x_off, *dy_off], vec![*dx_off]),
         Step::ResizeNearest2x {
+            src_off, dst_off, ..
+        } => (vec![*src_off], vec![*dst_off]),
+        Step::Interpolate3d {
             src_off, dst_off, ..
         } => (vec![*src_off], vec![*dst_off]),
         Step::ComplexCast {

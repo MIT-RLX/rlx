@@ -394,6 +394,13 @@ fn build_members(
     if weights.iter().any(|w| w.scheme.starts_with("gguf_")) {
         push_feat(&mut features, "dequant_matmul");
     }
+    if weights
+        .iter()
+        .any(|w| w.scheme.starts_with("mlx_affine") || w.scheme.starts_with("mlx_mxfp"))
+    {
+        push_feat(&mut features, "dequant_matmul");
+        push_feat(&mut features, "mlx_packed");
+    }
     if opts.placement.is_some() {
         push_feat(&mut features, "dist_placement");
     }
@@ -555,9 +562,9 @@ pub fn infer_container(path: &Path, explicit: Option<ContainerKind>) -> Result<C
         Some("rlxp") => Ok(ContainerKind::Flat),
         Some("zip") => Ok(ContainerKind::Zip),
         None => Ok(ContainerKind::Dir),
-        Some(other) => bail!(
-            "cannot infer package kind from .{other}; use .rlxp (flat), .zip, or a directory"
-        ),
+        Some(other) => {
+            bail!("cannot infer package kind from .{other}; use .rlxp (flat), .zip, or a directory")
+        }
     }
 }
 
@@ -567,9 +574,6 @@ pub fn infer_zip_from_path(path: &Path, explicit_zip: Option<bool>) -> Result<bo
     match explicit_zip {
         Some(true) => Ok(true),
         Some(false) => Ok(false),
-        None => Ok(matches!(
-            infer_container(path, None)?,
-            ContainerKind::Zip
-        )),
+        None => Ok(matches!(infer_container(path, None)?, ContainerKind::Zip)),
     }
 }

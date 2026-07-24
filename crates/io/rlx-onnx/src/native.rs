@@ -49,9 +49,7 @@ fn io_from_manifest(manifest: &rlx_onnx_import::BundleManifest) -> (Vec<IoDesc>,
             .shape
             .iter()
             .map(|v| match v {
-                serde_json::Value::Number(n) => {
-                    n.as_i64().and_then(|d| if d > 0 { Some(d) } else { None })
-                }
+                serde_json::Value::Number(n) => n.as_i64().filter(|&d| d > 0),
                 _ => None,
             })
             .collect(),

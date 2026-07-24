@@ -223,7 +223,6 @@ fn cpu_gated_delta_net_resets_state_between_batches() {
     }
 }
 
-
 #[cfg(feature = "metal")]
 #[test]
 fn metal_gated_delta_net_host_matches_cpu_n128() {

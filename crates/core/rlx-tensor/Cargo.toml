@@ -14,10 +14,10 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.13" }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.13", default-features = false, optional = true }
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.13", optional = true }
-rlx-optim = { path = "../rlx-optim", version = "0.2.13", optional = true }
+rlx-ir = { path = "../rlx-ir", version = "0.2.14" }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.14", default-features = false, optional = true }
+rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.14", optional = true }
+rlx-optim = { path = "../rlx-optim", version = "0.2.14", optional = true }
 ndarray = { version = "0.16", optional = true }
 
 [features]

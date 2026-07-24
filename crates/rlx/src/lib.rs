@@ -73,10 +73,12 @@
 //! | namespace            | what                                                                          |
 //! |----------------------|-------------------------------------------------------------------------------|
 //! | [`rlx::quant`]       | `QuantScheme`, `QuantMap` (IR quantization metadata)                          |
-//! | [`rlx::ops`]         | `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ChainStep`, `ChainOperand`    |
-//! | [`rlx::autodiff`]    | `jvp`, `hvp`, `vmap` + the autodiff entry points                              |
+//! | [`rlx::ops`]         | `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ReduceOp`, `InterpMode`, `FftNorm`, … |
+//! | [`rlx::autodiff`]    | `grad`, `grad_with_loss`, `jvp`, `hvp`, `vmap`, `nth_order_grad`, …           |
+//! | [`rlx::pkg`]         | `.rlxp` open / compile / bind — `Package`, `open_rlxp`, `compile_rlxp`, …    |
+//! | [`rlx::compile`]     | `CompileOptions`, `Precision`, `PrecisionPolicy`, fusion / pass helpers      |
 //! | `rlx::distributed`   | transports + in-graph collectives + ship-graph train/infer *(feature `distributed`)* |
-//! | [`rlx::prelude`]     | star-import target covering the 95% case                                      |
+//! | [`rlx::prelude`]     | star-import: graph + Session + CompileOptions + quant + autodiff + pkg       |
 //!
 //! ## Backend feature gates
 //!
@@ -251,28 +253,38 @@ pub use rlx_fpga::{
     ExportQuantMode, FpgaExportConfig, GraphIoBind, HwTarget, InputIface, IoConfig, OutputIface,
     OutputKind, PortNames, SidebandSpec, tinyconv_mnist_from_cortexm,
 };
+pub use rlx_ir::fft::FftNorm;
+pub use rlx_ir::op::ReduceOp;
+pub use rlx_ir::ops::upsample::InterpMode;
 pub use rlx_ir::quant::QuantScheme;
 pub use rlx_ir::{
-    DType, Element, FusionPolicy, Graph, GraphExt, GraphModule, GraphStage, HirModule, HirOp,
-    LirModule, MirModule, Node, NodeId, Op, OpKind, Shape, Tick, scalar_constant_bytes,
+    DType, Dim, Element, FusionPolicy, Graph, GraphExt, GraphModule, GraphStage, HirModule, HirOp,
+    LirModule, MirModule, Node, NodeId, Op, OpKind, Shape, Tick, VerifyError,
+    scalar_constant_bytes, verify, verify_all, verify_shapes,
 };
 pub use rlx_ir::{
     NodeOrigin, inspect_graph, inspect_graph_diff, inspect_hir, inspect_hir_stats, inspect_lir,
     inspect_mir, inspect_mir_diff, inspect_mir_stats, node_label,
 };
+/// Proc macros — also available as `rlx::macros::{rlx_model, pipeline_schedule}`.
+pub use rlx_macros::{pipeline_schedule, rlx_model};
 pub use rlx_opt::{
-    CalibrationRecord, CompilePipeline, CompileResult, FusionOptions, FusionReport, FusionTarget,
-    MissReason, MissedFusion, Pass, PipelineInspect, Precision, PrecisionPolicy, fusion_passes,
-    fusion_passes_for_supported, hvp, inspect_pipeline, jvp, maybe_dump_pipeline,
-    supported_for_target, supports_op, vmap,
+    AutodiffError, CalibrationRecord, CompilePipeline, CompileResult, FusionOptions, FusionReport,
+    FusionTarget, GradWithLossOptions, HigherOrderOptions, MissReason, MissedFusion, Pass,
+    PipelineInspect, PrecisionPolicy, fusion_passes, fusion_passes_for_supported, grad,
+    grad_with_loss, grad_with_loss_opts, hvp, inspect_pipeline, jvp, maybe_dump_pipeline,
+    nth_order_grad, prepare_graph_for_ad, supported_for_target, supports_op, vmap,
 };
 pub use rlx_runtime::{
-    BackendsManifest, CompiledGraph, DeviceBenchResult, DeviceCandidate, DeviceFallbackError,
-    DevicePickStrategy, DevicePolicy, DeviceRouter, FlexibleSession, GraphDevices,
-    ParseDeviceError, Session, available_devices, benchmark_devices, device_chain_from_env,
-    device_from_env, device_label, device_report, devices_for, devices_for_with_policy,
-    fastest_device, fastest_device_for, graph_param_names, is_available, parse_device,
-    parse_device_list, resolve_device, resolve_device_chain, run_with_fallback,
+    BackendsManifest, BytesWeightLoader, CompileOptions, CompiledGraph, DeviceBenchResult,
+    DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy, DeviceRouter,
+    FlexibleSession, GraphDevices, MaterializeMode, Package, ParseDeviceError, Placement,
+    Precision, Session, WeightLoader, available_devices, benchmark_devices, compile_rlxp,
+    compile_rlxp_bind_params, compile_rlxp_with, device_chain_from_env, device_from_env,
+    device_label, device_report, devices_for, devices_for_with_policy, fastest_device,
+    fastest_device_for, graph_param_names, is_available, load_rlxp_graph, load_rlxp_placement,
+    open_rlxp, parse_device, parse_device_list, resolve_device, resolve_device_chain,
+    run_with_fallback, tensors_for_rank, weight_names_for_rank,
 };
 #[cfg(feature = "fpga")]
 pub use rlx_runtime::{
@@ -299,34 +311,73 @@ pub mod quant {
 
 /// Op-builder helper enums — the variants the graph builder methods
 /// (`g.binary`, `g.compare`, `g.activation`, `g.attention_kind`, …)
-/// take as their first argument, plus the fused-chain primitives
-/// used by `Op::ElementwiseRegion`.
+/// take as their first argument, plus FFT norm and the fused-chain
+/// primitives used by `Op::ElementwiseRegion`.
 ///
 /// ```ignore
 /// use rlx::{Graph, GraphExt, Shape, DType};
-/// use rlx::ops::{Activation, BinaryOp};
-///
-/// let mut g = Graph::new("ex");
-/// let x = g.input("x", Shape::new(&[4], DType::F32));
-/// let y = g.input("y", Shape::new(&[4], DType::F32));
-/// let s = g.binary(BinaryOp::Add, x, y, Shape::new(&[4], DType::F32));
-/// let r = g.activation(Activation::Silu, s, Shape::new(&[4], DType::F32));
-/// let scaled = g.mul(x, g.constant(2.0, DType::F32));
-/// g.set_outputs(vec![r, scaled]);
+/// use rlx::ops::{Activation, BinaryOp, ReduceOp, FftNorm};
 /// ```
 pub mod ops {
-    pub use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind};
+    pub use rlx_ir::fft::FftNorm;
+    pub use rlx_ir::op::{
+        Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, MaskKind, ReduceOp,
+    };
+    pub use rlx_ir::ops::upsample::InterpMode;
 }
 
-/// Autodiff + transforms — re-exports the public entry points from
-/// `rlx_opt`. Use these when computing gradients or doing
-/// `vmap` / `jvp` / `hvp` over a graph.
+/// Autodiff + transforms — reverse-mode `grad` / `grad_with_loss`,
+/// forward-mode `jvp`, Hessian-vector `hvp`, `vmap`, and higher-order
+/// helpers. Prefer these over digging into `rlx_opt` / `rlx_autodiff`.
 ///
 /// ```ignore
-/// use rlx::autodiff::{jvp, vmap};
+/// use rlx::autodiff::{grad_with_loss, jvp, vmap};
 /// ```
 pub mod autodiff {
-    pub use rlx_opt::{hvp, jvp, vmap};
+    pub use rlx_opt::{
+        AutodiffError, GradWithLossOptions, HigherOrderOptions, grad, grad_with_loss,
+        grad_with_loss_opts, hvp, jvp, nth_order_grad, prepare_graph_for_ad, vmap,
+    };
+}
+
+/// Compile + precision policy — the options you pass to
+/// [`Session::compile_with`](crate::Session::compile_with) / inspect after.
+///
+/// ```ignore
+/// use rlx::compile::{CompileOptions, Precision, PrecisionPolicy};
+///
+/// let opts = CompileOptions::default().precision(Precision::F16);
+/// ```
+///
+/// Note: [`Precision`](crate::Precision) here is the **runtime** session
+/// precision. The pass-level rewrite enum lives at
+/// [`rlx::opt::Precision`](crate::opt::Precision) / [`PassPrecision`].
+pub mod compile {
+    pub use crate::{
+        CalibrationRecord, CompileOptions, CompilePipeline, CompileResult, FusionOptions,
+        FusionPolicy, FusionReport, FusionTarget, MissReason, MissedFusion, Pass, PipelineInspect,
+        Precision, PrecisionPolicy, fusion_passes, fusion_passes_for_supported, inspect_pipeline,
+        maybe_dump_pipeline, supported_for_target, supports_op,
+    };
+    /// Pass-level numeric precision (AutoMixedPrecision rewrite). Distinct
+    /// from the session [`Precision`](crate::Precision) on [`CompileOptions`].
+    pub use rlx_opt::Precision as PassPrecision;
+}
+
+/// `.rlxp` packages — open, materialize graph, compile, bind packed weights.
+///
+/// ```ignore
+/// use rlx::pkg::{open_rlxp, compile_rlxp, Package};
+///
+/// let pack: Package = open_rlxp("model.rlxp")?;
+/// let mut compiled = compile_rlxp(&Session::new(Device::Cpu), "model.rlxp")?;
+/// ```
+pub mod pkg {
+    pub use crate::{
+        MaterializeMode, Package, Placement, compile_rlxp, compile_rlxp_bind_params,
+        compile_rlxp_with, load_rlxp_graph, load_rlxp_placement, open_rlxp, tensors_for_rank,
+        weight_names_for_rank,
+    };
 }
 
 /// Distributed training + inference — the single front door over all three
@@ -369,51 +420,91 @@ pub mod distributed {
 
 // ── Prelude — single `use rlx::prelude::*;` for the 95% case ────
 //
-// Includes the graph-building / runtime types, common IR helper
-// enums, and autodiff entry points. Skips less-common
-// types — those stay reachable via the module re-exports above.
+// Graph building, Session / multi-device run, compile options, common
+// IR enums, quant schemes, and autodiff entry points. Specialty crates
+// (GGUF, FPGA, splat, …) stay behind features / module paths.
 
-/// Star-import target covering the 95% case:
+/// Star-import target covering everyday graph build → compile → run → train.
 ///
 /// ```ignore
 /// use rlx::prelude::*;
 ///
-/// // graph building
+/// // Build
 /// let mut g = Graph::new("ex");
 /// let x = g.input("x", Shape::new(&[1, 4], DType::F32));
 /// let y = g.mul(x, g.constant(2.0, DType::F32));
 /// g.set_outputs(vec![y]);
+/// assert!(verify(&g).is_empty());
 ///
-/// // compile + run (auto-pick fastest, or choose any compatible backend)
-/// let mut runner = GraphDevices::new(g);
-/// let device = runner.fastest(); // or pick from runner.devices()
+/// // Compile + run (pick a device, or let GraphDevices choose)
+/// let mut runner = GraphDevices::new(g.clone());
+/// let device = runner.fastest();
 /// let out = runner.run(device, &[("x", &[1.0; 4])]).unwrap();
 ///
+/// // Or Session + CompileOptions
+/// let opts = CompileOptions::default().precision(Precision::F16);
+/// let mut compiled = Session::new(Device::Cpu).compile_with(g, &opts);
+/// let _ = compiled.run(&[("x", &[1.0; 4])]);
+///
+/// // Packages
+/// let pack: Package = open_rlxp("model.rlxp")?;
+/// let _ = compile_rlxp(&Session::new(Device::Cpu), "model.rlxp")?;
 /// ```
+///
+/// For focused imports without the full star set, prefer
+/// [`crate::ops`], [`crate::autodiff`], [`crate::quant`], [`crate::pkg`],
+/// [`crate::compile`].
 pub mod prelude {
     // Tensor DSL (expression-style graph building) — feature `tensor`.
     #[cfg(feature = "tensor")]
     pub use crate::tensor::{GraphScope, Tensor, ax, graph, graph_with, ix, rg, s, shape, tail};
+
     // Core graph + runtime
     pub use crate::{
-        BackendsManifest, CompiledGraph, DType, Device, DeviceBenchResult, DeviceCandidate,
-        DeviceFallbackError, DevicePickStrategy, DevicePolicy, DeviceRouter, Element, Error,
-        FlexibleSession, Graph, GraphDevices, GraphExt, GraphModule, GraphStage, Node, NodeId, Op,
-        OpKind, ParseDeviceError, Result, Session, Shape, Tick, available_devices,
-        benchmark_devices, device_chain_from_env, device_from_env, device_label, device_report,
-        devices_for, devices_for_with_policy, fastest_device, fastest_device_for,
-        graph_param_names, is_available, parse_device, parse_device_list, resolve_device,
-        resolve_device_chain, run_with_fallback, scalar_constant_bytes,
+        BackendsManifest, BytesWeightLoader, CompileOptions, CompiledGraph, DType, Device,
+        DeviceBenchResult, DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy,
+        DeviceRouter, Dim, Element, Error, FlexibleSession, FusionPolicy, Graph, GraphDevices,
+        GraphExt, GraphModule, GraphStage, Node, NodeId, Op, OpKind, ParseDeviceError, Result,
+        Session, Shape, Tick, VerifyError, WeightLoader, available_devices, benchmark_devices,
+        device_chain_from_env, device_from_env, device_label, device_report, devices_for,
+        devices_for_with_policy, fastest_device, fastest_device_for, graph_param_names,
+        is_available, parse_device, parse_device_list, pipeline_schedule, resolve_device,
+        resolve_device_chain, rlx_model, run_with_fallback, scalar_constant_bytes, verify,
+        verify_all, verify_shapes,
     };
+
     // IR builder helpers
-    pub use crate::ops::{Activation, BinaryOp, CmpOp, MaskKind};
+    pub use crate::ops::{
+        Activation, BinaryOp, ChainOperand, ChainStep, CmpOp, FftNorm, InterpMode, MaskKind,
+        ReduceOp,
+    };
+
     // Quant metadata
-    pub use crate::QuantScheme;
-    // Autodiff
-    pub use crate::{hvp, jvp, vmap};
-    // Optimizer types — useful when configuring passes / precision
+    pub use crate::quant::{QuantMap, QuantScheme};
+
+    // Autodiff + transforms
+    pub use crate::autodiff::{
+        AutodiffError, GradWithLossOptions, HigherOrderOptions, grad, grad_with_loss,
+        grad_with_loss_opts, hvp, jvp, nth_order_grad, prepare_graph_for_ad, vmap,
+    };
+
+    // `.rlxp` packages
+    pub use crate::pkg::{
+        MaterializeMode, Package, Placement, compile_rlxp, compile_rlxp_bind_params,
+        compile_rlxp_with, load_rlxp_graph, load_rlxp_placement, open_rlxp, tensors_for_rank,
+        weight_names_for_rank,
+    };
+
+    // Optimizer / compile-pass types
     pub use crate::ir::env::{self, RlxEnv, RuntimeOverrides, flag, set, unset, var};
     pub use crate::{CalibrationRecord, Pass, Precision, PrecisionPolicy};
+
+    // Training-step optimizers (feature `optim`)
+    #[cfg(feature = "optim")]
+    pub use crate::optim::{
+        Adafactor, Adam, AdamW, KronPsgd, Lamb, Lion, Mars, Muon, NAdamW, Optimizer, QHAdamW,
+        RAdam, Sgd, Soap, Sophia, Stiefel, global_grad_clip_scale, l2_norm,
+    };
 
     // FPGA / ASIC SystemVerilog export (feature `fpga`)
     #[cfg(feature = "fpga")]

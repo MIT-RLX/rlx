@@ -40,8 +40,9 @@ use crate::kernels::{
     batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
     complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
-    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
+    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, elementwise_region_kernel,
     elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
     fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel,
     fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
@@ -55,13 +56,13 @@ use crate::kernels::{
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel, narrow_kernel,
-    pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel, rms_norm_backward_kernel,
-    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scatter_add_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
-    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
+    reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_kernel, selective_scan_kernel,
+    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -584,7 +585,11 @@ impl WgpuExecutable {
                     }
                     Step::GatherAxis { params } => {
                         let mut p = *params;
-                        p.total = scale(p.total);
+                        // Active-extent trims the LEADING (outer) dim only; the
+                        // gathered axis + trailing are not seq-proportional.
+                        // Scaling `total` directly would drop trailing lanes for
+                        // a seq-collapsing gather (e.g. last-token select, outer=1).
+                        p.total = scale(p.outer) * p.num_idx * p.trailing;
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
@@ -645,6 +650,24 @@ impl WgpuExecutable {
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::MaxPool2dBackward { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::MaxPool3dBackward { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::Conv3dBackwardInput { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::Conv3dBackwardWeight { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
@@ -802,12 +825,19 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::DequantMatmulMlx { params } => {
+                        let mut p = *params;
+                        p.m = scale(p.m);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     // Im2ColGpu params are static (written once at compile);
                     // no active-extent scaling.
                     Step::Im2ColGpu { .. }
                     | Step::GatherSplit { .. }
                     | Step::DequantMatmulGguf { .. }
                     | Step::DequantMatmulInt8Host { .. }
+                    | Step::DequantMatmulMlxHost { .. }
                     | Step::Conv2dHost { .. }
                     | Step::DequantGroupedMatmulGguf { .. }
                     | Step::GatedDeltaNet { use_gpu: false, .. }
@@ -1599,7 +1629,10 @@ impl WgpuExecutable {
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::GatherAxis { params } => {
-                                let total_s = scale(params.total);
+                                // Trim only the leading (outer) dim; see the
+                                // uniform-write path above.
+                                let total_s =
+                                    scale(params.outer) * params.num_idx * params.trailing;
                                 if total_s == 0 {
                                     continue;
                                 }
@@ -1707,6 +1740,44 @@ impl WgpuExecutable {
                                 let gx = params.w.div_ceil(8);
                                 let gy = params.h.div_ceil(8);
                                 let gz = n_s * params.c;
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::MaxPool3dBackward { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = maxpool3d_backward_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = n_s * params.c * params.d * params.h * params.w;
+                                let (gx, gy, gz) = dispatch_dims(total, 256);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Conv3dBackwardInput { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = conv3d_backward_input_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total = n_s * params.c_in * params.d * params.h * params.w;
+                                let (gx, gy, gz) = dispatch_dims(total, 256);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Conv3dBackwardWeight { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let pk = conv3d_backward_weight_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let c_in_per_g = params.c_in / params.groups.max(1);
+                                let total =
+                                    params.c_out * c_in_per_g * params.kd * params.kh * params.kw;
+                                let (gx, gy, gz) = dispatch_dims(total, 256);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::GroupNormBackwardInput { params } => {
@@ -2007,6 +2078,19 @@ impl WgpuExecutable {
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
                             }
+                            Step::DequantMatmulMlx { params } => {
+                                let m_s = scale(params.m);
+                                if m_s == 0 {
+                                    continue;
+                                }
+                                let dk = dequant_matmul_mlx_kernel(&dev.device);
+                                pass.set_pipeline(&dk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // One workgroup per (col, row_tile); local size 256
+                                // splits K and stages X in workgroup memory.
+                                let n_row_tiles = m_s.div_ceil(8);
+                                pass.dispatch_workgroups(params.n * n_row_tiles, 1, 1);
+                            }
                             Step::FusedResidualLn { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
@@ -2151,6 +2235,7 @@ impl WgpuExecutable {
                             Step::GatherSplit { .. }
                             | Step::DequantMatmulGguf { .. }
                             | Step::DequantMatmulInt8Host { .. }
+                            | Step::DequantMatmulMlxHost { .. }
                             | Step::Conv2dHost { .. }
                             | Step::DequantGroupedMatmulGguf { .. }
                             | Step::GatedDeltaNet { use_gpu: false, .. }
@@ -2674,6 +2759,33 @@ impl WgpuExecutable {
                         *n as usize,
                         *block_size as usize,
                         *is_asymmetric,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *scale_byte_off as usize,
+                        *zp_byte_off as usize,
+                        *out_byte_off as usize,
+                    );
+                }
+                Step::DequantMatmulMlxHost {
+                    m,
+                    k,
+                    n,
+                    scheme,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    zp_byte_off,
+                    out_byte_off,
+                } => {
+                    let mm = scale(*m) as usize;
+                    crate::gguf_host::run_dequant_matmul_mlx(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        mm,
+                        *k as usize,
+                        *n as usize,
+                        *scheme,
                         *x_byte_off as usize,
                         *w_byte_off as usize,
                         *scale_byte_off as usize,

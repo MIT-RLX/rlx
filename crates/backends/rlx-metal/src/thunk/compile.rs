@@ -2750,9 +2750,22 @@ impl ThunkSchedule {
                                 n: n as u32,
                                 e5m2: true,
                             },
+                            QuantScheme::MlxAffine { .. }
+                            | QuantScheme::MlxMxfp4 { .. }
+                            | QuantScheme::MlxMxfp8 { .. } => Thunk::DequantMatMulMlx {
+                                x: off(node.inputs[0]),
+                                w_q: off(node.inputs[1]),
+                                scale: off(node.inputs[2]),
+                                zp: off(node.inputs[3]),
+                                dst: off(node.id),
+                                m: m as u32,
+                                k: k as u32,
+                                n: n as u32,
+                                scheme: *scheme,
+                            },
                             other => panic!(
                                 "rlx-metal: Op::DequantMatMul legacy scheme {other:?} \
-                                 is CPU-only unless Int4/FP8/NVFP4; use GGUF K-quants or Device::Cpu."
+                                 is CPU-only unless Int4/FP8/NVFP4/MLX; use GGUF K-quants or Device::Cpu."
                             ),
                         }
                     }
@@ -3077,6 +3090,122 @@ impl ThunkSchedule {
                         pw: padding.get(1).copied().unwrap_or(0) as u32,
                         dh: dilation.first().copied().unwrap_or(1) as u32,
                         dw_dil: dilation.get(1).copied().unwrap_or(1) as u32,
+                        groups: *groups as u32,
+                    }
+                }
+
+                Op::MaxPool3dBackward {
+                    kernel_size,
+                    stride,
+                    padding,
+                } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal MaxPool3dBackward: F32 only");
+                    }
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    Thunk::MaxPool3dBackward {
+                        x: off(node.inputs[0]),
+                        dy: off(node.inputs[1]),
+                        dx: off(node.id),
+                        n: x_shape.dim(0).unwrap_static() as u32,
+                        c: x_shape.dim(1).unwrap_static() as u32,
+                        d: x_shape.dim(2).unwrap_static() as u32,
+                        h: x_shape.dim(3).unwrap_static() as u32,
+                        w: x_shape.dim(4).unwrap_static() as u32,
+                        d_out: dy_shape.dim(2).unwrap_static() as u32,
+                        h_out: dy_shape.dim(3).unwrap_static() as u32,
+                        w_out: dy_shape.dim(4).unwrap_static() as u32,
+                        kd: kernel_size[0] as u32,
+                        kh: kernel_size[1] as u32,
+                        kw: kernel_size[2] as u32,
+                        sd: stride.first().copied().unwrap_or(1) as u32,
+                        sh: stride.get(1).copied().unwrap_or(1) as u32,
+                        sw: stride.get(2).copied().unwrap_or(1) as u32,
+                        pd: padding.first().copied().unwrap_or(0) as u32,
+                        ph: padding.get(1).copied().unwrap_or(0) as u32,
+                        pw: padding.get(2).copied().unwrap_or(0) as u32,
+                    }
+                }
+
+                Op::Conv3dBackwardInput {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal Conv3dBackwardInput: F32 only");
+                    }
+                    let dy_shape = &graph.node(node.inputs[0]).shape;
+                    let out_shape = &node.shape;
+                    Thunk::Conv3dBackwardInput {
+                        dy: off(node.inputs[0]),
+                        w: off(node.inputs[1]),
+                        dx: off(node.id),
+                        n: out_shape.dim(0).unwrap_static() as u32,
+                        c_in: out_shape.dim(1).unwrap_static() as u32,
+                        d: out_shape.dim(2).unwrap_static() as u32,
+                        h: out_shape.dim(3).unwrap_static() as u32,
+                        w_in: out_shape.dim(4).unwrap_static() as u32,
+                        c_out: dy_shape.dim(1).unwrap_static() as u32,
+                        d_out: dy_shape.dim(2).unwrap_static() as u32,
+                        h_out: dy_shape.dim(3).unwrap_static() as u32,
+                        w_out: dy_shape.dim(4).unwrap_static() as u32,
+                        kd: kernel_size[0] as u32,
+                        kh: kernel_size[1] as u32,
+                        kw: kernel_size[2] as u32,
+                        sd: stride.first().copied().unwrap_or(1) as u32,
+                        sh: stride.get(1).copied().unwrap_or(1) as u32,
+                        sw: stride.get(2).copied().unwrap_or(1) as u32,
+                        pd: padding.first().copied().unwrap_or(0) as u32,
+                        ph: padding.get(1).copied().unwrap_or(0) as u32,
+                        pw: padding.get(2).copied().unwrap_or(0) as u32,
+                        dd: dilation.first().copied().unwrap_or(1) as u32,
+                        dh: dilation.get(1).copied().unwrap_or(1) as u32,
+                        dw: dilation.get(2).copied().unwrap_or(1) as u32,
+                        groups: *groups as u32,
+                    }
+                }
+
+                Op::Conv3dBackwardWeight {
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal Conv3dBackwardWeight: F32 only");
+                    }
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let dy_shape = &graph.node(node.inputs[1]).shape;
+                    Thunk::Conv3dBackwardWeight {
+                        x: off(node.inputs[0]),
+                        dy: off(node.inputs[1]),
+                        dw: off(node.id),
+                        n: x_shape.dim(0).unwrap_static() as u32,
+                        c_in: x_shape.dim(1).unwrap_static() as u32,
+                        d: x_shape.dim(2).unwrap_static() as u32,
+                        h: x_shape.dim(3).unwrap_static() as u32,
+                        w: x_shape.dim(4).unwrap_static() as u32,
+                        c_out: dy_shape.dim(1).unwrap_static() as u32,
+                        d_out: dy_shape.dim(2).unwrap_static() as u32,
+                        h_out: dy_shape.dim(3).unwrap_static() as u32,
+                        w_out: dy_shape.dim(4).unwrap_static() as u32,
+                        kd: kernel_size[0] as u32,
+                        kh: kernel_size[1] as u32,
+                        kw: kernel_size[2] as u32,
+                        sd: stride.first().copied().unwrap_or(1) as u32,
+                        sh: stride.get(1).copied().unwrap_or(1) as u32,
+                        sw: stride.get(2).copied().unwrap_or(1) as u32,
+                        pd: padding.first().copied().unwrap_or(0) as u32,
+                        ph: padding.get(1).copied().unwrap_or(0) as u32,
+                        pw: padding.get(2).copied().unwrap_or(0) as u32,
+                        dd: dilation.first().copied().unwrap_or(1) as u32,
+                        dh: dilation.get(1).copied().unwrap_or(1) as u32,
+                        dw_dil: dilation.get(2).copied().unwrap_or(1) as u32,
                         groups: *groups as u32,
                     }
                 }

@@ -423,6 +423,19 @@ int rlx_mlx_op_maxpool2d_backward_metal(
     int ph, int pw,
     rlx_mlx_array_t** out);
 
+// Custom Metal kernel for 3D max-pool backward. NCDHW-layout `x`/`dy`,
+// produces dx [N, C, D, H, W] f32. Gather-style (strict `>` argmax),
+// matching CPU/CUDA. Caller frees `*out`.
+int rlx_mlx_op_maxpool3d_backward_metal(
+    rlx_mlx_array_t* x,
+    rlx_mlx_array_t* dy,
+    int n, int c, int d, int h, int w,
+    int d_out, int h_out, int w_out,
+    int kd, int kh, int kw,
+    int sd, int sh, int sw,
+    int pd, int ph, int pw,
+    rlx_mlx_array_t** out);
+
 // Element-wise gather along a single axis. `a` and `indices` must
 // broadcast on non-axis dims; output has `indices`'s shape (broadcast
 // up). Maps `mc::take_along_axis`.
@@ -485,7 +498,8 @@ int rlx_mlx_op_gather_mm(
 
 // quantized_matmul: w is the packed quantized weight matrix; scales
 // (and optional biases) come from the rlx QuantScheme metadata. bits
-// = 4 or 8 depending on scheme. Returns x @ dequant(w).
+// = 4 or 8 depending on scheme. `mode` is "affine" / "mxfp4" / "mxfp8"
+// / "nvfp4". Returns x @ dequant(w).
 int rlx_mlx_op_quantized_matmul(
     rlx_mlx_array_t* x,
     rlx_mlx_array_t* w,
@@ -494,6 +508,7 @@ int rlx_mlx_op_quantized_matmul(
     int transpose,
     int group_size,
     int bits,
+    const char* mode,
     rlx_mlx_array_t** out);
 
 // Multinomial categorical sample. `logits` shape [..., vocab]; output
@@ -657,6 +672,23 @@ int rlx_mlx_dist_all_reduce_array(rlx_mlx_array_t* in, int kind, rlx_mlx_array_t
 // native reduce-scatter). Both are lazy with no host round-trip.
 int rlx_mlx_dist_all_gather_array(rlx_mlx_array_t* in, rlx_mlx_array_t** out);
 int rlx_mlx_dist_reduce_scatter_array(rlx_mlx_array_t* in, int kind, rlx_mlx_array_t** out);
+
+// ── Weight I/O (mx.load / load_safetensors) ─────────────────────
+//
+// Named-array lists own heap strings + array handles. Caller frees with
+// rlx_mlx_named_list_free (which also frees each array handle).
+
+typedef struct rlx_mlx_named_array_list_s rlx_mlx_named_array_list_t;
+
+int rlx_mlx_load_safetensors(const char* path, rlx_mlx_named_array_list_t** out);
+int rlx_mlx_load_npy(const char* path, rlx_mlx_array_t** out);
+size_t rlx_mlx_named_list_len(const rlx_mlx_named_array_list_t* list);
+int rlx_mlx_named_list_get(
+    rlx_mlx_named_array_list_t* list,
+    size_t index,
+    const char** out_name,
+    rlx_mlx_array_t** out_array);
+void rlx_mlx_named_list_free(rlx_mlx_named_array_list_t* list);
 
 #ifdef __cplusplus
 }

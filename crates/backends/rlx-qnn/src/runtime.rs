@@ -391,6 +391,8 @@ pub struct QnnExecutable {
     /// Packed GGUF params for `DequantMatMul`: param name → (weight tensor
     /// index, scheme, N, K). `set_param_typed` dequants into that tensor.
     deferred_dequant: Vec<(String, usize, rlx_ir::quant::QuantScheme, usize, usize)>,
+    /// MLX DequantMatMul with Param sidecars — filled as w/scale/bias arrive.
+    deferred_mlx: Vec<DeferredMlxDequant>,
     /// Int8 Dequantize / QMatMul weights filled via `set_param_typed`: param
     /// name → (weight tensor index, scale, offset).
     deferred_i8: Vec<(String, usize, f32, i32)>,
@@ -407,6 +409,40 @@ pub struct QnnExecutable {
     session_pre: Option<*mut RlxQnnSession>,
     /// Set when params change after a session was created.
     session_stale: bool,
+}
+
+/// Deferred MLX host-dequant: wait for w + scale + bias Param bytes.
+#[derive(Debug, Clone)]
+struct DeferredMlxDequant {
+    w_name: String,
+    scale_name: String,
+    bias_name: String,
+    w_idx: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    n: usize,
+    k: usize,
+    w: Option<Vec<u8>>,
+    scales: Option<Vec<u8>>,
+    biases: Option<Vec<u8>>,
+}
+
+impl DeferredMlxDequant {
+    fn try_finish(&mut self, tensors: &mut [PlanTensor]) -> Result<(), String> {
+        let (Some(w), Some(s), Some(b)) = (&self.w, &self.scales, &self.biases) else {
+            return Ok(());
+        };
+        let kn = crate::dequant::dequant_mlx_for_qnn(self.scheme, w, s, b, self.n, self.k)?;
+        if kn.len() != tensors[self.w_idx].num_elems {
+            return Err(format!(
+                "mlx dequant {}: got {} want {}",
+                self.w_name,
+                kn.len(),
+                tensors[self.w_idx].num_elems
+            ));
+        }
+        tensors[self.w_idx].data = Some(kn);
+        Ok(())
+    }
 }
 
 /// One host-side INT8 matmul (mirrors `rlx-cpu` `Op::QMatMul`).
@@ -498,6 +534,7 @@ impl QnnExecutable {
         let mut quant_axis: Vec<(usize, i32, Vec<CScaleOffset>)> = Vec::new();
         let mut deferred_dequant: Vec<(String, usize, rlx_ir::quant::QuantScheme, usize, usize)> =
             Vec::new();
+        let mut deferred_mlx: Vec<DeferredMlxDequant> = Vec::new();
         let mut deferred_i8: Vec<(String, usize, f32, i32)> = Vec::new();
         let deferred_i4: Vec<(String, usize, f32, i32)> = Vec::new();
         let mut i8_static: Vec<(usize, Vec<i8>)> = Vec::new();
@@ -833,6 +870,68 @@ impl QnnExecutable {
                     });
                     nodes.push(PlanNode {
                         name: CString::new(format!("n{i}_dqmm")).expect("nul"),
+                        op_type: CString::new("MatMul").expect("nul"),
+                        inputs: vec![x, w_idx],
+                        output: i as u32,
+                        axis: -1,
+                        perm: Vec::new(),
+                        eps: 0.0,
+                    });
+                    (if is_output { 1 } else { 3 }, None)
+                }
+                // MLX affine / mxfp — host-dequant to `[K,N]` MatMul. Constants
+                // bake immediately; Param w/scale/bias fill via deferred bind.
+                Op::DequantMatMul { scheme } if node.inputs.len() >= 4 && scheme.is_mlx() => {
+                    let x = node.inputs[0].0;
+                    let x_shape = graph.shape(node.inputs[0]);
+                    if dims.len() < 2 || x_shape.rank() < 2 {
+                        return Err("rlx-qnn DequantMatMul[MLX]: need rank ≥ 2".into());
+                    }
+                    let n = dims[dims.len() - 1] as usize;
+                    let k = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                    let mlx_src =
+                        |id: rlx_ir::NodeId| -> Result<(String, Option<Vec<u8>>), String> {
+                            match &graph.node(id).op {
+                                Op::Constant { data } => Ok((String::new(), Some(data.clone()))),
+                                Op::Param { name } => Ok((name.clone(), None)),
+                                other => Err(format!(
+                                    "rlx-qnn DequantMatMul[MLX]: w/scale/bias must be Param/Constant, got {other:?}"
+                                )),
+                            }
+                        };
+                    let (w_name, w_data) = mlx_src(node.inputs[1])?;
+                    let (s_name, s_data) = mlx_src(node.inputs[2])?;
+                    let (b_name, b_data) = mlx_src(node.inputs[3])?;
+                    let w_idx = (num_nodes + extra.len()) as u32;
+                    let kn = match (&w_data, &s_data, &b_data) {
+                        (Some(w), Some(s), Some(b)) => {
+                            Some(crate::dequant::dequant_mlx_for_qnn(*scheme, w, s, b, n, k)?)
+                        }
+                        _ => {
+                            deferred_mlx.push(DeferredMlxDequant {
+                                w_name,
+                                scale_name: s_name,
+                                bias_name: b_name,
+                                w_idx: w_idx as usize,
+                                scheme: *scheme,
+                                n,
+                                k,
+                                w: w_data,
+                                scales: s_data,
+                                biases: b_data,
+                            });
+                            None
+                        }
+                    };
+                    extra.push(PlanTensor {
+                        ttype: 4,
+                        dims: vec![k as u32, n as u32],
+                        num_elems: k * n,
+                        data: kn,
+                        qnn_name: CString::new(format!("t{w_idx}_mlx_dqw")).expect("nul"),
+                    });
+                    nodes.push(PlanNode {
+                        name: CString::new(format!("n{i}_mlx_dqmm")).expect("nul"),
                         op_type: CString::new("MatMul").expect("nul"),
                         inputs: vec![x, w_idx],
                         output: i as u32,
@@ -1835,6 +1934,7 @@ impl QnnExecutable {
             i8_static,
             i4_static,
             deferred_dequant,
+            deferred_mlx,
             deferred_i8,
             deferred_i4,
             host_qmatmul,
@@ -1867,6 +1967,28 @@ impl QnnExecutable {
             self.tensors[idx].data = Some(data.to_vec());
             self.session_stale = true;
         }
+        // MLX DequantMatMul scale/bias sidecars (F32 LE).
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for x in data {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        let mut touched = false;
+        for d in &mut self.deferred_mlx {
+            if d.scale_name == name {
+                d.scales = Some(bytes.clone());
+                touched = true;
+            } else if d.bias_name == name {
+                d.biases = Some(bytes.clone());
+                touched = true;
+            }
+        }
+        if touched {
+            for d in &mut self.deferred_mlx {
+                d.try_finish(&mut self.tensors)
+                    .unwrap_or_else(|e| panic!("rlx-qnn mlx deferred: {e}"));
+            }
+            self.session_stale = true;
+        }
     }
 
     /// Bind a packed (U8/I8) weight:
@@ -1882,6 +2004,29 @@ impl QnnExecutable {
     ) -> Result<(), String> {
         if !matches!(dtype, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
             return Ok(());
+        }
+        // MLX packed weight / mxfp scale bytes.
+        {
+            let mut touched = false;
+            for d in &mut self.deferred_mlx {
+                if d.w_name == name {
+                    d.w = Some(data.to_vec());
+                    touched = true;
+                } else if d.scale_name == name {
+                    d.scales = Some(data.to_vec());
+                    touched = true;
+                } else if d.bias_name == name {
+                    d.biases = Some(data.to_vec());
+                    touched = true;
+                }
+            }
+            if touched {
+                for d in &mut self.deferred_mlx {
+                    d.try_finish(&mut self.tensors)?;
+                }
+                self.session_stale = true;
+                return Ok(());
+            }
         }
         if let Some((_, w_idx, scheme, n, k)) =
             self.deferred_dequant.iter().find(|(n0, ..)| n0 == name)

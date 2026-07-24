@@ -99,3 +99,36 @@ pub fn upload_param_bytes(
     };
     rlx_gpu_host::upload_param_bytes(&mut arena, byte_off, data);
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_matmul_mlx(
+    ctx: &RocmContext,
+    buffer: &HipBuffer<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    scale_byte_off: usize,
+    zp_byte_off: usize,
+    out_byte_off: usize,
+) {
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_dequant_matmul_mlx(
+        &mut arena,
+        m,
+        k,
+        n,
+        scheme,
+        x_byte_off,
+        w_byte_off,
+        scale_byte_off,
+        zp_byte_off,
+        out_byte_off,
+    );
+}

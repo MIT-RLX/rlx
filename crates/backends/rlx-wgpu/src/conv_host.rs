@@ -43,7 +43,7 @@ fn dtoh_f32_cached(
     a: &mut WgpuArena<'_>,
     byte_off: usize,
     n: usize,
-    mut act_cache: Option<&mut HostTensorCache>,
+    act_cache: Option<&mut HostTensorCache>,
 ) -> Vec<f32> {
     if n == 0 {
         return Vec::new();

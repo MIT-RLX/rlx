@@ -711,7 +711,7 @@ fn fill_os_entropy(out: &mut [u8]) {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0xC0FF_EE00_D15E_A5E);
+        .unwrap_or(0x0C0F_FEE0_0D15_EA5E);
     out.copy_from_slice(&t.to_le_bytes()[..out.len().min(8)]);
 }
 
@@ -720,7 +720,7 @@ fn fill_os_entropy(out: &mut [u8]) {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0xC0FF_EE00_D15E_A5E);
+        .unwrap_or(0x0C0F_FEE0_0D15_EA5E);
     let b = t.to_le_bytes();
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = b[i % 8];
@@ -1215,7 +1215,7 @@ mod tests {
     fn bnns_gumbel_alpha_beta_matches_documented_formula() {
         let u = 0.5f32;
         let g = bnns_gumbel_from_uniform(u, 2.0, 0.1);
-        let expected = -((-((2.0 * u + 0.1) as f32).ln()) + 0.1).ln();
+        let expected = -((-(2.0 * u + 0.1).ln() + 0.1).ln());
         assert!((g - expected).abs() < 1e-6);
         // α=1, β=0 recovers Espresso ICDF (with ε clamp).
         assert_eq!(

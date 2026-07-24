@@ -9,9 +9,7 @@
 
 use crate::format::RlxFile;
 use anyhow::Result;
-use rlx_pkg::{
-    BakeWeight, ContainerKind, WriteOptions, infer_container, package_from_bake,
-};
+use rlx_pkg::{BakeWeight, ContainerKind, WriteOptions, infer_container, package_from_bake};
 use std::path::Path;
 
 /// Write `file` as an `.rlxp` package (flat by default for `.rlxp`).

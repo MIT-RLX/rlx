@@ -13,5 +13,5 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.13" }
-rlx-flow = { path = "../rlx-flow", version = "0.2.13" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.14" }
+rlx-flow = { path = "../rlx-flow", version = "0.2.14" }

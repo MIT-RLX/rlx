@@ -1,6 +1,6 @@
 # RLX
 
-![status](https://img.shields.io/badge/status-0.2.13-blue)
+![status](https://img.shields.io/badge/status-0.2.14-blue)
 ![license](https://img.shields.io/badge/license-GPL--3.0--only-green)
 ![rust](https://img.shields.io/badge/rust-edition%202024-orange)
 [![repo](https://img.shields.io/badge/github-MIT--RLX%2Frlx-black)](https://github.com/MIT-RLX/rlx)
@@ -11,7 +11,7 @@ backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
 (CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), Qualcomm
 Hexagon (QNN) NPUs, and microcontrollers (Cortex-M).
 
-> Status: **0.2.13**, Apple-Silicon-first. The CPU and Apple GPU paths
+> Status: **0.2.14**, Apple-Silicon-first. The CPU and Apple GPU paths
 > are mature; CUDA / ROCm / TPU / WGPU / Vulkan / oneAPI claim the full
 > **153/`OpKind`** surface (see [`docs/op-coverage.md`](docs/op-coverage.md))
 > with growing native depth — still less field mileage than Metal/MLX.

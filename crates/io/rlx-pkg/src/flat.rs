@@ -500,9 +500,7 @@ pub fn write_flat(path: impl AsRef<Path>, manifest: Manifest, payload: FlatPaylo
         if tensors.iter().any(|t| t.tier == StorageTier::Warm) {
             push_feat(&mut manifest.features, "zstd_blocks_warm");
         }
-        if sidecars.iter().any(|s| s.codec == Codec::Zstd)
-            || placement_codec == Codec::Zstd
-        {
+        if sidecars.iter().any(|s| s.codec == Codec::Zstd) || placement_codec == Codec::Zstd {
             push_feat(&mut manifest.features, "zstd_cold");
         }
     }

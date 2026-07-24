@@ -31,8 +31,19 @@ inspectability. Convert or bake with `--format rlxp`:
 
 ```bash
 cargo run -p rlx-bake -- graph.json -o model.rlxp --format rlxp --weights w.safetensors
+cargo run -p rlx-bake -- graph.json -o model.rlxp --weights mlx-dir --weights-policy auto --opt merge
 cargo run -p rlx-bake -- convert model.rlx -o model.rlxp
 ```
+
+### `--weights-policy` (f32-first go / no-go)
+
+| Policy | f32-first | Use when |
+|--------|-----------|----------|
+| `f32` (default) | **GO** | Dense MatMul graphs; `--opt exact`/`size` ternary+Q8 |
+| `packed` | **NO-GO** if MLX packs or DDUF half exist | Space/speed — keep `mlx_*` / `f16` encodings |
+| `auto` | **NO-GO** if packs/half and ternary/quant off; else **GO** | Prefer packs without breaking size profile |
+
+`exact`/`size` always force **GO** (rewrites need floats).
 
 Optional ONNX → RLXP (executable MIR graph by default):
 

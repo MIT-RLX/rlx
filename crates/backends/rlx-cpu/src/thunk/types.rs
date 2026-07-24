@@ -899,6 +899,19 @@ pub enum Thunk {
         h: u32,
         w: u32,
     },
+    /// Nearest NCDHW resample to an explicit spatial size.
+    Interpolate3d {
+        src: usize,
+        dst: usize,
+        n: u32,
+        c: u32,
+        d_in: u32,
+        h_in: u32,
+        w_in: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+    },
     /// SAM2 axial 2-D RoPE on `[batch, seq, num_heads * head_dim]`.
     AxialRope2d {
         src: usize,
@@ -1197,6 +1210,19 @@ pub enum Thunk {
         m: u32,
         k: u32,
         n: u32,
+    },
+
+    /// MLX affine / mxfp DequantMatMul — host dequant via `rlx-mlx-io`.
+    DequantMatMulMlx {
+        x: usize,
+        w_q: usize,
+        scale: usize,
+        zp: usize,
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        scheme: rlx_ir::quant::QuantScheme,
     },
 
     /// Native low-precision scaled GEMM (FP8/FP6/FP4) — CPU reference oracle.
@@ -2182,6 +2208,85 @@ pub enum Thunk {
         groups: u32,
     },
 
+    MaxPool3dBackward {
+        x: usize,
+        dy: usize,
+        dx: usize,
+        n: u32,
+        c: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+    },
+
+    Conv3dBackwardInput {
+        dy: usize,
+        w: usize,
+        dx: usize,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+
+    Conv3dBackwardWeight {
+        x: usize,
+        dy: usize,
+        dw: usize,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw_dil: u32,
+        groups: u32,
+    },
+
     /// NCHW im2col for conv backward-weight matmul. Output `[M, C·kH·kW]`
     /// with `M = N · H_out · W_out`. `n == 0` means infer batch from `x`.
     Im2Col {
@@ -2528,6 +2633,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             ..
         } => vec![*src, *g, *b, *mean, *var],
         Thunk::ResizeNearest2x { src, .. } => vec![*src],
+        Thunk::Interpolate3d { src, .. } => vec![*src],
         Thunk::AxialRope2d { src, .. } => vec![*src],
         Thunk::FusedResidualLN {
             x, res, bias, g, b, ..
@@ -2568,6 +2674,9 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             global_scale,
             ..
         } => vec![*x, *w_q, *scale, *global_scale],
+        Thunk::DequantMatMulMlx {
+            x, w_q, scale, zp, ..
+        } => vec![*x, *w_q, *scale, *zp],
         Thunk::ScaledMatMul {
             lhs,
             rhs,

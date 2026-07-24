@@ -26,6 +26,54 @@
 use rlx_ir::{Graph, NodeId};
 use rlx_opt::memory::MemoryPlan;
 use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Process-wide reuse of weight buffers across prefill/decode compiles.
+/// Prefill + decode each used to allocate a full ~2 GiB weight copy and OOM
+/// VirtIO/DX12 (~8 GiB hostmem). Same **named** weight layout → share the GPU
+/// allocation (params are re-uploaded on compile).
+///
+/// Disable with `RLX_WGPU_SHARE_WEIGHTS=0`. Fingerprint includes sorted
+/// `(param_name, nbytes, offset)` so unrelated packages with coincidentally
+/// similar byte cursors do not share buffers.
+struct SharedWeightBuffers {
+    /// FNV-ish fingerprint of layout + param names/sizes.
+    fingerprint: u64,
+    first: wgpu::Buffer,
+    extras: Vec<wgpu::Buffer>,
+    shard_size: usize,
+    logical_bytes: usize,
+}
+
+static SHARED_WEIGHTS: Mutex<Option<SharedWeightBuffers>> = Mutex::new(None);
+
+fn weight_layout_fingerprint(
+    weight_cursor: usize,
+    named_slots: &[(String, usize, usize)], // (name, nbytes, offset)
+) -> u64 {
+    let mut fp = weight_cursor as u64;
+    for (name, nbytes, off) in named_slots {
+        fp = fp.wrapping_mul(0x100000001b3).wrapping_add(*nbytes as u64);
+        fp = fp.wrapping_mul(0x100000001b3).wrapping_add(*off as u64);
+        for b in name.as_bytes() {
+            fp = fp.wrapping_mul(0x100000001b3).wrapping_add(u64::from(*b));
+        }
+    }
+    fp
+}
+
+fn share_weights_enabled() -> bool {
+    // Default on (OOM mitigation). Set RLX_WGPU_SHARE_WEIGHTS=0 to force
+    // fresh allocations per compile. Prefer env registry flag when set to
+    // truthy; treat explicit "0"/"false"/"off" as disable.
+    match std::env::var("RLX_WGPU_SHARE_WEIGHTS") {
+        Ok(v) => {
+            let t = v.trim();
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
 
 /// Byte end (exclusive) of an f16 shadow write for a slot starting at
 /// `f32_byte_offset` with `f32_byte_len` bytes of f32 payload.
@@ -271,12 +319,17 @@ pub struct Arena {
     pub scratch_off: usize,
     /// Size in bytes of the tail scratch zone (0 when not used).
     pub scratch_bytes: usize,
-    /// Separate buffer holding large packed quant weights (U8/I8) when the
-    /// full arena would exceed wgpu's `max_buffer_size` (4 GiB). Bonsai-27B
-    /// Q1_0 is 3.54 GiB packed; activations may still be sharded.
-    /// Only the fused Q1_0 GEMV reads these, so no other op needs rebinding.
+    /// Separate buffer(s) holding parked params (packed quant and/or large
+    /// F32). When the logical weight range exceeds `max_buffer_size`, it is
+    /// striped across [`Self::weight_extra_shards`] like the act arena.
+    /// Only fused GGUF GEMV binds these directly; other ops stage into the
+    /// act window.
     pub weight_buffer: Option<wgpu::Buffer>,
-    /// Per-node byte offset into `weight_buffer` (quant params only).
+    /// Weight shards 1..N-1 when the logical weight range exceeds one buffer.
+    pub weight_extra_shards: Vec<wgpu::Buffer>,
+    /// Bytes per weight shard (0 = single unsharded `weight_buffer`).
+    pub weight_shard_size: usize,
+    /// Per-node byte offset into the logical weight buffer (quant / parked).
     pub weight_offsets: HashMap<NodeId, usize>,
 }
 
@@ -357,7 +410,50 @@ impl Arena {
         let mut plan = plan.clone();
         let size_hint = plan.arena_size.max(1);
         if size_hint > max_buf {
-            snap_plan_to_shards(&mut plan, shard_cap);
+            // Prefer shrinking the per-stripe stage reserve so a compact plan
+            // that only slightly exceeds max_buf (act + modest scratch) still
+            // lands in one allocation. Full 768 MiB reserves turn ~2 GiB into
+            // 2×2 GiB shards and OOM VirtIO/DX12 (~4 GiB total budget).
+            let compact = plan.clone();
+            let default_reserve = shard_stage_reserve();
+            let mut reserve = default_reserve.min(shard_cap / 2);
+            let mut best_fit: Option<MemoryPlan> = None;
+            let mut best_over: Option<MemoryPlan> = None;
+            loop {
+                let mut trial = compact.clone();
+                snap_plan_to_shards_ex(&mut trial, shard_cap, reserve);
+                if trial.arena_size <= max_buf {
+                    if reserve < default_reserve
+                        && (rlx_ir::env::flag("RLX_WGPU_DEBUG")
+                            || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
+                    {
+                        eprintln!(
+                            "[rlx-wgpu] physical snap with {:.0} MiB stage reserve \
+                             (default {:.0} MiB) → {:.3} GiB arena (fits max_buf)",
+                            reserve as f64 / (1024.0 * 1024.0),
+                            default_reserve as f64 / (1024.0 * 1024.0),
+                            trial.arena_size as f64 / (1u64 << 30) as f64,
+                        );
+                    }
+                    best_fit = Some(trial);
+                    break;
+                }
+                best_over = Some(trial);
+                if reserve <= 1024 * 1024 {
+                    break;
+                }
+                reserve = (reserve / 2).max(1024 * 1024);
+            }
+            if let Some(trial) = best_fit {
+                plan = trial;
+            } else if let Some(trial) = best_over {
+                if trial.arena_size < compact.arena_size.saturating_mul(2) {
+                    plan = trial;
+                } else {
+                    plan = compact;
+                    snap_plan_to_shards_ex(&mut plan, shard_cap, 1024 * 1024);
+                }
+            }
         } else if size_hint > bind_shard_cap {
             // One physical buffer, bind-sized virtual stripes. Full stage
             // reserve packing can inflate a compact plan that still fits
@@ -491,6 +587,9 @@ impl Arena {
         // act arena. Skip unless `RLX_WGPU_F16_WEIGHTS=1`.
         let want_f16 = device.features().contains(wgpu::Features::SHADER_F16)
             && !rlx_ir::env::flag("RLX_WGPU_NO_F16_SHADOW")
+            // VirtIO / DX12 often expose only ~2 GiB buffers *and* a small
+            // total GPU budget — a full-size f16 mirror OOMs next to weights.
+            && max_buf > (2usize << 30)
             && (shard_size == 0
                 || rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS")
                 || !crate::device::coop_discrete_backend());
@@ -527,6 +626,8 @@ impl Arena {
             scratch_off: 0,
             scratch_bytes: 0,
             weight_buffer: None,
+            weight_extra_shards: Vec::new(),
+            weight_shard_size: 0,
             weight_offsets: HashMap::new(),
         }
     }
@@ -565,30 +666,41 @@ impl Arena {
         // disables matmul param-anchor and panics on large F32 lm_heads.
         let max_bind = device.limits().max_storage_buffer_binding_size as usize;
         let bind_cap = (max_bind / 256) * 256;
+        let max_buf = device.limits().max_buffer_size as usize;
+        let weight_shard_cap = (max_buf / 256).saturating_mul(256).max(256);
         let scratch_aligned = scratch_bytes.div_ceil(16) * 16;
         let mut param_bytes_est = 0usize;
         for node in graph.nodes() {
             if matches!(&node.op, Op::Param { .. }) {
                 let ne = node.shape.num_elements().unwrap_or(0).max(1);
                 let dt = node.shape.dtype();
-                param_bytes_est = param_bytes_est.saturating_add(if matches!(
-                    dt,
-                    rlx_ir::DType::U8 | rlx_ir::DType::I8
-                ) {
-                    ne * dt.size_bytes()
-                } else {
-                    ne * 4
-                });
+                param_bytes_est = param_bytes_est.saturating_add(
+                    if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+                        ne * dt.size_bytes()
+                    } else {
+                        ne * 4
+                    },
+                );
             }
         }
         let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
-            || (new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap;
-        // Cover every non-view node the compact plan didn't assign (params +
-        // edge cases). Pure views are handled in a second pass so they alias
-        // their roots — placing Reshape/Cast-of-Param as fresh tail slots left
-        // those views zeroed (F5 DiT on >4 GiB sharded arenas: bias Reshape sat
-        // next to the Param with no copy → ExpandHost broadcast zeros →
-        // identity residual).
+            || ((new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
+                // Multi-shard weight buffers (~2 GiB × N) OOM on VirtIO/WARP
+                // and other adapters whose *total* GPU budget is ≈ one
+                // `max_buffer_size`. Only park-all when everything fits in one
+                // weight buffer.
+                && param_bytes_est <= weight_shard_cap)
+            // Same small-budget adapters: even when compact act + params fit
+            // one bind window, parking only the >512 MiB F32 tensors leaves
+            // the rest in the act arena → multi-×2 GiB act shards + weight
+            // OOM. If all params fit in one weight buffer, park them all.
+            || (param_bytes_est <= weight_shard_cap && max_buf <= (2usize << 30));
+        // Prefer parking the largest params first so lm_head / embeddings land
+        // in the weight buffer when only a subset fits. Tie-break by param
+        // name (not NodeId) so prefill/decode graphs pack identically and can
+        // share one GPU weight buffer.
+        let mut park_candidates: Vec<(NodeId, usize, usize, rlx_ir::DType, bool, String)> =
+            Vec::new();
         for node in graph.nodes() {
             if new_plan.assignments.contains_key(&node.id) {
                 continue;
@@ -599,27 +711,72 @@ impl Arena {
             let ne = node.shape.num_elements().unwrap_or(0).max(1);
             let dt = node.shape.dtype();
             let is_param = matches!(&node.op, Op::Param { .. });
-            // Packed quant (U8/I8) always goes to the weight buffer. Large
-            // F32/F16 params (e.g. Qwen3 lm_head ~594 MiB) and — when the act
-            // arena would otherwise exceed the bind limit — all params.
             let nbytes = if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
                 ne * dt.size_bytes()
             } else {
                 ne * 4
             };
-            const LARGE_F32_PARAM: usize = 512 * 1024 * 1024;
+            let name = match &node.op {
+                Op::Param { name } => name.clone(),
+                _ => String::new(),
+            };
+            park_candidates.push((node.id, ne, nbytes, dt, is_param, name));
+        }
+        park_candidates.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.5.cmp(&b.5))
+                .then_with(|| a.0.0.cmp(&b.0.0))
+        });
+
+        const LARGE_F32_PARAM: usize = 512 * 1024 * 1024;
+        // On adapters whose max_buffer_size is ≈2 GiB (VirtIO/DX12 WARP),
+        // packing only >512 MiB params into the weight buffer leaves the rest
+        // in the act arena → multi-shard act + weight OOMs. Fill the single
+        // weight shard with any param while room remains (largest first).
+        let fill_weight_shard = max_buf <= (2usize << 30);
+        let mut named_weight_slots: Vec<(String, usize, usize)> = Vec::new();
+        for (id, ne, nbytes, dt, is_param, name) in park_candidates {
             let to_weight = is_param
                 && (matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
                     || nbytes > LARGE_F32_PARAM
-                    || park_all_params);
+                    || park_all_params
+                    || fill_weight_shard);
             if to_weight {
+                if nbytes > weight_shard_cap {
+                    // Fall through to act arena — caller must stage per op.
+                    tail = tail.div_ceil(a) * a;
+                    new_plan.assignments.insert(
+                        id,
+                        rlx_opt::memory::BufferSlot {
+                            offset: tail,
+                            size: ne * 4,
+                        },
+                    );
+                    tail += ne * 4;
+                    continue;
+                }
                 weight_cursor = weight_cursor.div_ceil(walign) * walign;
-                weight_offsets.insert(node.id, weight_cursor);
+                // Single-shard budget: spill to act once the weight buffer is full.
+                if weight_cursor.saturating_add(nbytes) > weight_shard_cap {
+                    tail = tail.div_ceil(a) * a;
+                    new_plan.assignments.insert(
+                        id,
+                        rlx_opt::memory::BufferSlot {
+                            offset: tail,
+                            size: ne * 4,
+                        },
+                    );
+                    tail += ne * 4;
+                    continue;
+                }
+                named_weight_slots.push((name, nbytes, weight_cursor));
+                weight_offsets.insert(id, weight_cursor);
                 weight_cursor += nbytes;
             } else {
                 tail = tail.div_ceil(a) * a;
                 new_plan.assignments.insert(
-                    node.id,
+                    id,
                     rlx_opt::memory::BufferSlot {
                         offset: tail,
                         size: ne * 4,
@@ -693,15 +850,82 @@ impl Arena {
         }
         let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_bytes);
         if weight_cursor > 0 {
-            let wbuf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rlx-wgpu weight buffer (packed quant)"),
-                size: weight_cursor.max(4) as u64,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            arena.weight_buffer = Some(wbuf);
+            let n_shards = weight_cursor.div_ceil(weight_shard_cap);
+            if (rlx_ir::env::flag("RLX_WGPU_DEBUG") || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
+                && n_shards > 1
+            {
+                eprintln!(
+                    "[rlx-wgpu] sharded weight buffer: logical={:.3} GiB → {n_shards} × {:.3} GiB",
+                    weight_cursor as f64 / (1u64 << 30) as f64,
+                    weight_shard_cap as f64 / (1u64 << 30) as f64,
+                );
+            }
+            named_weight_slots.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+            let fp = weight_layout_fingerprint(weight_cursor, &named_weight_slots);
+            let shard_size = if n_shards > 1 { weight_shard_cap } else { 0 };
+            let reused = if share_weights_enabled() {
+                let guard = SHARED_WEIGHTS.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.as_ref() {
+                    Some(shared)
+                        if shared.fingerprint == fp
+                            && shared.logical_bytes == weight_cursor
+                            && shared.shard_size == shard_size
+                            && shared.extras.len() + 1 == n_shards =>
+                    {
+                        if rlx_ir::env::flag("RLX_WGPU_DEBUG")
+                            || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG")
+                        {
+                            eprintln!(
+                                "[rlx-wgpu] reusing shared weight buffer ({:.3} GiB)",
+                                weight_cursor as f64 / (1u64 << 30) as f64,
+                            );
+                        }
+                        Some((
+                            shared.first.clone(),
+                            shared.extras.clone(),
+                            shared.shard_size,
+                        ))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((first, extras, ws)) = reused {
+                arena.weight_buffer = Some(first);
+                arena.weight_extra_shards = extras;
+                arena.weight_shard_size = ws;
+            } else {
+                let mut shards = Vec::with_capacity(n_shards);
+                for i in 0..n_shards {
+                    let begin = i * weight_shard_cap;
+                    let this = (weight_cursor - begin).min(weight_shard_cap).max(4);
+                    shards.push(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("rlx-wgpu weight buffer (packed quant)"),
+                        size: this as u64,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST
+                            | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    }));
+                }
+                let first = shards.remove(0);
+                let extras = shards;
+                if share_weights_enabled() {
+                    if let Ok(mut guard) = SHARED_WEIGHTS.lock() {
+                        *guard = Some(SharedWeightBuffers {
+                            fingerprint: fp,
+                            first: first.clone(),
+                            extras: extras.clone(),
+                            shard_size,
+                            logical_bytes: weight_cursor,
+                        });
+                    }
+                }
+                arena.weight_buffer = Some(first);
+                arena.weight_extra_shards = extras;
+                arena.weight_shard_size = shard_size;
+            }
             arena.weight_offsets = weight_offsets;
         }
         arena
@@ -891,12 +1115,30 @@ impl Arena {
     /// Resolve a (possibly weight-tagged) byte offset to (buffer, raw offset).
     pub fn resolve_w(&self, tagged: usize) -> (&wgpu::Buffer, usize) {
         if is_weight_off(tagged) {
-            (
-                self.weight_buffer
-                    .as_ref()
-                    .expect("weight-tagged off without weight_buffer"),
-                raw_weight_off(tagged),
-            )
+            let raw = raw_weight_off(tagged);
+            let Some(first) = self.weight_buffer.as_ref() else {
+                panic!("weight-tagged off without weight_buffer");
+            };
+            if self.weight_shard_size == 0 {
+                return (first, raw);
+            }
+            let s = self.weight_shard_size;
+            let idx = raw / s;
+            let local = raw % s;
+            if idx == 0 {
+                (first, local)
+            } else {
+                (
+                    self.weight_extra_shards.get(idx - 1).unwrap_or_else(|| {
+                        panic!(
+                            "rlx-wgpu: weight off {raw} → shard {idx} missing \
+                                 ({} extra shards, shard_size={s})",
+                            self.weight_extra_shards.len()
+                        )
+                    }),
+                    local,
+                )
+            }
         } else {
             self.resolve_act(tagged)
         }
@@ -987,9 +1229,52 @@ impl Arena {
         if len == 0 {
             return Vec::new();
         }
-        // Weight buffer is a single contiguous allocation — never stripe-split.
-        if is_weight_off(byte_off)
-            || !self.is_sharded()
+        // Weight buffer is contiguous per-shard — never use act-stripe splits.
+        if is_weight_off(byte_off) {
+            let raw = raw_weight_off(byte_off);
+            let ws = self.weight_shard_size;
+            if ws == 0 || (raw / ws) == ((raw + len - 1) / ws) {
+                let (src, local) = self.resolve_w(byte_off);
+                let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rlx-wgpu readback bytes"),
+                    size: len as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rlx-wgpu readback bytes enc"),
+                });
+                enc.copy_buffer_to_buffer(src, local as u64, &staging, 0, len as u64);
+                queue.submit(std::iter::once(enc.finish()));
+
+                let slice = staging.slice(..);
+                let (sender, receiver) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = sender.send(r);
+                });
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                receiver.recv().unwrap().unwrap();
+
+                let view = slice.get_mapped_range().expect("buffer slice mapped");
+                let out = view.to_vec();
+                drop(view);
+                staging.unmap();
+                return out;
+            }
+            // Cross weight-shard: stitch.
+            let mut out = vec![0u8; len];
+            let mut done = 0usize;
+            while done < len {
+                let g = raw + done;
+                let room = ws - (g % ws);
+                let n = (len - done).min(room);
+                let piece = self.read_bytes_range(device, queue, byte_off + done, n);
+                out[done..done + n].copy_from_slice(&piece);
+                done += n;
+            }
+            return out;
+        }
+        if !self.is_sharded()
             || (byte_off / self.shard_size) == ((byte_off + len - 1) / self.shard_size)
         {
             let (src, local) = self.resolve_w(byte_off);
@@ -1049,7 +1334,11 @@ impl Arena {
         let mut off = 0usize;
         while off < data.len() {
             let mut n = (data.len() - off).min(CHUNK);
-            if !weight && self.is_sharded() {
+            if weight && self.weight_shard_size > 0 {
+                let g = raw_weight_off(byte_off) + off;
+                let room = self.weight_shard_size - (g % self.weight_shard_size);
+                n = n.min(room);
+            } else if !weight && self.is_sharded() {
                 let g = byte_off + off;
                 let room = self.shard_size - (g % self.shard_size);
                 n = n.min(room);
@@ -1060,7 +1349,10 @@ impl Arena {
             }
             if n == 0 {
                 n = (data.len() - off).min(4);
-                if !weight && self.is_sharded() {
+                if weight && self.weight_shard_size > 0 {
+                    let g = raw_weight_off(byte_off) + off;
+                    n = n.min(self.weight_shard_size - (g % self.weight_shard_size));
+                } else if !weight && self.is_sharded() {
                     let g = byte_off + off;
                     n = n.min(self.shard_size - (g % self.shard_size));
                 }

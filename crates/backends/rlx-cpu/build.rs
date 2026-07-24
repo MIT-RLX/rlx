@@ -87,30 +87,56 @@ fn main() {
         );
         return; // leave rlx_cpu_blas unset → SIMD fallback
     }
-    // Windows x86_64: only link when the import lib is findable. Fresh VMs
-    // and CI images often lack OpenBLAS; LNK1181 `openblas.lib` is worse than
-    // the portable gemm fallback.
-    if target_os == "windows" && !pinned && !windows_openblas_available() {
-        println!(
-            "cargo:warning=rlx-cpu: openblas.lib not found on PATH/LIB; using the \
-             portable SIMD gemm (set OPENBLAS_LIB_DIR or install OpenBLAS)"
-        );
-        return;
-    }
-    if let Some(dir) = openblas_lib_dir {
+    // Windows x86_64: only link when an import lib is findable. Fresh VMs
+    // and CI images often lack OpenBLAS; LNK1181 is worse than the portable
+    // gemm fallback. Official OpenBLAS MSVC zips ship `libopenblas.lib`
+    // (not `openblas.lib`).
+    let win_lib = if target_os == "windows" {
+        match find_windows_openblas_lib(openblas_lib_dir.as_deref(), openblas_dir.as_deref()) {
+            Some(hit) => Some(hit),
+            None if pinned => None, // user pinned a dir; still try generic link below
+            None => {
+                println!(
+                    "cargo:warning=rlx-cpu: openblas.lib/libopenblas.lib not found; using the \
+                     portable SIMD gemm (set OPENBLAS_LIB_DIR or install OpenBLAS under \
+                     C:\\OpenBLAS)"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some((lib_dir, link_name)) = win_lib {
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        println!("cargo:rustc-link-lib={link_name}");
+    } else if let Some(dir) = openblas_lib_dir {
         println!("cargo:rustc-link-search=native={dir}");
+        println!("cargo:rustc-link-lib=openblas");
     } else if let Some(root) = openblas_dir {
         println!("cargo:rustc-link-search=native={root}/lib");
+        println!("cargo:rustc-link-lib=openblas");
+    } else {
+        println!("cargo:rustc-link-lib=openblas");
     }
-    println!("cargo:rustc-link-lib=openblas");
     println!("cargo:rustc-cfg=rlx_cpu_blas");
     println!("cargo:rustc-cfg=rlx_cpu_blas_openblas");
 }
 
-/// True when the MSVC linker would find `openblas.lib` via LIB / common roots.
-fn windows_openblas_available() -> bool {
+/// `(lib_dir, rustc_link_lib_name)` for a Windows OpenBLAS install.
+fn find_windows_openblas_lib(
+    openblas_lib_dir: Option<&str>,
+    openblas_dir: Option<&str>,
+) -> Option<(String, &'static str)> {
     use std::path::PathBuf;
     let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = openblas_lib_dir {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(root) = openblas_dir {
+        dirs.push(PathBuf::from(root).join("lib"));
+    }
     if let Ok(lib) = std::env::var("LIB") {
         dirs.extend(lib.split(';').filter(|s| !s.is_empty()).map(PathBuf::from));
     }
@@ -122,5 +148,14 @@ fn windows_openblas_available() -> bool {
     ] {
         dirs.push(PathBuf::from(cand));
     }
-    dirs.iter().any(|d| d.join("openblas.lib").is_file())
+    for d in dirs {
+        // Prefer the official MSVC zip name, then the bare `openblas.lib`.
+        if d.join("libopenblas.lib").is_file() {
+            return Some((d.to_string_lossy().into_owned(), "libopenblas"));
+        }
+        if d.join("openblas.lib").is_file() {
+            return Some((d.to_string_lossy().into_owned(), "openblas"));
+        }
+    }
+    None
 }

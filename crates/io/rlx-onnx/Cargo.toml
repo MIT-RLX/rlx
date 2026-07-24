@@ -15,9 +15,9 @@ readme = "README.md"
 anyhow = "1"
 bytemuck = "1"
 serde_json = "1"
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", default-features = false, features = ["cpu"] }
-rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.13" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false, features = ["cpu"] }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.14" }
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 ort = { version = "=2.0.0-rc.11", optional = true, default-features = false, features = [

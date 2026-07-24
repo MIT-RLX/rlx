@@ -18,7 +18,9 @@
 //! Avoids the host D2H of large update tensors (Kitten wave: ~40 MiB).
 
 use crate::kernels::{dispatch_grid_1d, scatter_nd_kernel};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg,
+};
 use rlx_cpu::thunk::{IndexingThunk, Thunk};
 use rlx_ir::ScatterNdReduction;
 use std::sync::Arc;

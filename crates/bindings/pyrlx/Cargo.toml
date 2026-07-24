@@ -1,6 +1,6 @@
 [package]
 name = "pyrlx"
-version                = "0.2.13"
+version                = "0.2.14"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Python bindings for rlx — run RLX graphs and HF models on any RLX backend"
@@ -43,13 +43,16 @@ fpga            = ["rlx-runtime/fpga", "dep:rlx-fpga"]
 pyo3      = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 numpy     = "0.22"
 
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.13", default-features = false }
-rlx-fpga = { path = "../../backends/rlx-fpga", version = "0.2.13", optional = true }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
-rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.13", default-features = false, features = ["safetensors"] }
-rlx-pkg = { path = "../../io/rlx-pkg", version = "0.2.13" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14" }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false }
+rlx-fpga = { path = "../../backends/rlx-fpga", version = "0.2.14", optional = true }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
+rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.14", default-features = false, features = ["safetensors"] }
+rlx-pkg = { path = "../../io/rlx-pkg", version = "0.2.14" }
+rlx-mlx-io = { path = "../../io/rlx-mlx-io", version = "0.2.14" }
+rlx-dduf = { path = "../../io/rlx-dduf", version = "0.2.14" }
+rlx-nemo = { path = "../../io/rlx-nemo", version = "0.2.14" }
 anyhow = "1"
 bytemuck = "1"
 [lints]

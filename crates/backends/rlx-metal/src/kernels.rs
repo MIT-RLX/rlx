@@ -2933,6 +2933,200 @@ kernel void conv2d_backward_weight(
     dw[((co * c_in_per_g + ci_local) * kh + ki) * kw + kj] = acc;
 }
 
+// MaxPool3d backward (NCDHW). One thread per input element; accumulates dy
+// from every window whose argmax (strict `>`) lands here.
+kernel void maxpool3d_backward(
+    device const float* x   [[buffer(0)]],
+    device const float* dy  [[buffer(1)]],
+    device float* dx        [[buffer(2)]],
+    constant uint4& p0      [[buffer(3)]],  // [N, C, D, H]
+    constant uint4& p1      [[buffer(4)]],  // [W, D_out, H_out, W_out]
+    constant uint4& p2      [[buffer(5)]],  // [kd, kh, kw, sd]
+    constant uint4& p3      [[buffer(6)]],  // [sh, sw, pd, ph]
+    constant uint&  pw      [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint N = p0.x, C = p0.y, D = p0.z, H = p0.w;
+    uint W = p1.x, d_out = p1.y, h_out = p1.z, w_out = p1.w;
+    uint kd = p2.x, kh = p2.y, kw = p2.z, sd = p2.w;
+    uint sh = p3.x, sw = p3.y, pd = p3.z, ph = p3.w;
+    uint total = N * C * D * H * W;
+    if (gid >= total) return;
+
+    uint iw = gid % W;
+    uint q1 = gid / W;
+    uint ih = q1 % H;
+    uint q2 = q1 / H;
+    uint id = q2 % D;
+    uint q3 = q2 / D;
+    uint cc = q3 % C;
+    uint nn = q3 / C;
+    uint base_nc = (nn * C + cc) * D * H * W;
+
+    int do_lo = (int)id + (int)pd - (int)kd + 1;
+    do_lo = do_lo <= 0 ? 0 : (do_lo + (int)sd - 1) / (int)sd;
+    int do_hi = ((int)id + (int)pd) / (int)sd;
+    int ho_lo = (int)ih + (int)ph - (int)kh + 1;
+    ho_lo = ho_lo <= 0 ? 0 : (ho_lo + (int)sh - 1) / (int)sh;
+    int ho_hi = ((int)ih + (int)ph) / (int)sh;
+    int wo_lo = (int)iw + (int)pw - (int)kw + 1;
+    wo_lo = wo_lo <= 0 ? 0 : (wo_lo + (int)sw - 1) / (int)sw;
+    int wo_hi = ((int)iw + (int)pw) / (int)sw;
+
+    float acc = 0.0f;
+    for (int do_ = do_lo; do_ <= do_hi && do_ < (int)d_out; ++do_) {
+        int dstart = do_ * (int)sd - (int)pd;
+        for (int ho = ho_lo; ho <= ho_hi && ho < (int)h_out; ++ho) {
+            int hstart = ho * (int)sh - (int)ph;
+            for (int wo = wo_lo; wo <= wo_hi && wo < (int)w_out; ++wo) {
+                int wstart = wo * (int)sw - (int)pw;
+                float best = -INFINITY;
+                int best_idx = -1;
+                for (uint kz = 0; kz < kd; ++kz) {
+                    int irz = dstart + (int)kz;
+                    if (irz < 0 || irz >= (int)D) continue;
+                    for (uint i = 0; i < kh; ++i) {
+                        int ir = hstart + (int)i;
+                        if (ir < 0 || ir >= (int)H) continue;
+                        for (uint j = 0; j < kw; ++j) {
+                            int ic = wstart + (int)j;
+                            if (ic < 0 || ic >= (int)W) continue;
+                            uint id3 = base_nc + ((uint)irz * H + (uint)ir) * W + (uint)ic;
+                            float v = x[id3];
+                            if (v > best) { best = v; best_idx = (int)id3; }
+                        }
+                    }
+                }
+                if (best_idx == (int)gid)
+                    acc += dy[((((nn * C + cc) * d_out + (uint)do_) * h_out + (uint)ho) * w_out + (uint)wo)];
+            }
+        }
+    }
+    dx[gid] = acc;
+}
+
+// Conv3d backward-input (NCDHW gather). Weight [C_out, C_in/groups, kD, kH, kW].
+kernel void conv3d_backward_input(
+    device const float* dy  [[buffer(0)]],
+    device const float* wt  [[buffer(1)]],
+    device float* dx        [[buffer(2)]],
+    constant uint4& a       [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b       [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& cc      [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d       [[buffer(6)]],  // [sd, sh, sw, pd]
+    constant uint4& e       [[buffer(7)]],  // [ph, pw, dd, dh]
+    constant uint2& f       [[buffer(8)]],  // [dw, groups]
+    uint gid [[thread_position_in_grid]]
+) {
+    uint N=a.x, C_in=a.y, D=a.z, H=a.w;
+    uint W=b.x, C_out=b.y, D_out=b.z, H_out=b.w;
+    uint W_out=cc.x, kd=cc.y, kh=cc.z, kw=cc.w;
+    uint sd=d.x, sh=d.y, sw=d.z, pd=d.w;
+    uint ph=e.x, pw=e.y, dd=e.z, dh=e.w;
+    uint dw=f.x, groups=f.y;
+
+    uint total = N * C_in * D * H * W;
+    if (gid >= total) return;
+    uint iw = gid % W;
+    uint q1 = gid / W;
+    uint ih = q1 % H;
+    uint q2 = q1 / H;
+    uint id = q2 % D;
+    uint q3 = q2 / D;
+    uint ci = q3 % C_in;
+    uint nn = q3 / C_in;
+
+    uint c_in_per_g = C_in / groups;
+    uint c_out_per_g = C_out / groups;
+    uint g = ci / c_in_per_g;
+    uint ci_off = ci - g * c_in_per_g;
+    uint co_start = g * c_out_per_g;
+
+    float acc = 0.0f;
+    for (uint kz = 0; kz < kd; ++kz) {
+        int num_d = (int)id + (int)pd - (int)(kz * dd);
+        if (num_d < 0 || (num_d % (int)sd) != 0) continue;
+        int do_ = num_d / (int)sd;
+        if (do_ >= (int)D_out) continue;
+        for (uint ki = 0; ki < kh; ++ki) {
+            int num_h = (int)ih + (int)ph - (int)(ki * dh);
+            if (num_h < 0 || (num_h % (int)sh) != 0) continue;
+            int ho = num_h / (int)sh;
+            if (ho >= (int)H_out) continue;
+            for (uint kj = 0; kj < kw; ++kj) {
+                int num_w = (int)iw + (int)pw - (int)(kj * dw);
+                if (num_w < 0 || (num_w % (int)sw) != 0) continue;
+                int wo = num_w / (int)sw;
+                if (wo >= (int)W_out) continue;
+                for (uint co_off = 0; co_off < c_out_per_g; ++co_off) {
+                    uint co = co_start + co_off;
+                    float dyv = dy[((((nn * C_out + co) * D_out + (uint)do_) * H_out + (uint)ho) * W_out + (uint)wo)];
+                    float wv = wt[((((co * c_in_per_g + ci_off) * kd + kz) * kh + ki) * kw + kj)];
+                    acc += dyv * wv;
+                }
+            }
+        }
+    }
+    dx[gid] = acc;
+}
+
+// Conv3d backward-weight (NCDHW). One thread per dw element.
+kernel void conv3d_backward_weight(
+    device const float* x   [[buffer(0)]],
+    device const float* dy  [[buffer(1)]],
+    device float* dw        [[buffer(2)]],
+    constant uint4& a       [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b       [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& cc      [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d       [[buffer(6)]],  // [sd, sh, sw, pd]
+    constant uint4& e       [[buffer(7)]],  // [ph, pw, dd, dh]
+    constant uint2& f       [[buffer(8)]],  // [dw, groups]
+    uint gid [[thread_position_in_grid]]
+) {
+    uint N=a.x, C_in=a.y, D=a.z, H=a.w;
+    uint W=b.x, C_out=b.y, D_out=b.z, H_out=b.w;
+    uint W_out=cc.x, kd=cc.y, kh=cc.z, kw=cc.w;
+    uint sd=d.x, sh=d.y, sw=d.z, pd=d.w;
+    uint ph=e.x, pw=e.y, dd=e.z, dh=e.w;
+    uint dw_dil=f.x, groups=f.y;
+
+    uint c_in_per_g = C_in / groups;
+    uint c_out_per_g = C_out / groups;
+    uint total = C_out * c_in_per_g * kd * kh * kw;
+    if (gid >= total) return;
+
+    uint kj = gid % kw;
+    uint q1 = gid / kw;
+    uint ki = q1 % kh;
+    uint q2 = q1 / kh;
+    uint kz = q2 % kd;
+    uint q3 = q2 / kd;
+    uint ci_off = q3 % c_in_per_g;
+    uint co = q3 / c_in_per_g;
+    uint g = co / c_out_per_g;
+    uint ci = g * c_in_per_g + ci_off;
+
+    float acc = 0.0f;
+    for (uint nn = 0; nn < N; ++nn) {
+        for (uint do_ = 0; do_ < D_out; ++do_) {
+            int id = (int)(do_ * sd + kz * dd) - (int)pd;
+            if (id < 0 || id >= (int)D) continue;
+            for (uint ho = 0; ho < H_out; ++ho) {
+                int ih = (int)(ho * sh + ki * dh) - (int)ph;
+                if (ih < 0 || ih >= (int)H) continue;
+                for (uint wo = 0; wo < W_out; ++wo) {
+                    int iw = (int)(wo * sw + kj * dw_dil) - (int)pw;
+                    if (iw < 0 || iw >= (int)W) continue;
+                    float dyv = dy[((((nn * C_out + co) * D_out + do_) * H_out + ho) * W_out + wo)];
+                    float xv = x[((((nn * C_in + ci) * D + (uint)id) * H + (uint)ih) * W + (uint)iw)];
+                    acc += dyv * xv;
+                }
+            }
+        }
+    }
+    dw[gid] = acc;
+}
+
 // Conv2d backward-weight, pass 1 (batch-parallel). One thread per
 // (n, co, ci_local, ki, kj) writes a per-sample partial sum into `part`,
 // laid out [N, C_out, c_in_per_g, kh, kw]. Threads scale with N, so small
@@ -6017,18 +6211,29 @@ kernel void dequant_matmul_int4(
 }
 
 inline float dq_fp8_e4m3(uchar byte) {
+    // Match rlx-mlx-io `dequant_scale_fp8_e4m3` (bit-exact OCP E4M3).
     uint sign = (uint(byte) >> 7) & 1u;
-    uint exp_v = (uint(byte) >> 3) & 0x0Fu;
+    int exp_v = int((uint(byte) >> 3) & 0x0Fu);
     uint mant = uint(byte) & 0x7u;
-    float v;
-    if (exp_v == 0u) {
-        v = (mant == 0u) ? 0.0f : (float(mant) / 8.0f) * exp2(-6.0f);
-    } else if (exp_v == 0x0Fu && mant == 0x7u) {
-        v = 0.0f;
-    } else {
-        v = (1.0f + float(mant) / 8.0f) * exp2(float(int(exp_v) - 7));
+    if (exp_v == 0x0f && mant == 0x7u) {
+        return NAN; // Match rlx-mlx-io host decode
     }
-    return (sign != 0u) ? -v : v;
+    if (exp_v == 0) {
+        if (mant == 0u) {
+            return (sign != 0u) ? -0.0f : 0.0f;
+        }
+        uint m = mant;
+        int e = -6;
+        while ((m & 0x8u) == 0u) {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x7u;
+        uint bits = (sign << 31) | (uint(e + 127) << 23) | (m << 20);
+        return as_type<float>(bits);
+    }
+    uint bits = (sign << 31) | (uint(exp_v - 7 + 127) << 23) | (mant << 20);
+    return as_type<float>(bits);
 }
 
 inline float dq_fp8_e5m2(uchar byte) {
@@ -6101,6 +6306,261 @@ kernel void dequant_matmul_nvfp4(
         acc += x[i * k + p] * DQ_FP4_E2M1[nib] * s * gs;
     }
     out[i * n + j] = acc;
+}
+
+// MLX Linear packs: w [n,k] along K. kind 0=affine, 1=mxfp4, 2=mxfp8.
+inline float mlx_e8m0(uint s) {
+    if (s == 0u) return as_type<float>(uint(0x0040u) << 16);
+    return as_type<float>(s << 23);
+}
+inline float mlx_group_scale(uint s, uint gs) {
+    return (gs == 16u) ? dq_fp8_e4m3(uchar(s)) : mlx_e8m0(s);
+}
+inline uint mlx_pack_factor(uint bits) {
+    if (bits == 2u || bits == 4u || bits == 8u) return 8u / bits;
+    if (bits == 3u || bits == 5u) return 8u;
+    if (bits == 6u) return 4u;
+    return 1u;
+}
+inline uint mlx_bpp(uint bits) {
+    if (bits == 2u || bits == 4u || bits == 8u) return 1u;
+    if (bits == 3u || bits == 6u) return 3u;
+    if (bits == 5u) return 5u;
+    return 1u;
+}
+
+// Decode GEMV (m==1): one threadgroup per output column; threads split K.
+kernel void dequant_matmul_mlx_gemv(
+    device const float* x      [[buffer(0)]],
+    device const uchar* wq     [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* biases [[buffer(3)]],
+    device float* out          [[buffer(4)]],
+    constant uint& k           [[buffer(5)]],
+    constant uint& n           [[buffer(6)]],
+    constant uint& kind        [[buffer(7)]],
+    constant uint& bits        [[buffer(8)]],
+    constant uint& group_size  [[buffer(9)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint j [[threadgroup_position_in_grid]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    if (j >= n) return;
+    uint gs = group_size;
+    uint n_groups = k / gs;
+    device const uchar* scale_u = (device const uchar*)scales;
+    threadgroup float smem[256];
+    float acc = 0.0f;
+    for (uint p = tid; p < k; p += tpg) {
+        uint g = p / gs;
+        float w_dq;
+        if (kind == 0u) {
+            uint pf = mlx_pack_factor(bits);
+            uint bpp = mlx_bpp(bits);
+            uint packs_in_group = gs / pf;
+            uint local = p % gs;
+            uint row_base = j * n_groups * packs_in_group * bpp + g * packs_in_group * bpp;
+            uint code = 0u;
+            if (bits == 2u || bits == 4u || bits == 8u) {
+                uint pack_idx = local / pf;
+                uint in_pack = local % pf;
+                uchar byte = wq[row_base + pack_idx];
+                uint mask = (1u << bits) - 1u;
+                code = (uint(byte) >> (in_pack * bits)) & mask;
+            } else if (bits == 3u) {
+                uint pack_idx = local / 8u;
+                uint in_pack = local % 8u;
+                uint bo = row_base + pack_idx * 3u;
+                uchar b0 = wq[bo], b1 = wq[bo + 1], b2 = wq[bo + 2];
+                uint codes[8] = {
+                    uint(b0) & 0x7u,
+                    (uint(b0) & 0x38u) >> 3,
+                    ((uint(b0) & 0xc0u) >> 6) + ((uint(b1) & 0x1u) << 2),
+                    (uint(b1) & 0xeu) >> 1,
+                    (uint(b1) & 0x70u) >> 4,
+                    ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0x3u) << 1),
+                    (uint(b2) & 0x1cu) >> 2,
+                    (uint(b2) & 0xe0u) >> 5
+                };
+                code = codes[in_pack];
+            } else if (bits == 5u) {
+                uint pack_idx = local / 8u;
+                uint in_pack = local % 8u;
+                uint bo = row_base + pack_idx * 5u;
+                uchar b0 = wq[bo], b1 = wq[bo+1], b2 = wq[bo+2], b3 = wq[bo+3], b4 = wq[bo+4];
+                uint codes[8] = {
+                    uint(b0) & 0x1fu,
+                    ((uint(b0) & 0xe0u) >> 5) + ((uint(b1) & 0x3u) << 3),
+                    (uint(b1) & 0x7cu) >> 2,
+                    ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0xfu) << 1),
+                    ((uint(b2) & 0xf0u) >> 4) + ((uint(b3) & 0x1u) << 4),
+                    (uint(b3) & 0x3eu) >> 1,
+                    ((uint(b3) & 0xc0u) >> 6) + ((uint(b4) & 0x7u) << 2),
+                    (uint(b4) & 0xf8u) >> 3
+                };
+                code = codes[in_pack];
+            } else {
+                uint pack_idx = local / 4u;
+                uint in_pack = local % 4u;
+                uint bo = row_base + pack_idx * 3u;
+                uchar b0 = wq[bo], b1 = wq[bo+1], b2 = wq[bo+2];
+                uint codes[4] = {
+                    uint(b0) & 0x3fu,
+                    ((uint(b0) >> 6) & 0x03u) + ((uint(b1) & 0x0fu) << 2),
+                    ((uint(b1) >> 4) & 0x0fu) + ((uint(b2) & 0x03u) << 4),
+                    (uint(b2) >> 2) & 0x3fu
+                };
+                code = codes[in_pack];
+            }
+            w_dq = scales[j * n_groups + g] * float(code) + biases[j * n_groups + g];
+        } else if (kind == 1u) {
+            uint bidx = j * (k / 2u) + (p / 2u);
+            uchar byte = wq[bidx];
+            uint nib = ((p & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
+            w_dq = DQ_FP4_E2M1[nib] * mlx_group_scale(uint(scale_u[j * n_groups + g]), gs);
+        } else {
+            w_dq = dq_fp8_e4m3(wq[j * k + p]) * mlx_group_scale(uint(scale_u[j * n_groups + g]), gs);
+        }
+        acc += x[p] * w_dq;
+    }
+    smem[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) out[j] = smem[0];
+}
+
+// Prefill: one threadgroup per (col, row_tile); threads split K and stage
+// an X tile in threadgroup memory (TM=8 rows × threads_per_threadgroup).
+// Threadgroup id is linearized: tg = col * n_row_tiles + row_tile.
+kernel void dequant_matmul_mlx_gemm(
+    device const float* x      [[buffer(0)]],
+    device const uchar* wq     [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* biases [[buffer(3)]],
+    device float* out          [[buffer(4)]],
+    constant uint& m           [[buffer(5)]],
+    constant uint& k           [[buffer(6)]],
+    constant uint& n           [[buffer(7)]],
+    constant uint& kind        [[buffer(8)]],
+    constant uint& bits        [[buffer(9)]],
+    constant uint& group_size  [[buffer(10)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    const uint TM = 8u;
+    uint n_row_tiles = (m + TM - 1u) / TM;
+    uint col = tg / n_row_tiles;
+    uint row0 = (tg - col * n_row_tiles) * TM;
+    if (col >= n) return;
+    uint gs = group_size;
+    uint n_groups = k / gs;
+    device const uchar* scale_u = (device const uchar*)scales;
+    threadgroup float xs[8 * 256];
+    threadgroup float smem[8 * 256];
+    float acc[8];
+    for (uint t = 0u; t < TM; ++t) acc[t] = 0.0f;
+    for (uint p0 = 0u; p0 < k; p0 += tpg) {
+        uint p = p0 + tid;
+        for (uint t = 0u; t < TM; ++t) {
+            uint row = row0 + t;
+            float v = 0.0f;
+            if (row < m && p < k) v = x[row * k + p];
+            xs[t * tpg + tid] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (p < k) {
+            uint g = p / gs;
+            float w_dq;
+            if (kind == 0u) {
+                uint pf = mlx_pack_factor(bits);
+                uint bpp = mlx_bpp(bits);
+                uint packs_in_group = gs / pf;
+                uint local = p % gs;
+                uint row_base = col * n_groups * packs_in_group * bpp + g * packs_in_group * bpp;
+                uint code = 0u;
+                if (bits == 2u || bits == 4u || bits == 8u) {
+                    uint pack_idx = local / pf;
+                    uint in_pack = local % pf;
+                    uchar byte = wq[row_base + pack_idx];
+                    uint mask = (1u << bits) - 1u;
+                    code = (uint(byte) >> (in_pack * bits)) & mask;
+                } else if (bits == 3u) {
+                    uint pack_idx = local / 8u;
+                    uint in_pack = local % 8u;
+                    uint bo = row_base + pack_idx * 3u;
+                    uchar b0 = wq[bo], b1 = wq[bo + 1], b2 = wq[bo + 2];
+                    uint codes[8] = {
+                        uint(b0) & 0x7u, (uint(b0) & 0x38u) >> 3,
+                        ((uint(b0) & 0xc0u) >> 6) + ((uint(b1) & 0x1u) << 2),
+                        (uint(b1) & 0xeu) >> 1, (uint(b1) & 0x70u) >> 4,
+                        ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0x3u) << 1),
+                        (uint(b2) & 0x1cu) >> 2, (uint(b2) & 0xe0u) >> 5
+                    };
+                    code = codes[in_pack];
+                } else if (bits == 5u) {
+                    uint pack_idx = local / 8u;
+                    uint in_pack = local % 8u;
+                    uint bo = row_base + pack_idx * 5u;
+                    uchar b0 = wq[bo], b1 = wq[bo+1], b2 = wq[bo+2], b3 = wq[bo+3], b4 = wq[bo+4];
+                    uint codes[8] = {
+                        uint(b0) & 0x1fu,
+                        ((uint(b0) & 0xe0u) >> 5) + ((uint(b1) & 0x3u) << 3),
+                        (uint(b1) & 0x7cu) >> 2,
+                        ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0xfu) << 1),
+                        ((uint(b2) & 0xf0u) >> 4) + ((uint(b3) & 0x1u) << 4),
+                        (uint(b3) & 0x3eu) >> 1,
+                        ((uint(b3) & 0xc0u) >> 6) + ((uint(b4) & 0x7u) << 2),
+                        (uint(b4) & 0xf8u) >> 3
+                    };
+                    code = codes[in_pack];
+                } else {
+                    uint pack_idx = local / 4u;
+                    uint in_pack = local % 4u;
+                    uint bo = row_base + pack_idx * 3u;
+                    uchar b0 = wq[bo], b1 = wq[bo+1], b2 = wq[bo+2];
+                    uint codes[4] = {
+                        uint(b0) & 0x3fu,
+                        ((uint(b0) >> 6) & 0x03u) + ((uint(b1) & 0x0fu) << 2),
+                        ((uint(b1) >> 4) & 0x0fu) + ((uint(b2) & 0x03u) << 4),
+                        (uint(b2) >> 2) & 0x3fu
+                    };
+                    code = codes[in_pack];
+                }
+                w_dq = scales[col * n_groups + g] * float(code) + biases[col * n_groups + g];
+            } else if (kind == 1u) {
+                uint bidx = col * (k / 2u) + (p / 2u);
+                uchar byte = wq[bidx];
+                uint nib = ((p & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
+                w_dq = DQ_FP4_E2M1[nib] * mlx_group_scale(uint(scale_u[col * n_groups + g]), gs);
+            } else {
+                w_dq = dq_fp8_e4m3(wq[col * k + p]) * mlx_group_scale(uint(scale_u[col * n_groups + g]), gs);
+            }
+            for (uint t = 0u; t < TM; ++t) {
+                acc[t] += xs[t * tpg + tid] * w_dq;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint t = 0u; t < TM; ++t) smem[t * tpg + tid] = acc[t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            for (uint t = 0u; t < TM; ++t) {
+                smem[t * tpg + tid] += smem[t * tpg + tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        for (uint t = 0u; t < TM; ++t) {
+            uint row = row0 + t;
+            if (row < m) out[row * n + col] = smem[t * tpg];
+        }
+    }
 }
 
 // in-place SiLU: x * sigmoid(x)
@@ -8271,6 +8731,8 @@ pub struct Kernels {
     pub dequant_matmul_int4: ComputePipelineState,
     pub dequant_matmul_fp8: ComputePipelineState,
     pub dequant_matmul_nvfp4: ComputePipelineState,
+    pub dequant_matmul_mlx_gemv: ComputePipelineState,
+    pub dequant_matmul_mlx_gemm: ComputePipelineState,
     pub rope: ComputePipelineState,
     pub fused_swiglu: ComputePipelineState,
     pub fused_swiglu_h: ComputePipelineState,
@@ -8324,6 +8786,9 @@ pub struct Kernels {
     pub conv2d_backward_weight: ComputePipelineState,
     pub conv2d_backward_weight_partial: ComputePipelineState,
     pub conv2d_backward_weight_reduce: ComputePipelineState,
+    pub maxpool3d_backward: ComputePipelineState,
+    pub conv3d_backward_input: ComputePipelineState,
+    pub conv3d_backward_weight: ComputePipelineState,
     pub conv2d: ComputePipelineState,
     pub depthwise_conv1d_bsc: ComputePipelineState,
     pub conv2d_w1: ComputePipelineState,
@@ -8617,6 +9082,8 @@ impl Kernels {
             dequant_matmul_int4: pipeline("dequant_matmul_int4"),
             dequant_matmul_fp8: pipeline("dequant_matmul_fp8"),
             dequant_matmul_nvfp4: pipeline("dequant_matmul_nvfp4"),
+            dequant_matmul_mlx_gemv: pipeline("dequant_matmul_mlx_gemv"),
+            dequant_matmul_mlx_gemm: pipeline("dequant_matmul_mlx_gemm"),
             rope: pipeline("rope"),
             fused_swiglu: pipeline("fused_swiglu"),
             fused_swiglu_h: pipeline("fused_swiglu_h"),
@@ -8670,6 +9137,9 @@ impl Kernels {
             conv2d_backward_weight: pipeline("conv2d_backward_weight"),
             conv2d_backward_weight_partial: pipeline("conv2d_backward_weight_partial"),
             conv2d_backward_weight_reduce: pipeline("conv2d_backward_weight_reduce"),
+            maxpool3d_backward: pipeline("maxpool3d_backward"),
+            conv3d_backward_input: pipeline("conv3d_backward_input"),
+            conv3d_backward_weight: pipeline("conv3d_backward_weight"),
             conv2d: pipeline("conv2d"),
             depthwise_conv1d_bsc: pipeline("depthwise_conv1d_bsc"),
             conv2d_w1: pipeline("conv2d_w1"),

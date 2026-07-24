@@ -937,7 +937,7 @@ fn cast_f64_to_f32_roundtrip_preserves_values() {
 
     // Genuinely narrowing values (not f32-exact in f64) must round to nearest,
     // not bit-truncate.
-    let y: Vec<f32> = vec![0.1, -2.5, 3.14159_26, 1.0e7, -1.0e-7, 123.456];
+    let y: Vec<f32> = vec![0.1, -2.5, std::f32::consts::PI, 1.0e7, -1.0e-7, 123.456];
     let mut g2 = Graph::new("cast_rt2");
     let yn = g2.input("y", Shape::new(&[y.len()], f));
     let yw = g2.cast(yn, DType::F64);

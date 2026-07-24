@@ -8,7 +8,7 @@
 # refs to `dyn ::std::any::Any`.
 [package]
 name = "rlx-onnx-proto"
-version = "0.2.13"
+version = "0.2.14"
 edition = "2021"
 license = "MIT"
 description = "Vendored pure-Rust ONNX protobuf types (protoc-free)"

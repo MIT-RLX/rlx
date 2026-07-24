@@ -67,13 +67,18 @@ See [`docs/backend-selection.md`](../docs/backend-selection.md).
 
 | import                       | gives you                                                                |
 |------------------------------|--------------------------------------------------------------------------|
-| `use rlx::prelude::*;`       | `Graph`, `Session`, `GraphDevices`, `DeviceRouter`, `DevicePolicy`, `FlexibleSession`, `DType`, `Device`, `Result`, `Activation`, `BinaryOp`, `jvp`, `vmap`, … |
-| `use rlx::ops::*;`           | IR helper enums: `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ChainStep`, `ChainOperand` |
+| `use rlx::prelude::*;`       | `Graph`, `Session`, `CompileOptions`, `Package`, `GraphDevices`, `DeviceRouter`, `DevicePolicy`, `FlexibleSession`, `DType`, `Dim`, `Device`, `Result`, `Activation`, `BinaryOp`, `ReduceOp`, `FftNorm`, `QuantScheme`, `grad` / `jvp` / `vmap`, `verify`, `open_rlxp` / `compile_rlxp`, `rlx_model!`, … |
+| `use rlx::ops::*;`           | IR helper enums: `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ReduceOp`, `InterpMode`, `FftNorm`, `ChainStep`, `ChainOperand` |
 | `use rlx::quant::*;`         | `QuantScheme`, `QuantMap`                                                |
+| `use rlx::pkg::*;`           | `.rlxp` — `Package`, `Placement`, `open_rlxp`, `compile_rlxp`, `compile_rlxp_bind_params`, … |
+| `use rlx::compile::*;`       | `CompileOptions`, `Precision`, `PrecisionPolicy`, fusion / pass helpers  |
 | `use rlx::gguf::*;`          | GGUF parser + dequant (`gguf` feature)                                   |
-| `use rlx::autodiff::*;`      | `jvp`, `hvp`, `vmap`                                                     |
+| `use rlx::autodiff::*;`      | `grad`, `grad_with_loss`, `jvp`, `hvp`, `vmap`, `nth_order_grad`, …       |
 | `use rlx::ir::…`             | full `rlx-ir` surface (everything the prelude doesn't lift)              |
 | `use rlx::runtime::…`        | full `rlx-runtime` surface (backends, custom Session config)             |
+
+With `features = ["optim"]`, the prelude also star-imports `Adam`, `AdamW`,
+`Optimizer`, and the rest of `rlx-optim`.
 
 `rlx::Result<T>` and `rlx::Error` are aliases of `anyhow::Result<T>`
 and `anyhow::Error` — the whole stack returns those.

@@ -13,7 +13,7 @@ impl Backend for CoremlBackend {
         // `rlx_coreml::SUPPORTED_OPS_TRAINING`.
         #[cfg(feature = "training")]
         {
-            &rlx_coreml::SUPPORTED_OPS_TRAINING
+            rlx_coreml::SUPPORTED_OPS_TRAINING
         }
         #[cfg(not(feature = "training"))]
         {

@@ -425,9 +425,9 @@ impl<'a> LowerCtx<'a> {
                     n.inputs[0],
                     n.inputs[1],
                     &kernel_size,
-                    &stride.to_vec(),
-                    &padding.to_vec(),
-                    &dilation.to_vec(),
+                    stride.as_ref(),
+                    padding.as_ref(),
+                    dilation.as_ref(),
                     *groups,
                     out_shape,
                 )
@@ -457,9 +457,9 @@ impl<'a> LowerCtx<'a> {
                 attn_logit_softcap: _,
             } => self.lower_attention(&n.inputs, *num_heads, *head_dim, *mask_kind, out_shape),
 
-            Op::Rope {
-                head_dim, n_rot: _, ..
-            } => self.lower_rope(n.inputs[0], n.inputs[1], n.inputs[2], *head_dim, out_shape),
+            Op::Rope { head_dim, .. } => {
+                self.lower_rope(n.inputs[0], n.inputs[1], n.inputs[2], *head_dim, out_shape)
+            }
 
             Op::Reshape { new_shape: _ } => {
                 let x = self.hlo(n.inputs[0]);
@@ -572,6 +572,15 @@ impl<'a> LowerCtx<'a> {
             Op::DequantMatMul { scheme } if scheme.is_gguf() => {
                 self.lower_dequant_matmul_gguf(n.inputs[0], n.inputs[1], *scheme, out_shape)
             }
+
+            Op::DequantMatMul { scheme } if scheme.is_mlx() => self.lower_dequant_matmul_mlx(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                n.inputs[3],
+                *scheme,
+                out_shape,
+            ),
 
             Op::DequantMatMul { scheme } => self.lower_dequant_matmul(
                 n.inputs[0],
@@ -778,9 +787,9 @@ impl<'a> LowerCtx<'a> {
             } => self.lower_conv_transpose(
                 n.inputs[0],
                 n.inputs[1],
-                &stride.to_vec(),
-                &padding.to_vec(),
-                &dilation.to_vec(),
+                stride.as_ref(),
+                padding.as_ref(),
+                dilation.as_ref(),
                 *groups,
                 out_shape,
             ),
@@ -3034,6 +3043,75 @@ impl<'a> LowerCtx<'a> {
         self.entry.dot_general(x, w_hlo, dn, out)
     }
 
+    /// MLX packs: host-dequant at HLO emit (same pattern as GGUF), then
+    /// `dot_general` with W stored `[n, k]` (contract dim 1 on both sides).
+    pub(crate) fn lower_dequant_matmul_mlx(
+        &mut self,
+        x_id: NodeId,
+        w_id: NodeId,
+        s_id: NodeId,
+        z_id: NodeId,
+        scheme: QuantScheme,
+        out: Shape,
+    ) -> i64 {
+        let x_dims = self.ir_shape_dims(x_id);
+        let k = *x_dims.last().expect("DequantMatMul x rank >= 1") as usize;
+        let n = *out.dimensions.last().expect("DequantMatMul out rank >= 1") as usize;
+        let gs = scheme.mlx_group_size() as usize;
+        if gs == 0 || !k.is_multiple_of(gs) {
+            panic!("rlx-tpu: MLX DequantMatMul k={k} not divisible by group_size={gs}");
+        }
+        let n_groups = k / gs;
+        let w_bytes = self.gguf_weight_bytes(w_id);
+        let scale_bytes = self.gguf_weight_bytes(s_id);
+        let w_nk = match scheme {
+            QuantScheme::MlxAffine { bits, group_size } => {
+                let bias_bytes = self.gguf_weight_bytes(z_id);
+                let scales: Vec<f32> = scale_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let biases: Vec<f32> = bias_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                rlx_mlx_io::dequant_affine_f32(
+                    &w_bytes,
+                    &scales,
+                    &biases,
+                    bits as u32,
+                    group_size,
+                    n,
+                    n_groups,
+                )
+                .unwrap_or_else(|e| panic!("rlx-tpu: MLX affine dequant failed: {e}"))
+            }
+            QuantScheme::MlxMxfp4 { group_size } => {
+                rlx_mlx_io::dequant_mxfp4_f32(&w_bytes, &scale_bytes, group_size, n, n_groups)
+                    .unwrap_or_else(|e| panic!("rlx-tpu: MLX mxfp4 dequant failed: {e}"))
+            }
+            QuantScheme::MlxMxfp8 { group_size } => {
+                rlx_mlx_io::dequant_mxfp8_f32(&w_bytes, &scale_bytes, group_size, n, n_groups)
+                    .unwrap_or_else(|e| panic!("rlx-tpu: MLX mxfp8 dequant failed: {e}"))
+            }
+            other => panic!("rlx-tpu: unexpected MLX scheme {other:?}"),
+        };
+        let mut w_le = Vec::with_capacity(w_nk.len() * 4);
+        for v in &w_nk {
+            w_le.extend_from_slice(&v.to_le_bytes());
+        }
+        let nk_f32 = Shape::array(prim::F32, &[n as i64, k as i64]);
+        let w_hlo = self.lower_constant(&w_le, nk_f32, DType::F32);
+        let x = self.hlo(x_id);
+        let dn = DotDimNumbers {
+            lhs_contracting: vec![1],
+            rhs_contracting: vec![1],
+            lhs_batch: vec![],
+            rhs_batch: vec![],
+        };
+        self.entry.dot_general(x, w_hlo, dn, out)
+    }
+
     pub(crate) fn lower_dequant_matmul(
         &mut self,
         x_id: NodeId,
@@ -3087,6 +3165,11 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::GgufNVFP4 => panic!(
                 "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
             ),
+            QuantScheme::MlxAffine { .. }
+            | QuantScheme::MlxMxfp4 { .. }
+            | QuantScheme::MlxMxfp8 { .. } => {
+                panic!("rlx-tpu: MLX schemes must use lower_dequant_matmul_mlx (internal error).")
+            }
         };
         let kb = (k + block - 1) / block;
 

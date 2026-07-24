@@ -57,11 +57,7 @@ fn bench(label: &str, mut f: impl FnMut()) {
         samples.push(t0.elapsed());
     }
     let (m, s) = mean_std(&samples);
-    println!(
-        "{label:<48} {:>10.2?}  ±{:>8.2?}",
-        m,
-        s
-    );
+    println!("{label:<48} {:>10.2?}  ±{:>8.2?}", m, s);
 }
 
 fn fmt_bytes(n: u64) -> String {

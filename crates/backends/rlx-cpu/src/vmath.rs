@@ -79,7 +79,7 @@ pub fn vvexpf_fast(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
     #[cfg(target_arch = "aarch64")]
     {
-        return vvexpf_neon(y, x);
+        vvexpf_neon(y, x);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -164,7 +164,7 @@ pub fn vvtanhf_fast(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
     #[cfg(target_arch = "aarch64")]
     {
-        return vvtanhf_neon(y, x);
+        vvtanhf_neon(y, x);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -213,7 +213,7 @@ pub fn vvrecf(y: &mut [f32], x: &[f32]) {
     assert_eq!(y.len(), x.len());
     #[cfg(target_arch = "aarch64")]
     {
-        return vvrecf_neon(y, x);
+        vvrecf_neon(y, x);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -236,7 +236,7 @@ pub fn vvrecf_inplace(y: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     {
         let x = unsafe { &*(y as *const [f32]) };
-        return vvrecf_neon(y, x);
+        vvrecf_neon(y, x);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -368,7 +368,7 @@ mod accelerate {
 fn vvsqrtf_simd(y: &mut [f32], x: &[f32]) {
     #[cfg(target_arch = "aarch64")]
     {
-        return vvsqrtf_neon(y, x);
+        vvsqrtf_neon(y, x);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -386,7 +386,7 @@ fn vvsqrtf_simd(y: &mut [f32], x: &[f32]) {
 fn vvrsqrtf_simd(y: &mut [f32], x: &[f32]) {
     #[cfg(target_arch = "aarch64")]
     {
-        return vvrsqrtf_neon(y, x);
+        vvrsqrtf_neon(y, x);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {

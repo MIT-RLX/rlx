@@ -95,6 +95,9 @@ fn split_frag(rest: &str) -> Result<(&str, &str), String> {
 /// Resolve a weight tensor to f32 from its source URI. Supported schemes:
 ///   `gguf://<path>#<tensor>`         — dequantize a GGUF tensor (any K-quant)
 ///   `safetensors://<path>#<tensor>`  — read a safetensors tensor (F32/F16/BF16)
+///   `mlx://<path>#<tensor>`          — MLX dir / safetensors / npz (dequant if needed)
+///   `npz://<path>#<tensor>`          — alias for MLX `.npz` / `.npy`
+///   `dduf://<path>#<qualified>`      — DDUF ZIP tensor (`component/name`)
 ///   `file://<path>`                  — raw little-endian f32 array
 ///   `rlxp://<path>#<tensor>`         — f32 tensor from an `.rlxp` package
 ///
@@ -115,6 +118,22 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
         let (path, tensor) = split_frag(rest)?;
         let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         read_safetensors_f32(&bytes, tensor)
+    } else if let Some(rest) = uri
+        .strip_prefix("mlx://")
+        .or_else(|| uri.strip_prefix("npz://"))
+    {
+        let (path, tensor) = split_frag(rest)?;
+        let w = rlx_mlx_io::load_path(path).map_err(|e| e.to_string())?;
+        let map = w.into_f32_map().map_err(|e| e.to_string())?;
+        map.get(tensor)
+            .cloned()
+            .ok_or_else(|| format!("tensor not found in mlx weights: {tensor}"))
+    } else if let Some(rest) = uri.strip_prefix("dduf://") {
+        let (path, tensor) = split_frag(rest)?;
+        let f = rlx_dduf::DdufFile::open(path).map_err(|e| e.to_string())?;
+        f.tensor_f32(tensor)
+            .map(|s| s.to_vec())
+            .map_err(|e| e.to_string())
     } else if let Some(path) = uri.strip_prefix("file://") {
         let b = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         Ok(b.chunks_exact(4)
@@ -197,7 +216,12 @@ impl WeightCache {
             self.rlxp_pack(path)?
                 .tensor_f32(tensor)
                 .map_err(|e| e.to_string())
-        } else if uri.starts_with("safetensors://") || uri.starts_with("file://") {
+        } else if uri.starts_with("safetensors://")
+            || uri.starts_with("file://")
+            || uri.starts_with("mlx://")
+            || uri.starts_with("npz://")
+            || uri.starts_with("dduf://")
+        {
             resolve_weight_uri(uri) // header parse is cheap / file is the tensor
         } else {
             Err(format!("unsupported weight URI scheme: {uri}"))

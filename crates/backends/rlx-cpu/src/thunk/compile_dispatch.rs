@@ -623,6 +623,9 @@ pub fn compile_thunks_with_rng(
             Op::ResizeNearest2x => {
                 compile_resize_nearest2x(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
+            Op::Interpolate3d { .. } => {
+                compile_interpolate3d(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
             Op::AxialRope2d {
                 end_x,
                 end_y,
@@ -1001,6 +1004,15 @@ pub fn compile_thunks_with_rng(
                 dilation,
                 groups,
             } => compile_conv2d_backward_weight(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::MaxPool3dBackward { .. } => {
+                compile_max_pool3d_backward(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
+            Op::Conv3dBackwardInput { .. } => {
+                compile_conv3d_backward_input(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
+            Op::Conv3dBackwardWeight { .. } => {
+                compile_conv3d_backward_weight(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
             Op::Im2Col {
                 kernel_size,
                 stride,
@@ -1728,7 +1740,9 @@ pub fn compile_thunks_with_rng(
                         let w_bytes =
                             std::slice::from_raw_parts(base.add(w_q) as *const u8, total_bytes);
                         let out = sl_mut(dst, base, m * n);
-                        crate::gguf_matmul::gguf_matmul_bt_dispatch(xs, w_bytes, out, m, k, n, scheme);
+                        crate::gguf_matmul::gguf_matmul_bt_dispatch_at(
+                            xs, w_bytes, out, m, k, n, scheme, w_q,
+                        );
                     })
                 }
 
@@ -1817,6 +1831,25 @@ pub fn compile_thunks_with_rng(
                         let gs = sl(global_scale, base, 1)[0];
                         let out = sl_mut(dst, base, m * n);
                         dequant_matmul_nvfp4(xs, w_bytes, scale_bytes, gs, out, m, k, n);
+                    })
+                }
+
+                Thunk::DequantMatMulMlx {
+                    x,
+                    w_q,
+                    scale,
+                    zp,
+                    dst,
+                    m,
+                    k,
+                    n,
+                    scheme,
+                } => {
+                    let (m, k, n) = (m as usize, k as usize, n as usize);
+                    Arc::new(move |base: *mut u8| unsafe {
+                        exec_dequant_mat_mul_mlx_inner(
+                            base, x, w_q, scale, zp, dst, m, k, n, scheme,
+                        );
                     })
                 }
 
@@ -2753,7 +2786,7 @@ pub fn compile_thunks_with_rng(
                         act: None,
                         ..
                     } => (*a, *w, *bias, true),
-                    Thunk::Sgemm { a, b, n: _, .. } => (*a, *b, 0, false),
+                    Thunk::Sgemm { a, b, .. } => (*a, *b, 0, false),
                     _ => return None,
                 };
 

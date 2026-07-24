@@ -43,30 +43,31 @@ use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
     AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
     BinaryC64Params, BinaryParams, CastParams, ComplexCastParams, ComplexWirtingerParams,
-    Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
-    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
-    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
-    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
-    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
-    GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams, NarrowConcatParams,
-    Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams,
-    RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
-    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
-    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
-    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
-    axial_rope2d_kernel, batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel,
-    cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
-    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
-    conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_kernel,
-    copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
-    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
-    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
-    gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
-    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
+    CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
+    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
+    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams,
+    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
+    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupedMatmulParams, GruParams,
+    Im2Col2dParams, Kernel, LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulParams,
+    MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
+    RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams,
+    SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams,
+    WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
+    cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
+    complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
+    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, elementwise_region_kernel,
+    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
+    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel,
+    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
+    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
+    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
+    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
     group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
     layer_norm_backward_input_kernel, layernorm_kernel, lead_pack_uniform, mamba2_kernel,
@@ -74,13 +75,13 @@ use crate::kernels::{
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel, narrow_kernel,
-    pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel, rms_norm_backward_kernel,
-    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scatter_add_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
-    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
+    reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_kernel, selective_scan_kernel,
+    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, AdaNormKind, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -322,10 +323,19 @@ pub(crate) fn compile_static_inner(
     };
     let scratch_bytes = {
         let max_bind = dev.device.limits().max_storage_buffer_binding_size;
+        let max_buf = dev.device.limits().max_buffer_size;
         // Large unsharded arenas (> storage bind cap) stage far operands into
         // a dedicated tail so `scratch_off` is not stuck at `arena.size`.
+        // On ~2 GiB max_buffer adapters (VirtIO/DX12), a full 768 MiB stage
+        // on top of a nearly-full act arena + weight buffer OOMs — keep a
+        // modest tail; `RLX_WGPU_SHARD_STAGE_MIB` still overrides.
         let stage = if (plan.arena_size as u64) > max_bind {
-            crate::buffer::shard_stage_reserve()
+            let full = crate::buffer::shard_stage_reserve();
+            if max_buf <= (2u64 << 30) && std::env::var_os("RLX_WGPU_SHARD_STAGE_MIB").is_none() {
+                full.min(64 * 1024 * 1024)
+            } else {
+                full
+            }
         } else {
             0
         };
@@ -760,20 +770,13 @@ pub(crate) fn compile_static_inner(
                     arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                 }
                 if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
-                    // Large act-arena params must sit in the bind window
-                    // (param-anchor / whole-arena). Weight-buffer params are
-                    // staged into the window later (`arena_off_in_bind_window`)
-                    // — never require them to pass `arena_tensor_in_window`
-                    // (tagged offs are outside the act address space).
-                    let b_off = arena.offset(b_id);
-                    if !crate::buffer::is_weight_off(b_off) {
-                        assert!(
-                            arena_tensor_in_window(&arena, b_id, base, size),
-                            "rlx-wgpu matmul: large param B {:?} off={} not in window base={base} size={size}",
-                            b_id,
-                            b_off,
-                        );
-                    }
+                    // Large act-arena params stage into the bind window via
+                    // `arena_off_in_bind_window` below. Weight-buffer params
+                    // are tagged and skipped here. Do not assert in-window —
+                    // VirtIO/DX12 ~2 GiB caps often leave lm_head outside the
+                    // initial window; staging handles that.
+                    let _b_off = arena.offset(b_id);
+                    let _ = _b_off;
                 }
                 let a_off_f32 = arena_off_in_bind_window(
                     &graph,
@@ -4258,14 +4261,9 @@ pub(crate) fn compile_static_inner(
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
                     if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
-                        let b_off = arena.offset(b_id);
-                        if !crate::buffer::is_weight_off(b_off) {
-                            assert!(
-                                param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
-                                "rlx-wgpu FusedMatMul QKV: large param B {:?} not in bind window",
-                                b_id,
-                            );
-                        }
+                        // Staging via arena_off_in_bind_window — no in-window assert
+                        // (VirtIO/DX12 ~2 GiB caps leave large F32 params outside).
+                        let _ = arena.offset(b_id);
                     }
                     let a_off = arena_off_in_bind_window(
                         &graph,
@@ -4476,14 +4474,9 @@ pub(crate) fn compile_static_inner(
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
                     if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
-                        let b_off = arena.offset(b_id);
-                        if !crate::buffer::is_weight_off(b_off) {
-                            assert!(
-                                param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
-                                "rlx-wgpu FusedMatMul: large param B {:?} not in bind window",
-                                b_id,
-                            );
-                        }
+                        // Staging via arena_off_in_bind_window — no in-window assert
+                        // (VirtIO/DX12 ~2 GiB caps leave large F32 params outside).
+                        let _ = arena.offset(b_id);
                     }
                     let a_off_f32 = arena_off_in_bind_window(
                         &graph,
@@ -5282,6 +5275,12 @@ pub(crate) fn compile_static_inner(
                     dh: dilation.first().copied().unwrap_or(1) as u32,
                     dw_dil: dilation.get(1).copied().unwrap_or(1) as u32,
                     groups: (*groups).max(1) as u32,
+                });
+            }
+
+            Op::Interpolate3d { .. } => {
+                schedule.push(Step::HostOp {
+                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                 });
             }
 
@@ -6391,6 +6390,263 @@ pub(crate) fn compile_static_inner(
                 schedule.push(Step::MaxPool2dBackward { params: p });
                 let sk = maxpool2d_backward_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<MaxPool2dBwdParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::MaxPool3dBackward {
+                kernel_size,
+                stride,
+                padding,
+            } => {
+                let x_id = node.inputs[0];
+                let dy_id = node.inputs[1];
+                let x_shape = &graph.node(x_id).shape;
+                let dy_shape = &graph.node(dy_id).shape;
+                let mp_win = vec![node.id, x_id, dy_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let mp_fits = arena_span_bytes(&arena, &mp_win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &mp_win,
+                );
+                if !mp_fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let x_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    x_id,
+                    &mut base,
+                    &mut size,
+                );
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = MaxPool3dBwdParams {
+                    n: x_shape.dim(0).unwrap_static() as u32,
+                    c: x_shape.dim(1).unwrap_static() as u32,
+                    d: x_shape.dim(2).unwrap_static() as u32,
+                    h: x_shape.dim(3).unwrap_static() as u32,
+                    w: x_shape.dim(4).unwrap_static() as u32,
+                    d_out: dy_shape.dim(2).unwrap_static() as u32,
+                    h_out: dy_shape.dim(3).unwrap_static() as u32,
+                    w_out: dy_shape.dim(4).unwrap_static() as u32,
+                    kd: kernel_size[0] as u32,
+                    kh: kernel_size[1] as u32,
+                    kw: kernel_size[2] as u32,
+                    sd: stride[0] as u32,
+                    sh: stride[1] as u32,
+                    sw: stride[2] as u32,
+                    pd: padding[0] as u32,
+                    ph: padding[1] as u32,
+                    pw: padding[2] as u32,
+                    x_off,
+                    dy_off,
+                    dx_off: arena_local_off_f32(&arena, node.id, base),
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                    _pad3: 0,
+                };
+                schedule.push(Step::MaxPool3dBackward { params: p });
+                let sk = maxpool3d_backward_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<MaxPool3dBwdParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::Conv3dBackwardInput {
+                kernel_size: _,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let dy_id = node.inputs[0];
+                let w_id = node.inputs[1];
+                let dy_shape = &graph.node(dy_id).shape;
+                let w_shape = &graph.node(w_id).shape;
+                let dx_shape = &node.shape;
+                let win = vec![node.id, dy_id, w_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let w_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    w_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = Conv3dBwdInputParams {
+                    n: dx_shape.dim(0).unwrap_static() as u32,
+                    c_in: dx_shape.dim(1).unwrap_static() as u32,
+                    d: dx_shape.dim(2).unwrap_static() as u32,
+                    h: dx_shape.dim(3).unwrap_static() as u32,
+                    w: dx_shape.dim(4).unwrap_static() as u32,
+                    c_out: dy_shape.dim(1).unwrap_static() as u32,
+                    d_out: dy_shape.dim(2).unwrap_static() as u32,
+                    h_out: dy_shape.dim(3).unwrap_static() as u32,
+                    w_out: dy_shape.dim(4).unwrap_static() as u32,
+                    kd: w_shape.dim(2).unwrap_static() as u32,
+                    kh: w_shape.dim(3).unwrap_static() as u32,
+                    kw: w_shape.dim(4).unwrap_static() as u32,
+                    sd: stride[0] as u32,
+                    sh: stride[1] as u32,
+                    sw: stride[2] as u32,
+                    pd: padding[0] as u32,
+                    ph: padding[1] as u32,
+                    pw: padding[2] as u32,
+                    dd: dilation[0] as u32,
+                    dh: dilation[1] as u32,
+                    dw: dilation[2] as u32,
+                    groups: (*groups).max(1) as u32,
+                    dy_off,
+                    w_off,
+                    dx_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::Conv3dBackwardInput { params: p });
+                let sk = conv3d_backward_input_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<Conv3dBwdInputParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::Conv3dBackwardWeight {
+                kernel_size: _,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                let x_id = node.inputs[0];
+                let dy_id = node.inputs[1];
+                let x_shape = &graph.node(x_id).shape;
+                let dy_shape = &graph.node(dy_id).shape;
+                let dw_shape = &node.shape;
+                let win = vec![node.id, x_id, dy_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let x_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    x_id,
+                    &mut base,
+                    &mut size,
+                );
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = Conv3dBwdWeightParams {
+                    n: x_shape.dim(0).unwrap_static() as u32,
+                    c_in: x_shape.dim(1).unwrap_static() as u32,
+                    d: x_shape.dim(2).unwrap_static() as u32,
+                    h: x_shape.dim(3).unwrap_static() as u32,
+                    w: x_shape.dim(4).unwrap_static() as u32,
+                    c_out: dy_shape.dim(1).unwrap_static() as u32,
+                    d_out: dy_shape.dim(2).unwrap_static() as u32,
+                    h_out: dy_shape.dim(3).unwrap_static() as u32,
+                    w_out: dy_shape.dim(4).unwrap_static() as u32,
+                    kd: dw_shape.dim(2).unwrap_static() as u32,
+                    kh: dw_shape.dim(3).unwrap_static() as u32,
+                    kw: dw_shape.dim(4).unwrap_static() as u32,
+                    sd: stride[0] as u32,
+                    sh: stride[1] as u32,
+                    sw: stride[2] as u32,
+                    pd: padding[0] as u32,
+                    ph: padding[1] as u32,
+                    pw: padding[2] as u32,
+                    dd: dilation[0] as u32,
+                    dh: dilation[1] as u32,
+                    dw: dilation[2] as u32,
+                    groups: (*groups).max(1) as u32,
+                    x_off,
+                    dy_off,
+                    dw_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::Conv3dBackwardWeight { params: p });
+                let sk = conv3d_backward_weight_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<Conv3dBwdWeightParams>());
                 let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
                 uniforms.push(u);
                 bind_groups.push(bg);
@@ -8121,6 +8377,43 @@ pub(crate) fn compile_static_inner(
                         zp_byte_off: arena.offset(zp_id) as u64,
                         out_byte_off: arena.offset(node.id) as u64,
                     });
+                } else if let Some((kind, bits, group_size)) = scheme.mlx_gpu_launch() {
+                    let scale_id = node.inputs[2];
+                    let zp_id = node.inputs[3];
+                    if rlx_gpu_host::mlx_dequant_gpu_disabled() {
+                        schedule.push(Step::DequantMatmulMlxHost {
+                            m,
+                            k,
+                            n,
+                            scheme: *scheme,
+                            x_byte_off: arena.offset(x_id) as u64,
+                            w_byte_off: arena.offset(w_id) as u64,
+                            scale_byte_off: arena.offset(scale_id) as u64,
+                            zp_byte_off: arena.offset(zp_id) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
+                        });
+                    } else {
+                        let p = DequantMatmulMlxParams {
+                            m,
+                            k,
+                            n,
+                            kind,
+                            bits,
+                            group_size,
+                            x_byte_off: arena.offset(x_id) as u32,
+                            w_byte_off: arena.offset(w_id) as u32,
+                            scale_byte_off: arena.offset(scale_id) as u32,
+                            zp_byte_off: arena.offset(zp_id) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            _pad: 0,
+                        };
+                        schedule.push(Step::DequantMatmulMlx { params: p });
+                        let dk = dequant_matmul_mlx_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<DequantMatmulMlxParams>());
+                        let bg = bind_op_output_window(&dev.device, dk, &arena, node.id, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    }
                 } else {
                     let (block_size, scheme_id) = match scheme {
                         QuantScheme::Int8Block { block_size } => (*block_size, 0u32),

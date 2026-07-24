@@ -50,7 +50,9 @@ pub fn resolve_store_ranges(path: impl AsRef<Path>) -> Result<BTreeMap<String, M
         zip::ZipArchive::new(file).with_context(|| format!("zip {}", path.display()))?;
     let mut out = BTreeMap::new();
     for i in 0..archive.len() {
-        let mut zf = archive.by_index(i).with_context(|| format!("zip index {i}"))?;
+        let mut zf = archive
+            .by_index(i)
+            .with_context(|| format!("zip index {i}"))?;
         let name = zf.name().to_string();
         if zf.compression() != zip::CompressionMethod::Stored {
             bail!("member {name} is not STORE; mmap requires uncompressed payloads");

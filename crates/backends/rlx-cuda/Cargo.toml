@@ -13,14 +13,14 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.13" }
-rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.13" }
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
-rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.13" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", features = ["splat"] }
+rlx-gpu-kernels = { path = "../rlx-gpu-kernels", version = "0.2.14" }
+rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.14" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.14" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14" }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", features = ["splat"] }
 # IQ-family grid LUTs staged into a device buffer by `iq_grid.rs`.
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
 # Runtime dlopen of a pip/conda-installed cuDNN (see `device.rs::preload_real_cudnn`).
 libloading = "0.8"
 

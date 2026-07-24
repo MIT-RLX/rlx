@@ -38,6 +38,7 @@
 //! # anyhow::Ok(())
 //! ```
 
+mod arch;
 mod archive;
 mod config;
 mod dtype;
@@ -52,6 +53,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+pub use arch::{build_nemo_probe_graph, nemo_arch_summary};
 pub use config::NemoConfig;
 pub use dtype::DType;
 pub use pickle::TensorMeta;

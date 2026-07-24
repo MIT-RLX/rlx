@@ -237,10 +237,11 @@ pub fn gguf_matmul_bt_cached(
     k: usize,
     n: usize,
     scheme: QuantScheme,
+    w_off: usize,
 ) {
     assert_eq!(x.len(), m * k);
     assert_eq!(out.len(), m * n);
-    let w_f32 = crate::dequant_cache::gguf_weight_f32(0, w_bytes, k, n, scheme);
+    let w_f32 = crate::dequant_cache::gguf_weight_f32(w_off, w_bytes, k, n, scheme);
     if m == 1 {
         out.fill(0.0);
         crate::blas::sgemv_nn(w_f32.as_ref(), x, out, n, k, 1.0, 0.0);
@@ -258,6 +259,7 @@ pub fn gguf_matmul_bt_cached(
     k: usize,
     n: usize,
     scheme: QuantScheme,
+    _w_off: usize,
 ) {
     gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
 }
@@ -272,8 +274,22 @@ pub fn gguf_matmul_bt_dispatch(
     n: usize,
     scheme: QuantScheme,
 ) {
+    gguf_matmul_bt_dispatch_at(x, w_bytes, out, m, k, n, scheme, 0);
+}
+
+/// Like [`gguf_matmul_bt_dispatch`] but keys the dequant cache by arena `w_off`.
+pub fn gguf_matmul_bt_dispatch_at(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+    w_off: usize,
+) {
     if prefer_cached_blas(k, n, m) {
-        gguf_matmul_bt_cached(x, w_bytes, out, m, k, n, scheme);
+        gguf_matmul_bt_cached(x, w_bytes, out, m, k, n, scheme, w_off);
     } else {
         gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
     }
@@ -545,7 +561,7 @@ mod tests {
         let mut legacy = vec![0f32; m * n];
         let mut cached = vec![0f32; m * n];
         gguf_matmul_bt(&x, &packed, &mut legacy, m, k, n, QuantScheme::GgufQ4K);
-        gguf_matmul_bt_cached(&x, &packed, &mut cached, m, k, n, QuantScheme::GgufQ4K);
+        gguf_matmul_bt_cached(&x, &packed, &mut cached, m, k, n, QuantScheme::GgufQ4K, 0);
         for i in 0..legacy.len() {
             assert!(
                 (legacy[i] - cached[i]).abs() < 5e-3,

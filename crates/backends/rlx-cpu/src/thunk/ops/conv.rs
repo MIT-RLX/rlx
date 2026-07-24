@@ -116,6 +116,34 @@ pub(crate) fn compile_resize_nearest2x(
 }
 
 #[allow(unused_variables)]
+pub(crate) fn compile_interpolate3d(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::Interpolate3d { size } = &node.op else {
+        unreachable!()
+    };
+    let in_shape = &graph.node(node.inputs[0]).shape;
+    let _ = &node.shape;
+    Thunk::Interpolate3d {
+        src: node_offset(arena, node.inputs[0]),
+        dst: node_offset(arena, node.id),
+        n: in_shape.dim(0).unwrap_static() as u32,
+        c: in_shape.dim(1).unwrap_static() as u32,
+        d_in: in_shape.dim(2).unwrap_static() as u32,
+        h_in: in_shape.dim(3).unwrap_static() as u32,
+        w_in: in_shape.dim(4).unwrap_static() as u32,
+        d_out: size[0] as u32,
+        h_out: size[1] as u32,
+        w_out: size[2] as u32,
+    }
+}
+
+#[allow(unused_variables)]
 pub(crate) fn compile_conv(
     node: &rlx_ir::Node,
     graph: &Graph,
@@ -584,6 +612,146 @@ pub(crate) fn compile_conv2d_backward_weight(
     }
 }
 
+pub(crate) fn compile_max_pool3d_backward(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    _matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    _rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    _rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::MaxPool3dBackward {
+        kernel_size,
+        stride,
+        padding,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let x_shape = &graph.node(node.inputs[0]).shape;
+    let dy_shape = &graph.node(node.inputs[1]).shape;
+    Thunk::MaxPool3dBackward {
+        x: node_offset(arena, node.inputs[0]),
+        dy: node_offset(arena, node.inputs[1]),
+        dx: node_offset(arena, node.id),
+        n: x_shape.dim(0).unwrap_static() as u32,
+        c: x_shape.dim(1).unwrap_static() as u32,
+        d: x_shape.dim(2).unwrap_static() as u32,
+        h: x_shape.dim(3).unwrap_static() as u32,
+        w: x_shape.dim(4).unwrap_static() as u32,
+        d_out: dy_shape.dim(2).unwrap_static() as u32,
+        h_out: dy_shape.dim(3).unwrap_static() as u32,
+        w_out: dy_shape.dim(4).unwrap_static() as u32,
+        kd: kernel_size[0] as u32,
+        kh: kernel_size[1] as u32,
+        kw: kernel_size[2] as u32,
+        sd: stride[0] as u32,
+        sh: stride[1] as u32,
+        sw: stride[2] as u32,
+        pd: padding[0] as u32,
+        ph: padding[1] as u32,
+        pw: padding[2] as u32,
+    }
+}
+
+pub(crate) fn compile_conv3d_backward_input(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    _matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    _rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    _rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::Conv3dBackwardInput {
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let dy_shape = &graph.node(node.inputs[0]).shape;
+    let out_shape = &node.shape;
+    Thunk::Conv3dBackwardInput {
+        dy: node_offset(arena, node.inputs[0]),
+        w: node_offset(arena, node.inputs[1]),
+        dx: node_offset(arena, node.id),
+        n: out_shape.dim(0).unwrap_static() as u32,
+        c_in: out_shape.dim(1).unwrap_static() as u32,
+        d: out_shape.dim(2).unwrap_static() as u32,
+        h: out_shape.dim(3).unwrap_static() as u32,
+        w_in: out_shape.dim(4).unwrap_static() as u32,
+        c_out: dy_shape.dim(1).unwrap_static() as u32,
+        d_out: dy_shape.dim(2).unwrap_static() as u32,
+        h_out: dy_shape.dim(3).unwrap_static() as u32,
+        w_out: dy_shape.dim(4).unwrap_static() as u32,
+        kd: kernel_size[0] as u32,
+        kh: kernel_size[1] as u32,
+        kw: kernel_size[2] as u32,
+        sd: stride[0] as u32,
+        sh: stride[1] as u32,
+        sw: stride[2] as u32,
+        pd: padding[0] as u32,
+        ph: padding[1] as u32,
+        pw: padding[2] as u32,
+        dd: dilation[0] as u32,
+        dh: dilation[1] as u32,
+        dw: dilation[2] as u32,
+        groups: *groups as u32,
+    }
+}
+
+pub(crate) fn compile_conv3d_backward_weight(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    _matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    _rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    _rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::Conv3dBackwardWeight {
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let x_shape = &graph.node(node.inputs[0]).shape;
+    let dy_shape = &graph.node(node.inputs[1]).shape;
+    Thunk::Conv3dBackwardWeight {
+        x: node_offset(arena, node.inputs[0]),
+        dy: node_offset(arena, node.inputs[1]),
+        dw: node_offset(arena, node.id),
+        n: x_shape.dim(0).unwrap_static() as u32,
+        c_in: x_shape.dim(1).unwrap_static() as u32,
+        d: x_shape.dim(2).unwrap_static() as u32,
+        h: x_shape.dim(3).unwrap_static() as u32,
+        w: x_shape.dim(4).unwrap_static() as u32,
+        c_out: dy_shape.dim(1).unwrap_static() as u32,
+        d_out: dy_shape.dim(2).unwrap_static() as u32,
+        h_out: dy_shape.dim(3).unwrap_static() as u32,
+        w_out: dy_shape.dim(4).unwrap_static() as u32,
+        kd: kernel_size[0] as u32,
+        kh: kernel_size[1] as u32,
+        kw: kernel_size[2] as u32,
+        sd: stride[0] as u32,
+        sh: stride[1] as u32,
+        sw: stride[2] as u32,
+        pd: padding[0] as u32,
+        ph: padding[1] as u32,
+        pw: padding[2] as u32,
+        dd: dilation[0] as u32,
+        dh: dilation[1] as u32,
+        dw_dil: dilation[2] as u32,
+        groups: *groups as u32,
+    }
+}
+
 #[allow(unused_variables)]
 pub(crate) fn compile_im2_col(
     node: &rlx_ir::Node,
@@ -694,7 +862,7 @@ pub(crate) fn exec_conv_transpose2d(t: &Thunk, base: *mut u8) {
         let h_out = *h_out as usize;
         let w_out = *w_out as usize;
         let groups = *groups as usize;
-        let c_out_per_g = if groups == 0 { c_out } else { c_out / groups };
+        let c_out_per_g = c_out.checked_div(groups).unwrap_or(c_out);
         unsafe {
             let inp = sl(*src, base, n * c_in * h * w_in);
             let wt = sl(
@@ -983,6 +1151,44 @@ pub(crate) fn exec_resize_nearest2x(t: &Thunk, base: *mut u8) {
 }
 
 #[inline(always)]
+pub(crate) fn exec_interpolate3d(t: &Thunk, base: *mut u8) {
+    let Thunk::Interpolate3d {
+        src,
+        dst,
+        n,
+        c,
+        d_in,
+        h_in,
+        w_in,
+        d_out,
+        h_out,
+        w_out,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (n, c, d_in, h_in, w_in, d_out, h_out, w_out) = (
+        *n as usize,
+        *c as usize,
+        *d_in as usize,
+        *h_in as usize,
+        *w_in as usize,
+        *d_out as usize,
+        *h_out as usize,
+        *w_out as usize,
+    );
+    let in_elems = n * c * d_in * h_in * w_in;
+    let out_elems = n * c * d_out * h_out * w_out;
+    unsafe {
+        let input = sl(*src, base, in_elems);
+        let output = sl_mut(*dst, base, out_elems);
+        crate::kernels::interpolate3d_ncdhw(
+            input, output, n, c, d_in, h_in, w_in, d_out, h_out, w_out,
+        );
+    }
+}
+
+#[inline(always)]
 pub(crate) fn exec_conv2_d1x1(t: &Thunk, base: *mut u8) {
     let Thunk::Conv2D1x1 {
         src,
@@ -1138,6 +1344,232 @@ pub(crate) fn exec_max_pool2d_backward(t: &Thunk, base: *mut u8) {
     unsafe {
         execute_maxpool2d_backward_f32(
             *x, *dy, *dx, *n, *c, *h, *w, *h_out, *w_out, *kh, *kw, *sh, *sw, *ph, *pw, base,
+        );
+    }
+}
+
+#[inline(always)]
+pub(crate) fn exec_max_pool3d_backward(t: &Thunk, base: *mut u8) {
+    let Thunk::MaxPool3dBackward {
+        x,
+        dy,
+        dx,
+        n,
+        c,
+        d,
+        h,
+        w,
+        d_out,
+        h_out,
+        w_out,
+        kd,
+        kh,
+        kw,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        let n = *n as usize;
+        let c = *c as usize;
+        let d = *d as usize;
+        let h = *h as usize;
+        let w = *w as usize;
+        let d_out = *d_out as usize;
+        let h_out = *h_out as usize;
+        let w_out = *w_out as usize;
+        let xs = sl(*x, base, n * c * d * h * w);
+        let dys = sl(*dy, base, n * c * d_out * h_out * w_out);
+        let dxs = sl_mut(*dx, base, n * c * d * h * w);
+        crate::conv3d_bwd::maxpool3d_backward_ncdhw(
+            xs,
+            dys,
+            dxs,
+            n,
+            c,
+            d,
+            h,
+            w,
+            d_out,
+            h_out,
+            w_out,
+            *kd as usize,
+            *kh as usize,
+            *kw as usize,
+            *sd as usize,
+            *sh as usize,
+            *sw as usize,
+            *pd as usize,
+            *ph as usize,
+            *pw as usize,
+        );
+    }
+}
+
+#[inline(always)]
+pub(crate) fn exec_conv3d_backward_input(t: &Thunk, base: *mut u8) {
+    let Thunk::Conv3dBackwardInput {
+        dy,
+        w,
+        dx,
+        n,
+        c_in,
+        d,
+        h,
+        w_in,
+        c_out,
+        d_out,
+        h_out,
+        w_out,
+        kd,
+        kh,
+        kw,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        groups,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        let n = *n as usize;
+        let c_in = *c_in as usize;
+        let c_out = *c_out as usize;
+        let d = *d as usize;
+        let h = *h as usize;
+        let w_in = *w_in as usize;
+        let d_out = *d_out as usize;
+        let h_out = *h_out as usize;
+        let w_out = *w_out as usize;
+        let groups = (*groups).max(1) as usize;
+        let c_in_per_g = c_in / groups;
+        let dys = sl(*dy, base, n * c_out * d_out * h_out * w_out);
+        let ws = sl(
+            *w,
+            base,
+            c_out * c_in_per_g * *kd as usize * *kh as usize * *kw as usize,
+        );
+        let dxs = sl_mut(*dx, base, n * c_in * d * h * w_in);
+        crate::conv3d_bwd::conv3d_backward_input_ncdhw(
+            dys,
+            ws,
+            dxs,
+            n,
+            c_in,
+            c_out,
+            d,
+            h,
+            w_in,
+            d_out,
+            h_out,
+            w_out,
+            *kd as usize,
+            *kh as usize,
+            *kw as usize,
+            *sd as usize,
+            *sh as usize,
+            *sw as usize,
+            *pd as usize,
+            *ph as usize,
+            *pw as usize,
+            *dd as usize,
+            *dh as usize,
+            *dw as usize,
+            groups,
+        );
+    }
+}
+
+#[inline(always)]
+pub(crate) fn exec_conv3d_backward_weight(t: &Thunk, base: *mut u8) {
+    let Thunk::Conv3dBackwardWeight {
+        x,
+        dy,
+        dw,
+        n,
+        c_in,
+        d,
+        h,
+        w,
+        c_out,
+        d_out,
+        h_out,
+        w_out,
+        kd,
+        kh,
+        kw,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw_dil,
+        groups,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        let n = *n as usize;
+        let c_in = *c_in as usize;
+        let c_out = *c_out as usize;
+        let d = *d as usize;
+        let h = *h as usize;
+        let w = *w as usize;
+        let d_out = *d_out as usize;
+        let h_out = *h_out as usize;
+        let w_out = *w_out as usize;
+        let groups = (*groups).max(1) as usize;
+        let c_in_per_g = c_in / groups;
+        let xs = sl(*x, base, n * c_in * d * h * w);
+        let dys = sl(*dy, base, n * c_out * d_out * h_out * w_out);
+        let dws = sl_mut(
+            *dw,
+            base,
+            c_out * c_in_per_g * *kd as usize * *kh as usize * *kw as usize,
+        );
+        crate::conv3d_bwd::conv3d_backward_weight_ncdhw(
+            xs,
+            dys,
+            dws,
+            n,
+            c_in,
+            c_out,
+            d,
+            h,
+            w,
+            d_out,
+            h_out,
+            w_out,
+            *kd as usize,
+            *kh as usize,
+            *kw as usize,
+            *sd as usize,
+            *sh as usize,
+            *sw as usize,
+            *pd as usize,
+            *ph as usize,
+            *pw as usize,
+            *dd as usize,
+            *dh as usize,
+            *dw_dil as usize,
+            groups,
         );
     }
 }

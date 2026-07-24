@@ -13,7 +13,7 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.13" }
+rlx-ir = { path = "../rlx-ir", version = "0.2.14" }
 half = "2"
 # Zero-config LAN discovery (Bonjour/Avahi-compatible mDNS-SD), opt-in: the
 # unicast rendezvous path needs no extra deps, so keep this off by default.

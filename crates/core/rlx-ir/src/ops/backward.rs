@@ -400,6 +400,94 @@ impl Graph {
         )
     }
 
+    /// 3D max-pool backward on NCDHW. Output shape matches `x`.
+    pub fn maxpool3d_backward(
+        &mut self,
+        x: NodeId,
+        dy: NodeId,
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+    ) -> NodeId {
+        let x_shape = self.shape(x).clone();
+        debug_assert_eq!(x_shape.rank(), 5, "maxpool3d_backward: NCDHW only");
+        debug_assert_eq!(kernel_size.len(), 3, "maxpool3d_backward: 3-D only");
+        debug_assert_eq!(stride.len(), 3);
+        debug_assert_eq!(padding.len(), 3);
+        self.push(
+            Op::MaxPool3dBackward {
+                kernel_size,
+                stride,
+                padding,
+            },
+            vec![x, dy],
+            x_shape,
+            None,
+        )
+    }
+
+    /// Conv3D backward w.r.t. input. Caller supplies original `x_shape`.
+    pub fn conv3d_backward_input(
+        &mut self,
+        dy: NodeId,
+        w: NodeId,
+        x_shape: Shape,
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        groups: usize,
+    ) -> NodeId {
+        debug_assert_eq!(x_shape.rank(), 5, "conv3d_backward_input: NCDHW only");
+        debug_assert_eq!(kernel_size.len(), 3);
+        debug_assert_eq!(stride.len(), 3);
+        debug_assert_eq!(padding.len(), 3);
+        debug_assert_eq!(dilation.len(), 3);
+        self.push(
+            Op::Conv3dBackwardInput {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            },
+            vec![dy, w],
+            x_shape,
+            None,
+        )
+    }
+
+    /// Conv3D backward w.r.t. weight. Output shape matches forward weight.
+    pub fn conv3d_backward_weight(
+        &mut self,
+        x: NodeId,
+        dy: NodeId,
+        w_shape: Shape,
+        kernel_size: Vec<usize>,
+        stride: Vec<usize>,
+        padding: Vec<usize>,
+        dilation: Vec<usize>,
+        groups: usize,
+    ) -> NodeId {
+        debug_assert_eq!(w_shape.rank(), 5, "conv3d_backward_weight: 5-D weight");
+        debug_assert_eq!(kernel_size.len(), 3);
+        debug_assert_eq!(stride.len(), 3);
+        debug_assert_eq!(padding.len(), 3);
+        debug_assert_eq!(dilation.len(), 3);
+        self.push(
+            Op::Conv3dBackwardWeight {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            },
+            vec![x, dy],
+            w_shape,
+            None,
+        )
+    }
+
     /// Fused softmax + cross-entropy against a dense target distribution
     /// (soft labels / one-hot probabilities). `logits [N, C]`,
     /// `targets [N, C]` → `[N]` per-row loss

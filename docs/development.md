@@ -16,11 +16,17 @@ just build          # workspace build
 just test           # cargo test (workspace; Darwin caps -j for shared GPU)
 just test-gpu       # Metal/MLX/wgpu/Vulkan (+ apple/cuda/rocm runtime) on host
 
-just lint           # clippy
+just lint           # clippy (-D warnings)
 just fmt            # rustfmt
-just ci             # build + tests + clippy + pyrlx pytest
+just fmt-check      # rustfmt --check
+just install-git-hooks  # pre-commit auto-fmt + clippy
+just ci             # build + tests + fmt-check + clippy + pyrlx pytest
 just throttle       # thermal gate before benchmarks
 ```
+
+Fmt/clippy are gated by git: `just install-git-hooks` installs a pre-commit
+hook (`scripts/git-hooks/pre-commit`) that runs `cargo fmt --all`, re-stages
+touched staged `.rs` files, then clippy; `just ci` runs `fmt-check` + `lint`.
 
 Before benchmarks: run `just throttle` or set `RLX_ALLOW_THROTTLE=1` for one-offs.
 Use `rlx_ir::Tick` for sub-ms timing in hot paths, not `Instant::now()`.

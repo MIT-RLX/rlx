@@ -29,7 +29,11 @@
 mod auto_tier;
 mod flat;
 mod from_bake;
+mod from_dduf;
 mod from_gguf;
+mod from_mlx;
+mod from_nemo;
+mod from_pt;
 mod manifest;
 mod package;
 mod placement;
@@ -45,16 +49,20 @@ mod remote;
 
 pub use auto_tier::{AutoTierOptions, apply_auto_tier};
 pub use flat::{
-    FLAT_CONTAINER_VERSION, FLAT_MAGIC, FLAG_BINCODE_TOC, FLAG_HYBRID, FlatHeader, FlatToc,
+    FLAG_BINCODE_TOC, FLAG_HYBRID, FLAT_CONTAINER_VERSION, FLAT_MAGIC, FlatHeader, FlatToc,
     is_flat_magic,
 };
 pub use from_bake::{BakeWeight, package_from_bake};
+pub use from_dduf::{DdufImportOptions, dduf_to_rlxp};
 pub use from_gguf::{GgufImportOptions, gguf_to_rlxp};
+pub use from_mlx::{MlxImportOptions, mlx_to_rlxp};
+pub use from_nemo::{NemoImportOptions, nemo_to_rlxp};
+pub use from_pt::{PtImportOptions, pt_to_rlxp};
 pub use manifest::{
-    COMPAT_VERSION, FORMAT_NAME, FORMAT_VERSION, DistRef, GraphRef, Manifest, SidecarRef,
+    COMPAT_VERSION, DistRef, FORMAT_NAME, FORMAT_VERSION, GraphRef, Manifest, SidecarRef,
     WeightsRef,
 };
-pub use package::{MaterializeMode, MemberSource, Package};
+pub use package::{MaterializeMode, MemberSource, Package, dtype_for_weight_scheme};
 pub use placement::{ExpertPlacement, Placement, TensorShard};
 pub use seals::{SEAL_MAGIC, is_sealed, seal_bytes, unseal_bytes};
 pub use tier::{

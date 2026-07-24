@@ -413,6 +413,7 @@ impl CastScalar {
 /// Silicon's unified memory lets the GPU arena pointer be handed straight to
 /// this host kernel, so every `Op::Cast` dtype pair converts with identical
 /// numeric semantics on CPU and Metal — hence `pub`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // arena `base`; Metal/CPU share this host kernel
 pub fn exec_cast_generic(
     src: usize,
     dst: usize,

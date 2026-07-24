@@ -109,7 +109,7 @@ pub fn public_entries() -> impl Iterator<Item = &'static EnvVarEntry> {
 pub fn lookup(name: &str) -> Option<&'static EnvVarEntry> {
     REGISTRY
         .iter()
-        .find(|e| e.name == name || e.aliases.iter().any(|a| *a == name))
+        .find(|e| e.name == name || e.aliases.contains(&name))
         .or_else(|| {
             // Deprecated rows are looked up by their own `name`.
             REGISTRY
@@ -135,8 +135,7 @@ fn maybe_warn_deprecated(used: &str, entry: &EnvVarEntry) {
     if used == entry.name {
         return;
     }
-    if !matches!(entry.stability, EnvStability::Deprecated { .. })
-        && !entry.aliases.iter().any(|a| *a == used)
+    if !matches!(entry.stability, EnvStability::Deprecated { .. }) && !entry.aliases.contains(&used)
     {
         return;
     }

@@ -20,7 +20,7 @@ use std::time::Instant;
 // the conv1 `*1` in-channels factor (grayscale MNIST) is kept for that parity.
 #[allow(clippy::identity_op)]
 const PARAMS: &[(&str, usize)] = &[
-    ("conv1_w", 8 * 1 * 3 * 3),
+    ("conv1_w", 8 * 3 * 3),
     ("conv1_b", 8),
     ("conv2_w", 16 * 8 * 3 * 3),
     ("conv2_b", 16),

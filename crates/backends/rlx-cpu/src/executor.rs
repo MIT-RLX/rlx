@@ -1019,7 +1019,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
             // `cast_to` is currently advisory: rlx-cpu always operates in
             // f32, so backends that distinguish dtypes apply the cast; the
             // CPU executor stores the f32 result regardless.
-            Op::FusedSwiGLU { cast_to: _, .. } => {
+            Op::FusedSwiGLU { .. } => {
                 let input = get_data(arena, external, node.inputs[0]);
                 let output = get_output(arena, node_id);
                 // n = last-dim half (read from the node's own shape, NOT

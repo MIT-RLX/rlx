@@ -83,7 +83,7 @@ fn assert_native_thunk(g: &Graph, want: &str) {
         "expected native {want}, got HostOp; schedule={names:?}"
     );
     assert!(
-        names.iter().any(|n| *n == want),
+        names.contains(&want),
         "expected thunk `{want}` in schedule, got {names:?}"
     );
 }

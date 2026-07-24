@@ -50,8 +50,8 @@ var<workgroup> tile_b: array<array<f32, 64>, 32>;
 
 fn apply_act(v_in: f32) -> f32 {
     var v = v_in;
-    if (params.act_id == 0xFFFFu) { return v; }
     switch (params.act_id) {
+        case 0xFFFFu: {}
         case 0u: { v = max(v, 0.0); }
         case 1u: { v = 1.0 / (1.0 + exp(-clamp(v, -88.0, 88.0))); }
         case 2u: { v = tanh(clamp(v, -15.0, 15.0)); }
@@ -78,17 +78,19 @@ fn matmul_wide_nv(
     @builtin(local_invocation_id)    lid: vec3<u32>,
     @builtin(workgroup_id)           wid: vec3<u32>,
 ) {
+    // No early return before workgroupBarrier — FXC X4026 on DX12.
     let bz = wid.z;
-    if (bz >= params.batch) { return; }
+    let in_batch = bz < params.batch;
+    let bz_safe = select(0u, bz, in_batch);
 
     let lr = lid.y;
     let lc = lid.x;
     let row_base = wid.y * TILE_M + lr * RM;
     let col_base = wid.x * TILE_N + lc * RN;
 
-    let a_base = params.a_off + bz * params.a_batch_stride;
-    let b_base = params.b_off + bz * params.b_batch_stride;
-    let c_base = params.c_off + bz * params.c_batch_stride;
+    let a_base = params.a_off + bz_safe * params.a_batch_stride;
+    let b_base = params.b_off + bz_safe * params.b_batch_stride;
+    let c_base = params.c_off + bz_safe * params.c_batch_stride;
 
     var acc: array<array<f32, 4>, 4>;
     for (var i: u32 = 0u; i < RM; i = i + 1u) {
@@ -107,7 +109,7 @@ fn matmul_wide_nv(
             for (var j: u32 = 0u; j < 2u; j = j + 1u) {
                 let k_local = lc * 2u + j;
                 let global_k = k0 + k_local;
-                if (global_row < params.m && global_k < params.k) {
+                if (in_batch && global_row < params.m && global_k < params.k) {
                     tile_a[m_local][k_local] = arena[a_base + global_row * params.k + global_k];
                 } else {
                     tile_a[m_local][k_local] = 0.0;
@@ -120,7 +122,7 @@ fn matmul_wide_nv(
             for (var j: u32 = 0u; j < RN; j = j + 1u) {
                 let n_local = lc * RN + j;
                 let global_col = wid.x * TILE_N + n_local;
-                if (global_k < params.k && global_col < params.n) {
+                if (in_batch && global_k < params.k && global_col < params.n) {
                     tile_b[k_local][n_local] = arena[b_base + global_k * params.n + global_col];
                 } else {
                     tile_b[k_local][n_local] = 0.0;
@@ -151,16 +153,18 @@ fn matmul_wide_nv(
 
     for (var i: u32 = 0u; i < RM; i = i + 1u) {
         let global_row = row_base + i;
-        if (global_row >= params.m) { continue; }
-        for (var j: u32 = 0u; j < RN; j = j + 1u) {
-            let global_col = col_base + j;
-            if (global_col >= params.n) { continue; }
-            var v = acc[i][j];
-            if (params.has_bias != 0u) {
-                v = v + arena[params.bias_off + global_col];
+        if (in_batch && global_row < params.m) {
+            for (var j: u32 = 0u; j < RN; j = j + 1u) {
+                let global_col = col_base + j;
+                if (global_col < params.n) {
+                    var v = acc[i][j];
+                    if (params.has_bias != 0u) {
+                        v = v + arena[params.bias_off + global_col];
+                    }
+                    v = apply_act(v);
+                    arena[c_base + global_row * params.n + global_col] = v;
+                }
             }
-            v = apply_act(v);
-            arena[c_base + global_row * params.n + global_col] = v;
         }
     }
 }

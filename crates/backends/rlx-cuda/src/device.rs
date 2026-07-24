@@ -24,6 +24,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use cudarc::cublas::CudaBlas;
 use cudarc::cublaslt::sys as cublaslt_sys;
@@ -196,6 +197,84 @@ pub fn cuda_dnn_handle() -> Option<cudnn_sys::cudnnHandle_t> {
             result.ok().flatten()
         })
         .map(|h| h as cudnn_sys::cudnnHandle_t)
+}
+
+const CONV3D_PATH_NONE: u8 = 0;
+const CONV3D_PATH_CUDNN: u8 = 1;
+const CONV3D_PATH_KERNEL: u8 = 2;
+static LAST_CONV3D_PATH: AtomicU8 = AtomicU8::new(CONV3D_PATH_NONE);
+
+/// Record which Conv3d dispatch path ran (for parity tests).
+pub(crate) fn record_conv3d_path(used_cudnn: bool) {
+    LAST_CONV3D_PATH.store(
+        if used_cudnn {
+            CONV3D_PATH_CUDNN
+        } else {
+            CONV3D_PATH_KERNEL
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Last `Step::Conv3d` path: `"cudnn"` or `"kernel"`.
+pub fn last_conv3d_path() -> Option<&'static str> {
+    match LAST_CONV3D_PATH.load(Ordering::Relaxed) {
+        CONV3D_PATH_CUDNN => Some("cudnn"),
+        CONV3D_PATH_KERNEL => Some("kernel"),
+        _ => None,
+    }
+}
+
+const CT3D_PATH_NONE: u8 = 0;
+const CT3D_PATH_CUDNN: u8 = 1;
+const CT3D_PATH_KERNEL: u8 = 2;
+static LAST_CT3D_PATH: AtomicU8 = AtomicU8::new(CT3D_PATH_NONE);
+
+/// Record which ConvTranspose3d dispatch path ran (for parity tests).
+pub(crate) fn record_conv_transpose3d_path(used_cudnn: bool) {
+    LAST_CT3D_PATH.store(
+        if used_cudnn {
+            CT3D_PATH_CUDNN
+        } else {
+            CT3D_PATH_KERNEL
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Last `Step::ConvTranspose3d` path: `"cudnn"` or `"kernel"`.
+pub fn last_conv_transpose3d_path() -> Option<&'static str> {
+    match LAST_CT3D_PATH.load(Ordering::Relaxed) {
+        CT3D_PATH_CUDNN => Some("cudnn"),
+        CT3D_PATH_KERNEL => Some("kernel"),
+        _ => None,
+    }
+}
+
+const CONV3D_BWD_PATH_NONE: u8 = 0;
+const CONV3D_BWD_PATH_CUDNN: u8 = 1;
+const CONV3D_BWD_PATH_KERNEL: u8 = 2;
+static LAST_CONV3D_BWD_PATH: AtomicU8 = AtomicU8::new(CONV3D_BWD_PATH_NONE);
+
+/// Record which Conv3dBackward* dispatch path ran (for parity tests).
+pub(crate) fn record_conv3d_bwd_path(used_cudnn: bool) {
+    LAST_CONV3D_BWD_PATH.store(
+        if used_cudnn {
+            CONV3D_BWD_PATH_CUDNN
+        } else {
+            CONV3D_BWD_PATH_KERNEL
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Last `Step::Conv3dBackwardInput` / `Conv3dBackwardWeight` path.
+pub fn last_conv3d_bwd_path() -> Option<&'static str> {
+    match LAST_CONV3D_BWD_PATH.load(Ordering::Relaxed) {
+        CONV3D_BWD_PATH_CUDNN => Some("cudnn"),
+        CONV3D_BWD_PATH_KERNEL => Some("kernel"),
+        _ => None,
+    }
 }
 
 pub const CUBLASLT_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;

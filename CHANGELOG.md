@@ -1538,7 +1538,8 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.13...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.14...HEAD
+[0.2.14]: https://github.com/MIT-RLX/rlx/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/MIT-RLX/rlx/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.12
 [0.2.11]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.11

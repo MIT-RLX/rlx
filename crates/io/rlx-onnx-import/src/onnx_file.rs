@@ -271,9 +271,7 @@ pub fn take_if_branches() -> HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)>
 /// Install `If`-branch subgraphs before [`crate::build_hir_from_parts`] /
 /// [`crate::build_hir_from_bundle`] when loading a pre-exported RLX graph dir
 /// (no live `prepare_onnx_file` call on this thread).
-pub fn install_if_branches(
-    branches: HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)>,
-) {
+pub fn install_if_branches(branches: HashMap<String, (Vec<BundleNode>, Vec<BundleNode>)>) {
     IF_BRANCHES.with(|c| *c.borrow_mut() = branches);
 }
 

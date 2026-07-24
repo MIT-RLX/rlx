@@ -1232,7 +1232,7 @@ fn codec_context_dw() {
             "convGeluConv_dW",
             &bwd,
             &[
-                ("x", seeded(b * 1 * 256 * 256, 3)),
+                ("x", seeded(b * 256 * 256, 3)),
                 ("w1", seeded(64 * 25, 4)),
                 ("w2", seeded(12 * 64 * 25, 5)),
             ],

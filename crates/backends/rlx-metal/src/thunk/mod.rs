@@ -1196,6 +1196,18 @@ pub enum Thunk {
         k: u32,
         n: u32,
     },
+    /// MLX affine / mxfp — host dequant on unified memory (via `rlx-mlx-io`).
+    DequantMatMulMlx {
+        x: usize,
+        w_q: usize,
+        scale: usize,
+        zp: usize,
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+    },
     /// Fused decode-layer MLP: gate_proj + up_proj packed GEMVs + SwiGLU
     /// (`dst[i] = up[i] * silu(gate[i])`). m == 1 only. Pattern-merged from
     /// `gate(DequantMatMul) → up(DequantMatMul) → silu → mul` by
@@ -1450,6 +1462,85 @@ pub enum Thunk {
         sw: u32,
         ph: u32,
         pw: u32,
+        dh: u32,
+        dw_dil: u32,
+        groups: u32,
+    },
+    /// [`Op::MaxPool3dBackward`] — native MSL gather (F32, NCDHW).
+    MaxPool3dBackward {
+        x: usize,
+        dy: usize,
+        dx: usize,
+        n: u32,
+        c: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+    },
+    /// [`Op::Conv3dBackwardInput`] — native MSL gather (F32, NCDHW).
+    Conv3dBackwardInput {
+        dy: usize,
+        w: usize,
+        dx: usize,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w_in: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
+        dh: u32,
+        dw: u32,
+        groups: u32,
+    },
+    /// [`Op::Conv3dBackwardWeight`] — native MSL direct correlation (F32).
+    Conv3dBackwardWeight {
+        x: usize,
+        dy: usize,
+        dw: usize,
+        n: u32,
+        c_in: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        c_out: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
+        ph: u32,
+        pw: u32,
+        dd: u32,
         dh: u32,
         dw_dil: u32,
         groups: u32,
@@ -1786,6 +1877,9 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::MaxPool2dBackward { .. } => "maxpool2d_backward",
         Thunk::Conv2dBackwardInput { .. } => "conv2d_backward_input",
         Thunk::Conv2dBackwardWeight { .. } => "conv2d_backward_weight",
+        Thunk::MaxPool3dBackward { .. } => "maxpool3d_backward",
+        Thunk::Conv3dBackwardInput { .. } => "conv3d_backward_input",
+        Thunk::Conv3dBackwardWeight { .. } => "conv3d_backward_weight",
         Thunk::Rope { .. } => "rope",
         Thunk::Softmax { .. } => "softmax",
         Thunk::SoftmaxCrossEntropyDense { .. } => "softmax_cross_entropy_dense",
@@ -1849,6 +1943,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::DequantMatMulInt4 { .. } => "dequant_matmul_int4",
         Thunk::DequantMatMulFp8 { .. } => "dequant_matmul_fp8",
         Thunk::DequantMatMulNvfp4 { .. } => "dequant_matmul_nvfp4",
+        Thunk::DequantMatMulMlx { .. } => "dequant_matmul_mlx",
         Thunk::FusedMlpGateUpSwiGLU { .. } => "fused_mlp_gate_up_swiglu",
         Thunk::FusedMlpGateUpGelu { .. } => "fused_mlp_gate_up_gelu",
         Thunk::FusedMlpDownResidual { .. } => "fused_mlp_down_residual",
@@ -1935,7 +2030,10 @@ impl Thunk {
             | Thunk::GatherBackward { .. }
             | Thunk::MaxPool2dBackward { .. }
             | Thunk::Conv2dBackwardInput { .. }
-            | Thunk::Conv2dBackwardWeight { .. } => true,
+            | Thunk::Conv2dBackwardWeight { .. }
+            | Thunk::MaxPool3dBackward { .. }
+            | Thunk::Conv3dBackwardInput { .. }
+            | Thunk::Conv3dBackwardWeight { .. } => true,
             Thunk::Rope { .. } => true,
             // Decode seq=1 GDN / fused GGUF matmul: host paths use full
             // `batch`/`m` from the thunk (not seq-axis scale); marking
@@ -1955,6 +2053,7 @@ impl Thunk {
             | Thunk::DequantMatMulInt4 { .. }
             | Thunk::DequantMatMulFp8 { .. }
             | Thunk::DequantMatMulNvfp4 { .. }
+            | Thunk::DequantMatMulMlx { .. }
             | Thunk::FusedMlpGateUpSwiGLU { .. }
             | Thunk::FusedMlpGateUpGelu { .. }
             | Thunk::FusedMlpDownResidual { .. } => true,
@@ -4325,6 +4424,9 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::MaxPool2dBackward { x, dy, .. } => vec![*x, *dy],
         Thunk::Conv2dBackwardInput { dy, w, .. } => vec![*dy, *w],
         Thunk::Conv2dBackwardWeight { x, dy, .. } => vec![*x, *dy],
+        Thunk::MaxPool3dBackward { x, dy, .. } => vec![*x, *dy],
+        Thunk::Conv3dBackwardInput { dy, w, .. } => vec![*dy, *w],
+        Thunk::Conv3dBackwardWeight { x, dy, .. } => vec![*x, *dy],
         Thunk::FusedSwiGLU { src, .. } => vec![*src],
         Thunk::FusedMlpGateUpSwiGLU {
             x, gate_w, up_w, ..

@@ -7,9 +7,9 @@
 
 //! Placement helpers for `.rlxp` packages.
 
-use rlx_pkg::{Package, Placement, TensorShard, WriteOptions, package_from_bake, BakeWeight};
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
+use rlx_pkg::{BakeWeight, Package, Placement, TensorShard, WriteOptions, package_from_bake};
 use rlx_runtime::pkg::{tensors_for_rank, weight_names_for_rank};
 use std::collections::BTreeMap;
 

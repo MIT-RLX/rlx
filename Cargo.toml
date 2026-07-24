@@ -59,6 +59,8 @@ members = [
     "crates/io/rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
     "crates/io/rlx-bake",        # Offline weight bake: graph + weights → optimized *.rlx
     "crates/io/rlx-pkg",         # RLX package format (.rlxp): ZIP64/dir, mmap weights, sidecars, dist
+    "crates/io/rlx-mlx-io",      # MLX weight layouts: mlx-community dirs, .npz/.npy, affine/mxfp dequant
+    "crates/io/rlx-dduf",        # HuggingFace DDUF (.dduf) ZIP of nested safetensors + JSON
     "crates/io/rlx-nemo",        # NVIDIA NeMo `.nemo` loader (tar + torch.save ckpt + YAML)
     "crates/backends/rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
     "crates/backends/rlx-gpu-host",    # Shared host-fallback (D2H→CPU→H2D) staging for rlx-cuda + rlx-rocm
@@ -142,7 +144,7 @@ incremental = false
 # Add them as crates reach individual readiness.
 
 [workspace.package]
-version       = "0.2.13"
+version       = "0.2.14"
 edition       = "2024"
 rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
 license       = "GPL-3.0-only"

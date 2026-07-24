@@ -34,16 +34,17 @@ use crate::kernels::{
     batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_kernel,
     compare_kernel, concat_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel,
     conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
-    elementwise_region_kernel, expand_kernel, fake_quantize_backward_kernel,
-    fake_quantize_ema_kernel, fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel,
-    fake_quantize_lsq_bwd_x_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
-    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
-    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
-    gather_backward_kernel, gather_kernel, group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel,
-    group_norm_bwd_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
-    im2col_kernel, layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel, dispatch_grid_1d,
+    dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
+    fake_quantize_backward_kernel, fake_quantize_ema_kernel, fake_quantize_fixed_kernel,
+    fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
+    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, fused_attn_kernel,
+    fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
+    fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
+    gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
+    group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
+    group_norm_kernel, grouped_matmul_kernel, gru_kernel, im2col_kernel,
+    layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, mamba2_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel,
     maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
     quantize_i8_kernel, reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
@@ -95,6 +96,8 @@ pub(crate) fn schedule_needs_dnn(schedule: &[Step]) -> bool {
                 | Step::ConvTranspose3d { .. }
                 | Step::Conv2dBackwardInput { .. }
                 | Step::Conv2dBackwardWeight { .. }
+                | Step::Conv3dBackwardInput { .. }
+                | Step::Conv3dBackwardWeight { .. }
         )
     })
 }
@@ -1396,6 +1399,296 @@ pub(crate) unsafe fn cudnn_conv3d_forward(
     result
 }
 
+/// cuDNN backward-data 3-D convolution (NCDHW). Same nd-descriptor setup as
+/// [`cudnn_conv3d_forward`]; used for `Conv3dBackwardInput` and for forward
+/// `ConvTranspose3d` (transpose ≡ bwd-data with channel remap).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cudnn_conv3d_backward_data(
+    handle: cudnn_sys::cudnnHandle_t,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    arena_dev_ptr: u64,
+    n: u32,
+    c_in: u32,
+    c_out: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+    dy_off_f32: u32,
+    w_off_f32: u32,
+    dx_off_f32: u32,
+) -> Result<(), cudnn_result::CudnnError> {
+    use core::ffi::c_void;
+
+    let dt = cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT;
+    let fmt = cudnn_sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW;
+
+    let dx_desc = cudnn_result::create_tensor_descriptor()?;
+    let dy_desc = cudnn_result::create_tensor_descriptor()?;
+    let conv_desc = cudnn_result::create_convolution_descriptor()?;
+    let w_desc = unsafe {
+        let mut u = std::mem::MaybeUninit::uninit();
+        cudnn_sys::cudnnCreateFilterDescriptor(u.as_mut_ptr()).result()?;
+        u.assume_init()
+    };
+
+    let dx_dims: [i32; 5] = [n as i32, c_in as i32, d as i32, h as i32, w as i32];
+    let dx_strides: [i32; 5] = [
+        (c_in * d * h * w) as i32,
+        (d * h * w) as i32,
+        (h * w) as i32,
+        w as i32,
+        1,
+    ];
+    let dy_dims: [i32; 5] = [
+        n as i32,
+        c_out as i32,
+        d_out as i32,
+        h_out as i32,
+        w_out as i32,
+    ];
+    let dy_strides: [i32; 5] = [
+        (c_out * d_out * h_out * w_out) as i32,
+        (d_out * h_out * w_out) as i32,
+        (h_out * w_out) as i32,
+        w_out as i32,
+        1,
+    ];
+    let f_dims: [i32; 5] = [
+        c_out as i32,
+        (c_in / groups.max(1)) as i32,
+        kd as i32,
+        kh as i32,
+        kw as i32,
+    ];
+    let pads: [i32; 3] = [pd as i32, ph as i32, pw as i32];
+    let strides: [i32; 3] = [sd as i32, sh as i32, sw as i32];
+    let dilations: [i32; 3] = [dd as i32, dh as i32, dw as i32];
+
+    let setup = unsafe {
+        cudnn_result::set_tensornd_descriptor(
+            dx_desc,
+            dt,
+            5,
+            dx_dims.as_ptr(),
+            dx_strides.as_ptr(),
+        )?;
+        cudnn_result::set_tensornd_descriptor(
+            dy_desc,
+            dt,
+            5,
+            dy_dims.as_ptr(),
+            dy_strides.as_ptr(),
+        )?;
+        cudnn_result::set_filternd_descriptor(w_desc, dt, fmt, 5, f_dims.as_ptr())?;
+        cudnn_result::set_convolutionnd_descriptor(
+            conv_desc,
+            3,
+            pads.as_ptr(),
+            strides.as_ptr(),
+            dilations.as_ptr(),
+            cudnn_sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+            dt,
+        )?;
+        if groups > 1 {
+            cudnn_sys::cudnnSetConvolutionGroupCount(conv_desc, groups as i32).result()?;
+        }
+        cudnn_sys::cudnnSetConvolutionMathType(conv_desc, conv_math_type()).result()?;
+        Ok::<(), cudnn_result::CudnnError>(())
+    };
+
+    let result = setup.and_then(|()| unsafe {
+        let algo =
+            pick_conv_bwd_data_algo(handle, w_desc, dy_desc, conv_desc, dx_desc, workspace_size)?;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let w_ptr = (arena_dev_ptr + (w_off_f32 as u64) * 4) as *const c_void;
+        let dy_ptr = (arena_dev_ptr + (dy_off_f32 as u64) * 4) as *const c_void;
+        let dx_ptr = (arena_dev_ptr + (dx_off_f32 as u64) * 4) as *mut c_void;
+        let workspace_ptr = workspace_dev_ptr as *mut c_void;
+        cudnn_result::convolution_backward_data(
+            handle,
+            &alpha as *const _ as *const c_void,
+            w_desc,
+            w_ptr,
+            dy_desc,
+            dy_ptr,
+            conv_desc,
+            algo,
+            workspace_ptr,
+            workspace_size,
+            &beta as *const _ as *const c_void,
+            dx_desc,
+            dx_ptr,
+        )
+    });
+
+    unsafe {
+        let _ = cudnn_result::destroy_convolution_descriptor(conv_desc);
+        let _ = cudnn_result::destroy_filter_descriptor(w_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(dy_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(dx_desc);
+    }
+    result
+}
+
+/// cuDNN backward-filter 3-D convolution (NCDHW): dw from x and dy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cudnn_conv3d_backward_filter(
+    handle: cudnn_sys::cudnnHandle_t,
+    workspace_dev_ptr: u64,
+    workspace_size: usize,
+    arena_dev_ptr: u64,
+    n: u32,
+    c_in: u32,
+    c_out: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    dd: u32,
+    dh: u32,
+    dw: u32,
+    groups: u32,
+    x_off_f32: u32,
+    dy_off_f32: u32,
+    dw_off_f32: u32,
+) -> Result<(), cudnn_result::CudnnError> {
+    use core::ffi::c_void;
+
+    let dt = cudnn_sys::cudnnDataType_t::CUDNN_DATA_FLOAT;
+    let fmt = cudnn_sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW;
+
+    let x_desc = cudnn_result::create_tensor_descriptor()?;
+    let dy_desc = cudnn_result::create_tensor_descriptor()?;
+    let conv_desc = cudnn_result::create_convolution_descriptor()?;
+    let dw_desc = unsafe {
+        let mut u = std::mem::MaybeUninit::uninit();
+        cudnn_sys::cudnnCreateFilterDescriptor(u.as_mut_ptr()).result()?;
+        u.assume_init()
+    };
+
+    let x_dims: [i32; 5] = [n as i32, c_in as i32, d as i32, h as i32, w as i32];
+    let x_strides: [i32; 5] = [
+        (c_in * d * h * w) as i32,
+        (d * h * w) as i32,
+        (h * w) as i32,
+        w as i32,
+        1,
+    ];
+    let dy_dims: [i32; 5] = [
+        n as i32,
+        c_out as i32,
+        d_out as i32,
+        h_out as i32,
+        w_out as i32,
+    ];
+    let dy_strides: [i32; 5] = [
+        (c_out * d_out * h_out * w_out) as i32,
+        (d_out * h_out * w_out) as i32,
+        (h_out * w_out) as i32,
+        w_out as i32,
+        1,
+    ];
+    let f_dims: [i32; 5] = [
+        c_out as i32,
+        (c_in / groups.max(1)) as i32,
+        kd as i32,
+        kh as i32,
+        kw as i32,
+    ];
+    let pads: [i32; 3] = [pd as i32, ph as i32, pw as i32];
+    let strides: [i32; 3] = [sd as i32, sh as i32, sw as i32];
+    let dilations: [i32; 3] = [dd as i32, dh as i32, dw as i32];
+
+    let setup = unsafe {
+        cudnn_result::set_tensornd_descriptor(x_desc, dt, 5, x_dims.as_ptr(), x_strides.as_ptr())?;
+        cudnn_result::set_tensornd_descriptor(
+            dy_desc,
+            dt,
+            5,
+            dy_dims.as_ptr(),
+            dy_strides.as_ptr(),
+        )?;
+        cudnn_result::set_filternd_descriptor(dw_desc, dt, fmt, 5, f_dims.as_ptr())?;
+        cudnn_result::set_convolutionnd_descriptor(
+            conv_desc,
+            3,
+            pads.as_ptr(),
+            strides.as_ptr(),
+            dilations.as_ptr(),
+            cudnn_sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+            dt,
+        )?;
+        if groups > 1 {
+            cudnn_sys::cudnnSetConvolutionGroupCount(conv_desc, groups as i32).result()?;
+        }
+        cudnn_sys::cudnnSetConvolutionMathType(conv_desc, conv_math_type()).result()?;
+        Ok::<(), cudnn_result::CudnnError>(())
+    };
+
+    let result = setup.and_then(|()| unsafe {
+        let algo =
+            pick_conv_bwd_filter_algo(handle, x_desc, dy_desc, conv_desc, dw_desc, workspace_size)?;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let x_ptr = (arena_dev_ptr + (x_off_f32 as u64) * 4) as *const c_void;
+        let dy_ptr = (arena_dev_ptr + (dy_off_f32 as u64) * 4) as *const c_void;
+        let dw_ptr = (arena_dev_ptr + (dw_off_f32 as u64) * 4) as *mut c_void;
+        let workspace_ptr = workspace_dev_ptr as *mut c_void;
+        cudnn_result::convolution_backward_filter(
+            handle,
+            &alpha as *const _ as *const c_void,
+            x_desc,
+            x_ptr,
+            dy_desc,
+            dy_ptr,
+            conv_desc,
+            algo,
+            workspace_ptr,
+            workspace_size,
+            &beta as *const _ as *const c_void,
+            dw_desc,
+            dw_ptr,
+        )
+    });
+
+    unsafe {
+        let _ = cudnn_result::destroy_convolution_descriptor(conv_desc);
+        let _ = cudnn_result::destroy_filter_descriptor(dw_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(dy_desc);
+        let _ = cudnn_result::destroy_tensor_descriptor(x_desc);
+    }
+    result
+}
+
 /// Per-`Op::FusedAttentionBlock` scratch: packed QKV `[B,S,3*inner]` followed
 /// by the attention output `[B,S,inner]`, both f32, 16-byte aligned per block.
 /// Returns the total scratch size in BYTES and a map from each surviving FAB
@@ -1891,6 +2184,7 @@ pub(crate) fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = scatter_add_zero_kernel(ctx);
     let _ = scatter_add_acc_kernel(ctx);
     let _ = dequant_matmul_kernel(ctx);
+    let _ = dequant_matmul_mlx_kernel(ctx);
     let _ = dequant_matmul_gguf_kernel(ctx);
     let _ = dequant_gguf_kernel(ctx);
     let _ = sample_kernel(ctx);

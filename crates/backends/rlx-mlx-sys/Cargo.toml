@@ -1,6 +1,6 @@
 [package]
 name = "rlx-mlx-sys"
-version                = "0.2.13"
+version                = "0.2.14"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Low-level MLX C++ build + C ABI shim for RLX (vendored mlx, NVRTC-free)."

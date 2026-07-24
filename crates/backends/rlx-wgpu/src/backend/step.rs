@@ -19,17 +19,17 @@ use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
     AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
     BinaryC64Params, BinaryParams, CastParams, ComplexCastParams, ComplexWirtingerParams,
-    Conv1dParams, Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams,
-    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
-    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
-    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
-    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
-    GroupedMatmulParams, GruParams, Im2Col2dParams, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, NarrowConcatParams, Pool1dParams,
-    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
-    RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams,
-    SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams,
-    WhereParams,
+    Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
+    CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
+    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
+    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams,
+    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
+    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupedMatmulParams, GruParams,
+    Im2Col2dParams, LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulQkvParams,
+    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
+    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams,
+    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
 
 use super::helpers::{MatmulCompute, MatmulQkvKind};
@@ -553,6 +553,22 @@ pub(crate) enum Step {
         zp_byte_off: u64,
         out_byte_off: u64,
     },
+    /// MLX affine / mxfp4 / mxfp8 on-device WGSL dequant-matmul.
+    DequantMatmulMlx {
+        params: DequantMatmulMlxParams,
+    },
+    /// MLX host fallback (`RLX_MLX_DEQUANT_GPU_DISABLE` or bisect).
+    DequantMatmulMlxHost {
+        m: u32,
+        k: u32,
+        n: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        zp_byte_off: u64,
+        out_byte_off: u64,
+    },
     /// NCHW Conv2d on the host (discrete Vulkan/DX12 wgpu).
     ///
     /// Kitten's vocoder is dominated by 1×L "2d" convs; the SPIR-V tiled/direct
@@ -794,6 +810,18 @@ pub(crate) enum Step {
     /// Native WGSL `Op::MaxPool2dBackward` (f32 element offsets in params).
     MaxPool2dBackward {
         params: MaxPool2dBwdParams,
+    },
+    /// Native WGSL `Op::MaxPool3dBackward` (f32 element offsets in params).
+    MaxPool3dBackward {
+        params: MaxPool3dBwdParams,
+    },
+    /// Native WGSL `Op::Conv3dBackwardInput` (f32 element offsets in params).
+    Conv3dBackwardInput {
+        params: Conv3dBwdInputParams,
+    },
+    /// Native WGSL `Op::Conv3dBackwardWeight` (f32 element offsets in params).
+    Conv3dBackwardWeight {
+        params: Conv3dBwdWeightParams,
     },
     Llada2GroupLimitedGate {
         sig_byte_off: u32,
@@ -1062,6 +1090,8 @@ impl Step {
             | Step::GatherSplit { .. }
             | Step::GroupedMatmul { .. }
             | Step::DequantMatmul { .. }
+            | Step::DequantMatmulMlx { .. }
+            | Step::DequantMatmulMlxHost { .. }
             | Step::DequantMatmulGguf { .. }
             | Step::DequantMatmulInt8Host { .. }
             | Step::Conv2dHost { .. }
@@ -1091,6 +1121,9 @@ impl Step {
             | Step::Pool2d { .. }
             | Step::Pool3d { .. }
             | Step::MaxPool2dBackward { .. }
+            | Step::MaxPool3dBackward { .. }
+            | Step::Conv3dBackwardInput { .. }
+            | Step::Conv3dBackwardWeight { .. }
             | Step::AxialRope2d { .. }
             | Step::FakeQuantizeFixed { .. }
             | Step::FakeQuantizePerBatch { .. }
@@ -1287,6 +1320,8 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::GruHost { .. } => "gru_host",
         Step::RnnHost { .. } => "rnn_host",
         Step::DequantMatmul { .. } => "dequant_matmul",
+        Step::DequantMatmulMlx { .. } => "dequant_matmul_mlx",
+        Step::DequantMatmulMlxHost { .. } => "dequant_matmul_mlx_host",
         Step::GatherSplit { .. } => "gather_split",
         Step::DequantMatmulGguf { .. } => "dequant_matmul_gguf",
         Step::DequantMatmulInt8Host { .. } => "dequant_matmul_int8_host",
@@ -1310,6 +1345,9 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::GroupNormBackwardGamma { .. } => "group_norm_backward_gamma",
         Step::GroupNormBackwardBeta { .. } => "group_norm_backward_beta",
         Step::MaxPool2dBackward { .. } => "maxpool2d_backward",
+        Step::MaxPool3dBackward { .. } => "maxpool3d_backward",
+        Step::Conv3dBackwardInput { .. } => "conv3d_backward_input",
+        Step::Conv3dBackwardWeight { .. } => "conv3d_backward_weight",
         Step::Llada2GroupLimitedGate { .. } => "llada2_group_limited_gate",
         Step::UmapKnn { .. } => "umap_knn",
         Step::WgpuGpuKernel { .. } => "wgpu_gpu_kernel",
@@ -1364,6 +1402,7 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
         Step::GatherSplit { .. }
         | Step::DequantMatmulGguf { .. }
         | Step::DequantMatmulInt8Host { .. }
+        | Step::DequantMatmulMlxHost { .. }
         | Step::Conv2dHost { .. }
         | Step::DequantGroupedMatmulGguf { .. }
         | Step::Lstm { .. }

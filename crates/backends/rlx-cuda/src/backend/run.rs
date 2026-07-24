@@ -19,6 +19,7 @@ use crate::arena::{Arena, plan_f32_uniform};
 use crate::device::{
     CUBLASLT_WORKSPACE_BYTES, CUDNN_WORKSPACE_BYTES, cuda_blas, cuda_blas_lt_handle,
     cuda_blas_lt_workspace, cuda_context, cuda_dnn_handle, cuda_dnn_workspace,
+    record_conv_transpose3d_path, record_conv3d_bwd_path, record_conv3d_path,
 };
 use crate::host_staging::F32HostSlot;
 use crate::kernels::{
@@ -30,8 +31,10 @@ use crate::kernels::{
     compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel, complex_norm_sq_kernel,
     concat_kernel, conjugate_c64_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
     conv_transpose3d_kernel, conv1d_kernel, conv2d_backward_input_kernel,
-    conv2d_backward_weight_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequantize_i8_kernel,
+    conv2d_backward_weight_kernel, conv2d_kernel, conv3d_backward_input_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_gemm_kernel,
+    dequant_matmul_mlx_gemv_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
     dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
     fake_quantize_backward_kernel, fake_quantize_ema_kernel, fake_quantize_fixed_kernel,
     fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
@@ -40,9 +43,10 @@ use crate::kernels::{
     fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
     gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
     group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm_bwd_gamma_kernel,
-    layer_norm_bwd_input_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
-    matmul_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel,
+    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
+    layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
+    layernorm_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel,
+    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel,
     pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
     reduce_kernel, relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
     rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
@@ -493,13 +497,13 @@ impl CudaExecutable {
                             *m,
                             *k,
                             *n,
-                            *lhs_byte_off as u64,
-                            *rhs_byte_off as u64,
-                            *lhs_scale_byte_off as u64,
-                            *rhs_scale_byte_off as u64,
-                            *out_byte_off as u64,
+                            *lhs_byte_off,
+                            *rhs_byte_off,
+                            *lhs_scale_byte_off,
+                            *rhs_scale_byte_off,
+                            *out_byte_off,
                             *has_bias != 0,
-                            *bias_byte_off as u64,
+                            *bias_byte_off,
                             *lhs_e5m2 != 0,
                             *rhs_e5m2 != 0,
                             cu_stream,
@@ -2529,6 +2533,94 @@ impl CudaExecutable {
                             .expect("rlx-cuda: dequant_matmul launch failed");
                     }
                 }
+                Step::DequantMatmulMlx {
+                    m,
+                    k,
+                    n,
+                    scheme,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    zp_byte_off,
+                    out_byte_off,
+                } => {
+                    let m_s = scale(*m);
+                    if m_s == 0 {
+                        continue;
+                    }
+                    if rlx_gpu_host::mlx_dequant_gpu_disabled() {
+                        crate::gguf_host::run_dequant_matmul_mlx(
+                            &stream,
+                            self.arena.f32_buf_mut(),
+                            m_s as usize,
+                            *k as usize,
+                            *n as usize,
+                            *scheme,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *scale_byte_off as usize,
+                            *zp_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                        continue;
+                    }
+                    let (kind, bits, group_size) = scheme.mlx_gpu_launch().unwrap_or_else(|| {
+                        panic!("rlx-cuda DequantMatmulMlx: unexpected {scheme:?}")
+                    });
+                    if m_s == 1 {
+                        let kernel = dequant_matmul_mlx_gemv_kernel(&self.ctx);
+                        let cfg = LaunchConfig {
+                            grid_dim: (*n, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(k)
+                            .arg(n)
+                            .arg(&kind)
+                            .arg(&bits)
+                            .arg(&group_size)
+                            .arg(x_byte_off)
+                            .arg(w_byte_off)
+                            .arg(scale_byte_off)
+                            .arg(zp_byte_off)
+                            .arg(out_byte_off);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: dequant_matmul_mlx_gemv launch failed");
+                        }
+                    } else {
+                        let n_row_tiles = m_s.div_ceil(8);
+                        let kernel = dequant_matmul_mlx_gemm_kernel(&self.ctx);
+                        let cfg = LaunchConfig {
+                            grid_dim: (*n, n_row_tiles, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(&m_s)
+                            .arg(k)
+                            .arg(n)
+                            .arg(&kind)
+                            .arg(&bits)
+                            .arg(&group_size)
+                            .arg(x_byte_off)
+                            .arg(w_byte_off)
+                            .arg(scale_byte_off)
+                            .arg(zp_byte_off)
+                            .arg(out_byte_off);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: dequant_matmul_mlx_gemm launch failed");
+                        }
+                    }
+                }
                 Step::DequantMatmulGguf {
                     m,
                     k,
@@ -3568,14 +3660,7 @@ impl CudaExecutable {
                 } => {
                     let (buf, _arena_size) = self.arena.f32_buf_and_size();
                     if crate::dyn_quant_lstm_gpu::try_run(
-                        &self.ctx,
-                        &stream,
-                        buf,
-                        name,
-                        in_specs,
-                        *out_off,
-                        out_shape,
-                        attrs,
+                        &self.ctx, &stream, buf, name, in_specs, *out_off, out_shape, attrs,
                     ) {
                         // Handled on-device (Kitten DynamicQuantizeLSTM).
                     } else {
@@ -3867,6 +3952,87 @@ impl CudaExecutable {
                     w_off,
                     out_off,
                 } => {
+                    // ConvTranspose3d ≡ cuDNN convolution BackwardData (nd) with
+                    // PyTorch weight [C_in, C_out/g, kD, kH, kW]. Same remap as CT2d.
+                    // Opt out with `RLX_CUDA_CONV_T_KERNEL=1` or `RLX_CUDA_NO_CUDNN=1`.
+                    let try_cudnn = self.dnn.is_some()
+                        && self.dnn_workspace.is_some()
+                        && !rlx_ir::env::flag("RLX_CUDA_NO_CUDNN")
+                        && !rlx_ir::env::flag("RLX_CUDA_CONV_T_KERNEL");
+                    let used_cudnn = if try_cudnn {
+                        let handle = self.dnn.expect("dnn handle");
+                        let workspace = self.dnn_workspace.as_ref().expect("dnn workspace");
+                        let mut workspace = workspace.lock().unwrap();
+                        let (ws_ptr, _ws) = workspace.device_ptr_mut(&stream);
+                        let (arena_ptr, _ar) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                        // dy = CT input [N,C_in,D,H,W]; dx = CT output [N,C_out,Do,Ho,Wo]
+                        let r = unsafe {
+                            cudnn_conv3d_backward_data(
+                                handle,
+                                ws_ptr,
+                                CUDNN_WORKSPACE_BYTES,
+                                arena_ptr,
+                                *n,
+                                *c_out,
+                                *c_in,
+                                *d_out,
+                                *h_out,
+                                *w_out,
+                                *d,
+                                *h,
+                                *w,
+                                *kd,
+                                *kh,
+                                *kw,
+                                *sd,
+                                *sh,
+                                *sw,
+                                *pd,
+                                *ph,
+                                *pw,
+                                *dd,
+                                *dh,
+                                *dw,
+                                *groups,
+                                *in_off,
+                                *w_off,
+                                *out_off,
+                            )
+                        };
+                        if let Err(ref e) = r {
+                            log_fallback("conv_transpose3d.cudnn", e);
+                        }
+                        r.is_ok()
+                    } else {
+                        false
+                    };
+                    record_conv_transpose3d_path(used_cudnn);
+                    if rlx_ir::env::flag("RLX_CUDA_LOG_CONV_PATH") {
+                        eprintln!(
+                            "rlx-cuda-convpath: {} n={} c_in={} c_out={} {}x{}x{}→{}x{}x{} k={}x{}x{} g={}",
+                            if used_cudnn {
+                                "CUDNN_CT3D"
+                            } else {
+                                "KERNEL_CT3D"
+                            },
+                            n,
+                            c_in,
+                            c_out,
+                            d,
+                            h,
+                            w,
+                            d_out,
+                            h_out,
+                            w_out,
+                            kd,
+                            kh,
+                            kw,
+                            groups
+                        );
+                    }
+                    if used_cudnn {
+                        continue;
+                    }
                     let kernel = conv_transpose3d_kernel(&self.ctx);
                     let total = n * c_out * d_out * h_out * w_out;
                     let (grid, block) = dispatch_grid_1d(total, 256);
@@ -4662,6 +4828,45 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: resize_nearest_2x launch failed");
+                    }
+                }
+                Step::Interpolate3d {
+                    src_off,
+                    dst_off,
+                    n,
+                    c,
+                    d_in,
+                    h_in,
+                    w_in,
+                    d_out,
+                    h_out,
+                    w_out,
+                } => {
+                    let kernel = interpolate3d_kernel(&self.ctx);
+                    let total = n * c * d_out * h_out * w_out;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(src_off)
+                        .arg(dst_off)
+                        .arg(n)
+                        .arg(c)
+                        .arg(d_in)
+                        .arg(h_in)
+                        .arg(w_in)
+                        .arg(d_out)
+                        .arg(h_out)
+                        .arg(w_out);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: interpolate3d launch failed");
                     }
                 }
                 Step::ComplexCast {
@@ -5604,6 +5809,323 @@ impl CudaExecutable {
                         }
                     }
                 }
+                Step::MaxPool3dBackward {
+                    x_byte_off,
+                    dy_byte_off,
+                    dx_byte_off,
+                    n,
+                    c,
+                    d,
+                    h,
+                    w,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                } => {
+                    let kernel = maxpool3d_backward_kernel(&self.ctx);
+                    let total = n * c * d * h * w;
+                    let (grid, block) = dispatch_grid_1d(total, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let x_o = (*x_byte_off / 4) as u32;
+                    let dy_o = (*dy_byte_off / 4) as u32;
+                    let dx_o = (*dx_byte_off / 4) as u32;
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(c)
+                        .arg(d)
+                        .arg(h)
+                        .arg(w)
+                        .arg(d_out)
+                        .arg(h_out)
+                        .arg(w_out)
+                        .arg(kd)
+                        .arg(kh)
+                        .arg(kw)
+                        .arg(sd)
+                        .arg(sh)
+                        .arg(sw)
+                        .arg(pd)
+                        .arg(ph)
+                        .arg(pw)
+                        .arg(&x_o)
+                        .arg(&dy_o)
+                        .arg(&dx_o);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: maxpool3d_backward launch failed");
+                    }
+                }
+                Step::Conv3dBackwardInput {
+                    dy_byte_off,
+                    w_byte_off,
+                    dx_byte_off,
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w_in,
+                    c_out,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw,
+                    groups,
+                } => {
+                    let cudnn_ok_shape = *groups == 1 && *kd > 1 && *kh > 1 && *kw > 1;
+                    let allow_cudnn = !rlx_ir::env::flag("RLX_CUDA_CONV_FORCE_GATHER")
+                        && (cudnn_ok_shape || rlx_ir::env::flag("RLX_CUDA_CONV_BWD_CUDNN"));
+                    let used_cudnn = if allow_cudnn
+                        && let (Some(handle), Some(workspace)) =
+                            (self.dnn, self.dnn_workspace.as_ref())
+                    {
+                        let mut workspace = workspace.lock().unwrap();
+                        let (ws_ptr, _wr) = workspace.device_ptr_mut(&stream);
+                        let (arena_ptr, _ar) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                        let r = unsafe {
+                            cudnn_conv3d_backward_data(
+                                handle,
+                                ws_ptr,
+                                CUDNN_WORKSPACE_BYTES,
+                                arena_ptr,
+                                *n,
+                                *c_in,
+                                *c_out,
+                                *d,
+                                *h,
+                                *w_in,
+                                *d_out,
+                                *h_out,
+                                *w_out,
+                                *kd,
+                                *kh,
+                                *kw,
+                                *sd,
+                                *sh,
+                                *sw,
+                                *pd,
+                                *ph,
+                                *pw,
+                                *dd,
+                                *dh,
+                                *dw,
+                                *groups,
+                                (*dy_byte_off / 4) as u32,
+                                (*w_byte_off / 4) as u32,
+                                (*dx_byte_off / 4) as u32,
+                            )
+                        };
+                        if let Err(ref e) = r {
+                            log_fallback("conv3d_bwd_data.cudnn", e);
+                        }
+                        r.is_ok()
+                    } else {
+                        false
+                    };
+                    record_conv3d_bwd_path(used_cudnn);
+                    if !used_cudnn {
+                        let kernel = conv3d_backward_input_kernel(&self.ctx);
+                        let total = n * c_in * d * h * w_in;
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        let cfg = LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let (dy_e, w_e, dx_e) = (
+                            (*dy_byte_off / 4) as u32,
+                            (*w_byte_off / 4) as u32,
+                            (*dx_byte_off / 4) as u32,
+                        );
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(n)
+                            .arg(c_in)
+                            .arg(c_out)
+                            .arg(d)
+                            .arg(h)
+                            .arg(w_in)
+                            .arg(d_out)
+                            .arg(h_out)
+                            .arg(w_out)
+                            .arg(kd)
+                            .arg(kh)
+                            .arg(kw)
+                            .arg(sd)
+                            .arg(sh)
+                            .arg(sw)
+                            .arg(pd)
+                            .arg(ph)
+                            .arg(pw)
+                            .arg(dd)
+                            .arg(dh)
+                            .arg(dw)
+                            .arg(groups)
+                            .arg(&dy_e)
+                            .arg(&w_e)
+                            .arg(&dx_e);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: conv3d_backward_input launch failed");
+                        }
+                    }
+                }
+                Step::Conv3dBackwardWeight {
+                    x_byte_off,
+                    dy_byte_off,
+                    dw_byte_off,
+                    n,
+                    c_in,
+                    d,
+                    h,
+                    w,
+                    c_out,
+                    d_out,
+                    h_out,
+                    w_out,
+                    kd,
+                    kh,
+                    kw,
+                    sd,
+                    sh,
+                    sw,
+                    pd,
+                    ph,
+                    pw,
+                    dd,
+                    dh,
+                    dw_dil,
+                    groups,
+                } => {
+                    let cudnn_ok_shape = *groups == 1 && *kd > 1 && *kh > 1 && *kw > 1;
+                    let allow_cudnn = !rlx_ir::env::flag("RLX_CUDA_CONV_FORCE_GATHER")
+                        && (cudnn_ok_shape || rlx_ir::env::flag("RLX_CUDA_CONV_BWD_CUDNN"));
+                    let used_cudnn = if allow_cudnn
+                        && let (Some(handle), Some(workspace)) =
+                            (self.dnn, self.dnn_workspace.as_ref())
+                    {
+                        let mut workspace = workspace.lock().unwrap();
+                        let (ws_ptr, _wr) = workspace.device_ptr_mut(&stream);
+                        let (arena_ptr, _ar) = self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                        let r = unsafe {
+                            cudnn_conv3d_backward_filter(
+                                handle,
+                                ws_ptr,
+                                CUDNN_WORKSPACE_BYTES,
+                                arena_ptr,
+                                *n,
+                                *c_in,
+                                *c_out,
+                                *d,
+                                *h,
+                                *w,
+                                *d_out,
+                                *h_out,
+                                *w_out,
+                                *kd,
+                                *kh,
+                                *kw,
+                                *sd,
+                                *sh,
+                                *sw,
+                                *pd,
+                                *ph,
+                                *pw,
+                                *dd,
+                                *dh,
+                                *dw_dil,
+                                *groups,
+                                (*x_byte_off / 4) as u32,
+                                (*dy_byte_off / 4) as u32,
+                                (*dw_byte_off / 4) as u32,
+                            )
+                        };
+                        if let Err(ref e) = r {
+                            log_fallback("conv3d_bwd_filter.cudnn", e);
+                        }
+                        r.is_ok()
+                    } else {
+                        false
+                    };
+                    record_conv3d_bwd_path(used_cudnn);
+                    if !used_cudnn {
+                        let kernel = conv3d_backward_weight_kernel(&self.ctx);
+                        let c_in_per_g = c_in / groups;
+                        let total = c_out * c_in_per_g * kd * kh * kw;
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        let cfg = LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let (x_e, dy_e, dw_e) = (
+                            (*x_byte_off / 4) as u32,
+                            (*dy_byte_off / 4) as u32,
+                            (*dw_byte_off / 4) as u32,
+                        );
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(n)
+                            .arg(c_in)
+                            .arg(c_out)
+                            .arg(d)
+                            .arg(h)
+                            .arg(w)
+                            .arg(d_out)
+                            .arg(h_out)
+                            .arg(w_out)
+                            .arg(kd)
+                            .arg(kh)
+                            .arg(kw)
+                            .arg(sd)
+                            .arg(sh)
+                            .arg(sw)
+                            .arg(pd)
+                            .arg(ph)
+                            .arg(pw)
+                            .arg(dd)
+                            .arg(dh)
+                            .arg(dw_dil)
+                            .arg(groups)
+                            .arg(&x_e)
+                            .arg(&dy_e)
+                            .arg(&dw_e);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: conv3d_backward_weight launch failed");
+                        }
+                    }
+                }
                 Step::Pool1d {
                     n,
                     c,
@@ -6116,9 +6638,13 @@ impl CudaExecutable {
                     out_off,
                 } => {
                     // Tier 1: cuDNN nd-conv (NCDHW + 3-D pads/strides/dilations).
-                    let used_cudnn = if let (Some(handle), Some(workspace)) =
-                        (self.dnn, self.dnn_workspace.as_ref())
-                    {
+                    // Opt out with `RLX_CUDA_NO_CUDNN=1` (parity / kernel-only).
+                    let try_cudnn = self.dnn.is_some()
+                        && self.dnn_workspace.is_some()
+                        && !rlx_ir::env::flag("RLX_CUDA_NO_CUDNN");
+                    let used_cudnn = if try_cudnn {
+                        let handle = self.dnn.expect("dnn handle");
+                        let workspace = self.dnn_workspace.as_ref().expect("dnn workspace");
                         let mut workspace = workspace.lock().unwrap();
                         let (ws_ptr, _ws_record) = workspace.device_ptr_mut(&stream);
                         let (arena_ptr, _arena_record) =
@@ -6163,6 +6689,27 @@ impl CudaExecutable {
                     } else {
                         false
                     };
+                    record_conv3d_path(used_cudnn);
+                    if rlx_ir::env::flag("RLX_CUDA_LOG_CONV_PATH") {
+                        eprintln!(
+                            "rlx-cuda-convpath: {} n={} c_in={} c_out={} {}x{}x{} k={}x{}x{} g={}",
+                            if used_cudnn {
+                                "CUDNN_CONV3D"
+                            } else {
+                                "KERNEL_CONV3D"
+                            },
+                            n,
+                            c_in,
+                            c_out,
+                            d,
+                            h,
+                            w,
+                            kd,
+                            kh,
+                            kw,
+                            groups
+                        );
+                    }
                     if used_cudnn {
                         continue;
                     }

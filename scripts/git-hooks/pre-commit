@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Enforce rustfmt + clippy on staged Rust changes before commit.
+# rustfmt is applied (not only checked); reformatted staged files are re-added.
+# Compatible with macOS Bash 3.2 (no mapfile).
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+STAGED="$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.rs$' || true)"
+if [[ -z "$STAGED" ]]; then
+  exit 0
+fi
+
+FILES=()
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  case "$f" in
+    */vendor/*|crates/backends/rlx-mlx-sys/vendor/*) continue ;;
+  esac
+  FILES+=("$f")
+done <<<"$STAGED"
+[[ ${#FILES[@]} -eq 0 ]] && exit 0
+
+echo "[pre-commit] rustfmt (${#FILES[@]} staged .rs files; full workspace)"
+cargo fmt --all
+
+# Include fmt fixes in this commit for files that were already staged.
+EXISTING=()
+for f in "${FILES[@]}"; do
+  if [[ -f "$f" ]]; then
+    EXISTING+=("$f")
+  fi
+done
+if [[ ${#EXISTING[@]} -gt 0 ]]; then
+  git add -- "${EXISTING[@]}"
+fi
+
+if ! cargo fmt --all -- --check; then
+  echo "[pre-commit] rustfmt still dirty after auto-fmt — unexpected; run: just fmt"
+  exit 1
+fi
+
+PKGS="$(python3 "$ROOT/scripts/rust-packages-for-paths.py" "${FILES[@]}" || true)"
+PKG_COUNT=0
+if [[ -n "$PKGS" ]]; then
+  PKG_COUNT="$(printf '%s\n' "$PKGS" | grep -c . || true)"
+fi
+
+echo "[pre-commit] clippy -D warnings (${PKGS:-workspace})"
+if [[ "$PKG_COUNT" -eq 0 || "$PKG_COUNT" -gt 12 ]]; then
+  cargo clippy --all-targets -- -D warnings
+else
+  ARGS=()
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    ARGS+=(-p "$p")
+  done <<<"$PKGS"
+  cargo clippy "${ARGS[@]}" --all-targets -- -D warnings
+fi
+
+echo "[pre-commit] fmt + clippy ok"
+exit 0

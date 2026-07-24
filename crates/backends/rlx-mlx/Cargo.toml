@@ -16,17 +16,23 @@ documentation.workspace = true
 [features]
 default = []
 cuda = ["rlx-mlx-sys/cuda"]
+# Opt-in: lower `MlxMxfp4` / `MlxMxfp8` `DequantMatMul` via MLX C++
+# `quantized_matmul` (mode=mxfp4/mxfp8/nvfp4). Default (off) uses the
+# first-class Rust path: host dequant + cache + on-device matmul (same
+# layout as CPU/Metal/CUDA `DequantMatMul`).
+native-mxfp = []
 
 [dependencies]
-rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.13" }
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
-rlx-driver = { path = "../../core/rlx-driver", version = "0.2.13" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13" }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.13" }
+rlx-mlx-sys = { path = "../rlx-mlx-sys", version = "0.2.14" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-driver = { path = "../../core/rlx-driver", version = "0.2.14" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14" }
+rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", default-features = false, features = ["blas", "splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false, features = ["blas", "splat"] }
+rlx-mlx-io = { path = "../../io/rlx-mlx-io", version = "0.2.14" }
 libc = "0.2"
 
 [lints]

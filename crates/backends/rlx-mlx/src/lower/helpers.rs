@@ -56,20 +56,77 @@ pub(crate) fn build_sliding_window_mask(
     Array::from_f32_slice(&buf, &[s_q, s_k], DType::F32)
 }
 
-pub(crate) fn quant_scheme_to_mlx(scheme: &rlx_ir::QuantScheme) -> Result<(i32, i32), MlxError> {
+pub(crate) fn quant_scheme_to_mlx(
+    scheme: &rlx_ir::QuantScheme,
+) -> Result<(i32, i32, &'static str), MlxError> {
     use rlx_ir::QuantScheme as Q;
-    let bits = scheme.bits_per_element() as i32;
-    let gs = match scheme {
-        Q::Int8Block { block_size } => *block_size as i32,
-        Q::Int8BlockAsym { block_size } => *block_size as i32,
-        Q::Int4Block { block_size } => *block_size as i32,
+    match scheme {
+        Q::Int8Block { block_size } | Q::Int8BlockAsym { block_size } => {
+            Ok((8, *block_size as i32, "affine"))
+        }
+        Q::Int4Block { block_size } => Ok((4, *block_size as i32, "affine")),
+        Q::MlxAffine { bits, group_size } => Ok((*bits as i32, *group_size as i32, "affine")),
+        // mlx-lm `nvfp4` is MlxMxfp4 with group_size 16 (FP8 scales).
+        Q::MlxMxfp4 { group_size } if *group_size == 16 => Ok((4, 16, "nvfp4")),
+        Q::MlxMxfp4 { group_size } => Ok((4, *group_size as i32, "mxfp4")),
+        Q::MlxMxfp8 { group_size } => Ok((8, *group_size as i32, "mxfp8")),
+        other => Err(MlxError(format!(
+            "MLX quantized_matmul: unsupported scheme {other:?}"
+        ))),
+    }
+}
+
+/// Build a dequantized `[k, n]` f32 weight Array for MLX mxfp packs
+/// (host reference path — used when `native-mxfp` is off).
+#[cfg(not(feature = "native-mxfp"))]
+pub(crate) fn build_mlx_mxfp_kn(
+    w_bytes: &[u8],
+    scale_bytes: &[u8],
+    k: usize,
+    n: usize,
+    scheme: &rlx_ir::QuantScheme,
+) -> Result<Array, MlxError> {
+    use rlx_ir::QuantScheme as Q;
+    let (gs, mxfp8) = match scheme {
+        Q::MlxMxfp4 { group_size } => (*group_size, false),
+        Q::MlxMxfp8 { group_size } => (*group_size, true),
         other => {
             return Err(MlxError(format!(
-                "MLX quantized_matmul: unsupported scheme {other:?}"
+                "build_mlx_mxfp_kn: expected MlxMxfp*, got {other:?}"
             )));
         }
     };
-    Ok((bits, gs))
+    let n_groups = k / gs as usize;
+    let w_nk = if mxfp8 {
+        rlx_mlx_io::dequant_mxfp8_f32(w_bytes, scale_bytes, gs, n, n_groups)
+    } else {
+        rlx_mlx_io::dequant_mxfp4_f32(w_bytes, scale_bytes, gs, n, n_groups)
+    }
+    .map_err(|e| MlxError(format!("MLX mxfp host dequant: {e:#}")))?;
+    // Row-major [n, k] → [k, n] for `x @ W`.
+    let mut kn = vec![0f32; k * n];
+    for j in 0..n {
+        for p in 0..k {
+            kn[p * n + j] = w_nk[j * k + p];
+        }
+    }
+    Array::from_f32_slice(&kn, &[k, n], DType::F32)
+}
+
+#[cfg(not(feature = "native-mxfp"))]
+pub(crate) fn mlx_mxfp_cache_key(
+    name: &str,
+    k: usize,
+    n: usize,
+    scheme: &rlx_ir::QuantScheme,
+    w_bytes: &[u8],
+    scale_bytes: &[u8],
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    w_bytes.hash(&mut hasher);
+    scale_bytes.hash(&mut hasher);
+    format!("{name}#mxfp_kn:{k}x{n}:{scheme:?}:{}", hasher.finish())
 }
 
 // ── GGUF dequant cache ──────────────────────────────────────────────────

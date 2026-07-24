@@ -157,7 +157,7 @@ impl<'a> LowerCtx<'a> {
         let out_shape = node.shape.clone();
         let rank = in_shape.rank();
         let last = in_shape.dim(rank - 1).unwrap_static();
-        if last % 2 != 0 {
+        if !last.is_multiple_of(2) {
             return Err(CoremlError::Unsupported(format!(
                 "FusedSwiGLU: last dim {last} must be even"
             )));

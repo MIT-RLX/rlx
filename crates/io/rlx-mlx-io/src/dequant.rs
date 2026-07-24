@@ -1,0 +1,403 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, version 3.
+
+//! Host dequant for MLX affine / mxfp packs (matches MLX CPU kernels).
+
+use anyhow::{Result, bail};
+
+/// How many values are packed into one storage unit for power-of-two bits
+/// (MLX `get_pack_factor(bits, 8)` for bits ∈ {2,4,8}; odd bits use special packs).
+pub fn pack_factor(bits: u32) -> Result<u32> {
+    match bits {
+        2 | 4 | 8 => Ok(8 / bits),
+        3 | 5 => Ok(8),
+        6 => Ok(4),
+        other => bail!("unsupported MLX affine bits={other}"),
+    }
+}
+
+/// Validate `k` / `group_size` / weight byte length before arena slicing.
+pub fn validate_dequant_matmul_dims(
+    scheme: rlx_ir::QuantScheme,
+    k: usize,
+    n: usize,
+    w_len: Option<usize>,
+) -> Result<()> {
+    use rlx_ir::QuantScheme;
+    let gs = scheme.mlx_group_size() as usize;
+    if gs == 0 {
+        bail!("not an MLX QuantScheme: {scheme}");
+    }
+    if !k.is_multiple_of(gs) {
+        bail!("MLX DequantMatMul: k={k} not divisible by group_size={gs}");
+    }
+    let n_groups = k / gs;
+    if let Some(w_len) = w_len {
+        let need = match scheme {
+            QuantScheme::MlxAffine { bits, .. } => {
+                let pf = pack_factor(bits as u32)? as usize;
+                let packs = gs / pf;
+                let bpp = bytes_per_pack(bits as u32)?;
+                n * n_groups * packs * bpp
+            }
+            QuantScheme::MlxMxfp4 { .. } => n * k / 2,
+            QuantScheme::MlxMxfp8 { .. } => n * k,
+            _ => bail!("not an MLX QuantScheme: {scheme}"),
+        };
+        if w_len < need {
+            bail!("MLX DequantMatMul: weight bytes {w_len} < needed {need}");
+        }
+    }
+    Ok(())
+}
+
+fn bytes_per_pack(bits: u32) -> Result<usize> {
+    match bits {
+        2 | 4 | 8 => Ok(1),
+        3 => Ok(3),
+        5 => Ok(5),
+        6 => Ok(3),
+        other => bail!("unsupported MLX affine bits={other}"),
+    }
+}
+
+/// One quantized Linear / Embedding triple as stored by mlx-lm.
+#[derive(Debug, Clone)]
+pub struct QuantizedLayer {
+    pub weight: Vec<u8>,
+    pub weight_shape: Vec<usize>,
+    pub scales: Vec<f32>,
+    pub scales_shape: Vec<usize>,
+    pub biases: Option<Vec<f32>>,
+    pub biases_shape: Option<Vec<usize>>,
+    pub bits: u32,
+    pub group_size: u32,
+}
+
+fn extract_bits_3(w_in: &[u8], out: &mut [u8; 8]) {
+    out[0] = w_in[0] & 0x7;
+    out[1] = (w_in[0] & 0x38) >> 3;
+    out[2] = ((w_in[0] & 0xc0) >> 6) + ((w_in[1] & 0x1) << 2);
+    out[3] = (w_in[1] & 0xe) >> 1;
+    out[4] = (w_in[1] & 0x70) >> 4;
+    out[5] = ((w_in[1] & 0x80) >> 7) + ((w_in[2] & 0x3) << 1);
+    out[6] = (w_in[2] & 0x1c) >> 2;
+    out[7] = (w_in[2] & 0xe0) >> 5;
+}
+
+fn extract_bits_5(w_in: &[u8], out: &mut [u8; 8]) {
+    out[0] = w_in[0] & 0x1f;
+    out[1] = ((w_in[0] & 0xe0) >> 5) + ((w_in[1] & 0x3) << 3);
+    out[2] = (w_in[1] & 0x7c) >> 2;
+    out[3] = ((w_in[1] & 0x80) >> 7) + ((w_in[2] & 0xf) << 1);
+    out[4] = ((w_in[2] & 0xf0) >> 4) + ((w_in[3] & 0x1) << 4);
+    out[5] = (w_in[3] & 0x3e) >> 1;
+    out[6] = ((w_in[3] & 0xc0) >> 6) + ((w_in[4] & 0x7) << 2);
+    out[7] = (w_in[4] & 0xf8) >> 3;
+}
+
+fn extract_bits_6(w_in: &[u8], out: &mut [u8; 4]) {
+    out[0] = w_in[0] & 0x3f;
+    out[1] = ((w_in[0] >> 6) & 0x03) + ((w_in[1] & 0x0f) << 2);
+    out[2] = ((w_in[1] >> 4) & 0x0f) + ((w_in[2] & 0x03) << 4);
+    out[3] = (w_in[2] >> 2) & 0x3f;
+}
+
+/// Dequantize MLX affine packs to a dense `[rows, cols]` f32 matrix.
+///
+/// Layout matches MLX `_qmm_t` / `affine_dequantize`: rows = `scales_shape[0]`,
+/// cols = `n_groups * group_size`, weights stored row-major packed along K.
+pub fn dequant_affine_f32(
+    w: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    bits: u32,
+    group_size: u32,
+    rows: usize,
+    n_groups: usize,
+) -> Result<Vec<f32>> {
+    let gs = group_size as usize;
+    let cols = n_groups * gs;
+    let pf = pack_factor(bits)? as usize;
+    let bpp = bytes_per_pack(bits)?;
+    let packs_in_group = gs / pf;
+    let bitmask = (1u32 << bits) - 1;
+    if scales.len() < rows * n_groups || biases.len() < rows * n_groups {
+        bail!(
+            "affine dequant: scales/biases too short (need {} each)",
+            rows * n_groups
+        );
+    }
+    let need_w = rows * n_groups * packs_in_group * bpp;
+    if w.len() < need_w {
+        bail!("affine dequant: weight bytes {} < needed {need_w}", w.len());
+    }
+
+    let mut out = vec![0f32; rows * cols];
+    let mut w_off = 0usize;
+    for r in 0..rows {
+        for g in 0..n_groups {
+            let scale = scales[r * n_groups + g];
+            let bias = biases[r * n_groups + g];
+            let base = r * cols + g * gs;
+            let mut p = 0usize;
+            for _ in 0..packs_in_group {
+                match bits {
+                    3 => {
+                        let mut codes = [0u8; 8];
+                        extract_bits_3(&w[w_off..w_off + 3], &mut codes);
+                        for c in codes {
+                            out[base + p] = scale * (c as f32) + bias;
+                            p += 1;
+                        }
+                        w_off += 3;
+                    }
+                    5 => {
+                        let mut codes = [0u8; 8];
+                        extract_bits_5(&w[w_off..w_off + 5], &mut codes);
+                        for c in codes {
+                            out[base + p] = scale * (c as f32) + bias;
+                            p += 1;
+                        }
+                        w_off += 5;
+                    }
+                    6 => {
+                        let mut codes = [0u8; 4];
+                        extract_bits_6(&w[w_off..w_off + 3], &mut codes);
+                        for c in codes {
+                            out[base + p] = scale * (c as f32) + bias;
+                            p += 1;
+                        }
+                        w_off += 3;
+                    }
+                    2 | 4 | 8 => {
+                        let mut wi = w[w_off];
+                        w_off += 1;
+                        for _ in 0..pf {
+                            let code = (wi as u32) & bitmask;
+                            out[base + p] = scale * (code as f32) + bias;
+                            p += 1;
+                            if bits != 8 {
+                                wi >>= bits as u8;
+                            }
+                        }
+                    }
+                    other => bail!("unsupported bits {other}"),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Fused affine dequant + matmul: `x [m,k] @ w_dequant^T` when weights are
+/// stored `[n, k]` (MLX Linear). Output `[m, n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_matmul_affine(
+    x: &[f32],
+    w: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    bits: u32,
+    group_size: u32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    let gs = group_size as usize;
+    if !k.is_multiple_of(gs) {
+        bail!("affine DequantMatMul: k={k} not divisible by group_size={gs}");
+    }
+    let n_groups = k / gs;
+    let w_f = dequant_affine_f32(w, scales, biases, bits, group_size, n, n_groups)?;
+    // w_f is [n, k]; compute x @ w_f^T → [m, n]
+    let mut out = vec![0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f32;
+            for p in 0..k {
+                acc += x[i * k + p] * w_f[j * k + p];
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    Ok(out)
+}
+
+/// MXFP4 E2M1 LUT (MLX CPU `FP4_LUT`).
+const FP4_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Decode MLX E8M0-style uint8 scale used for group_size != 16.
+fn dequant_scale_e8m0(s: u8) -> f32 {
+    if s == 0 {
+        return half::bf16::from_bits(0x40).to_f32();
+    }
+    half::bf16::from_bits((s as u16) << 7).to_f32()
+}
+
+/// Decode FP8 E4M3 byte (OCP) to f32 — used when group_size == 16.
+fn dequant_scale_fp8_e4m3(s: u8) -> f32 {
+    // Match MLX FromFP8 for E4M3: reuse half conversion via softfloat-ish path.
+    // Bias 7, no inf; NaN at 0x7f / 0xff.
+    let sign = (s >> 7) as u32;
+    let exp = ((s >> 3) & 0x0f) as i32;
+    let mant = (s & 0x07) as u32;
+    if exp == 0x0f && mant == 0x07 {
+        return f32::NAN;
+    }
+    if exp == 0 {
+        if mant == 0 {
+            return if sign != 0 { -0.0 } else { 0.0 };
+        }
+        // subnormal
+        let mut m = mant;
+        let mut e = -6i32;
+        while m & 0x8 == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x7;
+        let bits = (sign << 31) | (((e + 127) as u32) << 23) | (m << 20);
+        return f32::from_bits(bits);
+    }
+    let bits = (sign << 31) | (((exp - 7 + 127) as u32) << 23) | (mant << 20);
+    f32::from_bits(bits)
+}
+
+/// Dequantize MLX `mxfp4` packs: nibbles → FP4 LUT × per-group scale.
+///
+/// `scales_u8` length = `rows * n_groups`. `group_size` is typically 32
+/// (E8M0 scales) or 16 (FP8 E4M3 scales).
+pub fn dequant_mxfp4_f32(
+    w: &[u8],
+    scales_u8: &[u8],
+    group_size: u32,
+    rows: usize,
+    n_groups: usize,
+) -> Result<Vec<f32>> {
+    let gs = group_size as usize;
+    let cols = n_groups * gs;
+    // 2 nibbles per byte
+    let need_w = rows * cols / 2;
+    if w.len() < need_w {
+        bail!("mxfp4: weight bytes {} < {need_w}", w.len());
+    }
+    if scales_u8.len() < rows * n_groups {
+        bail!("mxfp4: scales too short");
+    }
+    let mut out = vec![0f32; rows * cols];
+    let mut w_off = 0usize;
+    for r in 0..rows {
+        for g in 0..n_groups {
+            let scale = if gs == 16 {
+                dequant_scale_fp8_e4m3(scales_u8[r * n_groups + g])
+            } else {
+                dequant_scale_e8m0(scales_u8[r * n_groups + g])
+            };
+            let base = r * cols + g * gs;
+            for p in (0..gs).step_by(2) {
+                let b = w[w_off];
+                w_off += 1;
+                out[base + p] = FP4_LUT[(b & 0x0f) as usize] * scale;
+                out[base + p + 1] = FP4_LUT[(b >> 4) as usize] * scale;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Dequantize MLX `mxfp8` packs: raw FP8 E4M3 codes × E8M0/FP8 group scales.
+pub fn dequant_mxfp8_f32(
+    w: &[u8],
+    scales_u8: &[u8],
+    group_size: u32,
+    rows: usize,
+    n_groups: usize,
+) -> Result<Vec<f32>> {
+    let gs = group_size as usize;
+    let cols = n_groups * gs;
+    if w.len() < rows * cols {
+        bail!("mxfp8: weight bytes {} < {}", w.len(), rows * cols);
+    }
+    if scales_u8.len() < rows * n_groups {
+        bail!("mxfp8: scales too short");
+    }
+    let mut out = vec![0f32; rows * cols];
+    let mut w_off = 0usize;
+    for r in 0..rows {
+        for g in 0..n_groups {
+            let scale = if gs == 16 {
+                dequant_scale_fp8_e4m3(scales_u8[r * n_groups + g])
+            } else {
+                dequant_scale_e8m0(scales_u8[r * n_groups + g])
+            };
+            let base = r * cols + g * gs;
+            for p in 0..gs {
+                out[base + p] = dequant_scale_fp8_e4m3(w[w_off]) * scale;
+                w_off += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn affine_4bit_roundtrip_shape() {
+        // 1 row, group_size 8, bits 4 → 1 group, 4 packs (8/2? pack_factor=2 for bits=4)
+        // pack_factor(4)=2, packs_in_group = 8/2 = 4 bytes
+        let bits = 4;
+        let gs = 8u32;
+        let rows = 1;
+        let n_groups = 1;
+        // codes 0..7 packed as nibbles: [0x10, 0x32, 0x54, 0x76]
+        let w = vec![0x10, 0x32, 0x54, 0x76];
+        let scales = vec![2.0f32];
+        let biases = vec![-1.0f32];
+        let out = dequant_affine_f32(&w, &scales, &biases, bits, gs, rows, n_groups).unwrap();
+        assert_eq!(out.len(), 8);
+        // first nibble = 0 → 2*0 + (-1) = -1; second = 1 → 2*1-1 = 1
+        assert!((out[0] - (-1.0)).abs() < 1e-5);
+        assert!((out[1] - 1.0).abs() < 1e-5);
+        assert!((out[2] - 3.0).abs() < 1e-5); // 2*2-1
+    }
+
+    #[test]
+    fn affine_3bit_dequant_runs() {
+        // gs=8, bits=3 → 3 bytes/group, 8 values.
+        let w = vec![0x01, 0x02, 0x03];
+        let scales = vec![1.0f32];
+        let biases = vec![0.0f32];
+        let out = dequant_affine_f32(&w, &scales, &biases, 3, 8, 1, 1).unwrap();
+        assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn affine_5bit_dequant_runs() {
+        let w = vec![0u8; 5];
+        let scales = vec![1.0f32];
+        let biases = vec![0.0f32];
+        let out = dequant_affine_f32(&w, &scales, &biases, 5, 8, 1, 1).unwrap();
+        assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn affine_6bit_dequant_runs() {
+        // gs=8, bits=6 → pack_factor 4, packs_in_group=2, bpp=3 → 6 bytes?
+        // pack_factor(6)=4, packs = gs/pf = 2, bpp=3 → 6 bytes per group.
+        let w = vec![0u8; 6];
+        let scales = vec![1.0f32];
+        let biases = vec![0.0f32];
+        let out = dequant_affine_f32(&w, &scales, &biases, 6, 8, 1, 1).unwrap();
+        assert_eq!(out.len(), 8);
+    }
+}

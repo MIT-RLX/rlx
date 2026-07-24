@@ -125,7 +125,11 @@ pub fn is_host_op(op: &Op) -> bool {
         | Op::GatherBackward { .. }
         | Op::BatchNormInferenceBackwardInput { .. }
         | Op::BatchNormInferenceBackwardGamma { .. }
-        | Op::BatchNormInferenceBackwardBeta => true,
+        | Op::BatchNormInferenceBackwardBeta
+        | Op::MaxPool3dBackward { .. }
+        | Op::Conv3dBackwardInput { .. }
+        | Op::Conv3dBackwardWeight { .. }
+        | Op::Interpolate3d { .. } => true,
         // Native MIL under `training`; host-fallback otherwise so claiming the
         // OpKind for coverage does not hit the MIL Unsupported arm.
         #[cfg(not(feature = "training"))]

@@ -14,11 +14,11 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
 # Op legalization: lower composite/backward ops to the primitive set below.
-rlx-autodiff = { path = "../../core/rlx-autodiff", version = "0.2.13" }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
-rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.13" }
+rlx-autodiff = { path = "../../core/rlx-autodiff", version = "0.2.14" }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.14" }
+rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.14" }
 
 # Host/transport `collective.*` ops delegate to the one shared CPU kernel via
 # `rlx_cpu::op_registry::run_f32_custom_op_host`. This is NATIVE-only: the
@@ -27,7 +27,7 @@ rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.13" }
 # build (and the CPU executor errors on a collective there). `default-features
 # = false` drops the platform BLAS link (collectives don't GEMM).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", default-features = false }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false }
 
 # WebGL2 runtime — wasm only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

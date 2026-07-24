@@ -27,8 +27,8 @@ pub fn seal_bytes(plaintext: &[u8], password: &str) -> Result<Vec<u8>> {
     rand_core::OsRng.fill_bytes(&mut salt);
     rand_core::OsRng.fill_bytes(&mut nonce_bytes);
 
-    let params = Params::new(19_456, 2, 1, Some(32))
-        .map_err(|e| anyhow::anyhow!("argon2 params: {e}"))?;
+    let params =
+        Params::new(19_456, 2, 1, Some(32)).map_err(|e| anyhow::anyhow!("argon2 params: {e}"))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key_bytes = [0u8; 32];
     argon
@@ -66,8 +66,8 @@ pub fn unseal_bytes(sealed: &[u8], password: &str) -> Result<Vec<u8>> {
     let nonce_bytes = &sealed[24..36];
     let ciphertext = &sealed[36..];
 
-    let params = Params::new(19_456, 2, 1, Some(32))
-        .map_err(|e| anyhow::anyhow!("argon2 params: {e}"))?;
+    let params =
+        Params::new(19_456, 2, 1, Some(32)).map_err(|e| anyhow::anyhow!("argon2 params: {e}"))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key_bytes = [0u8; 32];
     argon

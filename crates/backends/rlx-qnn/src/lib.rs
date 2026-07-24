@@ -109,8 +109,9 @@ pub mod supported_ops;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 
-/// Host GGUF dequant helpers used by the FFI runtime's `DequantMatMul` path.
-#[cfg(feature = "runtime")]
+/// Host GGUF / MLX dequant helpers (`DequantMatMul` → f32 MatMul).
+/// Enabled by `host-dequant` (no SDK) or `runtime`.
+#[cfg(feature = "host-dequant")]
 pub mod dequant;
 
 /// Host INT8 `QMatMul` (no f32 weight bake) used by the FFI runtime.

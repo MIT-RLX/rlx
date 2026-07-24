@@ -19,10 +19,10 @@ default = []
 validation = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13", default-features = false, features = ["compile", "training"] }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
-rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.13" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14", default-features = false, features = ["compile", "training"] }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.14" }
+rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.14" }
 # CPU reference kernels for the host-fallback path (ops with no native SPIR-V
 # yet: oversized Lstm/Gru/Rnn/Mamba2, FFT, GGUF dequant, and Riemannian /
 # SPD-manifold ops — BiMap / ReEig / LogEig / SpdBatchNorm / SpdKarcherMean +
@@ -39,11 +39,11 @@ rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.13" }
 # off there and falls back to SIMD, so the driverless build still needs no
 # BLAS; only the eigen SPD ops (BiMap, which is pure GEMM, still works) are
 # unavailable in that narrow case. `splat` enables GaussianSplat* HostOp.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", default-features = false, features = [
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false, features = [
     "blas",
     "splat",
 ] }
-rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.13" }
+rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.14" }
 
 # Raw Vulkan. `loaded` = libloading-based dynamic load of the system
 # Vulkan loader at runtime via `Entry::load()`; no link-time dependency on

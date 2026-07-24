@@ -33,7 +33,8 @@ pub fn load_rlxp_graph(path: impl AsRef<Path>) -> Result<Graph> {
 
 /// Open a flat `.rlxp`, ZIP, or package directory.
 pub fn open_rlxp(path: impl AsRef<Path>) -> Result<Package> {
-    Package::open(path.as_ref()).with_context(|| format!("open package {}", path.as_ref().display()))
+    Package::open(path.as_ref())
+        .with_context(|| format!("open package {}", path.as_ref().display()))
 }
 
 /// Compile the embedded MIR graph of an `.rlxp` package.
@@ -42,6 +43,26 @@ pub fn open_rlxp(path: impl AsRef<Path>) -> Result<Package> {
 pub fn compile_rlxp(session: &Session, path: impl AsRef<Path>) -> Result<CompiledGraph> {
     let graph = load_rlxp_graph(path)?;
     Ok(session.compile(graph))
+}
+
+/// Compile an `.rlxp` and bind every catalog tensor onto matching Params
+/// (and leave Constants to [`Package::graph`] materialize).
+///
+/// Used for MLX `--keep-packed` packs where DequantMatMul weights are Params
+/// named `{base}.weight/.scales/.biases`.
+pub fn compile_rlxp_bind_params(
+    session: &Session,
+    path: impl AsRef<Path>,
+) -> Result<CompiledGraph> {
+    let pack = open_rlxp(path.as_ref())?;
+    let graph = pack
+        .graph_with(rlx_pkg::MaterializeMode::HotOnly)
+        .with_context(|| format!("graph {}", path.as_ref().display()))?;
+    let mut compiled = session.compile(graph);
+    for (name, bytes, dtype) in pack.typed_weight_bindings()? {
+        compiled.set_param_typed(&name, &bytes, dtype);
+    }
+    Ok(compiled)
 }
 
 /// Compile with explicit [`CompileOptions`].

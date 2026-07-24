@@ -17,10 +17,10 @@ documentation.workspace = true
 default = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.13" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.13", default-features = false, features = ["compile", "training"] }
-rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.13" }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14", default-features = false, features = ["compile", "training"] }
+rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.14" }
+rlx-compile = { path = "../../core/rlx-compile", version = "0.2.14" }
 # CPU reference kernels for the host-fallback path. On a host with no Intel
 # Level Zero device (this macOS dev box, CI), the whole legalized graph runs on
 # the `rlx-cpu` reference so results are bit-for-bit the ground truth; on Intel
@@ -36,11 +36,11 @@ rlx-compile = { path = "../../core/rlx-compile", version = "0.2.13" }
 # OpenBLAS — rlx-cpu's build.rs leaves the BLAS link off there and falls back to
 # SIMD, so the driverless build still needs no BLAS; only the eigen SPD ops
 # (BiMap, pure GEMM, still works) are unavailable in that narrow case.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.13", default-features = false, features = [
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false, features = [
     "blas",
     "splat",
 ] }
-rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.13" }
+rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.14" }
 
 # The Level Zero loader (`libze_loader.so.1` / `ze_loader.dll`) is opened at
 # runtime with `libloading` — no link-time dependency on the oneAPI runtime, so

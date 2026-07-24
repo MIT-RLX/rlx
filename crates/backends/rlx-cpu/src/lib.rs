@@ -28,6 +28,7 @@ pub mod autotune;
 pub mod blas;
 pub mod calibrate;
 pub mod config;
+pub mod conv3d_bwd;
 pub mod conv_bwd;
 pub mod conv_fwd;
 pub mod cost;

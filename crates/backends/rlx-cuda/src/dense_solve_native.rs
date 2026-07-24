@@ -273,6 +273,7 @@ pub fn run_dense(
 
 /// Batched `A[B,n,n] X = b[B,n]` / `b[B,n,K]` via cuBLAS getrfBatched/getrsBatched.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // cublas handle + device ptr FFI
 pub fn run_batched(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
@@ -337,10 +338,10 @@ pub fn run_batched(
             let (a_base, _ga) = d_a.device_ptr_mut(stream);
             let (b_base, _gb) = d_b_work.device_ptr_mut(stream);
             a_ptrs = (0..batch)
-                .map(|i| a_base as u64 + (i * a_stride * 4) as u64)
+                .map(|i| a_base + (i * a_stride * 4) as u64)
                 .collect();
             b_ptrs = (0..batch)
-                .map(|i| b_base as u64 + (i * b_stride * 4) as u64)
+                .map(|i| b_base + (i * b_stride * 4) as u64)
                 .collect();
         }
         let mut d_a_ptrs = stream.alloc_zeros::<u64>(batch).unwrap();

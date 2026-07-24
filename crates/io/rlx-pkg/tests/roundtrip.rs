@@ -67,10 +67,7 @@ fn roundtrip_flat_pack_default() {
         .expect("w node");
     // Tiny graph uses Param; bake exports use Constant. Either is fine — tensors
     // come from the data region either way.
-    assert!(matches!(
-        &w_node.op,
-        Op::Constant { .. } | Op::Param { .. }
-    ));
+    assert!(matches!(&w_node.op, Op::Constant { .. } | Op::Param { .. }));
 }
 
 #[test]
@@ -337,4 +334,3 @@ fn weight_only_and_zip_hybrid() {
     assert!(pack.graph().is_err());
     assert_eq!(pack.tensor_bytes("blob").unwrap(), warm_raw);
 }
-

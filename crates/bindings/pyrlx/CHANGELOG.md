@@ -6,6 +6,11 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-07-24
+
+- Aligned with RLX workspace **0.2.14**.
+
+
 ## [0.2.12] — 2026-07-06
 
 ### Changed
@@ -96,7 +101,9 @@ and the project follows [Semantic Versioning](https://semver.org/).
   `cpu`, `blas-accelerate`, `blas-mkl`, `blas-openblas`, `metal`,
   `mlx`, `gpu` (wgpu), `cuda`, `rocm`.
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.12...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/pyrlx-v0.2.14...HEAD
+[0.2.14]:     https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.14
+[0.2.13]:     https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.13
 [0.2.12]:     https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.12
 [0.2.11]:     https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.11
 [0.2.7]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.7

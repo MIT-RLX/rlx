@@ -519,8 +519,12 @@ fn vjp(
             dilation,
             groups,
         } => vjp_conv(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Conv3d { .. } => vjp_conv3d(node, upstream, upstream_shape, fwd_map, bwd),
         Op::ConvTranspose2d { .. } => {
             vjp_conv_transpose2d(node, upstream, upstream_shape, fwd_map, bwd)
+        }
+        Op::ConvTranspose3d { .. } => {
+            vjp_conv_transpose3d(node, upstream, upstream_shape, fwd_map, bwd)
         }
         Op::Pool {
             kind: ReduceOp::Max,
@@ -571,6 +575,7 @@ fn vjp(
             bits, axis, ste, ..
         } => vjp_fake_quantize(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Expand { .. } => vjp_expand(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Interpolate3d { .. } => vjp_interpolate3d(node, upstream, upstream_shape, fwd_map, bwd),
         Op::BatchNormInference { eps } => {
             vjp_batch_norm_inference(node, upstream, upstream_shape, fwd_map, bwd)
         }
@@ -802,6 +807,25 @@ fn vjp(
             dilation,
             groups,
         } => vjp_conv2d_backward_weight(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Conv3dBackwardInput {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => vjp_conv3d_backward_input(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Conv3dBackwardWeight {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => vjp_conv3d_backward_weight(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::MaxPool3dBackward {
+            kernel_size,
+            stride,
+            padding,
+        } => vjp_maxpool3d_backward(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Fft { inverse, norm } => vjp_fft(node, upstream, upstream_shape, fwd_map, bwd),
         Op::LogMel => vjp_log_mel(node, upstream, upstream_shape, fwd_map, bwd),
         // ── Riemannian / SPD-manifold layers ─────────────────────
@@ -1678,6 +1702,54 @@ fn vjp_conv(
     }
 }
 
+fn vjp_conv3d(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Conv3d {
+        stride,
+        padding,
+        dilation,
+        groups,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let w_bwd = fwd_map[&node.inputs[1]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let w_shape = bwd.node(w_bwd).shape.clone();
+    let kernel_size = vec![
+        w_shape.dim(2).unwrap_static(),
+        w_shape.dim(3).unwrap_static(),
+        w_shape.dim(4).unwrap_static(),
+    ];
+    let dx = bwd.conv3d_backward_input(
+        upstream,
+        w_bwd,
+        x_shape,
+        kernel_size.clone(),
+        stride.to_vec(),
+        padding.to_vec(),
+        dilation.to_vec(),
+        *groups,
+    );
+    let dw = bwd.conv3d_backward_weight(
+        x_bwd,
+        upstream,
+        w_shape,
+        kernel_size,
+        stride.to_vec(),
+        padding.to_vec(),
+        dilation.to_vec(),
+        *groups,
+    );
+    vec![(0, dx), (1, dw)]
+}
+
 // ── ConvTranspose2d ─────────────────────────────────────
 //
 // `conv_transpose2d(x, w)` is the *adjoint* of `conv2d`: it equals
@@ -1710,8 +1782,8 @@ fn vjp_conv_transpose2d(
     };
     assert!(
         output_padding.iter().all(|&p| p == 0),
-        "ConvTranspose2d VJP: output_padding != 0 not supported yet \
-         (breaks the conv2d adjoint size relationship)"
+        "autodiff: unsupported VJP for ConvTranspose2d with output_padding={output_padding:?} \
+         (only all-zero output_padding is supported; non-zero breaks the conv2d adjoint size relationship)"
     );
     let x_bwd = fwd_map[&node.inputs[0]];
     let w_bwd = fwd_map[&node.inputs[1]];
@@ -1744,6 +1816,61 @@ fn vjp_conv_transpose2d(
     vec![(0, dx), (1, dw)]
 }
 
+fn vjp_conv_transpose3d(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::ConvTranspose3d {
+        stride,
+        padding,
+        dilation,
+        output_padding,
+        groups,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    if !output_padding.iter().all(|&p| p == 0) {
+        panic!(
+            "autodiff: unsupported VJP for ConvTranspose3d with output_padding={output_padding:?} \
+             (only all-zero output_padding is supported)"
+        );
+    }
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let w_bwd = fwd_map[&node.inputs[1]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let w_shape = bwd.node(w_bwd).shape.clone();
+    let kernel_size = [
+        w_shape.dim(2).unwrap_static(),
+        w_shape.dim(3).unwrap_static(),
+        w_shape.dim(4).unwrap_static(),
+    ];
+    let dx = bwd.add_node(
+        Op::Conv3d {
+            stride: *stride,
+            padding: *padding,
+            dilation: *dilation,
+            groups: *groups,
+        },
+        vec![upstream, w_bwd],
+        x_shape,
+    );
+    let dw = bwd.conv3d_backward_weight(
+        upstream,
+        x_bwd,
+        w_shape,
+        kernel_size.to_vec(),
+        stride.to_vec(),
+        padding.to_vec(),
+        dilation.to_vec(),
+        *groups,
+    );
+    vec![(0, dx), (1, dw)]
+}
+
 #[allow(unused_variables)]
 fn vjp_pool(
     node: &Node,
@@ -1761,17 +1888,26 @@ fn vjp_pool(
     else {
         unreachable!()
     };
-    {
-        let x_bwd = fwd_map[&node.inputs[0]];
-        let dx = bwd.maxpool2d_backward(
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let dx = if kernel_size.len() == 3 {
+        bwd.maxpool3d_backward(
             x_bwd,
             upstream,
             kernel_size.clone(),
             stride.clone(),
             padding.clone(),
-        );
-        vec![(0, dx)]
-    }
+        )
+    } else {
+        assert_eq!(kernel_size.len(), 2, "Pool(Max) VJP: 2-D or 3-D only");
+        bwd.maxpool2d_backward(
+            x_bwd,
+            upstream,
+            kernel_size.clone(),
+            stride.clone(),
+            padding.clone(),
+        )
+    };
+    vec![(0, dx)]
 }
 
 #[allow(unused_variables)]
@@ -2087,6 +2223,85 @@ fn vjp_expand(
         let dx = unbroadcast(upstream, &x_shape, bwd);
         vec![(0, dx)]
     }
+}
+
+/// Nearest-neighbor `Interpolate3d` VJP: scatter-add upstream onto source
+/// indices (`src = min(floor(dst * in / out), in - 1)`), matching the forward
+/// CPU/GPU kernels.
+#[allow(unused_variables)]
+fn vjp_interpolate3d(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Interpolate3d { size } = &node.op else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    assert_eq!(x_shape.rank(), 5, "Interpolate3d VJP: NCDHW only");
+    assert_eq!(size.len(), 3, "Interpolate3d VJP: size must be [D,H,W]");
+    let n = x_shape.dim(0).unwrap_static();
+    let c = x_shape.dim(1).unwrap_static();
+    let d_in = x_shape.dim(2).unwrap_static();
+    let h_in = x_shape.dim(3).unwrap_static();
+    let w_in = x_shape.dim(4).unwrap_static();
+    let d_out = size[0];
+    let h_out = size[1];
+    let w_out = size[2];
+    let m_in = d_in * h_in * w_in;
+    let m_out = d_out * h_out * w_out;
+    let trailing = n * c;
+    let dt = x_shape.dtype();
+
+    let mut idx = vec![0f32; m_out];
+    for od in 0..d_out {
+        let id = ((od * d_in) / d_out).min(d_in.saturating_sub(1));
+        for oh in 0..h_out {
+            let ih = ((oh * h_in) / h_out).min(h_in.saturating_sub(1));
+            for ow in 0..w_out {
+                let iw = ((ow * w_in) / w_out).min(w_in.saturating_sub(1));
+                let o = (od * h_out + oh) * w_out + ow;
+                idx[o] = ((id * h_in + ih) * w_in + iw) as f32;
+            }
+        }
+    }
+    let idx_bytes: Vec<u8> = idx.into_iter().flat_map(f32::to_le_bytes).collect();
+    let idx_node = bwd.add_node(
+        Op::Constant { data: idx_bytes },
+        vec![],
+        Shape::new(&[m_out], DType::F32),
+    );
+
+    // dy: [N,C,D_out,H_out,W_out] → [N·C, M_out] → [M_out, N·C]
+    let dy_nc_m = bwd.reshape(
+        upstream,
+        vec![trailing as i64, m_out as i64],
+        Shape::new(&[trailing, m_out], dt),
+    );
+    let dy_m_nc = bwd.add_node(
+        Op::Transpose { perm: vec![1, 0] },
+        vec![dy_nc_m],
+        Shape::new(&[m_out, trailing], dt),
+    );
+    let dx_m_nc = bwd.add_node(
+        Op::ScatterAdd,
+        vec![dy_m_nc, idx_node],
+        Shape::new(&[m_in, trailing], dt),
+    );
+    let dx_nc_m = bwd.add_node(
+        Op::Transpose { perm: vec![1, 0] },
+        vec![dx_m_nc],
+        Shape::new(&[trailing, m_in], dt),
+    );
+    let dx = bwd.reshape(
+        dx_nc_m,
+        vec![n as i64, c as i64, d_in as i64, h_in as i64, w_in as i64],
+        x_shape,
+    );
+    vec![(0, dx)]
 }
 
 #[allow(unused_variables)]
@@ -2708,15 +2923,50 @@ fn vjp_pool_2(
         unreachable!()
     };
     {
-        assert_eq!(kernel_size.len(), 2, "Pool(Mean) VJP: 2-D pool only");
+        assert!(
+            kernel_size.len() == 2 || kernel_size.len() == 3,
+            "Pool(Mean) VJP: 2-D or 3-D pool only"
+        );
         let x_bwd = fwd_map[&node.inputs[0]];
         let x_shape = bwd.node(x_bwd).shape.clone();
         let dtype = x_shape.dtype();
-        // Channels = x_shape.dim(1).
         let c = match x_shape.dim(1) {
             Dim::Static(n) => n,
             _ => panic!("Pool(Mean) VJP: dynamic channel dim"),
         };
+        if kernel_size.len() == 3 {
+            let kd = kernel_size[0];
+            let kh = kernel_size[1];
+            let kw = kernel_size[2];
+            let inv_n = 1.0_f32 / (kd as f32 * kh as f32 * kw as f32);
+            let kernel_n = c * kd * kh * kw;
+            let mut bytes: Vec<u8> = Vec::with_capacity(kernel_n * 4);
+            for _ in 0..kernel_n {
+                bytes.extend_from_slice(&inv_n.to_le_bytes());
+            }
+            let kernel_shape = Shape::from_dims(
+                &[
+                    Dim::Static(c),
+                    Dim::Static(1),
+                    Dim::Static(kd),
+                    Dim::Static(kh),
+                    Dim::Static(kw),
+                ],
+                dtype,
+            );
+            let kernel = bwd.add_node(Op::Constant { data: bytes }, vec![], kernel_shape);
+            let dx = bwd.conv3d_backward_input(
+                upstream,
+                kernel,
+                x_shape,
+                kernel_size.clone(),
+                stride.clone(),
+                padding.clone(),
+                vec![1, 1, 1],
+                c,
+            );
+            return vec![(0, dx)];
+        }
         let kh = kernel_size[0];
         let kw = kernel_size[1];
         let inv_n = 1.0_f32 / (kh as f32 * kw as f32);
@@ -4056,6 +4306,117 @@ fn vjp_conv2d_backward_weight(
         );
         vec![(0, d_x), (1, d_dy)]
     }
+}
+
+#[allow(unused_variables)]
+fn vjp_conv3d_backward_input(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Conv3dBackwardInput {
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let dy_bwd = fwd_map[&node.inputs[0]];
+    let w_bwd = fwd_map[&node.inputs[1]];
+    let dy_shape = bwd.node(dy_bwd).shape.clone();
+    let d_dy = bwd.add_node(
+        Op::Conv3d {
+            stride: [stride[0], stride[1], stride[2]],
+            padding: [padding[0], padding[1], padding[2]],
+            dilation: [dilation[0], dilation[1], dilation[2]],
+            groups: *groups,
+        },
+        vec![upstream, w_bwd],
+        dy_shape,
+    );
+    let _ = (kernel_size, dy_bwd);
+    vec![(0, d_dy)]
+}
+
+#[allow(unused_variables)]
+fn vjp_conv3d_backward_weight(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Conv3dBackwardWeight {
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let dy_bwd = fwd_map[&node.inputs[1]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let dy_shape = bwd.node(dy_bwd).shape.clone();
+    let d_x = bwd.conv3d_backward_input(
+        dy_bwd,
+        upstream,
+        x_shape,
+        kernel_size.clone(),
+        stride.clone(),
+        padding.clone(),
+        dilation.clone(),
+        *groups,
+    );
+    let d_dy = bwd.add_node(
+        Op::Conv3d {
+            stride: [stride[0], stride[1], stride[2]],
+            padding: [padding[0], padding[1], padding[2]],
+            dilation: [dilation[0], dilation[1], dilation[2]],
+            groups: *groups,
+        },
+        vec![x_bwd, upstream],
+        dy_shape,
+    );
+    vec![(0, d_x), (1, d_dy)]
+}
+
+/// Piecewise-linear: Hessian w.r.t. `x` is zero a.e.; cotangent on `dy`
+/// reuses the same argmax routing (`MaxPool3dBackward`).
+#[allow(unused_variables)]
+fn vjp_maxpool3d_backward(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::MaxPool3dBackward {
+        kernel_size,
+        stride,
+        padding,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let d_dy = bwd.maxpool3d_backward(
+        x_bwd,
+        upstream,
+        kernel_size.clone(),
+        stride.clone(),
+        padding.clone(),
+    );
+    // No cotangent for `x` (index 0) — same as decomposing MaxPool2dBackward
+    // into a Compare mask whose second derivative vanishes.
+    vec![(1, d_dy)]
 }
 
 // 1D FFT: y = fft(x; inverse). Both forward and inverse are

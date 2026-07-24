@@ -147,7 +147,8 @@ pub(crate) fn is_mlx_typed_host_op(op: &Op) -> bool {
         | Op::Eigh
         | Op::EighBackward
         | Op::EighBatch
-        | Op::EighBatchBackward => true,
+        | Op::EighBatchBackward
+        | Op::Interpolate3d { .. } => true,
         _ => false,
     }
 }

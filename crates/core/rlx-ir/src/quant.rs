@@ -87,6 +87,16 @@ pub enum QuantScheme {
     /// scales, optional f32 global scale on input 3 (legacy `zp` slot).
     /// Used by FLUX.2 / MLX `nvfp4` checkpoints.
     Nvfp4Block,
+    /// MLX affine quantization (`nn.quantize` / mlx-lm default): packed
+    /// uint codes + per-group f32 scale and bias. Inputs to
+    /// `DequantMatMul`: `x`, `w_q`, `scales`, `biases` (biases in the
+    /// legacy `zp` slot). Typical `bits=4`, `group_size=64`.
+    MlxAffine { bits: u8, group_size: u32 },
+    /// MLX `mxfp4` mode — E2M1 nibbles × per-group scale (E8M0 or FP8).
+    /// Inputs: `x`, `w_q`, `scales`, unused `zp` (pass ones).
+    MlxMxfp4 { group_size: u32 },
+    /// MLX `mxfp8` mode — FP8 E4M3 codes × per-group scale.
+    MlxMxfp8 { group_size: u32 },
     // ── GGUF IQ-family (sub-byte LUT-coded) ─────────────────────
     /// IQ4_NL: 4.5 bpw non-linear. 32-element block (18 bytes).
     GgufIQ4NL,
@@ -187,6 +197,9 @@ impl QuantScheme {
             Self::GgufQ5_1 => 60, // 24 / 32 × 8 = 6.0 bpe
             Self::GgufQ8_0 => 85, // 34 / 32 × 8 = 8.5 bpe
             Self::Nvfp4Block => 40,
+            Self::MlxAffine { bits, .. } => (bits as u32) * 10,
+            Self::MlxMxfp4 { .. } => 40,
+            Self::MlxMxfp8 { .. } => 80,
             Self::GgufIQ4NL => 45,
             Self::GgufIQ4XS => 42, // 136/256 × 8 = 4.25
             Self::GgufIQ2XXS => 20,
@@ -249,12 +262,18 @@ impl QuantScheme {
                 | Self::Int8BlockAsym { .. }
                 | Self::Int4Block { .. }
                 | Self::Nvfp4Block
+                | Self::MlxAffine { .. }
+                | Self::MlxMxfp4 { .. }
+                | Self::MlxMxfp8 { .. }
         )
     }
 
-    /// True for NVFP4 block scales stored as FP8 E4M3 bytes (not f32).
+    /// True for NVFP4 / MLX mxfp block scales stored as FP8 / E8M0 bytes (not f32).
     pub const fn scale_is_fp8(self) -> bool {
-        matches!(self, Self::Nvfp4Block)
+        matches!(
+            self,
+            Self::Nvfp4Block | Self::MlxMxfp4 { .. } | Self::MlxMxfp8 { .. }
+        )
     }
 
     /// Fixed NVFP4 group size along K (0 for other schemes).
@@ -265,9 +284,40 @@ impl QuantScheme {
         }
     }
 
-    /// True if this scheme requires a per-block zero-point.
+    /// True if this scheme requires a per-block zero-point / bias tensor.
     pub const fn has_zero_point(self) -> bool {
-        matches!(self, Self::Int8BlockAsym { .. })
+        matches!(self, Self::Int8BlockAsym { .. } | Self::MlxAffine { .. })
+    }
+
+    /// True for MLX-native affine / mxfp schemes (not GGUF, not legacy int blocks).
+    pub const fn is_mlx(self) -> bool {
+        matches!(
+            self,
+            Self::MlxAffine { .. } | Self::MlxMxfp4 { .. } | Self::MlxMxfp8 { .. }
+        )
+    }
+
+    /// MLX group size along K (0 when not an MLX scheme).
+    pub const fn mlx_group_size(self) -> u32 {
+        match self {
+            Self::MlxAffine { group_size, .. }
+            | Self::MlxMxfp4 { group_size }
+            | Self::MlxMxfp8 { group_size } => group_size,
+            _ => 0,
+        }
+    }
+
+    /// GPU launch args for MLX dequant-matmul kernels: `(kind, bits, group_size)`.
+    ///
+    /// `kind`: 0 = [`Self::MlxAffine`], 1 = [`Self::MlxMxfp4`], 2 = [`Self::MlxMxfp8`].
+    /// `bits` is 0 for mxfp schemes. Returns `None` for non-MLX schemes.
+    pub const fn mlx_gpu_launch(self) -> Option<(u32, u32, u32)> {
+        match self {
+            Self::MlxAffine { bits, group_size } => Some((0, bits as u32, group_size)),
+            Self::MlxMxfp4 { group_size } => Some((1, 0, group_size)),
+            Self::MlxMxfp8 { group_size } => Some((2, 0, group_size)),
+            _ => None,
+        }
     }
 
     /// GGUF K-quant block size (256 elements) — meaningless for the
@@ -394,6 +444,11 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufQ5_1 => write!(f, "gguf_q5_1"),
             Self::GgufQ8_0 => write!(f, "gguf_q8_0"),
             Self::Nvfp4Block => write!(f, "nvfp4/16"),
+            Self::MlxAffine { bits, group_size } => {
+                write!(f, "mlx_affine/{bits}/{group_size}")
+            }
+            Self::MlxMxfp4 { group_size } => write!(f, "mlx_mxfp4/{group_size}"),
+            Self::MlxMxfp8 { group_size } => write!(f, "mlx_mxfp8/{group_size}"),
             Self::GgufIQ4NL => write!(f, "gguf_iq4_nl"),
             Self::GgufIQ4XS => write!(f, "gguf_iq4_xs"),
             Self::GgufIQ2XXS => write!(f, "gguf_iq2_xxs"),
@@ -912,6 +967,12 @@ mod tests {
             Fp8E4m3,
             Fp8E5m2,
             Nvfp4Block,
+            MlxAffine {
+                bits: 4,
+                group_size: 64,
+            },
+            MlxMxfp4 { group_size: 32 },
+            MlxMxfp8 { group_size: 32 },
         ] {
             assert_eq!(scheme.gpu_dequant_scheme_id(), None, "{scheme:?}");
         }

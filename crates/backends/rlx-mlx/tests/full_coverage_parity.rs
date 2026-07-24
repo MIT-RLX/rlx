@@ -862,7 +862,7 @@ fn scaled_dequantize_per_tensor_matches_cpu() {
         "ScaledDequantize PerTensor should lower natively"
     );
     let code_bytes: Vec<u8> = vec![0, 1, 2, 10, 20, 30];
-    let scale_v = vec![0.5f32];
+    let scale_v = [0.5f32];
     let want = cpu_run_typed(
         &g,
         &[

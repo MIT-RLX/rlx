@@ -794,8 +794,21 @@ pub(crate) fn compile_dequant_mat_mul(
                     block_size: *block_size,
                     is_asymmetric: true,
                 },
+                QuantScheme::MlxAffine { .. }
+                | QuantScheme::MlxMxfp4 { .. }
+                | QuantScheme::MlxMxfp8 { .. } => Thunk::DequantMatMulMlx {
+                    x: node_offset(arena, node.inputs[0]),
+                    w_q: node_offset(arena, node.inputs[1]),
+                    scale: node_offset(arena, node.inputs[2]),
+                    zp: node_offset(arena, node.inputs[3]),
+                    dst: node_offset(arena, node.id),
+                    m: m as u32,
+                    k: k as u32,
+                    n: n as u32,
+                    scheme: *scheme,
+                },
                 other => panic!(
-                    "DequantMatMul on CPU supports Int8/Int4/FP8/NVFP4 legacy or GGUF schemes; got {other}"
+                    "DequantMatMul on CPU supports Int8/Int4/FP8/NVFP4/MLX legacy or GGUF schemes; got {other}"
                 ),
             }
         }
@@ -1089,7 +1102,9 @@ pub(crate) fn exec_dequant_mat_mul_gguf(t: &Thunk, base: *mut u8) {
             let w_bytes_ptr = base.add(*w_q) as *const u8;
             let w_bytes = std::slice::from_raw_parts(w_bytes_ptr, total_bytes);
             let out = sl_mut(*dst, base, m * n);
-            crate::gguf_matmul::gguf_matmul_bt_dispatch(xs, w_bytes, out, m, k, n, *scheme);
+            crate::gguf_matmul::gguf_matmul_bt_dispatch_at(
+                xs, w_bytes, out, m, k, n, *scheme, *w_q,
+            );
         }
     }
 }
@@ -1184,6 +1199,154 @@ pub(crate) fn exec_dequant_mat_mul_nvfp4(t: &Thunk, base: *mut u8) {
             let out = sl_mut(*dst, base, m * n);
             dequant_matmul_nvfp4(xs, w_bytes, scale_bytes, gs, out, m, k, n);
         }
+    }
+}
+
+#[inline(always)]
+pub(crate) fn exec_dequant_mat_mul_mlx(t: &Thunk, base: *mut u8) {
+    let Thunk::DequantMatMulMlx {
+        x,
+        w_q,
+        scale,
+        zp,
+        dst,
+        m,
+        k,
+        n,
+        scheme,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        exec_dequant_mat_mul_mlx_inner(
+            base,
+            *x,
+            *w_q,
+            *scale,
+            *zp,
+            *dst,
+            *m as usize,
+            *k as usize,
+            *n as usize,
+            *scheme,
+        );
+    }
+}
+
+/// Shared body for MLX DequantMatMul (compile closure + exec_dispatch).
+pub(crate) unsafe fn exec_dequant_mat_mul_mlx_inner(
+    base: *mut u8,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+) {
+    use rlx_ir::quant::QuantScheme;
+    use rlx_mlx_io::{
+        dequant_matmul_affine, dequant_mxfp4_f32, dequant_mxfp8_f32, pack_factor,
+        validate_dequant_matmul_dims,
+    };
+    if let Err(e) = validate_dequant_matmul_dims(scheme, k, n, None) {
+        panic!("DequantMatMulMlx: {e}");
+    }
+    let xs = unsafe { sl(x, base, m * k) };
+    let out = unsafe { sl_mut(dst, base, m * n) };
+    match scheme {
+        QuantScheme::MlxAffine { bits, group_size } => {
+            let gs = group_size as usize;
+            let n_groups = k / gs;
+            let pf = match pack_factor(bits as u32) {
+                Ok(p) => p as usize,
+                Err(e) => panic!("DequantMatMulMlx: {e}"),
+            };
+            let packs = gs / pf;
+            let bpp = match bits {
+                3 | 6 => 3,
+                5 => 5,
+                _ => 1,
+            };
+            let w_need = n * n_groups * packs * bpp;
+            let w_bytes = unsafe { std::slice::from_raw_parts(base.add(w_q) as *const u8, w_need) };
+            let scales = unsafe { sl(scale, base, n * n_groups) };
+            let biases = unsafe { sl(zp, base, n * n_groups) };
+            match dequant_matmul_affine(
+                xs,
+                w_bytes,
+                scales,
+                biases,
+                bits as u32,
+                group_size,
+                m,
+                k,
+                n,
+            ) {
+                Ok(y) => out.copy_from_slice(&y),
+                Err(e) => panic!("DequantMatMulMlx affine: {e}"),
+            }
+        }
+        QuantScheme::MlxMxfp4 { group_size } => {
+            let gs = group_size as usize;
+            let n_groups = k / gs;
+            let w_bytes =
+                unsafe { std::slice::from_raw_parts(base.add(w_q) as *const u8, n * k / 2) };
+            let scales_u8 =
+                unsafe { std::slice::from_raw_parts(base.add(scale) as *const u8, n * n_groups) };
+            let w_f = match dequant_mxfp4_f32(w_bytes, scales_u8, group_size, n, n_groups) {
+                Ok(v) => v,
+                Err(e) => panic!("DequantMatMulMlx mxfp4: {e}"),
+            };
+            matmul_x_wt(xs, &w_f, out, m, k, n);
+        }
+        QuantScheme::MlxMxfp8 { group_size } => {
+            let gs = group_size as usize;
+            let n_groups = k / gs;
+            let w_bytes = unsafe { std::slice::from_raw_parts(base.add(w_q) as *const u8, n * k) };
+            let scales_u8 =
+                unsafe { std::slice::from_raw_parts(base.add(scale) as *const u8, n * n_groups) };
+            let w_f = match dequant_mxfp8_f32(w_bytes, scales_u8, group_size, n, n_groups) {
+                Ok(v) => v,
+                Err(e) => panic!("DequantMatMulMlx mxfp8: {e}"),
+            };
+            matmul_x_wt(xs, &w_f, out, m, k, n);
+        }
+        other => panic!("DequantMatMulMlx: unexpected scheme {other}"),
+    }
+}
+
+#[inline]
+fn matmul_x_wt(x: &[f32], w_nk: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f32;
+            for p in 0..k {
+                acc += x[i * k + p] * w_nk[j * k + p];
+            }
+            out[i * n + j] = acc;
+        }
+    }
+}
+
+/// Host-fallback entry for MLX affine/mxfp `Op::DequantMatMul` (Metal unified memory).
+pub unsafe fn execute_dequant_matmul_mlx_f32(
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    base: *mut u8,
+) {
+    unsafe {
+        exec_dequant_mat_mul_mlx_inner(base, x, w_q, scale, zp, dst, m, k, n, scheme);
     }
 }
 
@@ -1896,7 +2059,7 @@ pub unsafe fn execute_dequant_matmul_gguf_f32(
         let xs = sl(x, base, m * k);
         let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, total_bytes);
         let out = sl_mut(dst, base, m * n);
-        crate::gguf_matmul::gguf_matmul_bt_dispatch(xs, w_bytes, out, m, k, n, scheme);
+        crate::gguf_matmul::gguf_matmul_bt_dispatch_at(xs, w_bytes, out, m, k, n, scheme, w_q);
     }
 }
 

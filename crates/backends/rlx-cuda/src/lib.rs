@@ -86,9 +86,9 @@ pub mod log_mel_host {
 pub mod lstm_host {
     pub use super::host_ops::run_lstm;
 }
-pub mod lstm_gpu;
-pub mod lstm_cudnn;
 pub mod dyn_quant_lstm_gpu;
+pub mod lstm_cudnn;
+pub mod lstm_gpu;
 pub mod gru_host {
     pub use super::host_ops::run_gru;
 }
@@ -108,11 +108,11 @@ pub mod cuda_gpu_kernels;
 #[cfg(feature = "native-cuda-fft")]
 pub mod native_fft_dispatch;
 pub mod onnx_custom_host;
-pub mod rng_host;
 pub mod rng_gpu;
-pub mod scatter_nd_gpu;
+pub mod rng_host;
 pub mod sam_ops_host;
 pub mod scan_host;
+pub mod scatter_nd_gpu;
 pub mod spd;
 pub mod spd_host;
 pub mod splat_host {

@@ -123,7 +123,7 @@ pub fn run_host_op(graph: &Graph, node: NodeId, env: &mut HostTensors) {
     }
 }
 
-fn get<'a>(env: &'a HostTensors, id: NodeId) -> &'a [f32] {
+fn get(env: &HostTensors, id: NodeId) -> &[f32] {
     env.get(&id)
         .unwrap_or_else(|| panic!("rlx-tpu host: missing tensor for {id:?}"))
         .as_slice()

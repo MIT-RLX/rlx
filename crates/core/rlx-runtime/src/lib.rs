@@ -248,6 +248,10 @@ pub use rlx_cpu::moe_residency::MoeResidencyStats;
 #[cfg(not(feature = "cpu"))]
 #[derive(Debug, Clone, Default)]
 pub struct MoeResidencyStats;
+pub use pkg::{
+    compile_rlxp, compile_rlxp_bind_params, compile_rlxp_with, load_rlxp_graph,
+    load_rlxp_placement, open_rlxp, tensors_for_rank, weight_names_for_rank,
+};
 #[cfg(feature = "cpu")]
 pub use rlx_cpu::moe_topk_capture::MoeTopkCapture;
 pub use rlx_driver::{
@@ -258,11 +262,10 @@ pub use rlx_driver::{
 };
 pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
 pub use rlx_ir::{EnvVarDoc, format_env_catalog, public_catalog_docs as ENV_CATALOG};
+/// `.rlxp` package types — re-exported so `open_rlxp`’s return type is nameable
+/// without a direct `rlx-pkg` dependency.
+pub use rlx_pkg::{MaterializeMode, Package, Placement};
 pub use session::Session;
-pub use pkg::{
-    compile_rlxp, compile_rlxp_with, load_rlxp_graph, load_rlxp_placement, open_rlxp,
-    tensors_for_rank, weight_names_for_rank,
-};
 pub use stages::{
     compile_graph_stages, compile_graph_stages_for_backend, compile_hir_stages,
     compile_module_stages, fusion_target_for, graph_from_lir, maybe_log_fusion,

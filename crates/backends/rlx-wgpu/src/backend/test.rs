@@ -98,4 +98,10 @@ impl WgpuExecutable {
     pub fn test_arena_offset_elems(&self, id: NodeId) -> u32 {
         (self.arena.offset(id) / 4) as u32
     }
+
+    /// Test hook: step names in compile order (for native-path checks).
+    #[doc(hidden)]
+    pub fn test_step_names(&self) -> Vec<&'static str> {
+        self.schedule.iter().map(step_name).collect()
+    }
 }

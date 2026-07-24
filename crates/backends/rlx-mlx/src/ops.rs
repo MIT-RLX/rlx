@@ -430,6 +430,40 @@ pub fn maxpool2d_backward_metal(
     Ok(Array::from_raw(out))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn maxpool3d_backward_metal(
+    x: &Array,
+    dy: &Array,
+    n: i32,
+    c: i32,
+    d: i32,
+    h: i32,
+    w: i32,
+    d_out: i32,
+    h_out: i32,
+    w_out: i32,
+    kd: i32,
+    kh: i32,
+    kw: i32,
+    sd: i32,
+    sh: i32,
+    sw: i32,
+    pd: i32,
+    ph: i32,
+    pw: i32,
+) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
+    let mut out: *mut mlx_array_t = ptr::null_mut();
+    let rc = unsafe {
+        ffi::rlx_mlx_op_maxpool3d_backward_metal(
+            x.ptr, dy.ptr, n, c, d, h, w, d_out, h_out, w_out, kd, kh, kw, sd, sh, sw, pd, ph, pw,
+            &mut out,
+        )
+    };
+    check(rc)?;
+    Ok(Array::from_raw(out))
+}
+
 pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> Result<Array, MlxError> {
     let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
@@ -484,9 +518,29 @@ pub fn quantized_matmul(
     group_size: i32,
     bits: i32,
 ) -> Result<Array, MlxError> {
+    quantized_matmul_mode(x, w, scales, biases, transpose, group_size, bits, "affine")
+}
+
+/// Like [`quantized_matmul`] with an explicit MLX mode (`affine` / `mxfp4` /
+/// `mxfp8` / `nvfp4`).
+///
+/// Mxfp modes require the `native-mxfp` Cargo feature on `rlx-mlx` (or
+/// `rlx-runtime`'s `mlx-native-mxfp`). Without that feature the MLX backend
+/// lowers mxfp `DequantMatMul` via the Rust host-dequant path instead.
+pub fn quantized_matmul_mode(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+) -> Result<Array, MlxError> {
     let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let bias_ptr = biases.map(|b| b.ptr).unwrap_or(ptr::null_mut());
+    let mode_c = std::ffi::CString::new(mode).map_err(|e| MlxError(e.to_string()))?;
     let rc = unsafe {
         ffi::rlx_mlx_op_quantized_matmul(
             x.ptr,
@@ -496,6 +550,7 @@ pub fn quantized_matmul(
             if transpose { 1 } else { 0 },
             group_size,
             bits,
+            mode_c.as_ptr(),
             &mut out,
         )
     };

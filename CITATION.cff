@@ -18,8 +18,8 @@ authors:
 repository-code: "https://github.com/MIT-RLX/rlx"
 url: "https://github.com/MIT-RLX/rlx"
 license: GPL-3.0-only
-version: "0.2.13"
-date-released: "2026-07-18"
+version: "0.2.14"
+date-released: "2026-07-24"
 keywords:
   - machine learning
   - compiler

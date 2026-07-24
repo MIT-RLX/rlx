@@ -1,0 +1,31 @@
+[package]
+name = "rlx-mlx-io"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX — load MLX weight layouts (mlx-community safetensors dirs, .npz/.npy) including affine / mxfp dequant."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[dependencies]
+anyhow = "1"
+half = { version = "2", features = ["bytemuck"] }
+npyz = { version = "0.8", features = ["npz", "half"] }
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+
+[dev-dependencies]
+tempfile = "3"
+# Path-only: run packed Linear via Session (published manifest strips this).
+rlx-runtime = { path = "../../core/rlx-runtime", default-features = false, features = ["cpu"] }
+
+[lints]
+workspace = true
