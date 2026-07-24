@@ -531,13 +531,14 @@ impl Arena {
         }
     }
 
-    /// Build an arena that keeps params in a SEPARATE `weight_buffer`, so the
-    /// activation arena stays under wgpu's storage bind / `max_buffer_size`
-    /// caps. Used whenever the unified plan would exceed the bind limit
-    /// (NVIDIA ~2 GiB) — including dequantized F32 GGUF weights for Qwen-class
-    /// LMs and packed U8/I8 quant for 27B-class models. `offset()` returns a
-    /// WEIGHT_BUF_TAG-tagged offset for those params; matmul stages them into
-    /// the act window (or fused GGUF GEMV binds the weight buffer directly).
+    /// Build an arena that keeps large params in a SEPARATE `weight_buffer`
+    /// so the activation arena stays under wgpu's `max_buffer_size` / bind
+    /// caps. Packed U8/I8 quant always goes there; F32/F16 params larger than
+    /// 512 MiB (e.g. Qwen3 tied lm_head) do too — otherwise NVIDIA's ~2 GiB
+    /// storage bind virtual-shards the act arena and matmul panics. Smaller
+    /// F32 params stay in the act buffer. `offset()` returns a WEIGHT_BUF_TAG-
+    /// tagged offset for weight-buffer params; fused GGUF GEMV binds them
+    /// directly, other ops stage into the act window.
     pub fn from_plan_split(
         device: &wgpu::Device,
         plan: &MemoryPlan,
@@ -558,6 +559,30 @@ impl Arena {
         let mut weight_offsets: HashMap<NodeId, usize> = HashMap::new();
         let mut weight_cursor = 0usize;
         let mut tail = new_plan.arena_size;
+        // If activations + all params would exceed the storage bind limit,
+        // park every param in the weight buffer so the act arena stays in one
+        // bind window. Otherwise NVIDIA virtual-shards (~2 GiB stripes), which
+        // disables matmul param-anchor and panics on large F32 lm_heads.
+        let max_bind = device.limits().max_storage_buffer_binding_size as usize;
+        let bind_cap = (max_bind / 256) * 256;
+        let scratch_aligned = scratch_bytes.div_ceil(16) * 16;
+        let mut param_bytes_est = 0usize;
+        for node in graph.nodes() {
+            if matches!(&node.op, Op::Param { .. }) {
+                let ne = node.shape.num_elements().unwrap_or(0).max(1);
+                let dt = node.shape.dtype();
+                param_bytes_est = param_bytes_est.saturating_add(if matches!(
+                    dt,
+                    rlx_ir::DType::U8 | rlx_ir::DType::I8
+                ) {
+                    ne * dt.size_bytes()
+                } else {
+                    ne * 4
+                });
+            }
+        }
+        let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
+            || (new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap;
         // Cover every non-view node the compact plan didn't assign (params +
         // edge cases). Pure views are handled in a second pass so they alias
         // their roots — placing Reshape/Cast-of-Param as fresh tail slots left
@@ -574,21 +599,20 @@ impl Arena {
             let ne = node.shape.num_elements().unwrap_or(0).max(1);
             let dt = node.shape.dtype();
             let is_param = matches!(&node.op, Op::Param { .. });
-            // `from_plan_split` runs when a unified arena would exceed the
-            // storage bind limit (NVIDIA ~2 GiB). Park *all* params in the
-            // weight buffer so the act arena stays compact and does not
-            // virtual-shard — virtual sharding disables matmul param-anchor
-            // and then panics on large F32 lm_head/embedding (Qwen3-0.6B GGUF
-            // dequantized to F32). Packed U8/I8 quant already belonged here.
-            // Opt out with `RLX_WGPU_PARAMS_IN_ACT=1` for debugging.
-            // Legacy alias: `RLX_WGPU_ALL_PARAMS_WEIGHT=1` is now a no-op (default).
-            let to_weight = is_param && !rlx_ir::env::flag("RLX_WGPU_PARAMS_IN_ACT");
+            // Packed quant (U8/I8) always goes to the weight buffer. Large
+            // F32/F16 params (e.g. Qwen3 lm_head ~594 MiB) and — when the act
+            // arena would otherwise exceed the bind limit — all params.
+            let nbytes = if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+                ne * dt.size_bytes()
+            } else {
+                ne * 4
+            };
+            const LARGE_F32_PARAM: usize = 512 * 1024 * 1024;
+            let to_weight = is_param
+                && (matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                    || nbytes > LARGE_F32_PARAM
+                    || park_all_params);
             if to_weight {
-                let nbytes = if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
-                    ne * dt.size_bytes()
-                } else {
-                    ne * 4
-                };
                 weight_cursor = weight_cursor.div_ceil(walign) * walign;
                 weight_offsets.insert(node.id, weight_cursor);
                 weight_cursor += nbytes;
@@ -660,11 +684,11 @@ impl Arena {
         new_plan.arena_size = tail;
         if rlx_ir::env::flag("RLX_WGPU_DEBUG") {
             eprintln!(
-                "[rlx-wgpu split] weight_params={} weight_buf={:.3}GiB act_arena={:.3}GiB params_in_act={}",
+                "[rlx-wgpu split] weight_params={} weight_buf={:.3}GiB act_arena={:.3}GiB all_params={}",
                 weight_offsets.len(),
                 weight_cursor as f64 / (1u64 << 30) as f64,
                 new_plan.arena_size as f64 / (1u64 << 30) as f64,
-                rlx_ir::env::flag("RLX_WGPU_PARAMS_IN_ACT"),
+                rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT"),
             );
         }
         let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_bytes);

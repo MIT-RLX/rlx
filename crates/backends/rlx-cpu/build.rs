@@ -70,11 +70,11 @@ fn main() {
     }
 
     // OpenBLAS path (default for non-Apple). Link it only where it actually
-    // exists: x86_64 (Linux/Windows dev + CI ship libopenblas), or wherever the
-    // user points us via OPENBLAS_LIB_DIR / OPENBLAS_DIR (e.g. an aarch64 board
-    // that has libopenblas installed). On aarch64 Linux with no OpenBLAS — the
-    // Raspberry Pi / cross-compile / QEMU case — skip the link and fall back to
-    // the portable SIMD gemm so the crate still builds and runs.
+    // exists: x86_64 Linux (dev + CI ship libopenblas), or wherever the user
+    // points us via OPENBLAS_LIB_DIR / OPENBLAS_DIR. On aarch64 Linux with no
+    // OpenBLAS — and on fresh Windows boxes without an OpenBLAS install —
+    // skip the link and fall back to the portable SIMD gemm so the crate
+    // still builds.
     println!("cargo:rerun-if-env-changed=OPENBLAS_DIR");
     println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
     let openblas_lib_dir = std::env::var("OPENBLAS_LIB_DIR").ok();
@@ -87,6 +87,16 @@ fn main() {
         );
         return; // leave rlx_cpu_blas unset → SIMD fallback
     }
+    // Windows x86_64: only link when the import lib is findable. Fresh VMs
+    // and CI images often lack OpenBLAS; LNK1181 `openblas.lib` is worse than
+    // the portable gemm fallback.
+    if target_os == "windows" && !pinned && !windows_openblas_available() {
+        println!(
+            "cargo:warning=rlx-cpu: openblas.lib not found on PATH/LIB; using the \
+             portable SIMD gemm (set OPENBLAS_LIB_DIR or install OpenBLAS)"
+        );
+        return;
+    }
     if let Some(dir) = openblas_lib_dir {
         println!("cargo:rustc-link-search=native={dir}");
     } else if let Some(root) = openblas_dir {
@@ -95,4 +105,22 @@ fn main() {
     println!("cargo:rustc-link-lib=openblas");
     println!("cargo:rustc-cfg=rlx_cpu_blas");
     println!("cargo:rustc-cfg=rlx_cpu_blas_openblas");
+}
+
+/// True when the MSVC linker would find `openblas.lib` via LIB / common roots.
+fn windows_openblas_available() -> bool {
+    use std::path::PathBuf;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(lib) = std::env::var("LIB") {
+        dirs.extend(lib.split(';').filter(|s| !s.is_empty()).map(PathBuf::from));
+    }
+    for cand in [
+        r"C:\OpenBLAS\lib",
+        r"C:\openblas\lib",
+        r"C:\vcpkg\installed\x64-windows\lib",
+        r"C:\Program Files\OpenBLAS\lib",
+    ] {
+        dirs.push(PathBuf::from(cand));
+    }
+    dirs.iter().any(|d| d.join("openblas.lib").is_file())
 }

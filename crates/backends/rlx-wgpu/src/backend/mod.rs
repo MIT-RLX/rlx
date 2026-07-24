@@ -1691,7 +1691,25 @@ fn arena_off_in_window_or_stage(
             });
             return ((dst.saturating_sub(*base)) / 4) as u32;
         }
+        // Unsharded act arena: bump-allocate inside the dedicated scratch
+        // tail and wrap when an op stages more than fits in one pass.
+        // Without wrapping, parking many F32 params in the weight buffer
+        // walked `scratch` past `arena.size` and matmul/gather read zeros.
         let aligned = len.div_ceil(256) * 256;
+        let stage_begin = arena.scratch_off as u64;
+        let stage_end = stage_begin.saturating_add(arena.scratch_bytes.max(1) as u64);
+        if (arena.scratch_bytes as u64) < len {
+            panic!(
+                "rlx-wgpu: cannot stage {} bytes for weight node {:?} \
+                 (scratch reserve {} bytes)",
+                len,
+                id,
+                arena.scratch_bytes
+            );
+        }
+        if *scratch < stage_begin || scratch.saturating_add(aligned) > stage_end {
+            *scratch = stage_begin;
+        }
         let dst = *scratch;
         *scratch = scratch.saturating_add(aligned);
         schedule.push(Step::BufferCopy {
@@ -1699,6 +1717,24 @@ fn arena_off_in_window_or_stage(
             dst_byte_off: dst,
             bytes: len as u32,
         });
+        // Widen the act bind window so the shader can see the staged copy
+        // (same as the non-weight staging path below).
+        let lo = (*base).min(dst);
+        let hi = (*base)
+            .saturating_add(*size)
+            .max(dst.saturating_add(aligned));
+        let span = hi.saturating_sub(lo).max(1);
+        if span <= max_binding {
+            const ALIGN: u64 = 256;
+            *base = (lo / ALIGN) * ALIGN;
+            *size = span.div_ceil(ALIGN) * ALIGN;
+            *size = (*size).max(256).min(max_binding);
+            if (*base).saturating_add(*size) > arena.size as u64 {
+                *base = (arena.size as u64).saturating_sub(*size);
+                *base = (*base / ALIGN) * ALIGN;
+            }
+            arena_clamp_bind_window(arena, base, size);
+        }
         return ((dst.saturating_sub(*base)) / 4) as u32;
     }
     let src = src_tagged as u64;

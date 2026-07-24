@@ -334,26 +334,34 @@ impl Package {
     }
 
     fn advise_range(&self, shard: &str, offset: u64, length: u64) {
-        let len = length as usize;
-        if len == 0 {
-            return;
-        }
-        match &self.source {
-            MemberSource::Flat { map, .. } => {
-                let abs = (self.flat_data_start + offset) as usize;
-                let _ = map.advise_range(memmap2::Advice::WillNeed, abs, len);
+        // memmap2::Advice / advise_range are Unix-only; no-op on Windows.
+        #[cfg(unix)]
+        {
+            let len = length as usize;
+            if len == 0 {
+                return;
             }
-            MemberSource::Dir { shard_maps, .. } => {
-                if let Some(map) = shard_maps.get(shard) {
-                    let _ = map.advise_range(memmap2::Advice::WillNeed, offset as usize, len);
-                }
-            }
-            MemberSource::Zip { map, ranges, .. } => {
-                if let Some(r) = ranges.get(shard) {
-                    let abs = r.data_offset as usize + offset as usize;
+            match &self.source {
+                MemberSource::Flat { map, .. } => {
+                    let abs = (self.flat_data_start + offset) as usize;
                     let _ = map.advise_range(memmap2::Advice::WillNeed, abs, len);
                 }
+                MemberSource::Dir { shard_maps, .. } => {
+                    if let Some(map) = shard_maps.get(shard) {
+                        let _ = map.advise_range(memmap2::Advice::WillNeed, offset as usize, len);
+                    }
+                }
+                MemberSource::Zip { map, ranges, .. } => {
+                    if let Some(r) = ranges.get(shard) {
+                        let abs = r.data_offset as usize + offset as usize;
+                        let _ = map.advise_range(memmap2::Advice::WillNeed, abs, len);
+                    }
+                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (shard, offset, length);
         }
     }
 

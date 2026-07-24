@@ -583,16 +583,24 @@ pub mod mmap {
             let start_row = self.past_len - window;
             let k_start = self.k_offset + start_row * self.bytes_per_row;
             let v_start = self.v_offset + start_row * self.bytes_per_row;
-            let _ = self.mmap.advise_range(
-                memmap2::Advice::WillNeed,
-                k_start,
-                window * self.bytes_per_row,
-            );
-            let _ = self.mmap.advise_range(
-                memmap2::Advice::WillNeed,
-                v_start,
-                window * self.bytes_per_row,
-            );
+            // memmap2::Advice / advise_range are Unix-only; no-op on Windows.
+            #[cfg(unix)]
+            {
+                let _ = self.mmap.advise_range(
+                    memmap2::Advice::WillNeed,
+                    k_start,
+                    window * self.bytes_per_row,
+                );
+                let _ = self.mmap.advise_range(
+                    memmap2::Advice::WillNeed,
+                    v_start,
+                    window * self.bytes_per_row,
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (k_start, v_start);
+            }
         }
 
         /// Persist any dirty pages to the backing file. No-op for
