@@ -52,10 +52,12 @@ fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
 /// Tensors are never placed here; ops that bind a shard can stage outliers into
 /// this zone without clobbering live activations.
 ///
-/// Must fit the largest tensor still staged through the arena (Bonsai ~128 MiB).
-/// Override with `RLX_WGPU_SHARD_STAGE_MIB` (KittenTTS defaults to 64 on discrete
-/// wgpu so long-wave plans do not snap into multi-×4 GiB OOM).
-pub const SHARD_STAGE_RESERVE: usize = 576 * 1024 * 1024;
+/// Must fit the largest tensor still staged through the arena.
+/// Qwen3-0.6B tied lm_head/embedding is ~594 MiB F32; keep headroom above that
+/// so NVIDIA's ~2 GiB storage-bind path can stage weight-buffer params into the
+/// act window. Override with `RLX_WGPU_SHARD_STAGE_MIB` (KittenTTS defaults to
+/// 64 on discrete wgpu so long-wave plans do not snap into multi-×4 GiB OOM).
+pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 
 /// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
 pub fn shard_stage_reserve() -> usize {
@@ -529,12 +531,13 @@ impl Arena {
         }
     }
 
-    /// Build an arena that keeps large packed quant weights (U8/I8 params) in a
-    /// SEPARATE `weight_buffer`, so the activation arena stays under wgpu's
-    /// 4 GiB `max_buffer_size`. Non-quant params + activations go in the main
-    /// buffer. Used for 27B-class packed GGUF (Bonsai-27B Q1_0) that otherwise
-    /// overflow the single-buffer cap. `offset()` returns a WEIGHT_BUF_TAG-tagged
-    /// offset for quant params; the fused Q1_0 GEMV resolves it via `resolve_w`.
+    /// Build an arena that keeps params in a SEPARATE `weight_buffer`, so the
+    /// activation arena stays under wgpu's storage bind / `max_buffer_size`
+    /// caps. Used whenever the unified plan would exceed the bind limit
+    /// (NVIDIA ~2 GiB) — including dequantized F32 GGUF weights for Qwen-class
+    /// LMs and packed U8/I8 quant for 27B-class models. `offset()` returns a
+    /// WEIGHT_BUF_TAG-tagged offset for those params; matmul stages them into
+    /// the act window (or fused GGUF GEMV binds the weight buffer directly).
     pub fn from_plan_split(
         device: &wgpu::Device,
         plan: &MemoryPlan,
@@ -571,13 +574,15 @@ impl Arena {
             let ne = node.shape.num_elements().unwrap_or(0).max(1);
             let dt = node.shape.dtype();
             let is_param = matches!(&node.op, Op::Param { .. });
-            // Default: only packed quant (U8/I8) goes to the weight buffer.
-            // Opt-in `RLX_WGPU_ALL_PARAMS_WEIGHT=1` also parks f32/f16 params
-            // there so the act arena can fit under NVIDIA's 2 GiB storage bind
-            // (KittenTTS otherwise virtual-shards and collapses NSF).
-            let to_weight = is_param
-                && (matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
-                    || rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT"));
+            // `from_plan_split` runs when a unified arena would exceed the
+            // storage bind limit (NVIDIA ~2 GiB). Park *all* params in the
+            // weight buffer so the act arena stays compact and does not
+            // virtual-shard — virtual sharding disables matmul param-anchor
+            // and then panics on large F32 lm_head/embedding (Qwen3-0.6B GGUF
+            // dequantized to F32). Packed U8/I8 quant already belonged here.
+            // Opt out with `RLX_WGPU_PARAMS_IN_ACT=1` for debugging.
+            // Legacy alias: `RLX_WGPU_ALL_PARAMS_WEIGHT=1` is now a no-op (default).
+            let to_weight = is_param && !rlx_ir::env::flag("RLX_WGPU_PARAMS_IN_ACT");
             if to_weight {
                 let nbytes = if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
                     ne * dt.size_bytes()
@@ -655,11 +660,11 @@ impl Arena {
         new_plan.arena_size = tail;
         if rlx_ir::env::flag("RLX_WGPU_DEBUG") {
             eprintln!(
-                "[rlx-wgpu split] weight_params={} weight_buf={:.3}GiB act_arena={:.3}GiB all_params={}",
+                "[rlx-wgpu split] weight_params={} weight_buf={:.3}GiB act_arena={:.3}GiB params_in_act={}",
                 weight_offsets.len(),
                 weight_cursor as f64 / (1u64 << 30) as f64,
                 new_plan.arena_size as f64 / (1u64 << 30) as f64,
-                rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT"),
+                rlx_ir::env::flag("RLX_WGPU_PARAMS_IN_ACT"),
             );
         }
         let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_bytes);
@@ -881,7 +886,13 @@ impl Arena {
         let Some(f16) = &self.f16_buffer else {
             return false;
         };
-        let f16_off = self.offset(id) / 2;
+        // Weight-buffer params use a separate byte space; the f16 shadow is
+        // laid out against *arena* offsets, so tagged offs never fit there.
+        let off = self.offset(id);
+        if is_weight_off(off) {
+            return false;
+        }
+        let f16_off = off / 2;
         let f16_bytes = self.len_of(id) / 2;
         f16_off.saturating_add(f16_bytes) <= f16.size() as usize
     }

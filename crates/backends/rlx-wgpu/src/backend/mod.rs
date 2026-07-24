@@ -1205,7 +1205,13 @@ fn run_gather_split(
 }
 
 fn arena_tensor_in_window(arena: &Arena, id: NodeId, base: u64, size: u64) -> bool {
-    let src = arena.offset(id) as u64;
+    let src_tagged = arena.offset(id);
+    // Weight-buffer params are never inside the act bind window; callers stage
+    // them (or bind the weight buffer separately for packed GGUF).
+    if crate::buffer::is_weight_off(src_tagged) {
+        return false;
+    }
+    let src = src_tagged as u64;
     let len = arena.len_of(id) as u64;
     src >= base && src.saturating_add(len) <= base.saturating_add(size)
 }
@@ -1628,7 +1634,7 @@ fn f16_weight_bind_range(
     (base, size, rebased)
 }
 
-const ARENA_STAGE_CAP: u64 = 576 * 1024 * 1024;
+const ARENA_STAGE_CAP: u64 = crate::buffer::SHARD_STAGE_RESERVE as u64;
 
 /// Output spatial positions computed per thread by `conv2d.wgsl` (register
 /// tiling for weight reuse). MUST equal `TILE` in that kernel.

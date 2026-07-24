@@ -331,11 +331,11 @@ pub(crate) fn compile_static_inner(
         };
         base_scratch_bytes.max(conv_col_scratch).max(stage)
     };
-    // When the single-buffer arena would exceed wgpu's max_buffer_size (4 GiB),
-    // split large packed quant weights (U8/I8 params) into a separate weight
-    // buffer so the activation arena fits. Needed for 27B-class packed GGUF
-    // (Bonsai-27B Q1_0 = 3.54 GiB weights). Only the fused Q1_0 GEMV reads
-    // these, so no other op path changes.
+    // When the single-buffer arena would exceed the storage bind limit (or
+    // max_buffer_size), split params into a separate weight buffer so the act
+    // arena stays compact. Needed for NVIDIA ~2 GiB binds (Qwen3 F32 GGUF /
+    // safetensors) and 27B-class packed GGUF. Only fused GGUF GEMV binds the
+    // weight buffer directly; other ops stage params into the act window.
     let max_buf = dev.device.limits().max_buffer_size;
     let max_bind = dev.device.limits().max_storage_buffer_binding_size;
     // Use the split/view-alias planner when the arena exceeds one storage bind
@@ -760,20 +760,20 @@ pub(crate) fn compile_static_inner(
                     arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                 }
                 if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
-                    // The invariant we actually need is that the large param
-                    // B is addressable in the bound window. That holds either
-                    // via an explicit param anchor OR when the whole arena is
-                    // bound (`arena_whole_arena_bind`), in which case
-                    // `arena_matmul_bind_window` returns `param_anchor=false`
-                    // but B is trivially in `[0, arena.size)`. Keying the
-                    // assert on `param_anchor` alone spuriously panicked for
-                    // models whose entire arena fits `max_binding`.
-                    assert!(
-                        arena_tensor_in_window(&arena, b_id, base, size),
-                        "rlx-wgpu matmul: large param B {:?} off={} not in window base={base} size={size}",
-                        b_id,
-                        arena.offset(b_id),
-                    );
+                    // Large act-arena params must sit in the bind window
+                    // (param-anchor / whole-arena). Weight-buffer params are
+                    // staged into the window later (`arena_off_in_bind_window`)
+                    // — never require them to pass `arena_tensor_in_window`
+                    // (tagged offs are outside the act address space).
+                    let b_off = arena.offset(b_id);
+                    if !crate::buffer::is_weight_off(b_off) {
+                        assert!(
+                            arena_tensor_in_window(&arena, b_id, base, size),
+                            "rlx-wgpu matmul: large param B {:?} off={} not in window base={base} size={size}",
+                            b_id,
+                            b_off,
+                        );
+                    }
                 }
                 let a_off_f32 = arena_off_in_bind_window(
                     &graph,
@@ -4258,11 +4258,14 @@ pub(crate) fn compile_static_inner(
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
                     if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
-                        assert!(
-                            param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
-                            "rlx-wgpu FusedMatMul QKV: large param B {:?} not in bind window",
-                            b_id,
-                        );
+                        let b_off = arena.offset(b_id);
+                        if !crate::buffer::is_weight_off(b_off) {
+                            assert!(
+                                param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
+                                "rlx-wgpu FusedMatMul QKV: large param B {:?} not in bind window",
+                                b_id,
+                            );
+                        }
                     }
                     let a_off = arena_off_in_bind_window(
                         &graph,
@@ -4473,11 +4476,14 @@ pub(crate) fn compile_static_inner(
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
                     if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
-                        assert!(
-                            param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
-                            "rlx-wgpu FusedMatMul: large param B {:?} not in bind window",
-                            b_id,
-                        );
+                        let b_off = arena.offset(b_id);
+                        if !crate::buffer::is_weight_off(b_off) {
+                            assert!(
+                                param_anchor && arena_tensor_in_window(&arena, b_id, base, size),
+                                "rlx-wgpu FusedMatMul: large param B {:?} not in bind window",
+                                b_id,
+                            );
+                        }
                     }
                     let a_off_f32 = arena_off_in_bind_window(
                         &graph,
