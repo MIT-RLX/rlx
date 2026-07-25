@@ -82,6 +82,9 @@ onnx    = ["dep:rlx-onnx", "rlx-onnx/native", "rlx-onnx/cuda", "rlx-onnx/metal",
 # Aggregates only include features that resolve from crates.io.
 # `mlx` needs `rlx-mlx-sys` (vendored MLX submodule) on the index.
 apple-silicon = ["cpu", "metal", "blas-accelerate"]
+# Android: CPU + wgpu (Vulkan). Optional OpenBLAS via OPENBLAS_LIB_DIR / android-blas.
+android       = ["rlx-runtime/android"]
+android-blas  = ["rlx-runtime/android-blas"]
 nvidia        = ["cpu", "cuda"]
 edge          = ["cpu", "cortexm", "fpga"]
 all-cpu       = ["cpu", "gguf", "linalg"]

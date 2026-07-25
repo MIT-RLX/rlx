@@ -227,9 +227,47 @@ fn build_env(source: String) -> Result<Environment<'static>> {
             Err(JinjaError::new(ErrorKind::InvalidOperation, msg))
         },
     );
+    // Poolside / Unsloth Jinja uses Python str methods (`.strip()`, `.rstrip()`,
+    // …). MiniJinja does not expose those on builtins — bridge the common ones.
+    env.set_unknown_method_callback(hf_string_method_callback);
     env.add_template_owned(TEMPLATE_NAME, source)
         .context("compiling chat template")?;
     Ok(env)
+}
+
+/// Minimal HF/Python string method bridge for chat templates.
+fn hf_string_method_callback(
+    _state: &State<'_, '_>,
+    value: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, JinjaError> {
+    let Some(s) = value.as_str() else {
+        return Err(JinjaError::new(
+            ErrorKind::UnknownMethod,
+            format!("object has no method named {method}"),
+        ));
+    };
+    if !args.is_empty() {
+        return Err(JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method}() takes no arguments in this bridge"),
+        ));
+    }
+    let out = match method {
+        "strip" => s.trim(),
+        "lstrip" => s.trim_start(),
+        "rstrip" => s.trim_end(),
+        "lower" => return Ok(Value::from(s.to_lowercase())),
+        "upper" => return Ok(Value::from(s.to_uppercase())),
+        other => {
+            return Err(JinjaError::new(
+                ErrorKind::UnknownMethod,
+                format!("string has no method named {other}"),
+            ));
+        }
+    };
+    Ok(Value::from(out))
 }
 
 impl ChatTemplate {
@@ -446,6 +484,15 @@ mod tests {
         let t = ChatTemplate::from_source("{{ raise_exception('nope') }}").unwrap();
         let err = t.render(&[], false).unwrap_err();
         assert!(format!("{err:#}").contains("nope"));
+    }
+
+    #[test]
+    fn python_string_strip_methods_work() {
+        const TEMPLATE: &str =
+            "{% set s = '  hi  ' %}{{ s.strip() }}|{{ s.lstrip() }}|{{ s.rstrip() }}";
+        let t = ChatTemplate::from_source(TEMPLATE).unwrap();
+        let out = t.render(&[], false).unwrap();
+        assert_eq!(out, "hi|hi  |  hi");
     }
 
     /// Builds a minimal GGUF in a temp file with a chat_template + token

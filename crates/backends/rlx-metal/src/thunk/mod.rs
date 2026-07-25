@@ -814,6 +814,22 @@ pub enum Thunk {
         num_experts: u32,
         scheme: rlx_ir::quant::QuantScheme,
     },
+    /// MLX-affine MoE grouped matmul (separate scales/biases). Host-delegated
+    /// like [`Thunk::DequantMatMulMlx`] (no native Metal kernel yet).
+    DequantGroupedMatMulMlx {
+        input: usize,
+        w_q: usize,
+        scale: usize,
+        zp: usize,
+        expert_idx: usize,
+        dst: usize,
+        m: u32,
+        k_dim: u32,
+        n: u32,
+        num_experts: u32,
+        slab_bytes: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+    },
     /// Scatter-add. See CPU's Thunk::ScatterAdd.
     ScatterAdd {
         updates: usize,
@@ -1939,6 +1955,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Mamba2 { .. } => "mamba2",
         Thunk::DequantMatMulGguf { .. } => "dequant_matmul_gguf",
         Thunk::DequantGroupedMatMulGguf { .. } => "dequant_grouped_matmul_gguf",
+        Thunk::DequantGroupedMatMulMlx { .. } => "dequant_grouped_matmul_mlx",
         Thunk::DequantMatMulInt8 { .. } => "dequant_matmul_int8",
         Thunk::DequantMatMulInt4 { .. } => "dequant_matmul_int4",
         Thunk::DequantMatMulFp8 { .. } => "dequant_matmul_fp8",
@@ -2049,6 +2066,7 @@ impl Thunk {
             | Thunk::Mamba2 { .. }
             | Thunk::DequantMatMulGguf { .. }
             | Thunk::DequantGroupedMatMulGguf { .. }
+            | Thunk::DequantGroupedMatMulMlx { .. }
             | Thunk::DequantMatMulInt8 { .. }
             | Thunk::DequantMatMulInt4 { .. }
             | Thunk::DequantMatMulFp8 { .. }

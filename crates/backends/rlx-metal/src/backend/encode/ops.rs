@@ -4954,6 +4954,84 @@ pub(crate) fn encode_dequant_gguf(
     enc.dispatch_threads(grid, tg);
 }
 
+/// True when MoE grouped matmul can dispatch per-token fused kernels onto the
+/// parent compute encoder (no host sort / pack / unpermute, no private cmd_buf).
+pub(crate) fn dequant_grouped_can_encode_per_row(
+    scheme: rlx_ir::quant::QuantScheme,
+    k_dim: usize,
+) -> bool {
+    if rlx_ir::env::flag("RLX_METAL_GROUPED_GEMV_DISABLE") {
+        return false;
+    }
+    match scheme {
+        rlx_ir::quant::QuantScheme::GgufQ4_0 | rlx_ir::quant::QuantScheme::GgufQ8_0 => {
+            k_dim.is_multiple_of(32)
+        }
+        rlx_ir::quant::QuantScheme::GgufQ4K => {
+            k_dim.is_multiple_of(256) && !rlx_ir::env::flag("RLX_METAL_Q4K_FUSED_DISABLE")
+        }
+        rlx_ir::quant::QuantScheme::GgufQ6K => {
+            k_dim.is_multiple_of(256) && !rlx_ir::env::flag("RLX_METAL_Q6K_GEMM_DISABLE")
+        }
+        _ => false,
+    }
+}
+
+/// Per-token fused MoE GEMV/GEMM on an existing encoder. Writes `dst` in the
+/// original token order so callers do not need host unpermute or a mid-pipeline
+/// `wait_until_completed`. `expert_idx` must already be resident in `buffer`
+/// (host-uploaded or previously synced).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_dequant_grouped_matmul_gguf_per_row(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    input: usize,
+    w_q: usize,
+    expert_idx: usize,
+    dst: usize,
+    m: usize,
+    k_dim: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+) {
+    debug_assert!(dequant_grouped_can_encode_per_row(scheme, k_dim));
+    let block_elems = scheme.gguf_block_size() as usize;
+    let block_bytes = scheme.gguf_block_bytes() as usize;
+    let slab_bytes = (k_dim * n) / block_elems * block_bytes;
+    let use_q4k_sg = matches!(scheme, rlx_ir::quant::QuantScheme::GgufQ4K)
+        && n.is_multiple_of(8)
+        && !rlx_ir::env::flag("RLX_METAL_Q4K_SG_DISABLE");
+    let base = buffer.contents() as *const u8;
+    let idx_host = unsafe { std::slice::from_raw_parts(base.add(expert_idx) as *const f32, m) };
+    for row in 0..m {
+        let e = idx_host[row] as usize;
+        debug_assert!(e < num_experts, "expert_idx[{row}]={e} >= {num_experts}");
+        let x_off = input + row * k_dim * 4;
+        let y_off = dst + row * n * 4;
+        let w_off = w_q + e * slab_bytes;
+        match scheme {
+            rlx_ir::quant::QuantScheme::GgufQ8_0 => {
+                encode_q8_0_mv_f32(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+            }
+            rlx_ir::quant::QuantScheme::GgufQ4_0 => {
+                encode_q4_0_mv_f32(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+            }
+            rlx_ir::quant::QuantScheme::GgufQ4K if use_q4k_sg => {
+                encode_q4k_mv_f32_sg(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+            }
+            rlx_ir::quant::QuantScheme::GgufQ4K => {
+                encode_q4k_mv_f32(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+            }
+            rlx_ir::quant::QuantScheme::GgufQ6K => {
+                encode_qk_mm_f32(enc, &k.q6k_mm_f32, buffer, x_off, w_off, y_off, 1, k_dim, n)
+            }
+            _ => unreachable!("per-row grouped scheme guard"),
+        }
+    }
+}
+
 pub(crate) fn encode_dequant_grouped_matmul_gguf(
     queue: &metal::CommandQueueRef,
     k: &crate::kernels::Kernels,
@@ -4990,29 +5068,57 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
             packed_in.len(),
         );
 
-        // Decode / small-batch fast path: when every active expert has a single
-        // token (typical MoE decode with m=top_k routing), use fused Q4_0/Q8_0
-        // GEMV and skip full-slab f32 dequant + MPS sgemm.
-        let use_fused_gemv = k_dim.is_multiple_of(32)
+        // Fast paths that skip full-slab f32 dequant + MPS sgemm:
+        // - Singleton experts (typical MoE decode, m=top_k): fused GEMV for
+        //   Q4_0 / Q8_0 / Q4_K, or Q6_K via the fused mm kernel at m=1.
+        // - Multi-token expert groups (Q4_K / Q6_K): fused GEMM per expert.
+        // Off-switch: RLX_METAL_GROUPED_GEMV_DISABLE=1 (falls back to MPS).
+        let all_singleton = (0..num_experts).all(|e| {
+            let c = offsets[e + 1] - offsets[e];
+            c == 0 || c == 1
+        });
+        let fused_off = rlx_ir::env::flag("RLX_METAL_GROUPED_GEMV_DISABLE");
+        let use_fused_q40_gemv = !fused_off
+            && all_singleton
+            && k_dim.is_multiple_of(32)
             && matches!(
                 scheme,
                 rlx_ir::quant::QuantScheme::GgufQ4_0 | rlx_ir::quant::QuantScheme::GgufQ8_0
-            )
-            && !rlx_ir::env::flag("RLX_METAL_GROUPED_GEMV_DISABLE")
-            && (0..num_experts).all(|e| {
-                let c = offsets[e + 1] - offsets[e];
-                c == 0 || c == 1
-            });
+            );
+        let use_fused_q4k_gemv = !fused_off
+            && all_singleton
+            && k_dim.is_multiple_of(256)
+            && matches!(scheme, rlx_ir::quant::QuantScheme::GgufQ4K)
+            && !rlx_ir::env::flag("RLX_METAL_Q4K_FUSED_DISABLE");
+        let use_fused_qk_mm = !fused_off
+            && k_dim.is_multiple_of(256)
+            && match scheme {
+                rlx_ir::quant::QuantScheme::GgufQ4K => {
+                    !rlx_ir::env::flag("RLX_METAL_Q4K_GEMM_DISABLE")
+                }
+                rlx_ir::quant::QuantScheme::GgufQ6K => {
+                    !rlx_ir::env::flag("RLX_METAL_Q6K_GEMM_DISABLE")
+                }
+                _ => false,
+            };
+        // Prefer Q4_K GEMV when every expert is a singleton; otherwise GEMM
+        // (also covers Q6_K singletons — there is no dedicated q6k_mv).
+        let use_fused_gemv = use_fused_q40_gemv || use_fused_q4k_gemv;
+        let use_fused_mm = !use_fused_gemv && use_fused_qk_mm;
 
         let cmd_buf = queue.new_command_buffer();
         if use_fused_gemv {
+            // Independent per-expert writes — one Concurrent encoder is enough.
+            let enc = cmd_buf
+                .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+            let use_q4k_sg = use_fused_q4k_gemv
+                && n.is_multiple_of(8)
+                && !rlx_ir::env::flag("RLX_METAL_Q4K_SG_DISABLE");
             for e in 0..num_experts {
                 let count = offsets[e + 1] - offsets[e];
                 if count == 0 {
                     continue;
                 }
-                let enc = cmd_buf
-                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
                 let x_off = pack_in_off + offsets[e] * k_dim * 4;
                 let y_off = pack_out_off + offsets[e] * n * 4;
                 let w_off = w_q + e * slab_bytes;
@@ -5023,10 +5129,35 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
                     rlx_ir::quant::QuantScheme::GgufQ4_0 => {
                         encode_q4_0_mv_f32(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
                     }
+                    rlx_ir::quant::QuantScheme::GgufQ4K if use_q4k_sg => {
+                        encode_q4k_mv_f32_sg(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+                    }
+                    rlx_ir::quant::QuantScheme::GgufQ4K => {
+                        encode_q4k_mv_f32(enc, k, buffer, x_off, w_off, y_off, k_dim, n)
+                    }
                     _ => unreachable!("fused grouped GEMV scheme guard"),
                 }
-                enc.end_encoding();
             }
+            enc.end_encoding();
+        } else if use_fused_mm {
+            let pipeline = match scheme {
+                rlx_ir::quant::QuantScheme::GgufQ4K => &k.q4k_mm_f32,
+                rlx_ir::quant::QuantScheme::GgufQ6K => &k.q6k_mm_f32,
+                _ => unreachable!("fused grouped GEMM scheme guard"),
+            };
+            let enc = cmd_buf
+                .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+            for e in 0..num_experts {
+                let count = offsets[e + 1] - offsets[e];
+                if count == 0 {
+                    continue;
+                }
+                let x_off = pack_in_off + offsets[e] * k_dim * 4;
+                let y_off = pack_out_off + offsets[e] * n * 4;
+                let w_off = w_q + e * slab_bytes;
+                encode_qk_mm_f32(enc, pipeline, buffer, x_off, w_off, y_off, count, k_dim, n);
+            }
+            enc.end_encoding();
         } else {
             // Per expert: dequant the slab into `dequant_off` on a dedicated MSL
             // compute encoder, END that encoder, then MPS sgemm. The compute

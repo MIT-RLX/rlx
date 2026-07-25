@@ -90,6 +90,7 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::Pool,
     OpKind::GroupedMatMul,
     OpKind::DequantGroupedMatMul,
+    OpKind::DequantGroupedMatMulMlx,
     OpKind::DequantMoEWeights,
     OpKind::ScatterAdd,
     OpKind::ScatterNd,

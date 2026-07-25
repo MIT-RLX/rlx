@@ -634,6 +634,21 @@ pub(crate) enum Step {
         idx_byte_off: u64,
         out_byte_off: u64,
     },
+    /// MLX-affine MoE grouped matmul on the host (no SPIR-V kernel; mirrors
+    /// [`Step::DequantMatmulMlxHost`] with a stacked-expert weight + idx).
+    DequantGroupedMatmulMlxHost {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        zp_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
+    },
     /// Gated-DeltaNet scan (qwen35 / Bonsai linear layers).
     /// `use_gpu=false` forces host readback (`RLX_WGPU_GDN_HOST=1`).
     GatedDeltaNet {
@@ -1096,6 +1111,7 @@ impl Step {
             | Step::DequantMatmulInt8Host { .. }
             | Step::Conv2dHost { .. }
             | Step::DequantGroupedMatmulGguf { .. }
+            | Step::DequantGroupedMatmulMlxHost { .. }
             | Step::Lstm { .. }
             | Step::ConvTranspose2d { .. }
             | Step::ConvTranspose3dHost { .. }
@@ -1327,6 +1343,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmulInt8Host { .. } => "dequant_matmul_int8_host",
         Step::Conv2dHost { .. } => "conv2d_host",
         Step::DequantGroupedMatmulGguf { .. } => "dequant_grouped_matmul_gguf",
+        Step::DequantGroupedMatmulMlxHost { .. } => "dequant_grouped_matmul_mlx_host",
         Step::GatedDeltaNet { .. } => "gated_delta_net",
         Step::Lstm { .. } => "lstm",
         Step::ConvTranspose2d { .. } => "conv_transpose2d",
@@ -1405,6 +1422,7 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
         | Step::DequantMatmulMlxHost { .. }
         | Step::Conv2dHost { .. }
         | Step::DequantGroupedMatmulGguf { .. }
+        | Step::DequantGroupedMatmulMlxHost { .. }
         | Step::Lstm { .. }
         | Step::ConvTranspose2d { .. }
         | Step::ConvTranspose3dHost { .. }

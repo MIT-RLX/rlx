@@ -141,6 +141,9 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
             Op::DequantGroupedMatMul { scheme } if scheme.is_gguf() => {
                 return Some("DequantGroupedMatMul[GGUF] (host dequant)");
             }
+            Op::DequantGroupedMatMulMlx { .. } => {
+                return Some("DequantGroupedMatMulMlx (host dequant)");
+            }
             Op::GaussianSplatRender { .. } => return Some("GaussianSplatRender (host kernel)"),
             Op::GaussianSplatRenderBackward { .. } => {
                 return Some("GaussianSplatRenderBackward (host kernel)");

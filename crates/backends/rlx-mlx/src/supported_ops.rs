@@ -68,6 +68,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Pool,
         GroupedMatMul,
         DequantGroupedMatMul,
+        DequantGroupedMatMulMlx,
         DequantMoEWeights,
         ScatterAdd,
         ScatterNd,

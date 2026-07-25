@@ -536,6 +536,20 @@ pub(crate) enum Step {
         idx_byte_off: u64,
         out_byte_off: u64,
     },
+    /// MLX-affine MoE grouped matmul on the host (no native CUDA kernel).
+    DequantGroupedMatmulMlxHost {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        zp_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
+    },
     Sample {
         outer: u32,
         inner: u32,
@@ -1828,6 +1842,7 @@ impl Step {
                 | Step::DequantMatmulGguf { .. }
                 | Step::DequantMatmulMlx { .. }
                 | Step::DequantGroupedMatmulGguf { .. }
+                | Step::DequantGroupedMatmulMlxHost { .. }
                 | Step::Narrow { .. }
                 | Step::Concat { .. }
                 | Step::Gather { .. }
@@ -2043,6 +2058,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmulGguf { .. } => "rlx::DequantMatmulGguf",
         Step::DequantMatmulMlx { .. } => "rlx::DequantMatmulMlx",
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
+        Step::DequantGroupedMatmulMlxHost { .. } => "rlx::DequantGroupedMatmulMlxHost",
         Step::Sample { .. } => "rlx::Sample",
         Step::RngNormal { .. } => "rlx::RngNormal",
         Step::RngUniform { .. } => "rlx::RngUniform",
@@ -2653,6 +2669,24 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![
                 (*x_byte_off / 4) as u32,
                 (*w_byte_off / 4) as u32,
+                (*idx_byte_off / 4) as u32,
+            ],
+            vec![(*out_byte_off / 4) as u32],
+        ),
+        Step::DequantGroupedMatmulMlxHost {
+            x_byte_off,
+            w_byte_off,
+            scale_byte_off,
+            zp_byte_off,
+            idx_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![
+                (*x_byte_off / 4) as u32,
+                (*w_byte_off / 4) as u32,
+                (*scale_byte_off / 4) as u32,
+                (*zp_byte_off / 4) as u32,
                 (*idx_byte_off / 4) as u32,
             ],
             vec![(*out_byte_off / 4) as u32],

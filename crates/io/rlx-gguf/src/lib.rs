@@ -1033,6 +1033,11 @@ fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Byte size of one packed `block_q4_K` (d + dmin + scales + qs).
+pub const Q4K_BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 2;
+/// Byte size of one packed `block_q8_K` (f32 d + 256 i8 + 16 i16 bsums).
+pub const Q8K_BLOCK_BYTES: usize = 4 + QK_K + (QK_K / 16) * 2;
+
 /// Dequantize one Q4_K super-block (144 bytes) into `out` (256 f32s).
 pub fn dequant_q4_k_block(block: &[u8], out: &mut [f32; QK_K]) {
     let d = read_f16_le(&block[0..2]);
@@ -1060,6 +1065,125 @@ pub fn dequant_q4_k_block(block: &[u8], out: &mut [f32; QK_K]) {
         }
         is += 32;
     }
+}
+
+/// Dot one Q4_K super-block with an f32 activation slice of length [`QK_K`].
+///
+/// Equivalent to dequantizing the block then `sum_i w_i * x_i`, without writing
+/// the 256-element temp buffer (important for MoE decode GEMVs).
+#[inline]
+pub fn q4_k_dot_f32(block: &[u8], x: &[f32]) -> f32 {
+    debug_assert!(block.len() >= Q4K_BLOCK_BYTES);
+    debug_assert!(x.len() >= QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let dmin = read_f16_le(&block[2..4]);
+    let scales = &block[4..4 + K_SCALE_SIZE];
+    let qs = &block[4 + K_SCALE_SIZE..];
+    let mut is = 0usize;
+    let mut xi = 0usize;
+    let mut sum = 0.0f32;
+    for j in (0..8).step_by(2) {
+        let (sc0, m0) = get_scale_min_k4(j, scales);
+        let (sc1, m1) = get_scale_min_k4(j + 1, scales);
+        let d0 = d * sc0 as f32;
+        let m0f = dmin * m0 as f32;
+        let d1 = d * sc1 as f32;
+        let m1f = dmin * m1 as f32;
+        let mut sum_qx = 0.0f32;
+        let mut sum_x = 0.0f32;
+        for l in 0..32 {
+            let xv = x[xi + l];
+            sum_x += xv;
+            sum_qx += (qs[is + l] & 0x0F) as f32 * xv;
+        }
+        sum += d0 * sum_qx - m0f * sum_x;
+        xi += 32;
+        sum_qx = 0.0;
+        sum_x = 0.0;
+        for l in 0..32 {
+            let xv = x[xi + l];
+            sum_x += xv;
+            sum_qx += (qs[is + l] >> 4) as f32 * xv;
+        }
+        sum += d1 * sum_qx - m1f * sum_x;
+        xi += 32;
+        is += 32;
+    }
+    sum
+}
+
+/// Quantize an f32 activation row (`len % QK_K == 0`) into contiguous Q8_K blocks.
+///
+/// `out` must hold `(x.len() / QK_K) * Q8K_BLOCK_BYTES` bytes. Used once per
+/// GEMV so every weight row can int8-dot against the same packed activations.
+pub fn quantize_q8_k_row(x: &[f32], out: &mut [u8]) {
+    assert!(
+        x.len().is_multiple_of(QK_K),
+        "q8_k row len {} not multiple of {QK_K}",
+        x.len()
+    );
+    let nb = x.len() / QK_K;
+    assert_eq!(out.len(), nb * Q8K_BLOCK_BYTES);
+    for b in 0..nb {
+        crate::quantize::quantize_q8_k_block(
+            &x[b * QK_K..(b + 1) * QK_K],
+            &mut out[b * Q8K_BLOCK_BYTES..(b + 1) * Q8K_BLOCK_BYTES],
+        );
+    }
+}
+
+/// Int8 dot of one Q4_K weight super-block with one Q8_K activation super-block.
+///
+/// Matches llama.cpp `ggml_vec_dot_q4_K_q8_K` (generic). Prefer this over
+/// [`q4_k_dot_f32`] for GEMVs: activations are quantized once, then every
+/// output row reuses the packed Q8_K strip.
+#[inline]
+pub fn q4_k_dot_q8_k(q4: &[u8], q8: &[u8]) -> f32 {
+    debug_assert!(q4.len() >= Q4K_BLOCK_BYTES);
+    debug_assert!(q8.len() >= Q8K_BLOCK_BYTES);
+    let d = read_f16_le(&q4[0..2]);
+    let dmin = read_f16_le(&q4[2..4]);
+    let scales = &q4[4..4 + K_SCALE_SIZE];
+    let qs = &q4[4 + K_SCALE_SIZE..];
+    let yd = f32::from_le_bytes(q8[0..4].try_into().unwrap());
+    let q8s = &q8[4..4 + QK_K];
+    let bsums = &q8[4 + QK_K..4 + QK_K + (QK_K / 16) * 2];
+
+    // Min correction: sum_j bsums[j] * mins[j/2]  (llama.cpp layout).
+    let mut sumi_min = 0i32;
+    for j in 0..16 {
+        let (_, m) = get_scale_min_k4(j / 2, scales);
+        let bs = i16::from_le_bytes([bsums[j * 2], bsums[j * 2 + 1]]) as i32;
+        sumi_min += m as i32 * bs;
+    }
+
+    // Product: 8×32-element groups, low then high nibbles matching dequant order.
+    let mut sumi = 0i32;
+    let mut is = 0usize;
+    let mut yi = 0usize;
+    for j in (0..8).step_by(2) {
+        let (sc0, _) = get_scale_min_k4(j, scales);
+        let (sc1, _) = get_scale_min_k4(j + 1, scales);
+        let mut partial0 = 0i32;
+        for l in 0..32 {
+            let q4v = (qs[is + l] & 0x0F) as i32;
+            let q8v = q8s[yi + l] as i8 as i32;
+            partial0 += q4v * q8v;
+        }
+        sumi += sc0 as i32 * partial0;
+        yi += 32;
+        let mut partial1 = 0i32;
+        for l in 0..32 {
+            let q4v = (qs[is + l] >> 4) as i32;
+            let q8v = q8s[yi + l] as i8 as i32;
+            partial1 += q4v * q8v;
+        }
+        sumi += sc1 as i32 * partial1;
+        yi += 32;
+        is += 32;
+    }
+
+    d * yd * sumi as f32 - dmin * yd * sumi_min as f32
 }
 
 /// Dequantize one Q5_K super-block (176 bytes) into `out`.
@@ -1558,6 +1682,38 @@ mod tests {
         for v in &out[0..128] {
             assert!((v - 7.0).abs() < 1e-5, "Q4K decode mismatch: {v}");
         }
+    }
+
+    #[test]
+    fn q4_k_dot_matches_dequant_dot() {
+        let w: Vec<f32> = (0..QK_K).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        let packed = crate::quantize(&w, GgmlType::Q4K).unwrap();
+        assert_eq!(packed.len(), Q4K_BLOCK_BYTES);
+        let x: Vec<f32> = (0..QK_K).map(|i| 0.01 * (i as f32) - 0.5).collect();
+        let mut deq = [0f32; QK_K];
+        dequant_q4_k_block(&packed, &mut deq);
+        let expected: f32 = deq.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+        let got = q4_k_dot_f32(&packed, &x);
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "dot={got} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn q4_k_dot_q8_k_matches_dequantized_activation() {
+        let w: Vec<f32> = (0..QK_K).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        let q4 = crate::quantize(&w, GgmlType::Q4K).unwrap();
+        let x: Vec<f32> = (0..QK_K).map(|i| 0.01 * (i as f32) - 0.5).collect();
+        let mut q8 = vec![0u8; Q8K_BLOCK_BYTES];
+        quantize_q8_k_row(&x, &mut q8);
+        let x_hat = dequant_q8_k(&q8, QK_K).unwrap();
+        let expected = q4_k_dot_f32(&q4, &x_hat);
+        let got = q4_k_dot_q8_k(&q4, &q8);
+        assert!(
+            (got - expected).abs() < 1e-3,
+            "int8 dot={got} expected={expected}"
+        );
     }
 
     #[test]

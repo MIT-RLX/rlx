@@ -86,6 +86,12 @@ coreml = ["cpu", "dep:rlx-coreml"]
 # All Apple RLX backends: Metal (incl. MPS), MLX, portable wgpu-on-Metal, CoreML/ANE.
 apple = ["cpu", "metal", "mlx", "gpu", "coreml"]
 
+# Android on-device stack: CPU (NEON; portable GEMM unless OPENBLAS_LIB_DIR is set)
+# + wgpu (Vulkan). See android/README.md for the JNI demo.
+android = ["cpu", "gpu"]
+# Same Cargo features as `android`; use with OPENBLAS_LIB_DIR (android/build.sh --blas).
+android-blas = ["cpu", "gpu"]
+
 # On-device training / backward propagation. Turns on the autodiff backward
 # decompose path for device *selection* (so a backend is chosen for a graph that
 # carries `*Backward` ops) and, with `coreml`, the ANE native backward kernels +

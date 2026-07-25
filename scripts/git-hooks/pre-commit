@@ -41,22 +41,47 @@ if ! cargo fmt --all -- --check; then
   exit 1
 fi
 
-PKGS="$(python3 "$ROOT/scripts/rust-packages-for-paths.py" "${FILES[@]}" || true)"
-PKG_COUNT=0
-if [[ -n "$PKGS" ]]; then
-  PKG_COUNT="$(printf '%s\n' "$PKGS" | grep -c . || true)"
-fi
+# Map staged files -> "<pkg>\t<workspace-rel-dir>" ('.' == root workspace).
+# Nested workspaces (android/, rlx-cortexm/firmware/) are not members of the
+# root workspace, so `cargo -p <their-crate>` from here errors; keep them out of
+# the root clippy invocation — they cross-compile and have their own gates.
+RESOLVED="$(python3 "$ROOT/scripts/rust-packages-for-paths.py" "${FILES[@]}" || true)"
 
-echo "[pre-commit] clippy -D warnings (${PKGS:-workspace})"
-if [[ "$PKG_COUNT" -eq 0 || "$PKG_COUNT" -gt 12 ]]; then
+ROOT_PKGS=""     # newline list of package names in the root workspace
+NESTED_PKGS=""   # newline list of "ws/pkg" living in nested workspaces
+while IFS=$'\t' read -r pkg ws; do
+  [[ -n "$pkg" ]] || continue
+  if [[ -z "$ws" || "$ws" == "." ]]; then
+    ROOT_PKGS+="$pkg"$'\n'
+  else
+    NESTED_PKGS+="$ws/$pkg"$'\n'
+  fi
+done <<<"$RESOLVED"
+
+ROOT_PKG_LIST="$(printf '%s' "$ROOT_PKGS" | sed '/^$/d')"
+ROOT_PKG_COUNT="$(printf '%s\n' "$ROOT_PKG_LIST" | grep -c . || true)"
+
+echo "[pre-commit] clippy -D warnings (${ROOT_PKG_LIST:-workspace})"
+if [[ "$ROOT_PKG_COUNT" -eq 0 ]]; then
+  # Lint the whole workspace only when nothing mapped to a package at all; if all
+  # staged Rust lives in nested workspaces there is nothing to lint here.
+  if [[ -z "$NESTED_PKGS" ]]; then
+    cargo clippy --all-targets -- -D warnings
+  fi
+elif [[ "$ROOT_PKG_COUNT" -gt 12 ]]; then
   cargo clippy --all-targets -- -D warnings
 else
   ARGS=()
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     ARGS+=(-p "$p")
-  done <<<"$PKGS"
+  done <<<"$ROOT_PKG_LIST"
   cargo clippy "${ARGS[@]}" --all-targets -- -D warnings
+fi
+
+if [[ -n "$NESTED_PKGS" ]]; then
+  echo "[pre-commit] clippy skipped for nested-workspace crates — they cross-compile; run their own gate (e.g. \`just android-check\`):"
+  printf '%s\n' "$NESTED_PKGS" | sed '/^$/d' | sed 's/^/  - /'
 fi
 
 echo "[pre-commit] fmt + clippy ok"

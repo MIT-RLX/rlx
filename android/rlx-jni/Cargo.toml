@@ -1,0 +1,26 @@
+[package]
+name = "rlx-jni"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JNI bridge — runs a compiled RLX graph on Android (CPU / Vulkan via wgpu)"
+
+[features]
+default = ["scalar"]
+# NEON + portable GEMM (no OpenBLAS required).
+scalar = ["rlx-runtime/android"]
+# Cross-built OpenBLAS — run android/build-openblas.sh first, then build.sh --blas.
+blas = ["rlx-runtime/android-blas"]
+
+[lib]
+name = "rlx_jni"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "gen_mnist_assets"
+path = "examples/gen_mnist_assets.rs"
+
+[dependencies]
+jni = "0.21"
+rlx-ir = { path = "../../crates/core/rlx-ir" }
+rlx-runtime = { path = "../../crates/core/rlx-runtime", default-features = false }

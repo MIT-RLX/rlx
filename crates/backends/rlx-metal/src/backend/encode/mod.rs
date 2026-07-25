@@ -339,6 +339,20 @@ impl MetalExecutable {
                 num_experts: usize,
                 scheme: rlx_ir::quant::QuantScheme,
             },
+            DequantGroupedMatMulMlx {
+                input: usize,
+                w_q: usize,
+                scale: usize,
+                zp: usize,
+                expert_idx: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                num_experts: usize,
+                slab_bytes: usize,
+                scheme: rlx_ir::quant::QuantScheme,
+            },
             DequantMatMulInt8 {
                 x: usize,
                 w_q: usize,
@@ -834,6 +848,36 @@ impl MetalExecutable {
                                 k,
                                 n,
                                 num_experts,
+                                scheme,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantGroupedMatMulMlx {
+                            input,
+                            w_q,
+                            scale,
+                            zp,
+                            expert_idx,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            num_experts,
+                            slab_bytes,
+                            scheme,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_grouped_matmul_mlx_f32(
+                                input,
+                                w_q,
+                                scale,
+                                zp,
+                                expert_idx,
+                                dst,
+                                m,
+                                k,
+                                n,
+                                num_experts,
+                                slab_bytes,
                                 scheme,
                                 arena_ptr,
                             );
@@ -6577,6 +6621,23 @@ impl MetalExecutable {
                             num_experts: ne,
                             scheme: *scheme,
                         });
+                    } else if dequant_grouped_can_encode_per_row(*scheme, k_u) {
+                        // Decode / K-quant fast path: per-token fused GEMV on the
+                        // parent encoder — no host sort, no private cmd_buf wait.
+                        encode_dequant_grouped_matmul_gguf_per_row(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *input,
+                            *w_q,
+                            *expert_idx,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                            ne,
+                            *scheme,
+                        );
                     } else {
                         // Grouped path interleaves MSL dequant with MPS sgemm
                         // and needs the routed `input`/`expert_idx` on the host
@@ -6834,6 +6895,38 @@ impl MetalExecutable {
                             scheme: *scheme,
                         });
                     }
+                }
+
+                // MLX-affine MoE grouped matmul: no native Metal kernel yet, so
+                // always host-delegate (matches the CPU per-row dequant path).
+                Thunk::DequantGroupedMatMulMlx {
+                    input,
+                    w_q,
+                    scale,
+                    zp,
+                    expert_idx,
+                    dst,
+                    m,
+                    k_dim: kk,
+                    n,
+                    num_experts,
+                    slab_bytes,
+                    scheme,
+                } => {
+                    deferred_host.push(DeferredHostOp::DequantGroupedMatMulMlx {
+                        input: *input,
+                        w_q: *w_q,
+                        scale: *scale,
+                        zp: *zp,
+                        expert_idx: *expert_idx,
+                        dst: *dst,
+                        m: *m as usize,
+                        k: *kk as usize,
+                        n: *n as usize,
+                        num_experts: *num_experts as usize,
+                        slab_bytes: *slab_bytes as usize,
+                        scheme: *scheme,
+                    });
                 }
 
                 // Native low-precision GEMM + quantize: Apple GPUs have no FP8

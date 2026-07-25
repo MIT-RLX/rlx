@@ -323,6 +323,7 @@ pub enum OpKind {
     GatherBackward,
     GroupedMatMul,
     DequantGroupedMatMul,
+    DequantGroupedMatMulMlx,
     DequantMoEWeights,
     ScatterAdd,
     ScatterNd,
@@ -1328,6 +1329,19 @@ pub enum Op {
     /// `num_experts` contiguous packed expert slabs (GGML layout, expert
     /// dimension outermost). Scales live inside the packed bytes.
     DequantGroupedMatMul {
+        scheme: crate::quant::QuantScheme,
+    },
+
+    /// MLX-affine grouped expert matmul — the [`Op::DequantGroupedMatMul`]
+    /// analogue for mlx-community MoE, whose experts carry SEPARATE `scales`
+    /// and `biases` tensors (not embedded in the packed bytes). Five inputs:
+    ///   input   : [M, K]                       — one row per token
+    ///   weight  : [E · out · (K·bits/32)] U8   — stacked affine code words
+    ///   scales  : [E, out, n_groups] f32       — per-expert per-group scales
+    ///   biases  : [E, out, n_groups] f32       — per-expert per-group biases
+    ///   expert_idx : \[M\]                       — f32-encoded expert id per row
+    /// Output    : [M, out]                     — output\[i\] = input\[i\] @ dequant(expert_idx\[i\])
+    DequantGroupedMatMulMlx {
         scheme: crate::quant::QuantScheme,
     },
 
@@ -2497,6 +2511,7 @@ impl Op {
             Op::AttentionBackward { .. } => OpKind::AttentionBackward,
             Op::GroupedMatMul => OpKind::GroupedMatMul,
             Op::DequantGroupedMatMul { .. } => OpKind::DequantGroupedMatMul,
+            Op::DequantGroupedMatMulMlx { .. } => OpKind::DequantGroupedMatMulMlx,
             Op::DequantMoEWeights { .. } => OpKind::DequantMoEWeights,
             Op::ScatterAdd => OpKind::ScatterAdd,
             Op::ScatterNd { .. } => OpKind::ScatterNd,
@@ -2609,6 +2624,7 @@ impl Op {
                 | Op::FusedConvBiasAct { .. }
                 | Op::GroupedMatMul
                 | Op::DequantGroupedMatMul { .. }
+                | Op::DequantGroupedMatMulMlx { .. }
                 | Op::DequantMoEWeights { .. }
                 | Op::LoraMatMul { .. }
                 | Op::DequantMatMul { .. }
@@ -2676,9 +2692,10 @@ impl Op {
             Op::ScatterNd { .. } | Op::ScatterElements { .. } => 3, // data, indices, updates
             Op::GroupedMatMul => 3,                                 // input, weight, expert_idx
             Op::DequantGroupedMatMul { .. } => 3,                   // input, packed_w, expert_idx
-            Op::DequantMoEWeights { .. } => 1,                      // packed_w
-            Op::LoraMatMul { .. } => 4,                             // x, w, a, b
-            Op::PartitionedConv { .. } => 2,                        // x, ir
+            Op::DequantGroupedMatMulMlx { .. } => 5, // input, w, scales, biases, expert_idx
+            Op::DequantMoEWeights { .. } => 1,       // packed_w
+            Op::LoraMatMul { .. } => 4,              // x, w, a, b
+            Op::PartitionedConv { .. } => 2,         // x, ir
             // x, w_q, scale, zp — or x, packed_w_bytes for GGUF
             // schemes (their scales/mins live inside the packed bytes,
             // see `QuantScheme::is_gguf`).
@@ -3003,6 +3020,9 @@ impl std::fmt::Display for Op {
             Op::GroupedMatMul => write!(f, "grouped_matmul"),
             Op::DequantGroupedMatMul { scheme } => {
                 write!(f, "dequant_grouped_matmul({scheme})")
+            }
+            Op::DequantGroupedMatMulMlx { scheme } => {
+                write!(f, "dequant_grouped_matmul_mlx({scheme})")
             }
             Op::DequantMoEWeights { scheme } => write!(f, "dequant_moe_weights({scheme})"),
             Op::LoraMatMul { scale } => write!(f, "lora_matmul(scale={scale})"),

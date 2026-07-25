@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RLX Demo</string>
+    <string name="backend_placeholder">Tap a button to compile + execute on device.</string>
+    <string name="output_placeholder">—</string>
+    <string name="run_inference">Run GELU demo</string>
+    <string name="run_mnist">Run MNIST</string>
+    <string name="backend_label">Backend: %1$s</string>
+    <string name="mnist_result">MNIST pred=%1$d expected=%2$d\n%3$s</string>
+    <style name="Theme.RlxDemo" parent="Theme.MaterialComponents.DayNight.DarkActionBar" />
+</resources>

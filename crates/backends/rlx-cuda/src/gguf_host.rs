@@ -87,6 +87,44 @@ pub fn run_dequant_grouped_matmul_gguf(
     );
 }
 
+/// MLX-affine MoE grouped matmul on the host (packed expert stacks).
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_grouped_matmul_mlx(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    scale_byte_off: usize,
+    zp_byte_off: usize,
+    idx_byte_off: usize,
+    out_byte_off: usize,
+) {
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_dequant_grouped_matmul_mlx(
+        &mut arena,
+        m,
+        k,
+        n,
+        num_experts,
+        scheme,
+        x_byte_off,
+        w_byte_off,
+        scale_byte_off,
+        zp_byte_off,
+        idx_byte_off,
+        out_byte_off,
+    );
+}
+
 /// Upload raw U8 param bytes into the f32 arena slot at `byte_off`.
 pub fn upload_param_bytes(
     stream: &Arc<CudaStream>,

@@ -7579,6 +7579,30 @@ pub(crate) fn compile_static_inner(
                 // GPU-step count (host steps skipped), so pushing here would
                 // shift every later GPU op's lane. Do NOT push.
             }
+            Op::DequantGroupedMatMulMlx { scheme } => {
+                // 5 inputs: input, w_q, scales, biases, expert_idx.
+                let in_id = node.inputs[0];
+                let in_dims = graph.node(in_id).shape.dims();
+                let out_dims = node.shape.dims();
+                let m = in_dims[in_dims.len() - 2].unwrap_static() as u32;
+                let k = in_dims[in_dims.len() - 1].unwrap_static() as u32;
+                let n = out_dims[out_dims.len() - 1].unwrap_static() as u32;
+                let ne = graph.node(node.inputs[2]).shape.dims()[0].unwrap_static() as u32;
+                schedule.push(Step::DequantGroupedMatmulMlxHost {
+                    m,
+                    k,
+                    n,
+                    num_experts: ne,
+                    scheme: *scheme,
+                    x_byte_off: arena.offset(in_id) as u64,
+                    w_byte_off: arena.offset(node.inputs[1]) as u64,
+                    scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                    zp_byte_off: arena.offset(node.inputs[3]) as u64,
+                    idx_byte_off: arena.offset(node.inputs[4]) as u64,
+                    out_byte_off: arena.offset(node.id) as u64,
+                });
+                // Host step: schedule-only (see the GGUF grouped note above).
+            }
             Op::TopK { k } => {
                 let in_id = node.inputs[0];
                 let in_dims = graph.node(in_id).shape.dims();
@@ -8380,7 +8404,20 @@ pub(crate) fn compile_static_inner(
                 } else if let Some((kind, bits, group_size)) = scheme.mlx_gpu_launch() {
                     let scale_id = node.inputs[2];
                     let zp_id = node.inputs[3];
-                    if rlx_gpu_host::mlx_dequant_gpu_disabled() {
+                    // The GPU WGSL kernel binds the packed weight as a storage
+                    // buffer. A weight parked in the separate `weight_buffer`
+                    // (only large models — >~1 GiB — spill there) is read wrong
+                    // at large offsets: a driver-level defect (zeros past a
+                    // fuzzy ~2-3 GiB cliff, exhaustively ruled non-binding in the
+                    // llama-lm-head investigation). Host those — correct and
+                    // proven — while small models keep their in-arena GPU path.
+                    // Also host anything genuinely past the binding limit
+                    // (discrete Vulkan/DX12, where max_bind is 2 GiB).
+                    let max_bind = dev.device.limits().max_storage_buffer_binding_size as usize;
+                    let w_off_tagged = arena.offset(w_id);
+                    let weight_host = crate::buffer::is_weight_off(w_off_tagged)
+                        || crate::buffer::raw_weight_off(w_off_tagged) >= max_bind;
+                    if rlx_gpu_host::mlx_dequant_gpu_disabled() || weight_host {
                         schedule.push(Step::DequantMatmulMlxHost {
                             m,
                             k,

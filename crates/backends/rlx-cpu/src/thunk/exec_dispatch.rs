@@ -3097,6 +3097,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::DequantGroupedMatMulGguf { .. } => {
                 exec_dequant_grouped_mat_mul_gguf(thunk, base)
             }
+            Thunk::DequantGroupedMatMulMlx { .. } => exec_dequant_grouped_mat_mul_mlx(thunk, base),
             Thunk::DequantMoEWeightsGguf { .. } => exec_dequant_mo_e_weights_gguf(thunk, base),
             Thunk::TopK {
                 src,

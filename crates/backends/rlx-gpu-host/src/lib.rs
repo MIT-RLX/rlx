@@ -48,7 +48,7 @@ pub use gguf::{
     gguf_scheme_id, run_dequant_grouped_matmul_gguf, run_dequant_matmul_gguf, scheme_from_id,
     upload_param_bytes,
 };
-pub use mlx::{mlx_dequant_gpu_disabled, run_dequant_matmul_mlx};
+pub use mlx::{mlx_dequant_gpu_disabled, run_dequant_grouped_matmul_mlx, run_dequant_matmul_mlx};
 pub use rng::{run_rng_normal, run_rng_uniform};
 pub use scan::{
     HostTensorCache, run_host_op, run_host_op_packed, run_host_op_packed_cached, run_host_op_span,

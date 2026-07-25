@@ -139,6 +139,75 @@ pub fn run_dequant_matmul_mlx<A: DeviceArena>(
     a.htod(out_byte_off, bytemuck::cast_slice(&out));
 }
 
+/// Host MLX-affine MoE grouped matmul (per-row expert dequant). Mirrors
+/// [`run_dequant_matmul_mlx`] but the packed weight/scales/biases are
+/// `num_experts` contiguous slabs and `expert_idx` (`[m]` f32) selects the
+/// slab per row. Reused by wgpu / vulkan / cuda host-delegate paths.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_grouped_matmul_mlx<A: DeviceArena>(
+    a: &mut A,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: QuantScheme,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    scale_byte_off: usize,
+    zp_byte_off: usize,
+    idx_byte_off: usize,
+    out_byte_off: usize,
+) {
+    let (bits, group_size) = match scheme {
+        QuantScheme::MlxAffine { bits, group_size } => (bits, group_size as usize),
+        other => panic!("rlx-gpu-host grouped mlx: expected MlxAffine, got {other:?}"),
+    };
+    let n_groups = k / group_size.max(1);
+    let per_expert_w = match mlx_weight_bytes(scheme, k, n) {
+        Ok(v) => v,
+        Err(e) => panic!("rlx-gpu-host grouped mlx: {e}"),
+    };
+    let sb = num_experts * n * n_groups; // f32 scales/biases across all experts
+
+    a.sync();
+
+    let mut x_bytes = vec![0u8; m * k * 4];
+    a.dtoh(x_byte_off, &mut x_bytes);
+    let x_host: &[f32] = bytemuck::cast_slice(&x_bytes);
+
+    let w_host = dtoh_packed_bytes(a, w_byte_off, num_experts * per_expert_w);
+
+    let mut scale_bytes = vec![0u8; sb * 4];
+    a.dtoh(scale_byte_off, &mut scale_bytes);
+    let scales: &[f32] = bytemuck::cast_slice(&scale_bytes);
+
+    let mut bias_bytes = vec![0u8; sb * 4];
+    a.dtoh(zp_byte_off, &mut bias_bytes);
+    let biases: &[f32] = bytemuck::cast_slice(&bias_bytes);
+
+    let mut idx_bytes = vec![0u8; m * 4];
+    a.dtoh(idx_byte_off, &mut idx_bytes);
+    let idx_host: &[f32] = bytemuck::cast_slice(&idx_bytes);
+
+    let mut out_host = vec![0f32; m * n];
+    rlx_cpu::thunk::dequant_grouped_matmul_affine_bt(
+        x_host,
+        &w_host,
+        scales,
+        biases,
+        idx_host,
+        &mut out_host,
+        m,
+        k,
+        n,
+        num_experts,
+        bits as u32,
+        group_size,
+    );
+
+    a.htod(out_byte_off, bytemuck::cast_slice(&out_host));
+}
+
 fn matmul_nk(x: &[f32], w_nk: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut out = vec![0f32; m * n];
     for i in 0..m {

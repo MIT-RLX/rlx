@@ -1,0 +1,16 @@
+# Standalone workspace: the JNI cdylib cross-compiles for
+# aarch64-linux-android, separate from the host workspace.
+
+[workspace]
+members = ["rlx-jni"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+version = "0.2.14"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

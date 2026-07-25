@@ -16,8 +16,10 @@
 //! weights (Tier C.11).
 //!
 //! Computes `C[m,n] = A[m,k] @ B^T` where `B` is `[n,k]` row-major in
-//! packed GGUF layout. One 256-element super-block is dequantized at a
-//! time into stack storage and accumulated into `C`.
+//! packed GGUF layout. For Q4_K decode GEMVs (`m==1`, `k` multiple of 256)
+//! activations are quantized once to Q8_K and dotted with int8 NEON kernels
+//! (llama.cpp-style); other schemes still fold one 256-element super-block
+//! at a time into stack storage.
 
 use rlx_gguf::QK_K;
 use rlx_ir::quant::QuantScheme;
@@ -133,6 +135,39 @@ pub fn gguf_matmul_bt(
     n: usize,
     scheme: QuantScheme,
 ) {
+    gguf_matmul_bt_ex(
+        x, w_bytes, out, m, k, n, scheme, /*allow_parallel=*/ true,
+    );
+}
+
+/// Like [`gguf_matmul_bt`] but never spawns Rayon inside the `m==1` kernel.
+///
+/// Use this from an outer Rayon parallel region (e.g. MoE experts) so block-level
+/// parallelism does not nest and oversubscribe the pool.
+pub fn gguf_matmul_bt_serial(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+) {
+    gguf_matmul_bt_ex(
+        x, w_bytes, out, m, k, n, scheme, /*allow_parallel=*/ false,
+    );
+}
+
+fn gguf_matmul_bt_ex(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+    allow_parallel: bool,
+) {
     assert_eq!(x.len(), m * k);
     assert_eq!(out.len(), m * n);
     out.fill(0.0);
@@ -164,7 +199,7 @@ pub fn gguf_matmul_bt(
 
     if m == 1 {
         let x_row = x;
-        if num_blocks >= 32 && crate::pool::num_threads() > 1 {
+        if allow_parallel && num_blocks >= 32 && crate::pool::num_threads() > 1 {
             gguf_matmul_bt_m1_parallel(
                 x_row,
                 w_bytes,
@@ -311,6 +346,63 @@ pub fn gguf_grouped_matmul_bt(
     num_experts: usize,
     scheme: QuantScheme,
 ) {
+    gguf_grouped_matmul_bt_ex(
+        x,
+        w_bytes,
+        expert_idx,
+        out,
+        m,
+        k,
+        n,
+        num_experts,
+        scheme,
+        /*cache=*/ true,
+    );
+}
+
+/// Like [`gguf_grouped_matmul_bt`] but never materializes expert slabs into the
+/// process-wide F32 dequant cache (required for large MoE packs).
+///
+/// Unique expert groups run in parallel; each group uses the serial fused
+/// kernel so Rayon is not nested. Tokens that share an expert are batched
+/// (`m = count`) inside that group.
+pub fn gguf_grouped_matmul_bt_fused(
+    x: &[f32],
+    w_bytes: &[u8],
+    expert_idx: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: QuantScheme,
+) {
+    gguf_grouped_matmul_bt_ex(
+        x,
+        w_bytes,
+        expert_idx,
+        out,
+        m,
+        k,
+        n,
+        num_experts,
+        scheme,
+        /*cache=*/ false,
+    );
+}
+
+fn gguf_grouped_matmul_bt_ex(
+    x: &[f32],
+    w_bytes: &[u8],
+    expert_idx: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: QuantScheme,
+    cache: bool,
+) {
     assert_eq!(x.len(), m * k);
     assert_eq!(expert_idx.len(), m);
     assert_eq!(out.len(), m * n);
@@ -323,17 +415,60 @@ pub fn gguf_grouped_matmul_bt(
     let (packed_in, original_pos, offsets) =
         grouped_moe_sort_plan(x, expert_idx, m, k, num_experts);
 
+    let jobs: Vec<(usize, usize, usize)> = (0..num_experts)
+        .filter_map(|e| {
+            let count = offsets[e + 1] - offsets[e];
+            (count > 0).then_some((e, offsets[e], count))
+        })
+        .collect();
+
     let mut packed_out = vec![0f32; m * n];
-    for e in 0..num_experts {
-        let count = offsets[e + 1] - offsets[e];
-        if count == 0 {
-            continue;
+
+    if cache {
+        for &(e, start, count) in &jobs {
+            let in_slice = &packed_in[start * k..(start + count) * k];
+            let w_slice = &w_bytes[e * slab_bytes..(e + 1) * slab_bytes];
+            let out_slice = &mut packed_out[start * n..(start + count) * n];
+            gguf_matmul_bt_dispatch(in_slice, w_slice, out_slice, count, k, n, scheme);
         }
-        let in_start = offsets[e];
-        let in_slice = &packed_in[in_start * k..(in_start + count) * k];
-        let w_slice = &w_bytes[e * slab_bytes..(e + 1) * slab_bytes];
-        let out_slice = &mut packed_out[in_start * n..(in_start + count) * n];
-        gguf_matmul_bt_dispatch(in_slice, w_slice, out_slice, count, k, n, scheme);
+    } else if jobs.len() > 1 {
+        // Parallelize over unique experts; serial fused GEMM per group so Rayon
+        // is not nested. Batches tokens that share an expert (`count > 1`).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            let chunks: Vec<(usize, Vec<f32>)> = jobs
+                .par_iter()
+                .map(|&(e, start, count)| {
+                    let in_slice = &packed_in[start * k..(start + count) * k];
+                    let w_slice = &w_bytes[e * slab_bytes..(e + 1) * slab_bytes];
+                    let mut local = vec![0f32; count * n];
+                    gguf_matmul_bt_serial(in_slice, w_slice, &mut local, count, k, n, scheme);
+                    (start, local)
+                })
+                .collect();
+            for (start, local) in chunks {
+                let count = local.len() / n;
+                packed_out[start * n..(start + count) * n].copy_from_slice(&local);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            for &(e, start, count) in &jobs {
+                let in_slice = &packed_in[start * k..(start + count) * k];
+                let w_slice = &w_bytes[e * slab_bytes..(e + 1) * slab_bytes];
+                let out_slice = &mut packed_out[start * n..(start + count) * n];
+                gguf_matmul_bt_serial(in_slice, w_slice, out_slice, count, k, n, scheme);
+            }
+        }
+    } else {
+        // Single expert group: full-width parallel fused GEMM.
+        for &(e, start, count) in &jobs {
+            let in_slice = &packed_in[start * k..(start + count) * k];
+            let w_slice = &w_bytes[e * slab_bytes..(e + 1) * slab_bytes];
+            let out_slice = &mut packed_out[start * n..(start + count) * n];
+            gguf_matmul_bt(in_slice, w_slice, out_slice, count, k, n, scheme);
+        }
     }
 
     grouped_moe_unpermute_out(&packed_out, &original_pos, out, m, n);
@@ -463,6 +598,10 @@ fn gguf_matmul_bt_m1_sequential(
     block_elems: usize,
     k: usize,
 ) {
+    if scheme == QuantScheme::GgufQ4K && k.is_multiple_of(QK_K) && block_elems == QK_K {
+        q4k_gemv_rowmajor(x_row, w_bytes, out, k);
+        return;
+    }
     let mut block_f32 = [0f32; QK_K];
     for bi in 0..num_blocks {
         let off = bi * block_bytes;
@@ -489,6 +628,28 @@ fn gguf_matmul_bt_m1_parallel(
     block_bytes: usize,
     block_elems: usize,
 ) {
+    if scheme == QuantScheme::GgufQ4K && k.is_multiple_of(QK_K) && block_elems == QK_K {
+        // Independent output rows — no n-wide partial reduction.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            let blocks_per_row = k / QK_K;
+            let row_bytes = blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES;
+            debug_assert_eq!(n * row_bytes, w_bytes.len().min(n * row_bytes));
+            let mut x_q8 = vec![0u8; blocks_per_row * rlx_gguf::Q8K_BLOCK_BYTES];
+            rlx_gguf::quantize_q8_k_row(&x_row[..k], &mut x_q8);
+            out.par_iter_mut().enumerate().for_each(|(j, slot)| {
+                let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+                *slot = q4k_dot_row_q8(row, &x_q8, blocks_per_row);
+            });
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            q4k_gemv_rowmajor(x_row, w_bytes, out, k);
+            return;
+        }
+    }
     // wasm: single-threaded serial accumulate (no Rayon thread pool).
     #[cfg(target_arch = "wasm32")]
     {
@@ -544,6 +705,144 @@ fn gguf_matmul_bt_m1_parallel(
     }
 }
 
+/// `C[n] = x[k] @ W[n,k]^T` for Q4_K with `k` a multiple of [`QK_K`].
+///
+/// Activations are quantized once to Q8_K; each output row then uses the
+/// int8 Q4_K×Q8_K vec-dot (llama.cpp-style). This is the hot path for MoE
+/// expert GEMVs.
+fn q4k_gemv_rowmajor(x: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize) {
+    let n = out.len();
+    let blocks_per_row = k / QK_K;
+    let row_bytes = blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES;
+    debug_assert!(x.len() >= k);
+    debug_assert!(w_bytes.len() >= n * row_bytes);
+
+    let mut x_q8 = vec![0u8; blocks_per_row * rlx_gguf::Q8K_BLOCK_BYTES];
+    rlx_gguf::quantize_q8_k_row(&x[..k], &mut x_q8);
+
+    for j in 0..n {
+        let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+        out[j] = q4k_dot_row_q8(row, &x_q8, blocks_per_row);
+    }
+}
+
+/// Like [`q4k_gemv_rowmajor`] but `x` is already packed Q8_K (for parallel rows).
+#[allow(dead_code)] // kept for callers that pre-quantize activations
+fn q4k_gemv_rowmajor_q8(x_q8: &[u8], w_bytes: &[u8], out: &mut [f32], k: usize) {
+    let n = out.len();
+    let blocks_per_row = k / QK_K;
+    let row_bytes = blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES;
+    debug_assert_eq!(x_q8.len(), blocks_per_row * rlx_gguf::Q8K_BLOCK_BYTES);
+    for j in 0..n {
+        let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+        out[j] = q4k_dot_row_q8(row, x_q8, blocks_per_row);
+    }
+}
+
+#[inline]
+fn q4k_dot_row_q8(row_bytes: &[u8], x_q8: &[u8], blocks_per_row: usize) -> f32 {
+    let bb = rlx_gguf::Q4K_BLOCK_BYTES;
+    let qb = rlx_gguf::Q8K_BLOCK_BYTES;
+    let mut acc = 0.0f32;
+    for b in 0..blocks_per_row {
+        let q4 = &row_bytes[b * bb..(b + 1) * bb];
+        let q8 = &x_q8[b * qb..(b + 1) * qb];
+        acc += q4k_dot_q8_block(q4, q8);
+    }
+    acc
+}
+
+#[inline]
+fn q4k_dot_q8_block(q4: &[u8], q8: &[u8]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        q4k_dot_q8_block_neon(q4, q8)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        rlx_gguf::q4_k_dot_q8_k(q4, q8)
+    }
+}
+
+/// NEON-friendly Q4_K × Q8_K block dot (aarch64).
+///
+/// Uses int16/int32 accumulators (no `dotprod` requirement). Falls back to the
+/// scalar reference for the scale/min bookkeeping structure.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn q4k_dot_q8_block_neon(q4: &[u8], q8: &[u8]) -> f32 {
+    // SAFETY: full Q4_K / Q8_K slabs; NEON baseline on our aarch64 targets.
+    unsafe {
+        let d = half::f16::from_le_bytes([q4[0], q4[1]]).to_f32();
+        let dmin = half::f16::from_le_bytes([q4[2], q4[3]]).to_f32();
+        let scales = &q4[4..16];
+        let qs = q4.as_ptr().add(16);
+        let yd = f32::from_le_bytes([q8[0], q8[1], q8[2], q8[3]]);
+        let q8s = q8.as_ptr().add(4) as *const i8;
+        let bsums = q8.as_ptr().add(4 + QK_K);
+
+        let mut sumi_min = 0i32;
+        for j in 0..16 {
+            let (_, m) = q4k_scale_min(j / 2, scales);
+            let bs = i16::from_le_bytes([*bsums.add(j * 2), *bsums.add(j * 2 + 1)]) as i32;
+            sumi_min += m as i32 * bs;
+        }
+
+        let mut sumi = 0i32;
+        let mut is = 0usize;
+        let mut yi = 0usize;
+        for j in (0..8).step_by(2) {
+            let (sc0, _) = q4k_scale_min(j, scales);
+            let (sc1, _) = q4k_scale_min(j + 1, scales);
+            sumi += sc0 as i32 * q4k_group32_q8_dot_neon(qs.add(is), q8s.add(yi), false);
+            yi += 32;
+            sumi += sc1 as i32 * q4k_group32_q8_dot_neon(qs.add(is), q8s.add(yi), true);
+            yi += 32;
+            is += 32;
+        }
+        d * yd * sumi as f32 - dmin * yd * sumi_min as f32
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        let d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        (d, m)
+    }
+}
+
+/// Dot 32 Q4 nibbles (lo or hi) with 32 Q8 activations → i32 sum of products.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn q4k_group32_q8_dot_neon(qs: *const u8, q8: *const i8, high_nibble: bool) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc = vdupq_n_s32(0);
+        for i in (0..32).step_by(16) {
+            let qbytes = vld1q_u8(qs.add(i));
+            let nibble = if high_nibble {
+                vshrq_n_u8(qbytes, 4)
+            } else {
+                vandq_u8(qbytes, vdupq_n_u8(0x0F))
+            };
+            // u8 nibbles 0..15 → i8 (still non-negative)
+            let q4 = vreinterpretq_s8_u8(nibble);
+            let y = vld1q_s8(q8.add(i));
+            // 8×8 → 16 in low/high halves, then widen-add into i32.
+            let lo = vmull_s8(vget_low_s8(q4), vget_low_s8(y));
+            let hi = vmull_s8(vget_high_s8(q4), vget_high_s8(y));
+            acc = vpadalq_s16(acc, lo);
+            acc = vpadalq_s16(acc, hi);
+        }
+        vaddvq_s32(acc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,13 +862,80 @@ mod tests {
         gguf_matmul_bt(&x, &packed, &mut legacy, m, k, n, QuantScheme::GgufQ4K);
         gguf_matmul_bt_cached(&x, &packed, &mut cached, m, k, n, QuantScheme::GgufQ4K, 0);
         for i in 0..legacy.len() {
+            // Q4_K fused decode quantizes activations to Q8_K (llama.cpp-style);
+            // allow small relative error vs full-f32 cached BLAS.
+            let scale = cached[i].abs().max(1.0);
             assert!(
-                (legacy[i] - cached[i]).abs() < 5e-3,
+                (legacy[i] - cached[i]).abs() < 1e-2 * scale,
                 "i={i}: legacy={} cached={}",
                 legacy[i],
                 cached[i]
             );
         }
+    }
+
+    #[test]
+    fn q4k_rowmajor_serial_matches_generic_laguna_shape() {
+        // Laguna-XS expert gate/up: n=512, k=2048 (both Q4_K aligned).
+        let k = 2048;
+        let n = 512;
+        let w: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q4K).unwrap();
+        let x: Vec<f32> = (0..k).map(|i| 0.001 * i as f32 - 0.5).collect();
+        let mut fast = vec![0f32; n];
+        let mut slow = vec![0f32; n];
+        gguf_matmul_bt_serial(&x, &packed, &mut fast, 1, k, n, QuantScheme::GgufQ4K);
+        // Reference: same Q8_K activations + scalar Q4×Q8 block dots.
+        let bpr = k / QK_K;
+        let mut x_q8 = vec![0u8; bpr * rlx_gguf::Q8K_BLOCK_BYTES];
+        rlx_gguf::quantize_q8_k_row(&x, &mut x_q8);
+        let bb = rlx_gguf::Q4K_BLOCK_BYTES;
+        let qb = rlx_gguf::Q8K_BLOCK_BYTES;
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for b in 0..bpr {
+                let q4 = &packed[(j * bpr + b) * bb..(j * bpr + b + 1) * bb];
+                let q8 = &x_q8[b * qb..(b + 1) * qb];
+                acc += rlx_gguf::q4_k_dot_q8_k(q4, q8);
+            }
+            slow[j] = acc;
+        }
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            max_err = max_err.max((fast[i] - slow[i]).abs());
+        }
+        assert!(max_err < 1e-3, "max_err={max_err}");
+    }
+
+    #[test]
+    #[ignore = "manual kernel timing"]
+    fn q4k_gemv_microbench() {
+        let k = 2048usize;
+        let n = 512usize;
+        let w: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q4K).unwrap();
+        let x: Vec<f32> = (0..k).map(|i| 0.001 * i as f32 - 0.5).collect();
+        let mut out = vec![0f32; n];
+        for _ in 0..5 {
+            gguf_matmul_bt_serial(&x, &packed, &mut out, 1, k, n, QuantScheme::GgufQ4K);
+        }
+        let iters = 40;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            gguf_matmul_bt_serial(&x, &packed, &mut out, 1, k, n, QuantScheme::GgufQ4K);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            gguf_matmul_bt(&x, &packed, &mut out, 1, k, n, QuantScheme::GgufQ4K);
+        }
+        let ms_par = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!("q4k gemv n={n} k={k}: serial={ms:.3}ms  parallel={ms_par:.3}ms");
+        assert!(ms < 50.0, "serial unexpectedly slow: {ms}ms");
     }
 
     #[test]

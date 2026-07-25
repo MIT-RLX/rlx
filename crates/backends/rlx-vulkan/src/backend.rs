@@ -182,7 +182,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         WelchPeaks,        // native when `welch_peaks_gpu_native_eligible`; else HostOp
         DequantMatMul,
         DequantGroupedMatMul,
-        DequantMoEWeights, // GGUF quant
+        DequantGroupedMatMulMlx, // MLX-affine MoE (host-delegate)
+        DequantMoEWeights,       // GGUF quant
         // Native low-precision scaled GEMM (FP8/FP6/FP4 + parameterized `fNeXmY`
         // minifloats). No FP8/FP4 matrix HW on the current SPIR-V path, so these
         // decode-and-accumulate on the CPU reference against the mapped arena.
@@ -265,6 +266,7 @@ fn is_host_fallback(op: &Op) -> bool {
         // schedule (oversized RNN still uses dedicated Host schedule arms).
         Op::Fft { .. }
             | Op::DequantGroupedMatMul { .. }
+            | Op::DequantGroupedMatMulMlx { .. }
             | Op::DequantMoEWeights { .. }
             | Op::ScaledMatMul { .. }
             | Op::ScaledQuantScale { .. }

@@ -996,6 +996,214 @@ pub(crate) fn compile_dequant_grouped_mat_mul(
 }
 
 #[allow(unused_variables)]
+pub(crate) fn compile_dequant_grouped_mat_mul_mlx(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::DequantGroupedMatMulMlx { scheme } = &node.op else {
+        unreachable!()
+    };
+    let in_shape = &graph.node(node.inputs[0]).shape;
+    let m = in_shape.dim(in_shape.rank() - 2).unwrap_static();
+    let k_dim = in_shape.dim(in_shape.rank() - 1).unwrap_static();
+    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+    // scales are `[E, n, n_groups]` — expert count is the leading dim.
+    let scales_shape = &graph.node(node.inputs[2]).shape;
+    let num_experts = scales_shape.dim(0).unwrap_static();
+    let w_bytes = graph.node(node.inputs[1]).shape.num_elements().unwrap();
+    let slab_bytes = w_bytes / num_experts.max(1);
+    Thunk::DequantGroupedMatMulMlx {
+        input: node_offset(arena, node.inputs[0]),
+        w_q: node_offset(arena, node.inputs[1]),
+        scale: node_offset(arena, node.inputs[2]),
+        zp: node_offset(arena, node.inputs[3]),
+        expert_idx: node_offset(arena, node.inputs[4]),
+        dst: node_offset(arena, node.id),
+        m: m as u32,
+        k_dim: k_dim as u32,
+        n: n as u32,
+        num_experts: num_experts as u32,
+        slab_bytes: slab_bytes as u32,
+        scheme: *scheme,
+    }
+}
+
+/// Per row, dequant expert `idx[row]`'s MLX-affine slab and matmul the row.
+pub(crate) fn exec_dequant_grouped_mat_mul_mlx(t: &Thunk, base: *mut u8) {
+    let Thunk::DequantGroupedMatMulMlx {
+        input,
+        w_q,
+        scale,
+        zp,
+        expert_idx,
+        dst,
+        m,
+        k_dim,
+        n,
+        num_experts,
+        slab_bytes,
+        scheme,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        exec_dequant_grouped_mat_mul_mlx_inner(
+            base,
+            *input,
+            *w_q,
+            *scale,
+            *zp,
+            *expert_idx,
+            *dst,
+            *m as usize,
+            *k_dim as usize,
+            *n as usize,
+            *num_experts as usize,
+            *slab_bytes as usize,
+            *scheme,
+        );
+    }
+}
+
+/// Offset-based core shared by the CPU thunk and the GPU backends'
+/// host-delegate path ([`execute_dequant_grouped_matmul_mlx_f32`]).
+#[allow(clippy::too_many_arguments)]
+unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
+    base: *mut u8,
+    input: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    expert_idx: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    ne: usize,
+    slab: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+) {
+    let (bits, gs) = match scheme {
+        rlx_ir::quant::QuantScheme::MlxAffine { bits, group_size } => {
+            (bits as u32, group_size as usize)
+        }
+        other => panic!("DequantGroupedMatMulMlx: expected MlxAffine, got {other:?}"),
+    };
+    let n_groups = k / gs;
+    let sb_per_expert = n * n_groups; // scales/biases f32 per expert
+    unsafe {
+        let inp = sl(input, base, m * k);
+        let ids = sl(expert_idx, base, m);
+        let out = sl_mut(dst, base, m * n);
+        let wt = std::slice::from_raw_parts(base.add(w_q) as *const u8, ne * slab);
+        let scl = sl(scale, base, ne * sb_per_expert);
+        let zpb = sl(zp, base, ne * sb_per_expert);
+        for r in 0..m {
+            let e = (ids[r] as usize).min(ne.saturating_sub(1));
+            let w_slab = &wt[e * slab..(e + 1) * slab];
+            let s_slab = &scl[e * sb_per_expert..(e + 1) * sb_per_expert];
+            let b_slab = &zpb[e * sb_per_expert..(e + 1) * sb_per_expert];
+            let row = &inp[r * k..(r + 1) * k];
+            match rlx_mlx_io::dequant_matmul_affine(
+                row, w_slab, s_slab, b_slab, bits, gs as u32, 1, k, n,
+            ) {
+                Ok(o) => out[r * n..(r + 1) * n].copy_from_slice(&o),
+                Err(_) => out[r * n..(r + 1) * n].fill(0.0),
+            }
+        }
+    }
+}
+
+/// Slice-based grouped MLX-affine matmul for backends that host-delegate by
+/// value (rlx-mlx / rlx-wgpu / rlx-cuda copy Arrays out as `Vec`s rather than
+/// sharing the CPU arena). `x`=[m,k], `w_bytes`=`num_experts` packed slabs,
+/// `scales`/`biases`=[num_experts, n, n_groups] f32, `idx`=[m] f32-encoded
+/// expert ids; writes `out`=[m,n]. `x @ dequant(W_e)^T` per row.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_grouped_matmul_affine_bt(
+    x: &[f32],
+    w_bytes: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    idx: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    bits: u32,
+    group_size: usize,
+) {
+    let slab = w_bytes.len() / num_experts.max(1);
+    let n_groups = k / group_size.max(1);
+    let sb = n * n_groups; // scales/biases f32 per expert
+    for r in 0..m {
+        let e = (idx[r] as usize).min(num_experts.saturating_sub(1));
+        let w_slab = &w_bytes[e * slab..(e + 1) * slab];
+        let s_slab = &scales[e * sb..(e + 1) * sb];
+        let b_slab = &biases[e * sb..(e + 1) * sb];
+        let row = &x[r * k..(r + 1) * k];
+        match rlx_mlx_io::dequant_matmul_affine(
+            row,
+            w_slab,
+            s_slab,
+            b_slab,
+            bits,
+            group_size as u32,
+            1,
+            k,
+            n,
+        ) {
+            Ok(o) => out[r * n..(r + 1) * n].copy_from_slice(&o),
+            Err(_) => out[r * n..(r + 1) * n].fill(0.0),
+        }
+    }
+}
+
+/// Host-delegate entry for GPU backends (Metal/wgpu/…) that copy the routed
+/// inputs back and run the packed grouped MLX matmul on the CPU. Mirrors
+/// [`execute_dequant_matmul_mlx_f32`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_dequant_grouped_matmul_mlx_f32(
+    input: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    expert_idx: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    slab_bytes: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    base: *mut u8,
+) {
+    unsafe {
+        exec_dequant_grouped_mat_mul_mlx_inner(
+            base,
+            input,
+            w_q,
+            scale,
+            zp,
+            expert_idx,
+            dst,
+            m,
+            k,
+            n,
+            num_experts,
+            slab_bytes,
+            scheme,
+        );
+    }
+}
+
+#[allow(unused_variables)]
 pub(crate) fn compile_dequant_mo_e_weights(
     node: &rlx_ir::Node,
     graph: &Graph,

@@ -1625,6 +1625,32 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::DequantGroupedMatMulMlx { scheme } => {
+                    // 5 inputs: input, w_q, scales, biases, expert_idx.
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let m = in_shape.dim(in_shape.rank() - 2).unwrap_static();
+                    let k_dim = in_shape.dim(in_shape.rank() - 1).unwrap_static();
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let scales_shape = &graph.node(node.inputs[2]).shape;
+                    let num_experts = scales_shape.dim(0).unwrap_static();
+                    let w_bytes = graph.node(node.inputs[1]).shape.num_elements().unwrap();
+                    let slab_bytes = w_bytes / num_experts.max(1);
+                    Thunk::DequantGroupedMatMulMlx {
+                        input: off(node.inputs[0]),
+                        w_q: off(node.inputs[1]),
+                        scale: off(node.inputs[2]),
+                        zp: off(node.inputs[3]),
+                        expert_idx: off(node.inputs[4]),
+                        dst: off(node.id),
+                        m: m as u32,
+                        k_dim: k_dim as u32,
+                        n: n as u32,
+                        num_experts: num_experts as u32,
+                        slab_bytes: slab_bytes as u32,
+                        scheme: *scheme,
+                    }
+                }
+
                 Op::TopK { k } => {
                     let in_shape = &graph.node(node.inputs[0]).shape;
                     let rank = in_shape.rank();

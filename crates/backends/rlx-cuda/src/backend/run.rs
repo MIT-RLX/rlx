@@ -2757,6 +2757,35 @@ impl CudaExecutable {
                         );
                     }
                 }
+                Step::DequantGroupedMatmulMlxHost {
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    scheme,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    zp_byte_off,
+                    idx_byte_off,
+                    out_byte_off,
+                } => {
+                    crate::gguf_host::run_dequant_grouped_matmul_mlx(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *m as usize,
+                        *k as usize,
+                        *n as usize,
+                        *num_experts as usize,
+                        *scheme,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *scale_byte_off as usize,
+                        *zp_byte_off as usize,
+                        *idx_byte_off as usize,
+                        *out_byte_off as usize,
+                    );
+                }
                 Step::Sample {
                     outer,
                     inner,

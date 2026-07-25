@@ -1739,6 +1739,57 @@ pub fn lower_with_env(
                 );
                 Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
             }
+            Op::DequantGroupedMatMulMlx { scheme } => {
+                // MLX-affine MoE grouped matmul: host-dequant the routed expert
+                // per row (mirrors the GGUF grouped path above). Inputs:
+                // [input, w_q, scales, biases, expert_idx].
+                let (bits, group_size) = match scheme {
+                    rlx_ir::QuantScheme::MlxAffine { bits, group_size } => {
+                        (*bits as u32, *group_size as usize)
+                    }
+                    other => {
+                        return Err(MlxError(format!(
+                            "DequantGroupedMatMulMlx: expected MlxAffine, got {other:?}"
+                        )));
+                    }
+                };
+                // `contiguous` FIRST: `expert_idx` (and often `input`) arrive as
+                // strided views (narrow/reshape of the top-k indices); a bare
+                // `to_f32()` on a non-contiguous MLX array yields wrong data for
+                // rows > 0 (only token 0 comes out correct otherwise).
+                let x = ops::contiguous(lookup(&env, node.inputs[0])?)?;
+                let wq = ops::contiguous(lookup(&env, node.inputs[1])?)?;
+                let sc = ops::contiguous(lookup(&env, node.inputs[2])?)?;
+                let bs = ops::contiguous(lookup(&env, node.inputs[3])?)?;
+                let idx = ops::contiguous(lookup(&env, node.inputs[4])?)?;
+                let out_shape: Vec<usize> =
+                    node.shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                let m = out_shape[out_shape.len() - 2];
+                let n = out_shape[out_shape.len() - 1];
+                let x_f32 = x.to_f32()?;
+                let k = x_f32.len() / m.max(1);
+                let num_experts = graph.node(node.inputs[2]).shape.dim(0).unwrap_static();
+                let w_bytes = wq.to_bytes()?;
+                let scales = sc.to_f32()?;
+                let biases = bs.to_f32()?;
+                let idx_f32 = idx.to_f32()?;
+                let mut out_host = vec![0f32; m * n];
+                rlx_cpu::thunk::dequant_grouped_matmul_affine_bt(
+                    &x_f32,
+                    &w_bytes,
+                    &scales,
+                    &biases,
+                    &idx_f32,
+                    &mut out_host,
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    bits,
+                    group_size,
+                );
+                Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+            }
             Op::DequantMatMul { scheme } => {
                 if scheme.is_gguf() {
                     let x = lookup(&env, node.inputs[0])?;

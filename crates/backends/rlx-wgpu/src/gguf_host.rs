@@ -123,3 +123,43 @@ pub fn run_dequant_matmul_mlx(
         out_byte_off,
     );
 }
+
+/// MLX-affine MoE grouped matmul on the host (packed expert stacks).
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_grouped_matmul_mlx(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    scale_byte_off: usize,
+    zp_byte_off: usize,
+    idx_byte_off: usize,
+    out_byte_off: usize,
+) {
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_dequant_grouped_matmul_mlx(
+        &mut a,
+        m,
+        k,
+        n,
+        num_experts,
+        scheme,
+        x_byte_off,
+        w_byte_off,
+        scale_byte_off,
+        zp_byte_off,
+        idx_byte_off,
+        out_byte_off,
+    );
+}

@@ -438,6 +438,26 @@ test-apple-sim:
         --target aarch64-apple-ios-sim \
         --test apple_backends_sim -- --nocapture --test-threads=1
 
+# Android cross-compile gate — CPU (NEON) + wgpu via the `android` feature.
+# Needs NDK (ANDROID_NDK_HOME / ANDROID_HOME) for C deps (bzip2-sys, etc.).
+android-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rustup target add aarch64-linux-android
+    eval "$("{{justfile_directory()}}/android/ndk-env.sh")"
+    cargo check -p rlx-runtime --no-default-features --features android --target aarch64-linux-android
+    cargo check -p rlx --no-default-features --features android --target aarch64-linux-android
+    cargo check --manifest-path "{{justfile_directory()}}/android/rlx-jni/Cargo.toml" --target aarch64-linux-android
+
+# Cross-build librlx_jni.so for the Android demo app (stages under jniLibs/).
+# Pass --blas after ./android/build-openblas.sh for static OpenBLAS.
+android-build *ARGS:
+    {{justfile_directory()}}/android/build.sh {{ARGS}}
+
+# End-to-end Android gate (emulator + instrumented tests). See android/e2e.sh.
+android-e2e *ARGS:
+    {{justfile_directory()}}/android/e2e.sh {{ARGS}}
+
 # Build the browser bundle (wasm + JS bindings) into crates/bindings/rlx-web/web/pkg.
 # Add `--webgpu` to also bring up a WebGPU device. One command, all platforms.
 build-web *ARGS:

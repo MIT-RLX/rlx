@@ -1605,6 +1605,23 @@ pub enum Thunk {
         num_experts: u32,
         scheme: rlx_ir::quant::QuantScheme,
     },
+    /// MLX-affine grouped expert matmul: per row, dequant expert `idx[row]`'s
+    /// affine slab (codes+scales+biases) and matmul. `[M,K]×dequant([N,K])→[M,N]`.
+    DequantGroupedMatMulMlx {
+        input: usize,
+        w_q: usize,
+        scale: usize,
+        zp: usize,
+        expert_idx: usize,
+        dst: usize,
+        m: u32,
+        k_dim: u32,
+        n: u32,
+        num_experts: u32,
+        /// Packed-code bytes per expert (`total_w_q_bytes / num_experts`).
+        slab_bytes: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+    },
     /// Materialize packed MoE weights to F32 `[E, K, N]` (autodiff helper).
     DequantMoEWeightsGguf {
         w_q: usize,

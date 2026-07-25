@@ -1960,6 +1960,29 @@ impl CudaExecutable {
                         out_byte_off: arena.offset(node.id) as u64,
                     });
                 }
+                Op::DequantGroupedMatMulMlx { scheme } => {
+                    // 5 inputs: input, w_q, scales, biases, expert_idx.
+                    let in_id = node.inputs[0];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let out_dims = node.shape.dims();
+                    let m = in_dims[in_dims.len() - 2].unwrap_static() as u32;
+                    let k = in_dims[in_dims.len() - 1].unwrap_static() as u32;
+                    let n = out_dims[out_dims.len() - 1].unwrap_static() as u32;
+                    let ne = graph.node(node.inputs[2]).shape.dims()[0].unwrap_static() as u32;
+                    schedule.push(Step::DequantGroupedMatmulMlxHost {
+                        m,
+                        k,
+                        n,
+                        num_experts: ne,
+                        scheme: *scheme,
+                        x_byte_off: arena.offset(in_id) as u64,
+                        w_byte_off: arena.offset(node.inputs[1]) as u64,
+                        scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                        zp_byte_off: arena.offset(node.inputs[3]) as u64,
+                        idx_byte_off: arena.offset(node.inputs[4]) as u64,
+                        out_byte_off: arena.offset(node.id) as u64,
+                    });
+                }
                 Op::ScatterAdd => {
                     let upd_id = node.inputs[0];
                     let idx_id = node.inputs[1];

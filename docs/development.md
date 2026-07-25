@@ -159,6 +159,21 @@ Host-staged ops shared across discrete GPUs: `rlx-gpu-host`.
 GPU backend ranking uses on-disk JSON under `~/.cache/rlx/` (`*-calib-*.json`).
 Delete a file to force re-measurement. See [`backend-selection.md`](backend-selection.md).
 
+## Android
+
+JNI demo app: [`android/README.md`](../android/README.md).
+
+```sh
+just android-check          # cargo check for aarch64-linux-android (+ rlx-jni)
+just android-build          # NDK cross-build → app/src/main/jniLibs/arm64-v8a/
+just android-build -- --blas  # after ./android/build-openblas.sh
+just android-e2e            # emulator + instrumented tests
+```
+
+The `android` / `android-blas` features on `rlx` / `rlx-runtime` enable `cpu` +
+`gpu` (wgpu/Vulkan). OpenBLAS is optional via `OPENBLAS_LIB_DIR` (NDK has no
+system CBLAS).
+
 ## Docs index
 
 | Path | Contents |

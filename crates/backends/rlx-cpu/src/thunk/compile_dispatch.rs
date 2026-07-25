@@ -825,6 +825,14 @@ pub fn compile_thunks_with_rng(
             Op::DequantGroupedMatMul { scheme } => {
                 compile_dequant_grouped_mat_mul(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
+            Op::DequantGroupedMatMulMlx { scheme } => compile_dequant_grouped_mat_mul_mlx(
+                node,
+                graph,
+                arena,
+                &matmul_fold,
+                &rng_shared,
+                rng,
+            ),
             Op::DequantMoEWeights { scheme } => {
                 compile_dequant_mo_e_weights(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
