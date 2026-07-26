@@ -270,6 +270,13 @@ pub fn lower_with_env(
                     BinaryOp::Max => ops::max(&a, &b)?,
                     BinaryOp::Min => ops::min(&a, &b)?,
                     BinaryOp::Pow => ops::pow(&a, &b)?,
+                    BinaryOp::Mod => ops::fmod(&a, &b)?,
+                    BinaryOp::BitAnd => ops::bitand(&a, &b)?,
+                    BinaryOp::BitOr => ops::bitor(&a, &b)?,
+                    BinaryOp::BitXor => ops::bitxor(&a, &b)?,
+                    BinaryOp::Shl => ops::shl(&a, &b)?,
+                    BinaryOp::Shr => ops::shr(&a, &b)?,
+                    BinaryOp::Atan2 => ops::atan2(&a, &b)?,
                 }
             }
             Op::Compare(cop) => {
@@ -399,6 +406,17 @@ pub fn lower_with_env(
                     Activation::Tan => ops::unary(x, MlxUnary::Tan)?,
                     Activation::Atan => ops::unary(x, MlxUnary::Atan)?,
                     Activation::Recip => ops::unary(x, MlxUnary::Reciprocal)?,
+                    Activation::Floor => ops::unary(x, MlxUnary::Floor)?,
+                    Activation::Ceil => ops::unary(x, MlxUnary::Ceil)?,
+                    Activation::Sign => ops::unary(x, MlxUnary::Sign)?,
+                    Activation::Softplus => ops::unary(x, MlxUnary::Softplus)?,
+                    Activation::Elu => ops::unary(x, MlxUnary::Elu)?,
+                    Activation::Erf => ops::unary(x, MlxUnary::Erf)?,
+                    Activation::HardSwish => ops::unary(x, MlxUnary::HardSwish)?,
+                    Activation::HardSigmoid => ops::unary(x, MlxUnary::HardSigmoid)?,
+                    Activation::Mish => ops::unary(x, MlxUnary::Mish)?,
+                    Activation::Softsign => ops::unary(x, MlxUnary::Softsign)?,
+                    Activation::LogSigmoid => ops::unary(x, MlxUnary::LogSigmoid)?,
                 }
             }
             Op::Cast { to } => {
@@ -545,6 +563,14 @@ pub fn lower_with_env(
             Op::Cumsum { axis, exclusive } => {
                 let x = lookup(&env, node.inputs[0])?;
                 ops::cumsum(x, *axis, *exclusive)?
+            }
+            Op::CumProd { axis, exclusive } => {
+                let x = lookup(&env, node.inputs[0])?;
+                ops::cumprod(x, *axis, *exclusive)?
+            }
+            Op::CumMax { axis, exclusive } => {
+                let x = lookup(&env, node.inputs[0])?;
+                ops::cummax(x, *axis, *exclusive)?
             }
             Op::Fft { inverse, norm } => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -813,6 +839,17 @@ pub fn lower_with_env(
                     Some(Activation::Tan) => ops::unary(&biased, MlxUnary::Tan)?,
                     Some(Activation::Atan) => ops::unary(&biased, MlxUnary::Atan)?,
                     Some(Activation::Recip) => ops::unary(&biased, MlxUnary::Reciprocal)?,
+                    Some(Activation::Floor) => ops::unary(&biased, MlxUnary::Floor)?,
+                    Some(Activation::Ceil) => ops::unary(&biased, MlxUnary::Ceil)?,
+                    Some(Activation::Sign) => ops::unary(&biased, MlxUnary::Sign)?,
+                    Some(Activation::Softplus) => ops::unary(&biased, MlxUnary::Softplus)?,
+                    Some(Activation::Elu) => ops::unary(&biased, MlxUnary::Elu)?,
+                    Some(Activation::Erf) => ops::unary(&biased, MlxUnary::Erf)?,
+                    Some(Activation::HardSwish) => ops::unary(&biased, MlxUnary::HardSwish)?,
+                    Some(Activation::HardSigmoid) => ops::unary(&biased, MlxUnary::HardSigmoid)?,
+                    Some(Activation::Mish) => ops::unary(&biased, MlxUnary::Mish)?,
+                    Some(Activation::Softsign) => ops::unary(&biased, MlxUnary::Softsign)?,
+                    Some(Activation::LogSigmoid) => ops::unary(&biased, MlxUnary::LogSigmoid)?,
                 }
             }
             Op::FusedResidualLN { has_bias, eps } => {
@@ -2249,6 +2286,17 @@ pub fn lower_with_env(
                     Activation::Tan => ops::unary(&ffn1, MlxUnary::Tan)?,
                     Activation::Atan => ops::unary(&ffn1, MlxUnary::Atan)?,
                     Activation::Recip => ops::unary(&ffn1, MlxUnary::Reciprocal)?,
+                    Activation::Floor => ops::unary(&ffn1, MlxUnary::Floor)?,
+                    Activation::Ceil => ops::unary(&ffn1, MlxUnary::Ceil)?,
+                    Activation::Sign => ops::unary(&ffn1, MlxUnary::Sign)?,
+                    Activation::Softplus => ops::unary(&ffn1, MlxUnary::Softplus)?,
+                    Activation::Elu => ops::unary(&ffn1, MlxUnary::Elu)?,
+                    Activation::Erf => ops::unary(&ffn1, MlxUnary::Erf)?,
+                    Activation::HardSwish => ops::unary(&ffn1, MlxUnary::HardSwish)?,
+                    Activation::HardSigmoid => ops::unary(&ffn1, MlxUnary::HardSigmoid)?,
+                    Activation::Mish => ops::unary(&ffn1, MlxUnary::Mish)?,
+                    Activation::Softsign => ops::unary(&ffn1, MlxUnary::Softsign)?,
+                    Activation::LogSigmoid => ops::unary(&ffn1, MlxUnary::LogSigmoid)?,
                 };
                 let ffn2 = ops::matmul(&ffn1, fc2_w)?;
                 let ffn_out = maybe_add(ffn2, fc2_b)?;

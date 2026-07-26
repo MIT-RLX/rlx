@@ -83,6 +83,8 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::ArgMax,
     OpKind::ArgMin,
     OpKind::Cumsum,
+    OpKind::CumProd,
+    OpKind::CumMax,
     OpKind::TopK,
     OpKind::Sample,
     OpKind::Conv,
@@ -202,6 +204,18 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::QConv2d,
     OpKind::DenseSolve,
     OpKind::BatchedDenseSolve,
+    // Host-staged to CPU LAPACK (potrf / trsm / getrf) via the `Step::HostOp`
+    // catch-all in `compile/lower.rs`, same as DenseSolve.
+    OpKind::Cholesky,
+    OpKind::TriangularSolve,
+    OpKind::Det,
+    OpKind::LogDet,
+    // Sort / ArgSort host-stage to CPU (stable strided sort) via the
+    // `Step::HostOp` catch-all in `compile/lower.rs`, same as Det / LogDet.
+    OpKind::Sort,
+    OpKind::Svd,
+    OpKind::Qr,
+    OpKind::ArgSort,
     // Native WGSL C64 Wirtinger surface (`complex_wirtinger.wgsl`).
     OpKind::ComplexNormSq,
     OpKind::ComplexNormSqBackward,

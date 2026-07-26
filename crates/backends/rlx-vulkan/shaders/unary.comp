@@ -61,6 +61,22 @@ void main() {
         case 15u: y = atan(x); break;
         case 16u: y = floor(x + 0.5); break;               // round (half up)
         case 17u: y = 1.0 / x; break;                      // recip / vvrecf
+        case 18u: y = floor(x); break;                     // floor
+        case 19u: y = ceil(x); break;                      // ceil
+        case 20u: y = sign(x); break;                      // sign
+        case 21u: y = log(1.0 + exp(x)); break;            // softplus
+        case 22u: y = x > 0.0 ? x : (exp(x) - 1.0); break; // elu (alpha=1)
+        case 23u: { // erf via A&S 7.1.26
+            float s = sign(x); float ax = abs(x);
+            float t = 1.0 / (1.0 + 0.3275911 * ax);
+            float p = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+            y = s * (1.0 - p * exp(-ax * ax));
+        } break;
+        case 24u: y = x * clamp(x + 3.0, 0.0, 6.0) / 6.0; break;   // hardswish
+        case 25u: y = clamp(x / 6.0 + 0.5, 0.0, 1.0); break;       // hardsigmoid
+        case 26u: y = x * tanh(max(x, 0.0) + log(1.0 + exp(-abs(x)))); break; // mish
+        case 27u: y = x / (1.0 + abs(x)); break;                   // softsign
+        case 28u: y = min(x, 0.0) - log(1.0 + exp(-abs(x))); break; // logsigmoid
         // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
         case 100u: y = isnan(x) ? 0.0 : clamp(trunc(x), -128.0, 127.0); break;
         case 101u: y = isnan(x) ? 0.0 : clamp(trunc(x), -32768.0, 32767.0); break;

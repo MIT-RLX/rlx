@@ -78,6 +78,22 @@ fn unary(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         case 15u: { y = tan(x); }
         case 16u: { y = atan(x); }
         case 17u: { y = 1.0 / x; } // vvrecf
+        case 18u: { y = floor(x); }
+        case 19u: { y = ceil(x); }
+        case 20u: { y = sign(x); }
+        case 21u: { y = max(x, 0.0) + log(1.0 + exp(-abs(x))); } // softplus
+        case 22u: { y = select(exp(x) - 1.0, x, x > 0.0); } // elu (alpha=1)
+        case 23u: { // erf via A&S 7.1.26
+            let s = sign(x); let ax = abs(x);
+            let t = 1.0 / (1.0 + 0.3275911 * ax);
+            let p = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+            y = s * (1.0 - p * exp(-ax * ax));
+        }
+        case 24u: { y = x * clamp(x + 3.0, 0.0, 6.0) / 6.0; }              // hardswish
+        case 25u: { y = clamp(x / 6.0 + 0.5, 0.0, 1.0); }                 // hardsigmoid
+        case 26u: { let sp = max(x, 0.0) + log(1.0 + exp(-abs(x))); y = x * tanh(sp); } // mish
+        case 27u: { y = x / (1.0 + abs(x)); }                             // softsign
+        case 28u: { y = min(x, 0.0) - log(1.0 + exp(-abs(x))); }         // logsigmoid
         default: { y = x; }
     }
     arena[params.out_off + i] = y;

@@ -41,14 +41,15 @@ use crate::kernels::{
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
     complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
     conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
-    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, elementwise_region_kernel,
-    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
-    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
-    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
-    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cum_scan_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
+    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
+    gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
+    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
     group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
     layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
@@ -492,6 +493,12 @@ impl WgpuExecutable {
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Cumsum { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::CumScan { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
                         dev.queue
@@ -957,6 +964,10 @@ impl WgpuExecutable {
         let wk = where_kernel(&dev.device);
         let fk = fma_kernel(&dev.device);
         let abk = activation_backward_kernel(&dev.device);
+        // One dispatch per compute pass ⇒ WebGPU inserts a full memory barrier
+        // between every op, eliminating intra-pass hazard races on aliased arena
+        // slots (the source of nondeterministic deep-graph results on wgpu).
+        let one_op_per_pass = rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS");
         let mut step_i = 0;
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
@@ -1420,6 +1431,17 @@ impl WgpuExecutable {
                                     continue;
                                 }
                                 let ck2 = cumsum_kernel(&dev.device);
+                                pass.set_pipeline(&ck2.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::CumScan { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let ck2 = cum_scan_kernel(&dev.device);
                                 pass.set_pipeline(&ck2.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(outer_s, 64);
@@ -2286,6 +2308,9 @@ impl WgpuExecutable {
                         }
                         step_i += 1;
                         pass_dispatched = true;
+                        if one_op_per_pass {
+                            break; // end the pass after this op ⇒ barrier before next
+                        }
                     }
                 }
                 let needs_f16_drain = step_i < self.schedule.len()

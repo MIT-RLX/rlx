@@ -122,6 +122,11 @@ fn activation_backward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(n
         case 17u: { // recip: -1/x²
             dx = -dy / (x * x);
         }
+        case 18u: { dx = 0.0; } // floor
+        case 19u: { dx = 0.0; } // ceil
+        case 20u: { dx = 0.0; } // sign
+        case 21u: { dx = dy / (1.0 + exp(-x)); } // softplus': sigmoid(x)
+        case 22u: { dx = select(dy * exp(x), dy, x > 0.0); } // elu'
         default: { dx = dy; }
     }
     arena[params.dx_off + i] = dx;

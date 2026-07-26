@@ -253,6 +253,31 @@ fn main() {
             Activation::Tan => x.tan(),
             Activation::Atan => x.atan(),
             Activation::Recip => 1.0 / x,
+            Activation::Floor => x.floor(),
+            Activation::Ceil => x.ceil(),
+            Activation::Sign => {
+                if x > 0.0 {
+                    1.0
+                } else if x < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            }
+            Activation::Softplus => (1.0 + x.exp()).ln(),
+            Activation::Elu => {
+                if x > 0.0 {
+                    x
+                } else {
+                    x.exp() - 1.0
+                }
+            }
+            Activation::Erf => erf_approx(x),
+            Activation::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) / 6.0,
+            Activation::HardSigmoid => (x / 6.0 + 0.5).clamp(0.0, 1.0),
+            Activation::Mish => x * (1.0 + x.exp()).ln().tanh(),
+            Activation::Softsign => x / (1.0 + x.abs()),
+            Activation::LogSigmoid => x.min(0.0) - (1.0 + (-x.abs()).exp()).ln(),
         }
     }
     let act_variants = [

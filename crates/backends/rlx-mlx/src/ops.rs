@@ -44,6 +44,13 @@ binary!(div, rlx_mlx_op_div);
 binary!(max, rlx_mlx_op_max);
 binary!(min, rlx_mlx_op_min);
 binary!(pow, rlx_mlx_op_pow);
+binary!(fmod, rlx_mlx_op_fmod);
+binary!(bitand, rlx_mlx_op_bitand);
+binary!(bitor, rlx_mlx_op_bitor);
+binary!(bitxor, rlx_mlx_op_bitxor);
+binary!(shl, rlx_mlx_op_shl);
+binary!(shr, rlx_mlx_op_shr);
+binary!(atan2, rlx_mlx_op_atan2);
 
 binary!(eq, rlx_mlx_op_eq);
 binary!(ne, rlx_mlx_op_ne);
@@ -177,6 +184,24 @@ pub fn cumsum(a: &Array, axis: i32, exclusive: bool) -> Result<Array, MlxError> 
     let mut out: *mut mlx_array_t = ptr::null_mut();
     let rc =
         unsafe { ffi::rlx_mlx_op_cumsum(a.ptr, axis, if exclusive { 1 } else { 0 }, &mut out) };
+    check(rc)?;
+    Ok(Array::from_raw(out))
+}
+
+pub fn cumprod(a: &Array, axis: i32, exclusive: bool) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
+    let mut out: *mut mlx_array_t = ptr::null_mut();
+    let rc =
+        unsafe { ffi::rlx_mlx_op_cumprod(a.ptr, axis, if exclusive { 1 } else { 0 }, &mut out) };
+    check(rc)?;
+    Ok(Array::from_raw(out))
+}
+
+pub fn cummax(a: &Array, axis: i32, exclusive: bool) -> Result<Array, MlxError> {
+    let _guard = crate::sync::runtime_guard();
+    let mut out: *mut mlx_array_t = ptr::null_mut();
+    let rc =
+        unsafe { ffi::rlx_mlx_op_cummax(a.ptr, axis, if exclusive { 1 } else { 0 }, &mut out) };
     check(rc)?;
     Ok(Array::from_raw(out))
 }

@@ -60,6 +60,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         GroupNormBackwardBeta,
         RopeBackward,
         Cumsum,
+        CumProd,
+        CumMax,
         CumsumBackward,
         GatherBackward,
         Conv2dBackwardInput,
@@ -76,6 +78,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Expand,
         Gather,
         Reverse,
+        Pad,
+        Slice,
         Reduce,
         Softmax,
         SoftmaxCrossEntropy,
@@ -189,6 +193,19 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         FakeQuantizeLSQBackwardScale,
         DenseSolve,
         BatchedDenseSolve,
+        // Cholesky / TriangularSolve / Det / LogDet host-stage to CPU
+        // LAPACK via the `_other => Thunk::HostOp` catch-all (same as
+        // DenseSolve F64).
+        Cholesky,
+        TriangularSolve,
+        Det,
+        LogDet,
+        // Sort / ArgSort host-stage to CPU (stable strided sort) via the
+        // same `_other => Thunk::HostOp` catch-all as Det / LogDet.
+        Sort,
+        Svd,
+        Qr,
+        ArgSort,
         BatchNormInference,
         BatchNormInferenceBackwardInput,
         BatchNormInferenceBackwardGamma,

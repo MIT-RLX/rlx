@@ -898,6 +898,10 @@ pub trait HirGraphExt {
     fn reshape_(&mut self, x: HirNodeId, new_shape: Vec<i64>) -> HirNodeId;
     fn transpose_(&mut self, x: HirNodeId, perm: Vec<usize>) -> HirNodeId;
     fn narrow_(&mut self, x: HirNodeId, axis: usize, start: usize, len: usize) -> HirNodeId;
+    /// Pad each axis by `[low, high]` using `mode` (twin of `Graph::pad_`).
+    /// MLA uses it to zero-pad V's `v_head_dim` up to the QK `head_dim` so the
+    /// asymmetric-head attention can still ride the symmetric [`Op::Attention`].
+    fn pad_(&mut self, x: HirNodeId, pads: Vec<[usize; 2]>, mode: PadMode) -> HirNodeId;
     fn concat_(&mut self, inputs: Vec<HirNodeId>, axis: usize) -> HirNodeId;
     fn gather_(&mut self, table: HirNodeId, indices: HirNodeId, axis: usize) -> HirNodeId;
 
@@ -1240,6 +1244,11 @@ impl HirGraphExt for HirMut<'_> {
     fn narrow_(&mut self, x: HirNodeId, axis: usize, start: usize, len: usize) -> HirNodeId {
         let s = shape::narrow_shape(self.shape(x), axis, len).expect("narrow shape inference");
         self.0.mir(Op::Narrow { axis, start, len }, vec![x], s)
+    }
+
+    fn pad_(&mut self, x: HirNodeId, pads: Vec<[usize; 2]>, mode: PadMode) -> HirNodeId {
+        let s = shape::pad_shape(self.shape(x), &pads).expect("pad shape inference");
+        self.0.mir(Op::Pad { pads, mode }, vec![x], s)
     }
 
     fn concat_(&mut self, inputs: Vec<HirNodeId>, axis: usize) -> HirNodeId {

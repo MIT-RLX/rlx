@@ -1865,9 +1865,36 @@ inline float fused_bin(float lv, float rv, uint op) {
         case 3: return lv / rv;
         case 4: return max(lv, rv);
         case 5: return min(lv, rv);
+        case 6: return pow(lv, rv);
+        case 7: return fmod(lv, rv);
+        case 8: return (float)((int)lv & (int)rv);
+        case 9: return (float)((int)lv | (int)rv);
+        case 10: return (float)((int)lv ^ (int)rv);
+        case 11: return (float)((int)lv << (int)rv);
+        case 12: return (float)((int)lv >> (int)rv);
+        case 13: return atan2(lv, rv);
         default: return pow(lv, rv);
     }
 }
+
+// Same-size element-wise binary by opcode (Mod/bitwise: no dedicated elem_*).
+kernel void elem_binop(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c        [[buffer(2)]],
+    constant uint& n       [[buffer(3)]],
+    constant uint& op      [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= n) return; c[gid] = fused_bin(a[gid], b[gid], op); }
+
+kernel void elem_binop_h(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c       [[buffer(2)]],
+    constant uint& n     [[buffer(3)]],
+    constant uint& op    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) { if (gid >= n) return; c[gid] = half(fused_bin(float(a[gid]), float(b[gid]), op)); }
 
 inline float fused_act(float x, uint act) {
     switch (act) {
@@ -8157,6 +8184,29 @@ kernel void cumsum_fwd(
     }
 }
 
+// Cumulative product / maximum along the last axis (one threadgroup per row).
+// is_max=1 runs a running max (identity -inf) else a running product (identity 1).
+kernel void cum_scan(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& inner [[buffer(2)]],
+    constant uint& exclusive [[buffer(3)]],
+    constant uint& is_max [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    float acc = (is_max != 0u) ? (-INFINITY) : 1.0f;
+    for (uint i = 0; i < inner; ++i) {
+        float v = src[row * inner + i];
+        if (exclusive != 0u) {
+            dst[row * inner + i] = acc;
+            acc = (is_max != 0u) ? fmax(acc, v) : (acc * v);
+        } else {
+            acc = (is_max != 0u) ? fmax(acc, v) : (acc * v);
+            dst[row * inner + i] = acc;
+        }
+    }
+}
+
 kernel void cumsum_bwd(
     device const float* dy [[buffer(0)]],
     device float* dx [[buffer(1)]],
@@ -8603,9 +8653,57 @@ const RLX_KERNELS_MSL_FFT_GPU: &str = include_str!("fft_gpu.msl");
 const RLX_KERNELS_MSL_SPLAT: &str = include_str!("splat.msl");
 const RLX_KERNELS_MSL_SPLAT_CONIC: &str = include_str!("splat_conic_bin.msl");
 
+/// Single source of truth for Metal's scalar activation kernels. Each entry
+/// `(Variant, "name", "msl_expr")` generates an f32 + f16 in-place MSL kernel
+/// (the expr sees `float x`) and its pipeline pair. Adding an activation is one
+/// line here — no struct field, no dispatch arm, no separate kernel edit.
+macro_rules! scalar_activation_kernels {
+    ( $( $variant:ident, $name:literal, $expr:literal );+ $(;)? ) => {
+        const SCALAR_ACT_MSL: &str = concat!(
+            // Metal has no `erf` builtin — provide one (A&S 7.1.26).
+            "inline float rlx_erf(float x) { float s = sign(x); float ax = fabs(x); \
+             float t = 1.0f/(1.0f+0.3275911f*ax); \
+             float p = ((((1.061405429f*t - 1.453152027f)*t + 1.421413741f)*t - 0.284496736f)*t + 0.254829592f)*t; \
+             return s*(1.0f - p*exp(-ax*ax)); }\n",
+            $(
+            "kernel void ", $name, "_sa(device float* d [[buffer(0)]], constant uint& n [[buffer(1)]], uint g [[thread_position_in_grid]]) { if (g>=n) return; float x = d[g]; d[g] = ", $expr, "; }\n",
+            "kernel void ", $name, "_sa_h(device half* d [[buffer(0)]], constant uint& n [[buffer(1)]], uint g [[thread_position_in_grid]]) { if (g>=n) return; float x = float(d[g]); d[g] = half(", $expr, "); }\n",
+        )+);
+
+        /// Build the (f32, f16) pipeline pair for each scalar activation.
+        fn build_scalar_act_kernels(
+            pipeline: &dyn Fn(&str) -> ComputePipelineState,
+        ) -> std::collections::HashMap<rlx_ir::op::Activation, (ComputePipelineState, ComputePipelineState)>
+        {
+            let mut m = std::collections::HashMap::new();
+            $(
+                m.insert(
+                    rlx_ir::op::Activation::$variant,
+                    (pipeline(concat!($name, "_sa")), pipeline(concat!($name, "_sa_h"))),
+                );
+            )+
+            m
+        }
+    };
+}
+
+scalar_activation_kernels! {
+    Floor,       "floor",       "floor(x)";
+    Ceil,        "ceil",        "ceil(x)";
+    Sign,        "sign",        "sign(x)";
+    Softplus,    "softplus",    "max(x, 0.0f) + log(1.0f + exp(-fabs(x)))";
+    Elu,         "elu",         "(x > 0.0f) ? x : (exp(x) - 1.0f)";
+    Erf,         "erf",         "rlx_erf(x)";
+    HardSwish,   "hardswish",   "x * clamp(x + 3.0f, 0.0f, 6.0f) / 6.0f";
+    HardSigmoid, "hardsigmoid", "clamp(x / 6.0f + 0.5f, 0.0f, 1.0f)";
+    Mish,        "mish",        "x * tanh(max(x, 0.0f) + log(1.0f + exp(-fabs(x))))";
+    Softsign,    "softsign",    "x / (1.0f + fabs(x))";
+    LogSigmoid,  "logsigmoid",  "min(x, 0.0f) - log(1.0f + exp(-fabs(x)))";
+}
+
 fn msl_source() -> String {
     format!(
-        "{RLX_KERNELS_MSL}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}"
+        "{RLX_KERNELS_MSL}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}\n{SCALAR_ACT_MSL}"
     )
 }
 
@@ -8754,6 +8852,8 @@ pub struct Kernels {
     pub elem_max: ComputePipelineState,
     pub elem_min: ComputePipelineState,
     pub elem_pow: ComputePipelineState,
+    pub elem_binop: ComputePipelineState,
+    pub elem_binop_h: ComputePipelineState,
     pub elem_compare: ComputePipelineState,
     pub elem_compare_bcast: ComputePipelineState,
     pub elem_where: ComputePipelineState,
@@ -8916,6 +9016,7 @@ pub struct Kernels {
     pub group_norm_bwd_beta: ComputePipelineState,
     pub rope_bwd: ComputePipelineState,
     pub cumsum_fwd: ComputePipelineState,
+    pub cum_scan: ComputePipelineState,
     pub cumsum_bwd: ComputePipelineState,
     pub im2col_group: ComputePipelineState,
     pub im2col_group_w1: ComputePipelineState,
@@ -8952,6 +9053,12 @@ pub struct Kernels {
     pub gaussian_splat_bin_scatter: ComputePipelineState,
     pub gaussian_splat_build_tile_ranges: ComputePipelineState,
     pub gaussian_splat_pack_grads: ComputePipelineState,
+    /// Macro-generated scalar activation kernels (Floor/Ceil/Sign/Softplus/Elu):
+    /// `Activation → (f32_pipeline, f16_pipeline)`. See `scalar_activation_kernels!`.
+    pub scalar_acts: std::collections::HashMap<
+        rlx_ir::op::Activation,
+        (ComputePipelineState, ComputePipelineState),
+    >,
 }
 
 unsafe impl Send for Kernels {}
@@ -9103,6 +9210,8 @@ impl Kernels {
             elem_max: pipeline("elem_max"),
             elem_min: pipeline("elem_min"),
             elem_pow: pipeline("elem_pow"),
+            elem_binop: pipeline("elem_binop"),
+            elem_binop_h: pipeline("elem_binop_h"),
             elem_compare: pipeline("elem_compare"),
             elem_compare_bcast: pipeline("elem_compare_bcast"),
             elem_where: pipeline("elem_where"),
@@ -9240,6 +9349,7 @@ impl Kernels {
             group_norm_bwd_beta: pipeline("group_norm_bwd_beta"),
             rope_bwd: pipeline("rope_bwd"),
             cumsum_fwd: pipeline("cumsum_fwd"),
+            cum_scan: pipeline("cum_scan"),
             cumsum_bwd: pipeline("cumsum_bwd"),
             im2col_group: pipeline("im2col_group"),
             im2col_group_w1: pipeline("im2col_group_w1"),
@@ -9280,6 +9390,7 @@ impl Kernels {
             gaussian_splat_bin_scatter: pipeline("gaussian_splat_bin_scatter"),
             gaussian_splat_build_tile_ranges: pipeline("gaussian_splat_build_tile_ranges"),
             gaussian_splat_pack_grads: pipeline("gaussian_splat_pack_grads"),
+            scalar_acts: build_scalar_act_kernels(&pipeline),
             iq_grid_lut: build_iq_grid_lut(
                 &metal_device()
                     .expect("rlx-metal: no Metal device for IQ grid LUT staging")

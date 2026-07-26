@@ -148,6 +148,13 @@ int rlx_mlx_op_add   (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** 
 int rlx_mlx_op_mul   (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
 int rlx_mlx_op_sub   (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
 int rlx_mlx_op_div   (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
+int rlx_mlx_op_fmod  (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
+int rlx_mlx_op_bitand(rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
+int rlx_mlx_op_bitor (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
+int rlx_mlx_op_bitxor(rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
+int rlx_mlx_op_shl   (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
+int rlx_mlx_op_shr   (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
+int rlx_mlx_op_atan2 (rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out);
 
 int rlx_mlx_op_softmax (rlx_mlx_array_t* a, int axis, rlx_mlx_array_t** out);
 int rlx_mlx_op_gelu    (rlx_mlx_array_t* a, rlx_mlx_array_t** out);
@@ -244,6 +251,16 @@ typedef enum {
     RLX_MLX_UN_TAN = 13,
     RLX_MLX_UN_ATAN = 14,
     RLX_MLX_UN_RECIPROCAL = 15,
+    RLX_MLX_UN_FLOOR = 16,
+    RLX_MLX_UN_CEIL = 17,
+    RLX_MLX_UN_SIGN = 18,
+    RLX_MLX_UN_SOFTPLUS = 19,
+    RLX_MLX_UN_ELU = 20,
+    RLX_MLX_UN_HARDSWISH = 21,
+    RLX_MLX_UN_HARDSIGMOID = 22,
+    RLX_MLX_UN_MISH = 23,
+    RLX_MLX_UN_SOFTSIGN = 24,
+    RLX_MLX_UN_LOGSIGMOID = 25,
 } rlx_mlx_unary_t;
 int rlx_mlx_op_unary(rlx_mlx_array_t* a, rlx_mlx_unary_t kind, rlx_mlx_array_t** out);
 
@@ -299,6 +316,18 @@ int rlx_mlx_op_reduce(
     rlx_mlx_array_t** out);
 
 int rlx_mlx_op_cumsum(
+    rlx_mlx_array_t* a,
+    int axis,
+    int exclusive,
+    rlx_mlx_array_t** out);
+
+int rlx_mlx_op_cumprod(
+    rlx_mlx_array_t* a,
+    int axis,
+    int exclusive,
+    rlx_mlx_array_t** out);
+
+int rlx_mlx_op_cummax(
     rlx_mlx_array_t* a,
     int axis,
     int exclusive,

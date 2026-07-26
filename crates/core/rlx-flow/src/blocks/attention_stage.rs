@@ -17,7 +17,10 @@
 
 use anyhow::Result;
 
-use super::{BlockStage, LlamaDecodeLayerStage, Qwen3DecodeLayerStage, SelfAttnPrefillStage};
+use super::{
+    BlockStage, LlamaDecodeLayerStage, MlaAttnPrefillStage, Qwen3DecodeLayerStage,
+    SelfAttnPrefillStage,
+};
 use crate::context::FlowCtx;
 use crate::stage_contract::{LayerStage, StageArtifacts};
 use crate::stage_interfaces::{AttentionStage, KvCacheContract};
@@ -60,6 +63,25 @@ impl AttentionStage for SelfAttnPrefillStage {
             k: hidden.clone(),
             v: hidden.clone(),
         }
+    }
+}
+
+impl LayerStage for MlaAttnPrefillStage {
+    fn name(&self) -> &str {
+        "mla_attn_prefill"
+    }
+
+    fn emit_layer(
+        &self,
+        ctx: &mut FlowCtx<'_>,
+        input: FlowValue,
+    ) -> Result<(FlowValue, StageArtifacts)> {
+        let out = BlockStage::emit(self, ctx, input.clone())?;
+        let value = out.unwrap_or(input);
+        Ok((
+            value.clone(),
+            StageArtifacts::hidden_only(value.shape.clone()),
+        ))
     }
 }
 

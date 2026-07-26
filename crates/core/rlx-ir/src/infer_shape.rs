@@ -138,7 +138,9 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             shape::reduce_shape(in_shape(0), &[*axis], *keep_dim).ok()
         }
         Op::Softmax { .. } => Some(shape::softmax_shape(in_shape(0))),
-        Op::Cumsum { .. } => Some(shape::unary_shape(in_shape(0))),
+        Op::Cumsum { .. } | Op::CumProd { .. } | Op::CumMax { .. } => {
+            Some(shape::unary_shape(in_shape(0)))
+        }
 
         Op::Reshape { new_shape } => shape::reshape_shape(in_shape(0), new_shape).ok(),
         Op::Transpose { perm } => shape::transpose_shape(in_shape(0), perm).ok(),
@@ -156,6 +158,10 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::GatherNd { .. } => Some(node.shape.clone()),
         // Reverse flips element order along axes; shape is unchanged.
         Op::Reverse { .. } => Some(shape::unary_shape(in_shape(0))),
+        Op::Pad { pads, .. } => shape::pad_shape(in_shape(0), pads).ok(),
+        Op::Slice { axis, len, .. } => shape::slice_shape(in_shape(0), *axis, *len).ok(),
+        Op::Clamp { .. } | Op::Trilu { .. } => Some(shape::unary_shape(in_shape(0))),
+        Op::Tile { reps } => shape::tile_shape(in_shape(0), reps).ok(),
         Op::Expand { target_shape } => shape::expand_shape(in_shape(0), target_shape).ok(),
 
         Op::LayerNorm { .. } | Op::LayerNorm2d { .. } | Op::GroupNorm { .. } => {

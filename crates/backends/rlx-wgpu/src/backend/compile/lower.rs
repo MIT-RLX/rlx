@@ -44,30 +44,31 @@ use crate::kernels::{
     AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
     BinaryC64Params, BinaryParams, CastParams, ComplexCastParams, ComplexWirtingerParams,
     Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
-    CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
-    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams,
-    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
-    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupedMatmulParams, GruParams,
-    Im2Col2dParams, Kernel, LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulParams,
-    MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams,
-    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
-    RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams,
-    SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams,
-    WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
-    argmax_kernel, attention_bwd_kernel, attention_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
-    cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
-    complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
-    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
-    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, elementwise_region_kernel,
-    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
-    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
-    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
-    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    CopyParams, CumScanParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams,
+    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
+    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
+    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
+    GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams, LayerNormParams,
+    Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams,
+    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams,
+    RnnParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
+    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
+    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
+    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel,
+    cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
+    conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
+    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    dequant_matmul_mlx_kernel, elementwise_region_kernel, elementwise_region_spatial_kernel,
+    expand_kernel, fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel,
+    fft_butterfly_stage_kernel, fma_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
+    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
+    gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
+    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
     group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
     layer_norm_backward_input_kernel, layernorm_kernel, lead_pack_uniform, mamba2_kernel,
@@ -526,7 +527,27 @@ pub(crate) fn compile_static_inner(
         // elided. Coop16 still falls back to FMB+narrows (kernel
         // would need an f16-acc variant; deferred).
         if cp == MatmulCompute::F32 || cp == MatmulCompute::CoopF32 {
-            qkv_split.insert(parent_id, qkv);
+            // Slot-safety: the fused kernel writes Q/K/V into the narrow slots
+            // *during the same dispatch that reads the matmul inputs* (A activation,
+            // weight, bias). The memory planner, however, sees the narrows as born
+            // at their (later) narrow step — after A's last read at this matmul —
+            // so under liveness-aware reuse it may place a Q/K/V slot on top of a
+            // still-being-read input (commonly Q reusing A's just-freed slot). The
+            // fused write then clobbers A mid-dispatch and the K/V lanes that still
+            // need A read corrupted input → nondeterministic drift on reused arenas
+            // (bit-exact only under RLX_ARENA_NO_REUSE). Only elide the narrows when
+            // no Q/K/V output aliases any matmul input; otherwise fall back to the
+            // standard FMB (writes its own slot) + real Narrow steps, which read the
+            // materialized parent after A is dead — always safe.
+            let (q, k, v) = qkv;
+            let inputs_alias_output = parent.inputs.iter().any(|&inp| {
+                arena_tensors_overlap(&arena, inp, q)
+                    || arena_tensors_overlap(&arena, inp, k)
+                    || arena_tensors_overlap(&arena, inp, v)
+            });
+            if !inputs_alias_output {
+                qkv_split.insert(parent_id, qkv);
+            }
         }
     }
     let qkv_skip_narrows: HashSet<NodeId> = qkv_split
@@ -577,6 +598,26 @@ pub(crate) fn compile_static_inner(
     let mut coop_f16_host_activations: Vec<(NodeId, Activation, String)> = Vec::new();
     let mut static_once_steps: HashSet<usize> = HashSet::new();
     let mut static_weight_memo: HashMap<NodeId, bool> = HashMap::new();
+
+    // Slot-safety for `static_once`: a static-weight pack may only skip recompute
+    // on a graph re-run if it OWNS its arena slot exclusively. `plan_memory`'s
+    // `extend_static_weight_pack_liveness` pins such packs to graph-end so they
+    // get a private slot — but any pack the planner failed to pin shares a
+    // liveness-reused slot, and a later node clobbers it, so run 2+ (bucketed LM
+    // decode reuses one graph per token) reads stale data → zeroed lm_head
+    // logits. Count materialized owners per arena offset; only offset-exclusive
+    // (count==1) packs are marked run-once. Trusts the pin where it worked, falls
+    // back to recompute where it didn't. Repro/verify: rlx-models backend_sweep.
+    let mut offset_owner_count: HashMap<usize, usize> = HashMap::new();
+    for n in graph.nodes() {
+        if rlx_compile::memory::is_pure_view(&graph, n) || !arena.has(n.id) {
+            continue;
+        }
+        *offset_owner_count.entry(arena.offset(n.id)).or_insert(0) += 1;
+    }
+    let slot_is_exclusive = |arena: &crate::buffer::Arena, id: NodeId| -> bool {
+        arena.has(id) && offset_owner_count.get(&arena.offset(id)).copied() == Some(1)
+    };
 
     let emit_uniform = |size: usize| -> wgpu::Buffer {
         dev.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3049,7 +3090,7 @@ pub(crate) fn compile_static_inner(
                         });
                     }
                 }
-                if once {
+                if once && slot_is_exclusive(&arena, node.id) {
                     for i in sched_before..schedule.len() {
                         static_once_steps.insert(i);
                     }
@@ -5315,6 +5356,37 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
+            Op::CumProd { axis, exclusive } | Op::CumMax { axis, exclusive } => {
+                let in_id = node.inputs[0];
+                let in_shape = graph.node(in_id).shape.dims();
+                let last = (in_shape.len() - 1) as i32;
+                if *axis != -1 && *axis != last {
+                    // Non-last-axis: packed HostOp (CPU thunk).
+                    schedule.push(Step::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                    });
+                    continue;
+                }
+                let inner = in_shape[in_shape.len() - 1].unwrap_static() as u32;
+                let total: u32 = in_shape.iter().map(|d| d.unwrap_static() as u32).product();
+                let outer = total / inner.max(1);
+                let p = CumScanParams {
+                    outer,
+                    inner,
+                    in_off: (arena.offset(in_id) / 4) as u32,
+                    out_off: (arena.offset(node.id) / 4) as u32,
+                    exclusive: if *exclusive { 1 } else { 0 },
+                    is_max: matches!(node.op, Op::CumMax { .. }) as u32,
+                    _p0: 0,
+                    _p1: 0,
+                };
+                schedule.push(Step::CumScan { params: p });
+                let ck2 = cum_scan_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<CumScanParams>());
+                let bg = bind_op_output_window(&dev.device, ck2, &arena, node.id, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
             Op::Fft { inverse, norm } => {
                 let in_id = node.inputs[0];
                 let in_shape = graph.node(in_id).shape.clone();
@@ -6804,6 +6876,14 @@ pub(crate) fn compile_static_inner(
             | Op::QConv2d { .. }
             | Op::DenseSolve
             | Op::BatchedDenseSolve
+            | Op::Cholesky
+            | Op::TriangularSolve { .. }
+            | Op::Det
+            | Op::LogDet
+            | Op::Sort { .. }
+            | Op::Svd { .. }
+            | Op::Qr { .. }
+            | Op::ArgSort { .. }
             | Op::LoraMatMul { .. }
             | Op::FusedConvBiasAct { .. }
             | Op::PartitionedConv { .. }

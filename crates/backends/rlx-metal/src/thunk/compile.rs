@@ -47,6 +47,20 @@ fn activation_backward_op_id(act: Activation) -> u32 {
         Activation::Tan => 15,
         Activation::Atan => 16,
         Activation::Recip => 17,
+        // No native Metal backward kernel — these decompose at the AD level.
+        Activation::Floor
+        | Activation::Ceil
+        | Activation::Sign
+        | Activation::Softplus
+        | Activation::Elu
+        | Activation::Erf
+        | Activation::HardSwish
+        | Activation::HardSigmoid
+        | Activation::Mish
+        | Activation::Softsign
+        | Activation::LogSigmoid => {
+            panic!("rlx-metal: no native backward for {act:?} (decomposed)")
+        }
     }
 }
 
@@ -1691,6 +1705,33 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::CumProd { axis, exclusive } | Op::CumMax { axis, exclusive } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!("rlx-metal CumProd/CumMax: F32 only");
+                    }
+                    let rank = node.shape.rank();
+                    let ax = if *axis < 0 {
+                        (rank as i32 + *axis) as usize
+                    } else {
+                        *axis as usize
+                    };
+                    if ax != rank.saturating_sub(1) {
+                        panic!(
+                            "rlx-metal CumProd/CumMax: only last-axis wired (got axis={axis}, rank={rank})"
+                        );
+                    }
+                    let cols = node.shape.dim(ax).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    Thunk::CumScan {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        rows: (total / cols.max(1)) as u32,
+                        cols: cols as u32,
+                        exclusive: *exclusive,
+                        is_max: matches!(node.op, Op::CumMax { .. }),
+                    }
+                }
+
                 Op::Reduce {
                     op,
                     axes,
@@ -2458,6 +2499,52 @@ impl ThunkSchedule {
                         dst: off(node.id),
                         dims,
                         rev_mask,
+                        elem_bytes: in_shape.dtype().size_bytes() as u8,
+                    }
+                }
+
+                Op::Pad { pads, mode } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let dtype = in_shape.dtype();
+                    let in_dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    let before: Vec<u32> = (0..rank).map(|i| pads[i][0] as u32).collect();
+                    let after: Vec<u32> = (0..rank).map(|i| pads[i][1] as u32).collect();
+                    let elem_bytes = dtype.size_bytes();
+                    let fill = rlx_gpu_host::pad_fill_bytes(*mode, dtype, elem_bytes);
+                    Thunk::Pad {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        in_dims,
+                        before,
+                        after,
+                        mode: *mode,
+                        fill,
+                        elem_bytes: elem_bytes as u8,
+                    }
+                }
+
+                Op::Slice {
+                    axis,
+                    start,
+                    len,
+                    step,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let in_dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    Thunk::Slice {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        in_dims,
+                        axis: *axis as u32,
+                        start: *start as u32,
+                        len: *len as u32,
+                        step: *step,
                         elem_bytes: in_shape.dtype().size_bytes() as u8,
                     }
                 }
@@ -3380,15 +3467,16 @@ impl ThunkSchedule {
                     // not folded into `src`. To make Rope read from the
                     // parent buffer at the right column we have to bake
                     // `start` into the byte offset using the dtype size.
-                    let (n_src, n_dst, n_src_axis, n_start, n_dt) = match &thunks[i] {
+                    let (n_src, n_dst, n_src_axis, n_start, n_dt, n_outer) = match &thunks[i] {
                         Thunk::Narrow {
                             src,
                             dst,
                             src_axis,
                             start,
                             dt,
+                            outer,
                             ..
-                        } => (*src, *dst, *src_axis, *start, *dt),
+                        } => (*src, *dst, *src_axis, *start, *dt, *outer),
                         _ => continue,
                     };
                     let mut j = i + 1;
@@ -3398,20 +3486,28 @@ impl ThunkSchedule {
                     if j >= thunks.len() {
                         continue;
                     }
-                    let rope_reads_narrow = matches!(&thunks[j],
-                    Thunk::Rope { src, .. } if *src == n_dst);
-                    if !rope_reads_narrow {
+                    // The Rope must read the Narrow's dst, share its dtype, and —
+                    // critically — its row geometry must match Rope's flattened
+                    // `batch·seq` model. Rewiring to a single parent row stride is
+                    // only valid for a terminal-axis narrow (`outer == batch·seq`).
+                    // A non-terminal-axis narrow (MLA's per-head `qk_rope` slice
+                    // out of `[B, S, H, qk]`, whose `outer == batch·seq·H`) has
+                    // more, narrower rows and would be misread. Mirrors the CPU
+                    // pass in `rlx-cpu` compile_dispatch.
+                    let rope_ok = match &thunks[j] {
+                        Thunk::Rope {
+                            src,
+                            batch,
+                            seq,
+                            dt: rd,
+                            ..
+                        } => *src == n_dst && *rd == n_dt && n_outer == batch * seq,
+                        _ => false,
+                    };
+                    if !rope_ok {
                         continue;
                     }
                     if read_counts.get(&n_dst).copied().unwrap_or(0) != 1 {
-                        continue;
-                    }
-                    // Sanity: the Rope's dtype must match the Narrow's. If
-                    // not, something upstream did a precision conversion
-                    // and the buffers aren't byte-compatible — bail.
-                    let dt_matches = matches!(&thunks[j],
-                    Thunk::Rope { dt: rd, .. } if *rd == n_dt);
-                    if !dt_matches {
                         continue;
                     }
 

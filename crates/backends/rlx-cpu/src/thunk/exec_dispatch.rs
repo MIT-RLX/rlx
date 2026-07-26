@@ -161,6 +161,13 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
                     BinaryOp::Max => a.max(b),
                     BinaryOp::Min => a.min(b),
                     BinaryOp::Pow => a.powf(b),
+                    BinaryOp::Mod => a % b,
+                    BinaryOp::Atan2 => a.atan2(b),
+                    BinaryOp::BitAnd => ((a as i64) & (b as i64)) as f32,
+                    BinaryOp::BitOr => ((a as i64) | (b as i64)) as f32,
+                    BinaryOp::BitXor => ((a as i64) ^ (b as i64)) as f32,
+                    BinaryOp::Shl => (a as i64).wrapping_shl(b as u32) as f32,
+                    BinaryOp::Shr => (a as i64).wrapping_shr(b as u32) as f32,
                 };
             }
         }
@@ -227,6 +234,7 @@ pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
         Thunk::ActivationInPlace { .. } => "ActivationInPlace",
         Thunk::Narrow { .. } => "Narrow",
         Thunk::Cumsum { .. } => "Cumsum",
+        Thunk::CumScan { .. } => "CumScan",
         Thunk::Reduce { .. } => "Reduce",
         Thunk::BatchedSgemm { .. } => "BatchedSgemm",
         Thunk::DequantMatMul { .. } => "DequantMatMul",
@@ -536,6 +544,12 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::CgemmC64 { .. } => exec_cgemm_c64(thunk, base),
             Thunk::DenseSolveF64 { .. } => exec_dense_solve_f64(thunk, base),
             Thunk::DenseSolveF32 { .. } => exec_dense_solve_f32(thunk, base),
+            Thunk::CholeskyF32 { .. } => exec_cholesky(thunk, base),
+            Thunk::TriangularSolveF32 { .. } => exec_triangular_solve(thunk, base),
+            Thunk::DetF32 { .. } => exec_det(thunk, base),
+            Thunk::SortF32 { .. } => exec_sort(thunk, base),
+            Thunk::SvdF32 { .. } => exec_svd(thunk, base),
+            Thunk::QrF32 { .. } => exec_qr(thunk, base),
             Thunk::BatchedDenseSolveF64 { .. } => exec_batched_dense_solve_f64(thunk, base),
             Thunk::BatchedDenseSolveF32 { .. } => exec_batched_dense_solve_f32(thunk, base),
             Thunk::BatchedDgemmF64 { .. } => exec_batched_dgemm_f64(thunk, base),
@@ -1413,6 +1427,16 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             BinaryOp::Max => bini64!(|a: i64, b: i64| a.max(b)),
                             BinaryOp::Min => bini64!(|a: i64, b: i64| a.min(b)),
                             BinaryOp::Pow => bini64!(|a: i64, b: i64| a.pow(b.max(0) as u32)),
+                            BinaryOp::Mod => bini64!(|a: i64, b: i64| a % b),
+                            // atan2 is float-only; unreachable on integer tensors.
+                            BinaryOp::Atan2 => {
+                                bini64!(|a: i64, b: i64| (a as f64).atan2(b as f64) as i64)
+                            }
+                            BinaryOp::BitAnd => bini64!(|a: i64, b: i64| a & b),
+                            BinaryOp::BitOr => bini64!(|a: i64, b: i64| a | b),
+                            BinaryOp::BitXor => bini64!(|a: i64, b: i64| a ^ b),
+                            BinaryOp::Shl => bini64!(|a: i64, b: i64| a.wrapping_shl(b as u32)),
+                            BinaryOp::Shr => bini64!(|a: i64, b: i64| a.wrapping_shr(b as u32)),
                         }
                     } else {
                         let l = sl(*lhs, base, ll);
@@ -1478,6 +1502,23 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 BinaryOp::Max => bin_contig!(|a: f32, b: f32| a.max(b)),
                                 BinaryOp::Min => bin_contig!(|a: f32, b: f32| a.min(b)),
                                 BinaryOp::Pow => bin_contig!(|a: f32, b: f32| a.powf(b)),
+                                BinaryOp::Mod => bin_contig!(|a: f32, b: f32| a % b),
+                                BinaryOp::Atan2 => bin_contig!(|a: f32, b: f32| a.atan2(b)),
+                                BinaryOp::BitAnd => {
+                                    bin_contig!(|a: f32, b: f32| ((a as i64) & (b as i64)) as f32)
+                                }
+                                BinaryOp::BitOr => {
+                                    bin_contig!(|a: f32, b: f32| ((a as i64) | (b as i64)) as f32)
+                                }
+                                BinaryOp::BitXor => {
+                                    bin_contig!(|a: f32, b: f32| ((a as i64) ^ (b as i64)) as f32)
+                                }
+                                BinaryOp::Shl => bin_contig!(|a: f32, b: f32| (a as i64)
+                                    .wrapping_shl(b as u32)
+                                    as f32),
+                                BinaryOp::Shr => bin_contig!(|a: f32, b: f32| (a as i64)
+                                    .wrapping_shr(b as u32)
+                                    as f32),
                             }
                             continue;
                         }
@@ -1555,6 +1596,23 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             BinaryOp::Max => binf32!(|a: f32, b: f32| a.max(b)),
                             BinaryOp::Min => binf32!(|a: f32, b: f32| a.min(b)),
                             BinaryOp::Pow => binf32!(|a: f32, b: f32| a.powf(b)),
+                            BinaryOp::Mod => binf32!(|a: f32, b: f32| a % b),
+                            BinaryOp::Atan2 => binf32!(|a: f32, b: f32| a.atan2(b)),
+                            BinaryOp::BitAnd => {
+                                binf32!(|a: f32, b: f32| ((a as i64) & (b as i64)) as f32)
+                            }
+                            BinaryOp::BitOr => {
+                                binf32!(|a: f32, b: f32| ((a as i64) | (b as i64)) as f32)
+                            }
+                            BinaryOp::BitXor => {
+                                binf32!(|a: f32, b: f32| ((a as i64) ^ (b as i64)) as f32)
+                            }
+                            BinaryOp::Shl => {
+                                binf32!(|a: f32, b: f32| (a as i64).wrapping_shl(b as u32) as f32)
+                            }
+                            BinaryOp::Shr => {
+                                binf32!(|a: f32, b: f32| (a as i64).wrapping_shr(b as u32) as f32)
+                            }
                         }
                     }
                 }
@@ -1695,6 +1753,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::GatedResidualBackward { .. } => exec_gated_residual_backward(thunk, base),
             Thunk::Softmax { .. } => exec_softmax(thunk, base),
             Thunk::Cumsum { .. } => exec_cumsum(thunk, base),
+            Thunk::CumScan { .. } => exec_cum_scan(thunk, base),
             Thunk::Sample { .. } => exec_sample(thunk, base),
             Thunk::RngNormal {
                 dst,

@@ -255,6 +255,33 @@ fn lower_activation_backward(
         Activation::Gelu | Activation::GeluApprox => {
             lower_gelu_approx_backward(g, x, dy, out_shape)
         }
+        // Piecewise-constant: zero gradient.
+        Activation::Floor | Activation::Ceil | Activation::Sign => broadcast_scalar(g, 0.0, x),
+        // softplus'(x) = sigmoid(x).
+        Activation::Softplus => {
+            let s = g.activation(Activation::Sigmoid, x, shape::unary_shape(g.shape(x)));
+            g.mul(dy, s)
+        }
+        // ELU'(x) = 1 (x>0) else eˣ.
+        Activation::Elu => {
+            let zero = broadcast_scalar(g, 0.0, x);
+            let pos = compare_gt(g, x, zero);
+            let ex = g.exp(x);
+            let dy_ex = g.mul(dy, ex);
+            where_(g, pos, dy, dy_ex, out_shape)
+        }
+        // These never reach `Op::ActivationBackward`: `vjp_activation`
+        // decomposes them to `upstream · act'(x)` primitives at the AD level.
+        Activation::Erf
+        | Activation::HardSwish
+        | Activation::HardSigmoid
+        | Activation::Mish
+        | Activation::Softsign
+        | Activation::LogSigmoid => {
+            panic!(
+                "lower_activation_backward: {kind:?} is decomposed at the AD level, not via ActivationBackward"
+            )
+        }
     }
 }
 

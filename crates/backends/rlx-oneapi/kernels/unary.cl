@@ -36,6 +36,17 @@ __kernel void unary(__global float* arena,
         case 15u: r = atan(x); break;                                      // Atan
         case 16u: r = round(x); break;                                     // Round
         case 17u: r = 1.0f / x; break;                                     // Recip / vvrecf
+        case 18u: r = floor(x); break;                                     // Floor
+        case 19u: r = ceil(x); break;                                      // Ceil
+        case 20u: r = sign(x); break;                                      // Sign
+        case 21u: r = log1p(exp(x)); break;                                // Softplus
+        case 22u: r = x > 0.0f ? x : (exp(x) - 1.0f); break;               // Elu (alpha=1)
+        case 23u: r = erf(x); break;                                       // Erf
+        case 24u: r = x * clamp(x + 3.0f, 0.0f, 6.0f) / 6.0f; break;       // HardSwish
+        case 25u: r = clamp(x / 6.0f + 0.5f, 0.0f, 1.0f); break;           // HardSigmoid
+        case 26u: r = x * tanh(fmax(x, 0.0f) + log1p(exp(-fabs(x)))); break; // Mish
+        case 27u: r = x / (1.0f + fabs(x)); break;                         // Softsign
+        case 28u: r = fmin(x, 0.0f) - log1p(exp(-fabs(x))); break;         // LogSigmoid
         // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
         case 100u: r = isnan(x) ? 0.0f : clamp(trunc(x), -128.0f, 127.0f); break;
         case 101u: r = isnan(x) ? 0.0f : clamp(trunc(x), -32768.0f, 32767.0f); break;

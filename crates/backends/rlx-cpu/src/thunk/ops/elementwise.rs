@@ -1565,8 +1565,17 @@ pub(crate) fn exec_binary_full_c64(t: &Thunk, base: *mut u8) {
                             (a_im * b_re - a_re * b_im) / denom,
                         )
                     }
-                    BinaryOp::Max | BinaryOp::Min | BinaryOp::Pow => {
-                        unreachable!("C64 max/min/pow rejected at lowering")
+                    BinaryOp::Max
+                    | BinaryOp::Min
+                    | BinaryOp::Pow
+                    | BinaryOp::Mod
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::Shl
+                    | BinaryOp::Shr
+                    | BinaryOp::Atan2 => {
+                        unreachable!("C64 max/min/pow/mod/bitwise/atan2 rejected at lowering")
                     }
                 }
             };
@@ -1777,6 +1786,29 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                 Activation::Tan => apply!(|x: f32| x.tan()),
                 Activation::Atan => apply!(|x: f32| x.atan()),
                 Activation::Recip => crate::vmath::vvrecf_inplace(d),
+                Activation::Floor => apply!(|x: f32| x.floor()),
+                Activation::Ceil => apply!(|x: f32| x.ceil()),
+                Activation::Sign => {
+                    apply!(|x: f32| if x > 0.0 {
+                        1.0
+                    } else if x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    })
+                }
+                Activation::Softplus => apply!(|x: f32| x.max(0.0) + (-(x.abs())).exp().ln_1p()),
+                Activation::Elu => apply!(|x: f32| if x > 0.0 { x } else { x.exp() - 1.0 }),
+                Activation::Erf => apply!(|x: f32| erf_f32(x)),
+                Activation::HardSwish => apply!(|x: f32| x * (x + 3.0).clamp(0.0, 6.0) / 6.0),
+                Activation::HardSigmoid => apply!(|x: f32| (x / 6.0 + 0.5).clamp(0.0, 1.0)),
+                Activation::Mish => {
+                    apply!(|x: f32| x * (x.max(0.0) + (-(x.abs())).exp().ln_1p()).tanh())
+                }
+                Activation::Softsign => apply!(|x: f32| x / (1.0 + x.abs())),
+                Activation::LogSigmoid => {
+                    apply!(|x: f32| x.min(0.0) - (-(x.abs())).exp().ln_1p())
+                }
             }
         }
     }
@@ -2386,6 +2418,137 @@ pub unsafe fn execute_reverse(
     }
 }
 
+/// Output-indexed pad over the shared arena (mirrors [`execute_reverse`]).
+/// Every mode is a gather from `src` to `dst`; only `Constant` positions —
+/// where some axis coordinate falls outside the input — write `fill` (the
+/// constant value pre-encoded in the output dtype, `elem_bytes` long).
+///
+/// `before[i]`/`after[i]` are the pad widths on axis `i`; the output extent is
+/// `in_dims[i] + before[i] + after[i]`. Byte-generic like `execute_reverse`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_pad(
+    src: usize,
+    dst: usize,
+    in_dims: &[u32],
+    before: &[u32],
+    after: &[u32],
+    mode: rlx_ir::PadMode,
+    fill: &[u8],
+    elem_bytes: usize,
+    base: *mut u8,
+) {
+    use rlx_ir::PadMode;
+    let rank = in_dims.len();
+    let in_dims: Vec<usize> = in_dims.iter().map(|&d| d as usize).collect();
+    let out_dims: Vec<usize> = (0..rank)
+        .map(|i| in_dims[i] + before[i] as usize + after[i] as usize)
+        .collect();
+    let total: usize = out_dims.iter().product::<usize>().max(1);
+    let mut in_strides = vec![1usize; rank];
+    let mut out_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        in_strides[i] = in_strides[i + 1] * in_dims[i + 1];
+        out_strides[i] = out_strides[i + 1] * out_dims[i + 1];
+    }
+    unsafe {
+        let src_base = base.add(src);
+        let dst_base = base.add(dst);
+        for o in 0..total {
+            let mut rem = o;
+            let mut in_flat = 0usize;
+            let mut is_fill = false;
+            for ax in 0..rank {
+                let oc = (rem / out_strides[ax]) as isize;
+                rem %= out_strides[ax];
+                // Unpadded axis: identity (also avoids the reflect period=0 case).
+                if before[ax] == 0 && after[ax] == 0 {
+                    in_flat += oc as usize * in_strides[ax];
+                    continue;
+                }
+                let n = in_dims[ax] as isize;
+                let p = oc - before[ax] as isize;
+                let ic: isize = match mode {
+                    PadMode::Constant(_) => {
+                        if p < 0 || p >= n {
+                            is_fill = true;
+                            break;
+                        }
+                        p
+                    }
+                    PadMode::Replicate => p.clamp(0, n - 1),
+                    PadMode::Circular => ((p % n) + n) % n,
+                    PadMode::Reflect => {
+                        let period = 2 * (n - 1);
+                        let mut i = ((p % period) + period) % period;
+                        if i >= n {
+                            i = period - i;
+                        }
+                        i
+                    }
+                };
+                in_flat += ic as usize * in_strides[ax];
+            }
+            let dptr = dst_base.add(o * elem_bytes);
+            if is_fill {
+                std::ptr::copy_nonoverlapping(fill.as_ptr(), dptr, elem_bytes);
+            } else {
+                std::ptr::copy_nonoverlapping(src_base.add(in_flat * elem_bytes), dptr, elem_bytes);
+            }
+        }
+    }
+}
+
+/// Output-indexed strided slice over the shared arena (mirrors
+/// [`execute_reverse`]). `out[..,j,..] = in[.., start + j*step, ..]` along
+/// `axis` (`step` may be negative). Byte-generic.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_slice(
+    src: usize,
+    dst: usize,
+    in_dims: &[u32],
+    axis: usize,
+    start: usize,
+    len: usize,
+    step: i64,
+    elem_bytes: usize,
+    base: *mut u8,
+) {
+    let rank = in_dims.len();
+    let in_dims: Vec<usize> = in_dims.iter().map(|&d| d as usize).collect();
+    let mut out_dims = in_dims.clone();
+    out_dims[axis] = len;
+    let total: usize = out_dims.iter().product::<usize>().max(1);
+    let mut in_strides = vec![1usize; rank];
+    let mut out_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        in_strides[i] = in_strides[i + 1] * in_dims[i + 1];
+        out_strides[i] = out_strides[i + 1] * out_dims[i + 1];
+    }
+    unsafe {
+        let src_base = base.add(src);
+        let dst_base = base.add(dst);
+        for o in 0..total {
+            let mut rem = o;
+            let mut in_flat = 0usize;
+            for ax in 0..rank {
+                let oc = rem / out_strides[ax];
+                rem %= out_strides[ax];
+                let ic = if ax == axis {
+                    (start as i64 + oc as i64 * step) as usize
+                } else {
+                    oc
+                };
+                in_flat += ic * in_strides[ax];
+            }
+            std::ptr::copy_nonoverlapping(
+                src_base.add(in_flat * elem_bytes),
+                dst_base.add(o * elem_bytes),
+                elem_bytes,
+            );
+        }
+    }
+}
+
 pub unsafe fn execute_gather_backward_f32(
     dy: usize,
     indices: usize,
@@ -2439,6 +2602,31 @@ pub(crate) fn region_activation_scalar(act: rlx_ir::op::Activation, x: f32) -> f
         A::Atan => x.atan(),
         A::Recip => 1.0 / x,
         A::Round => x.round(),
+        A::Floor => x.floor(),
+        A::Ceil => x.ceil(),
+        A::Sign => {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        }
+        A::Softplus => x.max(0.0) + (-(x.abs())).exp().ln_1p(),
+        A::Elu => {
+            if x > 0.0 {
+                x
+            } else {
+                x.exp() - 1.0
+            }
+        }
+        A::Erf => erf_f32(x),
+        A::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) / 6.0,
+        A::HardSigmoid => (x / 6.0 + 0.5).clamp(0.0, 1.0),
+        A::Mish => x * (x.max(0.0) + (-(x.abs())).exp().ln_1p()).tanh(),
+        A::Softsign => x / (1.0 + x.abs()),
+        A::LogSigmoid => x.min(0.0) - (-(x.abs())).exp().ln_1p(),
     }
 }
 
@@ -2453,6 +2641,13 @@ pub(crate) fn region_binary_scalar(op: rlx_ir::op::BinaryOp, l: f32, r: f32) -> 
         B::Max => l.max(r),
         B::Min => l.min(r),
         B::Pow => l.powf(r),
+        B::Mod => l % r,
+        B::Atan2 => l.atan2(r),
+        B::BitAnd => ((l as i64) & (r as i64)) as f32,
+        B::BitOr => ((l as i64) | (r as i64)) as f32,
+        B::BitXor => ((l as i64) ^ (r as i64)) as f32,
+        B::Shl => (l as i64).wrapping_shl(r as u32) as f32,
+        B::Shr => (l as i64).wrapping_shr(r as u32) as f32,
     }
 }
 
@@ -2600,6 +2795,71 @@ pub(crate) fn apply_activation_inplace(d: &mut [f32], act: rlx_ir::op::Activatio
             }
         }
         Activation::Recip => crate::vmath::vvrecf_inplace(d),
+        Activation::Floor => {
+            for v in d.iter_mut() {
+                *v = v.floor();
+            }
+        }
+        Activation::Ceil => {
+            for v in d.iter_mut() {
+                *v = v.ceil();
+            }
+        }
+        Activation::Sign => {
+            for v in d.iter_mut() {
+                *v = if *v > 0.0 {
+                    1.0
+                } else if *v < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+            }
+        }
+        Activation::Softplus => {
+            for v in d.iter_mut() {
+                *v = v.max(0.0) + (-(v.abs())).exp().ln_1p();
+            }
+        }
+        Activation::Elu => {
+            for v in d.iter_mut() {
+                *v = if *v > 0.0 { *v } else { v.exp() - 1.0 };
+            }
+        }
+        Activation::Erf => {
+            for v in d.iter_mut() {
+                *v = erf_f32(*v);
+            }
+        }
+        Activation::HardSwish => {
+            for v in d.iter_mut() {
+                let x = *v;
+                *v = x * (x + 3.0).clamp(0.0, 6.0) / 6.0;
+            }
+        }
+        Activation::HardSigmoid => {
+            for v in d.iter_mut() {
+                *v = (*v / 6.0 + 0.5).clamp(0.0, 1.0);
+            }
+        }
+        Activation::Mish => {
+            for v in d.iter_mut() {
+                let x = *v;
+                *v = x * (x.max(0.0) + (-(x.abs())).exp().ln_1p()).tanh();
+            }
+        }
+        Activation::Softsign => {
+            for v in d.iter_mut() {
+                let x = *v;
+                *v = x / (1.0 + x.abs());
+            }
+        }
+        Activation::LogSigmoid => {
+            for v in d.iter_mut() {
+                let x = *v;
+                *v = x.min(0.0) - (-(x.abs())).exp().ln_1p();
+            }
+        }
     }
 }
 
@@ -2748,6 +3008,35 @@ pub(crate) fn activation_backward_kernel(
                 out[i] = -dys[i] / (xs[i] * xs[i]);
             }
         }
+        // Piecewise-constant: zero gradient.
+        Activation::Floor | Activation::Ceil | Activation::Sign => {
+            for o in out.iter_mut() {
+                *o = 0.0;
+            }
+        }
+        Activation::Softplus => {
+            for i in 0..n {
+                out[i] = dys[i] / (1.0 + (-xs[i]).exp());
+            }
+        }
+        Activation::Elu => {
+            for i in 0..n {
+                out[i] = if xs[i] > 0.0 {
+                    dys[i]
+                } else {
+                    dys[i] * xs[i].exp()
+                };
+            }
+        }
+        // Decomposed at the AD level (vjp_activation) — never reach this kernel.
+        Activation::Erf
+        | Activation::HardSwish
+        | Activation::HardSigmoid
+        | Activation::Mish
+        | Activation::Softsign
+        | Activation::LogSigmoid => {
+            panic!("activation_backward_kernel: {act:?} is decomposed at the AD level")
+        }
     }
 }
 
@@ -2872,6 +3161,35 @@ pub(crate) fn activation_backward_kernel_f64(
             for i in 0..n {
                 out[i] = -dys[i] / (xs[i] * xs[i]);
             }
+        }
+        // Piecewise-constant: zero gradient.
+        Activation::Floor | Activation::Ceil | Activation::Sign => {
+            for o in out.iter_mut() {
+                *o = 0.0;
+            }
+        }
+        Activation::Softplus => {
+            for i in 0..n {
+                out[i] = dys[i] / (1.0 + (-xs[i]).exp());
+            }
+        }
+        Activation::Elu => {
+            for i in 0..n {
+                out[i] = if xs[i] > 0.0 {
+                    dys[i]
+                } else {
+                    dys[i] * xs[i].exp()
+                };
+            }
+        }
+        // Decomposed at the AD level (vjp_activation) — never reach this kernel.
+        Activation::Erf
+        | Activation::HardSwish
+        | Activation::HardSigmoid
+        | Activation::Mish
+        | Activation::Softsign
+        | Activation::LogSigmoid => {
+            panic!("activation_backward_kernel: {act:?} is decomposed at the AD level")
         }
     }
 }
@@ -3059,6 +3377,67 @@ pub(crate) fn apply_activation_f64(inp: &[f64], out: &mut [f64], kind: Activatio
                 *o = 1.0 / v;
             }
         }
+        Activation::Floor => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v.floor();
+            }
+        }
+        Activation::Ceil => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v.ceil();
+            }
+        }
+        Activation::Sign => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = if v > 0.0 {
+                    1.0
+                } else if v < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+            }
+        }
+        Activation::Softplus => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v.max(0.0) + (-(v.abs())).exp().ln_1p();
+            }
+        }
+        Activation::Elu => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = if v > 0.0 { v } else { v.exp() - 1.0 };
+            }
+        }
+        Activation::Erf => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = erf_f64(v);
+            }
+        }
+        Activation::HardSwish => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v * (v + 3.0).clamp(0.0, 6.0) / 6.0;
+            }
+        }
+        Activation::HardSigmoid => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = (v / 6.0 + 0.5).clamp(0.0, 1.0);
+            }
+        }
+        Activation::Mish => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v * (v.max(0.0) + (-(v.abs())).exp().ln_1p()).tanh();
+            }
+        }
+        Activation::Softsign => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v / (1.0 + v.abs());
+            }
+        }
+        Activation::LogSigmoid => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v.min(0.0) - (-(v.abs())).exp().ln_1p();
+            }
+        }
         Activation::Gelu | Activation::GeluApprox | Activation::Silu => {
             panic!(
                 "apply_activation_f64: {kind:?} not yet implemented at f64. \
@@ -3078,5 +3457,12 @@ pub(crate) fn binary_op_f64(op: BinaryOp, a: f64, b: f64) -> f64 {
         BinaryOp::Max => a.max(b),
         BinaryOp::Min => a.min(b),
         BinaryOp::Pow => a.powf(b),
+        BinaryOp::Mod => a % b,
+        BinaryOp::Atan2 => a.atan2(b),
+        BinaryOp::BitAnd => ((a as i64) & (b as i64)) as f64,
+        BinaryOp::BitOr => ((a as i64) | (b as i64)) as f64,
+        BinaryOp::BitXor => ((a as i64) ^ (b as i64)) as f64,
+        BinaryOp::Shl => ((a as i64) << (b as i64)) as f64,
+        BinaryOp::Shr => ((a as i64) >> (b as i64)) as f64,
     }
 }

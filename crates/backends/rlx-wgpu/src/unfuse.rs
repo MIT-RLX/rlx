@@ -37,11 +37,11 @@ pub(crate) struct WgpuPolicy;
 
 impl DecomposePolicy for WgpuPolicy {
     fn fold_matmul_bias_act(&self) -> bool {
-        true
+        !rlx_ir::env::flag("RLX_WGPU_NO_FOLD_MMBA")
     }
 
     fn fold_residual_ln(&self) -> bool {
-        true
+        !rlx_ir::env::flag("RLX_WGPU_NO_FOLD_RESLN")
     }
 
     fn attention_accepts_rank3(&self) -> bool {

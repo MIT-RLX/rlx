@@ -61,6 +61,17 @@ extern "C" __global__ void unary(
         case 15: y = tanf(x); break;
         case 16: y = atanf(x); break;
         case 17: y = 1.0f / x; break; // vvrecf
+        case 18: y = floorf(x); break;
+        case 19: y = ceilf(x); break;
+        case 20: y = (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); break;
+        case 21: { float ax = fabsf(x); y = fmaxf(x, 0.0f) + log1pf(expf(-ax)); } break; // softplus
+        case 22: y = (x > 0.0f) ? x : (expf(x) - 1.0f); break; // elu (alpha=1)
+        case 23: y = erff(x); break;
+        case 24: y = x * fminf(fmaxf(x + 3.0f, 0.0f), 6.0f) / 6.0f; break;  // hardswish
+        case 25: y = fminf(fmaxf(x / 6.0f + 0.5f, 0.0f), 1.0f); break;      // hardsigmoid
+        case 26: { float sp = fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x))); y = x * tanhf(sp); } break; // mish
+        case 27: y = x / (1.0f + fabsf(x)); break;                         // softsign
+        case 28: y = fminf(x, 0.0f) - log1pf(expf(-fabsf(x))); break;      // logsigmoid
         // f32 -> int: truncate toward zero, saturate to dst range, NaN -> 0.
         case 100: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -128.0f), 127.0f); break;
         case 101: y = isnan(x) ? 0.0f : fminf(fmaxf(truncf(x), -32768.0f), 32767.0f); break;

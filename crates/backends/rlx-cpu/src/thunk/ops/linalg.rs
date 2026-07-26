@@ -126,6 +126,70 @@ pub(crate) fn compile_dense_solve(
 }
 
 #[allow(unused_variables)]
+pub(crate) fn compile_cholesky(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::Cholesky = &node.op else {
+        unreachable!()
+    };
+    let a_shape = &graph.node(node.inputs[0]).shape;
+    let n = a_shape.dim(0).unwrap_static();
+    debug_assert_eq!(
+        n,
+        a_shape.dim(1).unwrap_static(),
+        "Cholesky: A must be square"
+    );
+    assert_eq!(
+        node.shape.dtype(),
+        rlx_ir::DType::F32,
+        "Cholesky: only F32 lowered; got {:?}",
+        node.shape.dtype()
+    );
+    Thunk::CholeskyF32 {
+        a: node_offset(arena, node.inputs[0]),
+        l: node_offset(arena, node.id),
+        n: n as u32,
+    }
+}
+
+#[allow(unused_variables)]
+pub(crate) fn compile_triangular_solve(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::TriangularSolve { lower, transpose } = &node.op else {
+        unreachable!()
+    };
+    let a_shape = &graph.node(node.inputs[0]).shape;
+    let n = a_shape.dim(0).unwrap_static();
+    let nrhs = node.shape.num_elements().unwrap() / n;
+    assert_eq!(
+        node.shape.dtype(),
+        rlx_ir::DType::F32,
+        "TriangularSolve: only F32 lowered; got {:?}",
+        node.shape.dtype()
+    );
+    Thunk::TriangularSolveF32 {
+        a: node_offset(arena, node.inputs[0]),
+        b: node_offset(arena, node.inputs[1]),
+        x: node_offset(arena, node.id),
+        n: n as u32,
+        nrhs: nrhs as u32,
+        lower: *lower,
+        transpose: *transpose,
+    }
+}
+
+#[allow(unused_variables)]
 pub(crate) fn compile_batched_dense_solve(
     node: &rlx_ir::Node,
     graph: &Graph,
@@ -233,6 +297,282 @@ pub(crate) fn exec_dense_solve_f32(t: &Thunk, base: *mut u8) {
             }
             let dst = sl_mut(*x, base, n_ * nrhs_);
             dst.copy_from_slice(&x_buf);
+        }
+    }
+}
+
+pub(crate) fn exec_cholesky(t: &Thunk, base: *mut u8) {
+    let Thunk::CholeskyF32 { a, l, n } = t else {
+        unreachable!()
+    };
+    {
+        let n_ = *n as usize;
+        unsafe {
+            let a_src = sl(*a, base, n_ * n_);
+            // LAPACK `dpotrf` is f64; promote for numerical robustness. `lower`
+            // yields the row-major lower-triangular L (strict upper zeroed).
+            let mut buf: Vec<f64> = a_src.iter().map(|&v| v as f64).collect();
+            let info = crate::blas::dpotrf(&mut buf, n_, true);
+            assert_eq!(
+                info, 0,
+                "CholeskyF32: matrix not SPD (dpotrf info={info}, n={n_})"
+            );
+            let dst = sl_mut(*l, base, n_ * n_);
+            for i in 0..n_ * n_ {
+                dst[i] = buf[i] as f32;
+            }
+        }
+    }
+}
+
+#[allow(unused_variables)]
+pub(crate) fn compile_det(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let log_abs = match &node.op {
+        Op::Det => false,
+        Op::LogDet => true,
+        _ => unreachable!(),
+    };
+    let a_shape = &graph.node(node.inputs[0]).shape;
+    let n = a_shape.dim(0).unwrap_static();
+    Thunk::DetF32 {
+        a: node_offset(arena, node.inputs[0]),
+        out: node_offset(arena, node.id),
+        n: n as u32,
+        log_abs,
+    }
+}
+
+pub(crate) fn exec_det(t: &Thunk, base: *mut u8) {
+    let Thunk::DetF32 { a, out, n, log_abs } = t else {
+        unreachable!()
+    };
+    {
+        let n_ = *n as usize;
+        unsafe {
+            let a_src = sl(*a, base, n_ * n_);
+            let mut a64: Vec<f64> = a_src.iter().map(|&v| v as f64).collect();
+            let (logabs, _sign, det) = crate::blas::lu_slogdet(&mut a64, n_);
+            let dst = sl_mut(*out, base, 1);
+            dst[0] = if *log_abs { logabs as f32 } else { det as f32 };
+        }
+    }
+}
+
+#[allow(unused_variables)]
+pub(crate) fn compile_sort(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let (axis, descending, arg) = match &node.op {
+        Op::Sort { axis, descending } => (*axis, *descending, false),
+        Op::ArgSort { axis, descending } => (*axis, *descending, true),
+        _ => unreachable!(),
+    };
+    let shape = &graph.node(node.inputs[0]).shape;
+    let dims: Vec<usize> = (0..shape.rank())
+        .map(|d| shape.dim(d).unwrap_static())
+        .collect();
+    let axis_dim = dims[axis];
+    let outer: usize = dims[..axis].iter().product();
+    let inner: usize = dims[axis + 1..].iter().product();
+    Thunk::SortF32 {
+        src: node_offset(arena, node.inputs[0]),
+        dst: node_offset(arena, node.id),
+        outer: outer as u32,
+        axis_dim: axis_dim as u32,
+        inner: inner as u32,
+        descending,
+        arg,
+    }
+}
+
+pub(crate) fn exec_sort(t: &Thunk, base: *mut u8) {
+    let Thunk::SortF32 {
+        src,
+        dst,
+        outer,
+        axis_dim,
+        inner,
+        descending,
+        arg,
+    } = t
+    else {
+        unreachable!()
+    };
+    {
+        let (outer, axis_dim, inner) = (*outer as usize, *axis_dim as usize, *inner as usize);
+        let total = outer * axis_dim * inner;
+        unsafe {
+            let inp = sl(*src, base, total);
+            let out = sl_mut(*dst, base, total);
+            for o in 0..outer {
+                for i in 0..inner {
+                    let base_off = o * axis_dim * inner + i;
+                    // Stable sort of the `axis_dim` strided elements.
+                    let mut perm: Vec<usize> = (0..axis_dim).collect();
+                    perm.sort_by(|&a, &b| {
+                        let va = inp[base_off + a * inner];
+                        let vb = inp[base_off + b * inner];
+                        let ord = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                        if *descending { ord.reverse() } else { ord }
+                    });
+                    for (k, &r) in perm.iter().enumerate() {
+                        out[base_off + k * inner] = if *arg {
+                            r as f32
+                        } else {
+                            inp[base_off + r * inner]
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(unused_variables)]
+pub(crate) fn compile_svd(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let part = match &node.op {
+        Op::Svd { part } => match part {
+            rlx_ir::op::SvdPart::U => 0u8,
+            rlx_ir::op::SvdPart::S => 1u8,
+            rlx_ir::op::SvdPart::Vt => 2u8,
+        },
+        _ => unreachable!(),
+    };
+    let a_shape = &graph.node(node.inputs[0]).shape;
+    Thunk::SvdF32 {
+        a: node_offset(arena, node.inputs[0]),
+        out: node_offset(arena, node.id),
+        m: a_shape.dim(0).unwrap_static() as u32,
+        n: a_shape.dim(1).unwrap_static() as u32,
+        part,
+    }
+}
+
+pub(crate) fn exec_svd(t: &Thunk, base: *mut u8) {
+    let Thunk::SvdF32 { a, out, m, n, part } = t else {
+        unreachable!()
+    };
+    {
+        let (m_, n_) = (*m as usize, *n as usize);
+        let k = m_.min(n_);
+        unsafe {
+            let a_src = sl(*a, base, m_ * n_);
+            let mut a64: Vec<f64> = a_src.iter().map(|&v| v as f64).collect();
+            let mut s = vec![0f64; k];
+            let mut u = vec![0f64; m_ * k];
+            let mut vt = vec![0f64; k * n_];
+            let info = crate::blas::dgesdd_thin(&mut a64, m_, n_, &mut s, &mut u, &mut vt);
+            assert_eq!(info, 0, "Svd: gesdd failed (info={info}, m={m_}, n={n_})");
+            let (dst_len, srcv): (usize, &[f64]) = match part {
+                0 => (m_ * k, &u),
+                1 => (k, &s),
+                _ => (k * n_, &vt),
+            };
+            let dst = sl_mut(*out, base, dst_len);
+            for i in 0..dst_len {
+                dst[i] = srcv[i] as f32;
+            }
+        }
+    }
+}
+
+#[allow(unused_variables)]
+pub(crate) fn compile_qr(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let part = match &node.op {
+        Op::Qr { part } => match part {
+            rlx_ir::op::QrPart::Q => 0u8,
+            rlx_ir::op::QrPart::R => 1u8,
+        },
+        _ => unreachable!(),
+    };
+    let a_shape = &graph.node(node.inputs[0]).shape;
+    Thunk::QrF32 {
+        a: node_offset(arena, node.inputs[0]),
+        out: node_offset(arena, node.id),
+        m: a_shape.dim(0).unwrap_static() as u32,
+        n: a_shape.dim(1).unwrap_static() as u32,
+        part,
+    }
+}
+
+pub(crate) fn exec_qr(t: &Thunk, base: *mut u8) {
+    let Thunk::QrF32 { a, out, m, n, part } = t else {
+        unreachable!()
+    };
+    {
+        let (m_, n_) = (*m as usize, *n as usize);
+        let k = m_.min(n_);
+        unsafe {
+            let a_src = sl(*a, base, m_ * n_);
+            let a64: Vec<f64> = a_src.iter().map(|&v| v as f64).collect();
+            let mut q = vec![0f64; m_ * k];
+            let mut r = vec![0f64; k * n_];
+            let info = crate::blas::qr_thin(&a64, m_, n_, &mut q, &mut r);
+            assert_eq!(info, 0, "Qr: geqrf/orgqr failed (info={info})");
+            let (dst_len, srcv): (usize, &[f64]) = if *part == 0 {
+                (m_ * k, &q)
+            } else {
+                (k * n_, &r)
+            };
+            let dst = sl_mut(*out, base, dst_len);
+            for i in 0..dst_len {
+                dst[i] = srcv[i] as f32;
+            }
+        }
+    }
+}
+
+pub(crate) fn exec_triangular_solve(t: &Thunk, base: *mut u8) {
+    let Thunk::TriangularSolveF32 {
+        a,
+        b,
+        x,
+        n,
+        nrhs,
+        lower,
+        transpose,
+    } = t
+    else {
+        unreachable!()
+    };
+    {
+        let (n_, nrhs_) = (*n as usize, *nrhs as usize);
+        unsafe {
+            let a_src = sl(*a, base, n_ * n_);
+            let b_src = sl(*b, base, n_ * nrhs_);
+            let a64: Vec<f64> = a_src.iter().map(|&v| v as f64).collect();
+            let mut x64: Vec<f64> = b_src.iter().map(|&v| v as f64).collect();
+            crate::blas::dtrsm_lower_or_upper(&a64, &mut x64, n_, nrhs_, *lower, *transpose);
+            let dst = sl_mut(*x, base, n_ * nrhs_);
+            for i in 0..n_ * nrhs_ {
+                dst[i] = x64[i] as f32;
+            }
         }
     }
 }

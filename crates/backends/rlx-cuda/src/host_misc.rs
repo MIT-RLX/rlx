@@ -41,6 +41,54 @@ pub fn run_reverse(
     rlx_gpu_host::run_reverse(&mut arena, src, dst, dims, rev_mask, elem_bytes);
 }
 
+/// Strided slice (dtype-agnostic host fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn run_slice(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    src: usize,
+    dst: usize,
+    in_dims: &[u32],
+    axis: usize,
+    start: usize,
+    len: usize,
+    step: i64,
+    elem_bytes: usize,
+) {
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_slice(
+        &mut arena, src, dst, in_dims, axis, start, len, step, elem_bytes,
+    );
+}
+
+/// Constant/reflect/replicate/circular pad (dtype-agnostic).
+#[allow(clippy::too_many_arguments)]
+pub fn run_pad(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    src: usize,
+    dst: usize,
+    in_dims: &[u32],
+    before: &[u32],
+    after: &[u32],
+    mode: rlx_ir::PadMode,
+    fill: &[u8],
+    elem_bytes: usize,
+) {
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_pad(
+        &mut arena, src, dst, in_dims, before, after, mode, fill, elem_bytes,
+    );
+}
+
 /// ArgMax/ArgMin (f32-encoded indices) over the middle `reduced` axis.
 #[allow(clippy::too_many_arguments)]
 pub fn run_argreduce(

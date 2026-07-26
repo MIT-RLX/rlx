@@ -52,6 +52,37 @@ impl RopeTablesStage {
         }
     }
 
+    /// Bake per-token MRoPE (Qwen-VL / Qwen3.5) cos/sin tables from explicit
+    /// 3-D positions and publish them like any other RoPE table. `positions[t]
+    /// = [pt, ph, pw, pe]` (len = seq, or batch·seq for per-batch-distinct
+    /// positions). Feeds the existing per-token [`rlx_ir::op::Op::Rope`] path —
+    /// no MRoPE-specific op is needed. See [`crate::rope::build_mrope_tables`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn mrope(
+        rope_theta: f64,
+        head_dim: usize,
+        n_rot: usize,
+        sections: [usize; 4],
+        positions: &[[usize; 4]],
+        interleaved: bool,
+        named_slot: Option<String>,
+    ) -> Self {
+        let (cos_data, sin_data) = crate::rope::build_mrope_tables(
+            rope_theta,
+            head_dim,
+            n_rot,
+            sections,
+            positions,
+            interleaved,
+        );
+        let max_positions = positions.len();
+        let half_dim = head_dim / 2;
+        match named_slot {
+            Some(slot) => Self::param_named(slot, max_positions, half_dim, cos_data, sin_data),
+            None => Self::param(max_positions, half_dim, cos_data, sin_data),
+        }
+    }
+
     /// Variant that publishes the tables under a named slot (for
     /// per-layer RoPE) rather than the default flow-state handles.
     pub fn param_named(

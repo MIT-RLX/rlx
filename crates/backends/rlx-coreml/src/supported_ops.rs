@@ -117,6 +117,18 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         DotGeneral,
         DenseSolve,
         BatchedDenseSolve,
+        // Host-staged to CPU LAPACK (potrf / trsm / getrf) via `is_host_node`,
+        // same as DenseSolve (no MIL arm).
+        Cholesky,
+        TriangularSolve,
+        Det,
+        LogDet,
+        // Sort / ArgSort host-stage to CPU (stable strided sort) via
+        // `is_host_node`, same as Det / LogDet (no MIL arm).
+        Sort,
+        Svd,
+        Qr,
+        ArgSort,
         Im2Col,
         Conv3d,
         ConvTranspose3d,

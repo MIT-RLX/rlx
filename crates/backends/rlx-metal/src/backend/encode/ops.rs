@@ -187,11 +187,17 @@ pub(crate) unsafe fn binary_broadcast_host<T>(
                     rv
                 }
             }
-            BinaryOp::Pow => {
-                // Generic Pow isn't expressible at the T trait level;
-                // SAM doesn't need it on this code path. Fall back to
-                // a panic to avoid silent wrong results.
-                panic!("BinaryBroadcast Pow not implemented in host path");
+            BinaryOp::Pow
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Atan2 => {
+                // Not expressible at the generic `T` trait level here; these
+                // ops run on the standalone binary kernel path instead.
+                panic!("BinaryBroadcast {op:?} not implemented in host path");
             }
         };
     }
@@ -378,6 +384,13 @@ pub(crate) fn encode_fused_binary_activation(
         BinaryOp::Max => 4,
         BinaryOp::Min => 5,
         BinaryOp::Pow => 6,
+        BinaryOp::Mod => 7,
+        BinaryOp::BitAnd => 8,
+        BinaryOp::BitOr => 9,
+        BinaryOp::BitXor => 10,
+        BinaryOp::Shl => 11,
+        BinaryOp::Shr => 12,
+        BinaryOp::Atan2 => 13,
     };
     let act_op: u32 = match act {
         Activation::Gelu | Activation::GeluApprox => 0,
@@ -463,6 +476,13 @@ pub(crate) fn encode_fused_ternary_activation(
             BinaryOp::Max => 4,
             BinaryOp::Min => 5,
             BinaryOp::Pow => 6,
+            BinaryOp::Mod => 7,
+            BinaryOp::BitAnd => 8,
+            BinaryOp::BitOr => 9,
+            BinaryOp::BitXor => 10,
+            BinaryOp::Shl => 11,
+            BinaryOp::Shr => 12,
+            BinaryOp::Atan2 => 13,
         }
     };
     let bin_op0 = bin_op(op0);
@@ -697,6 +717,29 @@ pub(crate) fn encode_activation(
         (_, Activation::Atan) => &k.atan_inplace,
         (_, Activation::Recip) => &k.rec_inplace,
         (_, Activation::Round) => &k.round_inplace,
+        // Macro-generated scalar activations: one (f32, f16) pipeline pair per
+        // activation, keyed by the activation (see `scalar_activation_kernels!`).
+        (
+            _,
+            Activation::Floor
+            | Activation::Ceil
+            | Activation::Sign
+            | Activation::Softplus
+            | Activation::Elu
+            | Activation::Erf
+            | Activation::HardSwish
+            | Activation::HardSigmoid
+            | Activation::Mish
+            | Activation::Softsign
+            | Activation::LogSigmoid,
+        ) => {
+            let (f32p, f16p) = &k.scalar_acts[&act];
+            if matches!(dt, HalfFlag::F16) {
+                f16p
+            } else {
+                f32p
+            }
+        }
     };
     enc.set_compute_pipeline_state(pipeline);
     if matches!(dt, HalfFlag::F32)
@@ -1412,7 +1455,9 @@ pub(crate) fn encode_binary(
 ) {
     use crate::thunk::HalfFlag;
     use rlx_ir::op::BinaryOp;
-    let use_vec4 = matches!(dt, HalfFlag::F32) && len.is_multiple_of(4) && len >= 4;
+    // Mod/bitwise use the scalar `elem_binop` kernel (no vec4 variant).
+    let use_vec4 =
+        matches!(dt, HalfFlag::F32) && len.is_multiple_of(4) && len >= 4 && op.region_fusable();
     // Full f16 binary coverage (Add/Mul/Sub/Div/Max/Min/Pow).
     let pipeline = match (dt, op, use_vec4) {
         (HalfFlag::F16, BinaryOp::Add, _) => &k.elem_add_h,
@@ -1433,6 +1478,29 @@ pub(crate) fn encode_binary(
         (_, BinaryOp::Max, _) => &k.elem_max,
         (_, BinaryOp::Min, _) => &k.elem_min,
         (_, BinaryOp::Pow, _) => &k.elem_pow,
+        // Mod/bitwise: single opcode-driven `elem_binop` kernel (fused_bin).
+        (
+            HalfFlag::F16,
+            BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Atan2,
+            _,
+        ) => &k.elem_binop_h,
+        (
+            _,
+            BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Atan2,
+            _,
+        ) => &k.elem_binop,
     };
     let dispatch_len = if use_vec4 { len / 4 } else { len };
     enc.set_compute_pipeline_state(pipeline);
@@ -1464,6 +1532,20 @@ pub(crate) fn encode_binary(
             std::mem::size_of::<u32>() as u64,
             &dispatch_len as *const u32 as *const _,
         );
+        // `elem_binop` also needs the opcode (Mod=7 … Shr=12).
+        if !op.region_fusable() {
+            let op_id: u32 = match op {
+                BinaryOp::Mod => 7,
+                BinaryOp::BitAnd => 8,
+                BinaryOp::BitOr => 9,
+                BinaryOp::BitXor => 10,
+                BinaryOp::Shl => 11,
+                BinaryOp::Shr => 12,
+                BinaryOp::Atan2 => 13,
+                _ => unreachable!(),
+            };
+            enc.set_bytes(4, 4, &op_id as *const u32 as *const _);
+        }
     }
     let tg_w = pipeline.thread_execution_width().min(dispatch_len as u64);
     let grid = metal::MTLSize {
@@ -3735,6 +3817,40 @@ pub(crate) fn encode_cumsum(
     enc.set_bytes(2, 4, &cols as *const u32 as *const _);
     let ex: u32 = if exclusive { 1 } else { 0 };
     enc.set_bytes(3, 4, &ex as *const u32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_cum_scan(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    src: usize,
+    dst: usize,
+    rows: u32,
+    cols: u32,
+    exclusive: bool,
+    is_max: bool,
+) {
+    enc.set_compute_pipeline_state(&k.cum_scan);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 4, &cols as *const u32 as *const _);
+    let ex: u32 = if exclusive { 1 } else { 0 };
+    enc.set_bytes(3, 4, &ex as *const u32 as *const _);
+    let mx: u32 = if is_max { 1 } else { 0 };
+    enc.set_bytes(4, 4, &mx as *const u32 as *const _);
     enc.dispatch_threads(
         metal::MTLSize {
             width: rows as u64,

@@ -297,12 +297,18 @@ pub fn compile_thunks_with_rng(
                     // single natural complex definition.
                     match op {
                         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {}
-                        BinaryOp::Max | BinaryOp::Min | BinaryOp::Pow => panic!(
-                            "Op::Binary({op:?}) on DType::C64: complex \
-                             max/min/pow have no single natural definition \
-                             — caller should drop to 2N-real-block (see \
-                             spike-ac) and pick a convention there"
-                        ),
+                        BinaryOp::Max
+                        | BinaryOp::Min
+                        | BinaryOp::Pow
+                        | BinaryOp::Mod
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                        | BinaryOp::Atan2 => {
+                            panic!("Op::Binary({op:?}) on DType::C64: undefined for complex")
+                        }
                     }
                 }
                 // Compute broadcast strides for the slow path. Empty
@@ -756,6 +762,9 @@ pub fn compile_thunks_with_rng(
             Op::Cumsum { axis, exclusive } => {
                 compile_cumsum(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
+            Op::CumProd { axis, exclusive } | Op::CumMax { axis, exclusive } => {
+                compile_cum_scan(node, arena)
+            }
             Op::Attention {
                 num_heads,
                 head_dim,
@@ -1049,6 +1058,16 @@ pub fn compile_thunks_with_rng(
             Op::DenseSolve => {
                 compile_dense_solve(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
+            Op::Cholesky => compile_cholesky(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::TriangularSolve { .. } => {
+                compile_triangular_solve(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
+            Op::Det | Op::LogDet => compile_det(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::Sort { .. } | Op::ArgSort { .. } => {
+                compile_sort(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
+            Op::Svd { .. } => compile_svd(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::Qr { .. } => compile_qr(node, graph, arena, &matmul_fold, &rng_shared, rng),
             Op::BatchedDenseSolve => {
                 compile_batched_dense_solve(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
@@ -3292,18 +3311,31 @@ pub fn compile_thunks_with_rng(
                 continue;
             }
             // Must be Rope reading Narrow's dst
-            let (n_src, n_dst, n_src_stride) = match &thunks[narrow] {
+            let (n_src, n_dst, n_src_stride, n_outer) = match &thunks[narrow] {
                 Thunk::Narrow {
                     src,
                     dst,
                     src_stride,
+                    outer,
                     ..
-                } => (*src, *dst, *src_stride),
+                } => (*src, *dst, *src_stride, *outer),
                 _ => continue,
             };
-            let rope_reads_narrow = matches!(&thunks[j],
-                Thunk::Rope { src, .. } if *src == n_dst);
-            if !rope_reads_narrow {
+            // Rope must read the Narrow's dst, and the Narrow's row geometry
+            // must match Rope's flattened `batch·seq` row model. Rewiring Rope
+            // to read the parent with a single row stride is only valid when
+            // the Narrow slices the terminal axis (`outer == batch·seq`, which
+            // then forces its slice width to equal Rope's `hidden`). A Narrow
+            // on a non-terminal axis — e.g. MLA's per-head `qk_rope` slice out
+            // of `[B, S, H, qk]`, whose `outer == batch·seq·H` — has more,
+            // narrower rows and would be misread. Leave those unfused.
+            let rope_rows_ok = match &thunks[j] {
+                Thunk::Rope {
+                    src, batch, seq, ..
+                } => *src == n_dst && n_outer == batch * seq,
+                _ => false,
+            };
+            if !rope_rows_ok {
                 continue;
             }
             // Conservatively require that the Narrow's dst has exactly

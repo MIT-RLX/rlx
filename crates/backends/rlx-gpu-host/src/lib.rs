@@ -615,6 +615,109 @@ pub fn run_reverse<A: DeviceArena>(
     });
 }
 
+/// Encode a `PadMode::Constant` value as `elem_bytes` in the output dtype for
+/// the host pad fallback. Non-constant modes never read the fill (zero-filled).
+/// Shared by the Metal and CUDA pad thunks.
+pub fn pad_fill_bytes(mode: rlx_ir::PadMode, dtype: rlx_ir::DType, elem_bytes: usize) -> Vec<u8> {
+    use rlx_ir::{DType, PadMode};
+    let v = match mode {
+        PadMode::Constant(v) => v,
+        _ => return vec![0u8; elem_bytes],
+    };
+    match dtype {
+        DType::F16 => half::f16::from_f32(v).to_le_bytes().to_vec(),
+        DType::BF16 => half::bf16::from_f32(v).to_le_bytes().to_vec(),
+        // F32/F64/int types: reuse the canonical IR encoder.
+        _ => {
+            rlx_ir::scalar_constant_bytes(v as f64, dtype).unwrap_or_else(|_| vec![0u8; elem_bytes])
+        }
+    }
+}
+
+/// Strided slice (host-staged, dtype-agnostic).
+#[allow(clippy::too_many_arguments)]
+pub fn run_slice<A: DeviceArena>(
+    a: &mut A,
+    src: usize,
+    dst: usize,
+    in_dims: &[u32],
+    axis: usize,
+    start: usize,
+    len: usize,
+    step: i64,
+    elem_bytes: usize,
+) {
+    let rank = in_dims.len();
+    let in_total: usize = in_dims
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
+    let out_total: usize = (0..rank)
+        .map(|i| if i == axis { len } else { in_dims[i] as usize })
+        .product::<usize>()
+        .max(1);
+    let src_bytes = in_total * elem_bytes;
+    let dst_bytes = out_total * elem_bytes;
+    let span_start = src.min(dst);
+    let span_end = (src + src_bytes).max(dst + dst_bytes);
+    stage_span(a, span_start, span_end, |base| unsafe {
+        rlx_cpu::thunk::execute_slice(
+            src - span_start,
+            dst - span_start,
+            in_dims,
+            axis,
+            start,
+            len,
+            step,
+            elem_bytes,
+            base,
+        );
+    });
+}
+
+/// Constant/reflect/replicate/circular pad (host-staged, dtype-agnostic).
+#[allow(clippy::too_many_arguments)]
+pub fn run_pad<A: DeviceArena>(
+    a: &mut A,
+    src: usize,
+    dst: usize,
+    in_dims: &[u32],
+    before: &[u32],
+    after: &[u32],
+    mode: rlx_ir::PadMode,
+    fill: &[u8],
+    elem_bytes: usize,
+) {
+    let rank = in_dims.len();
+    let in_total: usize = in_dims
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
+    let out_total: usize = (0..rank)
+        .map(|i| in_dims[i] as usize + before[i] as usize + after[i] as usize)
+        .product::<usize>()
+        .max(1);
+    let src_bytes = in_total * elem_bytes;
+    let dst_bytes = out_total * elem_bytes;
+    let span_start = src.min(dst);
+    let span_end = (src + src_bytes).max(dst + dst_bytes);
+    stage_span(a, span_start, span_end, |base| unsafe {
+        rlx_cpu::thunk::execute_pad(
+            src - span_start,
+            dst - span_start,
+            in_dims,
+            before,
+            after,
+            mode,
+            fill,
+            elem_bytes,
+            base,
+        );
+    });
+}
+
 /// Host-side `Op::ArgMax`/`Op::ArgMin` (f32-encoded indices) over the middle
 /// `reduced` axis.
 pub fn run_argreduce<A: DeviceArena>(

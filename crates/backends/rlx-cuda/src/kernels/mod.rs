@@ -239,6 +239,8 @@ kernel_cache!(
     "unary"
 );
 kernel_cache!(COPY, copy_kernel, COPY_CU, "copy");
+kernel_cache!(PAD, pad_kernel, PAD_CU, "pad");
+kernel_cache!(SLICE, slice_kernel, SLICE_CU, "slice");
 kernel_cache!(
     MATMUL,
     matmul_kernel,
@@ -456,6 +458,7 @@ kernel_cache!(
 kernel_cache!(ARGMAX, argmax_kernel, ARGMAX_CU, "argmax");
 kernel_cache!(ROPE, rope_kernel, ROPE_CU, "rope");
 kernel_cache!(CUMSUM, cumsum_kernel, CUMSUM_CU, "cumsum");
+kernel_cache!(CUM_SCAN, cum_scan_kernel, CUM_SCAN_CU, "cum_scan");
 kernel_cache!(TOPK, topk_kernel, TOPK_CU, "topk");
 kernel_cache!(
     GROUPED_MATMUL,

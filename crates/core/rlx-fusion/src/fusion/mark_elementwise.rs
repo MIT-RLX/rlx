@@ -49,12 +49,17 @@ impl Pass for MarkElementwiseRegions {
             *consumers.entry(out).or_insert(0) += 1;
         }
 
-        // Predicate: does this op qualify for chain inclusion?
+        // Predicate: does this op qualify for chain inclusion? Newer scalar
+        // activations (`Activation::region_fusable() == false`) stay on the
+        // standalone kernel path — the fused-region kernels don't carry their
+        // opcodes yet.
         let chain_eligible = |op: &Op| -> bool {
-            matches!(
-                op,
-                Op::Activation(_) | Op::Cast { .. } | Op::Binary(_) | Op::Compare(_) | Op::Where
-            )
+            match op {
+                Op::Activation(a) => a.region_fusable(),
+                Op::Binary(b) => b.region_fusable(),
+                Op::Cast { .. } | Op::Compare(_) | Op::Where => true,
+                _ => false,
+            }
         };
 
         // Per-node refinement: a `Cast { to }` only qualifies when the

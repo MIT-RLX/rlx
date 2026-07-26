@@ -659,6 +659,14 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             | Op::ConvTranspose2d { .. }
             | Op::FusedTransformerLayer { .. }
             | Op::DenseSolve
+            // Full-matrix host-staged linalg — batch-bucket slicing unsafe.
+            | Op::Cholesky
+            | Op::TriangularSolve { .. }
+            | Op::Det
+            | Op::LogDet
+            // Sort / ArgSort reorder along an axis — bucket slicing unsafe.
+            | Op::Sort { .. } | Op::Svd { .. } | Op::Qr { .. }
+            | Op::ArgSort { .. }
             | Op::Custom { .. }
             | Op::If { .. }
             | Op::While { .. } => return false,

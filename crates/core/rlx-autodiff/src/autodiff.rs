@@ -501,6 +501,15 @@ fn vjp(
         Op::Activation(kind) => vjp_activation(node, upstream, upstream_shape, fwd_map, bwd),
         Op::MatMul => vjp_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
         Op::DenseSolve => vjp_dense_solve(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::TriangularSolve { .. } => {
+            vjp_triangular_solve(node, upstream, upstream_shape, fwd_map, bwd)
+        }
+        Op::Cholesky => vjp_cholesky(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Det | Op::LogDet => vjp_det(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Sort { .. } => vjp_sort(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ArgSort { .. } => vec![], // non-differentiable (integer indices)
+        Op::Svd { .. } => vjp_svd(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Qr { .. } => vjp_qr(node, upstream, upstream_shape, fwd_map, bwd),
         Op::BatchedDenseSolve => {
             vjp_batched_dense_solve(node, upstream, upstream_shape, fwd_map, bwd)
         }
@@ -588,6 +597,12 @@ fn vjp(
         Op::Transpose { perm } => vjp_transpose(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Concat { axis } => vjp_concat(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Narrow { axis, start, len } => vjp_narrow(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Reverse { .. } => vjp_reverse(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Pad { .. } => vjp_pad(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Slice { .. } => vjp_slice(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Clamp { .. } => vjp_clamp(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Tile { .. } => vjp_tile(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Trilu { .. } => vjp_trilu(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Gather { axis } => vjp_gather(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Compare(_) => vjp_compare(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Where => vjp_where(node, upstream, upstream_shape, fwd_map, bwd),
@@ -708,6 +723,59 @@ fn vjp(
         }
 
         Op::Binary(BinaryOp::Pow) => vjp_binary_pow(node, upstream, upstream_shape, fwd_map, bwd),
+        // fmod: ∂/∂a = 1 (b is the constant modulus, ∂/∂b = 0).
+        Op::Binary(BinaryOp::Mod) => {
+            let a_bwd = fwd_map[&node.inputs[0]];
+            let a_shape = bwd.node(a_bwd).shape.clone();
+            let da = unbroadcast(upstream, &a_shape, bwd);
+            vec![(0, da)]
+        }
+        // atan2(a, b): ∂/∂a = b/(a²+b²), ∂/∂b = -a/(a²+b²).
+        Op::Binary(BinaryOp::Atan2) => {
+            let a = fwd_map[&node.inputs[0]];
+            let b = fwd_map[&node.inputs[1]];
+            let a_shape = bwd.node(a).shape.clone();
+            let b_shape = bwd.node(b).shape.clone();
+            let a2 = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![a, a], a_shape.clone());
+            let b2 = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![b, b], b_shape.clone());
+            let denom = bwd.add_node(
+                Op::Binary(BinaryOp::Add),
+                vec![a2, b2],
+                upstream_shape.clone(),
+            );
+            let ua = bwd.add_node(
+                Op::Binary(BinaryOp::Mul),
+                vec![upstream, b],
+                upstream_shape.clone(),
+            );
+            let ga_full = bwd.add_node(
+                Op::Binary(BinaryOp::Div),
+                vec![ua, denom],
+                upstream_shape.clone(),
+            );
+            let ub = bwd.add_node(
+                Op::Binary(BinaryOp::Mul),
+                vec![upstream, a],
+                upstream_shape.clone(),
+            );
+            let gb_pos = bwd.add_node(
+                Op::Binary(BinaryOp::Div),
+                vec![ub, denom],
+                upstream_shape.clone(),
+            );
+            let gb_full = bwd.add_node(
+                Op::Activation(Activation::Neg),
+                vec![gb_pos],
+                upstream_shape.clone(),
+            );
+            let g_a = unbroadcast(ga_full, &a_shape, bwd);
+            let g_b = unbroadcast(gb_full, &b_shape, bwd);
+            vec![(0, g_a), (1, g_b)]
+        }
+        // Bitwise ops are non-differentiable → no gradient contribution.
+        Op::Binary(
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr,
+        ) => vec![],
         Op::ScaledMatMul {
             lhs_format,
             rhs_format,
@@ -733,6 +801,8 @@ fn vjp(
             vjp_gather_elements(node, upstream, upstream_shape, fwd_map, bwd)
         }
         Op::Cumsum { axis, exclusive } => vjp_cumsum(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::CumProd { .. } => vjp_cumprod(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::CumMax { .. } => vjp_cummax(node, upstream, upstream_shape, fwd_map, bwd),
         Op::GroupedMatMul => vjp_grouped_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
         Op::DequantGroupedMatMul { scheme } => {
             vjp_dequant_grouped_mat_mul(node, upstream, upstream_shape, fwd_map, bwd)
@@ -957,6 +1027,27 @@ fn vjp_activation(
         // family hits the generic kernel.
         let dx = match kind {
             Activation::Relu => bwd.relu_backward(x_bwd, upstream),
+            // Newer scalar activations (Floor/Ceil/Sign/Softplus/Elu) have no
+            // native `ActivationBackward` kernel on the GPU backends — decompose
+            // to `upstream · act'(x)` primitives here so training works on every
+            // backend without a per-backend backward kernel.
+            Activation::Floor
+            | Activation::Ceil
+            | Activation::Sign
+            | Activation::Softplus
+            | Activation::Elu
+            | Activation::Erf
+            | Activation::HardSwish
+            | Activation::HardSigmoid
+            | Activation::Mish
+            | Activation::Softsign
+            | Activation::LogSigmoid => {
+                let shape = bwd.node(x_bwd).shape.clone();
+                let deriv = crate::activation_deriv::activation_deriv_wrt_x(
+                    bwd, *kind, x_bwd, None, &shape,
+                );
+                bwd.mul(upstream, deriv)
+            }
             _ => bwd.activation_backward(*kind, x_bwd, upstream),
         };
         vec![(0, dx)]
@@ -1448,6 +1539,363 @@ fn vjp_dense_solve(
 
         vec![(0, neg_outer), (1, d_b)]
     }
+}
+
+fn vjp_triangular_solve(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::TriangularSolve { lower, transpose } = &node.op else {
+        unreachable!()
+    };
+    let (lower, transpose) = (*lower, *transpose);
+    // X = op(A)⁻¹ B ⇒
+    //   ḡ_B = op(A)⁻ᵀ ū  = triangular_solve(A, ū, lower, !transpose)
+    //   ḡ_A = -ḡ_B Xᵀ  (transpose=false) or -X ḡ_Bᵀ (transpose=true),
+    //         masked to the triangular half A actually uses.
+    let a_bwd = fwd_map[&node.inputs[0]];
+    let x_bwd = fwd_map[&node.id];
+    let a_shape = bwd.node(a_bwd).shape.clone();
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let n = match a_shape.dim(0) {
+        Dim::Static(n) => n,
+        Dim::Dynamic(_) => panic!("TriangularSolve VJP: dynamic N not supported"),
+    };
+    let dtype = a_shape.dtype();
+
+    let d_b = bwd.triangular_solve(a_bwd, upstream, lower, !transpose, x_shape.clone());
+
+    let ga_full = match x_shape.rank() {
+        1 => {
+            let col_shape = Shape::from_dims(&[Dim::Static(n), Dim::Static(1)], dtype);
+            let row_shape = Shape::from_dims(&[Dim::Static(1), Dim::Static(n)], dtype);
+            let (col_src, row_src) = if transpose {
+                (x_bwd, d_b)
+            } else {
+                (d_b, x_bwd)
+            };
+            let col = bwd.add_node(
+                Op::Reshape {
+                    new_shape: vec![n as i64, 1],
+                },
+                vec![col_src],
+                col_shape,
+            );
+            let row = bwd.add_node(
+                Op::Reshape {
+                    new_shape: vec![1, n as i64],
+                },
+                vec![row_src],
+                row_shape,
+            );
+            let outer = bwd.matmul(col, row, a_shape.clone());
+            bwd.activation(Activation::Neg, outer, a_shape.clone())
+        }
+        2 => {
+            let k = match x_shape.dim(1) {
+                Dim::Static(k) => k,
+                Dim::Dynamic(_) => panic!("TriangularSolve VJP: dynamic K not supported"),
+            };
+            // transpose=false: -ḡ_B·Xᵀ; transpose=true: -X·ḡ_Bᵀ.
+            let (left, right_src) = if transpose {
+                (x_bwd, d_b)
+            } else {
+                (d_b, x_bwd)
+            };
+            let rt_shape = Shape::from_dims(&[Dim::Static(k), Dim::Static(n)], dtype);
+            let right = bwd.add_node(
+                Op::Transpose { perm: vec![1, 0] },
+                vec![right_src],
+                rt_shape,
+            );
+            let outer = bwd.matmul(left, right, a_shape.clone());
+            bwd.activation(Activation::Neg, outer, a_shape.clone())
+        }
+        r => panic!("TriangularSolve VJP: B must be rank 1 or 2, got rank {r}"),
+    };
+
+    // Only the `lower`/upper triangle of A affects the output; zero the rest.
+    let ga = bwd.add_node(
+        Op::Trilu {
+            upper: !lower,
+            diagonal: 0,
+        },
+        vec![ga_full],
+        a_shape,
+    );
+    vec![(0, ga), (1, d_b)]
+}
+
+fn vjp_cholesky(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Cholesky = &node.op else {
+        unreachable!()
+    };
+    // A = L·Lᵀ, L lower. Given L̄ (`upstream`):
+    //   Ā_sym = symm(L⁻ᵀ · Φ(Lᵀ L̄) · L⁻¹),  Φ = tril with halved diagonal.
+    // Our CPU `potrf` reads only A's lower triangle (A treated symmetric), so the
+    // gradient w.r.t. the stored buffer reflects Ā_sym onto the lower triangle:
+    // diagonal once, off-diagonal doubled  →  tril(Ā_sym,0) + tril(Ā_sym,-1).
+    let l = fwd_map[&node.id];
+    let s = bwd.node(l).shape.clone(); // [n, n]
+    let tp = |bwd: &mut Graph, x: NodeId, s: &Shape| {
+        bwd.add_node(Op::Transpose { perm: vec![1, 0] }, vec![x], s.clone())
+    };
+    let tril = |bwd: &mut Graph, x: NodeId, diag: i64, s: &Shape| {
+        bwd.add_node(
+            Op::Trilu {
+                upper: false,
+                diagonal: diag,
+            },
+            vec![x],
+            s.clone(),
+        )
+    };
+    let half = scalar_const(0.5, bwd);
+
+    // Φ(Lᵀ L̄) = 0.5·(tril(M,0) + tril(M,-1)),  M = Lᵀ L̄.
+    let lt = tp(bwd, l, &s);
+    let m = bwd.matmul(lt, upstream, s.clone());
+    let m0 = tril(bwd, m, 0, &s);
+    let m1 = tril(bwd, m, -1, &s);
+    let msum = bwd.add_node(Op::Binary(BinaryOp::Add), vec![m0, m1], s.clone());
+    let p = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![msum, half], s.clone());
+
+    // Ā_raw = L⁻ᵀ P L⁻¹:  Y = L⁻ᵀ P;  Ā_raw = (L⁻ᵀ Yᵀ)ᵀ.
+    let y = bwd.triangular_solve(l, p, true, true, s.clone());
+    let yt = tp(bwd, y, &s);
+    let z = bwd.triangular_solve(l, yt, true, true, s.clone());
+    let a_raw = tp(bwd, z, &s);
+
+    // Symmetrize, then reflect onto the lower triangle.
+    let a_raw_t = tp(bwd, a_raw, &s);
+    let gsum = bwd.add_node(Op::Binary(BinaryOp::Add), vec![a_raw, a_raw_t], s.clone());
+    let g = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![gsum, half], s.clone());
+    let g0 = tril(bwd, g, 0, &s);
+    let g1 = tril(bwd, g, -1, &s);
+    let a_bar = bwd.add_node(Op::Binary(BinaryOp::Add), vec![g0, g1], s);
+    vec![(0, a_bar)]
+}
+
+fn vjp_det(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    // logdet: Ā = ū·A⁻ᵀ.   det: Ā = (ū·det(A))·A⁻ᵀ.   A⁻ᵀ = solve(Aᵀ, I).
+    let is_logdet = matches!(&node.op, Op::LogDet);
+    let a = fwd_map[&node.inputs[0]];
+    let a_shape = bwd.node(a).shape.clone();
+    let n = match a_shape.dim(0) {
+        Dim::Static(n) => n,
+        Dim::Dynamic(_) => panic!("Det/LogDet VJP: dynamic N not supported"),
+    };
+    let at = bwd.add_node(Op::Transpose { perm: vec![1, 0] }, vec![a], a_shape.clone());
+    let mut id = vec![0f32; n * n];
+    for i in 0..n {
+        id[i * n + i] = 1.0;
+    }
+    let id_bytes: Vec<u8> = id.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let id_node = bwd.add_node(Op::Constant { data: id_bytes }, vec![], a_shape.clone());
+    let ainv_t = bwd.dense_solve(at, id_node, a_shape.clone());
+    let scale = if is_logdet {
+        upstream
+    } else {
+        let det = fwd_map[&node.id];
+        let s = bwd.node(det).shape.clone();
+        bwd.add_node(Op::Binary(BinaryOp::Mul), vec![upstream, det], s)
+    };
+    // scalar `scale` broadcasts over A⁻ᵀ.
+    let ga = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![ainv_t, scale], a_shape);
+    vec![(0, ga)]
+}
+
+fn vjp_sort(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    // y = sort(x, axis); y[k] = x[p[k]] with p = argsort(x). So dx[p[k]] = ū[k]:
+    // scatter ū back to the original positions along the axis.
+    let Op::Sort { axis, descending } = &node.op else {
+        unreachable!()
+    };
+    let (axis, descending) = (*axis, *descending);
+    let x = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x).shape.clone();
+    let n = x_shape.num_elements().expect("Sort VJP: dynamic shape");
+    let p = bwd.add_node(Op::ArgSort { axis, descending }, vec![x], x_shape.clone());
+    let zeros = bwd.add_node(
+        Op::Constant {
+            data: vec![0u8; n * 4],
+        },
+        vec![],
+        x_shape.clone(),
+    );
+    let dx = bwd.scatter_elements(zeros, p, upstream, axis as i32, ScatterNdReduction::None);
+    vec![(0, dx)]
+}
+
+fn vjp_svd(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    // Only the singular VALUES are differentiable: Ā = U·diag(ū)·Vᵀ. U/Vt are
+    // forward-only (their grads need the F-matrix formula — future work).
+    let Op::Svd { part } = &node.op else {
+        unreachable!()
+    };
+    if !matches!(part, rlx_ir::op::SvdPart::S) {
+        return vec![];
+    }
+    let a = fwd_map[&node.inputs[0]];
+    let a_shape = bwd.node(a).shape.clone();
+    let m = match a_shape.dim(0) {
+        Dim::Static(m) => m,
+        Dim::Dynamic(_) => panic!("Svd VJP: dynamic M not supported"),
+    };
+    let n = match a_shape.dim(1) {
+        Dim::Static(n) => n,
+        Dim::Dynamic(_) => panic!("Svd VJP: dynamic N not supported"),
+    };
+    let k = m.min(n);
+    let dt = a_shape.dtype();
+    let uk = Shape::from_dims(&[Dim::Static(m), Dim::Static(k)], dt);
+    let ktn = Shape::from_dims(&[Dim::Static(k), Dim::Static(n)], dt);
+    let onek = Shape::from_dims(&[Dim::Static(1), Dim::Static(k)], dt);
+
+    let u = bwd.add_node(
+        Op::Svd {
+            part: rlx_ir::op::SvdPart::U,
+        },
+        vec![a],
+        uk.clone(),
+    );
+    let vt = bwd.add_node(
+        Op::Svd {
+            part: rlx_ir::op::SvdPart::Vt,
+        },
+        vec![a],
+        ktn,
+    );
+    // Scale U's columns by ū: U ⊙ reshape(ū, [1, k]).
+    let ubar_row = bwd.add_node(
+        Op::Reshape {
+            new_shape: vec![1, k as i64],
+        },
+        vec![upstream],
+        onek,
+    );
+    let u_scaled = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![u, ubar_row], uk);
+    let a_bar = bwd.matmul(u_scaled, vt, a_shape);
+    vec![(0, a_bar)]
+}
+
+fn vjp_qr(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    // Thin QR (m ≥ n), A = Q·R, Q [m,n], R [n,n]. For output = Q: R̄=0; for
+    // output = R: Q̄=0. Ā = (Q̄ + Q·copyltu(M))·R⁻ᵀ, with M = R·R̄ᵀ − Q̄ᵀ·Q,
+    // copyltu(M) = tril(M) + tril(M,-1)ᵀ.
+    let Op::Qr { part } = &node.op else {
+        unreachable!()
+    };
+    let is_q = matches!(part, rlx_ir::op::QrPart::Q);
+    let a = fwd_map[&node.inputs[0]];
+    let a_shape = bwd.node(a).shape.clone();
+    let m = match a_shape.dim(0) {
+        Dim::Static(m) => m,
+        Dim::Dynamic(_) => panic!("Qr VJP: dynamic M not supported"),
+    };
+    let n = match a_shape.dim(1) {
+        Dim::Static(n) => n,
+        Dim::Dynamic(_) => panic!("Qr VJP: dynamic N not supported"),
+    };
+    assert!(m >= n, "Qr VJP requires m >= n (thin QR)");
+    let dt = a_shape.dtype();
+    let mn = Shape::from_dims(&[Dim::Static(m), Dim::Static(n)], dt);
+    let sq = Shape::from_dims(&[Dim::Static(n), Dim::Static(n)], dt);
+    let nm = Shape::from_dims(&[Dim::Static(n), Dim::Static(m)], dt);
+    let tp = |bwd: &mut Graph, x: NodeId, s: &Shape| {
+        bwd.add_node(Op::Transpose { perm: vec![1, 0] }, vec![x], s.clone())
+    };
+
+    let q = bwd.add_node(
+        Op::Qr {
+            part: rlx_ir::op::QrPart::Q,
+        },
+        vec![a],
+        mn.clone(),
+    );
+    let r = bwd.add_node(
+        Op::Qr {
+            part: rlx_ir::op::QrPart::R,
+        },
+        vec![a],
+        sq.clone(),
+    );
+
+    // M [n,n].
+    let m_mat = if is_q {
+        // M = -Q̄ᵀ·Q.
+        let qbar_t = tp(bwd, upstream, &nm);
+        let qtq = bwd.matmul(qbar_t, q, sq.clone());
+        bwd.add_node(Op::Activation(Activation::Neg), vec![qtq], sq.clone())
+    } else {
+        // M = R·R̄ᵀ.
+        let rbar_t = tp(bwd, upstream, &sq);
+        bwd.matmul(r, rbar_t, sq.clone())
+    };
+    // copyltu(M) = tril(M,0) + tril(M,-1)ᵀ.
+    let t0 = bwd.add_node(
+        Op::Trilu {
+            upper: false,
+            diagonal: 0,
+        },
+        vec![m_mat],
+        sq.clone(),
+    );
+    let tm1 = bwd.add_node(
+        Op::Trilu {
+            upper: false,
+            diagonal: -1,
+        },
+        vec![m_mat],
+        sq.clone(),
+    );
+    let tm1t = tp(bwd, tm1, &sq);
+    let clt = bwd.add_node(Op::Binary(BinaryOp::Add), vec![t0, tm1t], sq.clone());
+    // Y = (Q̄ if is_q else 0) + Q·copyltu(M)   [m,n].
+    let qclt = bwd.matmul(q, clt, mn.clone());
+    let y = if is_q {
+        bwd.add_node(Op::Binary(BinaryOp::Add), vec![upstream, qclt], mn.clone())
+    } else {
+        qclt
+    };
+    // Ā = Y·R⁻ᵀ = (triangular_solve(R, Yᵀ, upper))ᵀ.
+    let yt = tp(bwd, y, &nm);
+    let z = bwd.triangular_solve(r, yt, false, false, nm);
+    let a_bar = tp(bwd, z, &mn);
+    vec![(0, a_bar)]
 }
 
 #[allow(unused_variables)]
@@ -2207,10 +2655,285 @@ fn vjp_fake_quantize(
 }
 
 #[allow(unused_variables)]
+/// `Op::Reverse` is self-adjoint: reversing the same axes transposes the
+/// permutation, so the input gradient is `reverse(upstream)`.
+fn vjp_reverse(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    _fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Reverse { axes } = &node.op else {
+        unreachable!()
+    };
+    let shape = bwd.node(upstream).shape.clone();
+    let dx = bwd.add_node(Op::Reverse { axes: axes.clone() }, vec![upstream], shape);
+    vec![(0, dx)]
+}
+
+/// VJP of `Op::Pad`. Pad is a linear map (the constant fill is `x`-independent,
+/// so it drops out of the input gradient); the transpose crops the interior and
+/// folds each padded region's gradient back onto the source positions it was
+/// copied from. Applied per-axis in **reverse** axis order — the transpose of a
+/// separable per-axis forward pad. Emits only ops that themselves have VJPs
+/// (`narrow`/`reverse`/`reduce`/constant-`pad`/`add`), so double-grad works.
+fn vjp_pad(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Pad { pads, mode } = &node.op else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let rank = x_shape.rank();
+
+    // Place `x` (size along `axis`) at offset `before` in a size-n axis, zeros
+    // elsewhere — a constant zero-pad on that single axis.
+    fn fold_at(
+        bwd: &mut Graph,
+        x: NodeId,
+        rank: usize,
+        axis: usize,
+        before: usize,
+        after: usize,
+    ) -> NodeId {
+        if before == 0 && after == 0 {
+            return x;
+        }
+        let mut pads = vec![[0usize, 0]; rank];
+        pads[axis] = [before, after];
+        bwd.pad_(x, pads, PadMode::Constant(0.0))
+    }
+    fn reverse_axis(bwd: &mut Graph, x: NodeId, axis: usize) -> NodeId {
+        let shape = bwd.node(x).shape.clone();
+        bwd.add_node(Op::Reverse { axes: vec![axis] }, vec![x], shape)
+    }
+
+    let mut dy = upstream;
+    for axis in (0..rank).rev() {
+        let [p0, p1] = pads[axis];
+        if p0 == 0 && p1 == 0 {
+            continue;
+        }
+        let n = match x_shape.dim(axis) {
+            Dim::Static(k) => k,
+            _ => panic!("Pad VJP: dynamic axis {axis} not supported"),
+        };
+        let full = n + p0 + p1;
+        // The un-padded copy of `x` — every mode contributes this 1×.
+        let interior = bwd.narrow_(dy, axis, p0, n);
+        dy = match mode {
+            PadMode::Constant(_) => interior,
+            PadMode::Circular => {
+                let mut acc = interior;
+                if p0 > 0 {
+                    let bg = bwd.narrow_(dy, axis, 0, p0); // → x[n-p0 .. n]
+                    let folded = fold_at(bwd, bg, rank, axis, n - p0, 0);
+                    acc = bwd.add(acc, folded);
+                }
+                if p1 > 0 {
+                    let ag = bwd.narrow_(dy, axis, full - p1, p1); // → x[0 .. p1]
+                    let folded = fold_at(bwd, ag, rank, axis, 0, n - p1);
+                    acc = bwd.add(acc, folded);
+                }
+                acc
+            }
+            PadMode::Replicate => {
+                let mut acc = interior;
+                if p0 > 0 {
+                    let bg = bwd.narrow_(dy, axis, 0, p0);
+                    let bsum = bwd.sum(bg, vec![axis], true); // all before-copies → x[0]
+                    let folded = fold_at(bwd, bsum, rank, axis, 0, n - 1);
+                    acc = bwd.add(acc, folded);
+                }
+                if p1 > 0 {
+                    let ag = bwd.narrow_(dy, axis, full - p1, p1);
+                    let asum = bwd.sum(ag, vec![axis], true); // all after-copies → x[n-1]
+                    let folded = fold_at(bwd, asum, rank, axis, n - 1, 0);
+                    acc = bwd.add(acc, folded);
+                }
+                acc
+            }
+            PadMode::Reflect => {
+                let mut acc = interior;
+                if p0 > 0 {
+                    let bg = bwd.narrow_(dy, axis, 0, p0);
+                    let brev = reverse_axis(bwd, bg, axis); // aligns to x[1 .. 1+p0]
+                    let folded = fold_at(bwd, brev, rank, axis, 1, n - 1 - p0);
+                    acc = bwd.add(acc, folded);
+                }
+                if p1 > 0 {
+                    let ag = bwd.narrow_(dy, axis, full - p1, p1);
+                    let arev = reverse_axis(bwd, ag, axis); // aligns to x[n-1-p1 .. n-1]
+                    let folded = fold_at(bwd, arev, rank, axis, n - 1 - p1, 1);
+                    acc = bwd.add(acc, folded);
+                }
+                acc
+            }
+        };
+    }
+    vec![(0, dy)]
+}
+
+/// VJP of `Op::Slice`. Strided slice is a strided gather; its transpose is a
+/// scatter-add of the upstream grad back onto the source positions
+/// `start + j*step` (zeros elsewhere) — uniform across all `step` values.
+fn vjp_slice(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Slice {
+        axis,
+        start,
+        len,
+        step,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let rank = x_shape.rank();
+    // `Op::ScatterAdd` reads f32-encoded indices and scatters along axis 0.
+    let idx_f32: Vec<f32> = (0..*len)
+        .map(|j| (*start as i64 + j as i64 * *step) as f32)
+        .collect();
+    let data: Vec<u8> = idx_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let idx_node = bwd.add_node(
+        Op::Constant { data },
+        vec![],
+        Shape::new(&[*len], DType::F32),
+    );
+
+    let dx = if *axis == 0 {
+        bwd.add_node(Op::ScatterAdd, vec![upstream, idx_node], x_shape)
+    } else {
+        // Move `axis` to front, scatter-add along axis 0, move back.
+        let mut perm: Vec<usize> = (0..rank).collect();
+        perm.remove(*axis);
+        perm.insert(0, *axis);
+        let dy_t = bwd.transpose_(upstream, perm.clone());
+        let xt_shape =
+            rlx_ir::shape::transpose_shape(&x_shape, &perm).expect("slice VJP transpose shape");
+        let scattered = bwd.add_node(Op::ScatterAdd, vec![dy_t, idx_node], xt_shape);
+        let mut inv = vec![0usize; rank];
+        for (i, &p) in perm.iter().enumerate() {
+            inv[p] = i;
+        }
+        bwd.transpose_(scattered, inv)
+    };
+    vec![(0, dx)]
+}
+
+/// VJP of `Op::Clamp`: pass-through where `min < x < max`, else 0. Indicator
+/// `relu(sign(x−min))·relu(sign(max−x))` (no Compare/Where).
+fn vjp_clamp(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    use rlx_ir::op::Activation;
+    let Op::Clamp { min, max } = &node.op else {
+        unreachable!()
+    };
+    let x = fwd_map[&node.inputs[0]];
+    let shape = bwd.node(x).shape.clone();
+    let dtype = shape.dtype();
+    let lo = bwd.full(&[1], *min, dtype);
+    let hi = bwd.full(&[1], *max, dtype);
+    let xm = bwd.sub(x, lo);
+    let s1 = bwd.activation(Activation::Sign, xm, shape.clone());
+    let g1 = bwd.activation(Activation::Relu, s1, shape.clone());
+    let hx = bwd.sub(hi, x);
+    let s2 = bwd.activation(Activation::Sign, hx, shape.clone());
+    let g2 = bwd.activation(Activation::Relu, s2, shape.clone());
+    let ind = bwd.mul(g1, g2);
+    let dx = bwd.mul(upstream, ind);
+    vec![(0, dx)]
+}
+
+/// VJP of `Op::Tile`: reduce-sum the repeated copies back onto the original.
+fn vjp_tile(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Tile { reps } = &node.op else {
+        unreachable!()
+    };
+    let x = fwd_map[&node.inputs[0]];
+    let x_dims: Vec<usize> = bwd
+        .node(x)
+        .shape
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static())
+        .collect();
+    let rank = x_dims.len();
+    let mut dy = upstream;
+    for axis in (0..rank).rev() {
+        let r = reps[axis];
+        if r <= 1 {
+            continue;
+        }
+        let cur: Vec<usize> = bwd
+            .node(dy)
+            .shape
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect();
+        // Split the tiled axis `n*r` into `[r, n]` (copies are the outer factor),
+        // then sum out the `r` axis.
+        let mut split: Vec<i64> = cur[..axis].iter().map(|&d| d as i64).collect();
+        split.push(r as i64);
+        split.push(x_dims[axis] as i64);
+        split.extend(cur[axis + 1..].iter().map(|&d| d as i64));
+        let reshaped = bwd.reshape_(dy, split);
+        dy = bwd.sum(reshaped, vec![axis], false);
+    }
+    vec![(0, dy)]
+}
+
+/// VJP of `Op::Trilu`: masking by a 0/1 triangular mask is self-adjoint.
+fn vjp_trilu(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    _fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Trilu { upper, diagonal } = &node.op else {
+        unreachable!()
+    };
+    let shape = bwd.node(upstream).shape.clone();
+    let dx = bwd.add_node(
+        Op::Trilu {
+            upper: *upper,
+            diagonal: *diagonal,
+        },
+        vec![upstream],
+        shape,
+    );
+    vec![(0, dx)]
+}
+
 fn vjp_expand(
     node: &Node,
     upstream: NodeId,
-    upstream_shape: Shape,
+    _upstream_shape: Shape,
     fwd_map: &HashMap<NodeId, NodeId>,
     bwd: &mut Graph,
 ) -> Vec<(usize, NodeId)> {
@@ -3596,6 +4319,134 @@ fn vjp_cumsum(
         let dx = bwd.cumsum_backward(upstream, x_shape, *axis, *exclusive);
         vec![(0, dx)]
     }
+}
+
+// ── CumProd ─────────────────────────────────────────────
+//
+// y_i = prod_{j<=i} x_j  (inclusive; j<i when exclusive). With g_i = dy_i·y_i,
+//   dx_k = (1/x_k) · sum_{i : k in prefix(i)} g_i = (1/x_k) · suffix_sum(g)_k.
+// The suffix sum is exactly `CumsumBackward` (the transpose of cumsum), so:
+//   dx = cumsum_backward(dy · cumprod(x)) / x.
+// Caveat: the `/x` form is undefined where x has zeros (the standard cumprod
+// grad caveat); nonzero inputs match JAX.
+fn vjp_cumprod(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::CumProd { axis, exclusive } = &node.op else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let y = bwd.cumprod(x_bwd, *axis, *exclusive, x_shape.clone());
+    let g = bwd.mul(upstream, y);
+    let suffix = bwd.cumsum_backward(g, x_shape, *axis, *exclusive);
+    let dx = bwd.div(suffix, x_bwd);
+    vec![(0, dx)]
+}
+
+// ── CumMax ──────────────────────────────────────────────
+//
+// y_i = max_{j<=i} x_j. Gradient routes each dy_i to the argmax key of prefix i
+// (ties split equally). Built from primitives over an inserted [query i, key j]
+// grid: mask the prefix, take the running max, form a normalized one-hot of the
+// maximisers, weight by dy, and sum over queries.
+fn vjp_cummax(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::CumMax { axis, exclusive } = &node.op else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let dtype = x_shape.dtype();
+    let dims: Vec<usize> = x_shape.dims().iter().map(|d| d.unwrap_static()).collect();
+    let rank = dims.len();
+    let axis = if *axis < 0 {
+        (*axis + rank as i32).max(0) as usize
+    } else {
+        *axis as usize
+    };
+    let len = dims[axis];
+
+    let reduce = |bwd: &mut Graph, x: NodeId, ax: usize, op: ReduceOp, keep: bool| -> NodeId {
+        let s = rlx_ir::shape::reduce_shape(&bwd.node(x).shape, &[ax], keep).unwrap();
+        bwd.reduce(x, op, vec![ax], keep, s)
+    };
+
+    // Insert a size-1 query axis at `axis`; key axis is now `axis + 1`.
+    let mut q_dims: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+    q_dims.insert(axis, 1);
+    let xq = bwd.reshape_(x_bwd, q_dims);
+
+    // Prefix mask [1,…,L(query),L(key),…,1]: keep[i,j] = exclusive ? j<i : j<=i.
+    let mut mask = vec![0f32; len * len];
+    for i in 0..len {
+        for j in 0..len {
+            let k = if *exclusive { j < i } else { j <= i };
+            mask[i * len + j] = k as u8 as f32;
+        }
+    }
+    let data: Vec<u8> = mask.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mask0 = bwd.add_node(
+        Op::Constant { data },
+        vec![],
+        Shape::new(&[len, len], DType::F32),
+    );
+    let mut bshape = vec![1i64; rank + 1];
+    bshape[axis] = len as i64;
+    bshape[axis + 1] = len as i64;
+    let keep = bwd.reshape_(mask0, bshape);
+
+    // masked[..,i,j,..] = keep ? x_j : -sentinel.
+    let kx = bwd.mul(keep, xq);
+    let one = bwd.full(&[1], 1.0, dtype);
+    let inv = bwd.sub(one, keep);
+    let sent = bwd.full(&[1], -3.0e38, dtype);
+    let gap = bwd.mul(inv, sent);
+    let masked = bwd.add(kx, gap);
+
+    // y[..,i,1,..] = max over keys; one-hot of maximisers, normalized over ties.
+    // `Op::Compare`/`Div` mishandle a trailing size-1 broadcast on some backends
+    // (CPU), so expand the reduced tensors to the full grid before comparing/dividing.
+    let grid = bwd.node(masked).shape.clone();
+    let grid_i64: Vec<i64> = grid
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static() as i64)
+        .collect();
+    let expand = |bwd: &mut Graph, x: NodeId| -> NodeId {
+        bwd.add_node(
+            Op::Expand {
+                target_shape: grid_i64.clone(),
+            },
+            vec![x],
+            grid.clone(),
+        )
+    };
+
+    let ymax = reduce(bwd, masked, axis + 1, ReduceOp::Max, true);
+    let ymax_e = expand(bwd, ymax);
+    let is_max_b = bwd.eq(masked, ymax_e);
+    let is_max = bwd.cast(is_max_b, dtype);
+    let count = reduce(bwd, is_max, axis + 1, ReduceOp::Sum, true);
+    let count_e = expand(bwd, count);
+    let weight = bwd.div(is_max, count_e);
+
+    // Weight by dy (query-indexed) and sum over queries → dx (key-indexed).
+    let mut dy_dims: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+    dy_dims.insert(axis + 1, 1);
+    let dyq = bwd.reshape_(upstream, dy_dims);
+    let contrib = bwd.mul(weight, dyq);
+    let dx = reduce(bwd, contrib, axis, ReduceOp::Sum, false);
+    vec![(0, dx)]
 }
 
 // ── GroupedMatMul (MoE primitive) ──────────────────────

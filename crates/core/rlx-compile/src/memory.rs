@@ -882,6 +882,56 @@ fn plan_memory_aligned_inner(
         arena_size = arena_size.max(aligned + placement_size);
     }
 
+    // ── In-place safety pass ─────────────────────────────────
+    // A node's output must never overlap the buffer of one of its own inputs:
+    // an in-place permute/matmul/reduce reads and writes the same bytes and
+    // corrupts (e.g. a Transpose whose output max exceeds its input's — only
+    // possible if it clobbered unread source elements). The liveness overlap
+    // check normally guarantees this (an input is live at the consumer's step,
+    // so its slot can't be reused for the output), but a view-chain can
+    // under-extend a root's death (reshape→transpose on wgpu) and slip an alias
+    // through. Relocate any offending output to a fresh tail slot. This fires
+    // ONLY on such a bug — correct planning never overlaps a live input — so it
+    // costs no arena in the common case.
+    if !opts.arena_no_reuse {
+        let ids: Vec<NodeId> = buffers.iter().map(|b| b.id).collect();
+        for id in ids {
+            let node = graph.node(id);
+            let Some(out) = assignments.get(&id).cloned() else {
+                continue;
+            };
+            let out_size = node_slot_bytes(node, f32_uniform).max(1);
+            let out_end = out.offset + out_size;
+            let mut overlaps_input = false;
+            for &inp in &node.inputs {
+                let (root, _off) = resolve_view_root(graph, inp);
+                if root == id {
+                    continue;
+                }
+                if let Some(rs) = assignments.get(&root) {
+                    let r_size = node_slot_bytes(graph.node(root), f32_uniform).max(1);
+                    if out.offset < rs.offset + r_size && out_end > rs.offset {
+                        overlaps_input = true;
+                        break;
+                    }
+                }
+            }
+            if overlaps_input {
+                let align = alignment;
+                let aligned = (arena_size + align - 1) & !(align - 1);
+                let guard = boundary_tail_guard(&node.op, align);
+                assignments.insert(
+                    id,
+                    BufferSlot {
+                        offset: aligned,
+                        size: out.size,
+                    },
+                );
+                arena_size = arena_size.max(aligned + out.size + guard);
+            }
+        }
+    }
+
     // ── View aliasing pass (plan #46) ────────────────────────
     // Every view node points at its root buffer's slot, offset by the
     // accumulated view offset. The root has its own allocation above;
@@ -901,6 +951,75 @@ fn plan_memory_aligned_inner(
                 );
             }
         }
+    }
+
+    // ── Optional invariant self-check (RLX_MEM_VERIFY) ───────
+    // The core planner invariant: no two buffers that are simultaneously live
+    // may share overlapping arena bytes. If this ever fires, the allocator (not
+    // the backend) is the culprit for a slot-reuse corruption. O(n²), so gated.
+    if rlx_ir::env::flag("RLX_MEM_VERIFY") {
+        let mut violations = 0usize;
+        for (i, a) in buffers.iter().enumerate() {
+            let Some(sa) = assignments.get(&a.id) else {
+                continue;
+            };
+            let a_end = sa.offset + a.size.max(1);
+            for b in &buffers[i + 1..] {
+                let Some(sb) = assignments.get(&b.id) else {
+                    continue;
+                };
+                let b_end = sb.offset + b.size.max(1);
+                let mem = sa.offset < b_end && a_end > sb.offset;
+                let time = a.birth <= b.death && a.death >= b.birth;
+                if mem && time {
+                    violations += 1;
+                    if violations <= 20 {
+                        eprintln!(
+                            "[mem-verify] OVERLAP {:?} off={}..{} live[{},{}] <> {:?} off={}..{} live[{},{}]",
+                            a.id,
+                            sa.offset,
+                            a_end,
+                            a.birth,
+                            a.death,
+                            b.id,
+                            sb.offset,
+                            b_end,
+                            b.birth,
+                            b.death,
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[mem-verify] {violations} live+memory overlaps among {} real buffers",
+            buffers.len()
+        );
+
+        // Second half of the invariant: no buffer may be READ after its
+        // computed death. If this fires, a consumer (possibly via a view chain)
+        // reads a root whose slot the planner already freed for reuse — the
+        // classic "reused while still needed" corruption. Together with the
+        // overlap check above, a clean pass here proves the *plan* is safe (so
+        // any remaining corruption is in the backend's execution, not here).
+        let mut read_after_death = 0usize;
+        for (step, node) in graph.nodes().iter().enumerate() {
+            for &input in &node.inputs {
+                let (root, _off) = resolve_view_root(graph, input);
+                if let Some(&(_b, d)) = ranges.get(&root) {
+                    if d < step {
+                        read_after_death += 1;
+                        if read_after_death <= 20 {
+                            eprintln!(
+                                "[mem-verify] READ-AFTER-DEATH node {:?} step={step} reads {:?} (via {:?}) whose death={d}",
+                                node.id, root, input,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("[mem-verify] {read_after_death} reads-after-death");
     }
 
     let schedule = graph.topo_order().collect();

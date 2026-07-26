@@ -43,6 +43,7 @@ mod llama_kv_tap;
 mod llama_layer;
 mod lm_head;
 mod logit_softcap;
+mod mla_attn;
 mod moe;
 mod nomic_layer;
 mod qwen3_decode_layer;
@@ -95,6 +96,7 @@ pub use llama_layer::{
 };
 pub use lm_head::LmHeadStage;
 pub use logit_softcap::LogitSoftcapStage;
+pub use mla_attn::{MlaAttnPrefillSpec, MlaAttnPrefillStage};
 pub use moe::MoeFfnStage;
 pub use nomic_layer::{NomicEncoderLayerSpec, NomicEncoderLayerStage};
 pub use qwen3_decode_layer::{Qwen3DecodeLayerSpec, Qwen3DecodeLayerStage};

@@ -323,9 +323,88 @@ pub fn build_mrope_text_tables(
     (cos, sin)
 }
 
+/// Build a **per-token** MRoPE cos/sin table of shape `[seq, head_dim/2]` from
+/// explicit per-token 3-D (+optional 4th) positions.
+///
+/// `positions[t] = [pt, ph, pw, pe]` is token `t`'s position in each modality
+/// section (temporal / height / width / extra). Text tokens set all entries to
+/// the same running scalar; image tokens carry their grid `(t, h, w)`. Row `t`
+/// of the returned tables holds the rotation angles for token `t`, so it drops
+/// straight into the existing per-token [`rlx_ir::op::Op::Rope`] path (the
+/// kernel indexes the table by global token when `rows == batch·seq`) — MRoPE
+/// needs no dedicated Rope op.
+///
+/// `interleaved` selects HF's THWTHW… pair layout (Qwen3.5 / Qwen3-VL
+/// `apply_interleaved_mrope`) over contiguous TTT…HHH…WWW sections.
+pub fn build_mrope_tables(
+    rope_theta: f64,
+    head_dim: usize,
+    n_rot: usize,
+    sections: [usize; 4],
+    positions: &[[usize; 4]],
+    interleaved: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let seq = positions.len();
+    let mut cos = vec![1f32; seq * half];
+    let mut sin = vec![0f32; seq * half];
+    for (t, pos) in positions.iter().enumerate() {
+        let (crow, srow) =
+            mrope_row_for_sections_ex(rope_theta, n_rot, sections, *pos, half, interleaved);
+        cos[t * half..t * half + half].copy_from_slice(&crow);
+        sin[t * half..t * half + half].copy_from_slice(&srow);
+    }
+    (cos, sin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mrope_reduces_to_standard_rope_for_text() {
+        // A single section owning every pair + identical positions across all
+        // modalities ⇒ MRoPE row == standard RoPE row (n_rot == head_dim).
+        let (head_dim, n_rot) = (8usize, 8usize);
+        let sections = [4, 0, 0, 0];
+        let positions = [[0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]];
+        let (mc, ms) = build_mrope_tables(10_000.0, head_dim, n_rot, sections, &positions, false);
+        let (dc, ds) = build_default_tables(10_000.0, head_dim, positions.len());
+        assert_eq!(mc.len(), dc.len());
+        for i in 0..mc.len() {
+            assert!(
+                (mc[i] - dc[i]).abs() < 1e-6,
+                "cos[{i}]: {} vs {}",
+                mc[i],
+                dc[i]
+            );
+            assert!(
+                (ms[i] - ds[i]).abs() < 1e-6,
+                "sin[{i}]: {} vs {}",
+                ms[i],
+                ds[i]
+            );
+        }
+    }
+
+    #[test]
+    fn mrope_sections_isolate_modalities() {
+        // sections = [T:1, H:1, W:2] over head_dim/2 = 4 pairs.
+        let (head_dim, n_rot) = (8usize, 8usize);
+        let sections = [1, 1, 2, 0];
+        let half = head_dim / 2;
+        // Two tokens sharing T but differing in H and W.
+        let positions = [[5, 5, 5, 0], [5, 3, 7, 0]];
+        let (cos, _) = build_mrope_tables(10_000.0, head_dim, n_rot, sections, &positions, false);
+        let row0 = &cos[0..half];
+        let row1 = &cos[half..2 * half];
+        // Pair 0 (T section, pos 5 for both) is identical.
+        assert!((row0[0] - row1[0]).abs() < 1e-7, "T pair should match");
+        // Pair 1 (H section) differs (5 vs 3).
+        assert!((row0[1] - row1[1]).abs() > 1e-4, "H pair should differ");
+        // Pairs 2,3 (W section) differ (5 vs 7).
+        assert!((row0[2] - row1[2]).abs() > 1e-4, "W pair should differ");
+    }
 
     #[test]
     fn default_freq_lengths() {

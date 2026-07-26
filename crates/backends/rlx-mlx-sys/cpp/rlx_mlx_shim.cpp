@@ -522,6 +522,38 @@ BINARY_OP(div,    divide)
 
 #undef BINARY_OP
 
+// fmod (sign of dividend, matches C / Rust `%`): a − b·trunc(a/b). mc::remainder
+// is Python-style (sign of divisor), so compute trunc explicitly.
+int rlx_mlx_op_fmod(rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out) {
+    return guarded([&] {
+        auto x = unwrap(a);
+        auto y = unwrap(b);
+        auto q = mc::divide(x, y);
+        auto tq = mc::where(mc::greater_equal(q, mc::array(0.0f, q.dtype())),
+                            mc::floor(q), mc::ceil(q));
+        *out = wrap(mc::subtract(x, mc::multiply(y, tq)));
+    });
+}
+
+// Bitwise on integer-valued operands: cast f→i32, op, cast back to input dtype.
+#define BITWISE_OP(name, mlx_fn)                                                 \
+    int rlx_mlx_op_##name(                                                      \
+        rlx_mlx_array_t* a, rlx_mlx_array_t* b, rlx_mlx_array_t** out)          \
+    {                                                                            \
+        return guarded([&] {                                                    \
+            auto x = unwrap(a);                                                 \
+            auto y = unwrap(b);                                                 \
+            auto r = mc::mlx_fn(mc::astype(x, mc::int32), mc::astype(y, mc::int32)); \
+            *out = wrap(mc::astype(r, x.dtype()));                             \
+        });                                                                      \
+    }
+BITWISE_OP(bitand, bitwise_and)
+BITWISE_OP(bitor,  bitwise_or)
+BITWISE_OP(bitxor, bitwise_xor)
+BITWISE_OP(shl,    left_shift)
+BITWISE_OP(shr,    right_shift)
+#undef BITWISE_OP
+
 // ── Linalg: dense solve ───────────────────────────────────────────
 // Wraps mc::linalg::solve, which accepts:
 //   • rank-2 A [n, n] · rank-1 b [n]      → rank-1 x [n]      (DenseSolve)
@@ -713,6 +745,8 @@ int rlx_mlx_op_layernorm(
 BINARY_OP(max, maximum)
 BINARY_OP(min, minimum)
 BINARY_OP(pow, power)
+// atan2(a, b) — quadrant-aware arctangent, numpy `arctan2(a, b)` == Rust `a.atan2(b)`.
+BINARY_OP(atan2, arctan2)
 
 BINARY_OP(eq, equal)
 BINARY_OP(ne, not_equal)
@@ -762,6 +796,41 @@ int rlx_mlx_op_unary(
                 case RLX_MLX_UN_TAN:     return mc::tan(x);
                 case RLX_MLX_UN_ATAN:    return mc::arctan(x);
                 case RLX_MLX_UN_RECIPROCAL: return mc::reciprocal(x);
+                case RLX_MLX_UN_FLOOR:   return mc::floor(x);
+                case RLX_MLX_UN_CEIL:    return mc::ceil(x);
+                case RLX_MLX_UN_SIGN:    return mc::sign(x);
+                // softplus(x) = log(1 + eˣ), stable via logaddexp(x, 0).
+                case RLX_MLX_UN_SOFTPLUS:
+                    return mc::logaddexp(x, mc::array(0.0f, x.dtype()));
+                // elu(x) = x>0 ? x : eˣ-1.
+                case RLX_MLX_UN_ELU:
+                    return mc::where(mc::greater(x, mc::array(0.0f, x.dtype())),
+                                     x,
+                                     mc::subtract(mc::exp(x), mc::array(1.0f, x.dtype())));
+                // hardswish(x) = x·clamp(x+3,0,6)/6.
+                case RLX_MLX_UN_HARDSWISH:
+                    return mc::divide(
+                        mc::multiply(x, mc::clip(mc::add(x, mc::array(3.0f, x.dtype())),
+                                                 mc::array(0.0f, x.dtype()),
+                                                 mc::array(6.0f, x.dtype()))),
+                        mc::array(6.0f, x.dtype()));
+                // hardsigmoid(x) = clamp(x/6+0.5,0,1).
+                case RLX_MLX_UN_HARDSIGMOID:
+                    return mc::clip(mc::add(mc::divide(x, mc::array(6.0f, x.dtype())),
+                                            mc::array(0.5f, x.dtype())),
+                                    mc::array(0.0f, x.dtype()), mc::array(1.0f, x.dtype()));
+                // mish(x) = x·tanh(softplus(x)), softplus = logaddexp(x, 0).
+                case RLX_MLX_UN_MISH:
+                    return mc::multiply(
+                        x, mc::tanh(mc::logaddexp(x, mc::array(0.0f, x.dtype()))));
+                // softsign(x) = x/(1+|x|).
+                case RLX_MLX_UN_SOFTSIGN:
+                    return mc::divide(
+                        x, mc::add(mc::array(1.0f, x.dtype()), mc::abs(x)));
+                // logsigmoid(x) = −softplus(−x).
+                case RLX_MLX_UN_LOGSIGMOID:
+                    return mc::negative(
+                        mc::logaddexp(mc::negative(x), mc::array(0.0f, x.dtype())));
             }
             throw std::runtime_error("invalid unary kind");
         }();
@@ -891,6 +960,30 @@ int rlx_mlx_op_cumsum(
         // mlx's cumsum has `inclusive` (the inverse of rlx's `exclusive`).
         bool inclusive = (exclusive == 0);
         *out = wrap(mc::cumsum(unwrap(a), axis, /*reverse=*/false, inclusive));
+    });
+}
+
+int rlx_mlx_op_cumprod(
+    rlx_mlx_array_t* a,
+    int axis,
+    int exclusive,
+    rlx_mlx_array_t** out)
+{
+    return guarded([&] {
+        bool inclusive = (exclusive == 0);
+        *out = wrap(mc::cumprod(unwrap(a), axis, /*reverse=*/false, inclusive));
+    });
+}
+
+int rlx_mlx_op_cummax(
+    rlx_mlx_array_t* a,
+    int axis,
+    int exclusive,
+    rlx_mlx_array_t** out)
+{
+    return guarded([&] {
+        bool inclusive = (exclusive == 0);
+        *out = wrap(mc::cummax(unwrap(a), axis, /*reverse=*/false, inclusive));
     });
 }
 

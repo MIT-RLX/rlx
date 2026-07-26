@@ -346,6 +346,32 @@ fn jvp_rule(
                         .into_iter()
                         .reduce(|a, b| bwd.binary(BinaryOp::Add, a, b, out_shape.clone()))
                 }
+                // atan2(a, b): t_y = (b·t_a − a·t_b) / (a² + b²).
+                BinaryOp::Atan2 => {
+                    let a2 = bwd.binary(BinaryOp::Mul, a_p, a_p, out_shape.clone());
+                    let b2 = bwd.binary(BinaryOp::Mul, b_p, b_p, out_shape.clone());
+                    let denom = bwd.binary(BinaryOp::Add, a2, b2, out_shape.clone());
+                    let mut terms = Vec::new();
+                    if let Some(t_a) = t_inputs[0] {
+                        terms.push(bwd.binary(BinaryOp::Mul, b_p, t_a, out_shape.clone()));
+                    }
+                    if let Some(t_b) = t_inputs[1] {
+                        let at = bwd.binary(BinaryOp::Mul, a_p, t_b, out_shape.clone());
+                        terms.push(bwd.activation(Activation::Neg, at, out_shape.clone()));
+                    }
+                    terms
+                        .into_iter()
+                        .reduce(|x, y| bwd.binary(BinaryOp::Add, x, y, out_shape.clone()))
+                        .map(|num| bwd.binary(BinaryOp::Div, num, denom, out_shape.clone()))
+                }
+                // fmod: ∂/∂a = 1, ∂/∂b treated as 0 → tangent is `t_a`.
+                BinaryOp::Mod => t_inputs[0],
+                // Bitwise ops are non-differentiable → zero tangent.
+                BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr => None,
             }
         }
 
@@ -475,6 +501,26 @@ fn jvp_rule(
                     let x_sig_om = bwd.binary(BinaryOp::Mul, x, sig_om, s.clone());
                     bwd.binary(BinaryOp::Add, sig, x_sig_om, s.clone())
                 }
+                // Piecewise-constant: zero tangent.
+                Activation::Floor | Activation::Ceil | Activation::Sign => return None,
+                // softplus'(x) = sigmoid(x).
+                Activation::Softplus => bwd.activation(Activation::Sigmoid, x, s.clone()),
+                // ELU'(x) = min(eˣ, 1).
+                Activation::Elu => {
+                    let ex = bwd.activation(Activation::Exp, x, s.clone());
+                    let one = scalar_const(1.0, &s, bwd);
+                    bwd.binary(BinaryOp::Min, ex, one, s.clone())
+                }
+                // Erf/HardSwish/HardSigmoid/Mish/Softsign/LogSigmoid: reuse the
+                // reverse-mode derivative builder (primitive subgraph).
+                Activation::Erf
+                | Activation::HardSwish
+                | Activation::HardSigmoid
+                | Activation::Mish
+                | Activation::Softsign
+                | Activation::LogSigmoid => {
+                    crate::activation_deriv::activation_deriv_wrt_x(bwd, *kind, x, None, &s)
+                }
             };
             // Default chain rule path: t_y = deriv · t_x.
             Some(bwd.binary(BinaryOp::Mul, deriv, t_x, node.shape.clone()))
@@ -594,6 +640,92 @@ fn jvp_rule(
                     axis: *axis,
                     start: *start,
                     len: *len,
+                },
+                vec![t_x],
+                node.shape.clone(),
+            ))
+        }
+
+        // Clamp: tangent passes where min<x<max else 0.
+        Op::Clamp { min, max } => {
+            let t_x = t_inputs[0]?;
+            let x = fwd_map[&node.inputs[0]];
+            let s = node.shape.clone();
+            let dtype = s.dtype();
+            let lo = bwd.full(&[1], *min, dtype);
+            let hi = bwd.full(&[1], *max, dtype);
+            let xm = bwd.sub(x, lo);
+            let s1 = bwd.activation(Activation::Sign, xm, s.clone());
+            let g1 = bwd.activation(Activation::Relu, s1, s.clone());
+            let hx = bwd.sub(hi, x);
+            let s2 = bwd.activation(Activation::Sign, hx, s.clone());
+            let g2 = bwd.activation(Activation::Relu, s2, s.clone());
+            let ind = bwd.mul(g1, g2);
+            Some(bwd.mul(t_x, ind))
+        }
+        // Tile / Trilu are linear: apply the same op to the tangent.
+        Op::Tile { reps } => {
+            let t_x = t_inputs[0]?;
+            Some(bwd.add_node(
+                Op::Tile { reps: reps.clone() },
+                vec![t_x],
+                node.shape.clone(),
+            ))
+        }
+        Op::Trilu { upper, diagonal } => {
+            let t_x = t_inputs[0]?;
+            Some(bwd.add_node(
+                Op::Trilu {
+                    upper: *upper,
+                    diagonal: *diagonal,
+                },
+                vec![t_x],
+                node.shape.clone(),
+            ))
+        }
+
+        // Strided slice is linear: tangent slices the same way.
+        Op::Slice {
+            axis,
+            start,
+            len,
+            step,
+        } => {
+            let t_x = t_inputs[0]?;
+            Some(bwd.add_node(
+                Op::Slice {
+                    axis: *axis,
+                    start: *start,
+                    len: *len,
+                    step: *step,
+                },
+                vec![t_x],
+                node.shape.clone(),
+            ))
+        }
+
+        // Reverse is linear: tangent of a flip is the flip of the tangent.
+        Op::Reverse { axes } => {
+            let t_x = t_inputs[0]?;
+            Some(bwd.add_node(
+                Op::Reverse { axes: axes.clone() },
+                vec![t_x],
+                node.shape.clone(),
+            ))
+        }
+
+        // Pad is linear; the tangent propagates through the same pad, except a
+        // constant fill contributes zero tangent (fill → 0.0).
+        Op::Pad { pads, mode } => {
+            let t_x = t_inputs[0]?;
+            let t_mode = match mode {
+                PadMode::Constant(_) => PadMode::Constant(0.0),
+                other => *other,
+            };
+            Some(bwd.add_node(
+                Op::Pad {
+                    pads: pads.clone(),
+                    mode: t_mode,
                 },
                 vec![t_x],
                 node.shape.clone(),
@@ -812,6 +944,25 @@ fn jvp_rule(
                 vec![t_x],
                 node.shape.clone(),
             ))
+        }
+
+        // ẏ_i = y_i · cumsum(ẋ/x)_i  where y = cumprod(x). (zero-x caveat)
+        Op::CumProd { axis, exclusive } => {
+            let t_x = t_inputs[0]?;
+            let x = fwd_map[&node.inputs[0]];
+            let x_shape = bwd.node(x).shape.clone();
+            let y = bwd.cumprod(x, *axis, *exclusive, x_shape.clone());
+            let ratio = bwd.div(t_x, x);
+            let cs = bwd.cumsum(ratio, *axis, *exclusive, x_shape);
+            Some(bwd.mul(y, cs))
+        }
+
+        // ẏ_i = ẋ_{argmax(prefix i)} — route the tangent through the same
+        // tie-split maximiser weights used by the reverse rule.
+        Op::CumMax { axis, exclusive } => {
+            let t_x = t_inputs[0]?;
+            let x = fwd_map[&node.inputs[0]];
+            Some(jvp_cummax(bwd, x, t_x, *axis, *exclusive))
         }
 
         Op::Gather { axis } => {
@@ -1250,6 +1401,87 @@ fn jvp_gated_residual(
 /// (shape `[1]`) so it can participate in element-wise ops with the
 /// chain rule. Supports F32 and F64 — the dtypes the IR and CPU
 /// backend currently exercise. Other dtypes panic — add when needed.
+/// Forward-mode CumMax: `ẏ_i = Σ_j w[i,j]·ẋ_j` with `w` the normalized one-hot
+/// of the prefix maximisers (mirrors `vjp_cummax`, but reduces over keys).
+fn jvp_cummax(bwd: &mut Graph, x: NodeId, t_x: NodeId, axis: i32, exclusive: bool) -> NodeId {
+    let x_shape = bwd.node(x).shape.clone();
+    let dtype = x_shape.dtype();
+    let dims: Vec<usize> = x_shape.dims().iter().map(|d| d.unwrap_static()).collect();
+    let rank = dims.len();
+    let axis = if axis < 0 {
+        (axis + rank as i32).max(0) as usize
+    } else {
+        axis as usize
+    };
+    let len = dims[axis];
+
+    let reduce = |bwd: &mut Graph, x: NodeId, ax: usize, op: ReduceOp, keep: bool| -> NodeId {
+        let s = rlx_ir::shape::reduce_shape(&bwd.node(x).shape, &[ax], keep).unwrap();
+        bwd.reduce(x, op, vec![ax], keep, s)
+    };
+
+    // Insert a size-1 query axis at `axis`; key axis is now `axis + 1`.
+    let mut q_dims: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+    q_dims.insert(axis, 1);
+    let xq = bwd.reshape_(x, q_dims.clone());
+    let txq = bwd.reshape_(t_x, q_dims);
+
+    let mut mask = vec![0f32; len * len];
+    for i in 0..len {
+        for j in 0..len {
+            let k = if exclusive { j < i } else { j <= i };
+            mask[i * len + j] = k as u8 as f32;
+        }
+    }
+    let data: Vec<u8> = mask.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mask0 = bwd.add_node(
+        Op::Constant { data },
+        vec![],
+        Shape::new(&[len, len], DType::F32),
+    );
+    let mut bshape = vec![1i64; rank + 1];
+    bshape[axis] = len as i64;
+    bshape[axis + 1] = len as i64;
+    let keep = bwd.reshape_(mask0, bshape);
+
+    let kx = bwd.mul(keep, xq);
+    let one = bwd.full(&[1], 1.0, dtype);
+    let inv = bwd.sub(one, keep);
+    let sent = bwd.full(&[1], -3.0e38, dtype);
+    let gap = bwd.mul(inv, sent);
+    let masked = bwd.add(kx, gap);
+
+    // Expand reduced tensors to the full grid before compare/div (trailing
+    // size-1 broadcast is mishandled by `Compare`/`Div` on some backends).
+    let grid = bwd.node(masked).shape.clone();
+    let grid_i64: Vec<i64> = grid
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static() as i64)
+        .collect();
+    let expand = |bwd: &mut Graph, x: NodeId| -> NodeId {
+        bwd.add_node(
+            Op::Expand {
+                target_shape: grid_i64.clone(),
+            },
+            vec![x],
+            grid.clone(),
+        )
+    };
+
+    let ymax = reduce(bwd, masked, axis + 1, ReduceOp::Max, true);
+    let ymax_e = expand(bwd, ymax);
+    let is_max_b = bwd.eq(masked, ymax_e);
+    let is_max = bwd.cast(is_max_b, dtype);
+    let count = reduce(bwd, is_max, axis + 1, ReduceOp::Sum, true);
+    let count_e = expand(bwd, count);
+    let weight = bwd.div(is_max, count_e);
+
+    // ẏ_i = Σ_j w[i,j]·ẋ_j — weight by the (key-broadcast) tangent, sum over keys.
+    let contrib = bwd.mul(weight, txq);
+    reduce(bwd, contrib, axis + 1, ReduceOp::Sum, false)
+}
+
 fn scalar_const(value: f64, shape: &Shape, bwd: &mut Graph) -> NodeId {
     let bytes = match shape.dtype() {
         DType::F32 => (value as f32).to_le_bytes().to_vec(),

@@ -59,16 +59,24 @@ fn fused_residual_rms_norm(
     let eps = bitcast<f32>(params.eps_bits);
     let with_bias = params.has_bias != 0u;
 
-    // Pass 1: fuse residual (+ bias) into the output slot and accumulate
-    // mean(x²) for RMSNorm.
-    var sum_x2: f32 = 0.0;
+    // Pass 1a: fuse residual (+ bias) into the output slot and accumulate the mean.
+    var sum_x: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         var v = arena[in_base + i] + arena[res_base + i];
         if (with_bias) { v = v + arena[params.bias_off + i]; }
         arena[out_base + i] = v;
-        sum_x2 = sum_x2 + v * v;
+        sum_x = sum_x + v;
     }
-    let inv_rms = inverseSqrt(sum_x2 * n_inv + eps);
+    let mean = sum_x * n_inv;
+    // Pass 1b: STABLE TWO-PASS mean(x²) = mean((x − mean)²) + mean² (see the RmsNorm
+    // note in layernorm.wgsl) — a large per-row DC offset otherwise swamps the
+    // one-pass f32 Σx² and drifts vs CPU's f64, corrupting the per-row scale on wgpu.
+    var sum_sq: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+        let d = arena[out_base + i] - mean;
+        sum_sq = sum_sq + d * d;
+    }
+    let inv_rms = inverseSqrt(sum_sq * n_inv + mean * mean + eps);
 
     // Pass 2: scale by gamma and shift by beta.
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {

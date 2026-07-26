@@ -22,13 +22,19 @@ use std::collections::{HashMap, HashSet};
 
 use rlx_fusion::control_flow::{LowerControlFlow, LowerScan};
 use rlx_fusion::fusion::UnfuseElementwiseRegions;
+use rlx_fusion::lower_axial_rope2d::LowerAxialRope2d;
 use rlx_fusion::lower_backward_ops::LowerBackwardOps;
+use rlx_fusion::lower_cumulative::LowerCumulative;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
+use rlx_fusion::lower_fake_quantize::LowerFakeQuantize;
 use rlx_fusion::lower_fma::LowerFma;
 use rlx_fusion::lower_logical_kernels;
 use rlx_fusion::lower_loss_ops::LowerSoftmaxCrossEntropy;
+use rlx_fusion::lower_pad::LowerPad;
 use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
+use rlx_fusion::lower_slice::LowerSlice;
 use rlx_fusion::lower_spectral::LowerSpectral;
+use rlx_fusion::lower_structural::LowerStructural;
 use rlx_fusion::lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNearest2x};
 use rlx_fusion::pass::Pass;
 use rlx_fusion::unfuse::unfuse_fused_for_autodiff;
@@ -235,6 +241,43 @@ pub fn rewrite_for_backend_with_config(
         }
         if bad.contains(&OpKind::ResizeNearest2x) {
             graph = LowerResizeNearest2x.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::Pad) {
+            // Every backend except Metal/CUDA (which claim `OpKind::Pad`) lowers
+            // pad to full/narrow/reverse/expand/concat here.
+            graph = LowerPad.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::Slice) {
+            // Non-native backends lower strided slice to narrow/reverse/gather.
+            graph = LowerSlice.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::AxialRope2d) {
+            // Non-native backends lower SAM2 axial 2-D RoPE to a constant-table
+            // `gather` + `mul`/`add` (bit-exact vs the CPU kernel).
+            graph = LowerAxialRope2d.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::FakeQuantize) {
+            // Non-native backends lower PerBatch fake-quant to
+            // `round`/`clamp`/`mul` (one canonical `Round` → consistent ties).
+            graph = LowerFakeQuantize.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::Clamp)
+            || bad.contains(&OpKind::Tile)
+            || bad.contains(&OpKind::Trilu)
+        {
+            // Clamp/Tile/Trilu decompose to max/min, concat, mul-by-mask.
+            graph = LowerStructural.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::CumProd) || bad.contains(&OpKind::CumMax) {
+            // CumProd/CumMax decompose to a masked reduce over an inserted
+            // query axis (CPU/Metal/CUDA claim them natively).
+            graph = LowerCumulative.run(graph);
             changed = true;
         }
         if bad.contains(&OpKind::DotGeneral) {

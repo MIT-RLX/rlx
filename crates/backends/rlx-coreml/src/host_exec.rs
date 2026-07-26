@@ -74,6 +74,14 @@ pub fn is_host_op(op: &Op) -> bool {
         | Op::DotGeneral { .. }
         | Op::DenseSolve
         | Op::BatchedDenseSolve
+        // Cholesky / TriangularSolve / Det / LogDet host-stage to CPU LAPACK (no MIL arm).
+        | Op::Cholesky
+        | Op::TriangularSolve { .. }
+        | Op::Det
+        | Op::LogDet
+        // Sort / ArgSort: stable strided sort on CPU, no MIL arm.
+        | Op::Sort { .. } | Op::Svd { .. } | Op::Qr { .. }
+        | Op::ArgSort { .. }
         | Op::Im2Col { .. }
         | Op::ReluBackward
         | Op::ActivationBackward { .. }

@@ -4772,6 +4772,7 @@ name = "rlx-gpu-host"
 version = "0.2.14"
 dependencies = [
  "bytemuck",
+ "half",
  "rlx-compile",
  "rlx-cpu",
  "rlx-ir",
@@ -5062,6 +5063,7 @@ dependencies = [
  "rlx-cuda",
  "rlx-dduf",
  "rlx-driver",
+ "rlx-flow",
  "rlx-fpga",
  "rlx-fusion",
  "rlx-gguf",

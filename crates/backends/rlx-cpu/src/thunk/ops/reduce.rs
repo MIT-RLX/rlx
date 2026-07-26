@@ -234,6 +234,71 @@ pub(crate) fn compile_cumsum(
     }
 }
 
+/// Compile `Op::{CumProd, CumMax}` to a last-axis [`Thunk::CumScan`] (mirrors
+/// [`compile_cumsum`]; higher-axis scans lower via transpose upstream).
+pub(crate) fn compile_cum_scan(node: &rlx_ir::Node, arena: &crate::arena::Arena) -> Thunk {
+    let (axis, exclusive, is_max) = match &node.op {
+        Op::CumProd { axis, exclusive } => (*axis, *exclusive, false),
+        Op::CumMax { axis, exclusive } => (*axis, *exclusive, true),
+        _ => unreachable!(),
+    };
+    let rank = node.shape.rank();
+    let ax = if axis < 0 {
+        (rank as i32 + axis) as usize
+    } else {
+        axis as usize
+    };
+    assert_eq!(
+        ax,
+        rank - 1,
+        "CumProd/CumMax only support the last axis on CPU"
+    );
+    let cols = node.shape.dim(ax).unwrap_static();
+    let total = node.shape.num_elements().unwrap();
+    Thunk::CumScan {
+        src: node_offset(arena, node.inputs[0]),
+        dst: node_offset(arena, node.id),
+        rows: (total / cols) as u32,
+        cols: cols as u32,
+        exclusive,
+        is_max,
+    }
+}
+
+#[inline(always)]
+pub(crate) fn exec_cum_scan(t: &Thunk, base: *mut u8) {
+    let Thunk::CumScan {
+        src,
+        dst,
+        rows,
+        cols,
+        exclusive,
+        is_max,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (rows, cols) = (*rows as usize, *cols as usize);
+    unsafe {
+        let s = sl(*src, base, rows * cols);
+        let d = sl_mut(*dst, base, rows * cols);
+        for r in 0..rows {
+            // Identity: 1 for product, -inf for max.
+            let mut acc = if *is_max { f32::NEG_INFINITY } else { 1.0 };
+            for c in 0..cols {
+                let v = s[r * cols + c];
+                if *exclusive {
+                    d[r * cols + c] = acc;
+                    acc = if *is_max { acc.max(v) } else { acc * v };
+                } else {
+                    acc = if *is_max { acc.max(v) } else { acc * v };
+                    d[r * cols + c] = acc;
+                }
+            }
+        }
+    }
+}
+
 #[allow(unused_variables)]
 pub(crate) fn compile_top_k(
     node: &rlx_ir::Node,

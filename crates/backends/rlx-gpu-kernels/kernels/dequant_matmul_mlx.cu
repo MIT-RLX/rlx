@@ -190,11 +190,11 @@ extern "C" __global__ void dequant_matmul_mlx(
     unsigned int kind,
     unsigned int bits,
     unsigned int group_size,
-    unsigned int x_byte_off,
-    unsigned int w_byte_off,
-    unsigned int scale_byte_off,
-    unsigned int zp_byte_off,
-    unsigned int out_byte_off
+    unsigned long long x_byte_off,
+    unsigned long long w_byte_off,
+    unsigned long long scale_byte_off,
+    unsigned long long zp_byte_off,
+    unsigned long long out_byte_off
 ) {
     unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
     unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -202,10 +202,10 @@ extern "C" __global__ void dequant_matmul_mlx(
 
     unsigned int gs = group_size;
     unsigned int n_groups = k / gs;
-    unsigned int x_off = x_byte_off / 4u;
-    unsigned int out_off = out_byte_off / 4u;
-    unsigned int scale_f_off = scale_byte_off / 4u;
-    unsigned int zp_f_off = zp_byte_off / 4u;
+    unsigned long long x_off = x_byte_off / 4ull;
+    unsigned long long out_off = out_byte_off / 4ull;
+    unsigned long long scale_f_off = scale_byte_off / 4ull;
+    unsigned long long zp_f_off = zp_byte_off / 4ull;
 
     float acc = 0.0f;
     for (unsigned int p = 0u; p < k; ++p) {
@@ -251,21 +251,21 @@ extern "C" __global__ void dequant_matmul_mlx_gemv(
     unsigned int kind,
     unsigned int bits,
     unsigned int group_size,
-    unsigned int x_byte_off,
-    unsigned int w_byte_off,
-    unsigned int scale_byte_off,
-    unsigned int zp_byte_off,
-    unsigned int out_byte_off
+    unsigned long long x_byte_off,
+    unsigned long long w_byte_off,
+    unsigned long long scale_byte_off,
+    unsigned long long zp_byte_off,
+    unsigned long long out_byte_off
 ) {
     unsigned int col = blockIdx.x;
     if (col >= n) return;
 
     unsigned int gs = group_size;
     unsigned int n_groups = k / gs;
-    unsigned int x_off = x_byte_off / 4u;
-    unsigned int out_off = out_byte_off / 4u;
-    unsigned int scale_f_off = scale_byte_off / 4u;
-    unsigned int zp_f_off = zp_byte_off / 4u;
+    unsigned long long x_off = x_byte_off / 4ull;
+    unsigned long long out_off = out_byte_off / 4ull;
+    unsigned long long scale_f_off = scale_byte_off / 4ull;
+    unsigned long long zp_f_off = zp_byte_off / 4ull;
 
     float acc = 0.0f;
     for (unsigned int p = threadIdx.x; p < k; p += blockDim.x) {
@@ -324,11 +324,11 @@ extern "C" __global__ void dequant_matmul_mlx_gemm(
     unsigned int kind,
     unsigned int bits,
     unsigned int group_size,
-    unsigned int x_byte_off,
-    unsigned int w_byte_off,
-    unsigned int scale_byte_off,
-    unsigned int zp_byte_off,
-    unsigned int out_byte_off
+    unsigned long long x_byte_off,
+    unsigned long long w_byte_off,
+    unsigned long long scale_byte_off,
+    unsigned long long zp_byte_off,
+    unsigned long long out_byte_off
 ) {
     unsigned int col = blockIdx.x;
     unsigned int row0 = blockIdx.y * MLX_TM;
@@ -338,10 +338,10 @@ extern "C" __global__ void dequant_matmul_mlx_gemm(
     unsigned int tpg = blockDim.x;
     unsigned int gs = group_size;
     unsigned int n_groups = k / gs;
-    unsigned int x_off = x_byte_off / 4u;
-    unsigned int out_off = out_byte_off / 4u;
-    unsigned int scale_f_off = scale_byte_off / 4u;
-    unsigned int zp_f_off = zp_byte_off / 4u;
+    unsigned long long x_off = x_byte_off / 4ull;
+    unsigned long long out_off = out_byte_off / 4ull;
+    unsigned long long scale_f_off = scale_byte_off / 4ull;
+    unsigned long long zp_f_off = zp_byte_off / 4ull;
 
     // TM * 256 max threadgroup; stage one K-slice of X.
     __shared__ float xs[MLX_TM * 256];

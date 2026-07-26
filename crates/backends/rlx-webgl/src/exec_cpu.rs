@@ -113,6 +113,13 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                         Bin::Max => av.max(bv),
                         Bin::Min => av.min(bv),
                         Bin::Pow => av.powf(bv),
+                        Bin::Mod => av % bv,
+                        Bin::BitAnd => ((av as i64) & (bv as i64)) as f32,
+                        Bin::BitOr => ((av as i64) | (bv as i64)) as f32,
+                        Bin::BitXor => ((av as i64) ^ (bv as i64)) as f32,
+                        Bin::Shl => (av as i64).wrapping_shl(bv as u32) as f32,
+                        Bin::Shr => (av as i64).wrapping_shr(bv as u32) as f32,
+                        Bin::Atan2 => av.atan2(bv),
                     };
                 }
                 vals[*out] = o;
@@ -398,8 +405,17 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                             let d = br * br + bi * bi;
                             ((ar * br + ai * bi) / d, (ai * br - ar * bi) / d)
                         }
-                        Bin::Max | Bin::Min | Bin::Pow => {
-                            unreachable!("C64 max/min/pow rejected at lowering")
+                        Bin::Max
+                        | Bin::Min
+                        | Bin::Pow
+                        | Bin::Mod
+                        | Bin::BitAnd
+                        | Bin::BitOr
+                        | Bin::BitXor
+                        | Bin::Shl
+                        | Bin::Shr
+                        | Bin::Atan2 => {
+                            unreachable!("C64 max/min/pow/mod/bitwise rejected at lowering")
                         }
                     };
                     o[2 * k] = cr;

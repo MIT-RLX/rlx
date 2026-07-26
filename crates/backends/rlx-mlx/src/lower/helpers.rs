@@ -1519,6 +1519,17 @@ pub(crate) fn eval_elementwise_region_on_inputs(
                     Activation::Tan => ops::unary(x, MlxUnary::Tan)?,
                     Activation::Atan => ops::unary(x, MlxUnary::Atan)?,
                     Activation::Recip => ops::unary(x, MlxUnary::Reciprocal)?,
+                    Activation::Floor => ops::unary(x, MlxUnary::Floor)?,
+                    Activation::Ceil => ops::unary(x, MlxUnary::Ceil)?,
+                    Activation::Sign => ops::unary(x, MlxUnary::Sign)?,
+                    Activation::Softplus => ops::unary(x, MlxUnary::Softplus)?,
+                    Activation::Elu => ops::unary(x, MlxUnary::Elu)?,
+                    Activation::Erf => ops::unary(x, MlxUnary::Erf)?,
+                    Activation::HardSwish => ops::unary(x, MlxUnary::HardSwish)?,
+                    Activation::HardSigmoid => ops::unary(x, MlxUnary::HardSigmoid)?,
+                    Activation::Mish => ops::unary(x, MlxUnary::Mish)?,
+                    Activation::Softsign => ops::unary(x, MlxUnary::Softsign)?,
+                    Activation::LogSigmoid => ops::unary(x, MlxUnary::LogSigmoid)?,
                 }
             }
             ChainStep::Cast(to, x_op) => {
@@ -1539,6 +1550,13 @@ pub(crate) fn eval_elementwise_region_on_inputs(
                     BinaryOp::Max => ops::max(a, b)?,
                     BinaryOp::Min => ops::min(a, b)?,
                     BinaryOp::Pow => ops::pow(a, b)?,
+                    BinaryOp::Mod => ops::fmod(a, b)?,
+                    BinaryOp::BitAnd => ops::bitand(a, b)?,
+                    BinaryOp::BitOr => ops::bitor(a, b)?,
+                    BinaryOp::BitXor => ops::bitxor(a, b)?,
+                    BinaryOp::Shl => ops::shl(a, b)?,
+                    BinaryOp::Shr => ops::shr(a, b)?,
+                    BinaryOp::Atan2 => ops::atan2(a, b)?,
                 }
             }
             ChainStep::Compare(cop, l_op, r_op) => {
@@ -2843,6 +2861,10 @@ pub(crate) fn activation_backward_compose(
             let x2 = ops::mul(x, x)?;
             let neg_dy = ops::unary(dy, MlxUnary::Neg)?;
             ops::div(&neg_dy, &x2)
+        }
+        Floor | Ceil | Sign | Softplus | Elu | Erf | HardSwish | HardSigmoid | Mish | Softsign
+        | LogSigmoid => {
+            panic!("rlx-mlx: no native backward for {kind:?} (decomposed on other backends)")
         }
     }
 }

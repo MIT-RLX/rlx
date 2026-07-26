@@ -38,6 +38,18 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         DotGeneral,
         DenseSolve,
         BatchedDenseSolve,
+        // Host-staged to CPU LAPACK via `host_eval_op_typed`
+        // (`is_mlx_typed_host_op`), the same route as Eigh.
+        Cholesky,
+        TriangularSolve,
+        Det,
+        LogDet,
+        // Sort / ArgSort host-stage to CPU via `host_eval_op_typed`
+        // (`is_mlx_typed_host_op`), same route as Det / LogDet.
+        Sort,
+        Svd,
+        Qr,
+        ArgSort,
         LayerNorm,
         LayerNorm2d,
         GroupNorm,
@@ -56,6 +68,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Reduce,
         Softmax,
         Cumsum,
+        CumProd,
+        CumMax,
         ArgMax,
         ArgMin,
         TopK,

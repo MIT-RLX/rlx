@@ -20,16 +20,17 @@ use crate::kernels::{
     AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
     BinaryC64Params, BinaryParams, CastParams, ComplexCastParams, ComplexWirtingerParams,
     Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
-    CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
-    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams,
-    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
-    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupedMatmulParams, GruParams,
-    Im2Col2dParams, LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulQkvParams,
-    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
-    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams,
-    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    CopyParams, CumScanParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams,
+    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
+    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
+    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
+    GroupedMatmulParams, GruParams, Im2Col2dParams, LayerNormBwdParams, LayerNormParams,
+    Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
+    Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams,
+    RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
+    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
+    WelchPeaksGpuParams, WhereParams,
 };
 
 use super::helpers::{MatmulCompute, MatmulQkvKind};
@@ -136,6 +137,9 @@ pub(crate) enum Step {
     },
     Cumsum {
         params: CumsumParams,
+    },
+    CumScan {
+        params: CumScanParams,
     },
     /// Native multi-kernel f32 FFT (gpu-fft dispatch strategy).
     FftGpu {
@@ -1086,6 +1090,7 @@ impl Step {
             | Step::AdaLayerNormBackward { .. }
             | Step::GatedResidualBackward { .. }
             | Step::Cumsum { .. }
+            | Step::CumScan { .. }
             | Step::Copy { .. }
             | Step::Cast { .. }
             | Step::ComplexCast { .. }
@@ -1282,6 +1287,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::SoftmaxCrossEntropyBackward { .. } => "softmax_cross_entropy_backward",
         Step::LayerNorm { .. } => "layer_norm",
         Step::Cumsum { .. } => "cumsum",
+        Step::CumScan { .. } => "cum_scan",
         Step::FftGpu { .. } => "fft_gpu",
         Step::FftHost { .. } => "fft_host",
         Step::WelchPeaksHost { .. } => "welch_peaks_host",

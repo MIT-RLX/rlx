@@ -37,6 +37,13 @@ extern "C" __global__ void binary(
         case 4: c = fmaxf(a, b); break;
         case 5: c = fminf(a, b); break;
         case 6: c = powf(a, b); break;
+        case 7: c = fmodf(a, b); break;                          // mod
+        case 8: c = (float)((long long)a & (long long)b); break; // bitand
+        case 9: c = (float)((long long)a | (long long)b); break; // bitor
+        case 10: c = (float)((long long)a ^ (long long)b); break; // bitxor
+        case 11: c = (float)((long long)a << (long long)b); break; // shl
+        case 12: c = (float)((long long)a >> (long long)b); break; // shr
+        case 13: c = atan2f(a, b); break;                        // atan2
         default: c = 0.0f;
     }
     arena[c_off + i] = c;

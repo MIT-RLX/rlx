@@ -136,6 +136,35 @@ fn activation_grad_ref(kind: Activation, x: f32, dy: f32) -> f32 {
         }
         Activation::Atan => dy / (1.0 + x * x),
         Activation::Recip => -dy / (x * x),
+        Activation::Floor | Activation::Ceil | Activation::Sign => 0.0,
+        Activation::Softplus => dy / (1.0 + (-x).exp()),
+        Activation::Elu => {
+            if x > 0.0 {
+                dy
+            } else {
+                dy * x.exp()
+            }
+        }
+        Activation::Erf => dy * std::f32::consts::FRAC_2_SQRT_PI * (-x * x).exp(),
+        Activation::Softsign => dy / (1.0 + x.abs()).powi(2),
+        Activation::LogSigmoid => dy / (1.0 + x.exp()),
+        Activation::HardSigmoid => {
+            if x.abs() < 3.0 {
+                dy / 6.0
+            } else {
+                0.0
+            }
+        }
+        Activation::HardSwish => {
+            let hs = (x / 6.0 + 0.5).clamp(0.0, 1.0);
+            let hsp = if x.abs() < 3.0 { x / 6.0 } else { 0.0 };
+            dy * (hs + hsp)
+        }
+        Activation::Mish => {
+            let sp = x.max(0.0) + (-(x.abs())).exp().ln_1p();
+            let t = sp.tanh();
+            dy * (t + x * (1.0 - t * t) * (1.0 / (1.0 + (-x).exp())))
+        }
     }
 }
 

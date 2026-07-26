@@ -136,7 +136,7 @@ pub use mir::{MirModule, MirNode, MirNodeId, MirOp};
 pub use module::{GraphModule, GraphStage};
 pub use numeric_check::{BadValue, DebugMode, DebugScanner, NanReport, check_node, first_bad};
 pub use op::{
-    AdaNormKind, ChainOperand, ChainStep, Op, OpKind, RegionPrologue, RopeStyle,
+    AdaNormKind, ChainOperand, ChainStep, Op, OpKind, PadMode, RegionPrologue, RopeStyle,
     ScatterNdReduction, SpdMatFn, TransformStep,
 };
 pub use op_registry::{

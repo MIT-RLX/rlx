@@ -47,6 +47,13 @@ void main() {
             }
             break;
         }
+        case 7u: c = a - b * trunc(a / b); break;   // mod (fmod)
+        case 8u: c = float(int(a) & int(b)); break;
+        case 9u: c = float(int(a) | int(b)); break;
+        case 10u: c = float(int(a) ^ int(b)); break;
+        case 11u: c = float(int(a) << int(b)); break;
+        case 12u: c = float(int(a) >> int(b)); break;
+        case 13u: c = atan(a, b); break;            // atan2 (GLSL 2-arg atan)
         default: c = 0.0; break;
     }
     arena_store(pc.c_off + i, c);

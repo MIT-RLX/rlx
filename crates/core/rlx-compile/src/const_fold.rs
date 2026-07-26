@@ -153,6 +153,31 @@ pub(crate) fn evaluate(
                     Activation::Tan => v.tan(),
                     Activation::Atan => v.atan(),
                     Activation::Recip => 1.0 / v,
+                    Activation::Floor => v.floor(),
+                    Activation::Ceil => v.ceil(),
+                    Activation::Sign => {
+                        if v > 0.0 {
+                            1.0
+                        } else if v < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    Activation::Softplus => v.max(0.0) + (-(v.abs())).exp().ln_1p(),
+                    Activation::Elu => {
+                        if v > 0.0 {
+                            v
+                        } else {
+                            v.exp() - 1.0
+                        }
+                    }
+                    Activation::Erf => const_erf(v),
+                    Activation::HardSwish => v * (v + 3.0).clamp(0.0, 6.0) / 6.0,
+                    Activation::HardSigmoid => (v / 6.0 + 0.5).clamp(0.0, 1.0),
+                    Activation::Mish => v * (v.max(0.0) + (-(v.abs())).exp().ln_1p()).tanh(),
+                    Activation::Softsign => v / (1.0 + v.abs()),
+                    Activation::LogSigmoid => v.min(0.0) - (-(v.abs())).exp().ln_1p(),
                 };
             }
             Some(out)
@@ -172,6 +197,13 @@ pub(crate) fn evaluate(
                     BinaryOp::Max => lhs[i].max(rhs[i]),
                     BinaryOp::Min => lhs[i].min(rhs[i]),
                     BinaryOp::Pow => lhs[i].powf(rhs[i]),
+                    BinaryOp::Mod => lhs[i] % rhs[i],
+                    BinaryOp::Atan2 => lhs[i].atan2(rhs[i]),
+                    BinaryOp::BitAnd => ((lhs[i] as i64) & (rhs[i] as i64)) as f32,
+                    BinaryOp::BitOr => ((lhs[i] as i64) | (rhs[i] as i64)) as f32,
+                    BinaryOp::BitXor => ((lhs[i] as i64) ^ (rhs[i] as i64)) as f32,
+                    BinaryOp::Shl => ((lhs[i] as i64) << (rhs[i] as i64)) as f32,
+                    BinaryOp::Shr => ((lhs[i] as i64) >> (rhs[i] as i64)) as f32,
                 };
             }
             Some(out)
@@ -204,6 +236,19 @@ pub(crate) fn evaluate(
 }
 
 /// Encode an f32 buffer as raw bytes for `Op::Constant`.
+/// erf via A&S 7.1.26 (matches `rlx_cpu`'s `erf_f32` — same coefficients).
+fn const_erf(x: f32) -> f32 {
+    let s = x.signum();
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_74) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp();
+    s * y
+}
+
 fn encode_constant(data: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for &v in data {

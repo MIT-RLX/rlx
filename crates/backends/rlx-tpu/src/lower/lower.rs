@@ -513,6 +513,12 @@ impl<'a> LowerCtx<'a> {
             Op::Cumsum { axis, exclusive } => {
                 self.lower_cumsum(n.inputs[0], *axis, *exclusive, out_shape)
             }
+            Op::CumProd { axis, exclusive } => {
+                self.lower_cum_scan(n.inputs[0], *axis, *exclusive, false, out_shape)
+            }
+            Op::CumMax { axis, exclusive } => {
+                self.lower_cum_scan(n.inputs[0], *axis, *exclusive, true, out_shape)
+            }
 
             Op::Fft { inverse, norm } => self.lower_fft(n.inputs[0], *inverse, *norm, out_shape),
 
@@ -833,6 +839,14 @@ impl<'a> LowerCtx<'a> {
             // Host-segmented specialty / SPD / non-FP8 scaled / scan.
             Op::DenseSolve
             | Op::BatchedDenseSolve
+            | Op::Cholesky
+            | Op::TriangularSolve { .. }
+            | Op::Det
+            | Op::LogDet
+            | Op::Sort { .. }
+            | Op::Svd { .. }
+            | Op::Qr { .. }
+            | Op::ArgSort { .. }
             | Op::Scan { .. }
             | Op::ScanBackward { .. }
             | Op::ScanBackwardXs { .. }
@@ -1158,6 +1172,105 @@ impl<'a> LowerCtx<'a> {
             Activation::Tan => self.entry.unary("tan", x, shape),
             Activation::Atan => self.entry.unary("atan", x, shape),
             Activation::Recip => self.entry.unary("reciprocal", x, shape),
+            // Direct HLO opcodes.
+            Activation::Floor => self.entry.unary("floor", x, shape),
+            Activation::Ceil => self.entry.unary("ceil", x, shape),
+            Activation::Sign => self.entry.unary("sign", x, shape),
+            // softplus(x) = log(1 + eˣ).
+            Activation::Softplus => {
+                let one = self.const_in_dtype(elt, 1.0);
+                let one_b = self.entry.broadcast(one, &[], shape.clone());
+                let ex = self.entry.unary("exponential", x, shape.clone());
+                let one_plus = self.entry.binary("add", one_b, ex, shape.clone());
+                self.entry.unary("log", one_plus, shape)
+            }
+            // elu(x) = x>0 ? x : eˣ-1.
+            Activation::Elu => {
+                let zero = self.const_in_dtype(elt, 0.0);
+                let one = self.const_in_dtype(elt, 1.0);
+                let zero_b = self.entry.broadcast(zero, &[], shape.clone());
+                let one_b = self.entry.broadcast(one, &[], shape.clone());
+                let ex = self.entry.unary("exponential", x, shape.clone());
+                let ex_m1 = self.entry.binary("subtract", ex, one_b, shape.clone());
+                let pred = self.entry.compare(x, zero_b, "GT", shape.clone());
+                self.entry.select(pred, x, ex_m1, shape)
+            }
+            // erf(x) — direct HLO opcode.
+            Activation::Erf => self.entry.unary("erf", x, shape),
+            // softsign(x) = x/(1+|x|).
+            Activation::Softsign => {
+                let one = self.const_in_dtype(elt, 1.0);
+                let one_b = self.entry.broadcast(one, &[], shape.clone());
+                let ax = self.entry.unary("abs", x, shape.clone());
+                let d = self.entry.binary("add", one_b, ax, shape.clone());
+                self.entry.binary("divide", x, d, shape)
+            }
+            // logsigmoid(x) = min(x,0) − log(1+e^(−|x|)).
+            Activation::LogSigmoid => {
+                let zero = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 0.0), &[], shape.clone());
+                let one = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 1.0), &[], shape.clone());
+                let ax = self.entry.unary("abs", x, shape.clone());
+                let nax = self.entry.unary("negate", ax, shape.clone());
+                let e = self.entry.unary("exponential", nax, shape.clone());
+                let onep = self.entry.binary("add", one, e, shape.clone());
+                let l = self.entry.unary("log", onep, shape.clone());
+                let minx = self.entry.binary("minimum", x, zero, shape.clone());
+                self.entry.binary("subtract", minx, l, shape)
+            }
+            // hardsigmoid(x) = min(max(x/6+0.5, 0), 1).
+            Activation::HardSigmoid => {
+                let sixth =
+                    self.entry
+                        .broadcast(self.const_in_dtype(elt, 1.0 / 6.0), &[], shape.clone());
+                let half = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 0.5), &[], shape.clone());
+                let zero = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 0.0), &[], shape.clone());
+                let one = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 1.0), &[], shape.clone());
+                let s = self.entry.binary("multiply", x, sixth, shape.clone());
+                let a = self.entry.binary("add", s, half, shape.clone());
+                let mx = self.entry.binary("maximum", a, zero, shape.clone());
+                self.entry.binary("minimum", mx, one, shape)
+            }
+            // hardswish(x) = x·min(max(x+3,0),6)/6.
+            Activation::HardSwish => {
+                let three = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 3.0), &[], shape.clone());
+                let zero = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 0.0), &[], shape.clone());
+                let six = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 6.0), &[], shape.clone());
+                let sixth =
+                    self.entry
+                        .broadcast(self.const_in_dtype(elt, 1.0 / 6.0), &[], shape.clone());
+                let xp3 = self.entry.binary("add", x, three, shape.clone());
+                let mx = self.entry.binary("maximum", xp3, zero, shape.clone());
+                let c = self.entry.binary("minimum", mx, six, shape.clone());
+                let xc = self.entry.binary("multiply", x, c, shape.clone());
+                self.entry.binary("multiply", xc, sixth, shape)
+            }
+            // mish(x) = x·tanh(log(1+eˣ)).
+            Activation::Mish => {
+                let one = self
+                    .entry
+                    .broadcast(self.const_in_dtype(elt, 1.0), &[], shape.clone());
+                let e = self.entry.unary("exponential", x, shape.clone());
+                let onep = self.entry.binary("add", one, e, shape.clone());
+                let sp = self.entry.unary("log", onep, shape.clone());
+                let t = self.entry.unary("tanh", sp, shape.clone());
+                self.entry.binary("multiply", x, t, shape)
+            }
         }
     }
 
@@ -1178,6 +1291,13 @@ impl<'a> LowerCtx<'a> {
             BinaryOp::Max => "maximum",
             BinaryOp::Min => "minimum",
             BinaryOp::Pow => "power",
+            BinaryOp::Mod => "remainder",
+            BinaryOp::BitAnd => "and",
+            BinaryOp::BitOr => "or",
+            BinaryOp::BitXor => "xor",
+            BinaryOp::Shl => "shift-left",
+            BinaryOp::Shr => "shift-right-logical",
+            BinaryOp::Atan2 => "atan2",
         };
         let (a, b) = self.broadcast_pair_to(a, b, a_id, b_id, &out.dimensions);
         self.entry.binary(opcode, a, b, out)
@@ -1254,6 +1374,13 @@ impl<'a> LowerCtx<'a> {
                         BinaryOp::Max => "maximum",
                         BinaryOp::Min => "minimum",
                         BinaryOp::Pow => "power",
+                        BinaryOp::Mod => "remainder",
+                        BinaryOp::BitAnd => "and",
+                        BinaryOp::BitOr => "or",
+                        BinaryOp::BitXor => "xor",
+                        BinaryOp::Shl => "shift-left",
+                        BinaryOp::Shr => "shift-right-logical",
+                        BinaryOp::Atan2 => "atan2",
                     };
                     self.entry.binary(opcode, a, b, out_shape.clone())
                 }
@@ -2520,6 +2647,86 @@ impl<'a> LowerCtx<'a> {
             let padded =
                 self.entry
                     .pad(scanned, zero, pad_cfg, Shape::array(prim_ty, &padded_dims));
+            let mut starts = vec![0i64; dims.len()];
+            let mut limits = padded_dims.clone();
+            let strides = vec![1i64; dims.len()];
+            starts[ax as usize] = 0;
+            limits[ax as usize] = dims[ax as usize];
+            self.entry.slice(padded, &starts, &limits, &strides, out)
+        } else {
+            scanned
+        }
+    }
+
+    // ── CumProd / CumMax ───────────────────────────────────────
+    //
+    // Same `reduce-window` prefix-scan as [`lower_cumsum`], parametric on the
+    // reducer (`multiply` / `maximum`) and its identity so the exclusive shift
+    // pads with the right value.
+    pub(crate) fn lower_cum_scan(
+        &mut self,
+        x_id: NodeId,
+        axis: i32,
+        exclusive: bool,
+        is_max: bool,
+        out: Shape,
+    ) -> i64 {
+        let x = self.hlo(x_id);
+        let dims = self.ir_shape_dims(x_id);
+        let prim_ty = prim_of(self.dtype(x_id));
+        let rank = dims.len() as i32;
+        let ax = if axis < 0 {
+            (rank + axis) as i64
+        } else {
+            axis as i64
+        };
+
+        let (red_name, ident) = if is_max {
+            ("maximum", f32::NEG_INFINITY)
+        } else {
+            ("multiply", 1.0_f32)
+        };
+        let init = self.const_in_dtype(prim_ty, ident);
+        let red = self.reducer(red_name, prim_ty);
+
+        let mut window_dims = vec![
+            WindowDim {
+                size: 1,
+                stride: 1,
+                padding_low: 0,
+                padding_high: 0,
+                window_dilation: 1,
+                base_dilation: 1,
+                window_reversal: false,
+            };
+            dims.len()
+        ];
+        window_dims[ax as usize] = WindowDim {
+            size: dims[ax as usize],
+            stride: 1,
+            padding_low: dims[ax as usize] - 1,
+            padding_high: 0,
+            window_dilation: 1,
+            base_dilation: 1,
+            window_reversal: false,
+        };
+        let window = Window {
+            dimensions: window_dims,
+        };
+        let scanned = self.entry.reduce_window(x, init, &red, window, out.clone());
+        if exclusive {
+            // Shift-right-by-one along axis, padding with the reducer identity.
+            let pad_val = self.const_in_dtype(prim_ty, ident);
+            let mut pad_cfg = vec![(0i64, 0i64, 0i64); dims.len()];
+            pad_cfg[ax as usize] = (1, 0, 0);
+            let mut padded_dims = dims.clone();
+            padded_dims[ax as usize] += 1;
+            let padded = self.entry.pad(
+                scanned,
+                pad_val,
+                pad_cfg,
+                Shape::array(prim_ty, &padded_dims),
+            );
             let mut starts = vec![0i64; dims.len()];
             let mut limits = padded_dims.clone();
             let strides = vec![1i64; dims.len()];

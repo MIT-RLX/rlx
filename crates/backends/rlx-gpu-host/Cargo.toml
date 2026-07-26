@@ -22,6 +22,7 @@ rlx-mlx-io = { path = "../../io/rlx-mlx-io", version = "0.2.14" }
 # SPD host-fallback builds a one-op CPU graph and plans its arena.
 rlx-compile = { path = "../../core/rlx-compile", version = "0.2.14" }
 bytemuck = { version = "1", features = ["derive"] }
+half = "2"
 
 [lints]
 workspace = true

@@ -148,6 +148,15 @@ pub(crate) fn is_mlx_typed_host_op(op: &Op) -> bool {
         | Op::EighBackward
         | Op::EighBatch
         | Op::EighBatchBackward
+        // Cholesky / TriangularSolve / Det / LogDet host-stage to CPU LAPACK
+        // (potrf / trsm / getrf); no native MLX-GPU primitive, same as Eigh.
+        | Op::Cholesky
+        | Op::TriangularSolve { .. }
+        | Op::Det
+        | Op::LogDet
+        // Sort / ArgSort: stable strided sort on CPU, no native MLX primitive.
+        | Op::Sort { .. } | Op::Svd { .. } | Op::Qr { .. }
+        | Op::ArgSort { .. }
         | Op::Interpolate3d { .. } => true,
         _ => false,
     }

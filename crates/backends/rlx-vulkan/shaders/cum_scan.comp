@@ -1,0 +1,32 @@
+#version 450
+// Cumulative product / maximum along the last axis (cols). One invocation per
+// row. is_max=1 ⇒ running max (identity -inf) else running product (identity 1).
+// exclusive=1 ⇒ out[j] = scan_{i<j} in[i]; else inclusive.
+layout(local_size_x = 64) in;
+
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint in_off;
+    uint out_off;
+    uint exclusive;
+    uint is_max;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.rows) { return; }
+    uint base = row * pc.cols;
+    float acc = (pc.is_max != 0u) ? (-3.402823466e+38) : 1.0;
+    for (uint j = 0u; j < pc.cols; j++) {
+        float v = arena_load(pc.in_off + base + j);
+        if (pc.exclusive != 0u) {
+            arena_store(pc.out_off + base + j, acc);
+            acc = (pc.is_max != 0u) ? max(acc, v) : (acc * v);
+        } else {
+            acc = (pc.is_max != 0u) ? max(acc, v) : (acc * v);
+            arena_store(pc.out_off + base + j, acc);
+        }
+    }
+}

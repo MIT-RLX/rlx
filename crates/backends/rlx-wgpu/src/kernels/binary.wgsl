@@ -45,6 +45,13 @@ fn binary(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
         case 4u: { c = max(a, b); }
         case 5u: { c = min(a, b); }
         case 6u: { c = pow(a, b); }
+        case 7u: { c = a - b * trunc(a / b); }      // mod (fmod)
+        case 8u: { c = f32(i32(a) & i32(b)); }
+        case 9u: { c = f32(i32(a) | i32(b)); }
+        case 10u: { c = f32(i32(a) ^ i32(b)); }
+        case 11u: { c = f32(i32(a) << u32(b)); }
+        case 12u: { c = f32(i32(a) >> u32(b)); }
+        case 13u: { c = atan2(a, b); }              // atan2 (quadrant-aware)
         default: { c = 0.0; }
     }
     arena[params.c_off + i] = c;

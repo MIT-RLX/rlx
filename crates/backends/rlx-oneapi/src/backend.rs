@@ -63,6 +63,16 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // oneMKL LAPACK linked (same HostOpDesc contract as wgpu / Vulkan).
         DenseSolve,
         BatchedDenseSolve,
+        // Host via rlx-cpu LAPACK (potrf / trsm / getrf) on the mapped arena,
+        // same HostOpDesc contract as DenseSolve. No device oneMKL LAPACK linked.
+        Cholesky,
+        TriangularSolve,
+        Det,
+        LogDet,
+        // Sort / ArgSort host-stage to CPU (stable strided sort) on the
+        // mapped arena, same HostOpDesc contract as Det / LogDet.
+        Sort,
+        ArgSort,
         Reduce,
         Softmax, // contraction / reduction
         LayerNorm,
@@ -139,6 +149,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Expand,
         Gather,
         Cumsum,
+        CumProd, // host-eval (CPU thunk), same path as Cumsum
+        CumMax,
         Reverse, // shape / indexing
         ArgMax,
         ArgMin,
@@ -381,6 +393,17 @@ fn activation_bwd_op_id(a: Activation) -> u32 {
         Activation::Tan => 15,
         Activation::Atan => 16,
         Activation::Recip => 17,
+        Activation::Floor => 18,
+        Activation::Ceil => 19,
+        Activation::Sign => 20,
+        Activation::Softplus => 21,
+        Activation::Elu => 22,
+        Activation::Erf => 23,
+        Activation::HardSwish => 24,
+        Activation::HardSigmoid => 25,
+        Activation::Mish => 26,
+        Activation::Softsign => 27,
+        Activation::LogSigmoid => 28,
     }
 }
 
@@ -946,7 +969,18 @@ impl OneApiExecutable {
             // rlx-cpu LAPACK; LogMel has no OpenCL twin. No device oneMKL LAPACK.
             if matches!(
                 node.op,
-                Op::DenseSolve | Op::BatchedDenseSolve | Op::LogMel | Op::LogMelBackward
+                Op::DenseSolve
+                    | Op::BatchedDenseSolve
+                    | Op::Cholesky
+                    | Op::TriangularSolve { .. }
+                    | Op::Det
+                    | Op::LogDet
+                    | Op::Sort { .. }
+                    | Op::Svd { .. }
+                    | Op::Qr { .. }
+                    | Op::ArgSort { .. }
+                    | Op::LogMel
+                    | Op::LogMelBackward
             ) {
                 let desc = rlx_cpu::thunk::host_op_desc_from_node(&self.graph, node, |id| {
                     arena.byte_offset(id)
@@ -2609,6 +2643,17 @@ fn act_id(a: Activation) -> u32 {
         Activation::Atan => 15,
         Activation::Round => 16,
         Activation::Recip => 17,
+        Activation::Floor => 18,
+        Activation::Ceil => 19,
+        Activation::Sign => 20,
+        Activation::Softplus => 21,
+        Activation::Elu => 22,
+        Activation::Erf => 23,
+        Activation::HardSwish => 24,
+        Activation::HardSigmoid => 25,
+        Activation::Mish => 26,
+        Activation::Softsign => 27,
+        Activation::LogSigmoid => 28,
     }
 }
 
@@ -2622,6 +2667,13 @@ fn binop_id(op: rlx_ir::op::BinaryOp) -> u32 {
         Max => 4,
         Min => 5,
         Pow => 6,
+        Mod => 7,
+        BitAnd => 8,
+        BitOr => 9,
+        BitXor => 10,
+        Shl => 11,
+        Shr => 12,
+        Atan2 => 13,
     }
 }
 

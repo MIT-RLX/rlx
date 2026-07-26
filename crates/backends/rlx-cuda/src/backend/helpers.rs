@@ -1881,6 +1881,13 @@ pub(crate) fn binary_op_id(op: BinaryOp) -> u32 {
         BinaryOp::Max => 4,
         BinaryOp::Min => 5,
         BinaryOp::Pow => 6,
+        BinaryOp::Mod => 7,
+        BinaryOp::BitAnd => 8,
+        BinaryOp::BitOr => 9,
+        BinaryOp::BitXor => 10,
+        BinaryOp::Shl => 11,
+        BinaryOp::Shr => 12,
+        BinaryOp::Atan2 => 13,
     }
 }
 
@@ -1963,6 +1970,17 @@ pub(crate) fn activation_op_id(act: Activation) -> u32 {
         Activation::Tan => 15,
         Activation::Atan => 16,
         Activation::Recip => 17,
+        Activation::Floor => 18,
+        Activation::Ceil => 19,
+        Activation::Sign => 20,
+        Activation::Softplus => 21,
+        Activation::Elu => 22,
+        Activation::Erf => 23,
+        Activation::HardSwish => 24,
+        Activation::HardSigmoid => 25,
+        Activation::Mish => 26,
+        Activation::Softsign => 27,
+        Activation::LogSigmoid => 28,
     }
 }
 

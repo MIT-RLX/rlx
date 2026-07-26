@@ -149,5 +149,70 @@ pub fn activation_deriv_wrt_x(
             g.binary(BinaryOp::Add, sig, x_sig_om, shape.clone())
         }
         Activation::Round => scalar_const(0.0, shape, g),
+        // Piecewise-constant: zero (sub)gradient.
+        Activation::Floor | Activation::Ceil | Activation::Sign => scalar_const(0.0, shape, g),
+        // softplus'(x) = sigmoid(x).
+        Activation::Softplus => g.activation(Activation::Sigmoid, x, shape.clone()),
+        // ELU'(x) = 1 (x>0) else eˣ  ==  min(eˣ, 1).
+        Activation::Elu => {
+            let ex = g.activation(Activation::Exp, x, shape.clone());
+            let one = scalar_const(1.0, shape, g);
+            g.add_node(Op::Binary(BinaryOp::Min), vec![ex, one], shape.clone())
+        }
+        // erf'(x) = (2/√π)·e^(−x²).
+        Activation::Erf => {
+            let x2 = g.binary(BinaryOp::Mul, x, x, shape.clone());
+            let neg = g.activation(Activation::Neg, x2, shape.clone());
+            let e = g.activation(Activation::Exp, neg, shape.clone());
+            let c = scalar_const(std::f64::consts::FRAC_2_SQRT_PI, shape, g); // 2/√π
+            g.binary(BinaryOp::Mul, e, c, shape.clone())
+        }
+        // softsign'(x) = 1/(1+|x|)².
+        Activation::Softsign => {
+            let ax = g.activation(Activation::Abs, x, shape.clone());
+            let one = scalar_const(1.0, shape, g);
+            let denom = g.binary(BinaryOp::Add, one, ax, shape.clone());
+            let denom2 = g.binary(BinaryOp::Mul, denom, denom, shape.clone());
+            let num = scalar_const(1.0, shape, g);
+            g.binary(BinaryOp::Div, num, denom2, shape.clone())
+        }
+        // logsigmoid'(x) = σ(−x).
+        Activation::LogSigmoid => {
+            let nx = g.activation(Activation::Neg, x, shape.clone());
+            g.activation(Activation::Sigmoid, nx, shape.clone())
+        }
+        // hardsigmoid'(x) = 1/6 on |x|<3 else 0 == relu(sign(3−|x|))/6 (no Compare).
+        Activation::HardSigmoid => hard_sigmoid_deriv(g, x, shape),
+        // hardswish'(x) = hardsigmoid(x) + x·hardsigmoid'(x).
+        Activation::HardSwish => {
+            let hs = g.activation(Activation::HardSigmoid, x, shape.clone());
+            let hsp = hard_sigmoid_deriv(g, x, shape);
+            let x_hsp = g.binary(BinaryOp::Mul, x, hsp, shape.clone());
+            g.binary(BinaryOp::Add, hs, x_hsp, shape.clone())
+        }
+        // mish'(x) = tanh(sp) + x·(1−tanh²(sp))·σ(x),  sp = softplus(x).
+        Activation::Mish => {
+            let sp = g.activation(Activation::Softplus, x, shape.clone());
+            let t = g.activation(Activation::Tanh, sp, shape.clone());
+            let t2 = g.binary(BinaryOp::Mul, t, t, shape.clone());
+            let one = scalar_const(1.0, shape, g);
+            let sech2 = g.binary(BinaryOp::Sub, one, t2, shape.clone());
+            let sig = g.activation(Activation::Sigmoid, x, shape.clone());
+            let a = g.binary(BinaryOp::Mul, x, sech2, shape.clone());
+            let b = g.binary(BinaryOp::Mul, a, sig, shape.clone());
+            g.binary(BinaryOp::Add, t, b, shape.clone())
+        }
     }
+}
+
+/// `hardsigmoid'(x) = 1/6` on `|x|<3` else 0, built as `relu(sign(3−|x|))/6`
+/// to avoid `Compare`/`Where` bool paths (per the module convention).
+fn hard_sigmoid_deriv(g: &mut Graph, x: NodeId, shape: &Shape) -> NodeId {
+    let ax = g.activation(Activation::Abs, x, shape.clone());
+    let three = scalar_const(3.0, shape, g);
+    let d = g.binary(BinaryOp::Sub, three, ax, shape.clone());
+    let s = g.activation(Activation::Sign, d, shape.clone());
+    let ind = g.activation(Activation::Relu, s, shape.clone());
+    let sixth = scalar_const(1.0 / 6.0, shape, g);
+    g.binary(BinaryOp::Mul, ind, sixth, shape.clone())
 }

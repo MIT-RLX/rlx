@@ -80,7 +80,14 @@ void main() {
     float a = texelFetch(A, p, 0).r;
     float b = texelFetch(B, p, 0).r;
     float r = uOp == 0 ? a + b : uOp == 1 ? a - b : uOp == 2 ? a * b : uOp == 3 ? a / b
-            : uOp == 4 ? max(a, b) : uOp == 5 ? min(a, b) : pow(a, b);
+            : uOp == 4 ? max(a, b) : uOp == 5 ? min(a, b) : uOp == 6 ? pow(a, b)
+            : uOp == 7 ? a - b * trunc(a / b)
+            : uOp == 8 ? float(int(a) & int(b))
+            : uOp == 9 ? float(int(a) | int(b))
+            : uOp == 10 ? float(int(a) ^ int(b))
+            : uOp == 11 ? float(int(a) << int(b))
+            : uOp == 12 ? float(int(a) >> int(b))
+            : atan(a, b);
     o = vec4(r, 0.0, 0.0, 1.0);
 }"#;
 
@@ -312,6 +319,13 @@ fn bin_code(b: Bin) -> i32 {
         Bin::Max => 4,
         Bin::Min => 5,
         Bin::Pow => 6,
+        Bin::Mod => 7,
+        Bin::BitAnd => 8,
+        Bin::BitOr => 9,
+        Bin::BitXor => 10,
+        Bin::Shl => 11,
+        Bin::Shr => 12,
+        Bin::Atan2 => 13,
     }
 }
 

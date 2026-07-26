@@ -4789,6 +4789,31 @@ fn activation_backward_matches_numerical_per_kind() {
                 Activation::Tan => x.tan(),
                 Activation::Atan => x.atan(),
                 Activation::Recip => 1.0 / x,
+                Activation::Floor => x.floor(),
+                Activation::Ceil => x.ceil(),
+                Activation::Sign => {
+                    if x > 0.0 {
+                        1.0
+                    } else if x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                }
+                Activation::Softplus => x.max(0.0) + (-(x.abs())).exp().ln_1p(),
+                Activation::Elu => {
+                    if x > 0.0 {
+                        x
+                    } else {
+                        x.exp() - 1.0
+                    }
+                }
+                Activation::Erf => erf_f32(x),
+                Activation::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) / 6.0,
+                Activation::HardSigmoid => (x / 6.0 + 0.5).clamp(0.0, 1.0),
+                Activation::Mish => x * (x.max(0.0) + (-(x.abs())).exp().ln_1p()).tanh(),
+                Activation::Softsign => x / (1.0 + x.abs()),
+                Activation::LogSigmoid => x.min(0.0) - (-(x.abs())).exp().ln_1p(),
             }
         };
         for i in 0..len {

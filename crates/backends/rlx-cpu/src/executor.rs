@@ -1084,6 +1084,138 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                 }
             }
 
+            // ── Cholesky: L·Lᵀ = A (F32 via LAPACK dpotrf) ──────────
+            // Mirrors `thunk::ops::linalg::exec_cholesky`: promote f32→f64
+            // for dpotrf robustness (lower=true), then cast the row-major
+            // lower-triangular L back to f32 (strict upper zeroed).
+            Op::Cholesky => {
+                let a_shape = &graph.node(node.inputs[0]).shape;
+                let n = a_shape.dim(0).unwrap_static();
+                let a = get_data(arena, external, node.inputs[0]);
+                let l = get_output(arena, node_id);
+                let mut buf: Vec<f64> = a.iter().map(|&v| v as f64).collect();
+                let info = crate::blas::dpotrf(&mut buf, n, true);
+                assert_eq!(
+                    info, 0,
+                    "Cholesky: matrix not SPD (dpotrf info={info}, n={n})"
+                );
+                for i in 0..n * n {
+                    l[i] = buf[i] as f32;
+                }
+            }
+
+            // ── TriangularSolve: op(A)·X = B (F32 via BLAS dtrsm) ────
+            // Mirrors `thunk::ops::linalg::exec_triangular_solve`.
+            Op::TriangularSolve { lower, transpose } => {
+                let a_shape = &graph.node(node.inputs[0]).shape;
+                let n = a_shape.dim(0).unwrap_static();
+                let b_elems = node.shape.num_elements().unwrap();
+                let nrhs = b_elems / n.max(1);
+                let a = get_data(arena, external, node.inputs[0]);
+                let b = get_data(arena, external, node.inputs[1]);
+                let x = get_output(arena, node_id);
+                let a64: Vec<f64> = a.iter().map(|&v| v as f64).collect();
+                let mut x64: Vec<f64> = b.iter().map(|&v| v as f64).collect();
+                crate::blas::dtrsm_lower_or_upper(&a64, &mut x64, n, nrhs, *lower, *transpose);
+                for i in 0..n * nrhs {
+                    x[i] = x64[i] as f32;
+                }
+            }
+
+            // ── Det / LogDet: scalar via LAPACK LU (F32 promoted) ───
+            // Mirrors `thunk::ops::linalg::exec_det`: promote f32→f64,
+            // LU-factor, then write the (signed) determinant for `Det`
+            // or log|det| for `LogDet` into the length-1 output.
+            Op::Det | Op::LogDet => {
+                let log_abs = matches!(node.op, Op::LogDet);
+                let a_shape = &graph.node(node.inputs[0]).shape;
+                let n = a_shape.dim(0).unwrap_static();
+                let a = get_data(arena, external, node.inputs[0]);
+                let out = get_output(arena, node_id);
+                let mut a64: Vec<f64> = a.iter().map(|&v| v as f64).collect();
+                let (logabs, _sign, det) = crate::blas::lu_slogdet(&mut a64, n);
+                out[0] = if log_abs { logabs as f32 } else { det as f32 };
+            }
+
+            // ── Sort / ArgSort: reorder along `axis` (F32) ──────────
+            // Mirrors `thunk::ops::linalg::exec_sort`: view the input as
+            // `outer × axis_dim × inner`, stable-sort each strided slice,
+            // then write sorted values (`Sort`) or the f32 permutation
+            // indices (`ArgSort`) into the same-shape output.
+            Op::Svd { part } => {
+                let a_shape = &graph.node(node.inputs[0]).shape;
+                let m = a_shape.dim(0).unwrap_static();
+                let n = a_shape.dim(1).unwrap_static();
+                let k = m.min(n);
+                let input = get_data(arena, external, node.inputs[0]);
+                let out = get_output(arena, node_id);
+                let mut a64: Vec<f64> = input.iter().map(|&v| v as f64).collect();
+                let mut s = vec![0f64; k];
+                let mut u = vec![0f64; m * k];
+                let mut vt = vec![0f64; k * n];
+                crate::blas::dgesdd_thin(&mut a64, m, n, &mut s, &mut u, &mut vt);
+                let src: &[f64] = match part {
+                    rlx_ir::op::SvdPart::U => &u,
+                    rlx_ir::op::SvdPart::S => &s,
+                    rlx_ir::op::SvdPart::Vt => &vt,
+                };
+                for (i, v) in src.iter().enumerate() {
+                    out[i] = *v as f32;
+                }
+            }
+            Op::Qr { part } => {
+                let a_shape = &graph.node(node.inputs[0]).shape;
+                let m = a_shape.dim(0).unwrap_static();
+                let n = a_shape.dim(1).unwrap_static();
+                let k = m.min(n);
+                let input = get_data(arena, external, node.inputs[0]);
+                let out = get_output(arena, node_id);
+                let a64: Vec<f64> = input.iter().map(|&v| v as f64).collect();
+                let mut q = vec![0f64; m * k];
+                let mut r = vec![0f64; k * n];
+                crate::blas::qr_thin(&a64, m, n, &mut q, &mut r);
+                let src: &[f64] = match part {
+                    rlx_ir::op::QrPart::Q => &q,
+                    rlx_ir::op::QrPart::R => &r,
+                };
+                for (i, v) in src.iter().enumerate() {
+                    out[i] = *v as f32;
+                }
+            }
+            Op::Sort { axis, descending } | Op::ArgSort { axis, descending } => {
+                let arg = matches!(node.op, Op::ArgSort { .. });
+                let descending = *descending;
+                let axis = *axis;
+                let in_shape = &graph.node(node.inputs[0]).shape;
+                let dims: Vec<usize> = (0..in_shape.rank())
+                    .map(|d| in_shape.dim(d).unwrap_static())
+                    .collect();
+                let axis_dim = dims[axis];
+                let outer: usize = dims[..axis].iter().product();
+                let inner: usize = dims[axis + 1..].iter().product();
+                let input = get_data(arena, external, node.inputs[0]);
+                let out = get_output(arena, node_id);
+                for o in 0..outer {
+                    for i in 0..inner {
+                        let base_off = o * axis_dim * inner + i;
+                        let mut perm: Vec<usize> = (0..axis_dim).collect();
+                        perm.sort_by(|&a, &b| {
+                            let va = input[base_off + a * inner];
+                            let vb = input[base_off + b * inner];
+                            let ord = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                            if descending { ord.reverse() } else { ord }
+                        });
+                        for (k, &r) in perm.iter().enumerate() {
+                            out[base_off + k * inner] = if arg {
+                                r as f32
+                            } else {
+                                input[base_off + r * inner]
+                            };
+                        }
+                    }
+                }
+            }
+
             // ── Passthrough for unimplemented ops ───────────────────
             _ => {
                 if !node.inputs.is_empty() && arena.has_buffer(node_id) {
@@ -1179,6 +1311,13 @@ fn binary_op(op: rlx_ir::op::BinaryOp, a: f32, b: f32) -> f32 {
         Max => a.max(b),
         Min => a.min(b),
         Pow => a.powf(b),
+        Mod => a % b,
+        Atan2 => a.atan2(b),
+        BitAnd => ((a as i64) & (b as i64)) as f32,
+        BitOr => ((a as i64) | (b as i64)) as f32,
+        BitXor => ((a as i64) ^ (b as i64)) as f32,
+        Shl => (a as i64).wrapping_shl(b as u32) as f32,
+        Shr => (a as i64).wrapping_shr(b as u32) as f32,
     }
 }
 

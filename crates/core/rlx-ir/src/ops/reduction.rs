@@ -42,6 +42,16 @@ impl Graph {
         self.push(Op::Cumsum { axis, exclusive }, vec![input], shape, None)
     }
 
+    /// Cumulative product along an axis (output shape == input shape).
+    pub fn cumprod(&mut self, input: NodeId, axis: i32, exclusive: bool, shape: Shape) -> NodeId {
+        self.push(Op::CumProd { axis, exclusive }, vec![input], shape, None)
+    }
+
+    /// Cumulative maximum along an axis (output shape == input shape).
+    pub fn cummax(&mut self, input: NodeId, axis: i32, exclusive: bool, shape: Shape) -> NodeId {
+        self.push(Op::CumMax { axis, exclusive }, vec![input], shape, None)
+    }
+
     /// Index of the max along `axis` (f32-encoded indices).
     pub fn argmax(&mut self, input: NodeId, axis: usize, keep_dim: bool, shape: Shape) -> NodeId {
         self.push(Op::ArgMax { axis, keep_dim }, vec![input], shape, None)

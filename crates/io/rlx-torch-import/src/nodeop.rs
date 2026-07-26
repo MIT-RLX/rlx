@@ -51,6 +51,13 @@ fn binop_variant(op: BinaryOp) -> &'static str {
         BinaryOp::Max => "Max",
         BinaryOp::Min => "Min",
         BinaryOp::Pow => "Pow",
+        BinaryOp::Mod => "Mod",
+        BinaryOp::BitAnd => "BitAnd",
+        BinaryOp::BitOr => "BitOr",
+        BinaryOp::BitXor => "BitXor",
+        BinaryOp::Shl => "Shl",
+        BinaryOp::Shr => "Shr",
+        BinaryOp::Atan2 => "Atan2",
     }
 }
 

@@ -22,6 +22,13 @@ __kernel void binary(__global float* arena,
         case 4u: r = fmax(a, b); break;   // Max
         case 5u: r = fmin(a, b); break;   // Min
         case 6u: r = pow(a, b); break;    // Pow
+        case 7u: r = fmod(a, b); break;                      // Mod
+        case 8u: r = (float)((int)a & (int)b); break;        // BitAnd
+        case 9u: r = (float)((int)a | (int)b); break;        // BitOr
+        case 10u: r = (float)((int)a ^ (int)b); break;       // BitXor
+        case 11u: r = (float)((int)a << (int)b); break;      // Shl
+        case 12u: r = (float)((int)a >> (int)b); break;      // Shr
+        case 13u: r = atan2(a, b); break;                    // Atan2
         default: r = a + b; break;
     }
     arena[off_out + gid] = r;

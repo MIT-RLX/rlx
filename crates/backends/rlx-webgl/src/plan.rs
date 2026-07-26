@@ -37,6 +37,13 @@ pub enum Bin {
     Max,
     Min,
     Pow,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Atan2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -750,7 +757,16 @@ fn lower(graph: &Graph) -> Result<Plan> {
                         BinaryOp::Sub => Bin::Sub,
                         BinaryOp::Mul => Bin::Mul,
                         BinaryOp::Div => Bin::Div,
-                        BinaryOp::Max | BinaryOp::Min | BinaryOp::Pow => {
+                        BinaryOp::Max
+                        | BinaryOp::Min
+                        | BinaryOp::Pow
+                        | BinaryOp::Mod
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::Shr
+                        | BinaryOp::Atan2 => {
                             return Err(WebglError(format!(
                                 "C64 Binary {bop:?} is undefined for complex \
                                  (only Add/Sub/Mul/Div); matches rlx-cpu rejection"
@@ -788,6 +804,13 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     BinaryOp::Max => Bin::Max,
                     BinaryOp::Min => Bin::Min,
                     BinaryOp::Pow => Bin::Pow,
+                    BinaryOp::Mod => Bin::Mod,
+                    BinaryOp::BitAnd => Bin::BitAnd,
+                    BinaryOp::BitOr => Bin::BitOr,
+                    BinaryOp::BitXor => Bin::BitXor,
+                    BinaryOp::Shl => Bin::Shl,
+                    BinaryOp::Shr => Bin::Shr,
+                    BinaryOp::Atan2 => Bin::Atan2,
                 };
                 let (ad, bd) = (input_dims(0)?, input_dims(1)?);
                 let a = b.expand_to(input_slot(0)?, &ad, &dims);

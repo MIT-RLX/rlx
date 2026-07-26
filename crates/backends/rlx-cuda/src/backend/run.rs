@@ -32,8 +32,8 @@ use crate::kernels::{
     concat_kernel, conjugate_c64_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
     conv_transpose3d_kernel, conv1d_kernel, conv2d_backward_input_kernel,
     conv2d_backward_weight_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel,
-    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_gemm_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cum_scan_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_gemm_kernel,
     dequant_matmul_mlx_gemv_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
     dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
     fake_quantize_backward_kernel, fake_quantize_ema_kernel, fake_quantize_fixed_kernel,
@@ -46,11 +46,11 @@ use crate::kernels::{
     group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
     layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel,
-    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel,
+    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel,
     pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
     reduce_kernel, relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
     rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel,
+    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, slice_kernel,
     softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     unary_kernel, where_kernel,
@@ -2298,6 +2298,40 @@ impl CudaExecutable {
                             .expect("rlx-cuda: cumsum launch failed");
                     }
                 }
+                Step::CumScan {
+                    outer,
+                    inner,
+                    in_off,
+                    out_off,
+                    exclusive,
+                    is_max,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = cum_scan_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(outer_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&outer_s)
+                        .arg(inner)
+                        .arg(in_off)
+                        .arg(out_off)
+                        .arg(exclusive)
+                        .arg(is_max);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: cum_scan launch failed");
+                    }
+                }
                 Step::TopK {
                     outer,
                     inner,
@@ -3176,6 +3210,122 @@ impl CudaExecutable {
                         rev_mask,
                         *elem_bytes as usize,
                     );
+                }
+                Step::PadHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    in_dims,
+                    before,
+                    after,
+                    mode,
+                    fill,
+                    elem_bytes,
+                } => {
+                    crate::host_misc::run_pad(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        in_dims,
+                        before,
+                        after,
+                        *mode,
+                        fill,
+                        *elem_bytes as usize,
+                    );
+                }
+                Step::Pad {
+                    n,
+                    src_off,
+                    dst_off,
+                    mode,
+                    fill,
+                    rank,
+                    meta_idx,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = pad_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(src_off)
+                        .arg(dst_off)
+                        .arg(mode)
+                        .arg(fill)
+                        .arg(rank)
+                        .arg(&self.meta_buffers[*meta_idx]);
+                    unsafe {
+                        launcher.launch(cfg).expect("rlx-cuda: pad launch failed");
+                    }
+                }
+                Step::SliceHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    in_dims,
+                    axis,
+                    start,
+                    len,
+                    step,
+                    elem_bytes,
+                } => {
+                    crate::host_misc::run_slice(
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        in_dims,
+                        *axis as usize,
+                        *start as usize,
+                        *len as usize,
+                        *step,
+                        *elem_bytes as usize,
+                    );
+                }
+                Step::Slice {
+                    n,
+                    src_off,
+                    dst_off,
+                    axis,
+                    start,
+                    step,
+                    rank,
+                    meta_idx,
+                } => {
+                    let n_s = scale(*n);
+                    if n_s == 0 {
+                        continue;
+                    }
+                    let kernel = slice_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(n_s, 256);
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(&n_s)
+                        .arg(src_off)
+                        .arg(dst_off)
+                        .arg(axis)
+                        .arg(start)
+                        .arg(step)
+                        .arg(rank)
+                        .arg(&self.meta_buffers[*meta_idx]);
+                    unsafe {
+                        launcher.launch(cfg).expect("rlx-cuda: slice launch failed");
+                    }
                 }
                 Step::ArgReduceHost {
                     src_byte_off,

@@ -407,6 +407,65 @@ pub fn narrow_shape(input: &Shape, axis: usize, len: usize) -> Result<Shape, Str
     Ok(input.clone().with_dim(axis, Dim::Static(len)))
 }
 
+/// Tile: axis `i` grows by factor `reps[i]` (aligned to the input rank).
+pub fn tile_shape(input: &Shape, reps: &[usize]) -> Result<Shape, String> {
+    if reps.len() != input.rank() {
+        return Err(format!(
+            "tile: reps length {} != rank {}",
+            reps.len(),
+            input.rank()
+        ));
+    }
+    let mut out = input.clone();
+    for (axis, &r) in reps.iter().enumerate() {
+        if r == 1 {
+            continue;
+        }
+        match input.dims[axis] {
+            Dim::Static(n) => out = out.with_dim(axis, Dim::Static(n * r)),
+            Dim::Dynamic(_) => return Err(format!("tile: cannot tile dynamic axis {axis}")),
+        }
+    }
+    Ok(out)
+}
+
+/// Strided slice: output axis `axis` has length `len` (the number of strided
+/// reads); all other axes unchanged.
+pub fn slice_shape(input: &Shape, axis: usize, len: usize) -> Result<Shape, String> {
+    if axis >= input.rank() {
+        return Err(format!("slice: axis {axis} >= rank {}", input.rank()));
+    }
+    Ok(input.clone().with_dim(axis, Dim::Static(len)))
+}
+
+/// Pad: each axis `i` grows by `pads[i][0] + pads[i][1]`. `pads` is aligned to
+/// the input rank. Padding a dynamic axis is rejected (the padded extent isn't
+/// statically known).
+pub fn pad_shape(input: &Shape, pads: &[[usize; 2]]) -> Result<Shape, String> {
+    if pads.len() != input.rank() {
+        return Err(format!(
+            "pad: pads length {} != rank {}",
+            pads.len(),
+            input.rank()
+        ));
+    }
+    let mut out = input.clone();
+    for (axis, &[before, after]) in pads.iter().enumerate() {
+        if before == 0 && after == 0 {
+            continue;
+        }
+        match input.dims[axis] {
+            Dim::Static(n) => out = out.with_dim(axis, Dim::Static(n + before + after)),
+            Dim::Dynamic(_) => {
+                return Err(format!(
+                    "pad: cannot pad dynamic axis {axis} by ({before},{after})"
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Concat along axis.
 pub fn concat_shape(inputs: &[&Shape], axis: usize) -> Result<Shape, String> {
     if inputs.is_empty() {

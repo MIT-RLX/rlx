@@ -103,6 +103,62 @@ pub enum Thunk {
         n: u32,
         nrhs: u32,
     },
+    /// Cholesky factorization `A = L·Lᵀ`. `a` input `[n,n]`, `l` output `[n,n]`
+    /// lower-triangular (upper zeroed). f32 arena; promoted to f64 for LAPACK
+    /// `dpotrf`.
+    CholeskyF32 {
+        a: usize,
+        l: usize,
+        n: u32,
+    },
+    /// Triangular solve `op(A)·X = B` (f32 arena; promoted to f64 for BLAS
+    /// `trsm`). `a` `[n,n]`, `b`/`x` `[n,nrhs]`.
+    TriangularSolveF32 {
+        a: usize,
+        b: usize,
+        x: usize,
+        n: u32,
+        nrhs: u32,
+        lower: bool,
+        transpose: bool,
+    },
+    /// Determinant (`log_abs=false`) or `log|det|` (`log_abs=true`) of `a`
+    /// `[n,n]` → scalar `out`. f32 arena; promoted to f64 for LAPACK LU.
+    DetF32 {
+        a: usize,
+        out: usize,
+        n: u32,
+        log_abs: bool,
+    },
+    /// Sort (`arg=false`, output values) or argsort (`arg=true`, output f32
+    /// indices) along an axis, viewed as `outer × axis_dim × inner`.
+    SortF32 {
+        src: usize,
+        dst: usize,
+        outer: u32,
+        axis_dim: u32,
+        inner: u32,
+        descending: bool,
+        arg: bool,
+    },
+    /// One factor of the thin SVD of `a` `[m,n]`. `part`: 0=U `[m,k]`, 1=S `[k]`,
+    /// 2=Vt `[k,n]` (`k=min(m,n)`). f32 arena; promoted to f64 for LAPACK `gesdd`.
+    SvdF32 {
+        a: usize,
+        out: usize,
+        m: u32,
+        n: u32,
+        part: u8,
+    },
+    /// One factor of the thin QR of `a` `[m,n]`. `part`: 0=Q `[m,k]`, 1=R `[k,n]`
+    /// (`k=min(m,n)`). f32 arena; promoted to f64 for LAPACK `geqrf`/`orgqr`.
+    QrF32 {
+        a: usize,
+        out: usize,
+        m: u32,
+        n: u32,
+        part: u8,
+    },
     /// Batched f64 dense solve. `a`, `b`, `x` are byte-offsets to
     /// the leading slice; `batch` is the number of independent
     /// systems. Per slice the kernel calls `dgesv(A_i, b_i, n, nrhs)`
@@ -1016,6 +1072,17 @@ pub enum Thunk {
         /// ragged offsets, e.g. MOSS-TTS's `cumsum(attention_mask)-1` RoPE positions
         /// must NOT go through the f32 path, which reads the i64 buffer as garbage).
         dtype: rlx_ir::DType,
+    },
+    /// Inclusive (or exclusive) cumulative product / maximum along the last
+    /// axis (f32). `is_max` selects max over product. Mirrors [`Thunk::Cumsum`]'s
+    /// row/col flattening; the reference O(L) scan behind `Op::{CumProd, CumMax}`.
+    CumScan {
+        src: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        exclusive: bool,
+        is_max: bool,
     },
     /// Mamba-style selective scan (plan #15).
     /// Inputs: x, delta \[b,s,h\], a \[h,n\], b \[b,s,n\], c \[b,s,n\].
@@ -2673,6 +2740,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::GatedResidualBackward { x, y, gate, dy, .. } => vec![*x, *y, *gate, *dy],
         Thunk::Softmax { data, .. } => vec![*data],
         Thunk::Cumsum { src, .. } => vec![*src],
+        Thunk::CumScan { src, .. } => vec![*src],
         Thunk::Sample { logits, .. } => vec![*logits],
         Thunk::RngNormal { .. } | Thunk::RngUniform { .. } => vec![],
         Thunk::LoraMatMul { x, w, a, b, .. } => vec![*x, *w, *a, *b],

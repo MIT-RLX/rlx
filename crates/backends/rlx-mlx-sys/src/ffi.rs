@@ -65,6 +65,16 @@ pub enum MlxUnary {
     Tan = 13,
     Atan = 14,
     Reciprocal = 15,
+    Floor = 16,
+    Ceil = 17,
+    Sign = 18,
+    Softplus = 19,
+    Elu = 20,
+    HardSwish = 21,
+    HardSigmoid = 22,
+    Mish = 23,
+    Softsign = 24,
+    LogSigmoid = 25,
 }
 
 // Mirror rlx_mlx_reduce_t.
@@ -180,6 +190,41 @@ unsafe extern "C" {
         out: *mut *mut mlx_array_t,
     ) -> c_int;
     pub fn rlx_mlx_op_add(
+        a: *mut mlx_array_t,
+        b: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_op_fmod(
+        a: *mut mlx_array_t,
+        b: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_op_bitand(
+        a: *mut mlx_array_t,
+        b: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_op_bitor(
+        a: *mut mlx_array_t,
+        b: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_op_bitxor(
+        a: *mut mlx_array_t,
+        b: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_op_shl(
+        a: *mut mlx_array_t,
+        b: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_op_shr(
+        a: *mut mlx_array_t,
+        b: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+    pub fn rlx_mlx_op_atan2(
         a: *mut mlx_array_t,
         b: *mut mlx_array_t,
         out: *mut *mut mlx_array_t,
@@ -334,6 +379,20 @@ unsafe extern "C" {
     ) -> c_int;
 
     pub fn rlx_mlx_op_cumsum(
+        a: *mut mlx_array_t,
+        axis: c_int,
+        exclusive: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+
+    pub fn rlx_mlx_op_cumprod(
+        a: *mut mlx_array_t,
+        axis: c_int,
+        exclusive: c_int,
+        out: *mut *mut mlx_array_t,
+    ) -> c_int;
+
+    pub fn rlx_mlx_op_cummax(
         a: *mut mlx_array_t,
         axis: c_int,
         exclusive: c_int,

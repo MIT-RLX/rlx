@@ -69,6 +69,7 @@ pub const CUMSUM_BWD_WGSL: &str = include_str!("cumsum_backward.wgsl");
 pub const ROPE_BWD_WGSL: &str = include_str!("rope_backward.wgsl");
 pub const GATHER_BWD_WGSL: &str = include_str!("gather_backward.wgsl");
 pub const CUMSUM_WGSL: &str = include_str!("cumsum.wgsl");
+pub const CUM_SCAN_WGSL: &str = include_str!("cum_scan.wgsl");
 pub const FFT_GPU_WGSL: &str = include_str!("fft_gpu.wgsl");
 /// native-gpu-fft: 32 KB on-chip radix-2/4/8 kernels (n<=4096) in a separate
 /// module — only instantiated on devices with >=32 KB workgroup storage.
@@ -591,6 +592,20 @@ pub struct CumsumParams {
     pub _p0: u32,
     pub _p1: u32,
     pub _p2: u32,
+}
+
+/// Layout for cum_scan (cumprod / cummax). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct CumScanParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub exclusive: u32,
+    pub is_max: u32,
+    pub _p0: u32,
+    pub _p1: u32,
 }
 
 /// Layout for FFT. 32 bytes. Matches `fft.wgsl::Params`.
@@ -2147,6 +2162,7 @@ static ROPE_BWD: OnceLock<Kernel> = OnceLock::new();
 static GATHER_BWD_ZERO: OnceLock<Kernel> = OnceLock::new();
 static GATHER_BWD_ACC: OnceLock<Kernel> = OnceLock::new();
 static CUMSUM: OnceLock<Kernel> = OnceLock::new();
+static CUM_SCAN: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_RADIX2: OnceLock<Kernel> = OnceLock::new();
 #[cfg(feature = "native-gpu-fft")]
 static FFT_GPU_RADIX2_BIG: OnceLock<Kernel> = OnceLock::new();
@@ -2818,6 +2834,9 @@ pub fn gather_backward_acc_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn cumsum_kernel(device: &wgpu::Device) -> &'static Kernel {
     CUMSUM.get_or_init(|| build_kernel(device, "rlx-wgpu cumsum", CUMSUM_WGSL, "cumsum"))
+}
+pub fn cum_scan_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CUM_SCAN.get_or_init(|| build_kernel(device, "rlx-wgpu cum_scan", CUM_SCAN_WGSL, "cum_scan"))
 }
 pub fn fft_gpu_radix2_full_kernel(device: &wgpu::Device) -> &'static Kernel {
     FFT_GPU_RADIX2.get_or_init(|| {

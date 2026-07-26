@@ -1896,6 +1896,24 @@ impl CudaExecutable {
                         exclusive: if *exclusive { 1 } else { 0 },
                     });
                 }
+                Op::CumProd { axis: _, exclusive } | Op::CumMax { axis: _, exclusive } => {
+                    let in_id = node.inputs[0];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let outer = in_dims[..in_dims.len() - 1]
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .product::<u32>()
+                        .max(1);
+                    schedule.push(Step::CumScan {
+                        outer,
+                        inner,
+                        in_off: (arena.offset(in_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        exclusive: if *exclusive { 1 } else { 0 },
+                        is_max: matches!(node.op, Op::CumMax { .. }) as u32,
+                    });
+                }
                 Op::TopK { k } => {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
@@ -2287,6 +2305,126 @@ impl CudaExecutable {
                         elem_bytes: in_shape.dtype().size_bytes() as u32,
                     });
                 }
+                Op::Pad { pads, mode } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let dtype = in_shape.dtype();
+                    let in_dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    let before: Vec<u32> = (0..rank).map(|i| pads[i][0] as u32).collect();
+                    let after: Vec<u32> = (0..rank).map(|i| pads[i][1] as u32).collect();
+                    if matches!(dtype, rlx_ir::DType::F32) {
+                        // Native on-GPU f32 pad. meta = [out_dims, in_dims, before,
+                        // in_strides]; one thread per output element.
+                        let out_dims: Vec<u32> = (0..rank)
+                            .map(|i| in_dims[i] + before[i] + after[i])
+                            .collect();
+                        let mut in_strides = vec![1u32; rank];
+                        for i in (0..rank.saturating_sub(1)).rev() {
+                            in_strides[i] = in_strides[i + 1] * in_dims[i + 1];
+                        }
+                        let mut meta_data: Vec<u32> = Vec::with_capacity(4 * rank);
+                        meta_data.extend_from_slice(&out_dims);
+                        meta_data.extend_from_slice(&in_dims);
+                        meta_data.extend_from_slice(&before);
+                        meta_data.extend_from_slice(&in_strides);
+                        let meta = ctx
+                            .default_stream()
+                            .clone_htod(&meta_data)
+                            .expect("rlx-cuda: pad meta upload failed");
+                        let meta_idx = meta_buffers.len();
+                        meta_buffers.push(meta);
+                        let n: u32 = out_dims.iter().product();
+                        let fill = match mode {
+                            rlx_ir::PadMode::Constant(v) => *v,
+                            _ => 0.0,
+                        };
+                        let mode_id = match mode {
+                            rlx_ir::PadMode::Constant(_) => 0u32,
+                            rlx_ir::PadMode::Reflect => 1,
+                            rlx_ir::PadMode::Replicate => 2,
+                            rlx_ir::PadMode::Circular => 3,
+                        };
+                        schedule.push(Step::Pad {
+                            n,
+                            src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                            dst_off: (arena.offset(node.id) / 4) as u32,
+                            mode: mode_id,
+                            fill,
+                            rank: rank as u32,
+                            meta_idx,
+                        });
+                    } else {
+                        // Non-f32 (f16/int/…): host-staged fallback over the arena.
+                        let elem_bytes = dtype.size_bytes();
+                        let fill = rlx_gpu_host::pad_fill_bytes(*mode, dtype, elem_bytes);
+                        schedule.push(Step::PadHost {
+                            src_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
+                            in_dims,
+                            before,
+                            after,
+                            mode: *mode,
+                            fill,
+                            elem_bytes: elem_bytes as u32,
+                        });
+                    }
+                }
+                Op::Slice {
+                    axis,
+                    start,
+                    len,
+                    step,
+                } => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let rank = in_shape.rank();
+                    let dtype = in_shape.dtype();
+                    let in_dims: Vec<u32> = (0..rank)
+                        .map(|i| in_shape.dim(i).unwrap_static() as u32)
+                        .collect();
+                    if matches!(dtype, rlx_ir::DType::F32) {
+                        let out_dims: Vec<u32> = (0..rank)
+                            .map(|i| if i == *axis { *len as u32 } else { in_dims[i] })
+                            .collect();
+                        let mut in_strides = vec![1u32; rank];
+                        for i in (0..rank.saturating_sub(1)).rev() {
+                            in_strides[i] = in_strides[i + 1] * in_dims[i + 1];
+                        }
+                        let mut meta_data: Vec<u32> = Vec::with_capacity(2 * rank);
+                        meta_data.extend_from_slice(&out_dims);
+                        meta_data.extend_from_slice(&in_strides);
+                        let meta = ctx
+                            .default_stream()
+                            .clone_htod(&meta_data)
+                            .expect("rlx-cuda: slice meta upload failed");
+                        let meta_idx = meta_buffers.len();
+                        meta_buffers.push(meta);
+                        let n: u32 = out_dims.iter().product();
+                        schedule.push(Step::Slice {
+                            n,
+                            src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                            dst_off: (arena.offset(node.id) / 4) as u32,
+                            axis: *axis as u32,
+                            start: *start as i32,
+                            step: *step as i32,
+                            rank: rank as u32,
+                            meta_idx,
+                        });
+                    } else {
+                        schedule.push(Step::SliceHost {
+                            src_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
+                            in_dims,
+                            axis: *axis as u32,
+                            start: *start as u32,
+                            len: *len as u32,
+                            step: *step,
+                            elem_bytes: dtype.size_bytes() as u32,
+                        });
+                    }
+                }
+
                 Op::ArgMax { axis, keep_dim: _ } | Op::ArgMin { axis, keep_dim: _ } => {
                     let in_shape = &graph.node(node.inputs[0]).shape;
                     let rank = in_shape.rank();
@@ -4228,7 +4366,17 @@ impl CudaExecutable {
                 // F64 (and unsupported dtypes) use LAPACK on host; CustomFn
                 // runs the opaque body. `PartitionedConv` is expanded to
                 // Fft/MatMul in `crate::unfuse` before this match.
-                Op::DenseSolve | Op::BatchedDenseSolve | Op::CustomFn { .. } => {
+                Op::DenseSolve
+                | Op::BatchedDenseSolve
+                | Op::Cholesky
+                | Op::TriangularSolve { .. }
+                | Op::Det
+                | Op::LogDet
+                | Op::Sort { .. }
+                | Op::Svd { .. }
+                | Op::Qr { .. }
+                | Op::ArgSort { .. }
+                | Op::CustomFn { .. } => {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });

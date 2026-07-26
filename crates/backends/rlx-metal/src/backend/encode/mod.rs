@@ -250,6 +250,26 @@ impl MetalExecutable {
                 rev_mask: Vec<bool>,
                 elem_bytes: u8,
             },
+            Pad {
+                src: usize,
+                dst: usize,
+                in_dims: Vec<u32>,
+                before: Vec<u32>,
+                after: Vec<u32>,
+                mode: rlx_ir::PadMode,
+                fill: Vec<u8>,
+                elem_bytes: u8,
+            },
+            Slice {
+                src: usize,
+                dst: usize,
+                in_dims: Vec<u32>,
+                axis: u32,
+                start: u32,
+                len: u32,
+                step: i64,
+                elem_bytes: u8,
+            },
             ArgReduce {
                 src: usize,
                 dst: usize,
@@ -663,6 +683,50 @@ impl MetalExecutable {
                                 dst,
                                 &dims,
                                 &rev_mask,
+                                elem_bytes as usize,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::Pad {
+                            src,
+                            dst,
+                            in_dims,
+                            before,
+                            after,
+                            mode,
+                            fill,
+                            elem_bytes,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_pad(
+                                src,
+                                dst,
+                                &in_dims,
+                                &before,
+                                &after,
+                                mode,
+                                &fill,
+                                elem_bytes as usize,
+                                arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::Slice {
+                            src,
+                            dst,
+                            in_dims,
+                            axis,
+                            start,
+                            len,
+                            step,
+                            elem_bytes,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_slice(
+                                src,
+                                dst,
+                                &in_dims,
+                                axis as usize,
+                                start as usize,
+                                len as usize,
+                                step,
                                 elem_bytes as usize,
                                 arena_ptr,
                             );
@@ -2384,6 +2448,13 @@ impl MetalExecutable {
                             rlx_ir::op::BinaryOp::Max => 4,
                             rlx_ir::op::BinaryOp::Min => 5,
                             rlx_ir::op::BinaryOp::Pow => 6,
+                            rlx_ir::op::BinaryOp::Mod => 7,
+                            rlx_ir::op::BinaryOp::BitAnd => 8,
+                            rlx_ir::op::BinaryOp::BitOr => 9,
+                            rlx_ir::op::BinaryOp::BitXor => 10,
+                            rlx_ir::op::BinaryOp::Shl => 11,
+                            rlx_ir::op::BinaryOp::Shr => 12,
+                            rlx_ir::op::BinaryOp::Atan2 => 13,
                         };
                         // Sub/Div/Pow are non-commutative. The scalar/col/row/
                         // 1-axis fast paths swap operands when the *lhs* is the
@@ -4108,6 +4179,30 @@ impl MetalExecutable {
                         *exclusive,
                     );
                 }
+                Thunk::CumScan {
+                    src,
+                    dst,
+                    rows,
+                    cols,
+                    exclusive,
+                    is_max,
+                } => {
+                    let rows = scale(*rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    encode_cum_scan(
+                        e!(),
+                        k,
+                        &self.arena.buffer,
+                        *src,
+                        *dst,
+                        rows,
+                        *cols,
+                        *exclusive,
+                        *is_max,
+                    );
+                }
                 Thunk::FusedSwiGLU {
                     src,
                     dst,
@@ -5786,6 +5881,50 @@ impl MetalExecutable {
                         dst: *dst,
                         dims: dims.clone(),
                         rev_mask: rev_mask.clone(),
+                        elem_bytes: *elem_bytes,
+                    });
+                }
+
+                Thunk::Pad {
+                    src,
+                    dst,
+                    in_dims,
+                    before,
+                    after,
+                    mode,
+                    fill,
+                    elem_bytes,
+                } => {
+                    deferred_host.push(DeferredHostOp::Pad {
+                        src: *src,
+                        dst: *dst,
+                        in_dims: in_dims.clone(),
+                        before: before.clone(),
+                        after: after.clone(),
+                        mode: *mode,
+                        fill: fill.clone(),
+                        elem_bytes: *elem_bytes,
+                    });
+                }
+
+                Thunk::Slice {
+                    src,
+                    dst,
+                    in_dims,
+                    axis,
+                    start,
+                    len,
+                    step,
+                    elem_bytes,
+                } => {
+                    deferred_host.push(DeferredHostOp::Slice {
+                        src: *src,
+                        dst: *dst,
+                        in_dims: in_dims.clone(),
+                        axis: *axis,
+                        start: *start,
+                        len: *len,
+                        step: *step,
                         elem_bytes: *elem_bytes,
                     });
                 }

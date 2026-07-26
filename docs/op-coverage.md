@@ -50,20 +50,30 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 
 ### Coverage at a glance
 
-| Backend | Ops claimed | of 157 |
+| Backend | Ops claimed | of 173 |
 |---------|------------:|-------:|
-| CPU  | **157** | reference (full OpKind surface; fused/control expand before thunks) |
-| MLX  | **157** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
-| MTL  | **157** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
-| WGPU  | **157** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
-| CUDA  | **157** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
-| ROCm  | **157** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
-| TPU  | **154** | full OpKind surface (HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd/AxialRope/Im2Col/ConvTranspose/PerTensor-FP8 Scaled* + host for SPD / splat / FftButterfly / DenseSolve) |
-| ANE  | **157** | static inference compiler + hybrid host segments |
+| CPU  | **173** | reference (full OpKind surface; fused/control expand before thunks) |
+| MLX  | **173** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
+| MTL  | **173** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
+| WGPU  | **173** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
+| CUDA  | **173** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
+| ROCm  | **173** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
+| TPU  | **170** | full OpKind surface (HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd/AxialRope/Im2Col/ConvTranspose/PerTensor-FP8 Scaled* + host for SPD / splat / FftButterfly / DenseSolve) |
+| ANE  | **171** | static inference compiler + hybrid host segments (linalg batch host-staged; `CumProd`/`CumMax` still lag) |
 
-*(Total **157** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
+*(Total **173** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
 
-**Also at 153 (EXTRA backends, not in the 8-column matrix):** **Vulkan** and **OneAPI** — claim parity with CUDA; native SPIR-V/OpenCL for norms/fused/RNN/vision-bwd/FFT/I8 quant + host/unfuse for specialty ops.
+**Also at ~169 (EXTRA backends, not in the 8-column matrix):** **Vulkan** and **OneAPI** — claim parity with CUDA; native SPIR-V/OpenCL for norms/fused/RNN/vision-bwd/FFT/I8 quant + host/unfuse for specialty ops.
+
+> **This revision** added a linear-algebra + sort batch — `Cholesky`,
+> `TriangularSolve`, `Det`, `LogDet`, `Sort`, `ArgSort`, `Svd` (U/S/Vt), `Qr`
+> (Q/R), plus the `Atan2` [BinaryOp](#binaryop) — each forward **+ backward** and
+> **host-staged bit-exact on every matrix backend** (the "linalg = stage to CPU
+> LAPACK, not GPU kernels" pattern; backwards decompose to primitives so they run
+> everywhere for free). It also closed the last two decomposition gaps
+> (`AxialRope2d`, `FakeQuantize` — see the **Decomposition gating** note further
+> down), and shipped the MLA prefill block (`rlx-flow`, decomposes to primitives
+> — not a new `OpKind`).
 
 > **Verification note (this revision):** CPU/Metal/MLX/WGPU additions are
 > parity-tested on-device (Apple Silicon) and benched (see below). CUDA/ROCm
@@ -118,6 +128,12 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `BatchedDenseSolve` | Batched dense linear solve | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GroupedMatMul` | MoE grouped matmul (per-token expert routing) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `LoraMatMul` | Base matmul + low-rank `A·B` LoRA update (native CPU/MLX/ANE; **all backends via decomposition**) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Cholesky` | Cholesky factor `A = L·Lᵀ` (LAPACK `potrf`; **host-staged to CPU LAPACK, bit-exact on every GPU backend** — the linalg pattern). Backward ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `TriangularSolve` | Solve `op(A)·X = B` with `A` triangular (`lower`/`transpose`; BLAS `trsm`; host-staged). Backward ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Det` | Determinant via LU (`getrf`; host-staged). Backward `det·A⁻ᵀ` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `LogDet` | Log-abs determinant via LU (host-staged). Backward `A⁻ᵀ` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Svd` | Thin SVD — `part ∈ {U,S,Vt}`, one op per factor (LAPACK `gesdd`; host-staged). Backward: singular-values `S` only | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Qr` | Thin QR — `part ∈ {Q,R}`, one op per factor, `m ≥ n` (LAPACK `geqrf`+`orgqr`; host-staged). Backward: **both** factors | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Normalization
 
@@ -148,6 +164,11 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `Expand` | Broadcast-expand singleton dims | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Gather` | Gather rows/elements by index | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Reverse` | Batch-general flip along axes (`[batch,seq,…]` seq-reverse) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Slice` | Strided slice `x[start:*:step]` (neg step ok; native CUDA on-GPU f32 kernel + host fallback; MTL host-staged; others decompose to narrow/reverse/gather via `LowerSlice`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Pad` | Constant/reflect/replicate/circular pad (native CUDA on-GPU f32 kernel + host fallback; MTL host-staged; others decompose via `LowerPad`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Clamp` | Elementwise `clamp(x,min,max)` (decomposes to `max`/`min` via `LowerStructural`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Tile` | Per-axis tiling (decomposes to `concat` via `LowerStructural`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Trilu` | Upper/lower triangle mask over last 2 axes (decomposes to mul-by-mask) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterAdd` | Scatter-add into output by index | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterNd` | ONNX ScatterND (data+indices+updates, reduction) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterElements` | ONNX ScatterElements (axis + reduction) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -163,9 +184,13 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `Reduce` | Axis reduction — see [ReduceOp](#reduceop) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Softmax` | Softmax along an axis | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Cumsum` | Cumulative sum | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `CumProd` | Cumulative product — native O(L) scan on CPU/Metal/CUDA/ROCm (`cum_scan` kernel), WGPU (WGSL), MLX (`mc::cumprod`), Vulkan (SPIR-V), TPU (reduce-window ×), oneAPI (host-eval like cumsum); WebGL/ANE decompose to on-device masked reduce-prod. VJP `cumsum_backward(dy·y)/x` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `CumMax` | Cumulative maximum — native O(L) scan on the same backends (`mc::cummax`, reduce-window max); WebGL/ANE decompose to masked reduce-max. VJP routes to argmax, ties split | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ArgMax` | Index of max along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ArgMin` | Index of min along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TopK` | Top-k values/indices | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Sort` | Sort values along an axis (`descending`), stable (host-staged, bit-exact). Backward scatters `ū` back through `ArgSort` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ArgSort` | Indices that sort along an axis (f32-encoded, like `ArgMax`; host-staged). Non-differentiable | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Sample` | Categorical / logit sampling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Random number generation
@@ -348,10 +373,18 @@ on at least CPU as of this revision).*
 > decomposition arm but was **missing from that set**, so standalone LoRA
 > hard-failed on Metal/WGPU/CUDA/ROCm/TPU (it only decomposed when some other
 > fused op happened to be present). Adding it to `FUSED_KINDS` closes it on every
-> backend (verified exact vs CPU). `AxialRope2d` and `FakeQuantize` still
-> hard-fail where not native — they have **no** decomposition arm; `FakeQuantize`
-> was prototyped but the primitive chain diverged per-backend (Round-tie /
-> Expand), so it needs a native kernel or a backend round-fix, not a quick rule.
+> backend (verified exact vs CPU). `AxialRope2d` and `FakeQuantize` **now have
+> decomposition arms** (`rlx_fusion::LowerAxialRope2d` / `LowerFakeQuantize`,
+> wired into `rewrite.rs::legalize` beside `LowerPad`/`LowerSlice`), so a backend
+> that does not claim the `OpKind` lowers to primitives instead of hard-failing.
+> `AxialRope2d` becomes a constant-table `gather` + `mul`/`add` (bit-exact vs the
+> CPU kernel — one output element is a fixed linear combo of itself and its GptJ
+> partner). `FakeQuantize` becomes `abs`→`reduce_max`→scale→`div`→**`round`**→
+> `clamp`→`mul`; the single canonical `Activation::Round` (half-to-even) is what
+> fixes the earlier per-backend Round-tie/Expand divergence. Only the stateless
+> `PerBatch` scale mode decomposes; `EMA` / `Fixed` carry a state tensor and stay
+> on their native / host-staged path. Verified by `decompose_gaps_parity.rs`
+> (native-CPU vs decomposed, `max_abs = 0` on both, incl. batched + per-channel).
 
 > **`Gru` / `Rnn` / `Mamba2`** — native fused kernels on **CPU** (`execute_{gru,rnn,mamba2}_f32`), **Metal** (native MSL), **WGPU** (native WGSL), and **CUDA/ROCm** (shared `.cu`; `state_size`/`hidden` ≤ 256 with host-staged fallback). Verified by `metal_rnn_native` / `wgpu_rnn_native`. On **MLX** they run via the `unfuse` → primitives decomposition (which *is* MLX's on-GPU path). All paths match the PyTorch/ONNX / SSD reference.
 
@@ -410,7 +443,12 @@ the full set:
 
 ### BinaryOp
 
-`Op::Binary(BinaryOp)`: `Add`, `Sub`, `Mul`, `Div`, `Max`, `Min`, `Pow`.
+`Op::Binary(BinaryOp)`: `Add`, `Sub`, `Mul`, `Div`, `Max`, `Min`, `Pow`, `Mod`
+(C `fmod`), `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Atan2`. Native on all
+backends (CoreML has no MIL `atan2`). `Mod` / bitwise / shift / `Atan2` are
+region-fusion-gated. Differentiability: `Atan2` in **both** args
+(`∂/∂a = b/(a²+b²)`, `∂/∂b = −a/(a²+b²)`); `Mod` in `a` only; bitwise / shift are
+non-differentiable.
 
 ### CmpOp
 
@@ -547,4 +585,4 @@ When adding or wiring an op:
 2. Add it to each backend's `*_SUPPORTED_OPS` const in `crates/core/rlx-runtime/src/backend/` (per-backend `*_backend.rs`) as kernels land.
 3. If a backend rejects specific *variants* (e.g. MLX `ScaleMode::EMA`), keep the per-op guard in `device_ext.rs`.
 4. Refresh this table (op list, category table, the gaps section, and the "at a glance" counts).
-5. Counts to keep honest: **113 `OpKind`s total** as of this revision (added `Reverse`).
+5. Counts to keep honest: **115 `OpKind`s total** as of this revision (added `Pad`, `Slice`).

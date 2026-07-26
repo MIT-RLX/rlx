@@ -2480,6 +2480,41 @@ fn apply_activation_host(act: Activation, data: &[f32]) -> Vec<f32> {
             Activation::Tan => x.tan(),
             Activation::Atan => x.atan(),
             Activation::Recip => 1.0 / x,
+            Activation::Floor => x.floor(),
+            Activation::Ceil => x.ceil(),
+            Activation::Sign => {
+                if x > 0.0 {
+                    1.0
+                } else if x < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            }
+            Activation::Softplus => x.max(0.0) + (-(x.abs())).exp().ln_1p(),
+            Activation::Elu => {
+                if x > 0.0 {
+                    x
+                } else {
+                    x.exp() - 1.0
+                }
+            }
+            Activation::Erf => {
+                let s = x.signum();
+                let ax = x.abs();
+                let t = 1.0 / (1.0 + 0.327_591_1 * ax);
+                s * (1.0
+                    - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_74)
+                        * t
+                        + 0.254_829_6)
+                        * t)
+                        * (-ax * ax).exp())
+            }
+            Activation::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) / 6.0,
+            Activation::HardSigmoid => (x / 6.0 + 0.5).clamp(0.0, 1.0),
+            Activation::Mish => x * (x.max(0.0) + (-(x.abs())).exp().ln_1p()).tanh(),
+            Activation::Softsign => x / (1.0 + x.abs()),
+            Activation::LogSigmoid => x.min(0.0) - (-(x.abs())).exp().ln_1p(),
         })
         .collect()
 }

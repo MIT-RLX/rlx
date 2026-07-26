@@ -50,6 +50,49 @@ pub fn is_weight_elem(off: u32) -> bool {
     off & WEIGHT_ELEM_TAG != 0
 }
 
+/// Params consumed *only* by ops that run on the host (`Step::Host` reads them
+/// off the mapped weight pointer, never through the storage binding). Such a
+/// param can live past the GPU-bound prefix of the weight buffer, so the
+/// binding-1 range stays ≤ `maxStorageBufferRange` even when the full
+/// host-visible weight buffer is larger (big MoE / >4 GiB-weight checkpoints).
+///
+/// Conservative: a param is host-only only when every consumer is an MLX
+/// dequant matmul (dense `DequantMatMul{MLX}` — host-delegated by default on
+/// this backend — or `DequantGroupedMatMulMlx`). Anything read by a GPU op
+/// (gather over the embedding, RmsNorm gamma, RoPE tables, …) stays GPU-bound.
+fn host_only_params(graph: &Graph) -> std::collections::HashSet<NodeId> {
+    // `RLX_VULKAN_MLX_NATIVE` opts dense MLX matmuls back onto the SPIR-V
+    // kernel, which *does* read the weight through the storage binding.
+    let mlx_native = rlx_ir::env::flag("RLX_VULKAN_MLX_NATIVE");
+    let host_consumes = |op: &Op| match op {
+        Op::DequantGroupedMatMulMlx { .. } => true,
+        Op::DequantMatMul { scheme } => scheme.is_mlx() && !mlx_native,
+        _ => false,
+    };
+    let mut consumers: HashMap<NodeId, (usize, usize)> = HashMap::new(); // (total, host)
+    for node in graph.nodes() {
+        let host = host_consumes(&node.op);
+        for &inp in &node.inputs {
+            let e = consumers.entry(inp).or_insert((0, 0));
+            e.0 += 1;
+            if host {
+                e.1 += 1;
+            }
+        }
+    }
+    graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(&n.op, Op::Param { .. }))
+        .filter_map(|n| {
+            consumers
+                .get(&n.id)
+                .filter(|&&(total, host)| total > 0 && total == host)
+                .map(|_| n.id)
+        })
+        .collect()
+}
+
 #[inline]
 pub fn raw_elem_off(off: u32) -> u32 {
     off & !WEIGHT_ELEM_TAG
@@ -144,8 +187,14 @@ pub struct Arena {
     extra_shards: Vec<BufferMem>,
     /// Bytes per shard (0 = unsharded single buffer of [`Self::size`]).
     pub shard_size: usize,
-    /// Optional weight buffer (params); always bound at descriptor binding 1.
+    /// Optional weight buffer (params); bound at descriptor binding 1.
     weight: Option<BufferMem>,
+    /// Bytes of the weight buffer exposed through the binding-1 storage
+    /// descriptor. Params consumed only by host ops (Step::Host — e.g. the
+    /// MLX dequant matmuls, read via the mapped pointer) live *past* this
+    /// prefix, so the storage-bound range can stay ≤ `maxStorageBufferRange`
+    /// even when the full weight buffer (host-visible, mapped) is larger.
+    weight_bind_bytes: usize,
     offsets: HashMap<NodeId, usize>,
     lens: HashMap<NodeId, usize>,
     /// Per-node byte offset into the weight buffer (un-tagged).
@@ -169,7 +218,7 @@ impl Arena {
                 dev.name,
             );
         }
-        Self::from_plan_inner(dev, plan, None, max_range)
+        Self::from_plan_inner(dev, plan, None, max_range, 0)
     }
 
     /// Split params into a dedicated weight buffer. When activations still exceed
@@ -187,6 +236,16 @@ impl Arena {
         let mut weight_cursor = 0usize;
         let mut tail = new_plan.arena_size;
 
+        // Which params are consumed *only* by host ops (Step::Host reads them
+        // straight off the mapped weight pointer, never through the storage
+        // binding). Placing those past the GPU-bound prefix lets the binding-1
+        // range stay ≤ maxStorageBufferRange while the full host-visible buffer
+        // grows past it — the difference between a 0.5 GiB bound prefix and a
+        // 4.35 GiB whole-buffer bind for a big MoE checkpoint.
+        let host_only = host_only_params(graph);
+        let mut gpu_params: Vec<(NodeId, usize)> = Vec::new();
+        let mut host_params: Vec<(NodeId, usize)> = Vec::new();
+
         for node in graph.nodes() {
             if new_plan.assignments.contains_key(&node.id) {
                 continue;
@@ -202,10 +261,11 @@ impl Arena {
                 } else {
                     ne * 4
                 };
-                weight_cursor = weight_cursor.div_ceil(walign) * walign;
-                weight_offsets.insert(node.id, weight_cursor);
-                weight_lens.insert(node.id, slot_bytes);
-                weight_cursor += slot_bytes;
+                if host_only.contains(&node.id) {
+                    host_params.push((node.id, slot_bytes));
+                } else {
+                    gpu_params.push((node.id, slot_bytes));
+                }
             } else {
                 tail = tail.div_ceil(a) * a;
                 new_plan.assignments.insert(
@@ -217,6 +277,25 @@ impl Arena {
                 );
                 tail += ne * 4;
             }
+        }
+
+        // GPU-bound params first — their end (`weight_bind_bytes`) is the only
+        // region the storage descriptor must cover. Host-only params follow.
+        for (id, slot_bytes) in gpu_params {
+            weight_cursor = weight_cursor.div_ceil(walign) * walign;
+            weight_offsets.insert(id, weight_cursor);
+            weight_lens.insert(id, slot_bytes);
+            weight_cursor += slot_bytes;
+        }
+        // Prefix the storage descriptor must cover. `.max(walign)` keeps the
+        // range valid (Vulkan forbids a 0-length binding) in the degenerate
+        // all-host-only case — binding a little host param data is harmless.
+        let weight_bind_bytes = (weight_cursor.div_ceil(walign) * walign).max(walign);
+        for (id, slot_bytes) in host_params {
+            weight_cursor = weight_cursor.div_ceil(walign) * walign;
+            weight_offsets.insert(id, weight_cursor);
+            weight_lens.insert(id, slot_bytes);
+            weight_cursor += slot_bytes;
         }
 
         let aliases = rlx_compile::memory::collect_view_aliases(graph);
@@ -280,11 +359,16 @@ impl Arena {
             snap_plan_to_shards(&mut new_plan, shard_cap);
         }
 
-        if weight_cursor > max_range {
+        // Only the GPU-bound prefix must fit the storage-descriptor range; the
+        // full (host-visible, mapped) weight buffer may run larger — capped by
+        // maxMemoryAllocationSize, which is effectively unbounded on discrete
+        // NVIDIA. Host-only params past the prefix are read via the map.
+        if weight_bind_bytes > max_range {
             panic!(
-                "rlx-vulkan: weight buffer {:.2} GiB exceeds maxStorageBufferRange \
-                 {:.2} GiB ({})",
-                weight_cursor as f64 / (1u64 << 30) as f64,
+                "rlx-vulkan: GPU-bound weight prefix {:.2} GiB exceeds \
+                 maxStorageBufferRange {:.2} GiB ({}) — even after splitting \
+                 host-only params out; needs weight-buffer sharding",
+                weight_bind_bytes as f64 / (1u64 << 30) as f64,
                 max_range as f64 / (1u64 << 30) as f64,
                 dev.name,
             );
@@ -294,9 +378,10 @@ impl Arena {
             || std::env::var("RLX_VULKAN_SHARD_LOG").ok().as_deref() == Some("1");
         if debug {
             eprintln!(
-                "[rlx-vulkan split] params={} weight_buf={:.2} GiB act_arena={:.2} GiB device={}",
+                "[rlx-vulkan split] params={} weight_buf={:.2} GiB (bind {:.2} GiB) act_arena={:.2} GiB device={}",
                 weight_offsets.len(),
                 weight_cursor as f64 / (1u64 << 30) as f64,
+                weight_bind_bytes as f64 / (1u64 << 30) as f64,
                 new_plan.arena_size as f64 / (1u64 << 30) as f64,
                 dev.name,
             );
@@ -312,6 +397,7 @@ impl Arena {
             &new_plan,
             weight_buf.map(|w| (w, weight_offsets, weight_lens)),
             max_range,
+            weight_bind_bytes.min(weight_cursor.max(4)),
         )
     }
 
@@ -320,6 +406,7 @@ impl Arena {
         plan: &MemoryPlan,
         weight: Option<(BufferMem, HashMap<NodeId, usize>, HashMap<NodeId, usize>)>,
         max_range: usize,
+        weight_bind_bytes: usize,
     ) -> Self {
         let size = plan.arena_size.max(4);
         let shard_cap = (max_range / 256) * 256;
@@ -401,6 +488,7 @@ impl Arena {
             extra_shards,
             shard_size,
             weight: weight_mem,
+            weight_bind_bytes,
             offsets,
             lens,
             weight_offsets,
@@ -517,6 +605,15 @@ impl Arena {
             .as_ref()
             .map(|w| w.buffer)
             .expect("rlx-vulkan: weight buffer always present")
+    }
+
+    /// Bytes of the weight buffer to expose through the binding-1 storage
+    /// descriptor (the GPU-bound param prefix). `0` → bind the whole buffer
+    /// (`vk::WHOLE_SIZE`); non-zero keeps a host-visible weight buffer larger
+    /// than `maxStorageBufferRange` legal by binding only the GPU-read prefix.
+    #[inline]
+    pub fn weight_bind_bytes(&self) -> usize {
+        self.weight_bind_bytes
     }
 
     #[inline]

@@ -76,13 +76,23 @@ fn norm(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
             arena[out_base + i] = (arena[in_base + i] - mean) * inv_std * g + b;
         }
     } else {
-        // RmsNorm: divide by sqrt(mean(x^2) + eps), apply scale.
-        var ss: f32 = 0.0;
+        // RmsNorm: divide by sqrt(mean(x^2) + eps), apply scale. STABLE TWO-PASS:
+        // mean(x²) = mean((x − mean)²) + mean². A large per-row DC offset (pre-norm
+        // residual streams) otherwise dominates the one-pass f32 Σx² and swamps the
+        // small variations — the sum drifts vs CPU's f64, corrupting the per-row scale
+        // on wgpu only and compounding across deep stacks. Splitting the DC (mean²)
+        // from the well-conditioned deviation sum matches CPU/Metal/MLX/CoreML/CUDA.
+        var sum_x: f32 = 0.0;
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-            let v = arena[in_base + i];
-            ss = ss + v * v;
+            sum_x = sum_x + arena[in_base + i];
         }
-        let inv_rms = inverseSqrt(ss * n_inv + eps);
+        let mean = sum_x * n_inv;
+        var sum_sq: f32 = 0.0;
+        for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+            let d = arena[in_base + i] - mean;
+            sum_sq = sum_sq + d * d;
+        }
+        let inv_rms = inverseSqrt(sum_sq * n_inv + mean * mean + eps);
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
             let g = arena[params.gamma_off + i];
             arena[out_base + i] = arena[in_base + i] * inv_rms * g;

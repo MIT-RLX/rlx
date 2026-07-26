@@ -146,6 +146,70 @@ impl Graph {
         self.push(Op::DenseSolve, vec![a, b], out_shape, None)
     }
 
+    /// Cholesky factorization `A = L·Lᵀ`. `a` is `[n, n]` symmetric
+    /// positive-definite; the output is the lower-triangular `L` (same shape,
+    /// strict upper triangle zeroed).
+    pub fn cholesky(&mut self, a: NodeId, out_shape: Shape) -> NodeId {
+        self.push(Op::Cholesky, vec![a], out_shape, None)
+    }
+
+    /// Triangular solve `op(A)·X = B`. `a` is `[n, n]` triangular (lower/upper
+    /// per `lower`), `op(A)` is `Aᵀ` when `transpose`; `b`/output are `[n]` or
+    /// `[n, nrhs]`.
+    pub fn triangular_solve(
+        &mut self,
+        a: NodeId,
+        b: NodeId,
+        lower: bool,
+        transpose: bool,
+        out_shape: Shape,
+    ) -> NodeId {
+        self.push(
+            Op::TriangularSolve { lower, transpose },
+            vec![a, b],
+            out_shape,
+            None,
+        )
+    }
+
+    /// Determinant of the square matrix `a` `[n, n]` → scalar (`out_shape` `[]`).
+    pub fn det(&mut self, a: NodeId, out_shape: Shape) -> NodeId {
+        self.push(Op::Det, vec![a], out_shape, None)
+    }
+
+    /// `log|det(a)|` of the square matrix `a` `[n, n]` → scalar (`out_shape` `[]`).
+    pub fn logdet(&mut self, a: NodeId, out_shape: Shape) -> NodeId {
+        self.push(Op::LogDet, vec![a], out_shape, None)
+    }
+
+    /// Sort `x` along `axis` (`descending` = largest-first). Output same shape.
+    pub fn sort(&mut self, x: NodeId, axis: usize, descending: bool, out_shape: Shape) -> NodeId {
+        self.push(Op::Sort { axis, descending }, vec![x], out_shape, None)
+    }
+
+    /// Indices that would sort `x` along `axis` (as f32). Output same shape.
+    pub fn argsort(
+        &mut self,
+        x: NodeId,
+        axis: usize,
+        descending: bool,
+        out_shape: Shape,
+    ) -> NodeId {
+        self.push(Op::ArgSort { axis, descending }, vec![x], out_shape, None)
+    }
+
+    /// One factor of the thin SVD `a = U·diag(S)·Vᵀ` (`a` `[m,n]`,
+    /// `k=min(m,n)`). `out_shape`: `U` `[m,k]`, `S` `[k]`, `Vt` `[k,n]`.
+    pub fn svd(&mut self, a: NodeId, part: crate::op::SvdPart, out_shape: Shape) -> NodeId {
+        self.push(Op::Svd { part }, vec![a], out_shape, None)
+    }
+
+    /// One factor of the thin QR `a = Q·R` (`a` `[m,n]`, `k=min(m,n)`).
+    /// `out_shape`: `Q` `[m,k]`, `R` `[k,n]`.
+    pub fn qr(&mut self, a: NodeId, part: crate::op::QrPart, out_shape: Shape) -> NodeId {
+        self.push(Op::Qr { part }, vec![a], out_shape, None)
+    }
+
     /// Batched dense linear solve. `A` is `[B, N, N]`; `b` is
     /// `[B, N]` (single-RHS) or `[B, N, K]` (multi-RHS). Per-batch
     /// independent — each slice solved as a separate `dense_solve`.

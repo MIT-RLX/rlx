@@ -56,7 +56,20 @@ impl<'a> LowerCtx<'a> {
                 vec![("mode", bind_value(scalar_str("TANH_APPROXIMATION")))],
             )),
             // Composed below.
-            Activation::Silu | Activation::Neg | Activation::Recip => None,
+            Activation::Floor => Some(("floor", vec![])),
+            Activation::Ceil => Some(("ceil", vec![])),
+            Activation::Sign => Some(("sign", vec![])),
+            Activation::Softplus => Some(("softplus", vec![])),
+            Activation::Elu => Some(("elu", vec![("alpha", bind_value(scalar_f32(1.0)))])),
+            Activation::Erf => Some(("erf", vec![])),
+            Activation::Softsign => Some(("softsign", vec![])),
+            Activation::Silu
+            | Activation::Neg
+            | Activation::Recip
+            | Activation::HardSwish
+            | Activation::HardSigmoid
+            | Activation::Mish
+            | Activation::LogSigmoid => None,
         };
 
         if let Some((ty, mut params)) = direct {
@@ -172,7 +185,20 @@ impl<'a> LowerCtx<'a> {
                 "gelu",
                 vec![("mode", bind_value(scalar_str("TANH_APPROXIMATION")))],
             )),
-            Activation::Silu | Activation::Neg | Activation::Recip => None,
+            Activation::Floor => Some(("floor", vec![])),
+            Activation::Ceil => Some(("ceil", vec![])),
+            Activation::Sign => Some(("sign", vec![])),
+            Activation::Softplus => Some(("softplus", vec![])),
+            Activation::Elu => Some(("elu", vec![("alpha", bind_value(scalar_f32(1.0)))])),
+            Activation::Erf => Some(("erf", vec![])),
+            Activation::Softsign => Some(("softsign", vec![])),
+            Activation::Silu
+            | Activation::Neg
+            | Activation::Recip
+            | Activation::HardSwish
+            | Activation::HardSigmoid
+            | Activation::Mish
+            | Activation::LogSigmoid => None,
         };
         if let Some((ty, mut params)) = direct {
             let mut binds = vec![("x", bind_name(x))];

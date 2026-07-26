@@ -26,6 +26,13 @@ pub(super) fn binary_mil(b: BinaryOp) -> &'static str {
         BinaryOp::Max => "maximum",
         BinaryOp::Min => "minimum",
         BinaryOp::Pow => "pow",
+        BinaryOp::Mod => "mod",
+        // MIL has a unary `atan` but no binary `atan2` op — unsupported on ANE.
+        BinaryOp::Atan2 => panic!("rlx-coreml: atan2 unsupported on ANE (no MIL atan2 op)"),
+        // ANE is float-only — no integer bitwise ops in MIL.
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr => {
+            panic!("rlx-coreml: bitwise ops unsupported on ANE (integer-only)")
+        }
     }
 }
 

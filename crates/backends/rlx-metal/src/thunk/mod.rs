@@ -736,6 +736,16 @@ pub enum Thunk {
         cols: u32,
         exclusive: bool,
     },
+    /// Native cumulative product / maximum (`is_max` selects max) along the
+    /// last axis — mirrors [`Thunk::Cumsum`].
+    CumScan {
+        src: usize,
+        dst: usize,
+        rows: u32,
+        cols: u32,
+        exclusive: bool,
+        is_max: bool,
+    },
     /// Fused SwiGLU: `out[r,i] = x[r,i] * silu(x[r, n_half+i])`.
     /// Optional output cast: when `cast_to != src_dt` the kernel writes
     /// the result in `cast_to` precision; otherwise plain f32/f16 path.
@@ -1073,6 +1083,31 @@ pub enum Thunk {
         dst: usize,
         dims: Vec<u32>,
         rev_mask: Vec<bool>,
+        elem_bytes: u8,
+    },
+    /// Constant/reflect/replicate/circular pad. Output-indexed gather over the
+    /// shared arena (host fallback like [`Thunk::Reverse`]); `fill` is the
+    /// constant value pre-encoded in the output dtype.
+    Pad {
+        src: usize,
+        dst: usize,
+        in_dims: Vec<u32>,
+        before: Vec<u32>,
+        after: Vec<u32>,
+        mode: rlx_ir::PadMode,
+        fill: Vec<u8>,
+        elem_bytes: u8,
+    },
+    /// Strided slice `out[..,j,..] = in[.., start + j*step, ..]` along `axis`.
+    /// Host fallback over the shared arena (like [`Thunk::Reverse`]).
+    Slice {
+        src: usize,
+        dst: usize,
+        in_dims: Vec<u32>,
+        axis: u32,
+        start: u32,
+        len: u32,
+        step: i64,
         elem_bytes: u8,
     },
     /// ArgMax/ArgMin (f32-encoded indices). Host fallback over unified memory.
@@ -1902,6 +1937,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::SoftmaxCrossEntropyWithLogits { .. } => "softmax_cross_entropy_with_logits",
         Thunk::SoftmaxCrossEntropyBackward { .. } => "softmax_cross_entropy_backward",
         Thunk::Cumsum { .. } => "cumsum",
+        Thunk::CumScan { .. } => "cum_scan",
         Thunk::FusedSwiGLU { .. } => "fused_swiglu",
         Thunk::Concat { .. } => "concat",
         Thunk::Compare { .. } => "compare",
@@ -1948,6 +1984,8 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::SelectiveScan { .. } => "selective_scan",
         Thunk::Sample { .. } => "sample",
         Thunk::Reverse { .. } => "reverse",
+        Thunk::Pad { .. } => "pad",
+        Thunk::Slice { .. } => "slice",
         Thunk::ArgReduce { .. } => "argreduce",
         Thunk::Lstm { .. } => "lstm",
         Thunk::Gru { .. } => "gru",
@@ -1997,6 +2035,7 @@ impl Thunk {
             | Thunk::Softmax { .. }
             | Thunk::SoftmaxCrossEntropyDense { .. }
             | Thunk::Cumsum { .. }
+            | Thunk::CumScan { .. }
             | Thunk::FusedResidualLN { .. }
             | Thunk::FusedResidualRmsNorm { .. }
             | Thunk::AdaLayerNorm { .. }
@@ -2059,6 +2098,8 @@ impl Thunk {
             | Thunk::SelectiveScan { .. }
             | Thunk::Sample { .. }
             | Thunk::Reverse { .. }
+            | Thunk::Pad { .. }
+            | Thunk::Slice { .. }
             | Thunk::ArgReduce { .. }
             | Thunk::Lstm { .. }
             | Thunk::Gru { .. }
@@ -4380,6 +4421,7 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             ..
         } => vec![*logits, *labels, *d_loss],
         Thunk::Cumsum { src, .. } => vec![*src],
+        Thunk::CumScan { src, .. } => vec![*src],
         // SPD host op reads all its operand slots. Reported so the
         // Narrow→Rope read-count fusion never treats a slot an SPD op
         // consumes as unused.

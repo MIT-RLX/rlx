@@ -138,6 +138,21 @@ pub trait GraphExt {
     fn transpose_(&mut self, x: NodeId, perm: Vec<usize>) -> NodeId;
     fn narrow_(&mut self, x: NodeId, axis: usize, start: usize, len: usize) -> NodeId;
     fn concat_(&mut self, inputs: Vec<NodeId>, axis: usize) -> NodeId;
+    /// Pad each axis by `pads[i] = [before, after]` (rank-aligned) per `mode`.
+    fn pad_(&mut self, x: NodeId, pads: Vec<[usize; 2]>, mode: PadMode) -> NodeId;
+    /// Strided slice along `axis`: `len` reads at `start + j*step` (`step != 0`,
+    /// may be negative for reverse).
+    fn slice_(&mut self, x: NodeId, axis: usize, start: usize, len: usize, step: i64) -> NodeId;
+    /// Elementwise `clamp(x, min, max)`.
+    fn clamp_(&mut self, x: NodeId, min: f32, max: f32) -> NodeId;
+    /// Tile `x` by `reps[i]` along axis `i` (rank-aligned).
+    fn tile_(&mut self, x: NodeId, reps: Vec<usize>) -> NodeId;
+    /// Keep upper/lower triangle (last two axes) relative to `diagonal`.
+    fn trilu_(&mut self, x: NodeId, upper: bool, diagonal: i64) -> NodeId;
+    /// Cumulative product along `axis` (shape-inferring).
+    fn cumprod_(&mut self, x: NodeId, axis: i32, exclusive: bool) -> NodeId;
+    /// Cumulative maximum along `axis` (shape-inferring).
+    fn cummax_(&mut self, x: NodeId, axis: i32, exclusive: bool) -> NodeId;
     fn gather_(&mut self, table: NodeId, indices: NodeId, axis: usize) -> NodeId;
 
     // ── Comparison ──────────────────────────────────────────
@@ -475,6 +490,50 @@ impl GraphExt for Graph {
         let shapes: Vec<&Shape> = inputs.iter().map(|&id| self.shape(id)).collect();
         let s = shape::concat_shape(&shapes, axis).expect("concat shape inference");
         self.concat(inputs, axis, s)
+    }
+
+    fn pad_(&mut self, x: NodeId, pads: Vec<[usize; 2]>, mode: PadMode) -> NodeId {
+        let s = shape::pad_shape(self.shape(x), &pads).expect("pad shape inference");
+        self.add_node(Op::Pad { pads, mode }, vec![x], s)
+    }
+
+    fn slice_(&mut self, x: NodeId, axis: usize, start: usize, len: usize, step: i64) -> NodeId {
+        let s = shape::slice_shape(self.shape(x), axis, len).expect("slice shape inference");
+        self.add_node(
+            Op::Slice {
+                axis,
+                start,
+                len,
+                step,
+            },
+            vec![x],
+            s,
+        )
+    }
+
+    fn clamp_(&mut self, x: NodeId, min: f32, max: f32) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::Clamp { min, max }, vec![x], s)
+    }
+
+    fn tile_(&mut self, x: NodeId, reps: Vec<usize>) -> NodeId {
+        let s = shape::tile_shape(self.shape(x), &reps).expect("tile shape inference");
+        self.add_node(Op::Tile { reps }, vec![x], s)
+    }
+
+    fn trilu_(&mut self, x: NodeId, upper: bool, diagonal: i64) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::Trilu { upper, diagonal }, vec![x], s)
+    }
+
+    fn cumprod_(&mut self, x: NodeId, axis: i32, exclusive: bool) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::CumProd { axis, exclusive }, vec![x], s)
+    }
+
+    fn cummax_(&mut self, x: NodeId, axis: i32, exclusive: bool) -> NodeId {
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::CumMax { axis, exclusive }, vec![x], s)
     }
 
     fn gather_(&mut self, table: NodeId, indices: NodeId, axis: usize) -> NodeId {

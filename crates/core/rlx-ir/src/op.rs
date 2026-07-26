@@ -53,6 +53,54 @@ pub enum Activation {
     /// → Round → Clamp → Mul-by-scale = a hand-rolled FakeQuantize
     /// that the elementwise-region pass can fuse into a single kernel).
     Round,
+    /// `floor(x)`. Backward: 0 (piecewise-constant).
+    Floor,
+    /// `ceil(x)`. Backward: 0.
+    Ceil,
+    /// `sign(x)` = -1/0/+1 (sign of zero is 0). Backward: 0.
+    Sign,
+    /// `softplus(x) = ln(1 + eˣ)`. Backward: `dx = u·sigmoid(x)`.
+    Softplus,
+    /// ELU (α=1): `x if x>0 else eˣ-1`. Backward: `u·(1 if x>0 else eˣ)`.
+    Elu,
+    /// `erf(x)` (Gauss error function). Backward: `dx = u·(2/√π)·e^(-x²)`.
+    Erf,
+    /// HardSwish `x·clamp(x+3,0,6)/6`. Backward: 0/1/`(2x+3)/6` piecewise.
+    HardSwish,
+    /// HardSigmoid `clamp(x/6+0.5,0,1)`. Backward: `1/6` on `|x|<3` else 0.
+    HardSigmoid,
+    /// Mish `x·tanh(softplus(x))`.
+    Mish,
+    /// Softsign `x/(1+|x|)`. Backward: `1/(1+|x|)²`.
+    Softsign,
+    /// LogSigmoid `log(σ(x)) = min(x,0) − ln(1+e^(−|x|))`. Backward: `σ(−x)`.
+    LogSigmoid,
+}
+
+impl Activation {
+    /// Activations that may be folded into a fused `ElementwiseRegion` /
+    /// `TransformRegion` chain. The newer scalar activations
+    /// (`Floor`/`Ceil`/`Sign`/`Softplus`/`Elu`) run only on the standalone
+    /// kernel path for now — the per-backend fused-region kernels don't yet
+    /// carry their opcodes, and their `default` passthrough would silently
+    /// mis-evaluate them. Keeping them unfused is correct; a fused kernel is a
+    /// perf follow-up.
+    pub fn region_fusable(self) -> bool {
+        !matches!(
+            self,
+            Activation::Floor
+                | Activation::Ceil
+                | Activation::Sign
+                | Activation::Softplus
+                | Activation::Elu
+                | Activation::Erf
+                | Activation::HardSwish
+                | Activation::HardSigmoid
+                | Activation::Mish
+                | Activation::Softsign
+                | Activation::LogSigmoid
+        )
+    }
 }
 
 /// Scale-tracking strategy for `Op::FakeQuantize`. Determines how
@@ -139,6 +187,41 @@ pub enum BinaryOp {
     Max,
     Min,
     Pow,
+    /// C `fmod` (sign of dividend) — matches Rust `%`. Differentiable in `a`
+    /// (`∂/∂a = 1`); `b` treated as the constant modulus (`∂/∂b = 0`).
+    Mod,
+    /// Bitwise ops on integer-valued operands (GPU: `(int)a op (int)b`).
+    /// Non-differentiable (zero gradient).
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// Left/right shift: `a << b` / `a >> b` on integer-valued operands.
+    Shl,
+    Shr,
+    /// `atan2(a, b)` — quadrant-aware arctangent (angle of the point `(b, a)`,
+    /// i.e. Rust's `a.atan2(b)`). Smooth and differentiable in both operands:
+    /// `∂/∂a = b/(a²+b²)`, `∂/∂b = -a/(a²+b²)`. Standalone kernel only (not
+    /// region-fusable — the fused-region kernels don't carry its opcode).
+    Atan2,
+}
+
+impl BinaryOp {
+    /// Ops that may fold into a fused `ElementwiseRegion`. The newer ops
+    /// (`Mod` + bitwise) run only on the standalone binary kernel for now — the
+    /// per-backend fused-region kernels don't carry their opcodes yet (a
+    /// perf follow-up), and their `default` would silently mis-evaluate them.
+    pub fn region_fusable(self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Max
+                | BinaryOp::Min
+                | BinaryOp::Pow
+        )
+    }
 }
 
 /// Comparison operations (return Bool tensor).
@@ -167,6 +250,28 @@ pub enum ScatterNdReduction {
     Mul,
     Max,
     Min,
+}
+
+/// Which factor of a thin SVD `A = U·diag(S)·Vᵀ` an [`Op::Svd`] node yields.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SvdPart {
+    /// `U` `[m, k]` (left singular vectors, `k = min(m,n)`).
+    U,
+    /// `S` `[k]` (singular values, descending).
+    S,
+    /// `Vᵀ` `[k, n]` (right singular vectors, transposed).
+    Vt,
+}
+
+/// Which factor of a thin QR `A = Q·R` an [`Op::Qr`] node yields.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QrPart {
+    /// `Q` `[m, k]` (orthonormal columns, `k = min(m,n)`).
+    Q,
+    /// `R` `[k, n]` (upper-triangular).
+    R,
 }
 
 /// What kind of attention mask the kernel should apply.
@@ -256,6 +361,14 @@ pub enum OpKind {
     DotGeneral,
     DenseSolve,
     BatchedDenseSolve,
+    Cholesky,
+    TriangularSolve,
+    Det,
+    LogDet,
+    Sort,
+    ArgSort,
+    Svd,
+    Qr,
     LayerNorm,
     LayerNorm2d,
     GroupNorm,
@@ -274,9 +387,16 @@ pub enum OpKind {
     Expand,
     Gather,
     Reverse,
+    Pad,
+    Slice,
+    Clamp,
+    Tile,
+    Trilu,
     Reduce,
     Softmax,
     Cumsum,
+    CumProd,
+    CumMax,
     ArgMax,
     ArgMin,
     TopK,
@@ -541,6 +661,30 @@ pub enum SpdMatFn {
 ///
 /// Operations are categorized for fusion analysis:
 /// - Element-wise ops fuse with anything reading their output
+/// How [`Op::Pad`] fills the region added around the input.
+///
+/// Semantics match NumPy `pad` / PyTorch `F.pad`:
+/// - `Constant(v)` — fill with the scalar `v`.
+/// - `Reflect` — mirror across the edge, **excluding** the edge element
+///   (`abcd` → `cb|abcd|cb`). Requires `pad < axis_len`.
+/// - `Replicate` — repeat the edge element (`abcd` → `aa|abcd|dd`).
+/// - `Circular` — wrap around (`abcd` → `cd|abcd|ab`). Requires `pad ≤ axis_len`.
+///
+/// Not `Eq`/`Hash` because `Constant` carries an `f32` — mirrors [`Op`], which
+/// already holds `f32` attributes (e.g. `eps`) and is only `PartialEq`.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PadMode {
+    /// Fill padded positions with a constant scalar.
+    Constant(f32),
+    /// Mirror across the edge, excluding the edge element.
+    Reflect,
+    /// Repeat the edge element.
+    Replicate,
+    /// Wrap around (periodic).
+    Circular,
+}
+
 /// - Matmul/Conv are BLAS-dispatched and form fusion boundaries
 /// - Reductions are fusion roots (drive the loop iteration)
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
@@ -778,6 +922,58 @@ pub enum Op {
     /// `dgesv` / `sgesv`, cuSOLVER, etc.).
     DenseSolve,
 
+    /// Cholesky factorization of a symmetric positive-definite matrix.
+    /// Input `A` is `[n, n]` (SPD, row-major); output `L` is `[n, n]`
+    /// lower-triangular with the strict upper triangle zeroed, so `A = L·Lᵀ`.
+    /// One input. CPU: LAPACK `potrf` (promoted to f64). Backward (added with
+    /// `TriangularSolve`) is `Ā = Φ(L⁻ᵀ · Φ(Lᵀ L̄) · L⁻¹)` symmetrized.
+    Cholesky,
+
+    /// Solve `op(A)·X = B` for triangular `A` (`[n, n]`), with `B` `[n]` or
+    /// `[n, nrhs]`. `op(A)` is `Aᵀ` when `transpose` else `A`; `A` is read as
+    /// lower- or upper-triangular per `lower` (non-unit diagonal). Two inputs
+    /// `[A, B]`; output `X` matches `B`. CPU: BLAS `trsm`. Differentiable in
+    /// both (grads are themselves triangular solves).
+    TriangularSolve {
+        lower: bool,
+        transpose: bool,
+    },
+
+    /// Determinant of a square matrix `A` `[n, n]` → scalar `[]`. One input.
+    /// CPU: LAPACK LU (`getrf`). Backward: `Ā = (det(A)·ū)·A⁻ᵀ`.
+    Det,
+    /// `log|det(A)|` of a square matrix `A` `[n, n]` → scalar `[]`. One input.
+    /// Numerically stable (sum of `log|Uᵢᵢ|`). Backward: `Ā = ū·A⁻ᵀ`.
+    LogDet,
+
+    /// Sort values along `axis` (ascending, or `descending`). One input; output
+    /// same shape/dtype. Backward scatters `ū` back via the argsort permutation.
+    Sort {
+        axis: usize,
+        descending: bool,
+    },
+    /// Indices that would sort along `axis`, as f32 (like `ArgMax`). One input;
+    /// output same shape. Non-differentiable.
+    ArgSort {
+        axis: usize,
+        descending: bool,
+    },
+
+    /// One factor of a thin SVD `A = U·diag(S)·Vᵀ` (`A` `[m, n]`,
+    /// `k = min(m, n)`), selected by `part`. One input. CPU: LAPACK `gesdd`.
+    /// Only `SvdPart::S` is differentiable (`Ā = U·diag(ū)·Vᵀ`); `U`/`Vt` are
+    /// forward-only.
+    Svd {
+        part: SvdPart,
+    },
+
+    /// One factor of a thin QR `A = Q·R` (`A` `[m, n]`, `k = min(m, n)`),
+    /// selected by `part`: `Q` `[m, k]` or `R` `[k, n]`. One input. CPU: LAPACK
+    /// `geqrf`+`orgqr`. Differentiable (the QR pullback via `copyltu` + `R⁻ᵀ`).
+    Qr {
+        part: QrPart,
+    },
+
     // ── Normalization ───────────────────────────────────────────
     /// Layer normalization: input, gamma, beta → normalized output.
     /// `axis` is the feature dimension (usually -1).
@@ -892,6 +1088,19 @@ pub enum Op {
         start: usize,
         len: usize,
     },
+    /// Strided slice along an axis: output element `j` reads input index
+    /// `start + j*step` for `j` in `0..len`. `step` may be negative (reverse);
+    /// `step != 0`. All accessed indices must lie in `[0, axis_len)`. The
+    /// contiguous `step == 1` case is [`Op::Narrow`]; this covers `x[::2]`,
+    /// `x[::-1]`, dilation, and general strided indexing. No backend has a
+    /// native kernel except Metal/CUDA; others legalize to `narrow`/`reverse`/
+    /// `gather` via `rlx_fusion::LowerSlice`.
+    Slice {
+        axis: usize,
+        start: usize,
+        len: usize,
+        step: i64,
+    },
     /// Concatenate along an axis.
     Concat {
         axis: usize,
@@ -911,6 +1120,36 @@ pub enum Op {
     /// reversing a `[batch, seq, …]` sequence without a batch=1 assumption).
     Reverse {
         axes: Vec<usize>,
+    },
+    /// Pad each axis by `pads[i] = [before, after]` (aligned to the input rank)
+    /// per [`PadMode`]. Output axis `i` grows by `before + after`. Single tensor
+    /// input; the constant fill value lives in the mode, not an input.
+    ///
+    /// No backend has a native kernel except Metal/CUDA; every other backend
+    /// legalizes it to `narrow`/`reverse`/`concat`/`gather`/`full` via
+    /// `rlx_fusion::LowerPad`, so the decomposition is the semantic oracle.
+    Pad {
+        pads: Vec<[usize; 2]>,
+        mode: PadMode,
+    },
+    /// Elementwise `clamp(x, min, max)`. Decomposes to `max`/`min` (native on
+    /// every backend); no dedicated kernel needed. Backward: pass-through where
+    /// `min ≤ x ≤ max`, else 0.
+    Clamp {
+        min: f32,
+        max: f32,
+    },
+    /// Tile (repeat) the input `reps[i]` times along axis `i` (`reps` aligned to
+    /// the input rank). Decomposes to `concat`. Backward: reduce-sum the copies.
+    Tile {
+        reps: Vec<usize>,
+    },
+    /// Keep the upper (`upper=true`) or lower triangle relative to `diagonal`;
+    /// zero the rest. Operates on the last two axes. Decomposes to a multiply by
+    /// a constant triangular mask. Backward: same mask.
+    Trilu {
+        upper: bool,
+        diagonal: i64,
     },
 
     // ── Reduction ───────────────────────────────────────────────
@@ -1280,6 +1519,23 @@ pub enum Op {
     /// `exclusive=true` shifts the result so output\[0\] = 0 (useful
     /// for offset arrays where the first segment starts at 0).
     Cumsum {
+        axis: i32,
+        exclusive: bool,
+    },
+
+    /// Inclusive cumulative product along an axis. Same shape in/out.
+    /// `exclusive=true` shifts so output\[0\] = 1 (the multiplicative identity).
+    /// Mirrors [`Op::Cumsum`]; native on CPU/Metal/CUDA, decomposes to a
+    /// masked reduce-product elsewhere.
+    CumProd {
+        axis: i32,
+        exclusive: bool,
+    },
+
+    /// Inclusive cumulative maximum along an axis. Same shape in/out.
+    /// `exclusive=true` shifts so output\[0\] = -inf. Native on CPU/Metal/CUDA,
+    /// decomposes to a masked reduce-max elsewhere.
+    CumMax {
         axis: i32,
         exclusive: bool,
     },
@@ -2447,6 +2703,14 @@ impl Op {
             Op::DotGeneral { .. } => OpKind::DotGeneral,
             Op::DenseSolve => OpKind::DenseSolve,
             Op::BatchedDenseSolve => OpKind::BatchedDenseSolve,
+            Op::Cholesky => OpKind::Cholesky,
+            Op::TriangularSolve { .. } => OpKind::TriangularSolve,
+            Op::Det => OpKind::Det,
+            Op::LogDet => OpKind::LogDet,
+            Op::Sort { .. } => OpKind::Sort,
+            Op::ArgSort { .. } => OpKind::ArgSort,
+            Op::Svd { .. } => OpKind::Svd,
+            Op::Qr { .. } => OpKind::Qr,
             Op::LayerNorm { .. } => OpKind::LayerNorm,
             Op::LayerNorm2d { .. } => OpKind::LayerNorm2d,
             Op::GroupNorm { .. } => OpKind::GroupNorm,
@@ -2464,9 +2728,16 @@ impl Op {
             Op::Expand { .. } => OpKind::Expand,
             Op::Gather { .. } => OpKind::Gather,
             Op::Reverse { .. } => OpKind::Reverse,
+            Op::Pad { .. } => OpKind::Pad,
+            Op::Slice { .. } => OpKind::Slice,
+            Op::Clamp { .. } => OpKind::Clamp,
+            Op::Tile { .. } => OpKind::Tile,
+            Op::Trilu { .. } => OpKind::Trilu,
             Op::Reduce { .. } => OpKind::Reduce,
             Op::Softmax { .. } => OpKind::Softmax,
             Op::Cumsum { .. } => OpKind::Cumsum,
+            Op::CumProd { .. } => OpKind::CumProd,
+            Op::CumMax { .. } => OpKind::CumMax,
             Op::ArgMax { .. } => OpKind::ArgMax,
             Op::ArgMin { .. } => OpKind::ArgMin,
             Op::TopK { .. } => OpKind::TopK,
@@ -2667,12 +2938,19 @@ impl Op {
             | Op::Transpose { .. }
             | Op::Narrow { .. }
             | Op::Reverse { .. }
+            | Op::Pad { .. }
+            | Op::Slice { .. }
+            | Op::Clamp { .. }
+            | Op::Tile { .. }
+            | Op::Trilu { .. }
             | Op::Expand { .. }
             | Op::Reduce { .. }
             | Op::Softmax { .. }
             | Op::FusedSwiGLU { .. }
             | Op::TopK { .. }
             | Op::Cumsum { .. }
+            | Op::CumProd { .. }
+            | Op::CumMax { .. }
             | Op::ArgMax { .. }
             | Op::ArgMin { .. }
             | Op::Sample { .. }
@@ -2791,8 +3069,14 @@ impl Op {
             Op::SoftmaxCrossEntropyBackward => 3,            // logits, labels, d_loss
             Op::Concat { .. } => 0,                          // variadic — checked at graph level
             Op::DotGeneral { .. } => 2,
-            Op::DenseSolve => 2,        // A, b
-            Op::BatchedDenseSolve => 2, // A [B,N,N], b [B,N] or [B,N,K]
+            Op::DenseSolve => 2,             // A, b
+            Op::BatchedDenseSolve => 2,      // A [B,N,N], b [B,N] or [B,N,K]
+            Op::Cholesky => 1,               // A (SPD)
+            Op::TriangularSolve { .. } => 2, // A (triangular), B
+            Op::Det | Op::LogDet => 1,       // A
+            Op::Sort { .. } | Op::ArgSort { .. } => 1,
+            Op::Svd { .. } => 1,
+            Op::Qr { .. } => 1,
             Op::FusedAttentionBlock {
                 has_bias, has_rope, ..
             } => 4 + if *has_bias { 2 } else { 0 } + if *has_rope { 2 } else { 0 },
@@ -2905,6 +3189,18 @@ impl std::fmt::Display for Op {
             Op::DotGeneral { .. } => write!(f, "dot_general"),
             Op::DenseSolve => write!(f, "dense_solve"),
             Op::BatchedDenseSolve => write!(f, "batched_dense_solve"),
+            Op::Cholesky => write!(f, "cholesky"),
+            Op::TriangularSolve { lower, transpose } => {
+                write!(f, "trisolve(lower={lower},trans={transpose})")
+            }
+            Op::Det => write!(f, "det"),
+            Op::LogDet => write!(f, "logdet"),
+            Op::Sort { axis, descending } => write!(f, "sort(axis={axis},desc={descending})"),
+            Op::ArgSort { axis, descending } => {
+                write!(f, "argsort(axis={axis},desc={descending})")
+            }
+            Op::Svd { part } => write!(f, "svd({part:?})"),
+            Op::Qr { part } => write!(f, "qr({part:?})"),
             Op::LayerNorm { eps, .. } => write!(f, "layer_norm(eps={eps})"),
             Op::GroupNorm { num_groups, eps } => {
                 write!(f, "group_norm(groups={num_groups},eps={eps})")
@@ -2962,7 +3258,19 @@ impl std::fmt::Display for Op {
             Op::Reshape { new_shape } => write!(f, "reshape({new_shape:?})"),
             Op::Transpose { perm } => write!(f, "transpose({perm:?})"),
             Op::Narrow { axis, start, len } => write!(f, "narrow({axis},{start},{len})"),
+            Op::Slice {
+                axis,
+                start,
+                len,
+                step,
+            } => {
+                write!(f, "slice({axis},{start},{len},step={step})")
+            }
+            Op::Clamp { min, max } => write!(f, "clamp({min},{max})"),
+            Op::Tile { reps } => write!(f, "tile({reps:?})"),
+            Op::Trilu { upper, diagonal } => write!(f, "trilu(upper={upper},diag={diagonal})"),
             Op::Reverse { axes } => write!(f, "reverse({axes:?})"),
+            Op::Pad { pads, mode } => write!(f, "pad({pads:?},{mode:?})"),
             Op::Concat { axis } => write!(f, "concat(axis={axis})"),
             Op::Expand { .. } => write!(f, "expand"),
             Op::Gather { axis } => write!(f, "gather(axis={axis})"),
@@ -2973,6 +3281,20 @@ impl std::fmt::Display for Op {
                     write!(f, "cumsum(axis={axis},excl)")
                 } else {
                     write!(f, "cumsum(axis={axis})")
+                }
+            }
+            Op::CumProd { axis, exclusive } => {
+                if *exclusive {
+                    write!(f, "cumprod(axis={axis},excl)")
+                } else {
+                    write!(f, "cumprod(axis={axis})")
+                }
+            }
+            Op::CumMax { axis, exclusive } => {
+                if *exclusive {
+                    write!(f, "cummax(axis={axis},excl)")
+                } else {
+                    write!(f, "cummax(axis={axis})")
                 }
             }
             Op::ArgMax { axis, keep_dim } => write!(f, "argmax(axis={axis},keep={keep_dim})"),

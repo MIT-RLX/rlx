@@ -379,6 +379,7 @@ kernel_cache!(
 kernel_cache!(ARGMAX, argmax_kernel, ARGMAX_CU, "argmax");
 kernel_cache!(ROPE, rope_kernel, ROPE_CU, "rope");
 kernel_cache!(CUMSUM, cumsum_kernel, CUMSUM_CU, "cumsum");
+kernel_cache!(CUM_SCAN, cum_scan_kernel, CUM_SCAN_CU, "cum_scan");
 kernel_cache!(TOPK, topk_kernel, TOPK_CU, "topk");
 kernel_cache!(
     GROUPED_MATMUL,
@@ -688,6 +689,7 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = argmax_kernel(ctx);
     let _ = rope_kernel(ctx);
     let _ = cumsum_kernel(ctx);
+    let _ = cum_scan_kernel(ctx);
     let _ = topk_kernel(ctx);
     let _ = grouped_matmul_kernel(ctx);
     let _ = scatter_add_zero_kernel(ctx);

@@ -47,6 +47,15 @@ pub fn is_host_op(op: &Op) -> bool {
     match op {
         Op::DenseSolve
         | Op::BatchedDenseSolve
+        // Cholesky / TriangularSolve / Det / LogDet → generic CPU host-eval
+        // path (`run_host_op_node_f32`), no dedicated specialization needed.
+        | Op::Cholesky
+        | Op::TriangularSolve { .. }
+        | Op::Det
+        | Op::LogDet
+        // Sort / ArgSort: stable strided sort on CPU, no HLO primitive.
+        | Op::Sort { .. } | Op::Svd { .. } | Op::Qr { .. }
+        | Op::ArgSort { .. }
         // FftButterflyStage is a ternary-pruned stage, not Op::Fft.
         | Op::Scan { .. }
         | Op::ScanBackward { .. }

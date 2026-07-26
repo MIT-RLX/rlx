@@ -425,6 +425,17 @@ unsafe extern "C" {
         info_out: *mut i32,
     );
 
+    /// dgetrf — LU factorization with partial pivoting (det / logdet).
+    #[link_name = "dgetrf_"]
+    fn lapack_dgetrf(
+        m: *const i32,
+        n: *const i32,
+        a: *mut f64,
+        lda: *const i32,
+        ipiv: *mut i32,
+        info_out: *mut i32,
+    );
+
     /// dsyevd — symmetric eigendecomp via divide-and-conquer.
     /// `jobz`: b'N' (eigenvalues only) or b'V' (also eigenvectors).
     #[link_name = "dsyevd_"]
@@ -950,6 +961,21 @@ unsafe fn lapack_dpotrf(_: *const i8, _: *const i32, _: *mut f64, _: *const i32,
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
+unsafe fn lapack_dgetrf(
+    _: *const i32,
+    _: *const i32,
+    _: *mut f64,
+    _: *const i32,
+    _: *mut i32,
+    info: *mut i32,
+) {
+    unsafe {
+        *info = -1;
+    }
+    panic!("rlx-cpu: dgetrf requires a linked LAPACK backend (unavailable on this target)");
+}
+#[cfg(not(rlx_cpu_blas))]
+#[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dsyevd(
     _: *const i8,
     _: *const i8,
@@ -1133,6 +1159,37 @@ pub fn dpotrf(a: &mut [f64], n: usize, lower: bool) -> i32 {
         }
     }
     info
+}
+
+/// LU-factorize a row-major n×n matrix and return `(log|det|, sign, det)`.
+/// Row-major bytes are col-major `Aᵀ`, and `det(Aᵀ) = det(A)`, so this is exact.
+/// Overwrites `a` with the LU factors. Singular ⇒ `(-inf, 0, 0)`.
+pub fn lu_slogdet(a: &mut [f64], n: usize) -> (f64, f64, f64) {
+    assert_eq!(a.len(), n * n, "lu_slogdet: A must be n×n");
+    let mut ipiv = vec![0i32; n];
+    let mut info: i32 = 0;
+    let nn = n as i32;
+    unsafe {
+        lapack_dgetrf(&nn, &nn, a.as_mut_ptr(), &nn, ipiv.as_mut_ptr(), &mut info);
+    }
+    if info > 0 {
+        return (f64::NEG_INFINITY, 0.0, 0.0); // U has a zero pivot → singular.
+    }
+    let (mut logabs, mut sign, mut det) = (0.0f64, 1.0f64, 1.0f64);
+    for i in 0..n {
+        let d = a[i * n + i]; // U_ii (col-major diagonal = row-major diagonal).
+        det *= d;
+        logabs += d.abs().ln();
+        if d < 0.0 {
+            sign = -sign;
+        }
+        if ipiv[i] != (i as i32 + 1) {
+            // 1-based pivot; a row swap flips the sign.
+            sign = -sign;
+            det = -det;
+        }
+    }
+    (logabs, sign, det)
 }
 
 /// In-place symmetric eigendecomposition. `a` is row-major n×n
@@ -1322,6 +1379,96 @@ pub fn dgesvd_thin(
 /// Thin SVD via LAPACK **`dgesdd`** (divide-and-conquer) — the driver NumPy's
 /// `linalg.svd`/`linalg.pinv` use. Same I/O contract as [`dgesvd_thin`]; use
 /// this when bit-exact NumPy parity on ill-conditioned inputs is required.
+/// Thin QR of a row-major `m×n` matrix: `A = Q·R`, `Q` `[m,k]` orthonormal,
+/// `R` `[k,n]` upper-triangular (`k = min(m,n)`). `a` is consumed (converted to
+/// col-major internally). Returns LAPACK `info` (0 = ok).
+pub fn qr_thin(a: &[f64], m: usize, n: usize, q: &mut [f64], r: &mut [f64]) -> i32 {
+    let k = m.min(n);
+    assert_eq!(a.len(), m * n);
+    assert_eq!(q.len(), m * k);
+    assert_eq!(r.len(), k * n);
+    let mut a_col = transpose_to_col(a, m, n); // col-major [m, n]
+    let (mm, nn, kk) = (m as i32, n as i32, k as i32);
+    let mut tau = vec![0f64; k];
+    let mut info: i32 = 0;
+    let m1: i32 = -1;
+    let mut wq = [0f64; 1];
+    unsafe {
+        lapack_dgeqrf(
+            &mm,
+            &nn,
+            a_col.as_mut_ptr(),
+            &mm,
+            tau.as_mut_ptr(),
+            wq.as_mut_ptr(),
+            &m1,
+            &mut info,
+        );
+    }
+    let lwork = (wq[0] as i32).max(1);
+    let mut work = vec![0f64; lwork as usize];
+    unsafe {
+        lapack_dgeqrf(
+            &mm,
+            &nn,
+            a_col.as_mut_ptr(),
+            &mm,
+            tau.as_mut_ptr(),
+            work.as_mut_ptr(),
+            &lwork,
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return info;
+    }
+    // R = upper triangle (k×n) of the factored matrix → row-major.
+    for i in 0..k {
+        for j in 0..n {
+            r[i * n + j] = if i <= j { a_col[i + j * m] } else { 0.0 };
+        }
+    }
+    // Form Q [m,k] in a_col (col-major, first k columns).
+    let mut wq2 = [0f64; 1];
+    unsafe {
+        lapack_dorgqr(
+            &mm,
+            &kk,
+            &kk,
+            a_col.as_mut_ptr(),
+            &mm,
+            tau.as_ptr(),
+            wq2.as_mut_ptr(),
+            &m1,
+            &mut info,
+        );
+    }
+    let lwork2 = (wq2[0] as i32).max(1);
+    let mut work2 = vec![0f64; lwork2 as usize];
+    unsafe {
+        lapack_dorgqr(
+            &mm,
+            &kk,
+            &kk,
+            a_col.as_mut_ptr(),
+            &mm,
+            tau.as_ptr(),
+            work2.as_mut_ptr(),
+            &lwork2,
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return info;
+    }
+    for i in 0..m {
+        for j in 0..k {
+            q[i * k + j] = a_col[i + j * m];
+        }
+    }
+    info
+}
+
 pub fn dgesdd_thin(
     a: &mut [f64],
     m: usize,

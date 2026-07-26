@@ -87,20 +87,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RLX_MLX_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=RLX_MLX_JOBS");
 
-    // FetchContent clones fmt into OUT_DIR/build/_deps/fmt-src. A failed or
-    // interrupted prior configure leaves that tree dirty, and CMake's
-    // `git checkout <GIT_TAG>` then aborts ("local changes would be
-    // overwritten"). Drop stale fmt populate dirs before every configure.
-    {
-        let deps = out_dir.join("build").join("_deps");
-        for name in ["fmt-src", "fmt-subbuild", "fmt-build"] {
-            let p = deps.join(name);
-            if p.exists() {
-                let _ = std::fs::remove_dir_all(&p);
-            }
-        }
-    }
-
     let mut mlx_cfg = cmake::Config::new(&mlx_src);
     mlx_cfg
         .profile(cmake_build_type)
@@ -118,6 +104,16 @@ fn main() {
         .define("MLX_BUILD_SAFETENSORS", "OFF")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_BUILD_TYPE", cmake_build_type);
+
+    // MLX pulls `fmt` in via CMake FetchContent (git clone + `git checkout
+    // <tag>`). An interrupted prior configure can leave that tree half-checked
+    // out (empty working tree, HEAD on the default branch); the next
+    // `git checkout <tag>` then aborts with "local changes would be
+    // overwritten" and fails every subsequent build. Seed a persistent,
+    // correctly checked-out fmt once and hand CMake `FETCHCONTENT_SOURCE_DIR_FMT`
+    // so no git runs at configure time — deterministic, offline-friendly after
+    // the first fetch, and immune to the dirty-tree abort.
+    seed_fmt_source(&mlx_src, &out_dir, &mut mlx_cfg);
 
     let macos_deploy = if is_macos {
         let deploy = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "14.0".into());
@@ -294,6 +290,164 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/rlx_mlx_shim.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/mlx/mlx/version.h");
+}
+
+/// Pre-seed the `fmt` source MLX's CMake fetches so no `git clone`/`git
+/// checkout` runs during configure (the step that fails with "Failed to
+/// checkout tag" when a prior populate was interrupted). Clones the pinned tag
+/// once into a persistent cache shared across every rlx-mlx-sys build variant
+/// of this profile, then points CMake at it via `FETCHCONTENT_SOURCE_DIR_FMT`.
+///
+/// Falls back to the previous behaviour — drop any half-populated fmt tree so
+/// FetchContent re-clones from scratch — when the tag can't be determined or
+/// git isn't available (e.g. offline with no cache yet), so the build still
+/// works exactly as before in that case.
+fn seed_fmt_source(mlx_src: &Path, out_dir: &Path, cfg: &mut cmake::Config) {
+    let seeded = fmt_git_tag(mlx_src).and_then(|tag| {
+        // OUT_DIR is `.../target/<profile>/build/<pkg>-<hash>/out`; its
+        // grandparent `.../build` is shared by all rlx-mlx-sys variants, so a
+        // cache there is fetched once and reused everywhere.
+        let build_root = out_dir.ancestors().nth(2)?;
+        ensure_fmt_cache(build_root, &tag)
+    });
+
+    if let Some(cache) = seeded {
+        cfg.define(
+            "FETCHCONTENT_SOURCE_DIR_FMT",
+            cache.to_string_lossy().as_ref(),
+        );
+        // Re-seed if MLX bumps the pinned fmt tag.
+        println!("cargo:rerun-if-changed=vendor/mlx/CMakeLists.txt");
+        return;
+    }
+
+    // Fallback: couldn't seed. Remove any dirty/half-populated fmt populate
+    // dirs so FetchContent's own clone starts clean instead of aborting.
+    let deps = out_dir.join("build").join("_deps");
+    for name in ["fmt-src", "fmt-subbuild", "fmt-build"] {
+        force_remove_dir_all(&deps.join(name));
+    }
+}
+
+/// The `GIT_TAG` pinned for the fmt FetchContent dependency in MLX's top-level
+/// CMakeLists.txt, so the seeded checkout always matches the vendored MLX.
+fn fmt_git_tag(mlx_src: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(mlx_src.join("CMakeLists.txt")).ok()?;
+    let mut saw_fmt_repo = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.contains("fmtlib/fmt.git") {
+            saw_fmt_repo = true;
+            continue;
+        }
+        if saw_fmt_repo {
+            if let Some(rest) = l.strip_prefix("GIT_TAG") {
+                let tag = rest.trim().trim_matches('"').trim().to_string();
+                if !tag.is_empty() {
+                    return Some(tag);
+                }
+            }
+            // GIT_TAG follows GIT_REPOSITORY inside the same Declare block; stop
+            // if we reach its end without finding one.
+            if l.ends_with(')') || l.contains("FetchContent_MakeAvailable") {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Ensure a full fmt checkout at `tag` exists under `build_root`, returning its
+/// path. Clones into a unique temp dir then atomically renames it into place so
+/// concurrent build variants racing to seed the shared cache can't corrupt it.
+fn ensure_fmt_cache(build_root: &Path, tag: &str) -> Option<PathBuf> {
+    let cache = build_root.join(format!("rlx-mlx-sys-fmt-{tag}"));
+    if fmt_checkout_ok(&cache) {
+        return Some(cache);
+    }
+    std::fs::create_dir_all(build_root).ok()?;
+
+    let tmp = build_root.join(format!("rlx-mlx-sys-fmt-{tag}.tmp.{}", std::process::id()));
+    force_remove_dir_all(&tmp);
+    let cloned = Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            tag,
+            "--config",
+            "advice.detachedHead=false",
+            "https://github.com/fmtlib/fmt.git",
+        ])
+        .arg(&tmp)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !cloned || !fmt_checkout_ok(&tmp) {
+        force_remove_dir_all(&tmp);
+        // A concurrent build may have finished the cache while we cloned.
+        return fmt_checkout_ok(&cache).then_some(cache);
+    }
+
+    match std::fs::rename(&tmp, &cache) {
+        Ok(()) => Some(cache),
+        Err(_) => {
+            // Lost the publish race (or cross-dir rename); a valid cache wins.
+            force_remove_dir_all(&tmp);
+            fmt_checkout_ok(&cache).then_some(cache)
+        }
+    }
+}
+
+/// A directory is a usable fmt source if it has fmt's CMakeLists and headers.
+fn fmt_checkout_ok(dir: &Path) -> bool {
+    dir.join("CMakeLists.txt").exists() && dir.join("include/fmt/format.h").exists()
+}
+
+/// Remove a directory tree robustly: retry after clearing read-only bits (git
+/// pack files are read-only) and, as a last resort, shell out to the platform
+/// force-remove. The plain `remove_dir_all` this replaces silently swallowed
+/// partial failures, which is how half-deleted fmt trees leaked out.
+fn force_remove_dir_all(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if std::fs::remove_dir_all(path).is_ok() {
+        return;
+    }
+    fn make_writable(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&p, perms);
+            }
+            if meta.file_type().is_dir() {
+                make_writable(&p);
+            }
+        }
+    }
+    make_writable(path);
+    if std::fs::remove_dir_all(path).is_ok() {
+        return;
+    }
+    #[cfg(windows)]
+    let _ = Command::new("cmd")
+        .args(["/C", "rmdir", "/S", "/Q"])
+        .arg(path)
+        .status();
+    #[cfg(not(windows))]
+    let _ = Command::new("rm").arg("-rf").arg(path).status();
 }
 
 /// `libclang_rt.<variant>` — required for `___isPlatformVersionAtLeast` from

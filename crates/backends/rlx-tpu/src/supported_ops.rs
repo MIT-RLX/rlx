@@ -63,6 +63,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         ReluBackward,
         ActivationBackward,
         Cumsum,
+        CumProd,
+        CumMax,
         TopK,
         Sample,
         ArgMax,
@@ -125,6 +127,19 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // Host segments (CPU LAPACK / vision kernels between HLO).
         DenseSolve,
         BatchedDenseSolve,
+        // Cholesky / TriangularSolve / Det / LogDet host-stage to CPU LAPACK
+        // (potrf / trsm / getrf) via `is_host_op` → `run_host_op_node_f32`,
+        // same as DenseSolve.
+        Cholesky,
+        TriangularSolve,
+        Det,
+        LogDet,
+        // Sort / ArgSort host-stage to CPU (stable strided sort) via
+        // `is_host_op` → `run_host_op_node_f32`, same as Det / LogDet.
+        Sort,
+        Svd,
+        Qr,
+        ArgSort,
         Fft,
         FftButterflyStage,
         LogMel,

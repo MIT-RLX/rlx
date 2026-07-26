@@ -388,6 +388,14 @@ pub(crate) enum Step {
         out_off: u32,
         exclusive: u32,
     },
+    CumScan {
+        outer: u32,
+        inner: u32,
+        in_off: u32,
+        out_off: u32,
+        exclusive: u32,
+        is_max: u32,
+    },
     TopK {
         outer: u32,
         inner: u32,
@@ -1695,6 +1703,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::AttentionBackward { .. } => "rlx::AttentionBackward",
         Step::Rope { .. } => "rlx::Rope",
         Step::Cumsum { .. } => "rlx::Cumsum",
+        Step::CumScan { .. } => "rlx::CumScan",
         Step::TopK { .. } => "rlx::TopK",
         Step::GroupedMatmul { .. } => "rlx::GroupedMatmul",
         Step::ScatterAddZero { .. } => "rlx::ScatterAdd::zero",
@@ -1973,6 +1982,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             in_off, out_off, ..
         }
         | Step::Cumsum {
+            in_off, out_off, ..
+        }
+        | Step::CumScan {
             in_off, out_off, ..
         }
         | Step::Sample {
@@ -2987,6 +2999,7 @@ impl Step {
                 | Step::AdaLayerNormBackward { .. }
                 | Step::GatedResidualBackward { .. }
                 | Step::Cumsum { .. }
+                | Step::CumScan { .. }
                 | Step::FusedBinaryUnary { .. }
                 | Step::ElementwiseRegion { .. }
                 | Step::BatchElementwiseRegion { .. }

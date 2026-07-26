@@ -460,6 +460,14 @@ pub(crate) enum Step {
         out_off: u32,
         exclusive: u32,
     },
+    CumScan {
+        outer: u32,
+        inner: u32,
+        in_off: u32,
+        out_off: u32,
+        exclusive: u32,
+        is_max: u32,
+    },
     TopK {
         outer: u32,
         inner: u32,
@@ -685,6 +693,52 @@ pub(crate) enum Step {
         dims: Vec<u32>,
         rev_mask: Vec<bool>,
         elem_bytes: u32,
+    },
+    /// Host-staged constant/reflect/replicate/circular pad. `fill` is the
+    /// constant value pre-encoded in the output dtype. Non-f32 fallback for
+    /// [`Step::Pad`].
+    PadHost {
+        src_byte_off: u64,
+        dst_byte_off: u64,
+        in_dims: Vec<u32>,
+        before: Vec<u32>,
+        after: Vec<u32>,
+        mode: rlx_ir::PadMode,
+        fill: Vec<u8>,
+        elem_bytes: u32,
+    },
+    /// Native on-GPU f32 pad. `meta` = `[out_dims, in_dims, before, in_strides]`
+    /// (each rank-length). `mode`: 0=const 1=reflect 2=replicate 3=circular.
+    Pad {
+        n: u32,
+        src_off: u32,
+        dst_off: u32,
+        mode: u32,
+        fill: f32,
+        rank: u32,
+        meta_idx: usize,
+    },
+    /// Host-staged strided slice — non-f32 fallback for [`Step::Slice`].
+    SliceHost {
+        src_byte_off: u64,
+        dst_byte_off: u64,
+        in_dims: Vec<u32>,
+        axis: u32,
+        start: u32,
+        len: u32,
+        step: i64,
+        elem_bytes: u32,
+    },
+    /// Native on-GPU f32 strided slice. `meta` = `[out_dims, in_strides]`.
+    Slice {
+        n: u32,
+        src_off: u32,
+        dst_off: u32,
+        axis: u32,
+        start: i32,
+        step: i32,
+        rank: u32,
+        meta_idx: usize,
     },
     /// Host-staged ArgMax/ArgMin (f32-encoded indices).
     ArgReduceHost {
@@ -1833,6 +1887,7 @@ impl Step {
                 | Step::AdaLayerNormBackward { .. }
                 | Step::GatedResidualBackward { .. }
                 | Step::Cumsum { .. }
+                | Step::CumScan { .. }
                 | Step::FusedBinaryUnary { .. }
                 | Step::ElementwiseRegion { .. }
                 | Step::BatchElementwiseRegion { .. }
@@ -1874,6 +1929,8 @@ impl Step {
             | Step::RngNormal { .. }
             | Step::RngUniform { .. }
             | Step::ReverseHost { .. }
+            | Step::PadHost { .. }
+            | Step::SliceHost { .. }
             | Step::ArgReduceHost { .. }
             | Step::ScanHost { .. }
             | Step::Lstm { .. }
@@ -2050,6 +2107,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::AttentionBackward { .. } => "rlx::AttentionBackward",
         Step::Rope { .. } => "rlx::Rope",
         Step::Cumsum { .. } => "rlx::Cumsum",
+        Step::CumScan { .. } => "rlx::CumScan",
         Step::TopK { .. } => "rlx::TopK",
         Step::GroupedMatmul { .. } => "rlx::GroupedMatmul",
         Step::ScatterAddZero { .. } => "rlx::ScatterAdd::zero",
@@ -2071,6 +2129,10 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::FftButterflyStage { .. } => "rlx::FftButterflyStage",
         Step::Im2ColHost { .. } => "rlx::Im2ColHost",
         Step::ReverseHost { .. } => "rlx::ReverseHost",
+        Step::PadHost { .. } => "rlx::PadHost",
+        Step::Pad { .. } => "rlx::Pad",
+        Step::SliceHost { .. } => "rlx::SliceHost",
+        Step::Slice { .. } => "rlx::Slice",
         Step::ArgReduceHost { .. } => "rlx::ArgReduceHost",
         Step::AxialRope2d { .. } => "rlx::AxialRope2d",
         Step::GatedDeltaNet { .. } => "rlx::GatedDeltaNet",
@@ -2385,6 +2447,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::Unary {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
+        Step::Pad {
+            src_off, dst_off, ..
+        }
+        | Step::Slice {
+            src_off, dst_off, ..
+        } => (vec![*src_off], vec![*dst_off]),
         Step::Where {
             cond_off,
             x_off,
@@ -2409,6 +2477,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             in_off, out_off, ..
         }
         | Step::Cumsum {
+            in_off, out_off, ..
+        }
+        | Step::CumScan {
             in_off, out_off, ..
         }
         | Step::Sample {
@@ -2766,6 +2837,16 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![(*col_byte_off / 4) as u32],
         ),
         Step::ReverseHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        }
+        | Step::PadHost {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        }
+        | Step::SliceHost {
             src_byte_off,
             dst_byte_off,
             ..

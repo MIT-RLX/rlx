@@ -866,6 +866,36 @@ impl RocmExecutable {
                         [&mut arena_ptr, &outer_s, inner, in_off, out_off, exclusive]
                     );
                 }
+                Step::CumScan {
+                    outer,
+                    inner,
+                    in_off,
+                    out_off,
+                    exclusive,
+                    is_max,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = cum_scan_kernel(&self.ctx);
+                    let (grid, block) = dispatch_grid_1d(outer_s, 256);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (grid, 1, 1),
+                        (block, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &outer_s,
+                            inner,
+                            in_off,
+                            out_off,
+                            exclusive,
+                            is_max
+                        ]
+                    );
+                }
                 Step::TopK {
                     outer,
                     inner,

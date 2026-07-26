@@ -1437,6 +1437,24 @@ impl RocmExecutable {
                         exclusive: if *exclusive { 1 } else { 0 },
                     });
                 }
+                Op::CumProd { axis: _, exclusive } | Op::CumMax { axis: _, exclusive } => {
+                    let in_id = node.inputs[0];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let outer = in_dims[..in_dims.len() - 1]
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .product::<u32>()
+                        .max(1);
+                    schedule.push(Step::CumScan {
+                        outer,
+                        inner,
+                        in_off: (arena.offset(in_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        exclusive: if *exclusive { 1 } else { 0 },
+                        is_max: matches!(node.op, Op::CumMax { .. }) as u32,
+                    });
+                }
                 Op::TopK { k } => {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
@@ -3661,7 +3679,17 @@ impl RocmExecutable {
                 // fall here when native libs/dtypes are unavailable; CustomFn
                 // runs the opaque body. `PartitionedConv` is expanded to
                 // Fft/MatMul in `crate::unfuse` before this match.
-                Op::DenseSolve | Op::BatchedDenseSolve | Op::CustomFn { .. } => {
+                Op::DenseSolve
+                | Op::BatchedDenseSolve
+                | Op::Cholesky
+                | Op::TriangularSolve { .. }
+                | Op::Det
+                | Op::LogDet
+                | Op::Sort { .. }
+                | Op::Svd { .. }
+                | Op::Qr { .. }
+                | Op::ArgSort { .. }
+                | Op::CustomFn { .. } => {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });

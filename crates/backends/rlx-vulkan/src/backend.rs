@@ -143,6 +143,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Expand,
         Gather,
         Cumsum,
+        CumProd,
+        CumMax,
         Reverse, // shape / indexing
         ArgMax,
         ArgMin,
@@ -203,6 +205,16 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // No device-side solver on Vulkan (no cuSOLVER/oneMKL equivalent here).
         DenseSolve,
         BatchedDenseSolve,
+        // Host-staged to rlx-cpu LAPACK (potrf / trsm / getrf) on the mapped
+        // arena, same HostOpDesc contract as DenseSolve.
+        Cholesky,
+        TriangularSolve,
+        Det,
+        LogDet,
+        // Sort / ArgSort host-stage to CPU (stable strided sort) on the
+        // mapped f32 arena, same HostOpDesc contract as Det / LogDet.
+        Sort,
+        ArgSort,
         // Native SPIR-V packed-INT8 matmul / conv (see quantize_i8 / q_matmul).
         QMatMul,
         QConv2d,
@@ -329,6 +341,7 @@ fn host_ops_forced(op: &Op) -> bool {
         Op::ArgMax { .. } | Op::ArgMin { .. } => hit(&["reduce", "argreduce"]),
         Op::Gather { .. } => hit(&["gather"]),
         Op::Cumsum { .. } | Op::Reverse { .. } => hit(&["cumsum", "reverse", "reindex"]),
+        Op::CumProd { .. } | Op::CumMax { .. } => hit(&["cum_scan"]),
         Op::Pool { .. } | Op::Im2Col { .. } | Op::ResizeNearest2x => {
             hit(&["pool", "im2col", "vision", "conv"])
         }
@@ -729,6 +742,17 @@ fn act_id(a: Activation) -> u32 {
         Activation::Atan => 15,
         Activation::Round => 16,
         Activation::Recip => 17,
+        Activation::Floor => 18,
+        Activation::Ceil => 19,
+        Activation::Sign => 20,
+        Activation::Softplus => 21,
+        Activation::Elu => 22,
+        Activation::Erf => 23,
+        Activation::HardSwish => 24,
+        Activation::HardSigmoid => 25,
+        Activation::Mish => 26,
+        Activation::Softsign => 27,
+        Activation::LogSigmoid => 28,
     }
 }
 
@@ -753,6 +777,17 @@ fn activation_bwd_op_id(a: Activation) -> u32 {
         Activation::Tan => 15,
         Activation::Atan => 16,
         Activation::Recip => 17,
+        Activation::Floor => 18,
+        Activation::Ceil => 19,
+        Activation::Sign => 20,
+        Activation::Softplus => 21,
+        Activation::Elu => 22,
+        Activation::Erf => 23,
+        Activation::HardSwish => 24,
+        Activation::HardSigmoid => 25,
+        Activation::Mish => 26,
+        Activation::Softsign => 27,
+        Activation::LogSigmoid => 28,
     }
 }
 
@@ -801,6 +836,13 @@ fn binop_id(op: BinaryOp) -> u32 {
         BinaryOp::Max => 4,
         BinaryOp::Min => 5,
         BinaryOp::Pow => 6,
+        BinaryOp::Mod => 7,
+        BinaryOp::BitAnd => 8,
+        BinaryOp::BitOr => 9,
+        BinaryOp::BitXor => 10,
+        BinaryOp::Shl => 11,
+        BinaryOp::Shr => 12,
+        BinaryOp::Atan2 => 13,
     }
 }
 
@@ -975,10 +1017,18 @@ impl VulkanExecutable {
             )
         }
         .expect("vk descriptor_set");
+        // Bind only the GPU-consumed prefix of the weight buffer. Host-only
+        // params (MLX dequant matmuls) sit past it and are read via the mapped
+        // pointer, so a weight buffer larger than `maxStorageBufferRange` stays
+        // legal (the descriptor range must be ≤ that limit).
+        let weight_range = match arena.weight_bind_bytes() {
+            0 => vk::WHOLE_SIZE,
+            n => n as u64,
+        };
         let weight_info = vk::DescriptorBufferInfo::default()
             .buffer(arena.weight_buffer())
             .offset(0)
-            .range(vk::WHOLE_SIZE);
+            .range(weight_range);
         let mut act_infos = Vec::with_capacity(n_act_sets);
         for i in 0..n_act_sets {
             act_infos.push(
@@ -2151,6 +2201,8 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 Op::RmsNorm { .. } | Op::LayerNorm { .. } | Op::LayerNorm2d { .. } => "norm",
                 Op::Fft { .. } => "fft(host)",
                 Op::Cumsum { .. } => "cumsum",
+                Op::CumProd { .. } => "cumprod",
+                Op::CumMax { .. } => "cummax",
                 Op::Pool { .. } => "pool",
                 Op::Im2Col { .. } => "im2col",
                 Op::Attention { .. } => "attention",
@@ -4141,6 +4193,31 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 );
             }
 
+            Op::CumProd { axis, exclusive } | Op::CumMax { axis, exclusive } => {
+                let x = node.inputs[0];
+                let xd = dims(graph, x);
+                let ax = norm_axis(*axis, xd.len());
+                debug_assert_eq!(ax, xd.len().saturating_sub(1), "cum_scan expects last axis");
+                let cols = *xd.get(ax).unwrap_or(&1);
+                let rows = numel(&xd) / cols.max(1);
+                let push = Push::default()
+                    .u(rows as u32)
+                    .u(cols as u32)
+                    .u(binder.off(arena, x))
+                    .u(binder.off(arena, out))
+                    .u(if *exclusive { 1 } else { 0 })
+                    .u(matches!(node.op, Op::CumMax { .. }) as u32)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "cum_scan",
+                    push,
+                    groups1d(rows, 64),
+                );
+            }
+
             Op::Reverse { axes } => {
                 let x = node.inputs[0];
                 let xd = dims(graph, x);
@@ -5315,10 +5392,19 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
             | Op::ScanBackwardXs { .. }
             | Op::DenseSolve
             | Op::BatchedDenseSolve
+            | Op::Cholesky
+            | Op::TriangularSolve { .. }
+            | Op::Det
+            | Op::LogDet
+            | Op::Sort { .. }
+            | Op::Svd { .. }
+            | Op::Qr { .. }
+            | Op::ArgSort { .. }
             | Op::LogMel
             | Op::LogMelBackward => {
-                // DenseSolve → rlx-cpu LAPACK on the mapped f32 arena (same
-                // HostOpDesc contract as wgpu). LogMel has no SPIR-V twin.
+                // DenseSolve / Cholesky / TriangularSolve / Det / LogDet →
+                // rlx-cpu LAPACK on the mapped f32 arena (same HostOpDesc
+                // contract as wgpu). LogMel has no SPIR-V twin.
                 steps.push(Step::HostOp {
                     desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.byte_offset(id)),
                 });

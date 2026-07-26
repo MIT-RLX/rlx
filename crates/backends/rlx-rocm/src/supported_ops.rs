@@ -83,6 +83,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         ReluBackward,
         ActivationBackward,
         Cumsum,
+        CumProd,
+        CumMax,
         TopK,
         Sample,
         Conv,
@@ -200,6 +202,19 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // in `crate::unfuse` to Fft/MatMul (batched-GEMM frequency path).
         DenseSolve,
         BatchedDenseSolve,
+        // Cholesky / TriangularSolve / Det / LogDet host-stage to CPU LAPACK
+        // (potrf / trsm / getrf) via the `Step::HostOp` catch-all in
+        // `backend/compile.rs`. Native hipSOLVER is a future perf follow-up.
+        Cholesky,
+        TriangularSolve,
+        Det,
+        LogDet,
+        // Sort / ArgSort host-stage to CPU (stable strided sort) via the
+        // `Step::HostOp` catch-all in `backend/compile.rs`, same as Det / LogDet.
+        Sort,
+        Svd,
+        Qr,
+        ArgSort,
         QMatMul,
         QConv2d,
         FftButterflyStage,

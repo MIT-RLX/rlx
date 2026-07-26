@@ -370,3 +370,43 @@ fn more_ops_exact() {
         rlx_vulkan::device_name()
     );
 }
+
+/// Native `cum_scan` (CumProd / CumMax) last-axis parity against a hand-rolled
+/// reference. Runs on lavapipe in the Docker container.
+#[test]
+fn cum_scan_matches_reference() {
+    if !rlx_vulkan::is_available() {
+        return;
+    }
+    let x = vec![1.5f32, 0.5, 2.0, 0.8, -1.0, 3.0, 2.0, 0.5];
+
+    // Inclusive cumprod over last axis [2,4].
+    let mut g = Graph::new("cumprod");
+    let inp = g.input("x", s(&[2, 4]));
+    let o = g.add_node(
+        Op::CumProd {
+            axis: -1,
+            exclusive: false,
+        },
+        vec![inp],
+        s(&[2, 4]),
+    );
+    g.set_outputs(vec![o]);
+    let r = VulkanExecutable::compile(g).run(&[("x", &x)]);
+    assert_eq!(r[0], vec![1.5, 0.75, 1.5, 1.2, -1.0, -3.0, -6.0, -3.0]);
+
+    // Inclusive cummax over last axis [2,4].
+    let mut g = Graph::new("cummax");
+    let inp = g.input("x", s(&[2, 4]));
+    let o = g.add_node(
+        Op::CumMax {
+            axis: -1,
+            exclusive: false,
+        },
+        vec![inp],
+        s(&[2, 4]),
+    );
+    g.set_outputs(vec![o]);
+    let r = VulkanExecutable::compile(g).run(&[("x", &x)]);
+    assert_eq!(r[0], vec![1.5, 1.5, 2.0, 2.0, -1.0, 3.0, 3.0, 3.0]);
+}
