@@ -8,6 +8,7 @@ use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available};
 
+#[allow(unused)]
 fn graph(act: Activation) -> Graph {
     let mut graph = Graph::new("vmath_act_parity");
     let shape = Shape::new(&[8], DType::F32);
@@ -17,6 +18,7 @@ fn graph(act: Activation) -> Graph {
     graph
 }
 
+#[allow(unused)]
 fn backward_graph(act: Activation) -> Graph {
     let mut graph = Graph::new("vmath_act_backward_parity");
     let shape = Shape::new(&[8], DType::F32);
@@ -27,6 +29,7 @@ fn backward_graph(act: Activation) -> Graph {
     graph
 }
 
+#[allow(unused)]
 fn run(device: Device, act: Activation, x: &[f32]) -> Vec<f32> {
     Session::new(device).compile(graph(act)).run(&[("x", x)])[0].clone()
 }
@@ -38,6 +41,7 @@ fn run_backward(device: Device, act: Activation, x: &[f32], dy: &[f32]) -> Vec<f
         .clone()
 }
 
+#[allow(unused)]
 fn check(device: Device, act: Activation, x: &[f32], tol: f32) {
     if !is_available(device) {
         return;
@@ -52,6 +56,7 @@ fn check(device: Device, act: Activation, x: &[f32], tol: f32) {
     }
 }
 
+#[allow(unused)]
 fn check_backward(device: Device, act: Activation, x: &[f32], dy: &[f32], tol: f32) {
     if !is_available(device) {
         return;
@@ -66,14 +71,17 @@ fn check_backward(device: Device, act: Activation, x: &[f32], dy: &[f32], tol: f
     }
 }
 
+#[allow(unused)]
 fn recip_x() -> [f32; 8] {
     [-4.0, -2.0, -0.5, -0.25, 0.25, 0.5, 2.0, 4.0]
 }
 
+#[allow(unused)]
 fn exp_tanh_x() -> [f32; 8] {
     [-2.0, -1.0, -0.5, -0.1, 0.1, 0.5, 1.0, 2.0]
 }
 
+#[allow(unused)]
 fn backward_dy() -> [f32; 8] {
     [-1.0, -0.75, -0.25, 0.1, 0.3, 0.5, 0.8, 1.0]
 }

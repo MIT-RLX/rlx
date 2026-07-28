@@ -19,8 +19,7 @@
 #![cfg(feature = "cpu")]
 #![allow(dead_code)]
 
-use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_ir::DType;
 
 const F: DType = DType::F32;
 const EPS: f32 = 1e-5;

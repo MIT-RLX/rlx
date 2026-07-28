@@ -38,3 +38,91 @@ libc = { version = "0.2", optional = true }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "direct_gemm"
+required-features = ["direct"]
+
+[[example]]
+name = "direct_probe"
+required-features = ["direct"]
+
+[[example]]
+name = "direct_query"
+required-features = ["direct"]
+
+[[example]]
+name = "direct_turbo"
+required-features = ["direct"]
+
+[[example]]
+name = "npu_gemm_check"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_attention"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_attention_proj"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_binary"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_datamove"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_eltwise"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_emit"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_fused"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_matmul_emit"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_matmul_microkernel"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_matmul_multicol"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_matmul_tiled"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_norm"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_reduce"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_relu_f32"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_rmsnorm_affine"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_softmax"
+required-features = ["xrt"]
+
+[[example]]
+name = "xdna_unary"
+required-features = ["xrt"]

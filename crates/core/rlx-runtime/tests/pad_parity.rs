@@ -173,6 +173,7 @@ fn pad_2d_all_modes() {
     }
 }
 
+#[allow(unused)]
 fn all_modes() -> [PadMode; 4] {
     [
         PadMode::Constant(9.0),

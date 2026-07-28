@@ -95,6 +95,10 @@ fn ggml_type_name(ggml: GgmlType) -> &'static str {
         Q8_1 => "Q8_1",
         Q1_0 => "Q1_0",
         Q2_0 => "Q2_0",
+        I2_S => "I2_S",
+        I8_S => "I8_S",
+        FV5 => "FV5",
+        FV5B => "FV5B",
     }
 }
 

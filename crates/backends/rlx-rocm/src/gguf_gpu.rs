@@ -151,6 +151,7 @@ pub fn run_dequant_matmul_gguf_gpu(
 /// `C = X @ W` via hipBLAS. Layout matches `rlx_cpu::dequant_matmul_mxfp4x2` so
 /// the decoded scratch feeds the same sgemm as the GGUF path.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn run_dequant_matmul_mxfp4x2_gpu(
     ctx: &Arc<RocmContext>,
     stream: crate::hip::HipStream,

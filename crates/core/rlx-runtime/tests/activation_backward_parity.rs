@@ -23,6 +23,7 @@ use rlx_runtime::{Device, Session, is_available, supports_graph};
 const N: usize = 64;
 const TOL: f32 = 5e-3;
 
+#[allow(clippy::vec_init_then_push)]
 fn available_backends() -> Vec<Device> {
     let mut v: Vec<Device> = Vec::new();
     #[cfg(all(feature = "metal", target_os = "macos"))]
