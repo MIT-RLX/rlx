@@ -1,10 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Dequant-on-the-fly matmul for MLX weight packs (mlx-lm Linear layout).
 //
 // Weight storage: [n, k] packed along K (row j → output column j).

@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Buffer arena for the wgpu backend. Mirrors the rlx-metal arena
 //! shape: pre-plan one big storage buffer at compile time, sub-allocate
@@ -142,19 +131,33 @@ fn snap_plan_to_shards_ex(plan: &mut MemoryPlan, shard_cap: usize, stage_reserve
     let mut remap: HashMap<usize, usize> = HashMap::with_capacity(ordered.len());
     let mut cursor = 0usize;
     for (old_off, size) in ordered {
-        if size > usable {
+        if size > shard_cap {
             panic!(
                 "rlx-wgpu: tensor slot at byte {old_off} is {size} bytes \
-                 ({:.2} GiB) — exceeds the usable shard of {usable} bytes \
-                 ({:.2} GiB = {stage_reserve}-byte stage reserve below the \
-                 shard cap). A single tensor cannot exceed one buffer; chunk \
-                 the oversized op over its output dimension at the graph level.",
+                 ({:.2} GiB) — exceeds a whole buffer ({:.2} GiB shard cap). A \
+                 single tensor cannot exceed one buffer; chunk the oversized op \
+                 over its output dimension at the graph level.",
                 size as f64 / (1u64 << 30) as f64,
-                usable as f64 / (1u64 << 30) as f64,
+                shard_cap as f64 / (1u64 << 30) as f64,
             );
         }
         cursor = cursor.div_ceil(16) * 16;
         let local = cursor % shard_cap;
+        // A slot that fits a whole buffer but not the reserve-trimmed `usable`
+        // zone (e.g. this model's ~2 GiB stacked 256-expert MoE codes, which is
+        // read only via host-delegate COPY, never bound as a >usable storage
+        // buffer) gets its OWN dedicated shard: start on a fresh shard boundary so
+        // it can use the full buffer, and push the next slot to the following
+        // shard. The stage reserve only matters for shards that hold staged ops.
+        if size > usable {
+            if local != 0 {
+                cursor = cursor.div_ceil(shard_cap) * shard_cap;
+            }
+            remap.insert(old_off, cursor);
+            cursor += size;
+            cursor = cursor.div_ceil(shard_cap) * shard_cap;
+            continue;
+        }
         // Jump to next stripe when the slot would enter the stage reserve or
         // cross a hard shard boundary.
         if local + size > usable {

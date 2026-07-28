@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `OneApiExecutable` — compile an IR graph for the Intel oneAPI Level Zero
 //! backend and execute it.
@@ -372,39 +372,10 @@ const CAST_F32_TO_U8: u32 = 104;
 const CAST_F32_TO_U32: u32 = 105;
 const CAST_TO_BOOL: u32 = 106;
 
-/// Op ids for `activation_backward.cl` — match CUDA / wgpu (not forward unary).
+/// Op ids for `activation_backward.cl` — "relu-first" scheme (matches CUDA /
+/// wgpu, not the forward unary switch). Canonical table in `rlx_ir::opcodes`.
 fn activation_bwd_op_id(a: Activation) -> u32 {
-    match a {
-        Activation::Relu => 0,
-        Activation::Sigmoid => 1,
-        Activation::Tanh => 2,
-        Activation::Exp => 3,
-        Activation::Log => 4,
-        Activation::Sqrt => 5,
-        Activation::Rsqrt => 6,
-        Activation::Neg => 7,
-        Activation::Abs => 8,
-        Activation::Gelu => 9,
-        Activation::Silu => 10,
-        Activation::GeluApprox => 11,
-        Activation::Round => 12,
-        Activation::Sin => 13,
-        Activation::Cos => 14,
-        Activation::Tan => 15,
-        Activation::Atan => 16,
-        Activation::Recip => 17,
-        Activation::Floor => 18,
-        Activation::Ceil => 19,
-        Activation::Sign => 20,
-        Activation::Softplus => 21,
-        Activation::Elu => 22,
-        Activation::Erf => 23,
-        Activation::HardSwish => 24,
-        Activation::HardSigmoid => 25,
-        Activation::Mish => 26,
-        Activation::Softsign => 27,
-        Activation::LogSigmoid => 28,
-    }
+    a.opcode_relu_first()
 }
 
 /// How an `Op::Cast` lowers on the f32-uniform arena.
@@ -2623,58 +2594,14 @@ fn ceil_div(n: usize, d: u32) -> u32 {
     (n as u64).div_ceil(d as u64) as u32
 }
 
+/// Op ids for the forward `unary.cl` switch (Vulkan/oneAPI "gelu-first"
+/// scheme). Canonical table lives in `rlx_ir::opcodes`.
 fn act_id(a: Activation) -> u32 {
-    match a {
-        Activation::Gelu => 0,
-        Activation::GeluApprox => 1,
-        Activation::Silu => 2,
-        Activation::Relu => 3,
-        Activation::Sigmoid => 4,
-        Activation::Tanh => 5,
-        Activation::Exp => 6,
-        Activation::Log => 7,
-        Activation::Sqrt => 8,
-        Activation::Rsqrt => 9,
-        Activation::Neg => 10,
-        Activation::Abs => 11,
-        Activation::Sin => 12,
-        Activation::Cos => 13,
-        Activation::Tan => 14,
-        Activation::Atan => 15,
-        Activation::Round => 16,
-        Activation::Recip => 17,
-        Activation::Floor => 18,
-        Activation::Ceil => 19,
-        Activation::Sign => 20,
-        Activation::Softplus => 21,
-        Activation::Elu => 22,
-        Activation::Erf => 23,
-        Activation::HardSwish => 24,
-        Activation::HardSigmoid => 25,
-        Activation::Mish => 26,
-        Activation::Softsign => 27,
-        Activation::LogSigmoid => 28,
-    }
+    a.opcode_gelu_first()
 }
 
 fn binop_id(op: rlx_ir::op::BinaryOp) -> u32 {
-    use rlx_ir::op::BinaryOp::*;
-    match op {
-        Add => 0,
-        Sub => 1,
-        Mul => 2,
-        Div => 3,
-        Max => 4,
-        Min => 5,
-        Pow => 6,
-        Mod => 7,
-        BitAnd => 8,
-        BitOr => 9,
-        BitXor => 10,
-        Shl => 11,
-        Shr => 12,
-        Atan2 => 13,
-    }
+    op.opcode()
 }
 
 /// Widen a constant byte blob (any IR dtype) to f32 for the f32-uniform arena.

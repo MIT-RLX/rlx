@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! PLAN: F16/BF16 host I/O on CPU + Metal. Verifies `set_param_typed`
 //! and `run_typed` widen typed input bytes to f32 at the host boundary.

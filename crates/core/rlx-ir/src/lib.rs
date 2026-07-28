@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! RLX Tensor IR — the intermediate representation for the RLX ML compiler.
 //!
@@ -63,6 +52,7 @@ pub mod numeric_check;
 pub mod nvfp4;
 pub mod op;
 pub mod op_registry;
+pub mod opcodes;
 pub mod ops;
 pub mod perfetto;
 pub mod phase;
@@ -70,6 +60,7 @@ pub mod pretty;
 pub mod provenance;
 pub mod quant;
 pub mod region_encode;
+pub mod residual;
 pub mod rng;
 pub use nvfp4::{FP4_E2M1_LUT, NVFP4_GROUP_SIZE, fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32};
 pub mod binding_manifest;

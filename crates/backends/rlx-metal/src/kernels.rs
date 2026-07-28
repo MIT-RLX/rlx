@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Custom MSL compute kernels for element-wise + fused operations.
 //!
@@ -28,6 +17,17 @@ use std::sync::OnceLock;
 pub const RLX_KERNELS_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+// Scalar activation math — one `inline float rlx_<name>_scalar(float x)` per
+// activation, generated from the shared rlxsl manifest. Every activation kernel
+// below (scalar f32/f16 + tuned vec4) calls these, so each activation's math
+// (the A&S erf polynomial, softplus trick, …) has a single on-device definition.
+// @@RLX_SCALAR_ACT_FNS@@
+
+// Rust-`powf`-matching scalar pow (signed for negative base + integer exponent;
+// bare MSL `pow` NaNs on any negative base). Generated from rlxsl so the tuned
+// broadcast kernels below get the correct semantics at zero perf cost (inlined).
+// @@RLX_POW_SCALAR_FN@@
 
 // Naive sgemm: one thread per output element, one dot product each.
 // C[m,n] = A[m,k] @ B[k,n]. Good baseline; tiled version below for speed.
@@ -326,16 +326,9 @@ kernel void hgemm_simd_4x4_bias(
         // Promote to fp32 for activation math (more accurate)
         float v = float(tile[sgid * 64 + idx]) + float(bias[out_col_base + cc]);
         if (act_kind == 1) {
-            float arg = v * 0.7071067811865475f;
-            float sign = arg >= 0.0f ? 1.0f : -1.0f;
-            float xa = abs(arg);
-            float t = 1.0f / (1.0f + 0.3275911f * xa);
-            float y = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f
-                    + t * (-1.453152027f + t * 1.061405429f))));
-            float erf_val = sign * (1.0f - y * exp(-min(xa * xa, 80.0f)));
-            v = v * 0.5f * (1.0f + erf_val);
+            v = rlx_gelu_scalar(v);
         } else if (act_kind == 2) {
-            v = v / (1.0f + exp(-v));
+            v = rlx_silu_scalar(v);
         }
         C[(out_row_base + r) * N + (out_col_base + cc)] = half(v);
     }
@@ -355,148 +348,10 @@ kernel void bias_add_h(
     data[row * n + col] += bias[col];
 }
 
-kernel void gelu_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    // Promote to f32 for math (more accurate for f16 input)
-    float x = float(data[gid]);
-    float arg = x * 0.7071067811865475f;
-    float sign = arg >= 0.0f ? 1.0f : -1.0f;
-    float xa = abs(arg);
-    float t = 1.0f / (1.0f + 0.3275911f * xa);
-    float y = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f
-            + t * (-1.453152027f + t * 1.061405429f))));
-    float erf_val = sign * (1.0f - y * exp(-min(xa * xa, 80.0f)));
-    data[gid] = half(x * 0.5f * (1.0f + erf_val));
-}
-
-kernel void gelu_approx_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    float x = float(data[gid]);
-    // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
-    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
-    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
-    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
-    data[gid] = half(0.5f * x * (1.0f + tanh(inner)));
-}
-
-kernel void silu_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    float x = float(data[gid]);
-    data[gid] = half(x / (1.0f + exp(-x)));
-}
-
-kernel void relu_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    data[gid] = max(data[gid], half(0.0h));
-}
-
-kernel void sigmoid_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    float x = float(data[gid]);
-    data[gid] = half(1.0f / (1.0f + exp(-x)));
-}
-
-kernel void tanh_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    float x = float(data[gid]);
-    data[gid] = half(tanh(clamp(x, -15.0f, 15.0f)));
-}
-
-kernel void exp_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(exp(float(data[gid]))); }
-
-kernel void log_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(log(float(data[gid]))); }
-
-kernel void sqrt_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(sqrt(float(data[gid]))); }
-
-kernel void rsqrt_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(rsqrt(float(data[gid]))); }
-
-kernel void rec_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(1.0f / float(data[gid])); }
-
-kernel void neg_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = -data[gid]; }
-
-kernel void abs_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = abs(data[gid]); }
-
-kernel void sin_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(sin(float(data[gid]))); }
-
-kernel void cos_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(cos(float(data[gid]))); }
-
-kernel void tan_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(tan(float(data[gid]))); }
-
-kernel void atan_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(atan(float(data[gid]))); }
-
-kernel void round_inplace_h(
-    device half* data  [[buffer(0)]],
-    constant uint& len [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; data[gid] = half(round(float(data[gid]))); }
+// Core scalar-activation f16 in-place kernels — generated once from the shared
+// rlxsl manifest (was hand-written MSL re-inlining the A&S erf polynomial with
+// drift: unclamped erf arg + ties-away `round`). Injected by msl_source().
+// @@RLX_ACT_INPLACE_H@@
 
 // f16 input, f32 reduction, f16 output (mixed precision LayerNorm)
 kernel void layer_norm_h(
@@ -1191,16 +1046,9 @@ kernel void sgemm_simd_4x4_bias(
         uint cc = idx % 8;
         float v = tile[sgid * 64 + idx] + bias[out_col_base + cc];
         if (act_kind == 1) {
-            float arg = v * 0.7071067811865475;
-            float sign = arg >= 0.0 ? 1.0 : -1.0;
-            float xa = abs(arg);
-            float t = 1.0 / (1.0 + 0.3275911 * xa);
-            float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                    + t * (-1.453152027 + t * 1.061405429))));
-            float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
-            v = v * 0.5 * (1.0 + erf_val);
+            v = rlx_gelu_scalar(v);
         } else if (act_kind == 2) {
-            v = v / (1.0 + exp(-v));
+            v = rlx_silu_scalar(v);
         }
         C[(out_row_base + r) * N + (out_col_base + cc)] = v;
     }
@@ -1245,17 +1093,9 @@ kernel void sgemm_simd_bias(
         uint cc = idx % 8;
         float v = tile[idx] + bias[col_base + cc];
         if (act_kind == 1) {
-            // GELU (Abramowitz & Stegun erf approx)
-            float arg = v * 0.7071067811865475;
-            float sign = arg >= 0.0 ? 1.0 : -1.0;
-            float xa = abs(arg);
-            float t = 1.0 / (1.0 + 0.3275911 * xa);
-            float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                    + t * (-1.453152027 + t * 1.061405429))));
-            float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
-            v = v * 0.5 * (1.0 + erf_val);
+            v = rlx_gelu_scalar(v);
         } else if (act_kind == 2) {
-            v = v / (1.0 + exp(-v));
+            v = rlx_silu_scalar(v);
         }
         C[(row_base + r) * N + (col_base + cc)] = v;
     }
@@ -1317,16 +1157,9 @@ kernel void sgemm_simd_padded_bias(
         if (dst_row < M && dst_col < N) {
             float v = C_pad[idx] + bias[dst_col];
             if (act_kind == 1) {
-                float arg = v * 0.7071067811865475;
-                float sign = arg >= 0.0 ? 1.0 : -1.0;
-                float xa = abs(arg);
-                float t = 1.0 / (1.0 + 0.3275911 * xa);
-                float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                        + t * (-1.453152027 + t * 1.061405429))));
-                float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
-                v = v * 0.5 * (1.0 + erf_val);
+                v = rlx_gelu_scalar(v);
             } else if (act_kind == 2) {
-                v = v / (1.0 + exp(-v));
+                v = rlx_silu_scalar(v);
             }
             C[dst_row * N + dst_col] = v;
         }
@@ -1467,43 +1300,9 @@ kernel void bias_add(
 
 // in-place GELU using Abramowitz & Stegun erf approximation
 // (matches CPU NEON kernel for parity)
-kernel void gelu_inplace(
-    device char* arena [[buffer(0)]],
-    constant ulong& data_byte_off [[buffer(1)]],
-    constant uint& len [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    device float* data = (device float*)(arena + data_byte_off);
-    float x = data[gid];
-    float arg = x * 0.7071067811865475;  // x / sqrt(2)
-    float sign = arg >= 0.0 ? 1.0 : -1.0;
-    float xa = abs(arg);
-    float t = 1.0 / (1.0 + 0.3275911 * xa);
-    float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-            + t * (-1.453152027 + t * 1.061405429))));
-    float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
-    data[gid] = x * 0.5 * (1.0 + erf_val);
-}
-
-// Tanh-approximation GELU — matches CPU `scalar_gelu_approx` / PyTorch default:
-//   y = 0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 · x³)))
-// Routed from `Activation::GeluApprox` (Gemma 4 MLP, ViT, DINOv2).
-kernel void gelu_approx_inplace(
-    device char* arena [[buffer(0)]],
-    constant ulong& data_byte_off [[buffer(1)]],
-    constant uint& len [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= len) return;
-    device float* data = (device float*)(arena + data_byte_off);
-    float x = data[gid];
-    // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
-    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
-    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
-    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
-    data[gid] = 0.5f * x * (1.0f + tanh(inner));
-}
+// f32 gelu / gelu_approx in-place (arena form) — generated from rlxsl. The tuned
+// vec4 `*_inplace4` variants below stay hand-written (peak-perf hot path).
+// @@RLX_GELU_INPLACE_F32@@
 
 kernel void gelu_approx_inplace4(
     device char* arena [[buffer(0)]],
@@ -1516,12 +1315,7 @@ kernel void gelu_approx_inplace4(
     packed_float4 px = data[gid];
     packed_float4 out;
     for (uint c = 0; c < 4; ++c) {
-        float x = px[c];
-        // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
-    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
-    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
-    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
-        out[c] = 0.5f * x * (1.0f + tanh(inner));
+        out[c] = rlx_gelu_approx_scalar(px[c]);
     }
     data[gid] = out;
 }
@@ -1539,12 +1333,7 @@ kernel void gelu_approx_out4(
     packed_float4 px = src[gid];
     packed_float4 out;
     for (uint c = 0; c < 4; ++c) {
-        float x = px[c];
-        // Clamp to the tanh saturation range: tanh(±15)≈±1 to f32 precision, but a
-    // huge argument (packed-QAT gate outliers → large x³, or +inf) makes Metal's
-    // fast-math tanh return NaN. clamp() also folds ±inf to ±15.
-    float inner = clamp(0.7978845608f * (x + 0.044715f * x * x * x), -15.0f, 15.0f);
-        out[c] = 0.5f * x * (1.0f + tanh(inner));
+        out[c] = rlx_gelu_approx_scalar(px[c]);
     }
     dst[gid] = out;
 }
@@ -1560,15 +1349,7 @@ kernel void gelu_inplace4(
     packed_float4 px = data[gid];
     packed_float4 out;
     for (uint c = 0; c < 4; ++c) {
-        float xv = px[c];
-        float arg = xv * 0.7071067811865475;
-        float sign = arg >= 0.0 ? 1.0 : -1.0;
-        float xa = abs(arg);
-        float t = 1.0 / (1.0 + 0.3275911 * xa);
-        float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                + t * (-1.453152027 + t * 1.061405429))));
-        float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
-        out[c] = xv * 0.5 * (1.0 + erf_val);
+        out[c] = rlx_gelu_scalar(px[c]);
     }
     data[gid] = out;
 }
@@ -1584,8 +1365,7 @@ kernel void silu_inplace4(
     packed_float4 px = data[gid];
     packed_float4 out;
     for (uint c = 0; c < 4; ++c) {
-        float xv = px[c];
-        out[c] = xv / (1.0 + exp(-xv));
+        out[c] = rlx_silu_scalar(px[c]);
     }
     data[gid] = out;
 }
@@ -1604,8 +1384,7 @@ kernel void silu_out4(
     packed_float4 px = src[gid];
     packed_float4 out;
     for (uint c = 0; c < 4; ++c) {
-        float xv = px[c];
-        out[c] = xv / (1.0 + exp(-xv));
+        out[c] = rlx_silu_scalar(px[c]);
     }
     dst[gid] = out;
 }
@@ -1633,7 +1412,7 @@ kernel void binary_broadcast_rhs_col_f32(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst[m * cols + n] = out;
 }
@@ -1665,7 +1444,7 @@ kernel void binary_broadcast_rhs_col4(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst4[n4] = out;
 }
@@ -1693,7 +1472,7 @@ kernel void binary_broadcast_rhs_row_f32(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst[m * cols + n] = out;
 }
@@ -1725,7 +1504,7 @@ kernel void binary_broadcast_rhs_row4(
         case 3: out = lv / rv4; break;
         case 4: out = max(lv, rv4); break;
         case 5: out = min(lv, rv4); break;
-        default: out = pow(lv, rv4); break;
+        default: out = rlx_pow_scalar(lv, rv4); break;
     }
     dst4[n4] = out;
 }
@@ -1754,7 +1533,7 @@ kernel void binary_broadcast_rhs_scalar_f32(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst[gid] = out;
 }
@@ -1783,7 +1562,7 @@ kernel void binary_broadcast_rhs_scalar4(
         case 3: out = lv / rv4; break;
         case 4: out = max(lv, rv4); break;
         case 5: out = min(lv, rv4); break;
-        default: out = pow(lv, rv4); break;
+        default: out = rlx_pow_scalar(lv, rv4); break;
     }
     dst[gid] = out;
 }
@@ -1815,7 +1594,7 @@ kernel void binary_broadcast_1ax_f32(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst[li] = out;
 }
@@ -1852,30 +1631,15 @@ kernel void binary_broadcast_1ax4(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst4[col4] = out;
 }
 
-inline float fused_bin(float lv, float rv, uint op) {
-    switch (op) {
-        case 0: return lv + rv;
-        case 1: return lv - rv;
-        case 2: return lv * rv;
-        case 3: return lv / rv;
-        case 4: return max(lv, rv);
-        case 5: return min(lv, rv);
-        case 6: return pow(lv, rv);
-        case 7: return fmod(lv, rv);
-        case 8: return (float)((int)lv & (int)rv);
-        case 9: return (float)((int)lv | (int)rv);
-        case 10: return (float)((int)lv ^ (int)rv);
-        case 11: return (float)((int)lv << (int)rv);
-        case 12: return (float)((int)lv >> (int)rv);
-        case 13: return atan2(lv, rv);
-        default: return pow(lv, rv);
-    }
-}
+// Binary-op math generated once from the shared rlxsl manifest (fixes the
+// negative-base `pow` and 32-bit-bitwise drift the hand-written switch had).
+// @@RLX_BINARY_FN@@
+inline float fused_bin(float lv, float rv, uint op) { return rlx_binary_apply(op, lv, rv); }
 
 // Same-size element-wise binary by opcode (Mod/bitwise: no dedicated elem_*).
 kernel void elem_binop(
@@ -1896,22 +1660,17 @@ kernel void elem_binop_h(
     uint gid [[thread_position_in_grid]]
 ) { if (gid >= n) return; c[gid] = half(fused_bin(float(a[gid]), float(b[gid]), op)); }
 
+// Fused-region activation dispatch. Its mini opcode scheme (0=gelu 1=silu
+// 2=relu 3=sigmoid 4=tanh) routes to the shared `rlx_<name>_scalar` functions
+// generated from rlxsl — so the A&S erf polynomial (and its drift) is no longer
+// re-inlined here. Metal inlines these, so the fused epilogue stays as fast.
 inline float fused_act(float x, uint act) {
     switch (act) {
-        case 0: {
-            float arg = x * 0.7071067811865475;
-            float sign = arg >= 0.0 ? 1.0 : -1.0;
-            float xa = abs(arg);
-            float t = 1.0 / (1.0 + 0.3275911 * xa);
-            float y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                    + t * (-1.453152027 + t * 1.061405429))));
-            float erf_val = sign * (1.0 - y * exp(-min(xa * xa, 80.0f)));
-            return x * 0.5 * (1.0 + erf_val);
-        }
-        case 1: return x / (1.0 + exp(-x));
-        case 2: return max(x, 0.0);
-        case 3: return 1.0 / (1.0 + exp(-x));
-        case 4: return tanh(clamp(x, -15.0f, 15.0f)); // fast-math tanh NaNs on large |x|
+        case 0: return rlx_gelu_scalar(x);
+        case 1: return rlx_silu_scalar(x);
+        case 2: return rlx_relu_scalar(x);
+        case 3: return rlx_sigmoid_scalar(x);
+        case 4: return rlx_tanh_scalar(x);
         default: return x;
     }
 }
@@ -2067,7 +1826,7 @@ kernel void binary_broadcast_rank2_f32(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst[gid] = out;
 }
@@ -2106,7 +1865,7 @@ kernel void binary_broadcast_rank24(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     *dst4 = out;
 }
@@ -2151,7 +1910,7 @@ kernel void binary_broadcast_f32(
         case 3: out = lv / rv; break;
         case 4: out = max(lv, rv); break;
         case 5: out = min(lv, rv); break;
-        default: out = pow(lv, rv); break;
+        default: out = rlx_pow_scalar(lv, rv); break;
     }
     dst[gid] = out;
 }
@@ -2256,12 +2015,14 @@ kernel void elem_pow(
     device float* c       [[buffer(2)]],
     constant uint& len    [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
-) { if (gid >= len) return; c[gid] = pow(a[gid], b[gid]); }
+) { if (gid >= len) return; c[gid] = rlx_pow_scalar(a[gid], b[gid]); }
 
 // Element-wise compare: writes 1.0 / 0.0 per element. `op_kind` selects:
 //   0=Eq 1=Ne 2=Lt 3=Le 4=Gt 5=Ge
 // One kernel for all six variants keeps the binary-shaped dispatch path
 // uniform — the encoder picks op_kind at submit time.
+// Compare-op math generated once from the shared rlxsl manifest.
+// @@RLX_COMPARE_FN@@
 kernel void elem_compare(
     device const float* a    [[buffer(0)]],
     device const float* b    [[buffer(1)]],
@@ -2271,15 +2032,7 @@ kernel void elem_compare(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= len) return;
-    float x = a[gid], y = b[gid];
-    bool r = false;
-    if      (op_kind == 0) r = (x == y);
-    else if (op_kind == 1) r = (x != y);
-    else if (op_kind == 2) r = (x <  y);
-    else if (op_kind == 3) r = (x <= y);
-    else if (op_kind == 4) r = (x >  y);
-    else                   r = (x >= y);
-    c[gid] = r ? 1.0f : 0.0f;
+    c[gid] = rlx_compare_apply(op_kind, a[gid], b[gid]);
 }
 
 /// Compare with optional scalar broadcast (`flags`: bit0=lhs scalar, bit1=rhs).
@@ -2295,14 +2048,7 @@ kernel void elem_compare_bcast(
     if (gid >= len) return;
     float x = (flags & 1u) ? a[0] : a[gid];
     float y = (flags & 2u) ? b[0] : b[gid];
-    bool r = false;
-    if      (op_kind == 0) r = (x == y);
-    else if (op_kind == 1) r = (x != y);
-    else if (op_kind == 2) r = (x <  y);
-    else if (op_kind == 3) r = (x <= y);
-    else if (op_kind == 4) r = (x >  y);
-    else                   r = (x >= y);
-    c[gid] = r ? 1.0f : 0.0f;
+    c[gid] = rlx_compare_apply(op_kind, x, y);
 }
 
 // 2D convolution (naive direct, NCHW input). One thread per output
@@ -3628,16 +3374,6 @@ kernel void elem_fma(
 // Element-wise ReLU / activation backward. `op` matches CUDA
 // `activation_op_id` / unary forward ids (0=relu … 16=atan).
 // Formulas mirror rlx-cpu `activation_backward_kernel`.
-inline float erf_as(float x) {
-    // Abramowitz & Stegun 7.1.26 — matches rlx-cpu `erf_f32`.
-    float s = x < 0.0f ? -1.0f : 1.0f;
-    float xa = fabs(x);
-    float t = 1.0f / (1.0f + 0.3275911f * xa);
-    float y = 1.0f - (((((1.0614054f * t - 1.4531521f) * t) + 1.4214138f) * t
-                       - 0.28449674f) * t + 0.2548296f) * t * exp(-xa * xa);
-    return s * y;
-}
-
 kernel void relu_backward(
     device const float* x  [[buffer(0)]],
     device const float* dy [[buffer(1)]],
@@ -3651,6 +3387,7 @@ kernel void relu_backward(
     dx[gid] = (xv > 0.0f) ? dyv : 0.0f;
 }
 
+// @@RLX_ACTIVATION_BACKWARD@@
 kernel void activation_backward(
     device const float* x  [[buffer(0)]],
     device const float* dy [[buffer(1)]],
@@ -3662,85 +3399,9 @@ kernel void activation_backward(
     if (gid >= len) return;
     float xv = x[gid];
     float dyv = dy[gid];
-    float out;
-    switch (op) {
-        case 0u: // relu
-            out = (xv > 0.0f) ? dyv : 0.0f;
-            break;
-        case 1u: { // sigmoid: σ(1-σ)
-            float xc = clamp(xv, -88.0f, 88.0f);
-            float s = 1.0f / (1.0f + exp(-xc));
-            out = s * (1.0f - s) * dyv;
-        } break;
-        case 2u: { // tanh: 1 - t²
-            float t = tanh(clamp(xv, -15.0f, 15.0f));
-            out = (1.0f - t * t) * dyv;
-        } break;
-        case 3u: // exp
-            out = exp(xv) * dyv;
-            break;
-        case 4u: // log
-            out = dyv / xv;
-            break;
-        case 5u: { // sqrt
-            float s = sqrt(xv);
-            out = (s > 0.0f) ? (0.5f * dyv / s) : 0.0f;
-        } break;
-        case 6u: { // rsqrt
-            float s = sqrt(xv);
-            out = (s > 0.0f) ? (-0.5f * dyv / (xv * s)) : 0.0f;
-        } break;
-        case 7u: // neg
-            out = -dyv;
-            break;
-        case 8u: // abs: sign(x), 0 at 0
-            out = (xv > 0.0f) ? dyv : ((xv < 0.0f) ? -dyv : 0.0f);
-            break;
-        case 9u: { // gelu (erf)
-            const float INV_SQRT2 = 0.7071067811865475f;
-            const float INV_SQRT_2PI = 0.3989422804014327f;
-            float phi = 0.5f * (1.0f + erf_as(xv * INV_SQRT2));
-            float pdf = INV_SQRT_2PI * exp(-0.5f * xv * xv);
-            out = (phi + xv * pdf) * dyv;
-        } break;
-        case 10u: { // silu: σ · (1 + x · (1 - σ))
-            float xc = clamp(xv, -88.0f, 88.0f);
-            float s = 1.0f / (1.0f + exp(-xc));
-            out = s * (1.0f + xv * (1.0f - s)) * dyv;
-        } break;
-        case 11u: { // gelu_approx (tanh)
-            const float C = 0.7978845608028654f;
-            const float A = 0.044715f;
-            float inner = clamp(C * (xv + A * xv * xv * xv), -15.0f, 15.0f);
-            float t = tanh(inner);
-            float dinner = C * (1.0f + 3.0f * A * xv * xv);
-            float d = 0.5f * (1.0f + t) + 0.5f * xv * (1.0f - t * t) * dinner;
-            out = d * dyv;
-        } break;
-        case 12u: // round STE: identity
-            out = dyv;
-            break;
-        case 13u: // sin
-            out = cos(xv) * dyv;
-            break;
-        case 14u: // cos
-            out = -sin(xv) * dyv;
-            break;
-        case 15u: { // tan: 1 + tan²
-            float t = tan(xv);
-            out = (1.0f + t * t) * dyv;
-        } break;
-        case 16u: // atan: 1 / (1 + x²)
-            out = dyv / (1.0f + xv * xv);
-            break;
-        case 17u: // reciprocal: -1 / x²
-            out = -dyv / (xv * xv);
-            break;
-        default:
-            out = dyv;
-            break;
-    }
-    dx[gid] = out;
+    // Derivative dispatch generated from the rlxsl manifest (auto-differentiated
+    // from the forward); definition substituted for the marker below at runtime.
+    dx[gid] = rlx_activation_backward(op, xv, dyv);
 }
 
 // C64 Wirtinger surface on interleaved [re, im] f32 pairs (mirrors
@@ -6335,6 +5996,43 @@ kernel void dequant_matmul_nvfp4(
     out[i * n + j] = acc;
 }
 
+// MxFp4x2 two-level residual E2M1 fused decode-matmul. wq = [plane0|plane1]
+// (E2M1 nibbles packed 2/byte over the [k,n] grid); scales = [s0|s1] f32 per
+// (block = k/group_size, n). out[i,j] = sum_p x[i,p]·(s0·LUT[q0] + s1·LUT[q1]).
+// Same math + layout as rlx_cpu::dequant_matmul_mxfp4x2.
+kernel void dequant_matmul_mxfp4x2(
+    device const float* x      [[buffer(0)]],
+    device const uchar* wq     [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* out          [[buffer(3)]],
+    constant uint& m           [[buffer(4)]],
+    constant uint& k           [[buffer(5)]],
+    constant uint& n           [[buffer(6)]],
+    constant uint& group_size  [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= m * n) return;
+    uint i = gid / n;
+    uint j = gid % n;
+    uint total = k * n;
+    uint plane = (total + 1u) >> 1;                     // bytes per nibble plane
+    uint g = (group_size == 0u) ? 1u : group_size;
+    uint nblk = (k + g - 1u) / g;
+    float acc = 0.0f;
+    for (uint p = 0u; p < k; ++p) {
+        uint idx = p * n + j;
+        uint byte_idx = idx >> 1;
+        uint sh = ((idx & 1u) == 0u) ? 0u : 4u;
+        uint q0 = (uint(wq[byte_idx]) >> sh) & 0x0Fu;
+        uint q1 = (uint(wq[plane + byte_idx]) >> sh) & 0x0Fu;
+        uint block = p / g;
+        float s0 = scales[block * n + j];
+        float s1 = scales[nblk * n + block * n + j];
+        acc += x[i * k + p] * (s0 * DQ_FP4_E2M1[q0] + s1 * DQ_FP4_E2M1[q1]);
+    }
+    out[i * n + j] = acc;
+}
+
 // MLX Linear packs: w [n,k] along K. kind 0=affine, 1=mxfp4, 2=mxfp8.
 inline float mlx_e8m0(uint s) {
     if (s == 0u) return as_type<float>(uint(0x0040u) << 16);
@@ -7128,7 +6826,7 @@ kernel void elementwise_region(
                 else if (op_sub == 3u) result = lhs / rhs;
                 else if (op_sub == 4u) result = max(lhs, rhs);
                 else if (op_sub == 5u) result = min(lhs, rhs);
-                else                   result = pow(lhs, rhs);
+                else                   result = rlx_pow_scalar(lhs, rhs);
             } else {
                 bool b;
                 if      (op_sub == 0u) b = (lhs == rhs);
@@ -7260,7 +6958,7 @@ kernel void batch_elementwise_region(
                 else if (op_sub == 3u) result = lhs / rhs;
                 else if (op_sub == 4u) result = max(lhs, rhs);
                 else if (op_sub == 5u) result = min(lhs, rhs);
-                else                   result = pow(lhs, rhs);
+                else                   result = rlx_pow_scalar(lhs, rhs);
             } else {
                 bool b;
                 if      (op_sub == 0u) b = (lhs == rhs);
@@ -8657,18 +8355,32 @@ const RLX_KERNELS_MSL_SPLAT_CONIC: &str = include_str!("splat_conic_bin.msl");
 /// `(Variant, "name", "msl_expr")` generates an f32 + f16 in-place MSL kernel
 /// (the expr sees `float x`) and its pipeline pair. Adding an activation is one
 /// line here — no struct field, no dispatch arm, no separate kernel edit.
+// The macro owns the (Activation → kernel-name) binding once; the scalar MATH
+// comes from the shared `rlxsl` manifest (a single definition across all
+// backends; the A&S erf polynomial now lives once in rlxsl rather than a
+// hand-written `rlx_erf` helper — MSL has no erf builtin). Metal compiles MSL
+// at runtime, so the source is assembled as a `String`; no build.rs needed.
 macro_rules! scalar_activation_kernels {
-    ( $( $variant:ident, $name:literal, $expr:literal );+ $(;)? ) => {
-        const SCALAR_ACT_MSL: &str = concat!(
-            // Metal has no `erf` builtin — provide one (A&S 7.1.26).
-            "inline float rlx_erf(float x) { float s = sign(x); float ax = fabs(x); \
-             float t = 1.0f/(1.0f+0.3275911f*ax); \
-             float p = ((((1.061405429f*t - 1.453152027f)*t + 1.421413741f)*t - 0.284496736f)*t + 0.254829592f)*t; \
-             return s*(1.0f - p*exp(-ax*ax)); }\n",
+    ( $( $variant:ident, $name:literal );+ $(;)? ) => {
+        /// Build the standalone scalar-activation MSL kernels (f32 + f16) from
+        /// the rlxsl manifest.
+        fn scalar_act_msl() -> String {
+            let mut src = String::new();
             $(
-            "kernel void ", $name, "_sa(device float* d [[buffer(0)]], constant uint& n [[buffer(1)]], uint g [[thread_position_in_grid]]) { if (g>=n) return; float x = d[g]; d[g] = ", $expr, "; }\n",
-            "kernel void ", $name, "_sa_h(device half* d [[buffer(0)]], constant uint& n [[buffer(1)]], uint g [[thread_position_in_grid]]) { if (g>=n) return; float x = float(d[g]); d[g] = half(", $expr, "); }\n",
-        )+);
+                {
+                    let (stmts, expr) = rlxsl::emit_activation(
+                        rlx_ir::op::Activation::$variant, rlxsl::Lang::Msl);
+                    let body = stmts.join(" ");
+                    src.push_str(&format!(
+                        "kernel void {n}_sa(device float* d [[buffer(0)]], constant uint& n [[buffer(1)]], uint g [[thread_position_in_grid]]) {{ if (g>=n) return; float x = d[g]; {b} d[g] = {e}; }}\n",
+                        n = $name, b = body, e = expr));
+                    src.push_str(&format!(
+                        "kernel void {n}_sa_h(device half* d [[buffer(0)]], constant uint& n [[buffer(1)]], uint g [[thread_position_in_grid]]) {{ if (g>=n) return; float x = float(d[g]); {b} d[g] = half({e}); }}\n",
+                        n = $name, b = body, e = expr));
+                }
+            )+
+            src
+        }
 
         /// Build the (f32, f16) pipeline pair for each scalar activation.
         fn build_scalar_act_kernels(
@@ -8688,22 +8400,126 @@ macro_rules! scalar_activation_kernels {
 }
 
 scalar_activation_kernels! {
-    Floor,       "floor",       "floor(x)";
-    Ceil,        "ceil",        "ceil(x)";
-    Sign,        "sign",        "sign(x)";
-    Softplus,    "softplus",    "max(x, 0.0f) + log(1.0f + exp(-fabs(x)))";
-    Elu,         "elu",         "(x > 0.0f) ? x : (exp(x) - 1.0f)";
-    Erf,         "erf",         "rlx_erf(x)";
-    HardSwish,   "hardswish",   "x * clamp(x + 3.0f, 0.0f, 6.0f) / 6.0f";
-    HardSigmoid, "hardsigmoid", "clamp(x / 6.0f + 0.5f, 0.0f, 1.0f)";
-    Mish,        "mish",        "x * tanh(max(x, 0.0f) + log(1.0f + exp(-fabs(x))))";
-    Softsign,    "softsign",    "x / (1.0f + fabs(x))";
-    LogSigmoid,  "logsigmoid",  "min(x, 0.0f) - log(1.0f + exp(-fabs(x)))";
+    Floor,       "floor";
+    Ceil,        "ceil";
+    Sign,        "sign";
+    Softplus,    "softplus";
+    Elu,         "elu";
+    Erf,         "erf";
+    HardSwish,   "hardswish";
+    HardSigmoid, "hardsigmoid";
+    Mish,        "mish";
+    Softsign,    "softsign";
+    LogSigmoid,  "logsigmoid";
+}
+
+/// The core scalar activations paired with their Metal kernel base name — the
+/// single list driving the generated inline functions and the f16/f32 kernels.
+const CORE_ACTS: &[(rlx_ir::op::Activation, &str)] = {
+    use rlx_ir::op::Activation as A;
+    &[
+        (A::Gelu, "gelu"),
+        (A::GeluApprox, "gelu_approx"),
+        (A::Silu, "silu"),
+        (A::Relu, "relu"),
+        (A::Sigmoid, "sigmoid"),
+        (A::Tanh, "tanh"),
+        (A::Exp, "exp"),
+        (A::Log, "log"),
+        (A::Sqrt, "sqrt"),
+        (A::Rsqrt, "rsqrt"),
+        (A::Recip, "rec"),
+        (A::Neg, "neg"),
+        (A::Abs, "abs"),
+        (A::Sin, "sin"),
+        (A::Cos, "cos"),
+        (A::Tan, "tan"),
+        (A::Atan, "atan"),
+        (A::Round, "round"),
+    ]
+};
+
+/// One `inline float rlx_<name>_scalar(float x)` per core activation, generated
+/// from the shared rlxsl manifest — the single on-device definition of each
+/// activation's scalar math. The f16/f32/vec4 kernels below all call these, so
+/// the A&S erf polynomial (etc.) is no longer re-inlined per kernel. Metal
+/// inlines these, so routing through them costs no performance.
+fn scalar_act_fns_msl() -> String {
+    let mut src = String::from("// @generated from rlxsl — scalar activation device functions.\n");
+    for (act, name) in CORE_ACTS {
+        let (stmts, expr) = rlxsl::emit_activation(*act, rlxsl::Lang::Msl);
+        let body = stmts.join(" ");
+        src.push_str(&format!(
+            "inline float rlx_{name}_scalar(float x) {{ {body} return {expr}; }}\n"
+        ));
+    }
+    src
+}
+
+/// The core scalar-activation **f16** in-place kernels (`{name}_inplace_h`),
+/// each just calling the shared `rlx_<name>_scalar`. Replaces the hand-written
+/// MSL that re-inlined the A&S erf polynomial (and had drifted: unclamped erf
+/// arg, ties-away `round`). Signature matches the dispatch: `buffer(0)=half*
+/// data`, `buffer(1)=len`.
+fn core_act_inplace_h_msl() -> String {
+    let mut src =
+        String::from("// @generated from rlxsl — core scalar-activation f16 in-place kernels.\n");
+    for (_act, name) in CORE_ACTS {
+        src.push_str(&format!(
+            "kernel void {name}_inplace_h(device half* data [[buffer(0)]], constant uint& len [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{ if (gid >= len) return; data[gid] = half(rlx_{name}_scalar(float(data[gid]))); }}\n"
+        ));
+    }
+    src
+}
+
+/// The f32 `gelu`/`gelu_approx` in-place kernels (char-arena form), each calling
+/// the shared `rlx_<name>_scalar`. These were the f32 scalar `_inplace` kernels
+/// that re-inlined non-trivial math; the trivial ones (relu/exp/…) stay
+/// hand-written.
+fn gelu_inplace_f32_msl() -> String {
+    let mut src = String::from("// @generated from rlxsl — f32 gelu/gelu_approx in-place.\n");
+    for name in ["gelu", "gelu_approx"] {
+        src.push_str(&format!(
+            "kernel void {name}_inplace(device char* arena [[buffer(0)]], constant ulong& data_byte_off [[buffer(1)]], constant uint& len [[buffer(2)]], uint gid [[thread_position_in_grid]]) {{ if (gid >= len) return; device float* data = (device float*)(arena + data_byte_off); data[gid] = rlx_{name}_scalar(data[gid]); }}\n"
+        ));
+    }
+    src
+}
+
+/// `inline float rlx_pow_scalar(float a, float b)` — the Rust-`powf`-matching
+/// pow generated from rlxsl, for the tuned broadcast kernels (whose bare MSL
+/// `pow` NaN'd on a negative base). Metal inlines it → no perf cost.
+fn pow_scalar_fn_msl() -> String {
+    let (stmts, expr) =
+        rlxsl::binary::emit_binary(rlx_ir::op::BinaryOp::Pow, rlxsl::Lang::Msl);
+    format!(
+        "// @generated from rlxsl — Rust-powf-matching scalar pow (+ a vec4 overload\n\
+         // for the packed_float4 broadcast kernels).\n\
+         inline float rlx_pow_scalar(float a, float b) {{ {} return {expr}; }}\n\
+         inline packed_float4 rlx_pow_scalar(packed_float4 a, packed_float4 b) {{ \
+         packed_float4 r; for (uint i = 0u; i < 4u; ++i) {{ r[i] = rlx_pow_scalar(a[i], b[i]); }} return r; }}\n",
+        stmts.join(" ")
+    )
 }
 
 fn msl_source() -> String {
+    // Substitute the generated dispatch/kernels at their markers. The backward
+    // derivative dispatch must be defined before the `activation_backward` kernel
+    // that calls it; the in-place activation kernels are standalone entry points.
+    let core = RLX_KERNELS_MSL
+        .replace("// @@RLX_SCALAR_ACT_FNS@@", &scalar_act_fns_msl())
+        .replace("// @@RLX_POW_SCALAR_FN@@", &pow_scalar_fn_msl())
+        .replace(
+            "// @@RLX_ACTIVATION_BACKWARD@@",
+            &rlxsl::msl_activation_backward_module(),
+        )
+        .replace("// @@RLX_ACT_INPLACE_H@@", &core_act_inplace_h_msl())
+        .replace("// @@RLX_GELU_INPLACE_F32@@", &gelu_inplace_f32_msl())
+        .replace("// @@RLX_BINARY_FN@@", &rlxsl::binary::msl_binary_module())
+        .replace("// @@RLX_COMPARE_FN@@", &rlxsl::compare::msl_compare_module());
     format!(
-        "{RLX_KERNELS_MSL}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}\n{SCALAR_ACT_MSL}"
+        "{core}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}\n{}",
+        scalar_act_msl()
     )
 }
 
@@ -8829,6 +8645,7 @@ pub struct Kernels {
     pub dequant_matmul_int4: ComputePipelineState,
     pub dequant_matmul_fp8: ComputePipelineState,
     pub dequant_matmul_nvfp4: ComputePipelineState,
+    pub dequant_matmul_mxfp4x2: ComputePipelineState,
     pub dequant_matmul_mlx_gemv: ComputePipelineState,
     pub dequant_matmul_mlx_gemm: ComputePipelineState,
     pub rope: ComputePipelineState,
@@ -8868,6 +8685,9 @@ pub struct Kernels {
     pub fake_quantize_fixed: ComputePipelineState,
     pub fake_quantize_perbatch: ComputePipelineState,
     pub reduce_axes: ComputePipelineState,
+    /// Double-single (2× f32 ≈ f64) full-sum reduction — high-precision
+    /// `Op::Reduce{Sum}` on Metal (opt-in via `RLX_METAL_DW_SUM`).
+    pub dw_sum_arena: ComputePipelineState,
     pub topk_lastax: ComputePipelineState,
     pub grouped_matmul: ComputePipelineState,
     pub scatter_add_zero: ComputePipelineState,
@@ -9064,6 +8884,31 @@ pub struct Kernels {
 unsafe impl Send for Kernels {}
 unsafe impl Sync for Kernels {}
 
+/// Double-single (2× f32 ≈ f64) sum reduction over the f32 arena — the
+/// high-precision path for `Op::Reduce{Sum}` on Metal (no native f64). Prepended
+/// with the `rlxsl::dw` prelude and compiled with PRECISE math (fast-math would
+/// break the error-free transforms). See [`Kernels::new`].
+const DW_SUM_ARENA_MSL: &str = r#"
+// Buffers are bound at the src/dst byte offsets (mirrors encode_reduce_axes),
+// so index from 0. Writes the correctly-rounded scalar sum to out[0].
+kernel void dw_sum_arena(device const float* x [[buffer(0)]],
+                         device float* out      [[buffer(1)]],
+                         constant uint& n       [[buffer(2)]],
+                         uint tid      [[thread_position_in_threadgroup]],
+                         uint nthreads [[threads_per_threadgroup]]) {
+    threadgroup DwF32 shared[256];
+    DwF32 acc = DwF32{0.0f, 0.0f};
+    for (uint i = tid; i < n; i += nthreads) { acc = dw_add(acc, DwF32{x[i], 0.0f}); }
+    shared[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads >> 1; s > 0u; s >>= 1) {
+        if (tid < s) { shared[tid] = dw_add(shared[tid], shared[tid + s]); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) { out[0] = shared[0].hi + shared[0].lo; }
+}
+"#;
+
 impl Kernels {
     fn new() -> Self {
         let dev = metal_device().expect("Metal device required");
@@ -9074,7 +8919,25 @@ impl Kernels {
                 .new_compute_pipeline_state_with_function(&f)
                 .unwrap_or_else(|_| panic!("pipeline {name}"))
         };
+        // Separate PRECISE-math library for the double-single reduction.
+        let dw_sum_arena = {
+            let src = format!(
+                "#include <metal_stdlib>\nusing namespace metal;\n{}\n{DW_SUM_ARENA_MSL}",
+                rlxsl::dw::double_single_prelude(rlxsl::Lang::Msl)
+            );
+            let opts = metal::CompileOptions::new();
+            opts.set_fast_math_enabled(false);
+            let lib = dev
+                .device
+                .new_library_with_source(&src, &opts)
+                .expect("rlx-metal: compile dw_sum_arena library");
+            let f = lib.get_function("dw_sum_arena", None).expect("dw_sum_arena");
+            dev.device
+                .new_compute_pipeline_state_with_function(&f)
+                .expect("rlx-metal: dw_sum_arena pipeline")
+        };
         Self {
+            dw_sum_arena,
             sgemm: pipeline("sgemm"),
             sgemm_f16w: pipeline("sgemm_f16w"),
             sgemm_f16w_small_m: pipeline("sgemm_f16w_small_m"),
@@ -9189,6 +9052,7 @@ impl Kernels {
             dequant_matmul_int4: pipeline("dequant_matmul_int4"),
             dequant_matmul_fp8: pipeline("dequant_matmul_fp8"),
             dequant_matmul_nvfp4: pipeline("dequant_matmul_nvfp4"),
+            dequant_matmul_mxfp4x2: pipeline("dequant_matmul_mxfp4x2"),
             dequant_matmul_mlx_gemv: pipeline("dequant_matmul_mlx_gemv"),
             dequant_matmul_mlx_gemm: pipeline("dequant_matmul_mlx_gemm"),
             rope: pipeline("rope"),

@@ -51,4 +51,4 @@ cd cerebras-out && bash commands_wse2.sh   # cslc + cs_python run.py → "SUCCES
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

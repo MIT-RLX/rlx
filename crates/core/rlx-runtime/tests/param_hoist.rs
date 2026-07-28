@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Param-invariant subgraph hoisting: split a graph into a weight-only
 //! `prepare` graph (run once) + a `main` graph that reads the prepared tensors
 //! as bound inputs. Validates the split + manual prepare→bind→main orchestration

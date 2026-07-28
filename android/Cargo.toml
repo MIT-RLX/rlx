@@ -7,7 +7,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-license = "GPL-3.0-only"
+license = "MIT OR Apache-2.0"
 version = "0.2.14"
 
 [profile.release]

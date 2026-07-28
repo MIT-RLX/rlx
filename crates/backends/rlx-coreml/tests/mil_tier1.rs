@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Host-portable MIL lowering tests for Tier-1 ANE ops.
 
 use std::collections::HashMap;

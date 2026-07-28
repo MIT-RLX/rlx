@@ -571,3 +571,6 @@ just gen-rlx-env-vars
 ```
 
 Add new names to `env_registry_data.inc.rs`. Unregistered `env::flag("RLX_…")` call sites fail `just check-rlx-env-vars`.
+## License
+
+MIT OR Apache-2.0.

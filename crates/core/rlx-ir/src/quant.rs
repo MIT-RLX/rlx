@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Quantization metadata as graph annotations (plan #57).
 //!
@@ -97,6 +86,11 @@ pub enum QuantScheme {
     MlxMxfp4 { group_size: u32 },
     /// MLX `mxfp8` mode — FP8 E4M3 codes × per-group scale.
     MlxMxfp8 { group_size: u32 },
+    /// **MxFp4x2** — two-level residual FP4 (E2M1): `value ≈ s0·q0 + s1·q1`,
+    /// each level an E2M1 nibble plane with its own per-group scale. Roughly
+    /// doubles the effective mantissa of MXFP4 (~3.3 → ~6.7 bits) at 2× storage.
+    /// The low-precision analog of double-word; see [`crate::residual`].
+    MxFp4x2Block { group_size: u32 },
     // ── GGUF IQ-family (sub-byte LUT-coded) ─────────────────────
     /// IQ4_NL: 4.5 bpw non-linear. 32-element block (18 bytes).
     GgufIQ4NL,
@@ -200,6 +194,8 @@ impl QuantScheme {
             Self::MlxAffine { bits, .. } => (bits as u32) * 10,
             Self::MlxMxfp4 { .. } => 40,
             Self::MlxMxfp8 { .. } => 80,
+            Self::MxFp4x2Block { .. } => 84, // 2× E2M1 nibbles + 2 group scales
+
             Self::GgufIQ4NL => 45,
             Self::GgufIQ4XS => 42, // 136/256 × 8 = 4.25
             Self::GgufIQ2XXS => 20,
@@ -265,6 +261,7 @@ impl QuantScheme {
                 | Self::MlxAffine { .. }
                 | Self::MlxMxfp4 { .. }
                 | Self::MlxMxfp8 { .. }
+                | Self::MxFp4x2Block { .. }
         )
     }
 
@@ -281,6 +278,16 @@ impl QuantScheme {
         match self {
             Self::Nvfp4Block => crate::nvfp4::NVFP4_GROUP_SIZE as u32,
             _ => 0,
+        }
+    }
+
+    /// For [`Self::MxFp4x2Block`]: `(per-element format, residual levels, group
+    /// size)`; `None` for every other scheme. Ties the scheme to the shared
+    /// residual codec in [`crate::residual`].
+    pub const fn mxfp4x2_config(self) -> Option<(ScaledFormat, u32, u32)> {
+        match self {
+            Self::MxFp4x2Block { group_size } => Some((ScaledFormat::F4E2M1, 2, group_size)),
+            _ => None,
         }
     }
 
@@ -448,6 +455,7 @@ impl std::fmt::Display for QuantScheme {
                 write!(f, "mlx_affine/{bits}/{group_size}")
             }
             Self::MlxMxfp4 { group_size } => write!(f, "mlx_mxfp4/{group_size}"),
+            Self::MxFp4x2Block { group_size } => write!(f, "mxfp4x2/{group_size}"),
             Self::MlxMxfp8 { group_size } => write!(f, "mlx_mxfp8/{group_size}"),
             Self::GgufIQ4NL => write!(f, "gguf_iq4_nl"),
             Self::GgufIQ4XS => write!(f, "gguf_iq4_xs"),

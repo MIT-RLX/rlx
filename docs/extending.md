@@ -218,3 +218,6 @@ development" recipes in the rlx-models `Justfile`.
 
 - Runtime-validate the **ROCm** `RocmGpuKernel` path on an AMD GPU (it's
   compile-verified + HW-ready; there's no ROCm rig wired up yet).
+## License
+
+MIT OR Apache-2.0.

@@ -183,4 +183,4 @@ system CBLAS).
 | [`docs/benchmarks/higher-order-ad.md`](benchmarks/higher-order-ad.md) | HO AD benches |
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Vulkan instance / physical-device / logical-device / compute-queue
 //! singleton, brought up through `ash` with the dynamically-loaded Vulkan
@@ -330,6 +330,34 @@ impl VulkanDevice {
             (type_bits & (1 << i)) != 0
                 && mp.memory_types[i as usize].property_flags.contains(flags)
         })
+    }
+
+    /// Like [`find_memory_type`], but chosen for an allocation of `size` bytes.
+    /// Among the matching types, prefer one whose backing heap can actually hold
+    /// `size`, then a *non*-DEVICE_LOCAL heap (GTT / system RAM on an APU — large),
+    /// then the largest heap. This keeps an oversubscribed arena out of a tiny
+    /// dedicated-VRAM BAR region (which OOMs) and in host memory the iGPU pages
+    /// against — the Vulkan analogue of CUDA managed memory.
+    pub fn find_memory_type_for_size(
+        &self,
+        type_bits: u32,
+        flags: vk::MemoryPropertyFlags,
+        size: u64,
+    ) -> Option<u32> {
+        let mp = &self.mem_props;
+        (0..mp.memory_type_count)
+            .filter(|&i| {
+                (type_bits & (1 << i)) != 0
+                    && mp.memory_types[i as usize].property_flags.contains(flags)
+            })
+            .max_by_key(|&i| {
+                let ty = mp.memory_types[i as usize];
+                let heap = mp.memory_heaps[ty.heap_index as usize];
+                let fits = (heap.size >= size) as u8;
+                let host =
+                    (!ty.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)) as u8;
+                (fits, host, heap.size)
+            })
     }
 
     /// Record `record` into a one-shot primary command buffer, submit it to

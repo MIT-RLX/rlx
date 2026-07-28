@@ -53,5 +53,8 @@ research op — use the stable seams in
 - Match the surrounding code's style, comment density, and idioms.
 - Make sure `just ci` is green.
 
-By contributing you agree that your contributions are licensed under the
-project's [GPL-3.0-only](LICENSE) license.
+By contributing you agree that your contributions are dual-licensed under the
+project's [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE) licenses. Unless
+you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! HIP device-memory arena.
 //!
@@ -178,7 +167,12 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
             elems * 4
         } else {
             match node.shape.dtype() {
-                rlx_ir::DType::U8 | rlx_ir::DType::I8 | rlx_ir::DType::Bool => elems,
+                // U8/I8 byte-pack (quantized weight storage). Bool is NOT
+                // byte-packed: it is a compare/mask output written as f32
+                // (1.0/0.0) into the f32-uniform arena, so it needs the full
+                // `elems * 4` (a compare kernel writes — and the readback reads —
+                // f32 lanes; byte-sizing it overruns the slot). Mirrors rlx-cuda.
+                rlx_ir::DType::U8 | rlx_ir::DType::I8 => elems,
                 // Complex simulates on f32 lanes: C64 = 2 lanes/elem (8 B), C128 =
                 // 4 lanes/elem (16 B, df64). Sizing these elems*4 would truncate
                 // the imaginary / low lanes.

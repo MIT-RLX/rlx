@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
-// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna. GPL-3.0-only.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The CPU attention-block fusion (`Thunk::FusedAttnBlock`) reimplements RoPE
 //! inline. It must honor the RoPE *pairing style* (NeoX rotate-half vs GPT-J

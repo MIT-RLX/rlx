@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Ship-graph **inference**: partition a model into stages, ship each worker a
 //! self-describing `StageSpec`, and drive activations rank→rank. Shared weight
 //! loading + device resolution live in the parent `dist` module.

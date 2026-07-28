@@ -57,4 +57,4 @@ let (idx, q) = rlx_vq::vector_quantize(
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

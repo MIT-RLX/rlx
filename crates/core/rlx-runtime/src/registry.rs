@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Backend registry — a single registration point for all backends.
 //!
@@ -133,6 +122,15 @@ fn register_builtin(r: &Registry) {
     #[cfg(feature = "qnn")]
     map.insert(Device::Hexagon, || {
         Box::new(crate::backend::qnn_backend::QnnBackend) as Box<dyn Backend>
+    });
+
+    // XDNA NPU: registers the seam so `backend_for(Device::Xdna)` resolves and a
+    // dispatch report reads "0 ops supported". `is_available(Xdna)` stays honest
+    // (false without a runtime), so this never runs unless explicitly forced,
+    // in which case `XdnaBackend::compile` returns rlx_xdna's clear diagnostic.
+    #[cfg(feature = "xdna")]
+    map.insert(Device::Xdna, || {
+        Box::new(crate::backend::xdna_backend::XdnaBackend) as Box<dyn Backend>
     });
 }
 

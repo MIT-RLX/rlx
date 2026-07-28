@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// GPL-3.0-only. See LICENSE.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // GGUF dequant — one thread per GGUF block. Block size varies per scheme;
 // see rlx_metal/src/dequant_gguf.msl for the scheme_id table (ids 0–23,

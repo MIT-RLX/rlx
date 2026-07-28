@@ -243,3 +243,6 @@ next batch), larger batches, and gradient bucketing to make it compute-bound.
 | `crates/core/rlx-driver/src/transport.rs` | the `Transport` trait + `ProcessGroup` it plugs into |
 | `crates/core/rlx-driver` `iroh` feature | gates all of the above (`dep:iroh`, `dep:tokio`) |
 | `../rlx-models/crates/rlx-vision-bench` (`iroh` feature) | `build_multinode_group()` / `TOPOLOGY=iroh` + `training_device()` (`RLX_DEVICE`) — the launcher wiring |
+## License
+
+MIT OR Apache-2.0.

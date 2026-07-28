@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! ORT vs RLX parity for ONNX random ops (CPU, Ort RNG backend).
 
 use rlx_ir::RngOptions;

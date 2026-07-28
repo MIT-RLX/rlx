@@ -1,0 +1,26 @@
+[package]
+name = "rlx-distributed"
+version.workspace       = true
+edition.workspace       = true
+rust-version.workspace  = true
+description = "RLX multi-node pipeline-parallel execution: graph partition into weight-sharded stages + tensor transport, to pool RAM across machines for models larger than any single node."
+authors.workspace       = true
+license.workspace       = true
+keywords.workspace      = true
+categories.workspace    = true
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+
+[dependencies]
+rlx-ir      = { path = "../rlx-ir", version = "0.2.14", features = ["serialize"] }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.14" }
+# Layer-block seam: transports (TCP / Thunderbolt / MLX) + ProcessGroup.
+rlx-driver  = { path = "../rlx-driver", version = "0.2.14" }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+anyhow      = "1"
+toml        = "0.8"
+
+[dev-dependencies]
+# (tests build small graphs directly against rlx-ir + rlx-runtime CPU)

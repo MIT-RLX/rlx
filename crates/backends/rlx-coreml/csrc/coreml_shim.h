@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // C ABI exposed by csrc/coreml_shim.m. Consumed from Rust via the FFI
 // declarations in src/ffi.rs. Tensor I/O is contiguous row-major f32 or f16.

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! In-graph RNG ops: compile, execute, and runtime policy override.
 
 use rlx_ir::{DType, Graph, Op, RngOptions, Shape};

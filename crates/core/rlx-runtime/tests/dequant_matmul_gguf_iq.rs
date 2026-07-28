@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // End-to-end `Op::DequantMatMul` for IQ / legacy GGUF schemes encoded via
 // `rlx_gguf::quantize` — compares graph output to dequant + matmul reference.

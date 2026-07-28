@@ -156,4 +156,4 @@ write_rlx("model.rlx", &file)?;
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Per-process HIP runtime + context singleton.
 //!
@@ -128,6 +117,11 @@ pub fn rocm_blas_lt() -> Option<Arc<HipblasLtContext>> {
 /// without libMIOpen (Mac, ROCm-less Linux) — Conv2d falls through
 /// to the custom direct-conv kernel in that case.
 pub fn rocm_dnn() -> Option<Arc<MiopenContext>> {
+    // Escape hatch: force the im2col+GEMM conv path (MIOpen is unstable on some
+    // unofficial archs, e.g. gfx1103 via HSA_OVERRIDE_GFX_VERSION).
+    if rlx_ir::env::var("RLX_ROCM_DISABLE_MIOPEN").is_some() {
+        return None;
+    }
     DNN.get_or_init(|| {
         let ctx = rocm_context()?;
         let runtime = MiopenRuntime::load()?;

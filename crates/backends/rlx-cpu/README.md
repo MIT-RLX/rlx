@@ -106,4 +106,4 @@ cargo test  -p rlx-cpu --release   # 26 tests — mostly parity vs. naive
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

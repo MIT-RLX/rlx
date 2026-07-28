@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Host-side execution for ops with no stable MIL lowering (FFT, log-mel
 // filterbank, token sampling, RNG fills). Used by the hybrid ANE runner when

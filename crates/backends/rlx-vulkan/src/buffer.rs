@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The f32-uniform GPU arena. Activations live in one or more storage buffers;
 //! large param tensors may be parked in an optional second weight buffer when
@@ -507,10 +507,13 @@ impl Arena {
         let buffer = unsafe { dev.device.create_buffer(&info, None) }.expect("vk create_buffer");
 
         let req = unsafe { dev.device.get_buffer_memory_requirements(buffer) };
+        // Size-aware: for a big arena, land in a heap that fits (GTT/system RAM on
+        // an APU), not the first HOST_VISIBLE type (a small VRAM BAR → OOM).
         let mem_type = dev
-            .find_memory_type(
+            .find_memory_type_for_size(
                 req.memory_type_bits,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                req.size,
             )
             .expect("rlx-vulkan: no HOST_VISIBLE|HOST_COHERENT memory type");
         let memory = unsafe {

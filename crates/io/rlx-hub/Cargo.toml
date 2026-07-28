@@ -1,0 +1,16 @@
+[package]
+name = "rlx-hub"
+version.workspace       = true
+edition.workspace       = true
+rust-version.workspace  = true
+description = "RLX — HuggingFace shard-aware download + verification: safetensors index parsing, layer→shard planning for distributed loads, resumable fetch, and integrity checks."
+authors.workspace       = true
+license.workspace       = true
+keywords.workspace      = true
+categories.workspace    = true
+repository.workspace    = true
+
+[dependencies]
+anyhow     = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"

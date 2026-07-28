@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Compile the OpenCL-C compute kernels under `kernels/*.cl` to (Kernel-flavor)
 //! SPIR-V for the Level Zero module loader, and embed the resulting `.spv`
 //! blobs via a generated `kernels_generated.rs`.
@@ -53,6 +56,14 @@ fn main() {
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| p.extension().map(|x| x == "cl").unwrap_or(false))
+            // `*_main.cl` are the plumbing halves of rlxsl-generated kernels; they
+            // reference `rlx_activation_apply` / `rlx_activation_backward` and are
+            // combined with the generated math below, not compiled standalone.
+            .filter(|p| {
+                !p.file_stem()
+                    .map(|s| s.to_string_lossy().ends_with("_main"))
+                    .unwrap_or(false)
+            })
             .collect();
         files.sort();
 
@@ -68,6 +79,24 @@ fn main() {
                 ),
             }
         }
+
+        // Activation kernels @generated from the shared rlxsl manifest (single
+        // source across all backends) + the local plumbing half. Forward
+        // dispatches with gelu-first ids (matches `act_id`); backward with
+        // relu-first ids (matches `activation_bwd_op_id`).
+        for (name, generated) in generated_activation_kernels(&kernel_dir) {
+            let cl_path = Path::new(&out_dir).join(format!("{name}.cl"));
+            fs::write(&cl_path, &generated)
+                .unwrap_or_else(|e| panic!("rlx-oneapi: write {}: {e}", cl_path.display()));
+            let spv_path = Path::new(&out_dir).join(format!("{name}.spv"));
+            match compile_cl_to_spirv(&ocloc, &device_token, &cl_path, &spv_path) {
+                Ok(()) => entries.push(name.to_string()),
+                Err(e) => println!(
+                    "cargo:warning=rlx-oneapi: skipped generated kernel {name}.cl ({e}); \
+                     it will run via the CPU reference path"
+                ),
+            }
+        }
     } else {
         println!(
             "cargo:warning=rlx-oneapi: native SPIR-V kernels not built \
@@ -75,6 +104,10 @@ fn main() {
              compute runs via the CPU reference path"
         );
     }
+
+    // Keep the embedded-kernel order deterministic regardless of glob vs.
+    // generated insertion order (the `names()` iterator promises this).
+    entries.sort();
 
     // Generate the registry source. Reference blobs RELATIVE to OUT_DIR so the
     // embed survives a relocated target dir (mirrors rlx-vulkan).
@@ -104,6 +137,42 @@ fn main() {
     .unwrap();
 
     fs::write(Path::new(&out_dir).join("kernels_generated.rs"), src).unwrap();
+}
+
+/// The rlxsl-generated OpenCL-C activation kernels: `(kernel name, source)`.
+/// Each is the shared rlxsl activation math (single source across all backends)
+/// prepended to the crate-local plumbing half `kernels/<name>_main.cl`.
+fn generated_activation_kernels(kernel_dir: &Path) -> Vec<(&'static str, String)> {
+    let read_main = |stem: &str| {
+        let p = kernel_dir.join(format!("{stem}_main.cl"));
+        fs::read_to_string(&p).unwrap_or_else(|e| panic!("rlx-oneapi: read {}: {e}", p.display()))
+    };
+    vec![
+        (
+            "unary",
+            format!(
+                "{}\n{}",
+                rlxsl::opencl_activation_module(rlxsl::OpcodeScheme::GeluFirst),
+                read_main("unary"),
+            ),
+        ),
+        (
+            "activation_backward",
+            format!(
+                "{}\n{}",
+                rlxsl::opencl_activation_backward_module(),
+                read_main("activation_backward"),
+            ),
+        ),
+        (
+            "binary",
+            format!(
+                "{}\n{}",
+                rlxsl::binary::opencl_binary_module(),
+                read_main("binary"),
+            ),
+        ),
+    ]
 }
 
 /// Invoke `ocloc compile -spv_only` and copy the emitted SPIR-V to `spv_path`.

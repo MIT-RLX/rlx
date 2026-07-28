@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! keep-packed + arch config embeds Llama prefill graph (not parallel dequant).
 
 use std::collections::HashMap;

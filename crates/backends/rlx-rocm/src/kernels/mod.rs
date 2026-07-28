@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! HIP kernel sources + hipRTC compile cache.
 //!
@@ -59,8 +48,12 @@ fn fnv1a64(s: &str) -> u64 {
 }
 
 pub(crate) fn compile(ctx: &Arc<RocmContext>, src: &str, entry: &str) -> HipKernel {
-    let cache_path =
-        hsaco_cache_dir().map(|d| d.join(format!("{}-{:016x}.hsaco", entry, fnv1a64(src))));
+    // Include the target arch in the cache key: a `.hsaco` compiled for one
+    // gfx arch must never be reused for another (it would fail to load, or
+    // load a wrong-arch binary). `default` when no arch is resolved.
+    let arch = crate::hip::rocm_target_arch().unwrap_or_else(|| "default".to_string());
+    let cache_path = hsaco_cache_dir()
+        .map(|d| d.join(format!("{}-{}-{:016x}.hsaco", entry, arch, fnv1a64(src))));
 
     let hsaco: Vec<u8> = if let Some(ref p) = cache_path {
         if let Ok(bytes) = std::fs::read(p) {
@@ -180,6 +173,12 @@ kernel_cache!(
     "scaled_matmul_decode"
 );
 kernel_cache!(
+    MXFP4X2_DEQUANT,
+    mxfp4x2_dequant_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "mxfp4x2_dequant"
+);
+kernel_cache!(
     UNARY,
     unary_kernel,
     rlx_gpu_kernels::unary_cuda_src(),
@@ -239,7 +238,7 @@ kernel_cache!(
     SOFTMAX_CROSS_ENTROPY_CU,
     "softmax_cross_entropy_backward"
 );
-kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "norm");
+kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "rlx_norm");
 kernel_cache!(
     LAYER_NORM_BWD_INPUT,
     layer_norm_bwd_input_kernel,

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # RLX — scaffold helper for adding a new Op.
 # Prints the checklist from AGENTS.md and optional stub paths.
 # Does not invent IR definitions — use --write only for empty reminder files.

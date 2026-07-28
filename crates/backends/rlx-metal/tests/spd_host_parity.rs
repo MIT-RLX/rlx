@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CPU-vs-Metal parity for the core Riemannian / SPD-manifold ops, which run on
 //! the CPU host-fallback path (`rlx_metal::spd`). The SPD ops are F64 and have

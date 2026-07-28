@@ -1,35 +1,13 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Graph lowering match + schedule emission.
 
 #![allow(unused_imports)]
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `compile` — extracted from the `backend` module for navigability (see `mod.rs`).
 
@@ -7680,6 +7658,7 @@ pub(crate) fn compile_static_inner(
                     zp_byte_off: arena.offset(node.inputs[3]) as u64,
                     idx_byte_off: arena.offset(node.inputs[4]) as u64,
                     out_byte_off: arena.offset(node.id) as u64,
+                    scale_bf16: graph.node(node.inputs[2]).shape.dtype() == rlx_ir::DType::BF16,
                 });
                 // Host step: schedule-only (see the GGUF grouped note above).
             }

@@ -1,10 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // General (all-format, all-scale-layout) low-precision quantize + GEMM for
 // Op::ScaledMatMul on CUDA / ROCm. This is the **decode-and-accumulate
 // reference on GPU cores** — NOT tensor-core native. It's the path for formats
@@ -245,6 +241,110 @@ extern "C" __global__ void scaled_dequantize_general(
     }
     const unsigned char* codes = reinterpret_cast<const unsigned char*>(arena) + codes_byte_off;
     arena[out_off_f32 + i] = rlx_decode_lowp(fmt, codes[i]) * s;
+}
+
+// MxFp4x2 two-level residual FP4 decode: out = s0·E2M1[q0] + s1·E2M1[q1].
+// The low-precision analog of double-word (see rlx_ir::residual). Codes are one
+// byte each (0..15); scales are per-group f32. LUT matches
+// rlx_ir::nvfp4::FP4_E2M1_LUT so it decodes rlx's F4E2M1 nibbles bit-for-bit.
+extern "C" __global__ void mxfp4x2_decode(
+    const unsigned char* __restrict__ q0,
+    const unsigned char* __restrict__ q1,
+    const float* __restrict__ s0,
+    const float* __restrict__ s1,
+    float* __restrict__ out,
+    unsigned int n,
+    unsigned int group)
+{
+    const float E2M1[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int blk = i / group;
+    out[i] = s0[blk] * E2M1[q0[i] & 0xF] + s1[blk] * E2M1[q1[i] & 0xF];
+}
+
+// MxFp4x2 DequantMatMul decode-to-scratch: dequant a packed two-level residual
+// E2M1 weight into an f32 [k,n] scratch (row-major, dst[p*n+j]) — the on-GPU
+// twin of rlx_cpu's `dequant_matmul_mxfp4x2`, byte-for-byte the same layout so
+// the same hipBLAS/cuBLAS sgemm consumes it (col-major n×k, A[j + p*n]). w_q =
+// [plane0|plane1] E2M1 nibbles packed 2/byte over the [k,n] grid; scales =
+// [s0|s1] f32 per (block=k/group, n). Arena is the f32-uniform buffer; offsets
+// are byte (weight) / f32-index (scales, dst). Run it, then sgemm x·scratch.
+extern "C" __global__ void mxfp4x2_dequant(
+    float* arena,
+    unsigned long long w_byte_off,   // [plane0|plane1] start (arena bytes)
+    unsigned long long s_f32_off,    // [s0|s1] start (arena f32 index)
+    unsigned long long dst_f32_off,  // scratch start (arena f32 index)
+    unsigned int k,
+    unsigned int n,
+    unsigned int group)
+{
+    const float E2M1[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = k * n;
+    if (idx >= total) return;
+
+    unsigned int p = idx / n;           // k index
+    unsigned int j = idx - p * n;       // n index
+    unsigned int g = group ? group : 1u;
+    unsigned int nblk = (k + g - 1u) / g;
+    unsigned int blk = p / g;
+
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(arena) + w_byte_off;
+    unsigned int plane = (total + 1u) >> 1;      // bytes per nibble plane
+    unsigned int byte = idx >> 1;
+    unsigned int shift = (idx & 1u) ? 4u : 0u;
+    unsigned int q0 = (w[byte] >> shift) & 0xFu;
+    unsigned int q1 = (w[plane + byte] >> shift) & 0xFu;
+
+    const float* s = arena + s_f32_off;
+    float s0 = s[blk * n + j];
+    float s1 = s[nblk * n + blk * n + j];
+    arena[dst_f32_off + idx] = s0 * E2M1[q0] + s1 * E2M1[q1];
+}
+
+// MxFp4x2 decode-to-scratch, TRANSPOSED output layout: writes the decoded
+// weight as row-major [n,k] (dst[j*k + p]) instead of [k,n] — for backends
+// whose GEMM wants the GGUF `matmul_bt` convention (C[m,n] = X[m,k]·W[n,k]ᵀ,
+// e.g. rlx-cuda). Input packing / scales are read identically to
+// `mxfp4x2_dequant`; only the store index differs.
+extern "C" __global__ void mxfp4x2_dequant_nk(
+    float* arena,
+    unsigned long long w_byte_off,
+    unsigned long long s_f32_off,
+    unsigned long long dst_f32_off,
+    unsigned int k,
+    unsigned int n,
+    unsigned int group)
+{
+    const float E2M1[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = k * n;
+    if (idx >= total) return;
+
+    unsigned int p = idx / n;           // k index
+    unsigned int j = idx - p * n;       // n index
+    unsigned int g = group ? group : 1u;
+    unsigned int nblk = (k + g - 1u) / g;
+    unsigned int blk = p / g;
+
+    const unsigned char* w = reinterpret_cast<const unsigned char*>(arena) + w_byte_off;
+    unsigned int plane = (total + 1u) >> 1;
+    unsigned int byte = idx >> 1;
+    unsigned int shift = (idx & 1u) ? 4u : 0u;
+    unsigned int q0 = (w[byte] >> shift) & 0xFu;
+    unsigned int q1 = (w[plane + byte] >> shift) & 0xFu;
+
+    const float* s = arena + s_f32_off;
+    float s0 = s[blk * n + j];
+    float s1 = s[nblk * n + blk * n + j];
+    arena[dst_f32_off + (unsigned long long)j * k + p] = s0 * E2M1[q0] + s1 * E2M1[q1];
 }
 
 // Decode-and-accumulate GEMM (TN: lhs[m,k]·rhs[n,k]ᵀ → out[m,n]) — the

@@ -184,4 +184,4 @@ tile matmul kernel remains correctness-first for unaligned shapes.
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

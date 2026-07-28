@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Native low-precision `Op::ScaledMatMul` on Vulkan with a parameterized
 //! `ScaledFormat::Custom` minifloat (`f4e3m0`) and a named FP8 format.

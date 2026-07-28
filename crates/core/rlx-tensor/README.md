@@ -55,6 +55,41 @@ let g2 = graph("batched", |g| {
 });
 ```
 
+## Declarative DSL — `rlx!` (feature `dsl`)
+
+For a compact, readable little language, `rlx! { … }` declares the whole graph —
+shapes, wiring, and outputs are inferred — and evaluates to an `rlx_ir::Graph`:
+
+```rust
+use rlx_tensor::rlx; // feature `dsl` (on for umbrella `rlx` users via `tensor`)
+
+let g = rlx! {
+    graph "mlp";
+    input x: [?, 784];              // `?` = dynamic batch; shape![] grammar
+    param w1: [784, 256];  param b1: [256];
+    param w2: [256, 10];   param b2: [10];
+
+    let h = gelu(x @ w1 + b1);      // `@` = matmul (NumPy precedence)
+    let y = h @ w2 + b2;
+    out y;                          // defaults to the last `let`
+};
+```
+
+- **`@`** matmul, **`+ - * /`** elementwise (broadcasting + scalar promotion),
+  precedence `.method()` > unary `-` > (`@` `*` `/`) > (`+` `-`), matching NumPy.
+- **`f(x)`** sugar → `x.f()` for any no-arg method (`gelu`, `relu`, `sqrt`, …).
+- **`x.method(args)`** escape hatch reaches the full `Tensor` API. A bare
+  argument naming a binding is validated and auto-borrowed, so
+  `q.attention(k, v, 8, 64, MaskKind::Causal)` reads naturally; wrap an external
+  value as `(value)` to pass it through raw.
+- Inputs/params are **auto-named** from the binding ident; feed them by that
+  name (`compiled.set_param("w1", …)` / `run(&[("x", …)])`).
+
+Statement forms: `graph "name";` (optional), `input`/`param name: [dims];`,
+`const name = value : DType;`, `let name = expr;`, `out a, b;`. Mistakes —
+unknown bindings, matmul on a scalar, a `let` that isn't a tensor — are reported
+as spanned compile errors, not cryptic downstream type errors.
+
 ## Op surface
 
 - **Arithmetic** — `+ - * /` (operator overloads, tensor & scalar rhs),
@@ -118,6 +153,7 @@ let (loss, _) = f.train_step(&mut opt, &[("x", &xs)]);
 | feature        | what it adds                                                                 |
 |----------------|------------------------------------------------------------------------------|
 | *(default)*    | pure rlx-ir graph builder — symbolic only, no backend                        |
+| `dsl`          | the `rlx! { … }` declarative graph DSL (pulls in the `rlx-macros` proc macro) |
 | `eval`         | materialize via `rlx_runtime::Session`: `to_vec`, `on(device)`, CPU backend  |
 | `eval-metal` / `eval-mlx` / `eval-cuda` / `eval-rocm` / `eval-gpu` / `eval-coreml` | `.on(Device::…)` for that backend |
 | `eval-apple`   | all Apple GPU/NPU backends (Metal + MLX + wgpu + CoreML/ANE)                  |
@@ -139,4 +175,4 @@ through the same fusion / memory-planning / backend pipeline as the rest of RLX.
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

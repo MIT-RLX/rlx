@@ -61,6 +61,9 @@ half = "2"
 # the crate, so there is no runtime shader compilation. GLSL stays the
 # source of record under `shaders/`.
 naga = { version = "29", features = ["glsl-in", "spv-out"] }
+# The unary/activation GLSL switch is @generated from the shared scalar-
+# expression manifest (gelu-first ids for native Vulkan) and compiled here.
+rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
 
 [dev-dependencies]
 # Path-only (no version): test-only cycle on the umbrella crate, which is

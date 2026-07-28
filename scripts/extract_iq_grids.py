@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Extract IQ-family grid LUTs from llama.cpp's ggml-common.h.
 
 Regenerates ``rlx-gguf/src/iq_grids.rs`` byte-for-byte from upstream.

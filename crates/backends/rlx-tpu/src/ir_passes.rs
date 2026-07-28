@@ -1,7 +1,6 @@
 // RLX - versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// Licensed under the GNU General Public License, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! IR passes shared by [`crate::TpuExecutable::compile`] and orchestrated HLO segments.
 

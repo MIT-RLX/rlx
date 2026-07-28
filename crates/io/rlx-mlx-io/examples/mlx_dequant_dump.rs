@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Throwaway parity probe: dequantize an mlx-community model dir and dump
 //! selected tensors as raw little-endian f32 for comparison against
 //! `mlx.core.dequantize`. Not committed.

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // TinyConv-MNIST inference across RLX backends via the runtime Session.
 //
 // Same CNN as the trainer; loads the trained fp32 weights (RLX_F32_DUMP) and

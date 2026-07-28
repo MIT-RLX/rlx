@@ -234,4 +234,4 @@ cd crates/pyrlx && pytest tests/test_graph_devices.py -q
 | Ops / deploy introspection | `BackendsManifest`, `device_report` |
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

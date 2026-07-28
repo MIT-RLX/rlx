@@ -66,4 +66,4 @@ Linux and Windows; on Linux, `lapacke.h` must be present (`liblapacke-dev`) or
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

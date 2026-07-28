@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Parity test for new IQ/TQ/MX dequant kernels against real model weights.
 //
 // We quantize Qwen3-0.6B to several IQ/TQ formats with llama.cpp's

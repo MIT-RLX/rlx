@@ -132,4 +132,4 @@ pending a SwiGLU stride fix (see `thunk.rs:3315`).
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

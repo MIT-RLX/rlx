@@ -586,3 +586,6 @@ When adding or wiring an op:
 3. If a backend rejects specific *variants* (e.g. MLX `ScaleMode::EMA`), keep the per-op guard in `device_ext.rs`.
 4. Refresh this table (op list, category table, the gaps section, and the "at a glance" counts).
 5. Counts to keep honest: **115 `OpKind`s total** as of this revision (added `Pad`, `Slice`).
+## License
+
+MIT OR Apache-2.0.

@@ -1,4 +1,7 @@
 // RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// RLX — versatile ML compiler + runtime.
 // Block-layout segment spectra [outer, 2*n_fft] → packed top-K peaks [batch, k*2].
 // One thread per welch_batch row; mirrors rlx_ir::audio::welch_peaks_block_f32.
 

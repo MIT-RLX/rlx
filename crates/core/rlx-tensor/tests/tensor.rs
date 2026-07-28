@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use rlx_ir::{DType, Dim, NodeId};
 use rlx_tensor::{GraphScope, Tensor, ax, graph, graph_with, rg, s, shape};

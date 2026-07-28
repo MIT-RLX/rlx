@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Quantized-weight ops, verified on-device. GGUF weights are stored
 // `[N, K]` (B-transposed); the backend host-dequantizes them to f32 and
 // matmuls with transpose_y. We quantize a known f32 weight, run through

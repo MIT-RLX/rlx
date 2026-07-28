@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! End-to-end TPU GGUF bake via [`Session::compile_with`] +
 //! [`CompileOptions::quant_param_bindings`].
 

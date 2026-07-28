@@ -64,4 +64,4 @@ Hardware change → cache miss → re-measure automatically.
   graph.
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

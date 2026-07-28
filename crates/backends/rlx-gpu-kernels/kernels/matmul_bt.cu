@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// GPL-3.0-only. See LICENSE.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // C[m,n] = A[m,k] @ B^T where B is stored row-major as [n,k] (GGUF dequant layout).
 // Mirrors rlx-wgpu `matmul.wgsl` `matmul_bt` and rlx-cpu `gguf_matmul_bt`.

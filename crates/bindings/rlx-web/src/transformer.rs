@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
-// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna. GPL-3.0-only.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! A real decoder-only transformer (Llama / Qwen3-style) forward pass, built
 //! directly on `rlx_ir::Graph` and run through `rlx_runtime::Session` on the

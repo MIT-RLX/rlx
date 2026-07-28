@@ -113,4 +113,4 @@ Runtime dequant on Metal / CUDA / WGPU: [docs/gguf-backend-paths.md](../../docs/
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

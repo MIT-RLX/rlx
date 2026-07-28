@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, ReduceOp};
 
@@ -57,77 +46,19 @@ pub(crate) fn fft_dtype_from_tag(tag: u32) -> rlx_ir::DType {
 }
 
 pub(crate) fn binary_op_id(op: BinaryOp) -> u32 {
-    match op {
-        BinaryOp::Add => 0,
-        BinaryOp::Sub => 1,
-        BinaryOp::Mul => 2,
-        BinaryOp::Div => 3,
-        BinaryOp::Max => 4,
-        BinaryOp::Min => 5,
-        BinaryOp::Pow => 6,
-        BinaryOp::Mod => 7,
-        BinaryOp::BitAnd => 8,
-        BinaryOp::BitOr => 9,
-        BinaryOp::BitXor => 10,
-        BinaryOp::Shl => 11,
-        BinaryOp::Shr => 12,
-        BinaryOp::Atan2 => 13,
-    }
+    op.opcode()
 }
 
 pub(crate) fn compare_op_id(op: CmpOp) -> u32 {
-    match op {
-        CmpOp::Eq => 0,
-        CmpOp::Ne => 1,
-        CmpOp::Lt => 2,
-        CmpOp::Le => 3,
-        CmpOp::Gt => 4,
-        CmpOp::Ge => 5,
-    }
+    op.opcode()
 }
 
 pub(crate) fn reduce_op_id(op: ReduceOp) -> u32 {
-    match op {
-        ReduceOp::Sum => 0,
-        ReduceOp::Mean => 1,
-        ReduceOp::Max => 2,
-        ReduceOp::Min => 3,
-        ReduceOp::Prod => 4,
-    }
+    op.opcode()
 }
 
 pub(crate) fn activation_op_id(act: Activation) -> u32 {
-    match act {
-        Activation::Relu => 0,
-        Activation::Sigmoid => 1,
-        Activation::Tanh => 2,
-        Activation::Exp => 3,
-        Activation::Log => 4,
-        Activation::Sqrt => 5,
-        Activation::Rsqrt => 6,
-        Activation::Neg => 7,
-        Activation::Abs => 8,
-        Activation::Gelu => 9,
-        Activation::Silu => 10,
-        Activation::GeluApprox => 11,
-        Activation::Round => 12,
-        Activation::Sin => 13,
-        Activation::Cos => 14,
-        Activation::Tan => 15,
-        Activation::Atan => 16,
-        Activation::Recip => 17,
-        Activation::Floor => 18,
-        Activation::Ceil => 19,
-        Activation::Sign => 20,
-        Activation::Softplus => 21,
-        Activation::Elu => 22,
-        Activation::Erf => 23,
-        Activation::HardSwish => 24,
-        Activation::HardSigmoid => 25,
-        Activation::Mish => 26,
-        Activation::Softsign => 27,
-        Activation::LogSigmoid => 28,
-    }
+    act.opcode_relu_first()
 }
 
 /// True when a matmul reads its weight `B` from the separate f16 shadow buffer

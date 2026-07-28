@@ -264,4 +264,4 @@ in `xla/pjrt/c/pjrt_c_api.h` and add the missing trailing fields.
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

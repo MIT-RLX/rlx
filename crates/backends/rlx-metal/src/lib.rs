@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 // `objc` crate's `class!` / `msg_send!` macros expand to
 // `cfg(feature = "cargo-clippy")` checks that aren't recognized by
@@ -122,6 +111,9 @@ pub mod splat_training_pipeline;
 
 #[cfg(rlx_metal_host)]
 pub mod pipeline_cache;
+/// Double-single (2× f32 ≈ f64) reductions — near-f64 precision on Metal, which
+/// has no native f64. Compiled with precise math (fast-math breaks EFT).
+pub mod double_single;
 
 #[cfg(rlx_metal_host)]
 pub mod onnx_qmatmul;

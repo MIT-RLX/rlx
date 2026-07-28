@@ -167,3 +167,6 @@ as the codegen path does.
   hardware-named variants, with the backend lib (`Cpu`/`Htp`/`Gpu`) selected via
   env — but `Qnn` is defensible if we want one variant spanning all QNN targets.
 ```
+## License
+
+MIT OR Apache-2.0.

@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Cross-backend validation: run the same computation on every GPU backend
 //! compiled in AND live on this host, and check each matches CPU.

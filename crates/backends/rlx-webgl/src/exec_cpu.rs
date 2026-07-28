@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
-// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna. GPL-3.0-only.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CPU executor for a [`Plan`]. This is the reference the WebGL fragment
 //! shaders mirror — it is unit-tested against RLX's own CPU autodiff/runtime,

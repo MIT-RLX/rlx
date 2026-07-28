@@ -1,6 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Decode-shaped sgemm (m=2 CFG) on Metal vs CPU — exercises SimdPadded /
 //! MPS routing that replaced Naive for large k,n with m < 32.

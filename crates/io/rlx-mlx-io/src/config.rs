@@ -1,9 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `config.json` fields relevant to MLX / mlx-lm weight loading.
 
@@ -80,10 +77,26 @@ impl MlxQuantConfig {
 /// Parsed mlx-community / mlx-lm `config.json` (quantization + arch + passthrough).
 #[derive(Debug, Clone, Default)]
 pub struct MlxConfig {
+    /// Global quantization config (the scalar `group_size`/`bits`/`mode`).
     pub quantization: Option<MlxQuantConfig>,
+    /// Per-module quant overrides — mlx-lm mixed-precision checkpoints (e.g.
+    /// gpt-oss: experts mxfp4 gs=32 globally, but `model.embed_tokens` /
+    /// attention projections affine gs=64). Keyed by module base (no `.weight`).
+    pub per_module_quant: std::collections::HashMap<String, MlxQuantConfig>,
     pub arch: Option<MlxArchConfig>,
     /// Raw JSON for sidecars / debugging.
     pub raw: Option<serde_json::Value>,
+}
+
+impl MlxConfig {
+    /// Resolve the quant config for a tensor base name (`{module}` without the
+    /// `.weight` suffix): the per-module override if present, else the global.
+    pub fn quant_for(&self, base: &str) -> Option<MlxQuantConfig> {
+        self.per_module_quant
+            .get(base)
+            .cloned()
+            .or_else(|| self.quantization.clone())
+    }
 }
 
 /// Llama / Qwen / SmolLM-style architecture fields from `config.json`.
@@ -199,8 +212,41 @@ impl MlxConfig {
             }),
             _ => None,
         };
+        // Per-module quant overrides: any key under `quantization` whose value
+        // is an object carrying group_size/bits/mode (mlx-lm mixed precision).
+        let mut per_module_quant = std::collections::HashMap::new();
+        if let Some(obj) = raw.get("quantization").and_then(|v| v.as_object()) {
+            for (module, val) in obj {
+                let Some(mobj) = val.as_object() else { continue };
+                if !(mobj.contains_key("group_size")
+                    || mobj.contains_key("bits")
+                    || mobj.contains_key("mode"))
+                {
+                    continue;
+                }
+                if let Ok(rq) = serde_json::from_value::<RawQuant>(val.clone()) {
+                    let mode = match rq.mode.as_deref() {
+                        None | Some("") => MlxQuantMode::Affine,
+                        Some(s) => match MlxQuantMode::parse(s) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        },
+                    };
+                    let d = MlxQuantConfig::defaults_for(mode);
+                    per_module_quant.insert(
+                        module.clone(),
+                        MlxQuantConfig {
+                            group_size: rq.group_size.unwrap_or(d.group_size),
+                            bits: rq.bits.unwrap_or(d.bits),
+                            mode,
+                        },
+                    );
+                }
+            }
+        }
         Ok(Self {
             quantization,
+            per_module_quant,
             arch,
             raw: Some(raw),
         })

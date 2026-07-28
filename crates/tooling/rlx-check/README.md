@@ -102,3 +102,6 @@ Findings print to stderr when the model is first built. Control at runtime with
 `RLX_CHECK`: `off`/`0` (silent), `all` (every backend, always print), `strict`
 (panic on any error-level finding). This is the "diagnostics in your normal dev
 loop" integration; an editor LSP would call the same `check_graph`.
+## License
+
+MIT OR Apache-2.0.

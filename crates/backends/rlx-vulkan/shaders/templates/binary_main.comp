@@ -1,0 +1,27 @@
+#version 450
+// Plumbing half of the standalone `binary` kernel. The per-op scalar math
+// (`rlx_binary_apply`) is @generated once from the shared rlxsl manifest and
+// inserted right after `#version 450` by build.rs (before the arena include) —
+// so the op set + negative-base `pow` fix live in a single cross-backend source.
+// This file lives under `templates/` so the shader auto-discovery loop skips it.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;       // output element count
+    uint a_off;   // f32-element offset of lhs
+    uint b_off;   // f32-element offset of rhs
+    uint c_off;   // f32-element offset of output
+    uint a_mod;   // lhs element count for broadcast (0 = no broadcast)
+    uint b_mod;   // rhs element count for broadcast (0 = no broadcast)
+    uint op;      // BinaryOp opcode (see rlx_ir::opcodes)
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    uint ai = (pc.a_mod == 0u) ? i : (i % pc.a_mod);
+    uint bi = (pc.b_mod == 0u) ? i : (i % pc.b_mod);
+    float a = arena_load(pc.a_off + ai);
+    float b = arena_load(pc.b_off + bi);
+    arena_store(pc.c_off + i, rlx_binary_apply(pc.op, a, b));
+}

@@ -363,3 +363,6 @@ MNIST examples require **both** `encrypt` and `runtime`.
 a **sealed, weight-aware optimized artifact**. The MNIST pair of examples is the
 shortest way to see every stage: train → value-based packing → smaller payload →
 encrypt → decrypt via env → compile and run with no weight sidecar.
+## License
+
+MIT OR Apache-2.0.

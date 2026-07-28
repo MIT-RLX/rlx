@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Cross-backend agreement guard: the LSTM / GRU / Elman-RNN family
 //! (`carry = false`) must produce matching output on CPU, MLX (Metal), and
 //! CoreML/ANE. CPU is the reference kernel; MLX and CoreML run their native

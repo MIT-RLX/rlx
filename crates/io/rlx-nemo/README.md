@@ -47,4 +47,4 @@ let w = m.tensor("encoder.layers.0.norm_out.weight")?; // -> NemoTensor (f32)
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

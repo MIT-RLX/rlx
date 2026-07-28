@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Native (on-device) `Op::Lstm` on CoreML/ANE, unrolled over the sequence into
 // MIL primitives. Verified against the CPU backend (the reference executor)
 // through the public Session API — no CPU host-eval in the ANE path.

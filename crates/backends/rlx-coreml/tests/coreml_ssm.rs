@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // State-space ops (Mamba selective scan, Qwen3.5 gated delta-net), lowered
 // by unrolling over the sequence. Verified against the CPU backend — the
 // reference executor — through the public Session API.

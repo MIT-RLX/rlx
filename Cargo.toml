@@ -18,6 +18,8 @@ members = [
 
     # In-graph collective ops (tensor-parallel all-reduce)
     "crates/core/rlx-collectives",
+    # Multi-node pipeline-parallel execution (graph partition + weight-sharded stages)
+    "crates/core/rlx-distributed",
 
     # CPU backend
     "crates/backends/rlx-cpu",         # SIMD kernels, BLAS FFI, thread pool, arena executor
@@ -30,6 +32,7 @@ members = [
     "crates/backends/rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU)
     "crates/backends/rlx-cuda",        # NVIDIA CUDA (cuBLAS + NVRTC kernels via cudarc)
     "crates/backends/rlx-rocm",        # AMD ROCm/HIP — same kernels as rlx-cuda
+    "crates/backends/rlx-xdna",        # AMD XDNA / Ryzen AI NPU (amdxdna) — Device::Xdna detection + AIE seam
     "crates/backends/rlx-tpu",         # Google TPU via libtpu's PJRT plugin (no Python)
 
     # Microcontroller backend
@@ -59,6 +62,7 @@ members = [
     "crates/io/rlx-gguf-convert", # safetensors / ONNX → GGUF conversion with per-tensor quant
     "crates/io/rlx-bake",        # Offline weight bake: graph + weights → optimized *.rlx
     "crates/io/rlx-pkg",         # RLX package format (.rlxp): ZIP64/dir, mmap weights, sidecars, dist
+    "crates/io/rlx-hub",         # Shard-aware HuggingFace download + verification (layer→shard planning)
     "crates/io/rlx-mlx-io",      # MLX weight layouts: mlx-community dirs, .npz/.npy, affine/mxfp dequant
     "crates/io/rlx-dduf",        # HuggingFace DDUF (.dduf) ZIP of nested safetensors + JSON
     "crates/io/rlx-nemo",        # NVIDIA NeMo `.nemo` loader (tar + torch.save ckpt + YAML)
@@ -89,6 +93,7 @@ members = [
     "crates/tooling/rlx-bench",       # BenchmarkPattern + per-backend timing harness
     "crates/tooling/rlx-hwprofile",   # Host GPU/VRAM detection for device selection + topology planning
     "crates/tooling/rlx-check",       # `cargo rlx check` — device-free static graph diagnostics
+    "crates/tooling/rlxsl",  # Scalar-expr manifest → WGSL/CUDA/MSL/GLSL warm-tier kernel codegen
     "crates/io/rlx-onnx",        # ONNX Runtime inference for .onnx files (PLAN B7)
     "crates/io/rlx-onnx-proto",  # Vendored pure-Rust ONNX protobuf types (protoc-free)
     "crates/io/rlx-onnx-import", # ONNX → RLX HIR import + op lowering
@@ -147,7 +152,7 @@ incremental = false
 version       = "0.2.14"
 edition       = "2024"
 rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
-license       = "GPL-3.0-only"
+license       = "MIT OR Apache-2.0"
 authors       = ["Eugene Hauptmann", "Nataliya Kosmyna"]
 repository    = "https://github.com/MIT-RLX/rlx"
 homepage      = "https://github.com/MIT-RLX/rlx"

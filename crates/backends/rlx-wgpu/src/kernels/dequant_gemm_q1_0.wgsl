@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // RLX — fused Q1_0 GEMM (prefill m>1) for `Op::DequantMatMul`.
 //
 // Mirrors Metal `q1_0_mm_f32`: TM=8 output rows per thread, one thread per

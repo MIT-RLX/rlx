@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // RLX — fused GGUF K-quant GEMV (decode m=1) for `Op::DequantMatMul`.
 //
 // Computes one row of `y = x @ W^T` where `W` is a GGUF-packed weight `[n, k]`

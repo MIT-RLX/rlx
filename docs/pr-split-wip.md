@@ -27,3 +27,6 @@ flowchart LR
 - Shape-preserving packing + streaming DDUF visit
 
 **Note:** Do not open PRs until this plan is approved. Snapshot with `git stash create` first.
+## License
+
+MIT OR Apache-2.0.

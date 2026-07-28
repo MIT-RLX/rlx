@@ -46,7 +46,7 @@ cargo run -p rlx-bench --release --example bench_nth_order --features metal,mlx,
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.
 
 [`grad_with_loss`]: https://docs.rs/rlx-autodiff/latest/rlx_autodiff/fn.grad_with_loss.html
 [`jvp`]: https://docs.rs/rlx-autodiff/latest/rlx_autodiff/fn.jvp.html

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // ANE parity for native host RNN ops, unfused Gru (now native), and Sample.
 
 #![cfg(target_os = "macos")]

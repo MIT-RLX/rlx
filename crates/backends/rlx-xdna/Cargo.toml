@@ -1,0 +1,40 @@
+[package]
+name = "rlx-xdna"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "AMD XDNA / Ryzen AI NPU backend for RLX — Device::Xdna hardware detection + AIE execution seam (amdxdna /dev/accel*)."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Detection + seam only: no build script, no SDK. The AIE kernel path (AMD XRT
+# + amdxdna shim + an AIE-compiled kernel image) plugs into `ensure_executable`
+# once a userspace runtime is present on the host.
+
+[features]
+default = []
+# Native XRT C-API binding (no Python): dlopen `libxrt_coreutil` and resolve the
+# amdxdna run-path symbols (device/xclbin/kernel/run/BO). This is the low-latency
+# submission path; enable when the XRT NPU runtime is installed on the host.
+xrt = ["dep:libloading"]
+# CLOSEST TO THE METAL: talk the `amdxdna` DRM-accel ioctl ABI on `/dev/accel*`
+# directly (no XRT, no C++ shim) — own hwctx/BO/exec/syncobj, and ultimately the
+# user-mode-queue doorbell for zero-syscall dispatch. Linux-only; needs libc for
+# ioctl/mmap. See `direct`.
+direct = ["dep:libc"]
+
+[dependencies]
+# For the (currently empty) `SUPPORTED_OPS` claim the legalizer consults.
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+# Dynamic loader for the XRT C-API (no build-time link; XRT is often absent).
+libloading = { version = "0.8", optional = true }
+# ioctl/mmap for the direct amdxdna DRM path (feature `direct`, Linux-only).
+libc = { version = "0.2", optional = true }
+
+[lints]
+workspace = true

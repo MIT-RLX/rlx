@@ -145,6 +145,13 @@ oneapi = ["cpu", "dep:rlx-oneapi"]
 # a QNN backend library; needs QNN_SDK_ROOT at build time for the SDK headers.
 qnn = ["cpu", "dep:rlx-qnn"]
 
+# ── AMD NPU ─────────────────────────────────────────────────
+# XDNA / Ryzen AI NPU (`Device::Xdna`) via the `amdxdna` driver. Detection +
+# execution seam: pure Rust, no SDK/toolchain at build time. `is_available` is
+# honest (needs hardware + XRT runtime); execution is unimplemented until the
+# AIE kernel path lands.
+xdna = ["cpu", "dep:rlx-xdna", "rlx-xdna/xrt", "rlx-xdna/direct"]
+
 # FPGA / SystemVerilog export (`rlx_runtime::export`). Offline artifact emit —
 # does not register a runtime Device / Backend.
 fpga = ["dep:rlx-fpga"]
@@ -167,6 +174,7 @@ rlx-rocm = { path = "../../backends/rlx-rocm", version = "0.2.14", optional = tr
 rlx-oneapi = { path = "../../backends/rlx-oneapi", version = "0.2.14", optional = true }
 rlx-tpu = { path = "../../backends/rlx-tpu", version = "0.2.14", optional = true }
 rlx-qnn = { path = "../../backends/rlx-qnn", version = "0.2.14", optional = true, features = ["runtime"] }
+rlx-xdna = { path = "../../backends/rlx-xdna", version = "0.2.14", optional = true }
 rlx-fpga = { path = "../../backends/rlx-fpga", version = "0.2.14", optional = true }
 rlx-macros = { path = "../rlx-macros", version = "0.2.14" }
 # rlx-compile: used unconditionally by src/check.rs, so it belongs in
@@ -208,6 +216,9 @@ serde_json = "1"
 [dev-dependencies]
 rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.14" }
 rlx-fusion = { path = "../rlx-fusion", version = "0.2.14" }
+# Warm-tier kernel codegen manifest — the `kernel_dsl_matches_cpu_oracle` test
+# checks its scalar-expression math against the trusted CPU activation kernel.
+rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
 # Cross-backend parity tests build real model blocks (e.g. MLA) via the flow
 # DSL, then run them on each backend. Dev-only; the rlx-flow↔rlx-runtime edge is
 # a dev-dependency cycle (allowed by cargo, never a normal-build cycle).

@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Native Metal decode kernels — `Op::ArgMax`/`Op::ArgMin` last-axis reduction
 //! and `Op::Sample` (temperature / top-k / top-p / Philox) vs the CPU

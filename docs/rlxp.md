@@ -185,3 +185,6 @@ rlx-bake convert model.rlx -o model.rlxp
 
 `RLXENC01` stays on bake `.rlx`. Optional `RLXSEAL1` seals are available
 behind the `encrypt` feature for cold/sidecar blobs.
+## License
+
+MIT OR Apache-2.0.

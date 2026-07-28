@@ -9,6 +9,38 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ### Added
 
+- **AMD XDNA / Ryzen AI NPU backend (`rlx-xdna`, `Device::Xdna`).** Runs graphs on
+  the AI Engine (`aie2`) tile array via the in-kernel `amdxdna` driver — validated
+  bit-exact (cosine for the quantized matmul) against the CPU backend on a Ryzen
+  **Phoenix `npu1`** APU. `XdnaBackend::supported_ops()` covers ~39 kinds: **INT8
+  GEMM** (~638 GOP/s peak, via the vendor `aie::mmul` overlay), multi-head causal
+  attention, RoPE (NeoX/GptJ), RMS/Layer/GroupNorm, softmax, 26 activations,
+  elementwise / reduce / scan, data-movement, Quantize / Dequantize / FakeQuantize,
+  and 2-D pool + im2col (a conv is `im2col → INT8 GEMM` on the NPU). **Backward +
+  training:** backward graphs decompose to these primitives and run on the NPU
+  (including a dynamic-weight GEMM for `xᵀ @ dy`); a host-optimizer SGD loop trains
+  with the gradient computed on-device. Pure-Rust **AIE-MLIR emitter** + Python-free
+  overlay compilation (native `aiecc`). `RLX_XDNA_TURBO=1` clocks the array to max
+  DPM (+11% on the GEMM; needs root). The AIE array is INT8/BF16, so f32 matmuls run
+  quantized (cosine ≈ 0.99); everything else is bit-exact. A `direct` amdxdna-ioctl
+  path (no XRT / no C++ shim) is code-complete but parked (firmware exec-hang on
+  Phoenix under Secure Boot lockdown). No CPU fallback — a missing runtime is a clear
+  `XdnaError`, never a masquerade.
+
+- **`rlx! { … }` declarative graph DSL (`rlx-tensor`, feature `dsl`).** A compact
+  little language for declaring an `rlx_ir::Graph`: `graph`/`input`/`param`/
+  `const`/`let`/`out` statements with `@` matmul (NumPy precedence), `+ - * /`
+  elementwise (broadcasting + scalar promotion), `f(x)` activation sugar, and a
+  `x.method(args)` escape hatch to the full `Tensor` API (bare-ident args
+  validated + auto-borrowed; `(value)` opts an external value out). Shapes,
+  wiring, and outputs are inferred; inputs/params auto-name from the binding.
+  A semantic pass reports unknown bindings, matmul-on-scalar, and non-tensor
+  `let`s as spanned compile errors. Implemented as a `macro_rules!` wrapper (for
+  `$crate` hygiene across `rlx_tensor::rlx!` / umbrella `rlx::rlx!`) over a
+  Pratt-parser proc macro in `rlx-macros`; lowers to the existing shape-inferring
+  builders at zero runtime cost. Opt-in on `rlx-tensor` (`dsl`); enabled by
+  default for umbrella `rlx` users via the `tensor` feature.
+
 - **`.rlxp` package format (`rlx-pkg`).** Default **flat mmap** (`RLXPFLAT` +
   JSON TOC + 64-byte-aligned data) with **hybrid tiers**: hot (raw mmap), warm
   (`zstd_blocks` / `ZBLK`), cold (whole-blob zstd sidecars). No weight duplex;
@@ -1553,4 +1585,4 @@ Initial release. Tracked at [git history root].
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

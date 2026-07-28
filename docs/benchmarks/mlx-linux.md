@@ -211,4 +211,4 @@ grep MLX_BUILD_CUDA ~/rlx-workspace-mirror/rlx/target/debug/build/rlx-mlx-sys-*/
 ```
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! MLP capstone: learn XOR with a 2-layer tanh network. Exercises deep
 //! autodiff (stacked matmuls + nonlinearity, gradients to four param tensors)

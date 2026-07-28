@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// GPL-3.0-only. See LICENSE.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Gated-DeltaNet scan (f32). Mirrors Metal `gated_delta_net` / CPU
 // `execute_gated_delta_net_f32`. One block per (batch, head); `n` threads

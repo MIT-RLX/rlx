@@ -134,3 +134,6 @@ emits when folding a BatchNorm scale into a conv filter) — those are handled b
 
 Tests: `crates/core/rlx-runtime/tests/param_hoist.rs` (CPU) and
 `cuda_param_hoist.rs` (CUDA); `crates/io/rlx-bake/tests/bake_roundtrip.rs`.
+## License
+
+MIT OR Apache-2.0.

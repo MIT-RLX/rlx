@@ -45,7 +45,7 @@ cargo test -p rlx-compile
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.
 
 [`CompilePipeline`]: https://docs.rs/rlx-compile/latest/rlx_compile/struct.CompilePipeline.html
 [`rlx-ir`]: ../rlx-ir/README.md

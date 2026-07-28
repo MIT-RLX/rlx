@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Metal device discovery + capabilities.
 
@@ -54,6 +43,19 @@ impl MetalDevice {
         let buf = self
             .device
             .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+        // A Shared buffer is backed by physical RAM at creation. When the request
+        // exceeds `maxBufferLength` or free memory, Metal returns a nil-backed
+        // buffer (`contents()` == NULL) instead of erroring — and the zero-fill
+        // below would then segfault on a NULL write. Fail loudly with the limit.
+        if bytes > 0 && buf.contents().is_null() {
+            panic!(
+                "rlx-metal: failed to allocate a {:.2} GB shared buffer \
+                 (maxBufferLength {:.2} GB, likely out of free RAM). \
+                 Lower the stage size or shard the arena.",
+                bytes as f64 / 1e9,
+                self.device.max_buffer_length() as f64 / 1e9,
+            );
+        }
         // Metal `new_buffer` leaves contents undefined. Ops that read unwritten
         // arena regions (e.g. conv halo padding) would otherwise pick up
         // per-process garbage — a nondeterminism / correctness bug. Shared

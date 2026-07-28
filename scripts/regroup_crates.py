@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Regroup the rlx workspace crates into a layered directory taxonomy.
 
 Behavior-preserving: crate *names* are unchanged; only directory locations and

@@ -51,3 +51,6 @@ so existing call sites are unchanged.
 Depends only on `rlx-ir`. This is *not* the MIR autodiff-unfuse in
 `rlx-fusion` (`unfuse_fused_for_autodiff`) — that is a separate pass at a
 different stage.
+## License
+
+MIT OR Apache-2.0.

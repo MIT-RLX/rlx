@@ -1,9 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Closed-form activation derivatives as primitive MIR (`f'(x)`).
 
@@ -65,10 +62,11 @@ pub fn activation_deriv_wrt_x(
             g.binary(BinaryOp::Mul, y, om, shape.clone())
         }
         Activation::Relu => {
-            // H(x) = relu(x)/x for x≠0 (0 at x=0). Differentiable for stacking
-            // without `Compare`/`Cast` bool paths that break CPU execution.
-            let rx = g.activation(Activation::Relu, x, shape.clone());
-            g.binary(BinaryOp::Div, rx, x, shape.clone())
+            // H(x) = relu(sign(x)): 1 for x>0, 0 for x≤0. The old `relu(x)/x` was
+            // `0/0 = NaN` at the x=0 kink; this is NaN-free (no `Compare`/`Cast` bool
+            // path either) and `H(0)=relu(sign(0))=0` matches the native ReluBackward.
+            let sx = g.activation(Activation::Sign, x, shape.clone());
+            g.activation(Activation::Relu, sx, shape.clone())
         }
         Activation::Sin => g.activation(Activation::Cos, x, shape.clone()),
         Activation::Cos => {
@@ -94,8 +92,9 @@ pub fn activation_deriv_wrt_x(
             g.activation(Activation::Neg, y2, shape.clone())
         }
         Activation::Abs => {
-            let ax = g.activation(Activation::Abs, x, shape.clone());
-            g.binary(BinaryOp::Div, x, ax, shape.clone())
+            // |x|' = sign(x). The old `x/|x|` was `0/0 = NaN` at x=0; `sign(0)=0` is
+            // the standard subgradient there.
+            g.activation(Activation::Sign, x, shape.clone())
         }
         // `GeluApprox` (tanh-approx GELU, the PyTorch/ViT default) shares this
         // derivative EXACTLY; `Gelu` (erf form) uses it as a ~1e-3 approximation.

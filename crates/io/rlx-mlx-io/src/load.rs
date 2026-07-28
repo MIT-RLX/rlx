@@ -1,16 +1,14 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Path dispatch + mlx-community directory / safetensors loading.
 
 use anyhow::{Context, Result, bail};
+use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use crate::config::{MlxConfig, MlxQuantMode};
@@ -64,7 +62,7 @@ impl MlxWeights {
 
     /// Dense f32 map with logical shapes preserved (`[rows, cols]` after dequant).
     pub fn into_shaped_f32(self) -> Result<HashMap<String, crate::ShapedF32>> {
-        let quant = self.config.quantization.clone();
+        let config = self.config.clone();
         let mut tensors = self.tensors;
         let mut out = HashMap::new();
 
@@ -87,7 +85,7 @@ impl MlxWeights {
             let scales_t = tensors.remove(&scales_k).context("scales")?;
             let biases_t = tensors.remove(&biases_k);
 
-            let qcfg = quant.clone().unwrap_or_else(|| {
+            let qcfg = config.quant_for(&base).unwrap_or_else(|| {
                 crate::config::MlxQuantConfig::defaults_for(MlxQuantMode::Affine)
             });
 
@@ -190,11 +188,29 @@ impl MlxWeights {
         })
     }
 
-    fn qcfg(&self) -> crate::config::MlxQuantConfig {
+    /// Quant config for a specific layer base — per-module override (mixed
+    /// precision, e.g. gpt-oss) or the global config.
+    fn qcfg_for(&self, base: &str) -> crate::config::MlxQuantConfig {
         self.config
-            .quantization
-            .clone()
+            .quant_for(base)
             .unwrap_or_else(|| crate::config::MlxQuantConfig::defaults_for(MlxQuantMode::Affine))
+    }
+
+    /// [`QuantScheme`] for a specific layer base (per-module aware).
+    fn quant_scheme_for(&self, base: &str) -> Option<QuantScheme> {
+        let q = self.config.quant_for(base)?;
+        Some(match q.mode {
+            MlxQuantMode::Affine => QuantScheme::MlxAffine {
+                bits: q.bits as u8,
+                group_size: q.group_size,
+            },
+            MlxQuantMode::Mxfp4 | MlxQuantMode::Nvfp4 => QuantScheme::MlxMxfp4 {
+                group_size: q.group_size,
+            },
+            MlxQuantMode::Mxfp8 => QuantScheme::MlxMxfp8 {
+                group_size: q.group_size,
+            },
+        })
     }
 
     /// Logical (primary) tensor names — everything that is not a
@@ -240,7 +256,7 @@ impl MlxWeights {
     /// Dequantize quantized layer `{base}` to a dense `[rows, cols]` f32
     /// matrix, consuming `{base}.weight/.scales/.biases`.
     fn dequant_layer(&mut self, base: &str) -> Result<(Vec<f32>, Vec<usize>)> {
-        let qcfg = self.qcfg();
+        let qcfg = self.qcfg_for(base);
         let w = self
             .tensors
             .remove(&format!("{base}.weight"))
@@ -293,14 +309,16 @@ impl MlxWeights {
         if !self.is_quantized_layer(hf_key) {
             return Ok(None);
         }
-        let Some(scheme) = self.quant_scheme() else {
+        let base = hf_key.trim_end_matches(".weight").to_string();
+        // Per-module scheme (mixed precision) — NOT the global one, else affine
+        // attn/embed tensors get mis-decoded as the global mxfp4 (gpt-oss).
+        let Some(scheme) = self.quant_scheme_for(&base) else {
             return Ok(None);
         };
         if !scheme.is_mlx() {
             return Ok(None);
         }
-        let base = hf_key.trim_end_matches(".weight").to_string();
-        let qcfg = self.qcfg();
+        let qcfg = self.qcfg_for(&base);
         let w = self
             .tensors
             .remove(hf_key)
@@ -408,9 +426,23 @@ fn load_safetensors_bytes(bytes: &[u8]) -> Result<HashMap<String, MlxTensor>> {
     let mut out = HashMap::new();
     for name in st.names() {
         let view = st.tensor(name)?;
-        let shape: Vec<usize> = view.shape().to_vec();
-        let raw = view.data();
-        let dtype = view.dtype();
+        let t = tensor_from_view(name, view.shape().to_vec(), view.dtype(), view.data())?;
+        out.insert(name.to_string(), t);
+    }
+    Ok(out)
+}
+
+/// Decode one safetensors tensor (`raw` bytes + dtype + shape) into an
+/// [`MlxTensor`] (dense f32, or raw u8 for quant packs). Shared by the eager
+/// [`load_safetensors_bytes`] and the lazy [`LazyMlxWeights`] so both classify
+/// float-vs-quant identically.
+fn tensor_from_view(
+    name: &str,
+    shape: Vec<usize>,
+    dtype: safetensors::Dtype,
+    raw: &[u8],
+) -> Result<MlxTensor> {
+    {
         let (data_f32, data_u8, is_quant_weight) = match dtype {
             safetensors::Dtype::U8 | safetensors::Dtype::I8 => (None, Some(raw.to_vec()), true),
             safetensors::Dtype::U16
@@ -451,23 +483,241 @@ fn load_safetensors_bytes(bytes: &[u8]) -> Result<HashMap<String, MlxTensor>> {
         } else {
             (data_f32, data_u8, is_quant_weight)
         };
-        out.insert(
-            name.to_string(),
-            MlxTensor {
-                name: name.to_string(),
-                shape,
-                data_f32,
-                data_u8,
-                is_quant_weight,
-            },
-        );
+        Ok(MlxTensor {
+            name: name.to_string(),
+            shape,
+            data_f32,
+            data_u8,
+            is_quant_weight,
+        })
     }
-    Ok(out)
 }
 
 fn load_safetensors_file(path: &Path) -> Result<HashMap<String, MlxTensor>> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     load_safetensors_bytes(&bytes)
+}
+
+/// Unique, sorted `.safetensors` shard files in an mlx dir (from the
+/// `model.safetensors.index.json` weight_map, else a directory glob).
+fn gather_shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let index_path = dir.join("model.safetensors.index.json");
+    let mut files: Vec<PathBuf> = Vec::new();
+    if index_path.is_file() {
+        let idx: serde_json::Value = serde_json::from_slice(&fs::read(&index_path)?)?;
+        if let Some(map) = idx.get("weight_map").and_then(|v| v.as_object()) {
+            let mut set = std::collections::BTreeSet::new();
+            for v in map.values() {
+                if let Some(s) = v.as_str() {
+                    // A pipeline node holds only ITS layer slice's shards. Skip
+                    // shards the index names but that aren't present here, rather
+                    // than failing to open the whole checkpoint.
+                    let p = dir.join(s);
+                    if p.is_file() {
+                        set.insert(p);
+                    }
+                }
+            }
+            files.extend(set);
+        }
+    }
+    if files.is_empty() {
+        for ent in fs::read_dir(dir)? {
+            let p = ent?.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+                files.push(p);
+            }
+        }
+        files.sort();
+    }
+    if files.is_empty() {
+        bail!("no safetensors files in {}", dir.display());
+    }
+    Ok(files)
+}
+
+/// Common read surface shared by the eager [`MlxWeights`] and the lazy
+/// [`LazyMlxWeights`] — the four operations rlx-models' `MlxLoader` needs.
+pub trait MlxRead: Send {
+    fn mlx_config(&self) -> &MlxConfig;
+    fn logical_keys(&self) -> Vec<String>;
+    fn take_dense_f32(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)>;
+    fn take_packed_linear(&mut self, key: &str) -> Result<Option<MlxPackedLinear>>;
+}
+
+impl MlxRead for MlxWeights {
+    fn mlx_config(&self) -> &MlxConfig {
+        &self.config
+    }
+    fn logical_keys(&self) -> Vec<String> {
+        MlxWeights::logical_keys(self)
+    }
+    fn take_dense_f32(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        MlxWeights::take_dense_f32(self, key)
+    }
+    fn take_packed_linear(&mut self, key: &str) -> Result<Option<MlxPackedLinear>> {
+        MlxWeights::take_packed_linear(self, key)
+    }
+}
+
+/// **Lazy, mmap-backed** MLX weights. `open` mmaps each shard and indexes tensor
+/// names from the safetensors headers (no data copied); a `take` materializes
+/// only the tensor(s) it needs. Peak resident RAM is one tensor (+ any dequant
+/// scratch), so a worker can load its shard of a checkpoint far larger than its
+/// own RAM — the enabler for running a 96 GB model across small nodes.
+pub struct LazyMlxWeights {
+    shards: Vec<Mmap>,
+    name_to_shard: HashMap<String, usize>,
+    pub config: MlxConfig,
+    pub source: PathBuf,
+}
+
+impl LazyMlxWeights {
+    fn from_shards(shard_paths: Vec<PathBuf>, config: MlxConfig, source: PathBuf) -> Result<Self> {
+        let mut shards = Vec::with_capacity(shard_paths.len());
+        let mut name_to_shard = HashMap::new();
+        for (idx, p) in shard_paths.iter().enumerate() {
+            let file = File::open(p).with_context(|| format!("open {}", p.display()))?;
+            // SAFETY: read-only mapping of a file we own for the loader's lifetime.
+            let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", p.display()))?;
+            {
+                let st = SafeTensors::deserialize(&mmap[..])
+                    .with_context(|| format!("safetensors header {}", p.display()))?;
+                for name in st.names() {
+                    name_to_shard.insert(name.to_string(), idx);
+                }
+            } // header borrow released before moving the mmap
+            shards.push(mmap);
+        }
+        Ok(Self { shards, name_to_shard, config, source })
+    }
+
+    /// Copy just this tensor's bytes out of its mmap → dense/quant [`MlxTensor`].
+    fn materialize(&self, name: &str) -> Result<MlxTensor> {
+        let idx = *self
+            .name_to_shard
+            .get(name)
+            .with_context(|| format!("mlx tensor not found: {name}"))?;
+        let mmap = &self.shards[idx];
+        let st = SafeTensors::deserialize(&mmap[..]).context("re-parse header")?;
+        let view = st.tensor(name)?;
+        let out = tensor_from_view(name, view.shape().to_vec(), view.dtype(), view.data());
+        // Release this tensor's mmap pages once copied into the owned MlxTensor.
+        // Building a big pipeline stage materializes tens of GB; without this the
+        // mmap page cache accumulates the whole shard set (~40GB) ALONGSIDE the
+        // arena being filled (~39GB) → the OS swaps the arena, and every later
+        // forward pages it back in (14s compute became 140s wall). DONTNEED keeps
+        // the mmap footprint to roughly the current tensor.
+        // Drop this tensor's mmap pages once copied. SAFETY: the shard mmap is
+        // read-only and never written, so MADV_DONTNEED (drop the cached pages;
+        // re-fault from the file if touched again) cannot lose data. It bounds the
+        // page-cache footprint during the build — otherwise materializing a big
+        // pipeline stage accumulates the whole shard set (~40GB) in cache ALONGSIDE
+        // the arena (~39GB), the OS swaps the arena, and every forward pages it
+        // back in (14s compute became 140s wall). Raw libc for memmap2-version
+        // portability. Page-aligned start so we never advise a neighbour's page.
+        #[cfg(unix)]
+        unsafe {
+            let start = view.data().as_ptr() as usize;
+            let page = 4096usize;
+            let aligned = (start + page - 1) & !(page - 1);
+            let end = start + view.data().len();
+            if end > aligned {
+                libc::madvise(aligned as *mut libc::c_void, end - aligned, libc::MADV_DONTNEED);
+            }
+        }
+        out
+    }
+
+    fn is_quantized_layer(&self, key: &str) -> bool {
+        key.strip_suffix(".weight")
+            .is_some_and(|b| self.name_to_shard.contains_key(&format!("{b}.scales")))
+    }
+
+    /// Temp eager [`MlxWeights`] holding just `names` (materialized) so we can
+    /// reuse the existing dequant / packed logic verbatim.
+    fn temp_with(&self, names: &[&str]) -> Result<MlxWeights> {
+        let mut tensors = HashMap::new();
+        for n in names {
+            if self.name_to_shard.contains_key(*n) {
+                tensors.insert(n.to_string(), self.materialize(n)?);
+            }
+        }
+        Ok(MlxWeights {
+            tensors,
+            config: self.config.clone(),
+            source: self.source.clone(),
+        })
+    }
+
+    pub fn logical_keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .name_to_shard
+            .keys()
+            .filter(|k| !k.ends_with(".scales") && !k.ends_with(".biases"))
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    pub fn take_dense_f32(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        if self.is_quantized_layer(key) {
+            let base = key.trim_end_matches(".weight");
+            let mut temp = self.temp_with(&[key, &format!("{base}.scales"), &format!("{base}.biases")])?;
+            return temp.take_dense_f32(key);
+        }
+        let t = self.materialize(key)?;
+        let data = t.data_f32.with_context(|| format!("mlx tensor {key} has no f32 data"))?;
+        Ok((data, t.shape))
+    }
+
+    pub fn take_packed_linear(&mut self, key: &str) -> Result<Option<MlxPackedLinear>> {
+        if !self.is_quantized_layer(key) {
+            return Ok(None);
+        }
+        let base = key.trim_end_matches(".weight");
+        let mut temp = self.temp_with(&[key, &format!("{base}.scales"), &format!("{base}.biases")])?;
+        temp.take_packed_linear(key)
+    }
+}
+
+impl MlxRead for LazyMlxWeights {
+    fn mlx_config(&self) -> &MlxConfig {
+        &self.config
+    }
+    fn logical_keys(&self) -> Vec<String> {
+        LazyMlxWeights::logical_keys(self)
+    }
+    fn take_dense_f32(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        LazyMlxWeights::take_dense_f32(self, key)
+    }
+    fn take_packed_linear(&mut self, key: &str) -> Result<Option<MlxPackedLinear>> {
+        LazyMlxWeights::take_packed_linear(self, key)
+    }
+}
+
+/// Lazily open an mlx-community directory or a single `.safetensors` (mmap, no
+/// eager copy). `.npz`/`.npy` aren't supported lazily — use [`load_path`].
+pub fn load_path_lazy(path: impl AsRef<Path>) -> Result<LazyMlxWeights> {
+    let path = path.as_ref();
+    if path.is_dir() {
+        let cfg_path = path.join("config.json");
+        let config = if cfg_path.is_file() { MlxConfig::from_path(&cfg_path)? } else { MlxConfig::default() };
+        let files = gather_shard_files(path)?;
+        LazyMlxWeights::from_shards(files, config, path.to_path_buf())
+    } else if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        let config = path
+            .parent()
+            .map(|d| d.join("config.json"))
+            .filter(|p| p.is_file())
+            .map(|p| MlxConfig::from_path(&p))
+            .transpose()?
+            .unwrap_or_default();
+        LazyMlxWeights::from_shards(vec![path.to_path_buf()], config, path.to_path_buf())
+    } else {
+        bail!("load_path_lazy: expected a dir or .safetensors, got {}", path.display());
+    }
 }
 
 fn load_mlx_dir(dir: &Path) -> Result<MlxWeights> {
@@ -486,7 +736,10 @@ fn load_mlx_dir(dir: &Path) -> Result<MlxWeights> {
             let mut set = std::collections::BTreeSet::new();
             for v in map.values() {
                 if let Some(s) = v.as_str() {
-                    set.insert(dir.join(s));
+                    let p = dir.join(s);
+                    if p.is_file() {
+                        set.insert(p);
+                    }
                 }
             }
             files.extend(set);

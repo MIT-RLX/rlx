@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `CompileOptions::scaled_quant` — the execution-flow knob that rewrites every
 //! 2-D matmul in a graph into a native low-precision `ScaledMatMul` in a chosen

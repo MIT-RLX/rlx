@@ -49,3 +49,6 @@ let arts = ExportSession::fpga("hw/out")
 ```
 
 See [docs/fpga-export.md](../../../../docs/fpga-export.md).
+## License
+
+MIT OR Apache-2.0.

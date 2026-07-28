@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `FuseConvBiasAct` correctness — the CUDA→cuDNN fused conv-bias-activation op.
 //!
 //! CUDA is the only backend that claims `Op::FusedConvBiasAct` (lowered to

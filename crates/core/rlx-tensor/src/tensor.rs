@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Symbolic tensor handle — zero payload bytes until compile + run.
 
@@ -114,7 +115,7 @@ impl std::fmt::Display for Tensor {
 /// to observe storage sharing and [`storage_bytes`](Self::storage_bytes) to
 /// confirm no data was copied. (Combining two *independently-constructed*
 /// tensors is the one case that copies — the right operand's nodes are merged
-/// in once; see [`crate::handle`].)
+/// in once; see the `handle` module.)
 #[derive(Clone, Debug)]
 pub struct Tensor {
     pub(crate) handle: GraphHandle,
@@ -511,7 +512,7 @@ impl Tensor {
         Self::new(self.handle.clone(), id)
     }
 
-    /// Cumulative sum along `axis`. `exclusive` shifts so output[0] = 0.
+    /// Cumulative sum along `axis`. `exclusive` shifts so `output[0]` = 0.
     pub fn cumsum(&self, axis: i32, exclusive: bool) -> Self {
         self.map_unary(|g, x| {
             let s = rlx_ir::shape::unary_shape(g.shape(x));
@@ -554,7 +555,7 @@ impl Tensor {
         self.map_unary(|g, x| g.fft(x, false))
     }
 
-    /// Inverse 1-D FFT along the last axis (unnormalized — pairs with [`fft`]
+    /// Inverse 1-D FFT along the last axis (unnormalized — pairs with [`Self::fft`]
     /// up to the `N` factor).
     pub fn ifft(&self) -> Self {
         self.map_unary(|g, x| g.fft(x, true))

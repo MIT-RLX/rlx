@@ -1748,6 +1748,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "hexf-parse"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+
+[[package]]
 name = "hickory-net"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2862,6 +2868,7 @@ dependencies = [
  "codespan-reporting",
  "half",
  "hashbrown 0.16.1",
+ "hexf-parse",
  "indexmap",
  "libm",
  "log",
@@ -2871,6 +2878,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.18",
+ "unicode-ident",
 ]
 
 [[package]]
@@ -4677,6 +4685,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-distributed"
+version = "0.2.14"
+dependencies = [
+ "anyhow",
+ "rlx-driver",
+ "rlx-ir",
+ "rlx-runtime",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "rlx-driver"
 version = "0.2.14"
 dependencies = [
@@ -4782,6 +4803,18 @@ dependencies = [
 [[package]]
 name = "rlx-gpu-kernels"
 version = "0.2.14"
+dependencies = [
+ "rlxsl",
+]
+
+[[package]]
+name = "rlx-hub"
+version = "0.2.14"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "rlx-hwprofile"
@@ -4836,6 +4869,7 @@ dependencies = [
  "rlx-mlx-io",
  "rlx-opt",
  "rlx-runtime",
+ "rlxsl",
  "safetensors",
  "serde",
  "serde_json",
@@ -4865,7 +4899,10 @@ version = "0.2.14"
 dependencies = [
  "anyhow",
  "half",
+ "libc",
+ "memmap2",
  "npyz",
+ "rayon",
  "rlx-ir",
  "rlx-runtime",
  "safetensors",
@@ -4906,6 +4943,7 @@ dependencies = [
  "rlx-ir",
  "rlx-opt",
  "rlx-unfuse",
+ "rlxsl",
 ]
 
 [[package]]
@@ -5036,6 +5074,7 @@ dependencies = [
  "cc",
  "libloading 0.8.9",
  "rlx-cpu",
+ "rlx-gguf",
  "rlx-gpu-host",
  "rlx-gpu-kernels",
  "rlx-ir",
@@ -5085,6 +5124,8 @@ dependencies = [
  "rlx-vulkan",
  "rlx-webgl",
  "rlx-wgpu",
+ "rlx-xdna",
+ "rlxsl",
  "safetensors",
  "serde",
  "serde_json",
@@ -5108,6 +5149,7 @@ dependencies = [
  "ndarray 0.16.1",
  "rlx-autodiff",
  "rlx-ir",
+ "rlx-macros",
  "rlx-optim",
  "rlx-runtime",
 ]
@@ -5217,6 +5259,7 @@ dependencies = [
  "rlx-opt",
  "rlx-runtime",
  "rlx-unfuse",
+ "rlxsl",
 ]
 
 [[package]]
@@ -5266,9 +5309,28 @@ dependencies = [
  "rlx-opt",
  "rlx-runtime",
  "rlx-unfuse",
+ "rlxsl",
  "serde",
  "serde_json",
  "wgpu",
+]
+
+[[package]]
+name = "rlx-xdna"
+version = "0.2.14"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
+ "rlx-ir",
+]
+
+[[package]]
+name = "rlxsl"
+version = "0.2.14"
+dependencies = [
+ "libm",
+ "naga 29.0.3",
+ "rlx-ir",
 ]
 
 [[package]]
@@ -7476,10 +7538,6 @@ name = "rlx-dinov3"
 version = "0.2.14"
 
 [[patch.unused]]
-name = "rlx-distributed"
-version = "0.2.14"
-
-[[patch.unused]]
 name = "rlx-embed"
 version = "0.2.14"
 
@@ -7877,10 +7935,6 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-dinov3"
-version = "0.2.14"
-
-[[patch.unused]]
-name = "rlx-distributed"
 version = "0.2.14"
 
 [[patch.unused]]

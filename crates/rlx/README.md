@@ -51,6 +51,20 @@ compiled.set_param("w", &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
 let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 ```
 
+Prefer to write the math? The `rlx!` DSL (feature `tensor`, on by default)
+builds the same graph in a compact little language — `@` is matmul, shapes and
+outputs are inferred:
+
+```rust
+use rlx::rlx;
+
+let g = rlx! {
+    input x: [1, 4];
+    param w: [4, 2];
+    let y = x @ w;      // → rlx_ir::Graph
+};
+```
+
 ### Multi-backend runtime
 
 ```rust
@@ -67,7 +81,7 @@ See [`docs/backend-selection.md`](../docs/backend-selection.md).
 
 | import                       | gives you                                                                |
 |------------------------------|--------------------------------------------------------------------------|
-| `use rlx::prelude::*;`       | `Graph`, `Session`, `CompileOptions`, `Package`, `GraphDevices`, `DeviceRouter`, `DevicePolicy`, `FlexibleSession`, `DType`, `Dim`, `Device`, `Result`, `Activation`, `BinaryOp`, `ReduceOp`, `FftNorm`, `QuantScheme`, `grad` / `jvp` / `vmap`, `verify`, `open_rlxp` / `compile_rlxp`, `rlx_model!`, … |
+| `use rlx::prelude::*;`       | `Graph`, `Session`, `CompileOptions`, `Package`, `GraphDevices`, `DeviceRouter`, `DevicePolicy`, `FlexibleSession`, `DType`, `Dim`, `Device`, `Result`, `Activation`, `BinaryOp`, `ReduceOp`, `FftNorm`, `QuantScheme`, `grad` / `jvp` / `vmap`, `verify`, `open_rlxp` / `compile_rlxp`, `rlx_model!`, `rlx!`, … |
 | `use rlx::ops::*;`           | IR helper enums: `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ReduceOp`, `InterpMode`, `FftNorm`, `ChainStep`, `ChainOperand` |
 | `use rlx::quant::*;`         | `QuantScheme`, `QuantMap`                                                |
 | `use rlx::pkg::*;`           | `.rlxp` — `Package`, `Placement`, `open_rlxp`, `compile_rlxp`, `compile_rlxp_bind_params`, … |
@@ -140,4 +154,6 @@ rlx = { git = "https://github.com/MIT-RLX/rlx", features = ["apple-silicon", "ml
 
 ## License
 
-GPL-3.0-only. See [`LICENSE`](https://github.com/MIT-RLX/rlx/blob/main/LICENSE).
+MIT OR Apache-2.0, at your option. See
+[`LICENSE-MIT`](https://github.com/MIT-RLX/rlx/blob/main/LICENSE-MIT) and
+[`LICENSE-APACHE`](https://github.com/MIT-RLX/rlx/blob/main/LICENSE-APACHE).

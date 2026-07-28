@@ -36,4 +36,4 @@ or [`rlx`](https://crates.io/crates/rlx).
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

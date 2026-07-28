@@ -1,24 +1,13 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Shared GPU kernel sources for RLX CUDA and ROCm backends.
 //!
 //! Each constant is the full `.cu` source text, embedded at compile time.
 //! Backends JIT-compile via NVRTC / hipRTC on first use.
 
-pub const BINARY_CU: &str = include_str!("../kernels/binary.cu");
+pub const BINARY_CU: &str = include_str!(concat!(env!("OUT_DIR"), "/binary.cu"));
 /// Standalone complex `Op::Cast` on the f32-uniform arena (real<->C64,
 /// real<->C128, C64<->C128 — six pure lane-move modes). f32-uniform GPU
 /// backends simulate complex as interleaved f32 lanes; this re-pairs them.
@@ -40,7 +29,12 @@ pub const SCALED_LOWP_CU: &str = include_str!("../kernels/scaled_lowp.cu");
 /// for `Op::ScaledMatMul` — the on-device decode-and-accumulate fallback for
 /// block-scaled / FP4 / FP6 configs the FP8 tensor-core path can't do.
 pub const SCALED_LOWP_GENERAL_CU: &str = include_str!("../kernels/scaled_lowp_general.cu");
-pub const UNARY_CU: &str = include_str!("../kernels/unary.cu");
+/// Unary/activation + cast kernel. The activation dispatch (op 0..28) is
+/// @generated from the shared `rlxsl` manifest and prepended to the hand-written
+/// plumbing + cast selectors (`kernels/unary_main.cu`) at build time. Self-
+/// contained (the generated `rlx_activation_apply` inlines gelu), so — unlike
+/// the other kernels — it needs no `gelu.cuh` prepend.
+pub const UNARY_CU: &str = include_str!(concat!(env!("OUT_DIR"), "/unary.cu"));
 pub const LSTM_CU: &str = include_str!("../kernels/lstm.cu");
 /// Philox4×32-10 RNG fill (`rng_normal_philox` / `rng_uniform_philox` / `rng_fill_zero`).
 pub const RNG_PHILOX_CU: &str = include_str!("../kernels/rng_philox.cu");
@@ -58,12 +52,17 @@ pub const MATMUL_CU: &str = include_str!("../kernels/matmul.cu");
 pub const MATMUL_BT_CU: &str = include_str!("../kernels/matmul_bt.cu");
 pub const MATMUL_EPILOGUE_CU: &str = include_str!("../kernels/matmul_epilogue.cu");
 pub const MATMUL_WMMA_CU: &str = include_str!("../kernels/matmul_wmma.cu");
-pub const COMPARE_CU: &str = include_str!("../kernels/compare.cu");
+pub const COMPARE_CU: &str = include_str!(concat!(env!("OUT_DIR"), "/compare.cu"));
 pub const WHERE_CU: &str = include_str!("../kernels/where_select.cu");
 pub const FMA_CU: &str = include_str!("../kernels/fma.cu");
 pub const REDUCE_CU: &str = include_str!("../kernels/reduce.cu");
 pub const SOFTMAX_CU: &str = include_str!("../kernels/softmax.cu");
-pub const ACTIVATION_BACKWARD_CU: &str = include_str!("../kernels/activation_backward.cu");
+/// Activation backward (`dx = act'(x)·dy`). The derivative switch (op 0..17) is
+/// @generated from the rlxsl manifest — auto-differentiated from the forward, so
+/// it is exactly the gradient of the forward we ship — and prepended to the
+/// plumbing in `kernels/activation_backward_main.cu` at build time.
+pub const ACTIVATION_BACKWARD_CU: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/activation_backward.cu"));
 pub const SOFTMAX_CROSS_ENTROPY_CU: &str = include_str!("../kernels/softmax_cross_entropy.cu");
 pub const LAYERNORM_CU: &str = include_str!("../kernels/layernorm.cu");
 pub const LAYER_NORM_BWD_CU: &str = include_str!("../kernels/layer_norm_backward.cu");
@@ -156,7 +155,11 @@ macro_rules! cuda_src_with_gelu {
     };
 }
 
-cuda_src_with_gelu!(unary_cuda_src, include_str!("../kernels/unary.cu"));
+/// Unary/activation + cast kernel source. Already self-contained (activation
+/// dispatch is @generated with gelu inlined), so no `gelu.cuh` prepend.
+pub fn unary_cuda_src() -> &'static str {
+    UNARY_CU
+}
 cuda_src_with_gelu!(
     fused_binary_unary_cuda_src,
     include_str!("../kernels/fused_binary_unary.cu")

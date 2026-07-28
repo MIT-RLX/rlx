@@ -1,9 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! ONNX front-end — reuse `rlx-onnx-import`'s opset-versioned ONNX→HIR importer
 //! (~88 ops) rather than re-porting the ONNX operator list into the aten

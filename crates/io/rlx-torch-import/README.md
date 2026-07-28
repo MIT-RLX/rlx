@@ -257,3 +257,6 @@ Notes / deferred:
 - Unsupported ops are reported **all at once** with the exact aten names, so
   extending [`src/lower.rs`](src/lower.rs) is a matter of adding a handler + a
   `SUPPORTED` entry (and, for the generated crate, an `emit` arm).
+## License
+
+MIT OR Apache-2.0.

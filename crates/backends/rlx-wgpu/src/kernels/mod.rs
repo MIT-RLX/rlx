@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! WGSL kernel sources + per-kernel pipeline cache.
 //!
@@ -47,13 +36,18 @@ pub const MATMUL_QKV_COOP_F16_VK_F32ACC_WGSL: &str =
 pub const MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC_WGSL: &str =
     include_str!("matmul_qkv_coop_f16_vk_widen_f32acc.wgsl");
 pub const CAST_F32_TO_F16_WGSL: &str = include_str!("cast_f32_to_f16.wgsl");
-pub const BINARY_WGSL: &str = include_str!("binary.wgsl");
-pub const UNARY_WGSL: &str = include_str!("unary.wgsl");
+pub const BINARY_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/binary.wgsl"));
+// Assembled at build time: `rlx_activation_apply` (generated from the shared
+// rlxsl manifest) prepended to `unary_main.wgsl`. See build.rs.
+pub const UNARY_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/unary.wgsl"));
 pub const UNARY_F16_MIRROR_WGSL: &str = include_str!("unary_f16_mirror.wgsl");
-pub const COMPARE_WGSL: &str = include_str!("compare.wgsl");
+pub const COMPARE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/compare.wgsl"));
 pub const WHERE_WGSL: &str = include_str!("where.wgsl");
 pub const FMA_WGSL: &str = include_str!("fma.wgsl");
-pub const ACTIVATION_BACKWARD_WGSL: &str = include_str!("activation_backward.wgsl");
+// Assembled at build time: `rlx_activation_backward` (auto-differentiated from
+// the forward manifest via rlxsl) prepended to `activation_backward_main.wgsl`.
+pub const ACTIVATION_BACKWARD_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/activation_backward.wgsl"));
 pub const REDUCE_WGSL: &str = include_str!("reduce.wgsl");
 pub const SOFTMAX_WGSL: &str = include_str!("softmax.wgsl");
 pub const SOFTMAX_CROSS_ENTROPY_WGSL: &str = include_str!("softmax_cross_entropy.wgsl");

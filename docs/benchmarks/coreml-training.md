@@ -161,3 +161,6 @@ training path, not bugs:
 See also: [op-coverage.md](../op-coverage.md) (per-backend op support, incl. ANE)
 and [backend-selection.md](../backend-selection.md) (`RLX_COREML_UNITS` and
 device routing).
+## License
+
+MIT OR Apache-2.0.

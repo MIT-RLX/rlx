@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // DiT gated residual: out = x + gate * y  (gate broadcasts like adaLN scale).
 // lead_pack: [lead_rank, x_lead[8], gate_lead[8]] packed as vec4s (uniform
 // address space requires array stride multiple of 16 — plain `array<u32,N>`

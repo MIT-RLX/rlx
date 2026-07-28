@@ -124,3 +124,6 @@ files = pyrlx.export_fpga(
 ## See also
 
 - [`crates/backends/rlx-fpga/README.md`](../crates/backends/rlx-fpga/README.md)
+## License
+
+MIT OR Apache-2.0.

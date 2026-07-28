@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `VulkanExecutable` — compile an IR graph into a flat schedule of compute
 //! dispatches over a single f32 arena buffer, then execute it.
@@ -722,73 +722,17 @@ fn groups1d(n: usize, local: u32) -> (u32, u32, u32) {
     (ceil_div(n, local).max(1), 1, 1)
 }
 
+/// Op ids for the forward `unary.comp` switch (Vulkan/oneAPI "gelu-first"
+/// scheme). Canonical table lives in `rlx_ir::opcodes`.
 fn act_id(a: Activation) -> u32 {
-    match a {
-        Activation::Gelu => 0,
-        Activation::GeluApprox => 1,
-        Activation::Silu => 2,
-        Activation::Relu => 3,
-        Activation::Sigmoid => 4,
-        Activation::Tanh => 5,
-        Activation::Exp => 6,
-        Activation::Log => 7,
-        Activation::Sqrt => 8,
-        Activation::Rsqrt => 9,
-        Activation::Neg => 10,
-        Activation::Abs => 11,
-        Activation::Sin => 12,
-        Activation::Cos => 13,
-        Activation::Tan => 14,
-        Activation::Atan => 15,
-        Activation::Round => 16,
-        Activation::Recip => 17,
-        Activation::Floor => 18,
-        Activation::Ceil => 19,
-        Activation::Sign => 20,
-        Activation::Softplus => 21,
-        Activation::Elu => 22,
-        Activation::Erf => 23,
-        Activation::HardSwish => 24,
-        Activation::HardSigmoid => 25,
-        Activation::Mish => 26,
-        Activation::Softsign => 27,
-        Activation::LogSigmoid => 28,
-    }
+    a.opcode_gelu_first()
 }
 
-/// Op ids for `activation_backward.comp` — match CUDA / wgpu (not forward unary).
+/// Op ids for `activation_backward.comp` — "relu-first" scheme (matches
+/// CUDA / wgpu, not the forward unary switch). Canonical table in
+/// `rlx_ir::opcodes`.
 fn activation_bwd_op_id(a: Activation) -> u32 {
-    match a {
-        Activation::Relu => 0,
-        Activation::Sigmoid => 1,
-        Activation::Tanh => 2,
-        Activation::Exp => 3,
-        Activation::Log => 4,
-        Activation::Sqrt => 5,
-        Activation::Rsqrt => 6,
-        Activation::Neg => 7,
-        Activation::Abs => 8,
-        Activation::Gelu => 9,
-        Activation::Silu => 10,
-        Activation::GeluApprox => 11,
-        Activation::Round => 12,
-        Activation::Sin => 13,
-        Activation::Cos => 14,
-        Activation::Tan => 15,
-        Activation::Atan => 16,
-        Activation::Recip => 17,
-        Activation::Floor => 18,
-        Activation::Ceil => 19,
-        Activation::Sign => 20,
-        Activation::Softplus => 21,
-        Activation::Elu => 22,
-        Activation::Erf => 23,
-        Activation::HardSwish => 24,
-        Activation::HardSigmoid => 25,
-        Activation::Mish => 26,
-        Activation::Softsign => 27,
-        Activation::LogSigmoid => 28,
-    }
+    a.opcode_relu_first()
 }
 
 fn fake_quantize_q_max(bits: u8) -> f32 {
@@ -828,43 +772,15 @@ fn push_quantize_affine(scales: &[f32], zero_points: &[i32], chan_dim: usize) ->
 }
 
 fn binop_id(op: BinaryOp) -> u32 {
-    match op {
-        BinaryOp::Add => 0,
-        BinaryOp::Sub => 1,
-        BinaryOp::Mul => 2,
-        BinaryOp::Div => 3,
-        BinaryOp::Max => 4,
-        BinaryOp::Min => 5,
-        BinaryOp::Pow => 6,
-        BinaryOp::Mod => 7,
-        BinaryOp::BitAnd => 8,
-        BinaryOp::BitOr => 9,
-        BinaryOp::BitXor => 10,
-        BinaryOp::Shl => 11,
-        BinaryOp::Shr => 12,
-        BinaryOp::Atan2 => 13,
-    }
+    op.opcode()
 }
 
 fn cmp_id(op: CmpOp) -> u32 {
-    match op {
-        CmpOp::Eq => 0,
-        CmpOp::Ne => 1,
-        CmpOp::Lt => 2,
-        CmpOp::Le => 3,
-        CmpOp::Gt => 4,
-        CmpOp::Ge => 5,
-    }
+    op.opcode()
 }
 
 fn reduce_id(op: ReduceOp) -> u32 {
-    match op {
-        ReduceOp::Sum => 0,
-        ReduceOp::Mean => 1,
-        ReduceOp::Max => 2,
-        ReduceOp::Min => 3,
-        ReduceOp::Prod => 4,
-    }
+    op.opcode()
 }
 
 impl VulkanExecutable {

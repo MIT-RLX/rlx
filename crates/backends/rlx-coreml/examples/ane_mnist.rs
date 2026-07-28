@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // TinyConv-MNIST inference on the Apple Neural Engine (CoreML backend).
 //
 // The CNN matches the rlx-cortexm trainer / the other MNIST runners:

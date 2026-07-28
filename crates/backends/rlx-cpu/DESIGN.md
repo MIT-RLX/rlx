@@ -67,4 +67,4 @@ on Apple Silicon's P/E asymmetric cores.
   checks).
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

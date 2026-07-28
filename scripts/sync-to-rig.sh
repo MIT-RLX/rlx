@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Full-tree sync of this RLX checkout to a remote Linux rig.
 # Partial syncs (e.g. only rlx-cpu) cause IR/OpKind mismatches with older rlx-ir.
 # Set RLX_RIG_HOST=user@host (and optionally RLX_RIG_DEST=path) before running.

@@ -31,7 +31,7 @@ cargo test -p rlx-fusion
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.
 
 [`unfuse_fused_for_autodiff`]: https://docs.rs/rlx-fusion/latest/rlx_fusion/fn.unfuse_fused_for_autodiff.html
 [`rlx-ir`]: ../rlx-ir/README.md

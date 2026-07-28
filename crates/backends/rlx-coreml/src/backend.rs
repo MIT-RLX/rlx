@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // The executable: ties lowering + packaging + CoreML execution together.
 // Exposes an inherent API (compile / set_param / finalize / run) — the

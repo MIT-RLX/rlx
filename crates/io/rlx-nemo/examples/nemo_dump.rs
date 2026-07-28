@@ -1,11 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// Distributed WITHOUT ANY WARRANTY; see the GNU GPL v3 for details.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Dump a `.nemo`'s config + state-dict tensor names/shapes and spot-check
 //! a few tensors. Usage: `cargo run -p rlx-nemo --example nemo_dump -- <file.nemo>`.

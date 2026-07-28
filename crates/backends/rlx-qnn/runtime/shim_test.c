@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 /* Standalone validation harness for rlx_qnn_shim.c.
  *
  *   shim_test <path-to-libQnnCpu.so> [M K N]

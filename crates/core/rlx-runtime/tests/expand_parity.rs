@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `Op::Expand` cross-backend parity at various spatial sizes — the detection
 //! U-Net's bias broadcast (`[1,C,1,1] → [N,C,H,W]`) diverged on Metal only at
 //! full resolution, implicating a size-dependent Expand kernel bug.

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! IIR biquad signal kernels — zero-phase Butterworth filtering, the DSP complement to rlx's
 //! FIR (`conv`) and FFT paths. A 2nd-order biquad is 5 coefficients and filters short windows
 //! cleanly (no long FIR taps to overflow the signal), which makes it the right primitive for

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // On-device parity tests for the second wave of ops: comparison, select,
 // expand, cumsum, scatter-add, the norm family, LoRA, and the vision ops
 // (conv / conv_transpose / pool). Each checks CoreML output against a hand

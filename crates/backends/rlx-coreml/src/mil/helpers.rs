@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Proto-plumbing layer for the MIL lowering: pure builder functions that
 // construct CoreML protobuf messages (consts, bindings, scalar/vector

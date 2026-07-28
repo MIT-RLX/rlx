@@ -147,4 +147,4 @@ numpy / host Rust / on-device M4F (483 / 500 across all three).
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

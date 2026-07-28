@@ -37,4 +37,4 @@ Related repo docs:
 - [`crates/bindings/pyrlx/examples/dsl_quickstart.py`](../crates/bindings/pyrlx/examples/dsl_quickstart.py) — runnable DSL demo
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

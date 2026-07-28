@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Welch PSD accumulate + top-K peaks from block-layout spectra.
 // One thread per welch_batch row; matches rlx_ir::audio::welch_peaks_block_f32.
 

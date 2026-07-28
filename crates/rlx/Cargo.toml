@@ -49,7 +49,7 @@ blas-openblas   = ["rlx-runtime/blas-openblas",    "rlx-tensor?/eval"]
 # Off by default — `rlx::gguf` / etc. only show up when enabled.
 # `tensor` is on by default (see above) but still gateable: build with
 # `--no-default-features` to drop the DSL and its rlx-ir-only surface.
-tensor  = ["dep:rlx-tensor"]
+tensor  = ["dep:rlx-tensor", "rlx-tensor/dsl"]
 gguf    = ["dep:rlx-gguf"]
 # safetensors / ONNX → GGUF conversion with per-tensor quant. Pulls in
 # rlx-gguf transparently (re-exported as `rlx::gguf`).

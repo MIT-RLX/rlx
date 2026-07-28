@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Compile the GLSL compute shaders under `shaders/*.comp` to SPIR-V at
 //! build time using `naga` (pure Rust). The resulting `.spv` blobs are
 //! written to `OUT_DIR` and a generated `shaders_generated.rs` embeds them
@@ -45,6 +48,89 @@ fn main() {
         fs::write(&spv_path, &bytes)
             .unwrap_or_else(|e| panic!("rlx-vulkan: write {}: {e}", spv_path.display()));
         entries.push(name);
+    }
+
+    // The `unary` kernel is assembled, not auto-discovered: its activation
+    // dispatch (`rlx_activation_apply`, op 0..28) is @generated from the shared
+    // rlxsl manifest using Vulkan's gelu-first opcode ids, inserted right after
+    // `#version 450` (before the arena include), then compiled like any other
+    // shader. `templates/unary_main.comp` (a subdir, so the loop above skips it)
+    // owns the plumbing + cast selectors.
+    {
+        println!("cargo:rerun-if-changed=shaders/templates/unary_main.comp");
+        let main_src = fs::read_to_string(shader_dir.join("templates/unary_main.comp"))
+            .expect("rlx-vulkan: read shaders/templates/unary_main.comp");
+        let activation = rlxsl::glsl_activation_module(rlxsl::OpcodeScheme::GeluFirst);
+        let combined =
+            main_src.replacen("#version 450\n", &format!("#version 450\n{activation}\n"), 1);
+        let words = compile_glsl_to_spirv("unary", &combined, &shader_dir);
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        fs::write(Path::new(&out_dir).join("unary.spv"), &bytes)
+            .expect("rlx-vulkan: write unary.spv");
+        entries.push("unary".to_string());
+    }
+
+    // Same assembly for the activation-backward kernel: `rlx_activation_backward`
+    // (op 0..17, always relu-first) is auto-differentiated from the forward
+    // manifest and prepended to `templates/activation_backward_main.comp`.
+    {
+        println!("cargo:rerun-if-changed=shaders/templates/activation_backward_main.comp");
+        let main_src =
+            fs::read_to_string(shader_dir.join("templates/activation_backward_main.comp"))
+                .expect("rlx-vulkan: read shaders/templates/activation_backward_main.comp");
+        let bwd = rlxsl::glsl_activation_backward_module();
+        let combined = main_src.replacen("#version 450\n", &format!("#version 450\n{bwd}\n"), 1);
+        let words = compile_glsl_to_spirv("activation_backward", &combined, &shader_dir);
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        fs::write(Path::new(&out_dir).join("activation_backward.spv"), &bytes)
+            .expect("rlx-vulkan: write activation_backward.spv");
+        entries.push("activation_backward".to_string());
+    }
+
+    // Same assembly for the standalone `binary` kernel: `rlx_binary_apply`
+    // (op 0..13) is @generated from the shared rlxsl manifest and prepended to
+    // `templates/binary_main.comp` (which the auto-discovery loop skips).
+    {
+        println!("cargo:rerun-if-changed=shaders/templates/binary_main.comp");
+        let main_src = fs::read_to_string(shader_dir.join("templates/binary_main.comp"))
+            .expect("rlx-vulkan: read shaders/templates/binary_main.comp");
+        let bin = rlxsl::binary::glsl_binary_module();
+        let combined =
+            main_src.replacen("#version 450\n", &format!("#version 450\n{bin}\n"), 1);
+        let words = compile_glsl_to_spirv("binary", &combined, &shader_dir);
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        fs::write(Path::new(&out_dir).join("binary.spv"), &bytes)
+            .expect("rlx-vulkan: write binary.spv");
+        entries.push("binary".to_string());
+    }
+
+    // Same assembly for the standalone `compare` kernel: `rlx_compare_apply`
+    // (op 0..5) is @generated from the shared rlxsl manifest and prepended to
+    // `templates/compare_main.comp` (which the auto-discovery loop skips).
+    {
+        println!("cargo:rerun-if-changed=shaders/templates/compare_main.comp");
+        let main_src = fs::read_to_string(shader_dir.join("templates/compare_main.comp"))
+            .expect("rlx-vulkan: read shaders/templates/compare_main.comp");
+        let cmp = rlxsl::compare::glsl_compare_module();
+        let combined =
+            main_src.replacen("#version 450\n", &format!("#version 450\n{cmp}\n"), 1);
+        let words = compile_glsl_to_spirv("compare", &combined, &shader_dir);
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        fs::write(Path::new(&out_dir).join("compare.spv"), &bytes)
+            .expect("rlx-vulkan: write compare.spv");
+        entries.push("compare".to_string());
     }
 
     // Pre-compiled SPIR-V kernels under `shaders/precompiled/*.spv` — kernels

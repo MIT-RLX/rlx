@@ -43,3 +43,6 @@ The crate is `#![forbid(unsafe_code)]` and carries a test asserting the prelude
 surface still resolves, so an upstream rename breaks here first.
 
 See [`docs/extending.md`](../../../docs/extending.md) for worked examples.
+## License
+
+MIT OR Apache-2.0.

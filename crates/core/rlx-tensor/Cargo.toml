@@ -15,6 +15,7 @@ documentation.workspace = true
 
 [dependencies]
 rlx-ir = { path = "../rlx-ir", version = "0.2.14" }
+rlx-macros = { path = "../rlx-macros", version = "0.2.14", optional = true }
 rlx-runtime = { path = "../rlx-runtime", version = "0.2.14", default-features = false, optional = true }
 rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.14", optional = true }
 rlx-optim = { path = "../rlx-optim", version = "0.2.14", optional = true }
@@ -22,6 +23,10 @@ ndarray = { version = "0.16", optional = true }
 
 [features]
 default = []
+# `rlx! { … }` declarative graph DSL. Opt-in so the base crate stays a lean
+# `rlx-ir` graph builder — this feature is the only thing that pulls in the
+# `rlx-macros` proc-macro (and thus syn/quote) for `Tensor`-only consumers.
+dsl = ["dep:rlx-macros"]
 # JAX-shaped function transforms via `rlx_autodiff` (grad / vmap / jvp / hvp).
 # Symbolic only; pair with `eval` to read values. `grad` and `transforms` are
 # ergonomic aliases for the same `autodiff` umbrella.
@@ -51,6 +56,15 @@ eval-rocm = ["eval", "rlx-runtime/rocm"]
 # Training: a `Func::train_step` that runs value+grad and applies an
 # `rlx_optim` optimizer to the bound params. Implies autodiff + eval.
 optim = ["autodiff", "eval", "dep:rlx-optim"]
+
+# Document the full API on docs.rs. Default features are empty, so without this
+# the eval / transforms / optim / dsl surface — including the `rlx!` macro —
+# would be hidden and every feature-gated intra-doc link would break. CPU-only
+# set so it builds on the docs.rs runners.
+[package.metadata.docs.rs]
+features     = ["dsl", "eval", "transforms", "optim", "ndarray"]
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = false
 
 [dev-dependencies]
 

@@ -1,9 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! IQ-family GGUF encoders. IQ4NL / IQ4XS follow `quantize_row_iq4_nl_impl`
 //! from llama.cpp; IQ2/3/1 use kmap + sign-extraction (llama.cpp-style,

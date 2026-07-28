@@ -1,4 +1,7 @@
 // RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// RLX — versatile ML compiler + runtime.
 //! On-device Q1_0 dequant for MLX via `fast::metal_kernel`.
 //!
 //! Host-side `dequant_q1_0` → f32 caches blow up ~28× (Bonsai-27B: 3.8 GiB

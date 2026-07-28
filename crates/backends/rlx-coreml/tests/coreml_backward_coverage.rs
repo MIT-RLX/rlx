@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Coverage audit: gradient of each major forward op runs on the CoreML (ANE)
 // backend and matches the CPU oracle. For each op we build `loss = sum(op(...))`,
 // differentiate w.r.t. a parameter, run the backward graph on the ANE (which

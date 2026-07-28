@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![cfg(feature = "cpu")]
 //! Benchmark: composition VQ (matmul+argmin) vs a fused single-pass loop, to
 //! decide whether a fused native kernel is worth building. Run with:

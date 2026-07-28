@@ -1,4 +1,7 @@
 // RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// RLX — versatile ML compiler + runtime.
 // Ternary-pruned radix-2 butterfly stage (interleaved C64 [batch, n_fft, 2]).
 // Mirrors rlx-cpu `execute_fft_butterfly_stage_f32`: copy state → out, then for
 // each bf in 0..half with gate[bf] != 0 apply the twiddle butterfly (optional

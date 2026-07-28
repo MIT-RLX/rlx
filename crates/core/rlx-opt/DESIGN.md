@@ -53,4 +53,4 @@ compile the verify call out (zero overhead).
   duplicate the view-detection logic in backends.
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

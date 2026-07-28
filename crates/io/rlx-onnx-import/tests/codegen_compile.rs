@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Full round-trip validation of the ONNX codegen emitter: emit a standalone
 // Rust program for a graph that exercises every indexing/contraction op, then

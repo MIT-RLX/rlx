@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Engine-layer extensions for [`rlx_driver::Device`] (plan #58).
 //!
@@ -38,6 +27,7 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::Metal,
     Device::Ane,
     Device::Hexagon,
+    Device::Xdna,
     Device::Gpu,
     Device::Vulkan,
     Device::DirectX,
@@ -106,6 +96,14 @@ pub fn is_available(device: Device) -> bool {
     if device == Device::Rocm {
         return rlx_rocm::is_available();
     }
+    // XDNA is honest-gated: true only when the NPU hardware AND a userspace
+    // runtime are both present (rlx_xdna probes /dev/accel* + XRT). Hardware
+    // present but no runtime → false, so selection never picks a backend that
+    // can't run. See `detected_unavailable_devices` for the inventory signal.
+    #[cfg(feature = "xdna")]
+    if device == Device::Xdna {
+        return rlx_xdna::is_available();
+    }
     #[cfg(feature = "gpu")]
     if device == Device::Gpu {
         #[cfg(target_arch = "wasm32")]
@@ -168,6 +166,9 @@ pub fn is_available(device: Device) -> bool {
         Device::Ane => cfg!(any(feature = "coreml", feature = "ane")),
         Device::Cuda => cfg!(feature = "cuda"),
         Device::Rocm => cfg!(feature = "rocm"),
+        // Only reached when the `xdna` feature is OFF (the probe above owns the
+        // feature-ON case): no backend compiled in → unavailable.
+        Device::Xdna => false,
         Device::OneApi => cfg!(feature = "oneapi"),
         Device::Tpu => cfg!(feature = "tpu"),
         Device::Hexagon => cfg!(feature = "qnn"),
@@ -202,6 +203,25 @@ pub fn available_devices() -> Vec<Device> {
         .copied()
         .filter(|d| is_available(*d))
         .collect()
+}
+
+/// Devices whose **hardware is physically present but not executable** — the
+/// backend is compiled in and detects the device, yet a required userspace
+/// runtime is missing (so [`is_available`] is `false`). Each entry pairs the
+/// device with a human diagnostic naming what's missing.
+///
+/// Distinct from [`available_devices`] (which lists only *runnable* backends):
+/// this lets fleet inventory / topology tooling surface an accelerator that is
+/// installed but idle — e.g. an AMD XDNA NPU with no XRT runtime — without ever
+/// letting device selection dispatch to it.
+pub fn detected_unavailable_devices() -> Vec<(Device, String)> {
+    #[allow(unused_mut)]
+    let mut out: Vec<(Device, String)> = Vec::new();
+    #[cfg(feature = "xdna")]
+    if rlx_xdna::hardware_present() && !is_available(Device::Xdna) {
+        out.push((Device::Xdna, rlx_xdna::diagnostic()));
+    }
+    out
 }
 
 /// Browser backends currently runnable (`WebGpu` → `OpenGl` → `Cpu`).

@@ -37,3 +37,6 @@ roughly one member + the growing weight list (not the full ZIP decoded at once).
 Dist URI: `dduf://<path>#<component/tensor>`.
 
 v1 is **read/import only** (no DDUF writer).
+## License
+
+MIT OR Apache-2.0.

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Q4_0 / Q8_0 / Q4_1 / Q5_* / IQ4_NL WGPU `dequant_gguf` parity vs rlx-gguf CPU reference.
 
 use rlx_wgpu::kernels::{DequantGgufParams, dequant_gguf_kernel};

@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `run` — extracted from the `backend` module for navigability (see `mod.rs`).
 
@@ -484,6 +473,7 @@ impl RocmExecutable {
                 Step::Softmax {
                     outer,
                     inner,
+                    stride,
                     in_off,
                     out_off,
                 } => {
@@ -497,7 +487,7 @@ impl RocmExecutable {
                         stream,
                         (outer_s, 1, 1),
                         (256, 1, 1),
-                        [&mut arena_ptr, &outer_s, inner, in_off, out_off]
+                        [&mut arena_ptr, &outer_s, inner, stride, in_off, out_off]
                     );
                 }
                 Step::ReluBackward {
@@ -2152,6 +2142,38 @@ impl RocmExecutable {
                             *out_byte_off as usize,
                         );
                     }
+                }
+                Step::DequantMatmulMxFp4x2 {
+                    m,
+                    k,
+                    n,
+                    group,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    out_byte_off,
+                } => {
+                    let use_gpu = self.dequant_scratch_off > 0 && self.blas.is_some();
+                    assert!(
+                        use_gpu,
+                        "rlx-rocm DequantMatMul(MxFp4x2): needs hipBLAS + dequant scratch"
+                    );
+                    let blas = self.blas.as_ref().unwrap();
+                    crate::gguf_gpu::run_dequant_matmul_mxfp4x2_gpu(
+                        &self.ctx,
+                        stream,
+                        &self.arena.buffer,
+                        blas,
+                        *m as usize,
+                        *k as usize,
+                        *n as usize,
+                        *group as usize,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *scale_byte_off as usize,
+                        self.dequant_scratch_off,
+                        *out_byte_off as usize,
+                    );
                 }
                 Step::DequantGroupedMatmulGguf {
                     m,

@@ -63,7 +63,7 @@ cargo test  -p rlx-fusion -p rlx-autodiff -p rlx-compile
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.
 
 [`rlx`]: https://docs.rs/rlx
 [`rlx-fusion`]: ../rlx-fusion/README.md

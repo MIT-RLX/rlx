@@ -1,9 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Load MLX weight layouts into RLX.
 //!
@@ -44,8 +41,10 @@ pub use arch::{
 };
 pub use config::{MlxArchConfig, MlxConfig, MlxQuantConfig, MlxQuantMode};
 pub use dequant::{
-    QuantizedLayer, dequant_affine_f32, dequant_matmul_affine, dequant_mxfp4_f32,
-    dequant_mxfp8_f32, pack_factor, validate_dequant_matmul_dims,
+    QuantizedLayer, dequant_affine_f32, dequant_matmul_affine, dequant_matmul_mxfp4,
+    dequant_matvec_affine,
+    dequant_mxfp4_f32, dequant_mxfp8_f32, mxfp4_scale_e8m0_to_f32, pack_factor,
+    validate_dequant_matmul_dims,
 };
 pub use graph::{
     PackedLinearBinding, build_mlp_chain_graph, build_parallel_dequant_graph,
@@ -55,7 +54,9 @@ pub use hf::{
     DEFAULT_HF_MLX_REPO, fetch_default_mlx_community, fetch_mlx_community, fetch_ok, hf_cache_dir,
     write_fetch_ok,
 };
-pub use load::{MlxPackedLinear, MlxTensor, MlxWeights, load_path};
+pub use load::{
+    LazyMlxWeights, MlxPackedLinear, MlxRead, MlxTensor, MlxWeights, load_path, load_path_lazy,
+};
 pub use rope::{build_default_tables, default_inv_freq};
 
 /// Dense f32 payload with logical shape preserved.

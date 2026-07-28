@@ -1,9 +1,6 @@
 # RLX — versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, version 3.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Pure-logic tests for the ``torch_import`` auto-decompose fallback — the parts
 that don't need torch (op-name parsing + the export-breaking bisect). The full
 end-to-end path is exercised separately with a real torch install."""

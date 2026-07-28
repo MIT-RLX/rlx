@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `compile` — extracted from the `thunk` module for navigability (see `mod.rs`).
 
@@ -26,28 +15,12 @@ use std::sync::Arc;
 
 use super::*;
 
-/// Matches CUDA / wgpu `activation_op_id` (0=relu … 17=reciprocal).
+/// "Relu-first" opcode (canonical table in `rlx_ir::opcodes`; `0=relu …
+/// 17=reciprocal`) for the acts that have a native Metal backward kernel. The
+/// tail (`Floor`…`LogSigmoid`) has no native backward kernel — it decomposes at
+/// the AD level — so it must never reach here.
 fn activation_backward_op_id(act: Activation) -> u32 {
     match act {
-        Activation::Relu => 0,
-        Activation::Sigmoid => 1,
-        Activation::Tanh => 2,
-        Activation::Exp => 3,
-        Activation::Log => 4,
-        Activation::Sqrt => 5,
-        Activation::Rsqrt => 6,
-        Activation::Neg => 7,
-        Activation::Abs => 8,
-        Activation::Gelu => 9,
-        Activation::Silu => 10,
-        Activation::GeluApprox => 11,
-        Activation::Round => 12,
-        Activation::Sin => 13,
-        Activation::Cos => 14,
-        Activation::Tan => 15,
-        Activation::Atan => 16,
-        Activation::Recip => 17,
-        // No native Metal backward kernel — these decompose at the AD level.
         Activation::Floor
         | Activation::Ceil
         | Activation::Sign
@@ -61,6 +34,7 @@ fn activation_backward_op_id(act: Activation) -> u32 {
         | Activation::LogSigmoid => {
             panic!("rlx-metal: no native backward for {act:?} (decomposed)")
         }
+        _ => act.opcode_relu_first(),
     }
 }
 
@@ -1662,6 +1636,7 @@ impl ThunkSchedule {
                         num_experts: num_experts as u32,
                         slab_bytes: slab_bytes as u32,
                         scheme: *scheme,
+                        scale_bf16: scales_shape.dtype() == rlx_ir::DType::BF16,
                     }
                 }
 
@@ -2876,6 +2851,20 @@ impl ThunkSchedule {
                                 n: n as u32,
                                 scheme: *scheme,
                             },
+                            QuantScheme::MxFp4x2Block { group_size } => {
+                                // 3 inputs (x, w_q=[plane0|plane1], scale=[s0|s1]);
+                                // fused decode-matmul MSL kernel.
+                                Thunk::DequantMatMulMxFp4x2 {
+                                    x: off(node.inputs[0]),
+                                    w_q: off(node.inputs[1]),
+                                    scale: off(node.inputs[2]),
+                                    dst: off(node.id),
+                                    m: m as u32,
+                                    k: k as u32,
+                                    n: n as u32,
+                                    group: *group_size,
+                                }
+                            }
                             other => panic!(
                                 "rlx-metal: Op::DequantMatMul legacy scheme {other:?} \
                                  is CPU-only unless Int4/FP8/NVFP4/MLX; use GGUF K-quants or Device::Cpu."

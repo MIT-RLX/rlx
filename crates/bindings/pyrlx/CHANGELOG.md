@@ -111,3 +111,6 @@ and the project follows [Semantic Versioning](https://semver.org/).
 [0.2.4]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.4
 [0.2.3]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.2.3
 [0.1.0]:      https://github.com/MIT-RLX/rlx/releases/tag/pyrlx-v0.1.0
+## License
+
+MIT OR Apache-2.0.

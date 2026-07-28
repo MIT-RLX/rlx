@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! LLM normalization + rotary-embedding ops, validated end-to-end:
 //! `rms_norm`/`layer_norm` against their naive decompositions, and `rope`

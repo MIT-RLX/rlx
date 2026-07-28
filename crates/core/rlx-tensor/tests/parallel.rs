@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Same graph, run on CPU and GPU **in parallel** (data parallelism). `Func`
 //! owns a plain `Graph` (Send), so it can be moved to another thread; each

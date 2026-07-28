@@ -8,7 +8,7 @@ name = "rlx-cortexm-firmware"
 version = "0.2.14"
 edition = "2024"
 description = "MNIST-on-nRF52840 firmware demo for rlx-cortexm"
-license = "GPL-3.0-only"
+license = "MIT OR Apache-2.0"
 authors = ["Eugene Hauptmann", "Nataliya Kosmyna"]
 readme = "README.md"
 

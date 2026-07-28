@@ -350,3 +350,6 @@ lowering.
   the overhead-/compute-bound analysis and width sweep.
 - [backend-selection.md](../backend-selection.md) — RLX device routing, env vars.
 - `rlx-paper/bench/README.md` — the full results table and per-runner notes.
+## License
+
+MIT OR Apache-2.0.

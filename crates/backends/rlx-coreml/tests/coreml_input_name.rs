@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 use rlx_coreml::{ComputeUnits, CoremlExecutable};
 use rlx_ir::op::Activation;

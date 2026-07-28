@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// GPL-3.0-only. See LICENSE.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Sharded activation arenas (> wgpu max_buffer_size / ~4 GiB).
 

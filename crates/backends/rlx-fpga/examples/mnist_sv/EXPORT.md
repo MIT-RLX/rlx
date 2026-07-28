@@ -47,3 +47,6 @@ run place-and-route when the open toolchain is on `PATH`.
 
 Bit-exact reference: `rlx_fpga::reference` (Rust) ↔ emitted Verilog.
 Do not diff against f32 Cortex-M requant paths.
+## License
+
+MIT OR Apache-2.0.

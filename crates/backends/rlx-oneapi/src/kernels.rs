@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Embedded SPIR-V kernel blobs (compiled from `kernels/*.cl` by `build.rs`)
 //! and their Level Zero module/kernel cache. `SPIRV_BLOBS` is empty unless the

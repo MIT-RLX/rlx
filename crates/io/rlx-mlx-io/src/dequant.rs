@@ -1,9 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Host dequant for MLX affine / mxfp packs (matches MLX CPU kernels).
 
@@ -194,6 +191,107 @@ pub fn dequant_affine_f32(
     Ok(out)
 }
 
+/// Fused affine dequant-**matvec**: `y[0..n] = x[0..k] · dequant(w)^T` for a
+/// SINGLE input row, WITHOUT materializing the f32 weight. The materialize path
+/// ([`dequant_matmul_affine`]) writes an `n×k` f32 buffer (≈16× the packed 2-bit
+/// size) and reads it straight back — pure memory traffic that dominates MoE
+/// prefill, where every token dequantizes a whole expert weight. This reads the
+/// packed codes once and accumulates in the SAME k-order (bit-exact with the
+/// materialize path), parallelized across the `n` output features.
+///
+/// `w` is one expert's packed weight `[n, k]`; `scales`/`biases` are `[n,
+/// n_groups]`. Use for `m == 1` (the per-token MoE expert dispatch).
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_matvec_affine(
+    x: &[f32],
+    w: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    bits: u32,
+    group_size: u32,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    use rayon::prelude::*;
+    let gs = group_size as usize;
+    if !k.is_multiple_of(gs) {
+        bail!("affine matvec: k={k} not divisible by group_size={gs}");
+    }
+    let n_groups = k / gs;
+    let pf = pack_factor(bits)? as usize; // bails on unsupported bits
+    let bpp = bytes_per_pack(bits)?;
+    let packs_in_group = gs / pf;
+    let bitmask = (1u32 << bits) - 1;
+    let row_bytes = n_groups * packs_in_group * bpp;
+    if w.len() < n * row_bytes {
+        bail!("affine matvec: weight bytes {} < needed {}", w.len(), n * row_bytes);
+    }
+    if scales.len() < n * n_groups || biases.len() < n * n_groups {
+        bail!("affine matvec: scales/biases too short (need {} each)", n * n_groups);
+    }
+    if x.len() < k {
+        bail!("affine matvec: x len {} < k {k}", x.len());
+    }
+    let mut out = vec![0f32; n];
+    out.par_iter_mut().enumerate().for_each(|(r, y)| {
+        let wrow = &w[r * row_bytes..(r + 1) * row_bytes];
+        let mut acc = 0f32;
+        let mut w_off = 0usize;
+        for grp in 0..n_groups {
+            let scale = scales[r * n_groups + grp];
+            let bias = biases[r * n_groups + grp];
+            let xbase = grp * gs;
+            let mut p = 0usize;
+            for _ in 0..packs_in_group {
+                match bits {
+                    2 | 4 | 8 => {
+                        let mut wi = wrow[w_off];
+                        w_off += 1;
+                        for _ in 0..pf {
+                            let code = (wi as u32) & bitmask;
+                            acc += x[xbase + p] * (scale * (code as f32) + bias);
+                            p += 1;
+                            if bits != 8 {
+                                wi >>= bits as u8;
+                            }
+                        }
+                    }
+                    3 => {
+                        let mut codes = [0u8; 8];
+                        extract_bits_3(&wrow[w_off..w_off + 3], &mut codes);
+                        for c in codes {
+                            acc += x[xbase + p] * (scale * (c as f32) + bias);
+                            p += 1;
+                        }
+                        w_off += 3;
+                    }
+                    5 => {
+                        let mut codes = [0u8; 8];
+                        extract_bits_5(&wrow[w_off..w_off + 5], &mut codes);
+                        for c in codes {
+                            acc += x[xbase + p] * (scale * (c as f32) + bias);
+                            p += 1;
+                        }
+                        w_off += 5;
+                    }
+                    6 => {
+                        let mut codes = [0u8; 4];
+                        extract_bits_6(&wrow[w_off..w_off + 3], &mut codes);
+                        for c in codes {
+                            acc += x[xbase + p] * (scale * (c as f32) + bias);
+                            p += 1;
+                        }
+                        w_off += 3;
+                    }
+                    _ => unreachable!("bits validated by pack_factor"),
+                }
+            }
+        }
+        *y = acc;
+    });
+    Ok(out)
+}
+
 /// Fused affine dequant + matmul: `x [m,k] @ w_dequant^T` when weights are
 /// stored `[n, k]` (MLX Linear). Output `[m, n]`.
 #[allow(clippy::too_many_arguments)]
@@ -214,7 +312,81 @@ pub fn dequant_matmul_affine(
     }
     let n_groups = k / gs;
     let w_f = dequant_affine_f32(w, scales, biases, bits, group_size, n, n_groups)?;
-    // w_f is [n, k]; compute x @ w_f^T → [m, n]
+    // w_f is [n, k]; compute x @ w_f^T → [m, n]. This is the CPU host-delegate
+    // matmul for GPU backends (amd Vulkan / cuda / wgpu copy quantized weights back
+    // and run it here) — it was a naive single-threaded triple loop, which made a
+    // Vulkan stage's attention + shared-expert projections run ~16× slower than a
+    // native CPU stage. Parallelize over output columns `j` (n is large; m is the
+    // token count, small) into a transposed buffer so writes stay disjoint, then
+    // transpose back. Bit-identical to the serial loop (same accumulation order).
+    use rayon::prelude::*;
+    let mut out_t = vec![0f32; n * m]; // [n, m], column j-major
+    out_t.par_chunks_mut(m).enumerate().for_each(|(j, col)| {
+        let wj = &w_f[j * k..(j + 1) * k];
+        for (i, slot) in col.iter_mut().enumerate() {
+            let xi = &x[i * k..(i + 1) * k];
+            let mut acc = 0f32;
+            for p in 0..k {
+                acc += xi[p] * wj[p];
+            }
+            *slot = acc;
+        }
+    });
+    let mut out = vec![0f32; m * n];
+    for j in 0..n {
+        for i in 0..m {
+            out[i * n + j] = out_t[j * m + i];
+        }
+    }
+    Ok(out)
+}
+
+/// MXFP4 E2M1 LUT (MLX CPU `FP4_LUT`).
+const FP4_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// `x @ W^T` for one MXFP4-packed weight `W` (`[n, k]` nibbles) with **already
+/// f32-decoded** per-group `scales` (`[n, n_groups]`). Mirrors
+/// [`dequant_matmul_affine`] for the grouped-MoE op path: the E8M0/FP8 group
+/// scales are decoded to f32 by the loader, so this stays scale-dtype-agnostic
+/// and only differs from affine by the FP4 LUT code decode (and no zero-point).
+/// `x`=`[m, k]`, returns `[m, n]`.
+pub fn dequant_matmul_mxfp4(
+    x: &[f32],
+    w: &[u8],
+    scales: &[f32],
+    group_size: u32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    let gs = group_size as usize;
+    if gs == 0 || !k.is_multiple_of(gs) {
+        bail!("mxfp4 DequantMatMul: k={k} not divisible by group_size={gs}");
+    }
+    let n_groups = k / gs;
+    if w.len() < n * k / 2 {
+        bail!("mxfp4 DequantMatMul: weight bytes {} < {}", w.len(), n * k / 2);
+    }
+    if scales.len() < n * n_groups {
+        bail!("mxfp4 DequantMatMul: scales len {} < {}", scales.len(), n * n_groups);
+    }
+    // Dequantize W → [n, k] F32 (2 nibbles/byte, contiguous per row).
+    let mut w_f = vec![0f32; n * k];
+    let mut w_off = 0usize;
+    for r in 0..n {
+        for gidx in 0..n_groups {
+            let scale = scales[r * n_groups + gidx];
+            let base = r * k + gidx * gs;
+            for p in (0..gs).step_by(2) {
+                let b = w[w_off];
+                w_off += 1;
+                w_f[base + p] = FP4_LUT[(b & 0x0f) as usize] * scale;
+                w_f[base + p + 1] = FP4_LUT[(b >> 4) as usize] * scale;
+            }
+        }
+    }
     let mut out = vec![0f32; m * n];
     for i in 0..m {
         for j in 0..n {
@@ -228,10 +400,11 @@ pub fn dequant_matmul_affine(
     Ok(out)
 }
 
-/// MXFP4 E2M1 LUT (MLX CPU `FP4_LUT`).
-const FP4_LUT: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-];
+/// Decode an MLX E8M0 uint8 group scale to f32 (public for grouped-MoE loaders
+/// that pre-convert MXFP4 scales so the matmul op stays f32-uniform).
+pub fn mxfp4_scale_e8m0_to_f32(s: u8) -> f32 {
+    dequant_scale_e8m0(s)
+}
 
 /// Decode MLX E8M0-style uint8 scale used for group_size != 16.
 fn dequant_scale_e8m0(s: u8) -> f32 {
@@ -350,6 +523,37 @@ pub fn dequant_mxfp8_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mxfp4_matmul_matches_full_dequant() {
+        // n=2 out rows, k=64, group_size=32 → 2 groups; nibbles + E8M0 scales.
+        let (n, k, gs) = (2usize, 64usize, 32u32);
+        let n_groups = k / gs as usize;
+        // Deterministic nibble pairs per byte, n*k/2 bytes.
+        let w: Vec<u8> = (0..n * k / 2).map(|i| ((i * 7) % 256) as u8).collect();
+        let scales_u8: Vec<u8> = (0..n * n_groups).map(|i| (120 + i * 3) as u8).collect();
+        // Reference: full dequant (u8 scales) then x @ Wᵀ.
+        let w_ref = dequant_mxfp4_f32(&w, &scales_u8, gs, n, n_groups).unwrap();
+        let m = 3usize;
+        let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.013).cos()).collect();
+        let mut y_ref = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += x[i * k + p] * w_ref[j * k + p];
+                }
+                y_ref[i * n + j] = acc;
+            }
+        }
+        // New matmul path: E8M0 scales pre-decoded to f32 (as the loader does).
+        let scales_f32: Vec<f32> = scales_u8.iter().map(|&s| mxfp4_scale_e8m0_to_f32(s)).collect();
+        let y = dequant_matmul_mxfp4(&x, &w, &scales_f32, gs, m, k, n).unwrap();
+        assert_eq!(y.len(), y_ref.len());
+        for (a, b) in y.iter().zip(&y_ref) {
+            assert!((a - b).abs() < 1e-4, "mxfp4 matmul mismatch: {a} vs {b}");
+        }
+    }
 
     #[test]
     fn affine_4bit_roundtrip_shape() {

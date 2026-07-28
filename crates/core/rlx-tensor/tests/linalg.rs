@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Matrix inverse (composite over DenseSolve → LAPACK). Needs a BLAS eval
 //! build. Run: `cargo test -p rlx-tensor --features eval-blas`.

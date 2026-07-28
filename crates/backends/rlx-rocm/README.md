@@ -170,4 +170,4 @@ cargo test  -p rlx-rocm --release          # basic + unit tests
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

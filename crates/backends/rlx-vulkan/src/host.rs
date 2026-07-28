@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CPU host-fallback for ops that have no native SPIR-V kernel yet (or that
 //! exceed a native size cap): oversized Lstm/Gru/Rnn/Mamba2, FFT, GGUF

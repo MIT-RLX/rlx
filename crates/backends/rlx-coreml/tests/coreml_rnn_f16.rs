@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // fp16 (ANE-preferred) LSTM / GRU / RNN on CoreML. Compiling at `float_dtype =
 // F16` demotes the graph to f16 storage; the recurrent unrolls now emit their
 // intermediate tensors in the model's float dtype (not hardcoded f32), so they

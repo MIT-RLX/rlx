@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! transpose+reverse feeding a host-eval Op::Lstm on MLX vs CPU — isolates the
 //! tusnet-phase discrepancy (rot90 before the recurrent cell).
 #![cfg(all(feature = "cpu", feature = "mlx"))]

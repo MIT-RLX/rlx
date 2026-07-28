@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! ndarray-style ergonomics: random init, scalar/value access, pretty-print.
 //! Run: `cargo test -p rlx-tensor --features eval`.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Map workspace-relative .rs paths -> "<cargo package>\t<workspace-rel-dir>".
 # The workspace column is '.' for the repo's root workspace, or the directory
 # (relative to the repo root) of the *nested* workspace that owns the package

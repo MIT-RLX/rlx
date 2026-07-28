@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Extract self-contained arms of execute_thunks's `match thunk` (the per-forward
 HOT LOOP) into `#[inline(always)] fn exec_<t>(t: &Thunk[, base])`, replacing each
 arm with a call. `#[inline(always)]` => the compiler folds them back into the

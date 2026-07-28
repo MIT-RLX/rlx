@@ -272,3 +272,6 @@ Build with `maturin develop --features cpu,gguf-convert` (default). Optional
 Tests: `crates/bindings/pyrlx/tests/test_gguf_*.py`; `just test-pyrlx`.
 7. Parity test (Metal / WGPU / runtime integration as appropriate).
 8. Refresh this doc and [op-coverage.md](op-coverage.md).
+## License
+
+MIT OR Apache-2.0.

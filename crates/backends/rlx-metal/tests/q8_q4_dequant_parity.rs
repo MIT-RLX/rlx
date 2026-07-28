@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Q4_0 / Q8_0 Metal MSL `dequant_gguf` parity vs rlx-gguf CPU reference.
 
 #![cfg(target_os = "macos")]

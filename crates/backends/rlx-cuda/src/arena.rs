@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CUDA device-memory arena.
 //!
@@ -160,7 +149,46 @@ fn try_pool_take(need: usize) -> Option<CudaSlice<f32>> {
     None
 }
 
+/// Managed (unified) arena — pages migrate host↔device on demand, so the arena
+/// may **oversubscribe VRAM**: a pipeline stage larger than the GPU still runs
+/// (paged over PCIe). Opt in with `RLX_CUDA_UNIFIED=1` to run big models on small
+/// GPUs (e.g. a 42 GB stage on a 16 GB card). Slower than resident VRAM, but it
+/// runs where a plain `cudaMalloc` would OOM.
+fn unified_arena_enabled() -> bool {
+    rlx_ir::env::flag("RLX_CUDA_UNIFIED")
+}
+
 fn try_alloc_f32(ctx: &Arc<CudaContext>, n_f32: usize) -> Result<CudaSlice<f32>, ()> {
+    // Managed/pageable path: cuMemAllocManaged, wrapped as a CudaSlice via
+    // `upgrade_device_ptr` so the rest of the backend is unchanged (same type,
+    // same device pointer — the pages just migrate on access).
+    if unified_arena_enabled() {
+        let bytes = n_f32 * std::mem::size_of::<f32>();
+        let cu = unsafe {
+            cudarc::driver::result::malloc_managed(bytes, cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL)
+        }
+        .map_err(|_| ())?;
+        // Prefer HOST for the oversubscribed arena so it does NOT greedily migrate
+        // into the small VRAM. A stage far larger than the GPU (e.g. 50 GB on 16 GB)
+        // would otherwise fill VRAM with resident pages, leaving no room for the
+        // forward's device-only allocations (cuBLAS/cuDNN workspaces, `CudaSlice`
+        // clones) → CUDA_ERROR_OUT_OF_MEMORY mid-forward. With host-preferred pages,
+        // the GPU still reads them (migrated on access, then evictable back to host
+        // under VRAM pressure), so device allocs always find free VRAM. Best-effort.
+        unsafe {
+            const CU_DEVICE_CPU: i32 = -1;
+            let _ = cudarc::driver::sys::cuMemAdvise(
+                cu,
+                bytes,
+                cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION,
+                CU_DEVICE_CPU,
+            );
+        }
+        let mut slice = unsafe { ctx.default_stream().upgrade_device_ptr::<f32>(cu, n_f32) };
+        // Managed memory is uninitialized — zero it (same determinism as below).
+        let _ = ctx.default_stream().memset_zeros(&mut slice);
+        return Ok(slice);
+    }
     // Zero on allocation (default). An un-zeroed arena lets any op that reads a
     // slot's alignment padding, or a slot before its producer has written it,
     // pick up whatever garbage the driver handed back — which intermittently
@@ -792,12 +820,42 @@ impl Arena {
         // because params are only registered at compile / load time —
         // not on the run() hot path.
         let stream = ctx.default_stream();
-        let new_buf = stream
-            .alloc_zeros::<u16>(self.half_size.max(4))
-            .expect("rlx-cuda: half-arena allocation failed");
+        // The half side-buffer holds BF16 params (e.g. all the MoE scales of a big
+        // stage → several GB). On an oversubscribed GPU it must be MANAGED like the
+        // main arena, or this device alloc — plus the transient old+new during a
+        // grow — OOMs the small VRAM. Managed + host-preferred keeps it off VRAM.
+        let n_u16 = self.half_size.max(4);
+        let mut new_buf = if unified_arena_enabled() {
+            let bytes = n_u16 * std::mem::size_of::<u16>();
+            let cu = unsafe {
+                cudarc::driver::result::malloc_managed(bytes, cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL)
+            }
+            .expect("rlx-cuda: managed half-arena allocation failed");
+            unsafe {
+                const CU_DEVICE_CPU: i32 = -1;
+                let _ = cudarc::driver::sys::cuMemAdvise(
+                    cu,
+                    bytes,
+                    cudarc::driver::sys::CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION,
+                    CU_DEVICE_CPU,
+                );
+            }
+            let mut s = unsafe { stream.upgrade_device_ptr::<u16>(cu, n_u16) };
+            let _ = stream.memset_zeros(&mut s);
+            s
+        } else {
+            stream
+                .alloc_zeros::<u16>(n_u16)
+                .expect("rlx-cuda: half-arena allocation failed")
+        };
         if let Some(old) = self.half_buffer.take() {
-            // Copy old contents into the new buffer's prefix. Best-effort.
-            let _ = stream.memcpy_dtod(&old, &mut { new_buf.clone() });
+            // Copy old contents into the new buffer's prefix. Best-effort. Copy INTO
+            // `new_buf` directly — the old code cloned it into a throwaway temporary,
+            // which both lost the copy AND allocated a second full-size buffer (a
+            // 2× VRAM spike that OOMs once the half side-buffer holds many params,
+            // e.g. all the BF16 MoE scales of a big oversubscribed stage).
+            let n = old.len().min(new_buf.len());
+            let _ = stream.memcpy_dtod(&old.slice(0..n), &mut new_buf.slice_mut(0..n));
         }
         self.half_buffer = Some(new_buf);
         off

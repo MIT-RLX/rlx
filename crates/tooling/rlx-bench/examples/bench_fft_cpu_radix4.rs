@@ -1,7 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// Licensed under the GNU General Public License, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CPU FFT: radix-2 vs radix-4 for pure powers of four, toggled in-process via
 //! RLX_FFT_RADIX4. Serial (RLX_FFT_CPU_PARALLEL=0) to isolate the per-row kernel

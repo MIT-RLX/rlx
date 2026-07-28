@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Host-portable lowering tests: validate that an IR graph lowers to a
 // well-formed CoreML ML Program proto. These do NOT touch CoreML.framework
 // and so run on every platform (including the Linux CI), guarding the

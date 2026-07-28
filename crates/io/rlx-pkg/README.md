@@ -112,4 +112,4 @@ pyrlx.convert_gguf_to_rlxp("m.gguf", "m.rlxp", include_graph=False)
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

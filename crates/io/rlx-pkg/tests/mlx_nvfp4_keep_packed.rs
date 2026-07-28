@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `import-mlx --keep-packed` for mlx-lm `nvfp4` → `MlxMxfp4` packs.
 
 use std::collections::HashMap;

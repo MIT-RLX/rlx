@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `Op::Gru` / `Op::Rnn` (carry = false) native on-device on MLX, checked for
 //! numerical parity against the CPU reference kernels (`execute_gru_f32` /
 //! `execute_rnn_f32`). Native = unrolled MLX ops, no CPU host-eval.

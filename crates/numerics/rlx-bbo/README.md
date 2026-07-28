@@ -22,4 +22,4 @@ Depend on `rlx-bbo` directly (workspace path `../rlx/rlx-bbo`). EDA-specific pre
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

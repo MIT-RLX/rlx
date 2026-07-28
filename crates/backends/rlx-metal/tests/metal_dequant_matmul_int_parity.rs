@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Block-quantized int8 / int4 `Op::DequantMatMul` on Metal vs CPU. These ran
 //! as a host fallback over unified memory; they now have native MSL kernels

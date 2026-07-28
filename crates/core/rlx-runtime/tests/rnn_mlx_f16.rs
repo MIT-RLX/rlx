@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! fp16 compute for the native LSTM / GRU / RNN unrolls on MLX (Metal GPU).
 //! `RLX_MLX_RNN_F16` opts the recurrence into fp16 (matmuls accumulate in f32);
 //! inputs/outputs stay f32. Verified against the f32 CPU reference within fp16

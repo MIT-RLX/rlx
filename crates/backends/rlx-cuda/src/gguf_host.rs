@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Host-side GGUF K-quant `Op::DequantMatMul` for CUDA device arenas.
 //!
@@ -103,6 +92,7 @@ pub fn run_dequant_grouped_matmul_mlx(
     zp_byte_off: usize,
     idx_byte_off: usize,
     out_byte_off: usize,
+    scale_bf16: bool,
 ) {
     let mut arena = CudaArena {
         stream,
@@ -122,6 +112,7 @@ pub fn run_dequant_grouped_matmul_mlx(
         zp_byte_off,
         idx_byte_off,
         out_byte_off,
+        scale_bf16,
     );
 }
 

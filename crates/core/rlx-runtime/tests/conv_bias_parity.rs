@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `conv2d → Expand(bias) → add` cross-backend parity (the detection
 //! `conv2d_bias` sequence). conv and Expand pass standalone on Metal, but the
 //! detection diverges at full resolution — this tests the combination.

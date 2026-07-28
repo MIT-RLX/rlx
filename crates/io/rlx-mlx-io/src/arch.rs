@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Llama-like mlx-lm graph construction from config + packed Linears.
 //!
 //! Prefill includes NeoX RoPE on Q/K. Decode concatenates past K/V

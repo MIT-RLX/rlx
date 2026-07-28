@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Cargo target runner for Apple *simulator* targets (iOS / tvOS / visionOS sim).
 #
 # Cargo invokes this as `apple-sim-runner.sh <test-binary> [args...]`. The

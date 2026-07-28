@@ -148,4 +148,4 @@ x86_64 (Rosetta/emulation on Apple Silicon). See
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

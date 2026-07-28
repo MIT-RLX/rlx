@@ -153,4 +153,4 @@ Enable via the umbrella crate's `vulkan` feature: `cargo build -p rlx --features
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

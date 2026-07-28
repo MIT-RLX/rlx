@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // REVE-shaped transformer block: patch embed + one encoder layer.
 // Catches MPSGraph vs thunk drift (see reve-rs layer-1 bisect).

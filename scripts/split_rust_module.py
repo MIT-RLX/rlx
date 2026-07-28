@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Behavior-preserving splitter: carve a big single-file Rust module into a
 `mod.rs` + per-topic submodules, grouping items by a name->module map.
 

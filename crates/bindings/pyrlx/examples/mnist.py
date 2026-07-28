@@ -1,9 +1,6 @@
 # RLX — versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, version 3.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """MNIST classifier → RLX, exported in every form.  Run: `python mnist.py`
 
 A LeNet-style digit classifier: [B,1,28,28] → [B,10]. A conventional, complete

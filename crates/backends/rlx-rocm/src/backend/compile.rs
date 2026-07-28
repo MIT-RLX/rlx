@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `compile` — extracted from the `backend` module for navigability (see `mod.rs`).
 
@@ -686,6 +675,7 @@ impl RocmExecutable {
                     schedule.push(Step::Softmax {
                         outer,
                         inner,
+                        stride: 1,
                         in_off: (arena.offset(in_id) / 4) as u32,
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
@@ -1559,6 +1549,22 @@ impl RocmExecutable {
                                     w_byte_off: arena.offset(w_id) as u32,
                                     scale_byte_off: arena.offset(scale_id) as u32,
                                     zp_byte_off: arena.offset(zp_id) as u32,
+                                    out_byte_off: arena.offset(node.id) as u32,
+                                });
+                                continue;
+                            }
+                            QuantScheme::MxFp4x2Block { group_size } => {
+                                // 3 inputs (x, w_q=[plane0|plane1], scale=[s0|s1]);
+                                // decode to f32 scratch then hipBLAS sgemm.
+                                let scale_id = node.inputs[2];
+                                schedule.push(Step::DequantMatmulMxFp4x2 {
+                                    m,
+                                    k,
+                                    n,
+                                    group: *group_size,
+                                    x_byte_off: arena.offset(x_id) as u32,
+                                    w_byte_off: arena.offset(w_id) as u32,
+                                    scale_byte_off: arena.offset(scale_id) as u32,
                                     out_byte_off: arena.offset(node.id) as u32,
                                 });
                                 continue;

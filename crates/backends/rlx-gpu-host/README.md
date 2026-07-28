@@ -24,3 +24,6 @@ the byte-offset staging glue, so a fix to (say) the LSTM fallback lands in one
 place instead of N.
 
 This is by definition the **non-perf** path; native kernels stay per-backend.
+## License
+
+MIT OR Apache-2.0.

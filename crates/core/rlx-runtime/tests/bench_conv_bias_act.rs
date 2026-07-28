@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! A-B microbenchmark: `FusedConvBiasAct` (cuDNN fused / conv+epilogue) vs the
 //! unfused `conv → expand → add → relu` path, on CUDA.
 //!

@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! RLX proc macros for AOT model compilation.
 //!
@@ -41,8 +30,22 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ItemFn, parse_macro_input};
 
+mod graph_dsl;
 mod lm_runner;
 mod pipeline;
+
+/// Parser + code generator behind the public `rlx_tensor::rlx!` graph DSL.
+///
+/// This is an implementation detail — call the `rlx! { … }` macro from
+/// `rlx-tensor` (or the umbrella `rlx`) instead. That declarative wrapper
+/// brings the names this macro's output references (`GraphScope`, `shape!`,
+/// `DType`, `MaskKind`) into scope via `$crate::…` before delegating here, so
+/// the DSL resolves correctly no matter which crate re-exports it.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __rlx_build(item: TokenStream) -> TokenStream {
+    graph_dsl::rlx_build_impl(item.into()).into()
+}
 
 /// Compile-time pipeline scheduler (plan #11). See `pipeline_schedule_impl`
 /// in this crate's private `pipeline` module for the full grammar.

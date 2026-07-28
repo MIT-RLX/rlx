@@ -16,6 +16,9 @@ documentation.workspace = true
 [dependencies]
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
+memmap2 = "0.9"
+rayon = "1.10"
+libc = "0.2"
 npyz = { version = "0.8", features = ["npz", "half"] }
 safetensors = "0.7"
 serde = { version = "1", features = ["derive"] }

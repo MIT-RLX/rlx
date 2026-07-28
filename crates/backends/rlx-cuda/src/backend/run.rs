@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `run` — extracted from the `backend` module for navigability (see `mod.rs`).
 #![allow(unused_imports)]
 
@@ -2747,6 +2736,39 @@ impl CudaExecutable {
                         }
                     }
                 }
+                Step::DequantMatmulMxFp4x2 {
+                    m,
+                    k,
+                    n,
+                    group,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    out_byte_off,
+                } => {
+                    let m_s = scale(*m);
+                    if m_s == 0 {
+                        continue;
+                    }
+                    assert!(
+                        self.dequant_scratch_off > 0,
+                        "rlx-cuda DequantMatMul(MxFp4x2): needs dequant scratch"
+                    );
+                    crate::gguf_gpu::run_dequant_matmul_mxfp4x2_gpu(
+                        &self.ctx,
+                        &stream,
+                        self.arena.f32_buf_mut(),
+                        m_s as usize,
+                        *k as usize,
+                        *n as usize,
+                        *group as usize,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *scale_byte_off as usize,
+                        self.dequant_scratch_off,
+                        *out_byte_off as usize,
+                    );
+                }
                 Step::DequantGroupedMatmulGguf {
                     m,
                     k,
@@ -2803,6 +2825,7 @@ impl CudaExecutable {
                     zp_byte_off,
                     idx_byte_off,
                     out_byte_off,
+                    scale_bf16,
                 } => {
                     crate::gguf_host::run_dequant_grouped_matmul_mlx(
                         &stream,
@@ -2818,6 +2841,7 @@ impl CudaExecutable {
                         *zp_byte_off as usize,
                         *idx_byte_off as usize,
                         *out_byte_off as usize,
+                        *scale_bf16,
                     );
                 }
                 Step::Sample {

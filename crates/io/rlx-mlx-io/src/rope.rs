@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Minimal RoPE cos/sin tables for mlx-lm Llama-like graphs.
 //! (Avoids a `rlx-flow` dependency from `rlx-mlx-io`.)

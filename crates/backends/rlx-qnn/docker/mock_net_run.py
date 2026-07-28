@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Stand-in for `qnn-net-run`, used by the SDK-free harness self-test
 # (`validate.py harness-test`). It reads the SAME `input_list.txt` + raw
 # float32 layout the real tool consumes, and writes `output/Result_0/out.raw`

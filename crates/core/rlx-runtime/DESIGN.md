@@ -59,4 +59,4 @@ modules avoids the naming collision MAX hit by overloading "trace."
   callers don't need a direct `rlx_ir` dep.
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

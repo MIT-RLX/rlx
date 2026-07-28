@@ -129,4 +129,4 @@ just android-e2e
 
 ## License
 
-GPL-3.0-only — same as the RLX workspace.
+MIT OR Apache-2.0 — same as the RLX workspace.

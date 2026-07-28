@@ -78,3 +78,6 @@ Dist URI: `mlx://<path>#<tensor>` (alias `npz://`).
 `rlx-mlx-sys` exposes `rlx_mlx_load_safetensors` and `rlx_mlx_load_npy`
 (wrapping `mx::load_safetensors` / `mx::load`). Prefer `rlx-mlx-io` for
 cross-platform import; use the shim when arrays should stay on-device in MLX.
+## License
+
+MIT OR Apache-2.0.

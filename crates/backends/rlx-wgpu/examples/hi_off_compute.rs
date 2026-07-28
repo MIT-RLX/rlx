@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Probe: can a compute shader read/write at a 6 GiB offset into one buffer?
 fn main() {
     let Some(dev) = rlx_wgpu::device::wgpu_device() else {

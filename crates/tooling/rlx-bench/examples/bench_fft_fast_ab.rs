@@ -1,7 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// Licensed under the GNU General Public License, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! A/B benchmark for the `native-gpu-fft` on-chip FFT kernels on Metal/wgpu:
 //!   * old — the multi-kernel DRAM-round-trip path (RLX_FFT_FAST=0)

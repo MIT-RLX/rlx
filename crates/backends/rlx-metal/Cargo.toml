@@ -14,6 +14,10 @@ homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
 rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+# Single-source scalar-activation math: `scalar_activation_kernels!` builds the
+# per-activation MSL from this manifest at runtime (the A&S erf polynomial lives
+# once in rlxsl — MSL has no erf builtin).
+rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
 rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14" }
 # `spd` host-fallback (and shared GGUF scheme ids) via rlx-gpu-host.
 rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.14" }

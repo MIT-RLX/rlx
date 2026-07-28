@@ -136,3 +136,6 @@ federated averaging, dial-out), and the **aarch64 / Raspberry Pi** path (build
 behind interfaces that already exist** — `Transport`/`SymmetricTransport` for
 UCX/RDMA/NVSHMEM, backend kernel registration (à la `rlx_mlx::distributed`) for
 NCCL/RCCL — gated only by hardware this rig doesn't have.
+## License
+
+MIT OR Apache-2.0.

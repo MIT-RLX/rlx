@@ -17,4 +17,4 @@ let w = load_path("path/to/mlx-model")?;
 let f32_map = w.into_f32_map()?;
 ```
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

@@ -12,4 +12,4 @@ let f = DdufFile::open("model.dduf")?;
 let w = f.tensor_f32("transformer/weight")?;
 ```
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

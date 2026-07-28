@@ -122,4 +122,4 @@ offsets — weights are not stored twice. Inference uses `compile_module` /
   `rlx-metal` (device LIR).
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

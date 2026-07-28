@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Cross-backend divergence diagnostic — separate explainable f32 round-off from
 //! a real kernel bug by running one graph on the CPU oracle + every other backend.
 

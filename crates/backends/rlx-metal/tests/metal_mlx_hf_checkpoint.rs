@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Optional: real mlx-community checkpoint → one packed Linear on Metal.
 //!
 //! - Always runs when `$RLX_HF_CACHE` (or `~/.cache/rlx/hf`) already has the

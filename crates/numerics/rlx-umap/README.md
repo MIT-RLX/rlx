@@ -219,4 +219,4 @@ With `full`, see **Full UMAP quick start** above. CPU custom ops register via [`
 
 ## License
 
-GPL-3.0-only (RLX workspace).
+MIT OR Apache-2.0 (RLX workspace).

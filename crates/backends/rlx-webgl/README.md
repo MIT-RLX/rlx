@@ -78,4 +78,4 @@ execution is compile-verified and browser-validated via `rlx-web`
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

@@ -117,4 +117,4 @@ quantized weights uses the same backends as Rust (`Session` + GGUF-loaded graphs
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

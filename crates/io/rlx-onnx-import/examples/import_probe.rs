@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Import-feasibility probe: import an arbitrary ONNX file at a fixed sequence
 // length and print the lowering report (lowered / stubbed / unsupported).
 //

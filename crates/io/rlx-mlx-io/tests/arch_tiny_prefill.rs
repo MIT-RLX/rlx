@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Tiny Llama-like mlx-lm graph builds and runs on CPU.
 
 use rlx_ir::quant::QuantScheme;

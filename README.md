@@ -1,7 +1,7 @@
 # RLX
 
 ![status](https://img.shields.io/badge/status-0.2.14-blue)
-![license](https://img.shields.io/badge/license-GPL--3.0--only-green)
+![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 ![rust](https://img.shields.io/badge/rust-edition%202024-orange)
 [![repo](https://img.shields.io/badge/github-MIT--RLX%2Frlx-black)](https://github.com/MIT-RLX/rlx)
 
@@ -205,6 +205,25 @@ use rlx_tensor::Tensor; // crate `rlx-tensor`, feature `eval`
 let a = Tensor::from_vec(vec![1.0, 2.0, 3.0], [3]);
 let c = (&a + &Tensor::ones([3])).relu();
 assert_eq!(c.to_vec(), vec![2.0, 3.0, 4.0]); // auto-picks the fastest backend
+```
+
+Or declare the graph in a compact little language with `rlx!` (feature `tensor`,
+on by default) — `@` is matmul with NumPy precedence, shapes/wiring/outputs are
+inferred, and it lowers to the same IR:
+
+```rust
+use rlx::rlx;
+
+let g = rlx! {
+    graph "mlp";
+    input x: [?, 784];              // `?` = dynamic batch
+    param w1: [784, 256];  param b1: [256];
+    param w2: [256, 10];   param b2: [10];
+
+    let h = gelu(x @ w1 + b1);
+    let y = h @ w2 + b2;
+    out y;                          // → rlx_ir::Graph
+};
 ```
 
 Domain-specific namespaces if you want narrower star-imports:
@@ -727,4 +746,17 @@ canonical "how does this crate work" reference. Security reports:
 
 ## License
 
-GPL-3.0-only. See [`LICENSE`](./LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](./LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([`LICENSE-MIT`](./LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

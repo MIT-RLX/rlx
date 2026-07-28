@@ -62,4 +62,4 @@ export_graph(&graph, &FpgaExportConfig::default(), "hw/out")?;
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

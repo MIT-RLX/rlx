@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! RLX Runtime — the user-facing API.
 //!
@@ -167,7 +156,8 @@ pub use device_bench::{DeviceBenchResult, benchmark_devices, warm_all};
 #[cfg(feature = "apple")]
 pub use device_ext::available_apple_devices;
 pub use device_ext::{
-    BROWSER_DEVICE_PRIORITY, available_browser_devices, available_devices, devices_for,
+    BROWSER_DEVICE_PRIORITY, available_browser_devices, available_devices,
+    detected_unavailable_devices, devices_for,
     dispatch_report_for_device, dispatch_report_for_device_with_options, fastest_device,
     first_unsupported_op, first_unsupported_op_with_options, full_name, is_available,
     legalize_graph_for_device, legalize_graph_for_device_with_options,

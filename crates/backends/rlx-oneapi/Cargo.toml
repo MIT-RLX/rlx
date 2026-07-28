@@ -53,5 +53,11 @@ half = "2"
 [dev-dependencies]
 half = "2"
 
+[build-dependencies]
+# Single source for the warm-tier activation math: the unary + activation-backward
+# OpenCL-C kernels are @generated from the shared rlxsl manifest at build time
+# (see build.rs), instead of a hand-maintained copy of every activation's erf etc.
+rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
+
 [lints]
 workspace = true

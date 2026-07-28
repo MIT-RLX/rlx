@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Map [`rlx_gguf::GgmlType`] to RLX [`QuantScheme`] for graph builders.
 
 use rlx_gguf::GgmlType;

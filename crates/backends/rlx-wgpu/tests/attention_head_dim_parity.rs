@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `Op::Attention` prefill parity across head_dim + GQA — wgpu vs CPU.
 //!
 //! Regression probe for Gemma 4 E2B. Sliding layers: nh=8, nkv=1, head_dim=256

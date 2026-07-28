@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Extract each simple arm of vjp's giant `match &node.op` into a free fn
 `vjp_<op>(node, upstream, upstream_shape, fwd_map, bwd)`, replacing the arm with
 a call. Behavior-preserving: patterns kept VERBATIM (handles tuple+discriminant

@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! GPU GGUF dequant + cuBLAS matmul for `Op::DequantMatMul` and grouped MoE
 //! `Op::DequantGroupedMatMul`.
 //!
@@ -70,6 +59,17 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             {
                 continue;
             }
+            max = max.max(k * n * std::mem::size_of::<f32>());
+        }
+        // MxFp4x2 decodes into the same f32 [n,k] scratch before matmul_bt.
+        if let Op::DequantMatMul { scheme } = &node.op
+            && scheme.mxfp4x2_config().is_some()
+        {
+            let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+            let total = node.shape.num_elements().unwrap();
+            let m = total / n.max(1);
+            let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+            let k = x_total / m.max(1);
             max = max.max(k * n * std::mem::size_of::<f32>());
         }
         if let Op::DequantGroupedMatMul { scheme } = &node.op {
@@ -238,6 +238,68 @@ fn run_matmul_bt(
             .launch(cfg)
             .expect("rlx-cuda: matmul_bt launch failed");
     }
+}
+
+/// MxFp4x2 two-level residual E2M1 `DequantMatMul` on CUDA: decode the packed
+/// `[plane0|plane1]` weight + `[s0|s1]` scales into f32 `[n,k]` scratch (the
+/// `matmul_bt` row-major convention, via `mxfp4x2_dequant_nk`), then
+/// `C = X @ Wᵀ`. Twin of `rlx_rocm::gguf_gpu::run_dequant_matmul_mxfp4x2_gpu`
+/// (which uses hipBLAS sgemm(N,N) + the `[k,n]` `mxfp4x2_dequant` kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_matmul_mxfp4x2_gpu(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    group: usize,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    scale_byte_off: usize,
+    scratch_byte_off: usize,
+    out_byte_off: usize,
+) {
+    let total = (k * n) as u32;
+    let threads = 256u32.min(total).max(1);
+    let grid = total.div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let kernel = crate::kernels::mxfp4x2_dequant_nk_kernel(ctx);
+    let w_off_u64 = w_byte_off as u64;
+    let s_f32_off = (scale_byte_off / 4) as u64;
+    let dst_f32_off = (scratch_byte_off / 4) as u64;
+    let (k_u, n_u, g_u) = (k as u32, n as u32, group as u32);
+    let mut launcher = stream.launch_builder(&kernel.function);
+    launcher
+        .arg(&mut *buffer)
+        .arg(&w_off_u64)
+        .arg(&s_f32_off)
+        .arg(&dst_f32_off)
+        .arg(&k_u)
+        .arg(&n_u)
+        .arg(&g_u);
+    unsafe {
+        launcher
+            .launch(cfg)
+            .expect("rlx-cuda: mxfp4x2_dequant_nk launch failed");
+    }
+
+    run_matmul_bt(
+        ctx,
+        stream,
+        buffer,
+        m,
+        k,
+        n,
+        x_byte_off,
+        scratch_byte_off,
+        out_byte_off,
+        false,
+    );
 }
 
 /// Launch `dequant_gguf` into arena scratch, then `C = X @ W^T` via `matmul_bt`.

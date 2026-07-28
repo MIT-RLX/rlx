@@ -49,4 +49,4 @@ annotation case.
   No way around this without runtime dispatch.
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

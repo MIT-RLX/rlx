@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Hand-rolled HIP runtime + hipRTC shim.
 //!
@@ -55,6 +44,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 type c_size_t = usize;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use libloading::Library;
 
@@ -309,6 +299,26 @@ impl HipRuntime {
     pub fn hiprtc_compile_to_hsaco(&self, src: &str, name: &str) -> Result<Vec<u8>, String> {
         let src_c = CString::new(src).map_err(|e| e.to_string())?;
         let name_c = CString::new(name).map_err(|e| e.to_string())?;
+
+        // Target GPU arch for the emitted code object. With no
+        // `--offload-arch`, hipRTC compiles for a default arch whose `.hsaco`
+        // won't load on the actual device, surfacing as
+        // `hipErrorNoBinaryForGpu` (209) at `hipModuleLoadData` — observed on
+        // gfx1103 APUs. Resolve it (env override wins) and pass it explicitly.
+        // These backing `CString`s must outlive the compile call below.
+        let arch = rocm_target_arch();
+        let opt_cstrs: Vec<CString> = arch
+            .as_deref()
+            .and_then(|a| CString::new(format!("--offload-arch={a}")).ok())
+            .into_iter()
+            .collect();
+        let opt_ptrs: Vec<*const c_char> = opt_cstrs.iter().map(|c| c.as_ptr()).collect();
+        let (n_opts, opts_ptr): (c_int, *const *const c_char) = if opt_ptrs.is_empty() {
+            (0, ptr::null())
+        } else {
+            (opt_ptrs.len() as c_int, opt_ptrs.as_ptr())
+        };
+
         unsafe {
             let mut prog: HiprtcProgram = ptr::null_mut();
             (self.hiprtc_create)(
@@ -322,7 +332,7 @@ impl HipRuntime {
             .ok()
             .map_err(|e| format!("hiprtcCreateProgram: {e}"))?;
 
-            let compile_status = (self.hiprtc_compile)(prog, 0, ptr::null());
+            let compile_status = (self.hiprtc_compile)(prog, n_opts, opts_ptr);
             if compile_status.0 != 0 {
                 // Pull the log out before destroying.
                 let mut log_size: c_size_t = 0;
@@ -348,6 +358,85 @@ impl HipRuntime {
             Ok(code)
         }
     }
+}
+
+// ── GPU arch resolution (hipRTC --offload-arch) ──────────────────────
+
+/// Resolve the GPU target arch (e.g. `"gfx1103"`, `"gfx1100"`) used for
+/// hipRTC's `--offload-arch`. Resolution order, first hit wins:
+///
+///   1. `RLX_ROCM_ARCH`            — explicit override (`"gfx1100"`).
+///   2. `HSA_OVERRIDE_GFX_VERSION` — the HSA runtime is *reporting* an
+///      overridden arch, so the code object must match that, not the
+///      physical part (`"11.0.0"` → `"gfx1100"`). This is the common
+///      gfx1103/gfx1150 APU workaround.
+///   3. `rocm_agent_enumerator` / `rocminfo` — detected physical arch
+///      (cached for the process).
+///   4. `None` — compile with no `--offload-arch` (legacy behaviour; lets
+///      a host whose hipRTC default already matches keep working).
+pub fn rocm_target_arch() -> Option<String> {
+    if let Ok(a) = std::env::var("RLX_ROCM_ARCH") {
+        let a = a.trim();
+        if !a.is_empty() {
+            return Some(a.to_string());
+        }
+    }
+    if let Ok(v) = std::env::var("HSA_OVERRIDE_GFX_VERSION") {
+        if let Some(a) = gfx_from_hsa_override(v.trim()) {
+            return Some(a);
+        }
+    }
+    detected_rocm_arch().clone()
+}
+
+/// Map an `HSA_OVERRIDE_GFX_VERSION` triple (`major.minor.stepping`) to the
+/// gfx arch name. The stepping is a single hex nibble in the name, so
+/// `11.0.0`→`gfx1100`, `10.3.0`→`gfx1030`, `9.0.10`→`gfx90a`, `9.4.2`→`gfx942`.
+fn gfx_from_hsa_override(v: &str) -> Option<String> {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let maj: u32 = parts[0].parse().ok()?;
+    let min: u32 = parts[1].parse().ok()?;
+    let step: u32 = parts[2].parse().ok()?;
+    Some(format!("gfx{maj}{min}{step:x}"))
+}
+
+/// Physical device arch, detected once via the ROCm CLI tools and cached.
+fn detected_rocm_arch() -> &'static Option<String> {
+    static ARCH: OnceLock<Option<String>> = OnceLock::new();
+    ARCH.get_or_init(|| {
+        // `rocm_agent_enumerator` prints one gfx token per line — cheapest.
+        for cmd in ["rocm_agent_enumerator", "/opt/rocm/bin/rocm_agent_enumerator"] {
+            if let Ok(out) = std::process::Command::new(cmd).output() {
+                if out.status.success() {
+                    if let Some(a) = first_gfx_token(&String::from_utf8_lossy(&out.stdout)) {
+                        return Some(a);
+                    }
+                }
+            }
+        }
+        // Fall back to parsing `rocminfo`'s "Name: gfxNNNN" agent lines.
+        for cmd in ["rocminfo", "/opt/rocm/bin/rocminfo"] {
+            if let Ok(out) = std::process::Command::new(cmd).output() {
+                if out.status.success() {
+                    if let Some(a) = first_gfx_token(&String::from_utf8_lossy(&out.stdout)) {
+                        return Some(a);
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
+/// First real GPU arch token in ROCm CLI output — the whitespace-delimited
+/// token starting with `gfx` that isn't the `gfx000` CPU/host agent.
+fn first_gfx_token(s: &str) -> Option<String> {
+    s.split_whitespace()
+        .find(|t| t.starts_with("gfx") && *t != "gfx000")
+        .map(|t| t.to_string())
 }
 
 // ── Convenience wrappers ─────────────────────────────────────────────

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
 
@@ -1858,6 +1861,32 @@ pub fn compile_thunks_with_rng(
                         let gs = sl(global_scale, base, 1)[0];
                         let out = sl_mut(dst, base, m * n);
                         dequant_matmul_nvfp4(xs, w_bytes, scale_bytes, gs, out, m, k, n);
+                    })
+                }
+
+                Thunk::DequantMatMulMxFp4x2 {
+                    x,
+                    w_q,
+                    scale,
+                    dst,
+                    m,
+                    k,
+                    n,
+                    group,
+                } => {
+                    let (m, k, n, group) = (m as usize, k as usize, n as usize, group as usize);
+                    let plane = (k * n).div_ceil(2);
+                    let nblk = k.div_ceil(group.max(1));
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let xs = sl(x, base, m * k);
+                        let w_bytes =
+                            std::slice::from_raw_parts(base.add(w_q) as *const u8, 2 * plane);
+                        let scale_bytes = std::slice::from_raw_parts(
+                            base.add(scale) as *const u8,
+                            2 * nblk * n * 4,
+                        );
+                        let out = sl_mut(dst, base, m * n);
+                        dequant_matmul_mxfp4x2(xs, w_bytes, scale_bytes, group, out, m, k, n);
                     })
                 }
 

@@ -17,7 +17,9 @@ authors:
     affiliation: MIT
 repository-code: "https://github.com/MIT-RLX/rlx"
 url: "https://github.com/MIT-RLX/rlx"
-license: GPL-3.0-only
+license:
+  - MIT
+  - Apache-2.0
 version: "0.2.14"
 date-released: "2026-07-24"
 keywords:

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! MLX vs CPU depthwise 1-D ConvTranspose (StyleTTS2 F0/N pool pattern).
 #![cfg(all(feature = "cpu", feature = "mlx"))]
 use rlx_ir::op::Op;

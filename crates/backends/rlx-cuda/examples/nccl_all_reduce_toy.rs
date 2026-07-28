@@ -1,4 +1,7 @@
 // RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// RLX — versatile ML compiler + runtime.
 //! NCCL all-reduce toy (device-resident).
 //!
 //! **One rank (any single NVIDIA GPU):**

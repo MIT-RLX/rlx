@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # RLX — versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 #
 # Inline an ONNX model's EXTERNAL-DATA weights into a single self-contained
 # .onnx so rlx-onnx-import (whose `onnx` 0.1.0 proto lacks the external_data /

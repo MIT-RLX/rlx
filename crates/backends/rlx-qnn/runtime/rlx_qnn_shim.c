@@ -1,6 +1,6 @@
 /* RLX — versatile ML compiler + runtime.
  * Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
- * GPL-3.0-only. See the crate root for the full license text.
+ * SPDX-License-Identifier: MIT OR Apache-2.0
  *
  * QNN AI Engine Direct FFI shim — dynamic (style-1) graph build + execute, with
  * persistent sessions and context-binary save/load. Compiled against the real

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // RLX — perf gate for the execute_thunks hot-loop refactor.
 // Run in RELEASE: cargo test -p rlx-cpu --release --test bench_execute_hotloop -- --nocapture
 //

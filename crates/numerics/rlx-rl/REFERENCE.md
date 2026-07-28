@@ -46,4 +46,4 @@ Maps to `configs/config.yaml`: `flow_map_warmup_steps`, `flow_map_anneal_end_ste
 - `log_alpha` adaptive FMQ α
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

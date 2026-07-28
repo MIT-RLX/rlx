@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // RoPE + Attention MIL lowering, validated on-device against explicit
 // hand references (NeoX split-halves rope; causal scaled-dot-product
 // attention), then composed into a full transformer attention block.

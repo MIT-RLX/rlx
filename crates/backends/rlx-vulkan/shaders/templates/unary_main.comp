@@ -1,0 +1,44 @@
+#version 450
+// Element-wise activation/unary + cast over the f32 arena.
+//
+// The activation dispatch `rlx_activation_apply(op, x)` (op 0..28, gelu-first
+// ids) is @generated from the shared rlxsl manifest and inserted right after
+// this `#version` line at build time (see build.rs); the arena helpers are
+// injected there too. The math is defined ONCE in `rlxsl::activation_expr`.
+//
+// Cast selectors stay here (they are `Op::Cast` on the f32-uniform arena — the
+// dst dtype's value is stored back as f32). Keep in sync with `classify_cast`
+// in backend.rs / unary.cu / unary.cl:
+//  100 f32->i8  101 f32->i16 102 f32->i32 103 f32->i64
+//  104 f32->u8  105 f32->u32 106 (x!=0)->bool   255 identity copy
+// float->int truncates toward zero + saturates (Rust `as` / rlx-cpu); NaN->0.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint in_off;
+    uint out_off;
+    uint op;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    float x = arena_load(pc.in_off + i);
+    float y;
+    if (pc.op < 100u) {
+        y = rlx_activation_apply(pc.op, x);
+    } else {
+        switch (pc.op) {
+            case 100u: y = isnan(x) ? 0.0 : clamp(trunc(x), -128.0, 127.0); break;
+            case 101u: y = isnan(x) ? 0.0 : clamp(trunc(x), -32768.0, 32767.0); break;
+            case 102u: y = isnan(x) ? 0.0 : clamp(trunc(x), -2147483648.0, 2147483647.0); break;
+            case 103u: y = isnan(x) ? 0.0 : clamp(trunc(x), -9223372036854775808.0, 9223372036854775807.0); break;
+            case 104u: y = isnan(x) ? 0.0 : clamp(trunc(x), 0.0, 255.0); break;
+            case 105u: y = isnan(x) ? 0.0 : clamp(trunc(x), 0.0, 4294967295.0); break;
+            case 106u: y = (x != 0.0) ? 1.0 : 0.0; break;
+            default: y = x; break; // 255 = identity copy
+        }
+    }
+    arena_store(pc.out_off + i, y);
+}

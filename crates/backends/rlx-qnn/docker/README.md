@@ -48,3 +48,6 @@ the Hexagon NPU on real silicon (where the perf lives).
   `rlx-qnn-emit` (handy while the workspace is mid-build).
 - Both modes emit fresh artifacts via `cargo run -p rlx-qnn --bin rlx-qnn-emit`
   by default, so they always test the current codegen.
+## License
+
+MIT OR Apache-2.0.

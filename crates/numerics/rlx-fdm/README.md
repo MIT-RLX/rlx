@@ -151,4 +151,4 @@ let gq = goals_grad_wrt_q(&opt, &network, &goals, None)?;
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

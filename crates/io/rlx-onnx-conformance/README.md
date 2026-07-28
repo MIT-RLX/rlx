@@ -34,4 +34,4 @@ skip ORT in the harness (`OrtSession::from_bytes` bails).
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

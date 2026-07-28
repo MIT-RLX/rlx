@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! # RLX
 //!
@@ -131,6 +120,11 @@ pub use rlx_ir as ir;
 /// Available with the `tensor` feature (on by default).
 #[cfg(feature = "tensor")]
 pub use rlx_tensor as tensor;
+
+/// `rlx! { … }` — declarative graph DSL (a compact little language for
+/// declaring a [`Graph`]). Available with the `tensor` feature (on by default).
+#[cfg(feature = "tensor")]
+pub use rlx_tensor::rlx;
 
 /// Graph rewrites + autodiff + vmap.
 /// See [`rlx-opt`](https://crates.io/crates/rlx-opt).
@@ -457,7 +451,7 @@ pub mod distributed {
 pub mod prelude {
     // Tensor DSL (expression-style graph building) — feature `tensor`.
     #[cfg(feature = "tensor")]
-    pub use crate::tensor::{GraphScope, Tensor, ax, graph, graph_with, ix, rg, s, shape, tail};
+    pub use crate::tensor::{GraphScope, Tensor, ax, graph, graph_with, ix, rg, rlx, s, shape, tail};
 
     // Core graph + runtime
     pub use crate::{

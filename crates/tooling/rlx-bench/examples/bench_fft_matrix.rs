@@ -1,7 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// Licensed under the GNU General Public License, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Comprehensive FFT/IFFT benchmark matrix: every variant × precision × size ×
 //! batch, across every available backend, with a CPU-parity check per cell.

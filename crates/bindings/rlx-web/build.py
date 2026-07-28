@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # RLX — versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-# GPL-3.0-only. See LICENSE.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Build the rlx-web WebAssembly bundle and (optionally) serve the demo.
 
 One command, all platforms (macOS / Linux / Windows):

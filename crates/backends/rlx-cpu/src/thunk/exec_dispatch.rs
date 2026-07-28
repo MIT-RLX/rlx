@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
 
@@ -1798,6 +1801,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::DequantMatMulInt4 { .. } => exec_dequant_mat_mul_int4(thunk, base),
             Thunk::DequantMatMulFp8 { .. } => exec_dequant_mat_mul_fp8(thunk, base),
             Thunk::DequantMatMulNvfp4 { .. } => exec_dequant_mat_mul_nvfp4(thunk, base),
+            Thunk::DequantMatMulMxFp4x2 { .. } => exec_dequant_mat_mul_mxfp4x2(thunk, base),
             Thunk::DequantMatMulMlx { .. } => exec_dequant_mat_mul_mlx(thunk, base),
             Thunk::ScaledMatMul { .. } => exec_scaled_mat_mul(thunk, base),
             Thunk::ScaledQuantize { .. } => exec_scaled_quantize(thunk, base),

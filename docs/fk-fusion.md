@@ -228,4 +228,4 @@ If MPSGraph lowering returns `None`, Metal falls back to MSL thunks (`Thunk::Ele
 | TPU HLO + FKL | `rlx-tpu/src/lower.rs`, `rlx-tpu/src/ir_passes.rs`, `rlx-tpu/src/fk_pipeline.rs` |
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

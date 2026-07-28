@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The f32-uniform USM-shared GPU arena for the Level Zero dispatch path. Like
 //! rlx-vulkan's host-visible arena, every tensor is an f32 slot at a byte

@@ -156,3 +156,6 @@ own) and `rlx-wgpu` for a full post-run per-node scan.
 Extend the match in `rlx_ir::numeric_check::fix_hint`. Keep hints to a single
 actionable sentence; ops with no single obvious remedy return `None` (the
 location + culprit flag still localize them).
+## License
+
+MIT OR Apache-2.0.

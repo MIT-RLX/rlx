@@ -1,0 +1,23 @@
+[package]
+name = "rlxsl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Scalar-expression manifest + per-language emitters for RLX's warm-tier unary-activation kernels (single source for WGSL/CUDA/MSL/GLSL/OpenCL activation math, forward + auto-differentiated backward)."
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+libm = "0.2"
+# Validate that the emitted activation/double-single shaders are real, valid
+# shader source: WGSL (wgpu path) via `wgsl-in`, GLSL (native-Vulkan path) via
+# `glsl-in`. CUDA/MSL/OpenCL have no toolchain-free parser, so those emitters are
+# checked structurally (balanced delimiters + full case coverage).
+naga = { version = "29", features = ["wgsl-in", "glsl-in"] }

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # RLX — versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 #
 # One-shot native-vs-ort divergence localizer. Rewrites an ONNX graph so EVERY
 # float intermediate tensor is also a graph OUTPUT, in topological order. Run the

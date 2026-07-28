@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
 
@@ -614,16 +617,17 @@ pub(crate) fn exec_rope(t: &Thunk, base: *mut u8) {
             *head_dim as usize,
             *n_rot as usize,
         );
-        let tab_half = dh / 2;
         let rot_half = nr / 2;
         let nh = hs / dh;
         let cl = *cos_len as usize;
         let src_rs = *src_row_stride as usize;
-        // Number of rows in the RoPE table. A per-(batch·seq) table
-        // (`cos_rows == b*s`, distinct from the shared per-seq table) is
-        // indexed by the *global* token so ragged batched decode can
-        // give each sequence its own absolute position.
-        let cos_rows = cl / tab_half.max(1);
+        // Number of rows in the RoPE table. The table stores exactly the
+        // rotation angles — `n_rot/2` (rot_half) per token, NOT head_dim/2.
+        // For PARTIAL rope (n_rot < head_dim, e.g. DeepSeek-V4 MLA: rope only
+        // the first 64 of 512 dims) using head_dim/2 as the row stride reads
+        // out of bounds for token positions ≥1 → arena-dependent garbage.
+        // (Full rope has n_rot == head_dim, so rot_half == head_dim/2: no change.)
+        let cos_rows = cl / rot_half.max(1);
         let per_token = cos_rows == b * s && cos_rows != s;
         unsafe {
             let x = sl(*src, base, b * s * src_rs);
@@ -641,7 +645,7 @@ pub(crate) fn exec_rope(t: &Thunk, base: *mut u8) {
                 for idx in off..off + cnt {
                     let bi = idx / s;
                     let si = idx % s;
-                    let tab_off = if per_token { idx } else { si } * tab_half;
+                    let tab_off = if per_token { idx } else { si } * rot_half;
 
                     for hi in 0..nh {
                         let src_base = bi * s * src_rs + si * src_rs + hi * dh;

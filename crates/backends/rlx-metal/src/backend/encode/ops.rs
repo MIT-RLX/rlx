@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Kernel encode helpers extracted from `backend/mod.rs` for navigability.
 
@@ -376,22 +376,7 @@ pub(crate) fn encode_fused_binary_activation(
     act: rlx_ir::op::Activation,
 ) {
     use rlx_ir::op::{Activation, BinaryOp};
-    let bin_op: u32 = match op {
-        BinaryOp::Add => 0,
-        BinaryOp::Sub => 1,
-        BinaryOp::Mul => 2,
-        BinaryOp::Div => 3,
-        BinaryOp::Max => 4,
-        BinaryOp::Min => 5,
-        BinaryOp::Pow => 6,
-        BinaryOp::Mod => 7,
-        BinaryOp::BitAnd => 8,
-        BinaryOp::BitOr => 9,
-        BinaryOp::BitXor => 10,
-        BinaryOp::Shl => 11,
-        BinaryOp::Shr => 12,
-        BinaryOp::Atan2 => 13,
-    };
+    let bin_op: u32 = op.opcode();
     let act_op: u32 = match act {
         Activation::Gelu | Activation::GeluApprox => 0,
         Activation::Silu => 1,
@@ -467,26 +452,8 @@ pub(crate) fn encode_fused_ternary_activation(
     act: rlx_ir::op::Activation,
 ) {
     use rlx_ir::op::{Activation, BinaryOp};
-    let bin_op = |op: BinaryOp| -> u32 {
-        match op {
-            BinaryOp::Add => 0,
-            BinaryOp::Sub => 1,
-            BinaryOp::Mul => 2,
-            BinaryOp::Div => 3,
-            BinaryOp::Max => 4,
-            BinaryOp::Min => 5,
-            BinaryOp::Pow => 6,
-            BinaryOp::Mod => 7,
-            BinaryOp::BitAnd => 8,
-            BinaryOp::BitOr => 9,
-            BinaryOp::BitXor => 10,
-            BinaryOp::Shl => 11,
-            BinaryOp::Shr => 12,
-            BinaryOp::Atan2 => 13,
-        }
-    };
-    let bin_op0 = bin_op(op0);
-    let bin_op1 = bin_op(op1);
+    let bin_op0 = op0.opcode();
+    let bin_op1 = op1.opcode();
     let act_op: u32 = match act {
         Activation::Gelu | Activation::GeluApprox => 0,
         Activation::Silu => 1,
@@ -1455,9 +1422,19 @@ pub(crate) fn encode_binary(
 ) {
     use crate::thunk::HalfFlag;
     use rlx_ir::op::BinaryOp;
-    // Mod/bitwise use the scalar `elem_binop` kernel (no vec4 variant).
-    let use_vec4 =
-        matches!(dt, HalfFlag::F32) && len.is_multiple_of(4) && len >= 4 && op.region_fusable();
+    // Only Add/Mul/Sub/Div have vec4 kernels (`elem_{add,mul,sub,div}4`). The
+    // other region-fusable ops (Max/Min/Pow) and Mod/bitwise fall back to their
+    // scalar kernels, so they must NOT take the vec4 path — otherwise
+    // `dispatch_len = len/4` would run the scalar kernel over only the first
+    // quarter of the elements and leave the rest at zero (silent, and only when
+    // `len % 4 == 0`).
+    let use_vec4 = matches!(dt, HalfFlag::F32)
+        && len.is_multiple_of(4)
+        && len >= 4
+        && matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub | BinaryOp::Div
+        );
     // Full f16 binary coverage (Add/Mul/Sub/Div/Max/Min/Pow).
     let pipeline = match (dt, op, use_vec4) {
         (HalfFlag::F16, BinaryOp::Add, _) => &k.elem_add_h,
@@ -2563,6 +2540,46 @@ pub(crate) fn encode_dequant_matmul_nvfp4(
     enc.set_bytes(7, sz, &n as *const u32 as *const _);
     let gs = NVFP4_GROUP_SIZE as u32;
     enc.set_bytes(8, sz, &gs as *const u32 as *const _);
+    let total = (m * n) as u64;
+    let grid = metal::MTLSize {
+        width: total,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: total.min(256),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// MxFp4x2 two-level residual E2M1 fused decode-matmul (`dequant_matmul_mxfp4x2`
+/// MSL kernel). `w_q`=[plane0|plane1] nibbles, `scale`=[s0|s1] f32.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_dequant_matmul_mxfp4x2(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    dst: usize,
+    m: u32,
+    k: u32,
+    n: u32,
+    group: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(3, Some(buffer), dst as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(4, sz, &m as *const u32 as *const _);
+    enc.set_bytes(5, sz, &k as *const u32 as *const _);
+    enc.set_bytes(6, sz, &n as *const u32 as *const _);
+    enc.set_bytes(7, sz, &group as *const u32 as *const _);
     let total = (m * n) as u64;
     let grid = metal::MTLSize {
         width: total,

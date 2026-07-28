@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # Enforce rustfmt + clippy on staged Rust changes before commit.
 # rustfmt is applied (not only checked); reformatted staged files are re-added.
 # Compatible with macOS Bash 3.2 (no mapfile).

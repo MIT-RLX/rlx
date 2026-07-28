@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `compile` — extracted from the `backend` module for navigability (see `mod.rs`).
 #![allow(unused_imports)]
 
@@ -1999,6 +1988,7 @@ impl CudaExecutable {
                         zp_byte_off: arena.offset(node.inputs[3]) as u64,
                         idx_byte_off: arena.offset(node.inputs[4]) as u64,
                         out_byte_off: arena.offset(node.id) as u64,
+                        scale_bf16: graph.node(node.inputs[2]).shape.dtype() == rlx_ir::DType::BF16,
                     });
                 }
                 Op::ScatterAdd => {
@@ -2070,6 +2060,22 @@ impl CudaExecutable {
                                     w_byte_off: arena.offset(w_id) as u64,
                                     scale_byte_off: arena.offset(scale_id) as u64,
                                     zp_byte_off: arena.offset(zp_id) as u64,
+                                    out_byte_off: arena.offset(node.id) as u64,
+                                });
+                                continue;
+                            }
+                            QuantScheme::MxFp4x2Block { group_size } => {
+                                // 3 inputs (x, w_q=[plane0|plane1], scale=[s0|s1]);
+                                // decode to [n,k] f32 scratch then matmul_bt.
+                                let scale_id = node.inputs[2];
+                                schedule.push(Step::DequantMatmulMxFp4x2 {
+                                    m,
+                                    k,
+                                    n,
+                                    group: *group_size,
+                                    x_byte_off: arena.offset(x_id) as u64,
+                                    w_byte_off: arena.offset(w_id) as u64,
+                                    scale_byte_off: arena.offset(scale_id) as u64,
                                     out_byte_off: arena.offset(node.id) as u64,
                                 });
                                 continue;

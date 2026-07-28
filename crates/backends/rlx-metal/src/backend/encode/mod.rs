@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `encode` — extracted from the `backend` module for navigability (see `mod.rs`).
 
@@ -372,6 +361,7 @@ impl MetalExecutable {
                 num_experts: usize,
                 slab_bytes: usize,
                 scheme: rlx_ir::quant::QuantScheme,
+                scale_bf16: bool,
             },
             DequantMatMulInt8 {
                 x: usize,
@@ -416,6 +406,16 @@ impl MetalExecutable {
                 m: usize,
                 k: usize,
                 n: usize,
+            },
+            DequantMatMulMxFp4x2 {
+                x: usize,
+                w_q: usize,
+                scale: usize,
+                dst: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                group: usize,
             },
             DequantMatMulMlx {
                 x: usize,
@@ -929,6 +929,7 @@ impl MetalExecutable {
                             num_experts,
                             slab_bytes,
                             scheme,
+                            scale_bf16,
                         } => unsafe {
                             rlx_cpu::thunk::execute_dequant_grouped_matmul_mlx_f32(
                                 input,
@@ -943,6 +944,7 @@ impl MetalExecutable {
                                 num_experts,
                                 slab_bytes,
                                 scheme,
+                                scale_bf16,
                                 arena_ptr,
                             );
                         },
@@ -1032,6 +1034,20 @@ impl MetalExecutable {
                                 k,
                                 n,
                                 arena_ptr,
+                            );
+                        },
+                        DeferredHostOp::DequantMatMulMxFp4x2 {
+                            x,
+                            w_q,
+                            scale,
+                            dst,
+                            m,
+                            k,
+                            n,
+                            group,
+                        } => unsafe {
+                            rlx_cpu::thunk::execute_dequant_matmul_mxfp4x2_f32(
+                                x, w_q, scale, dst, m, k, n, group, arena_ptr,
                             );
                         },
                         DeferredHostOp::DequantMatMulMlx {
@@ -2440,22 +2456,7 @@ impl MetalExecutable {
                     // F16 path still falls back to the host (no f16 MSL
                     // kernel yet); f32 uses the dedicated GPU kernel.
                     if matches!(dt, HalfFlag::F32) {
-                        let op_id: u32 = match op {
-                            rlx_ir::op::BinaryOp::Add => 0,
-                            rlx_ir::op::BinaryOp::Sub => 1,
-                            rlx_ir::op::BinaryOp::Mul => 2,
-                            rlx_ir::op::BinaryOp::Div => 3,
-                            rlx_ir::op::BinaryOp::Max => 4,
-                            rlx_ir::op::BinaryOp::Min => 5,
-                            rlx_ir::op::BinaryOp::Pow => 6,
-                            rlx_ir::op::BinaryOp::Mod => 7,
-                            rlx_ir::op::BinaryOp::BitAnd => 8,
-                            rlx_ir::op::BinaryOp::BitOr => 9,
-                            rlx_ir::op::BinaryOp::BitXor => 10,
-                            rlx_ir::op::BinaryOp::Shl => 11,
-                            rlx_ir::op::BinaryOp::Shr => 12,
-                            rlx_ir::op::BinaryOp::Atan2 => 13,
-                        };
+                        let op_id: u32 = op.opcode();
                         // Sub/Div/Pow are non-commutative. The scalar/col/row/
                         // 1-axis fast paths swap operands when the *lhs* is the
                         // broadcast side (feeding the kernel `a OP b` with
@@ -4511,18 +4512,42 @@ impl MetalExecutable {
                     if outer == 0 {
                         continue;
                     }
-                    encode_reduce_axes(
-                        e!(),
-                        k,
-                        &self.arena.buffer,
-                        *src,
-                        *dst,
-                        outer,
-                        *reduced,
-                        *inner,
-                        *op,
-                        *dt,
-                    );
+                    // High-precision path: a full f32 sum-to-scalar reduction
+                    // accumulated in double-single (2× f32 ≈ f64), opt-in via
+                    // RLX_METAL_DW_SUM. Encoded into the same command buffer —
+                    // the pipeline's precise-math compilation is independent of
+                    // the (fast-math) main library. Buffers bound at the src/dst
+                    // byte offsets, exactly like `encode_reduce_axes`.
+                    if crate::double_single::dw_sum_reduce_enabled()
+                        && *op == rlx_ir::op::ReduceOp::Sum
+                        && outer == 1
+                        && *inner == 1
+                        && matches!(dt, crate::thunk::HalfFlag::F32)
+                    {
+                        let e = e!();
+                        e.set_compute_pipeline_state(&k.dw_sum_arena);
+                        e.set_buffer(0, Some(&self.arena.buffer), *src as u64);
+                        e.set_buffer(1, Some(&self.arena.buffer), *dst as u64);
+                        let n = *reduced;
+                        e.set_bytes(2, 4, &n as *const u32 as *const _);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize::new(1, 1, 1),
+                            metal::MTLSize::new(256, 1, 1),
+                        );
+                    } else {
+                        encode_reduce_axes(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *src,
+                            *dst,
+                            outer,
+                            *reduced,
+                            *inner,
+                            *op,
+                            *dt,
+                        );
+                    }
                 }
                 Thunk::TopK {
                     src,
@@ -6969,6 +6994,44 @@ impl MetalExecutable {
                     }
                 }
 
+                Thunk::DequantMatMulMxFp4x2 {
+                    x,
+                    w_q,
+                    scale,
+                    dst,
+                    m,
+                    k: kk,
+                    n,
+                    group,
+                } => {
+                    if deferred_host.is_empty() {
+                        encode_dequant_matmul_mxfp4x2(
+                            e!(),
+                            &k.dequant_matmul_mxfp4x2,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *scale,
+                            *dst,
+                            *m,
+                            *kk,
+                            *n,
+                            *group,
+                        );
+                    } else {
+                        deferred_host.push(DeferredHostOp::DequantMatMulMxFp4x2 {
+                            x: *x,
+                            w_q: *w_q,
+                            scale: *scale,
+                            dst: *dst,
+                            m: *m as usize,
+                            k: *kk as usize,
+                            n: *n as usize,
+                            group: *group as usize,
+                        });
+                    }
+                }
+
                 Thunk::DequantMatMulMlx {
                     x,
                     w_q,
@@ -7051,6 +7114,7 @@ impl MetalExecutable {
                     num_experts,
                     slab_bytes,
                     scheme,
+                    scale_bf16,
                 } => {
                     deferred_host.push(DeferredHostOp::DequantGroupedMatMulMlx {
                         input: *input,
@@ -7065,6 +7129,7 @@ impl MetalExecutable {
                         num_experts: *num_experts as usize,
                         slab_bytes: *slab_bytes as usize,
                         scheme: *scheme,
+                        scale_bf16: *scale_bf16,
                     });
                 }
 

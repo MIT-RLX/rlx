@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Extract each simple arm of compile_thunks_with_rng's `let t = match &node.op`
 (compile-time, ~3800 lines, 133 arms) into a free fn
 `compile_<op>(node, graph, arena, matmul_fold, rng_shared) -> Thunk`. Patterns

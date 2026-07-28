@@ -74,4 +74,4 @@ Online FMQ: project \(a_1\) with \(\nabla_a Q\) inside a trust region, then regr
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

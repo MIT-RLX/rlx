@@ -1,7 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// Licensed under the GNU General Public License, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CPU batched FFT: serial row loop vs rayon-parallel batch, toggled in-process
 //! via RLX_FFT_CPU_PARALLEL. Rows are independent, so batch parallelism should

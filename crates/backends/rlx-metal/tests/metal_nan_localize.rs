@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! End-to-end check that the `RLX_DEBUG_NANS` output-boundary scan runs on a
 //! real Metal execution. `sqrt` of a negative input produces a NaN on-device;

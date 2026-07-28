@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! GPU GGUF K-quant dequant + hipBLAS matmul for `Op::DequantMatMul` and
 //! grouped MoE `Op::DequantGroupedMatMul`.
 
@@ -28,8 +17,8 @@ fn launch_dequant_gguf(
     ctx: &Arc<RocmContext>,
     stream: crate::hip::HipStream,
     buffer: &HipBuffer<f32>,
-    w_off_u32: u32,
-    dst_f32_off: u32,
+    w_byte_off: u64,
+    dst_f32_off: u64,
     scheme_id: u32,
     nb_u32: u32,
 ) {
@@ -37,13 +26,22 @@ fn launch_dequant_gguf(
     let kernel = dequant_gguf_kernel(ctx);
     let block = 256u32.min(nb_u32).max(1);
     let grid = nb_u32.div_ceil(block);
+    // The kernel takes 6 params with **64-bit** arena offsets and an IQ grid
+    // LUT pointer (see `dequant_gguf.cu`). Passing 5 u32-offset params — as this
+    // did — makes hipModuleLaunchKernel read a 6th arg past the array and
+    // misread the offsets, so a >4 GB arena overflows u32 → SIGSEGV / garbage.
+    // IQ-family schemes index `iq_lut`; non-IQ schemes ignore it but the arg
+    // must still be bound. Mirrors `rlx_cuda::gguf_gpu`.
+    let lut = crate::iq_grid::rocm_iq_grid_buffer(ctx);
     let mut dev = buffer.ptr;
-    let mut params: [*mut c_void; 5] = [
+    let mut lut_ptr = lut.ptr;
+    let mut params: [*mut c_void; 6] = [
         &mut dev as *mut _ as *mut c_void,
-        &w_off_u32 as *const _ as *mut c_void,
+        &w_byte_off as *const _ as *mut c_void,
         &dst_f32_off as *const _ as *mut c_void,
         &scheme_id as *const _ as *mut c_void,
         &nb_u32 as *const _ as *mut c_void,
+        &mut lut_ptr as *mut _ as *mut c_void,
     ];
     unsafe {
         kernel
@@ -62,8 +60,10 @@ fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usi
 pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
     for node in graph.nodes() {
+        // GGUF and MxFp4x2 both decode the weight into an f32 [k,n] scratch
+        // before the sgemm, so they size the scratch identically.
         if let Op::DequantMatMul { scheme } = &node.op
-            && scheme.is_gguf()
+            && (scheme.is_gguf() || scheme.mxfp4x2_config().is_some())
         {
             let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
             let total = node.shape.num_elements().unwrap();
@@ -104,14 +104,14 @@ pub fn run_dequant_matmul_gguf_gpu(
     let total = k * n;
     let num_blocks = total / block_elems.max(1);
 
-    let dst_f32_off = (scratch_byte_off / 4) as u32;
-    let w_off_u32 = w_byte_off as u32;
+    let dst_f32_off = (scratch_byte_off / 4) as u64;
+    let w_off_u64 = w_byte_off as u64;
     let nb_u32 = num_blocks as u32;
     launch_dequant_gguf(
         ctx,
         stream,
         buffer,
-        w_off_u32,
+        w_off_u64,
         dst_f32_off,
         scheme_id,
         nb_u32,
@@ -144,6 +144,80 @@ pub fn run_dequant_matmul_gguf_gpu(
     result
         .ok()
         .expect("rlx-rocm: gguf matmul hipblasSgemm failed");
+}
+
+/// MxFp4x2 two-level residual E2M1 `DequantMatMul` on GPU: decode the packed
+/// `[plane0|plane1]` weight + `[s0|s1]` scales into f32 `[k,n]` scratch, then
+/// `C = X @ W` via hipBLAS. Layout matches `rlx_cpu::dequant_matmul_mxfp4x2` so
+/// the decoded scratch feeds the same sgemm as the GGUF path.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_matmul_mxfp4x2_gpu(
+    ctx: &Arc<RocmContext>,
+    stream: crate::hip::HipStream,
+    buffer: &HipBuffer<f32>,
+    blas: &Arc<Mutex<HipblasContext>>,
+    m: usize,
+    k: usize,
+    n: usize,
+    group: usize,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    scale_byte_off: usize,
+    scratch_byte_off: usize,
+    out_byte_off: usize,
+) {
+    use core::ffi::c_void;
+    let kernel = crate::kernels::mxfp4x2_dequant_kernel(ctx);
+    let total = (k * n) as u32;
+    let block = 256u32.min(total).max(1);
+    let grid = total.div_ceil(block);
+    let w_off_u64 = w_byte_off as u64;
+    let s_f32_off = (scale_byte_off / 4) as u64;
+    let dst_f32_off = (scratch_byte_off / 4) as u64;
+    let (k_u, n_u, g_u) = (k as u32, n as u32, group as u32);
+    let mut dev = buffer.ptr;
+    let mut params: [*mut c_void; 7] = [
+        &mut dev as *mut _ as *mut c_void,
+        &w_off_u64 as *const _ as *mut c_void,
+        &s_f32_off as *const _ as *mut c_void,
+        &dst_f32_off as *const _ as *mut c_void,
+        &k_u as *const _ as *mut c_void,
+        &n_u as *const _ as *mut c_void,
+        &g_u as *const _ as *mut c_void,
+    ];
+    unsafe {
+        kernel
+            .launch(stream, (grid, 1, 1), (block, 1, 1), 0, params.as_mut_ptr())
+            .expect("rlx-rocm: mxfp4x2_dequant launch failed");
+    }
+
+    let x_dev = buffer.ptr + (x_byte_off as u64);
+    let w_dev = buffer.ptr + (scratch_byte_off as u64);
+    let c_dev = buffer.ptr + (out_byte_off as u64);
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let blas = blas.lock().unwrap();
+    let result = unsafe {
+        (blas.runtime.sgemm)(
+            blas.handle,
+            HipblasOperation::N,
+            HipblasOperation::N,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha as *const f32,
+            w_dev as *const f32,
+            n as i32,
+            x_dev as *const f32,
+            k as i32,
+            &beta as *const f32,
+            c_dev as *mut f32,
+            n as i32,
+        )
+    };
+    result
+        .ok()
+        .expect("rlx-rocm: mxfp4x2 matmul hipblasSgemm failed");
 }
 
 /// GPU dequant + grouped matmul for MoE packed expert stacks.
@@ -207,7 +281,7 @@ pub unsafe fn run_dequant_grouped_matmul_gguf_gpu(
         );
     }
 
-    let dst_f32_off = (dequant_off / 4) as u32;
+    let dst_f32_off = (dequant_off / 4) as u64;
     let nb_u32 = num_blocks as u32;
 
     let blas = blas.lock().unwrap();
@@ -220,12 +294,12 @@ pub unsafe fn run_dequant_grouped_matmul_gguf_gpu(
             continue;
         }
         let w_off = w_byte_off + e * slab_bytes;
-        let w_off_u32 = w_off as u32;
+        let w_off_u64 = w_off as u64;
         launch_dequant_gguf(
             ctx,
             stream,
             buffer,
-            w_off_u32,
+            w_off_u64,
             dst_f32_off,
             scheme_id,
             nb_u32,

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # rlx-qnn Docker validation driver — cross-platform (macOS / Linux / Windows).
 #
 #   python3 validate.py harness-test [--dims M K N] [--artifacts DIR]

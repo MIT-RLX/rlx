@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `run` — extracted from the `backend` module for navigability (see `mod.rs`).
 
@@ -2923,6 +2912,7 @@ impl WgpuExecutable {
                     zp_byte_off,
                     idx_byte_off,
                     out_byte_off,
+                    scale_bf16,
                 } => {
                     crate::gguf_host::run_dequant_grouped_matmul_mlx(
                         &self.arena,
@@ -2939,6 +2929,7 @@ impl WgpuExecutable {
                         *zp_byte_off as usize,
                         *idx_byte_off as usize,
                         *out_byte_off as usize,
+                        *scale_bf16,
                     );
                 }
                 Step::GatedDeltaNet {

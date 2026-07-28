@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![cfg(all(feature = "cpu", feature = "metal", target_os = "macos"))]
 //! Diagnostic: isolate whether the VQ Metal mismatch is `argmin` itself or the
 //! upstream distance computation (matmul / row-broadcast subtract).

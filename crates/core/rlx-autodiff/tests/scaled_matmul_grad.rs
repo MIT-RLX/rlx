@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Straight-through QAT autodiff for the native low-precision GEMM.
 //! `Op::ScaledMatMul`'s VJP rebuilds the (quantized) operands and runs the

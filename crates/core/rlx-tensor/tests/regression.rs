@@ -1,5 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Capstone: fit a real linear model with gradient descent. Exercises the
 //! whole stack — inputs + multiple params, matmul, broadcast bias, MSE loss,

@@ -22,6 +22,11 @@ splat = ["rlx-cpu/splat"]
 # round-trips DRAM per outer stage. Runtime gate `RLX_FFT_FAST=0` disables.
 native-gpu-fft = []
 
+[build-dependencies]
+# Generates the standalone unary/activation WGSL switch from the shared
+# scalar-expression manifest (single source across backends).
+rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
+
 [dependencies]
 rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
 rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.14" }

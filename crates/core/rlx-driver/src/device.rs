@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Device selection — which backend to use.
 
@@ -40,6 +29,8 @@ pub enum Device {
     // ── AMD ─────────────────────────────────────────────────
     /// AMD GPU via ROCm/HIP.
     Rocm,
+    /// AMD XDNA / Ryzen AI NPU (AI Engine `aie2`) via the `amdxdna` driver.
+    Xdna,
 
     // ── Intel ───────────────────────────────────────────────
     /// Intel GPU (Arc / Data Center Max) via oneAPI Level Zero.
@@ -79,6 +70,7 @@ impl Device {
             Device::Ane => "ANE",
             Device::Cuda => "CUDA",
             Device::Rocm => "ROCm",
+            Device::Xdna => "XDNA NPU",
             Device::OneApi => "oneAPI (Level Zero)",
             Device::Tpu => "TPU",
             Device::Hexagon => "Hexagon NPU",
@@ -102,6 +94,7 @@ impl Device {
             Device::Ane => "ane",
             Device::Cuda => "cuda",
             Device::Rocm => "rocm",
+            Device::Xdna => "xdna",
             Device::OneApi => "oneapi",
             Device::Tpu => "tpu",
             Device::Hexagon => "hexagon",
@@ -124,6 +117,7 @@ impl Device {
             Device::Ane,
             Device::Cuda,
             Device::Rocm,
+            Device::Xdna,
             Device::OneApi,
             Device::Tpu,
             Device::Hexagon,
@@ -151,7 +145,7 @@ impl std::fmt::Display for DeviceFromStrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, oneapi, gpu, vulkan, opengl, directx, webgpu, tpu)",
+            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, xdna, oneapi, gpu, vulkan, opengl, directx, webgpu, tpu)",
             self.0
         )
     }
@@ -171,6 +165,7 @@ impl std::str::FromStr for Device {
             "ane" | "coreml" | "neural-engine" => Device::Ane,
             "cuda" | "nvidia" => Device::Cuda,
             "rocm" | "hip" | "amd" => Device::Rocm,
+            "xdna" | "aie" | "aie2" | "ryzenai" | "ryzen-ai" | "amdnpu" => Device::Xdna,
             "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Device::OneApi,
             "gpu" | "wgpu" => Device::Gpu,
             "vulkan" | "vk" => Device::Vulkan,

@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Cross-machine distributed smoke test: one process per rank joins a
 //! real [`NetTransport`] TCP mesh, then runs
@@ -1469,13 +1458,14 @@ fn run_placement(group: &Arc<ProcessGroup>, label: &str, spec: &str) {
 }
 
 /// Every `Device` the runtime knows, for the local-capability probe.
-const ALL_DEVICES: [Device; 11] = [
+const ALL_DEVICES: [Device; 12] = [
     Device::Cpu,
     Device::Metal,
     Device::Mlx,
     Device::Ane,
     Device::Cuda,
     Device::Rocm,
+    Device::Xdna,
     Device::OneApi,
     Device::Gpu,
     Device::Vulkan,
@@ -1492,6 +1482,12 @@ fn print_inventory(label: &str) {
         .map(|&d| device_label(d))
         .collect();
     eprintln!("[{label}] local backends: [{}]", avail.join(", "));
+    // Accelerators whose hardware is present but can't execute (e.g. an XDNA NPU
+    // detected with no XRT runtime): surfaced separately so the inventory shows
+    // the silicon without letting selection dispatch to a backend that can't run.
+    for (d, why) in rlx_runtime::detected_unavailable_devices() {
+        eprintln!("[{label}] detected, not runnable: {} — {why}", device_label(d));
+    }
 }
 
 /// Stable small code per device so a rank's chosen backend survives the f32

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Auto-generated from llama.cpp ggml-common.h. DO NOT EDIT BY HAND.
 // Regenerate with `scripts/extract_iq_grids.py <ggml-common.h>`.
 // LUTs for IQ-family dequant. Layout matches llama.cpp byte-for-byte.

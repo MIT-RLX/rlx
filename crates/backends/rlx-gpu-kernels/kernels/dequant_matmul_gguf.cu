@@ -1,7 +1,8 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// GPL-3.0-only. Fused GGUF K-quant dequant + GEMV (decode, m == 1).
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Fused GGUF K-quant dequant + GEMV (decode, m == 1).
 // Mirrors rlx-vulkan/shaders/dequant_matmul.comp and rlx-cpu gguf_matmul_bt.
 //
 // Schemes: 0 = Q4_K (256 elems / 144 B), 2 = Q6_K (256 / 210 B),

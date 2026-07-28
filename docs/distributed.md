@@ -306,3 +306,6 @@ discovery) is exactly what `dist_node MODE=fft` and `dist_job` demonstrate.
 | `crates/core/rlx-collectives/examples/wide_ep_toy.rs` | WideEP Phase 0: 2-expert / 2-rank padded EP MoE parity |
 | `crates/core/rlx-runtime/src/dist/` | ship-graph `{inference, training, diagnostics}` submodules + shared weight resolvers (`mod.rs`) |
 | `crates/core/rlx-collectives/DISTRIBUTED_ROADMAP.md` | the deeper tiers (NCCL/RCCL, UCX/RDMA, NVSHMEM) |
+## License
+
+MIT OR Apache-2.0.

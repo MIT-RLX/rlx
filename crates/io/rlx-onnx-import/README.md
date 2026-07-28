@@ -28,4 +28,4 @@ Optional raw ONNX tests: set `RLX_ONNX_TEST_MODEL` to a `.onnx` path.
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

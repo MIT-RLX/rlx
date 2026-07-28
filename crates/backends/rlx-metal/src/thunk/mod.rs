@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Pre-compiled command list — analog of rlx-cpu's Thunk.
 
@@ -839,6 +828,8 @@ pub enum Thunk {
         num_experts: u32,
         slab_bytes: u32,
         scheme: rlx_ir::quant::QuantScheme,
+        /// Scales/biases stored BF16 (2B) — decode per-expert (matches CPU).
+        scale_bf16: bool,
     },
     /// Scatter-add. See CPU's Thunk::ScatterAdd.
     ScatterAdd {
@@ -1246,6 +1237,18 @@ pub enum Thunk {
         m: u32,
         k: u32,
         n: u32,
+    },
+    /// MxFp4x2 two-level residual E2M1 fused decode-matmul. `w_q`=[plane0|plane1]
+    /// nibbles, `scale`=[s0|s1] f32 per (k/`group`, n).
+    DequantMatMulMxFp4x2 {
+        x: usize,
+        w_q: usize,
+        scale: usize,
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        group: u32,
     },
     /// MLX affine / mxfp — host dequant on unified memory (via `rlx-mlx-io`).
     DequantMatMulMlx {
@@ -1998,6 +2001,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::DequantMatMulInt4 { .. } => "dequant_matmul_int4",
         Thunk::DequantMatMulFp8 { .. } => "dequant_matmul_fp8",
         Thunk::DequantMatMulNvfp4 { .. } => "dequant_matmul_nvfp4",
+        Thunk::DequantMatMulMxFp4x2 { .. } => "dequant_matmul_mxfp4x2",
         Thunk::DequantMatMulMlx { .. } => "dequant_matmul_mlx",
         Thunk::FusedMlpGateUpSwiGLU { .. } => "fused_mlp_gate_up_swiglu",
         Thunk::FusedMlpGateUpGelu { .. } => "fused_mlp_gate_up_gelu",
@@ -2112,6 +2116,7 @@ impl Thunk {
             | Thunk::DequantMatMulInt4 { .. }
             | Thunk::DequantMatMulFp8 { .. }
             | Thunk::DequantMatMulNvfp4 { .. }
+            | Thunk::DequantMatMulMxFp4x2 { .. }
             | Thunk::DequantMatMulMlx { .. }
             | Thunk::FusedMlpGateUpSwiGLU { .. }
             | Thunk::FusedMlpGateUpGelu { .. }

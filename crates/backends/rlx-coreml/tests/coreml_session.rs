@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Drives the CoreML backend through the public runtime Session/registry
 // API — i.e. exactly how an application selects `Device::Ane`.
 #![cfg(any(target_os = "macos", target_os = "ios"))]

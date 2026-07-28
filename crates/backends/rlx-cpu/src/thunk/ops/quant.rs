@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
 
@@ -174,6 +177,53 @@ pub fn dequant_matmul_nvfp4(
                 let block = p / gs;
                 let scale = fp8_e4m3_scale_to_f32(scale_bytes[block * n + j]);
                 let w = fp4_e2m1_to_f32(nibble) * scale * global_scale;
+                acc += x[i * k + p] * w;
+            }
+            out[i * n + j] = acc;
+        }
+    }
+}
+
+/// MxFp4x2 (two-level residual E2M1) DequantMatMul reference — the CPU decode
+/// path for `QuantScheme::MxFp4x2Block`. `w_bytes` = `[plane0 | plane1]` (each
+/// E2M1 nibbles packed 2/byte, `[k,n]` row-major); `scale_bytes` = `[s0 | s1]`
+/// f32 per `(block = k/group, n)`. `out = x · (s0·LUT[q0] + s1·LUT[q1])`.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_matmul_mxfp4x2(
+    x: &[f32],
+    w_bytes: &[u8],
+    scale_bytes: &[u8],
+    group: usize,
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    use rlx_ir::fp4_e2m1_to_f32;
+    let plane = (k * n).div_ceil(2); // bytes per nibble plane
+    let nblk = k.div_ceil(group.max(1));
+    let sbytes = nblk * n * 4; // bytes per f32 scale set
+    let rd_scale = |half: usize, idx: usize| -> f32 {
+        let o = half + idx * 4;
+        f32::from_le_bytes([
+            scale_bytes[o],
+            scale_bytes[o + 1],
+            scale_bytes[o + 2],
+            scale_bytes[o + 3],
+        ])
+    };
+    let nib = |plane_off: usize, elem: usize| -> u8 {
+        let b = w_bytes[plane_off + elem / 2];
+        if elem & 1 == 0 { b & 0x0F } else { b >> 4 }
+    };
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f32;
+            for p in 0..k {
+                let elem = p * n + j;
+                let block = (p / group.max(1)) * n + j;
+                let w = fp4_e2m1_to_f32(nib(0, elem)) * rd_scale(0, block)
+                    + fp4_e2m1_to_f32(nib(plane, elem)) * rd_scale(sbytes, block);
                 acc += x[i * k + p] * w;
             }
             out[i * n + j] = acc;
@@ -738,6 +788,16 @@ pub(crate) fn compile_dequant_mat_mul(
                     k: k as u32,
                     n: n as u32,
                 },
+                QuantScheme::MxFp4x2Block { group_size } => Thunk::DequantMatMulMxFp4x2 {
+                    x: node_offset(arena, node.inputs[0]),
+                    w_q: node_offset(arena, node.inputs[1]),
+                    scale: node_offset(arena, node.inputs[2]),
+                    dst: node_offset(arena, node.id),
+                    m: m as u32,
+                    k: k as u32,
+                    n: n as u32,
+                    group: *group_size,
+                },
                 QuantScheme::Int4Block { block_size } => Thunk::DequantMatMulInt4 {
                     x: node_offset(arena, node.inputs[0]),
                     w_q: node_offset(arena, node.inputs[1]),
@@ -1016,6 +1076,7 @@ pub(crate) fn compile_dequant_grouped_mat_mul_mlx(
     let num_experts = scales_shape.dim(0).unwrap_static();
     let w_bytes = graph.node(node.inputs[1]).shape.num_elements().unwrap();
     let slab_bytes = w_bytes / num_experts.max(1);
+    let scale_bf16 = graph.node(node.inputs[2]).shape.dtype() == rlx_ir::DType::BF16;
     Thunk::DequantGroupedMatMulMlx {
         input: node_offset(arena, node.inputs[0]),
         w_q: node_offset(arena, node.inputs[1]),
@@ -1029,6 +1090,7 @@ pub(crate) fn compile_dequant_grouped_mat_mul_mlx(
         num_experts: num_experts as u32,
         slab_bytes: slab_bytes as u32,
         scheme: *scheme,
+        scale_bf16,
     }
 }
 
@@ -1047,6 +1109,7 @@ pub(crate) fn exec_dequant_grouped_mat_mul_mlx(t: &Thunk, base: *mut u8) {
         num_experts,
         slab_bytes,
         scheme,
+        scale_bf16,
     } = t
     else {
         unreachable!()
@@ -1066,6 +1129,7 @@ pub(crate) fn exec_dequant_grouped_mat_mul_mlx(t: &Thunk, base: *mut u8) {
             *num_experts as usize,
             *slab_bytes as usize,
             *scheme,
+            *scale_bf16,
         );
     }
 }
@@ -1087,12 +1151,16 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
     ne: usize,
     slab: usize,
     scheme: rlx_ir::quant::QuantScheme,
+    scale_bf16: bool,
 ) {
-    let (bits, gs) = match scheme {
-        rlx_ir::quant::QuantScheme::MlxAffine { bits, group_size } => {
-            (bits as u32, group_size as usize)
-        }
-        other => panic!("DequantGroupedMatMulMlx: expected MlxAffine, got {other:?}"),
+    // Group size is scheme-carried; MXFP4 experts share the same 5-input op as
+    // affine — the loader pre-decodes MXFP4 E8M0 scales to f32 and zeroes the
+    // bias slab, so the arena layout (f32 scales/biases per group) is uniform;
+    // only the per-row code decode differs (FP4 LUT vs `code·scale+bias`).
+    let gs = match scheme {
+        rlx_ir::quant::QuantScheme::MlxAffine { group_size, .. }
+        | rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size } => group_size as usize,
+        other => panic!("DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4, got {other:?}"),
     };
     let n_groups = k / gs;
     let sb_per_expert = n * n_groups; // scales/biases f32 per expert
@@ -1101,17 +1169,52 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
         let ids = sl(expert_idx, base, m);
         let out = sl_mut(dst, base, m * n);
         let wt = std::slice::from_raw_parts(base.add(w_q) as *const u8, ne * slab);
-        let scl = sl(scale, base, ne * sb_per_expert);
-        let zpb = sl(zp, base, ne * sb_per_expert);
+        // BF16 scales/biases (half the arena of f32): decode expert `e`'s slab on
+        // the fly. Byte length is 2× the f32 element count. Otherwise read as f32.
+        let (scl, zpb, scl_b16, zpb_b16) = if scale_bf16 {
+            let sb = std::slice::from_raw_parts(base.add(scale) as *const u8, ne * sb_per_expert * 2);
+            let zb = std::slice::from_raw_parts(base.add(zp) as *const u8, ne * sb_per_expert * 2);
+            (&[][..], &[][..], Some(sb), Some(zb))
+        } else {
+            (sl(scale, base, ne * sb_per_expert), sl(zp, base, ne * sb_per_expert), None, None)
+        };
+        let bf16_slab = |bytes: &[u8], e: usize| -> Vec<f32> {
+            bytes[e * sb_per_expert * 2..(e + 1) * sb_per_expert * 2]
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
         for r in 0..m {
             let e = (ids[r] as usize).min(ne.saturating_sub(1));
             let w_slab = &wt[e * slab..(e + 1) * slab];
-            let s_slab = &scl[e * sb_per_expert..(e + 1) * sb_per_expert];
-            let b_slab = &zpb[e * sb_per_expert..(e + 1) * sb_per_expert];
+            let (s_owned, b_owned);
+            let (s_slab, b_slab): (&[f32], &[f32]) = if let (Some(sb), Some(zb)) = (scl_b16, zpb_b16) {
+                s_owned = bf16_slab(sb, e);
+                b_owned = bf16_slab(zb, e);
+                (&s_owned, &b_owned)
+            } else {
+                (&scl[e * sb_per_expert..(e + 1) * sb_per_expert], &zpb[e * sb_per_expert..(e + 1) * sb_per_expert])
+            };
             let row = &inp[r * k..(r + 1) * k];
-            match rlx_mlx_io::dequant_matmul_affine(
-                row, w_slab, s_slab, b_slab, bits, gs as u32, 1, k, n,
-            ) {
+            let res = match scheme {
+                rlx_ir::quant::QuantScheme::MlxAffine { bits, group_size } => {
+                    // Fused matvec: reads the packed 2-bit codes ONCE and
+                    // accumulates in k-order (bit-exact with the materialize
+                    // path) — parallel over the n outputs. The old
+                    // `dequant_matmul_affine` materialized a whole f32 expert
+                    // weight per token (16× the traffic, single-threaded); with
+                    // one expert dequantized per token across a 256-expert MoE,
+                    // that was the prefill bottleneck.
+                    rlx_mlx_io::dequant_matvec_affine(
+                        row, w_slab, s_slab, b_slab, bits as u32, group_size, k, n,
+                    )
+                }
+                rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size } => {
+                    rlx_mlx_io::dequant_matmul_mxfp4(row, w_slab, s_slab, group_size, 1, k, n)
+                }
+                _ => unreachable!(),
+            };
+            match res {
                 Ok(o) => out[r * n..(r + 1) * n].copy_from_slice(&o),
                 Err(_) => out[r * n..(r + 1) * n].fill(0.0),
             }
@@ -1139,30 +1242,30 @@ pub fn dequant_grouped_matmul_affine_bt(
     bits: u32,
     group_size: usize,
 ) {
+    use rayon::prelude::*;
+    debug_assert_eq!(out.len(), m * n, "output buffer must be m×n");
     let slab = w_bytes.len() / num_experts.max(1);
     let n_groups = k / group_size.max(1);
     let sb = n * n_groups; // scales/biases f32 per expert
-    for r in 0..m {
+    // Parallelize over routed rows. This is the GPU host-delegate MoE path (amd
+    // Vulkan / cuda / wgpu copy the routed inputs back and run the packed grouped
+    // matmul on the CPU) — it was a SERIAL loop, so a Vulkan stage's MoE ran ~16×
+    // slower than the same matmul on a native CPU stage (which is rayon-parallel).
+    // Each row dequant-matmuls its expert's slab independently → embarrassingly
+    // parallel; write to disjoint `out` chunks.
+    out.par_chunks_mut(n).enumerate().for_each(|(r, out_row)| {
         let e = (idx[r] as usize).min(num_experts.saturating_sub(1));
         let w_slab = &w_bytes[e * slab..(e + 1) * slab];
         let s_slab = &scales[e * sb..(e + 1) * sb];
         let b_slab = &biases[e * sb..(e + 1) * sb];
         let row = &x[r * k..(r + 1) * k];
-        match rlx_mlx_io::dequant_matmul_affine(
-            row,
-            w_slab,
-            s_slab,
-            b_slab,
-            bits,
-            group_size as u32,
-            1,
-            k,
-            n,
-        ) {
-            Ok(o) => out[r * n..(r + 1) * n].copy_from_slice(&o),
-            Err(_) => out[r * n..(r + 1) * n].fill(0.0),
+        // FUSED matvec: accumulate straight from the packed codes, no n×k f32
+        // materialization (that memory traffic dominated the old path). Bit-exact.
+        match rlx_mlx_io::dequant_matvec_affine(row, w_slab, s_slab, b_slab, bits, group_size as u32, k, n) {
+            Ok(o) => out_row.copy_from_slice(&o),
+            Err(_) => out_row.fill(0.0),
         }
-    }
+    });
 }
 
 /// Host-delegate entry for GPU backends (Metal/wgpu/…) that copy the routed
@@ -1182,6 +1285,7 @@ pub unsafe fn execute_dequant_grouped_matmul_mlx_f32(
     num_experts: usize,
     slab_bytes: usize,
     scheme: rlx_ir::quant::QuantScheme,
+    scale_bf16: bool,
     base: *mut u8,
 ) {
     unsafe {
@@ -1199,6 +1303,7 @@ pub unsafe fn execute_dequant_grouped_matmul_mlx_f32(
             num_experts,
             slab_bytes,
             scheme,
+            scale_bf16,
         );
     }
 }
@@ -1407,6 +1512,33 @@ pub(crate) fn exec_dequant_mat_mul_nvfp4(t: &Thunk, base: *mut u8) {
             let out = sl_mut(*dst, base, m * n);
             dequant_matmul_nvfp4(xs, w_bytes, scale_bytes, gs, out, m, k, n);
         }
+    }
+}
+
+pub(crate) fn exec_dequant_mat_mul_mxfp4x2(t: &Thunk, base: *mut u8) {
+    let Thunk::DequantMatMulMxFp4x2 {
+        x,
+        w_q,
+        scale,
+        dst,
+        m,
+        k,
+        n,
+        group,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (m, k, n, group) = (*m as usize, *k as usize, *n as usize, *group as usize);
+    let plane = (k * n).div_ceil(2);
+    let nblk = k.div_ceil(group.max(1));
+    unsafe {
+        let xs = sl(*x, base, m * k);
+        let w_bytes = std::slice::from_raw_parts(base.add(*w_q) as *const u8, 2 * plane);
+        let scale_bytes =
+            std::slice::from_raw_parts(base.add(*scale) as *const u8, 2 * nblk * n * 4);
+        let out = sl_mut(*dst, base, m * n);
+        dequant_matmul_mxfp4x2(xs, w_bytes, scale_bytes, group, out, m, k, n);
     }
 }
 
@@ -2388,6 +2520,32 @@ pub unsafe fn execute_dequant_matmul_fp8_f32(
     }
 }
 
+/// Host-fallback entry for MxFp4x2 `Op::DequantMatMul` (Metal unified memory).
+/// `w_q`=[plane0|plane1] nibbles, `scale`=[s0|s1] f32; byte offsets into `base`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_dequant_matmul_mxfp4x2_f32(
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    group: usize,
+    base: *mut u8,
+) {
+    let plane = (k * n).div_ceil(2);
+    let nblk = k.div_ceil(group.max(1));
+    unsafe {
+        let xs = sl(x, base, m * k);
+        let w_bytes = std::slice::from_raw_parts(base.add(w_q) as *const u8, 2 * plane);
+        let scale_bytes =
+            std::slice::from_raw_parts(base.add(scale) as *const u8, 2 * nblk * n * 4);
+        let out = sl_mut(dst, base, m * n);
+        dequant_matmul_mxfp4x2(xs, w_bytes, scale_bytes, group, out, m, k, n);
+    }
+}
+
 /// Host-fallback entry for NVFP4 `Op::DequantMatMul` (Metal unified memory).
 pub unsafe fn execute_dequant_matmul_nvfp4_f32(
     x: usize,
@@ -2560,6 +2718,73 @@ pub(crate) fn quant_layout(shape: &rlx_ir::Shape, axis: Option<usize>) -> (usize
                 .product::<usize>()
                 .max(1);
             (d, chan_dim, inner)
+        }
+    }
+}
+
+#[cfg(test)]
+mod mxfp4x2_matmul_tests {
+    use super::dequant_matmul_mxfp4x2;
+    use rlx_ir::residual::{residual_dequantize, residual_quantize};
+    use rlx_ir::ScaledFormat;
+
+    // The op decodes a two-level residual E2M1 weight (s0·LUT[q0] + s1·LUT[q1])
+    // and matmuls with x. Verify the packed-nibble kernel reproduces a plain f32
+    // matmul against the same residual-decoded weight. group = k → one MX block
+    // per column (nblk = 1).
+    #[test]
+    fn dequant_matmul_mxfp4x2_matches_residual_decode() {
+        let (m, k, n) = (3usize, 32usize, 4usize);
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+        let w: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32 - 5.0) * 0.3).collect(); // [k,n]
+
+        let plane = (k * n).div_ceil(2);
+        let mut w_bytes = vec![0u8; 2 * plane];
+        let (mut s0, mut s1) = (vec![0f32; n], vec![0f32; n]);
+        let mut w_dq = vec![0f32; k * n]; // reference decoded weight
+
+        for j in 0..n {
+            let col: Vec<f32> = (0..k).map(|p| w[p * n + j]).collect();
+            let rb = residual_quantize(&col, ScaledFormat::F4E2M1, 2);
+            s0[j] = rb.scales[0];
+            s1[j] = rb.scales[1];
+            let dq = residual_dequantize(&rb);
+            for p in 0..k {
+                let elem = p * n + j;
+                let byte = elem / 2;
+                let shift: u32 = if elem & 1 == 0 { 0 } else { 4 };
+                let mask: u8 = 0x0Fu8 << shift;
+                w_bytes[byte] = (w_bytes[byte] & !mask) | ((rb.codes[0][p] & 0x0F) << shift);
+                w_bytes[plane + byte] =
+                    (w_bytes[plane + byte] & !mask) | ((rb.codes[1][p] & 0x0F) << shift);
+                w_dq[elem] = dq[p];
+            }
+        }
+
+        let mut scale_bytes = Vec::with_capacity(2 * n * 4);
+        for &s in &s0 {
+            scale_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        for &s in &s1 {
+            scale_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let mut out = vec![0f32; m * n];
+        dequant_matmul_mxfp4x2(&x, &w_bytes, &scale_bytes, k, &mut out, m, k, n);
+
+        let mut want = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += x[i * k + p] * w_dq[p * n + j];
+                }
+                want[i * n + j] = acc;
+            }
+        }
+
+        for (a, b) in out.iter().zip(&want) {
+            assert!((a - b).abs() < 1e-4, "kernel {a} vs reference {b}");
         }
     }
 }

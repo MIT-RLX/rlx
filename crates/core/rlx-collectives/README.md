@@ -90,4 +90,4 @@ heterogeneous fleet just works. Node bring-up is one call — `rlx_driver::Node`
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

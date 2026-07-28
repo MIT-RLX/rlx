@@ -1,7 +1,8 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// GPL-3.0-only. MLX affine / mxfp4 / mxfp8 fused dequant-matmul.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// MLX affine / mxfp4 / mxfp8 fused dequant-matmul.
 // Weight layout [n, k] packed along K (row j → output column j).
 // kind: 0=affine, 1=mxfp4, 2=mxfp8.
 

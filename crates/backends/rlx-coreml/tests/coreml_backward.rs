@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Backward / training on the CoreML (ANE) backend.
 //
 // Phase 1 validates the *decompose route*: a graph that carries `*Backward` ops

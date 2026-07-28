@@ -44,3 +44,6 @@ on no RLX backend or planner crate.
   devices already found by a more specific probe are skipped.
 - On Apple Silicon, unified memory means the Metal device's usable "VRAM" equals
   total system RAM.
+## License
+
+MIT OR Apache-2.0.

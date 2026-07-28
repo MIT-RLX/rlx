@@ -1,7 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// Licensed under the GNU General Public License, version 3.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! STFT: batched (one rfft over [n_frames, frame_len], the new `Graph::stft`)
 //! vs the old per-frame pattern (one rfft per frame). Same result; the batched

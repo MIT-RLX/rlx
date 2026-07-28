@@ -441,4 +441,4 @@ matmul/scatter_add contributing extras). Each one has:
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

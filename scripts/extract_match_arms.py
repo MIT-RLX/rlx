@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Extract each named arm of the giant `match &node.op` in
 `unfuse_fused_for_autodiff` into a free fn `unfuse_<op>(node, new_inputs, out)`,
 replacing the arm with a call. Behavior-preserving: arm bodies moved verbatim;

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """One-shot module split for crates/io/rlx-onnx-import/src/lower/ops.rs.
 
 Behavior-preserving: moves each `lower_<op>` handler fn into an op-family

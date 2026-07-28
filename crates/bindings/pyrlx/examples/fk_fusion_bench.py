@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # RLX - versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-#
-# Licensed under the GNU General Public License, version 3.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Minimal FKL fusion timing demo (pyrlx)."""
 
 from __future__ import annotations

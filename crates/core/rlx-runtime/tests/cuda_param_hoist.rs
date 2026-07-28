@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Param-invariant hoisting on CUDA. CUDA has no persistent `bind_handle`, so
 //! the staging uses the feed-each-forward fallback (prepared boundary fed as an
 //! ordinary input). Validates it matches plain CUDA + CPU and is stable.

@@ -128,4 +128,4 @@ helpers (`GraphDevices`, `DeviceRouter`).
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

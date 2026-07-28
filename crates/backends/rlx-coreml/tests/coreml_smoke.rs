@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // End-to-end smoke tests: build a tiny IR graph, lower it to a CoreML ML
 // Program, run it through CoreML.framework, and check the numbers. These
 // exercise the full proto → .mlpackage → MLModel pipeline on-device.

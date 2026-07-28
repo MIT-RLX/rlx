@@ -123,3 +123,6 @@ outs = rlx.run(compiled, x=x_f64)
 - [`quickstart.md`](quickstart.md) — install + first graph
 - [`backends.md`](backends.md) — maturin feature matrix
 - [`../../docs/backend-selection.md`](../../docs/backend-selection.md) — multi-device runtime
+## License
+
+MIT OR Apache-2.0.

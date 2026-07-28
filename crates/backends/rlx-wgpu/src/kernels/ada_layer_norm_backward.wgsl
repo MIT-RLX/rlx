@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Packed AdaLayerNorm backward: out = [dx ∥ dscale ∥ dshift] (1-D floats).
 // Launch: grid=(mod_rows,1,1), block=(256,1,1).
 

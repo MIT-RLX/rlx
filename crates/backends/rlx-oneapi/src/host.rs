@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Single-op CPU reference evaluation via `rlx-cpu`'s thunk executor (the same
 //! kernels the CPU backend uses, so results are bit-for-bit the reference).

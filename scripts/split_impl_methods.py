@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Behavior-preserving splitter for a single giant inherent `impl` block.
 
 Carves the methods of one big `impl<..> TYPE<..>` into per-topic sibling modules

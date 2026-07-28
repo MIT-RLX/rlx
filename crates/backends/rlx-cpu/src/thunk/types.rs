@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
 
@@ -1279,6 +1282,19 @@ pub enum Thunk {
         n: u32,
     },
 
+    /// MxFp4x2 two-level residual E2M1 DequantMatMul. `w_q` = `[plane0|plane1]`
+    /// nibbles, `scale` = `[s0|s1]` f32 per (k/`group`, n) block.
+    DequantMatMulMxFp4x2 {
+        x: usize,
+        w_q: usize,
+        scale: usize,
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        group: u32,
+    },
+
     /// MLX affine / mxfp DequantMatMul — host dequant via `rlx-mlx-io`.
     DequantMatMulMlx {
         x: usize,
@@ -1688,6 +1704,10 @@ pub enum Thunk {
         /// Packed-code bytes per expert (`total_w_q_bytes / num_experts`).
         slab_bytes: u32,
         scheme: rlx_ir::quant::QuantScheme,
+        /// Scales/biases stored as BF16 (2 bytes) instead of F32 — halves the
+        /// resident scale memory (the MoE scale slabs rival the packed codes at
+        /// 2-bit). Decoded to f32 per-expert on the fly.
+        scale_bf16: bool,
     },
     /// Materialize packed MoE weights to F32 `[E, K, N]` (autodiff helper).
     DequantMoEWeightsGguf {
@@ -2759,6 +2779,9 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             global_scale,
             ..
         } => vec![*x, *w_q, *scale, *global_scale],
+        Thunk::DequantMatMulMxFp4x2 {
+            x, w_q, scale, ..
+        } => vec![*x, *w_q, *scale],
         Thunk::DequantMatMulMlx {
             x, w_q, scale, zp, ..
         } => vec![*x, *w_q, *scale, *zp],

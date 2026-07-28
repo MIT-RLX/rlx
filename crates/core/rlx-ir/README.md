@@ -133,4 +133,4 @@ exposes fused decode GEMV for Q4_K / Q4_0 / Q8_0 when `m == 1`.
 
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

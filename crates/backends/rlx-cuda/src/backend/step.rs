@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -533,6 +522,18 @@ pub(crate) enum Step {
         zp_byte_off: u64,
         out_byte_off: u64,
     },
+    /// MxFp4x2 two-level residual E2M1: decode `w_q`=[plane0|plane1] +
+    /// `scale`=[s0|s1] into f32 [n,k] scratch, then `matmul_bt` x·Wᵀ.
+    DequantMatmulMxFp4x2 {
+        m: u32,
+        k: u32,
+        n: u32,
+        group: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        out_byte_off: u64,
+    },
     DequantGroupedMatmulGguf {
         m: u32,
         k: u32,
@@ -557,6 +558,7 @@ pub(crate) enum Step {
         zp_byte_off: u64,
         idx_byte_off: u64,
         out_byte_off: u64,
+        scale_bf16: bool,
     },
     Sample {
         outer: u32,
@@ -1896,6 +1898,7 @@ impl Step {
                 | Step::SelectiveScan { .. }
                 | Step::DequantMatmulGguf { .. }
                 | Step::DequantMatmulMlx { .. }
+                | Step::DequantMatmulMxFp4x2 { .. }
                 | Step::DequantGroupedMatmulGguf { .. }
                 | Step::DequantGroupedMatmulMlxHost { .. }
                 | Step::Narrow { .. }
@@ -2115,6 +2118,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmul { .. } => "rlx::DequantMatmul",
         Step::DequantMatmulGguf { .. } => "rlx::DequantMatmulGguf",
         Step::DequantMatmulMlx { .. } => "rlx::DequantMatmulMlx",
+        Step::DequantMatmulMxFp4x2 { .. } => "rlx::DequantMatmulMxFp4x2",
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
         Step::DequantGroupedMatmulMlxHost { .. } => "rlx::DequantGroupedMatmulMlxHost",
         Step::Sample { .. } => "rlx::Sample",
@@ -2727,6 +2731,20 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
                 (*w_byte_off / 4) as u32,
                 (*scale_byte_off / 4) as u32,
                 (*zp_byte_off / 4) as u32,
+            ],
+            vec![(*out_byte_off / 4) as u32],
+        ),
+        Step::DequantMatmulMxFp4x2 {
+            x_byte_off,
+            w_byte_off,
+            scale_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![
+                (*x_byte_off / 4) as u32,
+                (*w_byte_off / 4) as u32,
+                (*scale_byte_off / 4) as u32,
             ],
             vec![(*out_byte_off / 4) as u32],
         ),

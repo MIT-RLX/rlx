@@ -1,6 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-// GPL-3.0-only.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Compiles the QNN FFI shim (`runtime/rlx_qnn_shim.c`) against the SDK headers
 // when the `runtime` feature is on. Without that feature this is a no-op, so

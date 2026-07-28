@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `Op::Lstm` on MLX vs CPU. For `carry = false` (incl. bidirectional /
 //! multi-layer) MLX runs the *native* on-device unroll (`native_lstm`), so
 //! this is a numerical-parity check against the CPU `execute_lstm_f32`

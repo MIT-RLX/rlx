@@ -261,3 +261,6 @@ NVRTC bugs — the scaled kernels had never actually NVRTC-compiled before:
 Also fixed: `encode(±inf)` now saturates to `±max_finite` (was code `0`) on CPU
 and GPU in lockstep; the Vulkan generic host path now writes U8 outputs as raw
 bytes instead of reinterpreting them as f32.
+## License
+
+MIT OR Apache-2.0.

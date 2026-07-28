@@ -52,4 +52,4 @@ See also `rlx-autodiff/README.md` (API), `PLAN.md` (landed higher-order
 section), and `rlx-bench/examples/bench_nth_order.rs`.
 ## License
 
-GPL-3.0-only.
+MIT OR Apache-2.0.

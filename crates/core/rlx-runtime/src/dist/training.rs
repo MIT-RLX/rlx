@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! Ship-graph **training**: ship a `TrainSpec` (backward graph + data plan +
 //! optimizer) to a generic worker that trains any model on its local hardware,
 //! with a sample-weighted, optionally-deterministic gradient reduce.

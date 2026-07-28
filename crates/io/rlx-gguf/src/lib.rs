@@ -1,17 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 3.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! GGUF (GGML Universal Format) parser, dequantizer, **quantization
 //! encoder**, and **file writer**.
@@ -85,6 +74,8 @@ pub mod iq_grids;
 pub mod iq_quantize;
 pub mod mx_dequant;
 pub mod mx_quantize;
+pub mod i2s_dequant;
+pub mod i8s_dequant;
 pub mod q1_dequant;
 pub mod q2_dequant;
 pub mod quantize;
@@ -140,6 +131,9 @@ pub enum GgmlType {
     // Ternary / MX
     TQ1_0 = 34,
     TQ2_0 = 35,
+    // Microsoft BitNet (bitnet.cpp / VibeASR.cpp)
+    I2_S = 36,
+    I8_S = 37,
     MXFP4 = 39,
     NVFP4 = 40,
     Q1_0 = 41,
@@ -180,6 +174,8 @@ impl GgmlType {
             30 => Self::BF16,
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
+            36 => Self::I2_S,
+            37 => Self::I8_S,
             39 => Self::MXFP4,
             40 => Self::NVFP4,
             41 => Self::Q1_0,
@@ -310,6 +306,20 @@ impl GgufFile {
         let path = path.as_ref();
         let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         Self::from_reader(&mut f)
+    }
+
+    /// An empty GGUF file (no metadata, no tensors). Used as a placeholder loader
+    /// for runtimes that carry their weights out-of-band (e.g. mlx-affine host
+    /// paths that hold packed bytes inline and never touch the GGUF mmap).
+    pub fn empty() -> Self {
+        Self {
+            version: 3,
+            alignment: 32,
+            metadata: HashMap::new(),
+            tensors: HashMap::new(),
+            data: GgufData::Owned(Vec::new()),
+            data_offset: 0,
+        }
     }
 
     /// Merge a multi-part GGUF split (`split.count` > 1) into one in-memory file.
@@ -534,6 +544,8 @@ impl GgufFile {
             GgmlType::Q3K => dequant_q3_k(bytes, n)?,
             GgmlType::TQ1_0 => tq_dequant::dequant_tq1_0(bytes, n)?,
             GgmlType::TQ2_0 => tq_dequant::dequant_tq2_0(bytes, n)?,
+            GgmlType::I2_S => i2s_dequant::dequant_i2_s(bytes, n)?,
+            GgmlType::I8_S => i8s_dequant::dequant_i8_s(bytes, n)?,
             GgmlType::MXFP4 => mx_dequant::dequant_mxfp4(bytes, n)?,
             GgmlType::NVFP4 => mx_dequant::dequant_nvfp4(bytes, n)?,
             GgmlType::IQ4NL => iq_dequant::dequant_iq4_nl(bytes, n)?,
@@ -648,6 +660,8 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         // Ternary and microscaling FP4
         GgmlType::TQ1_0 => tq_dequant::tq1_0_bytes(n),
         GgmlType::TQ2_0 => tq_dequant::tq2_0_bytes(n),
+        GgmlType::I2_S => i2s_dequant::i2_s_bytes(n),
+        GgmlType::I8_S => i8s_dequant::i8_s_bytes(n),
         GgmlType::MXFP4 => mx_dequant::mxfp4_bytes(n),
         GgmlType::NVFP4 => mx_dequant::nvfp4_bytes(n),
         // I-quants

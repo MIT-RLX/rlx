@@ -1,6 +1,6 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
-// GPL-3.0-only.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Session-level int4 static-weight MatMul on `Device::Hexagon`.
 //! IR packs signed nibbles; QNN CPU stages them as BW_SCALE_OFFSET bitwidth=4.

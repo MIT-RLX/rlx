@@ -138,4 +138,4 @@ for ONNX sources). See `crates/pyrlx/tests/test_gguf_convert.py`.
 
 ## License
 
-GPL-3.0-only — same as the rest of RLX.
+MIT OR Apache-2.0 — same as the rest of RLX.

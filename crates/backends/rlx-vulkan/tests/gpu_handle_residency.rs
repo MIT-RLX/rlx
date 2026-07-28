@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 //
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! GPU-resident input handle (`bind_gpu_handle` + `set_gpu_handle_feed`) tests
 //! for the native Vulkan backend. This is the KV-cache residency primitive: an
