@@ -442,7 +442,13 @@ mod imp {
                 buffer_size: std::mem::size_of::<QueryAieVersion>() as u32,
                 buffer: &mut v as *mut _ as u64,
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + GET_INFO, std::mem::size_of::<GetInfo>()), &mut gi)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(DRM_COMMAND_BASE + GET_INFO, std::mem::size_of::<GetInfo>()),
+                    &mut gi,
+                )?
+            };
             Ok((v.major, v.minor))
         }
 
@@ -457,7 +463,13 @@ mod imp {
                 buffer_size: buf.len() as u32,
                 buffer: buf.as_mut_ptr() as u64,
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + GET_INFO, std::mem::size_of::<GetInfo>()), &mut gi)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(DRM_COMMAND_BASE + GET_INFO, std::mem::size_of::<GetInfo>()),
+                    &mut gi,
+                )?
+            };
             // SAFETY: the driver populated at least the head fields.
             let head = unsafe { &*(buf.as_ptr() as *const AieMetadataHead) };
             Ok((head.cols, head.rows, head.col_size))
@@ -476,7 +488,13 @@ mod imp {
                 buffer_size: buf.len() as u32,
                 buffer: buf.as_mut_ptr() as u64,
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + GET_INFO, std::mem::size_of::<GetInfo>()), &mut gi)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(DRM_COMMAND_BASE + GET_INFO, std::mem::size_of::<GetInfo>()),
+                    &mut gi,
+                )?
+            };
             let n = (gi.buffer_size as usize) / sz;
             let mut r = String::new();
             for i in 0..n {
@@ -506,7 +524,16 @@ mod imp {
                 ty: BO_SHMEM,
                 ..Default::default()
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + CREATE_BO, std::mem::size_of::<CreateBo>()), &mut cb)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + CREATE_BO,
+                        std::mem::size_of::<CreateBo>(),
+                    ),
+                    &mut cb,
+                )?
+            };
             let handle = cb.handle;
 
             let mut info = GetBoInfo {
@@ -514,8 +541,15 @@ mod imp {
                 ..Default::default()
             };
             unsafe {
-                ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + GET_BO_INFO, std::mem::size_of::<GetBoInfo>()), &mut info)
-                    .inspect_err(|_| self.gem_close(handle))?
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + GET_BO_INFO,
+                        std::mem::size_of::<GetBoInfo>(),
+                    ),
+                    &mut info,
+                )
+                .inspect_err(|_| self.gem_close(handle))?
             };
 
             // mmap the BO into our address space via the returned offset.
@@ -545,7 +579,13 @@ mod imp {
 
         fn gem_close(&self, handle: u32) {
             let mut gc = GemClose { handle, pad: 0 };
-            let _ = unsafe { ioctl(self.fd(), drm_iowr(DRM_GEM_CLOSE_NR, std::mem::size_of::<GemClose>()), &mut gc) };
+            let _ = unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(DRM_GEM_CLOSE_NR, std::mem::size_of::<GemClose>()),
+                    &mut gc,
+                )
+            };
         }
 
         /// Create a DRM syncobj, returning its handle. `signaled` starts it with
@@ -557,13 +597,28 @@ mod imp {
                 flags: if signaled { 1 } else { 0 }, // DRM_SYNCOBJ_CREATE_SIGNALED
                 ..Default::default()
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_SYNCOBJ_CREATE_NR, std::mem::size_of::<SyncobjCreate>()), &mut sc)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(DRM_SYNCOBJ_CREATE_NR, std::mem::size_of::<SyncobjCreate>()),
+                    &mut sc,
+                )?
+            };
             Ok(sc.handle)
         }
 
         pub fn syncobj_destroy(&self, handle: u32) {
             let mut sd = SyncobjDestroy { handle, pad: 0 };
-            let _ = unsafe { ioctl(self.fd(), drm_iowr(DRM_SYNCOBJ_DESTROY_NR, std::mem::size_of::<SyncobjDestroy>()), &mut sd) };
+            let _ = unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_SYNCOBJ_DESTROY_NR,
+                        std::mem::size_of::<SyncobjDestroy>(),
+                    ),
+                    &mut sd,
+                )
+            };
         }
 
         /// Wait for timeline `point` on `syncobj` up to `timeout_ns`. Returns
@@ -586,7 +641,14 @@ mod imp {
                 ..Default::default()
             };
             match unsafe {
-                ioctl(self.fd(), drm_iowr(DRM_SYNCOBJ_TIMELINE_WAIT_NR, std::mem::size_of::<SyncobjTimelineWait>()), &mut w)
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_SYNCOBJ_TIMELINE_WAIT_NR,
+                        std::mem::size_of::<SyncobjTimelineWait>(),
+                    ),
+                    &mut w,
+                )
             } {
                 Ok(()) => Ok(true),
                 Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(false),
@@ -610,7 +672,16 @@ mod imp {
                 mem_size: 0,
                 ..Default::default()
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + CREATE_HWCTX, std::mem::size_of::<CreateHwctx>()), &mut c)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + CREATE_HWCTX,
+                        std::mem::size_of::<CreateHwctx>(),
+                    ),
+                    &mut c,
+                )?
+            };
             Ok(Hwctx {
                 handle: c.handle,
                 syncobj: c.syncobj_handle,
@@ -621,7 +692,16 @@ mod imp {
 
         pub fn destroy_hwctx(&self, handle: u32) {
             let mut d = DestroyHwctx { handle, pad: 0 };
-            let _ = unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + DESTROY_HWCTX, std::mem::size_of::<DestroyHwctx>()), &mut d) };
+            let _ = unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + DESTROY_HWCTX,
+                        std::mem::size_of::<DestroyHwctx>(),
+                    ),
+                    &mut d,
+                )
+            };
         }
 
         /// Create a hardware context sized for the overlay. `num_tiles`/`max_opc`
@@ -638,13 +718,25 @@ mod imp {
         /// mode persists on the device until changed; hold the fd for the session so
         /// it isn't reset. Needs the accel device (no hwctx / heap prerequisite).
         pub fn set_power_mode(&self, mode: u8) -> io::Result<()> {
-            let pm = SetPowerMode { power_mode: mode, pad: [0; 7] };
+            let pm = SetPowerMode {
+                power_mode: mode,
+                pad: [0; 7],
+            };
             let mut st = SetState {
                 param: SET_POWER_MODE,
                 buffer_size: std::mem::size_of::<SetPowerMode>() as u32,
                 buffer: &pm as *const SetPowerMode as u64,
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + SET_STATE, std::mem::size_of::<SetState>()), &mut st) }
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + SET_STATE,
+                        std::mem::size_of::<SetState>(),
+                    ),
+                    &mut st,
+                )
+            }
         }
 
         /// Convenience: request maximum NPU clocks (`POWER_MODE_TURBO`).
@@ -658,7 +750,12 @@ mod imp {
         /// the driver to bind a UMQ and return `umq_doorbell` (the MMIO offset to ring
         /// for zero-syscall dispatch). On a KMQ-only device the driver either rejects
         /// a non-zero `umq_bo` or returns `umq_doorbell = 0`.
-        pub fn create_hwctx_umq(&self, num_tiles: u32, max_opc: u32, umq_bo: u32) -> io::Result<Hwctx> {
+        pub fn create_hwctx_umq(
+            &self,
+            num_tiles: u32,
+            max_opc: u32,
+            umq_bo: u32,
+        ) -> io::Result<Hwctx> {
             let qos = QosInfo::default();
             let mut c = CreateHwctx {
                 qos_p: &qos as *const QosInfo as u64,
@@ -667,7 +764,16 @@ mod imp {
                 num_tiles,
                 ..Default::default()
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + CREATE_HWCTX, std::mem::size_of::<CreateHwctx>()), &mut c)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + CREATE_HWCTX,
+                        std::mem::size_of::<CreateHwctx>(),
+                    ),
+                    &mut c,
+                )?
+            };
             Ok(Hwctx {
                 handle: c.handle,
                 syncobj: c.syncobj_handle,
@@ -693,7 +799,16 @@ mod imp {
                 param_val_size: cu.len() as u32,
                 pad: 0,
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + CONFIG_HWCTX, std::mem::size_of::<ConfigHwctx>()), &mut cfg) }
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + CONFIG_HWCTX,
+                        std::mem::size_of::<ConfigHwctx>(),
+                    ),
+                    &mut cfg,
+                )
+            }
         }
 
         /// Low-level `CREATE_BO` + `GET_BO_INFO`. Returns `(handle, map_offset,
@@ -705,13 +820,31 @@ mod imp {
                 ty,
                 ..Default::default()
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + CREATE_BO, std::mem::size_of::<CreateBo>()), &mut cb)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + CREATE_BO,
+                        std::mem::size_of::<CreateBo>(),
+                    ),
+                    &mut cb,
+                )?
+            };
             let handle = cb.handle;
             let mut info = GetBoInfo {
                 handle,
                 ..Default::default()
             };
-            match unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + GET_BO_INFO, std::mem::size_of::<GetBoInfo>()), &mut info) } {
+            match unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(
+                        DRM_COMMAND_BASE + GET_BO_INFO,
+                        std::mem::size_of::<GetBoInfo>(),
+                    ),
+                    &mut info,
+                )
+            } {
                 Ok(()) => Ok((handle, info.map_offset, info.xdna_addr)),
                 Err(e) => {
                     self.gem_close(handle);
@@ -745,7 +878,12 @@ mod imp {
         /// lands 64 MiB-aligned, and a plain `mmap` does not guarantee that. We
         /// reserve `size + align`, carve out an aligned sub-range, and `MAP_FIXED`
         /// the BO onto it. (Single-threaded setup, so the unmap→map gap is safe.)
-        pub fn mmap_bo_aligned(&self, map_offset: u64, size: usize, align: usize) -> io::Result<*mut u8> {
+        pub fn mmap_bo_aligned(
+            &self,
+            map_offset: u64,
+            size: usize,
+            align: usize,
+        ) -> io::Result<*mut u8> {
             let reserve = size + align;
             let base = unsafe {
                 libc::mmap(
@@ -796,7 +934,13 @@ mod imp {
                 arg_count: args.len() as u32,
                 ..Default::default()
             };
-            unsafe { ioctl(self.fd(), drm_iowr(DRM_COMMAND_BASE + EXEC_CMD, std::mem::size_of::<ExecCmd>()), &mut e)? };
+            unsafe {
+                ioctl(
+                    self.fd(),
+                    drm_iowr(DRM_COMMAND_BASE + EXEC_CMD, std::mem::size_of::<ExecCmd>()),
+                    &mut e,
+                )?
+            };
             Ok(e.seq)
         }
     }
@@ -887,7 +1031,13 @@ mod imp {
         /// bytes (we extract the PDI ourselves — no XRT), `insts` the paired
         /// instruction stream (u32 words). `m/k/n` are the overlay's compiled
         /// dims.
-        pub fn open(xclbin: &[u8], insts: &[u32], m: usize, k: usize, n: usize) -> io::Result<Self> {
+        pub fn open(
+            xclbin: &[u8],
+            insts: &[u32],
+            m: usize,
+            k: usize,
+            n: usize,
+        ) -> io::Result<Self> {
             const HEAP_SIZE: usize = 64 << 20; // 64 MiB, as XRT allocates
             let part = super::axlf::parse(xclbin)?;
 
@@ -913,12 +1063,16 @@ mod imp {
 
             // 1) Device heap — DEV BOs are carved from it; its host mapping is how
             //    we fill DEV BOs (they have no map_offset of their own).
-            let (heap_h, heap_off, heap_xdna) = step("create DEV_HEAP", npu.create_bo_raw(BO_DEV_HEAP, HEAP_SIZE))?;
+            let (heap_h, heap_off, heap_xdna) =
+                step("create DEV_HEAP", npu.create_bo_raw(BO_DEV_HEAP, HEAP_SIZE))?;
             bo_handles.push(heap_h);
             // The firmware maps the heap onto the 64 MiB device-memory window and
             // rejects a user VA not aligned to it — so align the heap mmap to its
             // own size (mirrors XRT, whose 64 MiB heap lands 64 MiB-aligned).
-            let heap_host = step("mmap heap", npu.mmap_bo_aligned(heap_off, HEAP_SIZE, HEAP_SIZE))?;
+            let heap_host = step(
+                "mmap heap",
+                npu.mmap_bo_aligned(heap_off, HEAP_SIZE, HEAP_SIZE),
+            )?;
             maps.push((heap_host, HEAP_SIZE));
             // Fault every heap page in NOW. aie2_hwctx_init pins the heap and
             // hands its userptr to the firmware (host buffer map via IOMMU SVA);
@@ -926,7 +1080,8 @@ mod imp {
             // ("Map host buffer failed"). Touching them makes them present.
             unsafe { std::ptr::write_bytes(heap_host, 0, HEAP_SIZE) };
             // Host pointer for a DEV BO at device address `xdna`.
-            let dev_host = |xdna: u64| -> *mut u8 { unsafe { heap_host.add((xdna - heap_xdna) as usize) } };
+            let dev_host =
+                |xdna: u64| -> *mut u8 { unsafe { heap_host.add((xdna - heap_xdna) as usize) } };
 
             // 2) Hardware context (XRT order: heap → GET_INFO → hwctx → CU BOs).
             // The interposer showed XRT issues a GET_INFO between the heap and
@@ -943,10 +1098,18 @@ mod imp {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0x2000usize);
-                let (ring_h, _, ring_xdna) = step("create UMQ ring BO", npu.create_bo_raw(BO_DEV, ring_bytes))?;
+                let (ring_h, _, ring_xdna) =
+                    step("create UMQ ring BO", npu.create_bo_raw(BO_DEV, ring_bytes))?;
                 bo_handles.push(ring_h);
-                let c = step("create_hwctx_umq", npu.create_hwctx_umq(num_tiles, 2048, ring_h))?;
-                let avail = if c.umq_doorbell == 0 { "KMQ-only (no doorbell)" } else { "UMQ available" };
+                let c = step(
+                    "create_hwctx_umq",
+                    npu.create_hwctx_umq(num_tiles, 2048, ring_h),
+                )?;
+                let avail = if c.umq_doorbell == 0 {
+                    "KMQ-only (no doorbell)"
+                } else {
+                    "UMQ available"
+                };
                 eprintln!(
                     "[umq] requested ring_bo={ring_h} ({ring_bytes}B @ 0x{ring_xdna:x}) → doorbell=0x{:x} [{avail}]",
                     c.umq_doorbell
@@ -957,18 +1120,28 @@ mod imp {
             };
 
             // 3) PDI into a DEV BO, then bind it as the context's compute unit.
-            let (pdi_h, _, pdi_xdna) = step("create PDI BO", npu.create_bo_raw(BO_DEV, part.pdi.len()))?;
+            let (pdi_h, _, pdi_xdna) =
+                step("create PDI BO", npu.create_bo_raw(BO_DEV, part.pdi.len()))?;
             bo_handles.push(pdi_h);
-            unsafe { std::ptr::copy_nonoverlapping(part.pdi.as_ptr(), dev_host(pdi_xdna), part.pdi.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(part.pdi.as_ptr(), dev_host(pdi_xdna), part.pdi.len())
+            };
             clflush_range(dev_host(pdi_xdna), part.pdi.len());
             step("config_cu", npu.config_cu(ctx.handle, pdi_h))?;
 
             // 4) Instruction stream into a DEV BO (device-addressable → its
             //    xdna_addr goes in the packet).
             let insts_bytes = insts.len() * 4;
-            let (instr_h, _, instr_xdna) = step("create instr BO", npu.create_bo_raw(BO_DEV, insts_bytes))?;
+            let (instr_h, _, instr_xdna) =
+                step("create instr BO", npu.create_bo_raw(BO_DEV, insts_bytes))?;
             bo_handles.push(instr_h);
-            unsafe { std::ptr::copy_nonoverlapping(insts.as_ptr() as *const u8, dev_host(instr_xdna), insts_bytes) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    insts.as_ptr() as *const u8,
+                    dev_host(instr_xdna),
+                    insts_bytes,
+                )
+            };
             clflush_range(dev_host(instr_xdna), insts_bytes);
 
             // 5) Operands as host-shared (SHMEM) BOs reached via SVA host-VAs
@@ -1080,9 +1253,16 @@ mod imp {
             self.build_packet();
             clflush_range(self.cmd_host, 13 * 4);
 
-            let args = [self.instr_handle, self.a_handle, self.b_handle, self.c_handle];
+            let args = [
+                self.instr_handle,
+                self.a_handle,
+                self.b_handle,
+                self.c_handle,
+            ];
             let seq = self.npu.exec(self.hwctx, self.cmd_handle, &args)?;
-            let signaled = self.npu.syncobj_timeline_wait(self.syncobj, seq, 10_000_000_000)?;
+            let signaled = self
+                .npu
+                .syncobj_timeline_wait(self.syncobj, seq, 10_000_000_000)?;
             // The firmware writes the ERT command state into the CMD BO header
             // (the shim's poll_command reads exactly this). Reading it tells us
             // where the firmware got to: 1=NEW(never processed) 2=QUEUED 3=RUNNING
@@ -1091,8 +1271,10 @@ mod imp {
             if !signaled {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("NPU exec fence timed out (10s); CMD BO ert state={ert_state} \
-                             (1=NEW 3=RUNNING 4=COMPLETED 5=ERROR 6=ABORT 8=TIMEOUT)"),
+                    format!(
+                        "NPU exec fence timed out (10s); CMD BO ert state={ert_state} \
+                             (1=NEW 3=RUNNING 4=COMPLETED 5=ERROR 6=ABORT 8=TIMEOUT)"
+                    ),
                 ));
             }
 
@@ -1100,7 +1282,11 @@ mod imp {
             clflush_range(self.c_host, self.m * self.n * 4);
             let mut out = vec![0i32; self.m * self.n];
             unsafe {
-                std::ptr::copy_nonoverlapping(self.c_host as *const i32, out.as_mut_ptr(), out.len());
+                std::ptr::copy_nonoverlapping(
+                    self.c_host as *const i32,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
             }
             Ok(out)
         }
@@ -1141,7 +1327,11 @@ mod imp {
         match npu.aie_metadata() {
             Ok((c, rows, col_size)) => {
                 cols = c;
-                writeln!(r, "[ok]   GET_INFO/aie_metadata: {c} cols x {rows} rows, col_size={col_size} B").ok()
+                writeln!(
+                    r,
+                    "[ok]   GET_INFO/aie_metadata: {c} cols x {rows} rows, col_size={col_size} B"
+                )
+                .ok()
             }
             Err(e) => writeln!(r, "[FAIL] GET_INFO/aie_metadata: {e}").ok(),
         };
@@ -1154,7 +1344,11 @@ mod imp {
                 for (i, b) in buf.iter_mut().enumerate() {
                     *b = (i * 7 + 1) as u8;
                 }
-                let ok = bo.as_slice().iter().enumerate().all(|(i, &b)| b == (i * 7 + 1) as u8);
+                let ok = bo
+                    .as_slice()
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == (i * 7 + 1) as u8);
                 writeln!(
                     r,
                     "[{}] CREATE_BO+mmap shmem 4096B (xdna_addr=0x{xa:x}): mmap roundtrip {}",
@@ -1205,7 +1399,11 @@ mod imp {
                 npu.destroy_hwctx(ctx.handle);
             }
             Err(e) => {
-                writeln!(r, "[info] CREATE_HWCTX(num_tiles={num_tiles}): {e} — refining params next").ok();
+                writeln!(
+                    r,
+                    "[info] CREATE_HWCTX(num_tiles={num_tiles}): {e} — refining params next"
+                )
+                .ok();
             }
         }
 

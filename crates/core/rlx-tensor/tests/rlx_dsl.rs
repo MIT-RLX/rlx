@@ -33,15 +33,9 @@ fn mlp_matmul_bias_activation() {
 
     // Two projections, two bias adds, one GELU.
     assert_eq!(count(&g, |op| matches!(op, Op::MatMul)), 2);
+    assert_eq!(count(&g, |op| matches!(op, Op::Binary(BinaryOp::Add))), 2);
     assert_eq!(
-        count(&g, |op| matches!(op, Op::Binary(BinaryOp::Add))),
-        2
-    );
-    assert_eq!(
-        count(
-            &g,
-            |op| matches!(op, Op::Activation(Activation::Gelu))
-        ),
+        count(&g, |op| matches!(op, Op::Activation(Activation::Gelu))),
         1
     );
 
@@ -79,14 +73,8 @@ fn precedence_and_scalar_promotion() {
         out z;
     };
     // 1 mul (b*c), 1 add (a+...), 1 scalar mul (y*0.5) → 2 muls total.
-    assert_eq!(
-        count(&g, |op| matches!(op, Op::Binary(BinaryOp::Mul))),
-        2
-    );
-    assert_eq!(
-        count(&g, |op| matches!(op, Op::Binary(BinaryOp::Add))),
-        1
-    );
+    assert_eq!(count(&g, |op| matches!(op, Op::Binary(BinaryOp::Mul))), 2);
+    assert_eq!(count(&g, |op| matches!(op, Op::Binary(BinaryOp::Add))), 1);
 }
 
 #[test]
@@ -157,10 +145,7 @@ fn scalar_left_promotion() {
         let z = 0.5 * x;
         out z;
     };
-    assert_eq!(
-        count(&g, |op| matches!(op, Op::Binary(BinaryOp::Mul))),
-        1
-    );
+    assert_eq!(count(&g, |op| matches!(op, Op::Binary(BinaryOp::Mul))), 1);
     assert_eq!(g.shape(g.outputs[0]).dim(0), Dim::Static(4));
 }
 

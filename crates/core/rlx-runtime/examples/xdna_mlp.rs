@@ -49,16 +49,22 @@ fn relu(v: &mut [f32]) {
 
 fn main() {
     if !is_available(Device::Xdna) {
-        eprintln!("Device::Xdna not available — set RLX_XDNA_SHIM/XCLBIN/INSTS/GEMM (+ LD_LIBRARY_PATH).");
+        eprintln!(
+            "Device::Xdna not available — set RLX_XDNA_SHIM/XCLBIN/INSTS/GEMM (+ LD_LIBRARY_PATH)."
+        );
         std::process::exit(2);
     }
 
     // Fractional weights with per-channel outliers (the realistic quant case).
     let x: Vec<f32> = (0..M * D0).map(|i| (i as f32 * 0.021).sin()).collect();
     let w1: Vec<f32> = (0..D0 * D1)
-        .map(|i| (i as f32 * 0.013).cos() * 0.4 * if (i % D1) % 8 == 0 { 6.0 } else { 1.0 })
+        .map(|i| {
+            (i as f32 * 0.013).cos() * 0.4 * if (i % D1).is_multiple_of(8) { 6.0 } else { 1.0 }
+        })
         .collect();
-    let w2: Vec<f32> = (0..D1 * D2).map(|i| (i as f32 * 0.009).sin() * 0.3).collect();
+    let w2: Vec<f32> = (0..D1 * D2)
+        .map(|i| (i as f32 * 0.009).sin() * 0.3)
+        .collect();
 
     // Run one matmul on the NPU (Device::Xdna): quantize→NPU→dequant, arbitrary shape.
     let npu_matmul = |a: &[f32], w: &[f32], m: usize, k: usize, n: usize| -> Vec<f32> {
@@ -89,7 +95,10 @@ fn main() {
             rel * 100.0
         );
     } else {
-        println!("rlx Device::Xdna MLP: FAIL ✗ — rel error {:.2}% too high", rel * 100.0);
+        println!(
+            "rlx Device::Xdna MLP: FAIL ✗ — rel error {:.2}% too high",
+            rel * 100.0
+        );
         std::process::exit(1);
     }
 }

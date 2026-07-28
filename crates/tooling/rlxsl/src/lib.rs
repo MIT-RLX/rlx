@@ -172,8 +172,8 @@ fn erf(a: Sx) -> Sx {
 /// [`Intr::Erf`] on backends without a native erf (WGSL/GLSL). Binds `arg` once
 /// (`_ea`) so a compound argument (e.g. gelu's `x·√½`) is not recomputed.
 fn erf_ansatz(arg: Sx) -> Sx {
-    // p = ((((1.061405429·t - 1.453152027)·t + 1.421413741)·t
-    //       - 0.284496736)·t + 0.254829592)·t
+    // p = ((((1.0614054·t - 1.4531521)·t + 1.4214138)·t
+    //       - 0.28449672)·t + 0.2548296)·t
     let poly = mul(
         add(
             mul(
@@ -181,18 +181,18 @@ fn erf_ansatz(arg: Sx) -> Sx {
                     mul(
                         add(
                             mul(
-                                add(mul(lit(1.061405429), var("_et")), lit(-1.453152027)),
+                                add(mul(lit(1.061_405_4), var("_et")), lit(-1.453_152_1)),
                                 var("_et"),
                             ),
-                            lit(1.421413741),
+                            lit(1.421_413_8),
                         ),
                         var("_et"),
                     ),
-                    lit(-0.284496736),
+                    lit(-0.284_496_72),
                 ),
                 var("_et"),
             ),
-            lit(0.254829592),
+            lit(0.254_829_6),
         ),
         var("_et"),
     );
@@ -269,7 +269,10 @@ pub fn activation_expr(act: Activation) -> Sx {
         // analytic `Φ(x) + x·φ(x)` instead of a differentiated polynomial.
         Activation::Gelu => mul(
             mul(lit(0.5), x()),
-            add(lit(1.0), erf(mul(x(), lit(std::f32::consts::FRAC_1_SQRT_2)))),
+            add(
+                lit(1.0),
+                erf(mul(x(), lit(std::f32::consts::FRAC_1_SQRT_2))),
+            ),
         ),
         // silu(x) = x * sigmoid(x); clamp -x to avoid exp overflow.
         Activation::Silu => let_(
@@ -285,7 +288,7 @@ pub fn activation_expr(act: Activation) -> Sx {
                 "inner",
                 clamp(
                     mul(
-                        lit(0.7978845608028654),
+                        lit(std::f32::consts::FRAC_2_SQRT_PI),
                         add(x(), mul(lit(0.044715), var("x3"))),
                     ),
                     -15.0,
@@ -318,10 +321,7 @@ pub fn activation_expr(act: Activation) -> Sx {
         // softsign: x / (1 + |x|)
         Activation::Softsign => div(x(), add(lit(1.0), absf(x()))),
         // logsigmoid: min(x,0) - log(1 + exp(-|x|))
-        Activation::LogSigmoid => sub(
-            minf(x(), lit(0.0)),
-            log(add(lit(1.0), exp(neg(absf(x()))))),
-        ),
+        Activation::LogSigmoid => sub(minf(x(), lit(0.0)), log(add(lit(1.0), exp(neg(absf(x())))))),
     }
 }
 
@@ -387,10 +387,10 @@ pub fn eval(sx: &Sx, xv: f32) -> f32 {
                         let s = if v >= 0.0 { 1.0 } else { -1.0 };
                         let ax = v.abs();
                         let t = 1.0 / (1.0 + 0.3275911 * ax);
-                        let p = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t
-                            - 0.284496736)
+                        let p = ((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t
+                            - 0.284_496_72)
                             * t
-                            + 0.254829592)
+                            + 0.254_829_6)
                             * t;
                         s * (1.0 - p * (-ax * ax).exp())
                     }
@@ -430,7 +430,7 @@ pub fn eval_activation(act: Activation, xv: f32) -> f32 {
 // ── Symbolic differentiation (backward from the forward manifest) ────────────
 
 /// `2/√π`, the constant in `d/dx erf(x) = (2/√π)·e^(-x²)`.
-const TWO_OVER_SQRT_PI: f32 = 1.128_379_2;
+const TWO_OVER_SQRT_PI: f32 = std::f32::consts::FRAC_2_SQRT_PI;
 
 /// Substitute every [`Sx::Let`] binding into its uses, returning a `let`-free
 /// tree. (Differentiation is simplest on a flat expression; the shared subterms
@@ -520,7 +520,10 @@ fn diff(sx: &Sx) -> Sx {
                 // (a^-½)' = -½·a^-3/2·a' = -½·(rsqrt(a)/a)·a'
                 Intr::Rsqrt => mul(mul(lit(-0.5), div(call(Intr::Rsqrt, aa()), aa())), da()),
                 Intr::Tanh => mul(
-                    sub(lit(1.0), mul(call(Intr::Tanh, aa()), call(Intr::Tanh, aa()))),
+                    sub(
+                        lit(1.0),
+                        mul(call(Intr::Tanh, aa()), call(Intr::Tanh, aa())),
+                    ),
                     da(),
                 ),
                 Intr::Sin => mul(call(Intr::Cos, aa()), da()),
@@ -1312,8 +1315,8 @@ mod tests {
         let s = if x >= 0.0 { 1.0 } else { -1.0 };
         let ax = x.abs();
         let t = 1.0 / (1.0 + 0.3275911 * ax);
-        let p = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
+        let p = ((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
             * t;
         s * (1.0 - p * (-ax * ax).exp())
     }
@@ -1332,7 +1335,8 @@ mod tests {
             Activation::Gelu => 0.5 * x * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2)),
             Activation::Silu => x / (1.0 + (-x).exp()),
             Activation::GeluApprox => {
-                let inner = (0.7978845608028654 * (x + 0.044715 * x * x * x)).clamp(-15.0, 15.0);
+                let inner = (std::f32::consts::FRAC_2_SQRT_PI * (x + 0.044715 * x * x * x))
+                    .clamp(-15.0, 15.0);
                 0.5 * x * (1.0 + inner.tanh())
             }
             Activation::Round => x.round_ties_even(),
@@ -1418,13 +1422,15 @@ mod tests {
             e_erf = e_erf.max((eval_activation(Activation::Erf, xf) as f64 - true_erf(x)).abs());
             e_gelu =
                 e_gelu.max((eval_activation(Activation::Gelu, xf) as f64 - true_gelu(x)).abs());
-            e_gg = e_gg.max(
-                (eval_activation_grad(Activation::Gelu, xf) as f64 - true_gelu_grad(x)).abs(),
-            );
+            e_gg = e_gg
+                .max((eval_activation_grad(Activation::Gelu, xf) as f64 - true_gelu_grad(x)).abs());
             x += 0.002;
         }
         assert!(e_erf < 2e-6, "erf abs error {e_erf:e} exceeds 2e-6");
-        assert!(e_gelu < 2e-6, "gelu forward abs error {e_gelu:e} exceeds 2e-6");
+        assert!(
+            e_gelu < 2e-6,
+            "gelu forward abs error {e_gelu:e} exceeds 2e-6"
+        );
         assert!(e_gg < 2e-6, "gelu backward abs error {e_gg:e} exceeds 2e-6");
     }
 
@@ -1452,8 +1458,7 @@ mod tests {
                     _ => base,
                 };
                 let g = eval_activation_grad(act, x);
-                let fd =
-                    (eval_activation(act, x + h) - eval_activation(act, x - h)) / (2.0 * h);
+                let fd = (eval_activation(act, x + h) - eval_activation(act, x - h)) / (2.0 * h);
                 let err = (g - fd).abs() / fd.abs().max(1.0);
                 assert!(
                     err < 5e-3,
@@ -1476,13 +1481,7 @@ mod tests {
 
     #[test]
     fn emitters_cover_all_activations_and_look_right() {
-        for lang in [
-            Lang::Wgsl,
-            Lang::Cuda,
-            Lang::Msl,
-            Lang::Glsl,
-            Lang::OpenCl,
-        ] {
+        for lang in [Lang::Wgsl, Lang::Cuda, Lang::Msl, Lang::Glsl, Lang::OpenCl] {
             for &act in &Activation::ALL {
                 let body = emit_case_body(act, lang, "float _y =");
                 assert!(!body.is_empty());
@@ -1561,7 +1560,10 @@ mod tests {
                 Lang::OpenCl => opencl_activation_backward_module(),
                 _ => unreachable!(),
             };
-            assert!(balanced(&bwd), "{lang:?} backward has unbalanced delimiters");
+            assert!(
+                balanced(&bwd),
+                "{lang:?} backward has unbalanced delimiters"
+            );
             assert_eq!(bwd.matches("case ").count(), 18, "{lang:?} backward cases");
             let bin = match lang {
                 Lang::Cuda => binary::cuda_binary_module(),
@@ -1717,13 +1719,7 @@ mod tests {
     #[test]
     fn non_finite_literals_emit_valid_tokens() {
         let clamp_inf = Sx::Clamp(Box::new(Sx::X), f32::NEG_INFINITY, f32::INFINITY);
-        for lang in [
-            Lang::Wgsl,
-            Lang::Cuda,
-            Lang::Msl,
-            Lang::Glsl,
-            Lang::OpenCl,
-        ] {
+        for lang in [Lang::Wgsl, Lang::Cuda, Lang::Msl, Lang::Glsl, Lang::OpenCl] {
             let mut stmts = Vec::new();
             let r = render(&clamp_inf, lang, &mut stmts);
             // Both bounds must take the bit-pattern path, never a bare `inf`

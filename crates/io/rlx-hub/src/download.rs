@@ -25,14 +25,23 @@ pub struct HfRepo {
 
 impl HfRepo {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), revision: "main".to_string() }
+        Self {
+            id: id.into(),
+            revision: "main".to_string(),
+        }
     }
     pub fn at(id: impl Into<String>, revision: impl Into<String>) -> Self {
-        Self { id: id.into(), revision: revision.into() }
+        Self {
+            id: id.into(),
+            revision: revision.into(),
+        }
     }
     /// The `resolve` URL for a file (LFS-redirected to the CDN by HF).
     pub fn file_url(&self, file: &str) -> String {
-        format!("https://huggingface.co/{}/resolve/{}/{}", self.id, self.revision, file)
+        format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            self.id, self.revision, file
+        )
     }
     pub fn api_url(&self) -> String {
         format!("https://huggingface.co/api/models/{}?blobs=true", self.id)
@@ -46,7 +55,10 @@ pub fn curl_bytes(url: &str) -> Result<Vec<u8>> {
         .output()
         .with_context(|| format!("spawn curl for {url}"))?;
     if !out.status.success() {
-        bail!("curl {url} failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "curl {url} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(out.stdout)
 }
@@ -60,7 +72,12 @@ pub fn fetch_index(repo: &HfRepo) -> Result<SafetensorsIndex> {
 pub fn fetch_sizes(repo: &HfRepo) -> Result<HashMap<String, u64>> {
     let v: serde_json::Value = serde_json::from_slice(&curl_bytes(&repo.api_url())?)?;
     let mut m = HashMap::new();
-    for s in v.get("siblings").and_then(|x| x.as_array()).into_iter().flatten() {
+    for s in v
+        .get("siblings")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
         if let (Some(n), Some(sz)) = (
             s.get("rfilename").and_then(|x| x.as_str()),
             s.get("size").and_then(|x| x.as_u64()),
@@ -74,10 +91,15 @@ pub fn fetch_sizes(repo: &HfRepo) -> Result<HashMap<String, u64>> {
 /// Verify a downloaded file: exact size (when known) + `.safetensors` structural
 /// integrity (header parses and data length matches the file).
 pub fn verify_file(path: &Path, expected_size: Option<u64>) -> Result<()> {
-    let len = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?.len();
+    let len = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
     if let Some(sz) = expected_size {
         if sz != 0 && len != sz {
-            bail!("{}: size {len} != expected {sz} (incomplete)", path.display());
+            bail!(
+                "{}: size {len} != expected {sz} (incomplete)",
+                path.display()
+            );
         }
     }
     if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
@@ -103,13 +125,20 @@ fn verify_safetensors_structure(path: &Path, file_len: u64) -> Result<()> {
     let mut hdr = vec![0u8; hlen as usize];
     f.read_exact(&mut hdr)?;
     let v: serde_json::Value = serde_json::from_slice(&hdr).context("parse header json")?;
-    let obj = v.as_object().ok_or_else(|| anyhow::anyhow!("header not an object"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("header not an object"))?;
     let mut max_end = 0u64;
     for (k, t) in obj {
         if k == "__metadata__" {
             continue;
         }
-        if let Some(end) = t.get("data_offsets").and_then(|o| o.as_array()).and_then(|o| o.get(1)).and_then(|x| x.as_u64()) {
+        if let Some(end) = t
+            .get("data_offsets")
+            .and_then(|o| o.as_array())
+            .and_then(|o| o.get(1))
+            .and_then(|x| x.as_u64())
+        {
             max_end = max_end.max(end);
         }
     }
@@ -129,7 +158,16 @@ pub fn download_file(repo: &HfRepo, file: &str, dest_dir: &Path) -> Result<PathB
     }
     let url = repo.file_url(file);
     let status = Command::new("curl")
-        .args(["-fSL", "--retry", "5", "--retry-delay", "2", "-C", "-", "-o"])
+        .args([
+            "-fSL",
+            "--retry",
+            "5",
+            "--retry-delay",
+            "2",
+            "-C",
+            "-",
+            "-o",
+        ])
         .arg(&dest)
         .arg(&url)
         .status()
@@ -167,7 +205,8 @@ pub fn download_files(
         // Fast path: already present + verifies.
         if dest.is_file() && verify_file(&dest, expected).is_ok() {
             on_event(file, "cached");
-            report.bytes += expected.unwrap_or_else(|| fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
+            report.bytes +=
+                expected.unwrap_or_else(|| fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
             report.ok.push(file.clone());
             continue;
         }

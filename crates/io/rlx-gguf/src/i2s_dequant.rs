@@ -52,7 +52,11 @@ pub fn dequant_i2_s(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     let packed = n / 4;
     let need = packed + I2_S_SCALE_BYTES;
     if bytes.len() < packed + 4 {
-        bail!("I2_S: expected >= {} bytes, got {}", packed + 4, bytes.len());
+        bail!(
+            "I2_S: expected >= {} bytes, got {}",
+            packed + 4,
+            bytes.len()
+        );
     }
     if bytes.len() != need {
         // Tolerate slight over-allocation but warn via error only when short.

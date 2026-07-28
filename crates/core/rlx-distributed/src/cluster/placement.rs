@@ -108,21 +108,39 @@ pub fn plan_placement(
     if policy == PlacementPolicy::Manual {
         let mut out = Vec::new();
         for (i, (caps, cfg)) in nodes.iter().enumerate() {
-            let r = cfg.manual_range().ok_or_else(|| anyhow::anyhow!("node {} has no `layers` for manual policy", cfg.addr))?;
-            out.push(mk_assignment(model, caps, cfg, r, i == 0, i == k - 1, reserve_bytes));
+            let r = cfg.manual_range().ok_or_else(|| {
+                anyhow::anyhow!("node {} has no `layers` for manual policy", cfg.addr)
+            })?;
+            out.push(mk_assignment(
+                model,
+                caps,
+                cfg,
+                r,
+                i == 0,
+                i == k - 1,
+                reserve_bytes,
+            ));
         }
         return Ok(out);
     }
 
-    let budgets: Vec<u64> = nodes.iter().map(|(c, cfg)| budget_bytes(c, cfg, reserve_bytes)).collect();
+    let budgets: Vec<u64> = nodes
+        .iter()
+        .map(|(c, cfg)| budget_bytes(c, cfg, reserve_bytes))
+        .collect();
     // Per-node capacity in layers (first pays embed, last pays head).
     let caps_layers: Vec<usize> = (0..k)
         .map(|i| {
-            let overhead = if i == 0 { model.embed_bytes } else { 0 } + if i == k - 1 { model.head_bytes } else { 0 };
+            let overhead = if i == 0 { model.embed_bytes } else { 0 }
+                + if i == k - 1 { model.head_bytes } else { 0 };
             layer_cap(budgets[i], model.per_layer_bytes, overhead)
         })
         .collect();
-    let total_cap: usize = caps_layers.iter().copied().map(|c| c.min(model.n_layers)).sum();
+    let total_cap: usize = caps_layers
+        .iter()
+        .copied()
+        .map(|c| c.min(model.n_layers))
+        .sum();
     if total_cap < model.n_layers {
         bail!(
             "model ({} layers, {:.1} GB) does not fit the cluster (capacity {} layers). \
@@ -135,18 +153,25 @@ pub fn plan_placement(
 
     // Weight each node by budget (ram_balanced) or throughput (gflops).
     let weight: Vec<f64> = match policy {
-        PlacementPolicy::Throughput => nodes.iter().map(|(c, _)| c.gflops.max(1.0) * model.per_layer_flops.max(0.001)).collect(),
+        PlacementPolicy::Throughput => nodes
+            .iter()
+            .map(|(c, _)| c.gflops.max(1.0) * model.per_layer_flops.max(0.001))
+            .collect(),
         _ => budgets.iter().map(|&b| b as f64).collect(),
     };
     let wsum: f64 = weight.iter().sum();
 
     // Proportional target, clamped to per-node layer cap, remainder water-filled.
-    let mut counts: Vec<usize> = (0..k).map(|i| ((model.n_layers as f64 * weight[i] / wsum).round() as usize).min(caps_layers[i])).collect();
+    let mut counts: Vec<usize> = (0..k)
+        .map(|i| ((model.n_layers as f64 * weight[i] / wsum).round() as usize).min(caps_layers[i]))
+        .collect();
     let mut assigned: usize = counts.iter().sum();
     // Add under-target: give leftover layers to nodes with remaining capacity,
     // most spare first. Remove over-target similarly.
     while assigned < model.n_layers {
-        let i = (0..k).filter(|&i| counts[i] < caps_layers[i]).max_by_key(|&i| caps_layers[i] - counts[i]);
+        let i = (0..k)
+            .filter(|&i| counts[i] < caps_layers[i])
+            .max_by_key(|&i| caps_layers[i] - counts[i]);
         match i {
             Some(i) => {
                 counts[i] += 1;
@@ -171,7 +196,15 @@ pub fn plan_placement(
     for (i, ((caps, cfg), &cnt)) in nodes.iter().zip(&counts).enumerate() {
         let r = start..start + cnt;
         start += cnt;
-        out.push(mk_assignment(model, caps, cfg, r, i == 0, i == k - 1, reserve_bytes));
+        out.push(mk_assignment(
+            model,
+            caps,
+            cfg,
+            r,
+            i == 0,
+            i == k - 1,
+            reserve_bytes,
+        ));
     }
     Ok(out)
 }
@@ -186,7 +219,9 @@ fn mk_assignment(
     reserve: u64,
 ) -> Assignment {
     let n = (layers.end - layers.start) as u64;
-    let est = n * model.per_layer_bytes + if first { model.embed_bytes } else { 0 } + if last { model.head_bytes } else { 0 };
+    let est = n * model.per_layer_bytes
+        + if first { model.embed_bytes } else { 0 }
+        + if last { model.head_bytes } else { 0 };
     Assignment {
         addr: cfg.addr.clone(),
         ssh: cfg.ssh.clone(),
@@ -233,13 +268,20 @@ mod tests {
     #[test]
     fn ram_balanced_fits_and_covers_all_layers() {
         // 43 layers @ ~3GB each ≈ 129GB across 3 uneven nodes.
-        let model = ModelCost { n_layers: 43, per_layer_bytes: 3_000_000_000, embed_bytes: 200_000_000, head_bytes: 200_000_000, per_layer_flops: 1.0 };
+        let model = ModelCost {
+            n_layers: 43,
+            per_layer_bytes: 3_000_000_000,
+            embed_bytes: 200_000_000,
+            head_bytes: 200_000_000,
+            per_layer_flops: 1.0,
+        };
         let nodes = vec![
             (caps("a", 60.0, 100.0), node("a")),
             (caps("b", 55.0, 90.0), node("b")),
             (caps("c", 44.0, 60.0), node("c")),
         ];
-        let plan = plan_placement(&model, &nodes, PlacementPolicy::RamBalanced, 5_000_000_000).unwrap();
+        let plan =
+            plan_placement(&model, &nodes, PlacementPolicy::RamBalanced, 5_000_000_000).unwrap();
         // Contiguous + complete cover of 0..43.
         assert_eq!(plan[0].layers.start, 0);
         assert_eq!(plan.last().unwrap().layers.end, 43);
@@ -248,14 +290,28 @@ mod tests {
         }
         // Every stage within budget.
         for a in &plan {
-            assert!(a.est_bytes <= a.budget_bytes, "{} over budget: {} > {}", a.addr, a.est_bytes, a.budget_bytes);
+            assert!(
+                a.est_bytes <= a.budget_bytes,
+                "{} over budget: {} > {}",
+                a.addr,
+                a.est_bytes,
+                a.budget_bytes
+            );
         }
     }
 
     #[test]
     fn rejects_when_too_big() {
-        let model = ModelCost { n_layers: 100, per_layer_bytes: 5_000_000_000, embed_bytes: 0, head_bytes: 0, per_layer_flops: 1.0 };
+        let model = ModelCost {
+            n_layers: 100,
+            per_layer_bytes: 5_000_000_000,
+            embed_bytes: 0,
+            head_bytes: 0,
+            per_layer_flops: 1.0,
+        };
         let nodes = vec![(caps("a", 40.0, 100.0), node("a"))];
-        assert!(plan_placement(&model, &nodes, PlacementPolicy::RamBalanced, 5_000_000_000).is_err());
+        assert!(
+            plan_placement(&model, &nodes, PlacementPolicy::RamBalanced, 5_000_000_000).is_err()
+        );
     }
 }

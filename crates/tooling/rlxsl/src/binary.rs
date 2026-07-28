@@ -196,7 +196,9 @@ fn binary_switch(lang: Lang, signature: &str, default_close: &str) -> String {
         } else {
             format!("{} ", stmts.join(" "))
         };
-        s.push_str(&format!("        case {id}u: {{ {pre}return {expr}; }} // {op:?}\n"));
+        s.push_str(&format!(
+            "        case {id}u: {{ {pre}return {expr}; }} // {op:?}\n"
+        ));
     }
     s.push_str(default_close);
     s
@@ -307,13 +309,7 @@ mod tests {
 
     #[test]
     fn every_language_emits_all_ops() {
-        for lang in [
-            Lang::Wgsl,
-            Lang::Cuda,
-            Lang::Msl,
-            Lang::Glsl,
-            Lang::OpenCl,
-        ] {
+        for lang in [Lang::Wgsl, Lang::Cuda, Lang::Msl, Lang::Glsl, Lang::OpenCl] {
             let m = match lang {
                 Lang::Wgsl => wgsl_binary_module(),
                 Lang::Cuda => cuda_binary_module(),

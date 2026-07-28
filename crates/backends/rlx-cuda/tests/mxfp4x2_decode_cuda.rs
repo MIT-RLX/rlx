@@ -25,7 +25,9 @@ fn mxfp4x2_cuda_decode_matches_cpu_oracle() {
     let ptx = cudarc::nvrtc::compile_ptx(rlx_gpu_kernels::SCALED_LOWP_GENERAL_CU)
         .expect("nvrtc compile scaled_lowp_general");
     let module = ctx.load_module(ptx).expect("load module");
-    let func = module.load_function("mxfp4x2_decode").expect("mxfp4x2_decode");
+    let func = module
+        .load_function("mxfp4x2_decode")
+        .expect("mxfp4x2_decode");
 
     // Quantize deterministic data to 2 residual levels, per MX group.
     let fmt = ScaledFormat::F4E2M1;
@@ -69,5 +71,8 @@ fn mxfp4x2_cuda_decode_matches_cpu_oracle() {
         .map(|(&c, &g)| (c - g).abs())
         .fold(0.0f32, f32::max);
     eprintln!("MxFp4x2 CUDA decode: worst |gpu-cpu| = {worst:.2e}  (n={n})");
-    assert!(worst < 1e-6, "CUDA decode must match CPU oracle, worst={worst:e}");
+    assert!(
+        worst < 1e-6,
+        "CUDA decode must match CPU oracle, worst={worst:e}"
+    );
 }

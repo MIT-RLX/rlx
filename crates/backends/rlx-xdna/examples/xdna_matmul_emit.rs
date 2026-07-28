@@ -15,7 +15,10 @@ use rlx_xdna::npu_gemm::NpuGemm;
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| d.parse().unwrap())
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| d.parse().unwrap())
 }
 
 fn main() {
@@ -24,7 +27,10 @@ fn main() {
 
     // 1) rlx EMITS the matmul kernel.
     let mlir = emit_matmul(m, k, n);
-    println!("1. rlx emitted AIE-MLIR i8 matmul {m}x{k}x{n} ({} lines)", mlir.lines().count());
+    println!(
+        "1. rlx emitted AIE-MLIR i8 matmul {m}x{k}x{n} ({} lines)",
+        mlir.lines().count()
+    );
 
     // 2) COMPILE via native aiecc (no Python).
     let aiecc = std::env::var("AIECC").expect("set AIECC");
@@ -70,7 +76,11 @@ fn main() {
     let c = mm.run(&a, &b).expect("run");
     let mism = (0..m * n).filter(|&i| c[i] != cref[i]).count();
     if mism != 0 {
-        let bad: Vec<_> = (0..m * n).filter(|&i| c[i] != cref[i]).take(3).map(|i| (i, c[i], cref[i])).collect();
+        let bad: Vec<_> = (0..m * n)
+            .filter(|&i| c[i] != cref[i])
+            .take(3)
+            .map(|i| (i, c[i], cref[i]))
+            .collect();
         println!("3. NPU matmul {m}x{k}x{n}: FAIL ✗ — {mism} mismatches (i,got,want): {bad:?}");
         std::process::exit(1);
     }
@@ -85,5 +95,8 @@ fn main() {
     }
     let flops = 2.0 * (m * k * n) as f64;
     // Scalar i8 MAC core (vectorized aievec.matmul blocked by Peano accumulator drain).
-    println!("4. warm run best {best:.1} us  →  {:.2} GOP/s (scalar i8 MAC; vectorized = C++ aie::mmul)", flops / (best * 1e3));
+    println!(
+        "4. warm run best {best:.1} us  →  {:.2} GOP/s (scalar i8 MAC; vectorized = C++ aie::mmul)",
+        flops / (best * 1e3)
+    );
 }

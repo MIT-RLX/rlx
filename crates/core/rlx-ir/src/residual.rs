@@ -90,7 +90,14 @@ pub fn residual_roundtrip(block: &[f32], fmt: ScaledFormat, levels: usize) -> Ve
 /// Dequantize every `block`-length chunk of each `cols`-wide row through
 /// `levels` residual levels — the operand a `MxFp4x2` `ScaledMatMul` decodes
 /// (MX block scaling runs along the contraction dimension).
-fn dequant_rows(data: &[f32], rows: usize, cols: usize, fmt: ScaledFormat, levels: usize, block: usize) -> Vec<f32> {
+fn dequant_rows(
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+    fmt: ScaledFormat,
+    levels: usize,
+    block: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
     for r in 0..rows {
         let base = r * cols;
@@ -115,7 +122,14 @@ pub fn scheme_roundtrip_rows(
     cols: usize,
 ) -> Option<Vec<f32>> {
     let (fmt, levels, group) = scheme.mxfp4x2_config()?;
-    Some(dequant_rows(data, rows, cols, fmt, levels as usize, group as usize))
+    Some(dequant_rows(
+        data,
+        rows,
+        cols,
+        fmt,
+        levels as usize,
+        group as usize,
+    ))
 }
 
 /// Reference `MxFp4x2` decode-GEMM: `C[m,n] = A[m,k] · B[k,n]` with both
@@ -222,8 +236,14 @@ mod tests {
 
         // 1 level is coarse FP4 (~3 bits); a residual level roughly doubles it.
         assert!(e1 > 5e-2, "1-level FP4 should be coarse, got {e1:e}");
-        assert!(e2 < e1 / 4.0, "2-level should be >=4x better, got {e2:e} vs {e1:e}");
-        assert!(bits(e2) > bits(e1) + 2.0, "2-level should add >2 mantissa bits");
+        assert!(
+            e2 < e1 / 4.0,
+            "2-level should be >=4x better, got {e2:e} vs {e1:e}"
+        );
+        assert!(
+            bits(e2) > bits(e1) + 2.0,
+            "2-level should add >2 mantissa bits"
+        );
     }
 
     /// Level 0 alone equals plain single-level MXFP4 (no regression to the
@@ -277,7 +297,10 @@ mod tests {
             "MxFp4 decode-GEMM: 1-level err={e1:.2e}  2-level err={e2:.2e}  ({:.1}x better)",
             e1 / e2
         );
-        assert!(e2 < e1 / 2.0, "2-level matmul must beat 1-level: {e2:e} vs {e1:e}");
+        assert!(
+            e2 < e1 / 2.0,
+            "2-level matmul must beat 1-level: {e2:e} vs {e1:e}"
+        );
     }
 
     /// The first-class `QuantScheme::MxFp4x2Block` drives the residual codec and
@@ -285,13 +308,14 @@ mod tests {
     #[test]
     fn quant_scheme_mxfp4x2_roundtrips() {
         let scheme = QuantScheme::MxFp4x2Block { group_size: 32 };
-        assert_eq!(
-            scheme.mxfp4x2_config(),
-            Some((ScaledFormat::F4E2M1, 2, 32))
-        );
+        assert_eq!(scheme.mxfp4x2_config(), Some((ScaledFormat::F4E2M1, 2, 32)));
         assert!(scheme.has_scale());
         assert_eq!(scheme.to_string(), "mxfp4x2/32");
-        assert!(QuantScheme::MlxMxfp4 { group_size: 32 }.mxfp4x2_config().is_none());
+        assert!(
+            QuantScheme::MlxMxfp4 { group_size: 32 }
+                .mxfp4x2_config()
+                .is_none()
+        );
 
         let (rows, cols) = (8usize, 64usize);
         let data: Vec<f32> = (0..rows * cols)

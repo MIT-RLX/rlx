@@ -11,8 +11,8 @@
 //   AIECC=.. PEANO=.. RLX_XDNA_SHIM=.. N=65536 CHUNK=2048 [BF16=1] \
 //     cargo run -p rlx-xdna --features xrt --example xdna_unary
 
-use rlx_xdna::aie::{emit_unary, Ty, UnaryOp};
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::aie::{Ty, UnaryOp, emit_unary};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::{NpuIoBf16, NpuIoF32};
 
 fn env(k: &str, d: &str) -> String {
@@ -32,7 +32,10 @@ fn main() {
     let pos: Vec<f32> = (0..n).map(|i| 0.1 + (i % 40) as f32 * 0.1).collect();
     let signed: Vec<f32> = (0..n).map(|i| ((i % 71) as f32 - 35.0) * 0.1).collect();
     let needs_pos = |op: UnaryOp| {
-        matches!(op, UnaryOp::Log | UnaryOp::Sqrt | UnaryOp::Rsqrt | UnaryOp::Recip)
+        matches!(
+            op,
+            UnaryOp::Log | UnaryOp::Sqrt | UnaryOp::Rsqrt | UnaryOp::Recip
+        )
     };
 
     let ops = [
@@ -89,7 +92,11 @@ fn main() {
             out_xclbin: &xclbin,
             out_insts: &insts_path,
         }) {
-            println!("  {:<8} COMPILE-FAIL  ({})", op.name(), first_line(&format!("{e:?}")));
+            println!(
+                "  {:<8} COMPILE-FAIL  ({})",
+                op.name(),
+                first_line(&format!("{e:?}"))
+            );
             fail += 1;
             continue;
         }

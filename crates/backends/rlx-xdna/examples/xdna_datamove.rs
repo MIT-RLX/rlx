@@ -14,11 +14,14 @@ use rlx_xdna::aie::{
     emit_cast, emit_clamp, emit_concat2, emit_expand, emit_gather, emit_narrow, emit_pad,
     emit_reverse, emit_slice, emit_tile, emit_transpose2d, emit_trilu,
 };
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuRun3;
 
 fn compile(name: &str, mlir: String) -> Option<Vec<u32>> {
-    let (aiecc, peano) = (std::env::var("AIECC").unwrap(), std::env::var("PEANO").unwrap());
+    let (aiecc, peano) = (
+        std::env::var("AIECC").unwrap(),
+        std::env::var("PEANO").unwrap(),
+    );
     let tmp = format!("/tmp/rlx_dm_{name}");
     std::fs::create_dir_all(&tmp).ok();
     let mp = format!("{tmp}/aie.mlir");
@@ -33,7 +36,10 @@ fn compile(name: &str, mlir: String) -> Option<Vec<u32>> {
         out_xclbin: &xclbin,
         out_insts: &insts_path,
     }) {
-        println!("  {name:<9} COMPILE-FAIL ({})", format!("{e:?}").lines().next().unwrap_or(""));
+        println!(
+            "  {name:<9} COMPILE-FAIL ({})",
+            format!("{e:?}").lines().next().unwrap_or("")
+        );
         return None;
     }
     Some(
@@ -51,16 +57,22 @@ fn xclbin_path(name: &str) -> String {
 
 // 1-input (arg1 dummy).
 fn run(name: &str, mlir: String, input: &[f32], cref: &[f32]) -> bool {
-    let Some(insts) = compile(name, mlir) else { return false };
-    let io = NpuRun3::open("", &xclbin_path(name), &insts, input.len(), 1, cref.len()).expect("open");
+    let Some(insts) = compile(name, mlir) else {
+        return false;
+    };
+    let io =
+        NpuRun3::open("", &xclbin_path(name), &insts, input.len(), 1, cref.len()).expect("open");
     let out = io.run(input, &[0.0]).expect("run");
     check(name, &out, cref, input.len())
 }
 
 // 2-input (concat / gather).
 fn run2(name: &str, mlir: String, a: &[f32], b: &[f32], cref: &[f32]) -> bool {
-    let Some(insts) = compile(name, mlir) else { return false };
-    let io = NpuRun3::open("", &xclbin_path(name), &insts, a.len(), b.len(), cref.len()).expect("open");
+    let Some(insts) = compile(name, mlir) else {
+        return false;
+    };
+    let io =
+        NpuRun3::open("", &xclbin_path(name), &insts, a.len(), b.len(), cref.len()).expect("open");
     let out = io.run(a, b).expect("run");
     check(name, &out, cref, a.len())
 }
@@ -112,7 +124,12 @@ fn main() {
     for a in 0..len {
         cref[a] = inp[(start as i64 + a as i64 * step) as usize];
     }
-    all &= run("slice", emit_slice(o, ax, inr, start, len, step), &inp, &cref);
+    all &= run(
+        "slice",
+        emit_slice(o, ax, inr, start, len, step),
+        &inp,
+        &cref,
+    );
 
     // tile [2, 3, 2] reps=3 on axis
     let (o, ax, inr, reps) = (2, 3, 2, 3);
@@ -157,7 +174,11 @@ fn main() {
     let mut cref = vec![0f32; m * m];
     for i in 0..m {
         for j in 0..m {
-            cref[i * m + j] = if (j as i64) >= i as i64 { inp[i * m + j] } else { 0.0 };
+            cref[i * m + j] = if (j as i64) >= i as i64 {
+                inp[i * m + j]
+            } else {
+                0.0
+            };
         }
     }
     all &= run("trilu", emit_trilu(m, m, true, 0), &inp, &cref);
@@ -213,7 +234,13 @@ fn main() {
             }
         }
     }
-    all &= run2("gather", emit_gather(o, ax, inr, idx.len()), &data, &idx, &cref);
+    all &= run2(
+        "gather",
+        emit_gather(o, ax, inr, idx.len()),
+        &data,
+        &idx,
+        &cref,
+    );
 
     // cast f32 → i32 (output bits reinterpreted as f32 by the runner)
     let inp: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 1.5).collect();
@@ -221,13 +248,28 @@ fn main() {
         let io = NpuRun3::open("", &xclbin_path("cast"), &insts, inp.len(), 1, inp.len()).unwrap();
         let out = io.run(&inp, &[0.0]).unwrap();
         let ok = (0..inp.len()).all(|i| (out[i].to_bits() as i32) == inp[i] as i32);
-        println!("  {:<9} {}", "cast", if ok { "PASS ✓  (f32→i32)" } else { "FAIL ✗" });
+        println!(
+            "  {:<9} {}",
+            "cast",
+            if ok {
+                "PASS ✓  (f32→i32)"
+            } else {
+                "FAIL ✗"
+            }
+        );
         all &= ok;
     } else {
         all = false;
     }
 
-    println!("\n{}", if all { "all data-movement ops match CPU ✓" } else { "MISMATCH" });
+    println!(
+        "\n{}",
+        if all {
+            "all data-movement ops match CPU ✓"
+        } else {
+            "MISMATCH"
+        }
+    );
     if !all {
         std::process::exit(1);
     }

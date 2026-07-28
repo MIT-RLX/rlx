@@ -42,9 +42,8 @@ pub use arch::{
 pub use config::{MlxArchConfig, MlxConfig, MlxQuantConfig, MlxQuantMode};
 pub use dequant::{
     QuantizedLayer, dequant_affine_f32, dequant_matmul_affine, dequant_matmul_mxfp4,
-    dequant_matvec_affine,
-    dequant_mxfp4_f32, dequant_mxfp8_f32, mxfp4_scale_e8m0_to_f32, pack_factor,
-    validate_dequant_matmul_dims,
+    dequant_matvec_affine, dequant_mxfp4_f32, dequant_mxfp8_f32, mxfp4_scale_e8m0_to_f32,
+    pack_factor, validate_dequant_matmul_dims,
 };
 pub use graph::{
     PackedLinearBinding, build_mlp_chain_graph, build_parallel_dequant_graph,

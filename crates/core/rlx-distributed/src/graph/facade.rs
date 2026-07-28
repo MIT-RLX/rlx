@@ -18,7 +18,7 @@
 //!
 //! // Cluster: split by whole layers, balance by weight bytes, ship + serve.
 //! let pipe = Pipeline::partition_with(&graph, 2, |i, m| if i < m/2 {0} else {1});
-//! let logits = pipe.run_tcp(&["msi:9000".into(), "amd:9000".into()], inputs)?;
+//! let logits = pipe.run_tcp(&["host-b:9000".into(), "host-c:9000".into()], inputs)?;
 //! ```
 
 use super::partition::{Stage, partition, partition_with};
@@ -37,7 +37,9 @@ pub struct Pipeline {
 impl Pipeline {
     /// Balanced split of `graph` into `n_stages` (by compute-node count).
     pub fn partition(graph: &Graph, n_stages: usize) -> Self {
-        Self { stages: partition(graph, n_stages) }
+        Self {
+            stages: partition(graph, n_stages),
+        }
     }
 
     /// Split with a custom compute-node→stage assignment (`(i, m) -> stage`),
@@ -48,7 +50,9 @@ impl Pipeline {
         n_stages: usize,
         assign: impl Fn(usize, usize) -> usize,
     ) -> Self {
-        Self { stages: partition_with(graph, n_stages, assign) }
+        Self {
+            stages: partition_with(graph, n_stages, assign),
+        }
     }
 
     /// Wrap pre-built stages (e.g. deserialized on a worker).

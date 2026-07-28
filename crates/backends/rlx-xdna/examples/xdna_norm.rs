@@ -10,17 +10,22 @@
 //     cargo run -p rlx-xdna --features xrt --example xdna_norm
 
 use rlx_xdna::aie::{emit_layer_norm, emit_rms_norm};
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuIoF32;
 
 fn envn(k: &str, d: &str) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| d.parse().unwrap())
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| d.parse().unwrap())
 }
 
 fn run(name: &str, mlir: String, rows: usize, cols: usize, cref: &[f32], input: &[f32]) -> bool {
     let n = rows * cols;
-    let (aiecc, peano) =
-        (std::env::var("AIECC").unwrap(), std::env::var("PEANO").unwrap());
+    let (aiecc, peano) = (
+        std::env::var("AIECC").unwrap(),
+        std::env::var("PEANO").unwrap(),
+    );
     let tmp = format!("/tmp/rlx_norm_{name}");
     std::fs::create_dir_all(&tmp).ok();
     let mp = format!("{tmp}/aie.mlir");
@@ -35,7 +40,10 @@ fn run(name: &str, mlir: String, rows: usize, cols: usize, cref: &[f32], input: 
         out_xclbin: &xclbin,
         out_insts: &insts_path,
     }) {
-        println!("  {name:<10} COMPILE-FAIL ({})", format!("{e:?}").lines().next().unwrap_or(""));
+        println!(
+            "  {name:<10} COMPILE-FAIL ({})",
+            format!("{e:?}").lines().next().unwrap_or("")
+        );
         return false;
     }
     let insts: Vec<u32> = std::fs::read(&insts_path)
@@ -62,7 +70,9 @@ fn main() {
     let (rows, cols) = (envn("ROWS", "32"), envn("COLS", "64"));
     let n = rows * cols;
     let eps = 1e-5f32;
-    let input: Vec<f32> = (0..n).map(|i| ((i % 29) as f32 - 14.0) * 0.2 + 0.5).collect();
+    let input: Vec<f32> = (0..n)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.2 + 0.5)
+        .collect();
 
     // rms reference
     let mut rms = vec![0f32; n];
@@ -87,8 +97,22 @@ fn main() {
     }
 
     println!("row-reduction norms {rows}x{cols}, eps={eps:e}\n");
-    let a = run("rms_norm", emit_rms_norm(rows, cols, eps), rows, cols, &rms, &input);
-    let b = run("layer_norm", emit_layer_norm(rows, cols, eps), rows, cols, &ln, &input);
+    let a = run(
+        "rms_norm",
+        emit_rms_norm(rows, cols, eps),
+        rows,
+        cols,
+        &rms,
+        &input,
+    );
+    let b = run(
+        "layer_norm",
+        emit_layer_norm(rows, cols, eps),
+        rows,
+        cols,
+        &ln,
+        &input,
+    );
     if !(a && b) {
         std::process::exit(1);
     }

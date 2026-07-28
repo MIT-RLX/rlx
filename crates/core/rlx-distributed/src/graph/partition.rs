@@ -105,7 +105,10 @@ pub fn partition_with(
     let mut last = 0usize;
     for (i, &id) in compute.iter().enumerate() {
         let s = assign(i, m).min(n_stages - 1);
-        assert!(s >= last, "stage assignment must be non-decreasing in topo order");
+        assert!(
+            s >= last,
+            "stage assignment must be non-decreasing in topo order"
+        );
         last = s;
         stage_of.insert(id, s);
     }
@@ -154,7 +157,12 @@ pub fn partition_with(
                 };
                 new_inputs.push(new_in);
             }
-            let nid = g.append_node(node.op.clone(), new_inputs, node.shape.clone(), node.name.clone());
+            let nid = g.append_node(
+                node.op.clone(),
+                new_inputs,
+                node.shape.clone(),
+                node.name.clone(),
+            );
             map.insert(cid, nid);
         }
 

@@ -32,8 +32,7 @@ pub fn dequant_i8_s(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() < n + 4 {
         bail!("I8_S: expected >= {} bytes, got {}", n + 4, bytes.len());
     }
-    let scale =
-        f32::from_le_bytes([bytes[n], bytes[n + 1], bytes[n + 2], bytes[n + 3]]);
+    let scale = f32::from_le_bytes([bytes[n], bytes[n + 1], bytes[n + 2], bytes[n + 3]]);
     let mut out = vec![0f32; n];
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = (bytes[i] as i8) as f32 * scale;

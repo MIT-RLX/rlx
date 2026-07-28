@@ -17,7 +17,7 @@ use std::ffi::c_void;
 /// `1e8`'s f32 ulp (=8), so naive f32 loses all of them.
 fn ill_conditioned() -> Vec<f32> {
     let mut x = vec![1e8f32];
-    x.extend(std::iter::repeat(1.0f32).take(10_000));
+    x.extend(std::iter::repeat_n(1.0f32, 10_000));
     x.push(-1e8f32);
     x
 }
@@ -39,7 +39,10 @@ fn dwreduce_recovers_f64_on_metal() {
     let dw = reducer.sum(&x);
     eprintln!("Metal (no f64) ill-conditioned: naive f32={naive}  DwReduce={dw}");
     assert!((naive as f64).abs() < 1.0, "naive f32 lost it: {naive}");
-    assert!((dw - 10_000.0).abs() < 1.0, "DwReduce should recover 10000: {dw}");
+    assert!(
+        (dw - 10_000.0).abs() < 1.0,
+        "DwReduce should recover 10000: {dw}"
+    );
 
     // 2) Harmonic sum of 2M f32 terms — compare to the exact sum of the SAME
     //    f32 values (in f64). dw tracks it; naive f32 accumulates error.
@@ -51,7 +54,10 @@ fn dwreduce_recovers_f64_on_metal() {
     let e_naive = ((naive_h as f64 - truth) / truth).abs();
     let e_dw = ((dw_h - truth) / truth).abs();
     eprintln!("Metal harmonic 2M:  naive f32 err={e_naive:.2e}  |  DwReduce err={e_dw:.2e}");
-    assert!(e_dw < e_naive / 100.0, "dw should be >=100x better than naive f32");
+    assert!(
+        e_dw < e_naive / 100.0,
+        "dw should be >=100x better than naive f32"
+    );
     assert!(e_dw < 1e-6, "dw should be near-f64: {e_dw:e}");
 }
 
@@ -107,6 +113,12 @@ kernel void dw_sum1(device const float* x [[buffer(0)]], device float* out [[buf
     let precise = run(false);
     let fast = run(true);
     eprintln!("EFT hazard: precise={precise}  fast-math={fast}  (true=10000)");
-    assert!((precise - 10_000.0).abs() < 1.0, "precise must work: {precise}");
-    assert!((fast - 10_000.0).abs() > 1.0, "fast-math must break it: {fast}");
+    assert!(
+        (precise - 10_000.0).abs() < 1.0,
+        "precise must work: {precise}"
+    );
+    assert!(
+        (fast - 10_000.0).abs() > 1.0,
+        "fast-math must break it: {fast}"
+    );
 }

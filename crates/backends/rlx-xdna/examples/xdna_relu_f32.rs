@@ -12,7 +12,7 @@
 //     cargo run -p rlx-xdna --features xrt --example xdna_relu_f32
 
 use rlx_xdna::aie::{emit_relu_bf16, emit_relu_f32};
-use rlx_xdna::npu_gemm::{bf16_to_f32, f32_to_bf16, NpuIoBf16, NpuIoF32};
+use rlx_xdna::npu_gemm::{NpuIoBf16, NpuIoF32, bf16_to_f32, f32_to_bf16};
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> String {
@@ -27,7 +27,11 @@ fn main() {
     let bf16 = env("BF16", "0") == "1";
 
     // 1) rlx EMITS the ReLU kernel (bf16 = vectorized/native, f32 = scalar).
-    let mlir = if bf16 { emit_relu_bf16(n, chunk) } else { emit_relu_f32(n, chunk) };
+    let mlir = if bf16 {
+        emit_relu_bf16(n, chunk)
+    } else {
+        emit_relu_f32(n, chunk)
+    };
     println!(
         "1. rlx emitted AIE-MLIR: {} relu, {n} elems, {}x{chunk}-chunks ({} lines)",
         if bf16 { "bf16" } else { "f32" },
@@ -62,13 +66,18 @@ fn main() {
         .collect();
 
     // 3) input with negatives (so ReLU is exercised) and non-integer f32 values.
-    let input: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.5 - (n as f32) * 0.25) * 1e-3).collect();
+    let input: Vec<f32> = (0..n)
+        .map(|i| ((i as f32) * 0.5 - (n as f32) * 0.25) * 1e-3)
+        .collect();
 
     // Reference. ReLU is exact (max(0,x), no rounding), so both dtypes are
     // bit-exact — the only rounding is the host f32→bf16 cast, which the bf16
     // reference applies too (relu(bf16(x)) round-tripped).
     let reference: Vec<f32> = if bf16 {
-        input.iter().map(|&x| bf16_to_f32(f32_to_bf16(x)).max(0.0)).collect()
+        input
+            .iter()
+            .map(|&x| bf16_to_f32(f32_to_bf16(x)).max(0.0))
+            .collect()
     } else {
         input.iter().map(|&x| x.max(0.0)).collect()
     };
@@ -103,7 +112,9 @@ fn main() {
     };
 
     let ty = if bf16 { "bf16" } else { "f32" };
-    let mism = (0..n).filter(|&i| out[i].to_bits() != reference[i].to_bits()).count();
+    let mism = (0..n)
+        .filter(|&i| out[i].to_bits() != reference[i].to_bits())
+        .count();
     if mism != 0 {
         let bad: Vec<_> = (0..n)
             .filter(|&i| out[i].to_bits() != reference[i].to_bits())
@@ -118,6 +129,7 @@ fn main() {
     let gbps = |us: f64| (n as f64 * ebytes * 2.0) / (us * 1e3);
     println!(
         "4. cold open {cold_ms:.0} ms; warm run avg {avg:.1} us / best {best:.1} us  →  {:.1} / {:.1} GB/s (over {iters})",
-        gbps(avg), gbps(best)
+        gbps(avg),
+        gbps(best)
     );
 }

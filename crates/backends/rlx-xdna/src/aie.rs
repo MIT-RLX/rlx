@@ -118,8 +118,14 @@ pub fn emit_eltwise(n: usize, chunk: usize, op: Eltwise) -> String {
 /// advantage on the NPU: e.g. `[MulScalar(w), AddScalar(b), Relu]` fuses to
 /// `relu(w*x + b)` in one kernel. Same streaming/ABI as [`emit_eltwise`].
 pub fn emit_eltwise_chain(n: usize, chunk: usize, ops: &[Eltwise]) -> String {
-    assert!(chunk > 0 && n % chunk == 0, "n ({n}) must be a multiple of chunk ({chunk})");
-    assert!(chunk % VEC == 0, "chunk ({chunk}) must be a multiple of the vector width ({VEC})");
+    assert!(
+        n.is_multiple_of(chunk),
+        "n ({n}) must be a multiple of chunk ({chunk})"
+    );
+    assert!(
+        chunk.is_multiple_of(VEC),
+        "chunk ({chunk}) must be a multiple of the vector width ({VEC})"
+    );
     assert!(!ops.is_empty(), "need at least one op");
     // Thread the value through the chain: %v0 = load; op0 → %v1; op1 → %v2; …
     let mut expr = String::new();
@@ -187,8 +193,14 @@ pub fn emit_eltwise_chain(n: usize, chunk: usize, ops: &[Eltwise]) -> String {
 /// double-buffered ObjectFIFO / 3-arg runtime ABI as [`emit_eltwise_chain`].
 /// Requires `n % chunk == 0`, `chunk % VEC == 0`.
 pub fn emit_relu_f32(n: usize, chunk: usize) -> String {
-    assert!(chunk > 0 && n % chunk == 0, "n ({n}) must be a multiple of chunk ({chunk})");
-    assert!(chunk % VEC == 0, "chunk ({chunk}) must be a multiple of the vector width ({VEC})");
+    assert!(
+        n.is_multiple_of(chunk),
+        "n ({n}) must be a multiple of chunk ({chunk})"
+    );
+    assert!(
+        chunk.is_multiple_of(VEC),
+        "chunk ({chunk}) must be a multiple of the vector width ({VEC})"
+    );
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
@@ -256,9 +268,12 @@ const VEC_BF16: usize = 32;
 /// cast happens at the I/O boundary (see [`crate::npu_gemm::NpuIoBf16`]).
 /// Requires `n % chunk == 0`, `chunk % VEC_BF16 == 0`.
 pub fn emit_relu_bf16(n: usize, chunk: usize) -> String {
-    assert!(chunk > 0 && n % chunk == 0, "n ({n}) must be a multiple of chunk ({chunk})");
     assert!(
-        chunk % VEC_BF16 == 0,
+        n.is_multiple_of(chunk),
+        "n ({n}) must be a multiple of chunk ({chunk})"
+    );
+    assert!(
+        chunk.is_multiple_of(VEC_BF16),
         "chunk ({chunk}) must be a multiple of the bf16 vector width ({VEC_BF16})"
     );
     format!(
@@ -319,10 +334,19 @@ pub fn emit_relu_bf16(n: usize, chunk: usize) -> String {
 /// over the single-tile [`emit_eltwise_chain`]. Requires `n % cols == 0`,
 /// `(n/cols) % chunk == 0`, `chunk % VEC == 0`.
 pub fn emit_eltwise_multicol(n: usize, chunk: usize, cols: usize, ops: &[Eltwise]) -> String {
-    assert!(cols >= 1 && n % cols == 0, "n ({n}) must be a multiple of cols ({cols})");
+    assert!(
+        cols >= 1 && n.is_multiple_of(cols),
+        "n ({n}) must be a multiple of cols ({cols})"
+    );
     let per_col = n / cols;
-    assert!(per_col % chunk == 0, "n/cols ({per_col}) must be a multiple of chunk ({chunk})");
-    assert!(chunk % VEC == 0, "chunk ({chunk}) must be a multiple of {VEC}");
+    assert!(
+        per_col.is_multiple_of(chunk),
+        "n/cols ({per_col}) must be a multiple of chunk ({chunk})"
+    );
+    assert!(
+        chunk.is_multiple_of(VEC),
+        "chunk ({chunk}) must be a multiple of {VEC}"
+    );
     assert!(!ops.is_empty());
 
     // Shared per-element (vectorized) op chain.
@@ -343,8 +367,12 @@ pub fn emit_eltwise_multicol(n: usize, chunk: usize, cols: usize, ops: &[Eltwise
     for c in 0..cols {
         tiles += &format!("    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n");
         tiles += &format!("    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n");
-        fifos += &format!("    aie.objectfifo @in{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xi32>>\n");
-        fifos += &format!("    aie.objectfifo @out{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xi32>>\n");
+        fifos += &format!(
+            "    aie.objectfifo @in{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xi32>>\n"
+        );
+        fifos += &format!(
+            "    aie.objectfifo @out{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xi32>>\n"
+        );
         cores += &format!(
             r#"    %cb{c} = aie.core(%core{c}) {{
       %z = arith.constant 0 : index
@@ -408,9 +436,18 @@ pub fn emit_eltwise_multicol(n: usize, chunk: usize, cols: usize, ops: &[Eltwise
 /// matches the `RlxXdnaGemm` host path (`NpuGemm`); runtime ABI is the GEMM 3-arg
 /// one (`arg0`=A, `arg1`=B, `arg2`=C). Requires `m % 4 == 0`, `k`/`n` `% 8 == 0`.
 pub fn emit_matmul(m: usize, k: usize, n: usize) -> String {
-    assert!(m % 4 == 0, "matmul m ({m}) must be a multiple of 4 (AIE2 MAC tile)");
-    assert!(k % 8 == 0, "matmul k ({k}) must be a multiple of 8 (AIE2 MAC tile)");
-    assert!(n % 8 == 0, "matmul n ({n}) must be a multiple of 8 (AIE2 MAC tile)");
+    assert!(
+        m.is_multiple_of(4),
+        "matmul m ({m}) must be a multiple of 4 (AIE2 MAC tile)"
+    );
+    assert!(
+        k.is_multiple_of(8),
+        "matmul k ({k}) must be a multiple of 8 (AIE2 MAC tile)"
+    );
+    assert!(
+        n.is_multiple_of(8),
+        "matmul n ({n}) must be a multiple of 8 (AIE2 MAC tile)"
+    );
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
@@ -537,12 +574,16 @@ pub fn emit_matmul(m: usize, k: usize, n: usize) -> String {
 /// generated shim DMA descriptors (compare a good vs bad nt); kept all-resident so
 /// the kernel is never silently wrong.
 pub fn emit_matmul_tiled(m: usize, k: usize, n: usize) -> String {
-    assert!(m % 4 == 0 && k % 8 == 0 && n % 8 == 0, "matmul dims must tile 4×8×8");
+    assert!(
+        m.is_multiple_of(4) && k.is_multiple_of(8) && n.is_multiple_of(8),
+        "matmul dims must tile 4×8×8"
+    );
     let (mt, kt, nt) = (m / 4, k / 8, n / 8);
     let (na, nb, nc) = (m * k, k * n, m * n);
     let cmap = "{indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d2, d1)>, affine_map<(d0, d1, d2) -> (d0, d1)>], iterator_types = [\"parallel\", \"parallel\", \"reduction\"], kind = #vector.kind<add>}";
     // Unrolled K: a chain of contracts feeding the accumulator (SSA, not loop-carried).
-    let mut chain = String::from("            %czero = arith.constant dense<0> : vector<4x8xi32>\n");
+    let mut chain =
+        String::from("            %czero = arith.constant dense<0> : vector<4x8xi32>\n");
     let mut prev = "%czero".to_string();
     for ki in 0..kt {
         let (aoff, boff) = (ki * 32, ki * nt * 64);
@@ -718,16 +759,26 @@ pub fn untile_c(ct: &[i32], m: usize, n: usize) -> Vec<i32> {
 /// [`tile_b_multicol`]), gathers per-column C (via [`untile_c_multicol`]), then the
 /// usual [`matmul_signed_fixup`]. Requires m%4==0, k%8==0, (n/cols)%8==0, cols≤4.
 pub fn emit_matmul_multicol(m: usize, k: usize, n: usize, cols: usize) -> String {
-    assert!(m % 4 == 0 && k % 8 == 0 && n % 8 == 0, "matmul dims must tile 4×8×8");
-    assert!((1..=4).contains(&cols) && n % cols == 0, "n ({n}) must split across cols ({cols}), cols≤4");
+    assert!(
+        m.is_multiple_of(4) && k.is_multiple_of(8) && n.is_multiple_of(8),
+        "matmul dims must tile 4×8×8"
+    );
+    assert!(
+        (1..=4).contains(&cols) && n.is_multiple_of(cols),
+        "n ({n}) must split across cols ({cols}), cols≤4"
+    );
     let nc = n / cols;
-    assert!(nc % 8 == 0, "n/cols ({nc}) must be a multiple of 8");
+    assert!(
+        nc.is_multiple_of(8),
+        "n/cols ({nc}) must be a multiple of 8"
+    );
     let (mt, kt, ntc) = (m / 4, k / 8, nc / 8);
     let (na, nbc, ncc) = (m * k, k * nc, m * nc);
     let cmap = "{indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d2, d1)>, affine_map<(d0, d1, d2) -> (d0, d1)>], iterator_types = [\"parallel\", \"parallel\", \"reduction\"], kind = #vector.kind<add>}";
     // Per-core K-unrolled contract chain (n = nc): A from the full resident buffer,
     // B from this core's column-slice buffer.
-    let mut chain = String::from("            %czero = arith.constant dense<0> : vector<4x8xi32>\n");
+    let mut chain =
+        String::from("            %czero = arith.constant dense<0> : vector<4x8xi32>\n");
     let mut prev = "%czero".to_string();
     for ki in 0..kt {
         let (aoff, boff) = (ki * 32, ki * ntc * 64);
@@ -745,12 +796,20 @@ pub fn emit_matmul_multicol(m: usize, k: usize, n: usize, cols: usize) -> String
     let mut rt = String::new();
     let mut awaits = String::new();
     for c in 0..cols {
-        tiles += &format!("    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n");
+        tiles += &format!(
+            "    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n"
+        );
         // @a depth 1: A is read-only + delivered once per run, so it needs no
         // double-buffer — halving its (dominant, full-m·k) tile footprint.
-        fifos += &format!("    aie.objectfifo @a{c}(%shim{c}, {{%core{c}}}, 1 : i32) : !aie.objectfifo<memref<{na}xi8>>\n");
-        fifos += &format!("    aie.objectfifo @b{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{nbc}xi8>>\n");
-        fifos += &format!("    aie.objectfifo @c{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{ncc}xi32>>\n");
+        fifos += &format!(
+            "    aie.objectfifo @a{c}(%shim{c}, {{%core{c}}}, 1 : i32) : !aie.objectfifo<memref<{na}xi8>>\n"
+        );
+        fifos += &format!(
+            "    aie.objectfifo @b{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{nbc}xi8>>\n"
+        );
+        fifos += &format!(
+            "    aie.objectfifo @c{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{ncc}xi32>>\n"
+        );
         cores += &format!(
             r#"    %cb{c} = aie.core(%core{c}) {{
       %z = arith.constant 0 : index
@@ -809,9 +868,15 @@ pub fn emit_matmul_multicol(m: usize, k: usize, n: usize, cols: usize) -> String
             nb = k * n,
             ncf = m * n,
         );
-        awaits += &format!("      aiex.dma_await_task(%tc{c})\n      aiex.dma_free_task(%ta{c})\n      aiex.dma_free_task(%tb{c})\n");
+        awaits += &format!(
+            "      aiex.dma_await_task(%tc{c})\n      aiex.dma_free_task(%ta{c})\n      aiex.dma_free_task(%tb{c})\n"
+        );
     }
-    let device = if cols <= 3 { format!("npu1_{cols}col") } else { "npu1".to_string() };
+    let device = if cols <= 3 {
+        format!("npu1_{cols}col")
+    } else {
+        "npu1".to_string()
+    };
     let (nb, ncf) = (k * n, m * n);
     format!(
         "module {{\n  aie.device({device}) {{\n{tiles}{fifos}{cores}    aie.runtime_sequence(%arg0: memref<{na}xi8>, %arg1: memref<{nb}xi8>, %arg2: memref<{ncf}xi32>) {{\n{rt}{awaits}    }}\n  }}\n}}\n"
@@ -898,10 +963,18 @@ pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> S
     let mut rt = String::new();
     let mut awaits = String::new();
     for c in 0..cols {
-        tiles += &format!("    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n");
-        fifos += &format!("    aie.objectfifo @a{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi8>>\n");
-        fifos += &format!("    aie.objectfifo @b{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi8>>\n");
-        fifos += &format!("    aie.objectfifo @c{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi32>>\n");
+        tiles += &format!(
+            "    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n"
+        );
+        fifos += &format!(
+            "    aie.objectfifo @a{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi8>>\n"
+        );
+        fifos += &format!(
+            "    aie.objectfifo @b{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi8>>\n"
+        );
+        fifos += &format!(
+            "    aie.objectfifo @c{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi32>>\n"
+        );
         cores += &format!(
             r#"    %cb{c} = aie.core(%core{c}) {{
       %z = arith.constant 0 : index
@@ -949,9 +1022,15 @@ pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> S
       aiex.dma_start_task(%tc{c})
 "#
         );
-        awaits += &format!("      aiex.dma_await_task(%tc{c})\n      aiex.dma_free_task(%ta{c})\n      aiex.dma_free_task(%tb{c})\n");
+        awaits += &format!(
+            "      aiex.dma_await_task(%tc{c})\n      aiex.dma_free_task(%ta{c})\n      aiex.dma_free_task(%tb{c})\n"
+        );
     }
-    let device = if cols <= 3 { format!("npu1_{cols}col") } else { "npu1".to_string() };
+    let device = if cols <= 3 {
+        format!("npu1_{cols}col")
+    } else {
+        "npu1".to_string()
+    };
     // arg0 = shared A (one `ka`-long stream, all cores read it); arg1 = per-core B
     // (nb = cols·ka); arg2 = gathered C (ncf = cols·dd).
     format!(
@@ -1076,7 +1155,10 @@ fn v_type(t: &str, lanes: usize) -> String {
 /// scalar `memref.load`.
 fn v_load(t: &str, lanes: usize, dst: &str, buf: &str, chunk: usize) -> String {
     if lanes > 1 {
-        format!("          {dst} = vector.load {buf}[%i] : memref<{chunk}x{t}>, {}\n", v_type(t, lanes))
+        format!(
+            "          {dst} = vector.load {buf}[%i] : memref<{chunk}x{t}>, {}\n",
+            v_type(t, lanes)
+        )
     } else {
         format!("          {dst} = memref.load {buf}[%i] : memref<{chunk}x{t}>\n")
     }
@@ -1085,7 +1167,10 @@ fn v_load(t: &str, lanes: usize, dst: &str, buf: &str, chunk: usize) -> String {
 /// A per-step store of `src` into `buf[%i]`.
 fn v_store(t: &str, lanes: usize, src: &str, buf: &str, chunk: usize) -> String {
     if lanes > 1 {
-        format!("          vector.store {src}, {buf}[%i] : memref<{chunk}x{t}>, {}\n", v_type(t, lanes))
+        format!(
+            "          vector.store {src}, {buf}[%i] : memref<{chunk}x{t}>, {}\n",
+            v_type(t, lanes)
+        )
     } else {
         format!("          memref.store {src}, {buf}[%i] : memref<{chunk}x{t}>\n")
     }
@@ -1206,8 +1291,14 @@ impl BinaryOp {
 /// through `NpuIo::run2`. Requires `n % chunk == 0` and (vectorized dtypes)
 /// `chunk % lanes == 0`.
 pub fn emit_binary(op: BinaryOp, ty: Ty, n: usize, chunk: usize) -> String {
-    assert!(chunk > 0 && n % chunk == 0, "n ({n}) must be a multiple of chunk ({chunk})");
-    assert!(!(op.is_bitwise() && ty.is_float()), "bitwise ops are integer-only");
+    assert!(
+        n.is_multiple_of(chunk),
+        "n ({n}) must be a multiple of chunk ({chunk})"
+    );
+    assert!(
+        !(op.is_bitwise() && ty.is_float()),
+        "bitwise ops are integer-only"
+    );
     // Effective vector width: fall back to scalar (1) for i32 ops with no vector
     // lowering, and always for f32 (aievec has no f32 vector path).
     let lanes = if ty == Ty::I32 && !op.i32_vectorizable() {
@@ -1215,10 +1306,17 @@ pub fn emit_binary(op: BinaryOp, ty: Ty, n: usize, chunk: usize) -> String {
     } else {
         ty.lanes()
     };
-    assert!(chunk % lanes == 0, "chunk ({chunk}) must be a multiple of {lanes} lanes");
+    assert!(
+        chunk.is_multiple_of(lanes),
+        "chunk ({chunk}) must be a multiple of {lanes} lanes"
+    );
     let t = ty.mlir();
     let step = lanes;
-    let expr = format!("          %vo = {} %va, %vb : {}\n", op.opcode(ty), v_type(t, lanes));
+    let expr = format!(
+        "          %vo = {} %va, %vb : {}\n",
+        op.opcode(ty),
+        v_type(t, lanes)
+    );
     let load_a = v_load(t, lanes, "%va", "%A", chunk);
     let load_b = v_load(t, lanes, "%vb", "%B", chunk);
     let store = v_store(t, lanes, "%vo", "%O", chunk);
@@ -1335,7 +1433,10 @@ fn fbits(name: &str, v: f32) -> String {
     // fractions like ±1.0/0.5) print cleanly and MUST NOT be nudged — a nudge
     // would shift an exact bound (e.g. a clamp limit). Only inexact short
     // decimals need the ≥8-sig-digit nudge to force the accepted hex form.
-    let exact = format!("{v}").parse::<f64>().map(|d| d == v as f64).unwrap_or(false);
+    let exact = format!("{v}")
+        .parse::<f64>()
+        .map(|d| d == v as f64)
+        .unwrap_or(false);
     let base = v.to_bits();
     let mut bits = base;
     if !exact {
@@ -1601,7 +1702,7 @@ impl UnaryOp {
                 "{c044}{csq}          %oneb = arith.constant 1.0 : f32\n          %twob = arith.constant 2.0 : f32\n          %chalfb = arith.constant 0.5 : f32\n          %x2g = arith.mulf %x, %x : f32\n          %x3g = arith.mulf %x2g, %x : f32\n          %cx3g = arith.mulf %x3g, %c044b : f32\n          %in0g = arith.addf %x, %cx3g : f32\n          %innerg = arith.mulf %in0g, %csqb : f32\n          %i2g = arith.mulf %innerg, %twob : f32\n{}          %numg = arith.subf %e2g, %oneb : f32\n          %deng = arith.addf %e2g, %oneb : f32\n          %thg = arith.divf %numg, %deng : f32\n          %t1g = arith.addf %thg, %oneb : f32\n          %hxg = arith.mulf %x, %chalfb : f32\n          %y = arith.mulf %hxg, %t1g : f32\n",
                 approx_exp_f32("%i2g", "%e2g"),
                 c044 = fbits("c044b", 0.044715),
-                csq = fbits("csqb", 0.7978845608)
+                csq = fbits("csqb", 0.797_884_6)
             ),
             UnaryOp::Log => approx_log_f32("%x", "%y"),
             // ── rounding / sign (pure arith: float→int→float + cmpf/select) ──
@@ -1648,11 +1749,11 @@ impl UnaryOp {
             UnaryOp::Erf => format!(
                 "{}{}{}{}{}{}          %ax = math.absf %x : f32\n          %c1e = arith.constant 1.0 : f32\n          %c0e = arith.constant 0.0 : f32\n          %pax = arith.mulf %perf, %ax : f32\n          %den = arith.addf %pax, %c1e : f32\n          %t = arith.divf %c1e, %den : f32\n          %h0 = arith.mulf %t, %a5f : f32\n          %h1 = arith.addf %h0, %a4f : f32\n          %h2 = arith.mulf %h1, %t : f32\n          %h3 = arith.addf %h2, %a3f : f32\n          %h4 = arith.mulf %h3, %t : f32\n          %h5 = arith.addf %h4, %a2f : f32\n          %h6 = arith.mulf %h5, %t : f32\n          %h7 = arith.addf %h6, %a1f : f32\n          %poly = arith.mulf %h7, %t : f32\n          %x2 = arith.mulf %x, %x : f32\n          %nx2 = arith.negf %x2 : f32\n{}          %pex = arith.mulf %poly, %ex : f32\n          %r = arith.subf %c1e, %pex : f32\n          %lt = arith.cmpf olt, %x, %c0e : f32\n          %nr = arith.negf %r : f32\n          %y = arith.select %lt, %nr, %r : f32\n",
                 fbits("perf", 0.327_591_1),
-                fbits("a1f", 0.254_829_592),
-                fbits("a2f", -0.284_496_736),
-                fbits("a3f", 1.421_413_741),
-                fbits("a4f", -1.453_152_027),
-                fbits("a5f", 1.061_405_429),
+                fbits("a1f", 0.254_829_6),
+                fbits("a2f", -0.284_496_72),
+                fbits("a3f", 1.421_413_8),
+                fbits("a4f", -1.453_152_1),
+                fbits("a5f", 1.061_405_4),
                 approx_exp_f32("%nx2", "%ex")
             ),
         }
@@ -1662,7 +1763,10 @@ impl UnaryOp {
         // Everything except the vector-legal relu/neg/abs/recip is scalar-f32:
         // the transcendental approximations, and the rounding/piecewise ops that
         // use cmpf/select/fptosi (no f32 vector path on AIE2).
-        !matches!(self, UnaryOp::Relu | UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Recip)
+        !matches!(
+            self,
+            UnaryOp::Relu | UnaryOp::Neg | UnaryOp::Abs | UnaryOp::Recip
+        )
     }
     /// Host reference (f32) for validation.
     pub fn apply_f32(&self, x: f32) -> f32 {
@@ -1679,7 +1783,7 @@ impl UnaryOp {
             UnaryOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
             UnaryOp::Silu => x / (1.0 + (-x).exp()),
             UnaryOp::Gelu => {
-                let inner = 0.7978845608 * (x + 0.044715 * x * x * x);
+                let inner = 0.797_884_6 * (x + 0.044715 * x * x * x);
                 0.5 * x * (1.0 + inner.tanh())
             }
             UnaryOp::Floor => x.floor(),
@@ -1702,8 +1806,8 @@ impl UnaryOp {
                     x.exp() - 1.0
                 }
             }
-            UnaryOp::HardSwish => x * (x + 3.0).max(0.0).min(6.0) / 6.0,
-            UnaryOp::HardSigmoid => ((x + 3.0) / 6.0).max(0.0).min(1.0),
+            UnaryOp::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) / 6.0,
+            UnaryOp::HardSigmoid => ((x + 3.0) / 6.0).clamp(0.0, 1.0),
             UnaryOp::Mish => x * (x.exp().ln_1p()).tanh(),
             UnaryOp::Softsign => x / (1.0 + x.abs()),
             UnaryOp::LogSigmoid => -(1.0 + (-x).exp()).ln(),
@@ -1715,9 +1819,9 @@ impl UnaryOp {
                 let ax = x.abs();
                 let t = 1.0 / (1.0 + 0.3275911 * ax);
                 let poly = t
-                    * (0.254829592
-                        + t * (-0.284496736
-                            + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+                    * (0.254_829_6
+                        + t * (-0.284_496_72
+                            + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
                 s * (1.0 - poly * (-ax * ax).exp())
             }
         }
@@ -1730,15 +1834,24 @@ impl UnaryOp {
 /// vector path); bf16 vectorizes 32-wide. Requires `n % chunk == 0`,
 /// `chunk % lanes == 0`.
 pub fn emit_unary(op: UnaryOp, ty: Ty, n: usize, chunk: usize) -> String {
-    assert!(ty.is_float(), "activations are float ops (use Ty::F32 or Ty::Bf16)");
+    assert!(
+        ty.is_float(),
+        "activations are float ops (use Ty::F32 or Ty::Bf16)"
+    );
     assert!(
         !(op.needs_approx() && ty != Ty::F32),
         "{} uses the pure-arith approximation (scalar f32 only)",
         op.name()
     );
-    assert!(chunk > 0 && n % chunk == 0, "n ({n}) must be a multiple of chunk ({chunk})");
+    assert!(
+        n.is_multiple_of(chunk),
+        "n ({n}) must be a multiple of chunk ({chunk})"
+    );
     let lanes = ty.lanes();
-    assert!(chunk % lanes == 0, "chunk ({chunk}) must be a multiple of {lanes} lanes");
+    assert!(
+        chunk.is_multiple_of(lanes),
+        "chunk ({chunk}) must be a multiple of {lanes} lanes"
+    );
     let t = ty.mlir();
     let vt = v_type(t, lanes);
     let step = lanes;
@@ -1808,7 +1921,10 @@ fn pick_tile_rows(rows: usize, cols: usize) -> usize {
     // double-buffered (4 live buffers), so 4·budget·4B must stay within the tile's
     // 64 KB data memory with headroom for code/stack.
     let budget = 1024usize;
-    (1..=rows).rev().find(|&tr| rows % tr == 0 && tr * cols <= budget).unwrap_or(1)
+    (1..=rows)
+        .rev()
+        .find(|&tr| rows.is_multiple_of(tr) && tr * cols <= budget)
+        .unwrap_or(1)
 }
 
 /// Emit AIE-MLIR for a numerically-stable row **softmax** over `[rows, cols]`:
@@ -2223,7 +2339,14 @@ pub fn emit_layer_norm_affine(rows: usize, cols: usize, eps: f32) -> String {
 /// mean/var normalize; the affine channel is `c = (r % G)·cg + j/hw`. Single-tile
 /// (whole tensor resident). `gamma‖beta` packed as `[2·C]` (arg1); x/out as arg0/2
 /// → [`crate::npu_gemm::NpuRun3`]. `cg = C/G`, `hw = H·W`, `C = G·cg`.
-pub fn emit_group_norm(rows: usize, group_size: usize, num_groups: usize, cg: usize, hw: usize, eps: f32) -> String {
+pub fn emit_group_norm(
+    rows: usize,
+    group_size: usize,
+    num_groups: usize,
+    cg: usize,
+    hw: usize,
+    eps: f32,
+) -> String {
     let n = rows * group_size;
     let c_total = num_groups * cg;
     let gb2 = 2 * c_total;
@@ -2684,7 +2807,9 @@ pub fn emit_argmax(rows: usize, cols: usize, is_max: bool) -> String {
     let load_x = if is_max {
         format!("            %x = memref.load %in[%r, %c] : memref<{rows}x{cols}xf32>\n")
     } else {
-        format!("            %xr = memref.load %in[%r, %c] : memref<{rows}x{cols}xf32>\n            %x = arith.negf %xr : f32\n")
+        format!(
+            "            %xr = memref.load %in[%r, %c] : memref<{rows}x{cols}xf32>\n            %x = arith.negf %xr : f32\n"
+        )
     };
     format!(
         r#"module {{
@@ -2768,9 +2893,13 @@ pub fn emit_scan(kind: ScanOp, rows: usize, cols: usize, exclusive: bool) -> Str
         ),
     };
     let inner = if exclusive {
-        format!("            memref.store %acc, %out[%f] : memref<{n}xf32>\n            %na = {op} %acc, %v : f32\n            scf.yield %na : f32\n")
+        format!(
+            "            memref.store %acc, %out[%f] : memref<{n}xf32>\n            %na = {op} %acc, %v : f32\n            scf.yield %na : f32\n"
+        )
     } else {
-        format!("            %na = {op} %acc, %v : f32\n            memref.store %na, %out[%f] : memref<{n}xf32>\n            scf.yield %na : f32\n")
+        format!(
+            "            %na = {op} %acc, %v : f32\n            memref.store %na, %out[%f] : memref<{n}xf32>\n            scf.yield %na : f32\n"
+        )
     };
     let body = format!(
         "        %rowsN = arith.constant {rows} : index\n        %colsN = arith.constant {cols} : index\n{init}        scf.for %r = %z0 to %rowsN step %one {{\n          %rc = arith.muli %r, %colsN : index\n          %fin = scf.for %j = %z0 to %colsN step %one iter_args(%acc = %init) -> (f32) {{\n            %f = arith.addi %rc, %j : index\n            %v = memref.load %in[%f] : memref<{n}xf32>\n{inner}          }}\n        }}\n"
@@ -2788,7 +2917,13 @@ pub fn emit_scan(kind: ScanOp, rows: usize, cols: usize, exclusive: bool) -> Str
 /// `[outer, in_axis, inner]` view, where `src` is MLIR computing `%sa` (source
 /// axis index, `index` type) from `%a` (output axis index, `0..out_axis`). The
 /// engine behind reverse / narrow / slice / tile / expand. `n_in`/`n_out` differ.
-fn emit_axis_copy(outer: usize, in_axis: usize, inner: usize, out_axis: usize, src: &str) -> String {
+fn emit_axis_copy(
+    outer: usize,
+    in_axis: usize,
+    inner: usize,
+    out_axis: usize,
+    src: &str,
+) -> String {
     let n_in = outer * in_axis * inner;
     let n_out = outer * out_axis * inner;
     let in_stride = in_axis * inner;
@@ -2859,11 +2994,32 @@ fn emit_axis_copy(outer: usize, in_axis: usize, inner: usize, out_axis: usize, s
 
 /// `Pad` the axis by `before`/`after` with `fill`: fill the whole output, then
 /// copy `in[…,a,…] → out[…,before+a,…]`. Constant mode only.
-pub fn emit_pad(outer: usize, in_axis: usize, inner: usize, before: usize, after: usize, fill: f32) -> String {
-    emit_pad_impl(outer, in_axis, inner, before, before + in_axis + after, fill)
+pub fn emit_pad(
+    outer: usize,
+    in_axis: usize,
+    inner: usize,
+    before: usize,
+    after: usize,
+    fill: f32,
+) -> String {
+    emit_pad_impl(
+        outer,
+        in_axis,
+        inner,
+        before,
+        before + in_axis + after,
+        fill,
+    )
 }
 
-fn emit_pad_impl(outer: usize, in_axis: usize, inner: usize, before: usize, out_axis: usize, fill: f32) -> String {
+fn emit_pad_impl(
+    outer: usize,
+    in_axis: usize,
+    inner: usize,
+    before: usize,
+    out_axis: usize,
+    fill: f32,
+) -> String {
     let n_in = outer * in_axis * inner;
     let n_out = outer * out_axis * inner;
     let (in_stride, out_stride) = (in_axis * inner, out_axis * inner);
@@ -2941,18 +3097,29 @@ fn emit_pad_impl(outer: usize, in_axis: usize, inner: usize, before: usize, out_
 /// `Reverse` along the axis: `out[…,a,…] = in[…,in_axis-1-a,…]`.
 pub fn emit_reverse(outer: usize, axis: usize, inner: usize) -> String {
     let amax = axis - 1;
-    let src = format!("            %amax = arith.constant {amax} : index\n            %sa = arith.subi %amax, %a : index\n");
+    let src = format!(
+        "            %amax = arith.constant {amax} : index\n            %sa = arith.subi %amax, %a : index\n"
+    );
     emit_axis_copy(outer, axis, inner, axis, &src)
 }
 
 /// `Narrow` along the axis: `out[…,a,…] = in[…,start+a,…]`, `a in 0..len`.
 pub fn emit_narrow(outer: usize, in_axis: usize, inner: usize, start: usize, len: usize) -> String {
-    let src = format!("            %startc = arith.constant {start} : index\n            %sa = arith.addi %a, %startc : index\n");
+    let src = format!(
+        "            %startc = arith.constant {start} : index\n            %sa = arith.addi %a, %startc : index\n"
+    );
     emit_axis_copy(outer, in_axis, inner, len, &src)
 }
 
 /// `Slice` with stride: `out[…,a,…] = in[…,start+a·step,…]` (step may be < 0).
-pub fn emit_slice(outer: usize, in_axis: usize, inner: usize, start: usize, len: usize, step: i64) -> String {
+pub fn emit_slice(
+    outer: usize,
+    in_axis: usize,
+    inner: usize,
+    start: usize,
+    len: usize,
+    step: i64,
+) -> String {
     // i32 arithmetic so a negative step works, then cast back to index.
     let src = format!(
         "            %ai = arith.index_cast %a : index to i32\n            %starti = arith.constant {start} : i32\n            %stepi = arith.constant {step} : i32\n            %mul = arith.muli %ai, %stepi : i32\n            %sai32 = arith.addi %mul, %starti : i32\n            %sa = arith.index_cast %sai32 : i32 to index\n"
@@ -2962,7 +3129,9 @@ pub fn emit_slice(outer: usize, in_axis: usize, inner: usize, start: usize, len:
 
 /// `Tile` (repeat) the axis `reps` times: `out[…,a,…] = in[…,a mod in_axis,…]`.
 pub fn emit_tile(outer: usize, in_axis: usize, inner: usize, reps: usize) -> String {
-    let src = format!("            %axisc = arith.constant {in_axis} : index\n            %sa = arith.remui %a, %axisc : index\n");
+    let src = format!(
+        "            %axisc = arith.constant {in_axis} : index\n            %sa = arith.remui %a, %axisc : index\n"
+    );
     emit_axis_copy(outer, in_axis, inner, in_axis * reps, &src)
 }
 
@@ -3211,7 +3380,8 @@ pub fn emit_cast(n: usize, f2i: bool) -> String {
         // in reinterpreted as i32 bits, out stored as f32.
         "          %vb = memref.load %in[%k] : memref<{n}xf32>\n          %iv = arith.bitcast %vb : f32 to i32\n          %o = arith.sitofp %iv : i32 to f32\n          memref.store %o, %out[%k] : memref<{n}xf32>\n"
     };
-    let body = format!("        scf.for %k = %z0 to %nN step %one {{\n{conv}        }}\n").replace("{n}", &n.to_string());
+    let body = format!("        scf.for %k = %z0 to %nN step %one {{\n{conv}        }}\n")
+        .replace("{n}", &n.to_string());
     dm_unary(n, &body)
 }
 

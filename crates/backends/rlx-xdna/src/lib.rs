@@ -155,7 +155,9 @@ pub fn is_available() -> bool {
 /// for the compile-on-demand op path).
 pub fn op_compile_available() -> bool {
     let ok = |k: &str| {
-        std::env::var(k).map(|v| std::path::Path::new(&v).exists()).unwrap_or(false)
+        std::env::var(k)
+            .map(|v| std::path::Path::new(&v).exists())
+            .unwrap_or(false)
     };
     ok("AIECC") && ok("PEANO")
 }
@@ -230,7 +232,12 @@ pub fn diagnostic() -> String {
              libxrt_driver_xdna.so; set XILINX_XRT) and an AIE-compiled kernel image to \
              execute. Refusing to run on the NPU — no CPU fallback."
         ),
-        XdnaStatus::RuntimePresent { node, fw, product, xrt_lib } => format!(
+        XdnaStatus::RuntimePresent {
+            node,
+            fw,
+            product,
+            xrt_lib,
+        } => format!(
             "AMD XDNA NPU live at {node} ({product}, fw {fw}); XRT runtime present ({xrt_lib}). \
              `Device::Xdna` runs graphs here once the mlir-aie toolchain is configured (set AIECC \
              + PEANO for the compile-on-demand op path, or RLX_XDNA_GEMM for a precompiled INT8 \
@@ -281,8 +288,7 @@ fn detect_linux() -> XdnaStatus {
         // An amdxdna-backed NPU: the bound driver is `amdxdna`, or the product
         // string names a Ryzen AI NPU (vbnv like "RyzenAI-npu1").
         let plc = product.to_ascii_lowercase();
-        let is_xdna =
-            driver_is_amdxdna(&devdir) || plc.contains("ryzenai") || plc.contains("npu");
+        let is_xdna = driver_is_amdxdna(&devdir) || plc.contains("ryzenai") || plc.contains("npu");
         if !is_xdna {
             continue;
         }

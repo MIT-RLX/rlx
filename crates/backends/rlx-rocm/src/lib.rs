@@ -39,11 +39,11 @@ pub mod hip;
 pub mod hipblas;
 pub mod hipblaslt;
 pub mod hipsolver;
-pub mod iq_grid;
 pub mod host_misc;
 pub mod host_ops;
 pub mod host_stage;
 pub mod host_staging;
+pub mod iq_grid;
 pub mod im2col_host {
     pub use super::host_ops::run_im2col;
 }

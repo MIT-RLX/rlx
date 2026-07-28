@@ -451,7 +451,9 @@ pub mod distributed {
 pub mod prelude {
     // Tensor DSL (expression-style graph building) — feature `tensor`.
     #[cfg(feature = "tensor")]
-    pub use crate::tensor::{GraphScope, Tensor, ax, graph, graph_with, ix, rg, rlx, s, shape, tail};
+    pub use crate::tensor::{
+        GraphScope, Tensor, ax, graph, graph_with, ix, rg, rlx, s, shape, tail,
+    };
 
     // Core graph + runtime
     pub use crate::{

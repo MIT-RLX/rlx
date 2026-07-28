@@ -14,8 +14,7 @@ use std::{env, fs, path::Path};
 
 fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let main_src =
-        fs::read_to_string("kernels/unary_main.cu").expect("read kernels/unary_main.cu");
+    let main_src = fs::read_to_string("kernels/unary_main.cu").expect("read kernels/unary_main.cu");
     let activation = rlxsl::cuda_activation_module(rlxsl::OpcodeScheme::ReluFirst);
     let combined = format!("{activation}\n{main_src}");
     fs::write(Path::new(&out_dir).join("unary.cu"), combined).expect("write $OUT_DIR/unary.cu");
@@ -35,7 +34,8 @@ fn main() {
 
     // Standalone `binary` kernel: per-op math (`rlx_binary_apply`) @generated from
     // the shared rlxsl manifest (native `powf`), prepended to binary_main.cu.
-    let bin_main = fs::read_to_string("kernels/binary_main.cu").expect("read kernels/binary_main.cu");
+    let bin_main =
+        fs::read_to_string("kernels/binary_main.cu").expect("read kernels/binary_main.cu");
     let bin = rlxsl::binary::cuda_binary_module();
     fs::write(
         Path::new(&out_dir).join("binary.cu"),

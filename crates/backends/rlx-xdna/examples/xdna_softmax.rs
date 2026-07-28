@@ -11,11 +11,14 @@
 //     cargo run -p rlx-xdna --features xrt --example xdna_softmax
 
 use rlx_xdna::aie::emit_softmax;
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuIoF32;
 
 fn env(k: &str, d: &str) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| d.parse().unwrap())
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| d.parse().unwrap())
 }
 
 fn main() {
@@ -26,7 +29,10 @@ fn main() {
 
     // 1) emit + 2) compile
     let mlir = emit_softmax(rows, cols);
-    println!("1. rlx emitted AIE-MLIR softmax {rows}x{cols} ({} lines)", mlir.lines().count());
+    println!(
+        "1. rlx emitted AIE-MLIR softmax {rows}x{cols} ({} lines)",
+        mlir.lines().count()
+    );
     let tmp = "/tmp/rlx_softmax";
     std::fs::create_dir_all(tmp).ok();
     let mp = format!("{tmp}/aie.mlir");

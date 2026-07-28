@@ -75,8 +75,7 @@ impl XrtBinding {
     pub fn load(lib_dir: &str) -> Result<Self, String> {
         let so = |stem: &str| first_soname(lib_dir, stem);
         // Best-effort preload of the coreutil dependency chain.
-        let core = so("libxrt_core.so")
-            .and_then(|p| unsafe { libloading::Library::new(p) }.ok());
+        let core = so("libxrt_core.so").and_then(|p| unsafe { libloading::Library::new(p) }.ok());
         let coreutil_path = so("libxrt_coreutil.so")
             .ok_or_else(|| format!("libxrt_coreutil.so* not found in {lib_dir}"))?;
         let coreutil = unsafe { libloading::Library::new(&coreutil_path) }

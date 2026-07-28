@@ -631,8 +631,8 @@ fn dequant_matmul_mxfp4x2_matches_reference() {
     if !rlx_rocm::is_available() {
         return;
     }
-    use rlx_ir::residual::{residual_dequantize, residual_quantize};
     use rlx_ir::ScaledFormat;
+    use rlx_ir::residual::{residual_dequantize, residual_quantize};
 
     let (m, k, n) = (2usize, 32usize, 4usize);
     let group = k; // one MX block per column → nblk = 1
@@ -656,7 +656,8 @@ fn dequant_matmul_mxfp4x2_matches_reference() {
             let shift: u32 = if elem & 1 == 0 { 0 } else { 4 };
             let mask: u8 = 0x0Fu8 << shift;
             w_bytes[byte] = (w_bytes[byte] & !mask) | ((rb.codes[0][p] & 0x0F) << shift);
-            w_bytes[plane + byte] = (w_bytes[plane + byte] & !mask) | ((rb.codes[1][p] & 0x0F) << shift);
+            w_bytes[plane + byte] =
+                (w_bytes[plane + byte] & !mask) | ((rb.codes[1][p] & 0x0F) << shift);
             w_dq[elem] = dq[p];
         }
     }
@@ -680,7 +681,9 @@ fn dequant_matmul_mxfp4x2_matches_reference() {
     let scale_param = g.param("scale", Shape::new(&[2 * nblk * n], DType::F32));
     let y = g.add_node(
         rlx_ir::Op::DequantMatMul {
-            scheme: QuantScheme::MxFp4x2Block { group_size: group as u32 },
+            scheme: QuantScheme::MxFp4x2Block {
+                group_size: group as u32,
+            },
         },
         vec![x_in, w_param, scale_param],
         Shape::new(&[m, n], DType::F32),

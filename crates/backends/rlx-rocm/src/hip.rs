@@ -408,7 +408,10 @@ fn detected_rocm_arch() -> &'static Option<String> {
     static ARCH: OnceLock<Option<String>> = OnceLock::new();
     ARCH.get_or_init(|| {
         // `rocm_agent_enumerator` prints one gfx token per line — cheapest.
-        for cmd in ["rocm_agent_enumerator", "/opt/rocm/bin/rocm_agent_enumerator"] {
+        for cmd in [
+            "rocm_agent_enumerator",
+            "/opt/rocm/bin/rocm_agent_enumerator",
+        ] {
             if let Ok(out) = std::process::Command::new(cmd).output() {
                 if out.status.success() {
                     if let Some(a) = first_gfx_token(&String::from_utf8_lossy(&out.stdout)) {

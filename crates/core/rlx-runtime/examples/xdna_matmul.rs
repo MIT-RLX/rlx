@@ -17,7 +17,10 @@ use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available};
 
 fn dim(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn mkn() -> (usize, usize, usize) {
     (dim("M", 512), dim("K", 512), dim("N", 512))
@@ -38,7 +41,9 @@ fn q_per_row(v: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
     let mut q = vec![0i8; rows * cols];
     let mut s = vec![1.0f32; rows];
     for r in 0..rows {
-        let amax = v[r * cols..r * cols + cols].iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let amax = v[r * cols..r * cols + cols]
+            .iter()
+            .fold(0.0f32, |m, &x| m.max(x.abs()));
         if amax == 0.0 {
             continue;
         }
@@ -81,7 +86,9 @@ fn main() {
         .collect();
 
     if !is_available(Device::Xdna) {
-        eprintln!("Device::Xdna not available — set RLX_XDNA_SHIM/XCLBIN/INSTS/GEMM (+ LD_LIBRARY_PATH).");
+        eprintln!(
+            "Device::Xdna not available — set RLX_XDNA_SHIM/XCLBIN/INSTS/GEMM (+ LD_LIBRARY_PATH)."
+        );
         std::process::exit(2);
     }
 
@@ -109,7 +116,12 @@ fn main() {
         .collect();
 
     // 1) NPU vs quant-ref (should match — same integer math + dequant).
-    let max_abs = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let max_abs = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
     let npu_err = max_abs(&y_npu, &y_ref);
     let scale = y_ref.iter().fold(1e-6f32, |m, &v| m.max(v.abs()));
     let npu_ok = npu_err < 1e-3 * scale;
@@ -126,7 +138,9 @@ fn main() {
     let amax = |v: &[f32]| v.iter().fold(0f32, |m, &x| m.max(x.abs()));
     let (sxt, swt) = (amax(&xv) / 127.0, amax(&wv) / 127.0);
     let qt = |v: &[f32], s: f32| -> Vec<i8> {
-        v.iter().map(|&x| (x / s).round().clamp(-127., 127.) as i8).collect()
+        v.iter()
+            .map(|&x| (x / s).round().clamp(-127., 127.) as i8)
+            .collect()
     };
     let (xt, wt) = (qt(&xv, sxt), qt(&wv, swt));
     let mut y_pt = vec![0f32; m * n];
@@ -160,7 +174,11 @@ fn main() {
              (vs per-tensor {:.2}%); warm {per_us:.0} us/call ({})",
             rel * 100.0,
             rel_pt * 100.0,
-            if resident { "resident weight" } else { "re-upload W" }
+            if resident {
+                "resident weight"
+            } else {
+                "re-upload W"
+            }
         );
     } else {
         println!(

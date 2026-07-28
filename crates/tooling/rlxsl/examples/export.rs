@@ -17,7 +17,9 @@ use rlxsl::OpcodeScheme::{GeluFirst, ReluFirst};
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    let out = env::args().nth(1).unwrap_or_else(|| "rlxsl-generated".to_string());
+    let out = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "rlxsl-generated".to_string());
     let dir = PathBuf::from(&out);
     fs::create_dir_all(&dir).expect("create output dir");
 
@@ -94,7 +96,10 @@ fn main() {
         ),
     ];
 
-    println!("rlxsl: exporting generated activation kernels to {}", dir.display());
+    println!(
+        "rlxsl: exporting generated activation kernels to {}",
+        dir.display()
+    );
     for (name, desc, src) in &artifacts {
         let path = dir.join(name);
         fs::write(&path, src).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));

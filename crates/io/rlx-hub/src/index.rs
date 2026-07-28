@@ -34,7 +34,12 @@ impl SafetensorsIndex {
 
     /// All shard files, sorted.
     pub fn shards(&self) -> Vec<String> {
-        self.weight_map.values().cloned().collect::<BTreeSet<_>>().into_iter().collect()
+        self.weight_map
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Shard files holding any tensor for which `pred` is true, sorted.
@@ -53,7 +58,11 @@ impl SafetensorsIndex {
     pub fn tensor_layer(name: &str) -> Option<usize> {
         let after = name.split("layers.").nth(1)?;
         let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() { None } else { digits.parse().ok() }
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
+        }
     }
 }
 
@@ -88,7 +97,11 @@ pub fn plan_layer_stages(
                 Some(l) => range.contains(&l),
                 None => extras.iter().any(|p| t.starts_with(p)),
             });
-            StageShards { stage: i, layers: range.clone(), shards }
+            StageShards {
+                stage: i,
+                layers: range.clone(),
+                shards,
+            }
         })
         .collect()
 }
@@ -134,10 +147,19 @@ mod tests {
 
     #[test]
     fn tensor_layer_parses() {
-        assert_eq!(SafetensorsIndex::tensor_layer("model.layers.7.mlp.w"), Some(7));
-        assert_eq!(SafetensorsIndex::tensor_layer("model.layers.42.x"), Some(42));
+        assert_eq!(
+            SafetensorsIndex::tensor_layer("model.layers.7.mlp.w"),
+            Some(7)
+        );
+        assert_eq!(
+            SafetensorsIndex::tensor_layer("model.layers.42.x"),
+            Some(42)
+        );
         assert_eq!(SafetensorsIndex::tensor_layer("lm_head.weight"), None);
-        assert_eq!(SafetensorsIndex::tensor_layer("model.embed_tokens.weight"), None);
+        assert_eq!(
+            SafetensorsIndex::tensor_layer("model.embed_tokens.weight"),
+            None
+        );
     }
 
     #[test]

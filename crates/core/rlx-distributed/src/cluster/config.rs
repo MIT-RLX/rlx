@@ -16,8 +16,8 @@
 //!
 //! [[node]]
 //! addr = "127.0.0.1:9100"
-//! ssh = "macmini"                    # for probe / launch / weight sync
-//! ckpt_dir = "/Users/Shared/DeepSeek-V4-Flash-2bit-DQ"
+//! ssh = "node-a"                     # ~/.ssh/config alias — for probe / launch / weight sync
+//! ckpt_dir = "/path/to/DeepSeek-V4-Flash-2bit-DQ"
 //! device = "cpu"                     # cpu | metal | cuda | ane | vulkan | "metal+cpu"
 //! precision = "bf16"                 # f32 | f16 | bf16 | mixed
 //! kv_cache = "host"                  # none | host | device
@@ -104,15 +104,21 @@ fn default_precision() -> String {
 impl NodeConfig {
     /// Parsed device preference list (primary first). CPU spill devices follow.
     pub fn devices(&self) -> Result<Vec<Device>> {
-        parse_device_list(&self.device.replace('+', ",")).map_err(|e| anyhow::anyhow!("node {}: bad device `{}`: {e:?}", self.addr, self.device))
+        parse_device_list(&self.device.replace('+', ","))
+            .map_err(|e| anyhow::anyhow!("node {}: bad device `{}`: {e:?}", self.addr, self.device))
     }
     /// Primary compute device (first in the list).
     pub fn primary_device(&self) -> Device {
-        self.devices().ok().and_then(|d| d.into_iter().next()).unwrap_or(Device::Cpu)
+        self.devices()
+            .ok()
+            .and_then(|d| d.into_iter().next())
+            .unwrap_or(Device::Cpu)
     }
     /// True if the node lists a CPU/host spill target after its primary.
     pub fn cpu_offload(&self) -> bool {
-        self.devices().map(|d| d.len() > 1 && d.iter().any(|x| *x == Device::Cpu)).unwrap_or(false)
+        self.devices()
+            .map(|d| d.len() > 1 && d.contains(&Device::Cpu))
+            .unwrap_or(false)
     }
     /// Manual layer range if given.
     pub fn manual_range(&self) -> Option<Range<usize>> {
@@ -161,11 +167,16 @@ impl ClusterConfig {
         toml::from_str(s).context("parse cluster TOML")
     }
     pub fn from_path(p: impl AsRef<Path>) -> Result<Self> {
-        let s = std::fs::read_to_string(p.as_ref()).with_context(|| format!("read {}", p.as_ref().display()))?;
+        let s = std::fs::read_to_string(p.as_ref())
+            .with_context(|| format!("read {}", p.as_ref().display()))?;
         Self::from_toml_str(&s)
     }
     /// Effective RNG seed for node `i` (per-node override, else global, else 0).
     pub fn seed_for(&self, i: usize) -> u64 {
-        self.nodes.get(i).and_then(|n| n.rng_seed).or(self.rng_seed).unwrap_or(0)
+        self.nodes
+            .get(i)
+            .and_then(|n| n.rng_seed)
+            .or(self.rng_seed)
+            .unwrap_or(0)
     }
 }

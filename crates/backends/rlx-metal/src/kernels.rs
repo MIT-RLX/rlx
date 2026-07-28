@@ -8490,8 +8490,7 @@ fn gelu_inplace_f32_msl() -> String {
 /// pow generated from rlxsl, for the tuned broadcast kernels (whose bare MSL
 /// `pow` NaN'd on a negative base). Metal inlines it → no perf cost.
 fn pow_scalar_fn_msl() -> String {
-    let (stmts, expr) =
-        rlxsl::binary::emit_binary(rlx_ir::op::BinaryOp::Pow, rlxsl::Lang::Msl);
+    let (stmts, expr) = rlxsl::binary::emit_binary(rlx_ir::op::BinaryOp::Pow, rlxsl::Lang::Msl);
     format!(
         "// @generated from rlxsl — Rust-powf-matching scalar pow (+ a vec4 overload\n\
          // for the packed_float4 broadcast kernels).\n\
@@ -8516,7 +8515,10 @@ fn msl_source() -> String {
         .replace("// @@RLX_ACT_INPLACE_H@@", &core_act_inplace_h_msl())
         .replace("// @@RLX_GELU_INPLACE_F32@@", &gelu_inplace_f32_msl())
         .replace("// @@RLX_BINARY_FN@@", &rlxsl::binary::msl_binary_module())
-        .replace("// @@RLX_COMPARE_FN@@", &rlxsl::compare::msl_compare_module());
+        .replace(
+            "// @@RLX_COMPARE_FN@@",
+            &rlxsl::compare::msl_compare_module(),
+        );
     format!(
         "{core}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}\n{}",
         scalar_act_msl()
@@ -8931,7 +8933,9 @@ impl Kernels {
                 .device
                 .new_library_with_source(&src, &opts)
                 .expect("rlx-metal: compile dw_sum_arena library");
-            let f = lib.get_function("dw_sum_arena", None).expect("dw_sum_arena");
+            let f = lib
+                .get_function("dw_sum_arena", None)
+                .expect("dw_sum_arena");
             dev.device
                 .new_compute_pipeline_state_with_function(&f)
                 .expect("rlx-metal: dw_sum_arena pipeline")

@@ -360,9 +360,7 @@ fn parse_atom(input: ParseStream) -> syn::Result<Expr> {
         return Ok(Expr::Var(id));
     }
 
-    Err(input.error(
-        "expected a tensor expression (a binding name, `f(x)`, `a @ b`, or `(…)`)",
-    ))
+    Err(input.error("expected a tensor expression (a binding name, `f(x)`, `a @ b`, or `(…)`)"))
 }
 
 /// Arguments to `f(…)` sugar are DSL expressions (so `gelu(x @ w + b)` works),
@@ -681,9 +679,7 @@ fn method_args(args: &[syn::Expr], vars: &HashSet<String>) -> Vec<TokenStream> {
     args.iter()
         .map(|a| {
             if let syn::Expr::Path(p) = a {
-                if p.qself.is_none()
-                    && p.path.leading_colon.is_none()
-                    && p.path.segments.len() == 1
+                if p.qself.is_none() && p.path.leading_colon.is_none() && p.path.segments.len() == 1
                 {
                     let seg = &p.path.segments[0];
                     if seg.arguments.is_none() && vars.contains(&seg.ident.to_string()) {

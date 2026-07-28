@@ -65,6 +65,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+pub mod fv5_dequant;
+pub mod i2s_dequant;
+pub mod i8s_dequant;
 mod iq1_encode;
 mod iq2_encode;
 mod iq3_encode;
@@ -74,8 +77,6 @@ pub mod iq_grids;
 pub mod iq_quantize;
 pub mod mx_dequant;
 pub mod mx_quantize;
-pub mod i2s_dequant;
-pub mod i8s_dequant;
 pub mod q1_dequant;
 pub mod q2_dequant;
 pub mod quantize;
@@ -95,6 +96,9 @@ pub const DEFAULT_ALIGNMENT: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+// Variant names mirror upstream `ggml_type` spelling verbatim (e.g. `I2_S`,
+// `I8_S`) so they map 1:1 to the on-disk format; keep them as-is.
+#[allow(non_camel_case_types)]
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
@@ -138,6 +142,10 @@ pub enum GgmlType {
     NVFP4 = 40,
     Q1_0 = 41,
     Q2_0 = 42,
+    // Fermion Research five-value ternary (fermion-fv5 llama.cpp fork):
+    // FV5 = transformer linears, FV5B = int8 embed/lm_head. See fv5_dequant.
+    FV5 = 43,
+    FV5B = 44,
 }
 
 impl GgmlType {
@@ -180,6 +188,8 @@ impl GgmlType {
             40 => Self::NVFP4,
             41 => Self::Q1_0,
             42 => Self::Q2_0,
+            43 => Self::FV5,
+            44 => Self::FV5B,
             other => bail!("unknown ggml type {other}"),
         })
     }
@@ -559,6 +569,8 @@ impl GgufFile {
             GgmlType::IQ1M => iq_dequant::dequant_iq1_m(bytes, n)?,
             GgmlType::Q1_0 => q1_dequant::dequant_q1_0(bytes, n)?,
             GgmlType::Q2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
+            GgmlType::FV5 => fv5_dequant::dequant_fv5(bytes, n)?,
+            GgmlType::FV5B => fv5_dequant::dequant_fv5b(bytes, n)?,
             GgmlType::I8 => {
                 if bytes.len() != n {
                     bail!("I8 tensor {name}: expected {n} bytes, got {}", bytes.len());
@@ -677,6 +689,9 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         // Custom 1-bit format (PrismML Bonsai-27B): f16 scale + 128 sign bits.
         GgmlType::Q1_0 => q1_dequant::q1_0_bytes(n),
         GgmlType::Q2_0 => q2_dequant::q2_0_bytes(n),
+        // Fermion five-value ternary (Neutrino): 256-elem blocks.
+        GgmlType::FV5 => fv5_dequant::fv5_bytes(n),
+        GgmlType::FV5B => fv5_dequant::fv5b_bytes(n),
         GgmlType::I8 => Some(n),
         GgmlType::I16 => Some(n * 2),
         GgmlType::I32 => Some(n * 4),

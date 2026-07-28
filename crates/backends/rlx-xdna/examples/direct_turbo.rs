@@ -15,12 +15,16 @@ fn main() {
         use rlx_xdna::direct::Npu;
         let npu = Npu::open("").expect("open /dev/accel/accel0");
         match npu.set_turbo() {
-            Ok(()) => println!("[turbo] SET_STATE(POWER_MODE_TURBO) OK — NPU clocked to max DPM (hold this fd to keep it)"),
+            Ok(()) => println!(
+                "[turbo] SET_STATE(POWER_MODE_TURBO) OK — NPU clocked to max DPM (hold this fd to keep it)"
+            ),
             Err(e) => println!("[turbo] SET_STATE(POWER_MODE_TURBO) FAILED: {e}"),
         }
         // Also exercise DEFAULT so we know the ioctl round-trips both ways.
         match npu.set_power_mode(0) {
-            Ok(()) => println!("[turbo] SET_STATE(POWER_MODE_DEFAULT) OK — reset to calculated DPM"),
+            Ok(()) => {
+                println!("[turbo] SET_STATE(POWER_MODE_DEFAULT) OK — reset to calculated DPM")
+            }
             Err(e) => println!("[turbo] SET_STATE(POWER_MODE_DEFAULT) FAILED: {e}"),
         }
     }

@@ -84,7 +84,12 @@ impl NpuGemm {
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
-                .map_err(|e| XdnaError(format!("shim symbol {}: {e}", String::from_utf8_lossy(name))))
+                .map_err(|e| {
+                    XdnaError(format!(
+                        "shim symbol {}: {e}",
+                        String::from_utf8_lossy(name)
+                    ))
+                })
         };
         // Resolve then transmute to typed fn pointers (valid while `lib` lives).
         let open_fn: OpenFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_gemm_open")?) };
@@ -164,7 +169,9 @@ impl NpuGemm {
         assert_eq!(b.len(), self.k * self.n, "weight block must be k*n");
         let rc = unsafe { (self.set_weight_block_fn)(self.handle, idx as c_int, b.as_ptr()) };
         if rc != 0 {
-            return Err(XdnaError(format!("rlx_xdna_gemm_set_weight_block returned {rc}")));
+            return Err(XdnaError(format!(
+                "rlx_xdna_gemm_set_weight_block returned {rc}"
+            )));
         }
         Ok(())
     }
@@ -174,7 +181,8 @@ impl NpuGemm {
     pub fn run_block(&self, idx: usize, a: &[i8]) -> Result<Vec<i32>, XdnaError> {
         assert_eq!(a.len(), self.m * self.k, "A block must be m*k");
         let mut c = vec![0i32; self.m * self.n];
-        let rc = unsafe { (self.run_block_fn)(self.handle, idx as c_int, a.as_ptr(), c.as_mut_ptr()) };
+        let rc =
+            unsafe { (self.run_block_fn)(self.handle, idx as c_int, a.as_ptr(), c.as_mut_ptr()) };
         if rc != 0 {
             return Err(XdnaError(format!("rlx_xdna_gemm_run_block returned {rc}")));
         }
@@ -223,14 +231,24 @@ pub struct NpuIo {
 impl NpuIo {
     /// One-time setup for an `n`-element i32 overlay. `shim_path` empty →
     /// `$RLX_XDNA_SHIM`.
-    pub fn open(shim_path: &str, xclbin_path: &str, insts: &[u32], n: usize) -> Result<Self, XdnaError> {
+    pub fn open(
+        shim_path: &str,
+        xclbin_path: &str,
+        insts: &[u32],
+        n: usize,
+    ) -> Result<Self, XdnaError> {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
-                .map_err(|e| XdnaError(format!("shim symbol {}: {e}", String::from_utf8_lossy(name))))
+                .map_err(|e| {
+                    XdnaError(format!(
+                        "shim symbol {}: {e}",
+                        String::from_utf8_lossy(name)
+                    ))
+                })
         };
         let open_fn: IoOpenFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_io_open")?) };
         let run_fn: IoRunFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_io_run")?) };
@@ -239,7 +257,9 @@ impl NpuIo {
         let xclbin_c = CString::new(xclbin_path).unwrap();
         let handle = unsafe { open_fn(xclbin_c.as_ptr(), insts.as_ptr(), insts.len(), n as c_int) };
         if handle.is_null() {
-            return Err(XdnaError("rlx_xdna_io_open returned null (XRT error on stderr)".into()));
+            return Err(XdnaError(
+                "rlx_xdna_io_open returned null (XRT error on stderr)".into(),
+            ));
         }
         Ok(Self {
             handle,
@@ -299,8 +319,15 @@ pub struct NpuIoF32 {
 impl NpuIoF32 {
     /// One-time setup for an `n`-element f32 overlay. `shim_path` empty →
     /// `$RLX_XDNA_SHIM`.
-    pub fn open(shim_path: &str, xclbin_path: &str, insts: &[u32], n: usize) -> Result<Self, XdnaError> {
-        Ok(Self { inner: NpuIo::open(shim_path, xclbin_path, insts, n)? })
+    pub fn open(
+        shim_path: &str,
+        xclbin_path: &str,
+        insts: &[u32],
+        n: usize,
+    ) -> Result<Self, XdnaError> {
+        Ok(Self {
+            inner: NpuIo::open(shim_path, xclbin_path, insts, n)?,
+        })
     }
 
     /// Hot path: run the f32 overlay over `input` (n f32), returning n f32 out.
@@ -350,9 +377,21 @@ pub struct NpuIoBf16 {
 impl NpuIoBf16 {
     /// One-time setup for an `n`-element bf16 overlay (`n` even). The underlying
     /// i32 shim BO is `n/2` cells = `n*2` bytes = `n` bf16.
-    pub fn open(shim_path: &str, xclbin_path: &str, insts: &[u32], n: usize) -> Result<Self, XdnaError> {
-        assert_eq!(n % 2, 0, "NpuIoBf16 requires an even element count (got {n})");
-        Ok(Self { inner: NpuIo::open(shim_path, xclbin_path, insts, n / 2)?, n })
+    pub fn open(
+        shim_path: &str,
+        xclbin_path: &str,
+        insts: &[u32],
+        n: usize,
+    ) -> Result<Self, XdnaError> {
+        assert_eq!(
+            n % 2,
+            0,
+            "NpuIoBf16 requires an even element count (got {n})"
+        );
+        Ok(Self {
+            inner: NpuIo::open(shim_path, xclbin_path, insts, n / 2)?,
+            n,
+        })
     }
 
     /// Hot path: cast f32→bf16, run the bf16 overlay, cast bf16→f32. The bf16
@@ -393,26 +432,55 @@ pub struct NpuMm32 {
 }
 
 impl NpuMm32 {
-    pub fn open(shim_path: &str, xclbin_path: &str, insts: &[u32], m: usize, k: usize, n: usize) -> Result<Self, XdnaError> {
+    pub fn open(
+        shim_path: &str,
+        xclbin_path: &str,
+        insts: &[u32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Self, XdnaError> {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
-                .map_err(|e| XdnaError(format!("shim symbol {}: {e}", String::from_utf8_lossy(name))))
+                .map_err(|e| {
+                    XdnaError(format!(
+                        "shim symbol {}: {e}",
+                        String::from_utf8_lossy(name)
+                    ))
+                })
         };
         let open_fn: Mm32OpenFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_mm32_open")?) };
         let run_fn: Mm32RunFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_mm32_run")?) };
         let close_fn: Mm32CloseFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_mm32_close")?) };
         let xclbin_c = CString::new(xclbin_path).unwrap();
         let handle = unsafe {
-            open_fn(xclbin_c.as_ptr(), insts.as_ptr(), insts.len(), m as c_int, k as c_int, n as c_int)
+            open_fn(
+                xclbin_c.as_ptr(),
+                insts.as_ptr(),
+                insts.len(),
+                m as c_int,
+                k as c_int,
+                n as c_int,
+            )
         };
         if handle.is_null() {
-            return Err(XdnaError("rlx_xdna_mm32_open returned null (XRT error on stderr)".into()));
+            return Err(XdnaError(
+                "rlx_xdna_mm32_open returned null (XRT error on stderr)".into(),
+            ));
         }
-        Ok(Self { handle, run_fn, close_fn, m, k, n, _lib: lib })
+        Ok(Self {
+            handle,
+            run_fn,
+            close_fn,
+            m,
+            k,
+            n,
+            _lib: lib,
+        })
     }
 
     pub fn run(&self, a: &[i32], b: &[i32]) -> Result<Vec<i32>, XdnaError> {
@@ -471,19 +539,41 @@ impl NpuRun3 {
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
-                .map_err(|e| XdnaError(format!("shim symbol {}: {e}", String::from_utf8_lossy(name))))
+                .map_err(|e| {
+                    XdnaError(format!(
+                        "shim symbol {}: {e}",
+                        String::from_utf8_lossy(name)
+                    ))
+                })
         };
         let open_fn: Run3OpenFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_run3_open")?) };
         let run_fn: Run3RunFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_run3_run")?) };
         let close_fn: Run3CloseFn = unsafe { std::mem::transmute(sym(b"rlx_xdna_run3_close")?) };
         let xclbin_c = CString::new(xclbin_path).unwrap();
         let handle = unsafe {
-            open_fn(xclbin_c.as_ptr(), insts.as_ptr(), insts.len(), na * 4, nb * 4, nc * 4)
+            open_fn(
+                xclbin_c.as_ptr(),
+                insts.as_ptr(),
+                insts.len(),
+                na * 4,
+                nb * 4,
+                nc * 4,
+            )
         };
         if handle.is_null() {
-            return Err(XdnaError("rlx_xdna_run3_open returned null (XRT error on stderr)".into()));
+            return Err(XdnaError(
+                "rlx_xdna_run3_open returned null (XRT error on stderr)".into(),
+            ));
         }
-        Ok(Self { handle, run_fn, close_fn, na, nb, nc, _lib: lib })
+        Ok(Self {
+            handle,
+            run_fn,
+            close_fn,
+            na,
+            nb,
+            nc,
+            _lib: lib,
+        })
     }
 
     /// Hot path: buffer `a` (na f32) + `b` (nb f32) in, `nc`-f32 out.

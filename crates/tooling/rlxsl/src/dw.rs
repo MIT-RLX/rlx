@@ -315,7 +315,10 @@ mod tests {
         let e_naive = ((naive as f64 - truth) / truth).abs();
         let e_dw = ((acc.to_f64() - truth) / truth).abs();
         eprintln!("round-trip worst={worst:e}  naive f32={e_naive:e}  2x f32={e_dw:e}");
-        assert!(e_naive > 1e-3, "expected naive f32 to be bad, got {e_naive:e}");
+        assert!(
+            e_naive > 1e-3,
+            "expected naive f32 to be bad, got {e_naive:e}"
+        );
         // ~5 orders better than naive; near-f64 (n·eps accumulation over 500k).
         assert!(e_dw < 1e-8, "double-single accumulation err {e_dw:e}");
     }
@@ -342,7 +345,9 @@ mod tests {
             if bv.abs() < 1e-6 {
                 continue;
             }
-            let got = DoubleSingle::from_f64(av).div(DoubleSingle::from_f64(bv)).to_f64();
+            let got = DoubleSingle::from_f64(av)
+                .div(DoubleSingle::from_f64(bv))
+                .to_f64();
             let truth = av / bv;
             worst = worst.max(((got - truth) / truth).abs());
         }

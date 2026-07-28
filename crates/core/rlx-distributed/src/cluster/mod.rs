@@ -29,8 +29,8 @@ pub mod stats;
 pub use caps::{DeviceInfo, NodeCaps, probe_local, probe_remote};
 pub use config::{ClusterConfig, KvPolicy, NodeConfig, PlacementPolicy};
 pub use placement::{Assignment, ModelCost, plan_placement};
-pub use stats::{ClusterRun, NodeReport, StageTiming};
 pub use rlx_driver::{ProcessGroup, ReduceKind};
+pub use stats::{ClusterRun, NodeReport, StageTiming};
 
 use crate::graph::transport::run_pipeline_tcp_timed;
 use crate::graph::{NamedTensor, Stage};
@@ -44,7 +44,8 @@ use std::process::Child;
 /// matmul outputs) or to aggregate per-node values (`Mean`/`Max`/`Min`). The
 /// ProcessGroup rides the same rlx-driver transports (TCP / Thunderbolt / MLX).
 pub fn all_reduce(pg: &ProcessGroup, buf: &mut [f32], kind: ReduceKind) -> Result<()> {
-    pg.all_reduce(buf, kind).map_err(|e| anyhow::anyhow!("all_reduce: {e:?}"))
+    pg.all_reduce(buf, kind)
+        .map_err(|e| anyhow::anyhow!("all_reduce: {e:?}"))
 }
 
 /// A configured, probed, planned cluster.
@@ -58,7 +59,11 @@ pub struct Cluster {
 
 impl Cluster {
     pub fn from_config(cfg: ClusterConfig) -> Self {
-        Self { cfg, caps: Vec::new(), plan: Vec::new() }
+        Self {
+            cfg,
+            caps: Vec::new(),
+            plan: Vec::new(),
+        }
     }
     pub fn from_path(p: impl AsRef<Path>) -> Result<Self> {
         Ok(Self::from_config(ClusterConfig::from_path(p)?))
@@ -71,7 +76,8 @@ impl Cluster {
         self.caps.clear();
         for n in &self.cfg.nodes {
             let caps = match &n.ssh {
-                Some(host) => probe_remote(host, remote_bin, &n.addr, &n.ckpt_dir).with_context(|| format!("probe {host}"))?,
+                Some(host) => probe_remote(host, remote_bin, &n.addr, &n.ckpt_dir)
+                    .with_context(|| format!("probe {host}"))?,
                 None => probe_local(&n.addr, &n.ckpt_dir, true),
             };
             self.caps.push(caps);
@@ -82,7 +88,12 @@ impl Cluster {
     /// Plan placement from the model cost model + probed caps (probe first).
     pub fn plan(&mut self, model: ModelCost) -> Result<&[Assignment]> {
         anyhow::ensure!(!self.caps.is_empty(), "probe() before plan()");
-        let nodes: Vec<_> = self.caps.iter().cloned().zip(self.cfg.nodes.iter().cloned()).collect();
+        let nodes: Vec<_> = self
+            .caps
+            .iter()
+            .cloned()
+            .zip(self.cfg.nodes.iter().cloned())
+            .collect();
         let reserve = (self.cfg.reserve_ram_gb * 1e9) as u64;
         self.plan = plan_placement(&model, &nodes, self.cfg.placement.policy, reserve)?;
         Ok(&self.plan)
@@ -94,19 +105,33 @@ impl Cluster {
         let a = &self.plan[i];
         let n = &self.cfg.nodes[i];
         let mut v = vec![
-            "--role".into(), "worker".into(),
-            "--index".into(), i.to_string(),
-            "--layers".into(), format!("{}:{}", a.layers.start, a.layers.end),
-            "--ckpt".into(), n.ckpt_dir.clone(),
-            "--addr".into(), n.addr.clone(),
-            "--seq".into(), self.cfg.seq.to_string(),
-            "--device".into(), n.device.clone(),
-            "--precision".into(), n.precision.clone(),
-            "--kv".into(), format!("{:?}", n.kv_cache).to_lowercase(),
-            "--rng".into(), self.cfg.seed_for(i).to_string(),
+            "--role".into(),
+            "worker".into(),
+            "--index".into(),
+            i.to_string(),
+            "--layers".into(),
+            format!("{}:{}", a.layers.start, a.layers.end),
+            "--ckpt".into(),
+            n.ckpt_dir.clone(),
+            "--addr".into(),
+            n.addr.clone(),
+            "--seq".into(),
+            self.cfg.seq.to_string(),
+            "--device".into(),
+            n.device.clone(),
+            "--precision".into(),
+            n.precision.clone(),
+            "--kv".into(),
+            format!("{:?}", n.kv_cache).to_lowercase(),
+            "--rng".into(),
+            self.cfg.seed_for(i).to_string(),
         ];
-        if a.first { v.push("--first".into()); }
-        if a.last { v.push("--last".into()); }
+        if a.first {
+            v.push("--first".into());
+        }
+        if a.last {
+            v.push("--last".into());
+        }
         v
     }
 
@@ -133,7 +158,8 @@ impl Cluster {
                     let mut c = std::process::Command::new(std::env::current_exe()?);
                     c.args(&argv).stdout(Stdio::piped());
                     if let Ok(dir) = std::env::var("RLX_WORKER_ERR_DIR") {
-                        if let Ok(f) = std::fs::File::create(format!("{dir}/local_worker_{i}.err")) {
+                        if let Ok(f) = std::fs::File::create(format!("{dir}/local_worker_{i}.err"))
+                        {
                             c.stderr(Stdio::from(f));
                         }
                     }
@@ -166,7 +192,11 @@ impl Cluster {
             })
             .collect::<Vec<_>>();
         let total: u64 = timings.iter().map(|t| t.forward_ms).sum();
-        Ok(ClusterRun { timings, total_forward_ms: total, output: out.into_iter().next().map(|t| t.data).unwrap_or_default() })
+        Ok(ClusterRun {
+            timings,
+            total_forward_ms: total,
+            output: out.into_iter().next().map(|t| t.data).unwrap_or_default(),
+        })
     }
 
     /// Coordinator-side boundary metadata for stage `i` (no weights, no graph):

@@ -217,7 +217,9 @@ impl MlxConfig {
         let mut per_module_quant = std::collections::HashMap::new();
         if let Some(obj) = raw.get("quantization").and_then(|v| v.as_object()) {
             for (module, val) in obj {
-                let Some(mobj) = val.as_object() else { continue };
+                let Some(mobj) = val.as_object() else {
+                    continue;
+                };
                 if !(mobj.contains_key("group_size")
                     || mobj.contains_key("bits")
                     || mobj.contains_key("mode"))

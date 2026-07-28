@@ -15,16 +15,22 @@ use rlx_xdna::aie::{
     emit_matmul_multicol, emit_matmul_tiled, matmul_signed_fixup, tile_a, tile_b, tile_b_multicol,
     untile_c, untile_c_multicol,
 };
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuGemm;
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| d.parse().unwrap())
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| d.parse().unwrap())
 }
 
 fn compile(name: &str, mlir: &str) -> Vec<u32> {
-    let (aiecc, peano) = (std::env::var("AIECC").unwrap(), std::env::var("PEANO").unwrap());
+    let (aiecc, peano) = (
+        std::env::var("AIECC").unwrap(),
+        std::env::var("PEANO").unwrap(),
+    );
     let tmp = format!("/tmp/rlx_mmc_{name}");
     std::fs::create_dir_all(&tmp).ok();
     let mp = format!("{tmp}/aie.mlir");
@@ -73,7 +79,11 @@ fn main() {
     matmul_signed_fixup(&mut c, &b, m, k, n);
     let mism = (0..m * n).filter(|&i| c[i] != cref[i]).count();
     if mism != 0 {
-        let bad: Vec<_> = (0..m * n).filter(|&i| c[i] != cref[i]).take(3).map(|i| (i, c[i], cref[i])).collect();
+        let bad: Vec<_> = (0..m * n)
+            .filter(|&i| c[i] != cref[i])
+            .take(3)
+            .map(|i| (i, c[i], cref[i]))
+            .collect();
         println!("multicol {m}x{k}x{n} cols={cols}: FAIL ✗ {mism} mism (i,got,want): {bad:?}");
         std::process::exit(1);
     }
@@ -90,7 +100,8 @@ fn main() {
     if std::env::var("NOSINGLE").is_err() {
         match std::panic::catch_unwind(|| compile("single", &emit_matmul_tiled(m, k, n))) {
             Ok(insts) => {
-                let sm = NpuGemm::open("", "/tmp/rlx_mmc_single/k.xclbin", &insts, m, k, n).expect("open");
+                let sm = NpuGemm::open("", "/tmp/rlx_mmc_single/k.xclbin", &insts, m, k, n)
+                    .expect("open");
                 let (sat, sbt) = (tile_a(&a, m, k), tile_b(&b, k, n));
                 let sct = sm.run(&sat, &sbt).expect("run");
                 let mut sc = untile_c(&sct, m, n);
@@ -109,7 +120,9 @@ fn main() {
                     mgops / sgops
                 );
             }
-            Err(_) => println!("single-core            (aiecc-failed to fit {m}³ — multicol scales past it)"),
+            Err(_) => println!(
+                "single-core            (aiecc-failed to fit {m}³ — multicol scales past it)"
+            ),
         }
     }
 }

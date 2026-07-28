@@ -10,21 +10,30 @@
 //     cargo run -p rlx-xdna --features xrt --example xdna_rmsnorm_affine
 
 use rlx_xdna::aie::emit_rms_norm_affine;
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuRun3;
 
 fn envn(k: &str, d: &str) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| d.parse().unwrap())
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| d.parse().unwrap())
 }
 
 fn main() {
     let (rows, cols) = (envn("ROWS", "32"), envn("COLS", "64"));
     let n = rows * cols;
     let eps = 1e-5f32;
-    let (aiecc, peano) = (std::env::var("AIECC").unwrap(), std::env::var("PEANO").unwrap());
+    let (aiecc, peano) = (
+        std::env::var("AIECC").unwrap(),
+        std::env::var("PEANO").unwrap(),
+    );
 
     let mlir = emit_rms_norm_affine(rows, cols, eps);
-    println!("1. rlx emitted AIE-MLIR affine rms_norm {rows}x{cols} ({} lines)", mlir.lines().count());
+    println!(
+        "1. rlx emitted AIE-MLIR affine rms_norm {rows}x{cols} ({} lines)",
+        mlir.lines().count()
+    );
     let tmp = "/tmp/rlx_rmsaff";
     std::fs::create_dir_all(tmp).ok();
     let mp = format!("{tmp}/aie.mlir");
@@ -48,7 +57,9 @@ fn main() {
         .collect();
 
     // inputs
-    let x: Vec<f32> = (0..n).map(|i| ((i % 29) as f32 - 14.0) * 0.2 + 0.5).collect();
+    let x: Vec<f32> = (0..n)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.2 + 0.5)
+        .collect();
     let gamma: Vec<f32> = (0..cols).map(|c| 0.5 + (c % 5) as f32 * 0.1).collect();
     let beta: Vec<f32> = (0..cols).map(|c| ((c % 7) as f32 - 3.0) * 0.05).collect();
     let mut gb = gamma.clone();

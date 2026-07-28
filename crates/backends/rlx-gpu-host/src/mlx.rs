@@ -142,7 +142,16 @@ pub fn run_dequant_matmul_mlx<A: DeviceArena>(
             let mut v = vec![0f32; m * n];
             for (i, out_row) in v.chunks_mut(n).enumerate() {
                 let xi = &x_host[i * k..(i + 1) * k];
-                match dequant_matvec_affine(xi, &w_host, scales, biases, bits as u32, group_size, k, n) {
+                match dequant_matvec_affine(
+                    xi,
+                    &w_host,
+                    scales,
+                    biases,
+                    bits as u32,
+                    group_size,
+                    k,
+                    n,
+                ) {
                     Ok(o) => out_row.copy_from_slice(&o),
                     Err(e) => panic!("rlx-gpu-host mlx affine matvec: {e}"),
                 }

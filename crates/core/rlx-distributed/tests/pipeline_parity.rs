@@ -58,7 +58,10 @@ fn single_node(g: &Graph, params: &HashMap<String, Vec<f32>>, x: &[f32]) -> Vec<
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "output length mismatch");
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 #[test]
@@ -72,11 +75,21 @@ fn partition_splits_weights_across_stages() {
     let mut uniq = all.clone();
     uniq.dedup();
     assert_eq!(all, uniq, "a param was duplicated across stages");
-    assert_eq!(uniq, vec!["b1", "b2", "w1", "w2"], "all four params must be covered exactly once");
+    assert_eq!(
+        uniq,
+        vec!["b1", "b2", "w1", "w2"],
+        "all four params must be covered exactly once"
+    );
     // Stage 0 emits a boundary the model input `x` alone can't satisfy stage 1.
-    assert!(!stages[0].outputs.is_empty(), "stage 0 must emit a boundary tensor");
     assert!(
-        stages[1].inputs.iter().any(|n| n.starts_with("__stage_boundary_")),
+        !stages[0].outputs.is_empty(),
+        "stage 0 must emit a boundary tensor"
+    );
+    assert!(
+        stages[1]
+            .inputs
+            .iter()
+            .any(|n| n.starts_with("__stage_boundary_")),
         "stage 1 must consume stage 0's boundary"
     );
 }
@@ -158,5 +171,8 @@ fn facade_with_closure_source_matches_single_node() {
     );
     assert_eq!(out.len(), 1);
     let d = max_abs_diff(&out[0].data, &reference);
-    assert!(d < 1e-6, "facade/closure-source pipeline diverged: max|err| {d:e}");
+    assert!(
+        d < 1e-6,
+        "facade/closure-source pipeline diverged: max|err| {d:e}"
+    );
 }

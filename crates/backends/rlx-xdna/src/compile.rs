@@ -46,7 +46,10 @@ pub fn compile_overlay(spec: &OverlaySpec) -> Result<(String, String), XdnaError
 /// available to aiecc's `link_with` resolution by copying it into the tmpdir under
 /// its basename — so an emitted `func.func private @k(...) attributes {link_with =
 /// "k.o"}` links against it. This is the seam for C++-microkernel cores (task #25).
-pub fn compile_overlay_linked(spec: &OverlaySpec, link_objs: &[&str]) -> Result<(String, String), XdnaError> {
+pub fn compile_overlay_linked(
+    spec: &OverlaySpec,
+    link_objs: &[&str],
+) -> Result<(String, String), XdnaError> {
     if !Path::new(spec.aiecc).exists() {
         return Err(XdnaError(format!(
             "native aiecc binary not found at {} (point at mlir_aie/bin/aiecc, not aiecc.py)",
@@ -55,7 +58,9 @@ pub fn compile_overlay_linked(spec: &OverlaySpec, link_objs: &[&str]) -> Result<
     }
     std::fs::create_dir_all(spec.tmpdir).ok();
     for obj in link_objs {
-        let base = Path::new(obj).file_name().ok_or_else(|| XdnaError(format!("bad link obj path {obj}")))?;
+        let base = Path::new(obj)
+            .file_name()
+            .ok_or_else(|| XdnaError(format!("bad link obj path {obj}")))?;
         let dst = Path::new(spec.tmpdir).join(base);
         std::fs::copy(obj, &dst)
             .map_err(|e| XdnaError(format!("copy link obj {obj} → {}: {e}", dst.display())))?;
@@ -96,10 +101,17 @@ pub fn compile_overlay_linked(spec: &OverlaySpec, link_objs: &[&str]) -> Result<
 /// `<peano>/bin/clang++`, `include` = `<mlir_aie>/include`. The `.o` (symbols
 /// `matmul_i8_i32` + `zero_i32`) is what [`compile_overlay_linked`] links against
 /// an emitted microkernel overlay. Idempotent-safe (overwrites). Cheap (~1s).
-pub fn build_mm_kernel(clangxx: &str, include: &str, d: usize, out_o: &str) -> Result<(), XdnaError> {
+pub fn build_mm_kernel(
+    clangxx: &str,
+    include: &str,
+    d: usize,
+    out_o: &str,
+) -> Result<(), XdnaError> {
     let src = format!("{include}/aie_kernels/aie2/mm.cc");
     if !Path::new(&src).exists() {
-        return Err(XdnaError(format!("kernel source not found at {src} (bad mlir_aie include dir?)")));
+        return Err(XdnaError(format!(
+            "kernel source not found at {src} (bad mlir_aie include dir?)"
+        )));
     }
     let wrap = format!("{out_o}.wrap.cc");
     std::fs::write(
@@ -130,7 +142,9 @@ pub fn build_mm_kernel(clangxx: &str, include: &str, d: usize, out_o: &str) -> R
         .status()
         .map_err(|e| XdnaError(format!("spawn {clangxx}: {e}")))?;
     if !status.success() {
-        return Err(XdnaError(format!("Peano clang++ failed compiling {src} (DIM={d})")));
+        return Err(XdnaError(format!(
+            "Peano clang++ failed compiling {src} (DIM={d})"
+        )));
     }
     if !Path::new(out_o).exists() {
         return Err(XdnaError(format!("kernel object {out_o} not produced")));

@@ -38,7 +38,15 @@ fn main() {
     let sh = Shape::new(&[n], DType::F32);
     let x1 = g1.param("x", sh.clone());
     let y1 = g1.activation(Activation::Relu, x1, sh.clone());
-    let l1 = g1.add_node(Op::Reduce { op: IrRed::Sum, axes: vec![0], keep_dim: true }, vec![y1], Shape::new(&[1], DType::F32));
+    let l1 = g1.add_node(
+        Op::Reduce {
+            op: IrRed::Sum,
+            axes: vec![0],
+            keep_dim: true,
+        },
+        vec![y1],
+        Shape::new(&[1], DType::F32),
+    );
     g1.set_outputs(vec![l1]);
     let bwd1 = grad(&g1, &[x1]);
     let run1 = |dev: Device| -> Vec<f32> {
@@ -48,7 +56,11 @@ fn main() {
     };
     let (cg1, ng1) = (run1(Device::Cpu), run1(Device::Xdna));
     let ok1 = cg1.len() == ng1.len() && cg1.iter().zip(&ng1).all(|(a, b)| (a - b).abs() < 1e-4);
-    println!("  {:<16} {}  (dL/dx elementwise)", "grad·relu·sum", if ok1 { "PASS ✓" } else { "FAIL ✗" });
+    println!(
+        "  {:<16} {}  (dL/dx elementwise)",
+        "grad·relu·sum",
+        if ok1 { "PASS ✓" } else { "FAIL ✗" }
+    );
     all &= ok1;
 
     // (2) MATMUL BACKWARD: loss = sum(relu(x @ W)); dL/dW = xᵀ @ (relu'(h) ⊙ 1).
@@ -63,8 +75,24 @@ fn main() {
     let h2 = g2.matmul(x2, w2, Shape::new(&[m, nn], DType::F32));
     let a2 = g2.activation(Activation::Relu, h2, Shape::new(&[m, nn], DType::F32));
     // reduce both axes → [1,1] (keep_dim) so no rank-0
-    let l2 = g2.add_node(Op::Reduce { op: IrRed::Sum, axes: vec![1], keep_dim: true }, vec![a2], Shape::new(&[m, 1], DType::F32));
-    let l2b = g2.add_node(Op::Reduce { op: IrRed::Sum, axes: vec![0], keep_dim: true }, vec![l2], Shape::new(&[1, 1], DType::F32));
+    let l2 = g2.add_node(
+        Op::Reduce {
+            op: IrRed::Sum,
+            axes: vec![1],
+            keep_dim: true,
+        },
+        vec![a2],
+        Shape::new(&[m, 1], DType::F32),
+    );
+    let l2b = g2.add_node(
+        Op::Reduce {
+            op: IrRed::Sum,
+            axes: vec![0],
+            keep_dim: true,
+        },
+        vec![l2],
+        Shape::new(&[1, 1], DType::F32),
+    );
     g2.set_outputs(vec![l2b]);
     let bwd2 = grad(&g2, &[w2]);
     let run2 = |dev: Device| -> Vec<f32> {
@@ -75,7 +103,12 @@ fn main() {
     let (cg2, ng2) = (run2(Device::Cpu), run2(Device::Xdna));
     let c2 = cos(&cg2, &ng2);
     let ok2 = c2 > 0.99;
-    println!("  {:<16} {}  cos {:.4}  (dL/dW via NPU matmul)", "grad·mlp", if ok2 { "PASS ✓" } else { "FAIL ✗" }, c2);
+    println!(
+        "  {:<16} {}  cos {:.4}  (dL/dW via NPU matmul)",
+        "grad·mlp",
+        if ok2 { "PASS ✓" } else { "FAIL ✗" },
+        c2
+    );
     all &= ok2;
 
     // (3) TRAINING LOOP on the NPU: linear regression loss = Σ(x@W − t)². The grad
@@ -83,8 +116,12 @@ fn main() {
     // the SGD step (W −= lr·grad) is on the host — the CoreML-training model. The
     // backward Session is compiled ONCE; each step just set_params W and re-runs.
     let (tm, tk, tn) = (8usize, 8usize, 4usize);
-    let xt: Vec<f32> = (0..tm * tk).map(|i| ((i * 7 + 1) % 11) as f32 / 11.0 - 0.5).collect();
-    let w_true: Vec<f32> = (0..tk * tn).map(|i| ((i * 5 + 2) % 9) as f32 / 9.0 - 0.4).collect();
+    let xt: Vec<f32> = (0..tm * tk)
+        .map(|i| ((i * 7 + 1) % 11) as f32 / 11.0 - 0.5)
+        .collect();
+    let w_true: Vec<f32> = (0..tk * tn)
+        .map(|i| ((i * 5 + 2) % 9) as f32 / 9.0 - 0.4)
+        .collect();
     // target t = x @ w_true (host) — an achievable optimum so the loss can reach ~0.
     let mut tgt = vec![0f32; tm * tn];
     for i in 0..tm {
@@ -109,10 +146,34 @@ fn main() {
     let ttn = gt.input("t", Shape::new(&[tm, tn], DType::F32));
     let wtn = gt.param("W", Shape::new(&[tk, tn], DType::F32));
     let htn = gt.matmul(xtn, wtn, Shape::new(&[tm, tn], DType::F32));
-    let dtn = gt.add_node(Op::Binary(rlx_ir::op::BinaryOp::Sub), vec![htn, ttn], Shape::new(&[tm, tn], DType::F32));
-    let sqn = gt.add_node(Op::Binary(rlx_ir::op::BinaryOp::Mul), vec![dtn, dtn], Shape::new(&[tm, tn], DType::F32));
-    let r1 = gt.add_node(Op::Reduce { op: IrRed::Sum, axes: vec![1], keep_dim: true }, vec![sqn], Shape::new(&[tm, 1], DType::F32));
-    let lossn = gt.add_node(Op::Reduce { op: IrRed::Sum, axes: vec![0], keep_dim: true }, vec![r1], Shape::new(&[1, 1], DType::F32));
+    let dtn = gt.add_node(
+        Op::Binary(rlx_ir::op::BinaryOp::Sub),
+        vec![htn, ttn],
+        Shape::new(&[tm, tn], DType::F32),
+    );
+    let sqn = gt.add_node(
+        Op::Binary(rlx_ir::op::BinaryOp::Mul),
+        vec![dtn, dtn],
+        Shape::new(&[tm, tn], DType::F32),
+    );
+    let r1 = gt.add_node(
+        Op::Reduce {
+            op: IrRed::Sum,
+            axes: vec![1],
+            keep_dim: true,
+        },
+        vec![sqn],
+        Shape::new(&[tm, 1], DType::F32),
+    );
+    let lossn = gt.add_node(
+        Op::Reduce {
+            op: IrRed::Sum,
+            axes: vec![0],
+            keep_dim: true,
+        },
+        vec![r1],
+        Shape::new(&[1, 1], DType::F32),
+    );
     gt.set_outputs(vec![lossn]);
     let bwdt = grad(&gt, &[wtn]);
 
@@ -133,10 +194,24 @@ fn main() {
     }
     let lf = host_loss(&w);
     let train_ok = lf < l0 * 0.1; // loss dropped by >10× on the NPU-computed grad
-    println!("  {:<16} {}  loss {:.4} → {:.4}  (SGD on NPU grad, {} steps)", "train·regress", if train_ok { "PASS ✓" } else { "FAIL ✗" }, l0, lf, steps);
+    println!(
+        "  {:<16} {}  loss {:.4} → {:.4}  (SGD on NPU grad, {} steps)",
+        "train·regress",
+        if train_ok { "PASS ✓" } else { "FAIL ✗" },
+        l0,
+        lf,
+        steps
+    );
     all &= train_ok;
 
-    println!("\n{}", if all { "NPU backward matches CPU ✓" } else { "MISMATCH" });
+    println!(
+        "\n{}",
+        if all {
+            "NPU backward matches CPU ✓"
+        } else {
+            "MISMATCH"
+        }
+    );
     if !all {
         std::process::exit(1);
     }

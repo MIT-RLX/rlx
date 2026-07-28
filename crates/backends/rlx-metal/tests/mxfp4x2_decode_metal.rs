@@ -144,6 +144,12 @@ fn mxfp4x2_gpu_decode_matches_cpu_oracle() {
         (num / den).sqrt()
     };
     eprintln!("MxFp4x2 GPU decode: worst |gpu-cpu|={worst:.2e}  rms vs f32={ref_err:.2e}");
-    assert!(worst < 1e-6, "GPU decode must match CPU oracle, worst={worst:e}");
-    assert!(ref_err < 2e-2, "2-level decode should be ~1% of f32, got {ref_err:e}");
+    assert!(
+        worst < 1e-6,
+        "GPU decode must match CPU oracle, worst={worst:e}"
+    );
+    assert!(
+        ref_err < 2e-2,
+        "2-level decode should be ~1% of f32, got {ref_err:e}"
+    );
 }

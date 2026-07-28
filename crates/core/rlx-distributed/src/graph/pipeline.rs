@@ -23,7 +23,11 @@ pub struct NamedTensor {
 
 impl NamedTensor {
     pub fn new(name: impl Into<String>, shape: Vec<usize>, data: Vec<f32>) -> Self {
-        Self { name: name.into(), shape, data }
+        Self {
+            name: name.into(),
+            shape,
+            data,
+        }
     }
 }
 
@@ -67,9 +71,9 @@ impl StageRunner {
             .inputs
             .iter()
             .map(|n| {
-                let t = pool
-                    .get(n)
-                    .unwrap_or_else(|| panic!("stage {} missing input tensor `{n}`", self.stage.index));
+                let t = pool.get(n).unwrap_or_else(|| {
+                    panic!("stage {} missing input tensor `{n}`", self.stage.index)
+                });
                 (n.as_str(), t.data.as_slice())
             })
             .collect();

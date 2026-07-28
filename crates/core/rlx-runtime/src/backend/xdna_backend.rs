@@ -17,14 +17,14 @@ use super::*;
 use rlx_ir::op::MaskKind;
 use rlx_ir::{Op, OpKind};
 use rlx_xdna::aie::{
-    emit_argmax, emit_attention, emit_binary, emit_cast, emit_clamp, emit_compare, emit_concat2,
-    emit_expand, emit_fma, emit_gather,
-    emit_group_norm, emit_layer_norm_affine, emit_matmul_microkernel, emit_narrow, emit_pad, emit_reduce,
-    emit_reverse, emit_rms_norm_affine, emit_rope, emit_scan, emit_slice, emit_softmax, emit_tile,
-    emit_transpose2d, emit_trilu, emit_unary, emit_where, tile_a_kacc, tile_b_kacc_multicol,
-    untile_c_multicol, BinaryOp as AieBinaryOp, ReduceOp as AieReduceOp, ScanOp, Ty, UnaryOp,
+    BinaryOp as AieBinaryOp, ReduceOp as AieReduceOp, ScanOp, Ty, UnaryOp, emit_argmax,
+    emit_attention, emit_binary, emit_cast, emit_clamp, emit_compare, emit_concat2, emit_expand,
+    emit_fma, emit_gather, emit_group_norm, emit_layer_norm_affine, emit_matmul_microkernel,
+    emit_narrow, emit_pad, emit_reduce, emit_reverse, emit_rms_norm_affine, emit_rope, emit_scan,
+    emit_slice, emit_softmax, emit_tile, emit_transpose2d, emit_trilu, emit_unary, emit_where,
+    tile_a_kacc, tile_b_kacc_multicol, untile_c_multicol,
 };
-use rlx_xdna::compile::{build_mm_kernel, compile_overlay, compile_overlay_linked, OverlaySpec};
+use rlx_xdna::compile::{OverlaySpec, build_mm_kernel, compile_overlay, compile_overlay_linked};
 use rlx_xdna::npu_gemm::{NpuGemm, NpuIo, NpuIoF32, NpuRun3};
 
 pub struct XdnaBackend;
@@ -88,7 +88,12 @@ impl Backend for XdnaBackend {
         let n_compute = graph
             .nodes()
             .iter()
-            .filter(|n| !matches!(n.op, Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }))
+            .filter(|n| {
+                !matches!(
+                    n.op,
+                    Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+                )
+            })
             .count();
         // A compute op reading a baked `Op::Constant` (bias/scale/table) needs the
         // chain path even at depth 1 — the chain seeds constants into the tensor map,
@@ -97,8 +102,17 @@ impl Backend for XdnaBackend {
         let consumes_constant = graph
             .nodes()
             .iter()
-            .filter(|n| !matches!(n.op, Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }))
-            .any(|n| n.inputs.iter().any(|id| matches!(graph.node(*id).op, Op::Constant { .. })));
+            .filter(|n| {
+                !matches!(
+                    n.op,
+                    Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+                )
+            })
+            .any(|n| {
+                n.inputs
+                    .iter()
+                    .any(|id| matches!(graph.node(*id).op, Op::Constant { .. }))
+            });
         let built = if n_compute > 1 || (consumes_constant && !has_matmul) {
             // multi-op subgraph → chain per-node execs (matmul-in-chain supported)
             build_chain(&graph).map(|e| Box::new(e) as Box<dyn ExecutableGraph>)
@@ -207,14 +221,22 @@ fn map_binary(op: rlx_ir::op::BinaryOp) -> Result<AieBinaryOp, String> {
         B::Max => AieBinaryOp::Max,
         B::Min => AieBinaryOp::Min,
         B::Mod => AieBinaryOp::Mod,
-        other => return Err(format!("binary {other:?} not on the NPU (f32 arithmetic only)")),
+        other => {
+            return Err(format!(
+                "binary {other:?} not on the NPU (f32 arithmetic only)"
+            ));
+        }
     })
 }
 
 /// Split static `dims` at `axis` into (outer, axis_len, inner) for the NPU
 /// data-movement engines.
 fn axis_split(dims: &[usize], axis: usize) -> (usize, usize, usize) {
-    (dims[..axis].iter().product(), dims[axis], dims[axis + 1..].iter().product())
+    (
+        dims[..axis].iter().product(),
+        dims[axis],
+        dims[axis + 1..].iter().product(),
+    )
 }
 
 fn map_reduce(op: rlx_ir::op::ReduceOp) -> AieReduceOp {
@@ -280,11 +302,27 @@ fn is_set_param_input(consumer: &Op, idx: usize, input: &Op) -> bool {
 fn decode_constant_f32(data: &[u8], dtype: rlx_ir::DType) -> Result<Vec<f32>, String> {
     use rlx_ir::DType::*;
     Ok(match dtype {
-        F32 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        F64 => data.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32).collect(),
-        I32 => data.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32).collect(),
-        I64 => data.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32).collect(),
-        other => return Err(format!("NPU chain: Constant dtype {other:?} unsupported as a threaded input")),
+        F32 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        F64 => data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        I32 => data
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect(),
+        I64 => data
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        other => {
+            return Err(format!(
+                "NPU chain: Constant dtype {other:?} unsupported as a threaded input"
+            ));
+        }
     })
 }
 
@@ -292,7 +330,12 @@ fn build_op_exec(graph: &Graph) -> Result<Box<dyn ExecutableGraph>, String> {
     let node_id = graph
         .nodes()
         .iter()
-        .position(|n| !matches!(n.op, Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }))
+        .position(|n| {
+            !matches!(
+                n.op,
+                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+            )
+        })
         .ok_or("no compute op in graph")?;
     build_node_exec(graph, node_id)
 }
@@ -307,7 +350,10 @@ fn build_chain(graph: &Graph) -> Result<XdnaChainExec, String> {
     std::env::var("PEANO").map_err(|_| "chain needs PEANO in env".to_string())?;
     let mut steps: Vec<ChainStep> = Vec::new();
     for (idx, node) in graph.nodes().iter().enumerate() {
-        if matches!(node.op, Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }) {
+        if matches!(
+            node.op,
+            Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+        ) {
             continue;
         }
         let is_matmul = matches!(node.op, Op::MatMul);
@@ -322,12 +368,19 @@ fn build_chain(graph: &Graph) -> Result<XdnaChainExec, String> {
             .filter(|(idx, id)| !is_set_param_input(&node.op, *idx, &graph.node(**id).op))
             .map(|(_, id)| node_ref(graph, *id))
             .collect();
-        steps.push(ChainStep { node_idx: idx, out_name: node_ref(graph, node.id), input_names, is_matmul });
+        steps.push(ChainStep {
+            node_idx: idx,
+            out_name: node_ref(graph, node.id),
+            input_names,
+            is_matmul,
+        });
     }
     // Decode the baked bytes of every Constant a step actually threads, so `run` can
     // seed them into the tensor map alongside the graph Inputs.
-    let referenced: std::collections::HashSet<&str> =
-        steps.iter().flat_map(|s| s.input_names.iter().map(String::as_str)).collect();
+    let referenced: std::collections::HashSet<&str> = steps
+        .iter()
+        .flat_map(|s| s.input_names.iter().map(String::as_str))
+        .collect();
     let mut constants: Vec<(String, Vec<f32>)> = Vec::new();
     for node in graph.nodes() {
         if let Op::Constant { data } = &node.op {
@@ -349,7 +402,10 @@ fn build_chain(graph: &Graph) -> Result<XdnaChainExec, String> {
         lru: Vec::new(),
         // Concurrent NPU hardware contexts are limited (~5-6 on amdxdna); keep an
         // LRU pool of open sub-exec contexts and re-open evicted ones on demand.
-        cap: std::env::var("RLX_XDNA_CHAIN_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+        cap: std::env::var("RLX_XDNA_CHAIN_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4),
     })
 }
 
@@ -391,14 +447,17 @@ impl ExecutableGraph for XdnaChainExec {
     }
     fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
         self.typed_params.retain(|(n, _, _)| n != name);
-        self.typed_params.push((name.to_string(), data.to_vec(), dtype));
+        self.typed_params
+            .push((name.to_string(), data.to_vec(), dtype));
         for ex in self.cache.values_mut() {
             ex.set_param_typed(name, data, dtype);
         }
     }
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        let mut map: std::collections::HashMap<String, Vec<f32>> =
-            inputs.iter().map(|(nm, d)| (nm.to_string(), d.to_vec())).collect();
+        let mut map: std::collections::HashMap<String, Vec<f32>> = inputs
+            .iter()
+            .map(|(nm, d)| (nm.to_string(), d.to_vec()))
+            .collect();
         for (nm, d) in &self.constants {
             map.entry(nm.clone()).or_insert_with(|| d.clone());
         }
@@ -422,9 +481,13 @@ impl ExecutableGraph for XdnaChainExec {
                 }
                 let node = &self.graph.nodes()[step.node_idx];
                 let mut ex: Box<dyn ExecutableGraph> = if step.is_matmul {
-                    Box::new(build_matmul_node_exec(&self.graph, node).unwrap_or_else(|e| panic!("XdnaBackend chain matmul: {e}")))
+                    Box::new(
+                        build_matmul_node_exec(&self.graph, node)
+                            .unwrap_or_else(|e| panic!("XdnaBackend chain matmul: {e}")),
+                    )
                 } else {
-                    build_node_exec(&self.graph, step.node_idx).unwrap_or_else(|e| panic!("XdnaBackend chain op: {e}"))
+                    build_node_exec(&self.graph, step.node_idx)
+                        .unwrap_or_else(|e| panic!("XdnaBackend chain op: {e}"))
                 };
                 for (nm, d) in &self.params {
                     ex.set_param(nm, d);
@@ -441,7 +504,9 @@ impl ExecutableGraph for XdnaChainExec {
                 .input_names
                 .iter()
                 .map(|nm| {
-                    let t = map.get(nm).unwrap_or_else(|| panic!("XdnaChainExec: tensor '{nm}' not yet produced"));
+                    let t = map
+                        .get(nm)
+                        .unwrap_or_else(|| panic!("XdnaChainExec: tensor '{nm}' not yet produced"));
                     (nm.as_str(), t.as_slice())
                 })
                 .collect();
@@ -450,7 +515,10 @@ impl ExecutableGraph for XdnaChainExec {
             drop(sub_in);
             map.insert(step.out_name.clone(), out);
         }
-        vec![map.remove(&self.output_name).unwrap_or_else(|| panic!("XdnaChainExec: output '{}' missing", self.output_name))]
+        vec![
+            map.remove(&self.output_name)
+                .unwrap_or_else(|| panic!("XdnaChainExec: output '{}' missing", self.output_name)),
+        ]
     }
 }
 
@@ -469,7 +537,12 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
     // Input 0 is threaded by name from the chain tensor map — a graph Input, an
     // intermediate `n{id}`, a seeded Constant, or a seeded data-Param (backward).
     let x_name = node_ref(graph, in_id);
-    let dims: Vec<usize> = node.shape.dims().iter().map(|d| d.unwrap_static()).collect();
+    let dims: Vec<usize> = node
+        .shape
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static())
+        .collect();
     if dims.is_empty() {
         return Err("op output must have a static shape".into());
     }
@@ -520,10 +593,17 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
     // Name of the threaded input at index `i` — graph Input, intermediate `n{id}`,
     // seeded Constant, or a seeded data-Param (backward). The structural set_param
     // inputs (matmul weight, norm gamma/beta) are resolved via `param_name` instead.
-    let input_name = |i: usize| -> Option<String> { node.inputs.get(i).map(|id| node_ref(graph, *id)) };
+    let input_name =
+        |i: usize| -> Option<String> { node.inputs.get(i).map(|id| node_ref(graph, *id)) };
     // Static dims of input 0 (the data-movement arms all read this).
     let in_dims = || -> Vec<usize> {
-        graph.node(in_id).shape.dims().iter().map(|x| x.unwrap_static()).collect()
+        graph
+            .node(in_id)
+            .shape
+            .dims()
+            .iter()
+            .map(|x| x.unwrap_static())
+            .collect()
     };
     // Collapse the shared 1-in data-movement tail: emit → compile → open `NpuRun3`
     // (arg0=in `$n_in`, arg1 dummy, arg2=out `n`) → box an `XdnaDmExec`.
@@ -531,19 +611,34 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
         ($mlir:expr, $tag:expr, $n_in:expr) => {{
             let (xclbin, insts) = build(&$mlir, &$tag)?;
             let io = NpuRun3::open("", &xclbin, &insts, $n_in, 1, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaDmExec { io, in_name: x_name.clone(), n_in: $n_in }) as Box<dyn ExecutableGraph>)
+            Ok(Box::new(XdnaDmExec {
+                io,
+                in_name: x_name.clone(),
+                n_in: $n_in,
+            }) as Box<dyn ExecutableGraph>)
         }};
     }
     // Last-axis cumulative scan (Cumsum/CumProd/CumMax) → 1-in f32 `XdnaOpExec`.
     macro_rules! scan_exec {
         ($kind:expr, $axis:expr, $exclusive:expr) => {{
-            let ax = if $axis < 0 { dims.len() as i32 + $axis } else { $axis };
+            let ax = if $axis < 0 {
+                dims.len() as i32 + $axis
+            } else {
+                $axis
+            };
             if ax != dims.len() as i32 - 1 {
                 return Err(format!("NPU scan: last axis only (got {})", $axis));
             }
-            let (xclbin, insts) = build(&emit_scan($kind, rows, cols, $exclusive), &format!("scan_{rows}x{cols}"))?;
+            let (xclbin, insts) = build(
+                &emit_scan($kind, rows, cols, $exclusive),
+                &format!("scan_{rows}x{cols}"),
+            )?;
             let io = NpuIoF32::open("", &xclbin, &insts, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaOpExec { io, in_name: x_name.clone(), n }) as Box<dyn ExecutableGraph>)
+            Ok(Box::new(XdnaOpExec {
+                io,
+                in_name: x_name.clone(),
+                n,
+            }) as Box<dyn ExecutableGraph>)
         }};
     }
     // ArgMax($is_max=true)/ArgMin over the last axis → f32-encoded index, one per
@@ -553,38 +648,69 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let d = in_dims();
             let rank = d.len();
             if rank < 1 || $axis != rank - 1 {
-                return Err(format!("NPU argmax/min: last axis only (axis {}, rank {})", $axis, rank));
+                return Err(format!(
+                    "NPU argmax/min: last axis only (axis {}, rank {})",
+                    $axis, rank
+                ));
             }
             let cols = d[rank - 1];
             let n_in: usize = d.iter().product();
             let rows = n_in / cols;
-            let (xclbin, insts) = build(&emit_argmax(rows, cols, $is_max), &format!("argmax_{rows}x{cols}"))?;
+            let (xclbin, insts) = build(
+                &emit_argmax(rows, cols, $is_max),
+                &format!("argmax_{rows}x{cols}"),
+            )?;
             let io = NpuIo::open("", &xclbin, &insts, n_in).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaReduceExec { io, in_name: x_name.clone(), n_in, rows, cols }) as Box<dyn ExecutableGraph>)
+            Ok(Box::new(XdnaReduceExec {
+                io,
+                in_name: x_name.clone(),
+                n_in,
+                rows,
+                cols,
+            }) as Box<dyn ExecutableGraph>)
         }};
     }
 
     match &node.op {
         Op::Activation(act) => {
             let uop = map_activation(act)?;
-            let (xclbin, insts) =
-                build(&emit_unary(uop, Ty::F32, n, pick_chunk(n)), &format!("act_{}", uop.name()))?;
+            let (xclbin, insts) = build(
+                &emit_unary(uop, Ty::F32, n, pick_chunk(n)),
+                &format!("act_{}", uop.name()),
+            )?;
             let io = NpuIoF32::open("", &xclbin, &insts, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaOpExec { io, in_name: x_name, n }))
+            Ok(Box::new(XdnaOpExec {
+                io,
+                in_name: x_name,
+                n,
+            }))
         }
         Op::Softmax { axis } => {
-            let ax = if *axis < 0 { dims.len() as i32 + axis } else { *axis };
+            let ax = if *axis < 0 {
+                dims.len() as i32 + axis
+            } else {
+                *axis
+            };
             if ax != dims.len() as i32 - 1 {
-                return Err(format!("NPU softmax supports only the last axis (got {axis})"));
+                return Err(format!(
+                    "NPU softmax supports only the last axis (got {axis})"
+                ));
             }
-            let (xclbin, insts) = build(&emit_softmax(rows, cols), &format!("softmax_{rows}x{cols}"))?;
+            let (xclbin, insts) =
+                build(&emit_softmax(rows, cols), &format!("softmax_{rows}x{cols}"))?;
             let io = NpuIoF32::open("", &xclbin, &insts, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaOpExec { io, in_name: x_name, n }))
+            Ok(Box::new(XdnaOpExec {
+                io,
+                in_name: x_name,
+                n,
+            }))
         }
         Op::RmsNorm { eps, .. } => {
             let gamma_name = param_name(1).ok_or("RmsNorm input 1 (gamma) must be a Param")?;
-            let (xclbin, insts) =
-                build(&emit_rms_norm_affine(rows, cols, *eps), &format!("rmsnorm_{rows}x{cols}"))?;
+            let (xclbin, insts) = build(
+                &emit_rms_norm_affine(rows, cols, *eps),
+                &format!("rmsnorm_{rows}x{cols}"),
+            )?;
             let io = NpuRun3::open("", &xclbin, &insts, n, 2 * cols, n).map_err(|e| e.0)?;
             Ok(Box::new(XdnaNormExec {
                 io,
@@ -599,8 +725,10 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
         }
         Op::LayerNorm { eps, .. } => {
             let gamma_name = param_name(1).ok_or("LayerNorm input 1 (gamma) must be a Param")?;
-            let (xclbin, insts) =
-                build(&emit_layer_norm_affine(rows, cols, *eps), &format!("layernorm_{rows}x{cols}"))?;
+            let (xclbin, insts) = build(
+                &emit_layer_norm_affine(rows, cols, *eps),
+                &format!("layernorm_{rows}x{cols}"),
+            )?;
             let io = NpuRun3::open("", &xclbin, &insts, n, 2 * cols, n).map_err(|e| e.0)?;
             Ok(Box::new(XdnaNormExec {
                 io,
@@ -613,12 +741,18 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 n,
             }))
         }
-        Op::Rope { head_dim, n_rot, style } => {
+        Op::Rope {
+            head_dim,
+            n_rot,
+            style,
+        } => {
             use rlx_ir::op::RopeStyle;
             let dx = in_dims(); // x: [.., hidden], hidden = nh·head_dim
             let hidden = *dx.last().ok_or("rope: x needs rank ≥ 1")?;
             if hidden % head_dim != 0 {
-                return Err(format!("NPU rope: hidden ({hidden}) not divisible by head_dim ({head_dim})"));
+                return Err(format!(
+                    "NPU rope: hidden ({hidden}) not divisible by head_dim ({head_dim})"
+                ));
             }
             let nh = hidden / head_dim;
             let rows_flat: usize = dx[..dx.len() - 1].iter().product(); // n_tokens (batch·seq)
@@ -628,10 +762,18 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let cos_name = input_name(1).ok_or("rope cos must be a graph Input")?;
             let sin_name = input_name(2).ok_or("rope sin must be a graph Input")?;
             let neox = matches!(style, RopeStyle::NeoX);
-            let (xclbin, insts) =
-                build(&emit_rope(rows, *head_dim, *n_rot, nh, neox), &format!("rope_{rows}x{head_dim}"))?;
+            let (xclbin, insts) = build(
+                &emit_rope(rows, *head_dim, *n_rot, nh, neox),
+                &format!("rope_{rows}x{head_dim}"),
+            )?;
             let io = NpuRun3::open("", &xclbin, &insts, n, 2 * half, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaRopeExec { io, x_name, cos_name, sin_name, half }))
+            Ok(Box::new(XdnaRopeExec {
+                io,
+                x_name,
+                cos_name,
+                sin_name,
+                half,
+            }))
         }
         Op::GroupNorm { num_groups, eps } => {
             let d = in_dims(); // NCHW (or NC*spatial), rank ≥ 3
@@ -641,13 +783,17 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let (nb, c) = (d[0], d[1]);
             let spatial: usize = d[2..].iter().product();
             if c % num_groups != 0 {
-                return Err(format!("NPU groupnorm: C ({c}) not divisible by num_groups ({num_groups})"));
+                return Err(format!(
+                    "NPU groupnorm: C ({c}) not divisible by num_groups ({num_groups})"
+                ));
             }
             let cg = c / num_groups;
             let (rows, group_size) = (nb * num_groups, cg * spatial);
             let gamma_name = param_name(1).ok_or("GroupNorm input 1 (gamma) must be a Param")?;
-            let (xclbin, insts) =
-                build(&emit_group_norm(rows, group_size, *num_groups, cg, spatial, *eps), &format!("groupnorm_{rows}x{group_size}"))?;
+            let (xclbin, insts) = build(
+                &emit_group_norm(rows, group_size, *num_groups, cg, spatial, *eps),
+                &format!("groupnorm_{rows}x{group_size}"),
+            )?;
             let io = NpuRun3::open("", &xclbin, &insts, n, 2 * c, n).map_err(|e| e.0)?;
             Ok(Box::new(XdnaNormExec {
                 io,
@@ -660,13 +806,23 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 n,
             }))
         }
-        Op::Attention { num_heads, head_dim, mask_kind, score_scale, attn_logit_softcap } => {
+        Op::Attention {
+            num_heads,
+            head_dim,
+            mask_kind,
+            score_scale,
+            attn_logit_softcap,
+        } => {
             // Scoped: None/Causal mask, no softcap, batch=1; multi-head via Q's
             // hidden dim = num_heads · head_dim.
             let causal = match mask_kind {
                 MaskKind::None => false,
                 MaskKind::Causal => true,
-                other => return Err(format!("NPU attention: only None/Causal mask (got {other:?})")),
+                other => {
+                    return Err(format!(
+                        "NPU attention: only None/Causal mask (got {other:?})"
+                    ));
+                }
             };
             if attn_logit_softcap.is_some() {
                 return Err("NPU attention: logit softcap not supported".into());
@@ -692,7 +848,13 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 &format!("attn_{}_{seq}x{nh}x{d}", if causal { "c" } else { "n" }),
             )?;
             let io = NpuRun3::open("", &xclbin, &insts, n, 2 * n, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaAttnExec { io, q_name: x_name, k_name, v_name, n }))
+            Ok(Box::new(XdnaAttnExec {
+                io,
+                q_name: x_name,
+                k_name,
+                v_name,
+                n,
+            }))
         }
         Op::Binary(binop) => {
             if node.shape.dtype() != rlx_ir::DType::F32 {
@@ -700,26 +862,48 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             }
             let aop = map_binary(*binop)?;
             let b_name = input_name(1).ok_or("binary input 1 must be a graph Input")?;
-            let (xclbin, insts) =
-                build(&emit_binary(aop, Ty::F32, n, pick_chunk(n)), &format!("bin_{}", aop.name()))?;
+            let (xclbin, insts) = build(
+                &emit_binary(aop, Ty::F32, n, pick_chunk(n)),
+                &format!("bin_{}", aop.name()),
+            )?;
             let io = NpuIo::open("", &xclbin, &insts, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaBinExec { io, a_name: x_name, b_name, n }))
+            Ok(Box::new(XdnaBinExec {
+                io,
+                a_name: x_name,
+                b_name,
+                n,
+            }))
         }
         Op::Reduce { op, axes, .. } => {
-            let in_dims: Vec<usize> =
-                graph.node(in_id).shape.dims().iter().map(|d| d.unwrap_static()).collect();
+            let in_dims: Vec<usize> = graph
+                .node(in_id)
+                .shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static())
+                .collect();
             let rank = in_dims.len();
             if rank < 1 || axes.len() != 1 || axes[0] != rank - 1 {
-                return Err(format!("NPU reduce: single last-axis only (axes {axes:?}, rank {rank})"));
+                return Err(format!(
+                    "NPU reduce: single last-axis only (axes {axes:?}, rank {rank})"
+                ));
             }
             let cols = in_dims[rank - 1];
             let n_in: usize = in_dims.iter().product();
             let rows = n_in / cols;
             let aop = map_reduce(*op);
-            let (xclbin, insts) =
-                build(&emit_reduce(aop, rows, cols), &format!("reduce_{}_{rows}x{cols}", aop.name()))?;
+            let (xclbin, insts) = build(
+                &emit_reduce(aop, rows, cols),
+                &format!("reduce_{}_{rows}x{cols}", aop.name()),
+            )?;
             let io = NpuIo::open("", &xclbin, &insts, n_in).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaReduceExec { io, in_name: x_name, n_in, rows, cols }))
+            Ok(Box::new(XdnaReduceExec {
+                io,
+                in_name: x_name,
+                n_in,
+                rows,
+                cols,
+            }))
         }
         // ── data-movement / shape ops (dtype-agnostic f32-cell moves) ──
         Op::Reshape { .. } => dm1!(emit_narrow(1, n, 1, 0, n), format!("reshape_{n}"), n),
@@ -727,9 +911,15 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
         Op::Transpose { perm } => {
             let d = in_dims();
             if d.len() != 2 || perm.as_slice() != [1, 0] {
-                return Err(format!("NPU transpose: 2-D [1,0] only (dims {d:?}, perm {perm:?})"));
+                return Err(format!(
+                    "NPU transpose: 2-D [1,0] only (dims {d:?}, perm {perm:?})"
+                ));
             }
-            dm1!(emit_transpose2d(d[0], d[1]), format!("transpose_{}x{}", d[0], d[1]), n)
+            dm1!(
+                emit_transpose2d(d[0], d[1]),
+                format!("transpose_{}x{}", d[0], d[1]),
+                n
+            )
         }
         Op::Trilu { upper, diagonal } => {
             let d = in_dims();
@@ -740,7 +930,11 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             if rows * cols != n {
                 return Err("NPU trilu: batched (>2-D) not yet supported".into());
             }
-            dm1!(emit_trilu(rows, cols, *upper, *diagonal), format!("trilu_{rows}x{cols}"), n)
+            dm1!(
+                emit_trilu(rows, cols, *upper, *diagonal),
+                format!("trilu_{rows}x{cols}"),
+                n
+            )
         }
         Op::Reverse { axes } => {
             let d = in_dims();
@@ -748,29 +942,52 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 return Err(format!("NPU reverse: single axis only (got {axes:?})"));
             }
             let (outer, mid, inner) = axis_split(&d, axes[0]);
-            dm1!(emit_reverse(outer, mid, inner), format!("reverse_{}", axes[0]), n)
+            dm1!(
+                emit_reverse(outer, mid, inner),
+                format!("reverse_{}", axes[0]),
+                n
+            )
         }
         Op::Narrow { axis, start, len } => {
             let d = in_dims();
             let n_in: usize = d.iter().product();
             let (outer, mid, inner) = axis_split(&d, *axis);
-            dm1!(emit_narrow(outer, mid, inner, *start, *len), format!("narrow_{axis}_{start}_{len}"), n_in)
+            dm1!(
+                emit_narrow(outer, mid, inner, *start, *len),
+                format!("narrow_{axis}_{start}_{len}"),
+                n_in
+            )
         }
-        Op::Slice { axis, start, len, step } => {
+        Op::Slice {
+            axis,
+            start,
+            len,
+            step,
+        } => {
             let d = in_dims();
             let n_in: usize = d.iter().product();
             let (outer, mid, inner) = axis_split(&d, *axis);
-            dm1!(emit_slice(outer, mid, inner, *start, *len, *step), format!("slice_{axis}"), n_in)
+            dm1!(
+                emit_slice(outer, mid, inner, *start, *len, *step),
+                format!("slice_{axis}"),
+                n_in
+            )
         }
         Op::Tile { reps } => {
             let d = in_dims();
             let n_in: usize = d.iter().product();
             let nz: Vec<usize> = (0..reps.len()).filter(|&i| reps[i] != 1).collect();
             if nz.len() != 1 {
-                return Err(format!("NPU tile: single repeated axis only (reps {reps:?})"));
+                return Err(format!(
+                    "NPU tile: single repeated axis only (reps {reps:?})"
+                ));
             }
             let (outer, mid, inner) = axis_split(&d, nz[0]);
-            dm1!(emit_tile(outer, mid, inner, reps[nz[0]]), format!("tile_{}", nz[0]), n_in)
+            dm1!(
+                emit_tile(outer, mid, inner, reps[nz[0]]),
+                format!("tile_{}", nz[0]),
+                n_in
+            )
         }
         Op::Expand { target_shape } => {
             let d = in_dims();
@@ -778,38 +995,89 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let tgt: Vec<usize> = target_shape.iter().map(|&x| x as usize).collect();
             let bc: Vec<usize> = (0..d.len()).filter(|&i| d[i] == 1 && tgt[i] > 1).collect();
             if bc.len() != 1 {
-                return Err(format!("NPU expand: single broadcast axis only (dims {d:?} → {tgt:?})"));
+                return Err(format!(
+                    "NPU expand: single broadcast axis only (dims {d:?} → {tgt:?})"
+                ));
             }
             let (outer, _mid, inner) = axis_split(&d, bc[0]);
-            dm1!(emit_expand(outer, inner, tgt[bc[0]]), format!("expand_{}", bc[0]), n_in)
+            dm1!(
+                emit_expand(outer, inner, tgt[bc[0]]),
+                format!("expand_{}", bc[0]),
+                n_in
+            )
         }
         Op::Concat { axis } => {
             if node.inputs.len() != 2 {
-                return Err(format!("NPU concat: 2 inputs only (got {})", node.inputs.len()));
+                return Err(format!(
+                    "NPU concat: 2 inputs only (got {})",
+                    node.inputs.len()
+                ));
             }
-            let da: Vec<usize> = graph.node(node.inputs[0]).shape.dims().iter().map(|x| x.unwrap_static()).collect();
-            let db: Vec<usize> = graph.node(node.inputs[1]).shape.dims().iter().map(|x| x.unwrap_static()).collect();
+            let da: Vec<usize> = graph
+                .node(node.inputs[0])
+                .shape
+                .dims()
+                .iter()
+                .map(|x| x.unwrap_static())
+                .collect();
+            let db: Vec<usize> = graph
+                .node(node.inputs[1])
+                .shape
+                .dims()
+                .iter()
+                .map(|x| x.unwrap_static())
+                .collect();
             let (outer, a_axis, inner) = axis_split(&da, *axis);
             let b_axis = db[*axis];
             let a_name = input_name(0).ok_or("concat input 0 must be a graph Input")?;
             let b_name = input_name(1).ok_or("concat input 1 must be a graph Input")?;
             let (na, nb) = (da.iter().product::<usize>(), db.iter().product::<usize>());
-            let (xclbin, insts) = build(&emit_concat2(outer, a_axis, b_axis, inner), &format!("concat_{axis}"))?;
+            let (xclbin, insts) = build(
+                &emit_concat2(outer, a_axis, b_axis, inner),
+                &format!("concat_{axis}"),
+            )?;
             let io = NpuRun3::open("", &xclbin, &insts, na, nb, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaDm2Exec { io, a_name, b_name, na, nb }))
+            Ok(Box::new(XdnaDm2Exec {
+                io,
+                a_name,
+                b_name,
+                na,
+                nb,
+            }))
         }
         Op::Gather { axis } => {
             // data = inputs[0], idx = inputs[1] (f32-encoded indices).
-            let dd: Vec<usize> = graph.node(node.inputs[0]).shape.dims().iter().map(|x| x.unwrap_static()).collect();
-            let di: Vec<usize> = graph.node(*node.inputs.get(1).ok_or("gather needs 2 inputs")?).shape.dims().iter().map(|x| x.unwrap_static()).collect();
+            let dd: Vec<usize> = graph
+                .node(node.inputs[0])
+                .shape
+                .dims()
+                .iter()
+                .map(|x| x.unwrap_static())
+                .collect();
+            let di: Vec<usize> = graph
+                .node(*node.inputs.get(1).ok_or("gather needs 2 inputs")?)
+                .shape
+                .dims()
+                .iter()
+                .map(|x| x.unwrap_static())
+                .collect();
             let (outer, in_axis, inner) = axis_split(&dd, *axis);
             let num_idx: usize = di.iter().product();
             let a_name = input_name(0).ok_or("gather data must be a graph Input")?;
             let b_name = input_name(1).ok_or("gather idx must be a graph Input")?;
             let (nd, ni) = (dd.iter().product::<usize>(), num_idx);
-            let (xclbin, insts) = build(&emit_gather(outer, in_axis, inner, num_idx), &format!("gather_{axis}"))?;
+            let (xclbin, insts) = build(
+                &emit_gather(outer, in_axis, inner, num_idx),
+                &format!("gather_{axis}"),
+            )?;
             let io = NpuRun3::open("", &xclbin, &insts, nd, ni, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaDm2Exec { io, a_name, b_name, na: nd, nb: ni }))
+            Ok(Box::new(XdnaDm2Exec {
+                io,
+                a_name,
+                b_name,
+                na: nd,
+                nb: ni,
+            }))
         }
         // forward identity — a passthrough copy (same bytes).
         Op::StopGradient => dm1!(emit_narrow(1, n, 1, 0, n), format!("stopgrad_{n}"), n),
@@ -824,7 +1092,11 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             };
             let (xclbin, insts) = build(&emit_cast(n, f2i), &format!("cast_{n}"))?;
             let io = NpuIoF32::open("", &xclbin, &insts, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaOpExec { io, in_name: x_name, n }))
+            Ok(Box::new(XdnaOpExec {
+                io,
+                in_name: x_name,
+                n,
+            }))
         }
         Op::Cumsum { axis, exclusive } => scan_exec!(ScanOp::Sum, *axis, *exclusive),
         Op::CumProd { axis, exclusive } => scan_exec!(ScanOp::Prod, *axis, *exclusive),
@@ -846,7 +1118,11 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let ax = padded[0];
             let (outer, in_axis, inner) = axis_split(&d, ax);
             let (before, after) = (pads[ax][0], pads[ax][1]);
-            dm1!(emit_pad(outer, in_axis, inner, before, after, fill), format!("pad_{ax}"), n_in)
+            dm1!(
+                emit_pad(outer, in_axis, inner, before, after, fill),
+                format!("pad_{ax}"),
+                n_in
+            )
         }
         Op::Compare(cmp) => {
             use rlx_ir::op::CmpOp as C;
@@ -861,7 +1137,12 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let b_name = input_name(1).ok_or("compare input 1 must be a graph Input")?;
             let (xclbin, insts) = build(&emit_compare(pred, n), &format!("compare_{pred}_{n}"))?;
             let io = NpuIo::open("", &xclbin, &insts, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaCompareExec { io, a_name: x_name, b_name, n }))
+            Ok(Box::new(XdnaCompareExec {
+                io,
+                a_name: x_name,
+                b_name,
+                n,
+            }))
         }
         Op::Where => {
             // inputs: [cond, a, b]; a‖b packed into arg1 by the exec.
@@ -869,7 +1150,13 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let b_name = input_name(2).ok_or("where input 2 (b) must be a graph Input")?;
             let (xclbin, insts) = build(&emit_where(n), &format!("where_{n}"))?;
             let io = NpuRun3::open("", &xclbin, &insts, n, 2 * n, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaTernExec { io, a_name: x_name, b_name: a_name, c_name: b_name, n }))
+            Ok(Box::new(XdnaTernExec {
+                io,
+                a_name: x_name,
+                b_name: a_name,
+                c_name: b_name,
+                n,
+            }))
         }
         Op::Fma => {
             // inputs: [a, b, c]; b‖c packed into arg1 by the exec (out = a*b + c).
@@ -877,9 +1164,19 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
             let c_name = input_name(2).ok_or("fma input 2 (c) must be a graph Input")?;
             let (xclbin, insts) = build(&emit_fma(n), &format!("fma_{n}"))?;
             let io = NpuRun3::open("", &xclbin, &insts, n, 2 * n, n).map_err(|e| e.0)?;
-            Ok(Box::new(XdnaTernExec { io, a_name: x_name, b_name, c_name, n }))
+            Ok(Box::new(XdnaTernExec {
+                io,
+                a_name: x_name,
+                b_name,
+                c_name,
+                n,
+            }))
         }
-        Op::Quantize { axis, scales, zero_points } => {
+        Op::Quantize {
+            axis,
+            scales,
+            zero_points,
+        } => {
             // f32 → packed-i8 (dtype boundary). Scales/zero-points are BAKED (static),
             // and the per-channel affine+round+clamp is a trivial memory-bound pass →
             // computed on host, then packed 4 codes per f32-cell (the runtime's i8
@@ -895,7 +1192,11 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 zero_points: zero_points.clone(),
             }))
         }
-        Op::Dequantize { axis, scales, zero_points } => {
+        Op::Dequantize {
+            axis,
+            scales,
+            zero_points,
+        } => {
             // packed-i8 → f32 (inverse of Quantize). Unpack the i8 codes from the f32
             // cell bytes, then x = (q − zp)·scale per channel. Host-computed twin.
             let (chan_dim, inner) = quant_layout(&in_dims(), *axis);
@@ -908,13 +1209,22 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 zero_points: zero_points.clone(),
             }))
         }
-        Op::Pool { kind, kernel_size, stride, padding } => {
+        Op::Pool {
+            kind,
+            kernel_size,
+            stride,
+            padding,
+        } => {
             // NCHW 2-D pooling (max/avg/sum): a windowed reduce. Host-computed (pure
             // gather+reduce, memory-bound — coverage for the vision path), bit-exact
             // with the CPU thunk. The perf-critical conv GEMM stays on the NPU.
             let d = in_dims();
             if d.len() != 4 || kernel_size.len() != 2 {
-                return Err(format!("NPU pool: NCHW 2-D only (in rank {}, k {})", d.len(), kernel_size.len()));
+                return Err(format!(
+                    "NPU pool: NCHW 2-D only (in rank {}, k {})",
+                    d.len(),
+                    kernel_size.len()
+                ));
             }
             let (kh, kw) = (kernel_size[0], kernel_size[1]);
             let (sh, sw) = (stride[0], stride[1]);
@@ -936,13 +1246,22 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 kind: *kind,
             }))
         }
-        Op::Im2Col { kernel_size, stride, padding, dilation } => {
+        Op::Im2Col {
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+        } => {
             // NCHW im2col unfold → [n·h_out·w_out, c·kh·kw]. Host gather (zero-pad),
             // bit-exact with the CPU thunk. Paired with the NPU int8 matmul this is a
             // full conv with the GEMM on the accelerator.
             let d = in_dims();
             if d.len() != 4 || kernel_size.len() != 2 {
-                return Err(format!("NPU im2col: NCHW 2-D only (in rank {}, k {})", d.len(), kernel_size.len()));
+                return Err(format!(
+                    "NPU im2col: NCHW 2-D only (in rank {}, k {})",
+                    d.len(),
+                    kernel_size.len()
+                ));
             }
             let (kh, kw) = (kernel_size[0], kernel_size[1]);
             let (sh, sw) = (stride[0], stride[1]);
@@ -966,9 +1285,7 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
                 dw,
             }))
         }
-        _ => Err(
-            "op not on the NPU (unsupported for this backend)".into(),
-        ),
+        _ => Err("op not on the NPU (unsupported for this backend)".into()),
     }
 }
 
@@ -1005,7 +1322,10 @@ impl ExecutableGraph for XdnaCompareExec {
                 .unwrap_or_else(|| panic!("XdnaBackend: compare input '{name}' not provided"))
         };
         let (a, b) = (get(&self.a_name), get(&self.b_name));
-        let mask = self.io.run2(as_i32(a), as_i32(b)).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let mask = self
+            .io
+            .run2(as_i32(a), as_i32(b))
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         // Re-encode the mask as packed bool bytes (0/1), then reinterpret as f32.
         let mut bytes = vec![0u8; self.n.div_ceil(4) * 4];
         for i in 0..self.n {
@@ -1013,7 +1333,10 @@ impl ExecutableGraph for XdnaCompareExec {
                 bytes[i] = 1;
             }
         }
-        let packed = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let packed = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         vec![packed]
     }
 }
@@ -1039,14 +1362,25 @@ impl ExecutableGraph for XdnaQuantizeExec {
             .iter()
             .find(|(nm, _)| *nm == self.x_name)
             .map(|(_, d)| *d)
-            .unwrap_or_else(|| panic!("XdnaBackend: quantize input '{}' not provided", self.x_name));
+            .unwrap_or_else(|| {
+                panic!("XdnaBackend: quantize input '{}' not provided", self.x_name)
+            });
         let mut bytes = vec![0u8; self.len.div_ceil(4) * 4];
         for i in 0..self.len {
-            let c = if self.chan_dim == 1 { 0 } else { (i / self.inner) % self.chan_dim };
+            let c = if self.chan_dim == 1 {
+                0
+            } else {
+                (i / self.inner) % self.chan_dim
+            };
             let v = (x[i] * (1.0 / self.scales[c])).round() as i32 + self.zero_points[c];
             bytes[i] = (v.clamp(-128, 127) as i8) as u8;
         }
-        vec![bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()]
+        vec![
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        ]
     }
 }
 
@@ -1069,7 +1403,12 @@ impl ExecutableGraph for XdnaDequantizeExec {
             .iter()
             .find(|(nm, _)| *nm == self.q_name)
             .map(|(_, d)| *d)
-            .unwrap_or_else(|| panic!("XdnaBackend: dequantize input '{}' not provided", self.q_name));
+            .unwrap_or_else(|| {
+                panic!(
+                    "XdnaBackend: dequantize input '{}' not provided",
+                    self.q_name
+                )
+            });
         // Reinterpret the packed f32 cells as bytes; the first `len` are the i8 codes.
         let mut codes = Vec::with_capacity(q.len() * 4);
         for &cell in q {
@@ -1077,7 +1416,11 @@ impl ExecutableGraph for XdnaDequantizeExec {
         }
         let mut out = vec![0f32; self.len];
         for i in 0..self.len {
-            let c = if self.chan_dim == 1 { 0 } else { (i / self.inner) % self.chan_dim };
+            let c = if self.chan_dim == 1 {
+                0
+            } else {
+                (i / self.inner) % self.chan_dim
+            };
             let qi = (codes[i] as i8) as i32;
             out[i] = (qi - self.zero_points[c]) as f32 * self.scales[c];
         }
@@ -1115,7 +1458,10 @@ impl ExecutableGraph for XdnaPool2dExec {
             .find(|(nm, _)| *nm == self.x_name)
             .map(|(_, d)| *d)
             .unwrap_or_else(|| panic!("XdnaBackend: pool input '{}' not provided", self.x_name));
-        let (is_max, is_mean) = (matches!(self.kind, ReduceOp::Max), matches!(self.kind, ReduceOp::Mean));
+        let (is_max, is_mean) = (
+            matches!(self.kind, ReduceOp::Max),
+            matches!(self.kind, ReduceOp::Mean),
+        );
         let area = (self.kh * self.kw) as f32;
         let mut out = vec![0f32; self.n * self.c * self.h_out * self.w_out];
         for nc in 0..self.n * self.c {
@@ -1193,7 +1539,11 @@ impl ExecutableGraph for XdnaIm2ColExec {
                             for kj in 0..self.kw {
                                 let hi = (ho * self.sh + ki * self.dh) as isize - self.ph as isize;
                                 let wi = (wo * self.sw + kj * self.dw) as isize - self.pw as isize;
-                                col[row + elem] = if hi < 0 || hi >= self.h as isize || wi < 0 || wi >= self.w as isize {
+                                col[row + elem] = if hi < 0
+                                    || hi >= self.h as isize
+                                    || wi < 0
+                                    || wi >= self.w as isize
+                                {
                                     0.0
                                 } else {
                                     x[x_base + (ci * self.h + hi as usize) * self.w + wi as usize]
@@ -1235,7 +1585,10 @@ impl ExecutableGraph for XdnaRopeExec {
         let mut cs = Vec::with_capacity(2 * self.half);
         cs.extend_from_slice(cos);
         cs.extend_from_slice(sin);
-        let out = self.io.run(x, &cs).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let out = self
+            .io
+            .run(x, &cs)
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         vec![out]
     }
 }
@@ -1266,7 +1619,10 @@ impl ExecutableGraph for XdnaTernExec {
         let mut bc = Vec::with_capacity(2 * self.n);
         bc.extend_from_slice(b);
         bc.extend_from_slice(c);
-        let out = self.io.run(a, &bc).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let out = self
+            .io
+            .run(a, &bc)
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         vec![out]
     }
 }
@@ -1288,7 +1644,10 @@ impl ExecutableGraph for XdnaDmExec {
             .map(|(_, d)| *d)
             .unwrap_or_else(|| panic!("XdnaBackend: input '{}' not provided", self.in_name));
         assert_eq!(x.len(), self.n_in);
-        let out = self.io.run(x, &[0.0]).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let out = self
+            .io
+            .run(x, &[0.0])
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         vec![out]
     }
 }
@@ -1315,7 +1674,10 @@ impl ExecutableGraph for XdnaDm2Exec {
         let (a, b) = (get(&self.a_name), get(&self.b_name));
         assert_eq!(a.len(), self.na);
         assert_eq!(b.len(), self.nb);
-        let out = self.io.run(a, b).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let out = self
+            .io
+            .run(a, b)
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         vec![out]
     }
 }
@@ -1373,9 +1735,14 @@ impl ExecutableGraph for XdnaReduceExec {
             .map(|(_, d)| *d)
             .unwrap_or_else(|| panic!("XdnaBackend: reduce input '{}' not provided", self.in_name));
         assert_eq!(x.len(), self.n_in);
-        let raw = self.io.run(as_i32(x)).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let raw = self
+            .io
+            .run(as_i32(x))
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         // Column 0 of each row holds the broadcast reduction.
-        let out = (0..self.rows).map(|r| f32::from_bits(raw[r * self.cols] as u32)).collect();
+        let out = (0..self.rows)
+            .map(|r| f32::from_bits(raw[r * self.cols] as u32))
+            .collect();
         vec![out]
     }
 }
@@ -1409,7 +1776,10 @@ impl ExecutableGraph for XdnaAttnExec {
         assert_eq!(q.len(), self.n, "XdnaBackend: attention Q wrong size");
         let mut kv = k.to_vec();
         kv.extend_from_slice(v);
-        let out = self.io.run(q, &kv).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let out = self
+            .io
+            .run(q, &kv)
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         vec![out]
     }
 }
@@ -1446,7 +1816,12 @@ impl ExecutableGraph for XdnaNormExec {
             .find(|(nm, _)| *nm == self.x_name)
             .map(|(_, d)| *d)
             .unwrap_or_else(|| panic!("XdnaBackend: input '{}' not provided", self.x_name));
-        assert_eq!(x.len(), self.n, "XdnaBackend: input '{}' wrong size", self.x_name);
+        assert_eq!(
+            x.len(),
+            self.n,
+            "XdnaBackend: input '{}' wrong size",
+            self.x_name
+        );
         // Pack gamma‖beta, defaulting to identity/zero when a param is absent.
         let mut gb = if self.gamma.len() == self.cols {
             self.gamma.clone()
@@ -1458,7 +1833,10 @@ impl ExecutableGraph for XdnaNormExec {
         } else {
             gb.extend(std::iter::repeat(0.0).take(self.cols));
         }
-        let out = self.io.run(x, &gb).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        let out = self
+            .io
+            .run(x, &gb)
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         vec![out]
     }
 }
@@ -1482,8 +1860,16 @@ impl ExecutableGraph for XdnaOpExec {
             .find(|(nm, _)| *nm == self.in_name)
             .map(|(_, d)| *d)
             .unwrap_or_else(|| panic!("XdnaBackend: input '{}' not provided", self.in_name));
-        assert_eq!(x.len(), self.n, "XdnaBackend: input '{}' wrong size", self.in_name);
-        let out = self.io.run(x).unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
+        assert_eq!(
+            x.len(),
+            self.n,
+            "XdnaBackend: input '{}' wrong size",
+            self.in_name
+        );
+        let out = self
+            .io
+            .run(x)
+            .unwrap_or_else(|e| panic!("XdnaBackend NPU run: {}", e.0));
         vec![out]
     }
 }
@@ -1497,9 +1883,16 @@ impl ExecutableGraph for XdnaOpExec {
 /// edges zero-padded). Per-row activation / per-col weight int8 quant, `sx·sw`
 /// dequant — same accuracy contract as [`XdnaGemmExec`].
 fn build_microkernel_exec(graph: &Graph) -> Result<XdnaMicrokernelExec, String> {
-    let mms: Vec<_> = graph.nodes().iter().filter(|n| matches!(n.op, Op::MatMul)).collect();
+    let mms: Vec<_> = graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, Op::MatMul))
+        .collect();
     if mms.len() != 1 {
-        return Err(format!("only a single matmul supported (graph has {})", mms.len()));
+        return Err(format!(
+            "only a single matmul supported (graph has {})",
+            mms.len()
+        ));
     }
     build_matmul_node_exec(graph, mms[0])
 }
@@ -1507,9 +1900,14 @@ fn build_microkernel_exec(graph: &Graph) -> Result<XdnaMicrokernelExec, String> 
 /// Build the fast microkernel exec for a specific MatMul node. The activation
 /// (input 0) may be a graph Input OR an intermediate (`n{id}`) from an earlier op
 /// in a chain; the weight (input 1) must be a `Param` (quantized once, resident).
-fn build_matmul_node_exec(graph: &Graph, mm: &rlx_ir::graph::Node) -> Result<XdnaMicrokernelExec, String> {
-    let aiecc = std::env::var("AIECC").map_err(|_| "microkernel matmul needs AIECC in env".to_string())?;
-    let peano = std::env::var("PEANO").map_err(|_| "microkernel matmul needs PEANO in env".to_string())?;
+fn build_matmul_node_exec(
+    graph: &Graph,
+    mm: &rlx_ir::graph::Node,
+) -> Result<XdnaMicrokernelExec, String> {
+    let aiecc =
+        std::env::var("AIECC").map_err(|_| "microkernel matmul needs AIECC in env".to_string())?;
+    let peano =
+        std::env::var("PEANO").map_err(|_| "microkernel matmul needs PEANO in env".to_string())?;
     // The mlir_aie include tree that holds BOTH `aie_kernels/aie2/mm.cc` (the vendor
     // microkernel source) and `aie_api/` (its headers). `RLX_XDNA_AIE_INCLUDE`
     // overrides it — required when aiecc doesn't sit at `<mlir_aie>/bin/aiecc` (e.g. a
@@ -1532,7 +1930,9 @@ fn build_matmul_node_exec(graph: &Graph, mm: &rlx_ir::graph::Node) -> Result<Xdn
     let act = graph.node(mm.inputs[0]);
     let wt = graph.node(mm.inputs[1]);
     let act_name = match &act.op {
-        Op::Param { .. } | Op::Constant { .. } => return Err("matmul input 0 must be the activation, not a param/const".into()),
+        Op::Param { .. } | Op::Constant { .. } => {
+            return Err("matmul input 0 must be the activation, not a param/const".into());
+        }
         _ => node_ref(graph, mm.inputs[0]),
     };
     // A Param weight is pre-tiled once via set_param; anything else (a backward
@@ -1543,7 +1943,10 @@ fn build_matmul_node_exec(graph: &Graph, mm: &rlx_ir::graph::Node) -> Result<Xdn
         _ => (node_ref(graph, mm.inputs[1]), true),
     };
     let dim = |s: &rlx_ir::Shape, i: usize| -> Result<usize, String> {
-        s.dims().get(i).map(|d| d.unwrap_static()).ok_or_else(|| "matmul operands must be rank-2 static shapes".into())
+        s.dims()
+            .get(i)
+            .map(|d| d.unwrap_static())
+            .ok_or_else(|| "matmul operands must be rank-2 static shapes".into())
     };
     let (m, k) = (dim(&act.shape, 0)?, dim(&act.shape, 1)?);
     let n = dim(&mm.shape, 1)?;
@@ -1553,7 +1956,10 @@ fn build_matmul_node_exec(graph: &Graph, mm: &rlx_ir::graph::Node) -> Result<Xdn
     let cols = n.div_ceil(D).clamp(1, 4);
     let kt = k.div_ceil(D).clamp(1, KTMAX);
 
-    let cache = format!("{}/rlx_xdna_mk_{D}_{kt}_{cols}", std::env::temp_dir().display());
+    let cache = format!(
+        "{}/rlx_xdna_mk_{D}_{kt}_{cols}",
+        std::env::temp_dir().display()
+    );
     std::fs::create_dir_all(&cache).map_err(|e| format!("mkdir {cache}: {e}"))?;
     let kernel_o = format!("{cache}/mm_{D}.o");
     let clangxx = format!("{peano}/bin/clang++");
@@ -1640,7 +2046,8 @@ impl XdnaMicrokernelExec {
         for kb in 0..self.nkb {
             for nb in 0..self.nnb {
                 let b_blk = block_i8(w_i8, k, n, kb * kk, nb * nn, kk, nn); // kk×nn
-                self.bt_blocks.push(tile_b_kacc_multicol(&b_blk, d, kt, cols));
+                self.bt_blocks
+                    .push(tile_b_kacc_multicol(&b_blk, d, kt, cols));
             }
         }
     }
@@ -1661,7 +2068,10 @@ impl ExecutableGraph for XdnaMicrokernelExec {
             self.sw = vec![1.0; self.n];
             self.precompute_weight_tiles(&q);
         } else {
-            let f: Vec<f32> = data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let f: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             self.set_param(name, &f);
         }
     }
@@ -1673,8 +2083,15 @@ impl ExecutableGraph for XdnaMicrokernelExec {
                 .iter()
                 .find(|(nm, _)| *nm == self.w_name)
                 .map(|(_, d)| *d)
-                .unwrap_or_else(|| panic!("XdnaBackend: dynamic weight '{}' not provided", self.w_name));
-            assert_eq!(w.len(), self.k * self.n, "XdnaBackend: dynamic weight '{}' wrong size", self.w_name);
+                .unwrap_or_else(|| {
+                    panic!("XdnaBackend: dynamic weight '{}' not provided", self.w_name)
+                });
+            assert_eq!(
+                w.len(),
+                self.k * self.n,
+                "XdnaBackend: dynamic weight '{}' wrong size",
+                self.w_name
+            );
             let (q, s) = quantize_per_col(w, self.k, self.n);
             self.sw = s;
             self.precompute_weight_tiles(&q);
@@ -1689,7 +2106,12 @@ impl ExecutableGraph for XdnaMicrokernelExec {
             .find(|(nm, _)| *nm == self.act_name)
             .map(|(_, d)| *d)
             .unwrap_or_else(|| panic!("XdnaBackend: input '{}' not provided", self.act_name));
-        assert_eq!(x.len(), self.m * self.k, "XdnaBackend: input '{}' wrong size", self.act_name);
+        assert_eq!(
+            x.len(),
+            self.m * self.k,
+            "XdnaBackend: input '{}' wrong size",
+            self.act_name
+        );
         let (a_i8, sx) = quantize_per_row(x, self.m, self.k);
 
         let (d, kt, cols) = (self.d, self.kt, self.cols);
@@ -1707,7 +2129,10 @@ impl ExecutableGraph for XdnaMicrokernelExec {
                 let at = tile_a_kacc(&a_blk, d, kt);
                 for nb in 0..nnb {
                     let bt = &self.bt_blocks[kb * nnb + nb];
-                    let ct = self.npu.run(&at, bt).unwrap_or_else(|e| panic!("microkernel run: {}", e.0));
+                    let ct = self
+                        .npu
+                        .run(&at, bt)
+                        .unwrap_or_else(|e| panic!("microkernel run: {}", e.0));
                     let cb = untile_c_multicol(&ct, d, nn, cols); // d×nn
                     for (a, p) in accs[nb].iter_mut().zip(&cb) {
                         *a += *p;
@@ -1723,7 +2148,9 @@ impl ExecutableGraph for XdnaMicrokernelExec {
                 }
             }
         }
-        let out: Vec<f32> = (0..m * n).map(|idx| c[idx] as f32 * sx[idx / n] * self.sw[idx % n]).collect();
+        let out: Vec<f32> = (0..m * n)
+            .map(|idx| c[idx] as f32 * sx[idx / n] * self.sw[idx % n])
+            .collect();
         vec![out]
     }
 }
@@ -1847,9 +2274,9 @@ struct XdnaGemmExec {
     n: usize,
     act_name: String,
     w_name: String,
-    w_i8: Vec<i8>, // full weight [k, n], symmetric-int8 quantized
-    sw: Vec<f32>,  // per-column (per-output-channel) weight scales, len n
-    resident: bool, // whole matmul fits one tile → keep the weight on-device
+    w_i8: Vec<i8>,   // full weight [k, n], symmetric-int8 quantized
+    sw: Vec<f32>,    // per-column (per-output-channel) weight scales, len n
+    resident: bool,  // whole matmul fits one tile → keep the weight on-device
     weight_up: bool, // resident weight already uploaded
 }
 
@@ -1858,7 +2285,15 @@ unsafe impl Send for XdnaGemmExec {}
 
 /// Copy the `[br,bc]` block of `src` (row-major `[rows,cols]`) at offset
 /// `(r0,c0)`, zero-padding where the block runs past the edges.
-fn block_i8(src: &[i8], rows: usize, cols: usize, r0: usize, c0: usize, br: usize, bc: usize) -> Vec<i8> {
+fn block_i8(
+    src: &[i8],
+    rows: usize,
+    cols: usize,
+    r0: usize,
+    c0: usize,
+    br: usize,
+    bc: usize,
+) -> Vec<i8> {
     let mut out = vec![0i8; br * bc];
     for i in 0..br {
         let r = r0 + i;
@@ -1912,7 +2347,12 @@ impl ExecutableGraph for XdnaGemmExec {
             .find(|(nm, _)| *nm == self.act_name)
             .map(|(_, d)| *d)
             .unwrap_or_else(|| panic!("XdnaBackend: input '{}' not provided", self.act_name));
-        assert_eq!(x.len(), self.m * self.k, "XdnaBackend: input '{}' wrong size", self.act_name);
+        assert_eq!(
+            x.len(),
+            self.m * self.k,
+            "XdnaBackend: input '{}' wrong size",
+            self.act_name
+        );
         // Quantize the activation per token (per-row); dequant `C[m,n]` by sx[m]·sw[n].
         let (a_i8, sx) = quantize_per_row(x, self.m, self.k);
 

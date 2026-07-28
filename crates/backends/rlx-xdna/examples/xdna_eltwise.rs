@@ -10,7 +10,7 @@
 //   RLX_XDNA_SHIM=<librlx_xdna_shim.so> N=1024 OP=relu ITERS=50 \
 //     cargo run -p rlx-xdna --features xrt --example xdna_eltwise
 
-use rlx_xdna::aie::{emit_eltwise, emit_eltwise_multicol, Eltwise};
+use rlx_xdna::aie::{Eltwise, emit_eltwise, emit_eltwise_multicol};
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> String {
@@ -62,7 +62,10 @@ fn main() {
         out_insts: &insts_path,
     })
     .expect("compile_overlay");
-    println!("2. compiled via aiecc in {:.1}s → {xclbin}", t.elapsed().as_secs_f64());
+    println!(
+        "2. compiled via aiecc in {:.1}s → {xclbin}",
+        t.elapsed().as_secs_f64()
+    );
 
     let insts: Vec<u32> = std::fs::read(&insts_path)
         .expect("read insts")
@@ -85,10 +88,16 @@ fn main() {
             .take(3)
             .map(|i| (i, input[i], out[i], op.apply(input[i])))
             .collect();
-        println!("3. NPU {} {n}: FAIL ✗ — {mism} mismatches (i,in,got,want): {bad:?}", op.name());
+        println!(
+            "3. NPU {} {n}: FAIL ✗ — {mism} mismatches (i,in,got,want): {bad:?}",
+            op.name()
+        );
         std::process::exit(1);
     }
-    println!("3. ran on NPU: PASS ✓ bit-exact vs CPU ({} over {n} i32)", op.name());
+    println!(
+        "3. ran on NPU: PASS ✓ bit-exact vs CPU ({} over {n} i32)",
+        op.name()
+    );
 
     // 5) warm benchmark (persistent context — just sync-in / dispatch / sync-out).
     let mut best = f64::MAX;
@@ -104,6 +113,7 @@ fn main() {
     let gbps = |us: f64| (n as f64 * 4.0 * 2.0) / (us * 1e3); // in+out bytes / ns
     println!(
         "4. cold open {cold_ms:.0} ms; warm run avg {avg:.1} us / best {best:.1} us  →  {:.1} / {:.1} GB/s (over {iters})",
-        gbps(avg), gbps(best)
+        gbps(avg),
+        gbps(best)
     );
 }

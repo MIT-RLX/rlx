@@ -31,8 +31,8 @@ fn main() {
 
     // Standalone `binary` kernel: per-op math (`rlx_binary_apply`) @generated from
     // the shared rlxsl manifest, prepended to the plumbing in binary_main.wgsl.
-    let bin_main =
-        fs::read_to_string("src/kernels/binary_main.wgsl").expect("read src/kernels/binary_main.wgsl");
+    let bin_main = fs::read_to_string("src/kernels/binary_main.wgsl")
+        .expect("read src/kernels/binary_main.wgsl");
     let bin = rlxsl::binary::wgsl_binary_module();
     fs::write(
         Path::new(&out_dir).join("binary.wgsl"),

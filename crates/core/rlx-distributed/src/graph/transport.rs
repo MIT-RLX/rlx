@@ -58,7 +58,8 @@ fn read_tensors<R: Read>(r: &mut R) -> io::Result<Vec<NamedTensor>> {
         let name_len = read_u32(r)? as usize;
         let mut nb = vec![0u8; name_len];
         r.read_exact(&mut nb)?;
-        let name = String::from_utf8(nb).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let name =
+            String::from_utf8(nb).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let rank = read_u32(r)? as usize;
         let mut shape = Vec::with_capacity(rank);
         for _ in 0..rank {
@@ -158,7 +159,11 @@ pub fn run_pipeline_tcp(
     worker_addrs: &[String],
     inputs: Vec<NamedTensor>,
 ) -> io::Result<Vec<NamedTensor>> {
-    assert_eq!(stages.len(), worker_addrs.len(), "one worker addr per stage");
+    assert_eq!(
+        stages.len(),
+        worker_addrs.len(),
+        "one worker addr per stage"
+    );
     let mut pool: HashMap<String, NamedTensor> =
         inputs.into_iter().map(|t| (t.name.clone(), t)).collect();
     let mut last = Vec::new();
@@ -168,7 +173,12 @@ pub fn run_pipeline_tcp(
             .iter()
             .map(|n| {
                 pool.get(n)
-                    .unwrap_or_else(|| panic!("coordinator: missing tensor `{n}` for stage {}", stage.index))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "coordinator: missing tensor `{n}` for stage {}",
+                            stage.index
+                        )
+                    })
                     .clone()
             })
             .collect();
@@ -190,15 +200,29 @@ pub fn run_pipeline_tcp_timed(
     worker_addrs: &[String],
     inputs: Vec<NamedTensor>,
 ) -> io::Result<(Vec<NamedTensor>, Vec<u64>)> {
-    assert_eq!(stages.len(), worker_addrs.len(), "one worker addr per stage");
-    let mut pool: HashMap<String, NamedTensor> = inputs.into_iter().map(|t| (t.name.clone(), t)).collect();
+    assert_eq!(
+        stages.len(),
+        worker_addrs.len(),
+        "one worker addr per stage"
+    );
+    let mut pool: HashMap<String, NamedTensor> =
+        inputs.into_iter().map(|t| (t.name.clone(), t)).collect();
     let mut last = Vec::new();
     let mut times = Vec::with_capacity(stages.len());
     for (stage, addr) in stages.iter().zip(worker_addrs) {
         let feed: Vec<NamedTensor> = stage
             .inputs
             .iter()
-            .map(|n| pool.get(n).unwrap_or_else(|| panic!("coordinator: missing tensor `{n}` for stage {}", stage.index)).clone())
+            .map(|n| {
+                pool.get(n)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "coordinator: missing tensor `{n}` for stage {}",
+                            stage.index
+                        )
+                    })
+                    .clone()
+            })
             .collect();
         let t0 = std::time::Instant::now();
         let mut sock = connect_retry(addr)?;

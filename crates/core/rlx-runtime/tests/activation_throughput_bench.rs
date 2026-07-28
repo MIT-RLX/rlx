@@ -27,6 +27,7 @@ use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available, supports_graph};
 use std::time::Instant;
 
+#[allow(clippy::vec_init_then_push)]
 fn available_backends() -> Vec<Device> {
     let mut v: Vec<Device> = Vec::new();
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -107,7 +108,11 @@ fn activation_kernel_throughput() {
             if i == 0 {
                 relu_rate = rate;
             }
-            let ratio = if relu_rate > 0.0 { rate / relu_rate } else { 1.0 };
+            let ratio = if relu_rate > 0.0 {
+                rate / relu_rate
+            } else {
+                1.0
+            };
             println!(
                 "{:<9} {:<5} {:>11.2} {:>10.1} {:>9.2}x",
                 format!("{dev:?}"),

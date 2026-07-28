@@ -224,10 +224,17 @@ pub fn dequant_matvec_affine(
     let bitmask = (1u32 << bits) - 1;
     let row_bytes = n_groups * packs_in_group * bpp;
     if w.len() < n * row_bytes {
-        bail!("affine matvec: weight bytes {} < needed {}", w.len(), n * row_bytes);
+        bail!(
+            "affine matvec: weight bytes {} < needed {}",
+            w.len(),
+            n * row_bytes
+        );
     }
     if scales.len() < n * n_groups || biases.len() < n * n_groups {
-        bail!("affine matvec: scales/biases too short (need {} each)", n * n_groups);
+        bail!(
+            "affine matvec: scales/biases too short (need {} each)",
+            n * n_groups
+        );
     }
     if x.len() < k {
         bail!("affine matvec: x len {} < k {k}", x.len());
@@ -367,10 +374,18 @@ pub fn dequant_matmul_mxfp4(
     }
     let n_groups = k / gs;
     if w.len() < n * k / 2 {
-        bail!("mxfp4 DequantMatMul: weight bytes {} < {}", w.len(), n * k / 2);
+        bail!(
+            "mxfp4 DequantMatMul: weight bytes {} < {}",
+            w.len(),
+            n * k / 2
+        );
     }
     if scales.len() < n * n_groups {
-        bail!("mxfp4 DequantMatMul: scales len {} < {}", scales.len(), n * n_groups);
+        bail!(
+            "mxfp4 DequantMatMul: scales len {} < {}",
+            scales.len(),
+            n * n_groups
+        );
     }
     // Dequantize W → [n, k] F32 (2 nibbles/byte, contiguous per row).
     let mut w_f = vec![0f32; n * k];
@@ -547,7 +562,10 @@ mod tests {
             }
         }
         // New matmul path: E8M0 scales pre-decoded to f32 (as the loader does).
-        let scales_f32: Vec<f32> = scales_u8.iter().map(|&s| mxfp4_scale_e8m0_to_f32(s)).collect();
+        let scales_f32: Vec<f32> = scales_u8
+            .iter()
+            .map(|&s| mxfp4_scale_e8m0_to_f32(s))
+            .collect();
         let y = dequant_matmul_mxfp4(&x, &w, &scales_f32, gs, m, k, n).unwrap();
         assert_eq!(y.len(), y_ref.len());
         for (a, b) in y.iter().zip(&y_ref) {

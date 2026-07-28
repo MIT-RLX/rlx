@@ -12,13 +12,18 @@
 //     DIM=64 KT=8 COLS=4 ITERS=50 \
 //     cargo run --release -p rlx-xdna --features xrt --example xdna_matmul_microkernel
 
-use rlx_xdna::aie::{emit_matmul_microkernel, tile_a_kacc, tile_b_kacc_multicol, untile_c_multicol};
-use rlx_xdna::compile::{build_mm_kernel, compile_overlay_linked, OverlaySpec};
+use rlx_xdna::aie::{
+    emit_matmul_microkernel, tile_a_kacc, tile_b_kacc_multicol, untile_c_multicol,
+};
+use rlx_xdna::compile::{OverlaySpec, build_mm_kernel, compile_overlay_linked};
 use rlx_xdna::npu_gemm::NpuGemm;
 use std::time::Instant;
 
 fn env(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -36,7 +41,9 @@ fn main() {
                     println!("[turbo] NPU power mode → TURBO (max DPM)");
                     std::mem::forget(npu);
                 }
-                Err(e) => println!("[turbo] SET_STATE(TURBO) failed: {e} — needs root/CAP_SYS_ADMIN"),
+                Err(e) => {
+                    println!("[turbo] SET_STATE(TURBO) failed: {e} — needs root/CAP_SYS_ADMIN")
+                }
             },
             Err(e) => println!("[turbo] cannot open accel device: {e}"),
         }
@@ -71,9 +78,14 @@ fn main() {
     let tmp = format!("/tmp/rlx_mmk_{d}_{kt}_{cols}");
     std::fs::create_dir_all(&tmp).ok();
     let kernel_o = format!("{tmp}/mm_{d}.o");
-    build_mm_kernel(&format!("{peano}/bin/clang++"), &include, d, &kernel_o).expect("build kernel .o");
+    build_mm_kernel(&format!("{peano}/bin/clang++"), &include, d, &kernel_o)
+        .expect("build kernel .o");
     let obj_base = format!("mm_{d}.o");
-    std::fs::write(format!("{tmp}/aie.mlir"), emit_matmul_microkernel(d, kt, cols, &obj_base)).unwrap();
+    std::fs::write(
+        format!("{tmp}/aie.mlir"),
+        emit_matmul_microkernel(d, kt, cols, &obj_base),
+    )
+    .unwrap();
     compile_overlay_linked(
         &OverlaySpec {
             aiecc: &aiecc,
@@ -93,14 +105,23 @@ fn main() {
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let mm = NpuGemm::open("", &format!("{tmp}/k.xclbin"), &insts, m, k, n).expect("open");
-    let (at, bt) = (tile_a_kacc(&a, d, kt), tile_b_kacc_multicol(&b, d, kt, cols));
+    let (at, bt) = (
+        tile_a_kacc(&a, d, kt),
+        tile_b_kacc_multicol(&b, d, kt, cols),
+    );
     let ct = mm.run(&at, &bt).expect("run");
     let c = untile_c_multicol(&ct, m, n, cols);
 
     let mism = (0..m * n).filter(|&i| c[i] != cref[i]).count();
     if mism != 0 {
-        let bad: Vec<_> = (0..m * n).filter(|&i| c[i] != cref[i]).take(4).map(|i| (i, c[i], cref[i])).collect();
-        println!("microkernel {m}x{k}x{n} (DIM={d} KT={kt} COLS={cols}): FAIL ✗ {mism} mism (i,got,want): {bad:?}");
+        let bad: Vec<_> = (0..m * n)
+            .filter(|&i| c[i] != cref[i])
+            .take(4)
+            .map(|i| (i, c[i], cref[i]))
+            .collect();
+        println!(
+            "microkernel {m}x{k}x{n} (DIM={d} KT={kt} COLS={cols}): FAIL ✗ {mism} mism (i,got,want): {bad:?}"
+        );
         std::process::exit(1);
     }
     let mut best = f64::MAX;
@@ -110,5 +131,7 @@ fn main() {
         best = best.min(t.elapsed().as_secs_f64() * 1e6);
     }
     let gops = 2.0 * (m * k * n) as f64 / (best * 1e3);
-    println!("microkernel {m}x{k}x{n} (DIM={d} KT={kt} COLS={cols})  PASS ✓  best {best:8.1} us  →  {gops:8.2} GOP/s");
+    println!(
+        "microkernel {m}x{k}x{n} (DIM={d} KT={kt} COLS={cols})  PASS ✓  best {best:8.1} us  →  {gops:8.2} GOP/s"
+    );
 }

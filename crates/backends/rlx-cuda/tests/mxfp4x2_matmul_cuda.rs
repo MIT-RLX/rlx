@@ -8,7 +8,7 @@
 use rlx_cuda::backend::CudaExecutable;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::residual::{residual_dequantize, residual_quantize};
-use rlx_ir::{DType, Graph, GraphExt, Op, ScaledFormat, Shape};
+use rlx_ir::{DType, Graph, Op, ScaledFormat, Shape};
 
 #[test]
 fn dequant_matmul_mxfp4x2_cuda_matches_reference() {
@@ -37,7 +37,8 @@ fn dequant_matmul_mxfp4x2_cuda_matches_reference() {
             let shift: u32 = if elem & 1 == 0 { 0 } else { 4 };
             let mask: u8 = 0x0Fu8 << shift;
             w_bytes[byte] = (w_bytes[byte] & !mask) | ((rb.codes[0][p] & 0x0F) << shift);
-            w_bytes[plane + byte] = (w_bytes[plane + byte] & !mask) | ((rb.codes[1][p] & 0x0F) << shift);
+            w_bytes[plane + byte] =
+                (w_bytes[plane + byte] & !mask) | ((rb.codes[1][p] & 0x0F) << shift);
             w_dq[elem] = dq[p];
         }
     }
@@ -61,7 +62,9 @@ fn dequant_matmul_mxfp4x2_cuda_matches_reference() {
     let scale_param = g.param("scale", Shape::new(&[2 * nblk * n], DType::F32));
     let y = g.add_node(
         Op::DequantMatMul {
-            scheme: QuantScheme::MxFp4x2Block { group_size: group as u32 },
+            scheme: QuantScheme::MxFp4x2Block {
+                group_size: group as u32,
+            },
         },
         vec![x_in, w_param, scale_param],
         Shape::new(&[m, n], DType::F32),

@@ -44,6 +44,7 @@ const N: usize = 64;
 /// Backends compiled into this build that are actually present on the box.
 /// Each push is `#[cfg]`-gated on its backend feature so we never name a
 /// `Device` variant that wasn't built, then filtered by live `is_available`.
+#[allow(clippy::vec_init_then_push)]
 fn available_backends() -> Vec<Device> {
     let mut v: Vec<Device> = Vec::new();
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -388,8 +389,8 @@ fn activation_vjp_finite_difference_cpu() {
             let mut xm = x.clone();
             xp[i] += eps;
             xm[i] -= eps;
-            let fd =
-                (activation_forward_loss(act, &xp) - activation_forward_loss(act, &xm)) / (2.0 * eps);
+            let fd = (activation_forward_loss(act, &xp) - activation_forward_loss(act, &xm))
+                / (2.0 * eps);
             let ad = grad[i];
             let abs_err = (fd - ad).abs();
             let rel_err = abs_err / fd.abs().max(1e-6);

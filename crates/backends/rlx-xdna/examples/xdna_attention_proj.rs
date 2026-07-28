@@ -14,13 +14,18 @@
 //   AIECC=.. PEANO=.. RLX_XDNA_AIE_INCLUDE=.. RLX_XDNA_SHIM=.. \
 //     M=64 K=4096 N=1024 cargo run --release -p rlx-xdna --features xrt \
 //     --example xdna_attention_proj
-use rlx_xdna::aie::{emit_matmul_microkernel, tile_a_kacc, tile_b_kacc_multicol, untile_c_multicol};
-use rlx_xdna::compile::{build_mm_kernel, compile_overlay_linked, OverlaySpec};
+use rlx_xdna::aie::{
+    emit_matmul_microkernel, tile_a_kacc, tile_b_kacc_multicol, untile_c_multicol,
+};
+use rlx_xdna::compile::{OverlaySpec, build_mm_kernel, compile_overlay_linked};
 use rlx_xdna::npu_gemm::NpuGemm;
 use std::time::Instant;
 
 fn env(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 // Deterministic ~Gaussian (sum of 3 uniforms) so the int8 quant error reflects a
@@ -28,7 +33,9 @@ fn env(k: &str, d: usize) -> usize {
 fn gauss(state: &mut u64) -> f32 {
     let mut s = 0f32;
     for _ in 0..3 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         s += (((*state >> 40) as u32) as f32 / (1u32 << 24) as f32) - 0.5;
     }
     s / 1.5 // ~unit-ish variance, range ~[-1,1]
@@ -38,7 +45,10 @@ fn main() {
     // DeepSeek-V4 q_a_proj scale by default (M=seq padded to the 64 tile).
     let (m, k, n) = (env("M", 64), env("K", 4096), env("N", 1024));
     let d = 64usize;
-    assert!(m == d, "this single-tile overlay uses M=DIM=64 (pad seq up)");
+    assert!(
+        m == d,
+        "this single-tile overlay uses M=DIM=64 (pad seq up)"
+    );
     assert!(k % d == 0 && n % d == 0, "K,N must be multiples of DIM=64");
     let kt = k / d;
     let cols = 4usize; // AIE columns per pass (array has ~4-5 usable)
@@ -70,7 +80,10 @@ fn main() {
     // 2) int8 quant: per-tensor act scale, per-output-channel weight scale.
     let amax = af.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-8);
     let sa = amax / 127.0;
-    let aq: Vec<i8> = af.iter().map(|&x| (x / sa).round().clamp(-127.0, 127.0) as i8).collect();
+    let aq: Vec<i8> = af
+        .iter()
+        .map(|&x| (x / sa).round().clamp(-127.0, 127.0) as i8)
+        .collect();
     let mut sw = vec![0f32; n];
     for j in 0..n {
         let mut mx = 1e-8f32;
@@ -90,9 +103,14 @@ fn main() {
     let tmp = format!("/tmp/rlx_attn_{d}_{kt}_{cols}");
     std::fs::create_dir_all(&tmp).ok();
     let kernel_o = format!("{tmp}/mm_{d}.o");
-    build_mm_kernel(&format!("{peano}/bin/clang++"), &include, d, &kernel_o).expect("build kernel .o");
+    build_mm_kernel(&format!("{peano}/bin/clang++"), &include, d, &kernel_o)
+        .expect("build kernel .o");
     let obj_base = format!("mm_{d}.o");
-    std::fs::write(format!("{tmp}/aie.mlir"), emit_matmul_microkernel(d, kt, cols, &obj_base)).unwrap();
+    std::fs::write(
+        format!("{tmp}/aie.mlir"),
+        emit_matmul_microkernel(d, kt, cols, &obj_base),
+    )
+    .unwrap();
     compile_overlay_linked(
         &OverlaySpec {
             aiecc: &aiecc,
@@ -110,7 +128,8 @@ fn main() {
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    let mm = NpuGemm::open("", &format!("{tmp}/k.xclbin"), &insts, m, kt * d, n_tile).expect("open");
+    let mm =
+        NpuGemm::open("", &format!("{tmp}/k.xclbin"), &insts, m, kt * d, n_tile).expect("open");
 
     let at = tile_a_kacc(&aq, d, kt);
     // Slice weight columns per N-tile ([K, n_tile]) and run on the NPU.
@@ -119,13 +138,15 @@ fn main() {
         let j0 = t * n_tile;
         let mut wtile = vec![0i8; k * n_tile];
         for l in 0..k {
-            wtile[l * n_tile..(l + 1) * n_tile].copy_from_slice(&wq[l * n + j0..l * n + j0 + n_tile]);
+            wtile[l * n_tile..(l + 1) * n_tile]
+                .copy_from_slice(&wq[l * n + j0..l * n + j0 + n_tile]);
         }
         let bt = tile_b_kacc_multicol(&wtile, d, kt, cols);
         let ct = mm.run(&at, &bt).expect("run");
         let ctile = untile_c_multicol(&ct, m, n_tile, cols);
         for i in 0..m {
-            c_i32[i * n + j0..i * n + j0 + n_tile].copy_from_slice(&ctile[i * n_tile..(i + 1) * n_tile]);
+            c_i32[i * n + j0..i * n + j0 + n_tile]
+                .copy_from_slice(&ctile[i * n_tile..(i + 1) * n_tile]);
         }
     }
 

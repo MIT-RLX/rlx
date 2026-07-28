@@ -1172,11 +1172,17 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
         // BF16 scales/biases (half the arena of f32): decode expert `e`'s slab on
         // the fly. Byte length is 2× the f32 element count. Otherwise read as f32.
         let (scl, zpb, scl_b16, zpb_b16) = if scale_bf16 {
-            let sb = std::slice::from_raw_parts(base.add(scale) as *const u8, ne * sb_per_expert * 2);
+            let sb =
+                std::slice::from_raw_parts(base.add(scale) as *const u8, ne * sb_per_expert * 2);
             let zb = std::slice::from_raw_parts(base.add(zp) as *const u8, ne * sb_per_expert * 2);
             (&[][..], &[][..], Some(sb), Some(zb))
         } else {
-            (sl(scale, base, ne * sb_per_expert), sl(zp, base, ne * sb_per_expert), None, None)
+            (
+                sl(scale, base, ne * sb_per_expert),
+                sl(zp, base, ne * sb_per_expert),
+                None,
+                None,
+            )
         };
         let bf16_slab = |bytes: &[u8], e: usize| -> Vec<f32> {
             bytes[e * sb_per_expert * 2..(e + 1) * sb_per_expert * 2]
@@ -1188,13 +1194,17 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
             let e = (ids[r] as usize).min(ne.saturating_sub(1));
             let w_slab = &wt[e * slab..(e + 1) * slab];
             let (s_owned, b_owned);
-            let (s_slab, b_slab): (&[f32], &[f32]) = if let (Some(sb), Some(zb)) = (scl_b16, zpb_b16) {
-                s_owned = bf16_slab(sb, e);
-                b_owned = bf16_slab(zb, e);
-                (&s_owned, &b_owned)
-            } else {
-                (&scl[e * sb_per_expert..(e + 1) * sb_per_expert], &zpb[e * sb_per_expert..(e + 1) * sb_per_expert])
-            };
+            let (s_slab, b_slab): (&[f32], &[f32]) =
+                if let (Some(sb), Some(zb)) = (scl_b16, zpb_b16) {
+                    s_owned = bf16_slab(sb, e);
+                    b_owned = bf16_slab(zb, e);
+                    (&s_owned, &b_owned)
+                } else {
+                    (
+                        &scl[e * sb_per_expert..(e + 1) * sb_per_expert],
+                        &zpb[e * sb_per_expert..(e + 1) * sb_per_expert],
+                    )
+                };
             let row = &inp[r * k..(r + 1) * k];
             let res = match scheme {
                 rlx_ir::quant::QuantScheme::MlxAffine { bits, group_size } => {
@@ -1206,7 +1216,14 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
                     // one expert dequantized per token across a 256-expert MoE,
                     // that was the prefill bottleneck.
                     rlx_mlx_io::dequant_matvec_affine(
-                        row, w_slab, s_slab, b_slab, bits as u32, group_size, k, n,
+                        row,
+                        w_slab,
+                        s_slab,
+                        b_slab,
+                        bits as u32,
+                        group_size,
+                        k,
+                        n,
                     )
                 }
                 rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size } => {
@@ -1261,7 +1278,16 @@ pub fn dequant_grouped_matmul_affine_bt(
         let row = &x[r * k..(r + 1) * k];
         // FUSED matvec: accumulate straight from the packed codes, no n×k f32
         // materialization (that memory traffic dominated the old path). Bit-exact.
-        match rlx_mlx_io::dequant_matvec_affine(row, w_slab, s_slab, b_slab, bits, group_size as u32, k, n) {
+        match rlx_mlx_io::dequant_matvec_affine(
+            row,
+            w_slab,
+            s_slab,
+            b_slab,
+            bits,
+            group_size as u32,
+            k,
+            n,
+        ) {
             Ok(o) => out_row.copy_from_slice(&o),
             Err(_) => out_row.fill(0.0),
         }
@@ -2725,8 +2751,8 @@ pub(crate) fn quant_layout(shape: &rlx_ir::Shape, axis: Option<usize>) -> (usize
 #[cfg(test)]
 mod mxfp4x2_matmul_tests {
     use super::dequant_matmul_mxfp4x2;
-    use rlx_ir::residual::{residual_dequantize, residual_quantize};
     use rlx_ir::ScaledFormat;
+    use rlx_ir::residual::{residual_dequantize, residual_quantize};
 
     // The op decodes a two-level residual E2M1 weight (s0·LUT[q0] + s1·LUT[q1])
     // and matmuls with x. Verify the packed-nibble kernel reproduces a plain f32

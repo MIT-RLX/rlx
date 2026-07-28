@@ -26,7 +26,12 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     fn new(device: Device, name: String, mem_bytes: u64, unified: bool) -> Self {
-        Self { device: device_label(device).to_string(), name, mem_bytes, unified }
+        Self {
+            device: device_label(device).to_string(),
+            name,
+            mem_bytes,
+            unified,
+        }
     }
     /// Parsed device kind.
     pub fn kind(&self) -> Device {
@@ -128,15 +133,31 @@ fn detect_devices(os: &str) -> Vec<DeviceInfo> {
         // Apple Silicon: unified-memory Metal/MLX GPU + Neural Engine.
         let name = cpu_name(os);
         out.push(DeviceInfo::new(Device::Metal, name.clone(), 0, true));
-        out.push(DeviceInfo::new(Device::Ane, format!("{name} Neural Engine"), 0, true));
+        out.push(DeviceInfo::new(
+            Device::Ane,
+            format!("{name} Neural Engine"),
+            0,
+            true,
+        ));
     } else {
         // NVIDIA via nvidia-smi.
-        if let Some(s) = run("nvidia-smi", &["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]) {
+        if let Some(s) = run(
+            "nvidia-smi",
+            &[
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+        ) {
             for line in s.lines() {
                 let mut it = line.split(',');
                 let name = it.next().unwrap_or("CUDA GPU").trim().to_string();
                 let mem_mib: u64 = it.next().and_then(|m| m.trim().parse().ok()).unwrap_or(0);
-                out.push(DeviceInfo::new(Device::Cuda, name, mem_mib * 1024 * 1024, false));
+                out.push(DeviceInfo::new(
+                    Device::Cuda,
+                    name,
+                    mem_mib * 1024 * 1024,
+                    false,
+                ));
             }
         }
         // AMD/Vulkan iGPU (shared RAM). Report GTT — the GPU-addressable slice of
@@ -145,11 +166,23 @@ fn detect_devices(os: &str) -> Vec<DeviceInfo> {
         // past GTT, so the planner must treat it as a hard cap.
         let amd_gtt = amdgpu_gtt_total();
         if run("rocminfo", &[]).is_some() {
-            out.push(DeviceInfo::new(Device::Rocm, "AMD ROCm".into(), amd_gtt, true));
-        } else if run("vulkaninfo", &["--summary"]).map(|s| s.contains("GPU")).unwrap_or(false)
+            out.push(DeviceInfo::new(
+                Device::Rocm,
+                "AMD ROCm".into(),
+                amd_gtt,
+                true,
+            ));
+        } else if run("vulkaninfo", &["--summary"])
+            .map(|s| s.contains("GPU"))
+            .unwrap_or(false)
             || amd_gtt > 0
         {
-            out.push(DeviceInfo::new(Device::Vulkan, "Vulkan GPU".into(), amd_gtt, true));
+            out.push(DeviceInfo::new(
+                Device::Vulkan,
+                "Vulkan GPU".into(),
+                amd_gtt,
+                true,
+            ));
         }
     }
     out
@@ -183,30 +216,50 @@ fn amdgpu_gtt_total() -> u64 {
 
 fn cpu_name(os: &str) -> String {
     if os == "macos" {
-        run("sysctl", &["-n", "machdep.cpu.brand_string"]).map(|s| s.trim().to_string()).unwrap_or_else(|| "CPU".into())
+        run("sysctl", &["-n", "machdep.cpu.brand_string"])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "CPU".into())
     } else {
         std::fs::read_to_string("/proc/cpuinfo")
             .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("CPU").trim().to_string()))
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("model name"))
+                    .map(|l| l.split(':').nth(1).unwrap_or("CPU").trim().to_string())
+            })
             .unwrap_or_else(|| "CPU".into())
     }
 }
 
 fn ram(os: &str) -> (u64, u64) {
     if os == "macos" {
-        let total: u64 = run("sysctl", &["-n", "hw.memsize"]).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let total: u64 = run("sysctl", &["-n", "hw.memsize"])
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
         // Available ≈ free + inactive pages × page size (vm_stat).
-        let page: u64 = run("sysctl", &["-n", "hw.pagesize"]).and_then(|s| s.trim().parse().ok()).unwrap_or(16384);
+        let page: u64 = run("sysctl", &["-n", "hw.pagesize"])
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(16384);
         let vm = run("vm_stat", &[]).unwrap_or_default();
         let grab = |key: &str| -> u64 {
-            vm.lines().find(|l| l.contains(key)).and_then(|l| l.rsplit(' ').next()).map(|n| n.trim_end_matches('.').parse().unwrap_or(0)).unwrap_or(0)
+            vm.lines()
+                .find(|l| l.contains(key))
+                .and_then(|l| l.rsplit(' ').next())
+                .map(|n| n.trim_end_matches('.').parse().unwrap_or(0))
+                .unwrap_or(0)
         };
-        let avail = (grab("Pages free:") + grab("Pages inactive:") + grab("Pages purgeable:")) * page;
+        let avail =
+            (grab("Pages free:") + grab("Pages inactive:") + grab("Pages purgeable:")) * page;
         (total, avail.min(total))
     } else {
         let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let kb = |key: &str| -> u64 {
-            mi.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0) * 1024
+            mi.lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+                * 1024
         };
         (kb("MemTotal:"), kb("MemAvailable:"))
     }
@@ -216,7 +269,11 @@ fn disk_free(dir: &str) -> u64 {
     // `df -k <dir>` → available KiB in the 4th column of the data row.
     run("df", &["-k", dir])
         .and_then(|s| s.lines().nth(1).map(String::from))
-        .and_then(|row| row.split_whitespace().nth(3).and_then(|k| k.parse::<u64>().ok()))
+        .and_then(|row| {
+            row.split_whitespace()
+                .nth(3)
+                .and_then(|k| k.parse::<u64>().ok())
+        })
         .map(|k| k * 1024)
         .unwrap_or(0)
 }
@@ -228,7 +285,9 @@ pub fn probe_local(addr: &str, ckpt_dir: &str, bench: bool) -> NodeCaps {
     let (ram_total, ram_avail) = ram(&os);
     NodeCaps {
         addr: addr.to_string(),
-        cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        cores: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
         ram_total,
         ram_avail,
         disk_free: disk_free(ckpt_dir),
@@ -241,13 +300,28 @@ pub fn probe_local(addr: &str, ckpt_dir: &str, bench: bool) -> NodeCaps {
 
 /// Probe a REMOTE node over SSH by running `<remote_bin> --probe --addr <addr>
 /// --ckpt <dir>` there and parsing its JSON. The same worker binary self-reports.
-pub fn probe_remote(ssh_host: &str, remote_bin: &str, addr: &str, ckpt_dir: &str) -> anyhow::Result<NodeCaps> {
+pub fn probe_remote(
+    ssh_host: &str,
+    remote_bin: &str,
+    addr: &str,
+    ckpt_dir: &str,
+) -> anyhow::Result<NodeCaps> {
     let cmd = format!("{remote_bin} --probe --addr {addr} --ckpt {ckpt_dir}");
-    let out = std::process::Command::new("ssh").arg(ssh_host).arg(&cmd).output()?;
+    let out = std::process::Command::new("ssh")
+        .arg(ssh_host)
+        .arg(&cmd)
+        .output()?;
     if !out.status.success() {
-        anyhow::bail!("probe {ssh_host} failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "probe {ssh_host} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let json = text.lines().find(|l| l.trim_start().starts_with('{')).unwrap_or("");
-    Ok(serde_json::from_str(json).map_err(|e| anyhow::anyhow!("parse caps from {ssh_host}: {e}: {json}"))?)
+    let json = text
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or("");
+    serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("parse caps from {ssh_host}: {e}: {json}"))
 }

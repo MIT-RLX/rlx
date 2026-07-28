@@ -355,7 +355,8 @@ impl VulkanDevice {
                 let heap = mp.memory_heaps[ty.heap_index as usize];
                 let fits = (heap.size >= size) as u8;
                 let host =
-                    (!ty.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)) as u8;
+                    (!ty.property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)) as u8;
                 (fits, host, heap.size)
             })
     }

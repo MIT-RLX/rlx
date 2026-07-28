@@ -60,7 +60,10 @@ impl ClusterRun {
         let vals = self.timings.iter().map(|t| t.resident_bytes as f64 / 1e9);
         match kind {
             Sum => vals.sum(),
-            Mean => { let n = self.timings.len().max(1) as f64; vals.sum::<f64>() / n }
+            Mean => {
+                let n = self.timings.len().max(1) as f64;
+                vals.sum::<f64>() / n
+            }
             Max => vals.fold(f64::MIN, f64::max),
             Min => vals.fold(f64::MAX, f64::min),
         }

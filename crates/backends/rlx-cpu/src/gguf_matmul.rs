@@ -48,6 +48,10 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
                 .try_into()
                 .unwrap(),
         ),
+        // Fermion five-value ternary (Neutrino): 256-element blocks == QK_K,
+        // so `out` maps 1:1. FV5 = transformer linears, FV5B = int8 embed/lm_head.
+        QuantScheme::GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5_block(block, out),
+        QuantScheme::GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b_block(block, out),
         // 32-element blocks: caller slices `out` to the correct length.
         QuantScheme::GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4_block(
             block,

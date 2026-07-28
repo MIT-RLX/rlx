@@ -126,6 +126,17 @@ pub enum QuantScheme {
     /// codes → `(q−1)·d`. 128 / 34 bytes (2.125 bpw). Used by Ternary Bonsai
     /// (`prism-ml/Ternary-Bonsai-*-gguf`). See `rlx_gguf::q2_dequant`.
     GgufQ2_0,
+    /// Fermion five-value ternary (`fermion-fv5` fork, ggml type 43): two f32
+    /// per-row scales `s_lo`/`s_hi` + three 256-bit planes (`bp`,`bn`,`br`)
+    /// → `w = (bp−bn)·(br ? s_hi : s_lo)`, five values `{0, ±s_lo, ±s_hi}`.
+    /// 256 / 104 bytes (3.25 bpw). All Neutrino transformer linears.
+    /// See `rlx_gguf::fv5_dequant`. CPU-only (no GPU kernel — matches the fork).
+    GgufFV5,
+    /// Fermion int8 companion (`fermion-fv5` fork, ggml type 44): one f32
+    /// per-row scale + 256 int8 codes → `w = s·q`. 256 / 260 bytes (8.125 bpw).
+    /// Neutrino's untied int8 `token_embd` / `output` (lm_head).
+    /// See `rlx_gguf::fv5_dequant`.
+    GgufFV5B,
 }
 
 /// Single source of truth for GGUF → GPU `dequant_gguf` scheme ids.
@@ -211,6 +222,8 @@ impl QuantScheme {
             Self::GgufNVFP4 => 45,
             Self::GgufQ1_0 => 11, // 18 bytes / 128 elems × 8 = 1.125 bpe
             Self::GgufQ2_0 => 21, // 34 bytes / 128 elems × 8 = 2.125 bpe
+            Self::GgufFV5 => 32,  // 104 bytes / 256 elems × 8 = 3.25 bpe
+            Self::GgufFV5B => 81, // 260 bytes / 256 elems × 8 = 8.125 bpe
         }
     }
 
@@ -346,7 +359,9 @@ impl QuantScheme {
             | Self::GgufIQ1S
             | Self::GgufIQ1M
             | Self::GgufTQ1_0
-            | Self::GgufTQ2_0 => 256,
+            | Self::GgufTQ2_0
+            | Self::GgufFV5
+            | Self::GgufFV5B => 256,
             Self::GgufQ4_0
             | Self::GgufQ4_1
             | Self::GgufQ5_0
@@ -388,8 +403,10 @@ impl QuantScheme {
             Self::GgufTQ2_0 => 66,
             Self::GgufMXFP4 => 17,
             Self::GgufNVFP4 => 9,
-            Self::GgufQ1_0 => 18, // f16 scale + 128 sign bits
-            Self::GgufQ2_0 => 34, // Metal fused Q2_0 block (128 elems)
+            Self::GgufQ1_0 => 18,  // f16 scale + 128 sign bits
+            Self::GgufQ2_0 => 34,  // Metal fused Q2_0 block (128 elems)
+            Self::GgufFV5 => 104,  // f32 s_lo + f32 s_hi + 3×32B planes (256 elems)
+            Self::GgufFV5B => 260, // f32 s + 256 int8 (256 elems)
             _ => 0,
         }
     }
@@ -427,6 +444,8 @@ impl QuantScheme {
                 | Self::GgufNVFP4
                 | Self::GgufQ1_0
                 | Self::GgufQ2_0
+                | Self::GgufFV5
+                | Self::GgufFV5B
         )
     }
 }
@@ -472,6 +491,8 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufNVFP4 => write!(f, "gguf_nvfp4"),
             Self::GgufQ1_0 => write!(f, "gguf_q1_0"),
             Self::GgufQ2_0 => write!(f, "gguf_q2_0"),
+            Self::GgufFV5 => write!(f, "gguf_fv5"),
+            Self::GgufFV5B => write!(f, "gguf_fv5b"),
         }
     }
 }

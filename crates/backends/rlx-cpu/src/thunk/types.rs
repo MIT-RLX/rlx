@@ -2779,9 +2779,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             global_scale,
             ..
         } => vec![*x, *w_q, *scale, *global_scale],
-        Thunk::DequantMatMulMxFp4x2 {
-            x, w_q, scale, ..
-        } => vec![*x, *w_q, *scale],
+        Thunk::DequantMatMulMxFp4x2 { x, w_q, scale, .. } => vec![*x, *w_q, *scale],
         Thunk::DequantMatMulMlx {
             x, w_q, scale, zp, ..
         } => vec![*x, *w_q, *scale, *zp],

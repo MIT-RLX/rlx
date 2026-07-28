@@ -16,7 +16,7 @@ use rlx_runtime::{Device, Session, is_available};
 /// ulp (=8), so plain f32 accumulation returns ~0.
 fn ill_conditioned() -> Vec<f32> {
     let mut x = vec![1e8f32];
-    x.extend(std::iter::repeat(1.0f32).take(100_000));
+    x.extend(std::iter::repeat_n(1.0f32, 100_000));
     x.push(-1e8f32);
     x
 }
@@ -34,7 +34,11 @@ fn sum_on_metal(x: &[f32]) -> f32 {
         Shape::new(&[1], DType::F32),
     );
     g.set_outputs(vec![s]);
-    Session::new(Device::Metal).compile(g).run(&[("x", x)]).pop().unwrap()[0]
+    Session::new(Device::Metal)
+        .compile(g)
+        .run(&[("x", x)])
+        .pop()
+        .unwrap()[0]
 }
 
 #[test]

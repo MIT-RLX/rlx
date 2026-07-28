@@ -11,8 +11,8 @@
 //   AIECC=.. PEANO=.. RLX_XDNA_SHIM=.. N=1048576 CHUNK=2048 ITERS=50 \
 //     cargo run -p rlx-xdna --features xrt --example xdna_binary
 
-use rlx_xdna::aie::{emit_binary, BinaryOp, Ty};
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::aie::{BinaryOp, Ty, emit_binary};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuIo;
 use std::time::Instant;
 
@@ -66,7 +66,11 @@ fn main() {
             out_insts: &insts_path,
         });
         if let Err(e) = cres {
-            println!("  {:<7} COMPILE-FAIL  ({})", op.name(), first_line(&format!("{e:?}")));
+            println!(
+                "  {:<7} COMPILE-FAIL  ({})",
+                op.name(),
+                first_line(&format!("{e:?}"))
+            );
             fail += 1;
             continue;
         }
@@ -91,14 +95,19 @@ fn main() {
                 continue;
             }
         };
-        let mism = (0..n).filter(|&i| out[i] != op.apply_i32(a[i], b[i])).count();
+        let mism = (0..n)
+            .filter(|&i| out[i] != op.apply_i32(a[i], b[i]))
+            .count();
         if mism != 0 {
             let bad: Vec<_> = (0..n)
                 .filter(|&i| out[i] != op.apply_i32(a[i], b[i]))
                 .take(2)
                 .map(|i| (a[i], b[i], out[i], op.apply_i32(a[i], b[i])))
                 .collect();
-            println!("  {:<7} FAIL ✗ {mism} mism (a,b,got,want): {bad:?}", op.name());
+            println!(
+                "  {:<7} FAIL ✗ {mism} mism (a,b,got,want): {bad:?}",
+                op.name()
+            );
             fail += 1;
             continue;
         }
@@ -109,7 +118,10 @@ fn main() {
             best = best.min(t.elapsed().as_secs_f64() * 1e6);
         }
         let gbps = (n as f64 * 4.0 * 3.0) / (best * 1e3); // a+b+out bytes / ns
-        println!("  {:<7} PASS ✓  best {best:7.1} us  {gbps:5.1} GB/s", op.name());
+        println!(
+            "  {:<7} PASS ✓  best {best:7.1} us  {gbps:5.1} GB/s",
+            op.name()
+        );
         pass += 1;
     }
     println!("\n{pass} passed, {fail} failed (of {})", ops.len());

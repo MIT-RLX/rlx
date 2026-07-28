@@ -9,23 +9,35 @@
 //   AIECC=.. PEANO=.. RLX_XDNA_SHIM=.. ROWS=32 COLS=64 \
 //     cargo run -p rlx-xdna --features xrt --example xdna_reduce
 
-use rlx_xdna::aie::{emit_reduce, ReduceOp};
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::aie::{ReduceOp, emit_reduce};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuIoF32;
 
 fn envn(k: &str, d: &str) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| d.parse().unwrap())
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| d.parse().unwrap())
 }
 
 fn main() {
     let (rows, cols) = (envn("ROWS", "32"), envn("COLS", "64"));
     let n = rows * cols;
-    let (aiecc, peano) = (std::env::var("AIECC").unwrap(), std::env::var("PEANO").unwrap());
+    let (aiecc, peano) = (
+        std::env::var("AIECC").unwrap(),
+        std::env::var("PEANO").unwrap(),
+    );
 
     // Values near 1.0 so `prod` over `cols` stays well-conditioned.
     let input: Vec<f32> = (0..n).map(|i| 0.95 + (i % 7) as f32 * 0.015).collect();
 
-    let ops = [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min, ReduceOp::Prod];
+    let ops = [
+        ReduceOp::Sum,
+        ReduceOp::Mean,
+        ReduceOp::Max,
+        ReduceOp::Min,
+        ReduceOp::Prod,
+    ];
     println!("row-reduction sweep {rows}x{cols}\n");
     let (mut pass, mut fail) = (0, 0);
     for op in ops {
@@ -43,7 +55,11 @@ fn main() {
             out_xclbin: &xclbin,
             out_insts: &insts_path,
         }) {
-            println!("  {:<5} COMPILE-FAIL ({})", op.name(), format!("{e:?}").lines().next().unwrap_or(""));
+            println!(
+                "  {:<5} COMPILE-FAIL ({})",
+                op.name(),
+                format!("{e:?}").lines().next().unwrap_or("")
+            );
             fail += 1;
             continue;
         }

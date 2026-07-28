@@ -165,7 +165,10 @@ fn try_alloc_f32(ctx: &Arc<CudaContext>, n_f32: usize) -> Result<CudaSlice<f32>,
     if unified_arena_enabled() {
         let bytes = n_f32 * std::mem::size_of::<f32>();
         let cu = unsafe {
-            cudarc::driver::result::malloc_managed(bytes, cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL)
+            cudarc::driver::result::malloc_managed(
+                bytes,
+                cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL,
+            )
         }
         .map_err(|_| ())?;
         // Prefer HOST for the oversubscribed arena so it does NOT greedily migrate
@@ -828,7 +831,10 @@ impl Arena {
         let mut new_buf = if unified_arena_enabled() {
             let bytes = n_u16 * std::mem::size_of::<u16>();
             let cu = unsafe {
-                cudarc::driver::result::malloc_managed(bytes, cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL)
+                cudarc::driver::result::malloc_managed(
+                    bytes,
+                    cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL,
+                )
             }
             .expect("rlx-cuda: managed half-arena allocation failed");
             unsafe {

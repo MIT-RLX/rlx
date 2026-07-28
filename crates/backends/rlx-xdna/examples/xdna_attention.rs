@@ -11,20 +11,29 @@
 //     cargo run -p rlx-xdna --features xrt --example xdna_attention
 
 use rlx_xdna::aie::emit_attention;
-use rlx_xdna::compile::{compile_overlay, OverlaySpec};
+use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuRun3;
 
 fn envn(k: &str, d: &str) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| d.parse().unwrap())
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| d.parse().unwrap())
 }
 
 fn main() {
     let (seq, d) = (envn("SEQ", "32"), envn("D", "32"));
     let sd = seq * d;
-    let (aiecc, peano) = (std::env::var("AIECC").unwrap(), std::env::var("PEANO").unwrap());
+    let (aiecc, peano) = (
+        std::env::var("AIECC").unwrap(),
+        std::env::var("PEANO").unwrap(),
+    );
 
     let mlir = emit_attention(seq, d, 1, 1.0 / (d as f32).sqrt(), false);
-    println!("1. rlx emitted AIE-MLIR attention seq={seq} d={d} ({} lines)", mlir.lines().count());
+    println!(
+        "1. rlx emitted AIE-MLIR attention seq={seq} d={d} ({} lines)",
+        mlir.lines().count()
+    );
     let tmp = "/tmp/rlx_attn";
     std::fs::create_dir_all(tmp).ok();
     let mp = format!("{tmp}/aie.mlir");

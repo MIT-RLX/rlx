@@ -147,13 +147,7 @@ mod tests {
 
     #[test]
     fn every_language_emits_all_ops() {
-        for lang in [
-            Lang::Wgsl,
-            Lang::Cuda,
-            Lang::Msl,
-            Lang::Glsl,
-            Lang::OpenCl,
-        ] {
+        for lang in [Lang::Wgsl, Lang::Cuda, Lang::Msl, Lang::Glsl, Lang::OpenCl] {
             let m = match lang {
                 Lang::Wgsl => wgsl_compare_module(),
                 Lang::Cuda => cuda_compare_module(),

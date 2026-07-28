@@ -1486,7 +1486,10 @@ fn print_inventory(label: &str) {
     // detected with no XRT runtime): surfaced separately so the inventory shows
     // the silicon without letting selection dispatch to a backend that can't run.
     for (d, why) in rlx_runtime::detected_unavailable_devices() {
-        eprintln!("[{label}] detected, not runnable: {} — {why}", device_label(d));
+        eprintln!(
+            "[{label}] detected, not runnable: {} — {why}",
+            device_label(d)
+        );
     }
 }
 

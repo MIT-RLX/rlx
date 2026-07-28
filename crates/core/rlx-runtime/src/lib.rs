@@ -157,12 +157,12 @@ pub use device_bench::{DeviceBenchResult, benchmark_devices, warm_all};
 pub use device_ext::available_apple_devices;
 pub use device_ext::{
     BROWSER_DEVICE_PRIORITY, available_browser_devices, available_devices,
-    detected_unavailable_devices, devices_for,
-    dispatch_report_for_device, dispatch_report_for_device_with_options, fastest_device,
-    first_unsupported_op, first_unsupported_op_with_options, full_name, is_available,
-    legalize_graph_for_device, legalize_graph_for_device_with_options,
-    legalize_graph_for_device_with_report, preferred_browser_device, supports, supports_graph,
-    supports_graph_with_options, supports_run_slots, trim_accelerator_arena_pool,
+    detected_unavailable_devices, devices_for, dispatch_report_for_device,
+    dispatch_report_for_device_with_options, fastest_device, first_unsupported_op,
+    first_unsupported_op_with_options, full_name, is_available, legalize_graph_for_device,
+    legalize_graph_for_device_with_options, legalize_graph_for_device_with_report,
+    preferred_browser_device, supports, supports_graph, supports_graph_with_options,
+    supports_run_slots, trim_accelerator_arena_pool,
 };
 pub use device_parse::{ParseDeviceError, device_label, parse_device, parse_device_list};
 pub use device_policy::{

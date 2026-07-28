@@ -41,7 +41,8 @@ fn dequant_matmul_mxfp4x2_cpu_end_to_end() {
             let shift: u32 = if elem & 1 == 0 { 0 } else { 4 };
             let mask: u8 = 0x0Fu8 << shift;
             w_bytes[byte] = (w_bytes[byte] & !mask) | ((rb.codes[0][p] & 0x0F) << shift);
-            w_bytes[plane + byte] = (w_bytes[plane + byte] & !mask) | ((rb.codes[1][p] & 0x0F) << shift);
+            w_bytes[plane + byte] =
+                (w_bytes[plane + byte] & !mask) | ((rb.codes[1][p] & 0x0F) << shift);
             w_dq[elem] = dq[p];
         }
     }
@@ -66,7 +67,9 @@ fn dequant_matmul_mxfp4x2_cpu_end_to_end() {
     let scale = g.param("scale", Shape::new(&[2 * nblk * n], DType::F32));
     let y = g.add_node(
         Op::DequantMatMul {
-            scheme: QuantScheme::MxFp4x2Block { group_size: group as u32 },
+            scheme: QuantScheme::MxFp4x2Block {
+                group_size: group as u32,
+            },
         },
         vec![x_in, w_q, scale],
         Shape::new(&[m, n], DType::F32),
@@ -83,6 +86,11 @@ fn dequant_matmul_mxfp4x2_cpu_end_to_end() {
     assert_eq!(actual.len(), expected.len());
     for i in 0..actual.len() {
         let diff = (actual[i] - expected[i]).abs();
-        assert!(diff < 1e-3, "at {i}: got {} expected {} (diff {diff})", actual[i], expected[i]);
+        assert!(
+            diff < 1e-3,
+            "at {i}: got {} expected {} (diff {diff})",
+            actual[i],
+            expected[i]
+        );
     }
 }

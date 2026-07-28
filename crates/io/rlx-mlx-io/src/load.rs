@@ -579,7 +579,8 @@ impl LazyMlxWeights {
         for (idx, p) in shard_paths.iter().enumerate() {
             let file = File::open(p).with_context(|| format!("open {}", p.display()))?;
             // SAFETY: read-only mapping of a file we own for the loader's lifetime.
-            let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", p.display()))?;
+            let mmap =
+                unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", p.display()))?;
             {
                 let st = SafeTensors::deserialize(&mmap[..])
                     .with_context(|| format!("safetensors header {}", p.display()))?;
@@ -589,7 +590,12 @@ impl LazyMlxWeights {
             } // header borrow released before moving the mmap
             shards.push(mmap);
         }
-        Ok(Self { shards, name_to_shard, config, source })
+        Ok(Self {
+            shards,
+            name_to_shard,
+            config,
+            source,
+        })
     }
 
     /// Copy just this tensor's bytes out of its mmap → dense/quant [`MlxTensor`].
@@ -623,7 +629,11 @@ impl LazyMlxWeights {
             let aligned = (start + page - 1) & !(page - 1);
             let end = start + view.data().len();
             if end > aligned {
-                libc::madvise(aligned as *mut libc::c_void, end - aligned, libc::MADV_DONTNEED);
+                libc::madvise(
+                    aligned as *mut libc::c_void,
+                    end - aligned,
+                    libc::MADV_DONTNEED,
+                );
             }
         }
         out
@@ -664,11 +674,14 @@ impl LazyMlxWeights {
     pub fn take_dense_f32(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
         if self.is_quantized_layer(key) {
             let base = key.trim_end_matches(".weight");
-            let mut temp = self.temp_with(&[key, &format!("{base}.scales"), &format!("{base}.biases")])?;
+            let mut temp =
+                self.temp_with(&[key, &format!("{base}.scales"), &format!("{base}.biases")])?;
             return temp.take_dense_f32(key);
         }
         let t = self.materialize(key)?;
-        let data = t.data_f32.with_context(|| format!("mlx tensor {key} has no f32 data"))?;
+        let data = t
+            .data_f32
+            .with_context(|| format!("mlx tensor {key} has no f32 data"))?;
         Ok((data, t.shape))
     }
 
@@ -677,7 +690,8 @@ impl LazyMlxWeights {
             return Ok(None);
         }
         let base = key.trim_end_matches(".weight");
-        let mut temp = self.temp_with(&[key, &format!("{base}.scales"), &format!("{base}.biases")])?;
+        let mut temp =
+            self.temp_with(&[key, &format!("{base}.scales"), &format!("{base}.biases")])?;
         temp.take_packed_linear(key)
     }
 }
@@ -703,7 +717,11 @@ pub fn load_path_lazy(path: impl AsRef<Path>) -> Result<LazyMlxWeights> {
     let path = path.as_ref();
     if path.is_dir() {
         let cfg_path = path.join("config.json");
-        let config = if cfg_path.is_file() { MlxConfig::from_path(&cfg_path)? } else { MlxConfig::default() };
+        let config = if cfg_path.is_file() {
+            MlxConfig::from_path(&cfg_path)?
+        } else {
+            MlxConfig::default()
+        };
         let files = gather_shard_files(path)?;
         LazyMlxWeights::from_shards(files, config, path.to_path_buf())
     } else if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
@@ -716,7 +734,10 @@ pub fn load_path_lazy(path: impl AsRef<Path>) -> Result<LazyMlxWeights> {
             .unwrap_or_default();
         LazyMlxWeights::from_shards(vec![path.to_path_buf()], config, path.to_path_buf())
     } else {
-        bail!("load_path_lazy: expected a dir or .safetensors, got {}", path.display());
+        bail!(
+            "load_path_lazy: expected a dir or .safetensors, got {}",
+            path.display()
+        );
     }
 }
 

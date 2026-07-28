@@ -10,7 +10,7 @@
 //   AIECC=.. PEANO=.. RLX_XDNA_SHIM=.. N=262144 CHUNK=2048 ITERS=100 \
 //     cargo run -p rlx-xdna --features xrt --example xdna_fused
 
-use rlx_xdna::aie::{emit_eltwise, emit_eltwise_chain, Eltwise};
+use rlx_xdna::aie::{Eltwise, emit_eltwise, emit_eltwise_chain};
 use rlx_xdna::npu_gemm::NpuIo;
 use std::time::Instant;
 
@@ -63,7 +63,10 @@ fn main() {
     let input: Vec<i32> = (0..n).map(|i| (i as i32 % 21) - 10).collect();
     let want = |x: i32| (x.wrapping_mul(w).wrapping_add(b)).max(0); // relu(w*x+b)
 
-    println!("relu({w}*x + {b}) over {n} i32 ({}x{chunk}-chunks)\n", n / chunk);
+    println!(
+        "relu({w}*x + {b}) over {n} i32 ({}x{chunk}-chunks)\n",
+        n / chunk
+    );
 
     // ── FUSED: one kernel ──────────────────────────────────────────────────
     let (xf, instf) = build("fused", &emit_eltwise_chain(n, chunk, &ops));
@@ -71,7 +74,10 @@ fn main() {
     let of = iof.run(&input).unwrap();
     let ok_f = (0..n).all(|i| of[i] == want(input[i]));
     let t_fused = bench(&iof, &input, iters);
-    println!("FUSED    (1 kernel, 1 dispatch):  {t_fused:.1} us   [{}]", if ok_f { "bit-exact ✓" } else { "FAIL ✗" });
+    println!(
+        "FUSED    (1 kernel, 1 dispatch):  {t_fused:.1} us   [{}]",
+        if ok_f { "bit-exact ✓" } else { "FAIL ✗" }
+    );
 
     // ── SEPARATE: three kernels, host-chained (3 dispatches, 3 round-trips) ──
     let (xm, instm) = build("mul", &emit_eltwise(n, chunk, Eltwise::MulScalar(w)));
@@ -89,7 +95,14 @@ fn main() {
         let _ = run_sep(&input);
         t_sep = t_sep.min(t.elapsed().as_secs_f64() * 1e6);
     }
-    println!("SEPARATE (3 kernels, 3 dispatch):  {t_sep:.1} us   [{}]", if ok_s { "bit-exact ✓" } else { "FAIL ✗" });
+    println!(
+        "SEPARATE (3 kernels, 3 dispatch):  {t_sep:.1} us   [{}]",
+        if ok_s { "bit-exact ✓" } else { "FAIL ✗" }
+    );
 
-    println!("\nfusion speedup: {:.2}x  ({:.1} us saved / call)", t_sep / t_fused, t_sep - t_fused);
+    println!(
+        "\nfusion speedup: {:.2}x  ({:.1} us saved / call)",
+        t_sep / t_fused,
+        t_sep - t_fused
+    );
 }
