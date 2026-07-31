@@ -104,11 +104,13 @@ pub enum HirOp {
         scheme: QuantScheme,
     },
 
-    /// Gated DeltaNet linear-attention scan (Qwen3.5 trunk).
-    /// Inputs: `[q, k, v, g, beta]` or with carry `[…, state]`.
+    /// Gated DeltaNet linear-attention scan (Qwen3.5 trunk / Kimi-K3 KDA).
+    /// Inputs: `[q, k, v, g, beta]` or with carry `[…, state]`. When
+    /// `gate_per_channel`, `g` is `[b, s, h, n]` (see [`crate::Op::GatedDeltaNet`]).
     GatedDeltaNet {
         state_size: usize,
         carry_state: bool,
+        gate_per_channel: bool,
     },
 
     /// Multi-layer (optionally bidirectional) LSTM. Packed weights;
@@ -489,6 +491,31 @@ impl HirModule {
             HirOp::GatedDeltaNet {
                 state_size,
                 carry_state: false,
+                gate_per_channel: false,
+            },
+            vec![q, k, v, g, beta],
+            out_shape,
+            None,
+        )
+    }
+
+    /// Gated DeltaNet with a **per-channel** log-gate (`g` is `[b, s, h, n]`) —
+    /// Kimi-K3 KDA. Prefill / reset per batch.
+    pub fn gated_delta_net_pc(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        g: HirNodeId,
+        beta: HirNodeId,
+        state_size: usize,
+        out_shape: Shape,
+    ) -> HirNodeId {
+        self.push_block(
+            HirOp::GatedDeltaNet {
+                state_size,
+                carry_state: false,
+                gate_per_channel: true,
             },
             vec![q, k, v, g, beta],
             out_shape,
@@ -512,6 +539,32 @@ impl HirModule {
             HirOp::GatedDeltaNet {
                 state_size,
                 carry_state: true,
+                gate_per_channel: false,
+            },
+            vec![q, k, v, g, beta, state],
+            out_shape,
+            None,
+        )
+    }
+
+    /// Gated DeltaNet with decode carry and a **per-channel** log-gate (KDA).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_carry_pc(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        g: HirNodeId,
+        beta: HirNodeId,
+        state: HirNodeId,
+        state_size: usize,
+        out_shape: Shape,
+    ) -> HirNodeId {
+        self.push_block(
+            HirOp::GatedDeltaNet {
+                state_size,
+                carry_state: true,
+                gate_per_channel: true,
             },
             vec![q, k, v, g, beta, state],
             out_shape,

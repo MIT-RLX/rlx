@@ -407,24 +407,27 @@ fn gfx_from_hsa_override(v: &str) -> Option<String> {
 fn detected_rocm_arch() -> &'static Option<String> {
     static ARCH: OnceLock<Option<String>> = OnceLock::new();
     ARCH.get_or_init(|| {
-        // `rocm_agent_enumerator` prints one gfx token per line — cheapest.
+        // `rocm_agent_enumerator` / `rocminfo` list EVERY GPU agent, in physical
+        // device order and NOT filtered by `HIP_VISIBLE_DEVICES` (that's a
+        // HIP-runtime concept; these are HSA tools). On a multi-GPU box with
+        // mixed archs we must select the arch of the device THIS process
+        // actually targets — otherwise e.g. a gfx908 code object is force-built
+        // (`--offload-arch=gfx908`) and fails to load on a gfx1103 device
+        // (hipModuleLoadData → hipError 209).
+        let pick = |s: &str| -> Option<String> {
+            let archs = all_gfx_tokens(s);
+            let idx = visible_device_index().min(archs.len().saturating_sub(1));
+            archs.get(idx).cloned()
+        };
         for cmd in [
             "rocm_agent_enumerator",
             "/opt/rocm/bin/rocm_agent_enumerator",
+            "rocminfo",
+            "/opt/rocm/bin/rocminfo",
         ] {
             if let Ok(out) = std::process::Command::new(cmd).output() {
                 if out.status.success() {
-                    if let Some(a) = first_gfx_token(&String::from_utf8_lossy(&out.stdout)) {
-                        return Some(a);
-                    }
-                }
-            }
-        }
-        // Fall back to parsing `rocminfo`'s "Name: gfxNNNN" agent lines.
-        for cmd in ["rocminfo", "/opt/rocm/bin/rocminfo"] {
-            if let Ok(out) = std::process::Command::new(cmd).output() {
-                if out.status.success() {
-                    if let Some(a) = first_gfx_token(&String::from_utf8_lossy(&out.stdout)) {
+                    if let Some(a) = pick(&String::from_utf8_lossy(&out.stdout)) {
                         return Some(a);
                     }
                 }
@@ -436,10 +439,30 @@ fn detected_rocm_arch() -> &'static Option<String> {
 
 /// First real GPU arch token in ROCm CLI output — the whitespace-delimited
 /// token starting with `gfx` that isn't the `gfx000` CPU/host agent.
-fn first_gfx_token(s: &str) -> Option<String> {
+/// All GPU gfx arch tokens the enumerator/`rocminfo` reports, in physical
+/// device order (CPU agents `gfx000` excluded).
+fn all_gfx_tokens(s: &str) -> Vec<String> {
     s.split_whitespace()
-        .find(|t| t.starts_with("gfx") && *t != "gfx000")
+        .filter(|t| t.starts_with("gfx") && *t != "gfx000")
         .map(|t| t.to_string())
+        .collect()
+}
+
+/// The physical GPU index this process targets: the first entry of
+/// `HIP_VISIBLE_DEVICES` (or `ROCR_VISIBLE_DEVICES`), which HIP device 0 maps
+/// to. Defaults to 0 when unset. Used to select the matching arch from the
+/// (unfiltered) agent list so kernels build for the device we actually run on.
+fn visible_device_index() -> usize {
+    for key in ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"] {
+        if let Ok(v) = std::env::var(key) {
+            if let Some(first) = v.split(',').next() {
+                if let Ok(i) = first.trim().parse::<usize>() {
+                    return i;
+                }
+            }
+        }
+    }
+    0
 }
 
 // ── Convenience wrappers ─────────────────────────────────────────────

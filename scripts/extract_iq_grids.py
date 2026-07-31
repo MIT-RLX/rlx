@@ -9,7 +9,6 @@ Run when bumping the pinned llama.cpp source.
 
 Usage:
     extract_iq_grids.py <path/to/ggml-common.h>     # writes to stdout
-    extract_iq_grids.py                              # uses DEFAULT_HEADER
 
 Then pipe to the target file:
 
@@ -22,11 +21,6 @@ header moved beyond what this extractor knows about.
 import re
 import sys
 from pathlib import Path
-
-DEFAULT_HEADER = (
-    "/Users/Shared/rlx-models/.eagle3-bench/llama-cpp-b9606"
-    "/ggml/src/ggml-common.h"
-)
 
 # (table_name, ggml dtype, declared length, Rust grouping per line)
 # A length of None means "read from #define NGRID_IQ1S".
@@ -78,7 +72,9 @@ def rust_array(name, rust_ty, items, group):
 
 
 def main():
-    header_path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HEADER)
+    if len(sys.argv) < 2:
+        raise SystemExit("usage: extract_iq_grids.py <path/to/ggml-common.h>")
+    header_path = Path(sys.argv[1])
     src = header_path.read_text()
     m = re.search(r"#define\s+NGRID_IQ1S\s+(\d+)", src)
     ngrid_iq1s = int(m.group(1)) if m else 2048

@@ -30,7 +30,21 @@
 //!   WORLD  number of ranks                            (default 1)
 //!   PEERS  comma-separated host:port, one per rank    (default loopback pair)
 //!   MODE   infer | train | both | bench | pipeline | topology | placement |
-//!          multidev | parity | federated | coordinator | worker   (default both)
+//!          multidev | parity | federated | coordinator | worker | autofleet |
+//!          benchfleet   (default both)
+//!          benchfleet = each rank benches its own device (inference GFLOP/s +
+//!                       precision, training steps/s + precision) and the leader
+//!                       prints a per-device speed+precision table. Use as an
+//!                       autofleet FLEET_MODE to bench the discovered fleet.
+//!          autofleet = launch with no RANK; discovers every runnable local
+//!                      device (CPU + one rank per physical ROCm GPU + any
+//!                      other runnable accelerator) and self-spawns one worker
+//!                      per device onto a loopback mesh, then runs FLEET_MODE
+//!                      (default both) across them. Idle-but-present devices
+//!                      (e.g. an NPU with no runtime) are reported, not used.
+//!                      Knobs: FLEET_MODE, FLEET_HOST (default 127.0.0.1),
+//!                      FLEET_PORT (default 29600), FLEET_TF32 (default 0 =
+//!                      precise f32 for CUDA; 1 = fast TF32 tensor cores).
 //!          parity = cross-backend divergence diagnostic on this node (CPU oracle
 //!                   vs every local backend) — flags round-off vs kernel-bug drift
 //!          federated = bounded-staleness federated averaging (LATE_MS makes
@@ -71,11 +85,13 @@ use rlx_collectives::prelude::*;
 // `all_reduce` aliased to distinguish the in-graph op builder from the host
 // `ProcessGroup::all_reduce` method used elsewhere in this file.
 use rlx_collectives::all_reduce as graph_all_reduce;
+use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::dist; // reusable ship-graph worker/coordinator API
 use rlx_runtime::{
-    Device, DevicePolicy, GraphDevices, Session, device_label, fastest_device, full_name,
-    is_available, parse_device, parse_device_list,
+    Device, DevicePolicy, GraphDevices, Session, available_devices, detected_unavailable_devices,
+    device_label, device_thermal_count, fastest_device, full_name, is_available, parse_device,
+    parse_device_list,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -120,7 +136,263 @@ fn y_targets(x: &[f32], w: &[f32]) -> Vec<f32> {
 }
 const LR: f32 = 0.15;
 
+/// Problem dim the K/M shard split must divide (`K == M` above); the fanned-out
+/// WORLD is padded up to a divisor of this so every rank's shard stays exact.
+const FLEET_SHARD_DIVISOR: usize = K;
+
+/// Smallest divisor of `n` that is `>= want` (clamped to `[1, n]`).
+fn divisor_ge(n: usize, want: usize) -> usize {
+    (want.max(1)..=n)
+        .find(|w| n.is_multiple_of(*w))
+        .unwrap_or(n)
+        .max(1)
+}
+
+/// `MODE=autofleet` (no `RANK`): discover every runnable local compute device
+/// and self-spawn one worker per device onto a loopback mesh, then run the
+/// inner mode (`FLEET_MODE`, default `both`) across them — maximizing hardware
+/// use with zero hand-tuning. Slots: CPU + one rank per physical ROCm GPU +
+/// any other runnable accelerator (CUDA / Metal / MLX / Vulkan / wgpu / XDNA).
+/// Accelerators that are present but idle (e.g. an NPU with no userspace
+/// runtime) are reported, never dispatched to.
+fn run_autofleet() -> i32 {
+    // 1. Discover runnable compute slots. A slot is (DEVICE, gpu_index?, name).
+    let runnable = available_devices();
+    let mut slots: Vec<(String, Option<usize>, String)> = Vec::new();
+    if runnable.contains(&Device::Cpu) {
+        slots.push(("cpu".into(), None, "cpu".into()));
+    }
+    // One worker per *physical* ROCm GPU — `HIP_VISIBLE_DEVICES` isolates each.
+    if runnable.contains(&Device::Rocm) {
+        let n = device_thermal_count(Device::Rocm).max(1);
+        for i in 0..n {
+            slots.push(("rocm".into(), Some(i), format!("rocm{i}")));
+        }
+    }
+    // One worker per *physical* NVIDIA GPU — `CUDA_VISIBLE_DEVICES` isolates each.
+    if runnable.contains(&Device::Cuda) {
+        let n = device_thermal_count(Device::Cuda).max(1);
+        for i in 0..n {
+            slots.push(("cuda".into(), Some(i), format!("cuda{i}")));
+        }
+    }
+    // Single-instance f32-capable accelerators — one rank each when runnable.
+    // (XDNA is intentionally absent: it's an INT8/fixed-shape engine that can't
+    // shard the f32 mesh, so it runs its own INT8 GEMM lane — see below.)
+    for (dev, tag) in [
+        (Device::Metal, "metal"),
+        (Device::Mlx, "mlx"),
+        (Device::Vulkan, "vulkan"),
+        (Device::Gpu, "gpu"),
+    ] {
+        if runnable.contains(&dev) {
+            slots.push((tag.to_string(), None, tag.to_string()));
+        }
+    }
+    if slots.is_empty() {
+        eprintln!("[autofleet] no runnable compute devices found");
+        return 1;
+    }
+
+    // Surface accelerators that are present but idle (missing runtime, etc.).
+    for (dev, why) in detected_unavailable_devices() {
+        eprintln!("[autofleet] detected, idle: {} — {why}", device_label(dev));
+    }
+
+    // INT8 NPU lane: an XDNA overlay is INT8/fixed-shape, so it can't shard the
+    // f32 mesh — when one is configured, run its GEMM here as its own lane.
+    // Runs first so its report isn't interleaved with the mesh workers' stderr.
+    let npu_ok = run_npu_lane();
+
+    // 2. Fan out: one rank per slot, padded up to a shard-exact WORLD.
+    let world = divisor_ge(FLEET_SHARD_DIVISOR, slots.len());
+    if world < slots.len() {
+        eprintln!(
+            "[autofleet] note: {} devices but WORLD capped at {world} (shard divisor {FLEET_SHARD_DIVISOR}); extra devices idle",
+            slots.len()
+        );
+    }
+    let assign: Vec<&(String, Option<usize>, String)> =
+        (0..world).map(|r| &slots[r % slots.len()]).collect();
+    let plan: Vec<String> = assign.iter().map(|(_, _, n)| n.clone()).collect();
+    eprintln!(
+        "[autofleet] {} runnable device(s) → WORLD={world}: [{}]",
+        slots.len(),
+        plan.join(", ")
+    );
+
+    // 3. Loopback mesh addresses + self-exec one child per rank.
+    let host = env("FLEET_HOST", "127.0.0.1");
+    let base: u16 = env("FLEET_PORT", "29600").parse().unwrap_or(29600);
+    let peers = (0..world)
+        .map(|i| format!("{host}:{}", base + i as u16))
+        .collect::<Vec<_>>()
+        .join(",");
+    let inner = env("FLEET_MODE", "both");
+    let steps = env("STEPS", "100");
+    let exe = std::env::current_exe().expect("current_exe");
+
+    let mut children = Vec::new();
+    for (rank, (dev, gpu, name)) in assign.iter().enumerate() {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.env("RANK", rank.to_string())
+            .env("WORLD", world.to_string())
+            .env("PEERS", &peers)
+            .env("MODE", &inner)
+            .env("DEVICE", dev)
+            .env("STEPS", &steps)
+            .env("LABEL", format!("r{rank}:{name}"));
+        // Pin a physical GPU: `CUDA_VISIBLE_DEVICES` for NVIDIA, else
+        // `HIP_VISIBLE_DEVICES` for ROCm. Clear both first so no rank inherits a
+        // stray pin from the launcher.
+        cmd.env_remove("HIP_VISIBLE_DEVICES");
+        cmd.env_remove("CUDA_VISIBLE_DEVICES");
+        if let Some(idx) = gpu {
+            let pin = if dev == "cuda" {
+                "CUDA_VISIBLE_DEVICES"
+            } else {
+                "HIP_VISIBLE_DEVICES"
+            };
+            cmd.env(pin, idx.to_string());
+        }
+        // Correctness-first default: run the fleet in precise f32 so training and
+        // inference stay bit-close to the CPU oracle. NVIDIA cuBLAS otherwise
+        // defaults to TF32 tensor-core f32, which drifts ~1e-4; forcing true f32
+        // pulls that to ~1e-6 for ~5% less inference throughput. `FLEET_TF32=1`
+        // opts back into the fast path. (ROCm/CPU are already true f32.)
+        if env("FLEET_TF32", "0") == "0" {
+            cmd.env("RLX_CUDA_NO_TF32", "1");
+        } else {
+            cmd.env_remove("RLX_CUDA_NO_TF32");
+        }
+        match cmd.spawn() {
+            Ok(child) => children.push((rank, name.clone(), child)),
+            Err(e) => {
+                eprintln!("[autofleet] spawn rank {rank} ({name}) failed: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // 4. Await all workers; aggregate exit status.
+    let mut failed = 0usize;
+    for (rank, name, mut child) in children {
+        match child.wait() {
+            Ok(st) if st.success() => {}
+            Ok(st) => {
+                failed += 1;
+                eprintln!("[autofleet] rank {rank} ({name}) exited: {st}");
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("[autofleet] rank {rank} ({name}) wait failed: {e}");
+            }
+        }
+    }
+    let npu_note = match npu_ok {
+        Some(true) => "  + NPU INT8-GEMM lane ✓",
+        Some(false) => "  + NPU INT8-GEMM lane ✗",
+        None => "",
+    };
+    let npu_failed = usize::from(matches!(npu_ok, Some(false)));
+    if failed == 0 && npu_failed == 0 {
+        eprintln!(
+            "[autofleet] ✓ all {world} mesh ranks passed across [{}]{npu_note}",
+            plan.join(", ")
+        );
+        0
+    } else {
+        eprintln!("[autofleet] ✗ {failed}/{world} rank(s) failed{npu_note}");
+        1
+    }
+}
+
+/// Run the XDNA NPU's INT8 GEMM lane when an overlay is configured
+/// (`RLX_XDNA_SHIM`/`XCLBIN`/`INSTS`/`GEMM` — read entirely from the
+/// environment). The AIE array is an INT8/fixed-shape engine, so this is a
+/// self-contained bit-exact-vs-CPU check, not an f32-mesh shard. Returns
+/// `Some(passed)` when the NPU participated, `None` when no overlay is set
+/// (the NPU then stays on the idle-inventory line above).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn run_npu_lane() -> Option<bool> {
+    let ov = rlx_xdna::overlay_from_env()?;
+    let (m, k, n) = (ov.m, ov.k, ov.n);
+    let insts: Vec<u32> = match std::fs::read(&ov.insts) {
+        Ok(b) => b
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        Err(e) => {
+            eprintln!("[autofleet] xdna: read insts failed: {e}");
+            return Some(false);
+        }
+    };
+    // Deterministic small INT8 operands → i32 accumulation is exact.
+    let a: Vec<i8> = (0..m * k).map(|i| ((i % 7) as i8) - 3).collect();
+    let b: Vec<i8> = (0..k * n).map(|i| ((i % 5) as i8) - 2).collect();
+    let gemm = match rlx_xdna::npu_gemm::NpuGemm::open(&ov.shim, &ov.xclbin, &insts, m, k, n) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[autofleet] xdna: NpuGemm::open failed: {e}");
+            return Some(false);
+        }
+    };
+    let got = match gemm.run(&a, &b) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[autofleet] xdna: run failed: {e}");
+            return Some(false);
+        }
+    };
+    // Warm timed loop for throughput (persistent context, INT8 tensor engine).
+    let iters = 20;
+    let t = Instant::now();
+    for _ in 0..iters {
+        let _ = gemm.run(&a, &b);
+    }
+    let per_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let gops = 2.0 * (m * k * n) as f64 / (per_us * 1e3);
+    // CPU reference (exact integer GEMM).
+    let mut cref = vec![0i32; m * n];
+    for i in 0..m {
+        for kk in 0..k {
+            let av = a[i * k + kk] as i32;
+            if av == 0 {
+                continue;
+            }
+            for j in 0..n {
+                cref[i * n + j] += av * b[kk * n + j] as i32;
+            }
+        }
+    }
+    let mism = got.iter().zip(&cref).filter(|(x, y)| x != y).count();
+    if mism == 0 {
+        eprintln!(
+            "[autofleet] xdna: INT8 GEMM {m}x{k}x{n} on the NPU — PASS ✓ \
+             (bit-exact vs CPU, {gops:.0} GOP/s)"
+        );
+        Some(true)
+    } else {
+        eprintln!("[autofleet] xdna: INT8 GEMM {m}x{k}x{n} — FAIL ✗ ({mism} mismatches)");
+        Some(false)
+    }
+}
+
+/// Non-Linux/x86_64 builds have no XDNA dev-dependency; the lane is a no-op.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn run_npu_lane() -> Option<bool> {
+    None
+}
+
 fn main() {
+    // Auto-fleet orchestrator: launched with `MODE=autofleet` and no `RANK`,
+    // this process discovers every runnable local accelerator and self-spawns
+    // one worker rank per device onto a loopback mesh (see `run_autofleet`).
+    // The spawned workers set `RANK`, so they skip this and take the path below.
+    if env("MODE", "both") == "autofleet" && std::env::var("RANK").is_err() {
+        std::process::exit(run_autofleet());
+    }
+
     // Node config (RANK/WORLD/PEERS or DISCOVER/TOPOLOGY) — one call.
     let node = Node::from_env().unwrap_or_else(|e| {
         eprintln!("[dist_node] bad node config: {e}");
@@ -166,6 +438,11 @@ fn main() {
     if mode == "topology" {
         run_topology(&group, &label, device);
         group.barrier().expect("post-topology barrier");
+    }
+
+    if mode == "benchfleet" {
+        ok &= run_benchfleet(&group, &label, device);
+        group.barrier().expect("post-benchfleet barrier");
     }
 
     if mode == "placement" {
@@ -1526,6 +1803,162 @@ fn device_throughput(device: Device) -> f64 {
     }
     let per = t.elapsed().as_secs_f64() / iters as f64;
     2.0 * (n as f64).powi(3) / per / 1e9
+}
+
+/// Relative error in the ∞-norm: ‖dev − ref‖∞ / ‖ref‖∞. Unlike per-element
+/// relative error, this does NOT divide by the many ≈0 entries a partially
+/// trained weight matrix has — those blow a real ~1e-3 drift up to ~1e-1 —
+/// so it reports the true arithmetic drift between the device and CPU oracle.
+fn rel_err(dev: &[f32], reff: &[f32]) -> f32 {
+    let num = dev
+        .iter()
+        .zip(reff)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    let den = reff.iter().map(|y| y.abs()).fold(0.0f32, f32::max);
+    num / den.max(1e-12)
+}
+
+/// Inference bench: fp32 1024³ matmul → (GFLOP/s, max-rel-err vs the CPU oracle).
+/// Speed shows how well the device is used; precision shows how far its f32
+/// accumulation drifts from the reference.
+fn bench_infer(device: Device) -> (f64, f32) {
+    let n = 1024usize;
+    let a: Vec<f32> = (0..n * n).map(|i| ((i % 97) as f32) * 0.01).collect();
+    let b: Vec<f32> = (0..n * n)
+        .map(|i| ((i % 89) as f32) * 0.013 - 0.5)
+        .collect();
+    let mut g = Graph::new("bench_infer_gemm");
+    let ain = g.input("a", Shape::new(&[n, n], DType::F32));
+    let bp = g.param("b", Shape::new(&[n, n], DType::F32));
+    let mm = g.matmul(ain, bp, Shape::new(&[n, n], DType::F32));
+    g.set_outputs(vec![mm]);
+
+    let mut c = Session::new(device).compile(g.clone());
+    c.set_param("b", &b);
+    let dev_out = c.run(&[("a", a.as_slice())]).into_iter().next().unwrap(); // warm + sample
+    let iters = 10;
+    let t = Instant::now();
+    for _ in 0..iters {
+        let _ = c.run(&[("a", a.as_slice())]);
+    }
+    let per = t.elapsed().as_secs_f64() / iters as f64;
+    let gflops = 2.0 * (n as f64).powi(3) / per / 1e9;
+
+    let err = if device == Device::Cpu {
+        0.0
+    } else {
+        let mut cc = Session::new(Device::Cpu).compile(g);
+        cc.set_param("b", &b);
+        let cpu_out = cc.run(&[("a", a.as_slice())]).into_iter().next().unwrap();
+        rel_err(&dev_out, &cpu_out)
+    };
+    (gflops, err)
+}
+
+/// Training bench: 20 gradient-descent steps of a `[256,512]×[512,512]` linear
+/// layer — forward matmul + backward matmul on-device, `W` updated on host →
+/// (steps/s, max-rel-err vs the CPU trajectory's final `W`).
+fn bench_train(device: Device) -> (f64, f32) {
+    let (b, k, n) = (256usize, 512usize, 512usize);
+    let x: Vec<f32> = (0..b * k)
+        .map(|i| ((i % 53) as f32) * 0.01 - 0.25)
+        .collect();
+    let mut xt = vec![0.0f32; k * b]; // Xᵀ (precomputed → no transpose op)
+    for i in 0..b {
+        for j in 0..k {
+            xt[j * b + i] = x[i * k + j];
+        }
+    }
+    let target: Vec<f32> = (0..b * n).map(|i| ((i % 31) as f32) * 0.02 - 0.3).collect();
+    let lr = 0.01f32;
+    let steps = 20usize;
+
+    // Y = X@W ; dY = Y − T ; dW = Xᵀ@dY  (matmuls on-device; W updated on host).
+    let build = || {
+        let mut g = Graph::new("bench_train_step");
+        let xin = g.input("X", Shape::new(&[b, k], DType::F32));
+        let xtin = g.input("Xt", Shape::new(&[k, b], DType::F32));
+        let tin = g.input("T", Shape::new(&[b, n], DType::F32));
+        let wp = g.param("W", Shape::new(&[k, n], DType::F32));
+        let y = g.matmul(xin, wp, Shape::new(&[b, n], DType::F32));
+        let dy = g.binary(BinaryOp::Sub, y, tin, Shape::new(&[b, n], DType::F32));
+        let dw = g.matmul(xtin, dy, Shape::new(&[k, n], DType::F32));
+        g.set_outputs(vec![dw]);
+        g
+    };
+
+    let run_gd = |dev: Device, timed: bool| -> (Vec<f32>, f64) {
+        let mut c = Session::new(dev).compile(build());
+        let mut w = vec![0.0f32; k * n];
+        let inputs = [
+            ("X", x.as_slice()),
+            ("Xt", xt.as_slice()),
+            ("T", target.as_slice()),
+        ];
+        c.set_param("W", &w);
+        let _ = c.run(&inputs); // warm (compile / upload)
+        let t = Instant::now();
+        for _ in 0..steps {
+            c.set_param("W", &w);
+            let dw = c.run(&inputs).into_iter().next().unwrap();
+            for (wi, di) in w.iter_mut().zip(&dw) {
+                *wi -= lr * di / b as f32;
+            }
+        }
+        let sps = if timed {
+            steps as f64 / t.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        (w, sps)
+    };
+
+    let (w_dev, sps) = run_gd(device, true);
+    let err = if device == Device::Cpu {
+        0.0
+    } else {
+        let (w_cpu, _) = run_gd(Device::Cpu, false);
+        rel_err(&w_dev, &w_cpu)
+    };
+    (sps, err)
+}
+
+/// `MODE=benchfleet`: every rank benchmarks its OWN discovered device
+/// (inference GFLOP/s + precision, training steps/s + precision), then the
+/// leader all-gathers and prints one speed+precision table across the fleet —
+/// so you can see how effectively each configuration runs training and
+/// inference, on real numbers.
+fn run_benchfleet(group: &Arc<ProcessGroup>, label: &str, device: Device) -> bool {
+    let (ig, ie) = bench_infer(device);
+    let (ts, te) = bench_train(device);
+    eprintln!(
+        "[{label}] {}: infer {ig:.0} GFLOP/s (err {ie:.1e}) | train {ts:.0} step/s (err {te:.1e})",
+        device_label(device)
+    );
+    // Exchange (device-code, infer GF/s, infer err, train st/s, train err).
+    let mine = vec![device_code(device), ig as f32, ie, ts as f32, te];
+    let all = group.all_gather(&mine).expect("benchfleet all_gather");
+    if group.is_leader() {
+        let n = group.world_size() as usize;
+        eprintln!("[{label}] ── per-device speed + precision (fp32, vs CPU oracle) ──");
+        eprintln!(
+            "[{label}]   {:<7} {:>11} {:>9} {:>11} {:>9}",
+            "device", "infer GF/s", "inf err", "train st/s", "trn err"
+        );
+        for r in 0..n {
+            let base = r * 5;
+            eprintln!(
+                "[{label}]   {:<7} {:>11.0} {:>9.1e} {:>11.0} {:>9.1e}",
+                code_label(all[base]),
+                all[base + 1],
+                all[base + 2],
+                all[base + 3],
+                all[base + 4],
+            );
+        }
+    }
+    true
 }
 
 /// `MODE=topology`: each rank measures its own device throughput and the

@@ -21,7 +21,7 @@ FULL_MARK = "SPDX-License-Identifier: MIT OR Apache-2.0"
 COPYRIGHT_MARK = "Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna."
 MD_LICENSE_MARKERS = ("## License", "MIT OR Apache-2.0", FULL_MARK)
 MD_LICENSE_FOOTER = "\n## License\n\nMIT OR Apache-2.0.\n"
-ROOT_DOC_NAMES = frozenset({"AGENTS.md", "CHANGELOG.md", "PLAN.md"})
+ROOT_DOC_NAMES = frozenset({"AGENTS.md", "CHANGELOG.md"})
 
 LICENSE_BODY = """\
 // SPDX-License-Identifier: MIT OR Apache-2.0
@@ -79,7 +79,6 @@ def iter_targets() -> list[Path]:
         ROOT / "llms.txt",
         ROOT / "AGENTS.md",
         ROOT / "CHANGELOG.md",
-        ROOT / "PLAN.md",
     ):
         if not extra.exists():
             continue

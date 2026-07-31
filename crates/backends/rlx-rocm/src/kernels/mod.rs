@@ -328,6 +328,12 @@ kernel_cache!(
     "fused_residual_ln"
 );
 kernel_cache!(
+    FUSED_RESIDUAL_RMS_NORM,
+    fused_residual_rms_norm_kernel,
+    FUSED_RESIDUAL_RMS_NORM_CU,
+    "fused_residual_rms_norm"
+);
+kernel_cache!(
     ADA_LAYER_NORM,
     ada_layer_norm_kernel,
     ADA_LAYER_NORM_CU,
@@ -672,6 +678,7 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = rope_backward_kernel(ctx);
     let _ = gather_backward_kernel(ctx);
     let _ = fused_residual_ln_kernel(ctx);
+    let _ = fused_residual_rms_norm_kernel(ctx);
     let _ = ada_layer_norm_kernel(ctx);
     let _ = gated_residual_kernel(ctx);
     let _ = ada_layer_norm_backward_kernel(ctx);

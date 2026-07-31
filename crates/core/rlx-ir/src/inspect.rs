@@ -361,11 +361,13 @@ fn format_hir_op(op: &HirOp) -> String {
         HirOp::GatedDeltaNet {
             state_size,
             carry_state,
+            gate_per_channel,
         } => {
+            let gpc = if *gate_per_channel { ",gpc" } else { "" };
             if *carry_state {
-                format!("gated_delta_net(n={state_size},carry)")
+                format!("gated_delta_net(n={state_size},carry{gpc})")
             } else {
-                format!("gated_delta_net(n={state_size})")
+                format!("gated_delta_net(n={state_size}{gpc})")
             }
         }
         HirOp::Lstm {

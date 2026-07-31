@@ -781,6 +781,8 @@ pub(crate) enum Step {
         state_size: u32,
         use_carry: bool,
         use_gpu: bool,
+        /// 1 = per-channel gate (`g` is `[b,s,h,n]`, Kimi-K3 KDA).
+        gate_per_channel: bool,
     },
     /// Single-layer LSTM via host fallback (D2H → CPU → H2D).
     Lstm {

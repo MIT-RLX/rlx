@@ -3,7 +3,7 @@
 Generic black-box optimization and **Flow Map Q-Guidance (FMQ)** / **QGBS** for any `f64` objective — no simulator bindings.
 
 Graph-based offline/online FMQ training (compiled MLP actor + twin critic on `rlx-ir`) lives in [`rlx-rl`](../rlx-rl/).  
-Reference JAX code: [`/Users/Shared/q-guided-flow-map-policies`](/Users/Shared/q-guided-flow-map-policies).
+Based on the FMQ / QGBS reference JAX implementation ([arXiv:2605.12416](https://arxiv.org/abs/2605.12416)).
 
 ## Modules
 

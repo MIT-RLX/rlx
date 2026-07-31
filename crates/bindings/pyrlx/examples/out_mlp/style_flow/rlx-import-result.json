@@ -1,9 +1,0 @@
-{
-  "model": "mlp",
-  "num_inputs": 1,
-  "num_params": 6,
-  "num_instrs": 12,
-  "bundle_dir": null,
-  "crate_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_mlp/style_flow/rlx-mlp",
-  "parity": null
-}

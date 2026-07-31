@@ -2478,6 +2478,7 @@ impl CudaExecutable {
                 Op::GatedDeltaNet {
                     state_size,
                     carry_state,
+                    gate_per_channel,
                 } => {
                     if *state_size > rlx_cpu::gdn::GDN_MAX_STATE {
                         panic!(
@@ -2521,6 +2522,7 @@ impl CudaExecutable {
                         state_size: *state_size as u32,
                         use_carry: *carry_state,
                         use_gpu,
+                        gate_per_channel: *gate_per_channel,
                     });
                 }
                 Op::Lstm {

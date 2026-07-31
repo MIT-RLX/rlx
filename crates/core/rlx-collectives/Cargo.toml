@@ -57,7 +57,14 @@ toml = "0.8"
 rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["metal", "gpu", "coreml"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cuda"] }
+# Enable the backends a Linux x86_64 host may expose so `dist_node` can pin
+# ranks to Device::{Cuda,Rocm,Xdna,Cpu} — NVIDIA GPUs, ROCm GPUs, an XDNA NPU.
+# All build driverless (cudarc/hip are dlopen'd; xdna is libc/libloading), so
+# the union is portable across CUDA and ROCm hosts alike.
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cuda", "rocm", "xdna", "cpu"] }
+# `autofleet` runs the NPU's INT8 GEMM lane directly through rlx-xdna when an
+# overlay is configured (INT8/fixed-shape → not an f32-mesh rank).
+rlx-xdna = { path = "../../backends/rlx-xdna", features = ["xrt", "direct"] }
 
 [lints]
 workspace = true

@@ -45,7 +45,7 @@ fn boundary_tail_guard(op: &rlx_ir::Op, alignment: usize) -> usize {
 /// copy needed, no separate arena slot. Returns the parent input index
 /// and the byte offset of the view within the parent.
 ///
-/// Borrowed from MAX's "view-vs-copy" pattern (#46 in PLAN.md).
+/// Borrowed from MAX's "view-vs-copy" pattern.
 /// The hard case (strided narrow on a non-outermost axis — e.g. BERT
 /// QKV split) requires kernels that consume strided inputs and is
 /// deferred. This function only catches the safely-elidable cases:

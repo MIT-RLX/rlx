@@ -5684,6 +5684,7 @@ pub(crate) fn compile_static_inner(
             Op::GatedDeltaNet {
                 state_size,
                 carry_state,
+                gate_per_channel,
             } => {
                 if *state_size > rlx_cpu::gdn::GDN_MAX_STATE {
                     panic!(
@@ -5856,7 +5857,7 @@ pub(crate) fn compile_static_inner(
                     out_off: out_off_w as u32,
                     use_carry: if *carry_state { 1 } else { 0 },
                     seq_stride: seq,
-                    _p1: 0,
+                    gate_per_channel: if *gate_per_channel { 1 } else { 0 },
                     _p2: 0,
                     _p3: 0,
                 };

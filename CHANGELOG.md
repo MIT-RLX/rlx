@@ -9,6 +9,36 @@ bump may carry breaking changes per `0.x`-semver convention.
 
 ### Added
 
+- **GPU thermal/power monitoring + control (`rlx_runtime::hwinfo`, `Device::Cuda`
+  & `Device::Rocm`).** Cross-backend, read-only telemetry —
+  `device_thermal(device, index) -> Option<GpuThermal>`, `device_thermal_count`,
+  and `all_gpu_thermal()` — reporting temperature (die/edge + junction/hotspot +
+  VRAM), board power, power cap, fan %, SM clock, and utilization. Every field is
+  `Option`: a sensor the board doesn't expose stays `None` rather than a fabricated
+  zero (a laptop GPU has no junction sensor / settable cap; an APU/iGPU reports
+  socket power only). The concrete readers are self-contained `libloading` shims —
+  `rlx_cuda::nvml` (NVML `libnvidia-ml.so`) and `rlx_rocm::rsmi` (ROCm-SMI
+  `librocm_smi64.so`) — that mirror `roctx.rs`: they dlopen at runtime and return a
+  clean `None` on hosts without the vendor library, so the crates still compile and
+  test on macOS/CI. **Control** (root-only): `set_power_cap` /
+  `set_locked_clocks` / `set_fan_percent` and their resets, plus `power_cap_range`,
+  returning a typed `ThermalError { Unavailable, Unsupported, PermissionDenied,
+  OutOfRange, Driver }` with range pre-validation so a caller can't drive a GPU
+  outside its safe envelope. Power-cap + fan work on both vendors; clock-lock is
+  NVIDIA-only (the effective lever on laptop parts that reject a power cap) — ROCm
+  clock-lock reports `Unsupported` (it needs perf-level=MANUAL + a frequency
+  bitmask; the MI100's lever is its power cap). Surfaced by a new **`rlx-gpu` CLI**
+  (a `rlx-bench` bin, zero-dep): `rlx-gpu --watch` to monitor and
+  `sudo rlx-gpu --device rocm --index 0 --power-cap 200` to control; plus a
+  **bench watchdog** that attaches `gpu_peak` (peak temp/power around the timed
+  loop) to `BenchResult`, so a thermally-throttled run is visible instead of
+  silently absorbed by wall-clock timing. Validated on real hardware: an AMD
+  **Instinct MI100** (edge/junction temps, 0–290 W cap range) alongside a Radeon
+  **780M** iGPU (socket-power fallback, no cap), and an **RTX 3080 Ti Laptop**
+  (1455 MHz SM clock, fan `NOT_SUPPORTED`, 1–150 W cap range); the read,
+  range-query, `PermissionDenied`, and `Unsupported` paths are all exercised
+  on-device (a successful privileged *set* still needs root on the box).
+
 - **AMD XDNA / Ryzen AI NPU backend (`rlx-xdna`, `Device::Xdna`).** Runs graphs on
   the AI Engine (`aie2`) tile array via the in-kernel `amdxdna` driver — validated
   bit-exact (cosine for the quantized matmul) against the CPU backend on a Ryzen

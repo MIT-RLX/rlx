@@ -93,6 +93,35 @@ extern "C" __global__ void dequant_gguf(
             return;
         }
 
+        if (scheme_id == 26u) {
+            // FV5 (Neutrino-8B ternary): f32 s_lo | f32 s_hi | three 32-byte
+            // bit-planes bp(+1) | bn(-1) | br(hi-mag select). 104 bytes / 256
+            // elements, LSB-first. w = (bp-bn) * (br ? s_hi : s_lo).
+            unsigned int off = gid * 104u;
+            float s_lo = *reinterpret_cast<const float*>(w_base + off);
+            float s_hi = *reinterpret_cast<const float*>(w_base + off + 4u);
+            const unsigned char* bp = w_base + off + 8u;
+            const unsigned char* bn = w_base + off + 40u;
+            const unsigned char* br = w_base + off + 72u;
+            for (unsigned int j = 0u; j < 256u; ++j) {
+                unsigned int byte = j >> 3u;
+                unsigned int bit = 1u << (j & 7u);
+                int sign = (int)((bp[byte] & bit) != 0u) - (int)((bn[byte] & bit) != 0u);
+                float mag = ((br[byte] & bit) != 0u) ? s_hi : s_lo;
+                dst[j] = (float)sign * mag;
+            }
+            return;
+        }
+
+        if (scheme_id == 27u) {
+            // FV5B (Neutrino-8B): f32 s | 256 int8 codes (260 bytes / 256 elems).
+            unsigned int off = gid * 260u;
+            float s = *reinterpret_cast<const float*>(w_base + off);
+            const unsigned char* qs = w_base + off + 4u;
+            for (unsigned int i = 0; i < 256u; ++i) dst[i] = s * (float)(signed char)qs[i];
+            return;
+        }
+
         if (scheme_id == 0u) {
             unsigned int blk = 2u + 2u + 12u + 256u / 2u;
             unsigned int off = gid * blk;

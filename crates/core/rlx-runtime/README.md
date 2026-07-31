@@ -20,6 +20,13 @@ and the device handle.
   `Gpu` (wgpu), `Vulkan`, `OpenGl`, `DirectX`, `WebGpu`.
 - **`device_ext.rs`** — `Device::is_available()` lookup against the
   registry (keeps the runtime→driver dep direction one-way).
+- **`hwinfo.rs`** — host + GPU introspection. `HwSnapshot` (CPU topology /
+  caches / Apple thermal state) plus live **GPU telemetry** and **control**:
+  `device_thermal(device, index)` / `all_gpu_thermal()` read
+  temperature / power / clock / fan across CUDA & ROCm (unprivileged), and
+  `set_power_cap` / `set_locked_clocks` / `set_fan_percent` (+ resets,
+  `power_cap_range`) are root-only knobs returning a typed `ThermalError`.
+  Drives the `rlx-gpu` CLI (in `rlx-bench`).
 - **`weights.rs`** — `WeightLoader` trait + `BytesWeightLoader`. Promote
   to registry per plan #24 / #56.
 - **`arena.rs`** — device-side arena buffer.

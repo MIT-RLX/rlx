@@ -11,6 +11,10 @@ PrecisionPolicy Y?"
 - **Per-backend timing harness** — measures each pattern across
   Device::Cpu / Metal / Mlx / Cuda / Rocm / Wgpu / Tpu / Fpga
   (whichever are enabled), reports p50 / p95 / GFLOP/s.
+- **GPU thermal watchdog + `rlx-gpu` monitor/control** — every timed run
+  records `gpu_peak` (peak temp/power) on `BenchResult`, and the `rlx-gpu`
+  bin reads live NVIDIA/AMD telemetry and, as root, sets power caps /
+  locked clocks / fan. See [GPU monitor & control](#gpu-monitor--control-rlx-gpu).
 - **Examples**:
   - `bench_all` — sweep every (pattern × device × policy) cell.
   - `bench_autodiff` — measure reverse-mode AD overhead per op.
@@ -68,6 +72,37 @@ RLX_MLX_DEVICE=cpu cargo run -p rlx-bench --release --example bench_mlx_wgpu --f
 ./rig.sh bench-nth-order both
 ./rig.sh bench-mlx-devices wsl
 ```
+
+## GPU monitor & control (`rlx-gpu`)
+
+`rlx-gpu` reads live GPU temperature / power / clock / fan telemetry and,
+as root, sets the thermal knobs — a hardware tool built on
+`rlx_runtime::device_thermal` and the per-vendor `rlx_cuda::nvml` (NVML) /
+`rlx_rocm::rsmi` (ROCm-SMI) `libloading` shims. Build with the matching
+backend feature to reach hardware; without one it prints an empty inventory.
+
+```sh
+# Monitor (read-only, unprivileged)
+cargo run -p rlx-bench --bin rlx-gpu --features rocm -- --watch
+cargo run -p rlx-bench --bin rlx-gpu --features cuda -- --device cuda --json
+
+# Control (needs root): power cap (both vendors), locked clocks (NVIDIA),
+# fan %; each has a --reset-* counterpart. Values are validated against the
+# device's reported range.
+sudo rlx-gpu --device rocm --index 0 --power-cap 200
+sudo rlx-gpu --device cuda --index 0 --lock-clocks 1500
+```
+
+Every reading is best-effort: a sensor the board doesn't expose stays blank
+rather than reporting a fake value (laptop GPUs omit the junction sensor and
+a settable cap; APUs report socket power only). Control returns a typed
+`ThermalError` — `PermissionDenied` without root, `Unsupported` where the
+board rejects a knob (e.g. ROCm clock-lock, which is not wired — use the
+power cap on discrete AMD parts), `OutOfRange` outside the valid envelope.
+
+The timing harness also samples the backing GPU around each timed loop and
+attaches the peak as `gpu_peak` to `BenchResult`, so a run whose wall-clock
+was silently inflated by thermal throttling is visible.
 
 ## License
 

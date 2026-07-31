@@ -124,6 +124,7 @@ pub(crate) fn compile_gated_delta_net(
     let Op::GatedDeltaNet {
         state_size,
         carry_state,
+        gate_per_channel,
     } = &node.op
     else {
         unreachable!()
@@ -152,6 +153,7 @@ pub(crate) fn compile_gated_delta_net(
             seq: seq as u32,
             heads: heads as u32,
             state_size: *state_size as u32,
+            gate_per_channel: *gate_per_channel,
         }
     }
 }
@@ -1387,6 +1389,7 @@ pub(crate) fn exec_gated_delta_net(t: &Thunk, base: *mut u8) {
         seq,
         heads,
         state_size,
+        gate_per_channel,
     } = t
     else {
         unreachable!()
@@ -1404,6 +1407,7 @@ pub(crate) fn exec_gated_delta_net(t: &Thunk, base: *mut u8) {
             *seq as usize,
             *heads as usize,
             *state_size as usize,
+            *gate_per_channel,
             base,
         );
     }
@@ -2272,6 +2276,7 @@ pub unsafe fn execute_selective_scan_f32(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn execute_gated_delta_net_f32(
     q: usize,
     k: usize,
@@ -2284,6 +2289,7 @@ pub unsafe fn execute_gated_delta_net_f32(
     seq: usize,
     heads: usize,
     state_size: usize,
+    gate_per_channel: bool,
     base: *mut u8,
 ) {
     #[derive(Copy, Clone)]
@@ -2315,7 +2321,16 @@ pub unsafe fn execute_gated_delta_net_f32(
         let qs = sl(q, arena.get(), b * s * h * n);
         let ks = sl(k, arena.get(), b * s * h * n);
         let vs = sl(v, arena.get(), b * s * h * n);
-        let gs = sl(g, arena.get(), b * s * h);
+        // Per-channel (KDA) gate is [b,s,h,n]; per-head gate is [b,s,h].
+        let gs = sl(
+            g,
+            arena.get(),
+            if gate_per_channel {
+                b * s * h * n
+            } else {
+                b * s * h
+            },
+        );
         let betas = sl(beta, arena.get(), b * s * h);
         let _out = sl_mut(dst, arena.get(), b * s * h * n);
         let hs_n = h * n;
@@ -2325,18 +2340,38 @@ pub unsafe fn execute_gated_delta_net_f32(
                 let qkv_step = bi * s * hs_n + ti * hs_n + hi * n;
                 let gb_step = bi * s * h + ti * h + hi;
                 let out_row = sl_mut(dst + qkv_step * std::mem::size_of::<f32>(), arena.get(), n);
-                crate::gdn::gdn_step_blas(
-                    s_mat,
+                let (q_r, k_r, v_r) = (
                     &qs[qkv_step..qkv_step + n],
                     &ks[qkv_step..qkv_step + n],
                     &vs[qkv_step..qkv_step + n],
-                    gs[gb_step],
-                    betas[gb_step],
-                    out_row,
-                    sk,
-                    n,
-                    scale,
                 );
+                if gate_per_channel {
+                    crate::gdn::gdn_step_blas_pc(
+                        s_mat,
+                        q_r,
+                        k_r,
+                        v_r,
+                        &gs[gb_step * n..gb_step * n + n],
+                        betas[gb_step],
+                        out_row,
+                        sk,
+                        n,
+                        scale,
+                    );
+                } else {
+                    crate::gdn::gdn_step_blas(
+                        s_mat,
+                        q_r,
+                        k_r,
+                        v_r,
+                        gs[gb_step],
+                        betas[gb_step],
+                        out_row,
+                        sk,
+                        n,
+                        scale,
+                    );
+                }
             }
         };
 

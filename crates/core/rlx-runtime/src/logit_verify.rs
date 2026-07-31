@@ -13,7 +13,7 @@
 //! Pure data layer — no HF / ORT integration here. Test code calls
 //! `compare(out, reference, tolerance)` and gets back a structured
 //! report it can `assert!` against. Hooking this up to specific
-//! reference implementations is per-bench wiring (see `burnembed`).
+//! reference implementations is per-bench wiring.
 
 #[derive(Debug, Clone, Copy)]
 pub struct Tolerance {

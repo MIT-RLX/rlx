@@ -5384,6 +5384,7 @@ pub(crate) fn encode_gated_delta_net(
     heads: u32,
     state_size: u32,
     use_carry: bool,
+    gate_per_channel: bool,
 ) {
     // ulong float indices — Fara arenas put GDN scratch past 16 GiB.
     let f32_idx = |byte_off: usize| -> u64 { (byte_off / 4) as u64 };
@@ -5412,6 +5413,8 @@ pub(crate) fn encode_gated_delta_net(
     enc.set_bytes(8, 16, dims.as_ptr() as *const _);
     let use_carry_u: u32 = if use_carry { 1 } else { 0 };
     enc.set_bytes(9, 4, &use_carry_u as *const u32 as *const _);
+    let gpc_u: u32 = if gate_per_channel { 1 } else { 0 };
+    enc.set_bytes(10, 4, &gpc_u as *const u32 as *const _);
     if use_sg {
         const NSG: u64 = 4;
         let grid = metal::MTLSize {

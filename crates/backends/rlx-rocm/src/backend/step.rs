@@ -211,6 +211,18 @@ pub(crate) enum Step {
         eps_bits: u32,
         has_bias: u32,
     },
+    FusedResidualRmsNorm {
+        outer: u32,
+        inner: u32,
+        in_off: u32,
+        residual_off: u32,
+        bias_off: u32,
+        gamma_off: u32,
+        beta_off: u32,
+        out_off: u32,
+        eps_bits: u32,
+        has_bias: u32,
+    },
     AdaLayerNorm {
         outer: u32,
         inner: u32,
@@ -632,6 +644,8 @@ pub(crate) enum Step {
         heads: u32,
         state_size: u32,
         use_carry: bool,
+        /// 1 = per-channel gate (`g` is `[b,s,h,n]`, Kimi-K3 KDA).
+        gate_per_channel: bool,
     },
     Lstm {
         x_byte_off: u32,
@@ -1690,6 +1704,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::SoftmaxCrossEntropyBackward { .. } => "rlx::SoftmaxCrossEntropyBackward",
         Step::LayerNorm { .. } => "rlx::LayerNorm",
         Step::FusedResidualLn { .. } => "rlx::FusedResidualLN",
+        Step::FusedResidualRmsNorm { .. } => "rlx::FusedResidualRmsNorm",
         Step::AdaLayerNorm { .. } => "rlx::AdaLayerNorm",
         Step::GatedResidual { .. } => "rlx::GatedResidual",
         Step::AdaLayerNormBackward { .. } => "rlx::AdaLayerNormBackward",
@@ -2038,6 +2053,22 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (vec![*in_off, *gamma_off, *beta_off], vec![*out_off]),
         Step::FusedResidualLn {
+            in_off,
+            residual_off,
+            bias_off,
+            gamma_off,
+            beta_off,
+            out_off,
+            has_bias,
+            ..
+        } => {
+            let mut r = vec![*in_off, *residual_off, *gamma_off, *beta_off];
+            if *has_bias != 0 {
+                r.push(*bias_off);
+            }
+            (r, vec![*out_off])
+        }
+        Step::FusedResidualRmsNorm {
             in_off,
             residual_off,
             bias_off,
@@ -3007,6 +3038,7 @@ impl Step {
                 | Step::BatchNormInference { .. }
                 | Step::BatchNormInferenceBackwardInput { .. }
                 | Step::FusedResidualLn { .. }
+                | Step::FusedResidualRmsNorm { .. }
                 | Step::AdaLayerNorm { .. }
                 | Step::GatedResidual { .. }
                 | Step::AdaLayerNormBackward { .. }

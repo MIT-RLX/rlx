@@ -21,6 +21,7 @@ pub(super) fn unfuse_gated_delta_net(
     let Op::GatedDeltaNet {
         state_size,
         carry_state,
+        gate_per_channel,
     } = &node.op
     else {
         unreachable!()
@@ -158,15 +159,6 @@ pub(super) fn unfuse_gated_delta_net(
                 vec![in_v],
                 b1hn.clone(),
             );
-            let gt_b1h = out.add_node(
-                Op::Narrow {
-                    axis: 1,
-                    start: t,
-                    len: 1,
-                },
-                vec![in_g],
-                b1h.clone(),
-            );
             let beta_b1h = out.add_node(
                 Op::Narrow {
                     axis: 1,
@@ -177,23 +169,56 @@ pub(super) fn unfuse_gated_delta_net(
                 b1h.clone(),
             );
 
-            let gt_bhn = out.reshape(
-                gt_b1h,
-                vec![b_dim as i64, h_dim as i64, 1],
-                IrShape::from_dims(
-                    &[Dim::Static(b_dim), Dim::Static(h_dim), Dim::Static(1)],
-                    dtype,
-                ),
-            );
-            let gt_bh11 = out.reshape(gt_bhn, vec![bh as i64, 1, 1], bh11.clone());
-            let gt_bhnn = out.add_node(
-                Op::Expand {
-                    target_shape: bhnn_i64.clone(),
-                },
-                vec![gt_bh11],
-                bhnn.clone(),
-            );
-            let exp_g = out.activation(Activation::Exp, gt_bhnn, bhnn.clone());
+            // Decay factor exp(g) broadcast to [BH, N, N]. Per-head: one scalar per
+            // head, identical for every (i, j). Per-channel (Kimi-K3 KDA): g is
+            // [B,S,H,N] → exp_g[i, j] = exp(g[i]) (decays the key row i).
+            let exp_g = if *gate_per_channel {
+                let gt_b1hn = out.add_node(
+                    Op::Narrow {
+                        axis: 1,
+                        start: t,
+                        len: 1,
+                    },
+                    vec![in_g],
+                    b1hn.clone(),
+                );
+                let gt_bhn1 = out.reshape(gt_b1hn, vec![bh as i64, n as i64, 1], bh_n1.clone());
+                let gt_bhnn = out.add_node(
+                    Op::Expand {
+                        target_shape: bhnn_i64.clone(),
+                    },
+                    vec![gt_bhn1],
+                    bhnn.clone(),
+                );
+                out.activation(Activation::Exp, gt_bhnn, bhnn.clone())
+            } else {
+                let gt_b1h = out.add_node(
+                    Op::Narrow {
+                        axis: 1,
+                        start: t,
+                        len: 1,
+                    },
+                    vec![in_g],
+                    b1h.clone(),
+                );
+                let gt_bhn = out.reshape(
+                    gt_b1h,
+                    vec![b_dim as i64, h_dim as i64, 1],
+                    IrShape::from_dims(
+                        &[Dim::Static(b_dim), Dim::Static(h_dim), Dim::Static(1)],
+                        dtype,
+                    ),
+                );
+                let gt_bh11 = out.reshape(gt_bhn, vec![bh as i64, 1, 1], bh11.clone());
+                let gt_bhnn = out.add_node(
+                    Op::Expand {
+                        target_shape: bhnn_i64.clone(),
+                    },
+                    vec![gt_bh11],
+                    bhnn.clone(),
+                );
+                out.activation(Activation::Exp, gt_bhnn, bhnn.clone())
+            };
 
             let state_bhnn = out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
             let damped = out.binary(BinaryOp::Mul, exp_g, state_bhnn, bhnn.clone());

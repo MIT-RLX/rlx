@@ -29,7 +29,6 @@ Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.14**).
 Related repo docs:
 
 - [`llms.txt`](../llms.txt) — workspace map for agents
-- [`PLAN.md`](../PLAN.md) — roadmap and landed items
 - [`crates/bindings/pyrlx/README.md`](../crates/bindings/pyrlx/README.md) — Python install and quickstart
 - [`crates/bindings/pyrlx/docs/dsl.md`](../crates/bindings/pyrlx/docs/dsl.md) — `graph()` / `Node` DSL, scalar literals, operators
 - [`crates/bindings/pyrlx/docs/quickstart.md`](../crates/bindings/pyrlx/docs/quickstart.md) — explicit vs DSL builders

@@ -145,6 +145,7 @@ pub fn run_gated_delta_net<A: DeviceArena>(
     heads: usize,
     state_size: usize,
     use_carry: bool,
+    gate_per_channel: bool,
 ) {
     assert!(
         state_size <= rlx_cpu::gdn::GDN_MAX_STATE,
@@ -164,6 +165,7 @@ pub fn run_gated_delta_net<A: DeviceArena>(
             seq,
             heads,
             state_size,
+            gate_per_channel,
             host.as_mut_ptr(),
         );
     });

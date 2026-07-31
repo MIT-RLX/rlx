@@ -187,3 +187,81 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
         );
     }
 }
+
+/// Pack one FV5 block (104 bytes) from 256 five-value codes in {-2,-1,0,1,2}.
+fn pack_fv5_block(codes: &[i8], s_lo: f32, s_hi: f32) -> Vec<u8> {
+    let mut b = vec![0u8; 104];
+    b[0..4].copy_from_slice(&s_lo.to_le_bytes());
+    b[4..8].copy_from_slice(&s_hi.to_le_bytes());
+    for (j, &c) in codes.iter().enumerate() {
+        let (byte, bit) = (j / 8, 1u8 << (j % 8));
+        let (p, ng, hi) = match c {
+            1 => (true, false, false),
+            2 => (true, false, true),
+            -1 => (false, true, false),
+            -2 => (false, true, true),
+            _ => (false, false, false),
+        };
+        if p {
+            b[8 + byte] |= bit;
+        }
+        if ng {
+            b[40 + byte] |= bit;
+        }
+        if hi {
+            b[72 + byte] |= bit;
+        }
+    }
+    b
+}
+
+// End-to-end FV5 (Neutrino ternary) DequantMatMul: exercises the full
+// lower → dispatch → dequant-to-scratch → matmul path on wgpu vs CPU.
+// FV5 has no float quantizer (packs are made offline), so we pack directly.
+#[test]
+fn wgpu_fv5_dequant_matmul_prefill_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Gpu) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    let (m, k, n) = (4usize, 256usize, 8usize); // k a multiple of 256 → 1 block/row
+    let mut packed = Vec::new();
+    for row in 0..n {
+        let codes: [i8; 256] = std::array::from_fn(|j| match (j + row) % 5 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => -1,
+            _ => -2,
+        });
+        packed.extend_from_slice(&pack_fv5_block(&codes, 0.05, 0.2));
+    }
+    let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.017).sin()).collect();
+
+    let mut g = Graph::new("wgpu_fv5_dq_prefill");
+    let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+    let w = g.param("w", Shape::new(&[packed.len()], DType::U8));
+    let y = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufFV5,
+        },
+        vec![x_in, w],
+        Shape::new(&[m, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let run = |device: Device| -> Vec<f32> {
+        let mut c = Session::new(device).compile(g.clone());
+        c.set_param_typed("w", &packed, DType::U8);
+        c.run(&[("x", x.as_slice())]).remove(0)
+    };
+    let gpu = run(Device::Gpu);
+    let cpu = run(Device::Cpu);
+    let max_abs = cpu
+        .iter()
+        .zip(&gpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("wgpu FV5 matmul m={m} k={k} n={n}: max_abs={max_abs:.6e}");
+    assert!(max_abs <= 1e-4, "wgpu FV5 prefill max_abs {max_abs} > 1e-4");
+}

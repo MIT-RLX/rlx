@@ -265,8 +265,8 @@ pub enum QrPart {
 
 /// What kind of attention mask the kernel should apply.
 ///
-/// Borrowed from MAX's `nn/attention/mha_mask.mojo` pattern (#20 in
-/// PLAN.md): one attention kernel handles all variants by branching on
+/// Borrowed from MAX's `nn/attention/mha_mask.mojo` pattern: one
+/// attention kernel handles all variants by branching on
 /// the mask kind, instead of forcing every caller to materialize a mask
 /// tensor. The win is two-fold:
 ///   1. **`None`** — single unpadded sequence: no mask load, no per-key
@@ -1201,9 +1201,16 @@ pub enum Op {
     /// in place across the sequence and leaves the final state in the
     /// same buffer (same layout as the internal scan state:
     /// `state[h, i, j]` row-major over `(n, n)` per head).
+    ///
+    /// When `gate_per_channel` is true (Kimi-K3 "KDA"), the `g` input is
+    /// `[b, s, h_v, n]` (one log-gate per key channel) instead of `[b, s, h_v]`,
+    /// and the state decay is applied per key-row: `S[i, j] *= exp(g[i])`
+    /// (vs the scalar `S *= exp(g)` of the per-head gate). Everything else is
+    /// identical; Qwen3-Next / Qwen3.5 use the per-head gate (`false`).
     GatedDeltaNet {
         state_size: usize,
         carry_state: bool,
+        gate_per_channel: bool,
     },
 
     /// Multi-layer (optionally bidirectional) LSTM over a
@@ -1472,7 +1479,7 @@ pub enum Op {
     /// `top_p == 1.0` disables. `seed` is the Philox seed; pass 0
     /// for "use process-global counter" (still deterministic
     /// given the call order).
-    /// Borrowed from MAX's nn/sampling.mojo (#42 in PLAN.md).
+    /// Borrowed from MAX's nn/sampling.mojo.
     /// Latency-critical: never materializes the full softmax
     /// distribution on the host.
     Sample {
@@ -1504,7 +1511,7 @@ pub enum Op {
 
     /// Inclusive cumulative sum along an axis. Same shape in/out.
     /// Underpins ragged-tensor offsets, sampling (top-p prefix sum),
-    /// and sequence-position math (#44 in PLAN.md).
+    /// and sequence-position math.
     /// `exclusive=true` shifts the result so output\[0\] = 0 (useful
     /// for offset arrays where the first segment starts at 0).
     Cumsum {
@@ -3377,11 +3384,13 @@ impl std::fmt::Display for Op {
             Op::GatedDeltaNet {
                 state_size,
                 carry_state,
+                gate_per_channel,
             } => {
+                let gpc = if *gate_per_channel { ",gpc" } else { "" };
                 if *carry_state {
-                    write!(f, "gated_delta_net(n={state_size},carry)")
+                    write!(f, "gated_delta_net(n={state_size},carry{gpc})")
                 } else {
-                    write!(f, "gated_delta_net(n={state_size})")
+                    write!(f, "gated_delta_net(n={state_size}{gpc})")
                 }
             }
             Op::Lstm {

@@ -144,6 +144,35 @@ kernel void dequant_gguf(
             return;
         }
 
+        if (scheme_id == 26u) {
+            // FV5 (Neutrino-8B ternary): f32 s_lo | f32 s_hi | three 32-byte
+            // bit-planes bp(+1) | bn(-1) | br(hi-mag select). 104 bytes / 256
+            // elements, LSB-first. w = (bp-bn) * (br ? s_hi : s_lo).
+            uint off = gid * 104u;
+            float s_lo = as_type<float>(*(device uint*)(w_base + off));
+            float s_hi = as_type<float>(*(device uint*)(w_base + off + 4u));
+            device const uchar* bp = w_base + off + 8u;
+            device const uchar* bn = w_base + off + 40u;
+            device const uchar* br = w_base + off + 72u;
+            for (uint j = 0u; j < DQ_QK_K; ++j) {
+                uint byte = j >> 3u;
+                uint bit = 1u << (j & 7u);
+                int sign = int((bp[byte] & bit) != 0u) - int((bn[byte] & bit) != 0u);
+                float mag = ((br[byte] & bit) != 0u) ? s_hi : s_lo;
+                dst[j] = float(sign) * mag;
+            }
+            return;
+        }
+
+        if (scheme_id == 27u) {
+            // FV5B (Neutrino-8B): f32 s | 256 int8 codes (260 bytes / 256 elems).
+            uint off = gid * 260u;
+            float s = as_type<float>(*(device uint*)(w_base + off));
+            device const uchar* qs = w_base + off + 4u;
+            for (uint i = 0; i < DQ_QK_K; ++i) dst[i] = s * float(int8_t(qs[i]));
+            return;
+        }
+
         if (scheme_id == 0u) {
             uint blk = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 2u;
             uint off = gid * blk;

@@ -1041,6 +1041,8 @@ pub enum Thunk {
         heads: u32,
         state_size: u32,
         f16: bool,
+        /// 1 = per-channel gate (`g` is `[b,s,h,n]`, Kimi-K3 KDA).
+        gate_per_channel: bool,
     },
     /// Mamba selective scan. Native MSL kernel (`selective_scan`) for f32
     /// with `state_size ≤ 128`; host fallback otherwise.

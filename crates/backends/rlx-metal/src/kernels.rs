@@ -6995,6 +6995,7 @@ kernel void gated_delta_net(
     constant ulong& dst_off    [[buffer(7)]],
     constant uint4& dims       [[buffer(8)]], // batch, seq, heads, n
     constant uint& use_carry   [[buffer(9)]],
+    constant uint& gate_per_channel [[buffer(10)]],
     uint gid [[thread_position_in_grid]]
 ) {
     const uint b = dims.x, s = dims.y, h = dims.z, n = dims.w;
@@ -7021,11 +7022,21 @@ kernel void gated_delta_net(
         device const float* q_ptr = arena + q_off + qkv_step;
         device const float* k_ptr = arena + k_off + qkv_step;
         device const float* v_ptr = arena + v_off + qkv_step;
-        const float g_exp = exp(arena[g_off + gb_step]);
+        const float g_exp = (gate_per_channel == 0u) ? exp(arena[g_off + gb_step]) : 0.0f;
         const float beta_t = arena[beta_off + gb_step];
 
-        for (uint i = 0u; i < n * n; ++i) {
-            s_mat[i] *= g_exp;
+        if (gate_per_channel != 0u) {
+            // per-channel decay: S[i,j] *= exp(g[i]), g is [b,s,h,n]
+            for (uint i = 0u; i < n; ++i) {
+                const float a = exp(arena[g_off + qkv_step + i]);
+                for (uint jj = 0u; jj < n; ++jj) {
+                    s_mat[i * n + jj] *= a;
+                }
+            }
+        } else {
+            for (uint i = 0u; i < n * n; ++i) {
+                s_mat[i] *= g_exp;
+            }
         }
         for (uint j = 0u; j < n; ++j) {
             float acc = 0.0f;
@@ -7065,6 +7076,7 @@ kernel void gated_delta_net_sg(
     constant ulong& dst_off    [[buffer(7)]],
     constant uint4& dims       [[buffer(8)]], // batch, seq, heads, n
     constant uint& use_carry   [[buffer(9)]],
+    constant uint& gate_per_channel [[buffer(10)]],
     uint3 tgpig                [[threadgroup_position_in_grid]],
     uint3 tpitg                [[thread_position_in_threadgroup]]
 ) {
@@ -7097,14 +7109,16 @@ kernel void gated_delta_net_sg(
         device const float* q_ptr = arena + q_off + qkv_step;
         device const float* k_ptr = arena + k_off + qkv_step;
         device const float* v_ptr = arena + v_off + qkv_step;
-        const float g_exp = exp(arena[g_off + gb_step]);
+        const float g_exp = (gate_per_channel == 0u) ? exp(arena[g_off + gb_step]) : 0.0f;
         const float beta_t = arena[beta_off + gb_step];
 
         float s_k = 0.0f;
         #pragma unroll
         for (uint j = 0u; j < GDN_SG_NSG; ++j) {
             const uint is = tx * GDN_SG_NSG + j;
-            ls[j] *= g_exp;
+            // per-channel decay uses the row/key channel `is`; per-head uses g_exp.
+            const float a = (gate_per_channel != 0u) ? exp(arena[g_off + qkv_step + is]) : g_exp;
+            ls[j] *= a;
             s_k += ls[j] * k_ptr[is];
         }
         s_k = simd_sum(s_k);

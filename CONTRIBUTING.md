@@ -26,9 +26,8 @@ own `README.md` documenting its public surface, build commands, and gotchas.
   backend dispatch, missed-fusion hints, and the provable-NaN/Inf lint into one
   report (no GPU required for the CPU-legality, fusion, shape, and numeric
   passes).
-- **Bench every change.** The roadmap (`PLAN.md`) drives priorities; its
-  `## Landed` section tracks in-tree work with bench deltas. PRs targeting a
-  plan item are expected to add a delta line — even "within noise" is data.
+- **Bench every change.** Note the before/after bench delta in the PR —
+  even "within noise" is data worth recording.
 - **Gate benches on thermal throttle** (`scripts/check-throttle.sh`); silent
   10× slowdowns under thermal pressure are a real failure mode on laptops.
 

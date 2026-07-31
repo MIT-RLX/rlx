@@ -16,7 +16,6 @@
 - [README.md](README.md): overview, install, quickstart, status by area
 - [AGENTS.md](AGENTS.md): instructions for AI agents — conventions, forbidden vocabulary, op checklist
 - [docs/README.md](docs/README.md): documentation index
-- [PLAN.md](PLAN.md): roadmap; its `## Landed` section tracks in-tree work with bench deltas
 - [CHANGELOG.md](CHANGELOG.md): per-release feature history
 
 ## Workspace (crates/ grouped by role)

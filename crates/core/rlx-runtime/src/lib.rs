@@ -182,6 +182,11 @@ pub use export::{ExportSession, export_tinyconv_mnist};
 pub use flexible_session::FlexibleSession;
 pub use graph_devices::{GraphDevices, graph_param_names};
 pub use hetero::{DeviceMap, HeteroExecutable};
+pub use hwinfo::{
+    GpuThermal, HwSnapshot, ThermalError, ThermalState, all_gpu_thermal, device_thermal,
+    device_thermal_count, power_cap_range, reset_fan, reset_locked_clocks, set_fan_percent,
+    set_locked_clocks, set_power_cap,
+};
 #[cfg(feature = "hwprofile")]
 pub use hwprofile_select::{device_vram_bytes, fastest_device_with_vram};
 pub use kv_cache::LayerKvCache;

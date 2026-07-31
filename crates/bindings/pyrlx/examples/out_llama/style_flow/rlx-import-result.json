@@ -1,9 +1,0 @@
-{
-  "model": "llama",
-  "num_inputs": 1,
-  "num_params": 27,
-  "num_instrs": 235,
-  "bundle_dir": null,
-  "crate_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_llama/style_flow/rlx-llama",
-  "parity": null
-}

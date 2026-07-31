@@ -60,6 +60,7 @@ pub fn run_gated_delta_net(
     heads: usize,
     state_size: usize,
     use_carry: bool,
+    gate_per_channel: bool,
 ) {
     let mut arena = CudaArena {
         stream,
@@ -80,6 +81,7 @@ pub fn run_gated_delta_net(
         heads,
         state_size,
         use_carry,
+        gate_per_channel,
     );
 }
 

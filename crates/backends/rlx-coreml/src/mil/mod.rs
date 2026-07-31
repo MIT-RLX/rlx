@@ -1209,8 +1209,15 @@ impl<'a> LowerCtx<'a> {
             Op::GatedDeltaNet {
                 state_size,
                 carry_state,
+                gate_per_channel,
             } => {
-                self.lower_gated_delta_net(id, *state_size, *carry_state, &out_name)?;
+                self.lower_gated_delta_net(
+                    id,
+                    *state_size,
+                    *carry_state,
+                    *gate_per_channel,
+                    &out_name,
+                )?;
             }
             Op::ArgMax { axis, keep_dim } => {
                 self.lower_argreduce(id, *axis, *keep_dim, true, &out_name)?;

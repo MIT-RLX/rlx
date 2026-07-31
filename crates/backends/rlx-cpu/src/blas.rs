@@ -5,7 +5,7 @@
 //! Direct BLAS FFI — zero abstraction overhead.
 //!
 //! Calls cblas_sgemm directly without going through ndarray, faer, or any
-//! wrapper. This is the same approach that gave burnembed 2× speedup
+//! wrapper. This is the same approach that gave a 2× speedup
 //! over Burn's NdArray backend.
 //!
 //! Whether a real CBLAS is linked is decided by `build.rs`, which sets the

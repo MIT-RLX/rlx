@@ -1,9 +1,0 @@
-{
-  "model": "encoder_decoder",
-  "num_inputs": 2,
-  "num_params": 18,
-  "num_instrs": 83,
-  "bundle_dir": null,
-  "crate_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_encoder_decoder/style_tensor/rlx-encoder-decoder",
-  "parity": null
-}

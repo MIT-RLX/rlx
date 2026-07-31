@@ -209,6 +209,7 @@ impl MetalExecutable {
                 heads: u32,
                 state_size: u32,
                 f16: bool,
+                gate_per_channel: bool,
             },
             SelectiveScan {
                 x: usize,
@@ -590,6 +591,7 @@ impl MetalExecutable {
                             heads,
                             state_size,
                             f16,
+                            gate_per_channel,
                         } => unsafe {
                             if f16 {
                                 rlx_cpu::thunk::execute_gated_delta_net_f16(
@@ -619,6 +621,7 @@ impl MetalExecutable {
                                     seq as usize,
                                     heads as usize,
                                     state_size as usize,
+                                    gate_per_channel,
                                     arena_ptr,
                                 );
                             }
@@ -5724,6 +5727,7 @@ impl MetalExecutable {
                     heads,
                     state_size,
                     f16,
+                    gate_per_channel,
                 } => {
                     // Native MSL GDN (one thread per head). Opt out with
                     // RLX_METAL_GDN_HOST_FALLBACK=1 / RLX_METAL_GDN_CPU=1.
@@ -5765,6 +5769,7 @@ impl MetalExecutable {
                             *heads,
                             *state_size,
                             use_carry,
+                            *gate_per_channel,
                         );
                     } else {
                         deferred_host.push(DeferredHostOp::GatedDeltaNet {
@@ -5780,6 +5785,7 @@ impl MetalExecutable {
                             heads: *heads,
                             state_size: *state_size,
                             f16: *f16,
+                            gate_per_channel: *gate_per_channel,
                         });
                     }
                 }

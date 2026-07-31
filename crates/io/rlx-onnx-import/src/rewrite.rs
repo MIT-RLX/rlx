@@ -966,15 +966,21 @@ mod rewrite_tests {
 
     #[test]
     fn kokoro_decoder_atan2_greater_promoted_when_weights_present() {
-        let onnx = std::path::Path::new(
-            "/Users/Shared/rlx-models/weights/tts/kokoro-82m/onnx/rlx-split/decoder_raw.onnx",
-        );
-        if !onnx.is_file() {
-            eprintln!("skip: missing {}", onnx.display());
+        // Weights live in the sibling rlx-models repo; try a repo-relative
+        // path first, then a common absolute location, and skip if absent.
+        let rel = "weights/tts/kokoro-82m/onnx/rlx-split/decoder_raw.onnx";
+        let candidates = [
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../../rlx-models")
+                .join(rel),
+            std::path::PathBuf::from("/Users/Shared/rlx-models").join(rel),
+        ];
+        let Some(onnx) = candidates.into_iter().find(|p| p.is_file()) else {
+            eprintln!("skip: kokoro-82m decoder_raw.onnx not present");
             return;
-        }
+        };
         let (manifest, nodes, params, _i64, init_shapes) =
-            crate::onnx_file::prepare_onnx_file(onnx).expect("load decoder_raw");
+            crate::onnx_file::prepare_onnx_file(&onnx).expect("load decoder_raw");
         let opts = ImportOptions::default();
         let out = rewrite_graph(
             nodes,

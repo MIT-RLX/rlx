@@ -543,6 +543,10 @@ pub trait MlxRead: Send {
     fn logical_keys(&self) -> Vec<String>;
     fn take_dense_f32(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)>;
     fn take_packed_linear(&mut self, key: &str) -> Result<Option<MlxPackedLinear>>;
+    /// `MADV_WILLNEED`-prefetch these tensors so their shard pages read ahead while
+    /// the caller compiles its stage (overlap IO with compute). Default no-op
+    /// (eager loaders already hold the data); the lazy mmap loader overrides it.
+    fn prewarm(&self, _keys: &[&str]) {}
 }
 
 impl MlxRead for MlxWeights {
@@ -565,9 +569,34 @@ impl MlxRead for MlxWeights {
 /// only the tensor(s) it needs. Peak resident RAM is one tensor (+ any dequant
 /// scratch), so a worker can load its shard of a checkpoint far larger than its
 /// own RAM — the enabler for running a 96 GB model across small nodes.
+/// `MADV_WILLNEED` for the current platform (0 on non-unix, where `advise`
+/// ignores it).
+#[cfg(unix)]
+#[inline]
+fn libc_madv_willneed() -> i32 {
+    libc::MADV_WILLNEED
+}
+#[cfg(not(unix))]
+#[inline]
+fn libc_madv_willneed() -> i32 {
+    0
+}
+
+/// Cached location of one tensor within its shard mmap — parsed ONCE at open so
+/// [`LazyMlxWeights::materialize`] slices directly instead of re-deserializing the
+/// (multi-MB) safetensors header on every `take`. `begin`/`end` are byte offsets
+/// into the shard mmap; `dtype`/`shape` reproduce the header view.
+struct TensorLoc {
+    shard: usize,
+    begin: usize,
+    end: usize,
+    dtype: safetensors::Dtype,
+    shape: Vec<usize>,
+}
+
 pub struct LazyMlxWeights {
     shards: Vec<Mmap>,
-    name_to_shard: HashMap<String, usize>,
+    locs: HashMap<String, TensorLoc>,
     pub config: MlxConfig,
     pub source: PathBuf,
 }
@@ -575,59 +604,110 @@ pub struct LazyMlxWeights {
 impl LazyMlxWeights {
     fn from_shards(shard_paths: Vec<PathBuf>, config: MlxConfig, source: PathBuf) -> Result<Self> {
         let mut shards = Vec::with_capacity(shard_paths.len());
-        let mut name_to_shard = HashMap::new();
+        let mut locs: HashMap<String, TensorLoc> = HashMap::new();
         for (idx, p) in shard_paths.iter().enumerate() {
             let file = File::open(p).with_context(|| format!("open {}", p.display()))?;
             // SAFETY: read-only mapping of a file we own for the loader's lifetime.
             let mmap =
                 unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", p.display()))?;
             {
+                let base = mmap.as_ptr() as usize;
                 let st = SafeTensors::deserialize(&mmap[..])
                     .with_context(|| format!("safetensors header {}", p.display()))?;
+                // Parse the header ONCE: record each tensor's byte range in the mmap
+                // so `materialize` never re-deserializes. `view.data()` points into
+                // this mmap, so its offset is `ptr - base`.
                 for name in st.names() {
-                    name_to_shard.insert(name.to_string(), idx);
+                    let view = st.tensor(name)?;
+                    let begin = view.data().as_ptr() as usize - base;
+                    locs.insert(
+                        name.to_string(),
+                        TensorLoc {
+                            shard: idx,
+                            begin,
+                            end: begin + view.data().len(),
+                            dtype: view.dtype(),
+                            shape: view.shape().to_vec(),
+                        },
+                    );
                 }
             } // header borrow released before moving the mmap
             shards.push(mmap);
         }
         Ok(Self {
             shards,
-            name_to_shard,
+            locs,
             config,
             source,
         })
     }
 
-    /// Copy just this tensor's bytes out of its mmap → dense/quant [`MlxTensor`].
+    /// Copy just this tensor's bytes out of its mmap → dense/quant [`MlxTensor`],
+    /// using the cached header offset (no per-take header re-parse).
     fn materialize(&self, name: &str) -> Result<MlxTensor> {
-        let idx = *self
-            .name_to_shard
+        let loc = self
+            .locs
             .get(name)
             .with_context(|| format!("mlx tensor not found: {name}"))?;
-        let mmap = &self.shards[idx];
-        let st = SafeTensors::deserialize(&mmap[..]).context("re-parse header")?;
-        let view = st.tensor(name)?;
-        let out = tensor_from_view(name, view.shape().to_vec(), view.dtype(), view.data());
-        // Release this tensor's mmap pages once copied into the owned MlxTensor.
-        // Building a big pipeline stage materializes tens of GB; without this the
-        // mmap page cache accumulates the whole shard set (~40GB) ALONGSIDE the
-        // arena being filled (~39GB) → the OS swaps the arena, and every later
-        // forward pages it back in (14s compute became 140s wall). DONTNEED keeps
-        // the mmap footprint to roughly the current tensor.
+        let data = &self.shards[loc.shard][loc.begin..loc.end];
+        // Hint the OS to prefetch this tensor's pages (overlap readahead with the
+        // copy) just before touching them.
+        Self::advise(data, libc_madv_willneed());
+        let out = tensor_from_view(name, loc.shape.clone(), loc.dtype, data);
         // Drop this tensor's mmap pages once copied. SAFETY: the shard mmap is
         // read-only and never written, so MADV_DONTNEED (drop the cached pages;
         // re-fault from the file if touched again) cannot lose data. It bounds the
         // page-cache footprint during the build — otherwise materializing a big
         // pipeline stage accumulates the whole shard set (~40GB) in cache ALONGSIDE
         // the arena (~39GB), the OS swaps the arena, and every forward pages it
-        // back in (14s compute became 140s wall). Raw libc for memmap2-version
-        // portability. Page-aligned start so we never advise a neighbour's page.
+        // back in (14s compute became 140s wall).
+        Self::advise_dontneed(data);
+        out
+    }
+
+    /// `MADV_WILLNEED`-prefetch a batch of tensors before a stage build so their
+    /// pages read ahead while the graph compiles (overlap IO with compute). No-op
+    /// on non-unix. Safe to call with names this loader doesn't hold.
+    pub fn prewarm(&self, names: &[&str]) {
+        for n in names {
+            if let Some(loc) = self.locs.get(*n) {
+                Self::advise(
+                    &self.shards[loc.shard][loc.begin..loc.end],
+                    libc_madv_willneed(),
+                );
+            }
+        }
+    }
+
+    /// `madvise` a byte slice (page-aligned inward so we never advise a neighbour's
+    /// shared page). `WILLNEED` covers the tensor (align start down, end up);
+    /// generic helper used for prefetch.
+    #[inline]
+    fn advise(data: &[u8], advice: i32) {
         #[cfg(unix)]
         unsafe {
-            let start = view.data().as_ptr() as usize;
+            if data.is_empty() {
+                return;
+            }
             let page = 4096usize;
+            let start = data.as_ptr() as usize & !(page - 1); // down
+            let end = (data.as_ptr() as usize + data.len() + page - 1) & !(page - 1); // up
+            libc::madvise(start as *mut libc::c_void, end - start, advice);
+        }
+        #[cfg(not(unix))]
+        let _ = (data, advice);
+    }
+
+    /// `MADV_DONTNEED` a byte slice (page-aligned start UP so we never drop a
+    /// neighbour's page that shares the first partial page).
+    #[inline]
+    fn advise_dontneed(data: &[u8]) {
+        #[cfg(unix)]
+        unsafe {
+            let page = 4096usize;
+            let start = data.as_ptr() as usize;
             let aligned = (start + page - 1) & !(page - 1);
-            let end = start + view.data().len();
+            let end = start + data.len();
             if end > aligned {
                 libc::madvise(
                     aligned as *mut libc::c_void,
@@ -636,12 +716,13 @@ impl LazyMlxWeights {
                 );
             }
         }
-        out
+        #[cfg(not(unix))]
+        let _ = data;
     }
 
     fn is_quantized_layer(&self, key: &str) -> bool {
         key.strip_suffix(".weight")
-            .is_some_and(|b| self.name_to_shard.contains_key(&format!("{b}.scales")))
+            .is_some_and(|b| self.locs.contains_key(&format!("{b}.scales")))
     }
 
     /// Temp eager [`MlxWeights`] holding just `names` (materialized) so we can
@@ -649,7 +730,7 @@ impl LazyMlxWeights {
     fn temp_with(&self, names: &[&str]) -> Result<MlxWeights> {
         let mut tensors = HashMap::new();
         for n in names {
-            if self.name_to_shard.contains_key(*n) {
+            if self.locs.contains_key(*n) {
                 tensors.insert(n.to_string(), self.materialize(n)?);
             }
         }
@@ -662,7 +743,7 @@ impl LazyMlxWeights {
 
     pub fn logical_keys(&self) -> Vec<String> {
         let mut v: Vec<String> = self
-            .name_to_shard
+            .locs
             .keys()
             .filter(|k| !k.ends_with(".scales") && !k.ends_with(".biases"))
             .cloned()
@@ -708,6 +789,9 @@ impl MlxRead for LazyMlxWeights {
     }
     fn take_packed_linear(&mut self, key: &str) -> Result<Option<MlxPackedLinear>> {
         LazyMlxWeights::take_packed_linear(self, key)
+    }
+    fn prewarm(&self, keys: &[&str]) {
+        LazyMlxWeights::prewarm(self, keys)
     }
 }
 

@@ -723,7 +723,7 @@ pub fn lower_with_env(
                     MaskKind::Causal => (MlxMask::Causal, None, None),
                     MaskKind::Custom => {
                         // MLX SDPA adds the mask additively to scores. The
-                        // burnembed BERT graph (and the CPU/Metal/wgpu
+                        // the BERT graph (and the CPU/Metal/wgpu
                         // backends) interpret MaskKind::Custom as a *binary*
                         // multiplicative mask (1 = valid, 0 = padding).
                         // Convert here so MLX matches the rest of the
@@ -1720,11 +1720,24 @@ pub fn lower_with_env(
                 }
             }
             Op::GroupedMatMul => {
-                // Inputs: [input, weight, expert_idx].
-                let x = lookup(&env, node.inputs[0])?;
-                let w = lookup(&env, node.inputs[1])?;
-                let i = lookup(&env, node.inputs[2])?;
-                ops::gather_mm(x, w, i)?
+                // Inputs: [x:[M,K], w:[E,K,N], expert_idx:[M]]. Per-row expert
+                // selection — row r uses expert idx[r]: out[r] = x[r] @ w[idx[r]]
+                // → [M,N]. MLX `gather_mm(x, w, rhs_indices=idx)` computes the
+                // full [L,M,N] cross-product (every token × every selected
+                // expert), not the per-row diagonal, so gather each token's
+                // expert weight with `take` and run a batched matmul instead.
+                let x = lookup(&env, node.inputs[0])?; // [M, K]
+                let w = lookup(&env, node.inputs[1])?; // [E, K, N]
+                let idx = mlx_indices_i64(lookup(&env, node.inputs[2])?)?; // [M]
+                let x_shape = node_input_shape(graph, node.inputs[0]); // [M, K]
+                let out_shape = node_input_shape(graph, node.id); // [M, N]
+                let m = x_shape[x_shape.len() - 2];
+                let k = x_shape[x_shape.len() - 1];
+                let n = out_shape[out_shape.len() - 1];
+                let w_sel = ops::take(w, &idx, 0)?; // [M, K, N]
+                let x3 = ops::reshape(x, &[m, 1, k])?; // [M, 1, K]
+                let out3 = ops::matmul(&x3, &w_sel)?; // [M, 1, N]
+                ops::reshape(&out3, &[m, n])?
             }
             Op::DequantGroupedMatMul { scheme } => {
                 if !scheme.is_gguf() {
@@ -3072,6 +3085,7 @@ pub fn lower_with_env(
             Op::GatedDeltaNet {
                 state_size,
                 carry_state,
+                gate_per_channel,
             } => {
                 let q = lookup(&env, node.inputs[0])?;
                 let k = lookup(&env, node.inputs[1])?;
@@ -3085,6 +3099,7 @@ pub fn lower_with_env(
                     g_in,
                     beta,
                     *state_size,
+                    *gate_per_channel,
                     if *carry_state {
                         Some(lookup(&env, node.inputs[5])?)
                     } else {

@@ -231,6 +231,7 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
             HirOp::GatedDeltaNet {
                 state_size,
                 carry_state,
+                gate_per_channel,
             } => {
                 let expected = if *carry_state { 6 } else { 5 };
                 if node.inputs.len() != expected {
@@ -240,8 +241,8 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                         got: node.inputs.len(),
                     });
                 }
-                if *carry_state {
-                    g.gated_delta_net_carry(
+                match (*carry_state, *gate_per_channel) {
+                    (true, false) => g.gated_delta_net_carry(
                         inputs[0],
                         inputs[1],
                         inputs[2],
@@ -250,9 +251,18 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                         inputs[5],
                         *state_size,
                         node.shape,
-                    )
-                } else {
-                    g.gated_delta_net(
+                    ),
+                    (true, true) => g.gated_delta_net_carry_pc(
+                        inputs[0],
+                        inputs[1],
+                        inputs[2],
+                        inputs[3],
+                        inputs[4],
+                        inputs[5],
+                        *state_size,
+                        node.shape,
+                    ),
+                    (false, false) => g.gated_delta_net(
                         inputs[0],
                         inputs[1],
                         inputs[2],
@@ -260,7 +270,16 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
                         inputs[4],
                         *state_size,
                         node.shape,
-                    )
+                    ),
+                    (false, true) => g.gated_delta_net_pc(
+                        inputs[0],
+                        inputs[1],
+                        inputs[2],
+                        inputs[3],
+                        inputs[4],
+                        *state_size,
+                        node.shape,
+                    ),
                 }
             }
 

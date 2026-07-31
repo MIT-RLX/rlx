@@ -35,7 +35,7 @@
 
 use rlx_driver::Device;
 use rlx_ir::{Graph, Tick};
-use rlx_runtime::Session;
+use rlx_runtime::{GpuThermal, Session, device_thermal};
 
 pub mod patterns;
 
@@ -94,6 +94,24 @@ pub struct BenchResult {
     pub n_runs: usize,
     /// Per-iteration nanoseconds (length == `n_runs`).
     pub samples_ns: Vec<u64>,
+    /// Peak GPU telemetry observed around the timed loop, when the bench
+    /// ran on a GPU backend with a readable sensor. `None` on CPU / Apple
+    /// backends or hosts without a GPU management library. Wall-clock
+    /// timing silently absorbs thermal throttling — this makes a
+    /// heat-degraded sample visible.
+    pub gpu_peak: Option<GpuPeak>,
+}
+
+/// Peak GPU readings captured across a timed benchmark. Read-only and
+/// best-effort — each field is `None` when the board doesn't expose it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuPeak {
+    /// GPU product name, if the driver reports one.
+    pub name: Option<String>,
+    /// Hottest GPU-die temperature seen, °C.
+    pub temp_c: Option<f32>,
+    /// Highest board power draw seen, W.
+    pub power_w: Option<f32>,
 }
 
 impl BenchResult {
@@ -136,8 +154,59 @@ impl std::fmt::Display for BenchResult {
             to_us(self.median_ns()),
             to_us(self.min_ns()),
             to_us(self.max_ns()),
-        )
+        )?;
+        if let Some(g) = &self.gpu_peak {
+            if let Some(t) = g.temp_c {
+                write!(f, " gpu_peak={t:.0}°C")?;
+            }
+            if let Some(p) = g.power_w {
+                write!(f, " {p:.0}W")?;
+            }
+        }
+        Ok(())
     }
+}
+
+/// Read the backing GPU's telemetry for a bench on `device`. Index 0
+/// matches the context both rlx-cuda and rlx-rocm bind (device 0). No-op
+/// (`None`) on non-GPU backends or hosts without a management library.
+fn gpu_bench_sample(device: Device) -> Option<GpuThermal> {
+    match device {
+        Device::Cuda | Device::Rocm => device_thermal(device, 0),
+        _ => None,
+    }
+}
+
+fn max_opt(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+/// Fold pre- and post-run GPU samples into a peak reading.
+fn merge_gpu_peak(a: Option<GpuThermal>, b: Option<GpuThermal>) -> Option<GpuPeak> {
+    if a.is_none() && b.is_none() {
+        return None;
+    }
+    let name = b
+        .as_ref()
+        .and_then(|x| x.name.clone())
+        .or_else(|| a.as_ref().and_then(|x| x.name.clone()));
+    let temp_c = max_opt(
+        a.as_ref().and_then(|x| x.temp_c),
+        b.as_ref().and_then(|x| x.temp_c),
+    );
+    let power_w = max_opt(
+        a.as_ref().and_then(|x| x.power_w),
+        b.as_ref().and_then(|x| x.power_w),
+    );
+    Some(GpuPeak {
+        name,
+        temp_c,
+        power_w,
+    })
 }
 
 /// Compile `pattern` for `device`, run `n_warmup` un-timed iterations,
@@ -172,6 +241,10 @@ pub fn run_benchmark<P: BenchmarkPattern>(
         let _ = compiled.run(&inputs);
     }
 
+    // GPU thermal watchdog: sample the backing GPU just before and after
+    // the timed loop (post-warm-up, so the "before" reading already
+    // reflects a hot device). Read-only + outside the timed region.
+    let gpu_before = gpu_bench_sample(device);
     let mut samples_ns = Vec::with_capacity(n_runs);
     let tick = Tick::now();
     for _ in 0..n_runs {
@@ -181,6 +254,7 @@ pub fn run_benchmark<P: BenchmarkPattern>(
         samples_ns.push(elapsed);
     }
     let _ = tick;
+    let gpu_after = gpu_bench_sample(device);
 
     BenchResult {
         pattern: pattern.name().to_string(),
@@ -188,6 +262,7 @@ pub fn run_benchmark<P: BenchmarkPattern>(
         device,
         n_runs,
         samples_ns,
+        gpu_peak: merge_gpu_peak(gpu_before, gpu_after),
     }
 }
 
@@ -260,6 +335,7 @@ mod tests {
             device: Device::Cpu,
             n_runs: 5,
             samples_ns: vec![100, 200, 300, 400, 500],
+            gpu_peak: None,
         };
         assert_eq!(r.min_ns(), 100);
         assert_eq!(r.max_ns(), 500);
@@ -275,6 +351,7 @@ mod tests {
             device: Device::Cpu,
             n_runs: 2,
             samples_ns: vec![1000, 2000],
+            gpu_peak: None,
         };
         let s = format!("{r}");
         assert!(s.contains("matmul"));

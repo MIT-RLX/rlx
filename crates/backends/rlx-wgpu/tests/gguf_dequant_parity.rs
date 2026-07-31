@@ -30,6 +30,8 @@ fn cpu_dequant_gguf(scheme_id: u32, packed: &[u8], elems: usize) -> Vec<f32> {
         GgufTQ2_0 => rlx_gguf::tq_dequant::dequant_tq2_0(packed, elems).unwrap(),
         GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4(packed, elems).unwrap(),
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(packed, elems).unwrap(),
+        GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(packed, elems).unwrap(),
+        GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(packed, elems).unwrap(),
         other => panic!("cpu_dequant_gguf: unsupported scheme_id {scheme_id} ({other})"),
     }
 }
@@ -333,6 +335,75 @@ fn mxfp4_wgsl_matches_cpu_reference() {
         packed.extend_from_slice(&block);
     }
     parity(10, &packed, 512, 1e-4, "MXFP4");
+}
+
+/// Pack one FV5 block (104 bytes) from 256 five-value codes in {-2,-1,0,1,2}.
+fn pack_fv5_block(codes: &[i8], s_lo: f32, s_hi: f32) -> Vec<u8> {
+    let mut b = vec![0u8; 104];
+    b[0..4].copy_from_slice(&s_lo.to_le_bytes());
+    b[4..8].copy_from_slice(&s_hi.to_le_bytes());
+    for (j, &c) in codes.iter().enumerate() {
+        let byte = j / 8;
+        let bit = 1u8 << (j % 8);
+        let (p, ng, hi) = match c {
+            1 => (true, false, false),
+            2 => (true, false, true),
+            -1 => (false, true, false),
+            -2 => (false, true, true),
+            _ => (false, false, false),
+        };
+        if p {
+            b[8 + byte] |= bit;
+        }
+        if ng {
+            b[40 + byte] |= bit;
+        }
+        if hi {
+            b[72 + byte] |= bit;
+        }
+    }
+    b
+}
+
+/// Pack one FV5B block (260 bytes) from one f32 scale + 256 int8 codes.
+fn pack_fv5b_block(qs: &[i8], s: f32) -> Vec<u8> {
+    let mut b = vec![0u8; 260];
+    b[0..4].copy_from_slice(&s.to_le_bytes());
+    for (i, &q) in qs.iter().enumerate() {
+        b[4 + i] = q as u8;
+    }
+    b
+}
+
+#[test]
+fn fv5_wgsl_matches_cpu_reference() {
+    let mut packed = Vec::new();
+    for blk in 0..4usize {
+        let codes: [i8; 256] = std::array::from_fn(|j| match (j + blk) % 5 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => -1,
+            _ => -2,
+        });
+        packed.extend_from_slice(&pack_fv5_block(
+            &codes,
+            0.05 * (blk as f32 + 1.0),
+            0.2 * (blk as f32 + 1.0),
+        ));
+    }
+    parity(26, &packed, 1024, 1e-6, "FV5");
+}
+
+#[test]
+fn fv5b_wgsl_matches_cpu_reference() {
+    let mut packed = Vec::new();
+    for blk in 0..4usize {
+        let qs: [i8; 256] =
+            std::array::from_fn(|i| ((i as i32 * 7 + blk as i32) % 251 - 125) as i8);
+        packed.extend_from_slice(&pack_fv5b_block(&qs, 0.03 * (blk as f32 + 1.0)));
+    }
+    parity(27, &packed, 1024, 1e-6, "FV5B");
 }
 
 #[test]

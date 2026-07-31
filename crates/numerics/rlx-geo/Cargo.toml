@@ -1,0 +1,44 @@
+# RLX — versatile ML compiler + runtime.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "rlx-geo"
+version.workspace       = true
+edition.workspace       = true
+rust-version.workspace  = true
+description = "Exact integer 2D Delaunay triangulation + discrete Voronoi (JFA) for RLX, with per-backend custom ops/kernels."
+authors.workspace       = true
+license.workspace       = true
+keywords = ["delaunay", "voronoi", "triangulation", "geometry", "rlx"]
+categories.workspace    = true
+readme                  = "README.md"
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+
+[features]
+# The pure-geometry core (predicates, triangulation, Voronoi) has no rlx deps
+# and builds under `--no-default-features`.
+default = ["cpu"]
+
+# Register `OpExtension` + `CpuKernel` for `geo.delaunay` / `geo.voronoi_grid`.
+# Every backend can execute these via the CPU kernel; native GPU kernels below
+# are opt-in acceleration.
+cpu = ["dep:rlx-ir", "dep:rlx-cpu"]
+
+# Native wgpu (WGSL) kernels for `geo.voronoi_grid` / predicates. Also enables
+# the on-device validation examples (they need wgpu/pollster/bytemuck).
+gpu = ["cpu", "dep:rlx-wgpu", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+rlx-ir  = { path = "../../core/rlx-ir",       version = "0.2.14", optional = true }
+rlx-cpu = { path = "../../backends/rlx-cpu",   version = "0.2.14", optional = true }
+rlx-wgpu = { path = "../../backends/rlx-wgpu", version = "0.2.14", optional = true }
+wgpu     = { version = "30", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", optional = true }
+
+[[example]]
+name = "gpu_validate"
+required-features = ["gpu"]
+
+[dev-dependencies]

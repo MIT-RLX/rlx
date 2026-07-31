@@ -160,14 +160,20 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Qwen3.5 gated delta-net, unrolled over the sequence. Inputs
-    /// `[q,k,v,g,beta(,state)]`, `q,k,v:[b,s,H,n]`, `g,beta:[b,s,H]`.
+    /// `[q,k,v,g,beta(,state)]`, `q,k,v:[b,s,H,n]`, `beta:[b,s,H]`.
     /// Per step: `S ← exp(g)·S`; `Δ=(v − Sᵀk)·β`; `S += k⊗Δ`;
     /// `y = (1/√n)·Sᵀq`.
+    ///
+    /// When `gate_per_channel` (KDA), `g` is `[b,s,H,n]` and the decay is
+    /// per row of the state: `S[i,j] ← exp(g[i])·S[i,j]` — reshape the
+    /// step's `g` to `[b,H,n,1]` so it broadcasts over the column axis.
+    /// Otherwise `g` is `[b,s,H]` and `exp(g)` is one scalar per head.
     pub(crate) fn lower_gated_delta_net(
         &mut self,
         id: NodeId,
         n: usize,
         carry: bool,
+        gate_per_channel: bool,
         out_name: &str,
     ) -> Result<()> {
         let node = self.graph.node(id);
@@ -210,12 +216,21 @@ impl<'a> LowerCtx<'a> {
             let qt = self.gdn_vec(&q, t, b, hh, n, &p, "q")?;
             let kt = self.gdn_vec(&k, t, b, hh, n, &p, "k")?;
             let vt = self.gdn_vec(&v, t, b, hh, n, &p, "v")?;
-            let gt = self.gdn_scalar(&g, t, b, hh, &p, "g")?;
             let bt = self.gdn_scalar(&beta, t, b, hh, &p, "b")?;
 
-            // S *= exp(g)
+            // S *= exp(g). Per-channel (KDA): g is [b,s,H,n]; reshape the
+            // step's row-vector to [b,H,n,1] so exp(g) broadcasts down the
+            // state rows (S[i,j] *= exp(g[i])). Per-head: one scalar/head.
             let ge = format!("{p}_ge");
-            self.emit("exp", &ge, &bh11, vec![("x", bind_name(&gt))])?;
+            if gate_per_channel {
+                let gv = self.gdn_vec(&g, t, b, hh, n, &p, "g")?; // [b,H,1,n]
+                let gcol = format!("{p}_gcol");
+                self.reshape_to(&gv, &[b as i64, hh as i64, n as i64, 1], &bhn1, &gcol)?;
+                self.emit("exp", &ge, &bhn1, vec![("x", bind_name(&gcol))])?;
+            } else {
+                let gt = self.gdn_scalar(&g, t, b, hh, &p, "g")?; // [b,H,1,1]
+                self.emit("exp", &ge, &bh11, vec![("x", bind_name(&gt))])?;
+            }
             let sg = format!("{p}_sg");
             self.emit(
                 "mul",

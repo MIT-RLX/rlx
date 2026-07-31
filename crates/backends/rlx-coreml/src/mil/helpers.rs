@@ -155,6 +155,8 @@ pub(super) fn dequant_scheme(scheme: QuantScheme, bytes: &[u8], n: usize) -> Res
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(bytes, n),
         GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(bytes, n),
         GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(bytes, n),
+        GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(bytes, n),
+        GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(bytes, n),
         other => {
             return Err(CoremlError::Unsupported(format!(
                 "GGUF dequant scheme {other:?}"

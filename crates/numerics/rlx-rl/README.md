@@ -2,7 +2,7 @@
 
 Flow-map generative policies with **Flow Map Q-Guidance (FMQ)** and **Q-Guided Beam Search (QGBS)** on RLX ([arxiv:2605.12416](https://arxiv.org/abs/2605.12416)).
 
-**Reference implementation (JAX):** [`/Users/Shared/q-guided-flow-map-policies`](/Users/Shared/q-guided-flow-map-policies) — see [`REFERENCE.md`](REFERENCE.md) for a module-by-module map.
+**Reference implementation (JAX):** the authors' code ([arXiv:2605.12416](https://arxiv.org/abs/2605.12416)) — see [`REFERENCE.md`](REFERENCE.md) for a module-by-module map.
 
 ## Design
 

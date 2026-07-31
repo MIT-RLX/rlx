@@ -20,6 +20,13 @@
 #![allow(dead_code)]
 
 use rlx_ir::DType;
+// Session/Graph/Shape + device probing are only referenced by the CUDA/wgpu
+// parity cases below; gate the imports to match so a default (cpu-only) build
+// neither fails to resolve them nor warns about unused imports.
+#[cfg(any(feature = "cuda", feature = "gpu"))]
+use rlx_ir::{Graph, Shape};
+#[cfg(any(feature = "cuda", feature = "gpu"))]
+use rlx_runtime::{Device, Session, is_available};
 
 const F: DType = DType::F32;
 const EPS: f32 = 1e-5;

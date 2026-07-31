@@ -255,7 +255,7 @@ fn map_reduce(op: rlx_ir::op::ReduceOp) -> AieReduceOp {
 /// in+out double-buffered f32 tiles (4 × chunk·4 B) stay within the 64 KB tile.
 fn pick_chunk(n: usize) -> usize {
     for c in [2048usize, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1] {
-        if n % c == 0 {
+        if n.is_multiple_of(c) {
             return c;
         }
     }
@@ -1831,7 +1831,7 @@ impl ExecutableGraph for XdnaNormExec {
         if self.beta.len() == self.cols {
             gb.extend_from_slice(&self.beta);
         } else {
-            gb.extend(std::iter::repeat(0.0).take(self.cols));
+            gb.extend(std::iter::repeat_n(0.0, self.cols));
         }
         let out = self
             .io

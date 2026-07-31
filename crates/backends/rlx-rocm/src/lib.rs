@@ -81,6 +81,7 @@ pub mod ms_deform_attn_host {
 }
 pub mod rng_host;
 pub mod roctx;
+pub mod rsmi;
 pub mod scan_host;
 pub mod spd;
 pub mod spd_host;

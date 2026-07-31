@@ -303,6 +303,10 @@ pub(crate) fn dequant_gguf_weight(
             .map_err(|e| MlxError(format!("GGUF Q1_0 dequant: {e}"))),
         Q::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF Q2_0 dequant: {e}"))),
+        Q::GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF FV5 dequant: {e}"))),
+        Q::GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF FV5B dequant: {e}"))),
         other => Err(MlxError(format!(
             "MLX DequantMatMul: unsupported GGUF scheme {other:?}"
         ))),
@@ -321,6 +325,7 @@ pub(crate) fn lower_gated_delta_net(
     g_in: &Array,
     beta: &Array,
     state_size: usize,
+    gate_per_channel: bool,
     state_in: Option<&Array>,
     q_shape: Vec<i32>,
 ) -> Result<(Array, Option<Array>), MlxError> {
@@ -357,12 +362,21 @@ pub(crate) fn lower_gated_delta_net(
         let qt = ops::slice(q, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
         let kt = ops::slice(k, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
         let vt = ops::slice(v, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
-        let gt = ops::slice(g_in, &[0, t, 0], &[batch, t + 1, heads])?;
         let beta_t = ops::slice(beta, &[0, t, 0], &[batch, t + 1, heads])?;
-
-        let gt = ops::reshape(&gt, &[batch, heads, 1, 1])?;
         let beta_bh = ops::reshape(&beta_t, &[bh, 1, 1])?;
-        let exp_g = ops::unary(&gt, MlxUnary::Exp)?;
+
+        // S *= exp(g). Per-channel (KDA): g is [b,s,H,n]; reshape to
+        // [b,H,n,1] so exp(g) scales down the state rows (S[i,j] *= exp(g[i])).
+        // Per-head: one scalar per head, [b,H,1,1].
+        let exp_g = if gate_per_channel {
+            let gt = ops::slice(g_in, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
+            let gt = ops::reshape(&gt, &[batch, heads, n, 1])?;
+            ops::unary(&gt, MlxUnary::Exp)?
+        } else {
+            let gt = ops::slice(g_in, &[0, t, 0], &[batch, t + 1, heads])?;
+            let gt = ops::reshape(&gt, &[batch, heads, 1, 1])?;
+            ops::unary(&gt, MlxUnary::Exp)?
+        };
         state = ops::mul(&state, &exp_g)?;
 
         let state_bh = ops::reshape(&state, &[bh, n, n])?;

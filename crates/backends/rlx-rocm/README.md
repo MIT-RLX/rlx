@@ -51,6 +51,12 @@ Feeds `RocmCostModel` in `rlx-runtime` for backend ranking.
   HIP API + 7 hipRTC functions we need at runtime so the crate
   compiles + tests cleanly on hosts without HIP installed.
   `HipRuntime::load()` returns `None` cleanly on missing libs.
+* **ROCm-SMI telemetry/control shim** (`src/rsmi.rs`) — same libloading
+  pattern over `librocm_smi64.so`. Read-only `sample(index)` (edge /
+  junction / memory temp, power, cap, fan, util) plus root-only
+  `set_power_cap` / `set_fan_percent` / `reset_fan` and `power_cap_range`.
+  Surfaced cross-backend via `rlx_runtime::device_thermal`; drives the
+  `rlx-gpu` CLI. Clock control is not wired (use the power cap).
 * **FFT** — same `rlx-gpu-kernels/fft.cu` plan as CUDA; `fft_host.rs`
   for partial sync on non-native shapes/dtypes.
 * **`HipBuffer<T>` / `HipKernel`** wrapper types matching cudarc's

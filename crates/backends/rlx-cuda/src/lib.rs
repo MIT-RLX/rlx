@@ -43,6 +43,7 @@ pub mod device;
 #[cfg(feature = "nccl")]
 pub mod distributed;
 pub mod fft_dispatch;
+pub mod nvml;
 pub mod fft_host {
     pub use super::host_ops::run_fft1d;
 }

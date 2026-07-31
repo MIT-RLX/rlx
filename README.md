@@ -5,53 +5,18 @@
 ![rust](https://img.shields.io/badge/rust-edition%202024-orange)
 [![repo](https://img.shields.io/badge/github-MIT--RLX%2Frlx-black)](https://github.com/MIT-RLX/rlx)
 
-A small ML compiler and runtime for transformer inference and training.
-JAX-shaped IR + autodiff + transforms (`jvp`, `hvp`, `vmap`) on top of
-backend-specific kernels for CPU, Apple Silicon (Metal / MLX), NVIDIA
-(CUDA), AMD (ROCm), Google TPU, cross-platform GPU (wgpu), Qualcomm
-Hexagon (QNN) NPUs, and microcontrollers (Cortex-M).
-
-> Status: **0.2.14**, Apple-Silicon-first. The CPU and Apple GPU paths
-> are mature; CUDA / ROCm / TPU / WGPU / Vulkan / oneAPI claim the full
-> **153/`OpKind`** surface (see [`docs/op-coverage.md`](docs/op-coverage.md))
-> with growing native depth — still less field mileage than Metal/MLX.
-> Cortex-M is a separate INT8 product. Multi-backend runtime helpers
-> (`GraphDevices`, `DeviceRouter`) — see [`docs/backend-selection.md`](docs/backend-selection.md).
-> **Unreleased (in tree):** full claim parity + native-depth wave —
-> shared CUDA/ROCm kernels for training bwd, FakeQuantize/LSQ, Gru/Rnn/Mamba2,
-> FftButterflyStage, packed-I8 `QMatMul`/`QConv2d`, DenseSolve (cuSOLVER/
-> hipSOLVER); Vulkan/oneAPI SPIR-V/OpenCL catch-up (RNN/SSM, vision bwd,
-> I8 quant); TPU HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd;
-> CoreML/MLX Complex* + FftButterfly + Scaled* PerTensor. See
-> [`CHANGELOG.md`](CHANGELOG.md) `[Unreleased]`.
-> **Since 0.2.13** (in tree): offline **`rlx-bake`** (graph + weights →
-> optimized deployable `*.rlx`, optional encrypt — [`docs/rlx-bake.md`](docs/rlx-bake.md));
-> on-device **C64** complex binary/cast across CUDA / ROCm / Vulkan / wgpu /
-> oneAPI (+ `DType::C128` cast plumbing); **WideEP** MoE
-> (`collective.moe_dispatch` / `moe_combine` + EPLB) and a CUDA **NCCL**
-> collectives scaffold (`rlx-cuda --features nccl`); native CUDA **LSTM**.
-> See [`docs/distributed.md`](docs/distributed.md) and [`CHANGELOG.md`](CHANGELOG.md).
-> **0.2.13** added a Qualcomm **Hexagon / QNN** NPU backend
-> (`Device::Hexagon` — codegen + FFI, on-device INT8/INT4 `QMatMul`,
-> context-binary save/load, fused attention), cuDNN **fused
-> conv+bias+act(+residual)** (`Op::FusedConvBiasAct` — 1.6–2.2× at batch 1
-> on an NVIDIA GPU), differentiable symmetric **eigendecomposition** (`Op::Eigh` /
-> `EighBatch`, native cuSOLVER / hipSOLVER batched Jacobi) and **SPD-manifold
-> Riemannian primitives** (Karcher mean, log / exp maps, parallel transport)
-> on every backend, fused forward-and-backward **DiT modulation** ops
-> (`Op::AdaLayerNorm` / `GatedResidual`), first-class **FPGA / SystemVerilog
-> export** (`rlx_runtime::export`, `pyrlx.export_fpga`), a **static graph
-> checker** (`cargo rlx check` / `#[rlx_model(check)]`), and **weight-compute
-> caching** — plus a large GPU-backend de-dup into the shared `rlx-gpu-host` /
-> `rlx-unfuse` crates. See [`CHANGELOG.md`](CHANGELOG.md).
-> **0.2.12** landed FIR / RIR / IIR digital filters + fused `Op::PartitionedConv`
-> (batched-GEMM convolution reverb), a native Vulkan FFT compute kernel (`Op::Fft`
-> on-device — fixes the discrete-GPU host-fallback crash), and parameterized
-> `fNeXmY` minifloats (`ScaledFormat::Custom`) — see [`CHANGELOG.md`](CHANGELOG.md).
-> **0.2.11** landed full GGUF IQ / TQ / MX backend parity, Metal fused IQ
-> GEMV, `FusedAttentionBlock` on every inference backend (with native CUDA /
-> Metal fused-attention kernels), and pyrlx GGUF load / save / convert — see
-> [`docs/gguf-backend-paths.md`](docs/gguf-backend-paths.md) and [`CHANGELOG.md`](CHANGELOG.md).
+RLX is an ML compiler and runtime for neural-network inference **and**
+training. At its core is a small, serializable tensor IR with JAX-shaped
+autodiff and transforms (`grad`, `jvp`, `hvp`, `vmap`); a compile pipeline
+(HIR → MIR → LIR) legalizes, fuses, and memory-plans the graph, then runs
+it through backend-specific kernels across CPU, Apple Silicon (Metal / MLX
+/ ANE), NVIDIA CUDA, AMD (ROCm + XDNA NPU), Intel oneAPI, Google TPU,
+Qualcomm Hexagon, cross-platform GPU (wgpu / Vulkan / WebGL / WASM),
+microcontrollers (Cortex-M), FPGA, and the Cerebras WSE. It imports models
+from ONNX, PyTorch (`torch.export`), and GGUF / safetensors; does
+quantization (GGUF K/IQ/TQ/MX, INT8/INT4, QAT) and multi-node distributed
+execution; and keeps the core model-agnostic — model crates live in
+sibling repos.
 
 ## Table of Contents
 
@@ -159,9 +124,6 @@ Off by default; enable per workload:
 | `sparse`       | sparse linear algebra (custom-op scaffold)               |
 | `linalg`       | dense linalg via LAPACK (custom-op scaffold)             |
 
-(3D Gaussian splatting moved out to the sibling `rlx-splat` crate; the old
-`splat` umbrella feature is now a no-op.)
-
 ### Specialty crates
 
 The `Backend` model doesn't fit microcontrollers or hardware synthesis.
@@ -233,32 +195,6 @@ via `rlx::ir::…` / `rlx::opt::…` / `rlx::runtime::…` etc. — every
 workspace crate is reachable as a module on `rlx`. Or depend on each
 crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`, …) for the
 smallest possible dep tree.
-
-### FFT (0.2.2)
-
-`Op::Fft` is a first-class IR primitive with CPU, Metal, MLX, CUDA,
-ROCm, wgpu, and TPU lowering. Graph helpers in `rlx_ir::Graph` cover
-real-input spectra and signal-processing workflows:
-
-- `fft_real` / `rfft` / `irfft` — Hermitian `irfft` mirrors the conjugate half
-- `fftfreq` / `rfftfreq` — sample-frequency constants
-- `psd` / `psd_real` — power spectral density
-- `stft`, `fft_conv1d` — short-time FFT (a single batched `rfft` over all frames)
-  and frequency-domain convolution
-
-Pow-2 **f32** transforms run native GPU kernels (CUDA / ROCm / Metal / wgpu);
-non-pow2 uses Bluestein/chirp-z, and f64 / C64 FFT still run on the host CPU
-path (wgpu packs complex into its f32-uniform arena for elementwise C64/C128
-cast + C64 arithmetic, but not for FFT). The `native-gpu-fft` feature adds the
-on-chip single-kernel radix-2/4/8 path (Metal / wgpu), CPU radix-4, and rayon
-batch parallelism. Runtime toggles: `RLX_FFT_FAST`, `RLX_FFT_RADIX`,
-`RLX_FFT_CPU_PARALLEL`, `RLX_FFT_RADIX4`, `RLX_FFT_FUSE_REAL`.
-
-Benchmark one size across backends with
-`cargo run -p rlx-bench --release --example bench_fft --features metal,gpu`, or
-the full variant × precision × size × backend matrix (with per-backend CPU-parity
-checks) via `bench_fft_matrix`. Python bindings: `pyrlx.Graph.fft`, `.rfft`,
-`.irfft`, `.fftfreq` (see [`crates/bindings/pyrlx/tests/test_fft.py`](crates/bindings/pyrlx/tests/test_fft.py)).
 
 ## Examples
 
@@ -489,49 +425,91 @@ and [`docs/gguf-backend-paths.md`](docs/gguf-backend-paths.md)).
 
 ## Workspace layout
 
+The umbrella `rlx` crate is a prelude that re-exports the framework; the
+first-party workspace is 61 crates under
+`crates/{core,backends,io,numerics,tooling,bindings}/`, each with its own
+`README.md`.
+
 ```
-rlx            prelude — re-exports framework crates + common types
-rlx-ir         leaf — types, shape, op enum, verifier, HIR hooks
-rlx-tensor     NumPy-style symbolic Tensor DSL (lazy, trace → fuse → any backend)
-rlx-flow       block assembly-line API for model builders
-rlx-fusion     MIR fusion passes + unfuse for AD
-rlx-unfuse     shared IR unfuse / decompose pass (FAB / FTL / DotGeneral / control flow) across GPU backends
-rlx-autodiff   grad / jvp / hvp / vmap on MIR
-rlx-compile    CompilePipeline, legalization, memory plan, precision
-rlx-opt        facade — re-exports fusion + autodiff + compile
-rlx-optim      training-step optimizers (Adam / Lion / Muon / SOAP / …)
-rlx-driver     Device enum + cross-cutting types
-rlx-cpu        CPU kernels (NEON / AVX / Accelerate / OpenBLAS)
-rlx-metal      Apple Metal native (MSL + MPSGraph + ICB)
-rlx-mlx        Apple MLX (vendored, hand-rolled C++ shim)
-rlx-coreml     Apple CoreML / Neural Engine (IR → MIL ML Program; Device::Ane)
-rlx-cuda       NVIDIA CUDA (cuBLAS + cuDNN + NVRTC + Graphs; optional NCCL)
-rlx-rocm       AMD ROCm/HIP (hipBLAS + MIOpen + hipGraph)
-rlx-tpu        Google TPU via libtpu PJRT
-rlx-wgpu       Cross-platform GPU via wgpu
-rlx-vulkan     native Vulkan compute (ash + SPIR-V)
-rlx-oneapi     Intel oneAPI Level Zero (SPIR-V)
-rlx-qnn        Qualcomm Hexagon / QNN codegen + FFI runtime (Device::Hexagon)
-rlx-gpu-host   shared host-fallback staging (D2H → CPU → H2D) for GPU backends
-rlx-collectives in-graph collectives (all_reduce, WideEP moe_dispatch/combine, EPLB)
-rlx-cortexm    ARMv7E-M INT8 kernels (no_std)
-rlx-fpga       IR → Verilog → bitstream
-rlx-runtime    user-facing Session / CompiledGraph
-rlx-check      static graph checker (shape / dispatch / fusion / NaN lint; `cargo rlx check`)
-rlx-gguf       standalone GGUF parser + dequant (every llama.cpp scheme: Q4_0..Q8_0, Q2_K..Q8_K, IQ1..IQ4, TQ1/TQ2, MXFP4, NVFP4)
-rlx-bake       offline bake: graph + weights → optimized `*.rlx` (optional encrypt)
-rlx-macros     #[rlx_model] AOT macro
-rlx-bench      benchmark harness
-rlx-sparse     downstream: CSR LU / mat-vec / CG (custom-op scaffold)
-rlx-linalg     downstream: dense linalg via LAPACK (custom-op scaffold)
-pyrlx          Python bindings via PyO3
+rlx                  umbrella prelude — re-exports the framework + common types
+
+core/  — IR, compiler, autodiff, runtime
+  rlx-ir             tensor IR: types, shapes, Op enum, verifier, serialization (leaf)
+  rlx-tensor         NumPy-style symbolic Tensor DSL (lazy: trace → fuse → any backend)
+  rlx-flow           block assembly-line API for model builders (fusion-first)
+  rlx-autodiff       JAX-shaped transforms on the MIR — grad / jvp / hvp / vmap
+  rlx-fusion         MIR fusion passes + fused-op decomposition
+  rlx-unfuse         shared IR unfuse/decompose pass for the GPU-family backends
+  rlx-compile        HIR → MIR → LIR pipeline (legalize, memory plan, precision)
+  rlx-opt            facade — re-exports fusion + autodiff + compile
+  rlx-optim          training-step optimizers (Adam / Lion / Muon / SOAP / Sophia / …)
+  rlx-driver         Device enum + driver layer (handles, arenas, buffers, streams)
+  rlx-runtime        user-facing Session / CompiledGraph; feature-gated backends
+  rlx-macros         proc macros — #[rlx_model] AOT model compilation
+  rlx-extend         one prelude for extending rlx downstream (custom ops / blocks / DSL)
+  rlx-collectives    in-graph collectives (all-reduce, WideEP moe_dispatch/combine, EPLB)
+  rlx-distributed    multi-node pipeline parallel — partition + shard + transport, pool RAM
+
+backends/  — one crate per hardware target
+  rlx-cpu            CPU: SIMD (NEON/AVX) + BLAS dispatch + threaded arena executor
+  rlx-metal          Apple Metal (custom MSL + MPSGraph + indirect command buffers)
+  rlx-mlx            Apple MLX via hand-rolled C++ shim (eager + lazy)
+  rlx-mlx-sys        low-level MLX C++ build + C-ABI shim (vendored mlx)
+  rlx-coreml         Apple CoreML / Neural Engine — IR → MIL ML Program (Device::Ane)
+  rlx-cuda           NVIDIA CUDA — cuBLAS + cuDNN + NVRTC kernels (opt. NCCL) via cudarc
+  rlx-rocm           AMD ROCm/HIP — shares rlx-cuda's .cu sources, dispatched via HIP
+  rlx-xdna           AMD XDNA / Ryzen AI NPU — Device::Xdna detection + AIE execution
+  rlx-oneapi         Intel oneAPI Level Zero (Arc / Data Center Max) + SPIR-V kernels
+  rlx-tpu            Google TPU via libtpu's PJRT plugin
+  rlx-vulkan         native Vulkan compute (raw ash + embedded SPIR-V)
+  rlx-wgpu           cross-platform GPU via wgpu (Metal / Vulkan / DX12 / WebGPU)
+  rlx-webgl          WebGL2 GPGPU — render-to-texture graph execution in-browser
+  rlx-qnn            Qualcomm Hexagon NPU — IR → QNN model (Device::Hexagon)
+  rlx-cortexm        Cortex-M INT8 kernels for ARMv7E-M microcontrollers (no_std)
+  rlx-fpga           FPGA — per-graph datapath synthesis (IR → Verilog → bitstream)
+  rlx-cerebras       Cerebras Wafer-Scale Engine — IR → CSL → fabric simulator
+  rlx-gpu-host       backend-agnostic host-fallback kernels (D2H → CPU → H2D)
+  rlx-gpu-kernels    shared CUDA/HIP C++ kernel sources (NVRTC / hipRTC)
+
+io/  — model + weight loading, conversion, packaging
+  rlx-gguf           standalone GGUF v1/2/3 parser + dequant (every llama.cpp scheme)
+  rlx-gguf-convert   safetensors / ONNX → GGUF with per-tensor quantization
+  rlx-onnx           ONNX inference — native compile by default, optional ORT fallback
+  rlx-onnx-import    ONNX → RLX HIR import (protobuf + op lowering)
+  rlx-onnx-proto     vendored pure-Rust ONNX protobuf types (protoc-free)
+  rlx-onnx-conformance   ONNX op-level conformance tests (ORT vs RLX)
+  rlx-torch-import   PyTorch (torch.export) → RLX HIR (aten→rlx registry + gen crate)
+  rlx-nemo           native loader for NVIDIA NeMo .nemo files
+  rlx-dduf           HuggingFace DDUF (.dduf) package loader
+  rlx-mlx-io         MLX weight layouts (mlx-community safetensors / .npz / affine+mxfp)
+  rlx-hub            HuggingFace shard-aware download + verify (resumable, layer→shard)
+  rlx-pkg            RLX package format (.rlxp) — flat hybrid mmap packs
+  rlx-bake           offline bake: graph + weights → optimized *.rlx (optional encrypt)
+  rlx-text           tokenizers, chat templates, sampling for downstream LM apps
+
+numerics/  — downstream domain packages (register against the custom-op scaffold)
+  rlx-linalg         dense linear algebra via LAPACK (eigh / svd / qr / cholesky / solve)
+  rlx-sparse         sparse linear algebra — CSR LU, mat-vec, conjugate gradient
+  rlx-vq             fused vector-quantization kernel (nearest-codebook assignment)
+  rlx-umap           parametric UMAP (fit / transform + k-NN)
+  rlx-fdm            force density method — pin-jointed form-finding
+  rlx-bbo            black-box optimization + FMQ/QGBS search
+  rlx-rl             flow-map generative policies (FMQ / QGBS)
+
+tooling/
+  rlx-check          device-free static graph checker (shape / dispatch / fusion / NaN)
+  rlx-bench          benchmark harness + `rlx-gpu` GPU telemetry/control CLI
+  rlx-hwprofile      host hardware profiler — GPU/VRAM detection for device selection
+  rlxsl              scalar-expr manifest → per-language activation kernels (WGSL/CUDA/MSL/…)
+
+bindings/
+  pyrlx              Python bindings (PyO3) — run RLX graphs + HF models on any backend
+  rlx-web            WebAssembly entry point — run models in-browser (CPU; WebGPU bring-up)
 ```
 
-This lists the load-bearing crates. The workspace has 50-plus crates
-grouped under `crates/{core,backends,io,numerics,tooling,bindings}/`,
-each with its own `README.md` covering public surface, build commands,
-and internal gotchas. Model crates (`rlx-nomic`, `rlx-qwen3`, …) and
-`rlx-splat` (3D Gaussian splatting) live in sibling repos, keeping RLX
+Each crate carries its own `README.md` covering public surface, build
+commands, and internal gotchas. Model crates (`rlx-qwen3`, `rlx-nomic`, …)
+and `rlx-splat` (3D Gaussian splatting) live in sibling repos, keeping RLX
 core model-agnostic.
 
 ## Building from source
@@ -640,26 +618,16 @@ until the kind moves from **common-ir** to **native**.
   (op.rs, infer.rs, graph.rs, verify.rs), every backend's thunks +
   cost models (rlx-cpu, rlx-metal, rlx-mlx, rlx-cuda, rlx-rocm, rlx-tpu,
   rlx-wgpu — sister-crate ports are usually mechanical), the optimizer
-  fusion patterns, and ideally a parity test in burnembed. Use
+  fusion patterns, and ideally a cross-backend parity test. Use
   `RLX_DISPATCH_REPORT=1` after compile to confirm native vs common-ir.
-- **Bench every change in burnembed.** The integration testbed at
-  `/Users/Shared/burnembed` is the canonical bench loop:
-  `cargo run --release --example bench_rlx_single --features ndarray,blas-accelerate,rlx,hf-download -- --model minilm6`.
-  Models pulled live from HF.
-- **PLAN.md** drives priorities; the `## Landed` section at the bottom
-  tracks what's already in tree, with bench deltas. PRs targeting plan
-  items are expected to add a delta line — even "within noise" is data
-  worth recording.
+- **Bench every change.** [`rlx-bench`](crates/tooling/rlx-bench) is the
+  in-tree harness — `cargo run -p rlx-bench --release --example bench_all`
+  sweeps every (pattern × device) cell.
+- **Record bench deltas.** Performance-affecting changes should note the
+  before/after in the PR — even "within noise" is data worth recording.
 
 The per-release feature history — every landed Op, backend, and fusion —
-lives in [`CHANGELOG.md`](CHANGELOG.md); `PLAN.md`'s `## Landed` section
-tracks in-tree work with bench deltas.
-
-## Versioning
-
-Pre-1.0; `0.x` minor bumps may include breaking IR changes. The `Op`
-enum and the `Graph` builder API in particular are still evolving as
-new ops land. Pin exact versions in production until 1.0.
+lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Training
 
@@ -737,12 +705,35 @@ in [`CITATION.cff`](CITATION.cff); a plain-text form:
 
 ## Contributing
 
-PRs welcome; the roadmap (`PLAN.md`) drives priorities. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev loop and conventions, and
-[`docs/development.md`](docs/development.md) for the deeper guide. Per-crate
-`README.md` files document build commands and gotchas; treat them as the
-canonical "how does this crate work" reference. Security reports:
-[`SECURITY.md`](SECURITY.md).
+PRs are welcome. Keep changes focused and note any before/after bench
+delta in the PR (even "within noise" is data worth recording). The
+[development workflow](#development-workflow) above covers the technical
+loop; [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+[`docs/development.md`](docs/development.md) go deeper, and each crate's
+`README.md` is its canonical reference.
+
+**Get started**
+
+```sh
+git clone --recurse-submodules https://github.com/MIT-RLX/rlx
+just install-git-hooks     # symlink the repo pre-commit hook
+just ci                    # build · test · fmt-check · lint · wasm · pyrlx — the gate every PR must pass
+```
+
+**A PR is ready when** `just ci` is green, new behavior is covered by a
+test — kernels get a **CPU-parity test**, since the CPU path is the
+numerical oracle every backend is checked against — and it adds a one-line
+entry to [`CHANGELOG.md`](CHANGELOG.md)'s `[Unreleased]` section. Adding an
+`Op` means landing it on *every* backend (see the dev-workflow note above),
+not just the one you use.
+
+**You may not need to touch core.** Custom ops, `LayerStage` blocks, and the
+flow DSL are exposed through [`rlx-extend`](crates/core/rlx-extend), so
+downstream crates (new models, domain numerics) can add capability without
+editing rlx's closed enums — reach for that seam before patching the core.
+
+Security issues: please follow [`SECURITY.md`](SECURITY.md) rather than
+opening a public issue.
 
 ## License
 

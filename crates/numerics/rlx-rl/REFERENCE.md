@@ -1,6 +1,6 @@
 # Reference: Python → rlx-rl
 
-Official JAX implementation: [`/Users/Shared/q-guided-flow-map-policies`](/Users/Shared/q-guided-flow-map-policies)  
+Official JAX implementation: the authors' reference code.  
 Paper: [arxiv:2605.12416](https://arxiv.org/abs/2605.12416)
 
 ## Module map

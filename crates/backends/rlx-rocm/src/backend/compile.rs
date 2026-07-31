@@ -806,6 +806,34 @@ impl RocmExecutable {
                         has_bias: if *has_bias { 1 } else { 0 },
                     });
                 }
+                // Residual-add + RMSNorm in one native kernel (shared
+                // `fused_residual_rms_norm.cu` via hipRTC). Mirrors the
+                // `FusedResidualLN` arm above and rlx-cuda's native path.
+                Op::FusedResidualRmsNorm { has_bias, eps } => {
+                    let x_id = node.inputs[0];
+                    let r_id = node.inputs[1];
+                    let (bias_id, g_id, b_id) = if *has_bias {
+                        (node.inputs[2], node.inputs[3], node.inputs[4])
+                    } else {
+                        (x_id, node.inputs[2], node.inputs[3])
+                    };
+                    let in_dims = node.shape.dims();
+                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
+                    let total: u32 = in_dims.iter().map(|d| d.unwrap_static() as u32).product();
+                    let outer = total / inner.max(1);
+                    schedule.push(Step::FusedResidualRmsNorm {
+                        outer,
+                        inner,
+                        in_off: (arena.offset(x_id) / 4) as u32,
+                        residual_off: (arena.offset(r_id) / 4) as u32,
+                        bias_off: (arena.offset(bias_id) / 4) as u32,
+                        gamma_off: (arena.offset(g_id) / 4) as u32,
+                        beta_off: (arena.offset(b_id) / 4) as u32,
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        eps_bits: eps.to_bits(),
+                        has_bias: if *has_bias { 1 } else { 0 },
+                    });
+                }
                 Op::AdaLayerNorm { norm, eps } => {
                     let x_id = node.inputs[0];
                     let scale_id = node.inputs[1];
@@ -1862,6 +1890,7 @@ impl RocmExecutable {
                 Op::GatedDeltaNet {
                     state_size,
                     carry_state,
+                    gate_per_channel,
                 } => {
                     if *state_size > rlx_cpu::gdn::GDN_MAX_STATE {
                         panic!(
@@ -1889,6 +1918,7 @@ impl RocmExecutable {
                         heads: q_shape.dim(2).unwrap_static() as u32,
                         state_size: *state_size as u32,
                         use_carry: *carry_state,
+                        gate_per_channel: *gate_per_channel,
                     });
                 }
                 Op::Lstm {
@@ -2930,6 +2960,28 @@ impl RocmExecutable {
                     });
                 }
                 Op::ResizeNearest2x => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    schedule.push(Step::ResizeNearest2x {
+                        src_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                    });
+                }
+                // Region-marking wraps a bare `Op::ResizeNearest2x` into a
+                // single-step `TransformRegion` (same as Metal / rlx-cuda).
+                // Unwrap it back to the native 2× nearest upsample step.
+                Op::TransformRegion { steps, .. }
+                    if steps.len() == 1
+                        && matches!(
+                            steps[0],
+                            rlx_ir::op::TransformStep::ResizeNearest2x(
+                                rlx_ir::op::ChainOperand::Input(0)
+                            )
+                        ) =>
+                {
                     let in_shape = &graph.node(node.inputs[0]).shape;
                     schedule.push(Step::ResizeNearest2x {
                         src_off: (arena.offset(node.inputs[0]) / 4) as u32,

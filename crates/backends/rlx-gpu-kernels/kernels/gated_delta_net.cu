@@ -23,7 +23,8 @@ extern "C" __global__ void gated_delta_net(
     unsigned int seq,
     unsigned int heads,
     unsigned int n,
-    unsigned int use_carry
+    unsigned int use_carry,
+    unsigned int gate_per_channel
 ) {
     unsigned int gid = blockIdx.x;   // (batch, head)
     unsigned int tid = threadIdx.x;  // column j in 0..n
@@ -59,9 +60,11 @@ extern "C" __global__ void gated_delta_net(
         float beta_t = arena[beta_off + gb_step];
         float g_exp = expf(g_t);
 
-        // Column-parallel gate scale (was serial tid==0 over n²).
+        // Column-parallel gate scale. Per-channel (KDA) decays by the key row i:
+        // S[i,j] *= exp(g[i]) with g = [b,s,h,n]; per-head uses the scalar g_exp.
         for (unsigned int i = 0u; i < n; ++i) {
-            s_mat[i * n + j] *= g_exp;
+            float a = (gate_per_channel != 0u) ? expf(arena[g_off + qkv_step + i]) : g_exp;
+            s_mat[i * n + j] *= a;
         }
         __syncthreads();
 

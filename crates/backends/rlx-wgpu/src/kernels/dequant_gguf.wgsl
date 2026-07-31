@@ -120,6 +120,38 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
             return;
         }
 
+        if (params.scheme_id == 26u) {
+            // FV5 (Neutrino-8B ternary): f32 s_lo | f32 s_hi | three 32-byte
+            // bit-planes bp(+1) | bn(-1) | br(hi-mag select). 104 bytes / 256
+            // elements, LSB-first. w = (bp-bn) * (br ? s_hi : s_lo).
+            let off = gid * 104u;
+            let s_lo = bitcast<f32>(read_w(off) | (read_w(off + 1u) << 8u) | (read_w(off + 2u) << 16u) | (read_w(off + 3u) << 24u));
+            let s_hi = bitcast<f32>(read_w(off + 4u) | (read_w(off + 5u) << 8u) | (read_w(off + 6u) << 16u) | (read_w(off + 7u) << 24u));
+            let bp = off + 8u;
+            let bn = off + 40u;
+            let br = off + 72u;
+            for (var j: u32 = 0u; j < 256u; j = j + 1u) {
+                let byte = j >> 3u;
+                let bit = 1u << (j & 7u);
+                let p = select(0i, 1i, (read_w(bp + byte) & bit) != 0u);
+                let ng = select(0i, 1i, (read_w(bn + byte) & bit) != 0u);
+                let mag = select(s_lo, s_hi, (read_w(br + byte) & bit) != 0u);
+                arena[dst_base + j] = f32(p - ng) * mag;
+            }
+            return;
+        }
+
+        if (params.scheme_id == 27u) {
+            // FV5B (Neutrino-8B): f32 s | 256 int8 codes (260 bytes / 256 elems).
+            let off = gid * 260u;
+            let s = bitcast<f32>(read_w(off) | (read_w(off + 1u) << 8u) | (read_w(off + 2u) << 16u) | (read_w(off + 3u) << 24u));
+            let qs_rel = off + 4u;
+            for (var i: u32 = 0u; i < 256u; i = i + 1u) {
+                arena[dst_base + i] = s * f32(read_w_i8(qs_rel + i));
+            }
+            return;
+        }
+
         if (params.scheme_id == 0u) {
             let blk = 2u + 2u + 12u + 256u / 2u;
             let off = gid * blk;

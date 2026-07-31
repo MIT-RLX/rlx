@@ -6,6 +6,7 @@
 
 #![cfg(all(feature = "cpu", feature = "rocm"))]
 
+use rlx_ir::infer::GraphExt;
 use rlx_ir::op::{Activation, BinaryOp, ReduceOp};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, Session, is_available};
@@ -63,6 +64,38 @@ fn rocm_relu_parity() {
     let y = g.activation(Activation::Relu, x, Shape::new(&[5], DType::F32));
     g.set_outputs(vec![y]);
     run_pair(g, &[("x", &[-2.0, -0.5, 0.0, 1.0, 3.0])], 1e-5, "relu");
+}
+
+#[test]
+fn rocm_residual_rmsnorm_parity() {
+    // `add(x, residual) → rms_norm` fuses into `Op::FusedResidualRmsNorm`
+    // (the FuseResidualRmsNorm pass fires because rocm lists it as supported).
+    // Exercises rlx-rocm's native fused kernel against the CPU oracle — the
+    // op previously had no lowering and panicked at compile.
+    let (rows, inner) = (3usize, 8usize);
+    let mut g = Graph::new("residual_rmsnorm");
+    let x = g.input("x", Shape::new(&[rows, inner], DType::F32));
+    let res = g.input("res", Shape::new(&[rows, inner], DType::F32));
+    let gamma = g.input("gamma", Shape::new(&[inner], DType::F32));
+    let beta = g.input("beta", Shape::new(&[inner], DType::F32));
+    let sum = g.binary(
+        BinaryOp::Add,
+        x,
+        res,
+        Shape::new(&[rows, inner], DType::F32),
+    );
+    let y = g.rms_norm(sum, gamma, beta, 1e-5);
+    g.set_outputs(vec![y]);
+    let xd: Vec<f32> = (0..rows * inner).map(|i| (i as f32) * 0.1 - 1.0).collect();
+    let rd: Vec<f32> = (0..rows * inner).map(|i| (i as f32) * 0.05).collect();
+    let gd: Vec<f32> = (0..inner).map(|i| 0.5 + i as f32 * 0.1).collect();
+    let bd: Vec<f32> = (0..inner).map(|i| -0.2 + i as f32 * 0.03).collect();
+    run_pair(
+        g,
+        &[("x", &xd), ("res", &rd), ("gamma", &gd), ("beta", &bd)],
+        1e-4,
+        "residual_rmsnorm",
+    );
 }
 
 #[test]

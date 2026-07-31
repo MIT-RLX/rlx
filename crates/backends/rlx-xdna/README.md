@@ -129,7 +129,7 @@ over 40 steps, gradient computed on the NPU).
   it amortizes as `M` grows and across a resident chain.
 - **TURBO:** `RLX_XDNA_TURBO=1` clocks the array to maximum DPM — **+11%** measured
   on the INT8 GEMM. Needs root / `CAP_SYS_ADMIN` (a clear one-line warning +
-  default DPM otherwise). Benchmark it with `scripts/xdna_turbo_bench.sh`.
+  default DPM otherwise).
 - **Hardware:** Phoenix `npu1` ≈ 16 INT8 TOPS across 4 usable AIE columns; static
   weights are pre-tiled + cached in `set_param`, dynamic weights (backward) re-tiled
   per run.

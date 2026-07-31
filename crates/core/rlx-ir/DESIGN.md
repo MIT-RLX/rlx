@@ -17,8 +17,8 @@ dtype?" bug class. Cost: some ops technically don't need a dtype on
 their output (Bool from compare) but pay for the field anyway.
 
 **`Dim::Dynamic` exists but is not yet used by any model.** Symbolic
-dims (#54 in PLAN.md) would let one compiled graph serve any seq
-length; today everyone passes `Dim::Static`. Keeping the variant
+dims would let one compiled graph serve any seq length; today everyone
+passes `Dim::Static`. Keeping the variant
 costs nothing and unblocks the future.
 
 **`MaskKind` lives on `Op::Attention`, not as a separate Op.** One

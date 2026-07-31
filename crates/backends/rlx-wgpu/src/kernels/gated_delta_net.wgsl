@@ -24,7 +24,8 @@ struct Params {
     use_carry: u32,
     // PLAN L1 — full-extent seq stride for per-batch offset math.
     seq_stride: u32,
-    _p1: u32,
+    // 1 = per-channel gate (g is [b,s,h,n], Kimi-K3 KDA); 0 = per-head scalar.
+    gate_per_channel: u32,
     _p2: u32,
     _p3: u32,
 };
@@ -82,8 +83,19 @@ fn gated_delta_net(
         }
 
         if (lane_on && tid == 0u) {
-            for (var idx: u32 = 0u; idx < n * n; idx = idx + 1u) {
-                arena[s_base + idx] = arena[s_base + idx] * g_exp;
+            if (params.gate_per_channel != 0u) {
+                // per-channel decay: S[i,j] *= exp(g[i]), g is [b,s,h,n]
+                let g_pc_base = params.g_off + bi * params.seq_stride * hs_n + ti * hs_n + hi * n;
+                for (var i: u32 = 0u; i < n; i = i + 1u) {
+                    let a = exp(arena[g_pc_base + i]);
+                    for (var jj: u32 = 0u; jj < n; jj = jj + 1u) {
+                        arena[s_base + i * n + jj] = arena[s_base + i * n + jj] * a;
+                    }
+                }
+            } else {
+                for (var idx: u32 = 0u; idx < n * n; idx = idx + 1u) {
+                    arena[s_base + idx] = arena[s_base + idx] * g_exp;
+                }
             }
         }
         workgroupBarrier();

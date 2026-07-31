@@ -676,10 +676,9 @@ pub fn compile_thunks_with_rng(
             Op::SelectiveScan { state_size } => {
                 compile_selective_scan(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
-            Op::GatedDeltaNet {
-                state_size,
-                carry_state,
-            } => compile_gated_delta_net(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::GatedDeltaNet { .. } => {
+                compile_gated_delta_net(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
             Op::Lstm {
                 hidden_size,
                 num_layers,

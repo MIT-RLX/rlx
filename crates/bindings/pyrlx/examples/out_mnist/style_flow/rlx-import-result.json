@@ -1,9 +1,0 @@
-{
-  "model": "mnist",
-  "num_inputs": 1,
-  "num_params": 6,
-  "num_instrs": 17,
-  "bundle_dir": null,
-  "crate_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_mnist/style_flow/rlx-mnist",
-  "parity": null
-}

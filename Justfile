@@ -462,21 +462,6 @@ serve-web *ARGS:
 serve-web-static BACKEND="python" PORT="8000":
     python3 crates/bindings/rlx-web/serve.py --backend {{BACKEND}} --port {{PORT}}
 
-# Run burnembed bench for a single model. `just bench minilm6`.
-bench MODEL:
-    {{justfile_directory()}}/scripts/check-throttle.sh
-    cd ../burnembed && cargo run --release \
-        --example bench_rlx_single \
-        --features "ndarray,blas-accelerate,rlx,hf-download" \
-        -- --model {{MODEL}}
-
-# Run burnembed Nomic Metal vs CPU comparison.
-bench-nomic-metal:
-    {{justfile_directory()}}/scripts/check-throttle.sh
-    cd ../burnembed && cargo run --release \
-        --example bench_nomic_metal_vs_cpu \
-        --features "rlx,rlx-metal,ndarray,blas-accelerate,hf-download"
-
 # Verbose run — exposes [rlx] / [ktrace] log lines.
 run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}

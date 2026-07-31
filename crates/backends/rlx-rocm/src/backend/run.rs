@@ -684,6 +684,43 @@ impl RocmExecutable {
                         ]
                     );
                 }
+                Step::FusedResidualRmsNorm {
+                    outer,
+                    inner,
+                    in_off,
+                    residual_off,
+                    bias_off,
+                    gamma_off,
+                    beta_off,
+                    out_off,
+                    eps_bits,
+                    has_bias,
+                } => {
+                    let outer_s = scale(*outer);
+                    if outer_s == 0 {
+                        continue;
+                    }
+                    let kernel = fused_residual_rms_norm_kernel(&self.ctx);
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        (outer_s, 1, 1),
+                        (256, 1, 1),
+                        [
+                            &mut arena_ptr,
+                            &outer_s,
+                            inner,
+                            in_off,
+                            residual_off,
+                            bias_off,
+                            gamma_off,
+                            beta_off,
+                            out_off,
+                            eps_bits,
+                            has_bias
+                        ]
+                    );
+                }
                 Step::AdaLayerNorm {
                     outer,
                     inner,
@@ -2517,6 +2554,7 @@ impl RocmExecutable {
                     heads,
                     state_size,
                     use_carry,
+                    gate_per_channel,
                 } => {
                     crate::gdn_host::run_gated_delta_net(
                         &self.ctx,
@@ -2534,6 +2572,7 @@ impl RocmExecutable {
                         *heads as usize,
                         *state_size as usize,
                         *use_carry,
+                        *gate_per_channel,
                     );
                 }
                 Step::Lstm {

@@ -115,6 +115,31 @@ impl Graph {
             Op::GatedDeltaNet {
                 state_size,
                 carry_state: false,
+                gate_per_channel: false,
+            },
+            vec![q, k, v, g, beta],
+            shape,
+            None,
+        )
+    }
+
+    /// Same as [`Self::gated_delta_net`] but with a **per-channel** log-gate
+    /// (`g` is `[b, s, h, n]`) — Kimi-K3 KDA.
+    pub fn gated_delta_net_pc(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        g: NodeId,
+        beta: NodeId,
+        state_size: usize,
+        shape: Shape,
+    ) -> NodeId {
+        self.push(
+            Op::GatedDeltaNet {
+                state_size,
+                carry_state: false,
+                gate_per_channel: true,
             },
             vec![q, k, v, g, beta],
             shape,
@@ -139,6 +164,32 @@ impl Graph {
             Op::GatedDeltaNet {
                 state_size,
                 carry_state: true,
+                gate_per_channel: false,
+            },
+            vec![q, k, v, g, beta, state],
+            shape,
+            None,
+        )
+    }
+
+    /// Carry variant with a **per-channel** log-gate (KDA).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_carry_pc(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        g: NodeId,
+        beta: NodeId,
+        state: NodeId,
+        state_size: usize,
+        shape: Shape,
+    ) -> NodeId {
+        self.push(
+            Op::GatedDeltaNet {
+                state_size,
+                carry_state: true,
+                gate_per_channel: true,
             },
             vec![q, k, v, g, beta, state],
             shape,

@@ -25,8 +25,15 @@ android/**/intermediates/
 /weights
 .venv-sam3/
 
+# Python bytecode cache
+__pycache__/
+*.pyc
+
 # rlx-bake demo artifacts (encrypted models)
 crates/io/rlx-bake/examples/out/
+
+# pyrlx from_torch example output (generated, machine-specific paths)
+crates/bindings/pyrlx/examples/out_*/
 
 # large binaries — fetch/build locally, do not commit
 /papers/

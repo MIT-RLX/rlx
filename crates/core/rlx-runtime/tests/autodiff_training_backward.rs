@@ -348,6 +348,7 @@ fn gated_delta_net_unfused_before_autodiff() {
         Op::GatedDeltaNet {
             state_size: 4,
             carry_state: false,
+            gate_per_channel: false,
         },
         vec![q, k, v, gv, beta],
         Shape::new(&[1, 2, 2, 4], f),

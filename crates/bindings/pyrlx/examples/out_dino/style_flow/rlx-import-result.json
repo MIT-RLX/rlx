@@ -1,9 +1,0 @@
-{
-  "model": "dino",
-  "num_inputs": 1,
-  "num_params": 20,
-  "num_instrs": 53,
-  "bundle_dir": null,
-  "crate_dir": "/Users/Shared/rlx/crates/bindings/pyrlx/examples/out_dino/style_flow/rlx-dino",
-  "parity": null
-}

@@ -6,7 +6,6 @@
 //!
 //! Each pass scans the graph in reverse topological order, looking for
 //! specific multi-node patterns and replacing them with single fused nodes.
-//! These are the same fusions we hand-coded in burnembed's ndarray_fused.rs.
 
 use rlx_ir::op::*;
 use rlx_ir::*;

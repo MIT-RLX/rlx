@@ -22,6 +22,13 @@ rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
 rlx-driver = { path = "../../core/rlx-driver", version = "0.2.14" }
 rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.14", optional = true }
 
+# `rlx-gpu`: read-only GPU temperature/power monitor. Reaches hardware
+# only when built with a backend feature (`--features cuda` / `rocm`);
+# otherwise prints an empty inventory.
+[[bin]]
+name = "rlx-gpu"
+path = "src/bin/rlx_gpu.rs"
+
 [features]
 default = []
 metal = ["rlx-runtime/metal"]

@@ -261,6 +261,8 @@ impl QuantScheme {
         (GgufQ5_1, 23),
         (GgufQ1_0, 24),
         (GgufQ2_0, 25),
+        (GgufFV5, 26),
+        (GgufFV5B, 27),
     }
 
     /// True if this scheme requires a per-block scale tensor on the side.
@@ -980,7 +982,7 @@ mod tests {
     #[test]
     fn gpu_dequant_scheme_id_is_stable() {
         use QuantScheme::*;
-        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 26);
+        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 28);
         for &(scheme, id) in QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS {
             assert_eq!(scheme.gpu_dequant_scheme_id(), Some(id), "{scheme:?}");
             assert_eq!(

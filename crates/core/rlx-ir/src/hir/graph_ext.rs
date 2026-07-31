@@ -995,6 +995,18 @@ pub trait HirGraphExt {
         state_size: usize,
         shape: Shape,
     ) -> HirNodeId;
+
+    /// Per-channel (`g` is `[b, s, h, n]`) gated delta-net — Kimi-K3 KDA.
+    fn gated_delta_net_pc(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        g: HirNodeId,
+        beta: HirNodeId,
+        state_size: usize,
+        shape: Shape,
+    ) -> HirNodeId;
 }
 
 impl HirGraphExt for HirMut<'_> {
@@ -1413,6 +1425,19 @@ impl HirGraphExt for HirMut<'_> {
         shape: Shape,
     ) -> HirNodeId {
         HirModule::gated_delta_net_carry(self.0, q, k, v, g, beta, state, state_size, shape)
+    }
+
+    fn gated_delta_net_pc(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        g: HirNodeId,
+        beta: HirNodeId,
+        state_size: usize,
+        shape: Shape,
+    ) -> HirNodeId {
+        HirModule::gated_delta_net_pc(self.0, q, k, v, g, beta, state_size, shape)
     }
 }
 

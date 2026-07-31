@@ -223,6 +223,7 @@ fn gated_delta_net_matches_hand_computed() {
         Op::GatedDeltaNet {
             state_size: n,
             carry_state: false,
+            gate_per_channel: false,
         },
         vec![q, k, v, g_in, beta],
         Shape::new(&[b, s, h, n], DType::F32),

@@ -1,6 +1,6 @@
 # Higher-order AD benchmarks
 
-See [PLAN.md](../../PLAN.md) (landed higher-order section) for API and cross-platform perf tables.
+See `crates/core/rlx-autodiff/README.md` for the API and [`CHANGELOG.md`](../../CHANGELOG.md) for the higher-order landing notes.
 
 ## Related tests
 
@@ -48,8 +48,8 @@ What is in good shape today:
 - Rig: `./rig.sh test-third-order-gpu` runs CPU + CUDA/WGPU parity (mirrors `just test-third-order-gpu`).
 - MLIP helpers, `hvp` / `directional_nth_grad`, pyrlx bindings.
 
-See also `rlx-autodiff/README.md` (API), `PLAN.md` (landed higher-order
-section), and `rlx-bench/examples/bench_nth_order.rs`.
+See also `rlx-autodiff/README.md` (API) and
+`rlx-bench/examples/bench_nth_order.rs`.
 ## License
 
 MIT OR Apache-2.0.

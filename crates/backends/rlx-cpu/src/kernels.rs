@@ -4,7 +4,7 @@
 
 //! SIMD kernels for fused operations.
 //!
-//! These are the production kernels extracted from burnembed's ndarray_fused.rs.
+//! These are the production fused CPU kernels.
 //! Each kernel processes data in-place or into a pre-allocated output buffer
 //! (from the arena). No allocation.
 
@@ -43,12 +43,16 @@ pub unsafe fn neon_exp4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch6
 /// stays in the ~2e-7 range. Runtime-dispatch via `is_x86_feature_detected`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
+// Cody–Waite ln2 split (`ln2_hi`/`ln2_lo`) and the Taylor coefficients below are
+// written at full precision on purpose — each rounds to the intended nearest-f32,
+// and truncating the literals would move the hand-tuned polynomial. Silence the
+// pedantic precision lint rather than degrade the approximation.
+#[allow(unsafe_op_in_unsafe_fn, clippy::excessive_precision)]
 pub unsafe fn avx2_exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let x = _mm256_max_ps(x, _mm256_set1_ps(-87.3));
     let x = _mm256_min_ps(x, _mm256_set1_ps(88.7));
-    let inv_ln2 = _mm256_set1_ps(1.442695040888963);
+    let inv_ln2 = _mm256_set1_ps(std::f32::consts::LOG2_E);
     let ln2_hi = _mm256_set1_ps(0.693145751953125);
     let ln2_lo = _mm256_set1_ps(1.428606765330187e-6);
     // n = round(x / ln2)  (round-to-nearest-even)
@@ -812,7 +816,10 @@ pub fn gelu_inplace(data: &mut [f32]) {
 /// Erf-GELU via AVX2+FMA. Caller must have checked feature bits.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
+// a1..a5 are the Abramowitz & Stegun 7.1.26 erf coefficients — published
+// full-precision values whose nearest-f32 is exactly what we want. Keep the
+// literals verbatim; the precision lint is a false positive here.
+#[allow(unsafe_op_in_unsafe_fn, clippy::excessive_precision)]
 unsafe fn gelu_inplace_avx2(data: &mut [f32]) {
     use std::arch::x86_64::*;
     let chunks = data.len() / 8;

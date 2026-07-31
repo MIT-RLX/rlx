@@ -72,9 +72,9 @@ impl DType {
 
     /// Promotion rank — higher means "wider, more expressive". The
     /// promoted dtype of a binary op is `max(rank(lhs), rank(rhs))`.
-    /// Borrowed from MAX's `dtype_promotion.py` pattern (#55 in
-    /// PLAN.md): one module owns the table; ops query it instead of
-    /// re-implementing ad-hoc rules.
+    /// Borrowed from MAX's `dtype_promotion.py` pattern: one module
+    /// owns the table; ops query it instead of re-implementing ad-hoc
+    /// rules.
     ///
     /// Ranks (low → high):
     ///   0 = Bool, 1 = U8/I8, 2 = I16/BF16, 3 = F16, 4 = U32/I32,

@@ -40,11 +40,11 @@ modules avoids the naming collision MAX hit by overloading "trace."
   have a validation target. Estimated 4-6 hours when there's a
   consumer.
 - **`weights.rs` is just a trait + a bytes loader.** The named
-  weights registry pattern (#24 in PLAN.md) — addressable handles,
+  weights registry pattern — addressable handles,
   ref counts, hot-swap LoRA — is the natural extension; not yet
   needed.
 - **No worker isolation.** Long-running serving paths probably
-  want a subprocess worker per request (#36 in PLAN.md). Today
+  want a subprocess worker per request. Today
   everything runs in-process; one bad model load takes the
   process down.
 

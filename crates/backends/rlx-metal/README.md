@@ -111,7 +111,7 @@ full GGUF env table.
 
 ## Status
 
-Mature for the BERT / Nomic inference path used in burnembed. ICB
+Mature for the BERT / Nomic inference path. ICB
 matmul + MPSGraph attention are production. Tier-2 fused ops
 (FusedAttnBlock, FusedBertLayer) work; FusedNomicLayer is disabled
 pending a SwiGLU stride fix (see `thunk.rs:3315`).

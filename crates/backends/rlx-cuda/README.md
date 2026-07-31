@@ -74,6 +74,12 @@ self-hosted Linux box.
 
 - `device.rs` — `CudaContext` singleton with panic-catching init so a
   missing libcuda returns `None` instead of crashing.
+- `nvml.rs` — NVML (`libnvidia-ml.so`) libloading shim for read-only
+  telemetry (`sample(index)`: temp, power, cap, fan, SM clock, util) and
+  root-only control (`set_power_cap` / `set_locked_clocks` /
+  `set_fan_percent` + resets, `power_cap_range`). Surfaced cross-backend
+  via `rlx_runtime::device_thermal`; drives the `rlx-gpu` CLI. Returns
+  `None` cleanly without an NVIDIA driver.
 - `arena.rs` — single device buffer + per-node offsets, mirroring the
   rlx-wgpu f32-uniform arena. Reshape and Cast alias the input slot.
   Process-wide f32 buffer pool (cap 16) for reuse across executables.

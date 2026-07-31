@@ -1120,6 +1120,8 @@ pub enum Thunk {
         seq: u32,
         heads: u32,
         state_size: u32,
+        /// When true (Kimi-K3 KDA), `g` is `[b, s, h, n]` (per key channel).
+        gate_per_channel: bool,
     },
 
     /// Multi-layer (optionally bidirectional, optional carry) LSTM with

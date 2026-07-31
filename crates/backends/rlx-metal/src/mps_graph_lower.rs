@@ -962,7 +962,22 @@ pub fn try_lower_with_constants(
                 for &in_id in &node.inputs {
                     refs.push(node_to_tensor.get(&in_id)?);
                 }
-                mg.concat(&refs, *axis as i32)
+                // MPSGraph left-pads lower-rank RLX tensors with leading batch
+                // dims (IR `[R,D]` → MPS `[1,R,D]`). The IR `axis` is relative to
+                // the IR rank, so rebase it by the leading-dim difference — same
+                // as the `Op::Narrow` lowering. Without this a 2-D last-axis
+                // concat (e.g. the dense-MLP `gate || up`) lands on the row axis,
+                // giving `[1,2R,D]`; a following last-axis narrow then slices the
+                // size-`D` axis at `start=D` and MPSGraph errors "start N does not
+                // fit dimension size N". No-op when ranks already match.
+                let mut ax = *axis as u64;
+                let ir_rank = graph.node(node.inputs[0]).shape.rank();
+                if let Some(mr) = refs[0].mps_rank()
+                    && mr > ir_rank
+                {
+                    ax += (mr - ir_rank) as u64;
+                }
+                mg.concat(&refs, ax as i32)
             }
             Op::Attention {
                 num_heads,

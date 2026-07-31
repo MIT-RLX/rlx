@@ -76,6 +76,8 @@ fn parity(scheme_id: u32, packed: &[u8], elems: usize, tol: f32, name: &str) {
         22 => rlx_gguf::dequant_q5_0(packed, elems).unwrap(),
         23 => rlx_gguf::dequant_q5_1(packed, elems).unwrap(),
         24 => rlx_gguf::q1_dequant::dequant_q1_0(packed, elems).unwrap(),
+        26 => rlx_gguf::fv5_dequant::dequant_fv5(packed, elems).unwrap(),
+        27 => rlx_gguf::fv5_dequant::dequant_fv5b(packed, elems).unwrap(),
         _ => panic!("bad scheme_id {scheme_id}"),
     };
     assert_eq!(metal_out.len(), elems);
@@ -166,6 +168,75 @@ fn q1_0_msl_matches_cpu_reference() {
     parity(24, &packed, 16 * 128, 1e-4, "Q1_0");
 }
 
+/// Pack one FV5 block (104 bytes) from 256 five-value codes in {-2,-1,0,1,2}.
+fn pack_fv5_block(codes: &[i8], s_lo: f32, s_hi: f32) -> Vec<u8> {
+    let mut b = vec![0u8; 104];
+    b[0..4].copy_from_slice(&s_lo.to_le_bytes());
+    b[4..8].copy_from_slice(&s_hi.to_le_bytes());
+    for (j, &c) in codes.iter().enumerate() {
+        let byte = j / 8;
+        let bit = 1u8 << (j % 8);
+        let (p, ng, hi) = match c {
+            1 => (true, false, false),
+            2 => (true, false, true),
+            -1 => (false, true, false),
+            -2 => (false, true, true),
+            _ => (false, false, false),
+        };
+        if p {
+            b[8 + byte] |= bit;
+        }
+        if ng {
+            b[40 + byte] |= bit;
+        }
+        if hi {
+            b[72 + byte] |= bit;
+        }
+    }
+    b
+}
+
+/// Pack one FV5B block (260 bytes): one f32 scale + 256 int8 codes.
+fn pack_fv5b_block(qs: &[i8], s: f32) -> Vec<u8> {
+    let mut b = vec![0u8; 260];
+    b[0..4].copy_from_slice(&s.to_le_bytes());
+    for (i, &q) in qs.iter().enumerate() {
+        b[4 + i] = q as u8;
+    }
+    b
+}
+
+#[test]
+fn fv5_msl_matches_cpu_reference() {
+    let mut packed = Vec::new();
+    for blk in 0..4usize {
+        let codes: [i8; 256] = std::array::from_fn(|j| match (j + blk) % 5 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => -1,
+            _ => -2,
+        });
+        packed.extend_from_slice(&pack_fv5_block(
+            &codes,
+            0.05 * (blk as f32 + 1.0),
+            0.2 * (blk as f32 + 1.0),
+        ));
+    }
+    parity(26, &packed, 1024, 1e-6, "FV5");
+}
+
+#[test]
+fn fv5b_msl_matches_cpu_reference() {
+    let mut packed = Vec::new();
+    for blk in 0..4usize {
+        let qs: [i8; 256] =
+            std::array::from_fn(|i| ((i as i32 * 7 + blk as i32) % 251 - 125) as i8);
+        packed.extend_from_slice(&pack_fv5b_block(&qs, 0.03 * (blk as f32 + 1.0)));
+    }
+    parity(27, &packed, 1024, 1e-6, "FV5B");
+}
+
 #[test]
 fn has_metal_dequant_kernel_q8_q4() {
     use rlx_ir::quant::QuantScheme;
@@ -180,5 +251,11 @@ fn has_metal_dequant_kernel_q8_q4() {
     ));
     assert!(rlx_metal::backend::has_metal_dequant_kernel(
         QuantScheme::GgufQ5_0
+    ));
+    assert!(rlx_metal::backend::has_metal_dequant_kernel(
+        QuantScheme::GgufFV5
+    ));
+    assert!(rlx_metal::backend::has_metal_dequant_kernel(
+        QuantScheme::GgufFV5B
     ));
 }

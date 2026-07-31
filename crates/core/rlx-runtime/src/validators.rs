@@ -15,7 +15,7 @@
 //!   - Adding a rule = one function, not editing a monolith.
 //!   - Easy to test rules in isolation.
 //!
-//! Used by future serving paths (#31, #32 in PLAN.md). Today the
+//! Used by future serving paths. Today the
 //! benchmark runners can use it for input sanity checks.
 
 use std::fmt;

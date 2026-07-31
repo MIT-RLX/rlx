@@ -2375,6 +2375,7 @@ fn gated_delta_net_matches_cpu_reference() {
         Op::GatedDeltaNet {
             state_size: n,
             carry_state: false,
+            gate_per_channel: false,
         },
         vec![q, k, v, g_in, beta],
         bshn,

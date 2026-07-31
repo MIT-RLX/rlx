@@ -29,4 +29,40 @@ pub fn gdn_step_blas(
     crate::blas::sgemv_at(s_mat, q_row, out_row, n, scale, 0.0);
 }
 
+/// One recurrent timestep with a **per-channel** log-gate (Kimi-K3 KDA): the
+/// state decays per key-row `S[i, j] *= exp(g_row[i])` instead of by a single
+/// scalar `exp(g_t)`. `g_row` has length `n` (one log-gate per key channel).
+/// Everything else matches [`gdn_step_blas`].
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_step_blas_pc(
+    s_mat: &mut [f32],
+    q_row: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    g_row: &[f32],
+    beta_t: f32,
+    out_row: &mut [f32],
+    sk_buf: &mut [f32],
+    n: usize,
+    scale: f32,
+) {
+    debug_assert!(n <= MAX_STATE);
+    debug_assert!(g_row.len() >= n);
+    // S[i, j] *= exp(g_row[i]) — decay the key dimension (rows) per channel.
+    for i in 0..n {
+        let a = g_row[i].exp();
+        let row = &mut s_mat[i * n..i * n + n];
+        for x in row.iter_mut() {
+            *x *= a;
+        }
+    }
+    crate::blas::sgemv_at(s_mat, k_row, sk_buf, n, 1.0, 0.0);
+    for j in 0..n {
+        sk_buf[j] = (v_row[j] - sk_buf[j]) * beta_t;
+    }
+    crate::blas::sger(s_mat, k_row, sk_buf, n, 1.0);
+    crate::blas::sgemv_at(s_mat, q_row, out_row, n, scale, 0.0);
+}
+
 pub const GDN_MAX_STATE: usize = MAX_STATE;

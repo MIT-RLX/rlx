@@ -3426,6 +3426,7 @@ impl CudaExecutable {
                     state_size,
                     use_carry,
                     use_gpu,
+                    gate_per_channel,
                 } => {
                     let state_bytes = if *use_carry {
                         *state_byte_off as usize
@@ -3452,6 +3453,7 @@ impl CudaExecutable {
                         let state_off = (state_bytes / 4) as u64;
                         let dst_off = *dst_byte_off / 4;
                         let use_carry_u: u32 = if *use_carry { 1 } else { 0 };
+                        let gate_pc_u: u32 = if *gate_per_channel { 1 } else { 0 };
                         let mut launcher = stream.launch_builder(&kernel.function);
                         launcher
                             .arg(self.arena.f32_buf_mut())
@@ -3466,7 +3468,8 @@ impl CudaExecutable {
                             .arg(seq)
                             .arg(heads)
                             .arg(state_size)
-                            .arg(&use_carry_u);
+                            .arg(&use_carry_u)
+                            .arg(&gate_pc_u);
                         unsafe {
                             launcher
                                 .launch(cfg)
@@ -3491,6 +3494,7 @@ impl CudaExecutable {
                             *heads as usize,
                             *state_size as usize,
                             *use_carry,
+                            *gate_per_channel,
                         );
                     }
                 }

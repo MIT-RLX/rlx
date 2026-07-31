@@ -2959,6 +2959,7 @@ impl WgpuExecutable {
                         params.heads as usize,
                         params.state_size as usize,
                         params.use_carry != 0,
+                        params.gate_per_channel != 0,
                     );
                 }
                 Step::GatedDeltaNet { use_gpu: true, .. } => {

@@ -88,6 +88,7 @@ members = [
     "crates/numerics/rlx-rl",          # Flow-map policies + FMQ / QGBS (offline-to-online RL)
     "crates/numerics/rlx-bbo",         # Black-box + trust-region Q-guidance / QGBS (domain-agnostic f64)
     "crates/numerics/rlx-umap",        # UMAP / fast-umap custom ops (k-NN from pairwise distances, …)
+    "crates/numerics/rlx-geo",         # Exact integer Delaunay + discrete Voronoi custom ops (per-backend)
 
     # Benchmark framework (PLAN L5)
     "crates/tooling/rlx-bench",       # BenchmarkPattern + per-backend timing harness

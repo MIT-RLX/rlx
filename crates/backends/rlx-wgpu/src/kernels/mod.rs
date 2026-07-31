@@ -1489,7 +1489,8 @@ pub struct GatedDeltaNetParams {
     pub use_carry: u32,
     /// PLAN L1 — full-extent seq stride for per-batch offset math.
     pub seq_stride: u32,
-    pub _p1: u32,
+    /// 1 = per-channel gate (`g` is `[b,s,h,n]`, Kimi-K3 KDA); 0 = per-head scalar.
+    pub gate_per_channel: u32,
     pub _p2: u32,
     pub _p3: u32,
 }

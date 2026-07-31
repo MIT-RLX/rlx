@@ -2409,6 +2409,7 @@ impl ThunkSchedule {
                 Op::GatedDeltaNet {
                     state_size,
                     carry_state,
+                    gate_per_channel,
                 } => {
                     let q_shape = &graph.node(node.inputs[0]).shape;
                     let q_f16 = matches!(q_shape.dtype(), rlx_ir::DType::F16);
@@ -2426,6 +2427,7 @@ impl ThunkSchedule {
                         heads: q_shape.dim(2).unwrap_static() as u32,
                         state_size: *state_size as u32,
                         f16: q_f16,
+                        gate_per_channel: *gate_per_channel,
                     }
                 }
 

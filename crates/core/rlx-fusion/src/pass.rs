@@ -58,7 +58,7 @@ pub fn run_registered_ir_passes(mut graph: Graph) -> Graph {
 /// When `RLX_FUSION_REPORT=1`, prints a [`fusion_report::FusionReport`]
 /// comparing the input graph to the fused result.
 ///
-/// In debug builds, the verifier (#50 in PLAN.md, lifted from MAX) runs
+/// In debug builds, the verifier (lifted from MAX) runs
 /// after every pass via [`rlx_ir::debug_assert_valid!`] — so any optimizer
 /// bug that introduces a malformed graph is caught at the boundary where it
 /// was introduced. In release builds the check is not compiled in.
