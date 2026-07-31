@@ -159,13 +159,14 @@ pub fn run_gated_delta_net<A: DeviceArena>(
             v_byte_off,
             g_byte_off,
             beta_byte_off,
-            if use_carry { state_byte_off } else { 0 },
+            state_byte_off,
             dst_byte_off,
             batch,
             seq,
             heads,
             state_size,
             gate_per_channel,
+            use_carry,
             host.as_mut_ptr(),
         );
     });

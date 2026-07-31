@@ -1043,6 +1043,9 @@ pub enum Thunk {
         f16: bool,
         /// 1 = per-channel gate (`g` is `[b,s,h,n]`, Kimi-K3 KDA).
         gate_per_channel: bool,
+        /// Resume from / write back the external `state` (decode). Explicit flag,
+        /// not `state != 0` — arena offset 0 is a valid state slot.
+        carry_state: bool,
     },
     /// Mamba selective scan. Native MSL kernel (`selective_scan`) for f32
     /// with `state_size ≤ 128`; host fallback otherwise.

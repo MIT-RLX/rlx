@@ -73,7 +73,7 @@ memory-latency-bound floor.
 
 ### How the parallel path was sped up (profiled at 200k)
 
-`prepare` (sort) → `par build` (chunks) → concat+trunk merge → `export`. The build
+`prepare` (sort) → `par build` (chunks) → concat → trunk merge → `export`. The build
 parallelizes ~7× (47 → 6 ms); the serial tails were the target:
 
 - **`export` parallelized** — each thread scans a disjoint dart range and emits a
@@ -98,9 +98,28 @@ parallelizes ~7× (47 → 6 ms); the serial tails were the target:
   in the parallel path too. Fast path only (16-bit Morton); the wide path keeps
   the x-cut build. Validated against the reference (`tests/dwyer.rs`).
 
-With Dwyer, `geo_fastest` **beats tuned C++ at ≤ 100k** and is **~1.5× at 200k,
-~1.9× at 1M** — down from 3.3–7.6× at the start. The residual gap is inner-loop
-constant factor + the parallel Morton-sort-per-chunk overhead.
+- **Shared-arena concat + parallel trunk merge** — profiling the old
+  `concat+trunk merge` line as one number hid where the cost was: at 1M the copy
+  was only ~0.75 ms while the *serial* left-fold trunk merge was ~2.2 ms. The
+  copy now scatters each piece into a disjoint window of one shared buffer in
+  parallel (the `bucket_sort` raw-pointer pattern). The merge became a **balanced
+  tree reduction** (`merge_tree_par`): each level stitches adjacent pairs
+  concurrently (odd tail carries up), halving the serial chain. All sibling
+  merges share one dart buffer — new edges bump-allocate from a single
+  `AtomicU32` cursor, deletes go on a per-merge free list, and a barrier between
+  levels orders the dependents; since siblings touch disjoint sub-triangulations
+  and claim disjoint cursor slots, the shared raw pointer is only ever
+  dereferenced at non-overlapping addresses (sound, lock-free). Trunk merge 1M:
+  **2.2 → 0.85 ms** (~2.6×). Validated race-free (25× full-Delaunay validation +
+  serial/parallel count parity at 200k/1M); bump high-water stays at ~6.0
+  darts/point, far under the reserved cap.
+
+With these, `geo_fastest` **beats tuned C++ at ≤ 50k**, **crushes the fastest
+public Rust library `delaunator` (S-hull) ~9× at 1M** (it's single-threaded), and
+is **~1.5× behind C++ at 1M** — down from 3.3–7.6× at the start. The residual gap
+is now almost entirely the memory-latency-bound `par build` (~15 ms at 1M); an
+AoS dart layout was tried and measured neutral, confirming the build is at the
+cache-miss frontier rather than a layout or serial-tail problem.
 
 So the auto-dispatched CPU-parallel path went from ~3.3× behind to **≤ 1× at 50k
 and ~2× at 1M**, ~4× faster than the serial port, and orders of magnitude faster

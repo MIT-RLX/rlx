@@ -1112,8 +1112,9 @@ pub enum Thunk {
         v: usize,
         g: usize,
         beta: usize,
-        /// When non-zero, load initial `[b, h, n, n]` state and write
-        /// the final state back in place after the scan.
+        /// Arena offset of the initial `[b, h, n, n]` state (valid only when
+        /// `carry_state`; may legitimately be 0). When carrying, the initial
+        /// state is loaded from here and the final state written back in place.
         state: usize,
         dst: usize,
         batch: u32,
@@ -1122,6 +1123,9 @@ pub enum Thunk {
         state_size: u32,
         /// When true (Kimi-K3 KDA), `g` is `[b, s, h, n]` (per key channel).
         gate_per_channel: bool,
+        /// When true, resume from / write back the external `state` (decode).
+        /// An explicit flag — NOT `state != 0`, since offset 0 is a valid slot.
+        carry_state: bool,
     },
 
     /// Multi-layer (optionally bidirectional, optional carry) LSTM with
@@ -2814,10 +2818,11 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             g,
             beta,
             state,
+            carry_state,
             ..
         } => {
             let mut v = vec![*q, *k, *v, *g, *beta];
-            if *state != 0 {
+            if *carry_state {
                 v.push(*state);
             }
             v

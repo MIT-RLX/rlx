@@ -2428,6 +2428,7 @@ impl ThunkSchedule {
                         state_size: *state_size as u32,
                         f16: q_f16,
                         gate_per_channel: *gate_per_channel,
+                        carry_state: *carry_state,
                     }
                 }
 

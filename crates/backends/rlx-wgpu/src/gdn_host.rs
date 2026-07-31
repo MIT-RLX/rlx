@@ -120,13 +120,14 @@ pub fn run_gated_delta_net(
             v_h,
             g_h,
             beta_h,
-            if use_carry { state_h } else { 0 },
+            state_h,
             dst_h,
             batch,
             seq,
             heads,
             state_size,
             gate_per_channel,
+            use_carry,
             host.as_mut_ptr(),
         );
     }

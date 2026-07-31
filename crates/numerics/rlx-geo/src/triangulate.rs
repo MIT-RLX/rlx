@@ -7,6 +7,7 @@
 
 use crate::predicates::{Pred, PredFast, PredWide, PredicateWidth, predicate_width};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const DELETED: u32 = u32::MAX;
 
@@ -289,7 +290,7 @@ fn run_par<P: Pred>(coord: &[[i32; 2]], orig: &[u32], threads: usize, out: &mut 
         .collect();
     let prof = std::env::var_os("GEO_PROF").is_some();
     let tb = std::time::Instant::now();
-    let mut pieces: Vec<Piece> = std::thread::scope(|s| {
+    let pieces: Vec<Piece> = std::thread::scope(|s| {
         let handles: Vec<_> = bounds
             .iter()
             .map(|&(lo, hi)| s.spawn(move || build_piece::<P>(coord, lo, hi)))
@@ -302,27 +303,63 @@ fn run_par<P: Pred>(coord: &[[i32; 2]], orig: &[u32], threads: usize, out: &mut 
             tb.elapsed().as_secs_f64() * 1e3
         );
     }
+    // Shared-arena concat: instead of copying each piece into `acc` serially
+    // (~3 ms at 1M), assign every piece a disjoint window in one buffer and let
+    // the threads scatter-copy into their windows in parallel — the same
+    // raw-pointer/disjoint-range pattern proven in `bucket_sort_by_x`.
     let tm = std::time::Instant::now();
-    let total: usize = pieces.iter().map(|p| p.darts.len()).sum::<usize>() + m * 2;
-    let mut acc = Arena::<P>::with_capacity(coord, total);
-    let mut drain = pieces.drain(..);
-    let first = drain.next().unwrap();
-    let (mut le, mut re) = (first.le, first.re);
-    acc.append_piece(first);
-    for p in drain {
-        let base = acc.len();
-        let (ple, pre) = (p.le + base, p.re + base);
-        acc.append_piece(p);
-        let (nle, nre) = acc.merge(le, re, ple, pre);
-        le = nle;
-        re = nre;
+    let np = pieces.len();
+    let mut base = vec![0u32; np + 1]; // window starts (dart units), prefix sum
+    for (i, p) in pieces.iter().enumerate() {
+        base[i + 1] = base[i] + p.darts.len() as u32;
     }
+    let total = base[np] as usize;
+    // Headroom for seam edges. Parallel merges each keep a private free list, so
+    // they reuse fewer deleted slots than the serial single-list path — reserve
+    // generously (bump stays far below this; overflow would panic, not corrupt).
+    let cap = total + m * 4;
+    let mut darts: Vec<[u32; 3]> = Vec::with_capacity(cap);
+    let base_addr = darts.as_mut_ptr() as usize; // usize is Send+Copy
+    std::thread::scope(|s| {
+        for (i, p) in pieces.iter().enumerate() {
+            let b = base[i];
+            let src = &p.darts; // &Vec is Copy; window [b, b+len) is disjoint
+            s.spawn(move || {
+                let ptr = base_addr as *mut [u32; 3];
+                // org (0) is a global site id; next/prev (1,2) shift by the base.
+                for (k, &[o, nx, pv]) in src.iter().enumerate() {
+                    unsafe { ptr.add(b as usize + k).write([o, nx + b, pv + b]) };
+                }
+            });
+        }
+    });
+    // Every slot in [0, total) was written exactly once (windows tile the range).
+    unsafe { darts.set_len(total) };
     if prof {
         eprintln!(
-            "  concat+trunk merge:     {:.2} ms",
+            "  par concat ({np} pieces):  {:.2} ms",
             tm.elapsed().as_secs_f64() * 1e3
         );
     }
+    let tmm = std::time::Instant::now();
+    // Parallel trunk merge: stitch the x-adjacent pieces via a balanced tree.
+    let hulls: Vec<(u32, u32)> = (0..np)
+        .map(|i| (pieces[i].le + base[i], pieces[i].re + base[i]))
+        .collect();
+    merge_tree_par::<P>(coord, &mut darts, hulls, total as u32, cap as u32);
+    if prof {
+        eprintln!(
+            "  par trunk merge:        {:.2} ms  (darts {})",
+            tmm.elapsed().as_secs_f64() * 1e3,
+            darts.len()
+        );
+    }
+    let acc = Arena::<P> {
+        coord,
+        darts,
+        free: Vec::new(),
+        _p: PhantomData,
+    };
     let te = std::time::Instant::now();
     acc.export_par(orig, threads, out);
     if prof {
@@ -374,19 +411,6 @@ impl<'c, P: Pred> Arena<'c, P> {
             free: Vec::new(),
             _p: PhantomData,
         }
-    }
-
-    #[inline(always)]
-    fn len(&self) -> u32 {
-        self.darts.len() as u32
-    }
-
-    /// Append a finished piece; dart links are shifted by the current base.
-    fn append_piece(&mut self, p: Piece) {
-        let base = self.darts.len() as u32;
-        // org (index 0) is a site id — unchanged; next/prev (1,2) shift by base.
-        self.darts
-            .extend(p.darts.iter().map(|&[o, n, pr]| [o, n + base, pr + base]));
     }
 
     fn into_piece(self, le: u32, re: u32) -> Piece {
@@ -654,6 +678,255 @@ impl<'c, P: Pred> Arena<'c, P> {
             out.extend_from_slice(p);
         }
     }
+}
+
+// ============================================================================
+// Parallel trunk merge (tree reduction)
+// ============================================================================
+
+/// A single Guibas-Stolfi merge running against a *shared* dart buffer. New
+/// edges are bump-allocated from one atomic cursor; deleted slots go on a
+/// **private** free list. Within a merge-tree level, sibling merges touch
+/// disjoint sub-triangulations and claim disjoint cursor slots, so the shared
+/// raw pointer is only ever dereferenced at non-overlapping addresses — sound
+/// without locking. A barrier between levels orders the dependent merges.
+struct MergeCtx<'c, P: Pred> {
+    coord: &'c [[i32; 2]],
+    base: *mut [u32; 3], // whole shared buffer; indices are global
+    cap: u32,            // buffer capacity (bump must stay below this)
+    cursor: &'c AtomicU32,
+    free: Vec<u32>, // even bases this merge deleted, reused before bumping
+    _p: PhantomData<P>,
+}
+
+impl<'c, P: Pred> MergeCtx<'c, P> {
+    #[inline(always)]
+    fn d(&self, e: u32) -> &[u32; 3] {
+        unsafe { &*self.base.add(e as usize) }
+    }
+    // Interior mutation through the shared raw buffer: `&self` returns `&mut` by
+    // design (see the type doc — sibling merges write disjoint, non-overlapping
+    // slots, so this is sound without `&mut self` serializing them).
+    #[allow(clippy::mut_from_ref)]
+    #[inline(always)]
+    fn dm(&self, e: u32) -> &mut [u32; 3] {
+        unsafe { &mut *self.base.add(e as usize) }
+    }
+    #[inline(always)]
+    fn sym(e: u32) -> u32 {
+        e ^ 1
+    }
+    #[inline(always)]
+    fn org(&self, e: u32) -> u32 {
+        self.d(e)[0]
+    }
+    #[inline(always)]
+    fn dest(&self, e: u32) -> u32 {
+        self.d(e ^ 1)[0]
+    }
+    #[inline(always)]
+    fn onext(&self, e: u32) -> u32 {
+        self.d(e)[1]
+    }
+    #[inline(always)]
+    fn oprev(&self, e: u32) -> u32 {
+        self.d(e)[2]
+    }
+    #[inline(always)]
+    fn lnext(&self, e: u32) -> u32 {
+        self.d(e ^ 1)[2]
+    }
+    #[inline(always)]
+    fn rprev(&self, e: u32) -> u32 {
+        self.d(e ^ 1)[1]
+    }
+
+    fn make_edge(&mut self, a: u32, b: u32) -> u32 {
+        let e = if let Some(e) = self.free.pop() {
+            e
+        } else {
+            let e = self.cursor.fetch_add(2, Ordering::Relaxed);
+            // Fail loud (panic, not OOB write) if the slack is exhausted — the
+            // caller sizes `cap` well above the seam edges a merge can create.
+            assert!(e + 1 < self.cap, "merge_tree_par: dart buffer overflow");
+            e
+        };
+        *self.dm(e) = [a, e, e];
+        *self.dm(e + 1) = [b, e + 1, e + 1];
+        e
+    }
+    fn splice(&self, a: u32, b: u32) {
+        let an = self.onext(a);
+        let bn = self.onext(b);
+        self.dm(a)[1] = bn;
+        self.dm(bn)[2] = a;
+        self.dm(b)[1] = an;
+        self.dm(an)[2] = b;
+    }
+    fn connect(&mut self, a: u32, b: u32) -> u32 {
+        let e = self.make_edge(self.dest(a), self.org(b));
+        let la = self.lnext(a);
+        self.splice(e, la);
+        let s = Self::sym(e);
+        self.splice(s, b);
+        e
+    }
+    fn delete_edge(&mut self, e: u32) {
+        let op = self.oprev(e);
+        self.splice(e, op);
+        let se = Self::sym(e);
+        let ops = self.oprev(se);
+        self.splice(se, ops);
+        let base = e & !1;
+        self.dm(base)[0] = DELETED;
+        self.dm(base | 1)[0] = DELETED;
+        self.free.push(base);
+    }
+
+    #[inline(always)]
+    fn pt(&self, s: u32) -> [i32; 2] {
+        unsafe { *self.coord.get_unchecked(s as usize) }
+    }
+    #[inline(always)]
+    fn orient3(&self, a: u32, b: u32, c: u32) -> i32 {
+        P::orient(self.pt(a), self.pt(b), self.pt(c))
+    }
+    #[inline(always)]
+    fn in_circle4(&self, a: u32, b: u32, c: u32, d: u32) -> bool {
+        P::in_circle(self.pt(a), self.pt(b), self.pt(c), self.pt(d)) > 0
+    }
+    #[inline(always)]
+    fn left_of(&self, x: u32, e: u32) -> bool {
+        self.orient3(x, self.org(e), self.dest(e)) > 0
+    }
+    #[inline(always)]
+    fn right_of(&self, x: u32, e: u32) -> bool {
+        self.orient3(x, self.dest(e), self.org(e)) > 0
+    }
+
+    /// Guibas-Stolfi merge (identical logic to `Arena::merge`); returns the
+    /// combined region's outer (left, right) hull darts.
+    fn merge(&mut self, mut ldo: u32, mut ldi: u32, mut rdi: u32, mut rdo: u32) -> (u32, u32) {
+        loop {
+            if self.left_of(self.org(rdi), ldi) {
+                ldi = self.lnext(ldi);
+            } else if self.right_of(self.org(ldi), rdi) {
+                rdi = self.rprev(rdi);
+            } else {
+                break;
+            }
+        }
+        let mut basel = self.connect(Self::sym(rdi), ldi);
+        if self.org(ldi) == self.org(ldo) {
+            ldo = Self::sym(basel);
+        }
+        if self.org(rdi) == self.org(rdo) {
+            rdo = basel;
+        }
+        loop {
+            let db = self.dest(basel);
+            let ob = self.org(basel);
+            let sb = Self::sym(basel);
+
+            let mut lcand = self.onext(sb);
+            let mut l_valid = self.orient3(self.dest(lcand), db, ob) > 0;
+            if l_valid {
+                loop {
+                    let ln = self.onext(lcand);
+                    if self.in_circle4(db, ob, self.dest(lcand), self.dest(ln)) {
+                        self.delete_edge(lcand);
+                        lcand = ln;
+                    } else {
+                        break;
+                    }
+                }
+                l_valid = self.orient3(self.dest(lcand), db, ob) > 0;
+            }
+
+            let mut rcand = self.oprev(basel);
+            let mut r_valid = self.orient3(self.dest(rcand), db, ob) > 0;
+            if r_valid {
+                loop {
+                    let rp = self.oprev(rcand);
+                    if self.in_circle4(db, ob, self.dest(rcand), self.dest(rp)) {
+                        self.delete_edge(rcand);
+                        rcand = rp;
+                    } else {
+                        break;
+                    }
+                }
+                r_valid = self.orient3(self.dest(rcand), db, ob) > 0;
+            }
+
+            if !l_valid && !r_valid {
+                break;
+            }
+            if !l_valid
+                || (r_valid
+                    && self.in_circle4(
+                        self.dest(lcand),
+                        self.org(lcand),
+                        self.org(rcand),
+                        self.dest(rcand),
+                    ))
+            {
+                basel = self.connect(rcand, sb);
+            } else {
+                basel = self.connect(sb, Self::sym(lcand));
+            }
+        }
+        (ldo, rdo)
+    }
+}
+
+/// Stitch x-adjacent pieces (each `(xl, xr)` in `nodes`, global dart indices)
+/// into one Delaunay triangulation via a **balanced tree of merges**: each level
+/// merges adjacent pairs concurrently (an odd tail carries up), halving the
+/// serial merge chain. All merges share `darts` (pre-reserved to `cap`); the
+/// atomic cursor hands out fresh dart slots. Sets `darts.len()` to the final
+/// high-water mark. `total` is the count of already-placed piece darts.
+fn merge_tree_par<P: Pred>(
+    coord: &[[i32; 2]],
+    darts: &mut Vec<[u32; 3]>,
+    mut nodes: Vec<(u32, u32)>,
+    total: u32,
+    cap: u32,
+) {
+    let cursor = AtomicU32::new(total);
+    let base_addr = darts.as_mut_ptr() as usize; // usize is Send+Copy
+    while nodes.len() > 1 {
+        let m = nodes.len();
+        let npairs = m / 2;
+        let mut next: Vec<(u32, u32)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..npairs)
+                .map(|k| {
+                    let l = nodes[2 * k];
+                    let r = nodes[2 * k + 1];
+                    let cur = &cursor;
+                    s.spawn(move || {
+                        let mut ctx = MergeCtx::<P> {
+                            coord,
+                            base: base_addr as *mut [u32; 3],
+                            cap,
+                            cursor: cur,
+                            free: Vec::new(),
+                            _p: PhantomData,
+                        };
+                        ctx.merge(l.0, l.1, r.0, r.1)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        if m % 2 == 1 {
+            next.push(nodes[m - 1]); // odd tail: carry the rightmost node up
+        }
+        nodes = next;
+    }
+    // Every slot in [0, hw) is initialized: [0, total) by the concat, and each
+    // bump in [total, hw) is written inside make_edge before any navigation.
+    let hw = cursor.load(Ordering::Relaxed) as usize;
+    unsafe { darts.set_len(hw) };
 }
 
 // ============================================================================

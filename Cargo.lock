@@ -7735,6 +7735,10 @@ name = "rlx-lfm"
 version = "0.2.14"
 
 [[patch.unused]]
+name = "rlx-lfm-vl"
+version = "0.2.14"
+
+[[patch.unused]]
 name = "rlx-llada2"
 version = "0.2.14"
 
@@ -7744,6 +7748,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-llama32"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-llama4"
 version = "0.2.14"
 
 [[patch.unused]]
@@ -7791,6 +7799,14 @@ name = "rlx-mistral"
 version = "0.2.14"
 
 [[patch.unused]]
+name = "rlx-mistral-vl"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-mllama"
+version = "0.2.14"
+
+[[patch.unused]]
 name = "rlx-models"
 version = "0.2.14"
 
@@ -7824,6 +7840,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-nemotron-asr"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-neutrino"
 version = "0.2.14"
 
 [[patch.unused]]
@@ -7880,6 +7900,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-qwen3-tts"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-qwen3-vl"
 version = "0.2.14"
 
 [[patch.unused]]
@@ -7960,6 +7984,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-vjepa2"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-vlm-base"
 version = "0.2.14"
 
 [[patch.unused]]
@@ -8135,6 +8163,10 @@ name = "rlx-lfm"
 version = "0.2.14"
 
 [[patch.unused]]
+name = "rlx-lfm-vl"
+version = "0.2.14"
+
+[[patch.unused]]
 name = "rlx-llada2"
 version = "0.2.14"
 
@@ -8144,6 +8176,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-llama32"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-llama4"
 version = "0.2.14"
 
 [[patch.unused]]
@@ -8191,6 +8227,14 @@ name = "rlx-mistral"
 version = "0.2.14"
 
 [[patch.unused]]
+name = "rlx-mistral-vl"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-mllama"
+version = "0.2.14"
+
+[[patch.unused]]
 name = "rlx-models"
 version = "0.2.14"
 
@@ -8224,6 +8268,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-nemotron-asr"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-neutrino"
 version = "0.2.14"
 
 [[patch.unused]]
@@ -8280,6 +8328,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-qwen3-tts"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-qwen3-vl"
 version = "0.2.14"
 
 [[patch.unused]]
@@ -8360,6 +8412,10 @@ version = "0.2.14"
 
 [[patch.unused]]
 name = "rlx-vjepa2"
+version = "0.2.14"
+
+[[patch.unused]]
+name = "rlx-vlm-base"
 version = "0.2.14"
 
 [[patch.unused]]

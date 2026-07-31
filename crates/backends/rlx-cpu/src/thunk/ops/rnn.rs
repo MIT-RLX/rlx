@@ -154,6 +154,7 @@ pub(crate) fn compile_gated_delta_net(
             heads: heads as u32,
             state_size: *state_size as u32,
             gate_per_channel: *gate_per_channel,
+            carry_state: *carry_state,
         }
     }
 }
@@ -1390,6 +1391,7 @@ pub(crate) fn exec_gated_delta_net(t: &Thunk, base: *mut u8) {
         heads,
         state_size,
         gate_per_channel,
+        carry_state,
     } = t
     else {
         unreachable!()
@@ -1408,6 +1410,7 @@ pub(crate) fn exec_gated_delta_net(t: &Thunk, base: *mut u8) {
             *heads as usize,
             *state_size as usize,
             *gate_per_channel,
+            *carry_state,
             base,
         );
     }
@@ -2290,6 +2293,7 @@ pub unsafe fn execute_gated_delta_net_f32(
     heads: usize,
     state_size: usize,
     gate_per_channel: bool,
+    carry_state: bool,
     base: *mut u8,
 ) {
     #[derive(Copy, Clone)]
@@ -2307,7 +2311,7 @@ pub unsafe fn execute_gated_delta_net_f32(
         let arena = ArenaPtr(base as usize);
         let (b, s, h, n) = (batch, seq, heads, state_size);
         let scale = 1.0f32 / (n as f32).sqrt();
-        let use_external = state != 0;
+        let use_external = carry_state;
         let mut owned_state = vec![0f32; h * n * n];
 
         crate::pool::num_threads();

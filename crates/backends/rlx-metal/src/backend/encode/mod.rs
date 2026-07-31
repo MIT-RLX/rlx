@@ -210,6 +210,7 @@ impl MetalExecutable {
                 state_size: u32,
                 f16: bool,
                 gate_per_channel: bool,
+                carry_state: bool,
             },
             SelectiveScan {
                 x: usize,
@@ -592,6 +593,7 @@ impl MetalExecutable {
                             state_size,
                             f16,
                             gate_per_channel,
+                            carry_state,
                         } => unsafe {
                             if f16 {
                                 rlx_cpu::thunk::execute_gated_delta_net_f16(
@@ -622,6 +624,7 @@ impl MetalExecutable {
                                     heads as usize,
                                     state_size as usize,
                                     gate_per_channel,
+                                    carry_state,
                                     arena_ptr,
                                 );
                             }
@@ -5728,13 +5731,14 @@ impl MetalExecutable {
                     state_size,
                     f16,
                     gate_per_channel,
+                    carry_state,
                 } => {
                     // Native MSL GDN (one thread per head). Opt out with
                     // RLX_METAL_GDN_HOST_FALLBACK=1 / RLX_METAL_GDN_CPU=1.
                     let force_host = rlx_ir::env::flag("RLX_METAL_GDN_HOST_FALLBACK")
                         || rlx_ir::env::flag("RLX_METAL_GDN_CPU");
                     let prefer_cpu_blas = false;
-                    let use_carry = *state != 0;
+                    let use_carry = *carry_state;
                     // Prefill (`!use_carry`): native MSL needs an ephemeral scratch
                     // slot (zeroed inside the kernel). Host CPU GDN treats any
                     // nonzero `state` as a live carry — reusing the shared scratch
@@ -5786,6 +5790,7 @@ impl MetalExecutable {
                             state_size: *state_size,
                             f16: *f16,
                             gate_per_channel: *gate_per_channel,
+                            carry_state: *carry_state,
                         });
                     }
                 }

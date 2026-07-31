@@ -1007,6 +1007,22 @@ pub trait HirGraphExt {
         state_size: usize,
         shape: Shape,
     ) -> HirNodeId;
+
+    /// Per-channel gated delta-net with a carried recurrent state — Kimi-K3 KDA
+    /// **decode**. Threads `state` `[b, h, n, n]` in and writes the updated state
+    /// back to it, so a chunk/step continues where the previous one left off
+    /// (O(1) per step instead of re-scanning the whole sequence).
+    fn gated_delta_net_carry_pc(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        g: HirNodeId,
+        beta: HirNodeId,
+        state: HirNodeId,
+        state_size: usize,
+        shape: Shape,
+    ) -> HirNodeId;
 }
 
 impl HirGraphExt for HirMut<'_> {
@@ -1438,6 +1454,20 @@ impl HirGraphExt for HirMut<'_> {
         shape: Shape,
     ) -> HirNodeId {
         HirModule::gated_delta_net_pc(self.0, q, k, v, g, beta, state_size, shape)
+    }
+
+    fn gated_delta_net_carry_pc(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        g: HirNodeId,
+        beta: HirNodeId,
+        state: HirNodeId,
+        state_size: usize,
+        shape: Shape,
+    ) -> HirNodeId {
+        HirModule::gated_delta_net_carry_pc(self.0, q, k, v, g, beta, state, state_size, shape)
     }
 }
 
