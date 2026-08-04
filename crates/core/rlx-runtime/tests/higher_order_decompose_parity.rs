@@ -411,6 +411,7 @@ fn build_attention_rank3_loss() -> Graph {
         Op::Attention {
             num_heads: 2,
             head_dim: 2,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -442,6 +443,7 @@ fn build_attention_loss(mask_kind: MaskKind) -> Graph {
         rlx_ir::Op::Attention {
             num_heads: H,
             head_dim: D,
+            v_head_dim: None,
             mask_kind,
             score_scale: None,
             attn_logit_softcap: None,

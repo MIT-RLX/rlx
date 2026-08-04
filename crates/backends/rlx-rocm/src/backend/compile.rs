@@ -25,6 +25,26 @@ use std::sync::Mutex;
 
 use super::*;
 
+/// Resolve `RLX_ROCM_EXEC` (`graph` | `ms<N>` | `stream`) over the caller's
+/// default, so hipGraph capture / multi-stream are reachable without new API.
+fn resolve_rocm_exec_mode(default: ExecMode) -> ExecMode {
+    match rlx_ir::env::var("RLX_ROCM_EXEC") {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            if v == "graph" {
+                ExecMode::Graph
+            } else if v == "stream" {
+                ExecMode::Stream
+            } else if let Some(n) = v.strip_prefix("ms") {
+                ExecMode::MultiStream(n.parse().unwrap_or(2).max(1))
+            } else {
+                default
+            }
+        }
+        None => default,
+    }
+}
+
 impl RocmExecutable {
     /// JIT compile, stream-mode execution. Default entry point.
     pub fn compile(graph: Graph) -> Self {
@@ -47,6 +67,12 @@ impl RocmExecutable {
         exec_mode: ExecMode,
         rng: rlx_ir::RngOptions,
     ) -> Self {
+        // `RLX_ROCM_EXEC` lets any caller opt into hipGraph capture (`graph`) or
+        // multi-stream (`msN`) without new API — the default Session path hardcodes
+        // Stream. Graph REPLAY collapses a decode forward's ~1400 per-op kernel
+        // launches into a single graph launch: the big win for launch-overhead-bound
+        // (memory-bound) inference. Capture-unsafe schedules fall back automatically.
+        let exec_mode = resolve_rocm_exec_mode(exec_mode);
         let ctx = rocm_context().expect("rlx-rocm: no HIP runtime available");
 
         if compile_mode == CompileMode::Aot {
@@ -221,6 +247,46 @@ impl RocmExecutable {
                             bias_off_f32: bias_byte / 4,
                         });
                     }
+                }
+                Op::ScaledGroupedMatMul {
+                    lhs_format,
+                    rhs_format,
+                    scale_layout,
+                    has_bias,
+                } => {
+                    // input [M,K], weight [E,N,K] (TN), expert_idx [M]; out [M,N].
+                    // Memory-sane on-device decode-GEMM: only the routed expert's
+                    // FP4 codes are read per token (no f32 weight materialization).
+                    let in_dims = graph.node(node.inputs[0]).shape.dims();
+                    let w_dims = graph.node(node.inputs[1]).shape.dims();
+                    let m = in_dims[0].unwrap_static() as u32;
+                    let k = in_dims[1].unwrap_static() as u32;
+                    let ne = w_dims[0].unwrap_static() as u32;
+                    let n = w_dims[w_dims.len() - 2].unwrap_static() as u32;
+                    let bias_byte = if *has_bias {
+                        arena.offset(node.inputs[5]) as u32
+                    } else {
+                        0
+                    };
+                    let (scale_mode, block) = scale_layout.mode_block();
+                    schedule.push(Step::ScaledGroupedMatMulDecode {
+                        m,
+                        k,
+                        n,
+                        num_experts: ne,
+                        input_byte_off: arena.offset(node.inputs[0]) as u32,
+                        weight_byte_off: arena.offset(node.inputs[1]) as u32,
+                        input_scale_byte_off: arena.offset(node.inputs[2]) as u32,
+                        weight_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                        idx_off_f32: (arena.offset(node.inputs[4]) / 4) as u32,
+                        out_off_f32: (arena.offset(node.id) / 4) as u32,
+                        bias_off_f32: bias_byte / 4,
+                        lhs_fmt: lhs_format.kernel_id(),
+                        rhs_fmt: rhs_format.kernel_id(),
+                        scale_mode,
+                        block,
+                        has_bias: u32::from(*has_bias),
+                    });
                 }
                 Op::ScaledQuantScale {
                     format,
@@ -642,15 +708,35 @@ impl RocmExecutable {
                 } => {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
-                    if axes.len() != 1 || axes[0] != in_dims.len() - 1 {
+                    let rank = in_dims.len();
+                    // The reduce kernel collapses a CONTIGUOUS TRAILING block of
+                    // `inner` elements per `outer` slice. A single last axis is the
+                    // common case, but a contiguous *suffix* of axes (e.g. [1,2] on
+                    // rank 3 — reduce the last two dims, as in global mean/pool or a
+                    // LayerNorm variance) maps to the very same kernel with
+                    // inner = ∏(trailing dims), outer = ∏(leading dims). Reduction is
+                    // commutative over axes, so sort a copy before checking.
+                    let mut sorted: Vec<usize> = axes.to_vec();
+                    sorted.sort_unstable();
+                    let is_trailing_suffix = !sorted.is_empty()
+                        && *sorted.last().unwrap() == rank - 1
+                        && sorted
+                            .iter()
+                            .enumerate()
+                            .all(|(i, &a)| a == rank - sorted.len() + i);
+                    if !is_trailing_suffix {
                         panic!(
-                            "rlx-rocm Reduce: only single last-axis supported \
-                                (got axes={axes:?}, rank={})",
-                            in_dims.len()
+                            "rlx-rocm Reduce: only a contiguous trailing axis block is \
+                                supported (got axes={axes:?}, rank={rank})"
                         );
                     }
-                    let inner = in_dims.last().unwrap().unwrap_static() as u32;
-                    let outer = in_dims[..in_dims.len() - 1]
+                    let split = rank - sorted.len();
+                    let inner = in_dims[split..]
+                        .iter()
+                        .map(|d| d.unwrap_static() as u32)
+                        .product::<u32>()
+                        .max(1);
+                    let outer = in_dims[..split]
                         .iter()
                         .map(|d| d.unwrap_static() as u32)
                         .product::<u32>()
@@ -765,7 +851,9 @@ impl RocmExecutable {
                     let outer = total / inner.max(1);
                     let is_layer = matches!(&node.op, Op::LayerNorm { .. });
                     let gamma_id = node.inputs[1];
-                    let beta_id = if is_layer && node.inputs.len() >= 3 {
+                    // Both LayerNorm and RmsNorm carry beta (inputs[2]); the
+                    // RmsNorm kernel branch now adds it (matches the CPU oracle).
+                    let beta_id = if node.inputs.len() >= 3 {
                         node.inputs[2]
                     } else {
                         gamma_id
@@ -1228,10 +1316,15 @@ impl RocmExecutable {
                 Op::Attention {
                     num_heads,
                     head_dim,
+                    v_head_dim,
                     mask_kind,
                     score_scale: _,
                     attn_logit_softcap,
                 } => {
+                    assert!(
+                        v_head_dim.is_none_or(|v| v == *head_dim),
+                        "rlx-rocm: asymmetric v_head_dim (MLA) not yet supported"
+                    );
                     let q_id = node.inputs[0];
                     let k_id = node.inputs[1];
                     let v_id = node.inputs[2];
@@ -1402,7 +1495,7 @@ impl RocmExecutable {
                 }
                 Op::Rope {
                     head_dim,
-                    n_rot: _,
+                    n_rot,
                     style,
                 } => {
                     let x_id = node.inputs[0];
@@ -1430,6 +1523,9 @@ impl RocmExecutable {
                         seq,
                         head_dim: *head_dim as u32,
                         half: (*head_dim / 2) as u32,
+                        // Partial rotary: rotate only n_rot dims (Gemma); == half for
+                        // full rope (qwen/llama). Mirrors rlx-cuda's Step::Rope.
+                        rot_half: (*n_rot / 2) as u32,
                         in_off: (arena.offset(x_id) / 4) as u32,
                         cos_off: (arena.offset(cos_id) / 4) as u32,
                         sin_off: (arena.offset(sin_id) / 4) as u32,
@@ -1640,6 +1736,52 @@ impl RocmExecutable {
                         idx_byte_off: arena.offset(idx_id) as u32,
                         out_byte_off: arena.offset(node.id) as u32,
                     });
+                }
+                Op::DequantGroupedMatMulMlx { scheme } => {
+                    // 5 inputs: input, w_q, scales, biases/zp, expert_idx. Host-delegated
+                    // (mirrors CUDA — no native grouped-MLX ROCm kernel yet).
+                    let in_id = node.inputs[0];
+                    let in_dims = graph.node(in_id).shape.dims();
+                    let out_dims = node.shape.dims();
+                    let m = in_dims[in_dims.len() - 2].unwrap_static() as u32;
+                    let k = in_dims[in_dims.len() - 1].unwrap_static() as u32;
+                    let n = out_dims[out_dims.len() - 1].unwrap_static() as u32;
+                    let scale_id = node.inputs[2];
+                    let ne = graph.node(scale_id).shape.dims()[0].unwrap_static() as u32;
+                    // MXFP4 experts → native on-device decode-GEMM (register nibble-decode,
+                    // no host round-trip); affine → host-delegate. Scales are f32 in the arena.
+                    if let rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size } = scheme {
+                        schedule.push(Step::DequantGroupedMatmulMlxNative {
+                            m,
+                            k,
+                            n,
+                            num_experts: ne,
+                            group_size: *group_size,
+                            x_byte_off: arena.offset(in_id) as u32,
+                            w_byte_off: arena.offset(node.inputs[1]) as u32,
+                            scale_byte_off: arena.offset(scale_id) as u32,
+                            idx_byte_off: arena.offset(node.inputs[4]) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                        });
+                    } else {
+                        schedule.push(Step::DequantGroupedMatmulMlxHost {
+                            m,
+                            k,
+                            n,
+                            num_experts: ne,
+                            scheme: *scheme,
+                            x_byte_off: arena.offset(in_id) as u32,
+                            w_byte_off: arena.offset(node.inputs[1]) as u32,
+                            scale_byte_off: arena.offset(scale_id) as u32,
+                            zp_byte_off: arena.offset(node.inputs[3]) as u32,
+                            idx_byte_off: arena.offset(node.inputs[4]) as u32,
+                            out_byte_off: arena.offset(node.id) as u32,
+                            // BF16 scale params are WIDENED to f32 in this backend's main arena
+                            // (mirrors rlx-cuda) — the host-delegate reads the f32 main buffer, so
+                            // it must read f32, never bf16 (graph dtype BF16 → every-other value=0).
+                            scale_bf16: false,
+                        });
+                    }
                 }
                 Op::SelectiveScan { state_size } => {
                     if *state_size > 256 {
@@ -1973,6 +2115,12 @@ impl RocmExecutable {
                             *hidden_size,
                         );
                     if native {
+                        // Carry (h0) is native now: seed from inputs[5] when set.
+                        let h0_byte_off = if *carry {
+                            arena.offset(node.inputs[5]) as u32
+                        } else {
+                            0
+                        };
                         schedule.push(Step::Gru {
                             x_byte_off: arena.offset(node.inputs[0]) as u32,
                             w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
@@ -1984,6 +2132,9 @@ impl RocmExecutable {
                             seq,
                             input_size,
                             hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            h0_byte_off,
                         });
                     } else {
                         let h0 = if *carry {
@@ -2030,6 +2181,11 @@ impl RocmExecutable {
                             *hidden_size,
                         );
                     if native {
+                        let h0_byte_off = if *carry {
+                            arena.offset(node.inputs[4]) as u32
+                        } else {
+                            0u32
+                        };
                         schedule.push(Step::Rnn {
                             x_byte_off: arena.offset(node.inputs[0]) as u32,
                             w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
@@ -2040,6 +2196,9 @@ impl RocmExecutable {
                             seq,
                             input_size,
                             hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            h0_byte_off,
                             relu: *relu,
                         });
                     } else {
@@ -3862,6 +4021,8 @@ impl RocmExecutable {
             input_staging,
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
+            kv_row_feeds: HashMap::new(),
+            gpu_handle_resident: std::collections::HashSet::new(),
             pending_read_indices: None,
             input_slot_names,
             input_slots,

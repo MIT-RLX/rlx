@@ -186,6 +186,9 @@ pub fn maybe_log_fusion(report: &FusionReport) {
     if rlx_ir::env::flag("RLX_FUSION_REPORT") {
         eprintln!("{report}");
     }
+    // Structured mirror for the observability/audit spine (no-op unless the
+    // `tracing` feature is on). Metadata only — fusion stats, never tensor data.
+    crate::obs::event("compile.fusion", format_args!("{report}"));
 }
 
 /// Extract the optimized graph from LIR (convenience for backends that

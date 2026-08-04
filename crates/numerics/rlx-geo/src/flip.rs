@@ -176,10 +176,62 @@ pub fn hull_seed(points: &[[i32; 2]]) -> Vec<[u32; 3]> {
     if n < 3 {
         return Vec::new();
     }
+    let _sp = std::env::var_os("GEO_SEED_PROF").is_some();
+    let _t = std::time::Instant::now();
     let v = coords(points);
+    if _sp {
+        eprintln!(
+            "  [seed] coords: {:.2} ms",
+            _t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let _t = std::time::Instant::now();
+    // Sort ids by (x,y). The old comparison sort was O(n log n) with a random
+    // gather per compare (~40 ms at 1M — most of the seed cost); an LSD radix on a
+    // monotone-packed u64 key is O(n) and cache-linear. Pack x,y (each i32, biased
+    // by 2^31 to stay unsigned-monotone) into one u64 so byte order == (x,y) order.
+    let key = |i: u32| -> u64 {
+        let p = points[i as usize];
+        (((p[0] as i64 + (1 << 31)) as u64) << 32) | ((p[1] as i64 + (1 << 31)) as u64)
+    };
     let mut order: Vec<u32> = (0..n as u32).collect();
-    order.sort_by(|&a, &b| v[a as usize].cmp(&v[b as usize]));
+    let mut keys: Vec<u64> = order.iter().map(|&i| key(i)).collect();
+    {
+        const RADIX: usize = 1 << 11;
+        const MASK: u64 = (RADIX as u64) - 1;
+        let maxkey = keys.iter().copied().max().unwrap_or(0);
+        let mut order2 = vec![0u32; n];
+        let mut keys2 = vec![0u64; n];
+        let mut shift = 0u32;
+        while shift < 64 && (maxkey >> shift) != 0 {
+            let mut cnt = [0u32; RADIX + 1];
+            for &k in &keys {
+                cnt[((k >> shift) & MASK) as usize + 1] += 1;
+            }
+            for i in 0..RADIX {
+                cnt[i + 1] += cnt[i];
+            }
+            for i in 0..n {
+                let d = ((keys[i] >> shift) & MASK) as usize;
+                let p = cnt[d] as usize;
+                cnt[d] += 1;
+                order2[p] = order[i];
+                keys2[p] = keys[i];
+            }
+            std::mem::swap(&mut order, &mut order2);
+            std::mem::swap(&mut keys, &mut keys2);
+            shift += 11;
+        }
+    }
+    // Duplicates are now adjacent (equal packed key ⇒ identical point) — dedup them.
     order.dedup_by(|a, b| v[*a as usize] == v[*b as usize]);
+    if _sp {
+        eprintln!(
+            "  [seed] radix sort+dedup: {:.2} ms",
+            _t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let _t = std::time::Instant::now();
     if order.len() < 3 {
         return Vec::new();
     }
@@ -199,70 +251,114 @@ pub fn hull_seed(points: &[[i32; 2]]) -> Vec<[u32; 3]> {
         return Vec::new(); // all collinear
     }
     let apex = order[k];
-    let mut tris: Vec<[u32; 3]> = Vec::new();
+    // A triangulation of m points has ≤ 2m triangles — pre-size to avoid ~2n reallocs
+    // (each grow copies the whole [u32;3] buffer; ~15 ms at 1M otherwise).
+    let mut tris: Vec<[u32; 3]> = Vec::with_capacity(2 * order.len());
     for t in 0..k - 1 {
         tris.push(ccw3(order[t], order[t + 1], apex, &v));
     }
-    // Hull CCW: the collinear chain order[0..k] plus the apex. order[0] and
-    // order[k-1] are the extremes; walk one side of the chain then the apex.
-    let mut hull: Vec<u32> = Vec::with_capacity(k + 1);
-    if orient(
-        v[order[0] as usize],
-        v[order[k - 1] as usize],
-        v[apex as usize],
-    ) > 0
+    // Hull as a CCW doubly-linked ring over vertex ids (`next`/`prev` indexed by id).
+    // The old version stored the hull as a Vec and, for every inserted point, did a
+    // FULL O(m) visibility rescan + O(m) rebuild — O(n·m) i128 `orient`s (≈180 ms at
+    // 1M, worse than the whole Delaunay). The ring updates the visible arc in O(1)
+    // amortised: each point starts the search at the previous insertion (`last`, which
+    // is almost always on the visible/right side since points arrive in x-order), then
+    // the interior of the visible arc is spliced out — every vertex is linked once and
+    // unlinked at most once, so total work is O(n) beyond the sort.
+    let mut next = vec![0u32; n];
+    let mut prev = vec![0u32; n];
     {
-        hull.extend_from_slice(&order[0..k]); // 0..k-1 then apex
-        hull.push(apex);
-    } else {
-        for t in (0..k).rev() {
-            hull.push(order[t]);
+        let mut ring: Vec<u32> = Vec::with_capacity(k + 1);
+        if orient(
+            v[order[0] as usize],
+            v[order[k - 1] as usize],
+            v[apex as usize],
+        ) > 0
+        {
+            ring.extend_from_slice(&order[0..k]); // 0..k-1 then apex
+            ring.push(apex);
+        } else {
+            for t in (0..k).rev() {
+                ring.push(order[t]);
+            }
+            ring.push(apex);
         }
-        hull.push(apex);
+        let h = ring.len();
+        for i in 0..h {
+            let a = ring[i] as usize;
+            next[a] = ring[(i + 1) % h];
+            prev[ring[(i + 1) % h] as usize] = ring[i];
+        }
     }
+    let mut last = apex; // last-inserted vertex; always a live hull vertex
 
+    // Exact i64 cross product for the sweep. hull_seed's inputs satisfy span ≤
+    // MAX_COORDINATE_SPAN (≈1.94e9), so |orient| ≤ 2·(1.94e9)² ≈ 7.5e18 < i64::MAX —
+    // the full-width i128 predicate is unnecessary here and ~2× more expensive.
+    let ori = |a: [i64; 2], b: [i64; 2], c: [i64; 2]| -> i64 {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
     for &p in &order[k + 1..] {
-        insert_hull_point(p, &mut hull, &mut tris, &v);
+        let pu = p as usize;
+        // Locate one visible edge (`s`, next[`s`]): CCW edge `a→b` is visible from p
+        // iff p is to its right, ori(a,b,p) < 0. Fast path: one of `last`'s two
+        // incident edges. Fallback (degenerate, e.g. x-ties): scan the ring once.
+        let nl = next[last as usize];
+        let pl = prev[last as usize];
+        let s;
+        if ori(v[last as usize], v[nl as usize], v[pu]) < 0 {
+            s = last;
+        } else if ori(v[pl as usize], v[last as usize], v[pu]) < 0 {
+            s = pl;
+        } else {
+            let mut x = nl;
+            let mut found = None;
+            while x != last {
+                if ori(v[x as usize], v[next[x as usize] as usize], v[pu]) < 0 {
+                    found = Some(x);
+                    break;
+                }
+                x = next[x as usize];
+            }
+            match found {
+                Some(x) => s = x,
+                None => continue, // p sees no edge (not strictly outside) — skip
+            }
+        }
+        // Expand the (contiguous) visible arc: r forward, l backward, to the tangents.
+        let mut r = s;
+        while ori(v[r as usize], v[next[r as usize] as usize], v[pu]) < 0 {
+            r = next[r as usize];
+        }
+        let mut l = s;
+        while ori(v[prev[l as usize] as usize], v[l as usize], v[pu]) < 0 {
+            l = prev[l as usize];
+        }
+        // One triangle per visible edge (l → … → r), then splice p between the tangents
+        // (interior visible vertices fall out of the ring). Winding is known: the edge
+        // x→nx is visible (orient(x,nx,p) < 0), so (x, p, nx) is strictly CCW — emit it
+        // directly instead of calling ccw3 (which would recompute that orient: ~2n
+        // saved i128 predicates, ~half the sweep at 1M).
+        let mut x = l;
+        while x != r {
+            let nx = next[x as usize];
+            tris.push([x, p, nx]);
+            x = nx;
+        }
+        next[l as usize] = p;
+        prev[pu] = l;
+        next[pu] = r;
+        prev[r as usize] = p;
+        last = p;
+    }
+    if _sp {
+        eprintln!(
+            "  [seed] ring sweep: {:.2} ms ({} tris)",
+            _t.elapsed().as_secs_f64() * 1e3,
+            tris.len()
+        );
     }
     tris
-}
-
-fn insert_hull_point(p: u32, hull: &mut Vec<u32>, tris: &mut Vec<[u32; 3]>, v: &[[i64; 2]]) {
-    let m = hull.len();
-    let vis: Vec<bool> = (0..m)
-        .map(|i| {
-            orient(
-                v[hull[i] as usize],
-                v[hull[(i + 1) % m] as usize],
-                v[p as usize],
-            ) < 0
-        })
-        .collect();
-    let start = match (0..m).find(|&i| vis[i] && !vis[(i + m - 1) % m]) {
-        Some(s) => s,
-        None => return, // p not strictly outside (collinear/duplicate) — skip
-    };
-    let mut edges = Vec::new();
-    let mut i = start;
-    while vis[i] {
-        edges.push(i);
-        i = (i + 1) % m;
-    }
-    for &e in &edges {
-        tris.push(ccw3(hull[e], p, hull[(e + 1) % m], v));
-    }
-    let after = (edges.last().unwrap() + 1) % m; // first kept vertex past the chain
-    let mut nh = Vec::with_capacity(m);
-    let mut j = after;
-    loop {
-        nh.push(hull[j]);
-        if j == start {
-            break;
-        }
-        j = (j + 1) % m;
-    }
-    nh.push(p);
-    *hull = nh;
 }
 
 /// For each interior edge, the four points `[t0.0, t0.1, t0.2, q]` (CCW triangle

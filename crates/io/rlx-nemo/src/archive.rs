@@ -86,7 +86,9 @@ pub struct TarMember {
 
 #[inline]
 fn round_up_512(n: u64) -> u64 {
-    n.div_ceil(512) * 512
+    // Saturate: `n` is an untrusted tar size field, so `* 512` could otherwise
+    // overflow/wrap and drive the archive walker's position backwards.
+    n.div_ceil(512).saturating_mul(512)
 }
 
 fn parse_cstr(buf: &[u8]) -> String {
@@ -141,6 +143,20 @@ fn parse_pax_path(buf: &[u8]) -> Option<String> {
     None
 }
 
+/// Allocate and read exactly `len` bytes, but first reject a `len` that
+/// exceeds `avail` (the bytes that can possibly still remain in the file). A
+/// corrupt or hostile container header can otherwise declare a huge size and
+/// force a multi-GB speculative allocation before the (absent) backing bytes
+/// are ever read — a cheap denial-of-service.
+fn read_exact_bounded(file: &mut File, len: u64, avail: u64, what: &str) -> Result<Vec<u8>> {
+    if len > avail {
+        bail!("{what}: declared length {len} exceeds {avail} available byte(s)");
+    }
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 /// List every regular-file member of an uncompressed tar archive.
 ///
 /// Handles the `ustar` `prefix` field, GNU long names (`L`), and pax
@@ -153,7 +169,9 @@ pub fn list_tar(file: &mut File) -> Result<Vec<TarMember>> {
     let mut pax_path: Option<String> = None;
     let mut gnu_longname: Option<String> = None;
 
-    while pos + 512 <= total {
+    // `pos.checked_add(512)` guards against an untrusted-size-driven advance
+    // wrapping `pos` around u64 and re-entering the loop forever.
+    while pos.checked_add(512).is_some_and(|p| p <= total) {
         file.seek(SeekFrom::Start(pos))?;
         let mut hdr = [0u8; 512];
         file.read_exact(&mut hdr)?;
@@ -169,24 +187,24 @@ pub fn list_tar(file: &mut File) -> Result<Vec<TarMember>> {
 
         match typeflag {
             b'x' | b'X' => {
-                let mut data = vec![0u8; size as usize];
+                // `size` is an untrusted tar header field; bound it to the
+                // bytes actually left in the file before allocating.
                 file.seek(SeekFrom::Start(data_off))?;
-                file.read_exact(&mut data)?;
+                let data = read_exact_bounded(file, size, total - data_off, "tar pax header")?;
                 pax_path = parse_pax_path(&data);
-                pos = data_off + round_up_512(size);
+                pos = data_off.saturating_add(round_up_512(size));
                 continue;
             }
             b'L' => {
-                let mut data = vec![0u8; size as usize];
                 file.seek(SeekFrom::Start(data_off))?;
-                file.read_exact(&mut data)?;
+                let data = read_exact_bounded(file, size, total - data_off, "tar GNU long name")?;
                 gnu_longname = Some(parse_cstr(&data));
-                pos = data_off + round_up_512(size);
+                pos = data_off.saturating_add(round_up_512(size));
                 continue;
             }
             b'g' => {
                 // Global pax header — not relevant to a single .nemo.
-                pos = data_off + round_up_512(size);
+                pos = data_off.saturating_add(round_up_512(size));
                 continue;
             }
             _ => {}
@@ -215,17 +233,22 @@ pub fn list_tar(file: &mut File) -> Result<Vec<TarMember>> {
                 size,
             });
         }
-        pos = data_off + round_up_512(size);
+        pos = data_off.saturating_add(round_up_512(size));
     }
     Ok(members)
 }
 
 /// Read a small tar member fully into memory (config / tokenizer files).
 pub fn read_member(file: &mut File, m: &TarMember) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; m.size as usize];
+    // `m.size`/`m.offset` come from the untrusted tar header; bound the read
+    // to the bytes actually present so a bogus size can't trigger a giant
+    // up-front allocation.
+    let total = file.metadata()?.len();
+    let avail = total
+        .checked_sub(m.offset)
+        .ok_or_else(|| anyhow!("tar member {} starts past EOF", m.name))?;
     file.seek(SeekFrom::Start(m.offset))?;
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+    read_exact_bounded(file, m.size, avail, "tar member")
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -251,6 +274,17 @@ const CDH_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
 pub fn list_zip(file: &mut File, zip_start: u64, zip_size: u64) -> Result<Vec<ZipEntry>> {
     if zip_size < 22 {
         bail!("zip region too small ({zip_size} bytes)");
+    }
+    // The declared zip region comes from an untrusted outer container (a
+    // `.nemo` tar header). Reject a region that runs past EOF up front: this
+    // both avoids u64 overflow in the offset math below and keeps every
+    // subsequent length (tail scan, central directory) bounded by real bytes.
+    let file_len = file.metadata()?.len();
+    let zip_end = zip_start
+        .checked_add(zip_size)
+        .ok_or_else(|| anyhow!("zip: region offset overflow"))?;
+    if zip_end > file_len {
+        bail!("zip: region [{zip_start}..{zip_end}) exceeds file length {file_len}");
     }
     // Scan backwards for the End Of Central Directory record. Its max
     // distance from EOF is 22 (fixed part) + 65535 (max comment).
@@ -284,7 +318,12 @@ pub fn list_zip(file: &mut File, zip_start: u64, zip_size: u64) -> Result<Vec<Zi
     file.seek(SeekFrom::Start(cd_abs))?;
     file.read_exact(&mut cd)?;
 
-    let mut entries = Vec::with_capacity(cd_count);
+    // `cd_count` is an untrusted u16; each central-directory header is at
+    // least 46 bytes, so the real entry count can't exceed `cd.len() / 46`.
+    // Clamp the capacity hint to that so a tiny directory claiming 65535
+    // entries can't force a multi-MB speculative allocation (the loop below
+    // still self-bounds by bailing on the first malformed header).
+    let mut entries = Vec::with_capacity(cd_count.min(cd.len() / 46 + 1));
     let mut p = 0usize;
     for _ in 0..cd_count {
         if p + 46 > cd.len() || cd[p..p + 4] != CDH_SIG {
@@ -336,10 +375,14 @@ pub fn read_zip_entry(file: &mut File, entry: &ZipEntry) -> Result<Vec<u8>> {
             entry.method
         );
     }
-    let mut buf = vec![0u8; entry.size as usize];
+    // `entry.size` is the central-directory-declared length (untrusted);
+    // bound it to the bytes actually present before allocating.
+    let total = file.metadata()?.len();
+    let avail = total
+        .checked_sub(entry.data_offset)
+        .ok_or_else(|| anyhow!("zip entry {} starts past EOF", entry.name))?;
     file.seek(SeekFrom::Start(entry.data_offset))?;
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+    read_exact_bounded(file, entry.size, avail, "zip entry")
 }
 
 #[cfg(test)]

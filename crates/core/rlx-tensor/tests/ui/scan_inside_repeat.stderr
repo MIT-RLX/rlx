@@ -1,0 +1,5 @@
+error: `scan` is not allowed inside `repeat`
+ --> tests/ui/scan_inside_repeat.rs:8:18
+  |
+8 |             scan h = x for 3 { let h = h @ w; }
+  |                  ^

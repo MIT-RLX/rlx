@@ -77,7 +77,7 @@ impl Pred for PredFast {
     }
 }
 
-/// Wide path: orientation in i64 (safe to ~3e9 span), in-circle in i128.
+/// Wide path: orientation in i64 (safe to ~3e9 span), in-circle mostly in i64.
 pub(crate) struct PredWide;
 impl Pred for PredWide {
     const USE_MORTON: bool = false;
@@ -85,8 +85,31 @@ impl Pred for PredWide {
     fn orient(a: [i32; 2], b: [i32; 2], c: [i32; 2]) -> i32 {
         orient_body!(i64, a, b, c)
     }
+    // Ablation build (`--features abl_slowpred`): the naive all-i128 determinant,
+    // to measure the i64-inner form's contribution. Identical result, ~2.5× more
+    // wide multiplies.
+    #[cfg(feature = "abl_slowpred")]
     #[inline(always)]
     fn in_circle(a: [i32; 2], b: [i32; 2], c: [i32; 2], d: [i32; 2]) -> i32 {
         in_circle_body!(i128, a, b, c, d)
+    }
+
+    #[cfg(not(feature = "abl_slowpred"))]
+    #[inline(always)]
+    fn in_circle(a: [i32; 2], b: [i32; 2], c: [i32; 2], d: [i32; 2]) -> i32 {
+        let ax = a[0] as i64 - d[0] as i64;
+        let ay = a[1] as i64 - d[1] as i64;
+        let bx = b[0] as i64 - d[0] as i64;
+        let by = b[1] as i64 - d[1] as i64;
+        let cx = c[0] as i64 - d[0] as i64;
+        let cy = c[1] as i64 - d[1] as i64;
+        let sa = ax * ax + ay * ay;
+        let sb = bx * bx + by * by;
+        let sc = cx * cx + cy * cy;
+        let bc = bx * cy - cx * by;
+        let ac = ax * cy - cx * ay;
+        let ab = ax * by - bx * ay;
+        let det = sa as i128 * bc as i128 - sb as i128 * ac as i128 + sc as i128 * ab as i128;
+        (det > 0) as i32 - (det < 0) as i32
     }
 }

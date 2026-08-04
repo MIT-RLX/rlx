@@ -1058,6 +1058,9 @@ fn resolve_dim_ir(v: &serde_json::Value, opts: &ImportOptions) -> Result<Dim> {
         // graph-split boundary dim (e.g. Kokoro decoder `unk__368`=total_frames,
         // `unk__357`=batch) is honored before any heuristic (or the `unk__` bail).
         serde_json::Value::String(s) if opts.named_lengths.contains_key(s.as_str()) => {
+            if std::env::var_os("RLX_DIM_DBG").is_some() {
+                eprintln!("[dim] '{s}' -> named {}", opts.named_lengths[s.as_str()]);
+            }
             Ok(Dim::Static(opts.named_lengths[s.as_str()]))
         }
         serde_json::Value::String(s) => match s.as_str() {

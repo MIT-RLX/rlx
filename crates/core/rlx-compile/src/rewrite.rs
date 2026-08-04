@@ -17,13 +17,20 @@ use rlx_fusion::lower_cumulative::LowerCumulative;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
 use rlx_fusion::lower_fake_quantize::LowerFakeQuantize;
 use rlx_fusion::lower_fma::LowerFma;
+use rlx_fusion::lower_histogram::LowerHistogram;
 use rlx_fusion::lower_logical_kernels;
 use rlx_fusion::lower_loss_ops::LowerSoftmaxCrossEntropy;
 use rlx_fusion::lower_pad::LowerPad;
 use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
+use rlx_fusion::lower_scaled_grouped_matmul::LowerScaledGroupedMatMul;
 use rlx_fusion::lower_slice::LowerSlice;
 use rlx_fusion::lower_spectral::LowerSpectral;
+use rlx_fusion::lower_spline_activation::LowerSplineActivation;
+use rlx_fusion::lower_spline_backward::LowerSplineActivationBackward;
 use rlx_fusion::lower_structural::LowerStructural;
+use rlx_fusion::lower_synth_matmul::LowerSynthMatMul;
+use rlx_fusion::lower_synth_matmul_backward::LowerSynthMatMulBackward;
+use rlx_fusion::lower_synth_reconstruct::LowerSynthReconstruct;
 use rlx_fusion::lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNearest2x};
 use rlx_fusion::pass::Pass;
 use rlx_fusion::unfuse::unfuse_fused_for_autodiff;
@@ -269,8 +276,55 @@ pub fn rewrite_for_backend_with_config(
             graph = LowerCumulative.run(graph);
             changed = true;
         }
+        if bad.contains(&OpKind::Histogram) {
+            // Only CPU claims Histogram natively; everywhere else it decomposes
+            // to Compare + mul + Reduce::Sum + Concat.
+            graph = LowerHistogram.run(graph);
+            changed = true;
+        }
         if bad.contains(&OpKind::DotGeneral) {
             graph = LowerDotGeneral.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::ScaledGroupedMatMul) {
+            // Backends without a native FP4-grouped kernel decompose to
+            // ScaledDequantize (both operands) + Transpose + GroupedMatMul
+            // (+ per-expert bias gather/add). Runs on every backend that
+            // supports the portable GroupedMatMul segmented GEMM.
+            graph = LowerScaledGroupedMatMul.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::SynthMatMul) {
+            // Backends without a native codebook-synthesis kernel decompose to
+            // Cast + Reshape + Gather (reconstruct the dense weight) + Transpose
+            // + MatMul. Runs on every backend with the portable MatMul.
+            graph = LowerSynthMatMul.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::SynthMatMulBackward) {
+            // Backends without the fused synth-backward kernel decompose it to the
+            // same primitives the generic VJP used to emit (Gather + MatMul +
+            // Transpose + ScatterAdd) — bit-identical, runs everywhere.
+            graph = LowerSynthMatMulBackward.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::SynthReconstruct) {
+            graph = LowerSynthReconstruct.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::SplineActivation) {
+            // Backends without a native KAN spline kernel decompose to the RBF
+            // basis expansion (Reshape/Expand/Sub/Mul/Exp) + ReduceSum. All-f32,
+            // so this runs on GPU backends too.
+            graph = LowerSplineActivation.run(graph);
+            changed = true;
+        }
+        if bad.contains(&OpKind::SplineActivationBackwardX)
+            || bad.contains(&OpKind::SplineActivationBackwardCoeff)
+        {
+            // Backends without the fused KAN spline-backward kernels decompose to
+            // the same RBF basis + contraction the generic VJP used to emit.
+            graph = LowerSplineActivationBackward.run(graph);
             changed = true;
         }
         if bad.contains(&OpKind::Fma) {

@@ -157,6 +157,8 @@ pub fn fastest_device_for_with_policy(
     #[cfg(feature = "gpu")]
     let wgpu = WgpuCostModel::new();
 
+    // Every push below is backend-cfg-gated; the backend-less build has none.
+    #[cfg_attr(not(feature = "cpu"), allow(unused_mut))]
     let mut models: Vec<&dyn BackendCostModel> = Vec::new();
     #[cfg(feature = "cpu")]
     if candidates.contains(&Device::Cpu) {

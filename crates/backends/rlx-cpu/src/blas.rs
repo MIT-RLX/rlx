@@ -1683,10 +1683,61 @@ fn transpose_to_col(a_row: &[f64], m: usize, n: usize) -> Vec<f64> {
 /// C = alpha * A @ B + beta * C
 ///
 /// A: [m, k] row-major
+/// Opt-in high-precision matmul accumulation (`RLX_CPU_MATMUL_F64_ACCUM=1`).
+///
+/// The default f32 GEMM accumulates the K-reduction in f32; for a long K (or a
+/// dequantized low-precision operand fed into the matmul) that rounding is the
+/// dominant avoidable error. When this flag is set, the affected GEMM entries
+/// promote to f64, accumulate via vendor `dgemm`, and narrow back — turning the
+/// K-reduction into an f64 sum. This is a *precision* mode (validated/parity
+/// runs), NOT a perf mode: it is DEFAULT-OFF so the vendor-BLAS fast path — the
+/// per-hardware peak — is completely untouched unless a user opts in. Cached
+/// once (set at process start, as for a validated pipeline).
+#[inline]
+pub(crate) fn f64_accum_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| rlx_ir::env_registry::flag("RLX_CPU_MATMUL_F64_ACCUM"))
+}
+
+/// `C = A@B` (or `C += A@B` when `accumulate`) with the K-reduction done in f64.
+/// Promote → vendor `dgemm` → narrow; the accumulate add is also f64 so an
+/// existing f32 `C` is folded in without a second rounding of the running sum.
+fn dgemm_f32_precise(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    accumulate: bool,
+) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    let a64: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+    let b64: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+    let mut c64 = vec![0f64; m * n];
+    dgemm(&a64, &b64, &mut c64, m, k, n);
+    if accumulate {
+        for (dst, &v) in c.iter_mut().zip(c64.iter()) {
+            *dst = (*dst as f64 + v) as f32;
+        }
+    } else {
+        for (dst, &v) in c.iter_mut().zip(c64.iter()) {
+            *dst = v as f32;
+        }
+    }
+}
+
 /// B: [k, n] row-major
 /// C: [m, n] row-major
 #[inline]
 pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    if f64_accum_enabled() {
+        dgemm_f32_precise(a, b, c, m, k, n, false);
+        return;
+    }
     unsafe {
         cblas_sgemm(
             ROW_MAJOR,
@@ -1710,6 +1761,10 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) 
 /// C += alpha * A @ B (accumulate into existing C)
 #[inline]
 pub fn sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    if f64_accum_enabled() {
+        dgemm_f32_precise(a, b, c, m, k, n, true);
+        return;
+    }
     unsafe {
         cblas_sgemm(
             ROW_MAJOR,
@@ -1733,6 +1788,12 @@ pub fn sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize,
 /// Like [`sgemm_accumulate`] with the same Rayon-split dispatch as [`sgemm_auto`].
 #[inline]
 pub fn sgemm_accumulate_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    // Precision mode wins over the parallel dispatch: the f64-accum path is
+    // serial (vendor `dgemm`), so route straight to it and skip `par_sgemm`.
+    if f64_accum_enabled() {
+        sgemm_accumulate(a, b, c, m, k, n);
+        return;
+    }
     // Defined below with `par_sgemm`; call via the public name once both are
     // in scope (same module — order-independent). Prefer parallel when large.
     if prefer_par_sgemm(m, k, n) {
@@ -2035,6 +2096,48 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
     {
         sgemm_via_gemm_crate(a, b, c, m, k, n);
         return;
+    }
+    // Direct ARM SME2 path (Apple M4+), opt-in via `RLX_CPU_SME=1`. Compiled
+    // only under `amx-sme` on Apple; `dispatch_enabled()` also checks the chip
+    // truly has SME2 at runtime. Placed after the parity-gemm early-return so
+    // bit-exact-candle intent still wins when both features are on.
+    #[cfg(all(rlx_cpu_amx_sme, not(feature = "parity-gemm")))]
+    {
+        if crate::intrinsics::apple_amx::sme::dispatch_enabled()
+            && crate::intrinsics::apple_amx::sme::worth_sme(m, k, n)
+        {
+            crate::intrinsics::apple_amx::sme::sme_sgemm(a, b, c, m, k, n);
+            return;
+        }
+    }
+    // Native SME bf16 path (Apple M4+, `amx-sme`), opt-in via `RLX_CPU_SME_BF16=1`.
+    // Our own bf16 GEMM (no vendor call); lossy f32→bf16 downcast so opt-in.
+    #[cfg(all(rlx_cpu_amx_sme, not(feature = "parity-gemm")))]
+    {
+        if crate::intrinsics::apple_amx::sme::bf16_dispatch_enabled()
+            && crate::intrinsics::apple_amx::sme::worth_sme(m, k, n)
+        {
+            crate::intrinsics::apple_amx::sme::sme_sgemm_bf16(a, b, c, m, k, n);
+            return;
+        }
+    }
+    // BNNS bf16 low-precision path (Apple, `amx-bnns`), opt-in via
+    // `RLX_CPU_BNNS_BF16=1`. Lossy (f32→bf16 downcast) so strictly opt-in; if
+    // BNNS rejects the shape it returns false and we fall through to Accelerate.
+    #[cfg(all(rlx_cpu_amx_bnns, not(feature = "parity-gemm")))]
+    {
+        // f16 (`F16F32`, 10 mantissa bits) — more precise than bf16 at the same
+        // half bandwidth; opt-in via `RLX_CPU_BNNS_F16=1`.
+        if crate::intrinsics::apple_amx::bnns::dispatch_enabled_f16()
+            && crate::intrinsics::apple_amx::bnns::matmul_f32_via_f16(a, b, c, m, k, n)
+        {
+            return;
+        }
+        if crate::intrinsics::apple_amx::bnns::dispatch_enabled()
+            && crate::intrinsics::apple_amx::bnns::matmul_f32_via_bf16(a, b, c, m, k, n)
+        {
+            return;
+        }
     }
     // `neon_sgemm_small` has a fixed `acc[8]` accumulator so m must be
     // ≤ 8. The cost model prefers NEON whenever its FLOP rate beats
@@ -2505,6 +2608,55 @@ mod tests {
         assert_eq!(c, [3.0, 4.0, 5.0, 6.0]);
     }
 
+    /// `RLX_CPU_MATMUL_F64_ACCUM` precise path (#6): the f64-accumulating GEMM
+    /// must reproduce an independent f64 reference bit-exactly after narrowing.
+    #[test]
+    fn dgemm_f32_precise_matches_f64_reference() {
+        // A few shapes incl. a long K (where f32 accumulation drifts most).
+        for &(m, k, n) in &[(2usize, 3usize, 4usize), (3, 512, 2), (1, 4096, 1)] {
+            let mut s: u32 = 0x1234_5678 ^ (k as u32);
+            let mut rng = || {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32) - 0.5
+            };
+            let a: Vec<f32> = (0..m * k).map(|_| rng()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| rng()).collect();
+            // Independent f64 oracle, narrowed to f32.
+            let mut want = vec![0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f64;
+                    for p in 0..k {
+                        acc += a[i * k + p] as f64 * b[p * n + j] as f64;
+                    }
+                    want[i * n + j] = acc as f32;
+                }
+            }
+            let mut got = vec![0f32; m * n];
+            dgemm_f32_precise(&a, &b, &mut got, m, k, n, false);
+            assert_eq!(got, want, "precise GEMM != f64 oracle at ({m},{k},{n})");
+        }
+    }
+
+    /// Catastrophic cancellation: the true result (1.0) is representable in f32
+    /// but a left-to-right f32 partial sum annihilates it (`2^24 + 1 - 2^24`).
+    /// The f64-accum path recovers it; this is the precision the knob buys.
+    #[test]
+    fn dgemm_f32_precise_survives_cancellation() {
+        let big = 16_777_216.0f32; // 2^24, where f32 ULP == 2
+        let a = [big, 1.0, -big]; // [1, 3]
+        let b = [1.0f32, 1.0, 1.0]; // [3, 1]
+        let mut c = [0.0f32];
+        dgemm_f32_precise(&a, &b, &mut c, 1, 3, 1, false);
+        assert_eq!(c[0], 1.0, "f64 accumulation should recover the exact 1.0");
+        // Accumulate mode folds an existing C in at f64 precision too.
+        let mut c2 = [10.0f32];
+        dgemm_f32_precise(&a, &b, &mut c2, 1, 3, 1, true);
+        assert_eq!(c2[0], 11.0);
+    }
+
     #[test]
     fn dgesv_2x2_known_solution() {
         // A = [[2, 1],
@@ -2591,5 +2743,167 @@ mod tests {
         let mut c = [0f32; 4];
         sgemm_bias_epilogue(&a, &b, &bias, &mut c, 2, 2, 2, |x| x.max(0.0));
         assert_eq!(c, [11.0, 102.0, 13.0, 104.0]);
+    }
+}
+
+/// bf16 bit-pattern → f32 (bf16 is the high 16 bits of an f32).
+/// (Only the non-aarch64 SAXPY fallback uses this scalar form; NEON inlines it.)
+#[inline]
+#[allow(dead_code)]
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// GEMM `C[m,n] = A[m,k] · Bᵀ` with a **B-transposed BF16** right-hand: `B` is
+/// `[N, K]` row-major (each output row `n` is a CONTIGUOUS `K`-vector — the raw HF
+/// `[vocab, hidden]` LM-head layout, so no transpose on load). `A`/`C` are f32.
+/// Dequants `B` on the fly (f32 accumulate), reading HALF the weight bytes of an
+/// f32 GEMM. Parallel over outputs `n`; each is an independent dot product
+/// `C[m,n] = Σ_k A[m,k]·bf16(B[n,k])` — `A` stays hot in cache, `B[n,:]` streams.
+/// The inner dot uses a 4-lane manual accumulator so the compiler can vectorize
+/// the FMA (the bf16→f32 widen is a single shift). Precision-approximate (bf16
+/// weights), NOT bit-exact to an f32 head.
+/// `acc[nn] += scale · bf16(b[nn])` over a contiguous BF16 row — the SAXPY inner of
+/// [`sgemm_bf16_rhs`]. NEON on aarch64: widen 8 `u16→u32`, shift left 16 (bf16 IS
+/// the high half of an f32), FMA into the accumulator, so the dequant vectorizes.
+#[inline]
+fn saxpy_bf16(scale: f32, b: &[u16], acc: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let n = acc.len();
+        let sv = vdupq_n_f32(scale);
+        let mut nn = 0;
+        while nn + 8 <= n {
+            let bh = vld1q_u16(b.as_ptr().add(nn));
+            let lo = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_low_u16(bh))));
+            let hi = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_high_u16(bh)));
+            let a0 = vld1q_f32(acc.as_ptr().add(nn));
+            let a1 = vld1q_f32(acc.as_ptr().add(nn + 4));
+            vst1q_f32(acc.as_mut_ptr().add(nn), vfmaq_f32(a0, sv, lo));
+            vst1q_f32(acc.as_mut_ptr().add(nn + 4), vfmaq_f32(a1, sv, hi));
+            nn += 8;
+        }
+        while nn < n {
+            acc[nn] += scale * f32::from_bits((b[nn] as u32) << 16);
+            nn += 1;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for (v, &bw) in acc.iter_mut().zip(b) {
+        *v += scale * bf16_bits_to_f32(bw);
+    }
+}
+
+/// GEMM `C[m,n] = A[m,k] · B[k,n]` with a **BF16** right-hand `B` in the standard
+/// `[K, N]` (row-major) layout — the SAME tensor every backend's native matmul
+/// consumes, so this is portable (not a CPU-only transposed reinterpret). `A`/`C`
+/// are f32; `B` is dequant-on-the-fly (f32 accumulate), reading HALF the weight
+/// bytes of an f32 GEMM. For the head GEMV (`m==1`) it splits `K` across threads —
+/// each streams a CONTIGUOUS `B` slab (rows `k0..k1`) as a NEON SAXPY into a private
+/// `[N]` partial, then reduces. NOTE: on Apple the f32 path runs on the AMX
+/// coprocessor (Accelerate) and still wins; this helps non-AMX CPUs + is the
+/// reference the GPU/ANE backends' native BF16 matmuls match. Precision-approximate.
+pub fn sgemm_bf16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
+    use rayon::prelude::*;
+    if m == 1 {
+        let nthreads = rayon::current_num_threads().max(1);
+        let kchunk = k.div_ceil(nthreads).max(1);
+        let partials: Vec<Vec<f32>> = (0..nthreads)
+            .into_par_iter()
+            .map(|t| {
+                let (k0, k1) = ((t * kchunk).min(k), ((t + 1) * kchunk).min(k));
+                let mut acc = vec![0f32; n];
+                for kk in k0..k1 {
+                    saxpy_bf16(a[kk], &b[kk * n..kk * n + n], &mut acc);
+                }
+                acc
+            })
+            .collect();
+        c.par_iter_mut().enumerate().for_each(|(j, cj)| {
+            *cj = partials.iter().map(|p| p[j]).sum();
+        });
+    } else {
+        c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
+            crow.iter_mut().for_each(|v| *v = 0.0);
+            for kk in 0..k {
+                saxpy_bf16(a[i * k + kk], &b[kk * n..kk * n + n], crow);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod bf16_gemm_tests {
+    use super::*;
+    #[test]
+    fn sgemm_bf16_rhs_matches_f32_rounded() {
+        // B is [K, N] (standard): out[i,j] = Σ_k a[i,k]·bf16(b[k,j]).
+        for &(m, k, n) in &[(1usize, 128usize, 64usize), (3, 96, 40)] {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1)
+                .collect();
+            let bf: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1)
+                .collect();
+            let b16: Vec<u16> = bf.iter().map(|&x| (x.to_bits() >> 16) as u16).collect();
+            let brnd: Vec<f32> = b16
+                .iter()
+                .map(|&w| f32::from_bits((w as u32) << 16))
+                .collect();
+            let mut cref = vec![0f32; m * n];
+            sgemm(&a, &brnd, &mut cref, m, k, n);
+            let mut cbf = vec![0f32; m * n];
+            sgemm_bf16_rhs(&a, &b16, &mut cbf, m, k, n);
+            let worst = cref
+                .iter()
+                .zip(&cbf)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0, f32::max);
+            assert!(worst < 1e-4, "bf16 gemm ({m}x{k}x{n}) mismatch {worst:.2e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bf16_bench {
+    use super::*;
+    use std::time::Instant;
+    #[test]
+    #[ignore]
+    fn bench_head_bf16_vs_f32() {
+        let (m, k, n) = (1usize, 7168usize, 163840usize); // real LM-head GEMV
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let bf: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 101) as f32 - 50.0) * 0.01)
+            .collect();
+        let b16: Vec<u16> = bf.iter().map(|&x| (x.to_bits() >> 16) as u16).collect(); // [K,N]
+        let bf32_kn: Vec<f32> = b16
+            .iter()
+            .map(|&w| f32::from_bits((w as u32) << 16))
+            .collect();
+        let mut c = vec![0f32; m * n];
+        for _ in 0..2 {
+            sgemm(&a, &bf32_kn, &mut c, m, k, n);
+        } // warm
+        let t = Instant::now();
+        for _ in 0..5 {
+            sgemm(&a, &bf32_kn, &mut c, m, k, n);
+        }
+        let f32_ms = t.elapsed().as_secs_f64() * 1000.0 / 5.0;
+        for _ in 0..2 {
+            sgemm_bf16_rhs(&a, &b16, &mut c, m, k, n);
+        }
+        let t = Instant::now();
+        for _ in 0..5 {
+            sgemm_bf16_rhs(&a, &b16, &mut c, m, k, n);
+        }
+        let bf16_ms = t.elapsed().as_secs_f64() * 1000.0 / 5.0;
+        eprintln!(
+            "HEAD GEMV [1,{k}]x[{k},{n}]: cblas-f32 {f32_ms:.1}ms  bf16-neon {bf16_ms:.1}ms  ({:.2}x)",
+            f32_ms / bf16_ms
+        );
     }
 }

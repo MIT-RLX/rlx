@@ -59,6 +59,7 @@ fn build_attn_graph(b: usize, s: usize, nh: usize, dh: usize) -> Graph {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -206,6 +207,7 @@ fn cpu_vs_metal_full_block_unpadded() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -433,6 +435,7 @@ fn bisect_three_narrows_to_attention() {
                 Op::Attention {
                     num_heads: nh,
                     head_dim: dh,
+                    v_head_dim: None,
                     mask_kind: MaskKind::Custom,
                     score_scale: None,
                     attn_logit_softcap: None,
@@ -614,6 +617,7 @@ fn bisect_full_qkv_to_attention() {
                 Op::Attention {
                     num_heads: nh,
                     head_dim: dh,
+                    v_head_dim: None,
                     mask_kind: MaskKind::Custom,
                     score_scale: None,
                     attn_logit_softcap: None,
@@ -779,6 +783,7 @@ fn bisect_mm_bias_then_full_attention_noslice() {
                 Op::Attention {
                     num_heads: nh,
                     head_dim: dh,
+                    v_head_dim: None,
                     mask_kind: MaskKind::Custom,
                     score_scale: None,
                     attn_logit_softcap: None,

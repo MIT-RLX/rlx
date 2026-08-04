@@ -19,10 +19,10 @@ use rlx_fusion::fk_fusion::{
     MarkTransformRegions,
 };
 use rlx_fusion::fusion::{
-    FuseAdaLayerNorm, FuseAttentionBlock, FuseConvAffineAct, FuseConvBiasAct, FuseGatedResidual,
-    FuseMatMulBiasAct, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
-    FuseSharedInputMatMul, FuseSwiGLU, FuseSwiGLUDualMatmul, FuseTransformerLayer,
-    MarkElementwiseRegions, UnfuseElementwiseRegions,
+    FuseAdaLayerNorm, FuseAttentionBackwardAll, FuseAttentionBlock, FuseConvAffineAct,
+    FuseConvBiasAct, FuseGatedResidual, FuseMatMulBiasAct, FuseMatMulResidual, FuseResidualLN,
+    FuseResidualRmsNorm, FuseRmsNormReshape, FuseSharedInputMatMul, FuseSwiGLU,
+    FuseSwiGLUDualMatmul, FuseTransformerLayer, MarkElementwiseRegions, UnfuseElementwiseRegions,
 };
 use rlx_fusion::limits::{FusionLimits, with_fusion_limits};
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
@@ -183,11 +183,15 @@ impl FusionOptions {
         }
     }
 
-    /// Metal keeps RMSNorm / matmul fusions but unfuses `ElementwiseRegion`
-    /// (fused MSL mis-lowers long chains on deep transformer graphs).
+    /// Metal keeps RMSNorm / matmul fusions but unfuses `ElementwiseRegion` by
+    /// default (fused MSL mis-lowers *long* chains on deep transformer graphs) —
+    /// UNLESS `RLX_KEEP_ELEMENTWISE_REGIONS` asks to keep them (short chains lower
+    /// fine and stay fused → fewer dispatches on the dispatch-bound backward).
     pub fn for_metal() -> Self {
         let mut opts = Self::from_metal_env();
-        opts.unfuse_elementwise_regions = true;
+        if !opts.keep_elementwise_regions {
+            opts.unfuse_elementwise_regions = true;
+        }
         opts
     }
 
@@ -268,6 +272,13 @@ pub fn fusion_passes_for_supported(
     if supports_op(supported, OpKind::FusedAttentionBlock) {
         passes.push(&FuseAttentionBlock);
     }
+    // Collapse the 3 sibling AttentionBackward ops (dQ/dK/dV) into one
+    // AttentionBackwardAll (single score+softmax recompute). Backend-gated:
+    // only fires where the op is lowered (CPU), leaving other backends' own
+    // attention-backward handling untouched.
+    if supports_op(supported, OpKind::AttentionBackwardAll) {
+        passes.push(&FuseAttentionBackwardAll);
+    }
     // FuseResidualLN must run BEFORE FuseTransformerLayer: the layer-level
     // pass matches `FAB → FusedResidualLN → FMBA(GeLU) → FMBA → FusedResidualLN`
     // and needs the residual+LN ops already collapsed.
@@ -302,11 +313,29 @@ pub fn fusion_passes_for_supported(
         passes.push(&FuseTransformerLayer);
     }
 
-    if supports_op(supported, OpKind::FusedSwiGLU) {
+    // Option B (`RLX_NO_WEIGHT_CONCAT_FUSION`): skip the two fusions that build a
+    // combined weight via a runtime `concat` of the individual weight params
+    // (gate/up here, QKV below). For batch-1 decode that concat re-copies ~1.18GB
+    // of CONSTANT weights every token (≈2× the weight bandwidth) — reading the
+    // weights in place (separate matmuls) is faster. The activation-only
+    // `FuseSwiGLU` (silu·mul) still runs.
+    let no_weight_concat = rlx_ir::env::flag("RLX_NO_WEIGHT_CONCAT_FUSION");
+    if supports_op(supported, OpKind::FusedSwiGLU) && !no_weight_concat {
         passes.push(&FuseSwiGLUDualMatmul);
     }
-    // Opt out: `RLX_NO_SHARED_INPUT_MATMUL=1` (debug / parity vs unfused AdaLN).
-    if supports_op(supported, OpKind::MatMul) && !rlx_ir::env::flag("RLX_NO_SHARED_INPUT_MATMUL") {
+    // Fold `add(skip, matmul)` residuals into the matmul store. Metal-only
+    // today (one fewer dispatch on the launch-latency-bound decode); other
+    // backends never claim the op, so the pass never runs for them and the
+    // plain MatMul + Add stays.
+    if supports_op(supported, OpKind::FusedMatMulResidual) {
+        passes.push(&FuseMatMulResidual);
+    }
+    // Opt out: `RLX_NO_SHARED_INPUT_MATMUL=1` (debug / parity vs unfused AdaLN)
+    // or `RLX_NO_WEIGHT_CONCAT_FUSION=1` (Option B — read QKV weights in place).
+    if supports_op(supported, OpKind::MatMul)
+        && !rlx_ir::env::flag("RLX_NO_SHARED_INPUT_MATMUL")
+        && !no_weight_concat
+    {
         passes.push(&FuseSharedInputMatMul);
     }
     if supports_op(supported, OpKind::FusedSwiGLU) {

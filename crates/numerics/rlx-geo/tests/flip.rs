@@ -130,7 +130,7 @@ fn distinct_points(rng: &mut Lcg, n: usize, span: i32) -> Vec<[i32; 2]> {
 
 fn run_case(pts: &[[i32; 2]]) {
     // Reference Delaunay via Guibas-Stolfi (indices 0..n since points are distinct).
-    let delaunay = triangulate(pts);
+    let delaunay = triangulate(pts).unwrap();
     assert!(!delaunay.is_empty());
     validate(pts, &delaunay).expect("reference GS mesh invalid");
 
@@ -193,9 +193,9 @@ fn flip_bigger() {
 fn parallel_matches_serial() {
     let mut rng = Lcg(0x9a51_2340);
     let pts = distinct_points(&mut rng, 60_000, 29_000);
-    let serial = triangulate(&pts);
+    let serial = triangulate(&pts).unwrap();
     for t in [2usize, 4, 8, 0] {
-        let par = triangulate_par(&pts, t);
+        let par = triangulate_par(&pts, t).unwrap();
         validate(&pts, &par).unwrap_or_else(|e| panic!("parallel (threads={t}) invalid: {e}"));
         assert_eq!(
             serial.len(),
@@ -230,7 +230,7 @@ fn hull_seed_completes_to_delaunay() {
         let seed = hull_seed(&pts);
         assert!(used_all(&pts, &seed), "hull_seed dropped a point");
         // (seed is generally NOT Delaunay; validate manifold+CCW via edge counts)
-        let reference = triangulate(&pts);
+        let reference = triangulate(&pts).unwrap();
         assert_eq!(
             seed.len(),
             reference.len(),

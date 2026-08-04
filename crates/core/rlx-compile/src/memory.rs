@@ -657,12 +657,18 @@ pub fn plan_memory_with_options(
     alignment: usize,
     opts: MemoryPlanOptions,
 ) -> MemoryPlan {
-    plan_memory_aligned_inner(graph, alignment, opts, None, false)
+    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Native)
 }
 
 /// Plan memory with custom alignment (inference defaults).
 pub fn plan_memory_aligned(graph: &Graph, alignment: usize) -> MemoryPlan {
-    plan_memory_aligned_inner(graph, alignment, MemoryPlanOptions::default(), None, false)
+    plan_memory_aligned_inner(
+        graph,
+        alignment,
+        MemoryPlanOptions::default(),
+        None,
+        ArenaWidthPolicy::Native,
+    )
 }
 
 /// Liveness-aware planning with every slot sized as `num_elements * 4`
@@ -681,7 +687,36 @@ pub fn plan_memory_f32_uniform(graph: &Graph, alignment: usize) -> MemoryPlan {
         pin_output_ancestors: pin,
         ..MemoryPlanOptions::default()
     };
-    plan_memory_aligned_inner(graph, alignment, opts, None, true)
+    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::F32Uniform)
+}
+
+/// **Native-width** sibling of [`plan_memory_f32_uniform`]: every slot is sized
+/// at its true dtype byte width (bf16/f16 = 2 B, i8 = 1 B, …) instead of a uniform
+/// 4 B. For backends that run low-precision activations + weights natively
+/// (CPU/Metal/MLX/CUDA) — halves activation memory for a low-precision graph.
+/// UNSAFE on a backend that widens bool/int activations to f32 at compute (use
+/// [`plan_memory_hybrid`] there). Shares the same host-indexing pin rule.
+pub fn plan_memory_native(graph: &Graph, alignment: usize) -> MemoryPlan {
+    let opts = MemoryPlanOptions {
+        pin_output_ancestors: graph_has_host_indexing(graph),
+        ..MemoryPlanOptions::default()
+    };
+    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Native)
+}
+
+/// **Hybrid** sibling of [`plan_memory_f32_uniform`]: `Param` weights AND F16/BF16
+/// activations keep their native (packed) width, while every other node stays
+/// f32-uniform (so the bool/int widen-at-compute path is safe). The best-of-both
+/// for a backend that runs f16/bf16 kernels natively but widens integer/bool
+/// tensors to f32 — it packs the float low-precision tensors + weights (e.g. a
+/// bf16 LM head + bf16 hidden states) without full [`plan_memory_native`]'s
+/// integer-overrun risk. Same host-indexing pin rule as the f32-uniform planner.
+pub fn plan_memory_hybrid(graph: &Graph, alignment: usize) -> MemoryPlan {
+    let opts = MemoryPlanOptions {
+        pin_output_ancestors: graph_has_host_indexing(graph),
+        ..MemoryPlanOptions::default()
+    };
+    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Hybrid)
 }
 
 /// Same as [`plan_memory_f32_uniform`] but leaves `Op::Param` nodes UNassigned
@@ -695,7 +730,7 @@ pub fn plan_memory_f32_uniform_no_params(graph: &Graph, alignment: usize) -> Mem
         allocate_params: false,
         ..MemoryPlanOptions::default()
     };
-    plan_memory_aligned_inner(graph, alignment, opts, None, true)
+    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::F32Uniform)
 }
 
 fn graph_has_host_indexing(graph: &Graph) -> bool {
@@ -721,38 +756,63 @@ pub fn plan_memory_backward(
         alignment,
         MemoryPlanOptions::backward_activations_only(),
         Some(weights),
-        false,
+        ArenaWidthPolicy::Native,
     )
 }
 
+/// How the arena planner sizes each node's slot — the width/packing strategy.
+/// A backend picks the policy its kernels can consume; the planner then lays out
+/// the arena accordingly. See [`plan_memory_f32_uniform`], [`plan_memory_native`],
+/// [`plan_memory_hybrid`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArenaWidthPolicy {
+    /// Every activation slot is 4 B/elem (F32-bindable), EXCEPT non-F32 `Param`
+    /// weights, which keep their native packed byte width. The classic
+    /// wgpu/vulkan/rocm/cuda/oneapi f32-uniform arena. Bool/int activations widen
+    /// to f32 at compute, so their slots must be f32-sized to avoid clobbering
+    /// the neighboring slot (a real bug: a VITS bool mask → all-zero TTS output).
+    #[default]
+    F32Uniform,
+    /// Every node at its native dtype byte width (bf16/f16 = 2 B, i8 = 1 B, …).
+    /// For backends that run low-precision activations + weights natively
+    /// (CPU/Metal/MLX/CUDA). Halves activation memory for low-precision graphs;
+    /// UNSAFE on a backend that widens bool/int to f32 at compute.
+    Native,
+    /// Best-of-both: `Param` weights (any non-F32) AND F16/BF16 activations keep
+    /// their native (packed) width; every OTHER node stays f32-uniform (so the
+    /// bool/int widen-at-compute path is safe). Lets a mixed-precision graph pack
+    /// its float low-precision tensors + weights without the integer-widening
+    /// overrun of full `Native` — for backends that run f16/bf16 kernels natively
+    /// but widen integer/bool tensors to f32.
+    Hybrid,
+}
+
 #[inline]
-fn node_slot_bytes(node: &rlx_ir::Node, f32_uniform: bool) -> usize {
-    // f32-uniform planning gives activation slots a uniform 4-byte-per-elem
-    // width (so any slot can be bound as f32). The one exception is packed /
-    // quantized WEIGHTS — non-F32 `Param`s read as raw bytes by DequantMatMul.
-    // Sizing those as f32 4x-bloats packed weights (a 2B model's ~1.7 GB →
-    // ~6.5 GB, which exceeds wgpu's 4 GiB single-buffer cap and OOMs), so they
-    // keep their true (sub-4-byte) byte width.
-    //
-    // Every OTHER tensor — including bool masks and integer activations —
-    // occupies 4 bytes per logical element in this arena (F32 directly; bool /
-    // int tensors are widened to f32 on upload / at compute time). Sizing such
-    // a slot by its native byte width (bool = 1 B/elem) leaves it 4x too small,
-    // so the kernel's `num_elements * 4`-byte write overruns into the following
-    // slot and silently clobbers whatever lives there — e.g. the persistent
-    // params sitting after a VITS relative-position bool attention mask, which
-    // turned long-form wgpu TTS output into all-zero garbage. Take the max of
-    // the native width and the f32 width so integer tensors that are stored
-    // wider than 4 bytes on other f32-uniform backends are never shrunk.
+fn node_slot_bytes(node: &rlx_ir::Node, policy: ArenaWidthPolicy) -> usize {
+    // See ArenaWidthPolicy for the rationale. `native` = the tensor's true byte
+    // width; `f32_wide` = the 4-B/elem width a slot needs if the backend binds /
+    // widens it as f32 (never shrink a tensor already stored wider than 4 B).
     let native = node.shape.size_bytes().unwrap_or(0);
-    if f32_uniform {
-        let packed_weight =
-            matches!(node.op, rlx_ir::Op::Param { .. }) && node.shape.dtype() != rlx_ir::DType::F32;
-        if !packed_weight {
-            return native.max(node.shape.num_elements().unwrap_or(0) * 4);
+    let f32_wide = || native.max(node.shape.num_elements().unwrap_or(0) * 4);
+    let is_param = matches!(node.op, rlx_ir::Op::Param { .. });
+    let non_f32_param = is_param && node.shape.dtype() != rlx_ir::DType::F32;
+    let low_prec_act =
+        !is_param && matches!(node.shape.dtype(), rlx_ir::DType::F16 | rlx_ir::DType::BF16);
+    match policy {
+        ArenaWidthPolicy::Native => native,
+        ArenaWidthPolicy::F32Uniform => {
+            // packed / quantized WEIGHTS keep native (sub-4-B) width; all else f32.
+            if non_f32_param { native } else { f32_wide() }
+        }
+        ArenaWidthPolicy::Hybrid => {
+            // params + f16/bf16 activations packed native; everything else f32.
+            if non_f32_param || low_prec_act {
+                native
+            } else {
+                f32_wide()
+            }
         }
     }
-    native
 }
 
 fn plan_memory_aligned_inner(
@@ -760,7 +820,7 @@ fn plan_memory_aligned_inner(
     alignment: usize,
     opts: MemoryPlanOptions,
     weights: Option<&SharedWeightLayout>,
-    f32_uniform: bool,
+    width: ArenaWidthPolicy,
 ) -> MemoryPlan {
     let mut ranges = compute_live_ranges_opts(graph, opts.pin_output_ancestors);
     extend_packed_qkv_parent_liveness(graph, &mut ranges);
@@ -787,7 +847,7 @@ fn plan_memory_aligned_inner(
         if pure_view_offset(graph, node).is_some() {
             continue;
         }
-        let raw_size = node_slot_bytes(node, f32_uniform);
+        let raw_size = node_slot_bytes(node, width);
         let size = if raw_size == 0 {
             boundary_min_slot_bytes(&node.op, alignment)
         } else {
@@ -889,7 +949,7 @@ fn plan_memory_aligned_inner(
             let Some(out) = assignments.get(&id).cloned() else {
                 continue;
             };
-            let out_size = node_slot_bytes(node, f32_uniform).max(1);
+            let out_size = node_slot_bytes(node, width).max(1);
             let out_end = out.offset + out_size;
             let mut overlaps_input = false;
             for &inp in &node.inputs {
@@ -898,7 +958,7 @@ fn plan_memory_aligned_inner(
                     continue;
                 }
                 if let Some(rs) = assignments.get(&root) {
-                    let r_size = node_slot_bytes(graph.node(root), f32_uniform).max(1);
+                    let r_size = node_slot_bytes(graph.node(root), width).max(1);
                     if out.offset < rs.offset + r_size && out_end > rs.offset {
                         overlaps_input = true;
                         break;
@@ -930,7 +990,7 @@ fn plan_memory_aligned_inner(
         if pure_view_offset(graph, node).is_some() {
             let (root, off) = resolve_view_root(graph, node.id);
             if let Some(root_slot) = assignments.get(&root).cloned() {
-                let view_size = node_slot_bytes(node, f32_uniform);
+                let view_size = node_slot_bytes(node, width);
                 assignments.insert(
                     node.id,
                     BufferSlot {
@@ -1009,6 +1069,32 @@ fn plan_memory_aligned_inner(
             }
         }
         eprintln!("[mem-verify] {read_after_death} reads-after-death");
+
+        // Third check: a VIEW must fit entirely inside its root's slot. If
+        // `off + view_size > root_size`, the view reads past the root into a
+        // neighbouring buffer — reuse-aliased corruption the two checks above
+        // miss (views aren't in `buffers`).
+        let mut view_ovf = 0usize;
+        for node in graph.nodes() {
+            if pure_view_offset(graph, node).is_none() {
+                continue;
+            }
+            let (root, off) = resolve_view_root(graph, node.id);
+            let view_size = node_slot_bytes(node, width);
+            let root_size = node_slot_bytes(graph.node(root), width);
+            if off + view_size > root_size {
+                view_ovf += 1;
+                if view_ovf <= 20 {
+                    eprintln!(
+                        "[mem-verify] VIEW-OVERFLOW node {:?} off={off}+size={view_size} > root {:?} size={root_size} (by {})",
+                        node.id,
+                        root,
+                        (off + view_size) - root_size,
+                    );
+                }
+            }
+        }
+        eprintln!("[mem-verify] {view_ovf} view-past-root overflows");
     }
 
     let schedule = graph.topo_order().collect();
@@ -1028,6 +1114,43 @@ fn plan_memory_aligned_inner(
 mod tests {
     use super::*;
     use rlx_ir::*;
+
+    #[test]
+    fn arena_width_policies_size_slots() {
+        let mut g = Graph::new("mix");
+        let x = g.input("x", Shape::new(&[64, 64], DType::F32));
+        let wbf = g.param("wbf", Shape::new(&[64, 64], DType::BF16)); // bf16 weight
+        let abf = g.add_node(
+            Op::Cast { to: DType::BF16 },
+            vec![x],
+            Shape::new(&[64, 64], DType::BF16),
+        ); // bf16 activation
+        let abool = g.add_node(
+            Op::Cast { to: DType::Bool },
+            vec![x],
+            Shape::new(&[64, 64], DType::Bool),
+        ); // bool activation (widens to f32 at compute on f32-uniform backends)
+        let ne = 64 * 64;
+        use ArenaWidthPolicy::*;
+
+        // A non-F32 Param weight stays PACKED (native, 2 B) under every policy.
+        for p in [F32Uniform, Native, Hybrid] {
+            assert_eq!(node_slot_bytes(g.node(wbf), p), ne * 2, "bf16 param {p:?}");
+        }
+        // A bf16 ACTIVATION: f32-uniform widens (4 B); native + hybrid pack (2 B).
+        assert_eq!(node_slot_bytes(g.node(abf), F32Uniform), ne * 4);
+        assert_eq!(node_slot_bytes(g.node(abf), Native), ne * 2);
+        assert_eq!(node_slot_bytes(g.node(abf), Hybrid), ne * 2);
+        // A bool ACTIVATION: hybrid keeps it f32-wide (safe for widen-at-compute),
+        // only full Native shrinks it to 1 B/elem.
+        assert_eq!(node_slot_bytes(g.node(abool), F32Uniform), ne * 4);
+        assert_eq!(node_slot_bytes(g.node(abool), Native), ne);
+        assert_eq!(node_slot_bytes(g.node(abool), Hybrid), ne * 4);
+        // A plain f32 activation is 4 B/elem under every policy.
+        for p in [F32Uniform, Native, Hybrid] {
+            assert_eq!(node_slot_bytes(g.node(x), p), ne * 4, "f32 input {p:?}");
+        }
+    }
 
     #[test]
     fn non_overlapping_buffers_share_memory() {

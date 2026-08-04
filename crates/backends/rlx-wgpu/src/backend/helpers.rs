@@ -17,6 +17,11 @@ pub(crate) enum MatmulCompute {
     /// Vulkan/NVIDIA 16×16 f16 tensor-core matmul with K-slab f32
     /// reduction (avoids Naga mixed f16/f32 coop_mat bugs).
     CoopF16Vk,
+    /// Packed-BF16 weight kept 2 B/elem in the `bf16_weight_buffer` side
+    /// buffer and unpacked in-shader (`matmul_bf16w`). Reads half the B
+    /// bytes; bit-exact to a bf16-rounded f32 matmul (f32 accumulator).
+    /// Used only by the plain tiled matmul path for a BF16 Param rhs.
+    Bf16Packed,
 }
 
 /// Split-write QKV matmul kernel selection.
@@ -70,4 +75,11 @@ pub(crate) fn matmul_b_from_f16(precision: MatmulCompute, b_is_param: bool) -> b
             precision,
             MatmulCompute::F16 | MatmulCompute::Coop16 | MatmulCompute::CoopF16Vk
         )
+}
+
+/// True when a matmul reads its weight `B` from the packed-BF16 side buffer
+/// (`bf16_weight_buffer`) instead of the arena — so the arena window must
+/// cover only the activation + output, never the weight.
+pub(crate) fn matmul_b_from_packed_bf16(precision: MatmulCompute, b_is_param: bool) -> bool {
+    b_is_param && precision == MatmulCompute::Bf16Packed
 }

@@ -419,3 +419,130 @@ extern "C" __global__ void dequant_matmul_mlx_gemm(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Native GROUPED (MoE) MXFP4 decode-GEMM — the on-device replacement for the
+// `DequantGroupedMatMulMlx` host-delegate. Each output row r picks its expert
+// e = (uint)idx[r]; W_e is a [n, k/2] packed-e2m1 slab at w_byte_off + e*n*(k/2).
+// UNLIKE the single-expert kernels above, the grouped op's group scales are already
+// e8m0→f32 in the arena (the loader decodes them and the backend widens bf16→f32),
+// so we read them as f32 [E, n, n_groups] and do NOT re-run mlx_group_scale.
+// Accumulation order (x·lut·scale) matches rlx_mlx_io::grouped_matmul_mxfp4_bt.
+//
+// V1 — one thread per output element (r, j). Optimal for MoE decode where each row
+// routes to a distinct expert (no cross-row weight reuse to amortize). 16×16 block,
+// grid (ceil(n/16), ceil(m/16)). Fully on-device: no host round-trip, no f32 weight.
+extern "C" __global__ void dequant_grouped_matmul_mlx_mxfp4(
+    float* arena,
+    unsigned int m,
+    unsigned int k,
+    unsigned int n,
+    unsigned int num_experts,
+    unsigned int group_size,
+    unsigned long long x_byte_off,
+    unsigned long long w_byte_off,
+    unsigned long long scale_byte_off,
+    unsigned long long idx_byte_off,
+    unsigned long long out_byte_off
+) {
+    unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m || col >= n) return;
+
+    unsigned int gs = group_size;
+    unsigned int n_groups = k / gs;
+    unsigned long long x_off = x_byte_off / 4ull;
+    unsigned long long out_off = out_byte_off / 4ull;
+    unsigned long long idx_off = idx_byte_off / 4ull;
+    unsigned long long scale_f_off = scale_byte_off / 4ull;
+
+    unsigned int e = (unsigned int)arena[idx_off + (unsigned long long)row];
+    if (e >= num_experts) e = num_experts - 1u;
+
+    unsigned long long half_k = (unsigned long long)(k / 2u);
+    unsigned long long ecol = (unsigned long long)e * (unsigned long long)n + (unsigned long long)col;
+    unsigned long long wrow_bytes = w_byte_off + ecol * half_k;                 // packed e2m1
+    unsigned long long srow_f = scale_f_off + ecol * (unsigned long long)n_groups; // f32 scales
+    unsigned long long xrow_f = x_off + (unsigned long long)row * (unsigned long long)k;
+
+    float acc = 0.0f;
+    for (unsigned int p = 0u; p < k; ++p) {
+        unsigned int g = p / gs;
+        unsigned int byte = mlx_rd_byte(arena, wrow_bytes + (unsigned long long)(p >> 1));
+        unsigned int nib = ((p & 1u) == 0u) ? (byte & 0x0fu) : (byte >> 4);
+        float scale = arena[srow_f + (unsigned long long)g];
+        acc += arena[xrow_f + (unsigned long long)p] * mlx_fp4_lut(nib) * scale;
+    }
+    arena[out_off + (unsigned long long)row * (unsigned long long)n + (unsigned long long)col] = acc;
+}
+
+// V2 — m>1 AMORTIZATION (prefill). Same signature as V1, but one thread per output
+// COLUMN j processing ALL m rows, grouped by expert IN-THREAD: each DISTINCT expert's
+// W_e[j, :] is streamed + nibble-decoded ONCE and multiplied into every row routing to
+// that expert (accumulators held in registers). So when several tokens hit the same
+// expert (common in prefill) the weight read + e2m1 decode are shared across them — the
+// reuse the per-element kernel cannot get. No host row-sort, no scratch: the grouping
+// is discovered in-thread from idx[0..m]. Requires m ≤ MLX_AMORT_MAXR (the launch uses
+// V1 otherwise). acc[]/ex[] live in registers. grid = (ceil(n/BX), 1); block = (BX,1).
+#define MLX_AMORT_MAXR 16u
+extern "C" __global__ void dequant_grouped_matmul_mlx_mxfp4_amort(
+    float* arena,
+    unsigned int m,
+    unsigned int k,
+    unsigned int n,
+    unsigned int num_experts,
+    unsigned int group_size,
+    unsigned long long x_byte_off,
+    unsigned long long w_byte_off,
+    unsigned long long scale_byte_off,
+    unsigned long long idx_byte_off,
+    unsigned long long out_byte_off
+) {
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= n) return;
+
+    unsigned int gs = group_size;
+    unsigned int n_groups = k / gs;
+    unsigned long long x_off = x_byte_off / 4ull;
+    unsigned long long out_off = out_byte_off / 4ull;
+    unsigned long long idx_off = idx_byte_off / 4ull;
+    unsigned long long scale_f_off = scale_byte_off / 4ull;
+    unsigned long long half_k = (unsigned long long)(k / 2u);
+
+    unsigned int mm = (m < MLX_AMORT_MAXR) ? m : MLX_AMORT_MAXR;
+    unsigned int ex[MLX_AMORT_MAXR];
+    float acc[MLX_AMORT_MAXR];
+    for (unsigned int r = 0u; r < mm; ++r) {
+        unsigned int e = (unsigned int)arena[idx_off + (unsigned long long)r];
+        if (e >= num_experts) e = num_experts - 1u;
+        ex[r] = e;
+        acc[r] = 0.0f;
+    }
+
+    // Iterate distinct experts (first occurrence); decode W_e[col,:] once per expert.
+    for (unsigned int r0 = 0u; r0 < mm; ++r0) {
+        unsigned int e = ex[r0];
+        bool seen = false;
+        for (unsigned int q = 0u; q < r0; ++q) {
+            if (ex[q] == e) { seen = true; break; }
+        }
+        if (seen) continue;
+        unsigned long long ecol = (unsigned long long)e * (unsigned long long)n + (unsigned long long)col;
+        unsigned long long wrow_bytes = w_byte_off + ecol * half_k;
+        unsigned long long srow_f = scale_f_off + ecol * (unsigned long long)n_groups;
+        for (unsigned int p = 0u; p < k; ++p) {
+            unsigned int g = p / gs;
+            unsigned int byte = mlx_rd_byte(arena, wrow_bytes + (unsigned long long)(p >> 1));
+            unsigned int nib = ((p & 1u) == 0u) ? (byte & 0x0fu) : (byte >> 4);
+            float w_dq = mlx_fp4_lut(nib) * arena[srow_f + (unsigned long long)g]; // decode ONCE
+            for (unsigned int r = r0; r < mm; ++r) {
+                if (ex[r] == e) {
+                    acc[r] += arena[x_off + (unsigned long long)r * (unsigned long long)k + (unsigned long long)p] * w_dq;
+                }
+            }
+        }
+    }
+    for (unsigned int r = 0u; r < mm; ++r) {
+        arena[out_off + (unsigned long long)r * (unsigned long long)n + (unsigned long long)col] = acc[r];
+    }
+}

@@ -2008,6 +2008,7 @@ pub(crate) fn encode_fused_residual_rms_norm(
     h: u32,
     eps: f32,
     dt: crate::thunk::HalfFlag,
+    sum_out: usize,
 ) {
     use crate::thunk::HalfFlag;
     let pipeline = match dt {
@@ -2027,6 +2028,11 @@ pub(crate) fn encode_fused_residual_rms_norm(
     enc.set_bytes(3, 8, &g_u as *const u64 as *const _);
     enc.set_bytes(4, 8, &b_u as *const u64 as *const _);
     enc.set_bytes(5, 8, &out_u as *const u64 as *const _);
+    // Dual output (f32 kernel only): the pre-norm sum for the skip stream.
+    if matches!(dt, HalfFlag::F32) {
+        let sum_u = sum_out as u64;
+        enc.set_bytes(8, 8, &sum_u as *const u64 as *const _);
+    }
     enc.set_bytes(
         6,
         std::mem::size_of::<u32>() as u64,
@@ -2069,6 +2075,7 @@ pub(crate) fn encode_sdpa(
     heads: u32,
     kv_heads: u32,
     head_dim: u32,
+    v_head_dim: u32,
     dt: crate::thunk::HalfFlag,
     seq_stride: u32,
     mask_kind: u32,
@@ -2078,6 +2085,7 @@ pub(crate) fn encode_sdpa(
     bhsd: u32,
     score_scale: f32,
     attn_logit_softcap: f32,
+    kv_f16: bool,
 ) {
     // The kernels read these as constants right after `window`. Sentinel
     // `0.0` keeps the existing default (`1/sqrt(head_dim)`, no softcap).
@@ -2091,6 +2099,15 @@ pub(crate) fn encode_sdpa(
     } else {
         kv_heads
     };
+    // V/output per-head width (== head_dim for symmetric SDPA). Packed into the
+    // high 32 bits of the SdpaOffsets kv_heads slot so no extra arg-table slot
+    // is needed (the Metal arg-table aliases individual set_bytes past index 16).
+    let v_head_dim = if v_head_dim == 0 {
+        head_dim
+    } else {
+        v_head_dim
+    };
+    let kv_v_pack: u64 = (kv_heads as u64) | ((v_head_dim as u64) << 32);
     use crate::thunk::HalfFlag;
     // The two-pass `sdpa` / `sdpa_h` kernels store an [seq, seq] scores
     // matrix in threadgroup memory (`scores[64*64]`); they're correct
@@ -2114,15 +2131,54 @@ pub(crate) fn encode_sdpa(
         // simdgroup_float8x8 internally; opt-in via `RLX_METAL_FA=1`
         // for benchmarking until the kernel is upgraded to use
         // simdgroup matrix primitives.
-        let use_fa = kv_seq >= 256 && head_dim <= 32 && rlx_ir::env::flag("RLX_METAL_FA");
+        // sdpa_fa_f32 is symmetric-only (no v_head_dim path); asymmetric MLA
+        // (head_dim=192) can't reach it anyway (head_dim<=32 gate).
+        let use_fa = kv_seq >= 256
+            && head_dim <= 32
+            && v_head_dim == head_dim
+            && rlx_ir::env::flag("RLX_METAL_FA");
         let use_decode_m1 = seq == 1
             && kv_seq != seq
             && head_dim <= 512
             && rlx_ir::env::var("RLX_METAL_SDPA_DECODE_M1").as_deref() != Some("0");
-        let pipeline = if use_fa {
+        // New prefill parallelizations (opt-in A/B). Both share sdpa_long's arg
+        // layout (SdpaOffsets @ buffer 17); only the grid/threadgroup shape and
+        // pipeline differ. Gated to Lq>1 (prefill) so decode still uses decode_m1.
+        let use_mma = seq > 1
+            && head_dim <= 64
+            && v_head_dim <= 64
+            && head_dim.is_multiple_of(8)
+            && v_head_dim % 8 == 0
+            && rlx_ir::env::flag("RLX_METAL_SDPA_MMA");
+        let use_fa2 = seq > 1
+            && !use_mma
+            && head_dim <= 64
+            && v_head_dim <= 64
+            && rlx_ir::env::flag("RLX_METAL_SDPA_FA2");
+        let use_splitk = seq > 1
+            && !use_fa2
+            && !use_mma
+            && head_dim <= 128
+            && v_head_dim <= 128
+            && rlx_ir::env::flag("RLX_METAL_SDPA_SPLITK");
+        let pipeline = if use_mma {
+            &k.sdpa_mma
+        } else if use_fa2 {
+            &k.sdpa_fa2
+        } else if use_splitk {
+            &k.sdpa_splitk
+        } else if use_fa {
             &k.sdpa_fa_f32
         } else if use_decode_m1 {
-            &k.sdpa_decode_m1
+            // F16-resident KV cache: read K/V as half (f32 Q/accum/out).
+            if kv_f16 {
+                &k.sdpa_decode_m1_f16kv
+            } else {
+                &k.sdpa_decode_m1
+            }
+        } else if seq > 1 && rlx_ir::env::flag("RLX_METAL_SDPA_OCCPAD") {
+            // Occupancy probe: sdpa_long + 20 KB dummy tgMem (same work, lower occupancy).
+            &k.sdpa_long_occpad
         } else {
             &k.sdpa_long
         };
@@ -2198,8 +2254,8 @@ pub(crate) fn encode_sdpa(
                 v as u64,
                 mask as u64,
                 out as u64,
-                // low 32 bits of slot 5 = kv_heads (matches SdpaOffsets layout)
-                kv_heads as u64,
+                // slot 5: low 32b = kv_heads, high 32b = v_head_dim (SdpaOffsets)
+                kv_v_pack,
             ];
             enc.set_bytes(
                 16,
@@ -2285,7 +2341,7 @@ pub(crate) fn encode_sdpa(
             v as u64,
             mask as u64,
             out as u64,
-            kv_heads as u64,
+            kv_v_pack,
         ];
         enc.set_bytes(
             17,
@@ -2294,7 +2350,37 @@ pub(crate) fn encode_sdpa(
         );
         // GQA for long/FA is in SdpaOffsets.kv_heads (FA still indexes as MHA
         // until that kernel grows a kv_heads path — decode_m1 is the hot path).
-        if use_fa {
+        if use_fa2 || use_mma {
+            // Br=8 query rows per threadgroup. grid = (q_tiles, H, B).
+            // fa2 = 64 threads (thread-parallel matmul); mma = 32 (one simdgroup).
+            const BR: u32 = 8;
+            let q_tiles = seq.div_ceil(BR);
+            let grid = metal::MTLSize {
+                width: q_tiles as u64,
+                height: heads as u64,
+                depth: batch as u64,
+            };
+            let tg = metal::MTLSize {
+                width: if use_mma { 32 } else { 64 },
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_thread_groups(grid, tg);
+        } else if use_splitk {
+            // One SIMD group (32 threads) per (batch, head, query-row).
+            let n_rows = (batch as u64) * (heads as u64) * (seq as u64);
+            let grid = metal::MTLSize {
+                width: n_rows,
+                height: 1,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_thread_groups(grid, tg);
+        } else if use_fa {
             const BR: u32 = 8;
             let q_tiles = seq.div_ceil(BR);
             let grid = metal::MTLSize {
@@ -2324,7 +2410,20 @@ pub(crate) fn encode_sdpa(
         }
         return;
     }
+    // `sdpa_simd` = SIMD-group-parallel softmax variant of `sdpa` (same
+    // dispatch: 32 threads/tg == 1 SIMD group). Opt-in for A/B while validated;
+    // once proven it can become the default seq<=64 f32 path.
+    let use_simd = matches!(dt, HalfFlag::F32) && rlx_ir::env::flag("RLX_METAL_SDPA_SIMD");
+    // f16-scores variant: half the threadgroup memory (8 KiB) for higher
+    // occupancy; f32 accumulation preserved. Requires seq<=64 (the [64,64] TG
+    // scores buffer). Opt-in via RLX_METAL_SDPA_H16 (implies SIMD softmax).
+    let use_h16 = matches!(dt, HalfFlag::F32)
+        && rlx_ir::env::flag("RLX_METAL_SDPA_H16")
+        && seq <= 64
+        && kv_seq <= 64;
     let pipeline = match dt {
+        HalfFlag::F32 if use_h16 => &k.sdpa_simd_h16,
+        HalfFlag::F32 if use_simd => &k.sdpa_simd,
         HalfFlag::F32 => &k.sdpa,
         HalfFlag::F16 => &k.sdpa_h,
     };
@@ -2412,7 +2511,7 @@ pub(crate) fn encode_sdpa(
     // the SAME value to all five slots — Metal's argument table seemed to
     // alias them past index 16. Packing into one struct sidesteps that
     // (task #50, post-u64 dequant fix).
-    let offs_pack: [u64; 6] = [q_off, k_off_u, v_off, m_off, o_off, kv_heads as u64];
+    let offs_pack: [u64; 6] = [q_off, k_off_u, v_off, m_off, o_off, kv_v_pack];
     enc.set_bytes(
         17,
         (6 * std::mem::size_of::<u64>()) as u64,
@@ -2677,6 +2776,107 @@ pub(crate) fn encode_dequant_matmul_mlx_gemv(
     };
     let grid = metal::MTLSize {
         width: n as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+/// Native MoE expert GEMV (m==1): like [`encode_dequant_matmul_mlx_gemv`] plus the
+/// `e_idx` buffer + `slab_bytes` so the kernel offsets into the stacked expert slab.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_grouped_dequant_matmul_mlx_gemv(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    e_idx: usize,
+    k: u32,
+    n: u32,
+    kind: u32,
+    bits: u32,
+    group_size: u32,
+    slab_bytes: u32,
+    scale_bf16: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(3, Some(buffer), zp as u64);
+    enc.set_buffer(4, Some(buffer), dst as u64);
+    enc.set_buffer(5, Some(buffer), e_idx as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(6, sz, &k as *const u32 as *const _);
+    enc.set_bytes(7, sz, &n as *const u32 as *const _);
+    enc.set_bytes(8, sz, &kind as *const u32 as *const _);
+    enc.set_bytes(9, sz, &bits as *const u32 as *const _);
+    enc.set_bytes(10, sz, &group_size as *const u32 as *const _);
+    enc.set_bytes(11, sz, &slab_bytes as *const u32 as *const _);
+    enc.set_bytes(12, sz, &scale_bf16 as *const u32 as *const _);
+    let tg = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let grid = metal::MTLSize {
+        width: n as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+/// Native MoE expert prefill GEMM (m>1): per-row expert via `e_idx` + `slab_bytes`.
+/// One threadgroup per (col, row_tile of 8).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_grouped_dequant_matmul_mlx_gemm(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    scale: usize,
+    zp: usize,
+    dst: usize,
+    e_idx: usize,
+    m: u32,
+    k: u32,
+    n: u32,
+    kind: u32,
+    bits: u32,
+    group_size: u32,
+    slab_bytes: u32,
+    scale_bf16: u32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), x as u64);
+    enc.set_buffer(1, Some(buffer), w_q as u64);
+    enc.set_buffer(2, Some(buffer), scale as u64);
+    enc.set_buffer(3, Some(buffer), zp as u64);
+    enc.set_buffer(4, Some(buffer), dst as u64);
+    enc.set_buffer(5, Some(buffer), e_idx as u64);
+    let sz = std::mem::size_of::<u32>() as u64;
+    enc.set_bytes(6, sz, &m as *const u32 as *const _);
+    enc.set_bytes(7, sz, &k as *const u32 as *const _);
+    enc.set_bytes(8, sz, &n as *const u32 as *const _);
+    enc.set_bytes(9, sz, &kind as *const u32 as *const _);
+    enc.set_bytes(10, sz, &bits as *const u32 as *const _);
+    enc.set_bytes(11, sz, &group_size as *const u32 as *const _);
+    enc.set_bytes(12, sz, &slab_bytes as *const u32 as *const _);
+    enc.set_bytes(13, sz, &scale_bf16 as *const u32 as *const _);
+    let tg = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let n_row_tiles = m.div_ceil(8);
+    let grid = metal::MTLSize {
+        width: (n * n_row_tiles) as u64,
         height: 1,
         depth: 1,
     };
@@ -3559,6 +3759,49 @@ pub(crate) fn rms_norm_bwd_scratch_bytes(graph: &Graph) -> usize {
     max_bytes
 }
 
+/// Scratch bytes for native multi-layer GRU / Elman RNN / LSTM: a ping-pong pair
+/// of `[batch, seq, dirs·hidden]` f32 buffers holding intermediate layer outputs
+/// (the LSTM cell state stays in registers, so no extra scratch). Only
+/// `num_layers > 1` needs it (single-layer writes straight to `dst`; both
+/// directions own disjoint output slices). Shared/reused across ops (sequential
+/// execution) → the max over nodes.
+pub(crate) fn rnn_gru_scratch_bytes(graph: &Graph) -> usize {
+    let mut max_bytes = 0usize;
+    for node in graph.nodes() {
+        let (hidden, num_layers, bidirectional) = match &node.op {
+            Op::Gru {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                ..
+            }
+            | Op::Rnn {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                ..
+            }
+            | Op::Lstm {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                ..
+            } => (*hidden_size, *num_layers, *bidirectional),
+            _ => continue,
+        };
+        if num_layers <= 1 {
+            continue;
+        }
+        let x_shape = &graph.node(node.inputs[0]).shape;
+        let batch = x_shape.dim(0).unwrap_static();
+        let seq = x_shape.dim(1).unwrap_static();
+        let dirs = if bidirectional { 2 } else { 1 };
+        let layer_elems = batch * seq * dirs * hidden;
+        max_bytes = max_bytes.max(2 * layer_elems * std::mem::size_of::<f32>());
+    }
+    max_bytes
+}
+
 pub(crate) fn encode_layer_norm_bwd_input(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -3650,6 +3893,33 @@ pub(crate) fn encode_layer_norm_bwd_gamma(
         },
     );
 
+    // SIMD variant: 32-wide threadgroup per column parallelizes the row
+    // reduction (the scalar kernel serializes it on one thread/column). More
+    // threads/tg (two-level reduction) was measured neutral — the reduction is
+    // memory-bound and small, so GPU fill isn't the limiter here.
+    let use_simd = rlx_ir::env::flag("RLX_METAL_LN_GAMMA_SIMD");
+    if use_simd {
+        enc.set_compute_pipeline_state(&k.layer_norm_bwd_gamma_reduce_simd);
+        enc.set_buffer(0, Some(buffer), x as u64);
+        enc.set_buffer(1, Some(buffer), dy as u64);
+        enc.set_buffer(2, Some(buffer), stats_scratch as u64);
+        enc.set_buffer(3, Some(buffer), dgamma as u64);
+        enc.set_bytes(4, 4, &rows as *const u32 as *const _);
+        enc.set_bytes(5, 4, &h as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: h as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     enc.set_compute_pipeline_state(&k.layer_norm_bwd_gamma_reduce_f32);
     enc.set_buffer(0, Some(buffer), x as u64);
     enc.set_buffer(1, Some(buffer), dy as u64);
@@ -3964,6 +4234,104 @@ pub(crate) fn encode_gather_bwd(
     );
 }
 
+/// Bytes of arena-tail scratch for the m>8 SynthMatMul recon→MPS prefill path:
+/// one shared f32 [n,k] weight slab, sized to the largest such node (small-m
+/// nodes use split-K and need no scratch).
+pub(crate) fn synth_matmul_scratch_bytes(graph: &Graph) -> usize {
+    let mut max = 0usize;
+    for node in graph.nodes() {
+        if let Op::SynthMatMul { .. } = &node.op {
+            let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+            let total = node.shape.num_elements().unwrap();
+            let m = total / n.max(1);
+            if m <= 8 {
+                continue;
+            }
+            let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+            let k = x_total / m.max(1);
+            // f32 recon→MPS needs the [n,k] f32 weight scratch. The opt-in f16 path
+            // (RLX_METAL_SYNTH_RECON_F16) instead needs three f16 buffers: W[k,n],
+            // x[m,k], dst[m,n] (256-aligned for MPS). Reserve the larger so either
+            // path fits without knowing the runtime flag at compile time.
+            let a256 = |b: usize| (b + 255) & !255;
+            let f32_need = k * n * 4;
+            let f16_need = a256(k * n * 2) + a256(m * k * 2) + a256(m * n * 2);
+            max = max.max(f32_need.max(f16_need));
+        }
+    }
+    max
+}
+
+/// f16 reconstruct: writes the dense weight W[k,n] as `half` into `w_scratch` — the
+/// weight half of the RLX_METAL_SYNTH_RECON_F16 prefill path (pair with a cast of x
+/// to f16 and `encode_mps_hgemm`, then cast the f16 result back to f32).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_synth_reconstruct_h(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    indices: usize,
+    codebook: usize,
+    w_scratch: usize,
+    k_dim: u32,
+    n_dim: u32,
+    entry_dim: u32,
+) {
+    enc.set_compute_pipeline_state(&k.synth_reconstruct_h);
+    enc.set_buffer(0, Some(buffer), 0);
+    let i_u = indices as u64;
+    enc.set_bytes(1, 8, &i_u as *const u64 as *const _);
+    let c_u = codebook as u64;
+    enc.set_bytes(2, 8, &c_u as *const u64 as *const _);
+    let w_u = w_scratch as u64;
+    enc.set_bytes(3, 8, &w_u as *const u64 as *const _);
+    enc.set_bytes(4, 4, &k_dim as *const u32 as *const _);
+    enc.set_bytes(5, 4, &n_dim as *const u32 as *const _);
+    enc.set_bytes(6, 4, &entry_dim as *const u32 as *const _);
+    let nb = k_dim / entry_dim.max(1);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: nb as u64,
+            height: n_dim as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32u64.min(nb as u64).max(1),
+            height: 8u64.min(n_dim as u64).max(1),
+            depth: 1,
+        },
+    );
+}
+
+/// Encode a `cast_f32_to_f16` (or reverse) over `len` elements from `src` to `dst`
+/// (both arena byte offsets). Used to move x into f16 and the result back to f32 for
+/// the RLX_METAL_SYNTH_RECON_F16 path.
+pub(crate) fn encode_arena_cast(
+    enc: &metal::ComputeCommandEncoderRef,
+    pipe: &metal::ComputePipelineState,
+    buffer: &metal::Buffer,
+    src_off: usize,
+    dst_off: usize,
+    len: u32,
+) {
+    enc.set_compute_pipeline_state(pipe);
+    enc.set_buffer(0, Some(buffer), src_off as u64);
+    enc.set_buffer(1, Some(buffer), dst_off as u64);
+    enc.set_bytes(2, 4, &len as *const u32 as *const _);
+    enc.dispatch_threads(
+        metal::MTLSize {
+            width: len as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256u64.min(len as u64).max(1),
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 pub(crate) fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
     for node in graph.nodes() {
@@ -4116,6 +4484,55 @@ pub(crate) fn encode_qk_mm_f32(
 /// pass, skipping the f32 dequant scratch the dequant + MPS sgemm path
 /// would write. Caller must guarantee `k_dim % 256 == 0`. Decode-only
 /// (`m == 1`) — m > 1 still falls through to the legacy GPU path.
+/// Generate a fused single-pass decode-GEMV encoder for one K-quant / block
+/// scheme. Every such kernel takes the identical 6 buffers (arena, x_off,
+/// w_off, dst_off, k_dim, n_dim) and dispatches one thread per output row —
+/// only the `Kernels` pipeline field differs. One invocation per quant/precision
+/// (e.g. `fused_mv_encoder!(encode_q3k_mv_f32, q3k_mv_f32)`); add a matching MSL
+/// kernel + `Kernels` field and the whole encoder is generated.
+macro_rules! fused_mv_encoder {
+    ($fn_name:ident, $pipe:ident) => {
+        pub(crate) fn $fn_name(
+            enc: &metal::ComputeCommandEncoderRef,
+            k: &crate::kernels::Kernels,
+            buffer: &metal::Buffer,
+            x: usize,
+            w_q: usize,
+            dst: usize,
+            k_dim: usize,
+            n_dim: usize,
+        ) {
+            enc.set_compute_pipeline_state(&k.$pipe);
+            enc.set_buffer(0, Some(buffer), 0);
+            let x_u = x as u64;
+            enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+            let w_u = w_q as u64;
+            enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+            let d_u = dst as u64;
+            enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+            let k_u = k_dim as u32;
+            enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+            let n_u = n_dim as u32;
+            enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+            let grid = metal::MTLSize {
+                width: n_dim as u64,
+                height: 1,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 256.min(n_dim) as u64,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+        }
+    };
+}
+
+// One line per quant/precision — MSL kernel + `Kernels` field is all else needed.
+fused_mv_encoder!(encode_q3k_mv_f32, q3k_mv_f32); // Q3_K_S trunk bulk weights
+fused_mv_encoder!(encode_q6k_mv_f32, q6k_mv_f32); // Q6_K LM head
+
 pub(crate) fn encode_q4k_mv_f32(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -4827,6 +5244,296 @@ pub(crate) fn encode_iq2_xxs_mv_f32(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Codebook weight-synthesis matmul. One thread per output column `gid ∈ [0,n)`;
+/// the kernel loops over the `m` rows internally. `x`, `codebook`, `dst` are f32
+/// arena tensors; `indices` is a packed U8 arena tensor (1 byte/elem).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_synth_matmul(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    indices: usize,
+    codebook: usize,
+    dst: usize,
+    m: u32,
+    k_dim: u32,
+    n_dim: u32,
+    entry_dim: u32,
+    num_entries: u32,
+    half: bool,
+) {
+    let split_k = m <= 8; // decode / small-M → split-K; else one-thread-per-output
+    enc.set_compute_pipeline_state(match (split_k, half) {
+        (true, false) => &k.synth_matmul_codebook,
+        (true, true) => &k.synth_matmul_codebook_h,
+        (false, false) => &k.synth_matmul_codebook_mm,
+        (false, true) => &k.synth_matmul_codebook_mm_h,
+    });
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let i_u = indices as u64;
+    enc.set_bytes(2, 8, &i_u as *const u64 as *const _);
+    let c_u = codebook as u64;
+    enc.set_bytes(3, 8, &c_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(4, 8, &d_u as *const u64 as *const _);
+    enc.set_bytes(5, 4, &k_dim as *const u32 as *const _);
+    enc.set_bytes(6, 4, &n_dim as *const u32 as *const _);
+    enc.set_bytes(7, 4, &entry_dim as *const u32 as *const _);
+    enc.set_bytes(8, 4, &num_entries as *const u32 as *const _);
+    enc.set_bytes(9, 4, &m as *const u32 as *const _);
+    // Small M / decode: split-K — grid (32 lanes × n × m); each SIMD group's 32
+    // lanes cooperate over the k-blocks + simd_sum, so the GPU isn't starved at
+    // M=1. Large M: one thread per output element (n·m already saturates; split-K
+    // there just adds reduction overhead).
+    let (grid, tg) = if split_k {
+        const KSPLIT: u64 = 32;
+        (
+            metal::MTLSize {
+                width: KSPLIT,
+                height: n_dim as u64,
+                depth: m as u64,
+            },
+            metal::MTLSize {
+                width: KSPLIT,
+                height: 8u64.min(n_dim as u64).max(1),
+                depth: 1,
+            },
+        )
+    } else {
+        // One thread per output element (fused prefill kernel; MPS wins here but
+        // this is the correct all-shapes fallback).
+        let tgh = 8u64.min(m as u64).max(1);
+        let tgw = (256 / tgh).min(n_dim as u64).max(1);
+        (
+            metal::MTLSize {
+                width: n_dim as u64,
+                height: m as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tgw,
+                height: tgh,
+                depth: 1,
+            },
+        )
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Threadgroup-tiled fused codebook matmul (`simdgroup_float8x8` MMAs). A 32×32
+/// output tile per threadgroup (16 simdgroups × 32 threads = 512), reconstructing
+/// the weight tile on-chip from u8 indices + the L1 codebook — no dense-weight DRAM
+/// materialization, no MPS launch. Targets the medium-M regime where recon→MPS's
+/// fixed reconstruct→scratch→MPS cost dominates. f32 only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_synth_matmul_tiled(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    indices: usize,
+    codebook: usize,
+    dst: usize,
+    m: u32,
+    k_dim: u32,
+    n_dim: u32,
+    entry_dim: u32,
+    num_entries: u32,
+    f16: bool,
+) {
+    enc.set_compute_pipeline_state(if f16 {
+        &k.synth_matmul_codebook_tiled_h
+    } else {
+        &k.synth_matmul_codebook_tiled
+    });
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let i_u = indices as u64;
+    enc.set_bytes(2, 8, &i_u as *const u64 as *const _);
+    let c_u = codebook as u64;
+    enc.set_bytes(3, 8, &c_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(4, 8, &d_u as *const u64 as *const _);
+    enc.set_bytes(5, 4, &k_dim as *const u32 as *const _);
+    enc.set_bytes(6, 4, &n_dim as *const u32 as *const _);
+    enc.set_bytes(7, 4, &entry_dim as *const u32 as *const _);
+    enc.set_bytes(8, 4, &num_entries as *const u32 as *const _);
+    enc.set_bytes(9, 4, &m as *const u32 as *const _);
+    // One 64×64 output tile per threadgroup; 512 threads = 16 simdgroups (4×4),
+    // each computing a 16×16 sub-tile (2×2 grid of 8×8 accumulators).
+    let tg_count = metal::MTLSize {
+        width: n_dim.div_ceil(64) as u64,
+        height: m.div_ceil(64) as u64,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 32,
+        height: 16,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(tg_count, tg);
+}
+
+/// Reconstruct the dense f32 weight Wᵀ[n,k] from u8 indices + f32 codebook into
+/// the arena scratch at `w_scratch` — the weight-only half of the m>8 recon→MPS
+/// prefill path. Pair with `encode_mps_sgemm_bt(x, w_scratch, dst, m, k, n)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_synth_reconstruct(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    indices: usize,
+    codebook: usize,
+    w_scratch: usize,
+    k_dim: u32,
+    n_dim: u32,
+    entry_dim: u32,
+) {
+    enc.set_compute_pipeline_state(&k.synth_reconstruct);
+    enc.set_buffer(0, Some(buffer), 0);
+    let i_u = indices as u64;
+    enc.set_bytes(1, 8, &i_u as *const u64 as *const _);
+    let c_u = codebook as u64;
+    enc.set_bytes(2, 8, &c_u as *const u64 as *const _);
+    let w_u = w_scratch as u64;
+    enc.set_bytes(3, 8, &w_u as *const u64 as *const _);
+    enc.set_bytes(4, 4, &k_dim as *const u32 as *const _);
+    enc.set_bytes(5, 4, &n_dim as *const u32 as *const _);
+    enc.set_bytes(6, 4, &entry_dim as *const u32 as *const _);
+    let nb = k_dim / entry_dim.max(1);
+    let grid = metal::MTLSize {
+        width: nb as u64,
+        height: n_dim as u64,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 32u64.min(nb as u64).max(1),
+        height: 8u64.min(n_dim as u64).max(1),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// KAN Gaussian-RBF spline activation. One thread per output element
+/// `gid ∈ [0, rows·channels)`; channel `c = gid % channels`. `x`, `coeff`,
+/// `dst` are f32 arena tensors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_spline_activation(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    coeff: usize,
+    dst: usize,
+    total: u32,
+    channels: u32,
+    num_basis: u32,
+    grid_min: f32,
+    grid_max: f32,
+) {
+    enc.set_compute_pipeline_state(&k.spline_activation);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let c_u = coeff as u64;
+    enc.set_bytes(2, 8, &c_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    enc.set_bytes(4, 4, &total as *const u32 as *const _);
+    enc.set_bytes(5, 4, &channels as *const u32 as *const _);
+    enc.set_bytes(6, 4, &num_basis as *const u32 as *const _);
+    enc.set_bytes(7, 4, &grid_min as *const f32 as *const _);
+    enc.set_bytes(8, 4, &grid_max as *const f32 as *const _);
+    let grid = metal::MTLSize {
+        width: total as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: 256.min(total) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Fused synth backward: `dx` (`[m,k] = upstream·Ŵᵀ`, reconstruct-in-loop) or
+/// `d_codebook` (`[num_entries, entry_dim]`, scatter-free block scan). One
+/// dispatch, no tiling — see MSL `synth_bwd_dx` / `synth_bwd_codebook`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_synth_bwd(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    indices: usize,
+    codebook: usize,
+    upstream: usize,
+    dst: usize,
+    m: u32,
+    n: u32,
+    k_dim: u32,
+    entry_dim: u32,
+    num_entries: u32,
+    dx: bool,
+) {
+    let d = entry_dim;
+    let up = upstream as u64;
+    let idx = indices as u64;
+    let ds = dst as u64;
+    enc.set_buffer(0, Some(buffer), 0);
+    enc.set_bytes(1, 8, &up as *const u64 as *const _);
+    enc.set_bytes(2, 8, &idx as *const u64 as *const _);
+    if dx {
+        // buffer(3) = codebook; grid = (k, m).
+        enc.set_compute_pipeline_state(&k.synth_bwd_dx);
+        let cb = codebook as u64;
+        enc.set_bytes(3, 8, &cb as *const u64 as *const _);
+        enc.set_bytes(4, 8, &ds as *const u64 as *const _);
+        enc.set_bytes(5, 4, &m as *const u32 as *const _);
+        enc.set_bytes(6, 4, &n as *const u32 as *const _);
+        enc.set_bytes(7, 4, &k_dim as *const u32 as *const _);
+        enc.set_bytes(8, 4, &d as *const u32 as *const _);
+        let grid = metal::MTLSize {
+            width: k_dim as u64,
+            height: m as u64,
+            depth: 1,
+        };
+        let tg = metal::MTLSize {
+            width: 16.min(k_dim as u64).max(1),
+            height: 16,
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tg);
+    } else {
+        // buffer(3) = x; grid = (entry_dim, num_entries).
+        enc.set_compute_pipeline_state(&k.synth_bwd_codebook);
+        let xx = x as u64;
+        enc.set_bytes(3, 8, &xx as *const u64 as *const _);
+        enc.set_bytes(4, 8, &ds as *const u64 as *const _);
+        enc.set_bytes(5, 4, &m as *const u32 as *const _);
+        enc.set_bytes(6, 4, &n as *const u32 as *const _);
+        enc.set_bytes(7, 4, &k_dim as *const u32 as *const _);
+        enc.set_bytes(8, 4, &d as *const u32 as *const _);
+        enc.set_bytes(9, 4, &num_entries as *const u32 as *const _);
+        let grid = metal::MTLSize {
+            width: d as u64,
+            height: num_entries as u64,
+            depth: 1,
+        };
+        let tg = metal::MTLSize {
+            width: (d as u64).max(1),
+            height: 64,
+            depth: 1,
+        };
+        enc.dispatch_threads(grid, tg);
+    }
+}
+
 pub(crate) fn encode_iq2_xs_mv_f32(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -5388,7 +6095,12 @@ pub(crate) fn encode_gated_delta_net(
 ) {
     // ulong float indices — Fara arenas put GDN scratch past 16 GiB.
     let f32_idx = |byte_off: usize| -> u64 { (byte_off / 4) as u64 };
-    let use_sg = state_size == 128 && rlx_ir::env::flag("RLX_METAL_GDN_SG");
+    // Simdgroup GDN (n==128) is the default: the column-private kernel launches
+    // only b*h threads (~48 for Qwen3.6-27B) and left ~99% of the GPU idle —
+    // it was 70% of decode time. The simdgroup variant (one simdgroup per state
+    // column) is ~1.5× faster on decode and ~6× on prefill, bit-identical.
+    // Opt out with RLX_METAL_GDN_SG_DISABLE=1.
+    let use_sg = state_size == 128 && !rlx_ir::env::flag("RLX_METAL_GDN_SG_DISABLE");
     if use_sg {
         enc.set_compute_pipeline_state(&k.gated_delta_net_sg);
     } else {
@@ -5501,36 +6213,40 @@ pub(crate) fn encode_selective_scan(
 
 /// Native MSL forward LSTM (f32, `hidden <= LSTM_MAX_H = 1024`). One
 /// threadgroup per batch item, `hidden` threads each.
+/// Native MSL LSTM (f32, any layers / dirs / carry, `hidden ≤ 1024`). Same
+/// per-(layer, direction) loop / in-arena scratch as `encode_gru`; gate order
+/// i,f,g,o with a single merged bias, `h0`+`c0` carry. Bit-for-bit mirror of
+/// `execute_lstm_f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lstm(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     buffer: &metal::Buffer,
+    scratch: usize,
     x: usize,
     w_ih: usize,
     w_hh: usize,
     bias: usize,
+    h0: usize,
+    c0: usize,
     dst: usize,
     batch: u32,
     seq: u32,
     input_size: u32,
     hidden: u32,
+    num_layers: u32,
+    bidirectional: bool,
+    carry: bool,
 ) {
-    let f32_idx = |byte_off: usize| -> u32 { (byte_off / 4) as u32 };
+    let (b, s, h) = (batch as usize, seq as usize, hidden as usize);
+    let dirs = if bidirectional { 2 } else { 1 };
+    let four_h = 4 * h;
+    let out_width = dirs * h;
+    let layer_elems = b * s * out_width;
+    let scratch_w = scratch / 4;
+
     enc.set_compute_pipeline_state(&k.lstm);
     enc.set_buffer(0, Some(buffer), 0);
-    let x_u = f32_idx(x);
-    let wih_u = f32_idx(w_ih);
-    let whh_u = f32_idx(w_hh);
-    let bias_u = f32_idx(bias);
-    let dst_u = f32_idx(dst);
-    enc.set_bytes(1, 4, &x_u as *const u32 as *const _);
-    enc.set_bytes(2, 4, &wih_u as *const u32 as *const _);
-    enc.set_bytes(3, 4, &whh_u as *const u32 as *const _);
-    enc.set_bytes(4, 4, &bias_u as *const u32 as *const _);
-    enc.set_bytes(5, 4, &dst_u as *const u32 as *const _);
-    let dims = [batch, seq, input_size, hidden];
-    enc.set_bytes(6, 16, dims.as_ptr() as *const _);
     let grid = metal::MTLSize {
         width: batch as u64,
         height: 1,
@@ -5541,42 +6257,90 @@ pub(crate) fn encode_lstm(
         height: 1,
         depth: 1,
     };
-    enc.dispatch_thread_groups(grid, tg);
+
+    let mut in_l = input_size as usize;
+    let mut wih_cursor = 0usize;
+    let mut in_off_w = x / 4;
+
+    for l in 0..num_layers as usize {
+        let last = l + 1 == num_layers as usize;
+        let out_off_w = if last {
+            dst / 4
+        } else {
+            scratch_w + (l % 2) * layer_elems
+        };
+        let wih_block = four_h * in_l;
+
+        for dir in 0..dirs {
+            let ld = l * dirs + dir;
+            let offs: [u32; 5] = [
+                (in_off_w) as u32,
+                (w_ih / 4 + wih_cursor + dir * wih_block) as u32,
+                (w_hh / 4 + ld * four_h * h) as u32,
+                (bias / 4 + ld * four_h) as u32,
+                (out_off_w) as u32,
+            ];
+            for (i, o) in offs.iter().enumerate() {
+                enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
+            }
+            let dims = [batch, seq, in_l as u32, hidden];
+            enc.set_bytes(6, 16, dims.as_ptr() as *const _);
+            let h0_off = if carry { h0 / 4 + ld * b * h } else { 0 };
+            let c0_off = if carry { c0 / 4 + ld * b * h } else { 0 };
+            let more = [
+                h0_off as u32,
+                out_width as u32,
+                (dir * h) as u32,
+                u32::from(dir == 1),
+            ];
+            enc.set_bytes(7, 16, more.as_ptr() as *const _);
+            let c0_u = c0_off as u32;
+            enc.set_bytes(8, 4, &c0_u as *const u32 as *const _);
+            enc.dispatch_thread_groups(grid, tg);
+        }
+
+        wih_cursor += dirs * wih_block;
+        in_l = out_width;
+        in_off_w = scratch_w + (l % 2) * layer_elems;
+    }
 }
 
-/// Native MSL GRU (f32, single-layer/unidir/no-carry, `hidden ≤ 1024`).
+/// Native MSL GRU (f32, any layers / dirs / carry, `hidden ≤ 1024`). Loops
+/// (layer, direction) on one encoder — Metal's default serial dispatch orders
+/// the launches — ping-ponging intermediate layer outputs through an in-arena
+/// scratch region at `scratch` (byte offset; needed only when `num_layers > 1`).
+/// `h0` is a byte offset when `carry`, else ignored. Bit-for-bit mirror of
+/// `execute_gru_f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_gru(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     buffer: &metal::Buffer,
+    scratch: usize,
     x: usize,
     w_ih: usize,
     w_hh: usize,
     b_ih: usize,
     b_hh: usize,
+    h0: usize,
     dst: usize,
     batch: u32,
     seq: u32,
     input_size: u32,
     hidden: u32,
+    num_layers: u32,
+    bidirectional: bool,
+    carry: bool,
 ) {
-    let f32_idx = |o: usize| -> u32 { (o / 4) as u32 };
+    let (b, s, h) = (batch as usize, seq as usize, hidden as usize);
+    let dirs = if bidirectional { 2 } else { 1 };
+    let three_h = 3 * h;
+    let out_width = dirs * h;
+    let layer_elems = b * s * out_width;
+    let scratch_w = scratch / 4;
+
     enc.set_compute_pipeline_state(&k.gru);
     enc.set_buffer(0, Some(buffer), 0);
-    let offs = [
-        f32_idx(x),
-        f32_idx(w_ih),
-        f32_idx(w_hh),
-        f32_idx(b_ih),
-        f32_idx(b_hh),
-        f32_idx(dst),
-    ];
-    for (i, o) in offs.iter().enumerate() {
-        enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
-    }
-    let dims = [batch, seq, input_size, hidden];
-    enc.set_bytes(7, 16, dims.as_ptr() as *const _);
     let grid = metal::MTLSize {
         width: batch as u64,
         height: 1,
@@ -5587,43 +6351,85 @@ pub(crate) fn encode_gru(
         height: 1,
         depth: 1,
     };
-    enc.dispatch_thread_groups(grid, tg);
+
+    let mut in_l = input_size as usize;
+    let mut wih_cursor = 0usize;
+    let mut in_off_w = x / 4;
+
+    for l in 0..num_layers as usize {
+        let last = l + 1 == num_layers as usize;
+        let out_off_w = if last {
+            dst / 4
+        } else {
+            scratch_w + (l % 2) * layer_elems
+        };
+        let wih_block = three_h * in_l;
+
+        for dir in 0..dirs {
+            let ld = l * dirs + dir;
+            let offs: [u32; 6] = [
+                (in_off_w) as u32,
+                (w_ih / 4 + wih_cursor + dir * wih_block) as u32,
+                (w_hh / 4 + ld * three_h * h) as u32,
+                (b_ih / 4 + ld * three_h) as u32,
+                (b_hh / 4 + ld * three_h) as u32,
+                (out_off_w) as u32,
+            ];
+            for (i, o) in offs.iter().enumerate() {
+                enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
+            }
+            let dims = [batch, seq, in_l as u32, hidden];
+            enc.set_bytes(7, 16, dims.as_ptr() as *const _);
+            let h0_off = if carry { h0 / 4 + ld * b * h } else { 0 };
+            let more = [
+                h0_off as u32,
+                out_width as u32,
+                (dir * h) as u32,
+                u32::from(dir == 1),
+            ];
+            enc.set_bytes(8, 16, more.as_ptr() as *const _);
+            enc.dispatch_thread_groups(grid, tg);
+        }
+
+        wih_cursor += dirs * wih_block;
+        in_l = out_width;
+        in_off_w = scratch_w + (l % 2) * layer_elems;
+    }
 }
 
-/// Native MSL Elman RNN (f32, single-layer/unidir/no-carry, `hidden ≤ 1024`).
+/// Native MSL Elman RNN (f32, any layers / dirs / carry, `hidden ≤ 1024`). Same
+/// per-(layer, direction) loop / in-arena scratch as `encode_gru`; `relu`
+/// selects ReLU vs tanh. Bit-for-bit mirror of `execute_rnn_f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_rnn(
     enc: &metal::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     buffer: &metal::Buffer,
+    scratch: usize,
     x: usize,
     w_ih: usize,
     w_hh: usize,
     bias: usize,
+    h0: usize,
     dst: usize,
     batch: u32,
     seq: u32,
     input_size: u32,
     hidden: u32,
+    num_layers: u32,
+    bidirectional: bool,
+    carry: bool,
     relu: bool,
 ) {
-    let f32_idx = |o: usize| -> u32 { (o / 4) as u32 };
+    let (b, s, h) = (batch as usize, seq as usize, hidden as usize);
+    let dirs = if bidirectional { 2 } else { 1 };
+    let out_width = dirs * h;
+    let layer_elems = b * s * out_width;
+    let scratch_w = scratch / 4;
+
     enc.set_compute_pipeline_state(&k.rnn);
     enc.set_buffer(0, Some(buffer), 0);
-    let offs = [
-        f32_idx(x),
-        f32_idx(w_ih),
-        f32_idx(w_hh),
-        f32_idx(bias),
-        f32_idx(dst),
-    ];
-    for (i, o) in offs.iter().enumerate() {
-        enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
-    }
-    let dims = [batch, seq, input_size, hidden];
-    enc.set_bytes(6, 16, dims.as_ptr() as *const _);
     let relu_u: u32 = if relu { 1 } else { 0 };
-    enc.set_bytes(7, 4, &relu_u as *const u32 as *const _);
     let grid = metal::MTLSize {
         width: batch as u64,
         height: 1,
@@ -5634,7 +6440,50 @@ pub(crate) fn encode_rnn(
         height: 1,
         depth: 1,
     };
-    enc.dispatch_thread_groups(grid, tg);
+
+    let mut in_l = input_size as usize;
+    let mut wih_cursor = 0usize;
+    let mut in_off_w = x / 4;
+
+    for l in 0..num_layers as usize {
+        let last = l + 1 == num_layers as usize;
+        let out_off_w = if last {
+            dst / 4
+        } else {
+            scratch_w + (l % 2) * layer_elems
+        };
+        let wih_block = h * in_l;
+
+        for dir in 0..dirs {
+            let ld = l * dirs + dir;
+            let offs: [u32; 5] = [
+                (in_off_w) as u32,
+                (w_ih / 4 + wih_cursor + dir * wih_block) as u32,
+                (w_hh / 4 + ld * h * h) as u32,
+                (bias / 4 + ld * h) as u32,
+                (out_off_w) as u32,
+            ];
+            for (i, o) in offs.iter().enumerate() {
+                enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
+            }
+            let dims = [batch, seq, in_l as u32, hidden];
+            enc.set_bytes(6, 16, dims.as_ptr() as *const _);
+            enc.set_bytes(7, 4, &relu_u as *const u32 as *const _);
+            let h0_off = if carry { h0 / 4 + ld * b * h } else { 0 };
+            let more = [
+                h0_off as u32,
+                out_width as u32,
+                (dir * h) as u32,
+                u32::from(dir == 1),
+            ];
+            enc.set_bytes(8, 16, more.as_ptr() as *const _);
+            enc.dispatch_thread_groups(grid, tg);
+        }
+
+        wih_cursor += dirs * wih_block;
+        in_l = out_width;
+        in_off_w = scratch_w + (l % 2) * layer_elems;
+    }
 }
 
 /// Native MSL Mamba-2 SSD scan (f32, `state_size ≤ 128`). One thread per
@@ -6938,13 +7787,18 @@ pub(crate) fn encode_transpose(
     total: u32,
     out_dims: &[u32],
     in_strides: &[u32],
+    half: bool,
 ) {
     let rank = out_dims.len() as u32;
     // Pack [out_dims..., in_strides...] into a single inline meta buffer.
     let mut meta: Vec<u32> = Vec::with_capacity(2 * out_dims.len());
     meta.extend_from_slice(out_dims);
     meta.extend_from_slice(in_strides);
-    enc.set_compute_pipeline_state(&k.transpose_nd);
+    enc.set_compute_pipeline_state(if half {
+        &k.transpose_nd_h
+    } else {
+        &k.transpose_nd
+    });
     enc.set_buffer(0, Some(buffer), src as u64);
     enc.set_buffer(1, Some(buffer), dst as u64);
     enc.set_bytes(2, 4, &rank as *const u32 as *const _);
@@ -7301,6 +8155,35 @@ pub(crate) fn encode_reduce_axes(
         ReduceOp::Min => 3,
         ReduceOp::Prod => 4,
     };
+    // SIMD variant for Sum/Mean when the reduced axis is long and there are few
+    // outputs (the bias/beta grad-sum pattern): one 32-wide threadgroup per
+    // output parallelizes the reduction the scalar kernel serializes.
+    let use_simd = matches!(dt, HalfFlag::F32)
+        && matches!(op, ReduceOp::Sum | ReduceOp::Mean)
+        && reduced >= 64
+        && (inner as u64 * outer as u64) <= reduced as u64
+        && rlx_ir::env::flag("RLX_METAL_REDUCE_SIMD");
+    if use_simd {
+        enc.set_compute_pipeline_state(&k.reduce_axes_sum_simd);
+        enc.set_buffer(0, Some(buffer), src as u64);
+        enc.set_buffer(1, Some(buffer), dst as u64);
+        enc.set_bytes(2, 4, &reduced as *const u32 as *const _);
+        enc.set_bytes(3, 4, &inner as *const u32 as *const _);
+        enc.set_bytes(4, 4, &op_kind as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: inner as u64 * outer as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     let pipeline = match dt {
         HalfFlag::F32 => &k.reduce_axes,
         HalfFlag::F16 => &k.reduce_axes_h,
@@ -7973,22 +8856,30 @@ pub(crate) fn encode_concat_midaxis(
     inner: u32,
     dt: crate::thunk::HalfFlag,
     inputs: &[(usize, u32)],
+    input_dts: &[crate::thunk::HalfFlag],
 ) {
     use crate::thunk::HalfFlag;
     // `dst`/`src_off` are byte offsets into the arena (the kernel adds them to
     // a char* base, then indexes elements), so no element-size scaling here.
-    let pipeline = match dt {
-        HalfFlag::F32 => &k.concat_midaxis_seg,
-        HalfFlag::F16 => &k.concat_midaxis_seg_h,
-    };
     let inner_e = inner as u64;
     let mut axis_off: u32 = 0;
-    for &(src_off, src_axis) in inputs {
+    for (seg_i, &(src_off, src_axis)) in inputs.iter().enumerate() {
         let total = outer as u64 * src_axis as u64 * inner_e;
         if total == 0 {
             axis_off += src_axis;
             continue;
         }
+        // Per-segment pipeline: when a source dtype differs from the output
+        // (an F32 segment into an F16 concat — e.g. an F32 `k_rope` after a pass
+        // dropped its cast), CONVERT (read f32, write half) instead of reading
+        // f32 bytes as half (→ inf/NaN saturation).
+        let src_dt = input_dts.get(seg_i).copied().unwrap_or(dt);
+        let pipeline = match (src_dt, dt) {
+            (HalfFlag::F32, HalfFlag::F16) => &k.concat_midaxis_seg_f32_to_f16,
+            (HalfFlag::F16, HalfFlag::F32) => &k.concat_midaxis_seg_f16_to_f32,
+            (HalfFlag::F16, HalfFlag::F16) => &k.concat_midaxis_seg_h,
+            (HalfFlag::F32, HalfFlag::F32) => &k.concat_midaxis_seg,
+        };
         enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(buffer), 0);
         let dst_byte = dst as u64; // already a byte offset

@@ -77,7 +77,9 @@ pub enum ComputeUnits {
 }
 
 impl ComputeUnits {
-    /// The integer code understood by the Objective-C shim.
+    /// The integer code understood by the Objective-C shim. Apple-only (the
+    /// shim / backend are gated to Apple); unused elsewhere.
+    #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
     pub(crate) fn code(self) -> i32 {
         match self {
             ComputeUnits::All => 0,

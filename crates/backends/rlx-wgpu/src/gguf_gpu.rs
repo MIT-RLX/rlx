@@ -297,17 +297,24 @@ const STORAGE_ALIGN: u64 = 256;
 /// large fraction of Bonsai-27B prefill time (hundreds of allocs/frame).
 /// Safe across dispatches in one encoder because each dispatch is followed by
 /// a `copy_buffer_to_buffer` into the arena before the next write.
+/// Pooled output buffer + its capacity. Named (vs a tuple) so it can assert
+/// `Send` on the browser WebGPU backend where `wgpu::Buffer` is `!Send`; wasm is
+/// single-threaded, so the process-global pool is never sent cross-thread.
+struct OutPool(wgpu::Buffer, u64);
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for OutPool {}
+
 fn with_pooled_out_buf<R>(
     device: &wgpu::Device,
     need_bytes: u64,
     f: impl FnOnce(&wgpu::Buffer) -> R,
 ) -> R {
     use std::sync::Mutex;
-    static POOL: Mutex<Option<(wgpu::Buffer, u64)>> = Mutex::new(None);
+    static POOL: Mutex<Option<OutPool>> = Mutex::new(None);
     let need = need_bytes.max(16).div_ceil(16) * 16;
     let mut slot = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let recreate = match slot.as_ref() {
-        Some((_, cap)) => *cap < need,
+        Some(OutPool(_, cap)) => *cap < need,
         None => true,
     };
     if recreate {
@@ -317,9 +324,9 @@ fn with_pooled_out_buf<R>(
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        *slot = Some((buf, need));
+        *slot = Some(OutPool(buf, need));
     }
-    let (buf, _) = slot.as_ref().expect("out pool");
+    let OutPool(buf, _) = slot.as_ref().expect("out pool");
     f(buf)
 }
 

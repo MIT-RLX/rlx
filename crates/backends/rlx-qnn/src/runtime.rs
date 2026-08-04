@@ -1207,6 +1207,7 @@ impl QnnExecutable {
                 Op::Attention {
                     num_heads,
                     head_dim,
+                    v_head_dim,
                     mask_kind,
                     score_scale,
                     attn_logit_softcap,
@@ -1214,6 +1215,10 @@ impl QnnExecutable {
                     && node.inputs.len() == 4
                     && matches!(mask_kind, rlx_ir::op::MaskKind::Custom) =>
                 {
+                    assert!(
+                        v_head_dim.is_none_or(|v| v == *head_dim),
+                        "rlx-qnn: asymmetric v_head_dim (MLA) not yet supported"
+                    );
                     let (b, h, sq, d) = (dims[0], dims[1], dims[2], dims[3]);
                     if h != *num_heads as u32 || d != *head_dim as u32 {
                         return Err(format!(
@@ -1341,6 +1346,7 @@ impl QnnExecutable {
                 Op::Attention {
                     num_heads,
                     head_dim,
+                    v_head_dim,
                     mask_kind,
                     score_scale,
                     attn_logit_softcap,
@@ -1352,6 +1358,10 @@ impl QnnExecutable {
                             | rlx_ir::op::MaskKind::SlidingWindow(_)
                     ) =>
                 {
+                    assert!(
+                        v_head_dim.is_none_or(|v| v == *head_dim),
+                        "rlx-qnn: asymmetric v_head_dim (MLA) not yet supported"
+                    );
                     let (b, sq, hs) = (dims[0], dims[1], dims[2]);
                     let (h, d) = (*num_heads as u32, *head_dim as u32);
                     if hs != h * d {

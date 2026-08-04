@@ -90,12 +90,28 @@ impl FlowCtx<'_> {
     }
 
     pub fn load_param(&mut self, key: &str, transpose: bool) -> Result<HirNodeId> {
+        self.load_param_typed(key, transpose, DType::F32)
+    }
+
+    /// Load a param with an explicit graph dtype. The weight bytes come from
+    /// the loader as `f32` and are stored in the flow `params` map as `f32`;
+    /// when `dtype` is `F16`/`BF16` the backend converts f32→low-precision at
+    /// bind time (Metal: `set_param` → `arena.write_from_f32` /
+    /// `write_weight_from_f32`), so the matmul RHS ends up truly f16-resident
+    /// (2 bytes/elem, half the weight-read bandwidth). Used to store decode
+    /// matmul weights as F16 on bandwidth-bound backends.
+    pub fn load_param_typed(
+        &mut self,
+        key: &str,
+        transpose: bool,
+        dtype: DType,
+    ) -> Result<HirNodeId> {
         let cache_key = param_cache_key(key, transpose);
         if let Some(&id) = self.state.loaded_params.get(&cache_key) {
             return Ok(id);
         }
         let (data, shape) = self.weights.take(key, transpose)?;
-        let ir_shape = Shape::new(&shape, DType::F32);
+        let ir_shape = Shape::new(&shape, dtype);
         let id = self.hir().param(key, ir_shape);
         self.params.insert(key.to_string(), data);
         self.state.loaded_params.insert(cache_key, id);

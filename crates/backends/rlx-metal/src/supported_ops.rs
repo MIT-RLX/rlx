@@ -39,6 +39,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         AxialRope2d,
         Attention,
         AttentionBackward,
+        AttentionBackwardAll,
         RmsNormBackwardInput,
         RmsNormBackwardGamma,
         RmsNormBackwardBeta,
@@ -94,6 +95,23 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         GatherNd,
         GatherElements,
         DequantMatMul,
+        SynthMatMul,
+        // Native fused reconstruct (`synth_reconstruct_nk`, writes `w_bt[n,k]` in
+        // one dispatch). Claimed so a forward-only INFERENCE path can emit it — it
+        // wins the forward (~35 vs 47ms). NOT emitted by `Tensor::synth_reconstruct`
+        // during training, where it MEASURED net-worse: the opaque op costs ~+20ms
+        // in the backward (hidden from the CSE + transpose-simplification that make
+        // the decomposed fold's `dx` free) — more than the ~12ms forward win.
+        SynthReconstruct,
+        // NOTE: `SynthMatMulBackward` intentionally NOT claimed — the native fused
+        // kernels (MSL `synth_bwd_dx`/`synth_bwd_codebook`) are built and
+        // correctness-validated, but MEASURED slower than decomposing to Gather +
+        // MPS-tiled sgemm (a hand GEMM ≈ 40% of MPS, same as the forward). So the
+        // op decomposes via `LowerSynthMatMulBackward`; the kernels stay dormant
+        // for a future tiled/simdgroup implementation that could beat MPS.
+        SplineActivation,
+        SplineActivationBackwardX,
+        SplineActivationBackwardCoeff,
         GatedDeltaNet,
         SelectiveScan,
         Lstm,
@@ -102,6 +120,16 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Mamba2,
         FusedSwiGLU,
         FusedMatMulBiasAct,
+        // FusedMatMulResidual intentionally NOT claimed: decode is weight-read
+        // bandwidth-bound, so folding the residual into the matmul saves zero
+        // GPU time (measured: identical 40.5ms wait with 56 fewer dispatches),
+        // and its f32-only epilogue kernel would force the o_proj/down_proj
+        // weights to materialize F32 — blocking the F16-resident weight win
+        // (RLX_QWEN3_F16_WEIGHTS: 23.9→33.2 tok/s). The op + pass + kernel stay
+        // in-tree for a future non-bandwidth-bound path; Metal just doesn't opt in.
+        // (Re-confirmed on the dispatch-bound training path 2026-08: fusing all 16
+        // residuals gave 1.00× — removing small dispatches doesn't move wall time
+        // here; only removing real recompute, like the attention-bwd fusion, does.)
         FusedResidualLN,
         FusedResidualRmsNorm,
         // Claimed so the Metal fusion pipeline may emit it;

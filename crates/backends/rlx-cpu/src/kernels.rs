@@ -304,23 +304,32 @@ pub fn layer_norm_row(
     let inv_hf = 1.0 / h as f32;
     let chunks = h / 4;
     unsafe {
+        // Pass 1: mean.
         let mut vsum = vdupq_n_f32(0.0);
-        let mut vsumsq = vdupq_n_f32(0.0);
         for c in 0..chunks {
             let x = vld1q_f32(input.as_ptr().add(c * 4));
             vsum = vaddq_f32(vsum, x);
-            vsumsq = vfmaq_f32(vsumsq, x, x);
         }
         let mut sum = vaddvq_f32(vsum);
-        let mut sumsq = vaddvq_f32(vsumsq);
         for i in (chunks * 4)..h {
             sum += input[i];
-            sumsq += input[i] * input[i];
         }
         let mean = sum * inv_hf;
-        let var = (sumsq * inv_hf - mean * mean).max(0.0);
-        let inv = 1.0 / (var + eps).sqrt();
         let vmean = vdupq_n_f32(mean);
+        // Pass 2: var = mean((x − mean)²). Two-pass avoids the one-pass
+        // E[x²]−mean² cancellation that corrupts rows with a large DC offset.
+        let mut vdev = vdupq_n_f32(0.0);
+        for c in 0..chunks {
+            let d = vsubq_f32(vld1q_f32(input.as_ptr().add(c * 4)), vmean);
+            vdev = vfmaq_f32(vdev, d, d);
+        }
+        let mut dev = vaddvq_f32(vdev);
+        for i in (chunks * 4)..h {
+            let d = input[i] - mean;
+            dev += d * d;
+        }
+        let var = (dev * inv_hf).max(0.0);
+        let inv = 1.0 / (var + eps).sqrt();
         let vinv = vdupq_n_f32(inv);
         for c in 0..chunks {
             let off = c * 4;
@@ -358,12 +367,10 @@ pub fn layer_norm_row(
     let inv_hf = 1.0 / h as f32;
     let chunks = h / 8;
     unsafe {
+        // Pass 1: mean.
         let mut vsum = _mm256_setzero_ps();
-        let mut vsumsq = _mm256_setzero_ps();
         for c in 0..chunks {
-            let x = _mm256_loadu_ps(input.as_ptr().add(c * 8));
-            vsum = _mm256_add_ps(vsum, x);
-            vsumsq = _mm256_fmadd_ps(x, x, vsumsq);
+            vsum = _mm256_add_ps(vsum, _mm256_loadu_ps(input.as_ptr().add(c * 8)));
         }
         // Horizontal reduce: 8 lanes → 1.
         let hsum = {
@@ -374,24 +381,33 @@ pub fn layer_norm_row(
             let s1 = _mm_add_ss(s2, _mm_shuffle_ps::<0x55>(s2, s2));
             _mm_cvtss_f32(s1)
         };
-        let hsumsq = {
-            let lo = _mm256_castps256_ps128(vsumsq);
-            let hi = _mm256_extractf128_ps::<1>(vsumsq);
+        let mut sum = hsum;
+        for i in (chunks * 8)..h {
+            sum += input[i];
+        }
+        let mean = sum * inv_hf;
+        let vmean = _mm256_set1_ps(mean);
+        // Pass 2: var = mean((x − mean)²). Two-pass avoids one-pass cancellation.
+        let mut vdev = _mm256_setzero_ps();
+        for c in 0..chunks {
+            let d = _mm256_sub_ps(_mm256_loadu_ps(input.as_ptr().add(c * 8)), vmean);
+            vdev = _mm256_fmadd_ps(d, d, vdev);
+        }
+        let hdev = {
+            let lo = _mm256_castps256_ps128(vdev);
+            let hi = _mm256_extractf128_ps::<1>(vdev);
             let s4 = _mm_add_ps(lo, hi);
             let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
             let s1 = _mm_add_ss(s2, _mm_shuffle_ps::<0x55>(s2, s2));
             _mm_cvtss_f32(s1)
         };
-        let mut sum = hsum;
-        let mut sumsq = hsumsq;
+        let mut dev = hdev;
         for i in (chunks * 8)..h {
-            sum += input[i];
-            sumsq += input[i] * input[i];
+            let d = input[i] - mean;
+            dev += d * d;
         }
-        let mean = sum * inv_hf;
-        let var = (sumsq * inv_hf - mean * mean).max(0.0);
+        let var = (dev * inv_hf).max(0.0);
         let inv = 1.0 / (var + eps).sqrt();
-        let vmean = _mm256_set1_ps(mean);
         let vinv = _mm256_set1_ps(inv);
         for c in 0..chunks {
             let off = c * 8;
@@ -424,14 +440,18 @@ pub fn layer_norm_row(
     eps: f32,
 ) {
     let inv_hf = 1.0 / h as f32;
+    // Two-pass: var = mean((x − mean)²) — avoids one-pass E[x²]−mean² cancellation.
     let mut sum = 0f32;
-    let mut sumsq = 0f32;
     for i in 0..h {
         sum += input[i];
-        sumsq += input[i] * input[i];
     }
     let mean = sum * inv_hf;
-    let var = (sumsq * inv_hf - mean * mean).max(0.0);
+    let mut dev = 0f32;
+    for i in 0..h {
+        let d = input[i] - mean;
+        dev += d * d;
+    }
+    let var = (dev * inv_hf).max(0.0);
     let inv = 1.0 / (var + eps).sqrt();
     for i in 0..h {
         output[i] = (input[i] - mean) * inv * gamma[i] + beta[i];

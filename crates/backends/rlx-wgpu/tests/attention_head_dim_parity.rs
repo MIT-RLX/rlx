@@ -40,6 +40,7 @@ fn run_case(nh: usize, nkv: usize, hd: usize, seq: usize) -> Option<f32> {
         Op::Attention {
             num_heads: nh,
             head_dim: hd,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: Some(1.0), // Gemma 4: unit scale (Q pre-normed)
             attn_logit_softcap: None,

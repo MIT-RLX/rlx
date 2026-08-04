@@ -106,7 +106,13 @@ impl Array {
                 &mut out,
             )
         };
-        check(rc)?;
+        check(rc).map_err(|e| {
+            let nelem: usize = shape.iter().product();
+            MlxError(format!(
+                "{e} [from_bytes shape={shape:?} dtype={dtype:?} data.len()={} nelem={nelem}]",
+                data.len()
+            ))
+        })?;
         Ok(Self { ptr: out })
     }
 

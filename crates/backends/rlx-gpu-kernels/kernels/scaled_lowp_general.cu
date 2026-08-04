@@ -430,3 +430,67 @@ extern "C" __global__ void scaled_matmul_decode(
         arena[out_off_f32 + i * n + j] = acc;
     }
 }
+
+// Native low-precision *grouped* (MoE) decode-GEMM for Op::ScaledGroupedMatMul —
+// the expert-indexed analogue of scaled_matmul_decode. One thread per output
+// C[row=token, col=out]; the token's expert picks the weight slab, and only that
+// routed expert's FP4 codes are decoded on the fly (no f32 weight
+// materialization — memory-sane for large MoE). TN per expert:
+//   out[i,j] = Σ_p decode(input[i,p])·s_in · decode(weight[e,j,p])·s_w  (+ bias[e,j])
+// input codes [M,K], weight codes [E,N,K], input scale [M,nblk],
+// weight scale [E·N,nblk], expert_idx [M] f32, bias [E·N] f32 (per-expert).
+extern "C" __global__ void scaled_grouped_matmul_decode(
+    float* __restrict__ arena,
+    unsigned int input_byte_off,
+    unsigned int weight_byte_off,
+    unsigned int input_scale_byte_off,
+    unsigned int weight_scale_byte_off,
+    unsigned int idx_off_f32,
+    unsigned int out_off_f32,
+    unsigned int bias_off_f32,
+    unsigned int m,
+    unsigned int k,
+    unsigned int n,
+    unsigned int num_experts,
+    unsigned int lhs_fmt,
+    unsigned int rhs_fmt,
+    unsigned int scale_mode,
+    unsigned int block,
+    unsigned int has_bias)
+{
+    unsigned int row = blockIdx.y * blockDim.y + threadIdx.y; // token i
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x; // output j
+    if (row >= m || col >= n) return;
+    unsigned int e = (unsigned int)arena[idx_off_f32 + row];
+    if (e >= num_experts) return;
+
+    const unsigned char* inp = reinterpret_cast<const unsigned char*>(arena) + input_byte_off;
+    const unsigned char* wt = reinterpret_cast<const unsigned char*>(arena) + weight_byte_off;
+    const unsigned char* isb = reinterpret_cast<const unsigned char*>(arena) + input_scale_byte_off;
+    const unsigned char* wsb = reinterpret_cast<const unsigned char*>(arena) + weight_scale_byte_off;
+    unsigned int nblk = (scale_mode == 0u) ? 1u : ((k + block - 1u) / block);
+    unsigned int wrow = e * n + col; // weight code/scale row for this expert+output
+
+    // Per-tensor scales live at the very start of their f32 tensor.
+    float ls0 = arena[input_scale_byte_off / 4u];
+    float rs0 = arena[weight_scale_byte_off / 4u];
+
+    float acc = 0.0f;
+    for (unsigned int p = 0u; p < k; ++p) {
+        float ls, rs;
+        if (scale_mode == 0u) {
+            ls = ls0;
+            rs = rs0;
+        } else {
+            unsigned int li = row * nblk + p / block;
+            unsigned int ri = wrow * nblk + p / block;
+            ls = (scale_mode == 1u) ? rlx_e8m0(isb[li]) : rlx_decode_lowp(0u, isb[li]);
+            rs = (scale_mode == 1u) ? rlx_e8m0(wsb[ri]) : rlx_decode_lowp(0u, wsb[ri]);
+        }
+        float a = rlx_decode_lowp(lhs_fmt, inp[row * k + p]) * ls;
+        float b = rlx_decode_lowp(rhs_fmt, wt[wrow * k + p]) * rs;
+        acc += a * b;
+    }
+    if (has_bias) acc += arena[bias_off_f32 + wrow];
+    arena[out_off_f32 + row * n + col] = acc;
+}

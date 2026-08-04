@@ -68,6 +68,8 @@ pub mod fft_dispatch;
 pub mod spd;
 
 #[cfg(rlx_metal_host)]
+pub mod hc_sinkhorn_gate;
+#[cfg(rlx_metal_host)]
 pub mod llada2_gate;
 #[cfg(rlx_metal_host)]
 pub mod ms_deform_attn;
@@ -111,6 +113,7 @@ pub mod splat_training_pipeline;
 
 /// Double-single (2× f32 ≈ f64) reductions — near-f64 precision on Metal, which
 /// has no native f64. Compiled with precise math (fast-math breaks EFT).
+#[cfg(rlx_metal_host)]
 pub mod double_single;
 #[cfg(rlx_metal_host)]
 pub mod pipeline_cache;

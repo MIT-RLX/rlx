@@ -126,9 +126,14 @@ pub fn icb_kernels() -> &'static IcbKernels {
         use crate::device::metal_device;
         let dev = metal_device().expect("Metal device required");
         let opts = metal::CompileOptions::new();
+        // Use the FULLY-ASSEMBLED source (placeholders like `@@RLX_SCALAR_ACT_FNS@@`
+        // substituted with the generated `rlx_gelu_scalar` / `rlx_pow_scalar` / …
+        // helper bodies) — the same source the regular `kernels()` compiles. The raw
+        // `RLX_KERNELS_MSL` const still has the markers, so ICB kernels referencing
+        // those helpers failed to compile ("use of undeclared identifier").
         let library = dev
             .device
-            .new_library_with_source(crate::kernels::RLX_KERNELS_MSL, &opts)
+            .new_library_with_source(&crate::kernels::msl_source(), &opts)
             .expect("MSL compilation for ICB kernels failed");
         IcbKernels::new(&dev.device, &library)
     })

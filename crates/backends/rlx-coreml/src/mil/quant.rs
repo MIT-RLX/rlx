@@ -212,22 +212,27 @@ impl<'a> LowerCtx<'a> {
             &[n, k],
             &indices,
         )?);
-        // LUT [n, kg, 2, 1] f16: grouped palettization (group_size 128 along k,
-        // 1 along n; 2 palette entries = 2^1; scalar vector).
+        // LUT [n, kg, 2, 1]: grouped palettization (group_size 128 along k,
+        // 1 along n; 2 palette entries = 2^1; scalar vector). Emit at the
+        // graph's float precision (F32 by default) so the 1-bit weight
+        // dequantizes and matmuls in f32 — the old code hard-coded F16 here,
+        // silently halving precision for a 27B-class model even in fp32 mode.
+        // Drops to F16 only when RLX_COREML_F16 sets float_dtype=F16.
+        let fdt = self.opts.float_dtype;
         let lut_name = format!("{prefix}_lut");
         self.operations.push(make_const_float(
             &mut self.blob,
             &lut_name,
-            &Shape::new(&[n, kg, 2, 1], DType::F16),
+            &Shape::new(&[n, kg, 2, 1], fdt),
             &lut,
-            DType::F16,
+            fdt,
         )?);
-        // `constexpr_lut_to_dense` requires lut.dtype == output.dtype (f16 here).
+        // `constexpr_lut_to_dense` requires lut.dtype == output.dtype.
         let dq_name = format!("{prefix}_w");
         self.emit(
             "constexpr_lut_to_dense",
             &dq_name,
-            &Shape::new(&[n, k], DType::F16),
+            &Shape::new(&[n, k], fdt),
             vec![
                 ("indices", bind_name(&idx_name)),
                 ("lut", bind_name(&lut_name)),

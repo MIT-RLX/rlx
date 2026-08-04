@@ -13,30 +13,31 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 335  
-**Unregistered mentions (migration leftovers):** 88
+**Registered names:** 346  
+**Unregistered mentions (migration leftovers):** 255
 
 ## Groups
 
 - [compile](#compile) — 9
 - [coreml](#coreml) — 8
-- [cpu](#cpu) — 6
+- [cpu](#cpu) — 8
 - [cuda](#cuda) — 38
 - [debug](#debug) — 12
 - [device](#device) — 4
 - [fft](#fft) — 10
 - [gpu](#gpu) — 4
-- [metal](#metal) — 88
-- [misc](#misc) — 65
+- [metal](#metal) — 94
+- [misc](#misc) — 66
 - [mlx](#mlx) — 17
 - [oneapi](#oneapi) — 4
 - [onnx](#onnx) — 4
 - [profile](#profile) — 1
 - [qnn](#qnn) — 1
+- [quant](#quant) — 1
 - [rocm](#rocm) — 6
 - [tpu](#tpu) — 1
 - [vulkan](#vulkan) — 14
-- [wgpu](#wgpu) — 43
+- [wgpu](#wgpu) — 44
 
 ## compile
 
@@ -71,9 +72,11 @@ semantics. Curated Public list: `just env-catalog`.
 |------|-----------|------|-------|---------|
 | `RLX_ARENA_ALIGN` | Bisect | U64 | Backend(cpu) | See call sites for `RLX_ARENA_ALIGN` |
 | `RLX_ARENA_NO_REUSE` | Bisect | Bool | Backend(cpu) | See call sites for `RLX_ARENA_NO_REUSE` |
+| `RLX_CPU_MATMUL_F64_ACCUM` | Public | Bool | Backend(cpu) | Accumulate the CPU matmul K-reduction in f64 (precision/validated mode; default-off, vendor-BLAS fast path untouched) |
 | `RLX_FAST_CONV` | Public | BoolOr | Backend(cpu) | CPU Conv2d im2col+BLAS path (default on; set 0 for scalar nested loops) |
 | `RLX_PAR_THRESHOLD` | Bisect | U64 | Backend(cpu) | See call sites for `RLX_PAR_THRESHOLD` |
 | `RLX_SDPA_THRESHOLD` | Bisect | U64 | Backend(cpu) | See call sites for `RLX_SDPA_THRESHOLD` |
+| `RLX_VMATH_ACCURATE` | Public | BoolOr | Backend(cpu) | CPU vmath exp/tanh/log/sqrt: use Accelerate/libm accurate path (default 0 = SIMD *_fast) |
 | `RLX_WORKERS` | Bisect | U64 | Backend(cpu) | See call sites for `RLX_WORKERS` |
 
 ## cuda
@@ -183,7 +186,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_METAL_CONCAT_MULTI` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_CONCAT_MULTI` |
 | `RLX_METAL_CONV_BWD_IMPLICIT` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_CONV_BWD_IMPLICIT` |
 | `RLX_METAL_DEBUG` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_DEBUG` |
-| `RLX_METAL_DEQUANT_GPU_DISABLE` | Public | Bool | Backend(metal) | Disable Metal GPU GGUF dequant (host / legacy path) aliases: `RLX_DISABLE_METAL_DEQUANT_GPU` |
+| `RLX_METAL_DEQUANT_GPU_DISABLE` | Public | Bool | Backend(metal) | Disable Metal GPU GGUF/MLX dequant (host / legacy path) aliases: `RLX_DISABLE_METAL_DEQUANT_GPU` |
 | `RLX_METAL_DEQUANT_MATMUL_LEGACY` | Public | Bool | Backend(metal) | Use pre-fused dequant+matmul path (materializes weights) |
 | `RLX_METAL_DISABLE_NARROW_ROPE_FUSE` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_DISABLE_NARROW_ROPE_FUSE` |
 | `RLX_METAL_DUMP_NODES` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_DUMP_NODES` |
@@ -221,6 +224,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_METAL_MPS_SDPA` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_MPS_SDPA` |
 | `RLX_METAL_NARROW_BATCH` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_NARROW_BATCH` |
 | `RLX_METAL_NO_FUSION` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_NO_FUSION` |
+| `RLX_METAL_NO_SGEMM64` | Bisect | Bool | Backend(metal) | Disable the default 64x64-tile Simd64 sgemm (fall back to Simd4x4) for aligned tall/short-K matmuls. |
 | `RLX_METAL_NO_SHARE` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_NO_SHARE` |
 | `RLX_METAL_ONNX_QMATMUL_GPU` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_ONNX_QMATMUL_GPU` |
 | `RLX_METAL_ONNX_QMATMUL_MIN_FLOPS` | Bisect | U64 | Backend(metal) | See call sites for `RLX_METAL_ONNX_QMATMUL_MIN_FLOPS` |
@@ -245,10 +249,15 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_METAL_SDPA_DECODE_M1` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_SDPA_DECODE_M1` |
 | `RLX_METAL_SGEMM_MPS` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_SGEMM_MPS` |
 | `RLX_METAL_SGEMM_PRECISE` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_SGEMM_PRECISE` |
+| `RLX_METAL_SGEMM_SPLITK` | Bisect | Bool | Backend(metal) | Enable the split-K 64x64 sgemm for fat-K/small-MN shapes (dW=xT.dq); atomic-accumulate into a pre-zeroed C. |
 | `RLX_METAL_SGEMM_VARIANT` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_SGEMM_VARIANT` |
 | `RLX_METAL_SOFTMAX_TRACE` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_SOFTMAX_TRACE` |
 | `RLX_METAL_SSM_CPU` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_SSM_CPU` |
 | `RLX_METAL_SSM_HOST_FALLBACK` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_SSM_HOST_FALLBACK` |
+| `RLX_METAL_SYNTH_MPS_DISABLE` | Bisect | Bool | Backend(metal) | SynthMatMul m>8 prefill uses the fused kernel instead of reconstruct→MPS (A/B) |
+| `RLX_METAL_SYNTH_RECON_F16` | Public | Bool | Backend(metal) | SynthMatMul m>8 prefill reconstructs the weight in f16 → MPS hgemm (~1.3×, 2× smaller scratch, relaxed precision) |
+| `RLX_METAL_SYNTH_TILED` | Bisect | Bool | Backend(metal) | SynthMatMul m>8 uses the threadgroup-tiled fused kernel (zero-scratch/capturable; slower than recon→MPS) |
+| `RLX_METAL_SYNTH_TILED_F16` | Bisect | Bool | Backend(metal) | With RLX_METAL_SYNTH_TILED, use the f16 (simdgroup_half8x8) tiled kernel variant |
 | `RLX_METAL_THUNK_PROFILE` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_THUNK_PROFILE` |
 | `RLX_METAL_TRACE` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_TRACE` |
 | `RLX_METAL_TRACE_FAB` | Bisect | Bool | Backend(metal) | See call sites for `RLX_METAL_TRACE_FAB` |
@@ -278,6 +287,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_DECODE_BUCKET_RESIDENT_BYTES` | Bisect | U64 | Tooling | See call sites for `RLX_DECODE_BUCKET_RESIDENT_BYTES` |
 | `RLX_DECODE_ONESHOT_PEAK_BYTES` | Bisect | U64 | Tooling | See call sites for `RLX_DECODE_ONESHOT_PEAK_BYTES` |
 | `RLX_DECOMPOSE_FUSION_REGIONS` | Bisect | Bool | Tooling | See call sites for `RLX_DECOMPOSE_FUSION_REGIONS` |
+| `RLX_DECOMPOSE_SPLINE_BWD` | Bisect | Bool | Tooling | Force the KAN spline VJP to the decomposed exp/mul/reduce chain instead of the fused SplineActivationBackwardX/Coeff ops (debug/parity). |
 | `RLX_DEQUANT_CACHE` | Bisect | Path | Tooling | See call sites for `RLX_DEQUANT_CACHE` |
 | `RLX_DIRECT_CONV` | Bisect | Bool | Tooling | See call sites for `RLX_DIRECT_CONV` |
 | `RLX_DISABLE_MPS` | Bisect | Bool | Tooling | See call sites for `RLX_DISABLE_MPS` |
@@ -384,6 +394,12 @@ semantics. Curated Public list: `just env-catalog`.
 |------|-----------|------|-------|---------|
 | `RLX_QNN_BACKEND_LIB` | Bisect | Bool | Backend(qnn) | See call sites for `RLX_QNN_BACKEND_LIB` |
 
+## quant
+
+| Name | Stability | Kind | Layer | Summary |
+|------|-----------|------|-------|---------|
+| `RLX_MLX_DEQUANT_GPU_DISABLE` | Public | Bool | Runtime | Force host-staged MLX DequantMatMul on all GPU backends |
+
 ## rocm
 
 | Name | Stability | Kind | Layer | Summary |
@@ -466,6 +482,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_Q1_0_GEMM_DISABLE` | Bisect | Bool | Backend(wgpu) | See call sites for `RLX_WGPU_Q1_0_GEMM_DISABLE` |
 | `RLX_WGPU_SCHEDULE` | Bisect | Bool | Backend(wgpu) | See call sites for `RLX_WGPU_SCHEDULE` |
 | `RLX_WGPU_SHARD_LOG` | Bisect | Bool | Backend(wgpu) | See call sites for `RLX_WGPU_SHARD_LOG` |
+| `RLX_WGPU_SHARE_WEIGHTS` | Public | Bool | Backend(wgpu) | Reuse GPU weight buffers across compiles with matching named layouts (default on; set 0 to disable) |
 | `RLX_WGPU_TILED_MIN_SPATIAL` | Bisect | U64 | Backend(wgpu) | See call sites for `RLX_WGPU_TILED_MIN_SPATIAL` |
 
 ## Unregistered mentions
@@ -474,18 +491,73 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 
 | Name | Example path |
 |------|--------------|
+| `RLX_ACTIVATION_BACKWARD` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_ACT_INPLACE_H` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_AD_FUSED_MMBA_VJP` | `crates/core/rlx-autodiff/src/autodiff.rs` |
+| `RLX_ANDROID_AVD` | `android/e2e.sh` |
+| `RLX_ARENA_CHECK` | `crates/backends/rlx-cpu/src/arena.rs` |
+| `RLX_ATTN_BWD_SERIAL` | `crates/backends/rlx-cpu/src/attention_bwd.rs` |
 | `RLX_BACKENDS_MANIFEST_PATH` | `crates/core/rlx-runtime/src/backends_manifest.rs` |
+| `RLX_BAKE_OUT` | `crates/io/rlx-bake/examples/common/mnist.rs` |
+| `RLX_BAKE_PASSWORD` | `crates/io/rlx-bake/examples/common/mnist.rs` |
 | `RLX_BATCH` | `CHANGELOG.md` |
 | `RLX_BENCH` | `crates/backends/rlx-cortexm/trainer/src/train.rs` |
+| `RLX_BINARY_FN` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_COMPARE_FN` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_COMPILE_OUTPUT_CAP` | `crates/backends/rlx-mlx/src/config.rs` |
+| `RLX_CONCAT_MIDAXIS` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_CONVINT_FLOAT_ACT` | `crates/io/rlx-onnx-import/src/rewrite.rs` |
+| `RLX_COREML_DEBUG_IO` | `crates/backends/rlx-coreml/src/backend.rs` |
+| `RLX_CPU_ARENA_REPORT` | `crates/core/rlx-runtime/src/backend/cpu_backend.rs` |
+| `RLX_CPU_ATTN_BWD_FUSE` | `crates/backends/rlx-metal/src/thunk/compile.rs` |
+| `RLX_CPU_BNNS_BF16` | `crates/backends/rlx-cpu/src/blas.rs` |
+| `RLX_CPU_BNNS_F16` | `crates/backends/rlx-cpu/src/blas.rs` |
+| `RLX_CPU_SME` | `crates/backends/rlx-cpu/src/blas.rs` |
+| `RLX_CPU_SME_BF16` | `crates/backends/rlx-cpu/src/blas.rs` |
+| `RLX_CPU_SME_W8A8` | `crates/backends/rlx-cpu/src/thunk/tests.rs` |
+| `RLX_CUDA_ATTENTION` | `crates/backends/rlx-cuda/src/config.rs` |
+| `RLX_CUDA_ATTENTION_WMMA` | `crates/backends/rlx-cuda/src/config.rs` |
+| `RLX_CUDA_ATTENTION_WMMA_MIN_WORK` | `crates/backends/rlx-cuda/src/config.rs` |
+| `RLX_CUDA_CAPTURE_DEBUG` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_CONV_FORCE_GATHER` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_CONV_TRACE` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_CONV_T_CUDNN` | `crates/backends/rlx-cuda/README.md` |
+| `RLX_CUDA_CONV_T_KERNEL` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_DUMP_IO` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_DYN_LSTM_HOST` | `crates/backends/rlx-cuda/src/dyn_quant_lstm_gpu.rs` |
+| `RLX_CUDA_DYN_LSTM_TRACE` | `crates/backends/rlx-cuda/src/dyn_quant_lstm_gpu.rs` |
 | `RLX_CUDA_FORCE_ATTENTION_ROW` | `crates/core/rlx-ir/src/attention_layout.rs` |
 | `RLX_CUDA_FULL_KV_READBACK` | `crates/backends/rlx-cuda/README.md` |
+| `RLX_CUDA_INDEXING_TRACE` | `crates/backends/rlx-gpu-host/src/scan.rs` |
+| `RLX_CUDA_INPUT_DIAG` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_LSTM_CUBLAS_TRACE` | `crates/backends/rlx-cuda/src/lstm_gpu.rs` |
+| `RLX_CUDA_LSTM_CUDNN` | `crates/backends/rlx-cuda/src/lstm_cudnn.rs` |
+| `RLX_CUDA_LSTM_CUDNN_TRACE` | `crates/backends/rlx-cuda/src/lstm_cudnn.rs` |
+| `RLX_CUDA_LSTM_DEBUG` | `crates/backends/rlx-cuda/src/lstm_gpu.rs` |
+| `RLX_CUDA_MATMUL_PRECISE_MIN_K` | `crates/backends/rlx-cuda/src/gguf_gpu.rs` |
+| `RLX_CUDA_NO_BCAST_BINARY` | `crates/backends/rlx-cuda/src/backend/compile.rs` |
+| `RLX_CUDA_RNN_HOST_FALLBACK` | `crates/backends/rlx-cuda/src/backend/compile.rs` |
+| `RLX_CUDA_SCATTER_ND_HOST` | `crates/backends/rlx-cuda/src/scatter_nd_gpu.rs` |
+| `RLX_CUDA_SCATTER_ND_TRACE` | `crates/backends/rlx-cuda/src/scatter_nd_gpu.rs` |
+| `RLX_CUDA_SEGMENTED_CAPTURE` | `crates/backends/rlx-cuda/src/backend/mod.rs` |
+| `RLX_CUDA_SEGMENTED_CAPTURE_ENGAGE` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_SSM_HOST_FALLBACK` | `crates/backends/rlx-cuda/src/backend/compile.rs` |
+| `RLX_CUDA_STEP_PROFILE` | `crates/backends/rlx-cuda/src/backend/run.rs` |
+| `RLX_CUDA_TMA` | `crates/backends/rlx-cuda/src/config.rs` |
+| `RLX_CUDA_UNIFIED` | `crates/backends/rlx-cuda/src/arena.rs` |
+| `RLX_CUDA_WHOLE_GRAPH_CAPTURE` | `crates/backends/rlx-cuda/src/backend/run.rs` |
 | `RLX_DECOMPOSE_BENCH_RUNS` | `rig.sh` |
 | `RLX_DECOMPOSE_BENCH_WARMUP` | `rig.sh` |
 | `RLX_DENY_DEVICES` | `docs/backend-selection.md` |
+| `RLX_DEQUANT_CACHE_MAX_BYTES` | `crates/backends/rlx-cpu/src/dequant_cache.rs` |
 | `RLX_DETERMINISTIC_REDUCE` | `crates/core/rlx-collectives/src/lib.rs` |
+| `RLX_DIM_DBG` | `crates/backends/rlx-mlx/src/lower/subgraph.rs` |
+| `RLX_DISABLE_CSE` | `crates/core/rlx-runtime/src/precompile.rs` |
 | `RLX_DISABLE_MPSGRAPH_HYBRID` | `crates/backends/rlx-metal/src/config.rs` |
 | `RLX_DISABLE_MPSGRAPH_PARAM_CONST` | `crates/backends/rlx-metal/src/backend/mod.rs` |
+| `RLX_DUMP_KERNELS` | `crates/backends/rlx-cuda/src/kernels/mod.rs` |
+| `RLX_ENC_MAGIC` | `crates/io/rlx-bake/src/lib.rs` |
+| `RLX_ENC_VERSION` | `crates/io/rlx-bake/src/lib.rs` |
 | `RLX_FFT_E2E_APPLE_FEATURES` | `rig.sh` |
 | `RLX_FFT_E2E_APPLE_JSON` | `rig.sh` |
 | `RLX_FFT_E2E_CUDA_JSON` | `rig.sh` |
@@ -502,43 +574,105 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_FFT_WELCH_TRAIN_STEPS` | `rig.sh` |
 | `RLX_FFT_WGPU_BIG` | `crates/backends/rlx-wgpu/src/fft_dispatch.rs` |
 | `RLX_FFT_WGPU_ONCHIP` | `crates/backends/rlx-wgpu/src/fft_dispatch.rs` |
+| `RLX_FORMAT_VERSION` | `crates/io/rlx-bake/src/format.rs` |
+| `RLX_GELU_INPLACE_F32` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_GEMMA3_GGUF` | `rig.sh` |
+| `RLX_GGUF_Q8K_PREFILL` | `crates/backends/rlx-cpu/src/gguf_matmul.rs` |
 | `RLX_GRAPH_FUSED` | `crates/backends/rlx-cortexm/trainer/src/train.rs` |
+| `RLX_HD_PROFILE` | `crates/backends/rlx-gpu-host/src/mlx.rs` |
+| `RLX_HF_CACHE` | `crates/io/rlx-mlx-io/src/hf.rs` |
+| `RLX_HF_MLX` | `crates/backends/rlx-metal/tests/metal_mlx_hf_checkpoint.rs` |
+| `RLX_HF_MLX_REPO` | `crates/io/rlx-mlx-io/src/hf.rs` |
+| `RLX_HF_REVISION` | `crates/io/rlx-mlx-io/src/hf.rs` |
+| `RLX_INSPECT_BINS` | `crates/core/rlx-ir/src/tensor_inspect.rs` |
+| `RLX_INSPECT_OPS` | `crates/backends/rlx-cpu/src/executor.rs` |
 | `RLX_IROH_ALPN` | `crates/core/rlx-driver/src/iroh_transport.rs` |
 | `RLX_IROH_PEERS` | `crates/core/rlx-driver/src/iroh_transport.rs` |
 | `RLX_IROH_SECRET` | `crates/core/rlx-driver/src/iroh_transport.rs` |
 | `RLX_IROH_SEED` | `crates/core/rlx-driver/src/iroh_transport.rs` |
+| `RLX_JNI_FEATURES` | `android/build.sh` |
 | `RLX_KERNELS_MSL` | `crates/backends/rlx-metal/src/icb.rs` |
 | `RLX_KERNELS_MSL_DEQUANT` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_KERNELS_MSL_FFT_GPU` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_KERNELS_MSL_SPLAT` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_KERNELS_MSL_SPLAT_CONIC` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_KITTEN_IF_STUB_META` | `crates/io/rlx-onnx-import/src/lower/ops/control.rs` |
+| `RLX_KITTEN_INORM_ACTIVE` | `crates/io/rlx-onnx-import/src/lower/ops/norm.rs` |
+| `RLX_KVSTORE_PREAD` | `crates/core/rlx-runtime/src/quantized_kv.rs` |
+| `RLX_KVSTORE_READ_STATS` | `crates/core/rlx-runtime/src/kv_context_store.rs` |
 | `RLX_LOCATEANYTHING_DIR` | `rig.sh` |
 | `RLX_LR` | `docs/benchmarks/coreml-training.md` |
+| `RLX_MADV` | `crates/core/rlx-runtime/src/backend/cpu_backend.rs` |
+| `RLX_MAGIC` | `crates/io/rlx-bake/src/format.rs` |
+| `RLX_MAX_RAM_BYTES` | `crates/core/rlx-runtime/src/resource_budget.rs` |
+| `RLX_MAX_RESIDENT_EXPERTS` | `crates/core/rlx-runtime/src/resource_budget.rs` |
+| `RLX_MEM_VERIFY` | `crates/core/rlx-compile/src/memory.rs` |
+| `RLX_METAL_ARENA_DIAG` | `crates/backends/rlx-metal/src/arena.rs` |
+| `RLX_METAL_ATTN_BWD_FUSE` | `crates/backends/rlx-metal/src/thunk/compile.rs` |
+| `RLX_METAL_ATTN_BWD_FUSED` | `crates/backends/rlx-metal/src/attention_bwd_gpu.rs` |
+| `RLX_METAL_ATTN_BWD_FUSED_ZEROONLY` | `crates/backends/rlx-metal/src/attention_bwd_gpu.rs` |
+| `RLX_METAL_DUMP_BYTES` | `crates/backends/rlx-metal/src/thunk/mod.rs` |
+| `RLX_METAL_DUMP_MSL` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_METAL_DW_SUM` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_METAL_FUSE_RESIDUAL_DUAL` | `crates/backends/rlx-metal/src/thunk/mod.rs` |
+| `RLX_METAL_GDN_NATIVE` | `crates/core/rlx-runtime/tests/cpu_gated_delta_net_parity.rs` |
+| `RLX_METAL_GDN_SG` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_METAL_GEMV_SPLITK` | `crates/backends/rlx-metal/src/blas.rs` |
+| `RLX_METAL_GROUPED_GEMV_DISABLE` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
 | `RLX_METAL_IQ` | `crates/backends/rlx-metal/README.md` |
+| `RLX_METAL_KERNEL_STATS` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_METAL_LN_GAMMA_SIMD` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_MATMUL_TRANSPOSE_FOLD` | `crates/backends/rlx-metal/src/thunk/compile.rs` |
+| `RLX_METAL_MATMUL_TRANSPOSE_FOLD_WEIGHTS` | `crates/backends/rlx-metal/src/thunk/compile.rs` |
+| `RLX_METAL_PARAM_DIAG` | `crates/core/rlx-runtime/src/backend/metal_backend.rs` |
+| `RLX_METAL_RB_DEBUG` | `crates/backends/rlx-metal/src/backend/encode/mod.rs` |
+| `RLX_METAL_RB_FUSED_GEMM` | `crates/backends/rlx-metal/src/backend/encode/mod.rs` |
+| `RLX_METAL_REDUCE_SIMD` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_SDPA_FA2` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_SDPA_H16` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_SDPA_MMA` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_SDPA_OCCPAD` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_SDPA_SIMD` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_SDPA_SPLITK` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_UNPIN_ALL` | `crates/backends/rlx-metal/src/backend/compile.rs` |
 | `RLX_MINICPM5_GGUF_DIR` | `rig.sh` |
 | `RLX_MINICPM5_GGUF_Q4_K_M` | `rig.sh` |
 | `RLX_MLX_BENCH_PROFILE` | `rig.sh` |
 | `RLX_MLX_COMPILE_OUTPUT_CAP` | `crates/backends/rlx-mlx/src/config.rs` |
 | `RLX_MLX_CUDA` | `crates/backends/rlx-mlx-sys/build.rs` |
+| `RLX_MLX_GROUPED_ONDEVICE` | `crates/backends/rlx-mlx/src/lower/env.rs` |
+| `RLX_MLX_GROUPED_ONDEVICE_MAX_BYTES` | `crates/backends/rlx-mlx/src/lower/env.rs` |
+| `RLX_MLX_KEEP_WARM` | `crates/io/rlx-mlx-io/src/load.rs` |
 | `RLX_MLX_NO_CCACHE` | `crates/backends/rlx-mlx-sys/build.rs` |
 | `RLX_MLX_OK` | `crates/backends/rlx-mlx/src/array.rs` |
 | `RLX_MODELS_BUILD_WIN` | `rig.sh` |
+| `RLX_MODELS_DIR` | `crates/io/rlx-onnx-import/src/rewrite.rs` |
 | `RLX_MODELS_SRC` | `rig.sh` |
 | `RLX_MODELS_WIN` | `rig.sh` |
 | `RLX_MODELS_WSL` | `rig.sh` |
 | `RLX_MPSGRAPH_ATTENTION` | `crates/backends/rlx-metal/src/mps_graph.rs` |
+| `RLX_MPS_LOWP_ACT` | `crates/backends/rlx-metal/src/mps_graph.rs` |
+| `RLX_NO_WEIGHT_CONCAT_FUSION` | `crates/core/rlx-compile/src/fusion_pipeline.rs` |
 | `RLX_NTH_ORDER_RUNS` | `rig.sh` |
 | `RLX_NTH_ORDER_SIZES` | `rig.sh` |
 | `RLX_NTH_ORDER_WARMUP` | `rig.sh` |
 | `RLX_ORT_INTRA_THREADS` | `crates/io/rlx-onnx/src/backend.rs` |
 | `RLX_PIPELINE_ALPN` | `crates/core/rlx-driver/src/lib.rs` |
+| `RLX_POW_SCALAR_FN` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_PRECISION` | `crates/core/rlx-tensor/src/cache.rs` |
 | `RLX_PREFER_DEVICES` | `docs/backend-selection.md` |
 | `RLX_QNN_HTP_LIB` | `Justfile` |
 | `RLX_QWEN25_GGUF` | `rig.sh` |
+| `RLX_QWEN3_BAKE_WEIGHTS` | `crates/backends/rlx-metal/src/thunk/mod.rs` |
+| `RLX_QWEN3_F16_KV` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_QWEN3_F16_LM_HEAD` | `CHANGELOG.md` |
+| `RLX_QWEN3_F16_WEIGHTS` | `crates/core/rlx-flow/src/blocks/lm_head.rs` |
+| `RLX_QWEN3_GQA_NATIVE` | `crates/core/rlx-flow/src/blocks/qwen3_decode_layer.rs` |
 | `RLX_QWEN3_PARITY` | `CHANGELOG.md` |
+| `RLX_QWEN3_RETENTION` | `docs/kv-retention.md` |
+| `RLX_QWEN3_RETENTION_DEBUG` | `docs/kv-retention.md` |
 | `RLX_QWEN3_TTS_DIR` | `rig.sh` |
+| `RLX_RANK` | `crates/core/rlx-distributed/src/config.rs` |
 | `RLX_REGIONS` | `crates/backends/rlx-cortexm/trainer/src/train.rs` |
 | `RLX_RESIDENT` | `docs/benchmarks/frameworks-and-backends.md` |
 | `RLX_RIG_BUILD` | `rig.sh` |
@@ -550,7 +684,23 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_RIG_SKIP_SYNC` | `rig.sh` |
 | `RLX_RIG_SYNC_NO_PRUNE` | `rig.sh` |
 | `RLX_RIG_WORKSPACE` | `rig.sh` |
+| `RLX_ROCM_ARCH` | `crates/backends/rlx-rocm/src/hip.rs` |
+| `RLX_ROCM_DISABLE_MIOPEN` | `crates/backends/rlx-rocm/src/device.rs` |
+| `RLX_ROCM_EXEC` | `crates/backends/rlx-rocm/src/backend/compile.rs` |
+| `RLX_ROCM_FAST_FP_ATOMICS` | `crates/backends/rlx-rocm/src/hip.rs` |
 | `RLX_ROCM_FORCE_ATTENTION_ROW` | `crates/backends/rlx-rocm/src/backend/run.rs` |
+| `RLX_ROCM_GEMV` | `crates/backends/rlx-rocm/src/backend/run.rs` |
+| `RLX_ROCM_NO_TF32` | `crates/backends/rlx-rocm/src/hipblas.rs` |
+| `RLX_ROCM_NO_VENDOR_GEMM` | `crates/backends/rlx-rocm/src/backend/run.rs` |
+| `RLX_ROCM_PARITY` | `crates/backends/rlx-rocm/src/hipblas.rs` |
+| `RLX_ROCM_PROFILE_STEPS` | `crates/backends/rlx-rocm/src/backend/run.rs` |
+| `RLX_ROCM_RNN_HOST_FALLBACK` | `crates/backends/rlx-rocm/src/backend/compile.rs` |
+| `RLX_ROCM_SSM_HOST_FALLBACK` | `crates/backends/rlx-rocm/src/backend/compile.rs` |
+| `RLX_ROCM_TRACE_STEPS` | `crates/backends/rlx-rocm/src/backend/run.rs` |
+| `RLX_SCALAR_ACT_FNS` | `crates/backends/rlx-metal/src/icb.rs` |
+| `RLX_SDPA_DECODE_M1` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_SELSCAN_LEGACY_UNROLL` | `crates/core/rlx-fusion/src/unfuse/rnn.rs` |
+| `RLX_SGEMM_TILES` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_SIM_DEVICE` | `Justfile` |
 | `RLX_SKIP_WRITEBACK` | `docs/benchmarks/frameworks-and-backends.md` |
 | `RLX_SMOLLM2_GGUF` | `rig.sh` |
@@ -558,10 +708,44 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_TORCH_IMPORT_BIN` | `crates/bindings/pyrlx/pyproject.toml` |
 | `RLX_TPU_BENCH` | `crates/backends/rlx-tpu/tests/pjrt_bench.rs` |
 | `RLX_TPU_BENCH_SWEEP` | `crates/backends/rlx-tpu/tests/pjrt_bench.rs` |
+| `RLX_TPU_MATMUL_HIGHEST` | `crates/backends/rlx-tpu/src/lower/lower.rs` |
 | `RLX_TRANSPORT` | `docs/iroh-transport.md` |
 | `RLX_USE_MPSGRAPH` | `crates/backends/rlx-metal/src/mps_graph.rs` |
 | `RLX_USE_MPS_GRAPH` | `crates/backends/rlx-metal/src/mps_graph.rs` |
+| `RLX_VULKAN_MLX_NATIVE` | `crates/backends/rlx-vulkan/src/buffer.rs` |
+| `RLX_VULKAN_SHARD_STAGE_MIB` | `crates/backends/rlx-vulkan/src/buffer.rs` |
+| `RLX_WGPU_ALL_PARAMS_WEIGHT` | `crates/backends/rlx-wgpu/src/buffer.rs` |
+| `RLX_WGPU_CONV_HOST` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_DBG_HOST_OP` | `crates/backends/rlx-gpu-host/src/scan.rs` |
+| `RLX_WGPU_DBG_INT8_HOST` | `crates/backends/rlx-wgpu/src/int8_host.rs` |
+| `RLX_WGPU_DISCRETE_HOST` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_EXPAND_HOST` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_FORCE_HOST` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_GATHER_SPLIT` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_GPU_NORM` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_HOST_EAGER_H2D` | `crates/backends/rlx-gpu-host/src/scan.rs` |
+| `RLX_WGPU_HOST_MATMUL` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_HOST_NORM` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_NO_FOLD_MMBA` | `crates/backends/rlx-wgpu/src/unfuse.rs` |
+| `RLX_WGPU_NO_FOLD_RESLN` | `crates/backends/rlx-wgpu/src/unfuse.rs` |
+| `RLX_WGPU_ONE_OP_PER_PASS` | `crates/backends/rlx-wgpu/src/backend/run.rs` |
+| `RLX_WGPU_SHARD_GPU` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WGPU_SHARD_STAGE_MIB` | `crates/backends/rlx-wgpu/src/buffer.rs` |
+| `RLX_WGPU_TRANSPOSE_HOST` | `crates/backends/rlx-wgpu/src/backend/compile/lower.rs` |
+| `RLX_WG_LAYERS` | `crates/core/rlx-runtime/tests/cuda_capture_probe.rs` |
 | `RLX_WHISPER_DIR` | `rig.sh` |
+| `RLX_WORKER_ERR_DIR` | `crates/core/rlx-distributed/src/cluster/mod.rs` |
+| `RLX_XDNA_AIE_INCLUDE` | `crates/core/rlx-runtime/src/backend/xdna_backend.rs` |
+| `RLX_XDNA_CHAIN_CAP` | `crates/core/rlx-runtime/src/backend/xdna_backend.rs` |
+| `RLX_XDNA_GEMM` | `crates/backends/rlx-xdna/src/lib.rs` |
+| `RLX_XDNA_INSTS` | `crates/backends/rlx-xdna/src/lib.rs` |
+| `RLX_XDNA_NO_RESIDENT` | `crates/core/rlx-runtime/src/backend/xdna_backend.rs` |
+| `RLX_XDNA_SHIM` | `crates/backends/rlx-xdna/src/lib.rs` |
+| `RLX_XDNA_TURBO` | `crates/backends/rlx-xdna/src/direct.rs` |
+| `RLX_XDNA_UMQ` | `crates/backends/rlx-xdna/src/direct.rs` |
+| `RLX_XDNA_UMQ_RING` | `crates/backends/rlx-xdna/src/direct.rs` |
+| `RLX_XDNA_XCLBIN` | `crates/backends/rlx-xdna/src/lib.rs` |
+| `RLX_XDNA_XRT_LIB` | `crates/backends/rlx-xdna/src/lib.rs` |
 
 ## Maintenance
 
@@ -571,6 +755,3 @@ just gen-rlx-env-vars
 ```
 
 Add new names to `env_registry_data.inc.rs`. Unregistered `env::flag("RLX_…")` call sites fail `just check-rlx-env-vars`.
-## License
-
-MIT OR Apache-2.0.

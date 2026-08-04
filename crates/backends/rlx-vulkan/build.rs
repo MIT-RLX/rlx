@@ -191,8 +191,11 @@ fn compile_glsl_to_spirv(name: &str, src: &str, shader_dir: &Path) -> Vec<u32> {
     // Packed-byte / GGUF kernels need the uint+i8 arena helpers (not float-only).
     let u32_arena = name.starts_with("dequant")
         || name.starts_with("quantize")
+        || name.starts_with("scaled_grouped")
         || name.starts_with("q_matmul")
-        || name.starts_with("q_conv");
+        || name.starts_with("q_conv")
+        // Packed-bf16 matmul: reads the weight as u32 words (unpacks bf16→f32).
+        || name == "matmul_bf16";
     let inc_name = if u32_arena {
         "arena_u32.inc"
     } else {

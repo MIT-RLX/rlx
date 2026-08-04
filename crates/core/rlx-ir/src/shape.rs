@@ -643,6 +643,28 @@ pub fn attention_shape(q: &Shape) -> Shape {
     q.clone()
 }
 
+/// Attention output shape accounting for an asymmetric V/output width. The
+/// output has the same layout as `q` except the per-head width is `v_head_dim`:
+/// rank-4 `[.., D]` → `[.., v_head_dim]`; rank ≤ 3 `[.., H·head_dim]` →
+/// `[.., num_heads·v_head_dim]`. Equals `q` when `head_dim == v_head_dim`.
+pub fn attention_shape_vdim(
+    q: &Shape,
+    num_heads: usize,
+    head_dim: usize,
+    v_head_dim: usize,
+) -> Shape {
+    if head_dim == v_head_dim || q.rank() == 0 {
+        return q.clone();
+    }
+    let rank = q.rank();
+    let new_last = if rank >= 4 {
+        v_head_dim
+    } else {
+        num_heads * v_head_dim
+    };
+    q.clone().with_dim(rank - 1, Dim::Static(new_last))
+}
+
 impl std::fmt::Display for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[")?;

@@ -23,7 +23,7 @@ npyz = { version = "0.8", features = ["npz", "half"] }
 safetensors = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-ir = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

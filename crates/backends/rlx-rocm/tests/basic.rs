@@ -430,6 +430,7 @@ fn attention_bshd_eeg_shape_matches_cpu() {
         rlx_ir::Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -526,6 +527,7 @@ fn packed_bshd_attn_matches_cpu_ref() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,

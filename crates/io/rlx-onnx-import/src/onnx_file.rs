@@ -819,13 +819,17 @@ mod tests {
         // rank-0 i64 initializer as a Gather index. Those must land in
         // `take_scalar_consts` so lowering drops the gathered axis — otherwise
         // STFT framing collapses (`binary_infer at /Sub_2`).
-        let candidates = [
+        // Weights live in the sibling rlx-models repo; try a repo-relative path
+        // first, then $RLX_MODELS_DIR, and skip if absent.
+        let rel = "weights/tts/chatterbox/onnx/speech_encoder.onnx";
+        let mut candidates = vec![
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../../rlx-models/weights/tts/chatterbox/onnx/speech_encoder.onnx"),
-            PathBuf::from(
-                "/Users/Shared/rlx-models/weights/tts/chatterbox/onnx/speech_encoder.onnx",
-            ),
+                .join("../../../../rlx-models")
+                .join(rel),
         ];
+        if let Some(dir) = std::env::var_os("RLX_MODELS_DIR") {
+            candidates.push(PathBuf::from(dir).join(rel));
+        }
         let Some(path) = candidates.into_iter().find(|p| p.is_file()) else {
             eprintln!("skip: chatterbox speech_encoder.onnx not present");
             return;

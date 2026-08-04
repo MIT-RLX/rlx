@@ -17,11 +17,13 @@ use crate::graph_rewrite::Rewriter;
 // ── Pass 1: MatMul + Bias + Activation → FusedMatMulBiasAct ─────────────
 
 mod ada_layer_norm;
+mod attention_backward_all;
 mod attention_block;
 mod conv_bias_act;
 mod gated_residual;
 mod mark_elementwise;
 mod matmul_bias_act;
+mod matmul_residual;
 mod residual_ln;
 mod residual_rmsnorm;
 mod rmsnorm_reshape;
@@ -32,11 +34,13 @@ mod transformer_layer;
 mod unfuse_elementwise;
 
 pub use ada_layer_norm::*;
+pub use attention_backward_all::*;
 pub use attention_block::*;
 pub use conv_bias_act::*;
 pub use gated_residual::*;
 pub use mark_elementwise::*;
 pub use matmul_bias_act::*;
+pub use matmul_residual::*;
 pub use residual_ln::*;
 pub use residual_rmsnorm::*;
 pub use rmsnorm_reshape::*;

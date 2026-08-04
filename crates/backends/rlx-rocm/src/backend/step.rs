@@ -74,6 +74,26 @@ pub(crate) enum Step {
         has_bias: u32,
         bias_off_f32: u32,
     },
+    /// Native low-precision *grouped* (MoE) decode-GEMM — expert-indexed
+    /// `ScaledMatMulDecode`. Weight codes `[E,N,K]`, per-expert scales/bias.
+    ScaledGroupedMatMulDecode {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        input_byte_off: u32,
+        weight_byte_off: u32,
+        input_scale_byte_off: u32,
+        weight_scale_byte_off: u32,
+        idx_off_f32: u32,
+        out_off_f32: u32,
+        bias_off_f32: u32,
+        lhs_fmt: u32,
+        rhs_fmt: u32,
+        scale_mode: u32,
+        block: u32,
+        has_bias: u32,
+    },
     /// General (all-format/all-layout) scale producer.
     ScaledQuantScaleGeneral {
         x_off_f32: u32,
@@ -376,6 +396,10 @@ pub(crate) enum Step {
         seq: u32,
         head_dim: u32,
         half: u32,
+        /// Half the rotated width (`n_rot/2`); `== half` for full rotation. The
+        /// rope kernel takes this as a distinct arg — omitting it shifts every
+        /// following arg and OOB-writes (was the gfx908 segfault).
+        rot_half: u32,
         in_off: u32,
         cos_off: u32,
         sin_off: u32,
@@ -479,6 +503,38 @@ pub(crate) enum Step {
         scheme_id: u32,
         x_byte_off: u32,
         w_byte_off: u32,
+        idx_byte_off: u32,
+        out_byte_off: u32,
+    },
+    /// MLX-affine/MXFP4 grouped MoE matmul, host-delegated (no native grouped-MLX ROCm
+    /// kernel yet). 5 operands: input, w_q (codes), scales, biases/zp, expert_idx.
+    DequantGroupedMatmulMlxHost {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        scheme: rlx_ir::quant::QuantScheme,
+        x_byte_off: u32,
+        w_byte_off: u32,
+        scale_byte_off: u32,
+        zp_byte_off: u32,
+        idx_byte_off: u32,
+        out_byte_off: u32,
+        scale_bf16: bool,
+    },
+    /// Native on-device MXFP4 grouped (MoE) decode-GEMM — replaces the host-delegate
+    /// for `MlxMxfp4` (register e2m1-nibble decode, no host round-trip, no f32 weight).
+    /// Scales are f32 in the arena. Offsets widened to u64 at launch (kernel is shared
+    /// with CUDA which allows >4 GiB arenas).
+    DequantGroupedMatmulMlxNative {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        group_size: u32,
+        x_byte_off: u32,
+        w_byte_off: u32,
+        scale_byte_off: u32,
         idx_byte_off: u32,
         out_byte_off: u32,
     },
@@ -663,7 +719,7 @@ pub(crate) enum Step {
         bidirectional: bool,
         carry: bool,
     },
-    /// Native ROCm GRU (L=1 / unidir / no-carry / hidden ≤ 1024).
+    /// Native ROCm GRU (any layers / dirs / carry, hidden ≤ 1024).
     Gru {
         x_byte_off: u32,
         w_ih_byte_off: u32,
@@ -675,8 +731,12 @@ pub(crate) enum Step {
         seq: u32,
         input_size: u32,
         hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        /// h0 (carry) byte offset; 0 = no carry (h0 = 0).
+        h0_byte_off: u32,
     },
-    /// Host-staged GRU fallback (multi-layer / bidir / carry / hidden > 1024).
+    /// Host-staged GRU fallback (hidden > 1024).
     GruHost {
         x_byte_off: u32,
         w_ih_byte_off: u32,
@@ -693,7 +753,7 @@ pub(crate) enum Step {
         bidirectional: bool,
         carry: bool,
     },
-    /// Native ROCm Elman RNN (L=1 / unidir / no-carry / hidden ≤ 1024).
+    /// Native ROCm Elman RNN (any layers / dirs / carry, hidden ≤ 1024).
     Rnn {
         x_byte_off: u32,
         w_ih_byte_off: u32,
@@ -704,9 +764,13 @@ pub(crate) enum Step {
         seq: u32,
         input_size: u32,
         hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        /// h0 (carry) byte offset; 0 = no carry (h0 = 0).
+        h0_byte_off: u32,
         relu: bool,
     },
-    /// Host-staged Elman RNN fallback.
+    /// Host-staged Elman RNN fallback (hidden > 1024).
     RnnHost {
         x_byte_off: u32,
         w_ih_byte_off: u32,
@@ -1687,6 +1751,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScaledQuantScale { .. } => "rlx::ScaledQuantScale",
         Step::ScaledQuantizeFp8 { .. } => "rlx::ScaledQuantizeFp8",
         Step::ScaledMatMulDecode { .. } => "rlx::ScaledMatMulDecode",
+        Step::ScaledGroupedMatMulDecode { .. } => "rlx::ScaledGroupedMatMulDecode",
         Step::ScaledQuantScaleGeneral { .. } => "rlx::ScaledQuantScaleGeneral",
         Step::ScaledQuantizeGeneral { .. } => "rlx::ScaledQuantizeGeneral",
         Step::ScaledDequantizeGeneral { .. } => "rlx::ScaledDequantizeGeneral",
@@ -1730,6 +1795,8 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmulMlx { .. } => "rlx::DequantMatmulMlx",
         Step::DequantMatmulMxFp4x2 { .. } => "rlx::DequantMatmulMxFp4x2",
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
+        Step::DequantGroupedMatmulMlxHost { .. } => "rlx::DequantGroupedMatmulMlxHost",
+        Step::DequantGroupedMatmulMlxNative { .. } => "rlx::DequantGroupedMatmulMlxNative",
         Step::Sample { .. } => "rlx::Sample",
         Step::RngNormal { .. } => "rlx::RngNormal",
         Step::RngUniform { .. } => "rlx::RngUniform",
@@ -1932,6 +1999,29 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
                 *rhs_byte_off / 4,
                 *lhs_scale_byte_off / 4,
                 *rhs_scale_byte_off / 4,
+            ];
+            if *has_bias != 0 {
+                r.push(*bias_off_f32);
+            }
+            (r, vec![*out_off_f32])
+        }
+        Step::ScaledGroupedMatMulDecode {
+            input_byte_off,
+            weight_byte_off,
+            input_scale_byte_off,
+            weight_scale_byte_off,
+            idx_off_f32,
+            out_off_f32,
+            has_bias,
+            bias_off_f32,
+            ..
+        } => {
+            let mut r = vec![
+                *input_byte_off / 4,
+                *weight_byte_off / 4,
+                *input_scale_byte_off / 4,
+                *weight_scale_byte_off / 4,
+                *idx_off_f32,
             ];
             if *has_bias != 0 {
                 r.push(*bias_off_f32);
@@ -2243,6 +2333,40 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![x_byte_off / 4, w_byte_off / 4, idx_byte_off / 4],
+            vec![out_byte_off / 4],
+        ),
+        Step::DequantGroupedMatmulMlxHost {
+            x_byte_off,
+            w_byte_off,
+            scale_byte_off,
+            zp_byte_off,
+            idx_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![
+                x_byte_off / 4,
+                w_byte_off / 4,
+                scale_byte_off / 4,
+                zp_byte_off / 4,
+                idx_byte_off / 4,
+            ],
+            vec![out_byte_off / 4],
+        ),
+        Step::DequantGroupedMatmulMlxNative {
+            x_byte_off,
+            w_byte_off,
+            scale_byte_off,
+            idx_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![
+                x_byte_off / 4,
+                w_byte_off / 4,
+                scale_byte_off / 4,
+                idx_byte_off / 4,
+            ],
             vec![out_byte_off / 4],
         ),
         Step::SelectiveScan {
@@ -3052,9 +3176,14 @@ impl Step {
     }
 
     /// False when the step performs host-side work or stream sync during dispatch.
-    pub fn graph_capture_safe(&self) -> bool {
+    pub fn graph_capture_safe(&self, rng_on_device: bool) -> bool {
         match self {
             Step::Im2ColHost { use_gpu, .. } | Step::Fft { use_gpu, .. } => *use_gpu,
+            // Philox / Zero fill entirely on-device (capturable); Ort / Bnns
+            // host-fill. `rng_on_device` reflects the live RNG policy — a policy
+            // change drops the captured graph in `set_rng`, so a captured
+            // Philox/Zero fill never replays a stale seed.
+            Step::RngNormal { .. } | Step::RngUniform { .. } => rng_on_device,
             Step::GatedDeltaNet { .. }
             | Step::Llada2GroupLimitedGate { .. }
             | Step::MsDeformAttnHost { .. }
@@ -3063,8 +3192,6 @@ impl Step {
             | Step::LogMelHost { .. }
             | Step::LogMelBackwardHost { .. }
             | Step::WelchPeaksHost { .. }
-            | Step::RngNormal { .. }
-            | Step::RngUniform { .. }
             | Step::ScanHost { .. }
             | Step::HostOp { .. }
             | Step::CpuIndexing { .. }
@@ -3086,8 +3213,8 @@ impl Step {
     }
 }
 
-pub(crate) fn schedule_graph_capture_safe(schedule: &[Step]) -> bool {
-    schedule.iter().all(Step::graph_capture_safe)
+pub(crate) fn schedule_graph_capture_safe(schedule: &[Step], rng_on_device: bool) -> bool {
+    schedule.iter().all(|s| s.graph_capture_safe(rng_on_device))
 }
 
 pub(crate) fn step_is_tail_host(step: &Step) -> bool {
@@ -3095,4 +3222,48 @@ pub(crate) fn step_is_tail_host(step: &Step) -> bool {
         step,
         Step::LogMelHost { .. } | Step::LogMelBackwardHost { .. } | Step::WelchPeaksHost { .. }
     )
+}
+
+#[cfg(test)]
+mod graph_capture_tests {
+    use super::*;
+
+    fn rng_normal_step() -> Step {
+        Step::RngNormal {
+            dst_byte_off: 0,
+            len: 8,
+            mean: 0.0,
+            scale: 1.0,
+            key: 1,
+            op_seed: None,
+        }
+    }
+
+    fn rng_uniform_step() -> Step {
+        Step::RngUniform {
+            dst_byte_off: 0,
+            len: 8,
+            low: 0.0,
+            high: 1.0,
+            key: 1,
+            op_seed: None,
+        }
+    }
+
+    #[test]
+    fn rng_steps_capture_safe_only_on_device() {
+        // Philox / Zero fill on-device via `rng_philox.cu` → capturable.
+        assert!(rng_normal_step().graph_capture_safe(true));
+        assert!(rng_uniform_step().graph_capture_safe(true));
+        // Ort / Bnns host-fill → never capturable.
+        assert!(!rng_normal_step().graph_capture_safe(false));
+        assert!(!rng_uniform_step().graph_capture_safe(false));
+    }
+
+    #[test]
+    fn schedule_capture_gated_by_rng_policy() {
+        let sched = vec![rng_normal_step(), rng_uniform_step()];
+        assert!(schedule_graph_capture_safe(&sched, true));
+        assert!(!schedule_graph_capture_safe(&sched, false));
+    }
 }

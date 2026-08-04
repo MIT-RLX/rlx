@@ -87,9 +87,10 @@ pub use profile::{
 pub use recipe::ModelRecipe;
 pub use rope::{
     Llama3Scaling, YarnScaling, build_default_tables, build_mrope_tables, build_mrope_text_tables,
-    build_tables, default_inv_freq, inv_freq_with_factors, llama3_scaled_inv_freq,
-    mrope_row_for_sections, mrope_row_for_sections_ex, mrope_section_for_pair, mrope_sections4,
-    ntk_scaled_inv_freq, yarn_scaled_inv_freq,
+    build_tables, build_yarn_tables, default_inv_freq, inv_freq_with_factors,
+    llama3_scaled_inv_freq, mrope_row_for_sections, mrope_row_for_sections_ex,
+    mrope_section_for_pair, mrope_sections4, ntk_scaled_inv_freq, yarn_mscale,
+    yarn_scaled_inv_freq,
 };
 pub use side::SideOutputs;
 pub use stage::FlowStage;

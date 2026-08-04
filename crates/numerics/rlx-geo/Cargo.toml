@@ -20,25 +20,87 @@ documentation.workspace = true
 # and builds under `--no-default-features`.
 default = ["cpu"]
 
+# Ablation only: force the naive all-i128 wide `in_circle` (measures the
+# i64-inner form's contribution). Never enable in production.
+abl_slowpred = []
+
 # Register `OpExtension` + `CpuKernel` for `geo.delaunay` / `geo.voronoi_grid`.
 # Every backend can execute these via the CPU kernel; native GPU kernels below
 # are opt-in acceleration.
 cpu = ["dep:rlx-ir", "dep:rlx-cpu"]
 
-# Native wgpu (WGSL) kernels for `geo.voronoi_grid` / predicates. Also enables
-# the on-device validation examples (they need wgpu/pollster/bytemuck).
-gpu = ["cpu", "dep:rlx-wgpu", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# `gpu` builds the SELF-CONTAINED wgpu paths — the on-device flip pipeline
+# (`flip_gpu`) and the WGSL predicate sources (`predicates_wgsl`). These use only
+# the `wgpu` crate, so `gpu` deliberately does NOT pull `rlx-wgpu` (nor the ML
+# graph / autodiff behind it): on-device geometry builds and runs without the rest
+# of RLX (e.g. `--no-default-features --features gpu`).
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# `gpu-ops` adds the native `geo.voronoi_grid` GPU *kernel registration*
+# (`wgpu_kernels`), which references the op registry (needs `cpu`) and the shared
+# wgpu device helper (needs `rlx-wgpu`). Enable it only to dispatch the geo ops
+# natively on the wgpu backend; the standalone flip pipeline never needs it.
+gpu-ops = ["gpu", "cpu", "dep:rlx-wgpu"]
 
 [dependencies]
-rlx-ir  = { path = "../../core/rlx-ir",       version = "0.2.14", optional = true }
-rlx-cpu = { path = "../../backends/rlx-cpu",   version = "0.2.14", optional = true }
-rlx-wgpu = { path = "../../backends/rlx-wgpu", version = "0.2.14", optional = true }
+rlx-ir  = { workspace = true, optional = true }
+rlx-cpu = { workspace = true, optional = true }
+rlx-wgpu = { workspace = true, optional = true }
 wgpu     = { version = "30", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1", optional = true }
 
 [[example]]
 name = "gpu_validate"
+required-features = ["gpu-ops"]
+
+# Standalone on-device divide-and-conquer benchmark (creates its own wgpu device).
+[[example]]
+name = "dc_bench"
+required-features = ["gpu"]
+
+# Standalone on-device flip benchmark + validation. Needs only the decoupled
+# `gpu` feature (creates its own wgpu device), so it builds without rlx-wgpu /
+# the ML graph — e.g. `--no-default-features --features gpu`.
+[[example]]
+name = "flip_gpu_bench"
 required-features = ["gpu"]
 
 [dev-dependencies]
+
+[[example]]
+name = "flip_robust"
+required-features = ["gpu"]
+
+# GPU-native construction (bounding box on host; whole triangulation on device).
+[[example]]
+name = "construct_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "tile_locality"
+required-features = ["gpu"]
+
+[[example]]
+name = "leaf_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "merge_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "perturb_bench"
+required-features = ["gpu"]
+
+[lints]
+workspace = true
+
+[[example]]
+name = "dump_mesh"
+
+[[example]]
+name = "predicate_precision"
+
+[[example]]
+name = "delaunay32_bench"

@@ -196,13 +196,46 @@ pub(crate) fn repeat_kv(
     if group == 1 {
         return x;
     }
-    let last_ax = g.shape(x).rank() - 1;
-    let mut pieces = Vec::with_capacity(num_kv_heads * group);
-    for h in 0..num_kv_heads {
-        let slice = g.narrow_(x, last_ax, h * head_dim, head_dim);
-        for _ in 0..group {
-            pieces.push(slice);
+    // GQA KV-head replication as a single broadcast, NOT narrow+concat. Repeating
+    // each of `num_kv_heads` contiguous head-blocks `group` times is exactly
+    // reshape([…, nkv, 1, dh]) → expand([…, nkv, group, dh]) → reshape([…, nkv*group*dh]),
+    // preserving the interleaved [kv0,kv0,…,kv1,kv1,…] order the old code built.
+    // The old form emitted `num_kv_heads` Narrow ops plus a many-input Concat that
+    // lowers to ONE kernel launch PER piece (num_kv_heads*group of them) — ~48
+    // launches/layer of pure data movement that dominate a launch-bound decode.
+    // Expand is one native kernel on every backend; the reshapes are views.
+    let sh = g.shape(x);
+    let rank = sh.rank();
+    let last_ax = rank - 1;
+    let lead: Vec<i64> = (0..rank - 1)
+        .map(|i| sh.dim(i))
+        .collect::<Vec<_>>()
+        .iter()
+        .map(|d| {
+            // Fall back to the old path if a leading dim is dynamic (can't build a
+            // concrete reshape target); decode/prefill shapes are static.
+            if d.is_static() {
+                d.unwrap_static() as i64
+            } else {
+                -1
+            }
+        })
+        .collect();
+    if lead.iter().any(|&d| d < 0) {
+        let mut pieces = Vec::with_capacity(num_kv_heads * group);
+        for h in 0..num_kv_heads {
+            let slice = g.narrow_(x, last_ax, h * head_dim, head_dim);
+            for _ in 0..group {
+                pieces.push(slice);
+            }
         }
+        return g.concat_(pieces, last_ax);
     }
-    g.concat_(pieces, last_ax)
+    let (nkv, dh, grp) = (num_kv_heads as i64, head_dim as i64, group as i64);
+    let split: Vec<i64> = lead.iter().copied().chain([nkv, 1, dh]).collect();
+    let expanded: Vec<i64> = lead.iter().copied().chain([nkv, grp, dh]).collect();
+    let merged: Vec<i64> = lead.iter().copied().chain([nkv * grp * dh]).collect();
+    let r = g.reshape_(x, split);
+    let e = g.expand_(r, expanded);
+    g.reshape_(e, merged)
 }

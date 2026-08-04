@@ -96,6 +96,10 @@ impl ExecutableGraph for MetalExecutableWrapper {
         self.inner.set_param(name, data);
     }
 
+    fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        self.inner.set_param_range(name, byte_offset, data)
+    }
+
     fn finalize_params(&mut self) {
         self.inner.preload_qmatmul_weights();
     }
@@ -112,6 +116,15 @@ impl ExecutableGraph for MetalExecutableWrapper {
     }
     fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         self.inner.bind_gpu_handle(name, data)
+    }
+    fn optimizer_step_resident(
+        &mut self,
+        trainable: &[(String, Vec<usize>)],
+        step: &mut dyn FnMut(&str, &[usize], &mut [f32], &[f32]),
+    ) -> bool {
+        self.inner
+            .optimizer_step_resident(trainable, |n, s, p, g| step(n, s, p, g));
+        true
     }
     fn has_gpu_handle(&self, name: &str) -> bool {
         self.inner.has_gpu_handle(name)
@@ -209,8 +222,20 @@ impl ExecutableGraph for MetalExecutableWrapper {
             let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
             self.inner.set_param(name, s);
         } else {
+            let diag = data.len() > 1_000_000 && std::env::var("RLX_METAL_PARAM_DIAG").is_ok();
+            let t0 = std::time::Instant::now();
             let f32_buf = super::widen_bytes_to_f32(data, dtype);
+            let t_widen = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             self.inner.set_param(name, &f32_buf);
+            if diag {
+                eprintln!(
+                    "[param] {name} {}MB {dtype:?}: widen {:.0}ms + write {:.0}ms",
+                    data.len() / 1_000_000,
+                    t_widen * 1e3,
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
         }
     }
 

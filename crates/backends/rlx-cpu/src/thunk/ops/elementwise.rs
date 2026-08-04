@@ -904,6 +904,31 @@ pub(crate) fn compile_compare(
         let rhs_scalar = rhs_n == 1 && len > 1;
         let in_dtype = graph.node(node.inputs[0]).shape.dtype();
         let inputs_i64 = u8::from(in_dtype == rlx_ir::DType::I64);
+        // A *partial* broadcast operand (numel neither 1 nor `len`) — e.g. rhs
+        // `[.,L,1]` against `[.,L,L]` — cannot be indexed by the flat fast path,
+        // which would read `len` elements from a shorter operand (past its end,
+        // into adjacent arena memory → wrong mask). Emit shape-aware broadcast
+        // strides for BOTH operands so exec indexes via row-major coords, just
+        // like `BinaryFull`. Needs static dims; a dynamic shape falls back to
+        // the fast path (behavior unchanged there).
+        let lhs_partial = lhs_n != len && lhs_n != 1;
+        let rhs_partial = rhs_n != len && rhs_n != 1;
+        let out_dims_s = get_static_dims(graph, node.id);
+        let lhs_dims_s = get_static_dims(graph, node.inputs[0]);
+        let rhs_dims_s = get_static_dims(graph, node.inputs[1]);
+        let (out_dims_bcast, bcast_lhs_strides, bcast_rhs_strides) = if (lhs_partial || rhs_partial)
+            && !out_dims_s.is_empty()
+            && !lhs_dims_s.is_empty()
+            && !rhs_dims_s.is_empty()
+        {
+            (
+                out_dims_s.iter().map(|&d| d as u32).collect::<Vec<u32>>(),
+                broadcast_strides(&lhs_dims_s, &out_dims_s),
+                broadcast_strides(&rhs_dims_s, &out_dims_s),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         Thunk::Compare {
             lhs: node_offset(arena, node.inputs[0]),
             rhs: node_offset(arena, node.inputs[1]),
@@ -915,6 +940,11 @@ pub(crate) fn compile_compare(
             dst_elem_bytes: node.shape.dtype().size_bytes() as u8,
             lhs_scalar,
             rhs_scalar,
+            lhs_len: lhs_n as u32,
+            rhs_len: rhs_n as u32,
+            out_dims_bcast,
+            bcast_lhs_strides,
+            bcast_rhs_strides,
         }
     }
 }

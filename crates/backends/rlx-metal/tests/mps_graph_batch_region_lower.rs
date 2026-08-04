@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! MPSGraph lowering for `BatchElementwiseRegion`.
+//!
+//! Exercises `mps_graph_lower` (an `rlx_metal_host`/Apple-only module), so the
+//! whole test is macOS-gated — it compiles to an empty test binary elsewhere.
+#![cfg(target_os = "macos")]
 
 use rlx_ir::op::{Activation, ChainOperand, ChainStep};
 use rlx_ir::{DType, Graph, Op, Shape};

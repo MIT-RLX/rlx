@@ -5,7 +5,7 @@
 //! Linear-algebra builders: matmul, LoRA, dequant, fused
 //! matmul+bias+activation (plan #53).
 
-use crate::op::Activation;
+use crate::op::{Activation, SynthKind};
 use crate::quant::{QuantScheme, ScaleLayout, ScaledFormat};
 use crate::{DType, Graph, NodeId, Op, Shape};
 
@@ -117,6 +117,88 @@ impl Graph {
         }
         self.push(
             Op::ScaledMatMul {
+                lhs_format: fmt,
+                rhs_format: fmt,
+                scale_layout: layout,
+                has_bias: bias.is_some(),
+            },
+            inputs,
+            Shape::new(&[m, n], DType::F32),
+            None,
+        )
+    }
+
+    /// Native low-precision *grouped* (MoE) GEMM — the expert-indexed
+    /// [`scaled_matmul`](Self::scaled_matmul). Dynamically quantizes f32
+    /// `input [M,K]` and the per-expert f32 weight stack `weight [E,N,K]`
+    /// (K-last) to `fmt`/`layout` codes, then wires
+    /// [`Op::ScaledGroupedMatMul`]. `expert_idx [M]` is the f32-encoded
+    /// expert id per token. Output `[M,N]` f32, with f32 accumulation.
+    pub fn scaled_grouped_matmul(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        expert_idx: NodeId,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> NodeId {
+        self.scaled_grouped_matmul_bias(input, weight, expert_idx, None, fmt, layout)
+    }
+
+    /// [`scaled_grouped_matmul`](Self::scaled_grouped_matmul) with an optional
+    /// per-expert f32 bias `[E, N]` added to each routed output row.
+    pub fn scaled_grouped_matmul_bias(
+        &mut self,
+        input: NodeId,
+        weight: NodeId,
+        expert_idx: NodeId,
+        bias: Option<NodeId>,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+    ) -> NodeId {
+        let m = self.node(input).shape.dim(0).unwrap_static();
+        let wshape = self.node(weight).shape.clone();
+        // weight is [E, N, K]; N is the output dim, K the contraction axis.
+        let e = wshape.dim(0).unwrap_static();
+        let n = wshape.dim(wshape.rank() - 2).unwrap_static();
+        let k = wshape.dim(wshape.rank() - 1).unwrap_static();
+        // Activations [M,K] quantize with the generic (2-D) helper.
+        let (iq, is) = self.scaled_quantize(input, fmt, layout);
+        // The per-expert weight stack keeps its natural rank: the scale is
+        // `[E, N, ⌈K/block⌉]` (or `[1]` per-tensor), matching `ScaledQuantScale`
+        // shape inference so the verifier is happy. Byte layout is identical to
+        // the flattened `[E·N, ⌈K/block⌉]` the oracle indexes.
+        let w_scale_shape = match layout {
+            ScaleLayout::PerTensor => Shape::new(&[1], layout.scale_dtype()),
+            _ => Shape::new(
+                &[e, n, k.div_ceil(layout.block() as usize)],
+                layout.scale_dtype(),
+            ),
+        };
+        let ws = self.push(
+            Op::ScaledQuantScale {
+                format: fmt,
+                scale_layout: layout,
+            },
+            vec![weight],
+            w_scale_shape,
+            None,
+        );
+        let wq = self.push(
+            Op::ScaledQuantize {
+                format: fmt,
+                scale_layout: layout,
+            },
+            vec![weight, ws],
+            wshape.with_dtype(DType::U8),
+            None,
+        );
+        let mut inputs = vec![iq, wq, is, ws, expert_idx];
+        if let Some(b) = bias {
+            inputs.push(b);
+        }
+        self.push(
+            Op::ScaledGroupedMatMul {
                 lhs_format: fmt,
                 rhs_format: fmt,
                 scale_layout: layout,
@@ -273,6 +355,75 @@ impl Graph {
             global_scale,
             QuantScheme::Nvfp4Block,
             shape,
+        )
+    }
+
+    /// On-chip codebook weight-synthesis matmul. See [`Op::SynthMatMul`].
+    /// `indices` is `[n, k/entry_dim]` u8; `codebook` is
+    /// `[num_entries, entry_dim]` f32; output is `[m, n]`. The weight is
+    /// reconstructed inside the matmul inner loop, never materialized.
+    pub fn synth_matmul(
+        &mut self,
+        x: NodeId,
+        indices: NodeId,
+        codebook: NodeId,
+        kind: SynthKind,
+        shape: Shape,
+    ) -> NodeId {
+        self.push(
+            Op::SynthMatMul { kind },
+            vec![x, indices, codebook],
+            shape,
+            None,
+        )
+    }
+
+    /// [`synth_matmul`](Self::synth_matmul) with a LOW-PRECISION codebook (fp8 /
+    /// fp4 / nvf4 / custom `fpXmYeZ`). The centroids are stored as `fmt`/`layout`
+    /// codes (`codebook_codes` U8 + `codebook_scale` from
+    /// [`scaled_quantize`](Self::scaled_quantize)) and decoded to f32 via
+    /// [`Op::ScaledDequantize`] before the synth matmul — so ANY [`ScaledFormat`],
+    /// including a parameterized [`ScaledFormat::Custom`] (e.g. `custom(3,0)` =
+    /// `f4e3m0`) or an [`ScaleLayout::Nvfp4`] layout, works on every backend with
+    /// no new kernel. The codebook is tiny, so the decode is negligible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synth_matmul_qcodebook(
+        &mut self,
+        x: NodeId,
+        indices: NodeId,
+        codebook_codes: NodeId,
+        codebook_scale: NodeId,
+        kind: SynthKind,
+        fmt: ScaledFormat,
+        layout: ScaleLayout,
+        shape: Shape,
+    ) -> NodeId {
+        let cb_f32 = self.scaled_dequantize(codebook_codes, codebook_scale, fmt, layout);
+        self.synth_matmul(x, indices, cb_f32, kind, shape)
+    }
+
+    /// KAN learnable spline activation. See [`Op::SplineActivation`]. `x` is
+    /// `[.., C]`, `coeff` is `[C, num_basis]`; the output matches `x`. Each
+    /// channel's univariate function is a Gaussian-RBF expansion with learned
+    /// per-channel coefficients.
+    pub fn spline_activation(
+        &mut self,
+        x: NodeId,
+        coeff: NodeId,
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
+    ) -> NodeId {
+        let shape = self.node(x).shape.clone();
+        self.push(
+            Op::SplineActivation {
+                num_basis,
+                grid_min,
+                grid_max,
+            },
+            vec![x, coeff],
+            shape,
+            None,
         )
     }
 

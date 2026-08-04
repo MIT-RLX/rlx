@@ -307,11 +307,24 @@ impl HipRuntime {
         // gfx1103 APUs. Resolve it (env override wins) and pass it explicitly.
         // These backing `CString`s must outlive the compile call below.
         let arch = rocm_target_arch();
-        let opt_cstrs: Vec<CString> = arch
+        let mut opt_cstrs: Vec<CString> = arch
             .as_deref()
             .and_then(|a| CString::new(format!("--offload-arch={a}")).ok())
             .into_iter()
             .collect();
+        // Opt-in native hardware FP atomics. Without this, HIP lowers
+        // `atomicAdd(float*)` to a `global_atomic_cmpswap` retry loop (confirmed by
+        // disassembling a kernel — the CAS + `s_cbranch_execnz` back-edge), even on
+        // gfx908/CDNA which has `global_atomic_add_f32`. `-munsafe-fp-atomics` emits
+        // the native op. FOOTGUN: on fine-grained / PCIe-host memory the hardware FP
+        // atomic can silently no-op, so this is gated — rlx's arena is one coarse-
+        // grained device allocation where it is safe, but leave the default off until
+        // every atomic-using kernel (scatter_add, rms_norm_bwd, …) is validated.
+        if rlx_ir::env::flag("RLX_ROCM_FAST_FP_ATOMICS") {
+            if let Ok(c) = CString::new("-munsafe-fp-atomics") {
+                opt_cstrs.push(c);
+            }
+        }
         let opt_ptrs: Vec<*const c_char> = opt_cstrs.iter().map(|c| c.as_ptr()).collect();
         let (n_opts, opts_ptr): (c_int, *const *const c_char) = if opt_ptrs.is_empty() {
             (0, ptr::null())

@@ -382,6 +382,7 @@ pub enum OpKind {
     Tile,
     Trilu,
     Reduce,
+    Histogram,
     Softmax,
     Cumsum,
     CumProd,
@@ -416,6 +417,7 @@ pub enum OpKind {
     SoftmaxCrossEntropyWithLogits,
     SoftmaxCrossEntropyBackward,
     AttentionBackward,
+    AttentionBackwardAll,
     LayerNormBackwardInput,
     LayerNormBackwardGamma,
     RmsNormBackwardInput,
@@ -434,6 +436,7 @@ pub enum OpKind {
     DequantGroupedMatMul,
     DequantGroupedMatMulMlx,
     DequantMoEWeights,
+    ScaledGroupedMatMul,
     ScatterAdd,
     ScatterNd,
     ScatterElements,
@@ -442,6 +445,12 @@ pub enum OpKind {
     LoraMatMul,
     PartitionedConv,
     DequantMatMul,
+    SynthMatMul,
+    SynthMatMulBackward,
+    SynthReconstruct,
+    SplineActivation,
+    SplineActivationBackwardX,
+    SplineActivationBackwardCoeff,
     QMatMul,
     QConv2d,
     ScaledMatMul,
@@ -456,6 +465,7 @@ pub enum OpKind {
     Mamba2,
     FusedSwiGLU,
     FusedMatMulBiasAct,
+    FusedMatMulResidual,
     FusedConvBiasAct,
     FusedResidualLN,
     FusedResidualRmsNorm,
@@ -672,6 +682,37 @@ pub enum PadMode {
     Replicate,
     /// Wrap around (periodic).
     Circular,
+}
+
+/// Weight-synthesis strategy for [`Op::SynthMatMul`] — how a compact
+/// stored representation is expanded into weight values *inside* the
+/// matmul inner loop (never materialized in DRAM), generalizing
+/// [`Op::DequantMatMul`] from fixed quant grids to learned functions.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SynthKind {
+    /// Single-level vector quantization with a *learned* codebook. The
+    /// weight is stored transposed (`[n, k]`, GGUF "bt" layout); each
+    /// contiguous `entry_dim`-length sub-vector along the contraction
+    /// axis `k` is replaced by a codebook centroid
+    /// `codebook[index] ∈ ℝ^{entry_dim}`. `num_entries` centroids; indices
+    /// are `u8` (so `num_entries ≤ 256`). Requires `k % entry_dim == 0`.
+    Codebook { entry_dim: u32, num_entries: u32 },
+}
+
+/// Which gradient an [`Op::SynthMatMulBackward`] node computes. The synth VJP
+/// (`y = x·Ŵ`, `Ŵ` reconstructed from a codebook) has two differentiable inputs;
+/// keeping each as a first-class backward op (rather than decomposing to
+/// Gather/MatMul/Transpose/ScatterAdd primitives) lets a backend fuse it into a
+/// single dispatch — mirroring [`Op::AttentionBackward`].
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SynthBwdWrt {
+    /// `dx = upstream · Ŵᵀ` (reconstruct `Ŵᵀ` in-kernel; shape = `x`'s `[m,k]`).
+    Dx,
+    /// `d_codebook = scatter_add(upstreamᵀ·x blocks, indices)` (shape = codebook's
+    /// `[num_entries, entry_dim]`).
+    Codebook,
 }
 
 /// - Matmul/Conv are BLAS-dispatched and form fusion boundaries
@@ -1038,6 +1079,12 @@ pub enum Op {
     Attention {
         num_heads: usize,
         head_dim: usize,
+        /// Value/output per-head width. `None` ⇒ same as `head_dim` (the common
+        /// case). `Some(v)` with `v != head_dim` is asymmetric SDPA — Q/K use
+        /// `head_dim` for the scores, V is read with `v_head_dim` and the output
+        /// is `num_heads * v_head_dim` wide. Used by DeepSeek/Kimi **MLA**, which
+        /// otherwise zero-pads V to `head_dim` and slices the output back.
+        v_head_dim: Option<usize>,
         mask_kind: MaskKind,
         score_scale: Option<f32>,
         attn_logit_softcap: Option<f32>,
@@ -1147,6 +1194,19 @@ pub enum Op {
         op: ReduceOp,
         axes: Vec<usize>,
         keep_dim: bool,
+    },
+
+    /// Histogram of `x` into `bins` equal-width buckets over `[min, max]`.
+    /// Output is a 1-D f32 tensor `[bins]` of counts. Elements outside
+    /// `[min, max]` are dropped; `x == max` lands in the last bin (half-open
+    /// buckets, closed at the top — matches `numpy.histogram`). Native on CPU;
+    /// decomposes to `Compare`+`Reduce::Sum` on every other backend (see
+    /// `LowerHistogram`). Non-differentiable (discrete counts, zero gradient).
+    /// Introduced for the data-pattern recording harness.
+    Histogram {
+        bins: usize,
+        min: f32,
+        max: f32,
     },
 
     /// Selective scan (plan #15) — Mamba-style state-space model
@@ -1342,6 +1402,79 @@ pub enum Op {
     /// a separate `QuantMap` lookup at run time.
     DequantMatMul {
         scheme: crate::quant::QuantScheme,
+    },
+
+    /// On-chip **weight synthesis** matmul: reconstruct the weight from a
+    /// compact learned representation *inside* the matmul inner loop,
+    /// trading DRAM weight-bandwidth for ALU — the sibling of
+    /// [`Op::DequantMatMul`], but with a *learned* function rather than a
+    /// fixed quant grid. Inputs (in order), for `SynthKind::Codebook`:
+    ///   * `x`        `[m, k]`                   f32 activations
+    ///   * `indices`  `[n, k/entry_dim]`         u8 codebook indices
+    ///                                           (weight stored transposed)
+    ///   * `codebook` `[num_entries, entry_dim]` f32 learned centroids
+    /// Output `y`: `[m, n]` f32, `y = x · Wᵀ` where
+    /// `W[n, kb·entry_dim + t] = codebook[indices[n, kb]][t]`.
+    SynthMatMul {
+        kind: SynthKind,
+    },
+
+    /// Fused backward of [`Op::SynthMatMul`] — one dispatch per gradient instead
+    /// of the ~11 primitives the generic VJP would emit (Gather + 2 MatMul +
+    /// Transpose + ScatterAdd + reshapes). Inputs (in order):
+    ///   * `x`        `[m, k]`                   f32 activations (forward input)
+    ///   * `indices`  `[n, k/entry_dim]`         u8 codebook indices
+    ///   * `codebook` `[num_entries, entry_dim]` f32 centroids
+    ///   * `upstream` `[m, n]`                   f32 grad w.r.t. the forward output
+    /// Output is `dx [m,k]` for `wrt=Dx`, or `d_codebook [num_entries,entry_dim]`
+    /// for `wrt=Codebook`. Backends without a native kernel decompose it via
+    /// `LowerSynthMatMulBackward` (bit-identical to the old primitive expansion).
+    SynthMatMulBackward {
+        kind: SynthKind,
+        wrt: SynthBwdWrt,
+    },
+
+    /// Reconstruct the dense weight `W [k,n]` from `indices [n, k/entry_dim]` (u8)
+    /// + `codebook [num_entries, entry_dim]`, in ONE fused kernel (no separate
+    /// cast/gather/reshape/transpose). Lets a model fold multi-stage VQ + LoRA into
+    /// one `W_eff = Σ reconstruct + A·Bᵀ` then a single matmul. Output `[k,n]`:
+    /// `W[kb·entry_dim+t, j] = codebook[indices[j, kb], t]`. Backends without the
+    /// native kernel decompose via `LowerSynthReconstruct`.
+    SynthReconstruct {
+        kind: SynthKind,
+    },
+
+    /// KAN (Kolmogorov–Arnold) learnable spline activation: each channel `c`
+    /// gets its own univariate function `φ_c` expressed in a fixed Gaussian-RBF
+    /// basis, with learned per-channel coefficients — "weights as functions".
+    /// Inputs:
+    ///   * `x`     `[.., C]`            f32 pre-activations
+    ///   * `coeff` `[C, num_basis]`     f32 learned basis coefficients
+    /// Output `y`: same shape as `x`, with
+    /// `y[.., c] = Σ_g coeff[c, g] · exp(-((x[.., c] − center_g) · inv_h)²)`,
+    /// where `center_g = grid_min + g·(grid_max−grid_min)/(num_basis−1)` and
+    /// `inv_h = (num_basis−1)/(grid_max−grid_min)` (adjacent RBFs ~one width
+    /// apart). Differentiable wrt both `x` and `coeff`.
+    SplineActivation {
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
+    },
+    /// Fused KAN spline VJP → `dx` (input grad). Inputs: `x`, `coeff`, `upstream`.
+    /// Builds the RBF basis + derivative in registers (loop over `num_basis`) and
+    /// emits `dx = upstream·Σ_g coeff[c,g]·B_g'(x)` in one pass — replaces the
+    /// decomposed exp/mul/reduce chain that materializes the `[.., C, G]` basis.
+    SplineActivationBackwardX {
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
+    },
+    /// Fused KAN spline VJP → `dcoeff` (coeff grad `[C, num_basis]`). Inputs: `x`,
+    /// `upstream`. Atomic-accumulates `dcoeff[c,g] = Σ_batch upstream·B_g(x)`.
+    SplineActivationBackwardCoeff {
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
     },
 
     /// Real INT8-arithmetic matrix multiply with i32 accumulation.
@@ -1602,6 +1735,34 @@ pub enum Op {
     /// declared on the node (`[E, K, N]`).
     DequantMoEWeights {
         scheme: crate::quant::QuantScheme,
+    },
+
+    /// **Native low-precision *grouped* (MoE) tensor-core GEMM** — the
+    /// expert-indexed analogue of [`Op::ScaledMatMul`]. Both operands are
+    /// sub-f16 [`crate::ScaledFormat`] codes fed directly into a segmented
+    /// GEMM with per-block (`scale_layout`) rescaling, so the MXFP4 path
+    /// (`F4E2M1` + `BlockMxE8M0`) wins on Blackwell / CDNA4 (native FP4
+    /// tensor cores) while every other backend runs the decode-and-segment
+    /// *reference* (see the CPU oracle and `LowerScaledGroupedMatMul`).
+    ///
+    /// Layout is **TN** per expert (`out = input · weight[e]ᵀ`) so every
+    /// block scale runs along the K/contraction axis, matching `ScaledMatMul`.
+    ///
+    /// Inputs (in order):
+    ///   `input      [M, K]`            U8 — packed codes (per-token acts)
+    ///   `weight     [E, N, K]`         U8 — packed codes, one slab per expert (K-last)
+    ///   `input_s    [M, ⌈K/block⌉]`    scale tensor, dtype per [`crate::ScaleLayout::scale_dtype`]
+    ///   `weight_s   [E, N, ⌈K/block⌉]` per-expert scale tensor
+    ///   `expert_idx [M]`               f32-encoded expert id per token
+    ///   `bias       [E, N]`            f32, present iff `has_bias` (per-expert)
+    /// Output: `[M, N]` f32. `out[i] = decode(input[i])·decode(weight[eidx[i]])ᵀ`.
+    ///
+    /// Output shape `[M, N]` is derived from `input`/`weight` in `infer_shape`.
+    ScaledGroupedMatMul {
+        lhs_format: crate::quant::ScaledFormat,
+        rhs_format: crate::quant::ScaledFormat,
+        scale_layout: crate::quant::ScaleLayout,
+        has_bias: bool,
     },
 
     /// Scatter-add into a destination tensor. The "unpermute" half of
@@ -1977,11 +2138,41 @@ pub enum Op {
         wrt: AttentionBwdWrt,
     },
 
+    /// Fused backward of [`Op::Attention`] computing dQ, dK **and** dV from a
+    /// single score+softmax recompute (the three [`Op::AttentionBackward`]
+    /// siblings share `q/k/v/dy`, so recomputing scores 3× is wasteful). Created
+    /// by a backend-gated fusion pass ([`OpKind::AttentionBackwardAll`]). The
+    /// packed output is `[3·B, S, H, D]` (dQ‖dK‖dV stacked on the batch axis);
+    /// three axis-0 `Narrow`s recover the individual gradients. Self-attention
+    /// only (`q_seq == k_seq`). Inputs match [`Op::AttentionBackward`]:
+    /// `[q, k, v, dy]` plus an optional mask.
+    AttentionBackwardAll {
+        num_heads: usize,
+        head_dim: usize,
+        mask_kind: MaskKind,
+    },
+
     // ── Fused operations (created by optimization passes) ──────
     /// Fused matmul + bias + activation. Created from MatMul → Add → Activation.
     FusedMatMulBiasAct {
         activation: Option<Activation>,
     },
+
+    /// Fused matmul + full-tensor residual add: `matmul(lhs, rhs) + residual`,
+    /// single output (same shape as the matmul result). Created from
+    /// `Add(MatMul(a, b), residual)` when the MatMul feeds only the Add — the
+    /// transformer's `add(skip, o_proj)` / `add(h, down_proj)` residuals. Unlike
+    /// [`Op::FusedMatMulBiasAct`] the third input is a *full* `[m, n]` activation
+    /// tensor (the residual/skip), not a rank-1 broadcast bias.
+    ///
+    /// Emitted only for backends that implement the fused epilogue (today:
+    /// Metal, which folds the add into the sgemm store to save one dispatch on
+    /// the launch-latency-bound decode). Every other backend never runs the
+    /// fusion pass (gated by `supports_op`) and decomposes it in `unfuse` back
+    /// to MatMul + Add, so emitting it is always safe.
+    ///
+    /// Inputs: `[lhs, rhs, residual]`. Output: `[m, n]`.
+    FusedMatMulResidual,
 
     /// Fused convolution + bias + activation. Created from
     /// `Conv → Reshape(bias→[1,C,1,1]) → Expand → Add → [Activation]`.
@@ -2730,6 +2921,7 @@ impl Op {
             Op::Tile { .. } => OpKind::Tile,
             Op::Trilu { .. } => OpKind::Trilu,
             Op::Reduce { .. } => OpKind::Reduce,
+            Op::Histogram { .. } => OpKind::Histogram,
             Op::Softmax { .. } => OpKind::Softmax,
             Op::Cumsum { .. } => OpKind::Cumsum,
             Op::CumProd { .. } => OpKind::CumProd,
@@ -2776,10 +2968,12 @@ impl Op {
             Op::SoftmaxCrossEntropyWithLogits => OpKind::SoftmaxCrossEntropyWithLogits,
             Op::SoftmaxCrossEntropyBackward => OpKind::SoftmaxCrossEntropyBackward,
             Op::AttentionBackward { .. } => OpKind::AttentionBackward,
+            Op::AttentionBackwardAll { .. } => OpKind::AttentionBackwardAll,
             Op::GroupedMatMul => OpKind::GroupedMatMul,
             Op::DequantGroupedMatMul { .. } => OpKind::DequantGroupedMatMul,
             Op::DequantGroupedMatMulMlx { .. } => OpKind::DequantGroupedMatMulMlx,
             Op::DequantMoEWeights { .. } => OpKind::DequantMoEWeights,
+            Op::ScaledGroupedMatMul { .. } => OpKind::ScaledGroupedMatMul,
             Op::ScatterAdd => OpKind::ScatterAdd,
             Op::ScatterNd { .. } => OpKind::ScatterNd,
             Op::ScatterElements { .. } => OpKind::ScatterElements,
@@ -2788,6 +2982,12 @@ impl Op {
             Op::LoraMatMul { .. } => OpKind::LoraMatMul,
             Op::PartitionedConv { .. } => OpKind::PartitionedConv,
             Op::DequantMatMul { .. } => OpKind::DequantMatMul,
+            Op::SynthMatMul { .. } => OpKind::SynthMatMul,
+            Op::SynthMatMulBackward { .. } => OpKind::SynthMatMulBackward,
+            Op::SynthReconstruct { .. } => OpKind::SynthReconstruct,
+            Op::SplineActivation { .. } => OpKind::SplineActivation,
+            Op::SplineActivationBackwardX { .. } => OpKind::SplineActivationBackwardX,
+            Op::SplineActivationBackwardCoeff { .. } => OpKind::SplineActivationBackwardCoeff,
             Op::QMatMul { .. } => OpKind::QMatMul,
             Op::QConv2d { .. } => OpKind::QConv2d,
             Op::ScaledMatMul { .. } => OpKind::ScaledMatMul,
@@ -2802,6 +3002,7 @@ impl Op {
             Op::Mamba2 { .. } => OpKind::Mamba2,
             Op::FusedSwiGLU { .. } => OpKind::FusedSwiGLU,
             Op::FusedMatMulBiasAct { .. } => OpKind::FusedMatMulBiasAct,
+            Op::FusedMatMulResidual => OpKind::FusedMatMulResidual,
             Op::FusedConvBiasAct { .. } => OpKind::FusedConvBiasAct,
             Op::FusedResidualLN { .. } => OpKind::FusedResidualLN,
             Op::FusedResidualRmsNorm { .. } => OpKind::FusedResidualRmsNorm,
@@ -2888,13 +3089,16 @@ impl Op {
                 | Op::Conv3d { .. }
                 | Op::ConvTranspose3d { .. }
                 | Op::FusedMatMulBiasAct { .. }
+                | Op::FusedMatMulResidual
                 | Op::FusedConvBiasAct { .. }
                 | Op::GroupedMatMul
                 | Op::DequantGroupedMatMul { .. }
                 | Op::DequantGroupedMatMulMlx { .. }
                 | Op::DequantMoEWeights { .. }
+                | Op::ScaledGroupedMatMul { .. }
                 | Op::LoraMatMul { .. }
                 | Op::DequantMatMul { .. }
+                | Op::SynthMatMul { .. }
                 | Op::QMatMul { .. }
                 | Op::QConv2d { .. }
                 | Op::ScaledMatMul { .. }
@@ -2941,6 +3145,7 @@ impl Op {
             | Op::Trilu { .. }
             | Op::Expand { .. }
             | Op::Reduce { .. }
+            | Op::Histogram { .. }
             | Op::Softmax { .. }
             | Op::FusedSwiGLU { .. }
             | Op::TopK { .. }
@@ -2968,8 +3173,10 @@ impl Op {
             Op::DequantGroupedMatMul { .. } => 3,                   // input, packed_w, expert_idx
             Op::DequantGroupedMatMulMlx { .. } => 5, // input, w, scales, biases, expert_idx
             Op::DequantMoEWeights { .. } => 1,       // packed_w
-            Op::LoraMatMul { .. } => 4,              // x, w, a, b
-            Op::PartitionedConv { .. } => 2,         // x, ir
+            // input, weight, input_s, weight_s, expert_idx (+ per-expert bias)
+            Op::ScaledGroupedMatMul { has_bias, .. } => 5 + usize::from(*has_bias),
+            Op::LoraMatMul { .. } => 4,      // x, w, a, b
+            Op::PartitionedConv { .. } => 2, // x, ir
             // x, w_q, scale, zp — or x, packed_w_bytes for GGUF
             // schemes (their scales/mins live inside the packed bytes,
             // see `QuantScheme::is_gguf`).
@@ -2982,8 +3189,14 @@ impl Op {
                     4
                 }
             }
-            Op::QMatMul { .. } => 3, // x, w, bias
-            Op::QConv2d { .. } => 3, // x, w, bias
+            Op::SynthMatMul { .. } => 3,         // x, indices, codebook
+            Op::SynthMatMulBackward { .. } => 4, // x, indices, codebook, upstream
+            Op::SynthReconstruct { .. } => 2,    // indices, codebook
+            Op::SplineActivation { .. } => 2,    // x, coeff
+            Op::SplineActivationBackwardX { .. } => 3, // x, coeff, upstream
+            Op::SplineActivationBackwardCoeff { .. } => 2, // x, upstream
+            Op::QMatMul { .. } => 3,             // x, w, bias
+            Op::QConv2d { .. } => 3,             // x, w, bias
             // lhs_codes, rhs_codes, lhs_scale, rhs_scale (+ bias)
             Op::ScaledMatMul { has_bias, .. } => 4 + usize::from(*has_bias),
             Op::ScaledQuantize { .. } => 2,   // x, scale
@@ -3008,7 +3221,8 @@ impl Op {
                 MaskKind::Custom | MaskKind::Bias => 4, // Q, K, V, mask
                 _ => 3,                                 // Q, K, V (mask synthesized in-kernel)
             },
-            Op::AttentionBackward { mask_kind, .. } => match mask_kind {
+            Op::AttentionBackward { mask_kind, .. }
+            | Op::AttentionBackwardAll { mask_kind, .. } => match mask_kind {
                 MaskKind::Custom | MaskKind::Bias => 5, // q, k, v, dy, mask
                 _ => 4,                                 // q, k, v, dy
             },
@@ -3020,6 +3234,7 @@ impl Op {
             | Op::RmsNorm { .. } => 3, // input, gamma, beta
             Op::BatchNormInference { .. } => 5, // x, gamma, beta, mean, var
             Op::FusedMatMulBiasAct { .. } => 3, // input, weight, bias
+            Op::FusedMatMulResidual => 3,       // lhs, rhs, residual
             Op::FusedConvBiasAct {
                 has_residual: true, ..
             } => 4, // + residual (z)
@@ -3216,6 +3431,7 @@ impl std::fmt::Display for Op {
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
@@ -3229,6 +3445,9 @@ impl std::fmt::Display for Op {
                     }
                     MaskKind::Bias => format!("attention(h={num_heads},d={head_dim},bias)"),
                 };
+                if let Some(vd) = v_head_dim {
+                    s.push_str(&format!(",vd={vd}"));
+                }
                 if let Some(sc) = score_scale {
                     s.push_str(&format!(",scale={sc}"));
                 }
@@ -3273,6 +3492,9 @@ impl std::fmt::Display for Op {
             Op::Expand { .. } => write!(f, "expand"),
             Op::Gather { axis } => write!(f, "gather(axis={axis})"),
             Op::Reduce { op, axes, .. } => write!(f, "reduce_{op:?}({axes:?})"),
+            Op::Histogram { bins, min, max } => {
+                write!(f, "histogram(bins={bins},[{min},{max}])")
+            }
             Op::Softmax { axis } => write!(f, "softmax(axis={axis})"),
             Op::Cumsum { axis, exclusive } => {
                 if *exclusive {
@@ -3345,9 +3567,44 @@ impl std::fmt::Display for Op {
                 write!(f, "dequant_grouped_matmul_mlx({scheme})")
             }
             Op::DequantMoEWeights { scheme } => write!(f, "dequant_moe_weights({scheme})"),
+            Op::ScaledGroupedMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } => write!(
+                f,
+                "scaled_grouped_matmul({lhs_format}×{rhs_format},{scale_layout}{})",
+                if *has_bias { ",bias" } else { "" }
+            ),
             Op::LoraMatMul { scale } => write!(f, "lora_matmul(scale={scale})"),
             Op::PartitionedConv { block } => write!(f, "partitioned_conv(block={block})"),
             Op::DequantMatMul { scheme } => write!(f, "dequant_matmul({scheme})"),
+            Op::SynthMatMul {
+                kind:
+                    SynthKind::Codebook {
+                        entry_dim,
+                        num_entries,
+                    },
+            } => write!(f, "synth_matmul(codebook:{num_entries}×{entry_dim})"),
+            Op::SynthMatMulBackward { wrt, .. } => {
+                write!(f, "synth_matmul_backward({wrt:?})")
+            }
+            Op::SynthReconstruct { .. } => write!(f, "synth_reconstruct"),
+            Op::SplineActivation {
+                num_basis,
+                grid_min,
+                grid_max,
+            } => write!(
+                f,
+                "spline_activation(basis={num_basis},grid=[{grid_min},{grid_max}])"
+            ),
+            Op::SplineActivationBackwardX { num_basis, .. } => {
+                write!(f, "spline_activation_backward_x(basis={num_basis})")
+            }
+            Op::SplineActivationBackwardCoeff { num_basis, .. } => {
+                write!(f, "spline_activation_backward_coeff(basis={num_basis})")
+            }
             Op::QMatMul {
                 x_zp,
                 w_zp,
@@ -3496,6 +3753,11 @@ impl std::fmt::Display for Op {
                 }
                 MaskKind::Bias => write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},bias)"),
             },
+            Op::AttentionBackwardAll {
+                num_heads,
+                head_dim,
+                mask_kind,
+            } => write!(f, "attn_bwd_all(h={num_heads},d={head_dim},{mask_kind:?})"),
             Op::FusedMatMulBiasAct { activation } => {
                 write!(f, "fused_mm_bias")?;
                 if let Some(a) = activation {
@@ -3503,6 +3765,7 @@ impl std::fmt::Display for Op {
                 }
                 Ok(())
             }
+            Op::FusedMatMulResidual => write!(f, "fused_mm_residual"),
             Op::FusedConvBiasAct {
                 activation,
                 has_residual,

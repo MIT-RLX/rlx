@@ -445,6 +445,15 @@ pub mod mmap {
         pub k_offset: usize,
         pub v_offset: usize,
         pub path: Option<PathBuf>,
+        /// Retained fd for the `pread` read path (file-backed maps only).
+        file: Option<std::fs::File>,
+        /// Use positional `read_at` (pread) instead of mmap-slice for `read_rows`
+        /// (opt-in via `RLX_KVSTORE_PREAD`; falls back to mmap for anonymous maps or
+        /// non-Unix). Reads become explicit bounded syscalls into a fresh buffer —
+        /// predictable latency, no reliance on the mapping, and the seam an
+        /// `io_uring`-batched cold-read backend would plug into on Linux. Writes
+        /// still go through the mmap; the shared page cache keeps the two coherent.
+        pread: bool,
     }
 
     impl MmapKvLayer {
@@ -480,6 +489,8 @@ pub mod mmap {
                 k_offset: 0,
                 v_offset: capacity_rows * bytes_per_row,
                 path: Some(path.as_ref().to_path_buf()),
+                file: Some(file),
+                pread: std::env::var_os("RLX_KVSTORE_PREAD").is_some(),
             })
         }
 
@@ -504,6 +515,8 @@ pub mod mmap {
                 k_offset: 0,
                 v_offset: capacity_rows * bytes_per_row,
                 path: None,
+                file: None,
+                pread: false, // no fd for anonymous maps → always mmap-slice reads
             })
         }
 
@@ -560,6 +573,65 @@ pub mod mmap {
             Ok((k, v))
         }
 
+        /// Read an arbitrary row range `[start_row, start_row+n_rows)` — the
+        /// random-access primitive for block retrieval (only the touched pages
+        /// fault in from disk). Rows outside `past_len` are clamped away.
+        pub fn read_rows(&self, start_row: usize, n_rows: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+            let start_row = start_row.min(self.past_len);
+            let n_rows = n_rows.min(self.past_len - start_row);
+            let n = n_rows * self.kv_dim;
+            let nbytes = n_rows * self.bytes_per_row;
+            let k_start = self.k_offset + start_row * self.bytes_per_row;
+            let v_start = self.v_offset + start_row * self.bytes_per_row;
+            // Positional-read path (opt-in): bounded `pread` into fresh buffers
+            // rather than slicing the mapping. Writes go through the (MAP_SHARED)
+            // mmap, so the shared page cache keeps pread coherent with them.
+            #[cfg(unix)]
+            if self.pread {
+                if let Some(f) = self.file.as_ref() {
+                    use std::os::unix::fs::FileExt;
+                    let mut kb = vec![0u8; nbytes];
+                    let mut vb = vec![0u8; nbytes];
+                    f.read_exact_at(&mut kb, k_start as u64)?;
+                    f.read_exact_at(&mut vb, v_start as u64)?;
+                    let k = dequant_rows(&kb, self.scheme, n)?;
+                    let v = dequant_rows(&vb, self.scheme, n)?;
+                    return Ok((k, v));
+                }
+            }
+            let k_end = k_start + nbytes;
+            let v_end = v_start + nbytes;
+            let k = dequant_rows(&self.mmap[k_start..k_end], self.scheme, n)?;
+            let v = dequant_rows(&self.mmap[v_start..v_end], self.scheme, n)?;
+            Ok((k, v))
+        }
+
+        /// Prefetch an arbitrary row range (madvise WILLNEED) so the retrieved
+        /// blocks' pages are warm before the synchronous read. Best-effort.
+        pub fn prefetch_rows(&self, start_row: usize, n_rows: usize) {
+            let start_row = start_row.min(self.past_len);
+            let n_rows = n_rows.min(self.past_len - start_row);
+            if n_rows == 0 {
+                return;
+            }
+            let k_start = self.k_offset + start_row * self.bytes_per_row;
+            let v_start = self.v_offset + start_row * self.bytes_per_row;
+            #[cfg(unix)]
+            {
+                let len = n_rows * self.bytes_per_row;
+                let _ = self
+                    .mmap
+                    .advise_range(memmap2::Advice::WillNeed, k_start, len);
+                let _ = self
+                    .mmap
+                    .advise_range(memmap2::Advice::WillNeed, v_start, len);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (k_start, v_start);
+            }
+        }
+
         /// Hint the kernel that we're about to read `window` rows
         /// linearly — prefetches pages into the page cache (madvise
         /// WILLNEED on supported platforms). Best-effort: failures are
@@ -590,6 +662,24 @@ pub mod mmap {
             {
                 let _ = (k_start, v_start);
             }
+        }
+
+        /// Advise the kernel this mapping is accessed **randomly**, disabling the
+        /// sequential read-ahead that otherwise faults in neighbor pages a
+        /// scattered block-retrieval read never uses. Opt-in (not baked into
+        /// `open`) so sequential users — `read_window` / `read_all` on the decode
+        /// KV path — keep their read-ahead. Best-effort, Unix-only.
+        pub fn advise_random(&self) {
+            #[cfg(unix)]
+            {
+                let _ = self.mmap.advise(memmap2::Advice::Random);
+            }
+        }
+
+        /// Force the positional-read (`pread`) path on/off, overriding the
+        /// `RLX_KVSTORE_PREAD` env default. No-op → mmap for anonymous maps (no fd).
+        pub fn set_pread(&mut self, on: bool) {
+            self.pread = on && self.file.is_some();
         }
 
         /// Persist any dirty pages to the backing file. No-op for
@@ -702,6 +792,37 @@ pub mod mmap {
             l.append_rows(&row, &row).unwrap();
             l.append_rows(&row, &row).unwrap();
             assert!(l.append_rows(&row, &row).is_err());
+        }
+
+        // Item 3: the opt-in positional-read (pread) path must return bit-identical
+        // rows to the mmap-slice path (writes go through the mmap; the shared page
+        // cache keeps pread coherent).
+        #[cfg(unix)]
+        #[test]
+        fn pread_matches_mmap_read() {
+            let dir = tempfile::tempdir().unwrap();
+            let kv_dim = 32;
+            let path = dir.path().join("layer.bin");
+            let mut layer = MmapKvLayer::open(&path, kv_dim, KvQuant::Q8_0, 64).unwrap();
+            let k: Vec<f32> = (0..kv_dim * 4).map(|i| (i as f32) * 0.01 - 1.0).collect();
+            let v: Vec<f32> = (0..kv_dim * 4).map(|i| (i as f32) * -0.02 + 0.5).collect();
+            layer.append_rows(&k, &v).unwrap();
+            // mmap-slice read (default).
+            layer.set_pread(false);
+            let (km, vm) = layer.read_rows(1, 2).unwrap();
+            // pread read of the same range.
+            layer.set_pread(true);
+            let (kp, vp) = layer.read_rows(1, 2).unwrap();
+            assert_eq!(km.len(), kp.len());
+            assert_eq!(vm.len(), vp.len());
+            assert!(
+                km.iter().zip(&kp).all(|(a, b)| (a - b).abs() < 1e-6),
+                "K mmap != pread"
+            );
+            assert!(
+                vm.iter().zip(&vp).all(|(a, b)| (a - b).abs() < 1e-6),
+                "V mmap != pread"
+            );
         }
     }
 }

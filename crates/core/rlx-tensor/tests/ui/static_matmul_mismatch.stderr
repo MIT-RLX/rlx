@@ -1,0 +1,5 @@
+error: matmul shape mismatch: inner dimensions differ (4 ≠ 8) — left is `[…, 4]`, right is `[8, …]`
+ --> tests/ui/static_matmul_mismatch.rs:7:19
+  |
+7 |         let y = x @ w;
+  |                   ^

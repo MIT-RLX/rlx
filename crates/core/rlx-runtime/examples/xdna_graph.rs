@@ -65,6 +65,7 @@ fn attention_graph(seq: usize, d: usize) -> Graph {
         Op::Attention {
             num_heads: 1,
             head_dim: d,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -612,6 +613,7 @@ fn main() {
         Op::Attention {
             num_heads: 1,
             head_dim: ad2,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -633,6 +635,7 @@ fn main() {
         Op::Attention {
             num_heads: 1,
             head_dim: ad2,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,
@@ -652,6 +655,7 @@ fn main() {
         Op::Attention {
             num_heads: 2,
             head_dim: 16,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,
@@ -698,6 +702,7 @@ fn main() {
         Op::Attention {
             num_heads: 1,
             head_dim: dd2,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,

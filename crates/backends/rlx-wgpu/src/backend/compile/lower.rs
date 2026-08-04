@@ -24,13 +24,14 @@ use crate::kernels::{
     Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
     CopyParams, CumScanParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams,
     DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
-    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
-    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
-    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
-    GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams,
-    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams,
-    RnnParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
+    FftButterflyStageParams, FmaParams, FusedConvBiasActParams, FusedResidualLnParams,
+    FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
+    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
+    GatherParams, GroupNormBwdParams, GroupedMatmulParams, GruParams, Im2Col2dParams, Kernel,
+    LayerNormBwdParams, LayerNormParams, LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams,
+    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
+    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    SampleParams, ScaledGroupedMatmulParams, ScatterAddParams, SceBwdParams, SceParams,
     SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
     WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
     ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
@@ -42,22 +43,23 @@ use crate::kernels::{
     cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
     dequant_matmul_mlx_kernel, elementwise_region_kernel, elementwise_region_spatial_kernel,
     expand_kernel, fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel,
-    fft_butterfly_stage_kernel, fma_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
-    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
-    gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
-    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    fft_butterfly_stage_kernel, fma_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, fused_swiglu_kernel,
+    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
+    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
+    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
     group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
-    layer_norm_backward_input_kernel, layernorm_kernel, lead_pack_uniform, mamba2_kernel,
-    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
-    matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
-    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
-    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
-    reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_kernel, selective_scan_kernel,
+    layer_norm_backward_input_kernel, layernorm_kernel, lead_pack_uniform, lstm_kernel,
+    mamba2_kernel, matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel,
+    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop16_kernel,
+    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
+    matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
+    matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
+    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel,
+    pool2d_kernel, pool3d_kernel, reduce_kernel, rms_norm_backward_kernel,
+    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scaled_grouped_matmul_decode_kernel, scatter_add_kernel, selective_scan_kernel,
     softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
@@ -284,6 +286,21 @@ pub(crate) fn compile_static_inner(
     } else {
         0
     };
+    // Ping-pong scratch (pair) for native multi-layer GRU / Elman RNN
+    // intermediate layer outputs; shared across ops like gdn_scratch.
+    let rnn_gru_scratch = rnn_gru_scratch_bytes(&graph);
+    let rnn_gru_scratch_off = if rnn_gru_scratch > 0 {
+        let aligned = plan.arena_size.div_ceil(16) * 16;
+        let new_size = aligned + rnn_gru_scratch.div_ceil(16) * 16;
+        if (new_size as u64) <= dev.device.limits().max_buffer_size {
+            plan.arena_size = new_size;
+            aligned
+        } else {
+            0
+        }
+    } else {
+        0
+    };
     // Pre-walk to compute the max scratch any single op needs.
     // Currently only `Op::LayerNormBackwardGamma` uses scratch
     // (`num_workgroups * H * 4` bytes for the partial-sums buffer).
@@ -427,6 +444,7 @@ pub(crate) fn compile_static_inner(
     let mm_w = matmul_wide_kernel(&dev.device);
     let _mm_w_active = matmul_wide_active_kernel(&dev.device);
     let mm_f16w = matmul_f16w_kernel(&dev.device);
+    let mm_bf16w = matmul_bf16w_kernel(&dev.device);
     let mm_f16c = matmul_f16_compute_kernel(&dev.device);
     let mm_coop = matmul_coop16_kernel(&dev.device);
     let mm_coop_f32 = matmul_coop_f32_active_kernel(&dev.device);
@@ -762,10 +780,30 @@ pub(crate) fn compile_static_inner(
                     && b_bytes > ARENA_STAGE_CAP
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
+                    // A genuine BF16 weight is stored f32 in the arena and must
+                    // stay bit-exact — reading it from the f16 shadow would drop
+                    // bf16's exponent range. Keep it on the F32 path.
+                    && !matches!(graph.node(b_id).shape.dtype(), rlx_ir::DType::BF16)
                 {
                     compute_precision = MatmulCompute::F16;
                 }
-                let b_in_arena = !matmul_b_from_f16(compute_precision, b_is_param);
+                // PACKED-BF16 weight path (plain tiled matmul only): a BF16
+                // Param rhs stays PACKED (2 B/elem) in the bf16 side buffer and
+                // is unpacked in-shader (matmul_bf16w) — reading HALF the B
+                // bytes with no host bf16→f32 widen and no ne*4 arena upload,
+                // bit-exact to a bf16-rounded f32 matmul. Only overrides the
+                // plain F32 case (leaves any forced CoopF32 alone); the fused
+                // bias/act matmul sites keep the widened-f32 path.
+                if b_is_param
+                    && compute_precision == MatmulCompute::F32
+                    && matches!(graph.node(b_id).shape.dtype(), rlx_ir::DType::BF16)
+                    && arena.bf16_packed_eligible(&dev.device, b_id)
+                {
+                    arena.register_bf16_packed(&dev.device, b_id);
+                    compute_precision = MatmulCompute::Bf16Packed;
+                }
+                let b_in_arena = !matmul_b_from_f16(compute_precision, b_is_param)
+                    && !matmul_b_from_packed_bf16(compute_precision, b_is_param);
                 let (mut base, mut size, param_anchor) = arena_matmul_bind_window(
                     &dev.device,
                     &arena,
@@ -883,7 +921,10 @@ pub(crate) fn compile_static_inner(
                 let b_off_bind = if b_is_param
                     && matches!(
                         compute_precision,
-                        MatmulCompute::Coop16 | MatmulCompute::CoopF16Vk | MatmulCompute::F16
+                        MatmulCompute::Coop16
+                            | MatmulCompute::CoopF16Vk
+                            | MatmulCompute::F16
+                            | MatmulCompute::Bf16Packed
                     ) {
                     b_off_global
                 } else {
@@ -902,6 +943,7 @@ pub(crate) fn compile_static_inner(
                     mm_k,
                     mm_w,
                     &mm_f16w,
+                    mm_bf16w,
                     &mm_f16c,
                     &mm_coop,
                     &mm_coop_f32,
@@ -2305,13 +2347,13 @@ pub(crate) fn compile_static_inner(
                 }
 
                 let gamma_id = node.inputs[1];
-                // beta is the third input for LayerNorm; RmsNorm
-                // ignores it (kernel branch on `op` skips the read).
-                let beta_id = if is_layer_norm && node.inputs.len() >= 3 {
+                // beta is the third input for BOTH LayerNorm and RmsNorm — the
+                // RmsNorm kernel branch now adds it, matching the CPU oracle.
+                let beta_id = if node.inputs.len() >= 3 {
                     node.inputs[2]
                 } else {
-                    // Use gamma's offset as a benign placeholder;
-                    // the RmsNorm kernel branch never reads it.
+                    // No beta input (shouldn't happen for RmsNorm/LayerNorm);
+                    // gamma's offset is a benign placeholder.
                     gamma_id
                 };
                 let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
@@ -2411,6 +2453,90 @@ pub(crate) fn compile_static_inner(
                 let lk = layernorm_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<LayerNormParams>());
                 let bg = bind_arena_window(&dev.device, lk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+
+            Op::FusedSwiGLU { gate_first, .. } => {
+                // Native SwiGLU: one kernel over the [.., 2*n_half] input instead
+                // of the Narrow+Silu+Mul decompose (3 arena intermediates/FFN).
+                let in_id = node.inputs[0];
+                let in_shape = graph.node(in_id).shape.dims();
+                let n2 = in_shape[in_shape.len() - 1].unwrap_static() as u32;
+                let n_half = n2 / 2;
+                let out_total: u32 = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static() as u32)
+                    .product();
+                let outer = out_total / n_half.max(1);
+                // Bind a window covering both the input and output (both
+                // activations); resolve each offset relative to that window.
+                let sg_win = vec![node.id, in_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let sg_fits = arena_span_bytes(&arena, &sg_win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &sg_win,
+                );
+                if !sg_fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let out_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    node.id,
+                    &mut base,
+                    &mut size,
+                );
+                let in_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    in_id,
+                    &mut base,
+                    &mut size,
+                );
+                // Re-resolve if staging relocated `base` (stale-offset trap).
+                let out_off = if arena_tensor_in_window(&arena, node.id, base, size) {
+                    arena_local_off_f32(&arena, node.id, base)
+                } else {
+                    out_off
+                };
+                let in_off = if arena_tensor_in_window(&arena, in_id, base, size) {
+                    arena_local_off_f32(&arena, in_id, base)
+                } else {
+                    in_off
+                };
+                let p = FusedSwiGLUParams {
+                    n_half,
+                    outer,
+                    gate_first: *gate_first as u32,
+                    in_off,
+                    out_off,
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::FusedSwiGLU { params: p });
+                let k = fused_swiglu_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<FusedSwiGLUParams>());
+                let bg = bind_arena_window(&dev.device, k, &arena, base, size, &u);
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
@@ -3078,10 +3204,15 @@ pub(crate) fn compile_static_inner(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap: _,
             } => {
+                // Asymmetric SDPA (DeepSeek/Kimi MLA): V rows + output are
+                // `v_head_dim` wide while Q·K scores still contract over
+                // `head_dim`. `None` ⇒ symmetric (V width == head_dim).
+                let hd_v = v_head_dim.unwrap_or(*head_dim) as u32;
                 // v5: rank-4 [B, H, S, D] inputs only. SlidingWindow
                 // synthesizes a Custom mask host-side.
                 let q_id = node.inputs[0];
@@ -3259,11 +3390,16 @@ pub(crate) fn compile_static_inner(
                         // detects their BSHD/BHSD layout from nkv·D.
                         let (kb, kh, ks) = rlx_ir::strides_for_shape(k_shape, nkv, hd, seq_k, bhsd);
                         let v_shape = graph.node(v_id).shape.dims();
-                        let (vb, vh, vs) = rlx_ir::strides_for_shape(v_shape, nkv, hd, seq_k, bhsd);
+                        // V rows are `hd_v` wide (MLA-asymmetric); use hd_v so the
+                        // batch/head/seq strides step by the V-width, not head_dim.
+                        let (vb, vh, vs) =
+                            rlx_ir::strides_for_shape(v_shape, nkv, hd_v, seq_k, bhsd);
                         (qb, qh, qs, kb, kh, ks, vb, vh, vs)
                     };
                 let out_shape = node.shape.dims();
-                let (o_b, o_h, o_s) = stride(out_shape, seq_q);
+                // Output rows are `hd_v` wide (MLA-asymmetric == V-width).
+                let (o_b, o_h, o_s) =
+                    rlx_ir::strides_for_shape(out_shape, heads, hd_v, seq_q, bhsd);
                 let mut attn_ids = if let Some((parent, _)) = packed_parent {
                     vec![node.id, parent]
                 } else {
@@ -3503,7 +3639,7 @@ pub(crate) fn compile_static_inner(
                     mask_batch_stride: mask_strides.b,
                     mask_head_stride: mask_strides.h,
                     kv_heads: nkv,
-                    _pad_mask_1: 0,
+                    v_head_dim: hd_v,
                     _pad_mask_2: 0,
                     q_batch_stride: q_b,
                     q_head_stride: q_h,
@@ -4245,6 +4381,10 @@ pub(crate) fn compile_static_inner(
                     && b_bytes > ARENA_STAGE_CAP
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
+                    // A genuine BF16 weight is stored f32 in the arena and must
+                    // stay bit-exact — reading it from the f16 shadow would drop
+                    // bf16's exponent range. Keep it on the F32 path.
+                    && !matches!(graph.node(b_id).shape.dtype(), rlx_ir::DType::BF16)
                 {
                     compute_precision = MatmulCompute::F16;
                 }
@@ -4598,6 +4738,7 @@ pub(crate) fn compile_static_inner(
                         mm_k,
                         mm_w,
                         &mm_f16w,
+                        mm_bf16w,
                         &mm_f16c,
                         &mm_coop,
                         &mm_coop_f32,
@@ -5173,6 +5314,122 @@ pub(crate) fn compile_static_inner(
                 }
             }
 
+            Op::FusedConvBiasAct {
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+                activation,
+                has_residual,
+            } => {
+                // Native 2D conv fused with the bias + optional-residual + act
+                // epilogue: y = act(conv(x,w) + bias[c] + residual). Replaces the
+                // CPU host round-trip; conv body matches conv2d.wgsl bit-for-bit.
+                let in_id = node.inputs[0];
+                let w_id = node.inputs[1];
+                let bias_id = node.inputs[2];
+                let res_id = if *has_residual {
+                    Some(node.inputs[3])
+                } else {
+                    None
+                };
+                assert_eq!(
+                    kernel_size.len(),
+                    2,
+                    "rlx-wgpu FusedConvBiasAct: only 2D NCHW convs are fused"
+                );
+
+                let mut win_ids = vec![node.id, in_id, w_id, bias_id];
+                if let Some(r) = res_id {
+                    win_ids.push(r);
+                }
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                arena_expand_bind_window(&arena, &win_ids, &mut base, &mut size, max_binding);
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let off = |id: rlx_ir::NodeId,
+                           base: &mut u64,
+                           size: &mut u64,
+                           schedule: &mut Vec<Step>,
+                           scratch: &mut u64| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        schedule,
+                        scratch,
+                        id,
+                        base,
+                        size,
+                    )
+                };
+                let in_off = off(in_id, &mut base, &mut size, &mut schedule, &mut scratch);
+                let w_off = off(w_id, &mut base, &mut size, &mut schedule, &mut scratch);
+                let bias_off = off(bias_id, &mut base, &mut size, &mut schedule, &mut scratch);
+                let residual_off = match res_id {
+                    Some(r) => off(r, &mut base, &mut size, &mut schedule, &mut scratch),
+                    None => 0,
+                };
+                let out_off = off(node.id, &mut base, &mut size, &mut schedule, &mut scratch);
+
+                let in_shape = graph.node(in_id).shape.dims();
+                let out_shape = node.shape.dims();
+                let s = |i: usize| stride.get(i).copied().unwrap_or(1) as u32;
+                let p = |i: usize| padding.get(i).copied().unwrap_or(0) as u32;
+                let d = |i: usize| dilation.get(i).copied().unwrap_or(1) as u32;
+                let act_id = match activation {
+                    Some(a) => activation_op_id(*a),
+                    None => 0xFFFF,
+                };
+                let params = FusedConvBiasActParams {
+                    n: in_shape[0].unwrap_static() as u32,
+                    c_in: in_shape[1].unwrap_static() as u32,
+                    c_out: out_shape[1].unwrap_static() as u32,
+                    h: in_shape[2].unwrap_static() as u32,
+                    w: in_shape[3].unwrap_static() as u32,
+                    h_out: out_shape[2].unwrap_static() as u32,
+                    w_out: out_shape[3].unwrap_static() as u32,
+                    kh: kernel_size[0] as u32,
+                    kw: kernel_size[1] as u32,
+                    sh: s(0),
+                    sw: s(1),
+                    ph: p(0),
+                    pw: p(1),
+                    dh: d(0),
+                    dw: d(1),
+                    groups: *groups as u32,
+                    in_off,
+                    w_off,
+                    out_off,
+                    has_bias: 1,
+                    bias_off,
+                    act_id,
+                    has_residual: *has_residual as u32,
+                    residual_off,
+                };
+                schedule.push(Step::FusedConvBiasAct { params });
+                let k = fused_conv_bias_act_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<FusedConvBiasActParams>());
+                let bg = bind_arena_window(&dev.device, k, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+
             Op::Im2Col {
                 kernel_size,
                 stride,
@@ -5568,32 +5825,72 @@ pub(crate) fn compile_static_inner(
                 let seq = in_dims[1].unwrap_static() as u32;
                 let input_size = in_dims[2].unwrap_static() as u32;
                 let hidden = *hidden_size as u32;
-                let simple = *num_layers == 1 && !*bidirectional && !*carry;
-                if simple && hidden <= 256 {
-                    let p = GruParams {
-                        batch,
-                        seq,
-                        input_size,
-                        hidden,
-                        x_off: (arena.offset(x_id) / 4) as u32,
-                        wih_off: (arena.offset(node.inputs[1]) / 4) as u32,
-                        whh_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        bih_off: (arena.offset(node.inputs[3]) / 4) as u32,
-                        bhh_off: (arena.offset(node.inputs[4]) / 4) as u32,
-                        out_off: (arena.offset(node.id) / 4) as u32,
-                        seq_stride: seq,
-                        _p1: 0,
-                        _p2: 0,
-                        _p3: 0,
-                        _p4: 0,
-                        _p5: 0,
+                if hidden <= 256 {
+                    // One dispatch per (layer, direction); intermediate layer
+                    // outputs ping-pong through the in-arena scratch pair. Bit-
+                    // for-bit mirror of `execute_gru_f32` (weight packing).
+                    let dirs = if *bidirectional { 2u32 } else { 1u32 };
+                    let three_h = 3 * hidden;
+                    let out_width = dirs * hidden;
+                    let layer_elems = batch * seq * out_width;
+                    let scratch_w = (rnn_gru_scratch_off / 4) as u32;
+                    let dst_w = (arena.offset(node.id) / 4) as u32;
+                    let wih_w = (arena.offset(node.inputs[1]) / 4) as u32;
+                    let whh_w = (arena.offset(node.inputs[2]) / 4) as u32;
+                    let bih_w = (arena.offset(node.inputs[3]) / 4) as u32;
+                    let bhh_w = (arena.offset(node.inputs[4]) / 4) as u32;
+                    let h0_w = if *carry {
+                        (arena.offset(node.inputs[5]) / 4) as u32
+                    } else {
+                        0
                     };
-                    schedule.push(Step::Gru { params: p });
-                    let gk = gru_kernel(&dev.device);
-                    let u = emit_uniform(std::mem::size_of::<GruParams>());
-                    let bg = bind_op_output_window(&dev.device, gk, &arena, node.id, &u);
-                    uniforms.push(u);
-                    bind_groups.push(bg);
+
+                    let mut in_l = input_size;
+                    let mut wih_cursor = 0u32;
+                    let mut in_off = (arena.offset(x_id) / 4) as u32;
+                    for l in 0..*num_layers as u32 {
+                        let last = l + 1 == *num_layers as u32;
+                        let out_off = if last {
+                            dst_w
+                        } else {
+                            scratch_w + (l % 2) * layer_elems
+                        };
+                        let wih_block = three_h * in_l;
+                        for dir in 0..dirs {
+                            let ld = l * dirs + dir;
+                            let p = GruParams {
+                                batch,
+                                seq,
+                                input_size: in_l,
+                                hidden,
+                                x_off: in_off,
+                                wih_off: wih_w + wih_cursor + dir * wih_block,
+                                whh_off: whh_w + ld * three_h * hidden,
+                                bih_off: bih_w + ld * three_h,
+                                bhh_off: bhh_w + ld * three_h,
+                                out_off,
+                                seq_stride: seq,
+                                h0_off: if *carry {
+                                    h0_w + ld * batch * hidden
+                                } else {
+                                    0
+                                },
+                                out_width,
+                                dir_off: dir * hidden,
+                                reverse: u32::from(dir == 1),
+                                _p5: 0,
+                            };
+                            schedule.push(Step::Gru { params: p });
+                            let gk = gru_kernel(&dev.device);
+                            let u = emit_uniform(std::mem::size_of::<GruParams>());
+                            let bg = bind_op_output_window(&dev.device, gk, &arena, node.id, &u);
+                            uniforms.push(u);
+                            bind_groups.push(bg);
+                        }
+                        wih_cursor += dirs * wih_block;
+                        in_l = out_width;
+                        in_off = scratch_w + (l % 2) * layer_elems;
+                    }
                 } else {
                     let h0 = if *carry {
                         arena.offset(node.inputs[5]) as u32
@@ -5631,32 +5928,69 @@ pub(crate) fn compile_static_inner(
                 let seq = in_dims[1].unwrap_static() as u32;
                 let input_size = in_dims[2].unwrap_static() as u32;
                 let hidden = *hidden_size as u32;
-                let simple = *num_layers == 1 && !*bidirectional && !*carry;
-                if simple && hidden <= 256 {
-                    let p = RnnParams {
-                        batch,
-                        seq,
-                        input_size,
-                        hidden,
-                        x_off: (arena.offset(x_id) / 4) as u32,
-                        wih_off: (arena.offset(node.inputs[1]) / 4) as u32,
-                        whh_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        bias_off: (arena.offset(node.inputs[3]) / 4) as u32,
-                        out_off: (arena.offset(node.id) / 4) as u32,
-                        seq_stride: seq,
-                        relu: u32::from(*relu),
-                        _p1: 0,
-                        _p2: 0,
-                        _p3: 0,
-                        _p4: 0,
-                        _p5: 0,
+                if hidden <= 256 {
+                    // One dispatch per (layer, direction); intermediate layer
+                    // outputs ping-pong through the in-arena scratch pair. Bit-
+                    // for-bit mirror of `execute_rnn_f32` (single merged bias).
+                    let dirs = if *bidirectional { 2u32 } else { 1u32 };
+                    let out_width = dirs * hidden;
+                    let layer_elems = batch * seq * out_width;
+                    let scratch_w = (rnn_gru_scratch_off / 4) as u32;
+                    let dst_w = (arena.offset(node.id) / 4) as u32;
+                    let wih_w = (arena.offset(node.inputs[1]) / 4) as u32;
+                    let whh_w = (arena.offset(node.inputs[2]) / 4) as u32;
+                    let bias_w = (arena.offset(node.inputs[3]) / 4) as u32;
+                    let h0_w = if *carry {
+                        (arena.offset(node.inputs[4]) / 4) as u32
+                    } else {
+                        0
                     };
-                    schedule.push(Step::Rnn { params: p });
-                    let rk = rnn_kernel(&dev.device);
-                    let u = emit_uniform(std::mem::size_of::<RnnParams>());
-                    let bg = bind_op_output_window(&dev.device, rk, &arena, node.id, &u);
-                    uniforms.push(u);
-                    bind_groups.push(bg);
+
+                    let mut in_l = input_size;
+                    let mut wih_cursor = 0u32;
+                    let mut in_off = (arena.offset(x_id) / 4) as u32;
+                    for l in 0..*num_layers as u32 {
+                        let last = l + 1 == *num_layers as u32;
+                        let out_off = if last {
+                            dst_w
+                        } else {
+                            scratch_w + (l % 2) * layer_elems
+                        };
+                        let wih_block = hidden * in_l;
+                        for dir in 0..dirs {
+                            let ld = l * dirs + dir;
+                            let p = RnnParams {
+                                batch,
+                                seq,
+                                input_size: in_l,
+                                hidden,
+                                x_off: in_off,
+                                wih_off: wih_w + wih_cursor + dir * wih_block,
+                                whh_off: whh_w + ld * hidden * hidden,
+                                bias_off: bias_w + ld * hidden,
+                                out_off,
+                                seq_stride: seq,
+                                relu: u32::from(*relu),
+                                h0_off: if *carry {
+                                    h0_w + ld * batch * hidden
+                                } else {
+                                    0
+                                },
+                                out_width,
+                                dir_off: dir * hidden,
+                                reverse: u32::from(dir == 1),
+                            };
+                            schedule.push(Step::Rnn { params: p });
+                            let rk = rnn_kernel(&dev.device);
+                            let u = emit_uniform(std::mem::size_of::<RnnParams>());
+                            let bg = bind_op_output_window(&dev.device, rk, &arena, node.id, &u);
+                            uniforms.push(u);
+                            bind_groups.push(bg);
+                        }
+                        wih_cursor += dirs * wih_block;
+                        in_l = out_width;
+                        in_off = scratch_w + (l % 2) * layer_elems;
+                    }
                 } else {
                     let h0 = if *carry {
                         arena.offset(node.inputs[4]) as u32
@@ -5912,38 +6246,114 @@ pub(crate) fn compile_static_inner(
                 carry,
             } => {
                 let x_shape = &graph.node(node.inputs[0]).shape;
-                let (h0, c0) = if *carry {
-                    (
-                        arena.offset(node.inputs[4]) as u32,
-                        arena.offset(node.inputs[5]) as u32,
-                    )
+                let batch = x_shape.dim(0).unwrap_static() as u32;
+                let seq = x_shape.dim(1).unwrap_static() as u32;
+                let input_size = x_shape.dim(2).unwrap_static() as u32;
+                let hidden = *hidden_size as u32;
+                if hidden <= 256 {
+                    // One dispatch per (layer, direction); intermediate layer
+                    // outputs ping-pong through the in-arena scratch pair. Bit-
+                    // for-bit mirror of `execute_lstm_f32` (gate order i,f,g,o;
+                    // single merged bias).
+                    let dirs = if *bidirectional { 2u32 } else { 1u32 };
+                    let four_h = 4 * hidden;
+                    let out_width = dirs * hidden;
+                    let layer_elems = batch * seq * out_width;
+                    let scratch_w = (rnn_gru_scratch_off / 4) as u32;
+                    let dst_w = (arena.offset(node.id) / 4) as u32;
+                    let wih_w = (arena.offset(node.inputs[1]) / 4) as u32;
+                    let whh_w = (arena.offset(node.inputs[2]) / 4) as u32;
+                    let bias_w = (arena.offset(node.inputs[3]) / 4) as u32;
+                    let (h0_w, c0_w) = if *carry {
+                        (
+                            (arena.offset(node.inputs[4]) / 4) as u32,
+                            (arena.offset(node.inputs[5]) / 4) as u32,
+                        )
+                    } else {
+                        (0, 0)
+                    };
+
+                    let mut in_l = input_size;
+                    let mut wih_cursor = 0u32;
+                    let mut in_off = (arena.offset(node.inputs[0]) / 4) as u32;
+                    for l in 0..*num_layers as u32 {
+                        let last = l + 1 == *num_layers as u32;
+                        let out_off = if last {
+                            dst_w
+                        } else {
+                            scratch_w + (l % 2) * layer_elems
+                        };
+                        let wih_block = four_h * in_l;
+                        for dir in 0..dirs {
+                            let ld = l * dirs + dir;
+                            let p = LstmParams {
+                                batch,
+                                seq,
+                                input_size: in_l,
+                                hidden,
+                                x_off: in_off,
+                                wih_off: wih_w + wih_cursor + dir * wih_block,
+                                whh_off: whh_w + ld * four_h * hidden,
+                                bias_off: bias_w + ld * four_h,
+                                out_off,
+                                seq_stride: seq,
+                                h0_off: if *carry {
+                                    h0_w + ld * batch * hidden
+                                } else {
+                                    0
+                                },
+                                c0_off: if *carry {
+                                    c0_w + ld * batch * hidden
+                                } else {
+                                    0
+                                },
+                                out_width,
+                                dir_off: dir * hidden,
+                                reverse: u32::from(dir == 1),
+                                _p: 0,
+                            };
+                            schedule.push(Step::LstmGpu { params: p });
+                            let lk = lstm_kernel(&dev.device);
+                            let u = emit_uniform(std::mem::size_of::<LstmParams>());
+                            let bg = bind_op_output_window(&dev.device, lk, &arena, node.id, &u);
+                            uniforms.push(u);
+                            bind_groups.push(bg);
+                        }
+                        wih_cursor += dirs * wih_block;
+                        in_l = out_width;
+                        in_off = scratch_w + (l % 2) * layer_elems;
+                    }
                 } else {
-                    (0u32, 0u32)
-                };
-                schedule.push(Step::Lstm {
-                    x_byte_off: arena.offset(node.inputs[0]) as u32,
-                    w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
-                    w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
-                    bias_byte_off: arena.offset(node.inputs[3]) as u32,
-                    h0_byte_off: h0,
-                    c0_byte_off: c0,
-                    dst_byte_off: arena.offset(node.id) as u32,
-                    batch: x_shape.dim(0).unwrap_static() as u32,
-                    seq: x_shape.dim(1).unwrap_static() as u32,
-                    input_size: x_shape.dim(2).unwrap_static() as u32,
-                    hidden: *hidden_size as u32,
-                    num_layers: *num_layers as u32,
-                    bidirectional: *bidirectional,
-                    carry: *carry,
-                });
-                // `Step::Lstm` is a host step: BOTH run loops skip it (the
-                // uniform pre-pass `continue`s, the compute pass `break`s), so
-                // it must push NEITHER a uniform NOR a bind_group — otherwise
-                // every later GPU step's `gpu_ui`/`gpu_bi` index is off by one
-                // and a downstream matmul reads a wrong-sized uniform (kokoro's
-                // StyleTTS2 encoder LSTM triggered "Copy 64 bytes into a
-                // 32-byte buffer"). The prior placeholder push predated the
-                // host-skip in both loops.
+                    let (h0, c0) = if *carry {
+                        (
+                            arena.offset(node.inputs[4]) as u32,
+                            arena.offset(node.inputs[5]) as u32,
+                        )
+                    } else {
+                        (0u32, 0u32)
+                    };
+                    schedule.push(Step::Lstm {
+                        x_byte_off: arena.offset(node.inputs[0]) as u32,
+                        w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
+                        w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
+                        bias_byte_off: arena.offset(node.inputs[3]) as u32,
+                        h0_byte_off: h0,
+                        c0_byte_off: c0,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        batch,
+                        seq,
+                        input_size,
+                        hidden,
+                        num_layers: *num_layers as u32,
+                        bidirectional: *bidirectional,
+                        carry: *carry,
+                    });
+                    // `Step::Lstm` is a host step: BOTH run loops skip it (the
+                    // uniform pre-pass `continue`s, the compute pass `break`s), so
+                    // it must push NEITHER a uniform NOR a bind_group — otherwise
+                    // every later GPU step's `gpu_ui`/`gpu_bi` index is off by one
+                    // and a downstream matmul reads a wrong-sized uniform.
+                }
             }
             Op::ConvTranspose2d {
                 kernel_size,
@@ -6864,7 +7274,6 @@ pub(crate) fn compile_static_inner(
             | Op::Qr { .. }
             | Op::ArgSort { .. }
             | Op::LoraMatMul { .. }
-            | Op::FusedConvBiasAct { .. }
             | Op::PartitionedConv { .. }
             | Op::CustomFn { .. } => {
                 schedule.push(Step::HostOp {
@@ -7605,6 +8014,65 @@ pub(crate) fn compile_static_inner(
                 let gk = grouped_matmul_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<GroupedMatmulParams>());
                 let bg = bind_op_output_window(&dev.device, gk, &arena, node.id, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::ScaledGroupedMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } => {
+                // Native MXFP4 (E2M1) grouped decode-GEMM. The WGSL kernel
+                // specializes the FP4 E2M1 codec (the MX default); other
+                // ScaledFormats aren't lowered natively on wgpu.
+                assert!(
+                    *lhs_format == rlx_ir::ScaledFormat::F4E2M1
+                        && *rhs_format == rlx_ir::ScaledFormat::F4E2M1,
+                    "rlx-wgpu: ScaledGroupedMatMul native path is MXFP4 (F4E2M1) only, got \
+                     {lhs_format:?}×{rhs_format:?}"
+                );
+                // input codes [M,K], weight codes [E,N,K], input_s, weight_s,
+                // expert_idx [M], (bias [E,N]).
+                let in_id = node.inputs[0];
+                let w_id = node.inputs[1];
+                let is_id = node.inputs[2];
+                let ws_id = node.inputs[3];
+                let idx_id = node.inputs[4];
+                let in_dims = graph.node(in_id).shape.dims();
+                let w_dims = graph.node(w_id).shape.dims();
+                let m = in_dims[0].unwrap_static() as u32;
+                let k = in_dims[1].unwrap_static() as u32;
+                let ne = w_dims[0].unwrap_static() as u32;
+                let n = w_dims[w_dims.len() - 2].unwrap_static() as u32;
+                let (scale_mode, block) = scale_layout.mode_block();
+                let bias_off = if *has_bias {
+                    (arena.offset(node.inputs[5]) / 4) as u32
+                } else {
+                    0
+                };
+                let p = ScaledGroupedMatmulParams {
+                    m,
+                    k,
+                    n,
+                    num_experts: ne,
+                    input_byte_off: arena.offset(in_id) as u32,
+                    weight_byte_off: arena.offset(w_id) as u32,
+                    input_scale_byte_off: arena.offset(is_id) as u32,
+                    weight_scale_byte_off: arena.offset(ws_id) as u32,
+                    idx_off: (arena.offset(idx_id) / 4) as u32,
+                    out_off: (arena.offset(node.id) / 4) as u32,
+                    bias_off,
+                    scale_mode,
+                    block,
+                    has_bias: u32::from(*has_bias),
+                    _pad0: 0,
+                    _pad1: 0,
+                };
+                schedule.push(Step::ScaledGroupedMatmul { params: p });
+                let sk = scaled_grouped_matmul_decode_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<ScaledGroupedMatmulParams>());
+                let bg = bind_op_output_window(&dev.device, sk, &arena, node.id, &u);
                 uniforms.push(u);
                 bind_groups.push(bg);
             }

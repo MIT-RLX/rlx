@@ -809,10 +809,15 @@ fn build_node_exec(graph: &Graph, node_id: usize) -> Result<Box<dyn ExecutableGr
         Op::Attention {
             num_heads,
             head_dim,
+            v_head_dim,
             mask_kind,
             score_scale,
             attn_logit_softcap,
         } => {
+            assert!(
+                v_head_dim.is_none_or(|v| v == *head_dim),
+                "rlx-xdna: asymmetric v_head_dim (MLA) not yet supported"
+            );
             // Scoped: None/Causal mask, no softcap, batch=1; multi-head via Q's
             // hidden dim = num_heads · head_dim.
             let causal = match mask_kind {

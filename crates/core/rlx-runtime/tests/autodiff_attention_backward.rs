@@ -40,6 +40,7 @@ fn build_attn_forward(mask_kind: MaskKind) -> AttnFwd {
         Op::Attention {
             num_heads: H,
             head_dim: D,
+            v_head_dim: None,
             mask_kind,
             score_scale: None,
             attn_logit_softcap: None,

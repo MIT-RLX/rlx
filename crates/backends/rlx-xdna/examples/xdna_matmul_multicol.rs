@@ -44,7 +44,7 @@ fn compile(name: &str, mlir: &str) -> Vec<u32> {
         out_insts: &format!("{tmp}/i.bin"),
     })
     .expect("compile");
-    std::fs::read(&format!("{tmp}/i.bin"))
+    std::fs::read(format!("{tmp}/i.bin"))
         .unwrap()
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))

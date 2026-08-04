@@ -46,7 +46,7 @@ fn dual_coverage() {
         }
     }
 
-    let truth = set(&triangulate(&pts));
+    let truth = set(&triangulate(&pts).unwrap());
     let labels = voronoi_grid_exact(&pts, w, h);
     let dual = voronoi_dual(&labels, w, h);
     let dset = set(&dual);

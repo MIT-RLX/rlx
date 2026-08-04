@@ -31,6 +31,19 @@ impl Arena {
     /// If `graph` is None, all buffers are assumed F32.
     pub fn from_plan_with_graph(plan: MemoryPlan, graph: Option<&Graph>) -> Self {
         let dev = metal_device().expect("Metal device required for rlx-metal arena");
+        if rlx_ir::env::flag("RLX_METAL_ARENA_DIAG") {
+            eprintln!(
+                "[rlx-metal] arena: {} bytes ({:.1} MiB) over {} slots{}",
+                plan.arena_size,
+                plan.arena_size as f64 / (1024.0 * 1024.0),
+                plan.assignments.len(),
+                if plan.arena_size >= (1u64 << 32) as usize {
+                    "  <-- >=4GiB: forces thunks_only_big_arena (no MPSGraph fusion)"
+                } else {
+                    ""
+                }
+            );
+        }
         let buffer = dev.alloc_shared(plan.arena_size.max(64));
 
         let mut offsets = HashMap::with_capacity(plan.assignments.len());
@@ -130,15 +143,33 @@ impl Arena {
                 DType::F16 => {
                     let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut half::f16, len);
-                    for (i, &v) in data.iter().take(len).enumerate() {
-                        dst[i] = half::f16::from_f32(v);
+                    if len >= 1 << 20 {
+                        use rayon::prelude::*;
+                        dst.par_iter_mut()
+                            .zip(&data[..len])
+                            .for_each(|(d, &v)| *d = half::f16::from_f32(v));
+                    } else {
+                        for (i, &v) in data.iter().take(len).enumerate() {
+                            dst[i] = half::f16::from_f32(v);
+                        }
                     }
                 }
                 DType::BF16 => {
+                    // Parallel f32→bf16 for large params (MXFP4 expert scales:
+                    // ~20M elem/param, serial was ~190ms each = the dominant expert
+                    // upload cost). Disjoint element writes into the unified-memory
+                    // arena → safe + bit-identical to the serial loop.
                     let len = data.len().min(cap);
                     let dst = std::slice::from_raw_parts_mut(base as *mut half::bf16, len);
-                    for (i, &v) in data.iter().take(len).enumerate() {
-                        dst[i] = half::bf16::from_f32(v);
+                    if len >= 1 << 20 {
+                        use rayon::prelude::*;
+                        dst.par_iter_mut()
+                            .zip(&data[..len])
+                            .for_each(|(d, &v)| *d = half::bf16::from_f32(v));
+                    } else {
+                        for (i, &v) in data.iter().take(len).enumerate() {
+                            dst[i] = half::bf16::from_f32(v);
+                        }
                     }
                 }
                 // Integer-typed inputs (token IDs, position indices) get
@@ -235,14 +266,24 @@ impl Arena {
         if n == 0 || dst_elem + n > dst_cap || src_elem + n > src_cap {
             return;
         }
+        // Byte-width per element from the node dtype (f16=2, f32=4). The KV feed
+        // copies same-dtype tensors (new K/V output row → past K/V input row), so
+        // a raw byte copy is exact; sizing by the actual dtype is what makes an
+        // f16 KV cache work — the old `*f32` (4-byte) offset math corrupted it.
+        let elem_bytes = self.dtype(dst).size_bytes().max(1);
+        debug_assert_eq!(
+            self.dtype(dst),
+            self.dtype(src),
+            "copy_node_f32_range: src/dst dtype mismatch (raw byte copy assumes equal dtype)"
+        );
         let dst_off = self.byte_offset(dst);
         let src_off = self.byte_offset(src);
         unsafe {
             let base = self.buffer.contents() as *mut u8;
-            let src_p = (base.add(src_off) as *const f32).add(src_elem);
-            let dst_p = (base.add(dst_off) as *mut f32).add(dst_elem);
-            if src_p as *const () != dst_p as *const () {
-                std::ptr::copy(src_p, dst_p, n);
+            let src_p = base.add(src_off + src_elem * elem_bytes) as *const u8;
+            let dst_p = base.add(dst_off + dst_elem * elem_bytes);
+            if !std::ptr::eq(src_p, dst_p) {
+                std::ptr::copy(src_p, dst_p, n * elem_bytes);
             }
         }
     }
@@ -277,6 +318,27 @@ impl Arena {
         let len = data.len().min(cap);
         unsafe {
             let base = (self.buffer.contents() as *mut u8).add(off);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), base, len);
+        }
+    }
+
+    /// Copy raw bytes into a sub-range of the node's arena slot, starting
+    /// `byte_offset` bytes into it. Used for incremental per-slot uploads of a
+    /// large packed-expert residency buffer (write one changed slot instead of the
+    /// whole buffer). Zero-copy on Apple unified memory — the GPU reads the same
+    /// bytes. Bounded by the slot's element/byte capacity.
+    pub fn write_bytes_at(&mut self, id: NodeId, byte_offset: usize, data: &[u8]) {
+        let off = self.byte_offset(id);
+        // element_counts is in ELEMENTS; convert to a byte cap so this is correct
+        // for U8 codes and BF16 scales alike.
+        let byte_cap =
+            *self.element_counts.get(&id).unwrap_or(&0) * self.dtype(id).size_bytes().max(1);
+        if byte_offset >= byte_cap {
+            return;
+        }
+        let len = data.len().min(byte_cap - byte_offset);
+        unsafe {
+            let base = (self.buffer.contents() as *mut u8).add(off + byte_offset);
             std::ptr::copy_nonoverlapping(data.as_ptr(), base, len);
         }
     }

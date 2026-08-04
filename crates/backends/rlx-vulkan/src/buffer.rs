@@ -11,21 +11,114 @@ use crate::device::{VulkanDevice, vulkan_device};
 use ash::vk;
 use rlx_compile::memory::MemoryPlan;
 use rlx_ir::{DType, Graph, NodeId, Op};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// High bit on f32 **element** offsets in push constants → binding 1 (weights).
 pub const WEIGHT_ELEM_TAG: u32 = 1 << 31;
 
-/// Shrink recorded U8/I8 activation capacities to packed width (offsets keep the
-/// f32-uniform liveness layout). Word-rounded so CAS i8 stores stay in-slot.
-pub(crate) fn pack_i8_u8_slot_sizes(graph: &Graph, plan: &mut MemoryPlan) {
+/// BF16 `Param` nodes consumed **only** as the rhs (input index 1) of
+/// `MatMul` / `FusedMatMulBiasAct` — the "matmul weight" case. These are kept
+/// PACKED in the arena (2 bytes/elem, `ceil(ne/2)` u32 words) and unpacked
+/// in-shader by the `matmul_bf16` kernel, instead of being host-widened to f32
+/// (`ne*4`) — the GPU then streams half the weight bytes.
+///
+/// Conservative: a bf16 param read by *any* other op, or used as an lhs, keeps
+/// the widen-to-f32 path (its consumer still sees plain f32), so packing never
+/// changes what a non-matmul consumer observes.
+pub(crate) fn bf16_packed_matmul_weights(graph: &Graph) -> HashSet<NodeId> {
+    // qualifies[id] = Some(true): a matmul-rhs use seen, still eligible.
+    //               = Some(false): bf16 param, no disqualifying use yet.
+    //               = absent: disqualified (or never a bf16 param).
+    let mut qualifies: HashMap<NodeId, bool> = HashMap::new();
     for node in graph.nodes() {
-        if !matches!(node.shape.dtype(), DType::U8 | DType::I8) {
-            continue;
+        if matches!(&node.op, Op::Param { .. }) && node.shape.dtype() == DType::BF16 {
+            qualifies.insert(node.id, false);
         }
-        if let Some(slot) = plan.assignments.get_mut(&node.id) {
-            let ne = node.shape.num_elements().unwrap_or(0).max(1);
-            slot.size = ne.div_ceil(4) * 4;
+    }
+    for node in graph.nodes() {
+        for (i, &inp) in node.inputs.iter().enumerate() {
+            if !qualifies.contains_key(&inp) {
+                continue;
+            }
+            let rhs_matmul =
+                matches!(node.op, Op::MatMul | Op::FusedMatMulBiasAct { .. }) && i == 1;
+            if rhs_matmul {
+                qualifies.insert(inp, true);
+            } else {
+                // Any non-matmul-rhs use disqualifies (keep the f32 widen path).
+                qualifies.remove(&inp);
+            }
+        }
+    }
+    qualifies
+        .into_iter()
+        .filter(|&(_, ok)| ok)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Packed byte width of a bf16 matmul weight: `ceil(ne/2)` u32 words. Word-
+/// aligned so the `matmul_bf16` kernel's `uint[]` reads stay in-slot.
+#[inline]
+pub(crate) fn packed_bf16_bytes(ne: usize) -> usize {
+    ne.div_ceil(2) * 4
+}
+
+/// Reconcile planned slot sizes with the f32-uniform arena's upload convention.
+///
+/// Two fixups on `plan.assignments` (the non-split `from_plan` path; the split
+/// path parks params in the weight buffer and sizes them itself):
+///
+/// * **U8/I8** slots shrink to packed width (offsets keep the f32-uniform
+///   liveness layout). Word-rounded so CAS i8 stores stay in-slot.
+/// * **Under-sized non-U8/I8 params** (F16/BF16, and other sub-4-byte dtypes)
+///   are f32-widened at upload — `set_param_typed` widens F16/BF16/int → f32 and
+///   `write_f32`s them, and the f32-uniform matmul shaders read them as f32. But
+///   `node_slot_bytes` sizes a non-F32 param at its *native* (2-byte for
+///   F16/BF16) width, so the slot is undersized: `write_f32` clamps to
+///   capacity and truncates the widened weight (e.g. a bf16 LM head loses half
+///   its rows) while the matmul reads `ne` f32 words past the short slot. Grow
+///   them to the `ne*4` f32 width the arena actually stores — the same width
+///   `from_plan_split` gives its weight-buffer params. Because the greedy
+///   allocator already packed the native-width slot flush against its neighbor,
+///   we cannot grow in place; re-home the slot to a fresh arena-tail region.
+///   Params are live for the whole program, so a tail slot never conflicts.
+///   (F32 / already-≥ne*4 params are untouched.)
+pub(crate) fn pack_i8_u8_slot_sizes(graph: &Graph, plan: &mut MemoryPlan) {
+    let packed = bf16_packed_matmul_weights(graph);
+    for node in graph.nodes() {
+        let ne = node.shape.num_elements().unwrap_or(0).max(1);
+        match node.shape.dtype() {
+            DType::U8 | DType::I8 => {
+                if let Some(slot) = plan.assignments.get_mut(&node.id) {
+                    slot.size = ne.div_ceil(4) * 4;
+                }
+            }
+            _ if matches!(node.op, Op::Param { .. }) => {
+                // BF16 matmul weights stay packed (`ne*2`, word-rounded); every
+                // other param widens to f32 (`ne*4`). Re-home packed weights
+                // unconditionally so the slot is word-aligned and exactly sized
+                // (the native bf16 slot is `ne*2` but may be off-by-a-word for
+                // odd `ne` and packed flush against a neighbor).
+                let is_packed = packed.contains(&node.id);
+                let need = if is_packed {
+                    packed_bf16_bytes(ne)
+                } else {
+                    ne * 4
+                };
+                let cur = plan.assignments.get(&node.id).map(|s| s.size);
+                if let Some(cur) = cur
+                    && (is_packed || need > cur)
+                {
+                    let off = plan.arena_size.div_ceil(16) * 16;
+                    plan.arena_size = off + need;
+                    if let Some(slot) = plan.assignments.get_mut(&node.id) {
+                        slot.offset = off;
+                        slot.size = need;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -243,6 +336,7 @@ impl Arena {
         // grows past it — the difference between a 0.5 GiB bound prefix and a
         // 4.35 GiB whole-buffer bind for a big MoE checkpoint.
         let host_only = host_only_params(graph);
+        let packed = bf16_packed_matmul_weights(graph);
         let mut gpu_params: Vec<(NodeId, usize)> = Vec::new();
         let mut host_params: Vec<(NodeId, usize)> = Vec::new();
 
@@ -258,6 +352,9 @@ impl Arena {
                 let dt = node.shape.dtype();
                 let slot_bytes = if matches!(dt, DType::U8 | DType::I8) {
                     ne * dt.size_bytes()
+                } else if packed.contains(&node.id) {
+                    // Packed bf16 matmul weight (2 bytes/elem, word-padded).
+                    packed_bf16_bytes(ne)
                 } else {
                     ne * 4
                 };

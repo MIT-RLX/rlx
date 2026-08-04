@@ -54,12 +54,16 @@ impl MpsGraphPlan {
 
 const F32_DT: u32 = 0x10000000 | 32;
 const F16_DT: u32 = 0x10000000 | 16;
+// MPSDataTypeBFloat16 = MPSDataTypeAlternateEncodingBit(0x80000000)
+// | MPSDataTypeFloatBit(0x10000000) | 16. Supported by MPSGraph on macOS 14+.
+const BF16_DT: u32 = 0x90000000 | 16;
 const I32_DT: u32 = 0x20000000 | 32;
 
 fn dtype_to_mps(d: DType) -> Option<u32> {
     match d {
         DType::F32 => Some(F32_DT),
         DType::F16 => Some(F16_DT),
+        DType::BF16 => Some(BF16_DT),
         DType::I32 => Some(I32_DT),
         _ => None,
     }
@@ -259,6 +263,41 @@ pub fn try_lower(graph: &Graph) -> Option<MpsGraphPlan> {
     try_lower_with_constants(graph, None)
 }
 
+/// True when `graph` contains an **interior-axis reduction of a rank≥4 tensor** —
+/// a `Reduce` whose reduced axis has a *non-reduced* axis after it (the reduction
+/// squeezes a middle dimension while keeping a later one). MPSGraph's whole-graph
+/// optimizer miscompiles this when the result reaches a graph output through
+/// elementwise ops: the DeepSeek-V4 hyper-connection tail (`Σ_k comb·residual`, a
+/// `[rows,hc,hc,d]` sum over axis 2) and the KV-compressor window pool read back
+/// as ZEROS on `--attn-gpu` even though every input is correct (the same op
+/// mid-graph, and the whole graph on the per-op thunk path, are exact). The thunk
+/// path is always correct, so both the full plan ([`try_lower_with_constants`])
+/// and the hybrid segmenter (`compile.rs`) refuse graphs with this pattern.
+/// Trailing reductions (vision `[N,C,H,W]` over `[2,3]`) are NOT interior and stay
+/// on MPSGraph. See the DSV4-Flash GA paged-decode work / `metal_hc_post_parity`.
+///
+/// NB an attempted `permute(axis→trailing) + trailing reduce` rewrite (2026-08-01)
+/// did NOT fix it: narrowing this guard to "only non-rewritable interior reduces"
+/// re-enabled the MPSGraph backbone at ~568 ms/tok (12L warm) but the output went
+/// back to ALL ZEROS — the miscompile is not confined to the reduce alone. So the
+/// guard stays BROAD (any interior rank≥4 reduce → thunks); the ~2.8× MPSGraph
+/// "speedup" is a mirage (it's fast because it skips/miscomputes work). The correct
+/// floor is the per-op thunk backbone (~764 ms/tok).
+pub fn graph_has_mps_hostile_reduce(graph: &Graph) -> bool {
+    graph.nodes().iter().any(|n| {
+        let Op::Reduce { axes, .. } = &n.op else {
+            return false;
+        };
+        let rank = graph.node(n.inputs[0]).shape.rank();
+        if rank < 4 {
+            return false;
+        }
+        let reduced: std::collections::HashSet<usize> = axes.iter().copied().collect();
+        axes.iter()
+            .any(|&a| (a + 1..rank).any(|b| !reduced.contains(&b)))
+    })
+}
+
 /// Same as [`try_lower`] but with an optional `params_as_constants`
 /// map. When provided, every `Op::Param { name }` whose name appears
 /// in the map is lowered as `constantWithData:shape:dataType:` —
@@ -283,6 +322,15 @@ pub fn try_lower_with_constants(
         .iter()
         .any(|n| matches!(n.op, Op::Fft { .. } | Op::LogMel | Op::LogMelBackward))
     {
+        return None;
+    }
+    if graph_has_mps_hostile_reduce(graph) {
+        if rlx_ir::env::flag("RLX_MPSGRAPH_TRACE") {
+            eprintln!(
+                "[rlx-metal] mps: refusing plan (interior rank≥4 reduction — HC/KV-pool; \
+                 MPSGraph miscompiles the output tail, using thunks)"
+            );
+        }
         return None;
     }
 
@@ -337,24 +385,31 @@ pub fn try_lower_with_constants(
             Op::MatMul => {
                 let a = node_to_tensor.get(&node.inputs[0])?;
                 let b = node_to_tensor.get(&node.inputs[1])?;
-                // F16 weight × F32 activation (Zonos Metal): cast B inside
-                // MPSGraph so the arena keeps half-sized params.
+                // F16/BF16 weight × F32 activation (Zonos Metal F16; bf16-resident
+                // LM head): cast B up to F32 inside MPSGraph so the arena/weight
+                // buffer keeps half-sized params (bf16 = 2 bytes/elem). MPSGraph
+                // reads the 16-bit weight from the buffer and fuses the cast into
+                // the matmul (no persistent f32 copy of the weight). matmul itself
+                // requires both operands to share a dtype, so we widen rather than
+                // feed a mixed f32×bf16 pair.
                 let b_dt = graph.node(node.inputs[1]).shape.dtype();
                 let a_dt = graph.node(node.inputs[0]).shape.dtype();
                 let b_f32;
-                let b_use = if matches!(b_dt, DType::F16) && matches!(a_dt, DType::F32) {
-                    b_f32 = mg.cast(b, F32_DT);
-                    &b_f32
-                } else {
-                    b
-                };
+                let b_use =
+                    if matches!(b_dt, DType::F16 | DType::BF16) && matches!(a_dt, DType::F32) {
+                        b_f32 = mg.cast(b, F32_DT);
+                        &b_f32
+                    } else {
+                        b
+                    };
                 let a_f32;
-                let a_use = if matches!(a_dt, DType::F16) && matches!(b_dt, DType::F32) {
-                    a_f32 = mg.cast(a, F32_DT);
-                    &a_f32
-                } else {
-                    a
-                };
+                let a_use =
+                    if matches!(a_dt, DType::F16 | DType::BF16) && matches!(b_dt, DType::F32) {
+                        a_f32 = mg.cast(a, F32_DT);
+                        &a_f32
+                    } else {
+                        a
+                    };
                 f16_compute2(&mg, fp16, a_use, b_use, |a, b| mg.matmul(a, b))
             }
             // ── Conv / pool (NCHW) and their gradients ──
@@ -982,10 +1037,23 @@ pub fn try_lower_with_constants(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap: _,
             } => {
+                // Asymmetric MLA (v_head_dim != head_dim): the MPSGraph SDPA
+                // reshapes assume a square per-head width. Bail to the thunk
+                // path, which handles v_head_dim natively.
+                if v_head_dim.is_some_and(|v| v != *head_dim) {
+                    if trace {
+                        eprintln!(
+                            "[mpsgraph] bail attention asymmetric v_head_dim: node {}",
+                            node.id
+                        );
+                    }
+                    return None;
+                }
                 // Apple's MPSGraph optimizer mishandles SDPA when Q/K/V are
                 // slice-views of *computed* tensors (narrow of MatMul/RoPE).
                 // Host-fed / leaf views are fine — bail so hybrid can run

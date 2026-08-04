@@ -938,6 +938,47 @@ impl BucketedCompileCache {
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
     }
 
+    /// Like [`Self::ensure_graph_with_params`] but also uploads **packed** U8
+    /// weight params (via `set_param_typed`) on first compile — the packed
+    /// decode path, where K-quant linears stay U8 in the arena rather than
+    /// dequant-to-f32. `build` returns `(graph, f32_params, packed_params)`
+    /// where each `packed_params` entry is `(name, bytes)` bound as [`DType::U8`].
+    /// Binding happens ONLY on the compile miss (same as the f32 params), so
+    /// steady-state decode pays nothing.
+    pub fn ensure_graph_with_packed<F>(
+        &mut self,
+        key: u64,
+        build: F,
+        options: &crate::CompileOptions,
+    ) -> Option<(u64, &mut CompiledGraph)>
+    where
+        F: FnOnce(u64) -> (Graph, HashMap<String, Vec<f32>>, Vec<(String, Vec<u8>)>),
+    {
+        let idx = self.bucket_for(key)?;
+        let upper = self.buckets[idx].range.end - 1;
+        if self.buckets[idx].compiled.is_none() {
+            let (graph, params, packed) = build(upper);
+            let bytes: usize = params.values().map(|v| v.len() * 4).sum::<usize>()
+                + packed.iter().map(|(_, b)| b.len()).sum::<usize>();
+            self.evict_for_incoming(idx, bytes);
+            let mut session = Session::new(self.device);
+            if let Some(p) = &self.policy {
+                session = session.with_policy(p.clone());
+            }
+            let mut compiled = session.compile_with(graph, options);
+            for (name, data) in params {
+                compiled.set_param(&name, &data);
+            }
+            for (name, data) in &packed {
+                compiled.set_param_typed(name, data, rlx_ir::DType::U8);
+            }
+            self.buckets[idx].compiled = Some(compiled);
+            self.buckets[idx].resident_bytes = bytes;
+        }
+        self.touch(idx);
+        Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
+    }
+
     /// HIR variant of [`Self::ensure_graph_with_params`].
     pub fn ensure_hir_with_params<F>(
         &mut self,

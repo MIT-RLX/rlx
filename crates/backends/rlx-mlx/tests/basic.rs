@@ -1335,6 +1335,7 @@ fn attention_no_mask_matches_reference() {
         Op::Attention {
             num_heads: 1,
             head_dim: 2,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -1609,6 +1610,7 @@ fn sliding_window_attention_matches_reference() {
         Op::Attention {
             num_heads: 1,
             head_dim: 2,
+            v_head_dim: None,
             mask_kind: MaskKind::SlidingWindow(0),
             score_scale: None,
             attn_logit_softcap: None,

@@ -469,6 +469,334 @@ fn scalar_const(value: f32, bwd: &mut Graph) -> NodeId {
     bwd.add_node(Op::Constant { data: bytes }, vec![], shape)
 }
 
+/// VJP for `Op::SynthMatMul` (codebook weight-synthesis matmul). The weight
+/// `W[j, b·d+t] = codebook[indices[j,b], t]` is reconstructed by a gather, so:
+///   * `dx         = upstream · W`   (`[m,n]·[n,k] → [m,k]`)
+///   * `d_codebook = scatter_add(grad_W blocks, indices)`, where
+///     `grad_W = upstreamᵀ · x`  (`[n,m]·[m,k] → [n,k]`) — exactly the
+///     data-gradient of the reconstructing gather.
+/// `indices` is integer and non-differentiable (no gradient returned).
+fn vjp_synth_mat_mul(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::SynthMatMul { kind } = &node.op else {
+        unreachable!()
+    };
+    let kind = *kind;
+    let SynthKind::Codebook { entry_dim, .. } = kind;
+    let d = entry_dim as usize;
+
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let indices_bwd = fwd_map[&node.inputs[1]];
+    let codebook_bwd = fwd_map[&node.inputs[2]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let idx_shape = bwd.node(indices_bwd).shape.clone();
+    let cb_shape = bwd.node(codebook_bwd).shape.clone();
+    let m = x_shape.dim(0).unwrap_static();
+    let k = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+    let n = idx_shape.dim(0).unwrap_static();
+    let kb = k / d;
+    let p = n * kb;
+
+    // dx = upstream·Ŵᵀ as a first-class FUSED op: reconstructing Ŵᵀ in-kernel is
+    // memory-friendly and avoids the Gather + dense-weight materialization, so the
+    // native Metal kernel is a clear dispatch win (decompose elsewhere).
+    let dx = bwd.add_node(
+        Op::SynthMatMulBackward {
+            kind,
+            wrt: SynthBwdWrt::Dx,
+        },
+        vec![x_bwd, indices_bwd, codebook_bwd, upstream],
+        x_shape,
+    );
+
+    // d_codebook stays on primitives: `grad_W = upstreamᵀ·x` is a transpose-GEMM
+    // contracting the large batch dim — MPS tiles it far better than a hand kernel
+    // (a fused hand-GEMM here measured catastrophically slow), and CSE dedupes the
+    // shared `upstreamᵀ·x` across the multi-stage residual sum.
+    let up_t = bwd.add_node(
+        Op::Transpose { perm: vec![1, 0] },
+        vec![upstream],
+        Shape::new(&[n, m], DType::F32),
+    );
+    let grad_w = bwd.add_node(
+        Op::MatMul,
+        vec![up_t, x_bwd],
+        Shape::new(&[n, k], DType::F32),
+    );
+    let grad_blocks = bwd.add_node(
+        Op::Reshape {
+            new_shape: vec![p as i64, d as i64],
+        },
+        vec![grad_w],
+        Shape::new(&[p, d], DType::F32),
+    );
+    let idx_f32 = bwd.add_node(
+        Op::Cast { to: DType::F32 },
+        vec![indices_bwd],
+        Shape::new(&[n, kb], DType::F32),
+    );
+    let idx_f32_flat = bwd.add_node(
+        Op::Reshape {
+            new_shape: vec![p as i64],
+        },
+        vec![idx_f32],
+        Shape::new(&[p], DType::F32),
+    );
+    let d_codebook = bwd.add_node(Op::ScatterAdd, vec![grad_blocks, idx_f32_flat], cb_shape);
+
+    vec![(0, dx), (2, d_codebook)]
+}
+
+/// VJP for `Op::SynthReconstruct` (`W[k,n]` from indices + codebook). Only the
+/// codebook is differentiable: `d_codebook = scatter_add(dWᵀ blocks, indices)` —
+/// weight-scale (no batch dim). `dW[k,n] → Transpose[n,k] → Reshape[p,d] →
+/// ScatterAdd(idx)`.
+fn vjp_synth_reconstruct(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::SynthReconstruct {
+        kind: SynthKind::Codebook { entry_dim, .. },
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let d = *entry_dim as usize;
+    let indices_bwd = fwd_map[&node.inputs[0]];
+    let codebook_bwd = fwd_map[&node.inputs[1]];
+    let idx_shape = bwd.node(indices_bwd).shape.clone();
+    let cb_shape = bwd.node(codebook_bwd).shape.clone();
+    let n = idx_shape.dim(0).unwrap_static();
+    let kb = idx_shape.dim(1).unwrap_static();
+    let p = n * kb;
+    // Output is `w_bt[n,k]`, so `upstream` is already `[n,k]` — reshape straight to
+    // `[p,d]` blocks and scatter into the codebook (no transpose, unlike the `[k,n]`
+    // variant). This is why the caller emits the forward `Transpose` separately.
+    let blocks = bwd.add_node(
+        Op::Reshape {
+            new_shape: vec![p as i64, d as i64],
+        },
+        vec![upstream],
+        Shape::new(&[p, d], DType::F32),
+    );
+    let idx_f32 = bwd.add_node(
+        Op::Cast { to: DType::F32 },
+        vec![indices_bwd],
+        Shape::new(&[n, kb], DType::F32),
+    );
+    let idx_f32_flat = bwd.add_node(
+        Op::Reshape {
+            new_shape: vec![p as i64],
+        },
+        vec![idx_f32],
+        Shape::new(&[p], DType::F32),
+    );
+    let d_codebook = bwd.add_node(Op::ScatterAdd, vec![blocks, idx_f32_flat], cb_shape);
+    vec![(1, d_codebook)]
+}
+
+/// VJP for `Op::SplineActivation` (KAN Gaussian-RBF spline, per-channel basis).
+///
+/// Forward: `y[..,c] = Σ_g coeff[c,g]·B_g(x[..,c])`, with
+/// `B_g(x) = exp(-inv_h²·(x−center_g)²)`. Builds the `[.., C, G]` basis tensor
+/// once and contracts it two ways:
+///   * `dcoeff[c,g] = Σ_batch upstream[..,c]·B_g(x[..,c])`
+///   * `dx[..,c]    = upstream[..,c]·Σ_g coeff[c,g]·B_g'(x[..,c])`,
+///     `B_g'(x) = B_g(x)·(−2 inv_h²)(x−center_g)`.
+///
+/// All working tensors are broadcast to `[.., C, G]` via explicit `Op::Expand`
+/// (never implicit binary broadcast — see the `vjp_softmax` keep-dim caveat).
+fn vjp_spline_activation(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::SplineActivation {
+        num_basis,
+        grid_min,
+        grid_max,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let x_bwd = fwd_map[&node.inputs[0]];
+    let coeff_bwd = fwd_map[&node.inputs[1]];
+    let x_shape = bwd.node(x_bwd).shape.clone();
+    let coeff_shape = bwd.node(coeff_bwd).shape.clone();
+
+    // Emit fused backward ops (native Metal kernel; `LowerSplineActivationBackward`
+    // decomposes them to the primitive exp/mul/reduce chain for other backends).
+    // This avoids materializing the `[.., C, num_basis]` RBF basis to DRAM — the
+    // decomposed form MEASURED ~34-60ms vs ~9ms fused (25M-elem intermediate).
+    if !rlx_ir::env::flag("RLX_DECOMPOSE_SPLINE_BWD") {
+        let dx = bwd.add_node(
+            Op::SplineActivationBackwardX {
+                num_basis: *num_basis,
+                grid_min: *grid_min,
+                grid_max: *grid_max,
+            },
+            vec![x_bwd, coeff_bwd, upstream],
+            x_shape.clone(),
+        );
+        let dcoeff = bwd.add_node(
+            Op::SplineActivationBackwardCoeff {
+                num_basis: *num_basis,
+                grid_min: *grid_min,
+                grid_max: *grid_max,
+            },
+            vec![x_bwd, upstream],
+            coeff_shape.clone(),
+        );
+        return vec![(0, dx), (1, dcoeff)];
+    }
+
+    let g = *num_basis as usize;
+    let step = if g > 1 {
+        (grid_max - grid_min) / (g as f32 - 1.0)
+    } else {
+        1.0
+    };
+    let inv_h2 = 1.0f32 / (step * step);
+
+    let xr = x_shape.rank();
+    let x_dims: Vec<usize> = (0..xr).map(|i| x_shape.dim(i).unwrap_static()).collect();
+    let c = x_dims[xr - 1]; // channels
+
+    // Working shape [.., C, G] + size-1 trailing variant for broadcasting.
+    let mut w_dims = x_dims.clone();
+    w_dims.push(g);
+    let w_shape = Shape::new(&w_dims, DType::F32);
+    let w_i64: Vec<i64> = w_dims.iter().map(|&d| d as i64).collect();
+    let mut xe_dims = x_dims.clone();
+    xe_dims.push(1);
+    let xe_i64: Vec<i64> = xe_dims.iter().map(|&d| d as i64).collect();
+    let xe_shape = Shape::new(&xe_dims, DType::F32);
+    let expand_to_w = |bwd: &mut Graph, src: NodeId| {
+        bwd.add_node(
+            Op::Expand {
+                target_shape: w_i64.clone(),
+            },
+            vec![src],
+            w_shape.clone(),
+        )
+    };
+
+    // x → [.., C, 1] → [.., C, G]
+    let x_e = bwd.add_node(
+        Op::Reshape {
+            new_shape: xe_i64.clone(),
+        },
+        vec![x_bwd],
+        xe_shape.clone(),
+    );
+    let x_b = expand_to_w(bwd, x_e);
+
+    // centers [1,..,1,G] → [.., C, G]
+    let centers: Vec<f32> = (0..g).map(|gi| grid_min + gi as f32 * step).collect();
+    let cen_bytes: Vec<u8> = centers.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut cen_dims = vec![1usize; xr];
+    cen_dims.push(g);
+    let centers_c = bwd.add_node(
+        Op::Constant { data: cen_bytes },
+        vec![],
+        Shape::new(&cen_dims, DType::F32),
+    );
+    let centers_b = expand_to_w(bwd, centers_c);
+
+    // diff = x − center; B = exp(−inv_h²·diff²)
+    let diff = bwd.add_node(
+        Op::Binary(BinaryOp::Sub),
+        vec![x_b, centers_b],
+        w_shape.clone(),
+    );
+    let dsq = bwd.add_node(Op::Binary(BinaryOp::Mul), vec![diff, diff], w_shape.clone());
+    let neg_ih2 = scalar_const(-inv_h2, bwd);
+    let scaled = bwd.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![dsq, neg_ih2],
+        w_shape.clone(),
+    );
+    let basis = bwd.add_node(
+        Op::Activation(Activation::Exp),
+        vec![scaled],
+        w_shape.clone(),
+    );
+
+    // upstream [.., C] → [.., C, 1] → [.., C, G]
+    let up_e = bwd.add_node(
+        Op::Reshape {
+            new_shape: xe_i64.clone(),
+        },
+        vec![upstream],
+        xe_shape.clone(),
+    );
+    let up_b = expand_to_w(bwd, up_e);
+
+    // dcoeff = Σ_batch upstream·B → [C, G]
+    let p = bwd.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![basis, up_b],
+        w_shape.clone(),
+    );
+    let dcoeff = unbroadcast(p, &coeff_shape, bwd);
+
+    // coeff [1,..,1,C,G] → [.., C, G]
+    let mut co_dims = vec![1usize; xr - 1];
+    co_dims.push(c);
+    co_dims.push(g);
+    let co_i64: Vec<i64> = co_dims.iter().map(|&d| d as i64).collect();
+    let coeff_r = bwd.add_node(
+        Op::Reshape { new_shape: co_i64 },
+        vec![coeff_bwd],
+        Shape::new(&co_dims, DType::F32),
+    );
+    let coeff_b = expand_to_w(bwd, coeff_r);
+
+    // dydx = Σ_g coeff·B',  B' = B·(−2 inv_h²)(x−center)
+    let m2_ih2 = scalar_const(-2.0 * inv_h2, bwd);
+    let dfac = bwd.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![diff, m2_ih2],
+        w_shape.clone(),
+    );
+    let bder = bwd.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![basis, dfac],
+        w_shape.clone(),
+    );
+    let weighted = bwd.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![bder, coeff_b],
+        w_shape.clone(),
+    );
+    let dydx = bwd.add_node(
+        Op::Reduce {
+            op: ReduceOp::Sum,
+            axes: vec![xr], // the trailing num_basis axis of [.., C, G]
+            keep_dim: false,
+        },
+        vec![weighted],
+        x_shape.clone(),
+    );
+    let dx = bwd.add_node(
+        Op::Binary(BinaryOp::Mul),
+        vec![upstream, dydx],
+        x_shape.clone(),
+    );
+
+    vec![(0, dx), (1, dcoeff)]
+}
+
 /// Per-op VJP rule. Returns (input_index, gradient_node_id) pairs;
 /// inputs not listed receive no gradient (e.g. the labels argument
 /// of `SoftmaxCrossEntropyWithLogits` is non-differentiable).
@@ -489,6 +817,9 @@ fn vjp(
         Op::Binary(BinaryOp::Mul) => vjp_binary_mul(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Activation(kind) => vjp_activation(node, upstream, upstream_shape, fwd_map, bwd),
         Op::MatMul => vjp_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::FusedMatMulBiasAct { .. } => {
+            vjp_fused_matmul_bias_act(node, upstream, upstream_shape, fwd_map, bwd)
+        }
         Op::DenseSolve => vjp_dense_solve(node, upstream, upstream_shape, fwd_map, bwd),
         Op::TriangularSolve { .. } => {
             vjp_triangular_solve(node, upstream, upstream_shape, fwd_map, bwd)
@@ -652,6 +983,7 @@ fn vjp(
         Op::Attention {
             num_heads,
             head_dim,
+            v_head_dim,
             mask_kind,
             score_scale: _,
             attn_logit_softcap: _,
@@ -771,6 +1103,12 @@ fn vjp(
             scale_layout,
             has_bias,
         } => vjp_scaled_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScaledGroupedMatMul {
+            lhs_format,
+            rhs_format,
+            scale_layout,
+            has_bias,
+        } => vjp_scaled_grouped_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
         Op::ScaledQuantize { .. } => {
             vjp_scaled_quantize(node, upstream, upstream_shape, fwd_map, bwd)
         }
@@ -779,6 +1117,13 @@ fn vjp(
         }
         Op::DequantMatMul { scheme: _ } => {
             vjp_dequant_mat_mul(node, upstream, upstream_shape, fwd_map, bwd)
+        }
+        Op::SynthMatMul { .. } => vjp_synth_mat_mul(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::SynthReconstruct { .. } => {
+            vjp_synth_reconstruct(node, upstream, upstream_shape, fwd_map, bwd)
+        }
+        Op::SplineActivation { .. } => {
+            vjp_spline_activation(node, upstream, upstream_shape, fwd_map, bwd)
         }
         Op::ScatterAdd => vjp_scatter_add(node, upstream, upstream_shape, fwd_map, bwd),
         Op::ScatterNd { reduction } => vjp_scatter_nd(node, upstream, upstream_shape, fwd_map, bwd),
@@ -814,10 +1159,14 @@ fn vjp(
             mult,
         } => vjp_q_conv2d(node, upstream, upstream_shape, fwd_map, bwd),
         // ── Sampling-style ops: non-differentiable ──
-        Op::TopK { .. } | Op::Sample { .. } | Op::RngNormal { .. } | Op::RngUniform { .. } => {
-            // TopK selects; Sample multinomial-draws. Gradient w.r.t.
-            // the input distribution is undefined / zero in the
-            // standard sense. Skip propagation.
+        Op::TopK { .. }
+        | Op::Sample { .. }
+        | Op::Histogram { .. }
+        | Op::RngNormal { .. }
+        | Op::RngUniform { .. } => {
+            // TopK selects; Sample multinomial-draws; Histogram counts.
+            // Gradient w.r.t. the input distribution is undefined / zero
+            // in the standard sense. Skip propagation.
             vec![]
         }
 
@@ -1119,6 +1468,77 @@ fn vjp_mat_mul(
 
         vec![(0, g_a), (1, g_b)]
     }
+}
+
+/// **Fused VJP** for [`Op::FusedMatMulBiasAct`] — `y = act(x·W + b)`. Kept fused
+/// through autodiff (opt-in via `RLX_AD_FUSED_MMBA_VJP`; see
+/// `unfuse_fused_for_autodiff`) instead of decomposing to matmul+add+activation.
+/// The pre-activation `p = x·W + b` is on-chip in the fused forward, so — like a
+/// flash-style backward — it is **recomputed** here rather than materialized.
+///
+/// Tradeoff: the recompute is one extra matmul, so this WINS only when the saved
+/// forward materialization (the matmul-only intermediate) outweighs the recompute
+/// — true for cheap-to-recompute intermediates, NOT for a compute-bound matmul.
+/// It exists to demonstrate the fused-VJP mechanism for the matmul family; the
+/// decomposed path stays the default because materializing `p` is cheaper here.
+fn vjp_fused_matmul_bias_act(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::FusedMatMulBiasAct { activation } = &node.op else {
+        unreachable!()
+    };
+    let x = fwd_map[&node.inputs[0]];
+    let w = fwd_map[&node.inputs[1]];
+    let b = fwd_map[&node.inputs[2]];
+    let x_shape = bwd.node(x).shape.clone();
+    let w_shape = bwd.node(w).shape.clone();
+    let b_shape = bwd.node(b).shape.clone();
+    let dtype = upstream_shape.dtype();
+
+    let trans_last_two = |bwd: &mut Graph, t: NodeId| -> NodeId {
+        let s = bwd.node(t).shape.clone();
+        let r = s.rank();
+        let mut perm: Vec<usize> = (0..r).collect();
+        perm.swap(r - 2, r - 1);
+        let mut dims: Vec<Dim> = s.dims().to_vec();
+        dims.swap(r - 2, r - 1);
+        bwd.add_node(
+            Op::Transpose { perm },
+            vec![t],
+            Shape::from_dims(&dims, s.dtype()),
+        )
+    };
+
+    // Recompute p = x·W + b (fused forward keeps it on-chip; act' needs it).
+    let m = x_shape.dim(0).unwrap_static();
+    let n = w_shape.dim(w_shape.rank() - 1).unwrap_static();
+    let pre_shape = Shape::from_dims(&[Dim::Static(m), Dim::Static(n)], dtype);
+    let pre_mm = bwd.matmul(x, w, pre_shape.clone());
+    let pre = bwd.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![pre_mm, b],
+        pre_shape.clone(),
+    );
+
+    // dpre = act'(p) ⊙ upstream (fused ActivationBackward), or upstream if no act.
+    let dpre = match activation {
+        Some(act) => bwd.activation_backward(*act, pre, upstream),
+        None => upstream,
+    };
+
+    // MatMul VJP of y = x·W with upstream = dpre:
+    //   dx = dpre·Wᵀ, dW = xᵀ·dpre, db = Σ_batch dpre.
+    let wt = trans_last_two(bwd, w);
+    let dx = bwd.matmul(dpre, wt, x_shape.clone());
+    let xt = trans_last_two(bwd, x);
+    let dw = bwd.matmul(xt, dpre, w_shape.clone());
+    let db = unbroadcast(dpre, &b_shape, bwd);
+
+    vec![(0, dx), (1, dw), (2, db)]
 }
 
 // ── Riemannian / SPD-manifold layer VJPs ─────────────────────────
@@ -3545,6 +3965,7 @@ fn vjp_attention(
     let Op::Attention {
         num_heads,
         head_dim,
+        v_head_dim,
         mask_kind,
         score_scale: _,
         attn_logit_softcap: _,
@@ -3552,6 +3973,10 @@ fn vjp_attention(
     else {
         unreachable!()
     };
+    assert!(
+        v_head_dim.is_none_or(|v| v == *head_dim),
+        "autodiff: asymmetric v_head_dim (MLA) backward not yet supported"
+    );
     {
         let q = fwd_map[&node.inputs[0]];
         let k = fwd_map[&node.inputs[1]];
@@ -3846,6 +4271,105 @@ fn vjp_scaled_mat_mul(
                 Shape::from_dims(&[n], f32),
             );
             grads.push((4usize, d_bias));
+        }
+        grads
+    }
+}
+
+// ── ScaledGroupedMatMul (MXFP4 / low-precision grouped MoE GEMM) ──
+//
+// Straight-through: reconstruct f32 operands via ScaledDequantize, transpose
+// the per-expert weight into GroupedMatMul's [E,K,N] layout, and reuse the
+// GroupedMatMul VJP. Gradients flow to the CODE inputs (identity through the
+// ScaledQuantize producers) and the per-expert bias; scales and the expert
+// index are detached (non-differentiable).
+//   dx[i]      = upstream[i] @ dequant(w[expert[i]])          # [M,K]
+//   dw[e,n,k]  = Σ_{i:expert[i]=e} dequant(x[i,k]) · upstream[i,n]
+//   dbias[e,n] = Σ_{i:expert[i]=e} upstream[i,n]   (ScatterAdd)
+#[allow(unused_variables)]
+fn vjp_scaled_grouped_mat_mul(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::ScaledGroupedMatMul {
+        lhs_format,
+        rhs_format,
+        scale_layout,
+        has_bias,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    {
+        let input_codes = fwd_map[&node.inputs[0]];
+        let weight_codes = fwd_map[&node.inputs[1]];
+        let input_scale = fwd_map[&node.inputs[2]];
+        let weight_scale = fwd_map[&node.inputs[3]];
+        let expert_idx = fwd_map[&node.inputs[4]];
+        let in_shape = bwd.node(input_codes).shape.clone();
+        let w_codes_shape = bwd.node(weight_codes).shape.clone();
+        let m = in_shape.dim(0);
+        let k = in_shape.dim(1);
+        let e = w_codes_shape.dim(0);
+        let n = w_codes_shape.dim(1); // weight codes are [E, N, K]
+        let f32 = DType::F32;
+
+        // Reconstruct f32 activations [M,K].
+        let input_recon = bwd.add_node(
+            Op::ScaledDequantize {
+                format: *lhs_format,
+                scale_layout: *scale_layout,
+            },
+            vec![input_codes, input_scale],
+            Shape::from_dims(&[m, k], f32),
+        );
+        // Reconstruct f32 weights [E,N,K] then transpose to GroupedMatMul's
+        // [E,K,N] weight layout.
+        let weight_recon = bwd.add_node(
+            Op::ScaledDequantize {
+                format: *rhs_format,
+                scale_layout: *scale_layout,
+            },
+            vec![weight_codes, weight_scale],
+            Shape::from_dims(&[e, n, k], f32),
+        );
+        let weight_kn = bwd.add_node(
+            Op::Transpose {
+                perm: vec![0, 2, 1],
+            },
+            vec![weight_recon],
+            Shape::from_dims(&[e, k, n], f32),
+        );
+        let x_shape = Shape::from_dims(&[m, k], f32);
+        let w_kn_shape = Shape::from_dims(&[e, k, n], f32);
+        let (dx, dw_kn) = grouped_matmul_vjp(
+            bwd,
+            upstream,
+            input_recon,
+            weight_kn,
+            expert_idx,
+            &x_shape,
+            &w_kn_shape,
+        );
+        // dw comes back in [E,K,N]; the weight codes are [E,N,K] → transpose.
+        let dw = bwd.add_node(
+            Op::Transpose {
+                perm: vec![0, 2, 1],
+            },
+            vec![dw_kn],
+            Shape::from_dims(&[e, n, k], f32),
+        );
+        let mut grads = vec![(0usize, dx), (1usize, dw)];
+        if *has_bias {
+            let d_bias = bwd.add_node(
+                Op::ScatterAdd,
+                vec![upstream, expert_idx],
+                Shape::from_dims(&[e, n], f32),
+            );
+            grads.push((5usize, d_bias));
         }
         grads
     }

@@ -9,9 +9,11 @@ use crate::op::MaskKind;
 use crate::{Graph, NodeId, Op, Shape};
 
 /// Build an [`Op::Attention`] with optional score scale and logit softcap.
+/// `v_head_dim = None` ⇒ V/output width equals `head_dim` (the common case).
 pub fn attention_kind_op(
     num_heads: usize,
     head_dim: usize,
+    v_head_dim: Option<usize>,
     mask_kind: MaskKind,
     score_scale: Option<f32>,
     attn_logit_softcap: Option<f32>,
@@ -19,6 +21,7 @@ pub fn attention_kind_op(
     Op::Attention {
         num_heads,
         head_dim,
+        v_head_dim,
         mask_kind,
         score_scale,
         attn_logit_softcap,
@@ -58,6 +61,7 @@ impl Graph {
             attention_kind_op(
                 num_heads,
                 head_dim,
+                None,
                 MaskKind::Custom,
                 score_scale,
                 attn_logit_softcap,
@@ -106,6 +110,7 @@ impl Graph {
             attention_kind_op(
                 num_heads,
                 head_dim,
+                None,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
@@ -153,11 +158,40 @@ impl Graph {
             attention_kind_op(
                 num_heads,
                 head_dim,
+                None,
                 MaskKind::Bias,
                 score_scale,
                 attn_logit_softcap,
             ),
             vec![q, k, v, bias],
+            shape,
+            None,
+        )
+    }
+
+    /// Asymmetric SDPA where V/output per-head width (`v_head_dim`) differs from
+    /// the Q/K score width (`head_dim`). Q/K/V only (kernel-synthesized mask).
+    /// Used by MLA to skip zero-padding V up to `head_dim`. `shape` is the
+    /// output `[.., num_heads * v_head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kind_vdim(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        mask_kind: MaskKind,
+        shape: Shape,
+    ) -> NodeId {
+        debug_assert!(
+            !matches!(mask_kind, MaskKind::Custom | MaskKind::Bias),
+            "attention_kind_vdim() requires a non-tensor MaskKind"
+        );
+        self.push(
+            attention_kind_op(num_heads, head_dim, Some(v_head_dim), mask_kind, None, None),
+            vec![q, k, v],
             shape,
             None,
         )

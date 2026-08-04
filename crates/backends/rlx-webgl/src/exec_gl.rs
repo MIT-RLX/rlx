@@ -191,13 +191,17 @@ uniform int uCols; uniform float uEps;
 out vec4 o;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    float ms = 0.0;
+    float n_inv = 1.0 / float(uCols);
+    // Two-pass: mean(x²) = mean((x-mean)^2) + mean^2. Matches the CPU oracle.
+    float sum = 0.0;
+    for (int i = 0; i < uCols; i++) { sum += texelFetch(X, ivec2(i, p.y), 0).r; }
+    float mean = sum * n_inv;
+    float dev = 0.0;
     for (int i = 0; i < uCols; i++) {
-        float v = texelFetch(X, ivec2(i, p.y), 0).r;
-        ms += v * v;
+        float d = texelFetch(X, ivec2(i, p.y), 0).r - mean;
+        dev += d * d;
     }
-    ms /= float(uCols);
-    float norm = texelFetch(X, p, 0).r * inversesqrt(ms + uEps);
+    float norm = texelFetch(X, p, 0).r * inversesqrt(dev * n_inv + mean * mean + uEps);
     float g = texelFetch(G, ivec2(p.x, 0), 0).r;
     float b = texelFetch(B, ivec2(p.x, 0), 0).r;
     o = vec4(norm * g + b, 0.0, 0.0, 1.0);

@@ -54,20 +54,105 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
+/// Dump one NVRTC translation unit for offline kernel inspection. Writes
+/// `<dir>/cu/<entry>.cu` (the exact assembled source NVRTC compiled) and
+/// `<dir>/ptx/<entry>.ptx` (rlx's own compiled PTX), and appends one JSON
+/// line to `<dir>/manifest.jsonl`. `src_hash` is the TU identity so the
+/// analyzer can dedup entry-points that share a `.cu` file. Best-effort:
+/// dump failures never disturb the compile. Appends are O_APPEND with sub-
+/// PIPE_BUF lines, so concurrent test threads interleave cleanly.
+fn dump_kernel(dir: &str, entry: &str, src: &str, ptx_src: &str) {
+    use std::io::Write;
+    let base = std::path::Path::new(dir);
+    let cu_dir = base.join("cu");
+    let ptx_dir = base.join("ptx");
+    let _ = std::fs::create_dir_all(&cu_dir);
+    let _ = std::fs::create_dir_all(&ptx_dir);
+    let _ = std::fs::write(cu_dir.join(format!("{entry}.cu")), src);
+    let _ = std::fs::write(ptx_dir.join(format!("{entry}.ptx")), ptx_src);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.join("manifest.jsonl"))
+    {
+        let _ = writeln!(
+            f,
+            "{{\"entry\":\"{entry}\",\"src_hash\":\"{:016x}\",\"src_bytes\":{},\"ptx_bytes\":{}}}",
+            fnv1a64(src),
+            src.len(),
+            ptx_src.len()
+        );
+    }
+}
+
+/// Portable compile: NVRTC emits PTX for its baseline virtual arch and the
+/// driver JITs to whatever GPU is present. Correct and forward-compatible for
+/// every non-arch-specific kernel — which is all of them today.
+/// CUDA toolkit include dir(s) for NVRTC (which has no default header search
+/// path). Probes `CUDA_PATH`/`CUDA_HOME`/`CUDA_ROOT` then the common install
+/// prefixes; keeps only dirs that actually exist. Lets kernels `#include
+/// <mma.h>` (wmma) / `<cuda_fp16.h>`.
+fn cuda_include_dirs() -> Vec<String> {
+    let mut out = Vec::new();
+    for k in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+        if let Ok(p) = std::env::var(k) {
+            out.push(format!("{p}/include"));
+        }
+    }
+    for p in [
+        "/usr/local/cuda/include",
+        "/opt/cuda/include",
+        "/usr/lib/cuda/include",
+    ] {
+        out.push(p.to_string());
+    }
+    out.retain(|p| std::path::Path::new(p).is_dir());
+    out.dedup();
+    out
+}
+
 pub(crate) fn compile(ctx: &Arc<CudaContext>, src: &str, entry: &str) -> CudaKernel {
+    compile_with_arch(ctx, src, entry, None)
+}
+
+/// Compile pinning an optional NVRTC target arch. `Some("compute_90a")` unlocks
+/// Hopper TMA/wgmma PTX (needs `sm_90` at runtime); `None` is the portable path.
+/// The arch tag folds into the disk-cache key so a `compute_90a` build and the
+/// portable build of the same entry never collide.
+pub(crate) fn compile_with_arch(
+    ctx: &Arc<CudaContext>,
+    src: &str,
+    entry: &str,
+    arch: Option<&'static str>,
+) -> CudaKernel {
     // Try the disk cache first. The cache key folds the kernel entry
-    // name into the source hash so different entry-points sharing a
-    // .cu file (scatter_add_zero / scatter_add_acc) get distinct
-    // cache slots.
-    let cache_path =
-        ptx_cache_dir().map(|d| d.join(format!("{}-{:016x}.ptx", entry, fnv1a64(src))));
+    // name and target arch into the source hash so different entry-points
+    // sharing a .cu file (scatter_add_zero / scatter_add_acc), and portable
+    // vs arch-pinned builds of the same entry, get distinct cache slots.
+    let arch_tag = arch.unwrap_or("portable");
+    let cache_path = ptx_cache_dir()
+        .map(|d| d.join(format!("{}-{}-{:016x}.ptx", entry, arch_tag, fnv1a64(src))));
+
+    let compile_fresh = || {
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch,
+            // NVRTC has no default header search path, so kernels that
+            // `#include <mma.h>` (wmma tensor cores) / `<cuda_fp16.h>` fail to
+            // find them. Add the toolkit include dir(s). Harmless for the
+            // kernels that include nothing.
+            include_paths: cuda_include_dirs(),
+            ..Default::default()
+        };
+        cudarc::nvrtc::compile_ptx_with_opts(src, opts).unwrap_or_else(|e| {
+            panic!("rlx-cuda: NVRTC compile failed for {entry} ({arch_tag}): {e}")
+        })
+    };
 
     let ptx = if let Some(ref p) = cache_path {
         if let Ok(cached) = std::fs::read_to_string(p) {
             cudarc::nvrtc::Ptx::from_src(cached)
         } else {
-            let fresh = cudarc::nvrtc::compile_ptx(src)
-                .unwrap_or_else(|e| panic!("rlx-cuda: NVRTC compile failed for {entry}: {e}"));
+            let fresh = compile_fresh();
             // Best-effort write to the cache. Atomic via tmp + rename
             // so a crash mid-write doesn't poison the cache.
             if let Some(dir) = p.parent() {
@@ -80,9 +165,18 @@ pub(crate) fn compile(ctx: &Arc<CudaContext>, src: &str, entry: &str) -> CudaKer
             fresh
         }
     } else {
-        cudarc::nvrtc::compile_ptx(src)
-            .unwrap_or_else(|e| panic!("rlx-cuda: NVRTC compile failed for {entry}: {e}"))
+        compile_fresh()
     };
+
+    // Kernel-inspection hook: with `RLX_DUMP_KERNELS=<dir>` set, snapshot
+    // the exact translation unit NVRTC saw (post gelu/codegen assembly) plus
+    // rlx's own compiled PTX, so the offline tooling in `tools/kernel-inspect/`
+    // can produce SASS / occupancy / register reports on the target GPU.
+    // Off by default; captures both the static `kernel_cache!` kernels and
+    // the dynamic `CudaGpuKernel` registry (both route through here).
+    if let Some(dir) = rlx_ir::env::var("RLX_DUMP_KERNELS") {
+        dump_kernel(&dir, entry, src, &ptx.to_src());
+    }
 
     let module = ctx
         .load_module(ptx)
@@ -98,6 +192,21 @@ macro_rules! kernel_cache {
         static $static_name: OnceLock<CudaKernel> = OnceLock::new();
         pub fn $fn_name(ctx: &Arc<CudaContext>) -> &'static CudaKernel {
             $static_name.get_or_init(|| compile(ctx, $src, $entry))
+        }
+    };
+}
+
+/// Like `kernel_cache!` but pins the Hopper target when the running device
+/// supports it (else portable). `$arch_fn` is a
+/// `fn(&Arc<CudaContext>) -> Option<&'static str>`, e.g.
+/// [`crate::backend::tma_arch`]. The `OnceLock` binds the first
+/// device's variant — the same single-device assumption `kernel_cache!`
+/// already makes.
+macro_rules! kernel_cache_arch {
+    ($static_name:ident, $fn_name:ident, $src:expr, $entry:expr, $arch_fn:path) => {
+        static $static_name: OnceLock<CudaKernel> = OnceLock::new();
+        pub fn $fn_name(ctx: &Arc<CudaContext>) -> &'static CudaKernel {
+            $static_name.get_or_init(|| compile_with_arch(ctx, $src, $entry, $arch_fn(ctx)))
         }
     };
 }
@@ -222,6 +331,12 @@ kernel_cache!(
     "scaled_matmul_decode"
 );
 kernel_cache!(
+    SCALED_GROUPED_MATMUL_DECODE,
+    scaled_grouped_matmul_decode_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_grouped_matmul_decode"
+);
+kernel_cache!(
     MXFP4X2_DEQUANT_NK,
     mxfp4x2_dequant_nk_kernel,
     SCALED_LOWP_GENERAL_CU,
@@ -265,6 +380,24 @@ kernel_cache!(
     matmul_wmma_kernel,
     MATMUL_WMMA_CU,
     "matmul_wmma"
+);
+// Hopper TMA-staged GEMM: compiled for `compute_90a` when the running device
+// is sm_90 and `RLX_CUDA_TMA` is set, else the portable fallback (which traps
+// on non-Hopper — dispatch never routes here off sm_90, so it can't fire).
+kernel_cache_arch!(
+    MATMUL_TMA,
+    matmul_tma_kernel,
+    MATMUL_TMA_CU,
+    "matmul_tma",
+    crate::backend::tma_arch
+);
+// TMA NT GEMM (C = A·Wᵀ) for the GGUF prefill post-dequant matmul. Same gate.
+kernel_cache_arch!(
+    MATMUL_BT_TMA,
+    matmul_bt_tma_kernel,
+    MATMUL_BT_TMA_CU,
+    "matmul_bt_tma",
+    crate::backend::tma_arch
 );
 kernel_cache!(COMPARE, compare_kernel, COMPARE_CU, "compare");
 kernel_cache!(WHEREK, where_kernel, WHERE_CU, "where_select");
@@ -432,6 +565,21 @@ kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
 kernel_cache!(ATTENTION, attention_kernel, ATTENTION_CU, "attention");
+// Tensor-Core (fp16 WMMA) attention — CUDA-only drop-in, opt-in via
+// `RLX_CUDA_ATTENTION_WMMA` dispatch in backend/run.rs.
+kernel_cache!(
+    ATTENTION_WMMA,
+    attention_wmma_kernel,
+    ATTENTION_WMMA_CU,
+    "attention_wmma"
+);
+// head_dim<=128 variant (2 warps, 32-query tile) — same source file.
+kernel_cache!(
+    ATTENTION_WMMA_D128,
+    attention_wmma_d128_kernel,
+    ATTENTION_WMMA_CU,
+    "attention_wmma_d128"
+);
 kernel_cache!(
     FUSED_ATTN,
     fused_attn_kernel,
@@ -502,6 +650,18 @@ kernel_cache!(
     dequant_matmul_mlx_gemm_kernel,
     DEQUANT_MATMUL_MLX_CU,
     "dequant_matmul_mlx_gemm"
+);
+kernel_cache!(
+    DEQUANT_GROUPED_MATMUL_MLX_MXFP4,
+    dequant_grouped_matmul_mlx_mxfp4_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_grouped_matmul_mlx_mxfp4"
+);
+kernel_cache!(
+    DEQUANT_GROUPED_MATMUL_MLX_MXFP4_AMORT,
+    dequant_grouped_matmul_mlx_mxfp4_amort_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_grouped_matmul_mlx_mxfp4_amort"
 );
 kernel_cache!(
     DEQUANT_GGUF,

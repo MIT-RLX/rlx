@@ -55,6 +55,7 @@ impl CudaExecutable {
     }
 
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        let diag = rlx_ir::env::flag("RLX_CUDA_INPUT_DIAG");
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
         {
@@ -67,6 +68,17 @@ impl CudaExecutable {
             stream
                 .memcpy_htod(data, &mut slot)
                 .expect("rlx-cuda: param upload failed");
+            if diag {
+                eprintln!("[cuda-param] {name:?} -> uploaded ({} f32)", data.len());
+            }
+        } else if diag {
+            // A param the graph declares (Op::Param) that set_param can't place
+            // stays zero-init → all downstream matmuls/convs read zero weights.
+            let reason = match self.param_offsets.get(name) {
+                None => "NOT in param_offsets (renamed by a pass / not a graph Param)",
+                Some(_) => "in param_offsets but no arena slot",
+            };
+            eprintln!("[cuda-param] {name:?} -> SKIPPED: {reason} (stays ZERO)");
         }
     }
 

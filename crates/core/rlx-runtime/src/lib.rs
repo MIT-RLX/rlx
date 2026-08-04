@@ -67,16 +67,24 @@ pub mod dist;
 pub mod expert_pool;
 pub mod export;
 pub mod graph_io;
+pub mod hnsw;
 #[cfg(feature = "hwprofile")]
 pub mod hwprofile_select;
 pub mod jacfwd;
 pub mod kernel_trace;
 pub mod kv_cache;
+#[cfg(feature = "mmap-kv")]
+pub mod kv_context_store;
+pub mod kv_metrics;
+pub mod kv_retention;
 pub mod lora_scheduler;
 pub mod memory_estimate;
 pub mod model_pipeline;
 pub mod moe_expert_store;
-#[cfg(feature = "cpu")]
+// Pure `tracing` facade (no backend dependency) — always present so
+// `crate::obs::event` resolves in every feature configuration; it compiles
+// to a no-op unless the `tracing` feature is on.
+pub mod obs;
 pub mod onnx_active;
 pub mod op_registry;
 pub mod options;
@@ -88,6 +96,7 @@ pub mod quantized_kv;
 pub mod record_replay;
 pub mod reflect;
 pub mod registry;
+pub mod resource_budget;
 pub mod router;
 pub mod samplers;
 pub mod session;

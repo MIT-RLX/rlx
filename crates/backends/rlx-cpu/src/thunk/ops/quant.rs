@@ -31,21 +31,174 @@ pub fn dequant_matmul_int8(
     asym: bool,
 ) {
     let blocks_per_col = k.div_ceil(block_size);
+    // m>1 (GEMM: block-verify / prefill): the fused loop's inner access `w[p*n+j]`
+    // is stride-n (column of a [k,n] row-major matrix) — cache-hostile and
+    // unvectorizable. Dequant once to a contiguous f32 [k,n] and route through
+    // Accelerate `sgemm` → the AMX coprocessor (weight is reused across all m rows,
+    // so the dequant amortizes). m==1 (decode GEMV) keeps the fused path below —
+    // memory-lean (streams the packed int8 once, no k·n·4 f32 materialization).
+    if m > 1 {
+        let mut w_f = vec![0f32; k * n];
+        for p in 0..k {
+            let b = p / block_size;
+            for j in 0..n {
+                let z = if asym { zps[b * n + j] } else { 0.0 };
+                w_f[p * n + j] = (w_bytes[p * n + j] as f32 - z) * scales[b * n + j];
+            }
+        }
+        crate::blas::sgemm(x, &w_f, out, m, k, n);
+        return;
+    }
     for i in 0..m {
+        let x_row = &x[i * k..i * k + k];
         for j in 0..n {
+            // Accumulate one block at a time and fold in that block's scale
+            // ONCE (not per element): fewer multiplies, and a blocked sum that
+            // is better conditioned than a single k-length running f32 accum
+            // (the block scale no longer stretches the dynamic range mid-sum).
+            // Pure reassociation of the same terms — no extra precision loss,
+            // strictly less rounding.
             let mut acc = 0f32;
-            for p in 0..k {
-                let block = p / block_size;
-                let s = scales[block * n + j];
-                let z = if asym { zps[block * n + j] } else { 0.0 };
-                let q = w_bytes[p * n + j] as f32;
-                let dequantized = (q - z) * s;
-                acc += x[i * k + p] * dequantized;
+            for b in 0..blocks_per_col {
+                let s = scales[b * n + j];
+                let z = if asym { zps[b * n + j] } else { 0.0 };
+                let lo = b * block_size;
+                let hi = (lo + block_size).min(k);
+                let mut bacc = 0f32;
+                for p in lo..hi {
+                    let q = w_bytes[p * n + j] as f32;
+                    bacc += x_row[p] * (q - z);
+                }
+                acc += bacc * s;
             }
             out[i * n + j] = acc;
         }
     }
-    let _ = blocks_per_col;
+}
+
+/// Codebook weight-synthesis matmul (single-level vector quantization).
+///
+/// The weight is stored transposed (`[n, k]`, GGUF "bt" layout) as codebook
+/// indices: `indices[j, kb]` selects centroid `codebook[indices[j,kb]] ∈
+/// ℝ^{entry_dim}`, which reconstructs the `entry_dim` weights at
+/// `W[j, kb·entry_dim .. (kb+1)·entry_dim]`. Output is `y = x · Wᵀ`, i.e.
+/// `out[i, j] = Σ_p x[i, p] · W[j, p]`. Like the dequant kernels, the win is
+/// weight-read bandwidth: the centroid is expanded inside the accumulate and
+/// the `k·n` f32 weight is never materialized (on the decode GEMV path).
+///
+/// Requires `k % entry_dim == 0` (guaranteed by the op's shape contract).
+#[allow(clippy::too_many_arguments)]
+pub fn synth_matmul_codebook(
+    x: &[f32],        // [m, k]
+    indices: &[u8],   // [n, k/entry_dim]
+    codebook: &[f32], // [num_entries, entry_dim]
+    out: &mut [f32],  // [m, n]
+    m: usize,
+    k: usize,
+    n: usize,
+    entry_dim: usize,
+) {
+    let kb_per_row = k / entry_dim.max(1); // codebook blocks per output column
+    // m>1 (GEMM/prefill): reconstruct the dense weight once and route through
+    // Accelerate `sgemm` — the codebook lookup amortizes across all m rows
+    // (same trade-off as `dequant_matmul_int8`'s m>1 branch).
+    if m > 1 {
+        // Reconstruct Wᵀ as [n, k] row-major — CONTIGUOUS writes (one
+        // `copy_from_slice` per codebook block), matching the [n, k/entry_dim]
+        // index layout. The earlier [k, n] layout scattered writes with stride
+        // n (cache-hostile, measured ~30× slower at real sizes). `sgemm_bt`
+        // then computes out = x · Wᵀ directly from the [n, k] weight.
+        let mut w_nk = vec![0f32; n * k];
+        for j in 0..n {
+            let wj = &mut w_nk[j * k..j * k + k];
+            let row = &indices[j * kb_per_row..j * kb_per_row + kb_per_row];
+            for (kb, &code) in row.iter().enumerate() {
+                let c = code as usize * entry_dim;
+                let base = kb * entry_dim;
+                wj[base..base + entry_dim].copy_from_slice(&codebook[c..c + entry_dim]);
+            }
+        }
+        crate::blas::sgemm_bt(x, &w_nk, out, m, k, n, 1.0);
+        return;
+    }
+    // m==1 (decode GEMV): stream the codes, reconstruct in-loop — the packed
+    // indices are read once, the k·n f32 weight is never built.
+    for i in 0..m {
+        let x_row = &x[i * k..i * k + k];
+        for j in 0..n {
+            let row = &indices[j * kb_per_row..j * kb_per_row + kb_per_row];
+            let mut acc = 0f32;
+            for (kb, &code) in row.iter().enumerate() {
+                let c = code as usize * entry_dim;
+                let cb = &codebook[c..c + entry_dim];
+                let base = kb * entry_dim;
+                for (t, &w) in cb.iter().enumerate() {
+                    acc += x_row[base + t] * w;
+                }
+            }
+            out[i * n + j] = acc;
+        }
+    }
+}
+
+/// Lower an `Op::SynthMatMul` node to a `Thunk::SynthMatMul` (resolve arena
+/// offsets + derive m/k/n from operand shapes).
+pub(crate) fn compile_synth_mat_mul(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+) -> Thunk {
+    let Op::SynthMatMul { kind } = &node.op else {
+        unreachable!()
+    };
+    let rlx_ir::SynthKind::Codebook {
+        entry_dim,
+        num_entries,
+    } = kind;
+    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+    let total = node.shape.num_elements().unwrap();
+    let m = total / n.max(1);
+    let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+    let k = x_total / m.max(1);
+    Thunk::SynthMatMul {
+        x: node_offset(arena, node.inputs[0]),
+        indices: node_offset(arena, node.inputs[1]),
+        codebook: node_offset(arena, node.inputs[2]),
+        dst: node_offset(arena, node.id),
+        m: m as u32,
+        k: k as u32,
+        n: n as u32,
+        entry_dim: *entry_dim,
+        num_entries: *num_entries,
+    }
+}
+
+/// Interpreter-path execution of `Thunk::SynthMatMul`.
+#[inline(always)]
+pub(crate) fn exec_synth_mat_mul(t: &Thunk, base: *mut u8) {
+    let Thunk::SynthMatMul {
+        x,
+        indices,
+        codebook,
+        dst,
+        m,
+        k,
+        n,
+        entry_dim,
+        num_entries,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (m, k, n, d) = (*m as usize, *k as usize, *n as usize, *entry_dim as usize);
+    let kb_per_row = k / d.max(1);
+    unsafe {
+        let xs = sl(*x, base, m * k);
+        let idx = std::slice::from_raw_parts(base.add(*indices) as *const u8, n * kb_per_row);
+        let cb = sl(*codebook, base, *num_entries as usize * d);
+        let out = sl_mut(*dst, base, m * n);
+        synth_matmul_codebook(xs, idx, cb, out, m, k, n, d);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,21 +214,50 @@ pub(crate) fn dequant_matmul_int4(
     block_size: usize,
     asym: bool,
 ) {
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0f32;
-            for p in 0..k {
-                let block = p / block_size;
-                let s = scales[block * n + j];
-                let z = if asym { zps[block * n + j] } else { 0.0 };
-                let byte_idx = (p * n + j) / 2;
-                let nibble = if (p * n + j) & 1 == 0 {
-                    w_bytes[byte_idx] & 0x0F
+    let blocks_per_col = k.div_ceil(block_size);
+    // m>1: dequant once to contiguous f32 [k,n] + AMX sgemm (see dequant_matmul_int8).
+    // m==1 keeps the memory-lean fused nibble path (streams packed int4, k·n/2 bytes).
+    if m > 1 {
+        let mut w_f = vec![0f32; k * n];
+        for p in 0..k {
+            let b = p / block_size;
+            for j in 0..n {
+                let elem = p * n + j;
+                let nibble = if elem & 1 == 0 {
+                    w_bytes[elem / 2] & 0x0F
                 } else {
-                    w_bytes[byte_idx] >> 4
+                    w_bytes[elem / 2] >> 4
                 };
-                let dequantized = (nibble as f32 - z) * s;
-                acc += x[i * k + p] * dequantized;
+                let z = if asym { zps[b * n + j] } else { 0.0 };
+                w_f[elem] = (nibble as f32 - z) * scales[b * n + j];
+            }
+        }
+        crate::blas::sgemm(x, &w_f, out, m, k, n);
+        return;
+    }
+    for i in 0..m {
+        let x_row = &x[i * k..i * k + k];
+        for j in 0..n {
+            // Block-at-a-time accumulation with the scale folded in once per
+            // block (see dequant_matmul_int8). Reassociation only.
+            let mut acc = 0f32;
+            for b in 0..blocks_per_col {
+                let s = scales[b * n + j];
+                let z = if asym { zps[b * n + j] } else { 0.0 };
+                let lo = b * block_size;
+                let hi = (lo + block_size).min(k);
+                let mut bacc = 0f32;
+                for p in lo..hi {
+                    let elem = p * n + j;
+                    let byte_idx = elem / 2;
+                    let nibble = if elem & 1 == 0 {
+                        w_bytes[byte_idx] & 0x0F
+                    } else {
+                        w_bytes[byte_idx] >> 4
+                    };
+                    bacc += x_row[p] * (nibble as f32 - z);
+                }
+                acc += bacc * s;
             }
             out[i * n + j] = acc;
         }
@@ -138,15 +320,33 @@ pub(crate) fn dequant_matmul_fp8(
     } else {
         fp8_e4m3_to_f32
     };
+    // m>1: dequant once to contiguous f32 [k,n] + AMX sgemm (per-column scale folded
+    // in). m==1 keeps the fused path below.
+    if m > 1 {
+        let mut w_f = vec![0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                let s = scales.get(j).copied().unwrap_or(1.0);
+                w_f[p * n + j] = dequant(w_bytes[p * n + j]) * s;
+            }
+        }
+        crate::blas::sgemm(x, &w_f, out, m, k, n);
+        return;
+    }
     for i in 0..m {
+        let x_row = &x[i * k..i * k + k];
         for j in 0..n {
+            // The per-column scale is loop-invariant: read it once and apply it
+            // to the finished dot instead of multiplying every term (the old
+            // code even re-fetched `scales.get(j)` on every k iteration). Fewer
+            // multiplies, one less rounding per element.
+            let s = scales.get(j).copied().unwrap_or(1.0);
             let mut acc = 0f32;
             for p in 0..k {
                 let w = dequant(w_bytes[p * n + j]);
-                let s = scales.get(j).copied().unwrap_or(1.0);
-                acc += x[i * k + p] * w * s;
+                acc += x_row[p] * w;
             }
-            out[i * n + j] = acc;
+            out[i * n + j] = acc * s;
         }
     }
 }
@@ -164,22 +364,52 @@ pub fn dequant_matmul_nvfp4(
 ) {
     use rlx_ir::{NVFP4_GROUP_SIZE, fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32};
     let gs = NVFP4_GROUP_SIZE;
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0f32;
-            for p in 0..k {
-                let byte_idx = (p * n + j) / 2;
-                let nibble = if (p * n + j) & 1 == 0 {
-                    w_bytes[byte_idx] & 0x0F
+    let n_blocks = k.div_ceil(gs);
+    // m>1: dequant once to contiguous f32 [k,n] + AMX sgemm (per-group E4M3 scale +
+    // global scale folded in). m==1 keeps the fused nibble path below.
+    if m > 1 {
+        let mut w_f = vec![0f32; k * n];
+        for p in 0..k {
+            let b = p / gs;
+            for j in 0..n {
+                let scale = fp8_e4m3_scale_to_f32(scale_bytes[b * n + j]) * global_scale;
+                let elem = p * n + j;
+                let nibble = if elem & 1 == 0 {
+                    w_bytes[elem / 2] & 0x0F
                 } else {
-                    w_bytes[byte_idx] >> 4
+                    w_bytes[elem / 2] >> 4
                 };
-                let block = p / gs;
-                let scale = fp8_e4m3_scale_to_f32(scale_bytes[block * n + j]);
-                let w = fp4_e2m1_to_f32(nibble) * scale * global_scale;
-                acc += x[i * k + p] * w;
+                w_f[elem] = fp4_e2m1_to_f32(nibble) * scale;
             }
-            out[i * n + j] = acc;
+        }
+        crate::blas::sgemm(x, &w_f, out, m, k, n);
+        return;
+    }
+    for i in 0..m {
+        let x_row = &x[i * k..i * k + k];
+        for j in 0..n {
+            // Fold the per-group E4M3 scale in once per group, and the single
+            // global scale in once at the end, instead of multiplying both into
+            // every element. Reassociation only — strictly fewer roundings.
+            let mut acc = 0f32;
+            for b in 0..n_blocks {
+                let scale = fp8_e4m3_scale_to_f32(scale_bytes[b * n + j]);
+                let lo = b * gs;
+                let hi = (lo + gs).min(k);
+                let mut bacc = 0f32;
+                for p in lo..hi {
+                    let elem = p * n + j;
+                    let byte_idx = elem / 2;
+                    let nibble = if elem & 1 == 0 {
+                        w_bytes[byte_idx] & 0x0F
+                    } else {
+                        w_bytes[byte_idx] >> 4
+                    };
+                    bacc += x_row[p] * fp4_e2m1_to_f32(nibble);
+                }
+                acc += bacc * scale;
+            }
+            out[i * n + j] = acc * global_scale;
         }
     }
 }
@@ -201,7 +431,8 @@ pub fn dequant_matmul_mxfp4x2(
 ) {
     use rlx_ir::fp4_e2m1_to_f32;
     let plane = (k * n).div_ceil(2); // bytes per nibble plane
-    let nblk = k.div_ceil(group.max(1));
+    let g = group.max(1);
+    let nblk = k.div_ceil(g);
     let sbytes = nblk * n * 4; // bytes per f32 scale set
     let rd_scale = |half: usize, idx: usize| -> f32 {
         let o = half + idx * 4;
@@ -217,14 +448,26 @@ pub fn dequant_matmul_mxfp4x2(
         if elem & 1 == 0 { b & 0x0F } else { b >> 4 }
     };
     for i in 0..m {
+        let x_row = &x[i * k..i * k + k];
         for j in 0..n {
+            // Accumulate the two residual planes' dot products per block, then
+            // fold each plane's block scale in once (s0·Σq0 + s1·Σq1) rather
+            // than scaling every element. Reassociation only.
             let mut acc = 0f32;
-            for p in 0..k {
-                let elem = p * n + j;
-                let block = (p / group.max(1)) * n + j;
-                let w = fp4_e2m1_to_f32(nib(0, elem)) * rd_scale(0, block)
-                    + fp4_e2m1_to_f32(nib(plane, elem)) * rd_scale(sbytes, block);
-                acc += x[i * k + p] * w;
+            for b in 0..nblk {
+                let s0 = rd_scale(0, b * n + j);
+                let s1 = rd_scale(sbytes, b * n + j);
+                let lo = b * g;
+                let hi = (lo + g).min(k);
+                let mut acc0 = 0f32;
+                let mut acc1 = 0f32;
+                for p in lo..hi {
+                    let elem = p * n + j;
+                    let xv = x_row[p];
+                    acc0 += xv * fp4_e2m1_to_f32(nib(0, elem));
+                    acc1 += xv * fp4_e2m1_to_f32(nib(plane, elem));
+                }
+                acc += acc0 * s0 + acc1 * s1;
             }
             out[i * n + j] = acc;
         }
@@ -355,17 +598,84 @@ pub(crate) fn lowp_scaled_matmul(
 ) {
     use rlx_ir::lowp_codec::decode;
     let nblk = lowp_nblk(k, layout);
+    // Both operands' scales are constant across a contraction block, so their
+    // product factors out: acc += (a_scale·b_scale)·Σ decode(a)·decode(b).
+    // One block spans all of k for PerTensor. Reassociation only.
+    let bs = match layout {
+        rlx_ir::ScaleLayout::PerTensor => k.max(1),
+        _ => layout.block() as usize,
+    };
     for i in 0..m {
         for j in 0..n {
             let mut acc = 0f32;
-            for p in 0..k {
-                let a =
-                    decode(lhs_fmt, lhs[i * k + p]) * lowp_scale_at(layout, lhs_scales, i, p, nblk);
-                let b =
-                    decode(rhs_fmt, rhs[j * k + p]) * lowp_scale_at(layout, rhs_scales, j, p, nblk);
-                acc += a * b;
+            for b in 0..nblk {
+                let lo = b * bs;
+                let hi = (lo + bs).min(k);
+                let a_scale = lowp_scale_at(layout, lhs_scales, i, lo, nblk);
+                let b_scale = lowp_scale_at(layout, rhs_scales, j, lo, nblk);
+                let mut bacc = 0f32;
+                for p in lo..hi {
+                    bacc += decode(lhs_fmt, lhs[i * k + p]) * decode(rhs_fmt, rhs[j * k + p]);
+                }
+                acc += bacc * (a_scale * b_scale);
             }
             out[i * n + j] = acc + bias.map_or(0.0, |bb| bb[j]);
+        }
+    }
+}
+
+/// Grouped (MoE) TN scaled GEMM — the expert-indexed [`lowp_scaled_matmul`].
+/// `input [m,k]` codes, `weight [E,n,k]` codes (one TN slab per expert),
+/// `input_scales` (`[m, nblk]` row-major), `weight_scales` (`[E·n, nblk]`
+/// row-major), `expert_idx [m]` (f32-encoded), optional per-expert
+/// `bias [E,n]`. `out[i] = decode(input[i]) · decode(weight[eidx[i]])ᵀ`.
+/// Correctness reference — one row per token against its routed expert,
+/// reusing the same block reassociation as [`lowp_scaled_matmul`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lowp_scaled_grouped_matmul(
+    input: &[u8],
+    weight: &[u8],
+    input_scales: &[f32],
+    weight_scales: &[f32],
+    expert_idx: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    num_experts: usize,
+    layout: rlx_ir::ScaleLayout,
+    lhs_fmt: rlx_ir::ScaledFormat,
+    rhs_fmt: rlx_ir::ScaledFormat,
+) {
+    use rlx_ir::lowp_codec::decode;
+    let nblk = lowp_nblk(k, layout);
+    let bs = match layout {
+        rlx_ir::ScaleLayout::PerTensor => k.max(1),
+        _ => layout.block() as usize,
+    };
+    for i in 0..m {
+        let e = expert_idx[i] as usize;
+        debug_assert!(
+            e < num_experts,
+            "scaled grouped expert_idx out of range: {e} >= {num_experts}"
+        );
+        let a_codes = &input[i * k..(i + 1) * k];
+        let w_codes = &weight[e * n * k..(e + 1) * n * k];
+        for j in 0..n {
+            let mut acc = 0f32;
+            for b in 0..nblk {
+                let lo = b * bs;
+                let hi = (lo + bs).min(k);
+                let a_scale = lowp_scale_at(layout, input_scales, i, lo, nblk);
+                let w_scale = lowp_scale_at(layout, weight_scales, e * n + j, lo, nblk);
+                let mut bacc = 0f32;
+                for p in lo..hi {
+                    bacc += decode(lhs_fmt, a_codes[p]) * decode(rhs_fmt, w_codes[j * k + p]);
+                }
+                acc += bacc * (a_scale * w_scale);
+            }
+            out[i * n + j] = acc + bias.map_or(0.0, |bb| bb[e * n + j]);
         }
     }
 }
@@ -923,6 +1233,56 @@ pub(crate) fn compile_scaled_mat_mul(
 }
 
 #[allow(unused_variables)]
+pub(crate) fn compile_scaled_grouped_mat_mul(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::ScaledGroupedMatMul {
+        lhs_format,
+        rhs_format,
+        scale_layout,
+        has_bias,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    {
+        // input [m,k]; weight [E,n,k] (TN, K-last); out [m,n].
+        let in_shape = &graph.node(node.inputs[0]).shape;
+        let w_shape = &graph.node(node.inputs[1]).shape;
+        let m = in_shape.dim(in_shape.rank() - 2).unwrap_static();
+        let k = in_shape.dim(in_shape.rank() - 1).unwrap_static();
+        let num_experts = w_shape.dim(0).unwrap_static();
+        let n = w_shape.dim(w_shape.rank() - 2).unwrap_static();
+        Thunk::ScaledGroupedMatMul {
+            input: node_offset(arena, node.inputs[0]),
+            weight: node_offset(arena, node.inputs[1]),
+            input_scale: node_offset(arena, node.inputs[2]),
+            weight_scale: node_offset(arena, node.inputs[3]),
+            expert_idx: node_offset(arena, node.inputs[4]),
+            bias: if *has_bias {
+                node_offset(arena, node.inputs[5])
+            } else {
+                0
+            },
+            dst: node_offset(arena, node.id),
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            num_experts: num_experts as u32,
+            lhs_fmt: *lhs_format,
+            rhs_fmt: *rhs_format,
+            layout: *scale_layout,
+            has_bias: *has_bias,
+        }
+    }
+}
+
+#[allow(unused_variables)]
 pub(crate) fn compile_scaled_quantize(
     node: &rlx_ir::Node,
     graph: &Graph,
@@ -1227,7 +1587,11 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
                     )
                 }
                 rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size } => {
-                    rlx_mlx_io::dequant_matmul_mxfp4(row, w_slab, s_slab, group_size, 1, k, n)
+                    // FUSED: decode e2m1 inline, parallel over the n outputs — no
+                    // `[n,k]` f32 weight materialized per token (was `dequant_matmul_mxfp4`
+                    // with m=1, which allocated + decoded the whole f32 expert weight
+                    // for every routed row). Bit-exact accumulation order.
+                    rlx_mlx_io::dequant_matvec_mxfp4(row, w_slab, s_slab, group_size, k, n)
                 }
                 _ => unreachable!(),
             };
@@ -1292,6 +1656,43 @@ pub fn dequant_grouped_matmul_affine_bt(
             Err(_) => out_row.fill(0.0),
         }
     });
+}
+
+/// Grouped MLX **MXFP4** matmul (`x @ dequant(W_e)^T` per row) — the MXFP4 analog
+/// of [`dequant_grouped_matmul_affine_bt`], for backends that host-delegate by value
+/// (rlx-mlx). `w_bytes` = `num_experts` packed e2m1 slabs (`n·k/2` bytes each),
+/// `scales` = `[num_experts, n, n_groups]` **decoded f32** (e8m0→f32; MXFP4 has no
+/// biases), `idx` = `[m]` f32-encoded expert ids; writes `out` = `[m,n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_grouped_matmul_mxfp4_bt(
+    x: &[f32],
+    w_bytes: &[u8],
+    scales: &[f32],
+    idx: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    group_size: usize,
+) {
+    // FUSED: decode e2m1 codes inline into the accumulate (no per-row `[n,k]` f32
+    // weight materialization) + parallel over ALL m·n outputs. Was: per-row
+    // `dequant_matmul_mxfp4(...,1,k,n)`, which allocated + decoded the whole ~n·k·4 f32
+    // expert weight FOR EVERY token and only parallelized over the m (≈3) routed rows —
+    // the packed MoE compute cliff on the GPU workers' host-delegate path (CUDA/ROCm).
+    rlx_mlx_io::grouped_matmul_mxfp4_bt(
+        x,
+        w_bytes,
+        scales,
+        idx,
+        out,
+        m,
+        k,
+        n,
+        num_experts,
+        group_size,
+    );
 }
 
 /// Host-delegate entry for GPU backends (Metal/wgpu/…) that copy the routed
@@ -1402,6 +1803,30 @@ pub(crate) fn exec_dequant_mat_mul(t: &Thunk, base: *mut u8) {
                 &[][..]
             };
             let out = sl_mut(*dst, base, m * n);
+            // Opt-in int8 W8A8 SME path (Apple M4+): quantizes activations to
+            // int8 and runs the SMOPA GEMM on the coprocessor. Restricted to
+            // symmetric, single-block (per-output-channel) weight quant — SMOPA
+            // does one int32 reduction so it can't fold per-K-block scales or
+            // asymmetric zero-points. Lossier than the f32-activation oracle, so
+            // strictly `RLX_CPU_SME_W8A8=1`. Falls through otherwise.
+            #[cfg(rlx_cpu_amx_sme)]
+            if n_blocks == 1
+                && !*is_asymmetric
+                && crate::intrinsics::apple_amx::sme::w8a8_dispatch_enabled()
+            {
+                use crate::intrinsics::apple_amx::sme;
+                if m == 1 {
+                    // Decode/GEMV: bandwidth-bound row-wise int8 kernel (MOPA is
+                    // catastrophic at m=1).
+                    let (xq, sx) = sme::quantize_i8_symmetric(xs);
+                    sme::qgemv_i8(&xq, sx, w_bytes, scales, out, k, n);
+                    return;
+                } else if sme::worth_sme(m, k, n) {
+                    let (xq, sx) = sme::quantize_i8_symmetric(xs);
+                    sme::sme_qmatmul_i8_percol(&xq, sx, w_bytes, scales, out, m, k, n);
+                    return;
+                }
+            }
             dequant_matmul_int8(xs, w_bytes, scales, zps, out, m, k, n, bs, *is_asymmetric);
         }
     }
@@ -1685,16 +2110,24 @@ pub(crate) unsafe fn exec_dequant_mat_mul_mlx_inner(
     }
 }
 
+/// `out[m,n] = x[m,k] @ w_nkᵀ` (`w_nk` is `[n,k]` row-major) for MLX dequant-matmul.
+///
+/// Routes through BLAS so Apple Silicon hits the **AMX matrix coprocessor**
+/// (Accelerate `sgemm`/`sgemv`) — the fastest CPU matmul path — instead of the
+/// scalar triple-loop this used to be. The dense f32 GGUF path (`gguf_matmul_bt_cached`)
+/// already did dequant→`sgemm_bt`; the MLX MXFP4/MXFP8 path did not, so this was the
+/// dominant CPU cost for MLX-quantized inference (e.g. DeepSeek-V4 MXFP4). Off-Apple
+/// / `--no-default-features` falls back to the portable SIMD gemm in `blas.rs` with
+/// the same calling convention. Numerically equivalent to the scalar loop up to f32
+/// accumulation order (blocked BLAS accumulation is if anything more accurate).
 #[inline]
 fn matmul_x_wt(x: &[f32], w_nk: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0f32;
-            for p in 0..k {
-                acc += x[i * k + p] * w_nk[j * k + p];
-            }
-            out[i * n + j] = acc;
-        }
+    if m == 1 {
+        // GEMV: out[n] = w_nk[n,k] @ x[k].
+        crate::blas::sgemv_nn(w_nk, x, out, n, k, 1.0, 0.0);
+    } else {
+        // GEMM: out[m,n] = x[m,k] @ w_nk[n,k]ᵀ.
+        crate::blas::sgemm_bt(x, w_nk, out, m, k, n, 1.0);
     }
 }
 
@@ -1758,6 +2191,49 @@ pub(crate) fn exec_scaled_mat_mul(t: &Thunk, base: *mut u8) {
                 lhs_b, rhs_b, &ls, &rs, bias_s, out, m, n, k, layout, *lhs_fmt, *rhs_fmt,
             );
         }
+    }
+}
+
+pub(crate) fn exec_scaled_grouped_mat_mul(t: &Thunk, base: *mut u8) {
+    let Thunk::ScaledGroupedMatMul {
+        input,
+        weight,
+        input_scale,
+        weight_scale,
+        expert_idx,
+        bias,
+        dst,
+        m,
+        k,
+        n,
+        num_experts,
+        lhs_fmt,
+        rhs_fmt,
+        layout,
+        has_bias,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        execute_scaled_grouped_matmul_f32(
+            *input,
+            *weight,
+            *input_scale,
+            *weight_scale,
+            *expert_idx,
+            *bias,
+            *dst,
+            *m as usize,
+            *k as usize,
+            *n as usize,
+            *num_experts as usize,
+            *has_bias,
+            *lhs_fmt,
+            *rhs_fmt,
+            *layout,
+            base,
+        );
     }
 }
 
@@ -2725,6 +3201,68 @@ pub unsafe fn execute_scaled_matmul_f32(
     }
 }
 
+/// Host fallback for `Op::ScaledGroupedMatMul` (expert-indexed TN). Byte
+/// offsets into `base`. `input [m,k]` codes, `weight [E,n,k]` codes,
+/// `input_scale [m,nblk]`, `weight_scale [E·n,nblk]`, `expert_idx [m]` f32,
+/// optional per-expert `bias [E,n]`. Used by GPU backends over mapped memory.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_scaled_grouped_matmul_f32(
+    input: usize,
+    weight: usize,
+    input_scale: usize,
+    weight_scale: usize,
+    expert_idx: usize,
+    bias: usize,
+    dst: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    has_bias: bool,
+    lhs_fmt: rlx_ir::ScaledFormat,
+    rhs_fmt: rlx_ir::ScaledFormat,
+    layout: rlx_ir::ScaleLayout,
+    base: *mut u8,
+) {
+    unsafe {
+        let input_b = std::slice::from_raw_parts(base.add(input), m * k);
+        let weight_b = std::slice::from_raw_parts(base.add(weight), num_experts * n * k);
+        let nblk = lowp_nblk(k, layout);
+        let per_tensor = matches!(layout, rlx_ir::ScaleLayout::PerTensor);
+        let n_i = if per_tensor { 1 } else { m * nblk };
+        let n_w = if per_tensor {
+            1
+        } else {
+            num_experts * n * nblk
+        };
+        let is = lowp_read_scales(layout, base, input_scale, n_i);
+        let ws = lowp_read_scales(layout, base, weight_scale, n_w);
+        let ids = sl(expert_idx, base, m);
+        let bias_s = if has_bias {
+            Some(sl(bias, base, num_experts * n))
+        } else {
+            None
+        };
+        let out = sl_mut(dst, base, m * n);
+        lowp_scaled_grouped_matmul(
+            input_b,
+            weight_b,
+            &is,
+            &ws,
+            ids,
+            bias_s,
+            out,
+            m,
+            n,
+            k,
+            num_experts,
+            layout,
+            lhs_fmt,
+            rhs_fmt,
+        );
+    }
+}
+
 /// Element-wise backward for `Op::Activation`. `xs` is the original
 /// input to the forward activation; `dys` is the upstream gradient.
 /// Writes `out[i] = (d/dx act(xs[i])) * dys[i]`.
@@ -2812,5 +3350,180 @@ mod mxfp4x2_matmul_tests {
         for (a, b) in out.iter().zip(&want) {
             assert!((a - b).abs() < 1e-4, "kernel {a} vs reference {b}");
         }
+    }
+}
+
+#[cfg(test)]
+mod amx_matmul_bench {
+    use super::matmul_x_wt;
+    use std::time::Instant;
+
+    // `matmul_x_wt` is the MLX MXFP4/MXFP8 dequant-matmul's inner product. Measures
+    // the AMX win (Accelerate sgemm/sgemv) vs the old scalar triple-loop at
+    // DeepSeek-V4-real dims (k=4096), for both decode (m=1 GEMV) and block/prefill
+    // (m>1 GEMM). `--nocapture` to see the table. Correctness-gated.
+    fn naive(x: &[f32], w: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut a = 0f32;
+                for p in 0..k {
+                    a += x[i * k + p] * w[j * k + p];
+                }
+                out[i * n + j] = a;
+            }
+        }
+    }
+
+    #[test]
+    fn amx_vs_scalar_dequant_matmul() {
+        let k = 4096usize;
+        println!("\n══ AMX (Accelerate) vs scalar matmul — MLX dequant-matmul inner, k={k} ══");
+        println!(
+            "{:>4} {:>6} {:>10} {:>10} {:>9}   {:>10}",
+            "m", "n", "scalar", "amx", "speedup", "rel|Δ|"
+        );
+        for (m, n) in [
+            (1usize, 2048usize),
+            (1, 4096),
+            (5, 4096),
+            (8, 2048),
+            (16, 4096),
+        ] {
+            let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.7).sin() * 0.1).collect();
+            let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.31).cos() * 0.1).collect();
+            let mut o_naive = vec![0f32; m * n];
+            let mut o_amx = vec![0f32; m * n];
+            naive(&x, &w, &mut o_naive, m, k, n);
+            matmul_x_wt(&x, &w, &mut o_amx, m, k, n);
+            let reps = if m == 1 { 40 } else { 20 };
+            let t = Instant::now();
+            for _ in 0..reps {
+                naive(&x, &w, &mut o_naive, m, k, n);
+            }
+            let tn = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t = Instant::now();
+            for _ in 0..reps {
+                matmul_x_wt(&x, &w, &mut o_amx, m, k, n);
+            }
+            let ta = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let err = o_naive
+                .iter()
+                .zip(&o_amx)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let mag = o_naive.iter().map(|v| v.abs()).fold(1e-6, f32::max);
+            println!(
+                "{m:>4} {n:>6} {:>8.3}ms {:>8.3}ms {:>8.1}× {:>10.1e}",
+                tn,
+                ta,
+                tn / ta,
+                err / mag
+            );
+            assert!(
+                err / mag < 1e-3,
+                "AMX matmul must match scalar (rel {:.1e})",
+                err / mag
+            );
+        }
+        println!();
+    }
+
+    // For the int8/int4/fp8/nvfp4 quant matmuls, the m>1 AMX path must equal the
+    // m==1 scalar path applied row-by-row (same packed bytes) — and be much faster.
+    // Uses random valid bytes: we compare two code paths, not vs a "true" dequant.
+    #[test]
+    fn amx_quant_matmul_schemes_m_gt_1() {
+        use super::{
+            dequant_matmul_fp8, dequant_matmul_int4, dequant_matmul_int8, dequant_matmul_nvfp4,
+        };
+        use rlx_ir::NVFP4_GROUP_SIZE;
+        let (k, n, bs, mm) = (4096usize, 2048usize, 32usize, 8usize);
+        let x: Vec<f32> = (0..mm * k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.03)
+            .collect();
+        let nb = k.div_ceil(bs);
+        // Time a full m=mm AMX call vs mm separate m=1 scalar (fused) calls; assert
+        // the batched result equals the row-by-row result.
+        let run = |name: &str,
+                   amx: &dyn Fn(&[f32], usize, &mut [f32]),
+                   scalar_row: &dyn Fn(&[f32], &mut [f32])| {
+            let mut got = vec![0f32; mm * n];
+            amx(&x, mm, &mut got);
+            let mut refr = vec![0f32; mm * n];
+            for r in 0..mm {
+                let mut row = vec![0f32; n];
+                scalar_row(&x[r * k..r * k + k], &mut row);
+                refr[r * n..r * n + n].copy_from_slice(&row);
+            }
+            let err = got
+                .iter()
+                .zip(&refr)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let mag = refr.iter().map(|v| v.abs()).fold(1e-6, f32::max);
+            let reps = 10usize;
+            let t = Instant::now();
+            for _ in 0..reps {
+                amx(&x, mm, &mut got);
+            }
+            let ta = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t = Instant::now();
+            let mut tmp = vec![0f32; n];
+            for _ in 0..reps {
+                for r in 0..mm {
+                    scalar_row(&x[r * k..r * k + k], &mut tmp);
+                }
+            }
+            let ts = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            println!(
+                "{name:<8} m={mm} k={k} n={n}: scalar(row×m) {ts:>8.3}ms  amx {ta:>7.3}ms  {:>6.1}×  rel|Δ| {:.1e}",
+                ts / ta,
+                err / mag
+            );
+            assert!(
+                err / mag < 1e-3,
+                "{name}: m>1 AMX must match row-by-row scalar (rel {:.1e})",
+                err / mag
+            );
+        };
+        println!("\n══ AMX vs scalar for int8/int4/fp8/nvfp4 dequant-matmul (m>1 GEMM) ══");
+        // int8
+        let w8: Vec<i8> = (0..k * n)
+            .map(|i| ((i * 31 % 251) as i32 - 125) as i8)
+            .collect();
+        let sc8: Vec<f32> = (0..nb * n)
+            .map(|i| 0.008 + (i % 7) as f32 * 0.002)
+            .collect();
+        run(
+            "int8",
+            &|x, m, o| dequant_matmul_int8(x, &w8, &sc8, &[], o, m, k, n, bs, false),
+            &|x, o| dequant_matmul_int8(x, &w8, &sc8, &[], o, 1, k, n, bs, false),
+        );
+        // int4 (packed nibbles)
+        let w4: Vec<u8> = (0..k * n / 2).map(|i| (i * 37 % 256) as u8).collect();
+        run(
+            "int4",
+            &|x, m, o| dequant_matmul_int4(x, &w4, &sc8, &[], o, m, k, n, bs, false),
+            &|x, o| dequant_matmul_int4(x, &w4, &sc8, &[], o, 1, k, n, bs, false),
+        );
+        // fp8 (per-column scale)
+        let wf8: Vec<u8> = (0..k * n).map(|i| (i * 53 % 256) as u8).collect();
+        let scc: Vec<f32> = (0..n).map(|j| 0.01 + (j % 5) as f32 * 0.004).collect();
+        run(
+            "fp8",
+            &|x, m, o| dequant_matmul_fp8(x, &wf8, &scc, o, m, k, n, false),
+            &|x, o| dequant_matmul_fp8(x, &wf8, &scc, o, 1, k, n, false),
+        );
+        // nvfp4 (group scale + global)
+        let gs = NVFP4_GROUP_SIZE;
+        let nbg = k.div_ceil(gs);
+        let wn4: Vec<u8> = (0..k * n / 2).map(|i| (i * 41 % 256) as u8).collect();
+        let scn: Vec<u8> = (0..nbg * n).map(|i| (0x30 + (i % 40)) as u8).collect();
+        run(
+            "nvfp4",
+            &|x, m, o| dequant_matmul_nvfp4(x, &wn4, &scn, 0.5, o, m, k, n),
+            &|x, o| dequant_matmul_nvfp4(x, &wn4, &scn, 0.5, o, 1, k, n),
+        );
+        println!();
     }
 }

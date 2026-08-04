@@ -36,6 +36,12 @@ impl DecomposePolicy for WgpuPolicy {
     fn attention_accepts_rank3(&self) -> bool {
         true
     }
+
+    // Keep `Op::FusedSwiGLU` fused — wgpu has a native kernel
+    // (`fused_swiglu.wgsl`) instead of the Narrow+Silu+Mul decompose.
+    fn swiglu_native(&self) -> bool {
+        true
+    }
 }
 
 pub fn unfuse(graph: Graph) -> Graph {

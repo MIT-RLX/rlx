@@ -120,6 +120,7 @@ LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
 SKIPPED=(
     pyrlx
     rlx-cortexm-trainer
+    rlx-opscope
 )
 
 # Tier definitions. Each array entry is a single tier; space-separated
@@ -162,17 +163,31 @@ SKIPPED=(
 # (rlx-cpu/rlx-ir/rlx-compile) is consumed by the GPU backends, so it sits in
 # the backend tier right after rlx-cpu and before rlx-cuda/rlx-rocm/rlx-wgpu.
 # rlx-check (rlx-runtime) follows runtime.
+# New-crate placements (all pinned to the workspace version):
+#   rlxsl (rlx-ir) is a BUILD-dependency of rlx-gpu-kernels (tier 0) and the
+#     GPU backends, so it rides tier 0 *before* rlx-gpu-kernels. Its dir has no
+#     hyphen, so validate_publish_order's `rlx-*` glob skips it — cargo publish
+#     still enforces the order, so keep it first.
+#   rlx-dduf / rlx-hub are dep-free leaves → tier 0. rlx-mlx-io (rlx-ir) → tier 1.
+#   rlx-pkg (rlx-ir/rlx-gguf/rlx-nemo/rlx-mlx-io/rlx-dduf) → tier 2. rlx-runtime
+#     now has [dependencies] on rlx-pkg/rlx-mlx-io/rlx-dduf (+ optional rlx-xdna),
+#     so all four must precede tier 7 — they do.
+#   rlx-xdna (rlx-ir) is an optional rlx-runtime backend → backend tier 5.
+#   rlx-distributed (rlx-ir/rlx-runtime/rlx-driver) follows runtime → tier 8.
+#   rlx-geo (opt rlx-ir/rlx-cpu/rlx-wgpu) and rlx-bake (rlx-compile/rlx-pkg/opt
+#     rlx-onnx-import+rlx-runtime) both need the backend/onnx tiers → tier 9.
+#   rlx-opscope is publish=false (dev/profiling tool) → SKIPPED, not a tier.
 TIERS=(
-    "rlx-ir rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto"
-    "rlx-unfuse rlx-flow rlx-fusion rlx-driver"
-    "rlx-autodiff rlx-extend"
+    "rlx-ir rlxsl rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub"
+    "rlx-unfuse rlx-flow rlx-fusion rlx-driver rlx-mlx-io"
+    "rlx-autodiff rlx-extend rlx-pkg"
     "rlx-compile"
     "rlx-opt"
-    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl"
+    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl rlx-xdna"
     "rlx-metal"
     "rlx-collectives rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web rlx-check"
-    "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance"
+    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web rlx-check rlx-distributed"
+    "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance rlx-geo rlx-bake"
     "rlx-onnx"
     "rlx-fdm rlx-bench"
     "rlx-rl"

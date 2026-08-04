@@ -1,0 +1,5 @@
+error: scan `h` has an empty body — it must end in a `let` to produce the next carry
+ --> tests/ui/scan_empty_body.rs:6:14
+  |
+6 |         scan h = h0 for 4 { }
+  |              ^

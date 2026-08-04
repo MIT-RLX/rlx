@@ -1,0 +1,5 @@
+error: unknown binding `w` — declare it with `input`/`param`/`let` first
+ --> tests/ui/unknown_binding.rs:6:21
+  |
+6 |         let y = x @ w;   // `w` never declared
+  |                     ^

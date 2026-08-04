@@ -146,7 +146,7 @@ fn main() {
 
     // expand [2, 1, 3] → axis 4
     let (o, inr, oax) = (2, 3, 4);
-    let inp: Vec<f32> = (0..o * 1 * inr).map(|i| i as f32).collect();
+    let inp: Vec<f32> = (0..o * inr).map(|i| i as f32).collect();
     let mut cref = vec![0f32; o * oax * inr];
     for oo in 0..o {
         for a in 0..oax {

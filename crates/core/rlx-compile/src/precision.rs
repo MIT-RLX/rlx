@@ -107,6 +107,7 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::DequantMoEWeights { .. }
         | Op::LoraMatMul { .. }
         | Op::DequantMatMul { .. }
+        | Op::SynthMatMul { .. }
         | Op::ScaledMatMul { .. }
         | Op::QMatMul { .. }
         | Op::QConv2d { .. }
@@ -447,6 +448,8 @@ impl Pass for AutoMixedPrecision {
                 // Keep *all* packed DequantMatMul at F32 until the full-graph
                 // AMP path (dual-Q1 / fused MLP + f16 residual) is proven.
                 Op::DequantMatMul { .. } => true,
+                // Same policy for the codebook-synthesis matmul.
+                Op::SynthMatMul { .. } => true,
                 _ => false,
             };
             if force_f32 {

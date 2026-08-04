@@ -29,6 +29,11 @@ hwprofile = ["dep:rlx-hwprofile"]
 # debugging op dispatch / shapes / per-kernel timing.
 kernel-trace = []
 
+# Structured observability / audit spine (`obs.rs`). Off by default — routes
+# diagnostics through `tracing` structured events (the foundation for a
+# per-inference audit trail). A downstream product swaps in its own subscriber.
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+
 # NaN/inf check epilogues (plan #18).
 # When on, every CompiledGraph::run output is scanned for NaN/inf
 # and the offending output node is reported. Off by default since
@@ -52,6 +57,8 @@ mmap-kv = ["dep:memmap2"]
 # BLAS acceleration (pick ONE per platform)
 blas-accelerate = ["cpu"]                          # macOS: Apple Accelerate (via rlx-cpu build.rs)
 blas-mkl = ["cpu", "rlx-cpu/blas-mkl"]              # Intel/AMD: MKL instead of OpenBLAS
+amx-sme = ["cpu", "rlx-cpu/amx-sme"]                # Apple M4+: direct ARM SME2 GEMM microkernel
+amx-bnns = ["cpu", "rlx-cpu/amx-bnns"]                # Apple: BNNS bf16/f16 low-precision matmul
 blas-openblas = ["cpu"]                            # Linux/Windows: OpenBLAS (rlx-cpu default)
 
 # Future: direct hardware access. Declared (empty) so device_ext.rs's
@@ -157,40 +164,45 @@ xdna = ["cpu", "dep:rlx-xdna", "rlx-xdna/xrt", "rlx-xdna/direct"]
 fpga = ["dep:rlx-fpga"]
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.14", features = ["serialize"] }
-rlx-opt = { path = "../rlx-opt", version = "0.2.14" }
+rlx-ir = { workspace = true, features = ["serialize"] }
+# Structured observability / audit spine (`obs.rs`), off by default. Optional so
+# the base build stays lean (empty-prelude ethos) and pays zero overhead.
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+rlx-opt = { workspace = true }
 # Host-side training-step optimizers (Adam/AdamW/Lion/Muon/Sophia/…) for the
 # CoreML training session. Only pulled under `training`.
-rlx-optim = { path = "../rlx-optim", version = "0.2.14", optional = true }
-rlx-driver = { path = "../rlx-driver", version = "0.2.14" }
-rlx-hwprofile = { path = "../../tooling/rlx-hwprofile", version = "0.2.14", optional = true }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14", optional = true }
-rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.14", optional = true }
-rlx-wgpu = { path = "../../backends/rlx-wgpu", version = "0.2.14", optional = true }
-rlx-webgl = { path = "../../backends/rlx-webgl", version = "0.2.14", optional = true }
-rlx-vulkan = { path = "../../backends/rlx-vulkan", version = "0.2.14", optional = true }
-rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.14", optional = true }
-rlx-rocm = { path = "../../backends/rlx-rocm", version = "0.2.14", optional = true }
-rlx-oneapi = { path = "../../backends/rlx-oneapi", version = "0.2.14", optional = true }
-rlx-tpu = { path = "../../backends/rlx-tpu", version = "0.2.14", optional = true }
-rlx-qnn = { path = "../../backends/rlx-qnn", version = "0.2.14", optional = true, features = ["runtime"] }
-rlx-xdna = { path = "../../backends/rlx-xdna", version = "0.2.14", optional = true }
-rlx-fpga = { path = "../../backends/rlx-fpga", version = "0.2.14", optional = true }
-rlx-macros = { path = "../rlx-macros", version = "0.2.14" }
+rlx-optim = { workspace = true, optional = true }
+rlx-driver = { workspace = true }
+rlx-hwprofile = { workspace = true, optional = true }
+rlx-cpu = { workspace = true, optional = true }
+rlx-mlx = { workspace = true, optional = true }
+rlx-wgpu = { workspace = true, optional = true }
+rlx-webgl = { workspace = true, optional = true }
+rlx-vulkan = { workspace = true, optional = true }
+rlx-cuda = { workspace = true, optional = true }
+rlx-rocm = { workspace = true, optional = true }
+rlx-oneapi = { workspace = true, optional = true }
+rlx-tpu = { workspace = true, optional = true }
+rlx-qnn = { workspace = true, optional = true, features = ["runtime"] }
+rlx-xdna = { workspace = true, optional = true }
+rlx-fpga = { workspace = true, optional = true }
+rlx-macros = { workspace = true }
 # rlx-compile: used unconditionally by src/check.rs, so it belongs in
 # [dependencies], not only [dev-dependencies].  The dev-dep entry
 # below is preserved for tests that need the `training` feature.
-rlx-compile = { path = "../rlx-compile", version = "0.2.14" }
+rlx-compile = { workspace = true }
 half = "2"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 inventory = "0.3"
 memmap2 = { version = "0.9", optional = true }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
-rlx-pkg = { path = "../../io/rlx-pkg", version = "0.2.14" }
-rlx-mlx-io = { path = "../../io/rlx-mlx-io", version = "0.2.14" }
-rlx-dduf = { path = "../../io/rlx-dduf", version = "0.2.14" }
+rlx-gguf = { workspace = true }
+rlx-pkg = { workspace = true }
+rlx-mlx-io = { workspace = true }
+rlx-dduf = { workspace = true }
 # rlx-gpu = { path = "../rlx-gpu", version = "0.2.14", optional = true }
 # rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.14", optional = true }
 
@@ -200,7 +212,7 @@ rlx-dduf = { path = "../../io/rlx-dduf", version = "0.2.14" }
 # Matches the source gating + rlx-metal's `rlx_metal_host`:
 # `all(target_vendor = "apple", not(target_os = "watchos"))`.
 [target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
-rlx-metal = { path = "../../backends/rlx-metal", version = "0.2.14", optional = true }
+rlx-metal = { workspace = true, optional = true }
 # CoreML / ANE is an Apple-only framework (rlx-coreml's `rlx-cpu` bridge is
 # itself Apple-gated), so — like rlx-metal — it must only be a dependency on
 # Apple targets. Previously in the general `[dependencies]`, which made any
@@ -208,23 +220,23 @@ rlx-metal = { path = "../../backends/rlx-metal", version = "0.2.14", optional = 
 # compile rlx-coreml on Linux → `cannot find crate rlx_cpu`. The `coreml`
 # feature's `dep:rlx-coreml` is a no-op on non-Apple targets (same as
 # `metal`/`dep:rlx-metal`).
-rlx-coreml = { path = "../../backends/rlx-coreml", version = "0.2.14", optional = true }
+rlx-coreml = { workspace = true, optional = true }
 
 [build-dependencies]
 serde_json = "1"
 
 [dev-dependencies]
-rlx-autodiff = { path = "../rlx-autodiff", version = "0.2.14" }
-rlx-fusion = { path = "../rlx-fusion", version = "0.2.14" }
+rlx-autodiff = { workspace = true }
+rlx-fusion = { workspace = true }
 # Warm-tier kernel codegen manifest — the `kernel_dsl_matches_cpu_oracle` test
 # checks its scalar-expression math against the trusted CPU activation kernel.
-rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
+rlxsl = { workspace = true }
 # Cross-backend parity tests build real model blocks (e.g. MLA) via the flow
 # DSL, then run them on each backend. Dev-only; the rlx-flow↔rlx-runtime edge is
 # a dev-dependency cycle (allowed by cargo, never a normal-build cycle).
-rlx-flow = { path = "../rlx-flow", version = "0.2.14" }
+rlx-flow = { workspace = true }
 rayon = "1"
-rlx-compile = { path = "../rlx-compile", version = "0.2.14", features = ["training"] }
+rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
 # rlx-splat = { path = "../rlx-splat", version = "0.2.14", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.

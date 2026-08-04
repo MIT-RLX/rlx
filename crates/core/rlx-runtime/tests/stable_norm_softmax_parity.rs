@@ -23,9 +23,21 @@ use rlx_ir::DType;
 // Session/Graph/Shape + device probing are only referenced by the CUDA/wgpu
 // parity cases below; gate the imports to match so a default (cpu-only) build
 // neither fails to resolve them nor warns about unused imports.
-#[cfg(any(feature = "cuda", feature = "gpu"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "gpu",
+    feature = "rocm",
+    feature = "vulkan",
+    all(feature = "metal", target_os = "macos")
+))]
 use rlx_ir::{Graph, Shape};
-#[cfg(any(feature = "cuda", feature = "gpu"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "gpu",
+    feature = "rocm",
+    feature = "vulkan",
+    all(feature = "metal", target_os = "macos")
+))]
 use rlx_runtime::{Device, Session, is_available};
 
 const F: DType = DType::F32;
@@ -51,7 +63,13 @@ fn assert_close(label: &str, got: &[f32], want: &[f32], tol: f32) {
     eprintln!("{label}: max_abs={e:.3e}");
 }
 
-#[cfg(any(feature = "cuda", feature = "gpu"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "gpu",
+    feature = "rocm",
+    feature = "vulkan",
+    all(feature = "metal", target_os = "macos")
+))]
 fn run(device: Device, g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
     Session::new(device)
         .compile(g)
@@ -62,7 +80,7 @@ fn run(device: Device, g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 
 /// Softmax along `axis` with the same strided layout the CUDA kernel uses:
 /// `base = o * axis_len * stride + s`, element `j` at `base + j * stride`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "gpu"))]
 fn ref_softmax(x: &[f32], dims: &[usize], axis: usize) -> Vec<f32> {
     let rank = dims.len();
     assert!(axis < rank);
@@ -260,16 +278,22 @@ fn wgpu_layer_norm_dc_offset_matches_two_pass_reference() {
     let bin = g.input("beta", Shape::new(&[inner], F));
     let y = g.layer_norm(xin, gin, bin, -1, EPS, Shape::new(&[rows, inner], F));
     g.set_outputs(vec![y]);
-    let got = run(
-        Device::Gpu,
-        g,
-        &[
-            ("x", x.as_slice()),
-            ("gamma", gamma.as_slice()),
-            ("beta", beta.as_slice()),
-        ],
-    );
-    assert_close("wgpu LayerNorm DC-offset vs two-pass", &got, &two, 2e-4);
+    let inputs: &[(&str, &[f32])] = &[
+        ("x", x.as_slice()),
+        ("gamma", gamma.as_slice()),
+        ("beta", beta.as_slice()),
+    ];
+    // CPU LayerNorm is now TWO-PASS (was one-pass E[x²]−mean²) → matches the
+    // two-pass reference under this DC offset (validates the CPU change).
+    let cpu = run(Device::Cpu, g.clone(), inputs);
+    assert_close("cpu LayerNorm two-pass vs reference", &cpu, &two, 1e-3);
+    let got = run(Device::Gpu, g, inputs);
+    // Tolerance note: the wgpu kernel does a parallel pairwise-tree reduction,
+    // *more* accurate than this reference's plain-f32 sequential `sum()`. Under
+    // the extreme DC=1000 fixture the ~2e-4 residual is the reference's own
+    // summation error, not the kernel's — still ~50× below the one-pass
+    // cancellation this test guards (`cancel > 1e-2` above).
+    assert_close("wgpu LayerNorm DC-offset vs two-pass", &got, &two, 1e-3);
 }
 
 /// CPU-only check that the DC fixture really stresses one-pass cancellation —
@@ -287,4 +311,331 @@ fn dc_offset_exposes_one_pass_layer_norm_cancellation() {
         e > 1e-2,
         "expected one-pass vs two-pass divergence under DC={DC}, got {e:.3e}"
     );
+}
+
+/// Pin: wgpu LayerNorm workgroup-tree reduction with `inner` > the 64-wide
+/// workgroup — exercises the per-thread striding loop (with a partial final
+/// stride, `inner` not a multiple of 64) + the shared-memory tree, under a DC
+/// offset (so the two-pass precision is also stressed). The prior scalar
+/// one-thread-per-row kernel had no striding to get wrong; this locks the
+/// parallel reduction.
+#[test]
+#[cfg(feature = "gpu")]
+fn wgpu_layer_norm_striding_matches_two_pass_reference() {
+    if !is_available(Device::Gpu) {
+        eprintln!("skip wgpu_layer_norm_striding (wgpu unavailable)");
+        return;
+    }
+    let (rows, inner) = (3usize, 130usize); // 130 = 2*64 + 2 → last stride is partial
+    let x = dc_ramp(rows * inner, 23);
+    let gamma: Vec<f32> = (0..inner).map(|i| 0.8 + (i as f32) * 0.001).collect();
+    let beta: Vec<f32> = (0..inner).map(|i| -0.1 + (i as f32) * 0.0005).collect();
+    let two = ref_layer_norm_two_pass(&x, rows, inner, &gamma, &beta);
+    let mut g = Graph::new("ln_stride");
+    let xin = g.input("x", Shape::new(&[rows, inner], F));
+    let gin = g.input("gamma", Shape::new(&[inner], F));
+    let bin = g.input("beta", Shape::new(&[inner], F));
+    let y = g.layer_norm(xin, gin, bin, -1, EPS, Shape::new(&[rows, inner], F));
+    g.set_outputs(vec![y]);
+    let got = run(
+        Device::Gpu,
+        g,
+        &[
+            ("x", x.as_slice()),
+            ("gamma", gamma.as_slice()),
+            ("beta", beta.as_slice()),
+        ],
+    );
+    // 1e-3: parallel-tree residual vs the plain-f32 reference under DC=1000 (see
+    // the DC-offset test's tolerance note) — still ~20× below one-pass cancellation.
+    assert_close(
+        "wgpu LayerNorm inner=130 (striding) vs two-pass",
+        &got,
+        &two,
+        1e-3,
+    );
+}
+
+/// Two-pass RmsNorm over the last axis: `mean(x²) = mean((x−mean)²) + mean²`
+/// (matches the fixed wgpu kernel's RmsNorm branch).
+#[cfg(any(
+    feature = "gpu",
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan",
+    all(feature = "metal", target_os = "macos")
+))]
+fn ref_rms_norm_two_pass(
+    x: &[f32],
+    rows: usize,
+    inner: usize,
+    gamma: &[f32],
+    beta: &[f32],
+) -> Vec<f32> {
+    let mut y = vec![0.0f32; x.len()];
+    let n_inv = 1.0 / inner as f32;
+    for r in 0..rows {
+        let off = r * inner;
+        let row = &x[off..off + inner];
+        let mean = row.iter().sum::<f32>() * n_inv;
+        let dev = row
+            .iter()
+            .map(|v| {
+                let d = v - mean;
+                d * d
+            })
+            .sum::<f32>()
+            * n_inv;
+        let inv = 1.0 / (dev + mean * mean + EPS).sqrt();
+        for i in 0..inner {
+            // `+ beta[i]` matches the CPU oracle (RmsNorm carries beta).
+            y[off + i] = row[i] * inv * gamma[i] + beta[i];
+        }
+    }
+    y
+}
+
+/// Pin: wgpu RmsNorm shares the LayerNorm workgroup-tree reduction (op flag); it
+/// only differs in the final scale. Validate the striding path under a DC offset
+/// too. RmsNorm is BETTER-conditioned than LayerNorm here (mean² dominates
+/// `inv_rms`, so it does not amplify the mean's rounding), hence the tighter tol.
+#[test]
+#[cfg(feature = "gpu")]
+fn wgpu_rms_norm_striding_matches_two_pass_reference() {
+    if !is_available(Device::Gpu) {
+        eprintln!("skip wgpu_rms_norm_striding (wgpu unavailable)");
+        return;
+    }
+    let (rows, inner) = (3usize, 130usize);
+    let x = dc_ramp(rows * inner, 29);
+    let gamma: Vec<f32> = (0..inner).map(|i| 0.8 + (i as f32) * 0.001).collect();
+    // NON-ZERO beta: RmsNorm now adds beta (matches CPU). A dropped-beta kernel
+    // (the prior wgpu bug) fails this.
+    let beta: Vec<f32> = (0..inner).map(|i| -0.3 + (i as f32) * 0.002).collect();
+    let two = ref_rms_norm_two_pass(&x, rows, inner, &gamma, &beta);
+    let mut g = Graph::new("rms_stride");
+    let xin = g.input("x", Shape::new(&[rows, inner], F));
+    let gin = g.input("gamma", Shape::new(&[inner], F));
+    let bin = g.input("beta", Shape::new(&[inner], F));
+    let y = g.add_node(
+        rlx_ir::Op::RmsNorm { axis: -1, eps: EPS },
+        vec![xin, gin, bin],
+        Shape::new(&[rows, inner], F),
+    );
+    g.set_outputs(vec![y]);
+    let inputs: &[(&str, &[f32])] = &[
+        ("x", x.as_slice()),
+        ("gamma", gamma.as_slice()),
+        ("beta", beta.as_slice()),
+    ];
+    // CPU is the sequential two-pass oracle → tight; confirms the reference
+    // matches the actual (now two-pass) CPU kernel.
+    let cpu = run(Device::Cpu, g.clone(), inputs);
+    assert_close("cpu RmsNorm two-pass+beta vs reference", &cpu, &two, 1e-5);
+    // wgpu tree vs the two-pass+beta reference/CPU.
+    let got = run(Device::Gpu, g, inputs);
+    assert_close(
+        "wgpu RmsNorm inner=130 vs CPU two-pass+beta",
+        &got,
+        &two,
+        3e-4,
+    );
+}
+
+/// Metal RmsNorm is now two-pass + beta (matches the CPU oracle). Same DC +
+/// non-zero-beta fixture; validates the Metal kernel change on-device.
+#[test]
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_rms_norm_matches_cpu_oracle() {
+    if !is_available(Device::Metal) {
+        eprintln!("skip metal_rms_norm (Metal unavailable)");
+        return;
+    }
+    let (rows, inner) = (3usize, 130usize);
+    let x = dc_ramp(rows * inner, 29);
+    let gamma: Vec<f32> = (0..inner).map(|i| 0.8 + (i as f32) * 0.001).collect();
+    let beta: Vec<f32> = (0..inner).map(|i| -0.3 + (i as f32) * 0.002).collect();
+    let two = ref_rms_norm_two_pass(&x, rows, inner, &gamma, &beta);
+    let mut g = Graph::new("rms_metal");
+    let xin = g.input("x", Shape::new(&[rows, inner], F));
+    let gin = g.input("gamma", Shape::new(&[inner], F));
+    let bin = g.input("beta", Shape::new(&[inner], F));
+    let y = g.add_node(
+        rlx_ir::Op::RmsNorm { axis: -1, eps: EPS },
+        vec![xin, gin, bin],
+        Shape::new(&[rows, inner], F),
+    );
+    g.set_outputs(vec![y]);
+    let inputs: &[(&str, &[f32])] = &[
+        ("x", x.as_slice()),
+        ("gamma", gamma.as_slice()),
+        ("beta", beta.as_slice()),
+    ];
+    let got = run(Device::Metal, g, inputs);
+    assert_close(
+        "metal RmsNorm inner=130 vs CPU two-pass+beta",
+        &got,
+        &two,
+        3e-4,
+    );
+}
+
+/// CUDA/ROCm shared `layernorm.cu` RmsNorm branch → two-pass + beta (+ the
+/// compile.rs beta-placeholder fix). Same DC + non-zero-beta fixture.
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
+fn rms_norm_two_pass_beta_case() -> (Graph, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (rows, inner) = (3usize, 130usize);
+    let x = dc_ramp(rows * inner, 29);
+    let gamma: Vec<f32> = (0..inner).map(|i| 0.8 + (i as f32) * 0.001).collect();
+    let beta: Vec<f32> = (0..inner).map(|i| -0.3 + (i as f32) * 0.002).collect();
+    let two = ref_rms_norm_two_pass(&x, rows, inner, &gamma, &beta);
+    let mut g = Graph::new("rms");
+    let xin = g.input("x", Shape::new(&[rows, inner], F));
+    let gin = g.input("gamma", Shape::new(&[inner], F));
+    let bin = g.input("beta", Shape::new(&[inner], F));
+    let y = g.add_node(
+        rlx_ir::Op::RmsNorm { axis: -1, eps: EPS },
+        vec![xin, gin, bin],
+        Shape::new(&[rows, inner], F),
+    );
+    g.set_outputs(vec![y]);
+    (g, x, gamma, beta, two)
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn cuda_rms_norm_matches_cpu_oracle() {
+    if !is_available(Device::Cuda) {
+        return;
+    }
+    let (g, x, gamma, beta, two) = rms_norm_two_pass_beta_case();
+    let inputs: &[(&str, &[f32])] = &[("x", &x), ("gamma", &gamma), ("beta", &beta)];
+    let got = run(Device::Cuda, g, inputs);
+    assert_close(
+        "cuda RmsNorm inner=130 vs CPU two-pass+beta",
+        &got,
+        &two,
+        3e-4,
+    );
+}
+
+#[test]
+#[cfg(feature = "rocm")]
+fn rocm_rms_norm_matches_cpu_oracle() {
+    if !is_available(Device::Rocm) {
+        return;
+    }
+    let (g, x, gamma, beta, two) = rms_norm_two_pass_beta_case();
+    let inputs: &[(&str, &[f32])] = &[("x", &x), ("gamma", &gamma), ("beta", &beta)];
+    let got = run(Device::Rocm, g, inputs);
+    assert_close(
+        "rocm RmsNorm inner=130 vs CPU two-pass+beta",
+        &got,
+        &two,
+        3e-4,
+    );
+}
+
+#[test]
+#[cfg(feature = "vulkan")]
+fn vulkan_rms_norm_matches_cpu_oracle() {
+    if !is_available(Device::Vulkan) {
+        return;
+    }
+    let (g, x, gamma, beta, two) = rms_norm_two_pass_beta_case();
+    let inputs: &[(&str, &[f32])] = &[("x", &x), ("gamma", &gamma), ("beta", &beta)];
+    let got = run(Device::Vulkan, g, inputs);
+    assert_close(
+        "vulkan RmsNorm inner=130 vs CPU two-pass+beta",
+        &got,
+        &two,
+        3e-4,
+    );
+}
+
+/// LayerNorm was one-pass `E[x²]−mean²` on CPU/Metal/CUDA/ROCm (DC-cancellation);
+/// upgraded to two-pass everywhere. Fixture: DC offset + inner>64 (striding).
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    all(feature = "metal", target_os = "macos")
+))]
+fn layer_norm_dc_case() -> (Graph, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (rows, inner) = (4usize, 130usize);
+    let x = dc_ramp(rows * inner, 11);
+    let gamma: Vec<f32> = (0..inner).map(|i| 0.8 + (i as f32) * 0.001).collect();
+    let beta: Vec<f32> = (0..inner).map(|i| -0.1 + (i as f32) * 0.0005).collect();
+    let two = ref_layer_norm_two_pass(&x, rows, inner, &gamma, &beta);
+    let mut g = Graph::new("ln_dc");
+    let xin = g.input("x", Shape::new(&[rows, inner], F));
+    let gin = g.input("gamma", Shape::new(&[inner], F));
+    let bin = g.input("beta", Shape::new(&[inner], F));
+    let y = g.layer_norm(xin, gin, bin, -1, EPS, Shape::new(&[rows, inner], F));
+    g.set_outputs(vec![y]);
+    (g, x, gamma, beta, two)
+}
+
+#[test]
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_layer_norm_dc_offset_matches_two_pass() {
+    if !is_available(Device::Metal) {
+        return;
+    }
+    let (g, x, gamma, beta, two) = layer_norm_dc_case();
+    let inputs: &[(&str, &[f32])] = &[("x", &x), ("gamma", &gamma), ("beta", &beta)];
+    let got = run(Device::Metal, g, inputs);
+    assert_close("metal LayerNorm DC vs two-pass", &got, &two, 1e-3);
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+fn cuda_layer_norm_dc_offset_matches_two_pass() {
+    if !is_available(Device::Cuda) {
+        return;
+    }
+    let (g, x, gamma, beta, two) = layer_norm_dc_case();
+    let inputs: &[(&str, &[f32])] = &[("x", &x), ("gamma", &gamma), ("beta", &beta)];
+    // msi CPU is x86_64+AVX2 → also validates the AVX CPU two-pass LayerNorm.
+    let cpu = run(Device::Cpu, g.clone(), inputs);
+    assert_close("cpu(avx) LayerNorm DC vs two-pass", &cpu, &two, 1e-3);
+    let got = run(Device::Cuda, g, inputs);
+    assert_close("cuda LayerNorm DC vs two-pass", &got, &two, 1e-3);
+}
+
+#[test]
+#[cfg(feature = "rocm")]
+fn rocm_layer_norm_dc_offset_matches_two_pass() {
+    if !is_available(Device::Rocm) {
+        return;
+    }
+    let (g, x, gamma, beta, two) = layer_norm_dc_case();
+    let inputs: &[(&str, &[f32])] = &[("x", &x), ("gamma", &gamma), ("beta", &beta)];
+    let got = run(Device::Rocm, g, inputs);
+    assert_close("rocm LayerNorm DC vs two-pass", &got, &two, 1e-3);
+}
+
+/// Pin: wgpu last-axis Softmax now uses a workgroup-tree reduction (parallel max
+/// + per-thread Kahan exp-sum + thread-0 Kahan merge). Exercises the striding
+/// loop (`inner`=130 not a multiple of 64) + a wide value range (max-subtraction
+/// + exp-sum matter). Softmax is well-conditioned after the max shift, so a
+/// tight tol holds.
+#[test]
+#[cfg(feature = "gpu")]
+fn wgpu_softmax_last_axis_striding_matches_reference() {
+    if !is_available(Device::Gpu) {
+        eprintln!("skip wgpu_softmax_striding (wgpu unavailable)");
+        return;
+    }
+    let dims = [3usize, 130];
+    let n: usize = dims.iter().product();
+    let x: Vec<f32> = (0..n)
+        .map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.2)
+        .collect();
+    let want = ref_softmax(&x, &dims, 1);
+    let mut g = Graph::new("sm_wgpu");
+    let xin = g.input("x", Shape::new(&dims, F));
+    let y = g.softmax(xin, 1, Shape::new(&dims, F));
+    g.set_outputs(vec![y]);
+    let got = run(Device::Gpu, g, &[("x", x.as_slice())]);
+    assert_close("wgpu softmax last-axis inner=130", &got, &want, 1e-5);
 }

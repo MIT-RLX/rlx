@@ -157,7 +157,7 @@ pub fn is_host_op(op: &Op) -> bool {
         | Op::GroupNormBackwardGamma { .. }
         | Op::GroupNormBackwardBeta { .. }
         | Op::AdaLayerNormBackward { .. }
-        | Op::GatedResidualBackward { .. } => true,
+        | Op::GatedResidualBackward => true,
         _ => false,
     }
 }
@@ -423,9 +423,9 @@ fn fft1d_f32(x: &[f32], row: usize, inverse: bool, norm: FftNorm) -> Result<Vec<
         )));
     }
     let outer = x.len() / row;
-    let mut out = x.to_vec();
     #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
     {
+        let mut out = x.to_vec();
         let base = out.as_mut_ptr() as *mut u8;
         unsafe {
             rlx_cpu::thunk::execute_fft1d_f32(0, 0, outer, n_complex, inverse, norm.tag(), base);

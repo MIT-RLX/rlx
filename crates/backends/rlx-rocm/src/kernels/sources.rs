@@ -6,6 +6,7 @@
 
 pub use rlx_gpu_kernels::*;
 
+pub use rlx_gpu_kernels::rocm::GEMV_SPLITK_CU;
 pub use rlx_gpu_kernels::rocm::MATMUL_MFMA_CU;
 
 /// HIP entry points compiled from shared sources (+ `matmul_mfma`).

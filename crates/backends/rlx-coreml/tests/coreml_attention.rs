@@ -152,6 +152,7 @@ fn attention_causal_matches_reference() {
         Op::Attention {
             num_heads: H,
             head_dim: D,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,
@@ -304,6 +305,7 @@ fn attn_block() -> Graph {
         Op::Attention {
             num_heads: H,
             head_dim: D,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,

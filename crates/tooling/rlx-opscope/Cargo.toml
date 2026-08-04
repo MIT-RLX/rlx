@@ -1,0 +1,155 @@
+[package]
+name = "rlx-opscope"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Data-pattern recording harness — inject stat taps into op graphs, sweep synthetic distributions, and mine exploitable structure for specialized kernels"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Dev/research harness — never published to crates.io.
+publish = false
+
+[dependencies]
+rlx-ir = { workspace = true }
+rlx-fusion = { workspace = true }
+# For the fused-Op::Attention tap: reuse the tested attention→softmax decompose.
+rlx-autodiff = { workspace = true }
+# default-features = false (no OpenBLAS link) mirrors rlx-collectives — required
+# so this crate unifies cleanly when path-depended cross-workspace from
+# rlx-models (a partial path/registry `links` mix otherwise breaks resolution).
+# The `cpu` feature transitively pulls rlx-cpu, so no direct rlx-cpu dep is needed.
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false, features = ["cpu"] }
+
+[[bin]]
+name = "opscope-sweep"
+path = "src/bin/sweep.rs"
+
+[[bin]]
+name = "opscope-mine"
+path = "src/bin/mine.rs"
+
+[[bin]]
+name = "opscope-motifs"
+path = "src/bin/motifs.rs"
+
+[[bin]]
+name = "opscope-seq"
+path = "src/bin/seq.rs"
+
+[[bin]]
+name = "opscope-mnist"
+path = "src/bin/mnist.rs"
+
+[[bin]]
+name = "opscope-flow"
+path = "src/bin/flow.rs"
+
+[[bin]]
+name = "opscope-graph"
+path = "src/bin/graph.rs"
+
+[[bin]]
+name = "opscope-shapes"
+path = "src/bin/shapes.rs"
+
+[[bin]]
+name = "opscope-infer"
+path = "src/bin/infer.rs"
+
+[[bin]]
+name = "opscope-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "opscope-plan"
+path = "src/bin/plan.rs"
+
+[[bin]]
+name = "opscope-llm"
+path = "src/bin/llm.rs"
+
+[[bin]]
+name = "opscope-optimize"
+path = "src/bin/optimize.rs"
+
+[[bin]]
+name = "opscope-replay"
+path = "src/bin/replay.rs"
+
+[[bin]]
+name = "opscope-parity"
+path = "src/bin/parity.rs"
+
+[[bin]]
+name = "opscope-guarded"
+path = "src/bin/guarded.rs"
+
+[[bin]]
+name = "opscope-live"
+path = "src/bin/live.rs"
+
+[[bin]]
+name = "opscope-kernels"
+path = "src/bin/kernels.rs"
+required-features = ["decompose"]
+
+[[bin]]
+name = "opscope-layers"
+path = "src/bin/layers.rs"
+required-features = ["allocate"]
+
+[[bin]]
+name = "opscope-actions"
+path = "src/bin/actions.rs"
+required-features = ["allocate"]
+
+[dependencies.arrow-array]
+version = "53"
+optional = true
+
+[dependencies.arrow-schema]
+version = "53"
+optional = true
+
+[dependencies.parquet]
+version = "53"
+optional = true
+default-features = false
+features = ["arrow", "snap"]
+
+[features]
+default = []
+# Optimization surface is opt-in (default off) so the base harness stays lean and
+# the hot path isn't diluted by experimental decomposition code.
+#   decompose — the actuation kernels: Monarch / Tucker / TT / low-rank / sparse /
+#               int8 matmul + the shared truncated SVD (`opscope-kernels` bin).
+#   allocate  — per-layer decomposition mining + the DADO allocator, which builds
+#               on the kernels (`opscope-layers` bin). Implies `decompose`.
+decompose = []
+allocate = ["decompose"]
+# Hardware-specific kernel paths (opt-in per target ISA / matrix unit). Without
+# any of these, `decompose` gives portable SCALAR kernels that run anywhere; each
+# flag lights up a hardware acceleration and is compiled ONLY when requested.
+#   neon    — aarch64 NEON weight-stationary GEMV/GEMM cores (f32 + W8A16 widen).
+#   dotprod — + ARMv8.2-A DotProd `SDOT` for the W8A8 fast path (inline asm).
+#   amx     — Apple AMX matrix coprocessor via the Accelerate framework (Apple
+#             targets only; links `Accelerate`). "Direct AMX" comparison kernel.
+#   apple   — convenience: everything an Apple-Silicon build wants.
+neon = ["decompose"]
+dotprod = ["neon"]
+amx = ["decompose"]
+apple = ["dotprod", "amx"]
+# Write the tidy sketch schema to Parquet instead of CSV. Off by default so the
+# base build stays dependency-light (arrow/parquet pull ~30 crates).
+parquet = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+metal = ["rlx-runtime/metal"]
+gpu   = ["rlx-runtime/gpu"]
+cuda  = ["rlx-runtime/cuda"]
+
+[lints]
+workspace = true

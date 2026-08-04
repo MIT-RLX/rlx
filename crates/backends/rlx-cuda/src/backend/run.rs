@@ -14,7 +14,8 @@ use crate::host_staging::F32HostSlot;
 use crate::kernels::{
     activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
     argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
-    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    attention_wmma_d128_kernel, attention_wmma_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_broadcast_kernel, binary_c64_kernel, binary_kernel,
     compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel, complex_norm_sq_kernel,
@@ -34,7 +35,7 @@ use crate::kernels::{
     group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
     group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
     layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
-    layernorm_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel,
+    layernorm_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_tma_kernel, matmul_wmma_kernel,
     maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel,
     pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
     reduce_kernel, relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
@@ -142,14 +143,20 @@ impl CudaExecutable {
             if !self.arena.has(node.id) {
                 continue;
             }
+            // `RLX_CUDA_DUMP_IO=1` also dumps Input/Param/Constant slots — needed
+            // to tell "input not landing in slot" from "param not loaded" from a
+            // genuine compute-op zero. Reshape/Cast stay skipped (they alias the
+            // parent slot, so their value is the parent's, already shown).
+            let dump_io = rlx_ir::env::flag("RLX_CUDA_DUMP_IO");
+            let is_io = matches!(
+                node.op,
+                rlx_ir::Op::Input { .. } | rlx_ir::Op::Param { .. } | rlx_ir::Op::Constant { .. }
+            );
             if matches!(
                 node.op,
-                rlx_ir::Op::Input { .. }
-                    | rlx_ir::Op::Param { .. }
-                    | rlx_ir::Op::Constant { .. }
-                    | rlx_ir::Op::Reshape { .. }
-                    | rlx_ir::Op::Cast { .. }
-            ) {
+                rlx_ir::Op::Reshape { .. } | rlx_ir::Op::Cast { .. }
+            ) || (is_io && !dump_io)
+            {
                 continue;
             }
             let n = node.shape.num_elements().unwrap_or(0);
@@ -176,13 +183,56 @@ impl CudaExecutable {
 
     pub(crate) fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         let default_stream = self.ctx.default_stream();
-        let stream = default_stream.clone();
+        // ANY CUDA graph capture (whole-graph `ExecMode::Graph` OR segmented)
+        // routes the ENTIRE run — input H2D copy, dispatch, capture — onto a
+        // dedicated non-null stream, because the legacy null default stream is
+        // (a) uncapturable and (b) would make captured kernels depend on the
+        // null-stream input copy → `CAPTURE_ISOLATION`. This is the fix for
+        // rlx's latent whole-graph no-op: `ExecMode::Graph` previously called
+        // `begin_capture` on the null stream, silently failed, and ran eager.
+        // Created here (before the input copy) so the copy lands on it too;
+        // reused as `seg_stream` in the dispatch loop below. Off unless graph
+        // mode is requested → default behaviour byte-identical.
+        let want_capture_stream = self.exec_mode == ExecMode::Graph
+            && self.active_extent.is_none()
+            && !self.capture_disabled
+            && ((rlx_ir::env::flag("RLX_CUDA_SEGMENTED_CAPTURE")
+                && rlx_ir::env::flag("RLX_CUDA_SEGMENTED_CAPTURE_ENGAGE"))
+                // Whole-graph capture is its OWN opt-in: it now begins capture on
+                // the non-null stream (the null-stream no-op is fixed), but a
+                // cuBLAS-internal op still async-invalidates the capture on
+                // multi-matmul graphs (end_capture → CAPTURE_INVALIDATED; falls
+                // back to eager gracefully). Kept opt-in until that's resolved so
+                // default `ExecMode::Graph` stays byte-identical (silent eager).
+                || rlx_ir::env::flag("RLX_CUDA_WHOLE_GRAPH_CAPTURE"));
+        if want_capture_stream && self.segment_stream.is_none() {
+            self.segment_stream = self.ctx.new_stream().ok();
+        }
+        // Creating a stream via `new_stream()` swaps the context into
+        // multi-stream mode, which turns on cudarc's per-`CudaSlice` cross-stream
+        // event tracking: every `.arg(arena)` then inserts a wait on the slice's
+        // last-use stream. During capture that wait targets uncaptured null-
+        // stream work → `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`. The whole
+        // segmented dispatch is single-stream (everything ordered on
+        // `seg_stream`), so we disable that auto-sync for the run — stream order
+        // alone is sufficient — and re-enable it after the loop.
+        if want_capture_stream && self.segment_stream.is_some() {
+            unsafe { self.ctx.disable_event_tracking() };
+        }
+        let stream = if want_capture_stream {
+            self.segment_stream
+                .clone()
+                .unwrap_or_else(|| default_stream.clone())
+        } else {
+            default_stream.clone()
+        };
 
         self.stage_gpu_handle_inputs(&stream, inputs);
 
         // Copy inputs to device. Always done outside any graph capture
         // — inputs change between runs and shouldn't be baked into the
         // captured CUDA Graph.
+        let input_diag = rlx_ir::env::flag("RLX_CUDA_INPUT_DIAG");
         for &(name, data) in inputs {
             if let Some(&id) = self.input_offsets.get(name)
                 && self.arena.has(id)
@@ -201,6 +251,20 @@ impl CudaExecutable {
                         .memcpy_htod(data, &mut slot)
                         .expect("rlx-cuda: input upload failed");
                 }
+                if input_diag {
+                    eprintln!("[cuda-input] {name:?} -> uploaded ({} f32)", data.len());
+                }
+            } else if input_diag {
+                // A provided input that is NOT uploaded here means the graph will
+                // read zero-initialised memory for it (the split-graph TTS silent
+                // bug). Distinguish the cause. gpu-handle inputs are staged
+                // separately (stage_gpu_handle_inputs) and are expected here.
+                let reason = match self.input_offsets.get(name) {
+                    None if self.has_gpu_handle(name) => "gpu-handle (staged separately, ok)",
+                    None => "NOT in input_offsets (name mismatch) -> graph reads ZEROS",
+                    Some(_) => "in input_offsets but no arena slot -> graph reads ZEROS",
+                };
+                eprintln!("[cuda-input] {name:?} -> SKIPPED: {reason}");
             }
         }
 
@@ -243,11 +307,119 @@ impl CudaExecutable {
         // normal dispatch loop with stream capture turned on; the
         // resulting graph is stashed in `self.captured_graph` and
         // replayed on every subsequent run.
+        // RNG steps are capture-safe only under an on-device policy (Philox /
+        // Zero); Ort / Bnns cold-fill on the host. Read the live policy here —
+        // `set_rng` drops the captured graph when the policy changes, so a
+        // captured Philox/Zero fill stays consistent with eager semantics.
+        let rng_on_device = matches!(
+            self.rng.read().expect("rng lock").backend,
+            rlx_ir::RngBackend::Philox | rlx_ir::RngBackend::Zero
+        );
         let graph_eligible = active.is_none()
             && self.exec_mode == ExecMode::Graph
-            && schedule_graph_capture_safe(&self.schedule);
+            && !self.capture_disabled
+            && schedule_graph_capture_safe(&self.schedule, rng_on_device);
         let do_replay = graph_eligible && self.captured_graph.is_some();
-        let do_capture = graph_eligible && self.captured_graph.is_none();
+        // Whole-graph capture, like segmented, needs an eager WARM-UP run first
+        // to load every kernel module + cuBLAS workspace (both illegal to
+        // allocate mid-capture). So the first graph-eligible run dispatches
+        // eagerly (on the capture stream) and only the SECOND run captures.
+        let do_capture = graph_eligible && self.captured_graph.is_none() && self.capture_warmed;
+
+        // Segmented capture (opt-in `RLX_CUDA_SEGMENTED_CAPTURE=1`): for the
+        // schedules the WHOLE-graph gate rejects (a host step forces eager),
+        // capture each maximal capture-safe run as its own graph and dispatch
+        // host steps eagerly between segment replays. Orthogonal to the
+        // whole-graph path above (that fires only when the WHOLE schedule is
+        // safe; this only when it is NOT). Same stream throughout, so segment
+        // graph launches and eager kernels serialize without extra syncs.
+        // Actually engaging capture requires the extra flag
+        // `RLX_CUDA_SEGMENTED_CAPTURE_ENGAGE` (kept as an opt-in while it's
+        // validated on real models). The foundation is now WORKING end-to-end
+        // (msi RTX 3080 Ti, cuBLAS + cuBLAS-free, capture+replay bit-exact):
+        //   • dedicated non-null capture stream (the default stream is the
+        //     uncapturable legacy null stream),
+        //   • the run's I/O routed onto it,
+        //   • and — the key — `disable_event_tracking()` for the dispatch:
+        //     creating the stream swaps the context to multi-stream mode, which
+        //     makes cudarc insert a per-`.arg` cross-stream WAIT (on the null
+        //     stream) that breaks capture isolation for BOTH plain kernels and
+        //     cuBLAS. Single-stream ordering makes that auto-sync unnecessary.
+        // `RLX_CUDA_SEGMENTED_CAPTURE=1` alone still only surfaces the
+        // opportunity diagnostic + runs eagerly. See `cuda_segmented_capture`.
+        let seg_plan: Vec<CaptureSegment> = if rlx_ir::env::flag("RLX_CUDA_SEGMENTED_CAPTURE")
+            && rlx_ir::env::flag("RLX_CUDA_SEGMENTED_CAPTURE_ENGAGE")
+            && active.is_none()
+            && self.exec_mode == ExecMode::Graph
+            && !graph_eligible
+        {
+            segment_schedule_for_capture(&self.schedule, rng_on_device, SEGMENT_MIN_RUN)
+        } else {
+            Vec::new()
+        };
+        // Capture needs a NON-null stream (the default stream is the legacy
+        // null stream, which CUDA refuses to capture). Create one lazily and
+        // persist it so a replay run launches the captured graphs on the same
+        // stream they were captured on. If creation fails, segmentation is
+        // disabled this run (graceful — the loop dispatches eagerly).
+        if segments_beat_all_or_nothing(&seg_plan) && self.segment_stream.is_none() {
+            self.segment_stream = self.ctx.new_stream().ok();
+        }
+        let segmented_active =
+            segments_beat_all_or_nothing(&seg_plan) && self.segment_stream.is_some();
+        let seg_stream: Arc<cudarc::driver::CudaStream> = self
+            .segment_stream
+            .clone()
+            .unwrap_or_else(|| default_stream.clone());
+        let seg_num_gpu = seg_plan
+            .iter()
+            .filter(|s| matches!(s, CaptureSegment::Gpu { .. }))
+            .count();
+        let seg_replay =
+            segmented_active && seg_num_gpu > 0 && self.segment_graphs.len() == seg_num_gpu;
+        // Capture only AFTER a warm-up run has loaded every kernel module +
+        // cuBLAS workspace (both illegal to allocate mid-capture). The first
+        // segmented run is a plain eager pass on `seg_stream`.
+        let seg_capture = segmented_active && !seg_replay && self.capture_warmed;
+        // Route cuBLAS / cuDNN to the capture stream for the whole graph-mode
+        // dispatch (segmented AND whole-graph) — else their kernels land on the
+        // null stream, not captured, and a null-stream op during capture
+        // invalidates it. Reset after the loop.
+        if want_capture_stream {
+            if let Some(blas) = self.blas.as_ref() {
+                let blas = blas.lock().unwrap();
+                unsafe {
+                    let _ = cudarc::cublas::result::set_stream(
+                        *blas.handle(),
+                        seg_stream.cu_stream() as _,
+                    );
+                }
+                // Pin a fixed cuBLAS workspace so cuBLAS does NO internal
+                // `cudaMalloc` / helper-stream sync during capture — that
+                // hidden op is what async-invalidates a multi-matmul whole-graph
+                // capture (`CAPTURE_INVALIDATED` with per-step status ACTIVE).
+                // Reuse the cuBLASLt scratch buffer (matmuls are sequential).
+                if let Some(ws) = self.blas_lt_workspace.as_ref() {
+                    let mut ws = ws.lock().unwrap();
+                    let (ws_ptr, _r) = ws.device_ptr_mut(&seg_stream);
+                    unsafe {
+                        let _ = cudarc::cublas::sys::cublasSetWorkspace_v2(
+                            *blas.handle(),
+                            ws_ptr as *mut std::ffi::c_void,
+                            CUBLASLT_WORKSPACE_BYTES,
+                        );
+                    }
+                }
+            }
+            if let Some(handle) = self.dnn {
+                unsafe {
+                    let _ = cudarc::cudnn::result::set_stream(
+                        handle,
+                        seg_stream.cu_stream() as cudnn_sys::cudaStream_t,
+                    );
+                }
+            }
+        }
 
         if do_replay {
             self.prepare_readback_plan();
@@ -282,6 +454,11 @@ impl CudaExecutable {
                         .expect("rlx-cuda: partial output dtoh failed after replay");
                 }
                 self.refresh_gpu_handles_from_staging(&plan);
+                // Restore event tracking disabled for this graph-mode run before
+                // the early return (the end-of-`run` restore is not reached).
+                if want_capture_stream {
+                    unsafe { self.ctx.enable_event_tracking() };
+                }
                 return self.outputs_from_staging_plan(&plan);
             }
             // Readback plan changed (e.g. partial grads); drop stale capture and re-dispatch.
@@ -314,16 +491,117 @@ impl CudaExecutable {
         // default stream around every step and accumulates time by step name;
         // dumped after the loop. Disabled during graph capture (the syncs would
         // corrupt the capture) and skipped in multi-stream mode.
-        let step_profile =
-            rlx_ir::env::flag("RLX_CUDA_STEP_PROFILE") && !capturing && !multi_stream;
+        let step_profile = rlx_ir::env::flag("RLX_CUDA_STEP_PROFILE")
+            && !capturing
+            && !multi_stream
+            && !seg_capture;
         let mut step_prof: HashMap<&'static str, (f64, usize)> = HashMap::new();
+
+        // Segmented-capture cursor state (all no-ops unless `segmented_active`).
+        // `seg_cursor` walks `seg_plan`; `seg_gpu_k` counts Gpu segments for
+        // replay indexing; `skip_until` skips a replayed Gpu segment's steps;
+        // `cur_cap_end` marks the exclusive end index of an in-progress capture;
+        // `captured_segs` accumulates the graphs built this run.
+        let mut seg_cursor = 0usize;
+        let mut seg_gpu_k = 0usize;
+        let mut skip_until = 0usize;
+        let mut cur_cap_end: Option<usize> = None;
+        let mut captured_segs: Vec<Option<cudarc::driver::CudaGraph>> = Vec::new();
+        // Whole-graph capture debug: pin the first step that invalidates the
+        // capture (`RLX_CUDA_CAPTURE_DEBUG`). Checked once per step after dispatch.
+        let cap_debug = capturing && rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG");
+        let mut cap_invalidated = false;
+        // Close a finished segment capture, instantiate + launch (capture only
+        // RECORDS — the launch actually computes the segment this run). Params
+        // (not captures) so it can be called from two sites without borrow
+        // conflicts. Returns false if the capture broke (a mis-classified op) —
+        // the caller then disables capture + re-runs eagerly for correctness
+        // (the segment's data would otherwise be silently missing/stale).
+        let close_seg = |ds: &std::sync::Arc<cudarc::driver::CudaStream>,
+                         segs: &mut Vec<Option<cudarc::driver::CudaGraph>>|
+         -> bool {
+            match ds.end_capture(
+                cudarc::driver::sys::CUgraphInstantiate_flags
+                    ::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            ) {
+                // The guard performs the upload+launch attempt; on success we keep
+                // the instantiated graph, otherwise fall through to `false`.
+                Ok(Some(g)) if g.upload().is_ok() && g.launch().is_ok() => {
+                    segs.push(Some(g));
+                    true
+                }
+                _ => false,
+            }
+        };
+        let mut seg_capture_failed = false;
 
         // Dispatch each step. Each iteration is wrapped in an NVTX
         // range so nsight-systems traces show step boundaries cleanly.
         // Gated behind the `nvtx` feature because CUDA 13 removed
         // `nvToolsExt.dll`; cudarc panics on first call when the lib
-        // isn't loadable.
-        for step in &self.schedule {
+        // isn't loadable. A range `for` (not `while`) so the many inner
+        // `continue`s in the match auto-advance the index.
+        for step_i in 0..self.schedule.len() {
+            // Segmented capture: close a finished capture FIRST (robust to an
+            // inner `continue` in the previous step leaving it open), then run
+            // the segment START boundary for this index.
+            if segmented_active {
+                if let Some(end) = cur_cap_end
+                    && step_i >= end
+                {
+                    seg_capture_failed |= !close_seg(&seg_stream, &mut captured_segs);
+                    cur_cap_end = None;
+                }
+                while seg_cursor < seg_plan.len() && seg_plan[seg_cursor].range().end <= step_i {
+                    seg_cursor += 1;
+                }
+                if let CaptureSegment::Gpu { start, end } = seg_plan[seg_cursor] {
+                    if step_i == start {
+                        if seg_replay {
+                            if let Some(Some(g)) = self.segment_graphs.get(seg_gpu_k) {
+                                g.launch().expect("rlx-cuda: segment graph replay failed");
+                            }
+                            seg_gpu_k += 1;
+                            skip_until = end;
+                        } else if seg_capture {
+                            let cap = seg_stream.begin_capture(
+                                cudarc::driver::sys::CUstreamCaptureMode
+                                    ::CU_STREAM_CAPTURE_MODE_RELAXED,
+                            );
+                            if let Err(e) = &cap
+                                && rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG")
+                            {
+                                eprintln!(
+                                    "rlx-cuda: segment begin_capture failed at step {step_i}: {e:?}"
+                                );
+                            }
+                            cur_cap_end = if cap.is_ok() { Some(end) } else { None };
+                        }
+                    }
+                }
+            }
+            // Replay: steps inside an already-launched Gpu segment are skipped.
+            if step_i < skip_until {
+                continue;
+            }
+            let step = &self.schedule[step_i];
+            // Capture-status probe at the TOP (before the match's many `continue`s
+            // could skip it): if the capture is invalidated here, step_i-1 is the
+            // culprit.
+            if cap_debug && !cap_invalidated && step_i > 0 {
+                if let Ok(s) = stream.capture_status() {
+                    if s != cudarc::driver::sys::CUstreamCaptureStatus
+                        ::CU_STREAM_CAPTURE_STATUS_ACTIVE
+                    {
+                        eprintln!(
+                            "rlx-cuda: capture invalidated BY step {} = {} (status {s:?})",
+                            step_i - 1,
+                            step_name(&self.schedule[step_i - 1])
+                        );
+                        cap_invalidated = true;
+                    }
+                }
+            }
             let _prof_t0 = if step_profile {
                 let _ = default_stream.synchronize();
                 Some(std::time::Instant::now())
@@ -372,9 +650,13 @@ impl CudaExecutable {
             } else {
                 None
             };
+            // Single-stream (incl. segmented) dispatches on `seg_stream`, which
+            // is the dedicated non-null capture stream when engaged and the null
+            // default stream otherwise — so input copy, dispatch, and capture
+            // all share one stream (dependency-isolated captures).
             let stream: Arc<cudarc::driver::CudaStream> = match assigned_idx {
                 Some(i) => self.streams[i].clone(),
-                None => default_stream.clone(),
+                None => seg_stream.clone(),
             };
             // Re-bind cuBLAS / cuDNN handles to the active stream so
             // their internal kernel launches go to the right queue.
@@ -655,6 +937,55 @@ impl CudaExecutable {
                             .expect("rlx-cuda: scaled_matmul_decode launch failed");
                     }
                 }
+                Step::ScaledGroupedMatMulDecode {
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    input_byte_off,
+                    weight_byte_off,
+                    input_scale_byte_off,
+                    weight_scale_byte_off,
+                    idx_off_f32,
+                    out_off_f32,
+                    bias_off_f32,
+                    lhs_fmt,
+                    rhs_fmt,
+                    scale_mode,
+                    block,
+                    has_bias,
+                } => {
+                    let kernel = crate::kernels::scaled_grouped_matmul_decode_kernel(&self.ctx);
+                    let cfg = LaunchConfig {
+                        grid_dim: ((*n).div_ceil(16), (*m).div_ceil(16), 1),
+                        block_dim: (16, 16, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(input_byte_off)
+                        .arg(weight_byte_off)
+                        .arg(input_scale_byte_off)
+                        .arg(weight_scale_byte_off)
+                        .arg(idx_off_f32)
+                        .arg(out_off_f32)
+                        .arg(bias_off_f32)
+                        .arg(m)
+                        .arg(k)
+                        .arg(n)
+                        .arg(num_experts)
+                        .arg(lhs_fmt)
+                        .arg(rhs_fmt)
+                        .arg(scale_mode)
+                        .arg(block)
+                        .arg(has_bias);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: scaled_grouped_matmul_decode launch failed");
+                    }
+                }
                 Step::Matmul {
                     m,
                     k,
@@ -670,6 +1001,78 @@ impl CudaExecutable {
                     bias_off_f32,
                     act_id,
                 } => {
+                    // Opt-in Hopper TMA GEMM (`RLX_CUDA_TMA` on sm_90). Only
+                    // eligible shapes route here; everything else falls through
+                    // to the cuBLAS cascade below. Bias/activation go through the
+                    // shared epilogue kernel afterward, exactly like WMMA.
+                    if tma_arch(&self.ctx).is_some() {
+                        if let Some((a_map, b_map)) = build_tma_gemm_maps(
+                            &self.arena,
+                            &stream,
+                            *m,
+                            *k,
+                            *n,
+                            *batch,
+                            *a_off_f32,
+                            *b_off_f32,
+                        ) {
+                            let kernel = matmul_tma_kernel(&self.ctx);
+                            let cfg = LaunchConfig {
+                                grid_dim: ((*n).div_ceil(64), (*m).div_ceil(64), 1),
+                                block_dim: (16, 16, 1),
+                                shared_mem_bytes: 0,
+                            };
+                            let mut launcher = stream.launch_builder(&kernel.function);
+                            launcher
+                                .arg(&a_map)
+                                .arg(&b_map)
+                                .arg(self.arena.f32_buf_mut())
+                                .arg(m)
+                                .arg(k)
+                                .arg(n)
+                                .arg(c_off_f32);
+                            unsafe {
+                                launcher
+                                    .launch(cfg)
+                                    .expect("rlx-cuda: matmul_tma launch failed");
+                            }
+                            if *has_bias != 0 || *act_id != 0xFFFFu32 {
+                                let kernel = matmul_epilogue_kernel(&self.ctx);
+                                let total = m * n * batch;
+                                let (grid, block) = dispatch_grid_1d(total, 256);
+                                let cfg = LaunchConfig {
+                                    grid_dim: (grid, 1, 1),
+                                    block_dim: (block, 1, 1),
+                                    shared_mem_bytes: 0,
+                                };
+                                let mut launcher = stream.launch_builder(&kernel.function);
+                                launcher
+                                    .arg(self.arena.f32_buf_mut())
+                                    .arg(&total)
+                                    .arg(n)
+                                    .arg(c_off_f32)
+                                    .arg(has_bias)
+                                    .arg(bias_off_f32)
+                                    .arg(act_id);
+                                unsafe {
+                                    launcher
+                                        .launch(cfg)
+                                        .expect("rlx-cuda: matmul_epilogue (post-tma) failed");
+                                }
+                            }
+                            if let Some(idx) = assigned_idx {
+                                if let Ok(evt) = stream.record_event(None) {
+                                    last_event.insert(idx, evt);
+                                }
+                                let (_, writes) = step_offsets(step);
+                                for w in &writes {
+                                    producer_of.insert(*w, idx);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     if matmul_parity_mode() {
                         let kernel = matmul_kernel(&self.ctx);
                         let cfg = LaunchConfig {
@@ -1195,6 +1598,13 @@ impl CudaExecutable {
                     let n_s = scale(*n);
                     if n_s == 0 {
                         continue;
+                    }
+                    if rlx_ir::env::flag("RLX_CUDA_INPUT_DIAG")
+                        && (*op == 13 || *op == 14 || *op == 12)
+                    {
+                        eprintln!(
+                            "[cuda-unary] op={op} n={n_s} in_off={in_off} out_off={out_off} (12=Round,13=Sin,14=Cos)"
+                        );
                     }
                     let kernel = unary_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(n_s, 256);
@@ -2065,10 +2475,49 @@ impl CudaExecutable {
                         *head_dim,
                         "RLX_CUDA_FORCE_ATTENTION_ROW",
                     );
-                    let mut launcher = stream.launch_builder(if use_row {
-                        &attention_row_kernel(&self.ctx).function
+                    // Attention variant policy (`RLX_CUDA_ATTENTION`). `Auto`
+                    // picks the Tensor-Core (fp16 WMMA) kernel when it's eligible
+                    // (non-row head_dim<=128, mask None/Causal, no softcap, sm70+)
+                    // AND the workload is big enough to amortize its per-block
+                    // overhead; else scalar flash / row. The WMMA kernels are
+                    // drop-ins (same signature); everything falls back to scalar.
+                    // See docs/attention-variants.md.
+                    use crate::config::AttentionVariant;
+                    let pol = crate::runtime_config().attention;
+                    let wmma_eligible = !use_row
+                        && *head_dim <= 128
+                        && (*mask_kind == 0 || *mask_kind == 1)
+                        && f32::from_bits(*softcap_bits) <= 0.0
+                        && crate::backend::helpers::device_cc(&self.ctx).0 >= 7;
+                    let want_wmma = match pol {
+                        // Explicit `wmma` allows the d128 kernel too (correct,
+                        // for experimentation), even though it doesn't beat the
+                        // scalar kernel at head_dim=128 yet.
+                        AttentionVariant::Wmma => wmma_eligible,
+                        // Auto only turns on the *proven-faster* d64 path
+                        // (head_dim<=64) when the workload amortizes it. The
+                        // d128 WMMA kernel is slower than scalar today, so auto
+                        // never picks it — auto is always >= scalar.
+                        AttentionVariant::Auto => {
+                            let work = *batch as u64 * *heads as u64 * seq_q_eff as u64;
+                            wmma_eligible
+                                && *head_dim <= 64
+                                && work >= crate::runtime_config().attention_wmma_min_work
+                        }
+                        AttentionVariant::Scalar | AttentionVariant::Row => false,
+                    };
+                    // 0 = scalar/row · 1 = WMMA d64 (4 warps) · 2 = WMMA d128 (2 warps)
+                    let wmma_kind: u8 = if want_wmma {
+                        if *head_dim <= 64 { 1 } else { 2 }
                     } else {
-                        &attention_kernel(&self.ctx).function
+                        0
+                    };
+                    let use_row_final = wmma_kind == 0 && (use_row || pol == AttentionVariant::Row);
+                    let mut launcher = stream.launch_builder(match wmma_kind {
+                        1 => &attention_wmma_kernel(&self.ctx).function,
+                        2 => &attention_wmma_d128_kernel(&self.ctx).function,
+                        _ if use_row_final => &attention_row_kernel(&self.ctx).function,
+                        _ => &attention_kernel(&self.ctx).function,
                     });
                     launcher
                         .arg(self.arena.f32_buf_mut())
@@ -2102,7 +2551,7 @@ impl CudaExecutable {
                         .arg(o_head_stride)
                         .arg(o_seq_stride)
                         .arg(softcap_bits);
-                    let cfg = if use_row {
+                    let cfg = if use_row_final {
                         let total = batch * heads * seq_q_eff;
                         let block = 256u32;
                         LaunchConfig {
@@ -2111,10 +2560,19 @@ impl CudaExecutable {
                             shared_mem_bytes: 0,
                         }
                     } else {
-                        let q_blocks = seq_q_eff.div_ceil(16);
+                        // Query-tile height (BR) + block size per variant:
+                        //   WMMA d64 = 4 warps / 64-query tile
+                        //   WMMA d128 = 2 warps / 32-query tile
+                        //   scalar flash = 128 threads / 16-query tile
+                        let (br, block) = match wmma_kind {
+                            1 => (64u32, 128u32),
+                            2 => (32u32, 64u32),
+                            _ => (16u32, 128u32),
+                        };
+                        let q_blocks = seq_q_eff.div_ceil(br);
                         LaunchConfig {
                             grid_dim: (q_blocks, batch * heads, 1),
-                            block_dim: (128, 1, 1),
+                            block_dim: (block, 1, 1),
                             shared_mem_bytes: 0,
                         }
                     };
@@ -2844,6 +3302,59 @@ impl CudaExecutable {
                         *scale_bf16,
                     );
                 }
+                Step::DequantGroupedMatmulMlxNative {
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    group_size,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    idx_byte_off,
+                    out_byte_off,
+                } => {
+                    // m>1 (prefill) with a register-safe row count → the amortized kernel
+                    // (decode each fired expert's weight once, reuse across its rows);
+                    // otherwise (decode, m==1) the per-element kernel is optimal.
+                    let amort = *m > 1 && *m <= 16;
+                    let kernel = if amort {
+                        crate::kernels::dequant_grouped_matmul_mlx_mxfp4_amort_kernel(&self.ctx)
+                    } else {
+                        crate::kernels::dequant_grouped_matmul_mlx_mxfp4_kernel(&self.ctx)
+                    };
+                    let cfg = if amort {
+                        LaunchConfig {
+                            grid_dim: ((*n).div_ceil(256), 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    } else {
+                        LaunchConfig {
+                            grid_dim: ((*n).div_ceil(16), (*m).div_ceil(16), 1),
+                            block_dim: (16, 16, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    };
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(m)
+                        .arg(k)
+                        .arg(n)
+                        .arg(num_experts)
+                        .arg(group_size)
+                        .arg(x_byte_off)
+                        .arg(w_byte_off)
+                        .arg(scale_byte_off)
+                        .arg(idx_byte_off)
+                        .arg(out_byte_off);
+                    unsafe {
+                        launcher
+                            .launch(cfg)
+                            .expect("rlx-cuda: dequant_grouped_matmul_mlx_mxfp4 launch failed");
+                    }
+                }
                 Step::Sample {
                     outer,
                     inner,
@@ -3569,6 +4080,9 @@ impl CudaExecutable {
                     seq,
                     input_size,
                     hidden,
+                    num_layers,
+                    bidirectional,
+                    h0_byte_off,
                 } => {
                     crate::gru_gpu::run_gru(
                         &self.ctx,
@@ -3584,6 +4098,9 @@ impl CudaExecutable {
                         *seq as usize,
                         *input_size as usize,
                         *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *h0_byte_off as usize,
                     );
                 }
                 Step::GruHost {
@@ -3633,6 +4150,9 @@ impl CudaExecutable {
                     seq,
                     input_size,
                     hidden,
+                    num_layers,
+                    bidirectional,
+                    h0_byte_off,
                     relu,
                 } => {
                     crate::rnn_gpu::run_rnn(
@@ -3648,6 +4168,9 @@ impl CudaExecutable {
                         *seq as usize,
                         *input_size as usize,
                         *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *h0_byte_off as usize,
                         *relu,
                     );
                 }
@@ -6966,6 +7489,21 @@ impl CudaExecutable {
                 }
             }
 
+            if cap_debug && !cap_invalidated {
+                match stream.capture_status() {
+                    Ok(
+                        cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE,
+                    ) => {}
+                    other => {
+                        eprintln!(
+                            "rlx-cuda: capture invalidated AT step {step_i} = {} (status {other:?})",
+                            step_name(step)
+                        );
+                        cap_invalidated = true;
+                    }
+                }
+            }
+
             // Multi-stream tail: record an event so future steps can
             // wait on this one, then update producer_of with the
             // offsets this step wrote.
@@ -6995,6 +7533,97 @@ impl CudaExecutable {
                 let e = step_prof.entry(key).or_insert((0.0, 0));
                 e.0 += dt;
                 e.1 += 1;
+            }
+        }
+        // A capture open at the last step (a Gpu segment ending at `len`) has no
+        // next iteration to close it — close it here.
+        if cur_cap_end.is_some() {
+            seg_capture_failed |= !close_seg(&seg_stream, &mut captured_segs);
+        }
+        // A segment capture broke (mis-classified op): its data was recorded but
+        // not executed → arena stale. Disable capture + re-run eagerly (correct).
+        if seg_capture && seg_capture_failed {
+            self.capture_disabled = true;
+            self.segment_graphs.clear();
+            unsafe { self.ctx.enable_event_tracking() };
+            if let Some(blas) = self.blas.as_ref() {
+                let blas = blas.lock().unwrap();
+                unsafe {
+                    let _ = cudarc::cublas::result::set_stream(
+                        *blas.handle(),
+                        default_stream.cu_stream() as _,
+                    );
+                }
+            }
+            if rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
+                eprintln!(
+                    "rlx-cuda: segment capture failed → disabling capture, re-running eagerly"
+                );
+            }
+            return self.run_inner(inputs);
+        }
+        // Commit segment graphs only if EVERY Gpu segment captured cleanly (else
+        // leave `segment_graphs` empty so the next run retries — this run has
+        // already computed correct data via the launches above and the eager
+        // spans).
+        if seg_capture {
+            if captured_segs.len() == seg_num_gpu {
+                self.segment_graphs = captured_segs;
+                if rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
+                    let replayable: usize = seg_plan
+                        .iter()
+                        .filter_map(|s| match s {
+                            CaptureSegment::Gpu { start, end } => Some(end - start),
+                            _ => None,
+                        })
+                        .sum();
+                    eprintln!(
+                        "rlx-cuda: segmented capture built {seg_num_gpu} graph(s) \
+                         ({replayable}/{} steps replayable)",
+                        self.schedule.len(),
+                    );
+                }
+            } else if rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
+                eprintln!(
+                    "rlx-cuda: segmented capture incomplete ({}/{seg_num_gpu} segments); \
+                     retrying next run",
+                    captured_segs.len(),
+                );
+            }
+        }
+        if want_capture_stream {
+            // First graph-mode run is the eager warm-up — capture starts next run
+            // (loads kernel modules + cuBLAS workspace, illegal mid-capture).
+            self.capture_warmed = true;
+        }
+        // Graph-mode dispatch + graph launches ran on `seg_stream`; sync it so the
+        // null-stream readback below sees all produced data, and reset cuBLAS /
+        // cuDNN back to the null stream (whole-graph and segmented alike).
+        // CRITICAL: do NOT sync while a whole-graph capture is still open
+        // (`capturing`) — a stream sync mid-capture INVALIDATES it (this is why
+        // whole-graph capture failed while segmented, which closes each segment
+        // in-loop before this point, succeeded). end_capture + the final
+        // stream sync below cover it.
+        if want_capture_stream {
+            if !capturing {
+                let _ = seg_stream.synchronize();
+            }
+            if let Some(blas) = self.blas.as_ref() {
+                let blas = blas.lock().unwrap();
+                unsafe {
+                    let _ = cudarc::cublas::result::set_stream(
+                        *blas.handle(),
+                        default_stream.cu_stream() as _,
+                    );
+                }
+            }
+            if let Some(handle) = self.dnn {
+                unsafe {
+                    let _ = cudarc::cudnn::result::set_stream(
+                        handle,
+                        default_stream.cu_stream() as cudnn_sys::cudaStream_t,
+                    );
+                }
             }
         }
         if step_profile {
@@ -7028,15 +7657,49 @@ impl CudaExecutable {
 
         if capturing {
             // End capture before dtoh — the graph records compute kernels only.
-            let cu_graph = stream.end_capture(
+            let cu_graph = match stream.end_capture(
                 cudarc::driver::sys::CUgraphInstantiate_flags
                     ::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
-            ).expect("rlx-cuda: end_capture failed");
-            if let Some(g) = cu_graph {
-                g.upload().expect("rlx-cuda: graph upload failed");
-                g.launch().expect("rlx-cuda: graph first launch failed");
-                self.captured_graph = Some(g);
-                self.captured_readback_plan = Some(plan.clone());
+            ) {
+                Ok(g) => g,
+                Err(e) => {
+                    if rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
+                        eprintln!("rlx-cuda: whole-graph end_capture failed: {e:?}");
+                    }
+                    // Capture invalidated mid-dispatch — leave `captured_graph`
+                    // None (eager this run + retry) rather than crash.
+                    None
+                }
+            };
+            match cu_graph {
+                Some(g) => {
+                    g.upload().expect("rlx-cuda: graph upload failed");
+                    g.launch().expect("rlx-cuda: graph first launch failed");
+                    self.captured_graph = Some(g);
+                    self.captured_readback_plan = Some(plan.clone());
+                    if rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
+                        eprintln!(
+                            "rlx-cuda: whole-graph capture built ({} steps)",
+                            self.schedule.len()
+                        );
+                    }
+                }
+                None => {
+                    // Capture failed (a step classified capture-safe broke it):
+                    // the recorded kernels may NOT have executed, so the arena is
+                    // stale → the outputs below would be WRONG. Permanently disable
+                    // capture for this schedule, restore state, and re-run from the
+                    // top EAGERLY (correct). The safety net for a mis-classified op.
+                    self.capture_disabled = true;
+                    unsafe { self.ctx.enable_event_tracking() };
+                    if rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
+                        eprintln!(
+                            "rlx-cuda: capture failed → disabling capture for this \
+                             schedule, re-running eagerly"
+                        );
+                    }
+                    return self.run_inner(inputs);
+                }
             }
         }
 
@@ -7049,6 +7712,13 @@ impl CudaExecutable {
         }
         self.refresh_gpu_handles_from_staging(&plan);
         stream.synchronize().expect("rlx-cuda: stream sync failed");
+        // Restore cudarc's cross-stream event tracking that the segmented
+        // dispatch disabled — AFTER readback + final sync, so the whole
+        // single-stream run (dispatch, capture, dtoh) stays consistently
+        // untracked. Context-wide state; must be back on for other exec modes.
+        if want_capture_stream {
+            unsafe { self.ctx.enable_event_tracking() };
+        }
         self.outputs_from_staging_plan(&plan)
     }
 }

@@ -48,6 +48,24 @@ fn dispatch_sgemm_variant(enc: &ComputeCommandEncoderRef, m: usize, k: usize, n:
                 },
             );
         }
+        SgemmVariant::Simd64 | SgemmVariant::Simd64SplitK => {
+            // 64×64 tile, 8 simdgroups (256 threads). pick_sgemm guarantees 64/8-alignment.
+            // SplitK reaches here only from call sites that can't pre-zero C (it needs
+            // atomic accumulate); the non-split kernel is correct, just not split.
+            enc.set_compute_pipeline_state(&kk.sgemm_simd64);
+            enc.dispatch_thread_groups(
+                MTLSize {
+                    width: (n / 64) as u64,
+                    height: (m / 64) as u64,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 32,
+                    height: 8,
+                    depth: 1,
+                },
+            );
+        }
         SgemmVariant::Simd => {
             enc.set_compute_pipeline_state(&kk.sgemm_simd);
             let tg_count = MTLSize {
@@ -201,6 +219,57 @@ pub fn metal_sgemm_bufs(
         std::mem::size_of::<u32>() as u64,
         &n_u as *const _ as *const _,
     );
+    // Split-K needs a pre-zeroed C (atomic accumulate) + a 3D grid + the split
+    // count — handle it here where we hold the C buffer; other variants dispatch
+    // straight through. pick_sgemm only returns SplitK when ksplits >= 4.
+    if matches!(hw_model().pick_sgemm(m, k, n), SgemmVariant::Simd64SplitK) {
+        let kk = kernels();
+        let s = hw_model().ksplits(m, k, n).max(1);
+        // zero C[c_off .. c_off + m*n]
+        let cn = (m * n) as u32;
+        enc.set_compute_pipeline_state(&kk.zero_f32);
+        enc.set_buffer(0, Some(c), c_off as u64);
+        enc.set_bytes(
+            1,
+            std::mem::size_of::<u32>() as u64,
+            &cn as *const _ as *const _,
+        );
+        enc.dispatch_threads(
+            MTLSize {
+                width: (m * n) as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        // split-K accumulate (A/B/C/M/K/N already bound at 0..5; add Ksplits at 6)
+        enc.set_buffer(0, Some(a), a_off as u64);
+        enc.set_buffer(1, Some(b), b_off as u64);
+        enc.set_buffer(2, Some(c), c_off as u64);
+        enc.set_bytes(
+            6,
+            std::mem::size_of::<u32>() as u64,
+            &s as *const _ as *const _,
+        );
+        enc.set_compute_pipeline_state(&kk.sgemm_simd64_splitk);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: (n / 64) as u64,
+                height: (m / 64) as u64,
+                depth: s as u64,
+            },
+            MTLSize {
+                width: 32,
+                height: 8,
+                depth: 1,
+            },
+        );
+        return;
+    }
     dispatch_sgemm_variant(enc, m, k, n);
 }
 
@@ -215,6 +284,70 @@ pub fn metal_sgemm(
     n: usize,
 ) {
     metal_sgemm_bufs(enc, arena, a_off, arena, b_off, arena, c_off, m, k, n);
+}
+
+/// `C = A·B + R` with the full `[m,n]` residual `R` folded into the matmul's
+/// store — one dispatch instead of a matmul plus a separate elementwise-add.
+/// Only the `SimdPadded` variant has a residual-epilogue kernel (the shape the
+/// batch-1 decode projections hit: `m=1, k≥256, n≥256, k%8==0`). For any other
+/// picked variant this writes `C = A·B` only and returns `false` so the caller
+/// adds `R` itself — correctness is preserved everywhere; the launch saving is
+/// taken on the decode hot path. Returns `true` iff `R` was applied in-kernel.
+#[must_use]
+pub fn metal_sgemm_residual_bufs(
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    a_off: usize,
+    b: &Buffer,
+    b_off: usize,
+    c: &Buffer,
+    c_off: usize,
+    r: &Buffer,
+    r_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    if !matches!(hw_model().pick_sgemm(m, k, n), SgemmVariant::SimdPadded) {
+        metal_sgemm_bufs(enc, a, a_off, b, b_off, c, c_off, m, k, n);
+        return false;
+    }
+    let kk = kernels();
+    let (m_u, k_u, n_u) = (m as u32, k as u32, n as u32);
+    enc.set_compute_pipeline_state(&kk.sgemm_simd_padded_residual);
+    enc.set_buffer(0, Some(a), a_off as u64);
+    enc.set_buffer(1, Some(b), b_off as u64);
+    enc.set_buffer(2, Some(c), c_off as u64);
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &m_u as *const _ as *const _,
+    );
+    enc.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &k_u as *const _ as *const _,
+    );
+    enc.set_bytes(
+        5,
+        std::mem::size_of::<u32>() as u64,
+        &n_u as *const _ as *const _,
+    );
+    enc.set_buffer(6, Some(r), r_off as u64);
+    let tg_count = MTLSize {
+        width: n.div_ceil(8) as u64,
+        height: m.div_ceil(8) as u64,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(
+        tg_count,
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    true
 }
 
 /// C = A_f32 @ B_f16 → C_f32. Loads half weights in-kernel (no full-matrix cast).
@@ -241,6 +374,36 @@ pub fn metal_sgemm_f16w_bufs(
     enc.set_bytes(4, 4, &k_u as *const _ as *const _);
     enc.set_bytes(5, 4, &n_u as *const _ as *const _);
 
+    // M=1 decode GEMV: K-split kernel launches KSPLIT× more threads to saturate
+    // memory on the small-N projections (24.4→33→45.7 tok/s across f32→f16→this
+    // on qwen3-0.6B, token-identical). Default on the F16 decode path; opt out
+    // with `RLX_METAL_GEMV_SPLITK=0`.
+    // half2 loads need an even N (2 columns/thread, aligned); all transformer
+    // projection widths are even. Odd N falls through to the scalar kernel.
+    if m == 1
+        && n >= 64
+        && n.is_multiple_of(2)
+        && rlx_ir::env::var("RLX_METAL_GEMV_SPLITK").as_deref() != Some("0")
+    {
+        const KSPLIT: u64 = 32;
+        enc.set_compute_pipeline_state(&kk.gemv_f16w_splitk);
+        // Buffers 0-2 already bound above; this kernel takes K,N at 3,4 (no M).
+        enc.set_bytes(3, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &n_u as *const _ as *const _);
+        // 64 columns per threadgroup (32 threads × 2 cols via half2).
+        let tg_count = MTLSize {
+            width: (n as u64).div_ceil(64),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 32,
+            height: KSPLIT,
+            depth: 1,
+        };
+        enc.dispatch_thread_groups(tg_count, tg);
+        return;
+    }
     // Prefer small-M column kernel for CFG decode (M=2): shares B loads across
     // rows. Padded simdgroup zeros 6/8 A rows and is slower for skinny M.
     if m <= 4 && n >= 64 {
@@ -314,6 +477,48 @@ pub fn metal_sgemm_f16w(
     n: usize,
 ) {
     metal_sgemm_f16w_bufs(enc, arena, a_off, arena, b_off, arena, c_off, m, k, n);
+}
+
+/// C = A_f16 @ B_f32 → C_f32, f32 accumulate. Mirror of `metal_sgemm_f16w_bufs`
+/// for the A operand: reads the 2-byte half A in-kernel instead of letting the
+/// plain f32 sgemm reinterpret it as f32. Used by the mixed-precision training
+/// backward, where grad matmuls take an f16 activation and an f32 upstream grad.
+pub fn metal_sgemm_f16a_bufs(
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    a_off: usize,
+    b: &Buffer,
+    b_off: usize,
+    c: &Buffer,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    let kk = kernels();
+    let (m_u, k_u, n_u) = (m as u32, k as u32, n as u32);
+    enc.set_buffer(0, Some(a), a_off as u64);
+    enc.set_buffer(1, Some(b), b_off as u64);
+    enc.set_buffer(2, Some(c), c_off as u64);
+    enc.set_bytes(3, 4, &m_u as *const _ as *const _);
+    enc.set_bytes(4, 4, &k_u as *const _ as *const _);
+    enc.set_bytes(5, 4, &n_u as *const _ as *const _);
+    enc.set_compute_pipeline_state(&kk.sgemm_f16a);
+    let grid = MTLSize {
+        width: n as u64,
+        height: m as u64,
+        depth: 1,
+    };
+    let tg_w = 16u64.min(n as u64);
+    let tg_h = 16u64.min(m as u64);
+    enc.dispatch_threads(
+        grid,
+        MTLSize {
+            width: tg_w,
+            height: tg_h,
+            depth: 1,
+        },
+    );
 }
 
 /// Activation kind passed to fused matmul kernels.

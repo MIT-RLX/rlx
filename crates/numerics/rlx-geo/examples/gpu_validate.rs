@@ -364,7 +364,7 @@ fn validate_flip_marking(device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
         }
     }
     // GS Delaunay -> scramble into a non-Delaunay seed -> the mesh a flip round sees.
-    let (mesh, _) = flip_all_convex_once(triangulate(&pts), &pts);
+    let (mesh, _) = flip_all_convex_once(triangulate(&pts).unwrap(), &pts);
     let quads = interior_quads(&mesh, &pts); // [t0v0, t0v1, t0v2, q] per interior edge
     let m = quads.len();
 
@@ -460,7 +460,7 @@ fn validate_dual_seed(device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
         v.sort_unstable();
         v
     };
-    let truth: HashSet<[u32; 3]> = triangulate(&pts).into_iter().map(canon).collect();
+    let truth: HashSet<[u32; 3]> = triangulate(&pts).unwrap().into_iter().map(canon).collect();
     let dset: HashSet<[u32; 3]> = dual.iter().map(|&t| canon(t)).collect();
     let correct = dset.iter().filter(|t| truth.contains(*t)).count();
     let precision = correct as f64 / dset.len().max(1) as f64;
@@ -528,18 +528,31 @@ fn illegal_count(points: &[[i32; 2]], tris: &[[u32; 3]]) -> Result<usize, String
 // The whole loop on-device: scramble a mesh, run flip_to_delaunay_gpu, and check
 // the downloaded result is a valid Delaunay mesh matching the CPU reference.
 fn validate_flip_gpu(device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
-    // Larger mesh + near-max span, to exercise the O(T) edge-hash and the i64
-    // in-circle bound (span ≤ 29 609).
-    let mut rng = Lcg(0x0ce0_f11du64);
+    // Test across coordinate spans: the small one fits the i32-inner arithmetic,
+    // but the large ones (> ~32k) need the i64-inner / i128-determinant path —
+    // they oscillated forever with the old i32 in-circle. Near-max exercises the
+    // full i128 range. n < 2^16 for the 16-bit edge hash.
+    let mut failures = 0u32;
+    for span in [29_000i32, 100_000, 1_000_000, MAX_FLIP_SPAN] {
+        failures += check_flip_span(device, queue, span);
+    }
+    failures
+}
+
+/// Largest span the GPU flip is certified for (matches `MAX_COORDINATE_SPAN`).
+const MAX_FLIP_SPAN: i32 = 1_940_470_527;
+
+fn check_flip_span(device: &wgpu::Device, queue: &wgpu::Queue, span: i32) -> u32 {
+    let mut rng = Lcg(0x0ce0_f11du64 ^ (span as u64));
     let mut seen = std::collections::HashSet::new();
     let mut pts: Vec<[i32; 2]> = Vec::new();
     while pts.len() < 1500 {
-        let p = [rng.coord(29_000), rng.coord(29_000)];
+        let p = [rng.coord(span), rng.coord(span)];
         if seen.insert(p) {
             pts.push(p);
         }
     }
-    let reference = triangulate(&pts);
+    let reference = triangulate(&pts).unwrap();
     // Complete valid seed (hull included) built by the convex-hull sweep.
     let seed = hull_seed(&pts);
     let seed_bad = illegal_count(&pts, &seed).expect("seed invalid");
@@ -557,22 +570,21 @@ fn validate_flip_gpu(device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
     match illegal_count(&pts, &out) {
         Ok(0) if complete => {
             println!(
-                "flip loop:    hull_seed -> GPU flip -> COMPLETE Delaunay  ({} tris, all {} pts, seed had {seed_bad} illegal) OK",
-                out.len(),
-                pts.len()
+                "flip loop (span {span:>10}): GPU flip -> COMPLETE Delaunay ({} tris, seed had {seed_bad} illegal) OK",
+                out.len()
             );
             0
         }
         Ok(bad) => {
             println!(
-                "flip loop:    incomplete/invalid ({bad} illegal, {} tris vs {} ref, complete={complete})",
+                "flip loop (span {span:>10}): INVALID ({bad} illegal, {} tris vs {} ref, complete={complete})",
                 out.len(),
                 reference.len()
             );
             1
         }
         Err(e) => {
-            println!("flip loop:    invalid mesh: {e}");
+            println!("flip loop (span {span:>10}): invalid mesh: {e}");
             1
         }
     }

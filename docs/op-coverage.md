@@ -50,18 +50,18 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 
 ### Coverage at a glance
 
-| Backend | Ops claimed | of 173 |
+| Backend | Ops claimed | of 183 |
 |---------|------------:|-------:|
 | CPU  | **173** | reference (full OpKind surface; fused/control expand before thunks) |
-| MLX  | **173** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
-| MTL  | **173** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
-| WGPU  | **173** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
-| CUDA  | **173** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
-| ROCm  | **173** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
-| TPU  | **170** | full OpKind surface (HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd/AxialRope/Im2Col/ConvTranspose/PerTensor-FP8 Scaled* + host for SPD / splat / FftButterfly / DenseSolve) |
-| ANE  | **171** | static inference compiler + hybrid host segments (linalg batch host-staged; `CumProd`/`CumMax` still lag) |
+| MLX  | **168** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
+| MTL  | **176** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
+| WGPU  | **169** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
+| CUDA  | **171** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
+| ROCm  | **169** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
+| TPU  | **163** | full OpKind surface (HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd/AxialRope/Im2Col/ConvTranspose/PerTensor-FP8 Scaled* + host for SPD / splat / FftButterfly / DenseSolve) |
+| ANE  | **165** | static inference compiler + hybrid host segments (linalg batch host-staged; `CumProd`/`CumMax` still lag) |
 
-*(Total **173** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
+*(Total **183** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
 
 **Also at ~169 (EXTRA backends, not in the 8-column matrix):** **Vulkan** and **OneAPI** — claim parity with CUDA; native SPIR-V/OpenCL for norms/fused/RNN/vision-bwd/FFT/I8 quant + host/unfuse for specialty ops.
 
@@ -127,6 +127,7 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `DenseSolve` | Dense linear solve `Ax=b` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `BatchedDenseSolve` | Batched dense linear solve | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GroupedMatMul` | MoE grouped matmul (per-token expert routing) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `ScaledGroupedMatMul` | Native low-precision (MXFP4) *grouped* MoE decode-GEMM — expert-indexed `ScaledMatMul` (native CPU + CUDA/ROCm decode-GEMM + wgpu WGSL + Vulkan GLSL; **all other backends via `LowerScaledGroupedMatMul` decomposition**). Claim columns mark the native fused path. | ✅ |  |  | ✅ |  | ✅ | ✅ |  |
 | `LoraMatMul` | Base matmul + low-rank `A·B` LoRA update (native CPU/MLX/ANE; **all backends via decomposition**) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Cholesky` | Cholesky factor `A = L·Lᵀ` (LAPACK `potrf`; **host-staged to CPU LAPACK, bit-exact on every GPU backend** — the linalg pattern). Backward ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TriangularSolve` | Solve `op(A)·X = B` with `A` triangular (`lower`/`transpose`; BLAS `trsm`; host-staged). Backward ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -164,18 +165,18 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `Expand` | Broadcast-expand singleton dims | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Gather` | Gather rows/elements by index | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Reverse` | Batch-general flip along axes (`[batch,seq,…]` seq-reverse) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Slice` | Strided slice `x[start:*:step]` (neg step ok; native CUDA on-GPU f32 kernel + host fallback; MTL host-staged; others decompose to narrow/reverse/gather via `LowerSlice`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Pad` | Constant/reflect/replicate/circular pad (native CUDA on-GPU f32 kernel + host fallback; MTL host-staged; others decompose via `LowerPad`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Clamp` | Elementwise `clamp(x,min,max)` (decomposes to `max`/`min` via `LowerStructural`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Tile` | Per-axis tiling (decomposes to `concat` via `LowerStructural`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Trilu` | Upper/lower triangle mask over last 2 axes (decomposes to mul-by-mask) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Slice` | Strided slice `x[start:*:step]` (neg step ok; native CUDA on-GPU f32 kernel + host fallback; MTL host-staged; others decompose to narrow/reverse/gather via `LowerSlice`) |  | ✅ |  |  |  | ✅ |  |  |
+| `Pad` | Constant/reflect/replicate/circular pad (native CUDA on-GPU f32 kernel + host fallback; MTL host-staged; others decompose via `LowerPad`) |  | ✅ |  |  |  | ✅ |  |  |
+| `Clamp` | Elementwise `clamp(x,min,max)` (decomposes to `max`/`min` via `LowerStructural`) |  |  |  |  |  |  |  |  |
+| `Tile` | Per-axis tiling (decomposes to `concat` via `LowerStructural`) |  |  |  |  |  |  |  |  |
+| `Trilu` | Upper/lower triangle mask over last 2 axes (decomposes to mul-by-mask) |  |  |  |  |  |  |  |  |
 | `ScatterAdd` | Scatter-add into output by index | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterNd` | ONNX ScatterND (data+indices+updates, reduction) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ScatterElements` | ONNX ScatterElements (axis + reduction) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GatherNd` | ONNX GatherND (batch_dims) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `GatherElements` | ONNX GatherElements / take_along_axis | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ResizeNearest2x` | 2× nearest-neighbour upsample | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Interpolate3d` | Nearest NCDHW resample to explicit size | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Interpolate3d` | Nearest NCDHW resample to explicit size | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
 
 ### Reduction & indexing
 
@@ -184,8 +185,8 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 | `Reduce` | Axis reduction — see [ReduceOp](#reduceop) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Softmax` | Softmax along an axis | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Cumsum` | Cumulative sum | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `CumProd` | Cumulative product — native O(L) scan on CPU/Metal/CUDA/ROCm (`cum_scan` kernel), WGPU (WGSL), MLX (`mc::cumprod`), Vulkan (SPIR-V), TPU (reduce-window ×), oneAPI (host-eval like cumsum); WebGL/ANE decompose to on-device masked reduce-prod. VJP `cumsum_backward(dy·y)/x` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `CumMax` | Cumulative maximum — native O(L) scan on the same backends (`mc::cummax`, reduce-window max); WebGL/ANE decompose to masked reduce-max. VJP routes to argmax, ties split | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `CumProd` | Cumulative product — native O(L) scan on CPU/Metal/CUDA/ROCm (`cum_scan` kernel), WGPU (WGSL), MLX (`mc::cumprod`), Vulkan (SPIR-V), TPU (reduce-window ×), oneAPI (host-eval like cumsum); WebGL/ANE decompose to on-device masked reduce-prod. VJP `cumsum_backward(dy·y)/x` | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
+| `CumMax` | Cumulative maximum — native O(L) scan on the same backends (`mc::cummax`, reduce-window max); WebGL/ANE decompose to masked reduce-max. VJP routes to argmax, ties split | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
 | `ArgMax` | Index of max along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ArgMin` | Index of min along axis (f32-encoded) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TopK` | Top-k values/indices | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -328,11 +329,11 @@ escape legalize). Vulkan / OneAPI also claim Scan* (host / packed).
 | `ReluBackward` | ReLU backward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `ActivationBackward` | Generic activation backward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `MaxPool2dBackward` | Max-pool backward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `MaxPool3dBackward` | Max-pool 3D backward (NCDHW) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `MaxPool3dBackward` | Max-pool 3D backward (NCDHW) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
 | `Conv2dBackwardInput` | Conv2d grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Conv2dBackwardWeight` | Conv2d grad w.r.t. weight | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Conv3dBackwardInput` | Conv3d grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `Conv3dBackwardWeight` | Conv3d grad w.r.t. weight | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `Conv3dBackwardInput` | Conv3d grad w.r.t. input | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
+| `Conv3dBackwardWeight` | Conv3d grad w.r.t. weight | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  |
 | `SoftmaxCrossEntropy` | Dense/soft-label softmax cross-entropy | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `SoftmaxCrossEntropyWithLogits` | Fused softmax + cross-entropy loss | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `SoftmaxCrossEntropyBackward` | Backward of softmax cross-entropy | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |

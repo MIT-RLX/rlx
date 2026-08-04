@@ -9,6 +9,17 @@ use rlx_opt::memory::{self, MemoryPlan};
 // backend (CPU, Metal, future CUDA/wgpu/WASM) shares one implementation.
 use rlx_driver::arena::{read_typed_to_f32, write_typed_from_f32};
 
+// `madvise(2)` — used by `release_scratch_pages` to return idle scratch pages to
+// the OS without pulling in the whole `libc` crate.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn madvise(
+        addr: *mut core::ffi::c_void,
+        len: usize,
+        advice: core::ffi::c_int,
+    ) -> core::ffi::c_int;
+}
+
 pub struct CpuBackend;
 
 impl Backend for CpuBackend {
@@ -73,7 +84,17 @@ impl Backend for CpuBackend {
         };
 
         // Re-plan after precision rewrites (may change dtypes / sizes).
-        let plan = memory::plan_memory_aligned(&exec_graph, cfg.arena_alignment);
+        // CPU runs the schedule strictly in-order, so it does NOT need the
+        // conservative `pin_output_ancestors` guard (which pins the whole output
+        // ancestor DAG to the last step and destroys slot reuse on deep
+        // feed-forward graphs — the supertonic vector_estimator/vocoder arenas
+        // ballooned to 1.36 GB / 1.17 GB from it). `plan_memory_native` keeps the
+        // same Native dtype widths but only pins when the graph has host indexing
+        // (Scatter/Gather), so ordinary graphs get full liveness-based reuse.
+        let plan = memory::plan_memory_native(&exec_graph, cfg.arena_alignment);
+        if rlx_ir::env::flag("RLX_CPU_ARENA_REPORT") {
+            eprint!("[rlx-arena-report]\n{}", plan.report());
+        }
         if cfg.verbose >= 1 {
             eprintln!(
                 "[rlx] arena: {} bytes, {} buffers, alignment: {}",
@@ -129,8 +150,10 @@ impl Backend for CpuBackend {
             None
         };
         // LegalizeBroadcast may insert Expand nodes — must replan; the
-        // embedded LIR buffer map is from before legalization.
-        let plan = memory::plan_memory_aligned(&exec_graph, alignment);
+        // embedded LIR buffer map is from before legalization. In-order CPU
+        // executor → `plan_memory_native` (unpinned unless host indexing) for
+        // full liveness slot reuse; see the note at the other plan site above.
+        let plan = memory::plan_memory_native(&exec_graph, alignment);
         #[cfg(not(target_arch = "wasm32"))]
         let t_plan = t1.map(|t| t.elapsed());
         #[cfg(not(target_arch = "wasm32"))]
@@ -317,11 +340,50 @@ struct CpuExecutable {
 unsafe impl Send for CpuExecutable {}
 
 impl CpuExecutable {
+    /// `RLX_CPU_ARENA_REPORT=1`: attribute the arena's resident bytes to nodes,
+    /// split persistent (Param/Input/Constant — live the whole run) vs scratch,
+    /// so a bloated footprint can be traced to specific buffers.
+    fn arena_report_if_requested(&self) {
+        if !rlx_ir::env::flag("RLX_CPU_ARENA_REPORT") {
+            return;
+        }
+        let mut rows: Vec<(usize, NodeId, bool)> = Vec::new();
+        for node in self.graph.nodes() {
+            if !self.arena.has_buffer(node.id) {
+                continue;
+            }
+            let dt = self
+                .node_dtypes
+                .get(&node.id)
+                .copied()
+                .unwrap_or(DType::F32);
+            let bytes = node.shape.num_elements().unwrap_or(0) * dt.size_bytes();
+            let persistent = matches!(
+                node.op,
+                Op::Param { .. } | Op::Input { .. } | Op::Constant { .. }
+            );
+            rows.push((bytes, node.id, persistent));
+        }
+        rows.sort_by_key(|b| std::cmp::Reverse(b.0));
+        let persist: usize = rows.iter().filter(|r| r.2).map(|r| r.0).sum();
+        let scratch: usize = rows.iter().filter(|r| !r.2).map(|r| r.0).sum();
+        eprintln!(
+            "[arena-report] {} buffers, persistent={}MB scratch={}MB",
+            rows.len(),
+            persist >> 20,
+            scratch >> 20
+        );
+        for (b, id, p) in rows.iter().take(15) {
+            eprintln!("  {:>6}MB  node {:>5}  persistent={}", b >> 20, id, p);
+        }
+    }
+
     /// Per-node dump (mirror of rlx-wgpu's `RLX_WGPU_DUMP_NODES`) for
     /// cross-backend divergence bisection: each F32 node's max|x| + nonzero
     /// count in topo order. Diff against the wgpu dump to find the first
     /// diverging node. `RLX_CPU_DUMP_FLAT=<i>` also prints that flat element.
     fn dump_nodes_if_requested(&self) {
+        self.arena_report_if_requested();
         if !rlx_ir::env::flag("RLX_CPU_DUMP_NODES") {
             return;
         }
@@ -365,7 +427,9 @@ impl CpuExecutable {
                 String::new()
             };
             eprintln!(
-                "  [{i:>3}] {:?} shape={:?} max={max:.6} nonzero={nz}/{}{flat_s}",
+                "  [{i:>3}] id={:?} name={:?} {:?} shape={:?} max={max:.6} nonzero={nz}/{}{flat_s}",
+                node.id,
+                node.name,
                 node.op,
                 node.shape.dims(),
                 data.len()
@@ -549,6 +613,10 @@ impl ExecutableGraph for CpuExecutable {
 
     fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
         self.active_extent = extent;
+    }
+
+    fn release_scratch(&mut self) {
+        self.release_scratch_pages();
     }
 
     fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
@@ -756,6 +824,98 @@ impl CpuExecutable {
     /// This keeps the per-run cost O(scratch) instead of O(params): a previous
     /// version cloned + rewrote the entire (multi-GB) weight region every run,
     /// which made large models swap-thrash.
+    /// Sorted, merged persistent (param + constant) byte ranges in the arena.
+    /// These live for the whole execution; everything else is ephemeral scratch.
+    /// Shared by `restore_arena_baseline` (zeros the complement) and
+    /// `release_scratch_pages` (returns the complement's pages to the OS).
+    fn persistent_keep_ranges(&self) -> Vec<(usize, usize)> {
+        let persistent: std::collections::HashSet<NodeId> = {
+            let mut s: std::collections::HashSet<NodeId> =
+                self.param_ids.values().copied().collect();
+            for node in self.graph.nodes() {
+                if matches!(node.op, Op::Constant { .. }) {
+                    s.insert(node.id);
+                }
+            }
+            s
+        };
+        let mut keep: Vec<(usize, usize)> = self
+            .graph
+            .nodes()
+            .iter()
+            .filter_map(|node| {
+                let id = node.id;
+                if !persistent.contains(&id) || !self.arena.has_buffer(id) {
+                    return None;
+                }
+                let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
+                let nbytes = node.shape.num_elements().unwrap_or(0) * dtype.size_bytes();
+                let off = self.arena.byte_offset(id);
+                Some((off, off + nbytes))
+            })
+            .collect();
+        keep.sort_unstable();
+        keep
+    }
+
+    /// Return the ephemeral (scratch) pages of the arena to the OS via
+    /// `madvise(MADV_FREE)`, dropping resident RSS while this cached graph sits
+    /// idle between pipeline stages. The arena's virtual allocation and its param
+    /// bytes stay intact; only whole pages that fall ENTIRELY inside the scratch
+    /// complement of the param ranges are advised, so weight bytes are never
+    /// touched. The next run's `restore_arena_baseline` re-zeros scratch, so this
+    /// is purely advisory and cannot affect correctness. Call it only when the
+    /// graph won't run again immediately (e.g. a TTS pipeline finished with a
+    /// subgraph) — never between the steps of a hot loop, or the pages just fault
+    /// back in. No-op on non-unix.
+    #[allow(unused_variables)]
+    fn release_scratch_pages(&self) {
+        #[cfg(unix)]
+        {
+            // 16 KiB covers Apple-silicon pages and is a multiple of 4 KiB, so
+            // rounding to it yields valid page-aligned spans on 4 KiB hosts too.
+            const PAGE: usize = 16 * 1024;
+            let keep = self.persistent_keep_ranges();
+            let base = self.arena.raw_buf_mut_ptr() as usize;
+            let total = self.arena.size();
+            // Walk the complement of `keep` = the scratch spans.
+            let mut cursor = 0usize;
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for &(s, e) in &keep {
+                let s = s.min(total);
+                if cursor < s {
+                    spans.push((cursor, s));
+                }
+                cursor = cursor.max(e.min(total));
+            }
+            if cursor < total {
+                spans.push((cursor, total));
+            }
+            for (s, e) in spans {
+                let a = (base + s).div_ceil(PAGE) * PAGE;
+                let b = (base + e) / PAGE * PAGE;
+                if b > a {
+                    // macOS MADV_FREE (5) is lazy — it flags pages freeable but does
+                    // NOT drop them from the physical footprint until memory
+                    // pressure. MADV_FREE_REUSABLE (7) returns them to the OS now and
+                    // decrements phys_footprint (the next access refaults). Linux
+                    // MADV_DONTNEED (4) drops anonymous pages immediately and
+                    // zero-fills on refault. Override with RLX_MADV to trade footprint
+                    // for refault latency (e.g. RLX_MADV=5 for lazy/pressure-only).
+                    #[cfg(target_os = "macos")]
+                    const ADVICE: i32 = 7;
+                    #[cfg(not(target_os = "macos"))]
+                    const ADVICE: i32 = 4;
+                    let advice = std::env::var("RLX_MADV")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(ADVICE);
+                    unsafe { madvise(a as *mut core::ffi::c_void, b - a, advice) };
+                }
+            }
+        }
+    }
+
     fn restore_arena_baseline(&mut self) {
         // Persistent slots (params + constants) — never zeroed.
         let persistent: std::collections::HashSet<NodeId> = {

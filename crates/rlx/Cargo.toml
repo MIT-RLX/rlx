@@ -14,11 +14,13 @@ homepage.workspace      = true
 documentation.workspace = true
 
 [features]
-# Default to CPU only so `cargo add rlx` works on every host without
-# extra setup. `tensor` ships the NumPy-style `Tensor` DSL in the prelude
-# (a thin rlx-ir graph builder, no backend of its own). Pick GPU /
-# accelerator features explicitly.
-default = ["cpu", "tensor"]
+# Empty by default: the prelude carries only the backend-agnostic IR / opt /
+# runtime surface, and the consumer picks a backend (`cpu`, `metal`, `cuda`,
+# …) plus companion features (`tensor`, `gguf`, …) explicitly. Keeps the base
+# build lean and makes the backend choice intentional. For the everyday
+# build-a-graph-and-run-it surface use `--features cpu,tensor` (`tensor` ships
+# the NumPy-style `Tensor` DSL — a thin rlx-ir builder with no backend of its own).
+default = []
 
 # ── Backend features (delegated to rlx-runtime) ─────────────────
 # Each also turns on `rlx-tensor`'s matching `eval` backend *iff* the
@@ -59,6 +61,9 @@ sparse  = ["dep:rlx-sparse"]
 linalg  = ["dep:rlx-linalg"]
 splat   = []   # rlx-splat moved to ../rlx-splat; no-op feature (was ["dep:rlx-splat"]) — keeps cfg gates valid
 umap    = ["dep:rlx-umap"]
+# Exact-integer 2D Delaunay + discrete Voronoi (JFA) custom ops (`geo.delaunay`,
+# `geo.voronoi_grid`) — the CPU op-registration surface (`rlx::geo::register`).
+geo     = ["dep:rlx-geo"]
 optim   = ["dep:rlx-optim"]
 # In-graph collective ops (`rlx::collectives`) + the unified `rlx::distributed`
 # front door. The ship-graph worker/coordinator + heterogeneous-placement API
@@ -90,26 +95,27 @@ edge          = ["cpu", "cortexm", "fpga"]
 all-cpu       = ["cpu", "gguf", "linalg"]
 
 [dependencies]
-rlx-ir      = { path = "../core/rlx-ir",      version = "0.2.14" }
-rlx-tensor  = { path = "../core/rlx-tensor", version = "0.2.14", optional = true }
-rlx-opt     = { path = "../core/rlx-opt",     version = "0.2.14" }
-rlx-driver  = { path = "../core/rlx-driver",  version = "0.2.14" }
-rlx-macros  = { path = "../core/rlx-macros",  version = "0.2.14" }
+rlx-ir      = { workspace = true }
+rlx-tensor  = { workspace = true, optional = true }
+rlx-opt     = { workspace = true }
+rlx-driver  = { workspace = true }
+rlx-macros  = { workspace = true }
 rlx-runtime = { path = "../core/rlx-runtime", version = "0.2.14", default-features = false }
-rlx-collectives = { path = "../core/rlx-collectives", version = "0.2.14", optional = true }
-rlx-gguf     = { path = "../io/rlx-gguf",    version = "0.2.14", optional = true }
-rlx-gguf-convert = { path = "../io/rlx-gguf-convert", version = "0.2.14", optional = true }
-rlx-bench   = { path = "../tooling/rlx-bench",   version = "0.2.14", optional = true }
-rlx-sparse  = { path = "../numerics/rlx-sparse",  version = "0.2.14", optional = true }
-rlx-linalg  = { path = "../numerics/rlx-linalg",  version = "0.2.14", optional = true }
+rlx-collectives = { workspace = true, optional = true }
+rlx-gguf     = { workspace = true, optional = true }
+rlx-gguf-convert = { workspace = true, optional = true }
+rlx-bench   = { workspace = true, optional = true }
+rlx-sparse  = { workspace = true, optional = true }
+rlx-linalg  = { workspace = true, optional = true }
 # rlx-splat   = { path = "../rlx-splat",   version = "0.2.14", optional = true, default-features = false, features = ["cpu", "core"] }
-rlx-umap    = { path = "../numerics/rlx-umap",    version = "0.2.14", optional = true, default-features = false, features = ["cpu", "graph"] }
-rlx-optim   = { path = "../core/rlx-optim",   version = "0.2.14", optional = true }
+rlx-umap    = { path = "../numerics/rlx-umap", version = "0.2.14", optional = true, default-features = false, features = ["cpu", "graph"] }
+rlx-geo     = { path = "../numerics/rlx-geo", version = "0.2.14", optional = true, default-features = false, features = ["cpu"] }
+rlx-optim   = { workspace = true, optional = true }
 # rlx-cortexm is `no_std` by default; we want the host-side parity
 # kernels (the `std` feature) when re-exported from the prelude.
 rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.14", optional = true, default-features = false, features = ["std"] }
-rlx-fpga    = { path = "../backends/rlx-fpga",    version = "0.2.14", optional = true }
-rlx-onnx    = { path = "../io/rlx-onnx",    version = "0.2.14", optional = true, default-features = true }
+rlx-fpga    = { workspace = true, optional = true }
+rlx-onnx    = { path = "../io/rlx-onnx", version = "0.2.14", optional = true, default-features = true }
 # `rlx::Result` / `rlx::Error` type aliases. Every workspace crate
 # already pulls anyhow in transitively (rlx-runtime, rlx-gguf), so this
 # adds no real bytes — just makes the alias
@@ -125,6 +131,6 @@ workspace = true
 # browsing https://docs.rs/rlx see the full IR / opt / runtime API
 # along with `rlx::gguf`, `rlx::bench`, `rlx::sparse`, `rlx::linalg`.
 [package.metadata.docs.rs]
-features      = ["cpu", "tensor", "gpu", "gguf", "bench", "sparse", "linalg", "cortexm", "fpga", "optim", "distributed"]
+features      = ["cpu", "tensor", "gpu", "gguf", "bench", "sparse", "linalg", "geo", "cortexm", "fpga", "optim", "distributed"]
 rustdoc-args  = ["--cfg", "docsrs"]
 all-features  = false

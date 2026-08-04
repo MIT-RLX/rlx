@@ -63,6 +63,18 @@ pub fn resolve_extent(dim: Option<i64>, dynamic_dim: i64) -> i64 {
     }
 }
 
+/// Upper bound on the element count synthesized for a single zero-input tensor.
+///
+/// The dims here come straight from the (untrusted) ONNX input `value_info`, and
+/// this count directly sizes a `vec![0; n]` in [`zero_tensor_sized`]. Without a
+/// ceiling, a hostile `.onnx` declaring a giant static input dim would drive a
+/// multi-GB up-front allocation (OOM/DoS) the moment a tool synthesizes zero
+/// inputs (e.g. the `rlx-onnx` run binary). `checked_mul` already rejects i64
+/// overflow; this rejects the still-enormous-but-non-overflowing case. 1 Gi
+/// elements (4 GiB as f32 / 8 GiB as i64) is far above any legitimate single
+/// input tensor, so real models are unaffected — we error cleanly instead.
+const MAX_ZERO_INPUT_ELEMENTS: i64 = 1 << 30;
+
 pub fn num_elements_sized(desc: &IoDesc, dynamic_dim: i64) -> Result<usize> {
     if desc.shape.is_empty() {
         return Ok(1);
@@ -73,6 +85,14 @@ pub fn num_elements_sized(desc: &IoDesc, dynamic_dim: i64) -> Result<usize> {
         n = n
             .checked_mul(e)
             .with_context(|| format!("shape overflow for '{}': {:?}", desc.name, desc.shape))?;
+    }
+    if n > MAX_ZERO_INPUT_ELEMENTS {
+        bail!(
+            "rlx-onnx: refusing to synthesize {n} zero elements for '{}' (shape {:?}) — exceeds \
+             the {MAX_ZERO_INPUT_ELEMENTS}-element cap; supply this input explicitly",
+            desc.name,
+            desc.shape
+        );
     }
     Ok(n as usize)
 }

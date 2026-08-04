@@ -78,8 +78,47 @@ pub(crate) fn compile(ctx: &Arc<RocmContext>, src: &str, entry: &str) -> HipKern
             .unwrap_or_else(|e| panic!("rlx-rocm: hipRTC compile failed for {entry}: {e}"))
     };
 
+    // Kernel-inspection hook: with `RLX_DUMP_KERNELS=<dir>` set, snapshot the
+    // shared `.cu` source hipRTC compiled plus the arch-specific `.hsaco` code
+    // object, so `tools/kernel-inspect/kinspect.py` can produce GCN ISA /
+    // VGPR-SGPR-LDS / occupancy reports on the AMD rig. Off by default; the
+    // twin of the rlx-cuda hook (NVRTC PTX there, hipRTC code object here).
+    if let Some(dir) = rlx_ir::env::var("RLX_DUMP_KERNELS") {
+        dump_kernel(&dir, entry, &arch, src, &hsaco);
+    }
+
     HipKernel::from_hsaco(&ctx.runtime, &hsaco, entry)
         .unwrap_or_else(|e| panic!("rlx-rocm: hipModuleLoadData failed for {entry}: {e}"))
+}
+
+/// Dump one hipRTC translation unit for offline kernel inspection. Writes
+/// `<dir>/cu/<entry>.cu` (the shared source hipRTC compiled) and
+/// `<dir>/codeobj/<entry>.hsaco` (the arch-specific AMD code object), and
+/// appends one JSON line to `<dir>/manifest.jsonl`. `arch` (gfx908/gfx1100/…)
+/// is recorded because an `.hsaco` is only meaningful for its target GPU.
+/// Best-effort; dump failures never disturb the compile.
+fn dump_kernel(dir: &str, entry: &str, arch: &str, src: &str, hsaco: &[u8]) {
+    use std::io::Write;
+    let base = std::path::Path::new(dir);
+    let cu_dir = base.join("cu");
+    let co_dir = base.join("codeobj");
+    let _ = std::fs::create_dir_all(&cu_dir);
+    let _ = std::fs::create_dir_all(&co_dir);
+    let _ = std::fs::write(cu_dir.join(format!("{entry}.cu")), src);
+    let _ = std::fs::write(co_dir.join(format!("{entry}.hsaco")), hsaco);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.join("manifest.jsonl"))
+    {
+        let _ = writeln!(
+            f,
+            "{{\"entry\":\"{entry}\",\"arch\":\"{arch}\",\"src_hash\":\"{:016x}\",\"src_bytes\":{},\"code_bytes\":{}}}",
+            fnv1a64(src),
+            src.len(),
+            hsaco.len()
+        );
+    }
 }
 
 macro_rules! kernel_cache {
@@ -173,6 +212,12 @@ kernel_cache!(
     "scaled_matmul_decode"
 );
 kernel_cache!(
+    SCALED_GROUPED_MATMUL_DECODE,
+    scaled_grouped_matmul_decode_kernel,
+    SCALED_LOWP_GENERAL_CU,
+    "scaled_grouped_matmul_decode"
+);
+kernel_cache!(
     MXFP4X2_DEQUANT,
     mxfp4x2_dequant_kernel,
     SCALED_LOWP_GENERAL_CU,
@@ -202,6 +247,12 @@ kernel_cache!(
     matmul_mfma_kernel,
     MATMUL_MFMA_CU,
     "matmul_mfma"
+);
+kernel_cache!(
+    GEMV_SPLITK,
+    gemv_splitk_kernel,
+    GEMV_SPLITK_CU,
+    "gemv_splitk"
 );
 kernel_cache!(COMPARE, compare_kernel, COMPARE_CU, "compare");
 kernel_cache!(WHEREK, where_kernel, WHERE_CU, "where_select");
@@ -429,12 +480,46 @@ kernel_cache!(
     "dequant_matmul_mlx_gemm"
 );
 kernel_cache!(
+    DEQUANT_GROUPED_MATMUL_MLX_MXFP4,
+    dequant_grouped_matmul_mlx_mxfp4_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_grouped_matmul_mlx_mxfp4"
+);
+kernel_cache!(
+    DEQUANT_GROUPED_MATMUL_MLX_MXFP4_AMORT,
+    dequant_grouped_matmul_mlx_mxfp4_amort_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_grouped_matmul_mlx_mxfp4_amort"
+);
+kernel_cache!(
     DEQUANT_GGUF,
     dequant_gguf_kernel,
     DEQUANT_GGUF_CU,
     "dequant_gguf"
 );
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
+// On-device Philox4×32-10 RNG (shared `rng_philox.cu`, bit-matched to
+// `rlx_ir::Philox4x32`). Three entry points share one source; each gets its
+// own hipRTC cache. Replaces the D2H→CPU→H2D `rng_host` bubble for the
+// Philox / Zero policies (Ort / Bnns still host-fill).
+kernel_cache!(
+    RNG_NORMAL_PHILOX,
+    rng_normal_philox_kernel,
+    RNG_PHILOX_CU,
+    "rng_normal_philox"
+);
+kernel_cache!(
+    RNG_UNIFORM_PHILOX,
+    rng_uniform_philox_kernel,
+    RNG_PHILOX_CU,
+    "rng_uniform_philox"
+);
+kernel_cache!(
+    RNG_FILL_ZERO,
+    rng_fill_zero_kernel,
+    RNG_PHILOX_CU,
+    "rng_fill_zero"
+);
 kernel_cache!(
     SELECTIVE_SCAN,
     selective_scan_kernel,

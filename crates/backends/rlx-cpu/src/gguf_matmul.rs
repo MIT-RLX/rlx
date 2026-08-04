@@ -931,6 +931,51 @@ mod tests {
         assert!(ms < 50.0, "serial unexpectedly slow: {ms}ms");
     }
 
+    /// The decisive decode question: does the int8 Q4_K GEMV (the SDOT-
+    /// optimizable path) actually BEAT cached-f32-BLAS (Accelerate = AMX), which
+    /// is what `prefer_cached_blas` routes real LLM Q4_K matmuls to? If int8
+    /// already wins, an SDOT speedup is a real decode lever; if Accelerate wins,
+    /// the framework's routing is already optimal and SDOT is moot.
+    ///   cargo test -p rlx-cpu q4k_int8_vs_cached_blas -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual kernel timing"]
+    fn q4k_int8_vs_cached_blas() {
+        use crate::dequant_cache::clear_dequant_cache;
+        use std::time::Instant;
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            for _ in 0..3 {
+                f();
+            }
+            let it = 30;
+            let t = Instant::now();
+            for _ in 0..it {
+                f();
+            }
+            eprintln!(
+                "    {label}: {:.3} ms",
+                t.elapsed().as_secs_f64() * 1e3 / it as f64
+            );
+        };
+        for (k, n) in [(1024usize, 1024usize), (1024, 3072), (1024, 151936)] {
+            let w: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+                .collect();
+            let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q4K).unwrap();
+            let x: Vec<f32> = (0..k).map(|i| 0.001 * i as f32 - 0.5).collect();
+            let mut out = vec![0f32; n];
+            eprintln!("decode GEMV k={k} n={n}:");
+            // int8 Q4_K GEMV (serial int8 Q8_K dots — the path SDOT would speed up).
+            time("int8 q4k gemv (serial)", &mut || {
+                super::q4k_gemv_rowmajor(&x, &packed, &mut out, k)
+            });
+            // cached-f32-BLAS = what the model actually runs (Accelerate/AMX).
+            clear_dequant_cache();
+            time("cached f32 BLAS (Accel)", &mut || {
+                gguf_matmul_bt_cached(&x, &packed, &mut out, 1, k, n, QuantScheme::GgufQ4K, 0)
+            });
+        }
+    }
+
     #[test]
     fn dispatch_matches_legacy_q8k_prefill() {
         use crate::dequant_cache::clear_dequant_cache;

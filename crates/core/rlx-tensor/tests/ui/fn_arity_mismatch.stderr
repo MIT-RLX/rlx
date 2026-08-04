@@ -1,0 +1,5 @@
+error: fn `block` takes 2 argument(s), but 1 were given
+ --> tests/ui/fn_arity_mismatch.rs:7:17
+  |
+7 |         let o = block(a);   // block takes 2 args
+  |                 ^^^^^

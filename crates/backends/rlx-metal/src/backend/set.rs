@@ -38,6 +38,27 @@ impl MetalExecutable {
         }
     }
 
+    /// Incrementally write `data` into a named param starting `byte_offset` bytes
+    /// into its storage (raw bytes, no dtype widen). Returns true if written. Used
+    /// to upload ONE changed slot of a large packed-expert residency buffer instead
+    /// of re-copying the whole buffer every step ([`PagedGroupedMoe`] paging). Only
+    /// the arena-resident path is supported (unified memory, zero-copy); params
+    /// parked in a separate weight MTLBuffer return false so the caller re-uploads
+    /// whole. No-op (false) for an unknown name.
+    pub fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        let Some(&id) = self.param_ids.get(name) else {
+            return false;
+        };
+        if self.weight_slots.contains_key(&id) {
+            return false; // separate weight buffer — caller falls back to whole upload
+        }
+        if self.arena.has_buffer(id) {
+            self.arena.write_bytes_at(id, byte_offset, data);
+            return true;
+        }
+        false
+    }
+
     /// True when named param storage is native F16 (AMP rewrite or
     /// F16 weight slot). Used by `set_param_typed` to decide whether
     /// F16 host bytes can be copied without an F32 widen.

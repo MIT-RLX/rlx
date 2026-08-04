@@ -435,6 +435,13 @@ pub struct Instr {
     /// XLA FFT fields (`fft_type`, `fft_length`, transform axes in `dimensions`).
     pub fft_type: i32,
     pub fft_length: Vec<i64>,
+
+    /// Per-operand `PrecisionConfig.Precision` (DEFAULT=0, HIGH=1, HIGHEST=2)
+    /// for `dot`/`convolution`. Empty ⇒ no `precision_config` (XLA default,
+    /// which on TPU is a single bf16 pass). Set to HIGHEST on dequant-matmul
+    /// dots so the f32 weights the dequant just produced aren't truncated to
+    /// bf16 in the matmul.
+    pub operand_precision: Vec<i32>,
 }
 
 impl Default for Shape {
@@ -521,6 +528,10 @@ impl Instr {
             dynamic_slice_sizes: self.dynamic_slice_sizes.clone(),
             fft_type: self.fft_type,
             fft_length: self.fft_length.clone(),
+            precision_config: (!self.operand_precision.is_empty()).then(|| xla::PrecisionConfig {
+                operand_precision: self.operand_precision.clone(),
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -736,6 +747,19 @@ impl Computation {
         let mut i = Instr::new(0, "dot".into(), "dot", shape);
         i.operand_ids = vec![a, b];
         i.dot_dim_numbers = Some(dn);
+        self.add_instr(i)
+    }
+
+    /// `dot_general` pinned to `PrecisionConfig::HIGHEST` on both operands —
+    /// forces XLA to run the matmul at full f32 (bf16x6 / f32 pass) instead of
+    /// the TPU default single bf16 pass. Used for dequant-matmul dots so the
+    /// f32 weights the dequant produced aren't silently truncated to bf16.
+    pub fn dot_general_highest(&self, a: i64, b: i64, dn: DotDimNumbers, shape: Shape) -> i64 {
+        let mut i = Instr::new(0, "dot".into(), "dot", shape);
+        i.operand_ids = vec![a, b];
+        i.dot_dim_numbers = Some(dn);
+        // PrecisionConfig::Precision::HIGHEST = 2, one entry per operand.
+        i.operand_precision = vec![2, 2];
         self.add_instr(i)
     }
 

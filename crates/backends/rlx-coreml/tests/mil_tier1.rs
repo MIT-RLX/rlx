@@ -62,6 +62,7 @@ fn lowers_sliding_window_attention() {
         rlx_ir::Op::Attention {
             num_heads: 2,
             head_dim: 8,
+            v_head_dim: None,
             mask_kind: MaskKind::SlidingWindow(2),
             score_scale: None,
             attn_logit_softcap: None,

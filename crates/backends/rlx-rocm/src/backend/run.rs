@@ -106,9 +106,15 @@ impl RocmExecutable {
         };
 
         // hipGraph fast path: replay the previously-captured schedule.
+        // RNG steps are capture-safe only under an on-device policy (Philox /
+        // Zero); `set_rng` drops the captured graph when the policy changes.
+        let rng_on_device = matches!(
+            self.rng.read().expect("rng lock").backend,
+            rlx_ir::RngBackend::Philox | rlx_ir::RngBackend::Zero
+        );
         let graph_eligible = active.is_none()
             && self.exec_mode == ExecMode::Graph
-            && schedule_graph_capture_safe(&self.schedule);
+            && schedule_graph_capture_safe(&self.schedule, rng_on_device);
         let do_replay = graph_eligible && self.captured_graph.is_some();
         let do_capture = graph_eligible && self.captured_graph.is_none();
         if do_replay {
@@ -138,7 +144,45 @@ impl RocmExecutable {
         let mut rr_cursor: usize = 0;
 
         // Dispatch each step on the default stream.
+        // RLX_ROCM_TRACE_STEPS: eprintln each step (synced) so a crashing kernel's
+        // last line names the exact op — a tool-free tracer for hosts without rocgdb.
+        let trace_steps = rlx_ir::env::flag("RLX_ROCM_TRACE_STEPS");
+        // RLX_ROCM_PROFILE_STEPS: attribute wall time to each op KIND by syncing
+        // between steps (serial, so totals inflate vs the async run, but the
+        // per-kind split + µs/launch reveal WHERE the launch-bound time goes).
+        let profile_steps = rlx_ir::env::flag("RLX_ROCM_PROFILE_STEPS");
+        let mut prof: std::collections::HashMap<String, (u64, u128)> =
+            std::collections::HashMap::new();
+        let mut prof_last = std::time::Instant::now();
+        let mut prof_prev: Option<String> = None;
         for step in &self.schedule {
+            if profile_steps {
+                unsafe {
+                    let _ = (self.ctx.runtime.hip_stream_sync)(stream);
+                }
+                let now = std::time::Instant::now();
+                if let Some(prev) = prof_prev.take() {
+                    let e = prof.entry(prev).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += now.duration_since(prof_last).as_nanos();
+                }
+                prof_last = now;
+                prof_prev = Some(
+                    step_name(step)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("?")
+                        .to_string(),
+                );
+            }
+            if trace_steps {
+                // Sync first so a *previous* step's async fault surfaces here (crashing
+                // before we print the next name) → the last printed line IS the culprit.
+                unsafe {
+                    let _ = (self.ctx.runtime.hip_stream_sync)(stream);
+                }
+                eprintln!("[rocm-step] {}", step_name(step));
+            }
             let _roctx = crate::roctx::scoped_range(step_name(step));
             // PLAN L3: cross-backend Perfetto trace; no-op when env
             // var RLX_TRACE_PERFETTO unset.
@@ -981,17 +1025,64 @@ impl RocmExecutable {
                     op_seed,
                 } => {
                     let opts = *self.rng.read().expect("rng lock");
-                    crate::rng_host::run_rng_normal(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        *dst_byte_off as usize,
-                        *len as usize,
-                        *mean,
-                        *scale,
-                        *key,
-                        *op_seed,
-                        opts,
-                    );
+                    match opts.backend {
+                        // On-device Philox / Zero fills — no host round-trip,
+                        // hipGraph-capture-safe (see `graph_capture_safe`).
+                        rlx_ir::RngBackend::Philox => {
+                            let seed = rlx_ir::combine_seed(opts.seed, *key);
+                            let seed_lo = (seed & 0xFFFF_FFFF) as u32;
+                            let seed_hi = (seed >> 32) as u32;
+                            let dst_off = *dst_byte_off / 4;
+                            let len = *len;
+                            let mean = *mean;
+                            let scale = *scale;
+                            let kernel = rng_normal_philox_kernel(&self.ctx);
+                            let (grid, block) = dispatch_grid_1d(len, 256);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    &dst_off,
+                                    &len,
+                                    &mean,
+                                    &scale,
+                                    &seed_lo,
+                                    &seed_hi
+                                ]
+                            );
+                        }
+                        rlx_ir::RngBackend::Zero => {
+                            let dst_off = *dst_byte_off / 4;
+                            let len = *len;
+                            let kernel = rng_fill_zero_kernel(&self.ctx);
+                            let (grid, block) = dispatch_grid_1d(len, 256);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [&mut arena_ptr, &dst_off, &len]
+                            );
+                        }
+                        // Ort / Bnns: ONNX-Runtime / Apple-BNNS parity streams
+                        // have no on-device kernel → host fill (D2H→CPU→H2D).
+                        rlx_ir::RngBackend::Ort | rlx_ir::RngBackend::Bnns => {
+                            crate::rng_host::run_rng_normal(
+                                &self.ctx,
+                                &self.arena.buffer,
+                                *dst_byte_off as usize,
+                                *len as usize,
+                                *mean,
+                                *scale,
+                                *key,
+                                *op_seed,
+                                opts,
+                            );
+                        }
+                    }
                 }
                 Step::RngUniform {
                     dst_byte_off,
@@ -1002,17 +1093,60 @@ impl RocmExecutable {
                     op_seed,
                 } => {
                     let opts = *self.rng.read().expect("rng lock");
-                    crate::rng_host::run_rng_uniform(
-                        &self.ctx,
-                        &self.arena.buffer,
-                        *dst_byte_off as usize,
-                        *len as usize,
-                        *low,
-                        *high,
-                        *key,
-                        *op_seed,
-                        opts,
-                    );
+                    match opts.backend {
+                        rlx_ir::RngBackend::Philox => {
+                            let seed = rlx_ir::combine_seed(opts.seed, *key);
+                            let seed_lo = (seed & 0xFFFF_FFFF) as u32;
+                            let seed_hi = (seed >> 32) as u32;
+                            let dst_off = *dst_byte_off / 4;
+                            let len = *len;
+                            let low = *low;
+                            let high = *high;
+                            let kernel = rng_uniform_philox_kernel(&self.ctx);
+                            let (grid, block) = dispatch_grid_1d(len, 256);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    &dst_off,
+                                    &len,
+                                    &low,
+                                    &high,
+                                    &seed_lo,
+                                    &seed_hi
+                                ]
+                            );
+                        }
+                        rlx_ir::RngBackend::Zero => {
+                            let dst_off = *dst_byte_off / 4;
+                            let len = *len;
+                            let kernel = rng_fill_zero_kernel(&self.ctx);
+                            let (grid, block) = dispatch_grid_1d(len, 256);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [&mut arena_ptr, &dst_off, &len]
+                            );
+                        }
+                        rlx_ir::RngBackend::Ort | rlx_ir::RngBackend::Bnns => {
+                            crate::rng_host::run_rng_uniform(
+                                &self.ctx,
+                                &self.arena.buffer,
+                                *dst_byte_off as usize,
+                                *len as usize,
+                                *low,
+                                *high,
+                                *key,
+                                *op_seed,
+                                opts,
+                            );
+                        }
+                    }
                 }
                 Step::Gather {
                     n_out,
@@ -1187,6 +1321,7 @@ impl RocmExecutable {
                     seq,
                     head_dim,
                     half,
+                    rot_half,
                     in_off,
                     cos_off,
                     sin_off,
@@ -1207,6 +1342,7 @@ impl RocmExecutable {
                             seq,
                             head_dim,
                             half,
+                            rot_half,
                             in_off,
                             cos_off,
                             sin_off,
@@ -1612,6 +1748,52 @@ impl RocmExecutable {
                         ]
                     );
                 }
+                Step::ScaledGroupedMatMulDecode {
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    input_byte_off,
+                    weight_byte_off,
+                    input_scale_byte_off,
+                    weight_scale_byte_off,
+                    idx_off_f32,
+                    out_off_f32,
+                    bias_off_f32,
+                    lhs_fmt,
+                    rhs_fmt,
+                    scale_mode,
+                    block,
+                    has_bias,
+                } => {
+                    let kernel = crate::kernels::scaled_grouped_matmul_decode_kernel(&self.ctx);
+                    let mut arena_ptr = arena_base;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        ((*n).div_ceil(16), (*m).div_ceil(16), 1),
+                        (16, 16, 1),
+                        [
+                            &mut arena_ptr,
+                            input_byte_off,
+                            weight_byte_off,
+                            input_scale_byte_off,
+                            weight_scale_byte_off,
+                            idx_off_f32,
+                            out_off_f32,
+                            bias_off_f32,
+                            m,
+                            k,
+                            n,
+                            num_experts,
+                            lhs_fmt,
+                            rhs_fmt,
+                            scale_mode,
+                            block,
+                            has_bias
+                        ]
+                    );
+                }
                 Step::Matmul {
                     m,
                     k,
@@ -1632,19 +1814,27 @@ impl RocmExecutable {
                     // and call hipblasGemmEx with both inputs half +
                     // f32 accumulator. Bias / activation epilogue
                     // runs through the shared matmul_epilogue kernel.
-                    let used_mixed = try_mixed_precision_gemm_rocm(
-                        &self.ctx,
-                        &mut self.arena,
-                        &mut self.half_act_scratch,
-                        self.blas.as_ref(),
-                        *m,
-                        *k,
-                        *n,
-                        *batch,
-                        *a_off_f32,
-                        *b_off_f32,
-                        *c_off_f32,
-                    );
+                    // A host whose hipBLAS/Tensile logic library lacks this GPU arch's
+                    // GEMM kernels (mixed-GPU rig, incomplete ROCm/Tensile install) makes
+                    // hipblasGemmEx / hipBLASLt SEGFAULT *inside* the vendor lib — before
+                    // it can return an error we could catch and fall back on. `RLX_ROCM_
+                    // NO_VENDOR_GEMM=1` skips the vendor tiers and routes matmul straight
+                    // to the custom Tier-4 kernel (no Tensile), which computes correctly.
+                    let no_vendor = rlx_ir::env::flag("RLX_ROCM_NO_VENDOR_GEMM");
+                    let used_mixed = !no_vendor
+                        && try_mixed_precision_gemm_rocm(
+                            &self.ctx,
+                            &mut self.arena,
+                            &mut self.half_act_scratch,
+                            self.blas.as_ref(),
+                            *m,
+                            *k,
+                            *n,
+                            *batch,
+                            *a_off_f32,
+                            *b_off_f32,
+                            *c_off_f32,
+                        );
                     if used_mixed {
                         if *has_bias != 0 || *act_id != 0xFFFFu32 {
                             let kernel = matmul_epilogue_kernel(&self.ctx);
@@ -1675,7 +1865,8 @@ impl RocmExecutable {
                     // to plain sgemm + epilogue kernel. Strided-batch
                     // is handled via LAYOUT_ATTR_BATCH_COUNT /
                     // STRIDED_BATCH_OFFSET in matmul_fused.
-                    let try_lt = self.blas_lt.is_some()
+                    let try_lt = !no_vendor
+                        && self.blas_lt.is_some()
                         && self.blas_lt_workspace.is_some()
                         && crate::hipblaslt::act_supported(*act_id);
                     let used_lt = if try_lt {
@@ -1720,7 +1911,9 @@ impl RocmExecutable {
                     // swap trick as the cuBLAS path in rlx-cuda — we
                     // compute the column-major transpose of our row-
                     // major matmul, which gives the right result back.
-                    let used_hipblas = if let Some(blas) = self.blas.as_ref() {
+                    let used_hipblas = if no_vendor {
+                        false
+                    } else if let Some(blas) = self.blas.as_ref() {
                         let blas = blas.lock().unwrap();
                         let alpha: f32 = 1.0;
                         let beta: f32 = 0.0;
@@ -1832,6 +2025,78 @@ impl RocmExecutable {
                         if *has_bias != 0 || *act_id != 0xFFFFu32 {
                             let kernel = matmul_epilogue_kernel(&self.ctx);
                             let total = m * n * batch;
+                            let (grid, block) = dispatch_grid_1d(total, 256);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    &total,
+                                    n,
+                                    c_off_f32,
+                                    has_bias,
+                                    bias_off_f32,
+                                    act_id
+                                ]
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Tier 3.5 (opt-in, `RLX_ROCM_GEMV=1`): skinny-m split-K GEMV.
+                    // The idea was that for small m (decode) the Tier-4 tiled kernel's
+                    // grid is (n/64, 1, batch) — a few dozen blocks that leave the CU
+                    // array idle — so splitting K across grid.y should fill the GPU.
+                    // MEASURED on the gfx908 MI100 (qwen3-0.6B, RLX_ROCM_NO_VENDOR_GEMM):
+                    // neutral at seq=8 (~45ms either way) and a ~31% REGRESSION at
+                    // seq=16 (m=16: 61.8ms vs the tiled kernel's 47.1ms). The forward
+                    // is launch-bound (1439 kernels ≈ 31µs each), not matmul-bandwidth-
+                    // bound, so the extra occupancy is invisible while the acc[16]
+                    // register pressure, atomicAdd contention, and 3-launches-per-matmul
+                    // cost real time. Kept behind a flag as a documented non-win; the
+                    // default rocm fallback stays the faster Tier-4 tiled kernel below.
+                    if *m > 0 && *m <= 16 && rlx_ir::env::flag("RLX_ROCM_GEMV") {
+                        let total = m * n * batch;
+                        // Zero C — it is the atomicAdd accumulator.
+                        let zk = rms_norm_bwd_zero_kernel(&self.ctx);
+                        let (zgrid, zblock) = dispatch_grid_1d(total, 256);
+                        crate::launch_kernel!(
+                            zk,
+                            stream,
+                            (zgrid, 1, 1),
+                            (zblock, 1, 1),
+                            [&mut arena_ptr, c_off_f32, &total]
+                        );
+                        // Target ~512 concurrent blocks over N by splitting K.
+                        let bn = 64u32;
+                        let n_blocks = (*n).div_ceil(bn);
+                        let k_cap = (*k / 128).clamp(1, 8);
+                        let k_splits = (512u32 / n_blocks.max(1)).clamp(1, k_cap);
+                        let gk = gemv_splitk_kernel(&self.ctx);
+                        crate::launch_kernel!(
+                            gk,
+                            stream,
+                            (n_blocks, k_splits, *batch),
+                            (bn, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                m,
+                                k,
+                                n,
+                                a_off_f32,
+                                b_off_f32,
+                                c_off_f32,
+                                batch,
+                                a_batch_stride,
+                                b_batch_stride,
+                                c_batch_stride,
+                                &k_splits
+                            ]
+                        );
+                        if *has_bias != 0 || *act_id != 0xFFFFu32 {
+                            let kernel = matmul_epilogue_kernel(&self.ctx);
                             let (grid, block) = dispatch_grid_1d(total, 256);
                             crate::launch_kernel!(
                                 kernel,
@@ -2260,6 +2525,90 @@ impl RocmExecutable {
                         );
                     }
                 }
+                Step::DequantGroupedMatmulMlxHost {
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    scheme,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    zp_byte_off,
+                    idx_byte_off,
+                    out_byte_off,
+                    scale_bf16,
+                } => {
+                    crate::gguf_host::run_dequant_grouped_matmul_mlx(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        *m as usize,
+                        *k as usize,
+                        *n as usize,
+                        *num_experts as usize,
+                        *scheme,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *scale_byte_off as usize,
+                        *zp_byte_off as usize,
+                        *idx_byte_off as usize,
+                        *out_byte_off as usize,
+                        *scale_bf16,
+                    );
+                }
+                Step::DequantGroupedMatmulMlxNative {
+                    m,
+                    k,
+                    n,
+                    num_experts,
+                    group_size,
+                    x_byte_off,
+                    w_byte_off,
+                    scale_byte_off,
+                    idx_byte_off,
+                    out_byte_off,
+                } => {
+                    // m>1 (prefill, register-safe count) → amortized kernel (decode each
+                    // fired expert once, reuse across its rows); else per-element (decode).
+                    let amort = *m > 1 && *m <= 16;
+                    let kernel = if amort {
+                        crate::kernels::dequant_grouped_matmul_mlx_mxfp4_amort_kernel(&self.ctx)
+                    } else {
+                        crate::kernels::dequant_grouped_matmul_mlx_mxfp4_kernel(&self.ctx)
+                    };
+                    let grid = if amort {
+                        ((*n).div_ceil(256), 1, 1)
+                    } else {
+                        ((*n).div_ceil(16), (*m).div_ceil(16), 1)
+                    };
+                    let block = if amort { (256, 1, 1) } else { (16, 16, 1) };
+                    let mut arena_ptr = arena_base;
+                    // Kernel offsets are u64 (shared with CUDA >4 GiB arenas); widen u32.
+                    let x64 = *x_byte_off as u64;
+                    let w64 = *w_byte_off as u64;
+                    let s64 = *scale_byte_off as u64;
+                    let idx64 = *idx_byte_off as u64;
+                    let out64 = *out_byte_off as u64;
+                    crate::launch_kernel!(
+                        kernel,
+                        stream,
+                        grid,
+                        block,
+                        [
+                            &mut arena_ptr,
+                            m,
+                            k,
+                            n,
+                            num_experts,
+                            group_size,
+                            &x64,
+                            &w64,
+                            &s64,
+                            &idx64,
+                            &out64
+                        ]
+                    );
+                }
                 Step::SelectiveScan {
                     batch,
                     seq,
@@ -2622,6 +2971,9 @@ impl RocmExecutable {
                     seq,
                     input_size,
                     hidden,
+                    num_layers,
+                    bidirectional,
+                    h0_byte_off,
                 } => {
                     crate::gru_gpu::run_gru(
                         &self.ctx,
@@ -2637,6 +2989,9 @@ impl RocmExecutable {
                         *seq as usize,
                         *input_size as usize,
                         *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *h0_byte_off as usize,
                     );
                 }
                 Step::GruHost {
@@ -2685,6 +3040,9 @@ impl RocmExecutable {
                     seq,
                     input_size,
                     hidden,
+                    num_layers,
+                    bidirectional,
+                    h0_byte_off,
                     relu,
                 } => {
                     crate::rnn_gpu::run_rnn(
@@ -2700,6 +3058,9 @@ impl RocmExecutable {
                         *seq as usize,
                         *input_size as usize,
                         *hidden as usize,
+                        *num_layers as usize,
+                        *bidirectional,
+                        *h0_byte_off as usize,
                         *relu,
                     );
                 }
@@ -5266,6 +5627,31 @@ impl RocmExecutable {
         // Sync stream + read outputs.
         unsafe {
             let _ = (self.ctx.runtime.hip_stream_sync)(stream);
+        }
+        if profile_steps {
+            if let Some(prev) = prof_prev.take() {
+                let now = std::time::Instant::now();
+                let e = prof.entry(prev).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += now.duration_since(prof_last).as_nanos();
+            }
+            let total: u128 = prof.values().map(|v| v.1).sum();
+            let mut rows: Vec<_> = prof.into_iter().collect();
+            rows.sort_by_key(|b| std::cmp::Reverse(b.1.1));
+            eprintln!(
+                "[rocm-profile] per-op-kind GPU time (synced serial), total {:.2}ms:",
+                total as f64 / 1e6
+            );
+            for (k, (n, ns)) in rows {
+                eprintln!(
+                    "  {:>26}  {:>5} launches  {:>8.3}ms  {:>5.1}%  {:>6.1}µs/launch",
+                    k,
+                    n,
+                    ns as f64 / 1e6,
+                    ns as f64 / total as f64 * 100.0,
+                    ns as f64 / 1e3 / (n as f64)
+                );
+            }
         }
         self.run_tail_host_audio_ops(false);
         self.finalize_outputs()

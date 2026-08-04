@@ -25,3 +25,8 @@
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
+
+/// Apple AMX / SME matrix-coprocessor fast paths. Only compiled on Apple
+/// platforms; the `amx-*` cargo features light the per-path submodules within.
+#[cfg(target_vendor = "apple")]
+pub mod apple_amx;

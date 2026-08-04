@@ -140,8 +140,17 @@ impl ExecutableGraph for WgpuExecutableWrapper {
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
                 self.inner.set_param(name, f32_slice);
             }
+            rlx_ir::DType::BF16 => {
+                // A BF16 matmul weight is kept PACKED (2 B/elem) in the wgpu
+                // arena's bf16 side-buffer and unpacked in-shader — no host
+                // widen, no ne*4 arena write. Non-matmul BF16 consumers (and
+                // deferred graphs) fall back to the f32-widen path below.
+                if !self.inner.set_param_bf16_packed(name, data) {
+                    let f32 = super::widen_bytes_to_f32(data, dtype);
+                    self.inner.set_param(name, &f32);
+                }
+            }
             rlx_ir::DType::F16
-            | rlx_ir::DType::BF16
             | rlx_ir::DType::F64
             | rlx_ir::DType::I64
             | rlx_ir::DType::I32

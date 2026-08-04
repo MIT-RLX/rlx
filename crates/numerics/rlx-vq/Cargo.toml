@@ -21,19 +21,19 @@ cpu = ["dep:rlx-cpu"]
 metal = ["dep:rlx-metal"]
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14", optional = true }
+rlx-ir = { workspace = true }
+rlx-cpu = { workspace = true, optional = true }
 rayon = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rlx-metal = { path = "../../backends/rlx-metal", version = "0.2.14", optional = true }
+rlx-metal = { workspace = true, optional = true }
 
 [dev-dependencies]
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", features = ["cpu"] }
+rlx-runtime = { workspace = true, features = ["cpu"] }
 
 # Metal/wgpu/MLX-featured runtime for the cross-backend parity test (macOS only).
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", features = ["cpu", "metal", "gpu", "mlx"] }
+rlx-runtime = { workspace = true, features = ["cpu", "metal", "gpu", "mlx"] }
 
 [lints]
 workspace = true

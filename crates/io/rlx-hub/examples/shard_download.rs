@@ -13,7 +13,7 @@
 //!     --repo mlx-community/DeepSeek-V4-Flash-2bit-DQ --plan 0:18,18:35,35:43
 
 use anyhow::{Context, Result, bail};
-use rlx_hub::{HfRepo, download_files, fetch_index, fetch_sizes, plan_layer_stages};
+use rlx_hub::{HfRepo, download_files, fetch_index, fetch_sha256s, fetch_sizes, plan_layer_stages};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -41,6 +41,8 @@ fn main() -> Result<()> {
     let repo = HfRepo::new(repo_id);
     let index = fetch_index(&repo).context("fetch index.json")?;
     let sizes = fetch_sizes(&repo).unwrap_or_default();
+    // Content digests for LFS shards (best-effort — small config files have none).
+    let shas = fetch_sha256s(&repo).unwrap_or_default();
     let sz = |files: &[String]| -> u64 { files.iter().filter_map(|f| sizes.get(f)).sum() };
 
     // ── Plan mode: print the whole multi-node split, no download ──
@@ -137,7 +139,7 @@ fn main() -> Result<()> {
         gb(sz(&stage.shards)),
         dest.display()
     );
-    let report = download_files(&repo, &files, dest, &sizes, |f, note| {
+    let report = download_files(&repo, &files, dest, &sizes, Some(&shas), |f, note| {
         // Terse per-file line; the boundary/config files are tiny.
         if note != "cached" {
             println!("  [{note}] {f}");

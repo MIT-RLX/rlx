@@ -106,6 +106,28 @@ impl WgpuExecutable {
         }
     }
 
+    /// Upload a raw BF16 weight byte stream (`ne*2` bytes, native LE) for a
+    /// param the compiled arena stores PACKED in `bf16_weight_buffer`. Returns
+    /// `true` iff handled here (param is packed) — no host bf16→f32 widen and
+    /// no ne*4 arena write. Returns `false` (caller falls back to the f32-widen
+    /// path) when the graph is still unresolved or the param is not packed.
+    /// The `Arena::write_f32` mirror covers the deferred-replay case.
+    pub fn set_param_bf16_packed(&mut self, name: &str, data: &[u8]) -> bool {
+        if self.unresolved.is_some() {
+            return false;
+        }
+        let Some(&id) = self.param_offsets.get(name) else {
+            return false;
+        };
+        if self.arena.has(id) && self.arena.is_bf16_packed(id) {
+            let dev = wgpu_device().expect("rlx-wgpu: device gone");
+            self.arena.write_bf16_packed(&dev.queue, id, data);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);

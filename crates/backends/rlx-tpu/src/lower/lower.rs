@@ -441,10 +441,17 @@ impl<'a> LowerCtx<'a> {
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale: _,
                 attn_logit_softcap: _,
-            } => self.lower_attention(&n.inputs, *num_heads, *head_dim, *mask_kind, out_shape),
+            } => {
+                assert!(
+                    v_head_dim.is_none_or(|v| v == *head_dim),
+                    "rlx-tpu: asymmetric v_head_dim (MLA) not yet supported"
+                );
+                self.lower_attention(&n.inputs, *num_heads, *head_dim, *mask_kind, out_shape)
+            }
 
             Op::Rope { head_dim, .. } => {
                 self.lower_rope(n.inputs[0], n.inputs[1], n.inputs[2], *head_dim, out_shape)
@@ -3193,7 +3200,7 @@ impl<'a> LowerCtx<'a> {
             lhs_batch: vec![0],
             rhs_batch: vec![0],
         };
-        self.entry.dot_general(input, gathered, dn, out)
+        self.dot_dequant(input, gathered, dn, out)
     }
 
     // ── DequantMatMul ────────────────────────────────────────────
@@ -3204,6 +3211,20 @@ impl<'a> LowerCtx<'a> {
     // `dequant_gguf_bytes`, embed as f32 Constant, `dot_general`. No on-device
     // GGUF kernels on TPU — weights must be available when the HLO module is built
     // (`Op::Constant`, or `Op::Param` with bytes in `LowerParamBytes`).
+
+    /// Dot for a dequant-matmul. The operands are quantized weights that were
+    /// carefully host-dequantized to f32 (or on-device HLO-dequantized) — but
+    /// XLA's default `dot` runs a single bf16 pass on TPU, truncating ~13
+    /// mantissa bits the dequant just produced. `RLX_TPU_MATMUL_HIGHEST` pins
+    /// these dots to `PrecisionConfig::HIGHEST` (full f32). Default off keeps
+    /// the fast bf16 pass — flip it on for accuracy-sensitive / parity runs.
+    fn dot_dequant(&self, a: i64, b: i64, dn: DotDimNumbers, shape: Shape) -> i64 {
+        if rlx_ir::env::flag("RLX_TPU_MATMUL_HIGHEST") {
+            self.entry.dot_general_highest(a, b, dn, shape)
+        } else {
+            self.entry.dot_general(a, b, dn, shape)
+        }
+    }
 
     pub(crate) fn lower_dequant_matmul_gguf(
         &mut self,
@@ -3236,7 +3257,7 @@ impl<'a> LowerCtx<'a> {
             lhs_batch: vec![],
             rhs_batch: vec![],
         };
-        self.entry.dot_general(x, w_hlo, dn, out)
+        self.dot_dequant(x, w_hlo, dn, out)
     }
 
     /// MLX packs: host-dequant at HLO emit (same pattern as GGUF), then
@@ -3305,7 +3326,7 @@ impl<'a> LowerCtx<'a> {
             lhs_batch: vec![],
             rhs_batch: vec![],
         };
-        self.entry.dot_general(x, w_hlo, dn, out)
+        self.dot_dequant(x, w_hlo, dn, out)
     }
 
     pub(crate) fn lower_dequant_matmul(
@@ -3399,7 +3420,7 @@ impl<'a> LowerCtx<'a> {
             lhs_batch: vec![],
             rhs_batch: vec![],
         };
-        self.entry.dot_general(x, w_dq, dn, out)
+        self.dot_dequant(x, w_dq, dn, out)
     }
 
     // ── QMatMul ───────────────────────────────────────────────────

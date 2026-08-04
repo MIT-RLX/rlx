@@ -1,0 +1,5 @@
+error: cannot declare an `input`/`param`/`const` inside `repeat` (its name would collide each iteration) — declare it outside
+ --> tests/ui/repeat_declares_param.rs:7:19
+  |
+7 |             param w: [4, 4];   // would collide each iteration
+  |                   ^

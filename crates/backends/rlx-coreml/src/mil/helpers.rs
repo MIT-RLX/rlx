@@ -2197,6 +2197,27 @@ pub(crate) fn bytes_to_f32(data: &[u8], shape: &Shape) -> Result<Vec<f32>> {
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect())
         }
+        // bf16 (2 bytes) → f32 by left-shifting into the f32 mantissa. This is
+        // exact — bf16 is just the top 16 bits of an f32. CoreML/MIL has no bf16
+        // storage, so a bf16-resident weight (e.g. a bf16 LM head passed via
+        // `set_param_typed(.., DType::BF16)`) is decoded here and baked as an
+        // f32/f16 MIL const; the matmul then runs in fp16 on the ANE (11-bit
+        // mantissa, strictly more precise than bf16's 8-bit) or fp32 on CPU/GPU.
+        // Mirrors the bf16→f16 conversion in `backend::demote_unsupported_floats`.
+        DType::BF16 => {
+            if !data.len().is_multiple_of(2) {
+                return Err(CoremlError::Runtime(
+                    "constant byte len not bf16-aligned".into(),
+                ));
+            }
+            Ok(data
+                .chunks_exact(2)
+                .map(|c| {
+                    let bf = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bf as u32) << 16)
+                })
+                .collect())
+        }
         other => Err(CoremlError::Unsupported(format!(
             "constant dtype {other:?} (only F32/f16/int/bool baked inline)"
         ))),

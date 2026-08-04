@@ -184,94 +184,11 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
 }
 
 pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
-    match t {
-        Thunk::Nop => "Nop",
-        Thunk::Gather { .. } => "Gather",
-        Thunk::GatherAxis { .. } => "GatherAxis",
-        Thunk::TopK { .. } => "TopK",
-        Thunk::Copy { .. } => "Copy",
-        Thunk::CopyF64 { .. } => "CopyF64",
-        Thunk::CopyI64 { .. } => "CopyI64",
-        Thunk::CastF32ToI64 { .. } => "CastF32ToI64",
-        Thunk::CastF64ToF32 { .. } => "CastF64ToF32",
-        Thunk::CastF64ToI64 { .. } => "CastF64ToI64",
-        Thunk::CastF64ToI32 { .. } => "CastF64ToI32",
-        Thunk::CastF64ToBool { .. } => "CastF64ToBool",
-        Thunk::CastI64ToI32 { .. } => "CastI64ToI32",
-        Thunk::CastI64ToF64 { .. } => "CastI64ToF64",
-        Thunk::CastI32ToF64 { .. } => "CastI32ToF64",
-        Thunk::CastF32ToF16 { .. } => "CastF32ToF16",
-        Thunk::CastF16ToF32 { .. } => "CastF16ToF32",
-        Thunk::CastF32ToBf16 { .. } => "CastF32ToBf16",
-        Thunk::CastBf16ToF32 { .. } => "CastBf16ToF32",
-        Thunk::CastI64ToF32 { .. } => "CastI64ToF32",
-        Thunk::CastBoolToI32 { .. } => "CastBoolToI32",
-        Thunk::CastBoolToF32 { .. } => "CastBoolToF32",
-        Thunk::CastF32ToBool { .. } => "CastF32ToBool",
-        Thunk::CastI32ToF32 { .. } => "CastI32ToF32",
-        Thunk::CastI32ToI64 { .. } => "CastI32ToI64",
-        Thunk::CastI32ToBool { .. } => "CastI32ToBool",
-        Thunk::CastI64ToBool { .. } => "CastI64ToBool",
-        Thunk::CastBoolToI64 { .. } => "CastBoolToI64",
-        Thunk::CastGeneric { .. } => "CastGeneric",
-        Thunk::Transpose { .. } => "Transpose",
-        Thunk::TransposeF64 { .. } => "TransposeF64",
-        Thunk::Where { .. } => "Where",
-        Thunk::Fma { .. } => "Fma",
-        Thunk::Compare { .. } => "Compare",
-        Thunk::BinaryFull { .. } => "BinaryFull",
-        Thunk::BinaryFullF64 { .. } => "BinaryFullF64",
-        Thunk::Sgemm { .. } => "Sgemm",
-        Thunk::SgemmT { .. } => "SgemmT",
-        Thunk::SgdMomentum { .. } => "SgdMomentum",
-        Thunk::Dgemm { .. } => "Dgemm",
-        Thunk::FusedMmBiasAct { .. } => "FusedMmBiasAct",
-        Thunk::BiasAdd { .. } => "BiasAdd",
-        Thunk::LayerNorm { .. } => "LayerNorm",
-        Thunk::Softmax { .. } => "Softmax",
-        Thunk::Conv2D { .. } => "Conv2D",
-        Thunk::Conv2D1x1 { .. } => "Conv2D1x1",
-        Thunk::Conv3d { .. } => "Conv3d",
-        Thunk::ConvTranspose3d { .. } => "ConvTranspose3d",
-        Thunk::CustomOp { .. } => "CustomOp",
-        Thunk::ActivationInPlace { .. } => "ActivationInPlace",
-        Thunk::Narrow { .. } => "Narrow",
-        Thunk::Cumsum { .. } => "Cumsum",
-        Thunk::CumScan { .. } => "CumScan",
-        Thunk::Reduce { .. } => "Reduce",
-        Thunk::BatchedSgemm { .. } => "BatchedSgemm",
-        Thunk::DequantMatMul { .. } => "DequantMatMul",
-        Thunk::Quantize { .. } => "Quantize",
-        Thunk::Dequantize { .. } => "Dequantize",
-        Thunk::ConvTranspose2d { .. } => "ConvTranspose2d",
-        Thunk::ResizeNearest2x { .. } => "ResizeNearest2x",
-        Thunk::Interpolate3d { .. } => "Interpolate3d",
-        Thunk::ElementwiseRegion { .. } => "ElementwiseRegion",
-        Thunk::Conv2dBackwardInput { .. } => "Conv2dBackwardInput",
-        Thunk::Conv2dBackwardWeight { .. } => "Conv2dBackwardWeight",
-        Thunk::Pool2D { .. } => "Pool2D",
-        Thunk::Pool3D { .. } => "Pool3D",
-        Thunk::MaxPool2dBackward { .. } => "MaxPool2dBackward",
-        Thunk::MaxPool3dBackward { .. } => "MaxPool3dBackward",
-        Thunk::Conv3dBackwardInput { .. } => "Conv3dBackwardInput",
-        Thunk::Conv3dBackwardWeight { .. } => "Conv3dBackwardWeight",
-        Thunk::ReluBackward { .. } => "ReluBackward",
-        Thunk::ActivationBackward { .. } => "ActivationBackward",
-        Thunk::Im2Col { .. } => "Im2Col",
-        Thunk::SoftmaxCrossEntropyDense { .. } => "SoftmaxCrossEntropyDense",
-        Thunk::SoftmaxCrossEntropy { .. } => "SoftmaxCrossEntropy",
-        Thunk::SoftmaxCrossEntropyBackward { .. } => "SoftmaxCrossEntropyBackward",
-        Thunk::Attention { .. } => "Attention",
-        Thunk::AdaLayerNorm { .. } => "AdaLayerNorm",
-        Thunk::GatedResidual { .. } => "GatedResidual",
-        Thunk::Rope { .. } => "Rope",
-        Thunk::Concat { .. } => "Concat",
-        Thunk::RmsNorm { .. } => "RmsNorm",
-        Thunk::FusedResidualLN { .. } => "FusedResidualLN",
-        Thunk::FusedSwiGLU { .. } => "FusedSwiGLU",
-        Thunk::AxialRope2d { .. } => "AxialRope2d",
-        _ => "Other",
-    }
+    // Zero-alloc variant name from the derived `IntoStaticStr` on `Thunk`
+    // (see its definition). Covers EVERY variant automatically, so a newly
+    // added thunk is labeled by name instead of silently bucketing into
+    // "Other" — which had hidden the pathologically slow AttentionBackward.
+    <&'static str>::from(t)
 }
 
 /// Per-thunk-kind wall-time accumulator, populated only when the env var
@@ -476,6 +393,19 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     } else {
                         crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
                     }
+                }
+            }
+
+            Thunk::SgemmBf16 { a, b, c, m, k, n } => {
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let c_len = m.saturating_mul(n);
+                let a_len = m.saturating_mul(k);
+                let bn = k.saturating_mul(n);
+                unsafe {
+                    let a_sl = sl(*a, base, a_len);
+                    let b16 = sl_typed::<u16>(*b, base, bn);
+                    let c_sl = sl_mut(*c, base, c_len);
+                    crate::blas::sgemm_bf16_rhs(a_sl, b16, c_sl, m, k, n);
                 }
             }
 
@@ -1797,6 +1727,8 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::Mamba2 { .. } => exec_mamba2(thunk, base),
             Thunk::SelectiveScan { .. } => exec_selective_scan(thunk, base),
             Thunk::DequantMatMul { .. } => exec_dequant_mat_mul(thunk, base),
+            Thunk::SynthMatMul { .. } => exec_synth_mat_mul(thunk, base),
+            Thunk::SplineActivation { .. } => exec_spline_activation(thunk, base),
             Thunk::DequantMatMulGguf { .. } => exec_dequant_mat_mul_gguf(thunk, base),
             Thunk::DequantMatMulInt4 { .. } => exec_dequant_mat_mul_int4(thunk, base),
             Thunk::DequantMatMulFp8 { .. } => exec_dequant_mat_mul_fp8(thunk, base),
@@ -1804,6 +1736,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::DequantMatMulMxFp4x2 { .. } => exec_dequant_mat_mul_mxfp4x2(thunk, base),
             Thunk::DequantMatMulMlx { .. } => exec_dequant_mat_mul_mlx(thunk, base),
             Thunk::ScaledMatMul { .. } => exec_scaled_mat_mul(thunk, base),
+            Thunk::ScaledGroupedMatMul { .. } => exec_scaled_grouped_mat_mul(thunk, base),
             Thunk::ScaledQuantize { .. } => exec_scaled_quantize(thunk, base),
             Thunk::ScaledQuantScale { .. } => exec_scaled_quant_scale(thunk, base),
             Thunk::ScaledDequantize { .. } => exec_scaled_dequantize(thunk, base),
@@ -1819,6 +1752,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 kv_seq,
                 heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 scale,
                 softcap,
@@ -1835,13 +1769,15 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     *heads as usize,
                     *head_dim as usize,
                 );
+                // V/output per-head width (== dh for symmetric SDPA; MLA differs).
+                let dh_v = *v_head_dim as usize;
                 let nkv = (*kv_heads as usize).max(1);
                 let group = (nh / nkv).max(1); // query heads per KV head (GQA/MQA)
-                let hs = nh * dh;
+                let hs_v = nh * dh_v; // output row stride (V-width)
                 // For [B, H, S, D] layout each (b, h) tile is dense
                 // contiguous; the qrs/krs/vrs strides are not used.
                 let (qrs, krs, vrs) = if *bhsd {
-                    (dh, dh, dh)
+                    (dh, dh, dh_v)
                 } else {
                     (
                         *q_row_stride as usize,
@@ -1872,7 +1808,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         b * k_s * krs
                     };
                     let v_len = if bhsd {
-                        b * nkv * k_s * dh
+                        b * nkv * k_s * dh_v
                     } else {
                         b * k_s * vrs
                     };
@@ -1885,9 +1821,9 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         _ => &[],
                     };
                     let out_len = if bhsd {
-                        b * nh * q_s * dh
+                        b * nh * q_s * dh_v
                     } else {
-                        b * q_s * hs
+                        b * q_s * hs_v
                     };
                     let out_data = sl_mut(*out, base, out_len);
 
@@ -1940,17 +1876,19 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     }
                                 }
                                 crate::kernels::neon_softmax(scores, q_s, k_s);
-                                // score @ V
+                                // score @ V — V and output are dh_v-wide per head.
+                                let o_head_base = bi * nh * q_s * dh_v + hi * q_s * dh_v;
+                                let v_head_base = bi * nkv * k_s * dh_v + kv_hi * k_s * dh_v;
                                 for qi in 0..q_s {
-                                    let o_base = q_head_base + qi * dh;
-                                    for d in 0..dh {
+                                    let o_base = o_head_base + qi * dh_v;
+                                    for d in 0..dh_v {
                                         out_data[o_base + d] = 0.0;
                                     }
                                     for ki in 0..k_s {
                                         let sc = scores[qi * k_s + ki];
                                         if sc > score_thr {
-                                            let v_base = k_head_base + ki * dh;
-                                            for d in 0..dh {
+                                            let v_base = v_head_base + ki * dh_v;
+                                            for d in 0..dh_v {
                                                 out_data[o_base + d] += sc * v_data[v_base + d];
                                             }
                                         }
@@ -1972,6 +1910,8 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let scores = &mut sdpa_scores[..ss];
                         #[cfg(target_arch = "aarch64")]
                         let neon_chunks = dh / 4;
+                        #[cfg(target_arch = "aarch64")]
+                        let neon_chunks_v = dh_v / 4;
 
                         for bi in 0..b {
                             for hi in 0..nh {
@@ -2030,22 +1970,23 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 apply_synthetic_mask(scores, q_s, k_s, *mask_kind);
                                 crate::kernels::neon_softmax(scores, q_s, k_s);
 
-                                // Score@V via strided NEON accumulation (zero-copy)
+                                // Score@V via strided NEON accumulation (zero-copy).
+                                // V/output are dh_v-wide per head (== dh unless MLA).
                                 for qi in 0..q_s {
-                                    let o_off = bi * q_s * hs + qi * hs + hi * dh;
+                                    let o_off = bi * q_s * hs_v + qi * hs_v + hi * dh_v;
                                     // Zero output for this head position
-                                    for d in 0..dh {
+                                    for d in 0..dh_v {
                                         out_data[o_off + d] = 0.0;
                                     }
                                     for ki in 0..k_s {
                                         let sc = scores[qi * k_s + ki];
                                         if sc > score_thr {
-                                            let v_off = bi * k_s * vrs + ki * vrs + kv_hi * dh;
+                                            let v_off = bi * k_s * vrs + ki * vrs + kv_hi * dh_v;
                                             #[cfg(target_arch = "aarch64")]
                                             {
                                                 use std::arch::aarch64::*;
                                                 let vsc = vdupq_n_f32(sc);
-                                                for c in 0..neon_chunks {
+                                                for c in 0..neon_chunks_v {
                                                     let off = c * 4;
                                                     let vo = vld1q_f32(
                                                         out_data.as_ptr().add(o_off + off),
@@ -2057,9 +1998,13 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                         vfmaq_f32(vo, vsc, vv),
                                                     );
                                                 }
+                                                // scalar tail if dh_v not a multiple of 4
+                                                for d in (neon_chunks_v * 4)..dh_v {
+                                                    out_data[o_off + d] += sc * v_data[v_off + d];
+                                                }
                                             }
                                             #[cfg(not(target_arch = "aarch64"))]
-                                            for d in 0..dh {
+                                            for d in 0..dh_v {
                                                 out_data[o_off + d] += sc * v_data[v_off + d];
                                             }
                                         }
@@ -2086,9 +2031,10 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 let q_start = (q_addr as *const f32).add(bi * q_s * qrs + hi * dh);
                                 let k_start =
                                     (k_addr as *const f32).add(bi * k_s * krs + kv_hi * dh);
+                                // V/output are dh_v-wide per head (== dh unless MLA).
                                 let v_start =
-                                    (v_addr as *const f32).add(bi * k_s * vrs + kv_hi * dh);
-                                let o_start = (o_addr as *mut f32).add(bi * q_s * hs + hi * dh);
+                                    (v_addr as *const f32).add(bi * k_s * vrs + kv_hi * dh_v);
+                                let o_start = (o_addr as *mut f32).add(bi * q_s * hs_v + hi * dh_v);
                                 let sc = std::slice::from_raw_parts_mut(
                                     (sc_addr as *mut f32).add(idx * ss),
                                     ss,
@@ -2141,21 +2087,20 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
 
                                 crate::kernels::neon_softmax(sc, q_s, k_s);
 
-                                // LDB = vrs (parent row stride when
-                                // fused; hs otherwise). LDC stays hs —
-                                // output is its own contiguous buffer.
+                                // score@V: N = dh_v (output/V width), LDB = vrs
+                                // (V row stride), LDC = hs_v (output row stride).
                                 crate::blas::sgemm_general(
                                     sc.as_ptr(),
                                     v_start,
                                     o_start,
                                     q_s,
-                                    dh,
+                                    dh_v,
                                     k_s,
                                     1.0,
                                     0.0,
                                     k_s,
                                     vrs,
-                                    hs,
+                                    hs_v,
                                     false,
                                     false,
                                 );
@@ -2166,6 +2111,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             }
 
             Thunk::AttentionBackward { .. } => exec_attention_backward(thunk, base),
+            Thunk::AttentionBackwardAll { .. } => exec_attention_backward_all(thunk, base),
             Thunk::ActivationInPlace { .. } => exec_activation_in_place(thunk, base),
             Thunk::FusedAttnBlock {
                 hidden,
@@ -2184,12 +2130,17 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 hs,
                 nh,
                 dh,
+                in_dim,
+                out_dim,
                 has_bias,
                 has_rope,
                 interleaved,
             } => {
                 let (b, s) = (*batch as usize, *seq as usize);
                 let (h, n_h, d_h) = (*hs as usize, *nh as usize, *dh as usize);
+                // QKV-proj input width and out-proj output width — differ from
+                // `h`(=hs) for MoonViT-style attention (hidden ≠ nh·dh).
+                let (in_dim, out_dim) = (*in_dim as usize, *out_dim as usize);
                 let interleaved = *interleaved;
                 let m = b * s;
                 let scale = (d_h as f32).powf(-0.5);
@@ -2201,55 +2152,70 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 // the absolute query position is just `qi`.
                 let use_custom_mask = matches!(mask_kind, rlx_ir::op::MaskKind::Custom);
                 unsafe {
-                    let inp = sl(*hidden, base, m * h);
-                    let wq = sl(*qkv_w, base, h * 3 * h);
-                    let wo = sl(*out_w, base, h * h);
+                    let inp = sl(*hidden, base, m * in_dim);
+                    let wq = sl(*qkv_w, base, in_dim * 3 * h);
+                    let wo = sl(*out_w, base, h * out_dim);
                     let mk = if use_custom_mask {
                         sl(*mask, base, b * s)
                     } else {
                         &[]
                     };
-                    let dst = sl_mut(*out, base, m * h);
+                    let dst = sl_mut(*out, base, m * out_dim);
 
                     // Stack-allocated intermediates — all fit in L1 cache for small batch
                     let mut qkv = vec![0f32; m * 3 * h];
                     let mut attn_out = vec![0f32; m * h];
-                    let mut scores_buf = vec![0f32; s * s]; // one head at a time
 
-                    // 1. QKV projection: [m, h] @ [h, 3h] → [m, 3h]
-                    crate::blas::sgemm(inp, wq, &mut qkv, m, h, 3 * h);
+                    // 1. QKV projection: [m, in_dim] @ [in_dim, 3h] → [m, 3h]
+                    crate::blas::par_sgemm(inp, wq, &mut qkv, m, in_dim, 3 * h);
                     if *has_bias {
                         let bias = sl(*qkv_b, base, 3 * h);
                         crate::blas::bias_add(&mut qkv, bias, m, 3 * h);
                     }
 
-                    // 2. Multi-head SDPA (Q/K/V are views into qkv at offsets 0, h, 2h)
-                    //    Process heads sequentially with inline RoPE — zero copy.
+                    // 2. Multi-head SDPA — PARALLEL across (batch, head). Each
+                    //    task owns its scores buffer and writes a DISJOINT
+                    //    head-slice of attn_out (`o_base` is unique per (bi,hi)),
+                    //    so the raw-pointer writes never alias; Q/K/V/cos/sin/mask
+                    //    are read-only. Serial per-head SDPA lost ~3× to the
+                    //    unfused Attention thunk (which is per-head parallel) on
+                    //    wide heads — e.g. MoonViT 12×128 @ seq 64.
                     #[cfg(target_arch = "aarch64")]
                     let neon_chunks = d_h / 4;
-                    #[cfg(target_arch = "aarch64")]
-                    let _rope_chunks = half / 4;
-
-                    for bi in 0..b {
-                        for hi in 0..n_h {
-                            // For each (query_pos, key_pos): compute Q@K^T with inline RoPE
+                    let qkv_ptr = qkv.as_ptr() as usize;
+                    let out_ptr = attn_out.as_mut_ptr() as usize;
+                    let mk_ptr = mk.as_ptr() as usize;
+                    let mk_len = mk.len();
+                    let base_addr = base as usize;
+                    let (cos_off, sin_off, cl) = (*cos, *sin, *cos_len as usize);
+                    let has_rope_c = *has_rope;
+                    let mask_kind_c = *mask_kind;
+                    let n_tasks = b * n_h;
+                    crate::pool::par_for(n_tasks, 1, &|off, cnt| {
+                        // Read-only views (multiple immutable aliases are fine).
+                        let qkv = std::slice::from_raw_parts(qkv_ptr as *const f32, m * 3 * h);
+                        let out = out_ptr as *mut f32;
+                        let base = base_addr as *mut u8;
+                        let (cos_tab, sin_tab): (&[f32], &[f32]) = if has_rope_c {
+                            (sl(cos_off, base, cl), sl(sin_off, base, cl))
+                        } else {
+                            (&[], &[])
+                        };
+                        let mk = std::slice::from_raw_parts(mk_ptr as *const f32, mk_len);
+                        let mut scores = vec![0f32; s * s];
+                        for t in off..off + cnt {
+                            let bi = t / n_h;
+                            let hi = t % n_h;
                             for qi in 0..s {
                                 let q_base = bi * s * 3 * h + qi * 3 * h + hi * d_h;
                                 for ki in 0..s {
                                     let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
                                     let mut dot = 0f32;
-
-                                    if *has_rope {
-                                        // Apply RoPE inline during dot product
+                                    if has_rope_c {
+                                        // Inline RoPE per pair, then dot. Pair offsets:
+                                        //   NeoX (i, i+half)  GPT-J (2i, 2i+1).
                                         let q_cos = qi * half;
                                         let k_cos = ki * half;
-                                        let cos_tab = sl(*cos, base, *cos_len as usize);
-                                        let sin_tab = sl(*sin, base, *cos_len as usize);
-                                        // Rotate per pair, then dot. The q·k sum
-                                        // is layout-independent, so only the pair
-                                        // element offsets differ by style:
-                                        //   NeoX:  (i, i+half)   GPT-J: (2i, 2i+1)
-                                        // angle index is the pair index `i` for both.
                                         for i in 0..half {
                                             let (qo1, qo2, ko1, ko2) = if interleaved {
                                                 (2 * i, 2 * i + 1, 2 * i, 2 * i + 1)
@@ -2271,7 +2237,6 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                             dot += qr1 * kr1 + qr2 * kr2;
                                         }
                                     } else {
-                                        // Standard dot product
                                         #[cfg(target_arch = "aarch64")]
                                         {
                                             use std::arch::aarch64::*;
@@ -2293,36 +2258,30 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                             dot += qkv[q_base + d] * qkv[k_base + d];
                                         }
                                     }
-
-                                    scores_buf[qi * s + ki] = dot * scale;
-                                    // Synthesized position masks (q_offset == 0):
-                                    //   Causal         → mask future keys ki > qi
-                                    //   SlidingWindow  → also mask ki + w < qi
-                                    let pos_masked = match mask_kind {
+                                    let mut sv = dot * scale;
+                                    let pos_masked = match mask_kind_c {
                                         rlx_ir::op::MaskKind::Causal => ki > qi,
                                         rlx_ir::op::MaskKind::SlidingWindow(w) => {
-                                            ki > qi || ki + *w < qi
+                                            ki > qi || ki + w < qi
                                         }
                                         _ => false,
                                     };
                                     if pos_masked || (use_custom_mask && mk[bi * s + ki] < mask_thr)
                                     {
-                                        scores_buf[qi * s + ki] = mask_neg;
+                                        sv = mask_neg;
                                     }
+                                    scores[qi * s + ki] = sv;
                                 }
                             }
-
-                            // Softmax
-                            crate::kernels::neon_softmax(&mut scores_buf[..s * s], s, s);
-
-                            // Score @ V accumulation (V at offset 2h in QKV)
+                            crate::kernels::neon_softmax(&mut scores[..s * s], s, s);
+                            // Score @ V accumulation (V at offset 2h in QKV).
                             for qi in 0..s {
                                 let o_base = bi * s * h + qi * h + hi * d_h;
                                 for d in 0..d_h {
-                                    attn_out[o_base + d] = 0.0;
+                                    *out.add(o_base + d) = 0.0;
                                 }
                                 for ki in 0..s {
-                                    let sc = scores_buf[qi * s + ki];
+                                    let sc = scores[qi * s + ki];
                                     if sc > score_thr {
                                         let v_base = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
                                         #[cfg(target_arch = "aarch64")]
@@ -2330,31 +2289,30 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                             use std::arch::aarch64::*;
                                             let vsc = vdupq_n_f32(sc);
                                             for c in 0..neon_chunks {
-                                                let off = c * 4;
-                                                let vo =
-                                                    vld1q_f32(attn_out.as_ptr().add(o_base + off));
-                                                let vv = vld1q_f32(qkv.as_ptr().add(v_base + off));
+                                                let o = c * 4;
+                                                let vo = vld1q_f32(out.add(o_base + o));
+                                                let vv = vld1q_f32(qkv.as_ptr().add(v_base + o));
                                                 vst1q_f32(
-                                                    attn_out.as_mut_ptr().add(o_base + off),
+                                                    out.add(o_base + o),
                                                     vfmaq_f32(vo, vsc, vv),
                                                 );
                                             }
                                         }
                                         #[cfg(not(target_arch = "aarch64"))]
                                         for d in 0..d_h {
-                                            attn_out[o_base + d] += sc * qkv[v_base + d];
+                                            *out.add(o_base + d) += sc * qkv[v_base + d];
                                         }
                                     }
                                 }
                             }
                         }
-                    }
+                    });
 
-                    // 3. Output projection: [m, h] @ [h, h] → dst
-                    crate::blas::sgemm(&attn_out, wo, dst, m, h, h);
+                    // 3. Output projection: [m, h] @ [h, out_dim] → dst
+                    crate::blas::par_sgemm(&attn_out, wo, dst, m, h, out_dim);
                     if *has_bias {
-                        let bias = sl(*out_b, base, h);
-                        crate::blas::bias_add(dst, bias, m, h);
+                        let bias = sl(*out_b, base, out_dim);
+                        crate::blas::bias_add(dst, bias, m, out_dim);
                     }
                 }
             }
@@ -2817,89 +2775,121 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 dst_elem_bytes,
                 lhs_scalar,
                 rhs_scalar,
+                lhs_len,
+                rhs_len,
+                out_dims_bcast,
+                bcast_lhs_strides,
+                bcast_rhs_strides,
             } => {
                 let len = *len as usize;
                 let arena_len = arena_buf.len();
                 let elem = (*inputs_elem_bytes).max(1) as usize;
                 let dst_eb = (*dst_elem_bytes).max(1) as usize;
-                let l_n = if *lhs_scalar { 1 } else { len };
-                let r_n = if *rhs_scalar { 1 } else { len };
                 let max_l = (arena_len.saturating_sub(*lhs)) / elem;
                 let max_r = (arena_len.saturating_sub(*rhs)) / elem;
                 let max_d = (arena_len.saturating_sub(*dst)) / dst_eb;
-                // Keep full `len` when broadcasting scalars — only the
-                // non-scalar operands (and dst) may shrink the loop.
-                let mut len = len.min(max_d);
-                if *lhs_scalar {
-                    if max_l < 1 {
-                        len = 0;
-                    }
-                } else {
-                    len = len.min(max_l);
-                }
-                if *rhs_scalar {
-                    if max_r < 1 {
-                        len = 0;
-                    }
-                } else {
-                    len = len.min(max_r);
-                }
-                if trace_thunks && len > 0 {
-                    eprintln!(
-                        "[compare] len={len} lhs={} rhs={} dst={} ls={} rs={}",
-                        *lhs, *rhs, *dst, *lhs_scalar, *rhs_scalar
-                    );
-                }
-                if elem == 1 {
-                    let l = arena_buf[*lhs..*lhs + l_n.min(max_l).max(1)].to_vec();
-                    let r = arena_buf[*rhs..*rhs + r_n.min(max_r).max(1)].to_vec();
-                    for i in 0..len {
-                        let li = if *lhs_scalar { 0 } else { i };
-                        let ri = if *rhs_scalar { 0 } else { i };
-                        let v = match op {
-                            CmpOp::Eq => l[li] == r[ri],
-                            CmpOp::Ne => l[li] != r[ri],
-                            CmpOp::Lt => l[li] < r[ri],
-                            CmpOp::Le => l[li] <= r[ri],
-                            CmpOp::Gt => l[li] > r[ri],
-                            CmpOp::Ge => l[li] >= r[ri],
+                if !out_dims_bcast.is_empty() {
+                    // Shape-aware broadcast (partial size-1 axes, e.g. `[.,L,1]`
+                    // vs `[.,L,L]`). Read each operand at its TRUE element count
+                    // and index via row-major coords · strides — the flat path
+                    // below would read past a partial operand into adjacent
+                    // arena memory. Mirrors `BinaryFull`'s broadcast loop.
+                    let len = len.min(max_d);
+                    let l_read = (*lhs_len as usize).min(max_l).max(1);
+                    let r_read = (*rhs_len as usize).min(max_r).max(1);
+                    let rank = out_dims_bcast.len();
+                    let bidx = |i: usize| -> (usize, usize) {
+                        let mut rem = i;
+                        let (mut li, mut ri) = (0usize, 0usize);
+                        for ax in (0..rank).rev() {
+                            let sz = out_dims_bcast[ax] as usize;
+                            let c = rem % sz;
+                            rem /= sz;
+                            li += c * bcast_lhs_strides[ax] as usize;
+                            ri += c * bcast_rhs_strides[ax] as usize;
+                        }
+                        (li, ri)
+                    };
+                    macro_rules! do_cmp {
+                        ($a:expr, $b:expr) => {
+                            match op {
+                                CmpOp::Eq => $a == $b,
+                                CmpOp::Ne => $a != $b,
+                                CmpOp::Lt => $a < $b,
+                                CmpOp::Le => $a <= $b,
+                                CmpOp::Gt => $a > $b,
+                                CmpOp::Ge => $a >= $b,
+                            }
                         };
-                        if *dst_elem_bytes == 1 {
-                            arena_buf[*dst + i] = u8::from(v);
-                        } else {
-                            unsafe {
-                                let o = sl_mut(*dst, base, len);
-                                o[i] = if v { 1.0 } else { 0.0 };
-                            }
-                        }
                     }
-                } else if *inputs_i64 != 0 {
-                    unsafe {
-                        let l = sl_i64(*lhs, base, l_n.min(max_l).max(1));
-                        let r = sl_i64(*rhs, base, r_n.min(max_r).max(1));
-                        for i in 0..len {
-                            let li = if *lhs_scalar { 0 } else { i };
-                            let ri = if *rhs_scalar { 0 } else { i };
-                            let v = match op {
-                                CmpOp::Eq => l[li] == r[ri],
-                                CmpOp::Ne => l[li] != r[ri],
-                                CmpOp::Lt => l[li] < r[ri],
-                                CmpOp::Le => l[li] <= r[ri],
-                                CmpOp::Gt => l[li] > r[ri],
-                                CmpOp::Ge => l[li] >= r[ri],
-                            };
+                    macro_rules! put {
+                        ($i:expr, $v:expr) => {
                             if *dst_elem_bytes == 1 {
-                                arena_buf[*dst + i] = u8::from(v);
+                                arena_buf[*dst + $i] = u8::from($v);
                             } else {
                                 let o = sl_mut(*dst, base, len);
-                                o[i] = if v { 1.0 } else { 0.0 };
+                                o[$i] = if $v { 1.0 } else { 0.0 };
+                            }
+                        };
+                    }
+                    if elem == 1 {
+                        let l = arena_buf[*lhs..*lhs + l_read].to_vec();
+                        let r = arena_buf[*rhs..*rhs + r_read].to_vec();
+                        for i in 0..len {
+                            let (li, ri) = bidx(i);
+                            let v = do_cmp!(l[li], r[ri]);
+                            unsafe { put!(i, v) }
+                        }
+                    } else if *inputs_i64 != 0 {
+                        unsafe {
+                            let l = sl_i64(*lhs, base, l_read);
+                            let r = sl_i64(*rhs, base, r_read);
+                            for i in 0..len {
+                                let (li, ri) = bidx(i);
+                                let v = do_cmp!(l[li], r[ri]);
+                                put!(i, v)
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            let l = sl(*lhs, base, l_read);
+                            let r = sl(*rhs, base, r_read);
+                            for i in 0..len {
+                                let (li, ri) = bidx(i);
+                                let v = do_cmp!(l[li], r[ri]);
+                                put!(i, v)
                             }
                         }
                     }
                 } else {
-                    unsafe {
-                        let l = sl(*lhs, base, l_n.min(max_l).max(1));
-                        let r = sl(*rhs, base, r_n.min(max_r).max(1));
+                    let l_n = if *lhs_scalar { 1 } else { len };
+                    let r_n = if *rhs_scalar { 1 } else { len };
+                    // Keep full `len` when broadcasting scalars — only the
+                    // non-scalar operands (and dst) may shrink the loop.
+                    let mut len = len.min(max_d);
+                    if *lhs_scalar {
+                        if max_l < 1 {
+                            len = 0;
+                        }
+                    } else {
+                        len = len.min(max_l);
+                    }
+                    if *rhs_scalar {
+                        if max_r < 1 {
+                            len = 0;
+                        }
+                    } else {
+                        len = len.min(max_r);
+                    }
+                    if trace_thunks && len > 0 {
+                        eprintln!(
+                            "[compare] len={len} lhs={} rhs={} dst={} ls={} rs={}",
+                            *lhs, *rhs, *dst, *lhs_scalar, *rhs_scalar
+                        );
+                    }
+                    if elem == 1 {
+                        let l = arena_buf[*lhs..*lhs + l_n.min(max_l).max(1)].to_vec();
+                        let r = arena_buf[*rhs..*rhs + r_n.min(max_r).max(1)].to_vec();
                         for i in 0..len {
                             let li = if *lhs_scalar { 0 } else { i };
                             let ri = if *rhs_scalar { 0 } else { i };
@@ -2914,8 +2904,56 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             if *dst_elem_bytes == 1 {
                                 arena_buf[*dst + i] = u8::from(v);
                             } else {
-                                let o = sl_mut(*dst, base, len);
-                                o[i] = if v { 1.0 } else { 0.0 };
+                                unsafe {
+                                    let o = sl_mut(*dst, base, len);
+                                    o[i] = if v { 1.0 } else { 0.0 };
+                                }
+                            }
+                        }
+                    } else if *inputs_i64 != 0 {
+                        unsafe {
+                            let l = sl_i64(*lhs, base, l_n.min(max_l).max(1));
+                            let r = sl_i64(*rhs, base, r_n.min(max_r).max(1));
+                            for i in 0..len {
+                                let li = if *lhs_scalar { 0 } else { i };
+                                let ri = if *rhs_scalar { 0 } else { i };
+                                let v = match op {
+                                    CmpOp::Eq => l[li] == r[ri],
+                                    CmpOp::Ne => l[li] != r[ri],
+                                    CmpOp::Lt => l[li] < r[ri],
+                                    CmpOp::Le => l[li] <= r[ri],
+                                    CmpOp::Gt => l[li] > r[ri],
+                                    CmpOp::Ge => l[li] >= r[ri],
+                                };
+                                if *dst_elem_bytes == 1 {
+                                    arena_buf[*dst + i] = u8::from(v);
+                                } else {
+                                    let o = sl_mut(*dst, base, len);
+                                    o[i] = if v { 1.0 } else { 0.0 };
+                                }
+                            }
+                        }
+                    } else {
+                        unsafe {
+                            let l = sl(*lhs, base, l_n.min(max_l).max(1));
+                            let r = sl(*rhs, base, r_n.min(max_r).max(1));
+                            for i in 0..len {
+                                let li = if *lhs_scalar { 0 } else { i };
+                                let ri = if *rhs_scalar { 0 } else { i };
+                                let v = match op {
+                                    CmpOp::Eq => l[li] == r[ri],
+                                    CmpOp::Ne => l[li] != r[ri],
+                                    CmpOp::Lt => l[li] < r[ri],
+                                    CmpOp::Le => l[li] <= r[ri],
+                                    CmpOp::Gt => l[li] > r[ri],
+                                    CmpOp::Ge => l[li] >= r[ri],
+                                };
+                                if *dst_elem_bytes == 1 {
+                                    arena_buf[*dst + i] = u8::from(v);
+                                } else {
+                                    let o = sl_mut(*dst, base, len);
+                                    o[i] = if v { 1.0 } else { 0.0 };
+                                }
                             }
                         }
                     }
@@ -3223,6 +3261,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             }
 
             Thunk::Reduce { .. } => exec_reduce(thunk, base),
+            Thunk::Histogram { .. } => exec_histogram(thunk, base),
             Thunk::ArgReduce { .. } => exec_arg_reduce(thunk, base),
             Thunk::Conv2D1x1 { .. } => exec_conv2_d1x1(thunk, base),
             Thunk::Conv2D { .. } => exec_conv2_d(thunk, base),

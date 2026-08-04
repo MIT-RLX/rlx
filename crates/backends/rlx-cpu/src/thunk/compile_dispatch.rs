@@ -722,12 +722,20 @@ pub fn compile_thunks_with_rng(
             Op::DequantMatMul { scheme } => {
                 compile_dequant_mat_mul(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
+            Op::SynthMatMul { .. } => compile_synth_mat_mul(node, graph, arena),
+            Op::SplineActivation { .. } => compile_spline_activation(node, graph, arena),
             Op::ScaledMatMul {
                 lhs_format,
                 rhs_format,
                 scale_layout,
                 has_bias,
             } => compile_scaled_mat_mul(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::ScaledGroupedMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } => compile_scaled_grouped_mat_mul(node, graph, arena, &matmul_fold, &rng_shared, rng),
             Op::ScaledQuantize {
                 format,
                 scale_layout,
@@ -770,6 +778,7 @@ pub fn compile_thunks_with_rng(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
@@ -780,6 +789,7 @@ pub fn compile_thunks_with_rng(
                 mask_kind,
                 wrt,
             } => compile_attention_backward(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::AttentionBackwardAll { .. } => compile_attention_backward_all(node, graph, arena),
             Op::FusedAttentionBlock {
                 num_heads,
                 head_dim,
@@ -853,6 +863,7 @@ pub fn compile_thunks_with_rng(
                 axes,
                 keep_dim: _,
             } => compile_reduce(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::Histogram { .. } => compile_histogram(node, graph, arena),
             Op::ArgMax { axis, keep_dim: _ } | Op::ArgMin { axis, keep_dim: _ } => {
                 let in_shape = &graph.node(node.inputs[0]).shape;
                 let rank = in_shape.rank();
@@ -1356,6 +1367,22 @@ pub fn compile_thunks_with_rng(
                     })
                 }
 
+                Thunk::SgemmBf16 { a, b, c, m, k, n } => {
+                    let (m, k, n) = (m as usize, k as usize, n as usize);
+                    Arc::new(move |base: *mut u8| unsafe {
+                        // b is a BF16 buffer (k*n u16); dequant-on-the-fly GEMM.
+                        let b16 = sl_typed::<u16>(b, base, k * n);
+                        crate::blas::sgemm_bf16_rhs(
+                            sl(a, base, m * k),
+                            b16,
+                            sl_mut(c, base, m * n),
+                            m,
+                            k,
+                            n,
+                        );
+                    })
+                }
+
                 Thunk::CgemmC64 { a, b, c, m, k, n } => {
                     let (m, k, n) = (m as usize, k as usize, n as usize);
                     Arc::new(move |base: *mut u8| unsafe {
@@ -1707,6 +1734,54 @@ pub fn compile_thunks_with_rng(
                         let out = sl_mut(dst, base, n);
                         let opts = *rng.read().unwrap();
                         rlx_ir::fill_uniform_like(out, low, high, opts, key, op_seed);
+                    })
+                }
+
+                Thunk::SplineActivation {
+                    x,
+                    coeff,
+                    dst,
+                    rows,
+                    channels,
+                    num_basis,
+                    grid_min,
+                    grid_max,
+                } => {
+                    let (rows, channels, nb) =
+                        (rows as usize, channels as usize, num_basis as usize);
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let xs = sl(x, base, rows * channels);
+                        let cb = sl(coeff, base, channels * nb);
+                        let out = sl_mut(dst, base, rows * channels);
+                        spline_activation_f32(
+                            xs, cb, out, rows, channels, nb, grid_min, grid_max,
+                        );
+                    })
+                }
+
+                Thunk::SynthMatMul {
+                    x,
+                    indices,
+                    codebook,
+                    dst,
+                    m,
+                    k,
+                    n,
+                    entry_dim,
+                    num_entries,
+                } => {
+                    let (m, k, n, d) = (m as usize, k as usize, n as usize, entry_dim as usize);
+                    let kb_per_row = k / d.max(1);
+                    let cb_len = num_entries as usize * d;
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let xs = sl(x, base, m * k);
+                        let idx = std::slice::from_raw_parts(
+                            base.add(indices) as *const u8,
+                            n * kb_per_row,
+                        );
+                        let cb = sl(codebook, base, cb_len);
+                        let out = sl_mut(dst, base, m * n);
+                        synth_matmul_codebook(xs, idx, cb, out, m, k, n, d);
                     })
                 }
 
@@ -2134,6 +2209,7 @@ pub fn compile_thunks_with_rng(
                     heads,
                     kv_heads,
                     head_dim,
+                    v_head_dim,
                     mask_kind,
                     scale,
                     softcap,
@@ -2160,7 +2236,11 @@ pub fn compile_thunks_with_rng(
                         heads as usize,
                         head_dim as usize,
                     );
-                    let hs = nh * dh;
+                    // V/output per-head width (== dh for symmetric SDPA; MLA
+                    // reads V and writes the output `v_head_dim`-wide while
+                    // Q/K scores still use `head_dim`).
+                    let dh_v = v_head_dim as usize;
+                    let hs_v = nh * dh_v; // output row stride (V-width)
                     // GQA/MQA: `group` query heads share one KV head. group == 1
                     // for MHA (kv_heads == heads), so this is a no-op there.
                     let nkv = (kv_heads as usize).max(1);
@@ -2180,9 +2260,11 @@ pub fn compile_thunks_with_rng(
                         let (q_len, k_len, v_len, o_len) = if bhsd {
                             let qn = b * nh * q_s * dh;
                             let kn = b * nkv * k_s * dh;
-                            (qn, kn, kn, qn)
+                            let vn = b * nkv * k_s * dh_v;
+                            let on = b * nh * q_s * dh_v;
+                            (qn, kn, vn, on)
                         } else {
-                            (b * q_s * qrs, b * k_s * krs, b * k_s * vrs, b * q_s * hs)
+                            (b * q_s * qrs, b * k_s * krs, b * k_s * vrs, b * q_s * hs_v)
                         };
                         let q_d = sl(q, base, q_len);
                         let k_d = sl(k, base, k_len);
@@ -2195,9 +2277,9 @@ pub fn compile_thunks_with_rng(
                         let o_d = sl_mut(out, base, o_len);
                         let mut qh = vec![0f32; q_s * dh];
                         let mut kh = vec![0f32; k_s * dh];
-                        let mut vh = vec![0f32; k_s * dh];
+                        let mut vh = vec![0f32; k_s * dh_v];
                         let mut sc = vec![0f32; q_s * k_s];
-                        let mut oh = vec![0f32; q_s * dh];
+                        let mut oh = vec![0f32; q_s * dh_v];
                         for bi in 0..b {
                             for hi in 0..nh {
                                 // Gather per-head Q.
@@ -2218,18 +2300,18 @@ pub fn compile_thunks_with_rng(
                                     let (k_off, v_off) = if bhsd {
                                         (
                                             bi * nkv * k_s * dh + kv_hi * k_s * dh + si * dh,
-                                            bi * nkv * k_s * dh + kv_hi * k_s * dh + si * dh,
+                                            bi * nkv * k_s * dh_v + kv_hi * k_s * dh_v + si * dh_v,
                                         )
                                     } else {
                                         (
                                             bi * k_s * krs + si * krs + kv_hi * dh,
-                                            bi * k_s * vrs + si * vrs + kv_hi * dh,
+                                            bi * k_s * vrs + si * vrs + kv_hi * dh_v,
                                         )
                                     };
                                     kh[si * dh..(si + 1) * dh]
                                         .copy_from_slice(&k_d[k_off..k_off + dh]);
-                                    vh[si * dh..(si + 1) * dh]
-                                        .copy_from_slice(&v_d[v_off..v_off + dh]);
+                                    vh[si * dh_v..(si + 1) * dh_v]
+                                        .copy_from_slice(&v_d[v_off..v_off + dh_v]);
                                 }
                                 for qi in 0..q_s {
                                     for ki in 0..k_s {
@@ -2296,19 +2378,20 @@ pub fn compile_thunks_with_rng(
                                     for ki in 0..k_s {
                                         let w = sc[qi * k_s + ki];
                                         if w > score_skip {
-                                            for d in 0..dh {
-                                                oh[qi * dh + d] += w * vh[ki * dh + d];
+                                            for d in 0..dh_v {
+                                                oh[qi * dh_v + d] += w * vh[ki * dh_v + d];
                                             }
                                         }
                                     }
                                 }
                                 for si in 0..q_s {
                                     let off = if bhsd {
-                                        bi * nh * q_s * dh + hi * q_s * dh + si * dh
+                                        bi * nh * q_s * dh_v + hi * q_s * dh_v + si * dh_v
                                     } else {
-                                        bi * q_s * hs + si * hs + hi * dh
+                                        bi * q_s * hs_v + si * hs_v + hi * dh_v
                                     };
-                                    o_d[off..off + dh].copy_from_slice(&oh[si * dh..(si + 1) * dh]);
+                                    o_d[off..off + dh_v]
+                                        .copy_from_slice(&oh[si * dh_v..(si + 1) * dh_v]);
                                 }
                             }
                         }
@@ -2831,17 +2914,20 @@ pub fn compile_thunks_with_rng(
                 let (_, t2) = a(2)?;
                 let (_, t3) = a(3)?;
 
-                // a[0] must be FusedMmBiasAct or Sgemm (QKV projection)
-                let (hidden, qkv_w, qkv_b, has_b) = match t0 {
+                // a[0] must be FusedMmBiasAct or Sgemm (QKV projection).
+                // Capture its K (input width) and N (3·qkv_hidden) so we can
+                // reject shapes the fused kernel can't represent.
+                let (hidden, qkv_w, qkv_b, has_b, qkv_k, qkv_n) = match t0 {
                     Thunk::FusedMmBiasAct {
                         a,
                         w,
                         bias,
-                        n: _,
+                        k,
+                        n,
                         act: None,
                         ..
-                    } => (*a, *w, *bias, true),
-                    Thunk::Sgemm { a, b, .. } => (*a, *b, 0, false),
+                    } => (*a, *w, *bias, true, *k as usize, *n as usize),
+                    Thunk::Sgemm { a, b, k, n, .. } => (*a, *b, 0, false, *k as usize, *n as usize),
                     _ => return None,
                 };
 
@@ -2920,21 +3006,42 @@ pub fn compile_thunks_with_rng(
                     return None;
                 }
 
-                // Next active must be out projection (FusedMmBiasAct or Sgemm)
+                // Next active must be out projection (FusedMmBiasAct or Sgemm).
+                // Capture its K (qkv_hidden) and N (output width) too.
                 let (_out_real_idx, out_t) = a(attn_ai + 1)?;
-                let (out_w, out_b, out_dst) = match out_t {
+                let (out_w, out_b, out_dst, out_k, out_n) = match out_t {
                     Thunk::FusedMmBiasAct {
                         w,
                         bias,
                         c,
+                        k,
+                        n,
                         act: None,
                         ..
-                    } => (*w, *bias, *c),
-                    Thunk::Sgemm { b: w, c, .. } => (*w, 0, *c),
+                    } => (*w, *bias, *c, *k as usize, *n as usize),
+                    Thunk::Sgemm { b: w, c, k, n, .. } => (*w, 0, *c, *k as usize, *n as usize),
                     _ => return None,
                 };
 
                 let hs = heads * head_dim;
+                // Structural constraints of the fused kernel: QKV emits q|k|v each
+                // `hs` wide (`qkv_n == 3*hs`) and the out proj consumes the
+                // `hs`-wide attention output (`out_k == hs`).
+                //
+                // The kernel ALSO carries `in_dim`/`out_dim` and can run
+                // `hidden != hs` (MoonViT vision), but benchmarking the 27-block
+                // MoonViT tower (12×128 heads @ seq 64) showed the fused path —
+                // even with the batch×head-parallel SDPA below — runs ~1.8×
+                // SLOWER than the unfused Attention thunk, whose score matrix uses
+                // cblas/AMX vs the fused kernel's scalar QK^T (+ redundant inline
+                // RoPE). So gate fusion to the same-width (BERT/Nomic) shape it was
+                // tuned for — where the parallelism is a clear win on batched
+                // inputs — and let `hidden != hs` take the faster unfused path. A
+                // future BLAS-score fused variant could lift the width equality.
+                let hs_us = hs as usize;
+                if qkv_n != 3 * hs_us || out_k != hs_us || qkv_k != hs_us || out_n != hs_us {
+                    return None;
+                }
                 let total_active = attn_ai + 2; // number of active thunks consumed
 
                 Some((
@@ -2956,6 +3063,8 @@ pub fn compile_thunks_with_rng(
                         hs,
                         nh: heads,
                         dh: head_dim,
+                        in_dim: qkv_k as u32,
+                        out_dim: out_n as u32,
                         has_bias: has_b,
                         has_rope,
                         interleaved: rope_interleaved,
@@ -3045,10 +3154,14 @@ pub fn compile_thunks_with_rng(
                         hs,
                         nh,
                         dh,
+                        // FusedBertLayer's kernel assumes hidden == hs == in == out;
+                        // only fold a same-width attention block.
+                        in_dim,
+                        out_dim,
                         has_bias: true,
                         has_rope: false,
                         ..
-                    } => (
+                    } if *in_dim == *hs && *out_dim == *hs => (
                         *hidden, *qkv_w, *qkv_b, *out_w, *out_b, *mask, *batch, *seq, *hs, *nh, *dh,
                     ),
                     _ => return None,
@@ -3164,12 +3277,15 @@ pub fn compile_thunks_with_rng(
                         hs,
                         nh,
                         dh,
+                        // FusedNomicLayer's kernel assumes hidden == hs == in == out.
+                        in_dim,
+                        out_dim,
                         has_bias: false,
                         has_rope: true,
                         mask_kind: rlx_ir::op::MaskKind::Custom,
                         interleaved,
                         ..
-                    } => (
+                    } if *in_dim == *hs && *out_dim == *hs => (
                         *hidden,
                         *qkv_w,
                         *out_w,

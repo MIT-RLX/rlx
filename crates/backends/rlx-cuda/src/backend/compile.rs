@@ -396,7 +396,13 @@ impl CudaExecutable {
                     } else {
                         0
                     };
-                    let native = lhs_format.is_native_fp8()
+                    // Native per-tensor FP8 → cuBLASLt tensor-core GEMM, but ONLY
+                    // on hardware with FP8 tensor cores (Ada sm_89 / Hopper sm_90+).
+                    // On Ampere & older the cuBLASLt FP8 GEMM returns NOT_SUPPORTED
+                    // (would panic), so fall through to the software
+                    // decode-and-accumulate path instead — correct on every arch.
+                    let native = crate::backend::helpers::fp8_tensor_cores(&ctx)
+                        && lhs_format.is_native_fp8()
                         && rhs_format.is_native_fp8()
                         && matches!(scale_layout, rlx_ir::ScaleLayout::PerTensor);
                     if native {
@@ -435,6 +441,46 @@ impl CudaExecutable {
                             bias_off_f32: (bias_byte / 4) as u32,
                         });
                     }
+                }
+                Op::ScaledGroupedMatMul {
+                    lhs_format,
+                    rhs_format,
+                    scale_layout,
+                    has_bias,
+                } => {
+                    // input [M,K], weight [E,N,K] (TN), expert_idx [M]; out [M,N].
+                    // Memory-sane on-device decode-GEMM — only the routed expert's
+                    // FP4 codes are read per token (no f32 weight materialization).
+                    let in_dims = graph.node(node.inputs[0]).shape.dims();
+                    let w_dims = graph.node(node.inputs[1]).shape.dims();
+                    let m = in_dims[0].unwrap_static() as u32;
+                    let k = in_dims[1].unwrap_static() as u32;
+                    let ne = w_dims[0].unwrap_static() as u32;
+                    let n = w_dims[w_dims.len() - 2].unwrap_static() as u32;
+                    let bias_byte = if *has_bias {
+                        arena.offset(node.inputs[5]) as u64
+                    } else {
+                        0
+                    };
+                    let (scale_mode, block) = scale_layout.mode_block();
+                    schedule.push(Step::ScaledGroupedMatMulDecode {
+                        m,
+                        k,
+                        n,
+                        num_experts: ne,
+                        input_byte_off: arena.offset(node.inputs[0]) as u64,
+                        weight_byte_off: arena.offset(node.inputs[1]) as u64,
+                        input_scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                        weight_scale_byte_off: arena.offset(node.inputs[3]) as u64,
+                        idx_off_f32: (arena.offset(node.inputs[4]) / 4) as u32,
+                        out_off_f32: (arena.offset(node.id) / 4) as u32,
+                        bias_off_f32: (bias_byte / 4) as u32,
+                        lhs_fmt: lhs_format.kernel_id(),
+                        rhs_fmt: rhs_format.kernel_id(),
+                        scale_mode,
+                        block,
+                        has_bias: u32::from(*has_bias),
+                    });
                 }
                 Op::ScaledQuantScale {
                     format,
@@ -1075,7 +1121,9 @@ impl CudaExecutable {
                     let outer = total / inner.max(1);
                     let is_layer = matches!(&node.op, Op::LayerNorm { .. });
                     let gamma_id = node.inputs[1];
-                    let beta_id = if is_layer && node.inputs.len() >= 3 {
+                    // Both LayerNorm and RmsNorm carry beta (inputs[2]); the
+                    // RmsNorm kernel branch now adds it (matches the CPU oracle).
+                    let beta_id = if node.inputs.len() >= 3 {
                         node.inputs[2]
                     } else {
                         gamma_id
@@ -1552,10 +1600,15 @@ impl CudaExecutable {
                 Op::Attention {
                     num_heads,
                     head_dim,
+                    v_head_dim,
                     mask_kind,
                     score_scale,
                     attn_logit_softcap,
                 } => {
+                    assert!(
+                        v_head_dim.is_none_or(|v| v == *head_dim),
+                        "rlx-cuda: asymmetric v_head_dim (MLA) not yet supported"
+                    );
                     let q_id = node.inputs[0];
                     let k_id = node.inputs[1];
                     let v_id = node.inputs[2];
@@ -1976,20 +2029,42 @@ impl CudaExecutable {
                     let k = in_dims[in_dims.len() - 1].unwrap_static() as u32;
                     let n = out_dims[out_dims.len() - 1].unwrap_static() as u32;
                     let ne = graph.node(node.inputs[2]).shape.dims()[0].unwrap_static() as u32;
-                    schedule.push(Step::DequantGroupedMatmulMlxHost {
-                        m,
-                        k,
-                        n,
-                        num_experts: ne,
-                        scheme: *scheme,
-                        x_byte_off: arena.offset(in_id) as u64,
-                        w_byte_off: arena.offset(node.inputs[1]) as u64,
-                        scale_byte_off: arena.offset(node.inputs[2]) as u64,
-                        zp_byte_off: arena.offset(node.inputs[3]) as u64,
-                        idx_byte_off: arena.offset(node.inputs[4]) as u64,
-                        out_byte_off: arena.offset(node.id) as u64,
-                        scale_bf16: graph.node(node.inputs[2]).shape.dtype() == rlx_ir::DType::BF16,
-                    });
+                    // MXFP4 experts run the NATIVE on-device decode-GEMM kernel (register
+                    // nibble-decode, no host round-trip, no f32 weight); affine falls back to
+                    // the host-delegate. Scales are f32 in the arena (bf16 widened on upload).
+                    if let rlx_ir::quant::QuantScheme::MlxMxfp4 { group_size } = scheme {
+                        schedule.push(Step::DequantGroupedMatmulMlxNative {
+                            m,
+                            k,
+                            n,
+                            num_experts: ne,
+                            group_size: *group_size,
+                            x_byte_off: arena.offset(in_id) as u64,
+                            w_byte_off: arena.offset(node.inputs[1]) as u64,
+                            scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                            idx_byte_off: arena.offset(node.inputs[4]) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
+                        });
+                    } else {
+                        schedule.push(Step::DequantGroupedMatmulMlxHost {
+                            m,
+                            k,
+                            n,
+                            num_experts: ne,
+                            scheme: *scheme,
+                            x_byte_off: arena.offset(in_id) as u64,
+                            w_byte_off: arena.offset(node.inputs[1]) as u64,
+                            scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                            zp_byte_off: arena.offset(node.inputs[3]) as u64,
+                            idx_byte_off: arena.offset(node.inputs[4]) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
+                            // The host-delegate reads scales from the MAIN f32 arena, and this
+                            // backend WIDENS bf16 params to f32 there (set_param) — so the delegate
+                            // must read f32, never bf16. Using the graph dtype (BF16) made it read
+                            // every-other value 0 (rel-L2 ~0.86). Always f32 for the f32-arena delegate.
+                            scale_bf16: false,
+                        });
+                    }
                 }
                 Op::ScatterAdd => {
                     let upd_id = node.inputs[0];
@@ -2577,6 +2652,12 @@ impl CudaExecutable {
                             *hidden_size,
                         );
                     if native {
+                        // Carry (h0) is native now: seed from inputs[5] when set.
+                        let h0_byte_off = if *carry {
+                            arena.offset(node.inputs[5]) as u64
+                        } else {
+                            0
+                        };
                         schedule.push(Step::Gru {
                             x_byte_off: arena.offset(node.inputs[0]) as u64,
                             w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
@@ -2588,6 +2669,9 @@ impl CudaExecutable {
                             seq,
                             input_size,
                             hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            h0_byte_off,
                         });
                     } else {
                         let h0 = if *carry {
@@ -2634,6 +2718,11 @@ impl CudaExecutable {
                             *hidden_size,
                         );
                     if native {
+                        let h0_byte_off = if *carry {
+                            arena.offset(node.inputs[4]) as u64
+                        } else {
+                            0u64
+                        };
                         schedule.push(Step::Rnn {
                             x_byte_off: arena.offset(node.inputs[0]) as u64,
                             w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
@@ -2644,6 +2733,9 @@ impl CudaExecutable {
                             seq,
                             input_size,
                             hidden,
+                            num_layers: *num_layers as u32,
+                            bidirectional: *bidirectional,
+                            h0_byte_off,
                             relu: *relu,
                         });
                     } else {
@@ -4522,6 +4614,10 @@ impl CudaExecutable {
             meta_buffers,
             exec_mode,
             captured_graph: None,
+            segment_graphs: Vec::new(),
+            segment_stream: None,
+            capture_warmed: false,
+            capture_disabled: false,
             streams,
             active_extent: None,
             output_staging,

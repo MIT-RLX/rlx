@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
 use cudarc::cublaslt::{result as cublaslt_result, sys as cublaslt_sys};
 use cudarc::cudnn::{result as cudnn_result, sys as cudnn_sys};
-use cudarc::driver::{CudaContext, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig, PushKernelArg,
+};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, ReduceOp};
 use rlx_ir::{Graph, NodeId, Op};
 
@@ -47,6 +49,200 @@ use super::{CompileMode, ExecMode, Step};
 /// Opt-in WMMA Tensor Core matmul (`RLX_CUDA_WMMA`).
 pub(crate) fn use_wmma() -> bool {
     crate::runtime_config().wmma
+}
+
+/// Device compute capability `(major, minor)` via the driver attribute query.
+/// Cheap (two attribute reads); only hit on cold kernel compile. Falls back to
+/// `(0, 0)` if the query errors, which disables every arch-gated path.
+pub(crate) fn device_cc(ctx: &Arc<CudaContext>) -> (i32, i32) {
+    ctx.compute_capability().unwrap_or((0, 0))
+}
+
+/// True when the device has FP8 (E4M3/E5M2) tensor cores — Ada (sm_89) and
+/// Hopper (sm_90)+. Ampere (sm_80/86) and older do NOT: there the cuBLASLt FP8
+/// GEMM returns `NOT_SUPPORTED`, so per-tensor FP8 must use the software
+/// decode-and-accumulate path (`ScaledMatMulDecode`) instead of the tensor-core
+/// GEMM. Gating on this makes `Op::ScaledMatMul` correct on ALL CUDA hardware.
+pub(crate) fn fp8_tensor_cores(ctx: &Arc<CudaContext>) -> bool {
+    let (maj, min) = device_cc(ctx);
+    (maj == 8 && min >= 9) || maj >= 9
+}
+
+/// NVRTC target for TMA/wgmma kernels: `Some("compute_90a")` on Hopper when
+/// `RLX_CUDA_TMA` is set, else `None` so dispatch falls back to the portable
+/// kernel. Returns `None` on sm_100+ *on purpose* — `sm_90a` is Hopper-specific
+/// and not forward-portable; a Blackwell path needs its own `compute_100a`
+/// variant before this opens up.
+pub(crate) fn tma_arch(ctx: &Arc<CudaContext>) -> Option<&'static str> {
+    if !crate::runtime_config().tma {
+        return None;
+    }
+    match device_cc(ctx) {
+        (9, _) => Some("compute_90a"),
+        _ => None,
+    }
+}
+
+// Tile shape of the TMA GEMM kernel (`kernels/matmul_tma.cu`). These MUST match
+// the `#define`s there — they are the TMA box dimensions.
+pub(crate) const TMA_BM: u32 = 64;
+pub(crate) const TMA_BN: u32 = 64;
+pub(crate) const TMA_BK: u32 = 16;
+
+/// A host-encoded `CUtensorMap` in a form the kernel launcher can push as a
+/// by-value `__grid_constant__` argument. `#[repr(transparent)]` keeps it
+/// byte- and align-identical to the 128-byte, 64B-aligned descriptor.
+#[repr(transparent)]
+pub(crate) struct TensorMapArg(pub cudarc::driver::sys::CUtensorMap);
+
+// SAFETY: `CUtensorMap` is a 128-byte plain-old-data descriptor with no Rust
+// pointers or drop glue; copying its bytes into the kernel param bank is exactly
+// what the driver expects for a grid-constant tensor-map parameter.
+unsafe impl DeviceRepr for TensorMapArg {}
+
+/// Encode a 2D tiled row-major f32 tensor-map. `dim0` is the fastest-varying
+/// (contiguous) logical dimension, `dim1` the outer one; `stride1_bytes` is the
+/// byte stride between successive `dim1` indices (row pitch). Returns `None` on
+/// any driver error so the caller can fall back to the portable GEMM.
+///
+/// SAFETY: `global_addr` must point at a live device allocation of at least
+/// `dim1 * stride1_bytes` bytes and be 16-byte aligned.
+pub(crate) unsafe fn tma_encode_tiled_2d(
+    global_addr: u64,
+    dim0: u64,
+    dim1: u64,
+    box0: u32,
+    box1: u32,
+    stride1_bytes: u64,
+) -> Option<TensorMapArg> {
+    use cudarc::driver::sys as cu;
+    let mut map = std::mem::MaybeUninit::<cu::CUtensorMap>::zeroed();
+    let global_dim = [dim0, dim1];
+    let global_strides = [stride1_bytes]; // rank-1 entries (strides for dims 1..)
+    let box_dim = [box0, box1];
+    let elem_strides = [1u32, 1u32];
+    // SAFETY: pointers are to live local arrays of the correct length; the enum
+    // arguments are valid variants; `global_addr` alignment is the caller's
+    // contract (documented above).
+    let res = unsafe {
+        cu::cuTensorMapEncodeTiled(
+            map.as_mut_ptr(),
+            cu::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+            2,
+            global_addr as *mut std::ffi::c_void,
+            global_dim.as_ptr(),
+            global_strides.as_ptr(),
+            box_dim.as_ptr(),
+            elem_strides.as_ptr(),
+            cu::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            cu::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            cu::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            cu::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+    };
+    if res != cu::CUresult::CUDA_SUCCESS {
+        // Rare on sm_90 (bad alignment/shape); expected NOT_SUPPORTED on
+        // pre-Hopper, but dispatch never reaches here off sm_90. Surface the
+        // reason under the same flag as the other fallbacks.
+        if crate::runtime_config().log_fallback {
+            eprintln!(
+                "[tma] cuTensorMapEncodeTiled -> {res:?} (dim0={dim0} dim1={dim1} box0={box0} box1={box1} stride1={stride1_bytes} addr={global_addr:#x})"
+            );
+        }
+        return None;
+    }
+    // SAFETY: a successful `cuTensorMapEncodeTiled` fully initializes `map`.
+    Some(TensorMapArg(unsafe { map.assume_init() }))
+}
+
+/// Is this matmul step eligible for the TMA GEMM kernel? Conservative: single
+/// batch, and the TMA row pitch + base address alignment constraints (16B) hold
+/// — i.e. `K`/`N` are multiples of 4 f32 (row stride multiple of 16B) and the
+/// operand offsets are 4-f32 aligned. Partial `M`/`N`/`K` tiles are fine (TMA
+/// zero-fills OOB and the kernel bounds-guards the store).
+pub(crate) fn tma_gemm_eligible(
+    m: u32,
+    k: u32,
+    n: u32,
+    batch: u32,
+    a_off_f32: u32,
+    b_off_f32: u32,
+) -> bool {
+    batch == 1
+        && m > 0
+        && k > 0
+        && n > 0
+        && k.is_multiple_of(4)
+        && n.is_multiple_of(4)
+        && a_off_f32.is_multiple_of(4)
+        && b_off_f32.is_multiple_of(4)
+}
+
+/// Build the A and B tensor-maps for a `[M,K]·[K,N]` row-major GEMM whose
+/// operands live in `arena` at the given f32-element offsets. Returns `None`
+/// when ineligible or on any encode failure, so the caller falls through to the
+/// cuBLAS cascade. The immutable arena borrow ends with this call, freeing the
+/// arena for the mutable output-write borrow at launch.
+pub(crate) fn build_tma_gemm_maps(
+    arena: &crate::arena::Arena,
+    stream: &cudarc::driver::CudaStream,
+    m: u32,
+    k: u32,
+    n: u32,
+    batch: u32,
+    a_off_f32: u32,
+    b_off_f32: u32,
+) -> Option<(TensorMapArg, TensorMapArg)> {
+    if !tma_gemm_eligible(m, k, n, batch, a_off_f32, b_off_f32) {
+        return None;
+    }
+    let base = {
+        let (p, _guard) = arena.f32_buf().device_ptr(stream);
+        p
+    };
+    let a_addr = base + (a_off_f32 as u64) * 4;
+    let b_addr = base + (b_off_f32 as u64) * 4;
+    // A [M,K] row-major: dim0=K (contiguous), dim1=M, row pitch = K*4 bytes.
+    let a_map =
+        unsafe { tma_encode_tiled_2d(a_addr, k as u64, m as u64, TMA_BK, TMA_BM, (k as u64) * 4)? };
+    // B [K,N] row-major: dim0=N (contiguous), dim1=K, row pitch = N*4 bytes.
+    let b_map =
+        unsafe { tma_encode_tiled_2d(b_addr, n as u64, k as u64, TMA_BN, TMA_BK, (n as u64) * 4)? };
+    Some((a_map, b_map))
+}
+
+/// Build the A and W tensor-maps for the NT GEMM `C[M,N] = A[M,K]·W[N,K]ᵀ` used
+/// by the GGUF prefill path (`matmul_bt_tma`). Both operands are row-major with
+/// K contiguous (`dim0=K`). `base_addr` is the f32 arena device pointer; the
+/// offsets are byte offsets (the GGUF arena can exceed 4 GB). Returns `None`
+/// when ineligible (16B alignment / K%4) or on encode failure → cuBLAS-bt
+/// fallback.
+pub(crate) fn build_tma_nt_maps(
+    base_addr: u64,
+    m: u32,
+    k: u32,
+    n: u32,
+    x_byte_off: u64,
+    w_byte_off: u64,
+) -> Option<(TensorMapArg, TensorMapArg)> {
+    if !(m > 0
+        && k > 0
+        && n > 0
+        && k.is_multiple_of(4)
+        && x_byte_off.is_multiple_of(16)
+        && w_byte_off.is_multiple_of(16))
+    {
+        return None;
+    }
+    let x_addr = base_addr + x_byte_off;
+    let w_addr = base_addr + w_byte_off;
+    // x [M,K] row-major: dim0=K (contiguous), dim1=M, row pitch = K*4 bytes.
+    let x_map =
+        unsafe { tma_encode_tiled_2d(x_addr, k as u64, m as u64, TMA_BK, TMA_BM, (k as u64) * 4)? };
+    // W [N,K] row-major: dim0=K (contiguous), dim1=N, row pitch = K*4 bytes.
+    let w_map =
+        unsafe { tma_encode_tiled_2d(w_addr, k as u64, n as u64, TMA_BK, TMA_BN, (k as u64) * 4)? };
+    Some((x_map, w_map))
 }
 
 /// Strict f32 matmul for encoder parity: tiled `matmul.cu` kernel (same

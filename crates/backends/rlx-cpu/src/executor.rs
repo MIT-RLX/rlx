@@ -33,6 +33,14 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
     // `RLX_DEBUG_NANS=abort` additionally fails fast. The env is read once here
     // so the hot loop pays only a bool test.
     let scanner = rlx_ir::numeric_check::DebugScanner::from_env("cpu");
+    // Op-data inspection epilogue (shape/stats/histogram/dataflow). Off unless
+    // `RLX_INSPECT_OPS` is set; when on, tag every op output with this forward's
+    // pass index so multi-forward sessions stay separable in the shared log.
+    let inspect_pass = if rlx_ir::tensor_inspect::op_tap_enabled() {
+        Some(rlx_ir::tensor_inspect::op_tap_begin_pass())
+    } else {
+        None
+    };
     for &node_id in &schedule {
         let node = graph.node(node_id);
 
@@ -554,10 +562,18 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
             } => {
+                // The naive reference interpreter is symmetric-SDPA only; the
+                // asymmetric-V (MLA) path is served by the thunk kernels
+                // (compile_dispatch / exec_dispatch).
+                assert!(
+                    v_head_dim.is_none_or(|v| v == *head_dim),
+                    "rlx-cpu executor: asymmetric v_head_dim (MLA) not supported in the naive interpreter"
+                );
                 let q = get_data(arena, external, node.inputs[0]);
                 let k = get_data(arena, external, node.inputs[1]);
                 let v = get_data(arena, external, node.inputs[2]);
@@ -1222,7 +1238,53 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
         if scanner.enabled() {
             scan_node_for_nans(&scanner, graph, node_id, arena, external);
         }
+        if let Some(pass) = inspect_pass {
+            inspect_node_ops(pass, graph, node_id, arena, external);
+        }
     }
+}
+
+/// Record one computed node's output tensor (shape / stats / histogram) and its
+/// input edges into the global op tap. F32 buffers only (mirrors
+/// [`scan_node_for_nans`]); a no-op when the node has no scannable buffer.
+pub(crate) fn inspect_node_ops(
+    pass: usize,
+    graph: &Graph,
+    node_id: NodeId,
+    arena: &Arena,
+    external: &ExternalBuffers,
+) {
+    let node = graph.node(node_id);
+    if node.shape.dtype() != rlx_ir::DType::F32 || !arena.has_buffer(node_id) {
+        return;
+    }
+    // Skip pass-through inputs/params/constants — they are not "ops".
+    if matches!(
+        node.op,
+        Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+    ) {
+        return;
+    }
+    let out = get_data(arena, external, node_id);
+    let dims: Vec<usize> = node
+        .shape
+        .dims()
+        .iter()
+        .map(|d| match d {
+            rlx_ir::Dim::Static(n) => *n,
+            rlx_ir::Dim::Dynamic(_) => 0, // runtime-symbolic; count reflects the buffer
+        })
+        .collect();
+    let input_ids: Vec<usize> = node.inputs.iter().map(|i| i.0 as usize).collect();
+    let op_kind = format!("{:?}", node.op.kind());
+    rlx_ir::tensor_inspect::op_tap_record(
+        pass,
+        &op_kind,
+        node_id.0 as usize,
+        &dims,
+        out,
+        &input_ids,
+    );
 }
 
 /// Localize a NaN/Inf on a single computed node using the same buffer

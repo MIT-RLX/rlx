@@ -51,6 +51,7 @@
 //! | `rlx::sparse`   | `rlx-sparse`    | downstream: sparse linalg *(feature `sparse`)*                                  |
 //! | `rlx::splat`    | `rlx-splat`     | 3D Gaussian splatting *(feature `splat`)* — `register()`, decomposed IR ops      |
 //! | `rlx::linalg`   | `rlx-linalg`    | downstream: dense linalg via LAPACK *(feature `linalg`)*                        |
+//! | `rlx::geo`      | `rlx-geo`       | exact 2D Delaunay / Voronoi custom ops *(feature `geo`)*                        |
 //! | `rlx::cortexm`  | `rlx-cortexm`   | INT8 ARMv7E-M kernels *(feature `cortexm`)* — no `Backend` impl, kernels only   |
 //! | `rlx::fpga`     | `rlx-fpga`      | IR → SystemVerilog export *(feature `fpga`)* — target-agnostic RTL; no `Backend` |
 //!
@@ -108,7 +109,7 @@
 //! rlx = { git = "https://github.com/MIT-RLX/rlx", features = ["apple-silicon", "mlx"] }
 //! ```
 
-#![doc(html_root_url = "https://docs.rs/rlx/0.2.1")]
+#![doc(html_root_url = "https://docs.rs/rlx/0.2.14")]
 
 // ── Module re-exports ───────────────────────────────────────────
 
@@ -176,6 +177,13 @@ pub use rlx_splat as splat;
 #[cfg(feature = "umap")]
 /// Downstream: UMAP / fast-umap custom ops (k-NN from pairwise distances).
 pub use rlx_umap as umap;
+
+#[cfg(feature = "geo")]
+/// Exact-integer 2D Delaunay triangulation + discrete Voronoi (JFA) custom ops
+/// (`geo.delaunay` / `geo.voronoi_grid`). Call [`geo::register`] once before
+/// compiling graphs that reference them.
+/// See [`rlx-geo`](https://crates.io/crates/rlx-geo).
+pub use rlx_geo as geo;
 
 #[cfg(feature = "optim")]
 /// Training-step optimizers (Adam, AdamW, NAdamW, RAdam, QHAdamW,

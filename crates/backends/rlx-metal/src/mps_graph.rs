@@ -36,6 +36,8 @@ unsafe extern "C" {}
 mod mps_dtype {
     pub const Float32: u32 = 0x10000000 | 32;
     pub const Float16: u32 = 0x10000000 | 16;
+    // MPSDataTypeBFloat16 = MPSDataTypeAlternateEncodingBit | Float16.
+    pub const BFloat16: u32 = 0x90000000 | 16;
     pub const Int32: u32 = 0x20000000 | 32; // MPSDataTypeSignedBit | 32
 }
 
@@ -43,6 +45,14 @@ mod mps_dtype {
 pub fn mps_graph_supported() -> bool {
     static AVAIL: OnceLock<bool> = OnceLock::new();
     *AVAIL.get_or_init(|| objc::runtime::Class::get("MPSGraph").is_some())
+}
+
+/// Compute composite activations (gelu/silu/…) in the input's low precision
+/// instead of up-casting to f32. Off by default (f32 is correct); opt in with
+/// `RLX_MPS_LOWP_ACT=1` for lower bandwidth at some accuracy cost.
+fn lowp_activations() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("RLX_MPS_LOWP_ACT").is_ok_and(|v| v != "0" && !v.is_empty()))
 }
 
 /// Owned wrapper around an MPSGraph instance. Drop releases.
@@ -132,25 +142,27 @@ impl MpsGraph {
     ///
     /// Use for `Activation::GeluApprox` (ViT / Brain-JEPA MLP blocks).
     pub fn gelu_approx(&self, x: &MpsTensor) -> MpsTensor {
-        let half = self.constant_scalar(0.5);
-        let one = self.constant_scalar(1.0);
-        let three = self.constant_scalar(3.0);
-        let coeff = self.constant_scalar(0.044715);
-        let sqrt_2_over_pi = self.constant_scalar(0.797_884_6);
+        self.in_f32(x, |x| {
+            let half = self.constant_scalar(0.5);
+            let one = self.constant_scalar(1.0);
+            let three = self.constant_scalar(3.0);
+            let coeff = self.constant_scalar(0.044715);
+            let sqrt_2_over_pi = self.constant_scalar(0.797_884_6);
 
-        let x3 = self.power(x, &three);
-        let inner_a = self.mul(&coeff, &x3);
-        let inner = self.add(x, &inner_a);
-        let scaled = self.mul(&sqrt_2_over_pi, &inner);
-        let t = self.tanh(&scaled);
-        let one_p = self.add(&one, &t);
-        let xt = self.mul(x, &one_p);
-        self.mul(&half, &xt)
+            let x3 = self.power(x, &three);
+            let inner_a = self.mul(&coeff, &x3);
+            let inner = self.add(x, &inner_a);
+            let scaled = self.mul(&sqrt_2_over_pi, &inner);
+            let t = self.tanh(&scaled);
+            let one_p = self.add(&one, &t);
+            let xt = self.mul(x, &one_p);
+            self.mul(&half, &xt)
+        })
     }
 
     /// Error function — matches CPU `Activation::Gelu` (erf form).
     pub fn erf(&self, x: &MpsTensor) -> MpsTensor {
-        unsafe {
+        self.in_f32(x, |x| unsafe {
             let nsname = ns_string("erf");
             let t: *mut Object = msg_send![self.obj,
                 erfWithTensor: x.obj
@@ -159,20 +171,24 @@ impl MpsGraph {
                 obj: t,
                 shape: None,
             }
-        }
+        })
     }
 
     /// Erf-based GELU — matches CPU `scalar_gelu` / `Activation::Gelu`:
     ///   `y = 0.5 · x · (1 + erf(x / √2))`
     pub fn gelu(&self, x: &MpsTensor) -> MpsTensor {
-        let inv_sqrt2 = self.constant_scalar(std::f32::consts::FRAC_1_SQRT_2);
-        let scaled = self.mul(x, &inv_sqrt2);
-        let e = self.erf(&scaled);
-        let one = self.constant_scalar(1.0);
-        let one_p_erf = self.add(&one, &e);
-        let half = self.constant_scalar(0.5);
-        let cdf = self.mul(&one_p_erf, &half);
-        self.mul(x, &cdf)
+        // Computed in f32 (see `in_f32`): the erf + f32-constant mix is wrong in
+        // bf16/f16 on MPSGraph.
+        self.in_f32(x, |x| {
+            let inv_sqrt2 = self.constant_scalar(std::f32::consts::FRAC_1_SQRT_2);
+            let scaled = self.mul(x, &inv_sqrt2);
+            let e = self.erf(&scaled);
+            let one = self.constant_scalar(1.0);
+            let one_p_erf = self.add(&one, &e);
+            let half = self.constant_scalar(0.5);
+            let cdf = self.mul(&one_p_erf, &half);
+            self.mul(x, &cdf)
+        })
     }
 
     /// `out = x * y` element-wise.
@@ -207,7 +223,7 @@ impl MpsGraph {
 
     /// `tanh(x)`.
     pub fn tanh(&self, x: &MpsTensor) -> MpsTensor {
-        unsafe {
+        self.in_f32(x, |x| unsafe {
             let nsname = ns_string("tanh");
             let t: *mut Object = msg_send![self.obj,
                 tanhWithTensor: x.obj
@@ -216,12 +232,12 @@ impl MpsGraph {
                 obj: t,
                 shape: None,
             }
-        }
+        })
     }
 
     /// `sigmoid(x) = 1 / (1 + exp(-x))`.
     pub fn sigmoid(&self, x: &MpsTensor) -> MpsTensor {
-        unsafe {
+        self.in_f32(x, |x| unsafe {
             let nsname = ns_string("sigmoid");
             let t: *mut Object = msg_send![self.obj,
                 sigmoidWithTensor: x.obj
@@ -230,14 +246,14 @@ impl MpsGraph {
                 obj: t,
                 shape: None,
             }
-        }
+        })
     }
 
     /// SiLU / Swish activation: `silu(x) = x * sigmoid(x)`.
     /// Used in SwiGLU FFN blocks (Nomic-Vision, LLaMA-style models).
     /// Element-wise `exp(x)`.
     pub fn exp(&self, x: &MpsTensor) -> MpsTensor {
-        unsafe {
+        self.in_f32(x, |x| unsafe {
             let t: *mut Object = msg_send![self.obj,
                 exponentWithTensor: x.obj
                 name: ns_string("exp")];
@@ -245,7 +261,7 @@ impl MpsGraph {
                 obj: t,
                 shape: None,
             }
-        }
+        })
     }
     /// Element-wise `sin(x)`.
     pub fn sin(&self, x: &MpsTensor) -> MpsTensor {
@@ -275,7 +291,7 @@ impl MpsGraph {
 
     /// Element-wise natural log `log(x)`.
     pub fn log(&self, x: &MpsTensor) -> MpsTensor {
-        unsafe {
+        self.in_f32(x, |x| unsafe {
             let t: *mut Object = msg_send![self.obj,
                 logarithmWithTensor: x.obj
                 name: ns_string("log")];
@@ -283,7 +299,7 @@ impl MpsGraph {
                 obj: t,
                 shape: None,
             }
-        }
+        })
     }
     /// Element-wise `sqrt(x)`.
     pub fn sqrt(&self, x: &MpsTensor) -> MpsTensor {
@@ -299,7 +315,7 @@ impl MpsGraph {
     }
     /// Element-wise `1 / sqrt(x)`.
     pub fn rsqrt(&self, x: &MpsTensor) -> MpsTensor {
-        unsafe {
+        self.in_f32(x, |x| unsafe {
             let t: *mut Object = msg_send![self.obj,
                 reverseSquareRootWithTensor: x.obj
                 name: ns_string("rsqrt")];
@@ -307,7 +323,7 @@ impl MpsGraph {
                 obj: t,
                 shape: None,
             }
-        }
+        })
     }
     /// Element-wise `-x`.
     pub fn neg(&self, x: &MpsTensor) -> MpsTensor {
@@ -552,8 +568,10 @@ impl MpsGraph {
     }
 
     pub fn silu(&self, x: &MpsTensor) -> MpsTensor {
-        let s = self.sigmoid(x);
-        self.mul(x, &s)
+        self.in_f32(x, |x| {
+            let s = self.sigmoid(x);
+            self.mul(x, &s)
+        })
     }
 
     /// Scalar constant tensor (broadcasts to operands).
@@ -794,6 +812,26 @@ impl MpsGraph {
                 shape: None,
             }
         }
+    }
+
+    /// The MPS dtype of a graph tensor (reads `MPSGraphTensor.dataType`).
+    fn tensor_dtype(&self, x: &MpsTensor) -> u32 {
+        unsafe { msg_send![x.obj, dataType] }
+    }
+
+    /// Run `body` on an f32 view of `x` and cast the result back to `x`'s dtype.
+    /// Composite activations (erf/tanh/sigmoid-based) that mix in f32 constants
+    /// are numerically wrong in bf16/f16 on MPSGraph, so by default they run in
+    /// f32 and cast back. Set `RLX_MPS_LOWP_ACT=1` to instead compute them in the
+    /// input's (low) precision — faster / lower-bandwidth, at some accuracy cost.
+    fn in_f32<F: FnOnce(&MpsTensor) -> MpsTensor>(&self, x: &MpsTensor, body: F) -> MpsTensor {
+        let dt = self.tensor_dtype(x);
+        if dt == mps_dtype::Float32 || lowp_activations() {
+            return body(x);
+        }
+        let xf = self.cast(x, mps_dtype::Float32);
+        let out = body(&xf);
+        self.cast(&out, dt)
     }
 
     /// Cast tensor to a new dtype.
@@ -2038,7 +2076,12 @@ unsafe fn mps_tensor_data_from_buffer(
             // takes a CPU pointer + length and treats the underlying memory as
             // GPU-shared. This works on Apple Silicon because of unified memory.
             let n_elem: usize = shape.iter().product();
-            let bytes = n_elem * if dtype == mps_dtype::Float16 { 2 } else { 4 };
+            let elem_bytes = if dtype == mps_dtype::Float16 || dtype == mps_dtype::BFloat16 {
+                2
+            } else {
+                4
+            };
+            let bytes = n_elem * elem_bytes;
             let raw_ptr = (buf.contents() as *mut u8).add(offset);
             let dev_ref: &metal::DeviceRef =
                 &crate::device::metal_device().expect("metal device").device;

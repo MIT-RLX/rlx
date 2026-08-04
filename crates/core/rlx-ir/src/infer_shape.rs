@@ -123,6 +123,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         }
 
         Op::Reduce { axes, keep_dim, .. } => shape::reduce_shape(in_shape(0), axes, *keep_dim).ok(),
+        Op::Histogram { bins, .. } => Some(Shape::new(&[*bins], DType::F32)),
         Op::ArgMax { axis, keep_dim } | Op::ArgMin { axis, keep_dim } => {
             shape::reduce_shape(in_shape(0), &[*axis], *keep_dim).ok()
         }
@@ -203,7 +204,17 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                 None
             }
         }
-        Op::Attention { .. } => Some(shape::attention_shape(in_shape(0))),
+        Op::Attention {
+            num_heads,
+            head_dim,
+            v_head_dim,
+            ..
+        } => Some(shape::attention_shape_vdim(
+            in_shape(0),
+            *num_heads,
+            *head_dim,
+            v_head_dim.unwrap_or(*head_dim),
+        )),
         Op::Rope { .. } => Some(shape::unary_shape(in_shape(0))),
         Op::AxialRope2d { .. } => Some(shape::unary_shape(in_shape(0))),
 
@@ -221,6 +232,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         }
 
         Op::FusedMatMulBiasAct { .. } => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
+        Op::FusedMatMulResidual => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
         // Like `Op::Conv`, the output shape is set explicitly by the fusion pass
         // (from the pre-fusion conv/activation output); nothing to infer here.
         Op::FusedConvBiasAct { .. } => None,
@@ -295,6 +307,45 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             shape::matmul_shape(in_shape(0), in_shape(1)).ok()
         }
 
+        // x [m, k] · Wᵀ → [m, n]; `n` is the row count of the `indices`
+        // tensor ([n, k/entry_dim]). The weight is synthesized in-loop,
+        // so its shape is derived from the operands, not a stored [k,n].
+        Op::SynthMatMul { .. } => {
+            let m = in_shape(0).dim(0).unwrap_static();
+            let n = in_shape(1).dim(0).unwrap_static();
+            Some(Shape::new(&[m, n], in_shape(0).dtype()))
+        }
+
+        // Fused synth backward: `dx` matches `x` [m,k] (input 0); `d_codebook`
+        // matches the codebook [num_entries, entry_dim] (input 2).
+        Op::SynthMatMulBackward { wrt, .. } => Some(match wrt {
+            SynthBwdWrt::Dx => in_shape(0).clone(),
+            SynthBwdWrt::Codebook => in_shape(2).clone(),
+        }),
+
+        // Reconstruct dense weight W[k,n]: indices [n, k/entry_dim] → k = dim1·ed,
+        // n = dim0.
+        Op::SynthReconstruct {
+            kind: SynthKind::Codebook { entry_dim, .. },
+        } => {
+            // `w_bt[n,k]` — the backward-friendly layout; caller transposes to `W[k,n]`.
+            let idx = in_shape(0);
+            let n = idx.dim(0).unwrap_static();
+            let k = idx.dim(1).unwrap_static() * *entry_dim as usize;
+            Some(Shape::new(&[n, k], DType::F32))
+        }
+
+        // KAN spline activation is shape-preserving (per-channel univariate map).
+        Op::SplineActivation { .. } => Some(shape::unary_shape(in_shape(0))),
+        // dx has x's shape (input 0).
+        Op::SplineActivationBackwardX { .. } => Some(shape::unary_shape(in_shape(0))),
+        // dcoeff is [C, num_basis]; C = last dim of x (input 0).
+        Op::SplineActivationBackwardCoeff { num_basis, .. } => {
+            let x = in_shape(0);
+            let c = x.dim(x.rank() - 1).unwrap_static();
+            Some(Shape::new(&[c, *num_basis as usize], DType::F32))
+        }
+
         // Full linear convolution: last axis of x (`L`) grows to `L + M − 1`,
         // where `M` is the rank-1 impulse-response length (input 1).
         Op::PartitionedConv { .. } => {
@@ -317,6 +368,20 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             } else {
                 let m = lhs.dims()[lhs.rank() - 2];
                 let n = rhs.dims()[rhs.rank() - 2];
+                Some(Shape::from_dims(&[m, n], DType::F32))
+            }
+        }
+
+        // Native low-precision *grouped* (MoE) GEMM: input [M,K], per-expert
+        // weight [E,N,K] (K-last), expert_idx [M] → out [M,N] f32.
+        Op::ScaledGroupedMatMul { .. } => {
+            let input = in_shape(0);
+            let weight = in_shape(1);
+            if input.rank() < 2 || weight.rank() < 3 {
+                None
+            } else {
+                let m = input.dims()[input.rank() - 2];
+                let n = weight.dims()[weight.rank() - 2];
                 Some(Shape::from_dims(&[m, n], DType::F32))
             }
         }

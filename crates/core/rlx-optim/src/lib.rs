@@ -40,7 +40,11 @@
 //! | [`Mars`]        | MARS (variance-reduced)       |
 //! | [`Stiefel`]     | Riemannian SGD on St(m,n)     |
 
-#![forbid(unsafe_code)]
+// Pure-safe by default. Relaxed from `forbid` to `deny` so the one
+// performance-critical exception — the Accelerate/AMX `cblas_sgemm` shim behind
+// Muon's Newton–Schulz on macOS — can opt in with a scoped `#[allow(unsafe_code)]`
+// (see `muon::accel`). Every other module stays unsafe-free.
+#![deny(unsafe_code)]
 
 mod common;
 
@@ -109,8 +113,31 @@ pub use common::{global_grad_clip_scale, l2_norm};
 /// multiply the base `lr` by a per-name factor. The provided method
 /// on the trait does NOT scale automatically; algorithms are free to
 /// consult it via [`Optimizer::lr_scale`] inside their `step`.
+/// One parameter's data for a batched optimizer step ([`Optimizer::step_batch`]):
+/// its name, static shape, mutable data slice (owned by the caller), and gradient.
+pub struct OptItem<'a> {
+    pub name: &'a str,
+    pub shape: &'a [usize],
+    pub param: &'a mut [f32],
+    pub grad: &'a [f32],
+}
+
 pub trait Optimizer {
     fn step(&mut self, name: &str, shape: &[usize], param: &mut [f32], grad: &[f32]);
+
+    /// Batched step over ALL parameters in one call. Default: sequential
+    /// `step` per item — bit-identical to the per-parameter loop. Optimizers
+    /// whose parameter groups are **independent** (e.g. Muon on the 2-D weight
+    /// matrices vs AdamW on the embeddings/biases/norms) can override this to
+    /// run the groups on separate threads; because the groups touch disjoint
+    /// parameters and disjoint optimizer state, the result is bit-for-bit the
+    /// same as the serial loop — only the wall-clock (the CPU-side optimizer
+    /// bubble) shrinks toward `max(group_times)` instead of their sum.
+    fn step_batch(&mut self, items: &mut [OptItem<'_>]) {
+        for it in items.iter_mut() {
+            self.step(it.name, it.shape, it.param, it.grad);
+        }
+    }
 
     /// Advance the global step counter. Most algorithms increment per
     /// call to [`step`], so most implementations leave this a no-op.

@@ -53,20 +53,22 @@ extern "C" __global__ void rlx_norm(
     __shared__ float s[LN_BLOCK];
 
     if (op == 0) {
-        // LayerNorm: var = max(E[x²] − E[x]², 0) — matches CPU / wgpu / PyTorch
-        // nn.LayerNorm (one read pass for moments, not two-pass (x−μ)²).
+        // LayerNorm: TWO-PASS var = mean((x−mean)²). The one-pass E[x²]−mean²
+        // catastrophically cancels in f32 on rows with a large DC offset
+        // (pre-norm ViT/DINOv2 activations) — this matches the CPU oracle.
         float local_sum = 0.0f;
-        float local_sum_sq = 0.0f;
         for (unsigned int i = tid; i < inner; i += bsz) {
-            float v = arena[in_base + i];
-            local_sum += v;
-            local_sum_sq += v * v;
+            local_sum += arena[in_base + i];
         }
         float sum_x = ln_block_sum(local_sum, s, tid, bsz);
         __syncthreads();
-        float sum_x2 = ln_block_sum(local_sum_sq, s, tid, bsz);
         float mean = sum_x * n_inv;
-        float var = fmaxf(sum_x2 * n_inv - mean * mean, 0.0f);
+        float local_sq = 0.0f;
+        for (unsigned int i = tid; i < inner; i += bsz) {
+            float d = arena[in_base + i] - mean;
+            local_sq += d * d;
+        }
+        float var = fmaxf(ln_block_sum(local_sq, s, tid, bsz) * n_inv, 0.0f);
         // Precise 1/sqrt — matches CPU `1.0/(var+eps).sqrt()` (not fast rsqrtf).
         float inv_std = 1.0f / sqrtf(var + eps);
 
@@ -76,18 +78,28 @@ extern "C" __global__ void rlx_norm(
             arena[out_base + i] = (arena[in_base + i] - mean) * inv_std * g + b;
         }
     } else {
-        // RmsNorm.
-        float local_ss = 0.0f;
+        // RmsNorm: two-pass mean(x²) = mean((x−mean)²) + mean²; `+ beta`. Matches
+        // the CPU oracle (subtracting the mean keeps the deviation sum well-
+        // conditioned under a large DC offset; `+ beta` since RmsNorm carries it).
+        float local_sum = 0.0f;
         for (unsigned int i = tid; i < inner; i += bsz) {
-            float v = arena[in_base + i];
-            local_ss += v * v;
+            local_sum += arena[in_base + i];
         }
-        float ss = ln_block_sum(local_ss, s, tid, bsz);
-        float inv_rms = 1.0f / sqrtf(ss * n_inv + eps);
+        float sum_x = ln_block_sum(local_sum, s, tid, bsz);
+        __syncthreads();
+        float mean = sum_x * n_inv;
+        float local_sq = 0.0f;
+        for (unsigned int i = tid; i < inner; i += bsz) {
+            float d = arena[in_base + i] - mean;
+            local_sq += d * d;
+        }
+        float dev = ln_block_sum(local_sq, s, tid, bsz);
+        float inv_rms = 1.0f / sqrtf(dev * n_inv + mean * mean + eps);
 
         for (unsigned int i = tid; i < inner; i += bsz) {
             float g = arena[gamma_off + i];
-            arena[out_base + i] = arena[in_base + i] * inv_rms * g;
+            float b = arena[beta_off + i];
+            arena[out_base + i] = arena[in_base + i] * inv_rms * g + b;
         }
     }
 }

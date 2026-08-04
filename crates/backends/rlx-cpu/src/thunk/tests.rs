@@ -545,6 +545,176 @@ fn dequant_matmul_int8_sym_matches_reference() {
     }
 }
 
+/// End-to-end (task): a 2-layer int8 FFN driven through the REAL
+/// graph→plan→compile→execute pipeline, comparing the scalar W8A32 path against
+/// the wired SME W8A8 path (`RLX_CPU_SME_W8A8=1`) on correctness (vs an f32
+/// reference) and latency. This exercises `exec_dequant_mat_mul`'s SME dispatch
+/// exactly as a real model would hit it. Ignored (sets a process-global env +
+/// times): run with
+///   cargo test -p rlx-cpu --features amx-sme sme_w8a8_end_to_end \
+///     -- --ignored --nocapture --test-threads=1
+#[cfg(rlx_cpu_amx_sme)]
+#[test]
+#[ignore = "end-to-end bench; run explicitly with --ignored --nocapture --test-threads=1"]
+fn sme_w8a8_end_to_end() {
+    use rlx_ir::Philox4x32;
+    use rlx_ir::quant::QuantScheme;
+    use std::time::Instant;
+
+    if !crate::intrinsics::apple_amx::sme::is_available_i8() {
+        eprintln!("SME2 int8 not available; skipping");
+        return;
+    }
+    let f = DType::F32;
+    let (m, k, hid) = (32usize, 1024usize, 4096usize); // FFN-ish shapes
+
+    // Per-output-channel symmetric int8 weights (block_size = k ⇒ 1 block).
+    let mut rng = Philox4x32::new(7);
+    let mut x = vec![0f32; m * k];
+    rng.fill_normal(&mut x);
+    let mk_w = |rows: usize, cols: usize, seed: i32| -> (Vec<i8>, Vec<f32>) {
+        let w: Vec<i8> = (0..rows * cols)
+            .map(|i| ((i as i32 * 17 + seed) % 127 - 63) as i8)
+            .collect();
+        let s: Vec<f32> = (0..cols)
+            .map(|j| 0.005 + 0.0001 * (j % 32) as f32)
+            .collect();
+        (w, s)
+    };
+    let (w1, s1) = mk_w(k, hid, 3); // [k, hid]
+    let (w2, s2) = mk_w(hid, k, 11); // [hid, k]
+
+    // f32 reference: dequant (per-column) then chain the two matmuls.
+    let deq = |w: &[i8], s: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+        let mut o = vec![0f32; rows * cols];
+        for p in 0..rows {
+            for j in 0..cols {
+                o[p * cols + j] = w[p * cols + j] as f32 * s[j];
+            }
+        }
+        o
+    };
+    let mm = |a: &[f32], b: &[f32], m: usize, k: usize, n: usize| -> Vec<f32> {
+        let mut o = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += a[i * k + p] * b[p * n + j];
+                }
+                o[i * n + j] = acc;
+            }
+        }
+        o
+    };
+    let href = mm(&x, &deq(&w1, &s1, k, hid), m, k, hid);
+    let yref = mm(&href, &deq(&w2, &s2, hid, k), m, hid, k);
+
+    // Build the graph once; re-execute under each dispatch policy.
+    let mut g = Graph::new("ffn_i8");
+    let xn = g.input("x", Shape::new(&[m, k], f));
+    let w1n = g.param("w1", Shape::new(&[k, hid], DType::I8));
+    let s1n = g.param("s1", Shape::new(&[1, hid], f));
+    let z1n = g.param("z1", Shape::new(&[1, hid], f));
+    let w2n = g.param("w2", Shape::new(&[hid, k], DType::I8));
+    let s2n = g.param("s2", Shape::new(&[1, k], f));
+    let z2n = g.param("z2", Shape::new(&[1, k], f));
+    let sc = |bs: usize| QuantScheme::Int8Block {
+        block_size: bs as u32,
+    };
+    let h = g.dequant_matmul(xn, w1n, s1n, z1n, sc(k), Shape::new(&[m, hid], f));
+    let y = g.dequant_matmul(h, w2n, s2n, z2n, sc(hid), Shape::new(&[m, k], f));
+    g.set_outputs(vec![y]);
+
+    let plan = rlx_opt::memory::plan_memory(&g);
+    let mut arena = crate::arena::Arena::from_plan(plan);
+    let sched = compile_thunks(&g, &arena);
+    let (xo, w1o, s1o, z1o, w2o, s2o, z2o, yo) = (
+        arena.byte_offset(xn),
+        arena.byte_offset(w1n),
+        arena.byte_offset(s1n),
+        arena.byte_offset(z1n),
+        arena.byte_offset(w2n),
+        arena.byte_offset(s2n),
+        arena.byte_offset(z2n),
+        arena.byte_offset(y),
+    );
+    let buf = arena.raw_buf_mut();
+    unsafe {
+        let seedf = |buf: &mut [u8], off: usize, v: &[f32]| {
+            let p = buf.as_mut_ptr().add(off) as *mut f32;
+            for (i, &x) in v.iter().enumerate() {
+                *p.add(i) = x;
+            }
+        };
+        let seedi = |buf: &mut [u8], off: usize, v: &[i8]| {
+            let p = buf.as_mut_ptr().add(off) as *mut i8;
+            for (i, &x) in v.iter().enumerate() {
+                *p.add(i) = x;
+            }
+        };
+        seedf(buf, xo, &x);
+        seedi(buf, w1o, &w1);
+        seedf(buf, s1o, &s1);
+        seedf(buf, z1o, &vec![0f32; hid]);
+        seedi(buf, w2o, &w2);
+        seedf(buf, s2o, &s2);
+        seedf(buf, z2o, &vec![0f32; k]);
+    }
+
+    let read_out = |arena: &crate::arena::Arena| -> Vec<f32> {
+        unsafe {
+            let p = arena.raw_buf().as_ptr().add(yo) as *const f32;
+            (0..m * k).map(|i| *p.add(i)).collect()
+        }
+    };
+    let cosine = |a: &[f32], b: &[f32]| -> f64 {
+        let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            d += (*x as f64) * (*y as f64);
+            na += (*x as f64).powi(2);
+            nb += (*y as f64).powi(2);
+        }
+        d / (na.sqrt() * nb.sqrt())
+    };
+    let run_timed = |arena: &mut crate::arena::Arena| -> f64 {
+        for _ in 0..3 {
+            execute_thunks(&sched, arena.raw_buf_mut());
+        }
+        let iters = 20;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            execute_thunks(&sched, arena.raw_buf_mut());
+        }
+        t0.elapsed().as_secs_f64() / iters as f64 * 1e3 // ms/pass
+    };
+
+    // Scalar W8A32 path (env unset).
+    unsafe { std::env::remove_var("RLX_CPU_SME_W8A8") };
+    let ms_scalar = run_timed(&mut arena);
+    let out_scalar = read_out(&arena);
+
+    // SME W8A8 path (env set).
+    unsafe { std::env::set_var("RLX_CPU_SME_W8A8", "1") };
+    let ms_sme = run_timed(&mut arena);
+    let out_sme = read_out(&arena);
+    unsafe { std::env::remove_var("RLX_CPU_SME_W8A8") };
+
+    let cos_scalar = cosine(&out_scalar, &yref);
+    let cos_sme = cosine(&out_sme, &yref);
+    eprintln!(
+        "2-layer int8 FFN [m={m},k={k},hid={hid}]:\n  scalar W8A32: {ms_scalar:.3} ms/pass  cos_vs_f32={cos_scalar:.5}\n  SME    W8A8 : {ms_sme:.3} ms/pass  cos_vs_f32={cos_sme:.5}  speedup={:.2}×",
+        ms_scalar / ms_sme
+    );
+    // Both paths must be correct end-to-end. Scalar is W8A32 (near-exact);
+    // SME is W8A8 (lossier) but must still track the f32 reference.
+    assert!(cos_scalar > 0.999, "scalar path wrong: cos {cos_scalar}");
+    assert!(
+        cos_sme > 0.99,
+        "SME W8A8 path wrong end-to-end: cos {cos_sme}"
+    );
+}
+
 /// Plan #9: LoRA matmul matches the unfused 3-matmul reference.
 #[test]
 fn lora_matmul_matches_unfused_reference() {
@@ -6051,7 +6221,7 @@ fn c64_binary_div_by_self_gives_unity() {
 }
 
 #[test]
-#[should_panic(expected = "C64: complex max/min/pow")]
+#[should_panic(expected = "on DType::C64: undefined for complex")]
 fn c64_binary_max_is_rejected_at_lowering() {
     run_c64_binary(BinaryOp::Max, &[(1.0_f32, 2.0_f32)], &[(3.0_f32, 4.0_f32)]);
 }
@@ -6418,6 +6588,64 @@ fn binary_full_5d_mid_singleton_broadcast() {
              (actual={}, expected={})",
         actual[max_idx],
         expected[max_idx]
+    );
+}
+
+/// Regression for the latent CPU `Op::Compare` trailing size-1 broadcast bug:
+/// `eq([1,L,L], [1,L,1])` (the `where(x == reduce_max(x, keepdim)…)` masking
+/// pattern). The old flat path read `rhs[i]` for `i` in `0..L*L` but rhs only
+/// holds `L` elements → it ran off the operand into adjacent arena memory, so
+/// only the first query row matched and the rest came back all-false. The
+/// shape-aware broadcast path indexes `rhs` via row-major coords · strides.
+#[test]
+fn compare_trailing_size1_broadcast() {
+    let l = 3usize;
+    let f = DType::F32;
+    let mut g = Graph::new("cmp_trailing_bcast");
+    // lhs `[1,L,L]` = 1..=9; rhs `[1,L,1]` = per-row key so each row has one hit.
+    let lhs = g.input("lhs", Shape::new(&[1, l, l], f));
+    let rhs = g.input("rhs", Shape::new(&[1, l, 1], f));
+    let out = g.add_node(
+        Op::Compare(CmpOp::Eq),
+        vec![lhs, rhs],
+        Shape::new(&[1, l, l], DType::Bool),
+    );
+    g.set_outputs(vec![out]);
+
+    let lhs_data: Vec<f32> = (1..=(l * l) as i32).map(|v| v as f32).collect(); // 1..9
+    let rhs_data: Vec<f32> = vec![3.0, 5.0, 8.0]; // row 0→col2, row 1→col1, row 2→col1
+    let mut expected = vec![0u8; l * l];
+    for i in 0..l {
+        for j in 0..l {
+            expected[i * l + j] = u8::from(lhs_data[i * l + j] == rhs_data[i]);
+        }
+    }
+
+    let plan = rlx_opt::memory::plan_memory(&g);
+    let mut arena = crate::arena::Arena::from_plan(plan);
+    let sched = compile_thunks(&g, &arena);
+    let lhs_off = arena.byte_offset(lhs);
+    let rhs_off = arena.byte_offset(rhs);
+    let out_off = arena.byte_offset(out);
+    let buf = arena.raw_buf_mut();
+    unsafe {
+        let p = buf.as_mut_ptr().add(lhs_off) as *mut f32;
+        for (i, &v) in lhs_data.iter().enumerate() {
+            *p.add(i) = v;
+        }
+        let p = buf.as_mut_ptr().add(rhs_off) as *mut f32;
+        for (i, &v) in rhs_data.iter().enumerate() {
+            *p.add(i) = v;
+        }
+    }
+    execute_thunks(&sched, arena.raw_buf_mut());
+    let actual: Vec<u8> = unsafe {
+        let p = arena.raw_buf().as_ptr().add(out_off);
+        (0..l * l).map(|i| *p.add(i)).collect()
+    };
+    assert_eq!(
+        actual, expected,
+        "Compare trailing size-1 broadcast wrong: got {actual:?}, want {expected:?}"
     );
 }
 

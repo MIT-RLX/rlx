@@ -26,6 +26,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         BatchElementwiseRegion,
         MatMul,
         ScaledMatMul,
+        ScaledGroupedMatMul,
         ScaledQuantize,
         ScaledQuantScale,
         ScaledDequantize,

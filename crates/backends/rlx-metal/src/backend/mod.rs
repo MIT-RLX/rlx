@@ -80,6 +80,12 @@ pub struct MetalExecutable {
     /// MPSGraph-vs-per-op adaptive dispatch (see `encode_and_run`).
     /// Computed once because graph shape is static after compile.
     max_matmul_flops: u64,
+    /// True when the graph has an `Op::MatMul` with a BF16 input. The
+    /// per-op thunk `Sgemm` has no bf16-weight kernel (only f16), so it
+    /// would read bf16 bytes as f32 → garbage. MPSGraph casts bf16→f32
+    /// correctly (see `mps_graph_lower::MatMul`), so route these graphs
+    /// through MPS regardless of the FLOP threshold. Computed once.
+    has_bf16_matmul: bool,
     /// Set after the first `encode_and_run` triggers
     /// `freeze_params_to_mps_constants`. Subsequent runs skip the
     /// (idempotent but not free) re-lower.
@@ -89,16 +95,24 @@ pub struct MetalExecutable {
     gdn_scratch_off: usize,
     /// Arena tail scratch for GPU GGUF dequant before matmul (reused per op).
     dequant_scratch_off: usize,
+    /// Arena tail scratch for the m>8 SynthMatMul recon→MPS prefill weight Wᵀ[n,k].
+    synth_matmul_scratch_off: usize,
     /// Arena tail scratch for GPU im2col before conv weight backward GEMM.
     conv_bwd_scratch_off: usize,
     /// Arena tail scratch for GPU attention backward (scores, dp, ds).
     attn_bwd_scratch_off: usize,
     /// Arena tail scratch for parallel RMSNorm param backward.
     rms_norm_bwd_scratch_off: usize,
+    /// Arena tail scratch (ping-pong pair) for native multi-layer GRU / Elman RNN.
+    rnn_gru_scratch_off: usize,
     /// Arena tail scratch for in-graph onnx.QMatMul act dequant (f32).
     onnx_qmatmul_act_scratch_off: usize,
     /// Cached dequant f32 weights for in-graph onnx.QMatMul.
     qmatmul_weight_cache: std::cell::RefCell<crate::onnx_qmatmul::QMatMulWeightCache>,
+    /// Option A (`RLX_QWEN3_BAKE_WEIGHTS`): arena offsets of weight-only concats
+    /// already computed once. On later steps those concats are skipped — the
+    /// fused (constant) weight is left in place, saving the per-token re-copy.
+    baked_weight_concats: std::cell::RefCell<std::collections::HashSet<usize>>,
     /// Persistent F32 scratch for promoting F16 Linear weights before sgemm
     /// (legacy path; prefer native `sgemm_f16w`).
     #[allow(dead_code)]

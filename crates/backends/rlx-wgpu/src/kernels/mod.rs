@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use bytemuck::{Pod, Zeroable};
 
 pub const MATMUL_WGSL: &str = include_str!("matmul.wgsl");
+pub const MATMUL_BF16W_WGSL: &str = include_str!("matmul_bf16w.wgsl");
 pub const MATMUL_WIDE_WGSL: &str = include_str!("matmul_wide.wgsl");
 pub const MATMUL_WIDE_NV_WGSL: &str = include_str!("matmul_wide_nv.wgsl");
 pub const MATMUL_F16W_WGSL: &str = include_str!("matmul_f16w.wgsl");
@@ -36,6 +37,9 @@ pub const MATMUL_QKV_COOP_F16_VK_F32ACC_WGSL: &str =
 pub const MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC_WGSL: &str =
     include_str!("matmul_qkv_coop_f16_vk_widen_f32acc.wgsl");
 pub const CAST_F32_TO_F16_WGSL: &str = include_str!("cast_f32_to_f16.wgsl");
+pub const RNG_PHILOX_WGSL: &str = include_str!("rng_philox.wgsl");
+pub const FUSED_SWIGLU_WGSL: &str = include_str!("fused_swiglu.wgsl");
+pub const FUSED_CONV_BIAS_ACT_WGSL: &str = include_str!("fused_conv_bias_act.wgsl");
 pub const BINARY_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/binary.wgsl"));
 // Assembled at build time: `rlx_activation_apply` (generated from the shared
 // rlxsl manifest) prepended to `unary_main.wgsl`. See build.rs.
@@ -111,12 +115,15 @@ pub const TOPK_WGSL: &str = include_str!("topk.wgsl");
 pub const WELCH_PEAKS_GPU_WGSL: &str = include_str!("welch_peaks_gpu.wgsl");
 pub const UMAP_KNN_WGSL: &str = include_str!("umap_knn.wgsl");
 pub const GROUPED_MATMUL_WGSL: &str = include_str!("grouped_matmul.wgsl");
+pub const SCALED_GROUPED_MATMUL_DECODE_WGSL: &str =
+    include_str!("scaled_grouped_matmul_decode.wgsl");
 pub const SAMPLE_WGSL: &str = include_str!("sample.wgsl");
 pub const SELECTIVE_SCAN_WGSL: &str = include_str!("selective_scan.wgsl");
 pub const GATED_DELTA_NET_WGSL: &str = include_str!("gated_delta_net.wgsl");
 pub const MAMBA2_WGSL: &str = include_str!("mamba2.wgsl");
 pub const GRU_WGSL: &str = include_str!("gru.wgsl");
 pub const RNN_WGSL: &str = include_str!("rnn.wgsl");
+pub const LSTM_WGSL: &str = include_str!("lstm.wgsl");
 pub const DEQUANT_MATMUL_WGSL: &str = include_str!("dequant_matmul.wgsl");
 pub const DEQUANT_MATMUL_MLX_WGSL: &str = include_str!("dequant_matmul_mlx.wgsl");
 pub const DEQUANT_GGUF_WGSL: &str = include_str!("dequant_gguf.wgsl");
@@ -775,6 +782,69 @@ pub struct CopyParams {
     pub _p4: u32,
 }
 
+/// Uniform layout for the on-device Philox RNG kernels (`rng_philox.wgsl`).
+/// `a`/`b` are `mean`/`scale` (normal) or `low`/`high` (uniform); unused by
+/// `rng_fill_zero`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct RngParams {
+    pub n: u32,
+    pub out_off: u32,
+    pub a: f32,
+    pub b: f32,
+    pub seed_lo: u32,
+    pub seed_hi: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
+/// Uniform layout for the native `fused_swiglu.wgsl` kernel. `out = up *
+/// silu(gate)` from a `[.., 2*n_half]` input; `outer` = rows (total output
+/// = `outer*n_half`). Offsets are relative to the bound arena window.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct FusedSwiGLUParams {
+    pub n_half: u32,
+    pub outer: u32,
+    pub gate_first: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
+/// Uniform layout for `fused_conv_bias_act.wgsl` — the Conv2d params plus the
+/// fused bias/activation/residual epilogue. Offsets are window-relative.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct FusedConvBiasActParams {
+    pub n: u32,
+    pub c_in: u32,
+    pub c_out: u32,
+    pub h: u32,
+    pub w: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub sh: u32,
+    pub sw: u32,
+    pub ph: u32,
+    pub pw: u32,
+    pub dh: u32,
+    pub dw: u32,
+    pub groups: u32,
+    pub in_off: u32,
+    pub w_off: u32,
+    pub out_off: u32,
+    pub has_bias: u32,
+    pub bias_off: u32,
+    pub act_id: u32,
+    pub has_residual: u32,
+    pub residual_off: u32,
+}
+
 /// Layout for transpose (uses the 3-binding bind layout).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -882,7 +952,10 @@ pub struct AttentionParams {
     /// GQA/MQA: number of key/value heads that the query heads share. Equals
     /// `heads` for plain MHA; 0 means unset and the shader falls back to MHA.
     pub kv_heads: u32,
-    pub _pad_mask_1: u32,
+    /// Asymmetric SDPA (DeepSeek/Kimi MLA): V rows + output are `v_head_dim`
+    /// wide while the Q·K score contracts over `head_dim`. Equals `head_dim`
+    /// for ordinary attention; 0 makes the shader fall back to `head_dim`.
+    pub v_head_dim: u32,
     pub _pad_mask_2: u32,
 
     // Q stride triple (in f32 elements). For [B, H, S, D]:
@@ -1417,10 +1490,13 @@ pub struct GruParams {
     pub bhh_off: u32,
     pub out_off: u32,
     pub seq_stride: u32,
-    pub _p1: u32,
-    pub _p2: u32,
-    pub _p3: u32,
-    pub _p4: u32,
+    /// h0 (carry) word offset; 0 = no carry (h0 = 0).
+    pub h0_off: u32,
+    /// dirs·hidden — width of an output row (this dir owns `[dir_off, dir_off+h)`).
+    pub out_width: u32,
+    pub dir_off: u32,
+    /// 1 → walk the sequence backwards (reverse direction of a bidir layer).
+    pub reverse: u32,
     pub _p5: u32,
 }
 
@@ -1439,11 +1515,40 @@ pub struct RnnParams {
     pub out_off: u32,
     pub seq_stride: u32,
     pub relu: u32,
-    pub _p1: u32,
-    pub _p2: u32,
-    pub _p3: u32,
-    pub _p4: u32,
-    pub _p5: u32,
+    /// h0 (carry) word offset; 0 = no carry (h0 = 0).
+    pub h0_off: u32,
+    /// dirs·hidden — width of an output row (this dir owns `[dir_off, dir_off+h)`).
+    pub out_width: u32,
+    pub dir_off: u32,
+    /// 1 → walk the sequence backwards (reverse direction of a bidir layer).
+    pub reverse: u32,
+}
+
+/// Layout for LSTM (native WGSL). 64 bytes. Gate order i, f, g, o; single
+/// merged bias. One dispatch per (layer, direction).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct LstmParams {
+    pub batch: u32,
+    pub seq: u32,
+    pub input_size: u32,
+    pub hidden: u32,
+    pub x_off: u32,
+    pub wih_off: u32,
+    pub whh_off: u32,
+    pub bias_off: u32,
+    pub out_off: u32,
+    pub seq_stride: u32,
+    /// h0 (carry) word offset; 0 = no carry (h0 = 0).
+    pub h0_off: u32,
+    /// c0 (carry) word offset; 0 = no carry (c0 = 0).
+    pub c0_off: u32,
+    /// dirs·hidden — width of an output row (this dir owns `[dir_off, dir_off+h)`).
+    pub out_width: u32,
+    pub dir_off: u32,
+    /// 1 → walk the sequence backwards (reverse direction of a bidir layer).
+    pub reverse: u32,
+    pub _p: u32,
 }
 
 /// Layout for SelectiveScan. 64 bytes.
@@ -1525,6 +1630,30 @@ pub struct GroupedMatmulParams {
     pub w_off: u32,
     pub idx_off: u32,
     pub out_off: u32,
+}
+
+/// Layout for ScaledGroupedMatMul (native MXFP4 grouped decode-GEMM). 64 bytes.
+/// Code/scale offsets are BYTE offsets (packed U8); idx/out/bias are f32
+/// element offsets.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ScaledGroupedMatmulParams {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub num_experts: u32,
+    pub input_byte_off: u32,
+    pub weight_byte_off: u32,
+    pub input_scale_byte_off: u32,
+    pub weight_scale_byte_off: u32,
+    pub idx_off: u32,
+    pub out_off: u32,
+    pub bias_off: u32,
+    pub scale_mode: u32,
+    pub block: u32,
+    pub has_bias: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 /// Layout for TopK. 32 bytes.
@@ -2109,6 +2238,7 @@ static MATMUL: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_WIDE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_WIDE_NV: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16W: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_BF16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16_COMPUTE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP16: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32: OnceLock<Kernel> = OnceLock::new();
@@ -2204,12 +2334,14 @@ static TOPK: OnceLock<Kernel> = OnceLock::new();
 static WELCH_PEAKS_GPU: OnceLock<Kernel> = OnceLock::new();
 static UMAP_KNN: OnceLock<Kernel> = OnceLock::new();
 static GROUPED_MATMUL: OnceLock<Kernel> = OnceLock::new();
+static SCALED_GROUPED_MATMUL_DECODE: OnceLock<Kernel> = OnceLock::new();
 static SAMPLE: OnceLock<Kernel> = OnceLock::new();
 static SELECTIVE_SCAN: OnceLock<Kernel> = OnceLock::new();
 static GATED_DELTA_NET: OnceLock<Kernel> = OnceLock::new();
 static MAMBA2: OnceLock<Kernel> = OnceLock::new();
 static GRU: OnceLock<Kernel> = OnceLock::new();
 static RNN: OnceLock<Kernel> = OnceLock::new();
+static LSTM: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL_MLX: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
@@ -2270,6 +2402,21 @@ pub fn matmul_f16w_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
             "matmul_f16w",
         )
     }))
+}
+/// Packed-BF16-weight matmul (f32 compute). Reads B as `array<u32>`
+/// (two bf16 per word) and unpacks `bitcast<f32>(bits << 16)` in-shader,
+/// so it reads HALF the B bytes vs the widened-f32 arena path and stays
+/// bit-exact to a bf16-rounded f32 matmul. Pure WGSL u32 ops — available
+/// on every device (no `SHADER_F16` needed).
+pub fn matmul_bf16w_kernel(device: &wgpu::Device) -> &'static Kernel {
+    MATMUL_BF16W.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu matmul_bf16w",
+            MATMUL_BF16W_WGSL,
+            "matmul_bf16w",
+        )
+    })
 }
 /// f16-compute matmul: f16 operands, f16 multiply, f32 accumulator.
 /// Targets the 2× f16 ALU throughput on Apple Silicon. Returns Some
@@ -2952,6 +3099,64 @@ pub fn fft_gpu_outer_r2_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn copy_kernel(device: &wgpu::Device) -> &'static Kernel {
     COPY.get_or_init(|| build_kernel(device, "rlx-wgpu copy", COPY_WGSL, "copy"))
 }
+
+static RNG_NORMAL_PHILOX: OnceLock<Kernel> = OnceLock::new();
+static RNG_UNIFORM_PHILOX: OnceLock<Kernel> = OnceLock::new();
+static RNG_FILL_ZERO: OnceLock<Kernel> = OnceLock::new();
+pub fn rng_normal_philox_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RNG_NORMAL_PHILOX.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu rng_normal_philox",
+            RNG_PHILOX_WGSL,
+            "rng_normal_philox",
+        )
+    })
+}
+pub fn rng_uniform_philox_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RNG_UNIFORM_PHILOX.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu rng_uniform_philox",
+            RNG_PHILOX_WGSL,
+            "rng_uniform_philox",
+        )
+    })
+}
+pub fn rng_fill_zero_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RNG_FILL_ZERO.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu rng_fill_zero",
+            RNG_PHILOX_WGSL,
+            "rng_fill_zero",
+        )
+    })
+}
+
+static FUSED_SWIGLU: OnceLock<Kernel> = OnceLock::new();
+pub fn fused_swiglu_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FUSED_SWIGLU.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fused_swiglu",
+            FUSED_SWIGLU_WGSL,
+            "fused_swiglu",
+        )
+    })
+}
+
+static FUSED_CONV_BIAS_ACT: OnceLock<Kernel> = OnceLock::new();
+pub fn fused_conv_bias_act_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FUSED_CONV_BIAS_ACT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fused_conv_bias_act",
+            FUSED_CONV_BIAS_ACT_WGSL,
+            "fused_conv_bias_act",
+        )
+    })
+}
 pub fn cast_kernel(device: &wgpu::Device) -> &'static Kernel {
     CAST.get_or_init(|| build_kernel(device, "rlx-wgpu cast", CAST_WGSL, "cast_main"))
 }
@@ -3176,6 +3381,16 @@ pub fn grouped_matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+pub fn scaled_grouped_matmul_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SCALED_GROUPED_MATMUL_DECODE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu scaled_grouped_matmul_decode",
+            SCALED_GROUPED_MATMUL_DECODE_WGSL,
+            "scaled_grouped_matmul_decode",
+        )
+    })
+}
 pub fn sample_kernel(device: &wgpu::Device) -> &'static Kernel {
     SAMPLE.get_or_init(|| build_kernel(device, "rlx-wgpu sample", SAMPLE_WGSL, "sample"))
 }
@@ -3207,6 +3422,9 @@ pub fn gru_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn rnn_kernel(device: &wgpu::Device) -> &'static Kernel {
     RNN.get_or_init(|| build_kernel(device, "rlx-wgpu rnn", RNN_WGSL, "rnn"))
+}
+pub fn lstm_kernel(device: &wgpu::Device) -> &'static Kernel {
+    LSTM.get_or_init(|| build_kernel(device, "rlx-wgpu lstm", LSTM_WGSL, "lstm"))
 }
 pub fn dequant_matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_MATMUL.get_or_init(|| {

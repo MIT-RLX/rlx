@@ -485,6 +485,7 @@ mod tests {
             Op::Attention {
                 num_heads: nh,
                 head_dim: dh,
+                v_head_dim: None,
                 mask_kind: MaskKind::None,
                 score_scale: None,
                 attn_logit_softcap: None,

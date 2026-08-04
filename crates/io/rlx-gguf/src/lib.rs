@@ -414,7 +414,12 @@ impl GgufFile {
         };
 
         let trace = std::env::var("RLX_GGUF_TRACE").is_ok();
-        let mut metadata = HashMap::with_capacity(kv_count as usize);
+        // `kv_count` comes straight from untrusted header bytes; a malformed
+        // file can claim billions of entries. Cap the pre-allocation hint (the
+        // map still grows for a genuinely large model) so a 20-byte hostile
+        // file can't trigger a multi-GB up-front alloc. The read loop below is
+        // self-bounding — it EOFs on a truncated file long before the cap.
+        let mut metadata = HashMap::with_capacity((kv_count as usize).min(1 << 16));
         for i in 0..kv_count {
             let pos_before = r.stream_position()?;
             let key = read_string(r, version)?;
@@ -439,11 +444,14 @@ impl GgufFile {
             .and_then(MetaValue::as_u64)
             .unwrap_or(DEFAULT_ALIGNMENT);
 
-        let mut tensors = HashMap::with_capacity(tensor_count as usize);
+        // Same untrusted-count hardening as the metadata map above.
+        let mut tensors = HashMap::with_capacity((tensor_count as usize).min(1 << 16));
         for _ in 0..tensor_count {
             let name = read_string(r, version)?;
             let n_dims = read_u32(r)?;
-            let mut shape = Vec::with_capacity(n_dims as usize);
+            // Untrusted count → clamp the alloc hint (the read loop self-bounds
+            // on EOF); real tensors have a tiny rank.
+            let mut shape = Vec::with_capacity((n_dims as usize).min(1 << 16));
             for _ in 0..n_dims {
                 let d = if version == 1 {
                     read_u32(r)? as u64
@@ -763,8 +771,15 @@ fn read_string<R: Read>(r: &mut R, version: u32) -> Result<String> {
     } else {
         read_u64(r)?
     };
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf)?;
+    // `len` is untrusted header data — do NOT pre-allocate it (a 20-byte hostile
+    // file can claim a u64::MAX length → multi-exabyte alloc / capacity panic).
+    // Read up to `len` via `take`, growing only as real bytes arrive, then
+    // verify the full string was present.
+    let mut buf = Vec::new();
+    let got = r.by_ref().take(len).read_to_end(&mut buf)?;
+    if got as u64 != len {
+        return Err(anyhow!("string truncated: got {got} of {len} bytes"));
+    }
     String::from_utf8(buf).map_err(|e| anyhow!("non-UTF8 string: {e}"))
 }
 
@@ -805,7 +820,9 @@ fn read_value<R: Read + Seek>(r: &mut R, version: u32) -> Result<MetaValue> {
             } else {
                 read_u64(r)?
             };
-            let mut out = Vec::with_capacity(len as usize);
+            // Untrusted array length → clamp the alloc hint; the push loop reads
+            // real bytes and EOFs on a truncated/hostile file.
+            let mut out = Vec::with_capacity((len as usize).min(1 << 16));
             for _ in 0..len {
                 out.push(read_scalar(r, inner_ty, version)?);
             }
@@ -1595,6 +1612,25 @@ pub fn dequant_q8_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A malformed header claiming a `u64::MAX` metadata-key length must error
+    /// cleanly, NOT try to allocate exabytes (the old `vec![0u8; len]` would
+    /// capacity-overflow-panic / OOM). Guards the untrusted-length hardening.
+    #[test]
+    fn hostile_string_length_errors_not_ooms() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
+        buf.extend_from_slice(&1u64.to_le_bytes()); // kv_count = 1
+        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // key length = u64::MAX
+        // …and no key bytes follow.
+        let r = GgufFile::header_from_bytes(&buf);
+        assert!(
+            r.is_err(),
+            "hostile huge string length should error, not OOM"
+        );
+    }
 
     #[test]
     fn roundtrip_f32_v3() {

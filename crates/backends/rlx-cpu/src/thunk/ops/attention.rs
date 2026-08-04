@@ -93,6 +93,7 @@ pub(crate) fn compile_attention(
     let Op::Attention {
         num_heads,
         head_dim,
+        v_head_dim,
         mask_kind,
         score_scale,
         attn_logit_softcap,
@@ -100,6 +101,8 @@ pub(crate) fn compile_attention(
     else {
         unreachable!()
     };
+    // V/output per-head width; == head_dim unless asymmetric (MLA).
+    let v_head_dim = v_head_dim.unwrap_or(*head_dim);
     {
         // Layout dispatch: rank-4 input could be either
         // `[B, S, H, D]` (CPU's historical convention) or
@@ -161,6 +164,7 @@ pub(crate) fn compile_attention(
             .unwrap_or(batch * kv_seq * *num_heads * *head_dim);
         let nkv = (k_numel / (batch.max(1) * kv_seq.max(1) * (*head_dim).max(1))).max(1) as u32;
         let kv_hs = nkv * *head_dim as u32;
+        let kv_hs_v = nkv * v_head_dim as u32; // V rows are v_head_dim-wide
         Thunk::Attention {
             q: node_offset(arena, node.inputs[0]),
             k: node_offset(arena, node.inputs[1]),
@@ -173,6 +177,7 @@ pub(crate) fn compile_attention(
             heads: *num_heads as u32,
             kv_heads: nkv,
             head_dim: *head_dim as u32,
+            v_head_dim: v_head_dim as u32,
             mask_kind: *mask_kind,
             scale: score_scale.unwrap_or((*head_dim as f32).powf(-0.5)),
             softcap: attn_logit_softcap.unwrap_or(0.0),
@@ -181,7 +186,7 @@ pub(crate) fn compile_attention(
             // Narrow→Attention fusion when applicable.
             q_row_stride: hs,
             k_row_stride: kv_hs,
-            v_row_stride: kv_hs,
+            v_row_stride: kv_hs_v,
             bhsd,
         }
     }
@@ -269,6 +274,94 @@ pub(crate) fn compile_attention_backward(
     }
 }
 
+/// Lower [`rlx_ir::Op::AttentionBackwardAll`] to the fused thunk. The node's own
+/// output slot is the packed `[3B,S,H,D]` buffer; dQ/dK/dV go to three disjoint
+/// byte sub-ranges of it (so the memory planner manages one live buffer, and the
+/// downstream axis-0 `Narrow`s alias into it).
+pub(crate) fn compile_attention_backward_all(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+) -> Thunk {
+    let Op::AttentionBackwardAll {
+        num_heads,
+        head_dim,
+        mask_kind,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    {
+        let q_shape = &graph.node(node.inputs[0]).shape;
+        let k_shape = &graph.node(node.inputs[1]).shape;
+        let rank = q_shape.rank();
+        let (batch, seq, kv_seq, bhsd) = if rank == 4 {
+            let d1 = q_shape.dim(1).unwrap_static();
+            let d2 = q_shape.dim(2).unwrap_static();
+            if d1 == *num_heads {
+                (
+                    q_shape.dim(0).unwrap_static(),
+                    d2,
+                    k_shape.dim(2).unwrap_static(),
+                    true,
+                )
+            } else {
+                (
+                    q_shape.dim(0).unwrap_static(),
+                    d1,
+                    k_shape.dim(1).unwrap_static(),
+                    false,
+                )
+            }
+        } else if rank >= 3 {
+            (
+                q_shape.dim(0).unwrap_static(),
+                q_shape.dim(1).unwrap_static(),
+                k_shape.dim(1).unwrap_static(),
+                false,
+            )
+        } else {
+            (
+                1,
+                q_shape.dim(0).unwrap_static(),
+                k_shape.dim(0).unwrap_static(),
+                false,
+            )
+        };
+        let mask_off = if matches!(
+            mask_kind,
+            rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias
+        ) {
+            node_offset(arena, node.inputs[4])
+        } else {
+            0
+        };
+        // Byte size of one gradient. dQ = dK = dV = q's shape (self-attention:
+        // the fusion pass only fires when q and k share a shape), so one
+        // gradient is exactly `q`'s element count.
+        let per_bytes =
+            graph.node(node.inputs[0]).shape.num_elements().unwrap() * std::mem::size_of::<f32>();
+        let base = node_offset(arena, node.id);
+        Thunk::AttentionBackwardAll {
+            q: node_offset(arena, node.inputs[0]),
+            k: node_offset(arena, node.inputs[1]),
+            v: node_offset(arena, node.inputs[2]),
+            dy: node_offset(arena, node.inputs[3]),
+            mask: mask_off,
+            out_q: base,
+            out_k: base + per_bytes,
+            out_v: base + 2 * per_bytes,
+            batch: batch as u32,
+            seq: seq as u32,
+            kv_seq: kv_seq as u32,
+            heads: *num_heads as u32,
+            head_dim: *head_dim as u32,
+            mask_kind: *mask_kind,
+            bhsd,
+        }
+    }
+}
+
 #[allow(unused_variables)]
 pub(crate) fn compile_fused_attention_block(
     node: &rlx_ir::Node,
@@ -339,6 +432,9 @@ pub(crate) fn compile_fused_attention_block(
             hs,
             nh: *num_heads as u32,
             dh: *head_dim as u32,
+            // The MIR `Op::FusedAttentionBlock` is BERT-shaped: hidden == hs.
+            in_dim: hs,
+            out_dim: hs,
             has_bias: *has_bias,
             has_rope: *has_rope,
             // The MIR `Op::FusedAttentionBlock` is BERT-only (NeoX rope).
@@ -584,6 +680,71 @@ pub(crate) fn exec_attention_backward(t: &Thunk, base: *mut u8) {
             crate::attention_bwd::attention_backward(
                 *wrt, q_data, k_data, v_data, dy_data, out_data, b, nh, q_s, k_s, dh, *mask_kind,
                 mask_data, *bhsd,
+            );
+        }
+    }
+}
+
+pub(crate) fn exec_attention_backward_all(t: &Thunk, base: *mut u8) {
+    let Thunk::AttentionBackwardAll {
+        q,
+        k,
+        v,
+        dy,
+        mask,
+        out_q,
+        out_k,
+        out_v,
+        batch,
+        seq,
+        kv_seq,
+        heads,
+        head_dim,
+        mask_kind,
+        bhsd,
+    } = t
+    else {
+        unreachable!()
+    };
+    {
+        let (b, q_s, k_s, nh, dh) = (
+            *batch as usize,
+            *seq as usize,
+            *kv_seq as usize,
+            *heads as usize,
+            *head_dim as usize,
+        );
+        unsafe {
+            let q_len = if *bhsd {
+                b * nh * q_s * dh
+            } else {
+                b * q_s * nh * dh
+            };
+            let k_len = if *bhsd {
+                b * nh * k_s * dh
+            } else {
+                b * k_s * nh * dh
+            };
+            let q_data = sl(*q, base, q_len);
+            let k_data = sl(*k, base, k_len);
+            let v_data = sl(*v, base, k_len);
+            let dy_data = sl(*dy, base, q_len);
+            let out_q_data = sl_mut(*out_q, base, q_len);
+            let out_k_data = sl_mut(*out_k, base, k_len);
+            let out_v_data = sl_mut(*out_v, base, k_len);
+            let mask_data: &[f32] = if *mask != 0 {
+                let ml = match mask_kind {
+                    rlx_ir::op::MaskKind::Custom => b * k_s,
+                    rlx_ir::op::MaskKind::Bias => b * nh * q_s * k_s,
+                    _ => 0,
+                };
+                sl(*mask, base, ml)
+            } else {
+                &[]
+            };
+            crate::attention_bwd::attention_backward_all(
+                q_data, k_data, v_data, dy_data, out_q_data, out_k_data, out_v_data, b, nh, q_s,
+                k_s, dh, *mask_kind, mask_data, *bhsd,
             );
         }
     }

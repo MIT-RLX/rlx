@@ -139,6 +139,30 @@ pub struct CudaExecutable {
     /// Captured CUDA Graph (built on first `run()` when `exec_mode ==
     /// Graph`). Replayed on subsequent runs to skip per-launch dispatch.
     captured_graph: Option<cudarc::driver::CudaGraph>,
+    /// Segmented capture (opt-in `RLX_CUDA_SEGMENTED_CAPTURE=1`): one captured
+    /// graph per maximal capture-safe run of the schedule, in order, for
+    /// schedules the whole-graph gate rejects (a host step forces eager). Host
+    /// steps + sub-threshold GPU runs execute eagerly between segment replays.
+    /// Empty until the first run captures them; dropped on RNG-policy change.
+    segment_graphs: Vec<Option<cudarc::driver::CudaGraph>>,
+    /// Dedicated NON-null stream for segmented capture. `default_stream()` is
+    /// the legacy null stream, which CUDA refuses to capture — so capture (and
+    /// the eager spans between segments, for co-ordering) run on this stream
+    /// instead. Persisted so a replay run launches the captured graphs on the
+    /// same stream they were captured on. Created lazily on the first
+    /// segmented run.
+    segment_stream: Option<Arc<cudarc::driver::CudaStream>>,
+    /// Whether the first segmented run has warmed the kernel cache. Module load
+    /// (`cuModuleLoadData`) and first-use cuBLAS workspace `cudaMalloc` are both
+    /// ILLEGAL during stream capture, so the first segmented run dispatches
+    /// eagerly (loading/allocating everything) and only the SECOND run captures.
+    capture_warmed: bool,
+    /// Set when a capture attempt failed for this schedule (a step classified
+    /// capture-safe actually broke capture). Permanently disables capture for
+    /// this executable so subsequent runs go straight to correct eager dispatch
+    /// — the safety net for a mis-classified op (schedule is fixed, so the
+    /// failure is deterministic; no point retrying).
+    capture_disabled: bool,
     /// Stream pool for `ExecMode::MultiStream(n)`. Empty for the other
     /// modes (which use the context's default stream).
     streams: Vec<Arc<cudarc::driver::CudaStream>>,
@@ -183,7 +207,23 @@ pub struct CudaExecutable {
 
 impl CudaExecutable {
     /// Override RNG policy for in-graph random ops without recompiling.
+    ///
+    /// A captured CUDA graph bakes the Philox seed / backend into by-value
+    /// kernel args, so a policy change must drop the capture: the next run
+    /// re-captures (or falls back to eager) under the new policy, matching
+    /// eager dispatch which re-reads the policy every run.
     pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        let changed = *self.rng.read().expect("rng lock") != rng;
+        if changed {
+            self.captured_graph = None;
+            self.captured_readback_plan = None;
+            // RNG steps are capture-safe only on-device, so a policy change can
+            // move them between Gpu/Eager segments — invalidate the segment
+            // graphs too (they re-capture under the new policy next run).
+            self.segment_graphs.clear();
+            self.segment_stream = None;
+            self.capture_warmed = false;
+        }
         *self.rng.write().expect("rng lock") = rng;
     }
 
@@ -639,7 +679,48 @@ impl CudaExecutable {
             exe.register_kv_row_feed(k, idx);
         }
         exe.set_active_extent(self.active_extent);
+        // CRITICAL: `compile_with_rng` re-bakes Constants into the fresh arena but
+        // leaves `Op::Param` slots zero-initialised — the params were uploaded to
+        // THIS executable's device arena via `set_param`, and a recompile cannot
+        // recover them. Copy them device-to-device so the clone runs with the real
+        // weights. Without this, any `compile_named().clone()` consumer (piper /
+        // kokoro / styletts2 / zipvoice flow_dec, fed via a clone rather than the
+        // in-place `run_named`) executes with zero weights → silent/garbage audio.
+        exe.copy_params_from(self);
         exe
+    }
+
+    /// D2D-copy every `Op::Param` slot from `src`'s arena into `self`'s arena.
+    /// Both executables share the same graph, so `param_offsets` and the arena
+    /// layout match. Only Params are copied (Constants are re-baked by the
+    /// recompile; activations are overwritten at run time).
+    fn copy_params_from(&mut self, src: &Self) {
+        // (src_off_f32, dst_off_f32, n_f32) for each param resident in both arenas.
+        let plan: Vec<(usize, usize, usize)> = self
+            .param_offsets
+            .iter()
+            .filter_map(|(name, &id)| {
+                let src_id = *src.param_offsets.get(name)?;
+                if !(self.arena.has(id) && src.arena.has(src_id)) {
+                    return None;
+                }
+                // f32-slot element count: byte size / 4 (covers packed U8/I8 params,
+                // which are stored as bytes inside the f32 arena buffer).
+                let bytes = self.graph.node(id).shape.size_bytes().unwrap_or(0);
+                let n = bytes.div_ceil(4);
+                (n > 0).then_some((src.arena.offset(src_id) / 4, self.arena.offset(id) / 4, n))
+            })
+            .collect();
+        if plan.is_empty() {
+            return;
+        }
+        let stream = self.ctx.default_stream();
+        let src_buf = src.arena.f32_buf();
+        let dst_buf = self.arena.f32_buf_mut();
+        for (s_off, d_off, n) in plan {
+            Self::copy_f32_dtod_between(&stream, src_buf, s_off, dst_buf, d_off, n);
+        }
+        let _ = stream.synchronize();
     }
 
     /// Build the sorted output readback plan into [`Self::readback_plan_buf`].

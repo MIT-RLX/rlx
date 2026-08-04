@@ -1,0 +1,5 @@
+error: `bind` is not allowed inside `repeat` — adopt outer tensors before the loop
+ --> tests/ui/bind_inside_repeat.rs:7:18
+  |
+7 |             bind w;            // `bind` adopts a name — not allowed inside a loop
+  |                  ^

@@ -9,14 +9,14 @@
 //!
 //! See [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use rlx_ir::{Graph, Op};
 use std::sync::Arc;
 
 use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
     dequant_gguf_kernel, dequant_matmul_gguf_kernel, dequant_matmul_gguf_q1_gemv_kernel,
-    matmul_bt_kernel,
+    matmul_bt_kernel, matmul_bt_tma_kernel,
 };
 
 fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usize {
@@ -223,6 +223,50 @@ fn run_matmul_bt(
             || rlx_ir::env::flag("RLX_CUDA_NO_TF32")
             || rlx_ir::env::flag("RLX_CUDA_MATMUL_PRECISE")) as u32
     };
+
+    // Opt-in Hopper TMA NT GEMM (`RLX_CUDA_TMA` on sm_90). Only when compensated
+    // accumulation isn't requested (the TMA kernel does plain FMA) and the tile
+    // is eligible; otherwise fall through to `matmul_bt`. Inert off sm_90.
+    if precise == 0 && crate::backend::tma_arch(ctx).is_some() {
+        let base = {
+            let (p, _guard) = buffer.device_ptr(stream);
+            p
+        };
+        if let Some((a_map, w_map)) = crate::backend::build_tma_nt_maps(
+            base,
+            m as u32,
+            k as u32,
+            n as u32,
+            x_byte_off as u64,
+            w_byte_off as u64,
+        ) {
+            let tma = matmul_bt_tma_kernel(ctx);
+            let cfg = LaunchConfig {
+                grid_dim: (n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let c_off_u = (out_byte_off / 4) as u64;
+            // matmul_bt_tma(a_map, w_map, arena, M, K, N, c_off): the two
+            // tensor-maps are the leading grid-constant args.
+            let mut launcher = stream.launch_builder(&tma.function);
+            launcher
+                .arg(&a_map)
+                .arg(&w_map)
+                .arg(&mut *buffer)
+                .arg(&m_u)
+                .arg(&k_u)
+                .arg(&n_u)
+                .arg(&c_off_u);
+            unsafe {
+                launcher
+                    .launch(cfg)
+                    .expect("rlx-cuda: matmul_bt_tma launch failed");
+            }
+            return;
+        }
+    }
+
     let mut launcher = stream.launch_builder(&kernel.function);
     launcher
         .arg(&mut *buffer)
@@ -359,7 +403,15 @@ pub fn run_dequant_matmul_gguf_gpu(
     }
 
     // Scheme 24 = GgufQ1_0 — auto-enable compensated matmul by default.
-    let precise_default = scheme_id == 24;
+    // Also auto-enable for large K, where the naive f32 k-reduction loses
+    // several mantissa bits that the dequant just produced: opt in by setting
+    // RLX_CUDA_MATMUL_PRECISE_MIN_K to the K above which compensation kicks in
+    // for every GGUF scheme. Default unset ⇒ no perf change (compensation
+    // stays opt-in for non-Q1_0 via RLX_CUDA_MATMUL_PRECISE / PARITY / NO_TF32,
+    // which run_matmul_bt already honors regardless of `precise_default`).
+    let precise_min_k =
+        rlx_ir::env::var("RLX_CUDA_MATMUL_PRECISE_MIN_K").and_then(|v| v.parse::<usize>().ok());
+    let precise_default = scheme_id == 24 || precise_min_k.is_some_and(|t| k >= t);
     let precise_off = matches!(
         rlx_ir::env::var("RLX_CUDA_MATMUL_PRECISE").as_deref(),
         Some("0") | Some("false") | Some("off")

@@ -24,6 +24,7 @@ fn build_packed_causal_attn(b: usize, s: usize, h: usize, d: usize) -> Graph {
         rlx_ir::Op::Attention {
             num_heads: h,
             head_dim: d,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,

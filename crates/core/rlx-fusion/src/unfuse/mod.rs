@@ -81,6 +81,15 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
             })
             .collect();
         let new_id = match &node.op {
+            // Opt-in: keep FusedMatMulBiasAct fused for AD (autodiff has a
+            // dedicated `vjp_fused_matmul_bias_act` that recomputes the
+            // pre-activation). Default decomposes — materializing the matmul
+            // intermediate is cheaper than the VJP's recompute for this op.
+            Op::FusedMatMulBiasAct { .. }
+                if rlx_ir::env::var("RLX_AD_FUSED_MMBA_VJP").as_deref() == Some("1") =>
+            {
+                out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+            }
             Op::FusedMatMulBiasAct { .. } => {
                 unfuse_fused_mat_mul_bias_act(node, new_inputs, &mut out)
             }

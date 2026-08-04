@@ -135,6 +135,23 @@ pub fn build_hybrid_plan(
     graph: &Graph,
     params_as_constants: Option<&HashMap<String, Vec<u8>>>,
 ) -> Option<Vec<HybridStep>> {
+    // The hybrid MPSGraph→native handoff miscompiles a subgraph that produces
+    // MULTIPLE boundary outputs feeding a single native op — CONFIRMED on both
+    // GatedDeltaNet (q,k,v,g,beta) and Attention (q,k,v): at real dims the boundary
+    // values come back finite-but-wrong (Kimi-K3 KDA drifts ~400/element; the MLA
+    // layer's hidden state diverges grossly — different experts routed, wrong
+    // token). These three ops are exactly where `is_split_boundary` cuts, so any
+    // graph containing one goes entirely down the bit-exact native-thunk path
+    // until the boundary handoff itself is fixed. (Correctness over the MPSGraph
+    // fusion speedup; the native op was already a thunk regardless.)
+    if graph.nodes().iter().any(|n| {
+        matches!(
+            n.op,
+            Op::GatedDeltaNet { .. } | Op::Attention { .. } | Op::Lstm { .. }
+        )
+    }) {
+        return None;
+    }
     let mut steps: Vec<HybridStep> = Vec::new();
     let mut pending: Vec<NodeId> = Vec::new();
     let mut pending_idxs: Vec<usize> = Vec::new();

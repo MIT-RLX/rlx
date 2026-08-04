@@ -998,6 +998,66 @@ pub fn expand_attention_forward_primitives(
     )
 }
 
+/// Build just the **attention-weights** node (post-softmax `[B*H, S_q, S_k]`) for
+/// a fused `Op::Attention`, decomposing `Q·Kᵀ → scale → mask → softmax` with the
+/// exact same reshape/scale/mask semantics as [`expand_attention_forward_primitives`]
+/// (which continues on to `·V`). Used by profiling harnesses to tap the attention
+/// distribution of a fused attention op without a `·V`. Self-attention only
+/// (`S_q == S_k`); ignores `score_scale`/`attn_logit_softcap` (default `1/√d`).
+pub fn attention_softmax_weights(
+    g: &mut Graph,
+    q: NodeId,
+    k: NodeId,
+    v: NodeId,
+    num_heads: usize,
+    head_dim: usize,
+    mask_kind: MaskKind,
+    mask: Option<NodeId>,
+    mask_shape: Option<&Shape>,
+) -> NodeId {
+    // rank-3 [B,S,H*D] → rank-4 [B,H,S,D] (dy dummy = q, discarded).
+    let (q4, k4, _v4, _dy, out_shape) = reshape_attn_rank4(g, q, k, v, q, num_heads, head_dim);
+    let dtype = out_shape.dtype();
+    let (b, h, s, d) = (
+        out_shape.dim(0).unwrap_static(),
+        out_shape.dim(1).unwrap_static(),
+        out_shape.dim(2).unwrap_static(),
+        out_shape.dim(3).unwrap_static(),
+    );
+    let bh = b * h;
+    let flat3 = Shape::new(&[bh, s, d], dtype);
+    let q_flat = g.reshape(q4, vec![bh as i64, s as i64, d as i64], flat3.clone());
+    let k_flat = g.reshape(k4, vec![bh as i64, s as i64, d as i64], flat3);
+    let k_t_shape = Shape::new(&[bh, d, s], dtype);
+    let k_t = g.add_node(
+        Op::Transpose {
+            perm: vec![0, 2, 1],
+        },
+        vec![k_flat],
+        k_t_shape.clone(),
+    );
+    let scores_shape = shape::matmul_shape(&g.node(q_flat).shape, &k_t_shape).expect("attn scores");
+    let scores = g.matmul(q_flat, k_t, scores_shape.clone());
+    let scale = (head_dim as f32).sqrt().recip();
+    let scale_n = scalar_const(scale as f64, &Shape::scalar(dtype), g);
+    let scale_b = broadcast_scalar(g, scale_n, &scores_shape);
+    let scaled = g.mul(scores, scale_b);
+    let masked = apply_attn_score_mask(
+        g,
+        scaled,
+        &scores_shape,
+        mask_kind,
+        mask,
+        mask_shape,
+        bh,
+        b,
+        h,
+        s,
+        s,
+    );
+    g.softmax(masked, -1, scores_shape)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

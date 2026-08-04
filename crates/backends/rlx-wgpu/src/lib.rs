@@ -18,6 +18,7 @@
 //! - `backend`  — Backend trait impl + per-op dispatch
 
 pub mod backend;
+pub use backend::bf16_packed_dispatch_count;
 pub mod supported_ops;
 pub use supported_ops::SUPPORTED_OPS;
 pub mod buffer;

@@ -262,7 +262,17 @@ impl HipblasContext {
             // (CDNA + RDNA3+) accelerate f32 GEMM through xDL math
             // when this is set; older archs ignore it. Matches what
             // rlx-cuda does for cuBLAS via cublasSetMathMode.
-            let _ = (runtime.set_math_mode)(handle, HIPBLAS_XF32_XDL_MATH);
+            //
+            // xDL/XF32 truncates both f32 operands to ~TF32 mantissa, which is
+            // a real precision loss for the dequant→sgemm path: the dequantized
+            // GGUF/int8 weights carry >10 effective mantissa bits after scaling
+            // that XF32 discards. Default stays ON (peak perf, matches cuBLAS),
+            // but a strict-parity run can force true f32 via RLX_ROCM_NO_TF32 /
+            // RLX_ROCM_PARITY — the escape hatch rlx-cuda has (RLX_CUDA_NO_TF32/
+            // PARITY) that ROCm was missing.
+            if !rlx_ir::env::flag("RLX_ROCM_NO_TF32") && !rlx_ir::env::flag("RLX_ROCM_PARITY") {
+                let _ = (runtime.set_math_mode)(handle, HIPBLAS_XF32_XDL_MATH);
+            }
             Some(Self {
                 runtime: runtime.clone(),
                 handle,

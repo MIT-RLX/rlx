@@ -816,7 +816,10 @@ impl MlxExecutable {
 
     /// Upload `data` once and keep the MLX array as a graph input across runs.
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> Result<(), MlxError> {
-        let shape = self.input_shape_for_name(name)?;
+        // Resolve the input's shape, inferring a single dynamic dim (e.g. the KV
+        // cache seq extent in a dynamic-past decode graph) from the bound data
+        // length so a GPU-resident K/V handle can bind without a static seq.
+        let shape = self.input_shape_resolved(name, data.len())?;
         let data = lower::broadcast_leaf_data(name, data, &shape)?;
         let arr = Array::from_f32_slice(&data, &shape, DType::F32)?;
         self.gpu_handles.insert(name.to_string(), arr);
@@ -856,16 +859,45 @@ impl MlxExecutable {
             .ok_or_else(|| MlxError(format!("output index {output_index} missing")))
     }
 
-    fn input_shape_for_name(&self, name: &str) -> Result<Vec<usize>, MlxError> {
+    /// Resolves a graph input's shape, deriving a single Dynamic dim from
+    /// `data_len` (the product of the static dims must divide it; the quotient is
+    /// the dynamic extent). Lets dynamic-past decode graphs bind a GPU-resident
+    /// K/V handle whose seq dim is only known at run time. Fully static shapes
+    /// resolve directly.
+    fn input_shape_resolved(&self, name: &str, data_len: usize) -> Result<Vec<usize>, MlxError> {
         for node in self.graph.nodes() {
             if let rlx_ir::Op::Input { name: n } = &node.op {
                 if n == name {
-                    return Ok(node
-                        .shape
-                        .dims()
-                        .iter()
-                        .map(|d| d.unwrap_static())
-                        .collect());
+                    let dims = node.shape.dims();
+                    let mut static_prod: usize = 1;
+                    let mut dyn_count = 0usize;
+                    for d in dims {
+                        if d.is_static() {
+                            static_prod = static_prod.saturating_mul(d.unwrap_static());
+                        } else {
+                            dyn_count += 1;
+                        }
+                    }
+                    if dyn_count == 0 {
+                        return Ok(dims.iter().map(|d| d.unwrap_static()).collect());
+                    }
+                    if dyn_count == 1 && static_prod > 0 && data_len.is_multiple_of(static_prod) {
+                        let dyn_val = data_len / static_prod;
+                        return Ok(dims
+                            .iter()
+                            .map(|d| {
+                                if d.is_static() {
+                                    d.unwrap_static()
+                                } else {
+                                    dyn_val
+                                }
+                            })
+                            .collect());
+                    }
+                    return Err(MlxError(format!(
+                        "cannot resolve dynamic shape for gpu handle '{name}' \
+                         (dyn_dims={dyn_count}, static_prod={static_prod}, data_len={data_len})"
+                    )));
                 }
             }
         }
@@ -939,6 +971,26 @@ impl MlxExecutable {
             self.gpu_handles.insert(name, handle);
         }
         Ok(())
+    }
+
+    /// Read one `row_inner`-wide row from output `out_idx` of the last run. Used
+    /// by GPU-resident KV decode to advance the host mirror one token at a time
+    /// (the new K/V row) without a full-tensor readback path. Returns `None` if the
+    /// output or row is out of range.
+    pub fn read_output_row(
+        &self,
+        out_idx: usize,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        let arr = self.last_outputs.get(out_idx)?;
+        let data = arr.to_f32().ok()?;
+        let start = row * row_inner;
+        let end = start + row_inner;
+        if end > data.len() {
+            return None;
+        }
+        Some(data[start..end].to_vec())
     }
 
     /// Batch-major past `[B, seq_cap, row_elems]` ← new `[B, 1, row_elems]`.

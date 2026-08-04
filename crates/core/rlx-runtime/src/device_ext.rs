@@ -600,7 +600,14 @@ fn metal_supports(op: &Op) -> bool {
 /// `Device::Ane` for autodiff-produced backward graphs. See
 /// [`rlx_coreml::BACKWARD_OPS`].
 fn coreml_supports(op: &Op) -> bool {
-    #[cfg(feature = "coreml")]
+    // `coreml` may be enabled transitively on non-Apple targets (a no-op there —
+    // `rlx-coreml` is an Apple-only dependency), so gate on the target too, matching
+    // where the crate actually exists (same pattern as `metal` above).
+    #[cfg(all(
+        feature = "coreml",
+        target_vendor = "apple",
+        not(target_os = "watchos")
+    ))]
     {
         let kind = op.kind();
         if rlx_coreml::SUPPORTED_OPS.contains(&kind) {
@@ -614,7 +621,11 @@ fn coreml_supports(op: &Op) -> bool {
         }
         false
     }
-    #[cfg(not(feature = "coreml"))]
+    #[cfg(not(all(
+        feature = "coreml",
+        target_vendor = "apple",
+        not(target_os = "watchos")
+    )))]
     {
         let _ = op;
         false

@@ -220,12 +220,24 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
             } => {
                 let q_dims = graph.node(node.inputs[0]).shape.dims();
                 if q_dims.len() == 3 {
+                    // Asymmetric v_head_dim (DeepSeek/Kimi MLA): the rank-3
+                    // straight-through path forwards `v_head_dim` intact, but
+                    // the rank-4 promotion (`to_bhsd`) reshapes V with
+                    // `head_dim` and can't express an asymmetric V width. Only
+                    // guard the latter (backends whose kernel needs rank-4).
+                    assert!(
+                        v_head_dim.is_none_or(|v| v == *head_dim)
+                            || policy.attention_accepts_rank3(),
+                        "unfuse: asymmetric v_head_dim (MLA) needs a rank-3-capable \
+                         Attention kernel (rank-4 promotion can't reshape asymmetric V)"
+                    );
                     expand_attention_rank3(
                         &mut out,
                         &graph,
@@ -234,6 +246,7 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
                         &node.shape,
                         *num_heads,
                         *head_dim,
+                        *v_head_dim,
                         *mask_kind,
                         *score_scale,
                         *attn_logit_softcap,
@@ -683,6 +696,7 @@ fn expand_fab(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim: None,
                 mask_kind: rlx_ir::op::MaskKind::Custom,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -710,6 +724,7 @@ fn expand_fab(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim: None,
                 mask_kind: rlx_ir::op::MaskKind::Custom,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -882,6 +897,7 @@ fn expand_ftl(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim: None,
                 mask_kind: rlx_ir::op::MaskKind::Custom,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -912,6 +928,7 @@ fn expand_ftl(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim: None,
                 mask_kind: rlx_ir::op::MaskKind::Custom,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -1275,6 +1292,7 @@ fn expand_attention_rank3(
     out_shape: &Shape,
     num_heads: usize,
     head_dim: usize,
+    v_head_dim: Option<usize>,
     mask_kind: MaskKind,
     score_scale: Option<f32>,
     attn_logit_softcap: Option<f32>,
@@ -1356,6 +1374,7 @@ fn expand_attention_rank3(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
@@ -1435,6 +1454,7 @@ fn expand_attention_rank3(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,

@@ -11,13 +11,14 @@ use crate::kernels::{
     Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
     CopyParams, CumScanParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams,
     DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
-    FftButterflyStageParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
-    FusedResidualRmsNormParams, GatedDeltaNetParams, GatedResidualBackwardParams,
-    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupNormBwdParams,
-    GroupedMatmulParams, GruParams, Im2Col2dParams, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
-    Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams,
-    RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
+    FftButterflyStageParams, FmaParams, FusedConvBiasActParams, FusedResidualLnParams,
+    FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
+    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
+    GatherParams, GroupNormBwdParams, GroupedMatmulParams, GruParams, Im2Col2dParams,
+    LayerNormBwdParams, LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams,
+    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
+    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    SampleParams, ScaledGroupedMatmulParams, ScatterAddParams, SceBwdParams, SceParams,
     SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
     WelchPeaksGpuParams, WhereParams,
 };
@@ -474,6 +475,9 @@ pub(crate) enum Step {
     GroupedMatmul {
         params: GroupedMatmulParams,
     },
+    ScaledGroupedMatmul {
+        params: ScaledGroupedMatmulParams,
+    },
     Sample {
         params: SampleParams,
     },
@@ -484,15 +488,15 @@ pub(crate) enum Step {
     Mamba2 {
         params: Mamba2Params,
     },
-    /// Native WGSL GRU (single-layer/unidir/no-carry, hidden ≤ 256).
+    /// Native WGSL GRU, one dispatch per (layer, dir), hidden ≤ 256.
     Gru {
         params: GruParams,
     },
-    /// Native WGSL Elman RNN (single-layer/unidir/no-carry, hidden ≤ 256).
+    /// Native WGSL Elman RNN, one dispatch per (layer, dir), hidden ≤ 256.
     Rnn {
         params: RnnParams,
     },
-    /// Host-staged GRU fallback (multi-layer / bidir / carry / hidden > 256).
+    /// Host-staged GRU fallback (hidden > 256).
     GruHost {
         x: u32,
         w_ih: u32,
@@ -673,6 +677,10 @@ pub(crate) enum Step {
         num_layers: u32,
         bidirectional: bool,
         carry: bool,
+    },
+    /// Native WGSL LSTM, one dispatch per (layer, dir), hidden ≤ 256.
+    LstmGpu {
+        params: LstmParams,
     },
     ConvTranspose2d {
         src_byte_off: u32,
@@ -1037,6 +1045,12 @@ pub(crate) enum Step {
     FusedResidualRmsNorm {
         params: FusedResidualRmsNormParams,
     },
+    FusedSwiGLU {
+        params: FusedSwiGLUParams,
+    },
+    FusedConvBiasAct {
+        params: FusedConvBiasActParams,
+    },
     AdaLayerNorm {
         params: AdaLayerNormParams,
     },
@@ -1075,6 +1089,8 @@ impl Step {
             | Step::FusedResidualLn { .. }
             | Step::FusedResidualLnTee { .. }
             | Step::FusedResidualRmsNorm { .. }
+            | Step::FusedSwiGLU { .. }
+            | Step::FusedConvBiasAct { .. }
             | Step::AdaLayerNorm { .. }
             | Step::GatedResidual { .. }
             | Step::AdaLayerNormBackward { .. }
@@ -1099,6 +1115,7 @@ impl Step {
             | Step::GatherAxis { .. }
             | Step::GatherSplit { .. }
             | Step::GroupedMatmul { .. }
+            | Step::ScaledGroupedMatmul { .. }
             | Step::DequantMatmul { .. }
             | Step::DequantMatmulMlx { .. }
             | Step::DequantMatmulMlxHost { .. }
@@ -1212,6 +1229,7 @@ impl Step {
             // the loop bound only. Safe under active-extent scaling.
             Step::Gru { .. } => true,
             Step::Rnn { .. } => true,
+            Step::LstmGpu { .. } => true,
             // Narrow + Concat: kernel iterates `params.total` in
             // row-major order with outer as the leading dim. Scaling
             // total by actual/upper effectively scales outer by the
@@ -1324,6 +1342,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::TopK { .. } => "topk",
         Step::WelchPeaksGpu { .. } => "welch_peaks_gpu",
         Step::GroupedMatmul { .. } => "grouped_matmul",
+        Step::ScaledGroupedMatmul { .. } => "scaled_grouped_matmul",
         Step::Sample { .. } => "sample",
         Step::SelectiveScan { .. } => "selective_scan",
         Step::Mamba2 { .. } => "mamba2",
@@ -1342,6 +1361,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantGroupedMatmulMlxHost { .. } => "dequant_grouped_matmul_mlx_host",
         Step::GatedDeltaNet { .. } => "gated_delta_net",
         Step::Lstm { .. } => "lstm",
+        Step::LstmGpu { .. } => "lstm_gpu",
         Step::ConvTranspose2d { .. } => "conv_transpose2d",
         Step::ConvTranspose3d { .. } => "conv_transpose3d",
         Step::ConvTranspose3dHost { .. } => "conv_transpose3d_host",
@@ -1392,6 +1412,8 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::FusedResidualLn { .. } => "fused_residual_ln",
         Step::FusedResidualLnTee { .. } => "fused_residual_ln_tee",
         Step::FusedResidualRmsNorm { .. } => "fused_residual_rms_norm",
+        Step::FusedSwiGLU { .. } => "fused_swiglu",
+        Step::FusedConvBiasAct { .. } => "fused_conv_bias_act",
         Step::AdaLayerNorm { .. } => "ada_layer_norm",
         Step::GatedResidual { .. } => "gated_residual",
         Step::AdaLayerNormBackward { .. } => "ada_layer_norm_backward",

@@ -95,15 +95,23 @@ impl BlockStage for Qwen3DecodeLayerStage {
         let dh = spec.head_dim;
         let batch = spec.batch;
 
+        // Decode is weight-read-bandwidth bound (batch=1 GEMV): storing the
+        // projection weights F16-resident halves the bytes read per token.
+        // Opt-in `RLX_QWEN3_F16_WEIGHTS`; norms/biases stay F32.
+        let w_dt = if rlx_ir::env::flag("RLX_QWEN3_F16_WEIGHTS") {
+            rlx_ir::DType::F16
+        } else {
+            rlx_ir::DType::F32
+        };
         let in_ln_g = ctx.load_param(&format!("{lp}.input_layernorm.weight"), false)?;
-        let q_w = ctx.load_param(&format!("{lp}.self_attn.q_proj.weight"), true)?;
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
-        let v_w = ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?;
-        let o_w = ctx.load_param(&format!("{lp}.self_attn.o_proj.weight"), true)?;
+        let q_w = ctx.load_param_typed(&format!("{lp}.self_attn.q_proj.weight"), true, w_dt)?;
+        let k_w = ctx.load_param_typed(&format!("{lp}.self_attn.k_proj.weight"), true, w_dt)?;
+        let v_w = ctx.load_param_typed(&format!("{lp}.self_attn.v_proj.weight"), true, w_dt)?;
+        let o_w = ctx.load_param_typed(&format!("{lp}.self_attn.o_proj.weight"), true, w_dt)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
-        let gate_w = ctx.load_param(&format!("{lp}.mlp.gate_proj.weight"), true)?;
-        let up_w = ctx.load_param(&format!("{lp}.mlp.up_proj.weight"), true)?;
-        let down_w = ctx.load_param(&format!("{lp}.mlp.down_proj.weight"), true)?;
+        let gate_w = ctx.load_param_typed(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?;
+        let up_w = ctx.load_param_typed(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?;
+        let down_w = ctx.load_param_typed(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?;
         let (q_bias, k_bias, v_bias) = if spec.attention_bias {
             (
                 Some(ctx.load_param(&format!("{lp}.self_attn.q_proj.bias"), false)?),
@@ -149,16 +157,41 @@ impl BlockStage for Qwen3DecodeLayerStage {
         let q_rope = gb.rope(q_rope_in, decode.cos, decode.sin, dh);
         let k_rope = gb.rope(k_rope_in, decode.cos, decode.sin, dh);
 
+        // F16-resident KV cache (opt-in `RLX_QWEN3_F16_KV`): store K/V half-sized
+        // so decode attention reads half the KV bytes. Q, softmax accumulation,
+        // and the attention output stay F32 (`sdpa_decode_m1_f16kv`). `past_k/v`
+        // are declared F16 to match (see the decode graph builder).
+        let (k_rope, v) = if rlx_ir::env::flag("RLX_QWEN3_F16_KV") {
+            (
+                gb.cast(k_rope, rlx_ir::DType::F16),
+                gb.cast(v, rlx_ir::DType::F16),
+            )
+        } else {
+            (k_rope, v)
+        };
+
         let new_k = gb.concat_(vec![past_k, k_rope], 1);
         let new_v = gb.concat_(vec![past_v, v], 1);
         self.kv_out.lock().expect("kv out").push(new_k);
         self.kv_out.lock().expect("kv out").push(new_v);
 
-        let k_rep = repeat_kv(&mut gb, new_k, nkv, dh, spec.kv_group_size);
-        let v_rep = repeat_kv(&mut gb, new_v, nkv, dh, spec.kv_group_size);
+        // GQA-native (opt-in `RLX_QWEN3_GQA_NATIVE`): the SDPA kernels index K/V
+        // by shared kv head internally, so pass the un-expanded nkv-head K/V and
+        // skip `repeat_kv`'s Expand — which writes 2× the KV that attention then
+        // reads (~75MB) vs ~30MB reading the base KV in place (shared-head
+        // re-reads hit L2). Measured FASTER on Metal decode: ~11.4→10.4ms wait,
+        // 82→89 tok/s, token-identical (M4 Pro, with RLX_QWEN3_BAKE_WEIGHTS).
+        let (k_attn, v_attn) = if rlx_ir::env::flag("RLX_QWEN3_GQA_NATIVE") {
+            (new_k, new_v)
+        } else {
+            (
+                repeat_kv(&mut gb, new_k, nkv, dh, spec.kv_group_size),
+                repeat_kv(&mut gb, new_v, nkv, dh, spec.kv_group_size),
+            )
+        };
         if let Some(ref sink) = self.qk_out {
             sink.lock().expect("qwen3 decode qk out").push(q_rope);
-            sink.lock().expect("qwen3 decode qk out").push(k_rep);
+            sink.lock().expect("qwen3 decode qk out").push(k_attn);
         }
 
         let attn_shape = shape::attention_shape(gb.shape(q_rope));
@@ -166,9 +199,9 @@ impl BlockStage for Qwen3DecodeLayerStage {
             let mask = decode
                 .mask
                 .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?;
-            gb.attention(q_rope, k_rep, v_rep, mask, nh, dh, attn_shape)
+            gb.attention(q_rope, k_attn, v_attn, mask, nh, dh, attn_shape)
         } else {
-            gb.attention_kind(q_rope, k_rep, v_rep, nh, dh, MaskKind::Causal, attn_shape)
+            gb.attention_kind(q_rope, k_attn, v_attn, nh, dh, MaskKind::Causal, attn_shape)
         };
 
         let attn_out = gb.mm(attn, o_w);

@@ -134,6 +134,18 @@ pub(crate) fn compile_mat_mul(
                 } else {
                     eff.num_elements().unwrap_or(1) / n.max(1)
                 };
+                // BF16 weight (rhs) with f32 output → dequant-on-the-fly GEMM
+                // (bf16-resident LM head: half the weight memory traffic).
+                if b_shape.dtype() == rlx_ir::DType::BF16 && shape.dtype() == rlx_ir::DType::F32 {
+                    return Thunk::SgemmBf16 {
+                        a: node_offset(arena, node.inputs[0]),
+                        b: node_offset(arena, node.inputs[1]),
+                        c: node_offset(arena, node.id),
+                        m: m as u32,
+                        k: k_dim as u32,
+                        n: n as u32,
+                    };
+                }
                 match shape.dtype() {
                     rlx_ir::DType::F64 => Thunk::Dgemm {
                         a: node_offset(arena, node.inputs[0]),

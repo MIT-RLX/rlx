@@ -102,8 +102,22 @@ impl MetalExecutable {
                     .enumerate()
                     .map(|(i, buf)| {
                         let len = self.output_slots[i].1;
-                        unsafe {
-                            std::slice::from_raw_parts(buf.contents() as *const f32, len).to_vec()
+                        // F16 outputs (e.g. an F16-resident KV side-output) are
+                        // read as half and widened to the f32 host lane.
+                        if self.graph.node(self.graph.outputs[i]).shape.dtype()
+                            == rlx_ir::DType::F16
+                        {
+                            unsafe {
+                                std::slice::from_raw_parts(buf.contents() as *const half::f16, len)
+                            }
+                            .iter()
+                            .map(|h| h.to_f32())
+                            .collect()
+                        } else {
+                            unsafe {
+                                std::slice::from_raw_parts(buf.contents() as *const f32, len)
+                                    .to_vec()
+                            }
                         }
                     })
                     .collect()

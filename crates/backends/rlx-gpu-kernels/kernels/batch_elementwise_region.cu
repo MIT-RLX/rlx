@@ -99,6 +99,27 @@ extern "C" __global__ void batch_elementwise_region(
             else if (op_sub == 9u) result = rsqrtf(lhs);
             else if (op_sub == 10u) result = -lhs;
             else if (op_sub == 11u) result = fabsf(lhs);
+            // Activations 12..28 (gelu-first opcode scheme) — previously fell
+            // through to identity, silently breaking any fused Sin/Cos/Round/…
+            // (e.g. the StyleTTS2 / Kokoro harmonic source → garbage audio).
+            // Expressions match the codegen'd `unary.cu` exactly.
+            else if (op_sub == 12u) result = sinf(lhs);
+            else if (op_sub == 13u) result = cosf(lhs);
+            else if (op_sub == 14u) result = tanf(lhs);
+            else if (op_sub == 15u) result = atanf(lhs);
+            else if (op_sub == 16u) result = rintf(lhs);
+            else if (op_sub == 17u) result = 1.0f / lhs;
+            else if (op_sub == 18u) result = floorf(lhs);
+            else if (op_sub == 19u) result = ceilf(lhs);
+            else if (op_sub == 20u) result = (float)(lhs > 0.0f) - (float)(lhs < 0.0f);
+            else if (op_sub == 21u) result = fmaxf(lhs, 0.0f) + logf(1.0f + expf(-fabsf(lhs)));
+            else if (op_sub == 22u) result = (lhs > 0.0f) ? lhs : (expf(lhs) - 1.0f);
+            else if (op_sub == 23u) result = erff(lhs);
+            else if (op_sub == 24u) result = (lhs * fminf(fmaxf(lhs + 3.0f, 0.0f), 6.0f)) / 6.0f;
+            else if (op_sub == 25u) result = fminf(fmaxf(lhs / 6.0f + 0.5f, 0.0f), 1.0f);
+            else if (op_sub == 26u) { float sp = fmaxf(lhs, 0.0f) + logf(1.0f + expf(-fabsf(lhs))); result = lhs * tanhf(sp); }
+            else if (op_sub == 27u) result = lhs / (1.0f + fabsf(lhs));
+            else if (op_sub == 28u) result = fminf(lhs, 0.0f) - logf(1.0f + expf(-fabsf(lhs)));
             else                    result = lhs;
         } else if (op_kind == 1u) {
             result = lhs;

@@ -43,6 +43,7 @@ fn ane_op_support_introspection() {
         &Op::Attention {
             num_heads: 1,
             head_dim: 8,
+            v_head_dim: None,
             mask_kind: rlx_ir::op::MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,

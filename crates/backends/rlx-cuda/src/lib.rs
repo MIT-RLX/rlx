@@ -31,8 +31,11 @@ pub mod arena;
 pub mod backend;
 pub mod config;
 pub mod supported_ops;
+#[cfg(test)]
+mod tma_validate;
 pub use config::{
-    CudaRuntimeConfig, install_runtime_config, reload_runtime_config, runtime_config,
+    AttentionVariant, CudaRuntimeConfig, install_runtime_config, reload_runtime_config,
+    runtime_config,
 };
 pub use supported_ops::SUPPORTED_OPS;
 pub mod calibrate;
@@ -95,6 +98,7 @@ pub mod ms_deform_attn_host {
     pub use super::host_ops::run_ms_deform_attn;
 }
 pub mod cuda_gpu_kernels;
+pub mod hc_sinkhorn_gate;
 #[cfg(feature = "native-cuda-fft")]
 pub mod native_fft_dispatch;
 pub mod onnx_custom_host;

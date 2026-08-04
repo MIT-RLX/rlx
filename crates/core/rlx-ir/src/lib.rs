@@ -62,6 +62,7 @@ pub mod quant;
 pub mod region_encode;
 pub mod residual;
 pub mod rng;
+pub mod tensor_inspect;
 pub use nvfp4::{FP4_E2M1_LUT, NVFP4_GROUP_SIZE, fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32};
 pub mod binding_manifest;
 pub mod component;
@@ -128,7 +129,7 @@ pub use module::{GraphModule, GraphStage};
 pub use numeric_check::{BadValue, DebugMode, DebugScanner, NanReport, check_node, first_bad};
 pub use op::{
     AdaNormKind, ChainOperand, ChainStep, Op, OpKind, PadMode, RegionPrologue, RopeStyle,
-    ScatterNdReduction, SpdMatFn, TransformStep,
+    ScatterNdReduction, SpdMatFn, SynthBwdWrt, SynthKind, TransformStep,
 };
 pub use op_registry::{
     CustomOpError, JvpContext, LowerContext, OpExtension, OpRegistry, VjpContext, VmapContext,

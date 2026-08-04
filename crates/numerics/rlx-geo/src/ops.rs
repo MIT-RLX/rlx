@@ -29,7 +29,7 @@ pub fn register_geo_ops() {
     register_op(Arc::new(VoronoiGridExt));
     register_cpu_kernel(Arc::new(VoronoiGridCpu));
 
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "gpu-ops")]
     crate::wgpu_kernels::register_wgpu_geo_kernels();
 }
 
@@ -107,7 +107,7 @@ impl CpuKernel for DelaunayCpu {
             ));
         }
         let points: Vec<[i32; 2]> = pts.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
-        let tris = triangulate(&points);
+        let tris = triangulate(&points).map_err(|e| format!("geo.delaunay: {e}"))?;
 
         let out = output.expect_i32_mut("geo.delaunay triangles")?;
         if out.len() != 2 * n * 3 {

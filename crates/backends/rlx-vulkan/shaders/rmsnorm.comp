@@ -19,12 +19,21 @@ void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= pc.rows) { return; }
     uint base = row * pc.n;
-    float ss = 0.0;
+    float n_inv = 1.0 / float(pc.n);
+    // Two-pass: mean(x²) = mean((x−mean)²) + mean². Subtracting the row mean
+    // first keeps the deviation sum well-conditioned under a large DC offset
+    // (the canonical form the CPU oracle + all backends match).
+    float sum = 0.0;
     for (uint i = 0u; i < pc.n; i++) {
-        float v = arena_load(pc.x_off + base + i);
-        ss += v * v;
+        sum += arena_load(pc.x_off + base + i);
     }
-    float inv = inversesqrt(ss / float(pc.n) + pc.eps);
+    float mean = sum * n_inv;
+    float dev = 0.0;
+    for (uint i = 0u; i < pc.n; i++) {
+        float d = arena_load(pc.x_off + base + i) - mean;
+        dev += d * d;
+    }
+    float inv = inversesqrt(dev * n_inv + mean * mean + pc.eps);
     for (uint i = 0u; i < pc.n; i++) {
         float g = arena_load(pc.gamma_off + i);
         float b = arena_load(pc.beta_off + i);

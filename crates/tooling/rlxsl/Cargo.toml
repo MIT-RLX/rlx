@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-ir = { workspace = true }
 
 [lints]
 workspace = true

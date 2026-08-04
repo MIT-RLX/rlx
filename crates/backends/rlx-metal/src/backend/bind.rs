@@ -130,4 +130,40 @@ impl MetalExecutable {
         self.gpu_handles.insert(name.to_string(), Vec::new());
         true
     }
+
+    /// ZERO-COPY optimizer step for GPU-resident training. For each trainable
+    /// weight — a resident arena `Input` bound via [`bind_gpu_handle`] — whose
+    /// gradient sits at output slot `1 + i` (backward outputs are
+    /// `[loss, grad0, grad1, …]`), this forms the param `&mut [f32]` and grad
+    /// `&[f32]` as ALIASES into the unified-memory arena and calls `step` in
+    /// place: no host `Vec`, no D2H/H2D copy. The updated weight stays resident,
+    /// so the next forward reads it with no re-upload — killing the classic
+    /// GPU→host→optimizer→host→GPU roundtrip. `trainable[i] = (input_name, shape)`.
+    ///
+    /// Generic over the step fn so rlx-metal needn't depend on rlx-optim — pass
+    /// `|name, shape, p, g| optimizer.step(name, shape, p, g)`.
+    ///
+    /// Soundness: param and grad are distinct graph nodes → disjoint arena
+    /// regions, so the two aliasing slices never overlap.
+    pub fn optimizer_step_resident<F>(&mut self, trainable: &[(String, Vec<usize>)], mut step: F)
+    where
+        F: FnMut(&str, &[usize], &mut [f32], &[f32]),
+    {
+        let slots: Vec<(usize, usize)> = self.output_slots.clone(); // [loss, grad0, …]
+        let base = self.arena.buffer.contents() as *mut u8;
+        for (i, (name, shape)) in trainable.iter().enumerate() {
+            let Some(&pid) = self.input_ids.get(name) else {
+                panic!("optimizer_step_resident: trainable `{name}` is not a graph input");
+            };
+            let p_off = self.arena.byte_offset(pid);
+            let p_len: usize = shape.iter().product();
+            let (g_off, g_len) = slots[1 + i];
+            debug_assert_eq!(p_len, g_len, "grad len must match param `{name}`");
+            unsafe {
+                let param = std::slice::from_raw_parts_mut(base.add(p_off) as *mut f32, p_len);
+                let grad = std::slice::from_raw_parts(base.add(g_off) as *const f32, g_len);
+                step(name, shape, param, grad);
+            }
+        }
+    }
 }

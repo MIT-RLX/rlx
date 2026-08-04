@@ -79,6 +79,11 @@ mod cache;
 mod handle;
 #[cfg(feature = "ndarray")]
 mod interop;
+/// Generic low-precision numerics — the `float_format!` macro + `fXmYeZ`
+/// quantizer for emulated any-precision (nvf4 / f8 / bf8 / …) training.
+pub mod lowp;
+#[cfg(feature = "eval")]
+mod model;
 mod scalar;
 #[cfg(feature = "optim")]
 mod schedule;
@@ -88,12 +93,12 @@ mod tensor;
 mod transform;
 
 pub use array::{cat, stack};
-pub use rlx_ir::op::MaskKind;
+pub use rlx_ir::op::{Activation, MaskKind};
 pub use rlx_ir::{DType, Dim, Graph, NodeId, ScaleLayout, ScaledFormat, Shape};
 /// Optimizers for [`Func::train_step`] (re-exported from `rlx_optim`).
 /// Available with the `optim` feature.
 #[cfg(feature = "optim")]
-pub use rlx_optim::{Adam, AdamW, Lion, Muon, Optimizer, Sgd};
+pub use rlx_optim::{Adam, AdamW, Lion, Muon, OptItem, Optimizer, Sgd};
 #[cfg(feature = "optim")]
 pub use schedule::LrSchedule;
 pub use scope::{GraphScope, graph, graph_with};
@@ -105,6 +110,10 @@ pub use transform::Jitted;
 
 #[cfg(feature = "eval")]
 pub use cache::{cache_stats, clear_cache};
+/// A compiled, runnable model with by-name weight binding. Available with the
+/// `eval` feature.
+#[cfg(feature = "eval")]
+pub use model::Model;
 /// Device selector for [`Tensor::on`] / [`Tensor::to_vec_on`] (re-exported
 /// from `rlx_runtime`). Available with the `eval` feature.
 #[cfg(feature = "eval")]
@@ -195,7 +204,7 @@ macro_rules! __shape_dims {
 
 #[cfg(feature = "dsl")]
 #[doc(hidden)]
-pub use rlx_macros::__rlx_build;
+pub use rlx_macros::{__rlx_build, __rlx_expr};
 
 /// Declare a computation [`Graph`] in a compact, readable little language.
 ///
@@ -210,26 +219,52 @@ pub use rlx_macros::__rlx_build;
 /// | `graph "name";` | *(optional, first)* names the graph |
 /// | `input x: [dims];` | a graph input; the binding is auto-named `"x"` |
 /// | `param w: [dims];` | a trainable parameter, auto-named `"w"` |
+/// | `param w[N]: [dims];` | a parameter *family* `w_0 … w_{N-1}`, indexed `w[i]` |
+/// | `param w @ "ir.name": [dims];` | override the IR/`set_param` name (`{i}` = family index) |
 /// | `const eps = 1e-6 : F32;` | a broadcastable scalar constant |
+/// | `const m = [[1,0],[0,1]] : F32;` | an N-D constant from a nested literal |
+/// | `bind t;` / `bind a, b;` | adopt outer-scope Rust `Tensor`(s) of the same name (a baked constant / codebook param) as in-scope bindings |
 /// | `let h = …;` | bind an intermediate to an expression |
+/// | `fn blk(x, w) { … }` | a reusable subgraph, inlined at each call site (call positionally or named: `blk(w: b, x: a)`) |
+/// | `repeat N { … }` | unroll the body `N` times at macro time (weight-tied stacks) |
+/// | `repeat n { … }` | *runtime* count `n` → a `for _ in 0..n` loop; config-driven depth, rebound bindings are loop-carried |
+/// | `repeat i in 0..N { … }` | unroll with index `i` (drives `w[i]`, distinct-weight stacks) |
+/// | `scan h = h0 for N { … }` | compact `Op::Scan` loop (one body graph, not unrolled) |
+/// | `tap a, b;` | expose intermediates as extra outputs (debugging) |
 /// | `out y;` / `out a, b;` | mark graph outputs (defaults to the last `let`) |
 ///
-/// `[dims]` uses the [`shape!`] grammar — literals, `usize` expressions, `?`
+/// `[dims]` uses the [`shape!`] grammar — literals, **runtime `usize`
+/// expressions** (`[bt, d]`, `[d, ff]` size a graph from config values), `?`
 /// for a dynamic axis, and an optional `DType;` prefix (`[F32; ?, 128]`).
 ///
 /// # Expressions
 /// * `a @ b` — matrix multiply (also `matmul(a, b)` / `mm(a, b)`)
-/// * `+ - * /` — elementwise, with broadcasting and scalar promotion (`x * 2.0`)
-/// * `f(x)` — any no-extra-arg [`Tensor`] method: `gelu(x)`, `relu(x)`,
-///   `sqrt(x)`, `sigmoid(x)`, …
+/// * `+ - * / %` `**` — elementwise, with broadcasting and scalar promotion
+///   (`x * 2.0`, `x ** 2`); `**` is power, `%` is `fmod`
+/// * `== != < <= > >=` — elementwise comparison → a `Bool` mask (`x > 0.0`)
+/// * `f(x)` — any no-extra-arg [`Tensor`] method: `gelu(x)`, `sqrt(x)`, …
+/// * `maximum(a,b)` `minimum(a,b)` `pow(a,b)` `atan2(a,b)` `rem(a,b)` — binary
+///   tensor ops (a scalar operand is promoted); `clamp(x, lo, hi)`;
+///   `select(cond, a, b)` (mask select, aka `where_`)
+/// * `linear(x, w, b)` — HF-style `x·Wᵀ + b` (W is `[out,in]`) as one fused
+///   matmul+bias op; a wrapping activation folds in (`gelu(linear(x,w,b))`).
+///   `matmul_t(a, b)` = `a·bᵀ`
+/// * a user `fn`, called `blk(a, w)`, inlines its body here
 /// * `x.method(args)` — the escape hatch: **any** `Tensor` method. A bare
 ///   argument naming a binding is validated and auto-borrowed, so
 ///   `q.attention(k, v, 8, 64, MaskKind::Causal)` reads naturally (and a typo'd
 ///   name is a clear DSL error). Other args are raw Rust; wrap an external
-///   value as `(value)` to pass it through unchecked.
+///   value as `(value)`, or prefix it with `~` (`~eps`, `~num_heads`), to pass
+///   it BY VALUE — the escape a scalar identifier/const needs to reach an
+///   `f32`/`usize`/enum parameter (`h.layer_norm(g, b, ~eps)`,
+///   `q.attention(k, v, ~nh, ~dh, MaskKind::Causal)`) instead of `&f32`.
 ///
-/// Precedence follows NumPy: `.method(…)` > unary `-` > (`@` `*` `/`) > (`+` `-`),
-/// all left-associative — so `x @ w * s` is `(x @ w) * s`.
+/// A definite static matmul shape mismatch (both operands statically 2-D with
+/// incompatible inner dims) is reported at macro-expansion time.
+///
+/// Precedence follows NumPy: `.method(…)` > unary `-` > `**` > (`@` `*` `/` `%`)
+/// > (`+` `-`) > (`== != < <= > >=`), left-associative except right-associative
+/// `**` — so `x @ w * s` is `(x @ w) * s`.
 ///
 /// # Example
 /// ```rust
@@ -263,7 +298,23 @@ macro_rules! rlx {
         // block-local scope via `$crate` (robust across re-exports). The
         // proc macro below then emits only bare names + method/operator calls.
         #[allow(unused_imports)]
-        use $crate::{GraphScope, DType, MaskKind, shape};
+        use $crate::{GraphScope, DType, MaskKind, Activation, shape};
         $crate::__rlx_build! { $($body)* }
+    }};
+}
+
+/// Evaluate a single `rlx!`-grammar expression over in-scope Rust [`Tensor`]
+/// values — the "Rust bridge". Every identifier is a normal Rust variable, so
+/// ordinary `for` loops and config drive the graph structure while the DSL
+/// expresses the per-step math (e.g. `h = rlx_expr!(gelu(linear(h, w, b)))`).
+/// This is what a macro-expanded `rlx! { … }` can't do: runtime-length loops.
+/// Requires the `dsl` feature.
+#[cfg(feature = "dsl")]
+#[macro_export]
+macro_rules! rlx_expr {
+    ( $($body:tt)* ) => {{
+        #[allow(unused_imports)]
+        use $crate::{DType, MaskKind, Activation};
+        $crate::__rlx_expr! { $($body)* }
     }};
 }

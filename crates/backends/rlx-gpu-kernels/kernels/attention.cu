@@ -33,7 +33,11 @@
 #define D_PAD (MAX_HEAD_DIM + 1)
 #define MAX_D_PER_THREAD (MAX_HEAD_DIM / WARPS_PER_Q)
 
-extern "C" __global__ void attention(
+// Occupancy hint: pin the exact launch geometry (THREADS=128) so NVRTC/hipRTC
+// budget registers/VGPRs for the real block instead of a conservative default.
+// Without it, gfx908 (MI100) spilled 477 VGPRs of the per-thread acc[] array
+// to scratch. Portable — `__launch_bounds__` is honored by both toolchains.
+extern "C" __global__ void __launch_bounds__(THREADS) attention(
     float* arena,
     unsigned int batch,
     unsigned int heads,

@@ -919,6 +919,7 @@ mod tests {
             Op::Attention {
                 num_heads: 2,
                 head_dim: 2,
+                v_head_dim: None,
                 mask_kind: MaskKind::None,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -953,6 +954,7 @@ mod tests {
             Op::Attention {
                 num_heads: 2,
                 head_dim: 2,
+                v_head_dim: None,
                 mask_kind: MaskKind::Causal,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -987,6 +989,7 @@ mod tests {
             Op::Attention {
                 num_heads: 2,
                 head_dim: 2,
+                v_head_dim: None,
                 mask_kind: MaskKind::SlidingWindow(1),
                 score_scale: None,
                 attn_logit_softcap: None,

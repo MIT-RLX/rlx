@@ -14,7 +14,6 @@ use crate::pickle::TensorMeta;
 ///
 /// `storage_f32` is the full decoded storage (all `numel` elements).
 pub fn gather(meta: &TensorMeta, storage_f32: &[f32]) -> Result<Vec<f32>> {
-    let numel: usize = meta.shape.iter().product();
     if meta.shape.len() != meta.stride.len() {
         bail!(
             "tensor {:?}: rank mismatch shape {:?} vs stride {:?}",
@@ -23,11 +22,27 @@ pub fn gather(meta: &TensorMeta, storage_f32: &[f32]) -> Result<Vec<f32>> {
             meta.stride
         );
     }
+    // `shape` is untrusted (straight from the checkpoint pickle). Fold with
+    // `checked_mul` so a hostile shape can neither wrap `numel` silently nor
+    // panic on overflow.
+    let numel: usize = meta
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "tensor {:?}: shape {:?} element count overflows",
+                meta.storage_key,
+                meta.shape
+            )
+        })?;
 
     // Fast path: the view is already contiguous row-major from `offset`.
     if is_contiguous(&meta.shape, &meta.stride) {
         let start = meta.offset;
-        let end = start + numel;
+        let end = start.checked_add(numel).ok_or_else(|| {
+            anyhow::anyhow!("tensor {:?}: offset+numel overflows", meta.storage_key)
+        })?;
         if end > storage_f32.len() {
             bail!(
                 "tensor {:?}: contiguous view [{start}..{end}) exceeds storage len {}",
@@ -38,7 +53,19 @@ pub fn gather(meta: &TensorMeta, storage_f32: &[f32]) -> Result<Vec<f32>> {
         return Ok(storage_f32[start..end].to_vec());
     }
 
-    // General strided gather.
+    // General strided gather. A materialized (non-broadcast) view can never
+    // contain more elements than its backing storage, so reject a `numel`
+    // larger than the storage: this refuses a hostile shape (e.g. broadcast
+    // strides) that would otherwise force a giant speculative allocation and
+    // an equally huge gather loop. `numel` is thus bounded by the real
+    // storage bytes, so `with_capacity` below is safe.
+    if numel > storage_f32.len() {
+        bail!(
+            "tensor {:?}: view element count {numel} exceeds storage len {}",
+            meta.storage_key,
+            storage_f32.len()
+        );
+    }
     let mut out = Vec::with_capacity(numel);
     let rank = meta.shape.len();
     let mut idx = vec![0usize; rank];

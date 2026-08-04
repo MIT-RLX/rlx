@@ -50,6 +50,31 @@ kernel void sgemm(
     C[row * N + col] = sum;
 }
 
+// F16 activations × F32 weights → F32, f32 accumulate. Mirror of `sgemm_f16w`
+// for the A operand. Training's mixed-precision backward produces grad matmuls
+// `A_f16^T @ grad_f32` (activation cast to f16, upstream grad in f32); routing
+// those through the plain f32 `sgemm` would reinterpret the 2-byte f16 A bytes
+// as f32 and corrupt the result. This reads A as half and accumulates in f32,
+// so K-long reductions (e.g. K=B*T=1024) never overflow f16's ±65504 range.
+kernel void sgemm_f16a(
+    device const half* A  [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= M || col >= N) return;
+    float sum = 0.0;
+    for (uint k = 0; k < K; ++k) {
+        sum += float(A[row * K + k]) * B[k * N + col];
+    }
+    C[row * N + col] = sum;
+}
+
 // F32 activations × F16 weights → F32 (Zonos Metal Linear). Avoids casting
 // the full weight matrix to F32 on every decode step.
 kernel void sgemm_f16w(
@@ -150,6 +175,53 @@ kernel void sgemm_f16w_small_m(
     if (M > 1u) C[N + col] = acc1;
     if (M > 2u) C[2u * N + col] = acc2;
     if (M > 3u) C[3u * N + col] = acc3;
+}
+
+// M=1 F16-weight GEMV with K-splitting. `sgemm_f16w_small_m` launches one
+// thread per output column — for the decode projections (N ~1-3k) that is only
+// ~1-3k threads, too few to saturate memory bandwidth (~37 GB/s of ~273 peak).
+// Here KSPLIT threads cooperate per column: each strides k by KSPLIT and sums a
+// K/KSPLIT slice, then the partials reduce through threadgroup memory. The
+// threadgroup is (32 cols × KSPLIT), and a simdgroup is the 32 columns for one
+// `ks`, so `B[k*N + col .. col+31]` stays fully coalesced (KSPLIT× the threads
+// at the same DRAM traffic). A: [1,K] f32, B: [K,N] f16, C: [1,N] f32.
+kernel void gemv_f16w_splitk(
+    device const float* A [[buffer(0)]],
+    device const half*  B [[buffer(1)]],
+    device float*       C [[buffer(2)]],
+    constant uint& K      [[buffer(3)]],
+    constant uint& N      [[buffer(4)]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    constexpr uint KSPLIT = 32u;
+    threadgroup float2 partial[32][32];
+    // Two columns per thread via half2 loads: 32 threads × 4 B = 128-byte
+    // coalesced transactions (full Apple cache line) vs 64 B for scalar half.
+    // Requires N even & col-pair aligned — the dispatch only routes here for
+    // even N (all transformer projection widths); odd N falls to scalar.
+    uint col = tgid.x * 64u + tid.x * 2u;
+    uint ks = tid.y;
+    float2 acc = float2(0.0f);
+    if (col < N) {
+        device const half2* Bp = (device const half2*)(B + col);
+        for (uint k = ks; k < K; k += KSPLIT) {
+            float a = A[k];
+            half2 b = Bp[k * (N / 2u)];
+            acc.x += a * float(b.x);
+            acc.y += a * float(b.y);
+        }
+    }
+    partial[tid.x][ks] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0u && col < N) {
+        float2 s = float2(0.0f);
+        for (uint j = 0u; j < KSPLIT; ++j) s += partial[tid.x][j];
+        C[col] = s.x;
+        if (col + 1u < N) {
+            C[col + 1u] = s.y;
+        }
+    }
 }
 
 // Padded simdgroup with F16 B (same staging as sgemm_simd_padded).
@@ -611,7 +683,7 @@ kernel void sdpa_h(
     if (bi >= batch) return;
 
     uint hs = heads * head_dim;
-    float scale = 1.0f / precise::sqrt(float(head_dim));
+    float scale = rsqrt(float(head_dim));
     uint per_batch_stride = seq_stride * hs;
 
     uint total = seq * seq;
@@ -984,6 +1056,22 @@ kernel void sgemm_simd_4x4(
     simdgroup_store(c, &C[out_row * N + out_col], N);
 }
 
+// Register-blocked simdgroup GEMM family (plain + split-K) — generated per tile
+// config by `sgemm_tile_variant!` / `sgemm_splitk_variant!` (see msl_source). Each
+// config is TROWS×TCOLS output/threadgroup, TROWS/8 simdgroups × NACC 8×8-col
+// accumulators. Measured: beats MPS on aligned shapes (plain on tall/short-K,
+// split-K on fat-K). NO edge handling — `pick_sgemm` gates to 64/8 alignment.
+// @@RLX_SGEMM_TILES@@
+
+// Zero an f32 buffer region (for split-K accumulation init).
+kernel void zero_f32(
+    device float* C [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) C[i] = 0.0f;
+}
+
 // 32x32-tiled with bias + optional activation fused.
 kernel void sgemm_simd_4x4_bias(
     device const float* A [[buffer(0)]],
@@ -1238,6 +1326,76 @@ kernel void sgemm_simd_padded(
         uint dst_col = col_base + cc;
         if (dst_row < M && dst_col < N) {
             C[dst_row * N + dst_col] = C_pad[idx];
+        }
+    }
+}
+
+// sgemm_simd_padded with a fused full-tensor residual add in the epilogue:
+// C = A·B + R (R same shape as C, [M,N]). Emitted for Op::FusedMatMulResidual
+// so the transformer residual `add(skip, matmul_out)` folds into the matmul's
+// store instead of a separate elementwise-add dispatch — one fewer launch on a
+// launch-latency-bound decode. Body is identical to sgemm_simd_padded; only the
+// store adds R[idx].
+kernel void sgemm_simd_padded_residual(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    device const float* R [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    uint row_base = tgid.y * 8;
+    uint col_base = tgid.x * 8;
+
+    threadgroup float A_pad[64];
+    threadgroup float B_pad[64];
+
+    simdgroup_float8x8 a, b, c;
+    c = simdgroup_float8x8(0.0f);
+
+    for (uint k = 0; k < K; k += 8) {
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid;
+            uint ar = idx / 8;
+            uint ac = idx % 8;
+            uint src_row = row_base + ar;
+            uint src_col = k + ac;
+            float v = (src_row < M && src_col < K) ? A[src_row * K + src_col] : 0.0f;
+            A_pad[idx] = v;
+        }
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid;
+            uint br = idx / 8;
+            uint bc = idx % 8;
+            uint src_row = k + br;
+            uint src_col = col_base + bc;
+            float v = (src_row < K && src_col < N) ? B[src_row * N + src_col] : 0.0f;
+            B_pad[idx] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_load(a, A_pad, 8);
+        simdgroup_load(b, B_pad, 8);
+        simdgroup_multiply_accumulate(c, a, b, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float C_pad[64];
+    simdgroup_store(c, C_pad, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 2; ++i) {
+        uint idx = i * 32 + slid;
+        uint cr = idx / 8;
+        uint cc = idx % 8;
+        uint dst_row = row_base + cr;
+        uint dst_col = col_base + cc;
+        if (dst_row < M && dst_col < N) {
+            uint o = dst_row * N + dst_col;
+            C[o] = C_pad[idx] + R[o];
         }
     }
 }
@@ -3010,6 +3168,30 @@ kernel void transpose_nd(
     dst[gid] = src[src_idx];
 }
 
+// F16 reindex — same index math as `transpose_nd`, half elements. Emitted for
+// Expand/Transpose/repeat_kv on an F16-resident KV cache (`RLX_QWEN3_F16_KV`).
+kernel void transpose_nd_h(
+    device const half* src [[buffer(0)]],
+    device half* dst       [[buffer(1)]],
+    constant uint& rank    [[buffer(2)]],
+    constant uint& total   [[buffer(3)]],
+    constant uint* meta    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    uint src_idx = 0;
+    uint remaining = gid;
+    uint stride_rem = total;
+    for (uint d = 0; d < rank; ++d) {
+        uint dim = meta[d];
+        stride_rem /= dim;
+        uint coord = remaining / stride_rem;
+        remaining = remaining - coord * stride_rem;
+        src_idx += coord * meta[rank + d];
+    }
+    dst[gid] = src[src_idx];
+}
+
 // Rank-2 swap (row-major [rows, cols] → [cols, rows]). Cheaper than transpose_nd
 // for attention/layout reshapes — 2D thread grid, coalesced reads.
 kernel void transpose_2d_f32(
@@ -3035,25 +3217,29 @@ kernel void transpose_2d_tiled_f32(
     ushort2 tid [[thread_position_in_threadgroup]],
     ushort2 tgp [[threadgroup_position_in_grid]]
 ) {
+    // Coalesced both ways: tid.x (the 32-wide fast lane) indexes the CONTIGUOUS
+    // dimension on BOTH the global load (src col) and the store (dst row); the
+    // transpose happens in the padded [32][33] threadgroup tile (+1 avoids bank
+    // conflicts). The prior version indexed the ROW with tid.x on both sides, so
+    // both global accesses were strided and the tile delivered ZERO coalescing —
+    // profiling measured this rewrite at 1.1–2.7× (2.7× on the
+    // common 192² weight-grad transpose). Same grid (tgp.x=row-block, tgp.y=col-block).
     threadgroup float tile[32][33];
-    uint r0 = (uint)tgp.x * 32u + (uint)tid.x;
-    uint c0 = (uint)tgp.y * 32u + (uint)tid.y;
-    // Load 32x32 tile from src.
+    uint row_base = (uint)tgp.x * 32u;
+    uint col_base = (uint)tgp.y * 32u;
+    uint col = col_base + (uint)tid.x;
     for (uint i = 0; i < 32; i += 8) {
-        uint c = c0 + i;
-        if (r0 < rows && c < cols) {
-            tile[tid.x][tid.y + i] = src[r0 * cols + c];
+        uint row = row_base + (uint)tid.y + i;
+        if (row < rows && col < cols) {
+            tile[tid.y + i][tid.x] = src[row * cols + col];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Store transposed tile to dst.
-    uint rr0 = (uint)tgp.y * 32u + (uint)tid.x;
-    uint cc0 = (uint)tgp.x * 32u + (uint)tid.y;
+    uint drow = row_base + (uint)tid.x;
     for (uint i = 0; i < 32; i += 8) {
-        uint rr = rr0;
-        uint cc = cc0 + i;
-        if (rr < cols && cc < rows) {
-            dst[rr * rows + cc] = tile[tid.y + i][tid.x];
+        uint dcol = col_base + (uint)tid.y + i;
+        if (drow < rows && dcol < cols) {
+            dst[dcol * rows + drow] = tile[tid.x][tid.y + i];
         }
     }
 }
@@ -3182,18 +3368,18 @@ kernel void transpose_swap12_batched_trail_tiled_f32(
 // phase 1 over `num_updates * trailing` threads. The encoder fires both
 // in sequence within one command buffer.
 kernel void scatter_add_zero(
-    device atomic_uint* dst [[buffer(0)]],   // bit-cast view of f32 buffer
+    device atomic_float* dst [[buffer(0)]],
     constant uint& out_total [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= out_total) return;
-    atomic_store_explicit(&dst[gid], 0u, memory_order_relaxed);
+    atomic_store_explicit(&dst[gid], 0.0f, memory_order_relaxed);
 }
 
 kernel void scatter_add_accumulate(
     device const float* updates [[buffer(0)]],
     device const float* indices [[buffer(1)]],
-    device atomic_uint* dst     [[buffer(2)]],   // f32 reinterpreted as u32 atomic
+    device atomic_float* dst    [[buffer(2)]],
     constant uint& trailing     [[buffer(3)]],
     constant uint& num_updates  [[buffer(4)]],
     constant uint& out_dim      [[buffer(5)]],
@@ -3205,21 +3391,13 @@ kernel void scatter_add_accumulate(
     uint row = (uint)indices[i];
     if (row >= out_dim) return;            // OOB safety
     float v = updates[i * trailing + j];
-    // Compare-and-swap loop for atomic float-add. Metal lacks native
-    // atomic_add for float; reinterpret as uint, CAS the float bits.
-    uint dst_idx = row * trailing + j;
-    uint old_bits = atomic_load_explicit(&dst[dst_idx], memory_order_relaxed);
-    while (true) {
-        float old_f = as_type<float>(old_bits);
-        float new_f = old_f + v;
-        uint new_bits = as_type<uint>(new_f);
-        if (atomic_compare_exchange_weak_explicit(
-                &dst[dst_idx], &old_bits, new_bits,
-                memory_order_relaxed, memory_order_relaxed)) {
-            break;
-        }
-        // CAS failed → old_bits now holds the latest value; retry.
-    }
+    // Native hardware-arbitrated float atomic-add. Replaces the old f32
+    // CAS-retry loop (as_type<uint> + compare_exchange_weak); profiling
+    // measured 10.5× under codebook-grad contention (~36 threads/entry, where
+    // the CAS spun). `atomic_float` compiles on metal3.1+ (all Apple-silicon
+    // Metal targets); same bits + same unordered-fadd (non-)determinism as the
+    // CAS.
+    atomic_fetch_add_explicit(&dst[row * trailing + j], v, memory_order_relaxed);
 }
 
 // Indexed batched matmul (MoE GEMM). One thread per output element
@@ -3324,6 +3502,35 @@ kernel void reduce_axes(
     }
     if (op_kind == 1) acc /= float(reduced);
     dst[o * inner + i] = acc;
+}
+
+// SIMD-parallel Sum/Mean reduction: one 32-wide threadgroup (== 1 SIMD group)
+// per output element; the 32 lanes split the `reduced` axis and combine with
+// simd_sum. `reduce_axes` above dispatches ONE thread per output, each serially
+// summing the whole reduced axis — for grad-sums (bias/beta: reduced = batch·seq
+// ≈ 1024, few outputs) that is a serial reduction at low occupancy. Sum/Mean
+// only (op_kind 0/1); max/min/prod stay on the scalar kernel.
+kernel void reduce_axes_sum_simd(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& reduced  [[buffer(2)]],
+    constant uint& inner    [[buffer(3)]],
+    constant uint& op_kind  [[buffer(4)]],
+    uint out_idx [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tsize   [[threads_per_threadgroup]]
+) {
+    uint i = out_idx % inner;
+    uint o = out_idx / inner;
+    uint base = o * reduced * inner + i;
+    float local = 0.0f;
+    for (uint r = tid; r < reduced; r += tsize) {
+        local += src[base + r * inner];
+    }
+    float total = simd_sum(local);
+    if (tid == 0) {
+        dst[out_idx] = (op_kind == 1u) ? total / float(reduced) : total;
+    }
 }
 
 // Ternary select: cond != 0 ? a : b. cond is treated as bool via != 0.
@@ -3775,6 +3982,56 @@ kernel void softmax_lastax(
     }
 }
 
+// Causal-bounded row softmax for the attention-backward score recompute. Row
+// r = slot*sq + qi softmaxes over only its causal band [0, qi]; cols ki>qi are
+// masked sentinels (-1e4) whose exp underflows to EXACTLY 0, so they contribute
+// nothing to the row max/sum — making this bit-identical to `softmax_lastax` for
+// the band that the consumers (attn_bwd dv/ds) actually read. Cols>qi are left
+// untouched (never read). ~2× less work per row for causal prefill.
+kernel void softmax_lastax_causal(
+    device float* data    [[buffer(0)]],
+    constant uint& cols   [[buffer(1)]],
+    constant uint& sq     [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    uint qi = row % sq;
+    uint active = min(qi + 1u, cols);   // causal band [0, qi]
+    uint base = row * cols;
+
+    float local_max = -INFINITY;
+    for (uint i = tid; i < active; i += tsize) {
+        local_max = max(local_max, data[base + i]);
+    }
+    partial[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial[tid] = max(partial[tid], partial[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = partial[0];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < active; i += tsize) {
+        float e = exp(data[base + i] - row_max);
+        data[base + i] = e;
+        local_sum += e;
+    }
+    partial[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / partial[0];
+
+    for (uint i = tid; i < active; i += tsize) {
+        data[base + i] *= inv_sum;
+    }
+}
+
 // Fused dense / soft-label softmax cross-entropy along the last axis.
 // One threadgroup per row computes, numerically stably,
 //   loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]
@@ -4161,49 +4418,12 @@ kernel void concat_segment_lastax_h(
 // decode step into ~100 tiny GPU submissions (the dominant cost on GGUF KV
 // caches). `arena` bound at 0 + ulong byte offsets so it is correct on
 // >4 GiB arenas (task #50). Generic: subsumes last-axis concat when inner==1.
-kernel void concat_midaxis_seg(
-    device char* arena       [[buffer(0)]],
-    constant ulong& dst_byte [[buffer(1)]],
-    constant ulong& src_byte [[buffer(2)]],
-    constant uint& outer     [[buffer(3)]],
-    constant uint& dst_axis  [[buffer(4)]],
-    constant uint& src_axis  [[buffer(5)]],
-    constant uint& inner     [[buffer(6)]],
-    constant uint& dst_col   [[buffer(7)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint total = outer * src_axis * inner;
-    if (gid >= total) return;
-    uint ii = gid % inner;
-    uint tmp = gid / inner;
-    uint a = tmp % src_axis;
-    uint o = tmp / src_axis;
-    device const float* src = (device const float*)(arena + src_byte);
-    device float* dst       = (device float*)(arena + dst_byte);
-    dst[(o * dst_axis + dst_col + a) * inner + ii] = src[(o * src_axis + a) * inner + ii];
-}
-
-kernel void concat_midaxis_seg_h(
-    device char* arena       [[buffer(0)]],
-    constant ulong& dst_byte [[buffer(1)]],
-    constant ulong& src_byte [[buffer(2)]],
-    constant uint& outer     [[buffer(3)]],
-    constant uint& dst_axis  [[buffer(4)]],
-    constant uint& src_axis  [[buffer(5)]],
-    constant uint& inner     [[buffer(6)]],
-    constant uint& dst_col   [[buffer(7)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint total = outer * src_axis * inner;
-    if (gid >= total) return;
-    uint ii = gid % inner;
-    uint tmp = gid / inner;
-    uint a = tmp % src_axis;
-    uint o = tmp / src_axis;
-    device const half* src = (device const half*)(arena + src_byte);
-    device half* dst       = (device half*)(arena + dst_byte);
-    dst[(o * dst_axis + dst_col + a) * inner + ii] = src[(o * src_axis + a) * inner + ii];
-}
+// Mid-axis concat segment kernels, one per (input, output) precision pair —
+// generated from CONCAT_MIDAXIS_SEG_TMPL by `concat_midaxis_variant!`. The
+// converting variants (f32→f16 / f16→f32) let a concat with a mismatched-dtype
+// input (e.g. an f32 `k_rope` into the f16 KV concat) convert on write instead
+// of reading the source bytes at the wrong width (→ inf/NaN saturation).
+// @@RLX_CONCAT_MIDAXIS@@
 
 // Fused residual + LN: out = LN(x + residual + bias, gamma, beta)
 // (bias is broadcast per row; pass empty/null offset for no-bias variant)
@@ -4754,6 +4974,7 @@ kernel void fused_residual_rms_norm(
     constant ulong& out_off    [[buffer(5)]],
     constant uint& h           [[buffer(6)]],
     constant float& eps        [[buffer(7)]],
+    constant ulong& sum_off    [[buffer(8)]],   // dual output: pre-norm sum (x+res), 0 = disabled
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tsize [[threads_per_threadgroup]]
@@ -4763,11 +4984,13 @@ kernel void fused_residual_rms_norm(
     device const float* gamma = (device const float*)(arena + g_off);
     device const float* beta = (device const float*)(arena + b_off);
     device float* out = (device float*)(arena + out_off);
+    device float* sum = (sum_off != 0) ? (device float*)(arena + sum_off) : (device float*)0;
     threadgroup float partial_sumsq[256];
     float local_sumsq = 0.0;
     for (uint i = tid; i < h; i += tsize) {
         float v = x[row * h + i] + res[row * h + i];
         local_sumsq += v * v;
+        if (sum != 0) sum[row * h + i] = v;   // emit the residual sum for the skip stream
     }
     partial_sumsq[tid] = local_sumsq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4796,7 +5019,10 @@ struct SdpaOffsets {
     // GQA/MQA: K/V head count (equals `heads` for MHA). Packed here so we
     // don't need a 7th set_bytes slot past the Metal arg-table quirk.
     uint kv_heads;
-    uint _pad;
+    // V/output per-head width. Equals `head_dim` for symmetric SDPA; smaller
+    // for asymmetric MLA (DeepSeek/Kimi qk=192, v=128). Packed into the high
+    // 32 bits of the kv_heads slot on the host side. 0 ⇒ fall back to head_dim.
+    uint v_head_dim;
 };
 
 // Q/K/V offset helpers — BSNH [B, L, H*D] vs BHSD [B, H, L, D].
@@ -4823,6 +5049,33 @@ static inline uint qkv_kv_offset(
     }
     uint hs = nkv * head_dim;
     return bi * k_stride * hs + ki * hs + hi_kv * head_dim;
+}
+// V read offset — like qkv_kv_offset but the per-head width is `v_head_dim`
+// (asymmetric MLA). Reduces exactly to qkv_kv_offset when v_head_dim==head_dim.
+static inline uint qkv_v_offset(
+    uint bi, uint hi, uint ki,
+    uint heads, uint kv_heads, uint seq_k, uint v_head_dim, uint k_stride, uint bhsd
+) {
+    uint nkv = (kv_heads == 0u) ? heads : kv_heads;
+    uint group = heads / nkv;
+    uint hi_kv = (group > 1u) ? (hi / group) : hi;
+    if (bhsd != 0u) {
+        return bi * nkv * seq_k * v_head_dim + hi_kv * seq_k * v_head_dim + ki * v_head_dim;
+    }
+    uint hs = nkv * v_head_dim;
+    return bi * k_stride * hs + ki * hs + hi_kv * v_head_dim;
+}
+// Output write offset — the attention output row is `heads * v_head_dim` wide
+// (asymmetric MLA). Reduces exactly to qkv_q_offset when v_head_dim==head_dim.
+static inline uint qkv_out_offset(
+    uint bi, uint hi, uint qi,
+    uint heads, uint seq_q, uint v_head_dim, uint q_stride, uint bhsd
+) {
+    if (bhsd != 0u) {
+        return bi * heads * seq_q * v_head_dim + hi * seq_q * v_head_dim + qi * v_head_dim;
+    }
+    uint hs = heads * v_head_dim;
+    return bi * q_stride * hs + qi * hs + hi * v_head_dim;
 }
 
 // Multi-head SDPA: attention(Q, K, V, mask) → out
@@ -4888,7 +5141,7 @@ kernel void sdpa(
     // `score_scale` is the host-provided multiplier (Gemma 4 sets 1.0
     // because Q is per-head RMS-normed before attention). Sentinel `0.0`
     // means "use the relaxed-precision default `1/sqrt(head_dim)`".
-    float scale = (score_scale > 0.0f) ? score_scale : 1.0f / precise::sqrt(float(head_dim));
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
     // Gemma 2 carries an attention-logit softcap (50.0); Gemma 4 sets 0.
     float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
     uint q_offset = seq_k - seq_q;
@@ -4953,18 +5206,248 @@ kernel void sdpa(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // 3. Output[qi, d] = sum_ki scores[qi, ki] * V[bi, ki, hi*dh + d]
-    uint out_total = seq_q * head_dim;
+    // 3. Output[qi, d] = sum_ki scores[qi, ki] * V[bi, ki, hi*vdh + d]
+    // V is read and the output is written `v_head_dim`-wide (asymmetric MLA;
+    // == head_dim for symmetric SDPA). Q/K scores above stay head_dim-wide.
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint out_total = seq_q * vdh;
     for (uint idx = tid; idx < out_total; idx += tsize) {
-        uint qi = idx / head_dim;
-        uint d = idx % head_dim;
+        uint qi = idx / vdh;
+        uint d = idx % vdh;
         float acc = 0.0;
         for (uint ki = 0; ki < seq_k; ++ki) {
-            uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+            uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
             acc += scores[qi * seq_k + ki] * V[v_base + d];
         }
-        uint o_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
+        uint o_base = qkv_out_offset(bi, hi, qi, heads, seq_q, vdh, q_stride, bhsd);
         OUT[o_base + d] = acc;
+    }
+}
+
+// SIMD-group-parallel SDPA (seq<=64 prefill). Identical math to `sdpa`, but the
+// per-row softmax reduction uses simd_max / simd_sum across the 32-wide
+// threadgroup (== one Apple SIMD group) instead of a serial `tid==0` scan. This
+// removes the single-thread softmax bottleneck and all per-row threadgroup
+// barriers; the score-matmul and A·V steps are already thread-parallel and are
+// kept verbatim. Dispatched with exactly 32 threads/threadgroup so the SIMD
+// reductions cover the whole threadgroup.
+kernel void sdpa_simd(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch      [[buffer(5)]],
+    constant uint& seq_q      [[buffer(6)]],
+    constant uint& heads      [[buffer(7)]],
+    constant uint& head_dim   [[buffer(8)]],
+    constant uint& q_stride   [[buffer(9)]],
+    constant uint& mask_kind  [[buffer(10)]],
+    constant uint& seq_k      [[buffer(11)]],
+    constant uint& k_stride   [[buffer(12)]],
+    constant uint& bhsd       [[buffer(13)]],
+    constant uint& window     [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint tid    [[thread_position_in_threadgroup]],
+    uint tsize  [[threads_per_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+    threadgroup float scores[64 * 64];
+
+    uint bi = tgid_x / heads;
+    uint hi = tgid_x % heads;
+    if (bi >= batch) return;
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint q_offset = seq_k - seq_q;
+
+    // 1. scores[qi,ki] = scale·(Q·K) + mask  (thread-parallel, verbatim from sdpa).
+    uint total = seq_q * seq_k;
+    for (uint idx = tid; idx < total; idx += tsize) {
+        uint qi = idx / seq_k;
+        uint ki = idx % seq_k;
+        float dot = 0.0;
+        uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        for (uint d = 0; d < head_dim; ++d) {
+            dot += Q[q_base + d] * K[k_base + d];
+        }
+        float s = dot * scale;
+        if (softcap_inv > 0.0f) {
+            s = precise::tanh(s * softcap_inv) * attn_softcap;
+        }
+        if (mask_kind == 1u) {
+            if (ki > q_offset + qi) s = -1e9;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5) s = -1e9;
+        } else if (mask_kind == 4u) {
+            uint abs_q = q_offset + qi;
+            uint lo = abs_q > window ? abs_q - window : 0u;
+            if (ki < lo || ki > abs_q) s = -1e9;
+        }
+        scores[qi * seq_k + ki] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Softmax per row via SIMD-group reductions. Each thread owns the strided
+    // columns ki = tid, tid+32, …; simd_max / simd_sum combine across the 32
+    // lanes. Each thread only reads/writes its own columns, so no barrier is
+    // needed between the phases (the SIMD ops synchronize the reduction).
+    for (uint qi = 0; qi < seq_q; ++qi) {
+        float lmax = -1e30;
+        for (uint ki = tid; ki < seq_k; ki += tsize) {
+            lmax = max(lmax, scores[qi * seq_k + ki]);
+        }
+        float mx = simd_max(lmax);
+        float lsum = 0.0;
+        for (uint ki = tid; ki < seq_k; ki += tsize) {
+            float e = precise::exp(scores[qi * seq_k + ki] - mx);
+            scores[qi * seq_k + ki] = e;
+            lsum += e;
+        }
+        float inv = 1.0f / simd_sum(lsum);
+        for (uint ki = tid; ki < seq_k; ki += tsize) {
+            scores[qi * seq_k + ki] *= inv;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Output[qi,d] = Σ_ki scores[qi,ki]·V[…]  (thread-parallel, verbatim).
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint out_total = seq_q * vdh;
+    for (uint idx = tid; idx < out_total; idx += tsize) {
+        uint qi = idx / vdh;
+        uint d = idx % vdh;
+        float acc = 0.0;
+        for (uint ki = 0; ki < seq_k; ++ki) {
+            uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+            acc += scores[qi * seq_k + ki] * V[v_base + d];
+        }
+        uint o_base = qkv_out_offset(bi, hi, qi, heads, seq_q, vdh, q_stride, bhsd);
+        OUT[o_base + d] = acc;
+    }
+}
+
+// f16-scores variant of `sdpa_simd`: the threadgroup scores matrix is stored as
+// `half` (8 KiB vs 16 KiB) so 2× as many threadgroups fit per core — the one real
+// occupancy limiter the shader trace found. ALL arithmetic stays f32 (Q·K dot,
+// softmax max/exp/sum, A·V accumulate); only the on-chip *storage* of scores /
+// probabilities is half. The scores are O(1) after scaling and softmax is
+// range-robust, so the accuracy cost is ~1 half-ULP in the probabilities.
+kernel void sdpa_simd_h16(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch      [[buffer(5)]],
+    constant uint& seq_q      [[buffer(6)]],
+    constant uint& heads      [[buffer(7)]],
+    constant uint& head_dim   [[buffer(8)]],
+    constant uint& q_stride   [[buffer(9)]],
+    constant uint& mask_kind  [[buffer(10)]],
+    constant uint& seq_k      [[buffer(11)]],
+    constant uint& k_stride   [[buffer(12)]],
+    constant uint& bhsd       [[buffer(13)]],
+    constant uint& window     [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint tid    [[thread_position_in_threadgroup]],
+    uint tsize  [[threads_per_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+    threadgroup half scores[64 * 64];   // 8 KiB (half of the f32 version)
+
+    uint bi = tgid_x / heads;
+    uint hi = tgid_x % heads;
+    if (bi >= batch) return;
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint q_offset = seq_k - seq_q;
+
+    uint total = seq_q * seq_k;
+    for (uint idx = tid; idx < total; idx += tsize) {
+        uint qi = idx / seq_k, ki = idx % seq_k;
+        float dot = 0.0;
+        uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        // AIR/AGX opt: vectorized float4 loads (4× fewer load ops) + explicit
+        // fma (1 fused instr, single-rounding ⇒ *more* accurate than mul+add).
+        // float4 needs 16-byte-aligned bases; head_dim/hs are multiples of 4 for
+        // real head dims, so the fast path applies. Scalar+fma fallback otherwise.
+        if ((head_dim & 3u) == 0u) {
+            device const float4* Q4 = (device const float4*)(Q + q_base);
+            device const float4* K4 = (device const float4*)(K + k_base);
+            for (uint d4 = 0; d4 < (head_dim >> 2); ++d4) {
+                float4 qv = Q4[d4], kv = K4[d4];
+                dot = fma(qv.x, kv.x, fma(qv.y, kv.y, fma(qv.z, kv.z, fma(qv.w, kv.w, dot))));
+            }
+        } else {
+            for (uint d = 0; d < head_dim; ++d) {
+                dot = fma(Q[q_base + d], K[k_base + d], dot);
+            }
+        }
+        float s = dot * scale;
+        if (softcap_inv > 0.0f) {
+            s = precise::tanh(s * softcap_inv) * attn_softcap;
+        }
+        if (mask_kind == 1u) {
+            if (ki > q_offset + qi) s = -65504.0f;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5) s = -65504.0f;
+        } else if (mask_kind == 4u) {
+            uint abs_q = q_offset + qi;
+            uint lo = abs_q > window ? abs_q - window : 0u;
+            if (ki < lo || ki > abs_q) s = -65504.0f;
+        }
+        scores[qi * seq_k + ki] = half(s);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint qi = 0; qi < seq_q; ++qi) {
+        float lmax = -1e30;
+        for (uint ki = tid; ki < seq_k; ki += tsize) {
+            lmax = max(lmax, float(scores[qi * seq_k + ki]));
+        }
+        float mx = simd_max(lmax);
+        float lsum = 0.0;
+        for (uint ki = tid; ki < seq_k; ki += tsize) {
+            float e = precise::exp(float(scores[qi * seq_k + ki]) - mx);
+            scores[qi * seq_k + ki] = half(e);
+            lsum += e;
+        }
+        float inv = 1.0f / simd_sum(lsum);
+        for (uint ki = tid; ki < seq_k; ki += tsize) {
+            scores[qi * seq_k + ki] = half(float(scores[qi * seq_k + ki]) * inv);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint out_total = seq_q * vdh;
+    for (uint idx = tid; idx < out_total; idx += tsize) {
+        uint qi = idx / vdh, d = idx % vdh;
+        float acc = 0.0;
+        for (uint ki = 0; ki < seq_k; ++ki) {
+            uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+            acc += float(scores[qi * seq_k + ki]) * V[v_base + d];
+        }
+        OUT[qkv_out_offset(bi, hi, qi, heads, seq_q, vdh, q_stride, bhsd) + d] = acc;
     }
 }
 
@@ -5029,8 +5512,11 @@ kernel void sdpa_long(
     uint bi = bh / heads;
 
     // Precise scale; honour caller's `score_scale` (Gemma 4 = 1.0).
-    float scale = (score_scale > 0.0f) ? score_scale : 1.0f / precise::sqrt(float(head_dim));
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
     float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+
+    // V/output per-head width (asymmetric MLA; == head_dim for symmetric).
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
 
     // Cache Q[qi, hi*dh : (hi+1)*dh] in registers — read seq_k times below.
     float q_reg[MAX_HEAD_DIM];
@@ -5041,13 +5527,20 @@ kernel void sdpa_long(
     uint bias_row_base = ((bi * heads + hi) * seq_q + qi) * seq_k;
     uint q_offset = seq_k - seq_q;
 
-    // Online softmax accumulators.
+    // Online softmax accumulators. O is v_head_dim-wide.
     float m_acc = -1e30;
     float l_acc = 0.0;
     float o_acc[MAX_HEAD_DIM];
-    for (uint d = 0; d < head_dim; ++d) o_acc[d] = 0.0;
+    for (uint d = 0; d < vdh; ++d) o_acc[d] = 0.0;
 
     for (uint ki = 0; ki < seq_k; ++ki) {
+        // Causal early-exit: keys ki > q_offset+qi are fully masked and contribute
+        // EXACTLY zero to the online softmax (m unchanged, e_cur = exp(-1e9-m) = 0,
+        // l/o += 0). Since ki increases monotonically, once past the diagonal every
+        // remaining key is masked — stop. Bit-identical; ~2× fewer iterations for
+        // causal prefill. Only fires for mask_kind==1 (non-causal graphs — vision
+        // seq=257, BERT, cross-attn — keep the full loop).
+        if (mask_kind == 1u && ki > q_offset + qi) break;
         // Score: scale * (Q · K[ki]) + mask
         uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
         float dot = 0.0;
@@ -5073,18 +5566,108 @@ kernel void sdpa_long(
         float e_old = precise::exp(m_acc - m_new);
         float e_cur = precise::exp(s - m_new);
         l_acc = e_old * l_acc + e_cur;
-        uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
-        for (uint d = 0; d < head_dim; ++d) {
+        uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) {
             o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
         }
         m_acc = m_new;
     }
 
-    // Normalize and emit.
+    // Normalize and emit (v_head_dim-wide output).
     float inv_l = 1.0 / l_acc;
-    uint o_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
-    for (uint d = 0; d < head_dim; ++d) {
+    uint o_base = qkv_out_offset(bi, hi, qi, heads, seq_q, vdh, q_stride, bhsd);
+    for (uint d = 0; d < vdh; ++d) {
         OUT[o_base + d] = o_acc[d] * inv_l;
+    }
+}
+
+// ── Occupancy-isolation probe (benchmark only) ──────────────────────────────
+// Byte-for-byte identical WORK to `sdpa_long` (same memory traffic, same
+// instruction stream) but declares a 20 KB dummy threadgroup array — matching
+// sdpa_fa2/attn_bwd_fused's tgMem footprint — so the compiler's
+// staticThreadgroupMemoryLength (hence concurrent-threadgroups-per-core /
+// occupancy) drops to their level while everything else is held constant. If
+// this runs ~2-3× slower than `sdpa_long`, threadgroup-memory-limited occupancy
+// is proven the cause of the flash-kernel slowdowns, independent of cache/roofline.
+kernel void sdpa_long_occpad(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& seq_q       [[buffer(6)]],
+    constant uint& heads       [[buffer(7)]],
+    constant uint& head_dim    [[buffer(8)]],
+    constant uint& q_stride    [[buffer(9)]],
+    constant uint& mask_kind   [[buffer(10)]],
+    constant uint& seq_k       [[buffer(11)]],
+    constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint tid_x [[thread_position_in_grid]],
+    uint tlid  [[thread_index_in_threadgroup]]
+) {
+    // 20 KB of threadgroup memory — declared (so it counts against occupancy)
+    // and lightly touched (so the compiler can't eliminate it), but it plays no
+    // role in the math below.
+    threadgroup float occ_pad[5120];
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+    constexpr uint MAX_HEAD_DIM = 512u;
+    uint total = batch * heads * seq_q;
+    if (tid_x >= total) return;
+    uint qi = tid_x % seq_q;
+    uint bh = tid_x / seq_q;
+    uint hi = bh % heads;
+    uint bi = bh / heads;
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    occ_pad[tlid] = scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_reg[MAX_HEAD_DIM];
+    uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
+    for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
+    uint bias_row_base = ((bi * heads + hi) * seq_q + qi) * seq_k;
+    uint q_offset = seq_k - seq_q;
+    float m_acc = -1e30;
+    float l_acc = 0.0;
+    float o_acc[MAX_HEAD_DIM];
+    for (uint d = 0; d < vdh; ++d) o_acc[d] = 0.0;
+    for (uint ki = 0; ki < seq_k; ++ki) {
+        if (mask_kind == 1u && ki > q_offset + qi) break;
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; ++d) dot += q_reg[d] * K[k_base + d];
+        float s = dot * scale;
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+        if (mask_kind == 1u) { if (ki > q_offset + qi) s = -1e9; }
+        else if (mask_kind == 2u) { if (M[bi * k_stride + ki] < 0.5) s = -1e9; }
+        else if (mask_kind == 3u) { s += M[bias_row_base + ki]; }
+        else if (mask_kind == 4u) { uint abs_q = q_offset + qi; uint lo = abs_q > window ? abs_q - window : 0u; if (ki < lo || ki > abs_q) s = -1e9; }
+        float m_new = max(m_acc, s);
+        float e_old = precise::exp(m_acc - m_new);
+        float e_cur = precise::exp(s - m_new);
+        l_acc = e_old * l_acc + e_cur;
+        uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
+        m_acc = m_new;
+    }
+    float inv_l = 1.0 / l_acc;
+    uint o_base = qkv_out_offset(bi, hi, qi, heads, seq_q, vdh, q_stride, bhsd);
+    // The dummy tgMem feeds a never-true branch so it can't be optimized away.
+    float pad_guard = occ_pad[tlid];
+    for (uint d = 0; d < vdh; ++d) {
+        float o = o_acc[d] * inv_l;
+        if (pad_guard > 1e38f) o += occ_pad[(tlid + d) % 5120];
+        OUT[o_base + d] = o;
     }
 }
 
@@ -5093,164 +5676,7 @@ kernel void sdpa_long(
 // One threadgroup per (batch, head); threads split the K axis and merge
 // online-softmax states. The old 1-thread-per-head launch left Apple GPUs
 // nearly idle on GQA decode (Zonos: batch=2 × 16 heads = 32 threads).
-kernel void sdpa_decode_m1(
-    device const float* arena_q   [[buffer(0)]],
-    device const float* arena_k   [[buffer(1)]],
-    device const float* arena_v   [[buffer(2)]],
-    device const float* arena_m   [[buffer(3)]],
-    device float*       arena_o   [[buffer(4)]],
-    constant uint& batch       [[buffer(5)]],
-    constant uint& heads       [[buffer(6)]],
-    constant uint& head_dim    [[buffer(7)]],
-    constant uint& q_stride    [[buffer(8)]],
-    constant uint& mask_kind   [[buffer(9)]],
-    constant uint& seq_k       [[buffer(10)]],
-    constant uint& k_stride    [[buffer(11)]],
-    constant uint& bhsd        [[buffer(12)]],
-    constant uint& window      [[buffer(13)]],
-    constant float& score_scale  [[buffer(14)]],
-    constant float& attn_softcap [[buffer(15)]],
-    constant SdpaOffsets& byte_offs [[buffer(16)]],
-    uint tid  [[thread_position_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint tsize [[threads_per_threadgroup]]
-) {
-    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
-    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
-    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
-    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
-    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
-
-    // TG=32 × dh≤128 → 16 KiB for partial O; fits Apple7/8 32 KiB tg limit.
-    constexpr uint MAX_DH = 128u;
-    constexpr uint TG = 32u;
-    threadgroup float tg_m[TG];
-    threadgroup float tg_l[TG];
-    threadgroup float tg_o[TG * MAX_DH];
-
-    uint bi = tgid / heads;
-    uint hi = tgid % heads;
-    if (bi >= batch) return;
-
-    float scale = (score_scale > 0.0f) ? score_scale : 1.0f / precise::sqrt(float(head_dim));
-    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
-    uint q_offset = seq_k - 1u;
-    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
-
-    // Large head_dim: one thread walks all of K (rare for LLM decode; Gemma-4).
-    if (head_dim > MAX_DH || tsize < 2u) {
-        if (tid != 0u) return;
-        float q_reg[512];
-        for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
-        float m_acc = -1e30f;
-        float l_acc = 0.0f;
-        float o_acc[512];
-        for (uint d = 0; d < head_dim; ++d) o_acc[d] = 0.0f;
-        for (uint ki = 0; ki < seq_k; ++ki) {
-            uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
-            float dot = 0.0f;
-            for (uint d = 0; d < head_dim; ++d) dot += q_reg[d] * K[k_base + d];
-            float s = dot * scale;
-            if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
-            if (mask_kind == 1u) {
-                if (ki > q_offset) s = -1e9f;
-            } else if (mask_kind == 2u) {
-                if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
-            } else if (mask_kind == 4u) {
-                uint lo = q_offset > window ? q_offset - window : 0u;
-                if (ki < lo || ki > q_offset) s = -1e9f;
-            }
-            float m_new = max(m_acc, s);
-            float e_old = precise::exp(m_acc - m_new);
-            float e_cur = precise::exp(s - m_new);
-            l_acc = e_old * l_acc + e_cur;
-            uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
-            for (uint d = 0; d < head_dim; ++d) {
-                o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
-            }
-            m_acc = m_new;
-        }
-        float inv_l = 1.0f / l_acc;
-        uint o_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
-        for (uint d = 0; d < head_dim; ++d) OUT[o_base + d] = o_acc[d] * inv_l;
-        return;
-    }
-
-    float q_reg[MAX_DH];
-    for (uint d = tid; d < head_dim; d += tsize) tg_o[d] = Q[q_base + d];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint d = 0; d < head_dim; ++d) q_reg[d] = tg_o[d];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float m_acc = -1e30f;
-    float l_acc = 0.0f;
-    float o_acc[MAX_DH];
-    for (uint d = 0; d < head_dim; ++d) o_acc[d] = 0.0f;
-
-    for (uint ki = tid; ki < seq_k; ki += tsize) {
-        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d += 4u) {
-            if (d + 3u < head_dim) {
-                float4 qv = float4(q_reg[d], q_reg[d + 1u], q_reg[d + 2u], q_reg[d + 3u]);
-                float4 kv = *(device const float4*)(K + k_base + d);
-                dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
-            } else {
-                for (uint dd = d; dd < head_dim; ++dd) dot += q_reg[dd] * K[k_base + dd];
-            }
-        }
-        float s = dot * scale;
-        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
-        if (mask_kind == 1u) {
-            if (ki > q_offset) s = -1e9f;
-        } else if (mask_kind == 2u) {
-            if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
-        } else if (mask_kind == 4u) {
-            uint lo = q_offset > window ? q_offset - window : 0u;
-            if (ki < lo || ki > q_offset) s = -1e9f;
-        }
-        float m_new = max(m_acc, s);
-        float e_old = precise::exp(m_acc - m_new);
-        float e_cur = precise::exp(s - m_new);
-        l_acc = e_old * l_acc + e_cur;
-        uint v_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
-        for (uint d = 0; d < head_dim; ++d) {
-            o_acc[d] = e_old * o_acc[d] + e_cur * V[v_base + d];
-        }
-        m_acc = m_new;
-    }
-
-    // Idle lanes beyond TG keep identity merge state (already set if tid>=TG).
-    if (tid < TG) {
-        tg_m[tid] = m_acc;
-        tg_l[tid] = l_acc;
-        for (uint d = 0; d < head_dim; ++d) tg_o[tid * MAX_DH + d] = o_acc[d];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = TG / 2u; stride > 0u; stride /= 2u) {
-        if (tid < stride) {
-            float m1 = tg_m[tid];
-            float m2 = tg_m[tid + stride];
-            float m_new = max(m1, m2);
-            float e1 = precise::exp(m1 - m_new);
-            float e2 = precise::exp(m2 - m_new);
-            tg_l[tid] = e1 * tg_l[tid] + e2 * tg_l[tid + stride];
-            tg_m[tid] = m_new;
-            for (uint d = 0; d < head_dim; ++d) {
-                tg_o[tid * MAX_DH + d] =
-                    e1 * tg_o[tid * MAX_DH + d] + e2 * tg_o[(tid + stride) * MAX_DH + d];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u) {
-        float inv_l = 1.0f / tg_l[0];
-        uint o_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
-        for (uint d = 0; d < head_dim; ++d) OUT[o_base + d] = tg_o[d] * inv_l;
-    }
-}
+// @@RLX_SDPA_DECODE_M1@@
 
 // Flash-attention tile kernel with optional additive bias mask.
 //
@@ -5417,6 +5843,437 @@ kernel void sdpa_fa_f32(
         if (pos < seq_q) {
             float o = o_row[qi * MAX_DH + di] / l_row[qi];
             OUT[qkv_q_offset(bi, hi, pos, heads, seq_q, head_dim, q_stride, bhsd) + di] = o;
+        }
+    }
+}
+
+// ── Variant 1: split-K SIMD prefill SDPA ────────────────────────────────────
+// One SIMD group (32 threads) per (batch, head, query-row). The 32 lanes split
+// the key axis (ki = lane, lane+32, …), each maintaining a partial online-softmax
+// state (m,l,O) over its strided keys, then merge across lanes via simd_max /
+// simd_sum. This parallelizes `sdpa_long`'s serial K walk 32-way while keeping
+// the same O(D)-register / no-scores-matrix footprint (scales to any seq).
+// head_dim, v_head_dim ≤ 128 (per-lane register accumulators). MUST be launched
+// with exactly 32 threads/threadgroup (== one Apple SIMD group).
+kernel void sdpa_splitk(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& seq_q       [[buffer(6)]],
+    constant uint& heads       [[buffer(7)]],
+    constant uint& head_dim    [[buffer(8)]],
+    constant uint& q_stride    [[buffer(9)]],
+    constant uint& mask_kind   [[buffer(10)]],
+    constant uint& seq_k       [[buffer(11)]],
+    constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lane   [[thread_index_in_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+
+    constexpr uint MAX_DH = 128u;
+    constexpr uint LANES = 32u;
+
+    uint total_rows = batch * heads * seq_q;
+    if (tgid_x >= total_rows) return;
+    uint qi = tgid_x % seq_q;
+    uint bh = tgid_x / seq_q;
+    uint hi = bh % heads;
+    uint bi = bh / heads;
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint q_offset = seq_k - seq_q;
+
+    // Q row into per-lane registers (small; head_dim ≤ 128).
+    float q_reg[MAX_DH];
+    uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
+    for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
+
+    // Per-lane online softmax over strided keys.
+    float m_i = -1e30f;
+    float l_i = 0.0f;
+    float o_i[MAX_DH];
+    for (uint d = 0; d < vdh; ++d) o_i[d] = 0.0f;
+    uint bias_row_base = ((bi * heads + hi) * seq_q + qi) * seq_k;
+
+    for (uint ki = lane; ki < seq_k; ki += LANES) {
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) dot = fma(q_reg[d], K[k_base + d], dot);
+        float s = dot * scale;
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+        bool masked = false;
+        if (mask_kind == 1u) {
+            if (ki > q_offset + qi) masked = true;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5f) masked = true;
+        } else if (mask_kind == 3u) {
+            s += M[bias_row_base + ki];
+        } else if (mask_kind == 4u) {
+            uint abs_q = q_offset + qi;
+            uint lo = abs_q > window ? abs_q - window : 0u;
+            if (ki < lo || ki > abs_q) masked = true;
+        }
+        if (masked) continue;
+        float m_new = max(m_i, s);
+        float e_old = precise::exp(m_i - m_new);
+        float e_cur = precise::exp(s - m_new);
+        l_i = e_old * l_i + e_cur;
+        uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) o_i[d] = e_old * o_i[d] + e_cur * V[v_base + d];
+        m_i = m_new;
+    }
+
+    // Merge the 32 partial states across the SIMD group. Empty lanes keep
+    // m_i = -1e30 ⇒ scale_i = exp(-inf) = 0, so they contribute nothing.
+    float m_g = simd_max(m_i);
+    float scale_i = precise::exp(m_i - m_g);
+    float l_g = simd_sum(l_i * scale_i);
+    float inv_l = (l_g > 0.0f) ? (1.0f / l_g) : 0.0f;
+    uint o_base = qkv_out_offset(bi, hi, qi, heads, seq_q, vdh, q_stride, bhsd);
+    for (uint d = 0; d < vdh; ++d) {
+        float o_d = simd_sum(o_i[d] * scale_i);
+        if (lane == 0u) OUT[o_base + d] = o_d * inv_l;
+    }
+}
+
+// ── Variant 2: improved flash-attention tile (full thread utilization) ───────
+// Rewrite of `sdpa_fa_f32`: Br=8 query rows per threadgroup with K/V loaded
+// cooperatively into threadgroup memory (each K/V element read once per row-tile,
+// not once per query), BUT — unlike sdpa_fa_f32, whose softmax + O update ran on
+// only Br of the 64 threads — the score matmul AND the O=P·V update both run
+// across all 64 threads. Only the tiny per-row softmax-stat reduction is Br-wide.
+// Uses proper SdpaOffsets byte offsets (sdpa_fa_f32 ignored them). head_dim,
+// v_head_dim ≤ 64 (MAX_DH); larger falls back to sdpa_long via the dispatch gate.
+kernel void sdpa_fa2(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& seq_q       [[buffer(6)]],
+    constant uint& heads       [[buffer(7)]],
+    constant uint& head_dim    [[buffer(8)]],
+    constant uint& q_stride    [[buffer(9)]],
+    constant uint& mask_kind   [[buffer(10)]],
+    constant uint& seq_k       [[buffer(11)]],
+    constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+
+    constexpr uint Br = 8u;
+    constexpr uint Bc = 32u;
+    constexpr uint MAX_DH = 64u;
+    constexpr uint THREADS = 64u;
+
+    threadgroup float Q_tg[Br * MAX_DH];
+    threadgroup float K_tg[Bc * MAX_DH];
+    threadgroup float V_tg[Bc * MAX_DH];
+    threadgroup float S_tg[Br * Bc];
+    threadgroup float O_tg[Br * MAX_DH];
+    threadgroup float m_row[Br];
+    threadgroup float l_row[Br];
+    threadgroup float eold_row[Br];
+
+    uint q_tile = tgid.x;
+    uint hi     = tgid.y;
+    uint bi     = tgid.z;
+    uint q_start = q_tile * Br;
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint q_offset = seq_k - seq_q;
+
+    // Load Q tile cooperatively.
+    for (uint i = tid; i < Br * head_dim; i += THREADS) {
+        uint qi = i / head_dim, di = i % head_dim;
+        uint pos = q_start + qi;
+        Q_tg[qi * MAX_DH + di] = (pos < seq_q)
+            ? Q[qkv_q_offset(bi, hi, pos, heads, seq_q, head_dim, q_stride, bhsd) + di]
+            : 0.0f;
+    }
+    if (tid < Br) { m_row[tid] = -1e30f; l_row[tid] = 0.0f; }
+    for (uint i = tid; i < Br * MAX_DH; i += THREADS) O_tg[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kt = 0; kt < seq_k; kt += Bc) {
+        // Load K and V tiles cooperatively.
+        for (uint i = tid; i < Bc * head_dim; i += THREADS) {
+            uint ki = i / head_dim, di = i % head_dim;
+            uint pos = kt + ki;
+            K_tg[ki * MAX_DH + di] = (pos < seq_k)
+                ? K[qkv_kv_offset(bi, hi, pos, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd) + di]
+                : 0.0f;
+        }
+        for (uint i = tid; i < Bc * vdh; i += THREADS) {
+            uint ki = i / vdh, di = i % vdh;
+            uint pos = kt + ki;
+            V_tg[ki * MAX_DH + di] = (pos < seq_k)
+                ? V[qkv_v_offset(bi, hi, pos, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd) + di]
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Scores S[Br,Bc] = scale·(Q·Kᵀ) + mask — all 64 threads (Br·Bc/64 cells each).
+        for (uint c = tid; c < Br * Bc; c += THREADS) {
+            uint qi = c / Bc, ki = c % Bc;
+            uint pos = kt + ki;
+            bool valid = (q_start + qi) < seq_q && pos < seq_k;
+            float s = -1e30f;
+            if (valid) {
+                float acc = 0.0f;
+                for (uint di = 0; di < head_dim; ++di)
+                    acc = fma(Q_tg[qi * MAX_DH + di], K_tg[ki * MAX_DH + di], acc);
+                s = acc * scale;
+                if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+                uint abs_q = q_offset + q_start + qi;
+                if (mask_kind == 1u) {
+                    if (pos > abs_q) s = -1e30f;
+                } else if (mask_kind == 2u) {
+                    if (M[bi * k_stride + pos] < 0.5f) s = -1e30f;
+                } else if (mask_kind == 3u) {
+                    s += M[((bi * heads + hi) * seq_q + (q_start + qi)) * seq_k + pos];
+                } else if (mask_kind == 4u) {
+                    uint lo = abs_q > window ? abs_q - window : 0u;
+                    if (pos < lo || pos > abs_q) s = -1e30f;
+                }
+            }
+            S_tg[c] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Per-row online-softmax stats (Br threads): update m,l; rewrite S←P.
+        if (tid < Br) {
+            uint qi = tid;
+            float m_old = m_row[qi];
+            float m_new = m_old;
+            for (uint ki = 0; ki < Bc; ++ki) m_new = max(m_new, S_tg[qi * Bc + ki]);
+            float e_old = precise::exp(m_old - m_new);
+            float l_new = e_old * l_row[qi];
+            for (uint ki = 0; ki < Bc; ++ki) {
+                float p = precise::exp(S_tg[qi * Bc + ki] - m_new);
+                S_tg[qi * Bc + ki] = p;
+                l_new += p;
+            }
+            m_row[qi] = m_new;
+            l_row[qi] = l_new;
+            eold_row[qi] = e_old;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O ← e_old·O + P·V — all 64 threads over (qi,di) = Br·vdh work items.
+        for (uint c = tid; c < Br * vdh; c += THREADS) {
+            uint qi = c / vdh, di = c % vdh;
+            float o = O_tg[qi * MAX_DH + di] * eold_row[qi];
+            for (uint ki = 0; ki < Bc; ++ki)
+                o = fma(S_tg[qi * Bc + ki], V_tg[ki * MAX_DH + di], o);
+            O_tg[qi * MAX_DH + di] = o;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Normalize + emit.
+    for (uint c = tid; c < Br * vdh; c += THREADS) {
+        uint qi = c / vdh, di = c % vdh;
+        uint pos = q_start + qi;
+        if (pos < seq_q) {
+            float inv = (l_row[qi] > 0.0f) ? (1.0f / l_row[qi]) : 0.0f;
+            OUT[qkv_out_offset(bi, hi, pos, heads, seq_q, vdh, q_stride, bhsd) + di]
+                = O_tg[qi * MAX_DH + di] * inv;
+        }
+    }
+}
+
+// ── Variant 3: simdgroup-matrix (float8x8 tensor-unit) flash attention ───────
+// One SIMD group (32 threads) per (Br=8 query rows, head, batch). QK^T and P·V
+// run on Apple's simdgroup_float8x8 matrix units (8×8×8 MMAs) instead of scalar
+// dot loops; the online-softmax rescale of the O accumulator is kept in scalar
+// threadgroup memory (simdgroup registers can't be row-scaled). Small Bc=8 blocks
+// keep threadgroup memory ~5 KB (vs sdpa_fa2's ~21 KB) so occupancy stays high.
+// Requires head_dim % 8 == 0 and head_dim, v_head_dim ≤ 64 (dispatch-gated).
+kernel void sdpa_mma(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& seq_q       [[buffer(6)]],
+    constant uint& heads       [[buffer(7)]],
+    constant uint& head_dim    [[buffer(8)]],
+    constant uint& q_stride    [[buffer(9)]],
+    constant uint& mask_kind   [[buffer(10)]],
+    constant uint& seq_k       [[buffer(11)]],
+    constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+
+    constexpr uint Br = 8u;
+    constexpr uint Bc = 8u;
+    constexpr uint MAX_DH = 64u;
+    constexpr uint THREADS = 32u;
+
+    threadgroup float Q_tg[Br * MAX_DH];
+    threadgroup float K_tg[Bc * MAX_DH];
+    threadgroup float V_tg[Bc * MAX_DH];
+    threadgroup float S_tg[Br * Bc];
+    threadgroup float PV_tg[Br * MAX_DH];
+    threadgroup float O_tg[Br * MAX_DH];
+    threadgroup float m_row[Br];
+    threadgroup float l_row[Br];
+    threadgroup float eold_row[Br];
+
+    uint q_tile = tgid.x, hi = tgid.y, bi = tgid.z;
+    uint q_start = q_tile * Br;
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint q_offset = seq_k - seq_q;
+
+    // Load Q tile (Br × head_dim), zero-pad rows past seq_q.
+    for (uint i = tid; i < Br * head_dim; i += THREADS) {
+        uint qi = i / head_dim, di = i % head_dim;
+        uint pos = q_start + qi;
+        Q_tg[qi * MAX_DH + di] = (pos < seq_q)
+            ? Q[qkv_q_offset(bi, hi, pos, heads, seq_q, head_dim, q_stride, bhsd) + di]
+            : 0.0f;
+    }
+    if (tid < Br) { m_row[tid] = -1e30f; l_row[tid] = 0.0f; }
+    for (uint i = tid; i < Br * MAX_DH; i += THREADS) O_tg[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint dh_chunks = head_dim / 8u;   // exact (dispatch-gated to head_dim%8==0)
+    uint vd_chunks = vdh / 8u;
+
+    for (uint kt = 0; kt < seq_k; kt += Bc) {
+        // Load K, V blocks (Bc × head_dim / vdh), zero-pad past seq_k.
+        for (uint i = tid; i < Bc * head_dim; i += THREADS) {
+            uint ki = i / head_dim, di = i % head_dim;
+            uint pos = kt + ki;
+            K_tg[ki * MAX_DH + di] = (pos < seq_k)
+                ? K[qkv_kv_offset(bi, hi, pos, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd) + di]
+                : 0.0f;
+        }
+        for (uint i = tid; i < Bc * vdh; i += THREADS) {
+            uint ki = i / vdh, di = i % vdh;
+            uint pos = kt + ki;
+            V_tg[ki * MAX_DH + di] = (pos < seq_k)
+                ? V[qkv_v_offset(bi, hi, pos, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd) + di]
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S[Br,Bc] = Q @ Kᵀ via simdgroup MMA (accumulate over head_dim chunks).
+        simdgroup_float8x8 sacc = simdgroup_float8x8(0.0f);
+        for (uint c = 0; c < dh_chunks; ++c) {
+            simdgroup_float8x8 qmat, kmat;
+            simdgroup_load(qmat, &Q_tg[c * 8u], MAX_DH);
+            simdgroup_load(kmat, &K_tg[c * 8u], MAX_DH, ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(sacc, qmat, kmat, sacc);
+        }
+        simdgroup_store(sacc, &S_tg[0], Bc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Scale + mask + online-softmax stats (Br threads); rewrite S ← P.
+        if (tid < Br) {
+            uint qi = tid;
+            uint abs_q = q_offset + q_start + qi;
+            bool row_valid = (q_start + qi) < seq_q;
+            float m_old = m_row[qi];
+            float m_new = m_old;
+            for (uint ki = 0; ki < Bc; ++ki) {
+                uint pos = kt + ki;
+                float s = S_tg[qi * Bc + ki] * scale;
+                if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+                bool ok = row_valid && pos < seq_k;
+                if (ok) {
+                    if (mask_kind == 1u) { if (pos > abs_q) ok = false; }
+                    else if (mask_kind == 2u) { if (M[bi * k_stride + pos] < 0.5f) ok = false; }
+                    else if (mask_kind == 3u) { s += M[((bi * heads + hi) * seq_q + (q_start + qi)) * seq_k + pos]; }
+                    else if (mask_kind == 4u) { uint lo = abs_q > window ? abs_q - window : 0u; if (pos < lo || pos > abs_q) ok = false; }
+                }
+                if (!ok) s = -1e30f;
+                S_tg[qi * Bc + ki] = s;
+                m_new = max(m_new, s);
+            }
+            float e_old = precise::exp(m_old - m_new);
+            float l_new = e_old * l_row[qi];
+            for (uint ki = 0; ki < Bc; ++ki) {
+                float p = precise::exp(S_tg[qi * Bc + ki] - m_new);
+                S_tg[qi * Bc + ki] = p;
+                l_new += p;
+            }
+            m_row[qi] = m_new;
+            l_row[qi] = l_new;
+            eold_row[qi] = e_old;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // PV[Br,vdh] = P @ V via simdgroup MMA (P is 8×8; V in 8-col chunks).
+        for (uint dc = 0; dc < vd_chunks; ++dc) {
+            simdgroup_float8x8 pmat, vmat;
+            simdgroup_load(pmat, &S_tg[0], Bc);
+            simdgroup_load(vmat, &V_tg[dc * 8u], MAX_DH);
+            simdgroup_float8x8 pvacc = simdgroup_float8x8(0.0f);
+            simdgroup_multiply_accumulate(pvacc, pmat, vmat, pvacc);
+            simdgroup_store(pvacc, &PV_tg[dc * 8u], MAX_DH);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O ← e_old·O + PV  (scalar rescale, all 32 threads).
+        for (uint i = tid; i < Br * vdh; i += THREADS) {
+            uint qi = i / vdh, di = i % vdh;
+            O_tg[qi * MAX_DH + di] = eold_row[qi] * O_tg[qi * MAX_DH + di] + PV_tg[qi * MAX_DH + di];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Normalize + emit.
+    for (uint i = tid; i < Br * vdh; i += THREADS) {
+        uint qi = i / vdh, di = i % vdh;
+        uint pos = q_start + qi;
+        if (pos < seq_q) {
+            float inv = (l_row[qi] > 0.0f) ? (1.0f / l_row[qi]) : 0.0f;
+            OUT[qkv_out_offset(bi, hi, pos, heads, seq_q, vdh, q_stride, bhsd) + di]
+                = O_tg[qi * MAX_DH + di] * inv;
         }
     }
 }
@@ -5857,13 +6714,23 @@ kernel void dequant_matmul_int8(
     if (gid >= m * n) return;
     uint i = gid / n;
     uint j = gid % n;
+    // Accumulate one block at a time and fold in that block's scale ONCE, not
+    // per element (see rlx_cpu dequant_matmul_int8). Reassociation only —
+    // fewer multiplies, tighter running-sum dynamic range, bit-consistent
+    // with the CPU oracle.
+    uint nblk = (k + block_size - 1u) / block_size;
     float acc = 0.0f;
-    for (uint p = 0; p < k; ++p) {
-        uint block = p / block_size;
-        float s = scales[block * n + j];
-        float z = (asym != 0u) ? zps[block * n + j] : 0.0f;
-        float q = float(wq[p * n + j]);
-        acc += x[i * k + p] * ((q - z) * s);
+    for (uint b = 0u; b < nblk; ++b) {
+        float s = scales[b * n + j];
+        float z = (asym != 0u) ? zps[b * n + j] : 0.0f;
+        uint lo = b * block_size;
+        uint hi = min(lo + block_size, k);
+        float bacc = 0.0f;
+        for (uint p = lo; p < hi; ++p) {
+            float q = float(wq[p * n + j]);
+            bacc += x[i * k + p] * (q - z);
+        }
+        acc += bacc * s;
     }
     out[i * n + j] = acc;
 }
@@ -5885,15 +6752,22 @@ kernel void dequant_matmul_int4(
     if (gid >= m * n) return;
     uint i = gid / n;
     uint j = gid % n;
+    // Block-at-a-time accumulation, scale folded once per block (see int8).
+    uint nblk = (k + block_size - 1u) / block_size;
     float acc = 0.0f;
-    for (uint p = 0; p < k; ++p) {
-        uint block = p / block_size;
-        float s = scales[block * n + j];
-        float z = (asym != 0u) ? zps[block * n + j] : 0.0f;
-        uint idx = p * n + j;
-        uchar byte = wq[idx >> 1];
-        uint nib = ((idx & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
-        acc += x[i * k + p] * ((float(nib) - z) * s);
+    for (uint b = 0u; b < nblk; ++b) {
+        float s = scales[b * n + j];
+        float z = (asym != 0u) ? zps[b * n + j] : 0.0f;
+        uint lo = b * block_size;
+        uint hi = min(lo + block_size, k);
+        float bacc = 0.0f;
+        for (uint p = lo; p < hi; ++p) {
+            uint idx = p * n + j;
+            uchar byte = wq[idx >> 1];
+            uint nib = ((idx & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
+            bacc += x[i * k + p] * (float(nib) - z);
+        }
+        acc += bacc * s;
     }
     out[i * n + j] = acc;
 }
@@ -5958,14 +6832,16 @@ kernel void dequant_matmul_fp8(
     if (gid >= m * n) return;
     uint i = gid / n;
     uint j = gid % n;
-    float acc = 0.0f;
+    // The per-column scale is loop-invariant: apply it once to the finished dot
+    // instead of every term. Reassociation only.
     float col_scale = scales[j];
+    float acc = 0.0f;
     for (uint p = 0u; p < k; ++p) {
         uchar byte = wq[p * n + j];
         float w = (e5m2 != 0u) ? dq_fp8_e5m2(byte) : dq_fp8_e4m3(byte);
-        acc += x[i * k + p] * w * col_scale;
+        acc += x[i * k + p] * w;
     }
-    out[i * n + j] = acc;
+    out[i * n + j] = acc * col_scale;
 }
 
 kernel void dequant_matmul_nvfp4(
@@ -5983,17 +6859,25 @@ kernel void dequant_matmul_nvfp4(
     if (gid >= m * n) return;
     uint i = gid / n;
     uint j = gid % n;
+    // Fold the per-group E4M3 scale in once per group and the single global
+    // scale in once at the end (see rlx_cpu dequant_matmul_nvfp4).
     float gs = gs_ptr[0];
+    uint nblk = (k + group_size - 1u) / group_size;
     float acc = 0.0f;
-    for (uint p = 0u; p < k; ++p) {
-        uint idx = p * n + j;
-        uint byte_idx = idx >> 1;
-        uint nib = ((idx & 1u) == 0u) ? (uint(wq[byte_idx]) & 0x0Fu) : (uint(wq[byte_idx]) >> 4);
-        uint block = p / group_size;
-        float s = dq_fp8_e4m3(scales[block * n + j]);
-        acc += x[i * k + p] * DQ_FP4_E2M1[nib] * s * gs;
+    for (uint b = 0u; b < nblk; ++b) {
+        float s = dq_fp8_e4m3(scales[b * n + j]);
+        uint lo = b * group_size;
+        uint hi = min(lo + group_size, k);
+        float bacc = 0.0f;
+        for (uint p = lo; p < hi; ++p) {
+            uint idx = p * n + j;
+            uint byte_idx = idx >> 1;
+            uint nib = ((idx & 1u) == 0u) ? (uint(wq[byte_idx]) & 0x0Fu) : (uint(wq[byte_idx]) >> 4);
+            bacc += x[i * k + p] * DQ_FP4_E2M1[nib];
+        }
+        acc += bacc * s;
     }
-    out[i * n + j] = acc;
+    out[i * n + j] = acc * gs;
 }
 
 // MxFp4x2 two-level residual E2M1 fused decode-matmul. wq = [plane0|plane1]
@@ -6018,17 +6902,27 @@ kernel void dequant_matmul_mxfp4x2(
     uint plane = (total + 1u) >> 1;                     // bytes per nibble plane
     uint g = (group_size == 0u) ? 1u : group_size;
     uint nblk = (k + g - 1u) / g;
+    // Accumulate each residual plane's dot per block, then fold each plane's
+    // block scale in once (s0·Σq0 + s1·Σq1). Reassociation only.
     float acc = 0.0f;
-    for (uint p = 0u; p < k; ++p) {
-        uint idx = p * n + j;
-        uint byte_idx = idx >> 1;
-        uint sh = ((idx & 1u) == 0u) ? 0u : 4u;
-        uint q0 = (uint(wq[byte_idx]) >> sh) & 0x0Fu;
-        uint q1 = (uint(wq[plane + byte_idx]) >> sh) & 0x0Fu;
-        uint block = p / g;
-        float s0 = scales[block * n + j];
-        float s1 = scales[nblk * n + block * n + j];
-        acc += x[i * k + p] * (s0 * DQ_FP4_E2M1[q0] + s1 * DQ_FP4_E2M1[q1]);
+    for (uint b = 0u; b < nblk; ++b) {
+        float s0 = scales[b * n + j];
+        float s1 = scales[nblk * n + b * n + j];
+        uint lo = b * g;
+        uint hi = min(lo + g, k);
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        for (uint p = lo; p < hi; ++p) {
+            uint idx = p * n + j;
+            uint byte_idx = idx >> 1;
+            uint sh = ((idx & 1u) == 0u) ? 0u : 4u;
+            uint q0 = (uint(wq[byte_idx]) >> sh) & 0x0Fu;
+            uint q1 = (uint(wq[plane + byte_idx]) >> sh) & 0x0Fu;
+            float xv = x[i * k + p];
+            a0 += xv * DQ_FP4_E2M1[q0];
+            a1 += xv * DQ_FP4_E2M1[q1];
+        }
+        acc += a0 * s0 + a1 * s1;
     }
     out[i * n + j] = acc;
 }
@@ -6157,6 +7051,133 @@ kernel void dequant_matmul_mlx_gemv(
     if (tid == 0u) out[j] = smem[0];
 }
 
+inline float mlx_bf16(ushort b) { return as_type<float>(uint(b) << 16); }
+
+// Grouped decode GEMV (m==1) — the native MoE expert kernel. Identical dequant
+// math to dequant_matmul_mlx_gemv, but the (single) row's expert e = e_idx[0]
+// offsets into the stacked [E,n,k] weight slab (wq + e*slab_bytes) and the
+// [E,n,n_groups] scales/biases (+ e*n*n_groups). Replaces the CPU host-delegate
+// for the DeepSeek-V4 MoE — reads packed codes straight from unified memory and
+// dequant+matmuls on-GPU. `scale_bf16`: scales/biases are BF16 (2B, the model's
+// per-expert slab format — already e8m0-decoded) rather than f32/e8m0-uchar.
+// One threadgroup per output column; threads split K.
+kernel void grouped_dequant_matmul_mlx_gemv(
+    device const float* x       [[buffer(0)]],
+    device const uchar* wq      [[buffer(1)]],
+    device const float* scales  [[buffer(2)]],
+    device const float* biases  [[buffer(3)]],
+    device float* out           [[buffer(4)]],
+    device const float* e_idx   [[buffer(5)]],
+    constant uint& k            [[buffer(6)]],
+    constant uint& n            [[buffer(7)]],
+    constant uint& kind         [[buffer(8)]],
+    constant uint& bits         [[buffer(9)]],
+    constant uint& group_size   [[buffer(10)]],
+    constant uint& slab_bytes   [[buffer(11)]],
+    constant uint& scale_bf16   [[buffer(12)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint j [[threadgroup_position_in_grid]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    if (j >= n) return;
+    uint gs = group_size;
+    uint n_groups = k / gs;
+    uint e = uint(e_idx[0] + 0.5f);              // this row's expert
+    device const uchar* wqe = wq + e * slab_bytes;   // expert weight slab
+    uint sc_off = e * n * n_groups;                  // expert scale/bias base
+    device const uchar* scale_u = (device const uchar*)scales;
+    device const ushort* scale_bf = (device const ushort*)scales;
+    device const ushort* bias_bf = (device const ushort*)biases;
+    threadgroup float smem[256];
+    float acc = 0.0f;
+    for (uint p = tid; p < k; p += tpg) {
+        uint g = p / gs;
+        float w_dq;
+        if (kind == 0u) {
+            uint pf = mlx_pack_factor(bits);
+            uint bpp = mlx_bpp(bits);
+            uint packs_in_group = gs / pf;
+            uint local = p % gs;
+            uint row_base = j * n_groups * packs_in_group * bpp + g * packs_in_group * bpp;
+            uint code = 0u;
+            if (bits == 2u || bits == 4u || bits == 8u) {
+                uint pack_idx = local / pf;
+                uint in_pack = local % pf;
+                uchar byte = wqe[row_base + pack_idx];
+                uint mask = (1u << bits) - 1u;
+                code = (uint(byte) >> (in_pack * bits)) & mask;
+            } else if (bits == 3u) {
+                uint pack_idx = local / 8u;
+                uint in_pack = local % 8u;
+                uint bo = row_base + pack_idx * 3u;
+                uchar b0 = wqe[bo], b1 = wqe[bo + 1], b2 = wqe[bo + 2];
+                uint codes[8] = {
+                    uint(b0) & 0x7u,
+                    (uint(b0) & 0x38u) >> 3,
+                    ((uint(b0) & 0xc0u) >> 6) + ((uint(b1) & 0x1u) << 2),
+                    (uint(b1) & 0xeu) >> 1,
+                    (uint(b1) & 0x70u) >> 4,
+                    ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0x3u) << 1),
+                    (uint(b2) & 0x1cu) >> 2,
+                    (uint(b2) & 0xe0u) >> 5
+                };
+                code = codes[in_pack];
+            } else if (bits == 5u) {
+                uint pack_idx = local / 8u;
+                uint in_pack = local % 8u;
+                uint bo = row_base + pack_idx * 5u;
+                uchar b0 = wqe[bo], b1 = wqe[bo+1], b2 = wqe[bo+2], b3 = wqe[bo+3], b4 = wqe[bo+4];
+                uint codes[8] = {
+                    uint(b0) & 0x1fu,
+                    ((uint(b0) & 0xe0u) >> 5) + ((uint(b1) & 0x3u) << 3),
+                    (uint(b1) & 0x7cu) >> 2,
+                    ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0xfu) << 1),
+                    ((uint(b2) & 0xf0u) >> 4) + ((uint(b3) & 0x1u) << 4),
+                    (uint(b3) & 0x3eu) >> 1,
+                    ((uint(b3) & 0xc0u) >> 6) + ((uint(b4) & 0x7u) << 2),
+                    (uint(b4) & 0xf8u) >> 3
+                };
+                code = codes[in_pack];
+            } else {
+                uint pack_idx = local / 4u;
+                uint in_pack = local % 4u;
+                uint bo = row_base + pack_idx * 3u;
+                uchar b0 = wqe[bo], b1 = wqe[bo+1], b2 = wqe[bo+2];
+                uint codes[4] = {
+                    uint(b0) & 0x3fu,
+                    ((uint(b0) >> 6) & 0x03u) + ((uint(b1) & 0x0fu) << 2),
+                    ((uint(b1) >> 4) & 0x0fu) + ((uint(b2) & 0x03u) << 4),
+                    (uint(b2) >> 2) & 0x3fu
+                };
+                code = codes[in_pack];
+            }
+            uint si = sc_off + j * n_groups + g;
+            float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : scales[si];
+            float bv = scale_bf16 ? mlx_bf16(bias_bf[si]) : biases[si];
+            w_dq = sv * float(code) + bv;
+        } else if (kind == 1u) {
+            uint bidx = j * (k / 2u) + (p / 2u);
+            uchar byte = wqe[bidx];
+            uint nib = ((p & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
+            uint si = sc_off + j * n_groups + g;
+            float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+            w_dq = DQ_FP4_E2M1[nib] * sv;
+        } else {
+            uint si = sc_off + j * n_groups + g;
+            float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+            w_dq = dq_fp8_e4m3(wqe[j * k + p]) * sv;
+        }
+        acc += x[p] * w_dq;
+    }
+    smem[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) out[j] = smem[0];
+}
+
 // Prefill: one threadgroup per (col, row_tile); threads split K and stage
 // an X tile in threadgroup memory (TM=8 rows × threads_per_threadgroup).
 // Threadgroup id is linearized: tg = col * n_row_tiles + row_tile.
@@ -6266,6 +7287,165 @@ kernel void dequant_matmul_mlx_gemm(
             }
             for (uint t = 0u; t < TM; ++t) {
                 acc[t] += xs[t * tpg + tid] * w_dq;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint t = 0u; t < TM; ++t) smem[t * tpg + tid] = acc[t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            for (uint t = 0u; t < TM; ++t) {
+                smem[t * tpg + tid] += smem[t * tpg + tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        for (uint t = 0u; t < TM; ++t) {
+            uint row = row0 + t;
+            if (row < m) out[row * n + col] = smem[t * tpg];
+        }
+    }
+}
+
+// Dequant one weight element w[col, p] from expert slab `wqe` (+ scale base
+// `sc_off`) for the grouped MoE GEMM — mirrors the GEMV dequant math (all bit
+// widths + scale_bf16). `col` is the output/weight-row index.
+inline float mlx_grouped_w(
+    device const uchar* wqe,
+    device const float* scales,
+    device const float* biases,
+    uint sc_off, uint col, uint p, uint g,
+    uint n_groups, uint gs, uint kind, uint bits, uint scale_bf16, uint k
+) {
+    device const uchar* scale_u = (device const uchar*)scales;
+    device const ushort* scale_bf = (device const ushort*)scales;
+    device const ushort* bias_bf = (device const ushort*)biases;
+    if (kind == 0u) {
+        uint pf = mlx_pack_factor(bits);
+        uint bpp = mlx_bpp(bits);
+        uint packs_in_group = gs / pf;
+        uint local = p % gs;
+        uint row_base = col * n_groups * packs_in_group * bpp + g * packs_in_group * bpp;
+        uint code = 0u;
+        if (bits == 2u || bits == 4u || bits == 8u) {
+            uint pack_idx = local / pf;
+            uint in_pack = local % pf;
+            uchar byte = wqe[row_base + pack_idx];
+            uint mask = (1u << bits) - 1u;
+            code = (uint(byte) >> (in_pack * bits)) & mask;
+        } else if (bits == 3u) {
+            uint pack_idx = local / 8u; uint in_pack = local % 8u;
+            uint bo = row_base + pack_idx * 3u;
+            uchar b0 = wqe[bo], b1 = wqe[bo+1], b2 = wqe[bo+2];
+            uint codes[8] = {
+                uint(b0) & 0x7u, (uint(b0) & 0x38u) >> 3,
+                ((uint(b0) & 0xc0u) >> 6) + ((uint(b1) & 0x1u) << 2),
+                (uint(b1) & 0xeu) >> 1, (uint(b1) & 0x70u) >> 4,
+                ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0x3u) << 1),
+                (uint(b2) & 0x1cu) >> 2, (uint(b2) & 0xe0u) >> 5
+            };
+            code = codes[in_pack];
+        } else if (bits == 5u) {
+            uint pack_idx = local / 8u; uint in_pack = local % 8u;
+            uint bo = row_base + pack_idx * 5u;
+            uchar b0 = wqe[bo], b1 = wqe[bo+1], b2 = wqe[bo+2], b3 = wqe[bo+3], b4 = wqe[bo+4];
+            uint codes[8] = {
+                uint(b0) & 0x1fu,
+                ((uint(b0) & 0xe0u) >> 5) + ((uint(b1) & 0x3u) << 3),
+                (uint(b1) & 0x7cu) >> 2,
+                ((uint(b1) & 0x80u) >> 7) + ((uint(b2) & 0xfu) << 1),
+                ((uint(b2) & 0xf0u) >> 4) + ((uint(b3) & 0x1u) << 4),
+                (uint(b3) & 0x3eu) >> 1,
+                ((uint(b3) & 0xc0u) >> 6) + ((uint(b4) & 0x7u) << 2),
+                (uint(b4) & 0xf8u) >> 3
+            };
+            code = codes[in_pack];
+        } else {
+            uint pack_idx = local / 4u; uint in_pack = local % 4u;
+            uint bo = row_base + pack_idx * 3u;
+            uchar b0 = wqe[bo], b1 = wqe[bo+1], b2 = wqe[bo+2];
+            uint codes[4] = {
+                uint(b0) & 0x3fu,
+                ((uint(b0) >> 6) & 0x03u) + ((uint(b1) & 0x0fu) << 2),
+                ((uint(b1) >> 4) & 0x0fu) + ((uint(b2) & 0x03u) << 4),
+                (uint(b2) >> 2) & 0x3fu
+            };
+            code = codes[in_pack];
+        }
+        uint si = sc_off + col * n_groups + g;
+        float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : scales[si];
+        float bv = scale_bf16 ? mlx_bf16(bias_bf[si]) : biases[si];
+        return sv * float(code) + bv;
+    } else if (kind == 1u) {
+        uint bidx = col * (k / 2u) + (p / 2u);
+        uchar byte = wqe[bidx];
+        uint nib = ((p & 1u) == 0u) ? (uint(byte) & 0x0Fu) : (uint(byte) >> 4);
+        uint si = sc_off + col * n_groups + g;
+        float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+        return DQ_FP4_E2M1[nib] * sv;
+    } else {
+        uint si = sc_off + col * n_groups + g;
+        float sv = scale_bf16 ? mlx_bf16(scale_bf[si]) : mlx_group_scale(uint(scale_u[si]), gs);
+        return dq_fp8_e4m3(wqe[col * k + p]) * sv;
+    }
+}
+
+// Grouped prefill GEMM — the native MoE expert kernel for m>1. Each row's expert
+// e = e_idx[row] offsets into the stacked slab; since rows in a TM-tile can route
+// to different experts, w is dequanted per row (no column-share). One threadgroup
+// per (col, row_tile); threads split K and stage an X tile in threadgroup memory.
+kernel void grouped_dequant_matmul_mlx_gemm(
+    device const float* x      [[buffer(0)]],
+    device const uchar* wq     [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* biases [[buffer(3)]],
+    device float* out          [[buffer(4)]],
+    device const float* e_idx  [[buffer(5)]],
+    constant uint& m           [[buffer(6)]],
+    constant uint& k           [[buffer(7)]],
+    constant uint& n           [[buffer(8)]],
+    constant uint& kind        [[buffer(9)]],
+    constant uint& bits        [[buffer(10)]],
+    constant uint& group_size  [[buffer(11)]],
+    constant uint& slab_bytes  [[buffer(12)]],
+    constant uint& scale_bf16  [[buffer(13)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    const uint TM = 8u;
+    uint n_row_tiles = (m + TM - 1u) / TM;
+    uint col = tg / n_row_tiles;
+    uint row0 = (tg - col * n_row_tiles) * TM;
+    if (col >= n) return;
+    uint gs = group_size;
+    uint n_groups = k / gs;
+    threadgroup float xs[8 * 256];
+    threadgroup float smem[8 * 256];
+    float acc[8];
+    for (uint t = 0u; t < TM; ++t) acc[t] = 0.0f;
+    for (uint p0 = 0u; p0 < k; p0 += tpg) {
+        uint p = p0 + tid;
+        for (uint t = 0u; t < TM; ++t) {
+            uint row = row0 + t;
+            float v = 0.0f;
+            if (row < m && p < k) v = x[row * k + p];
+            xs[t * tpg + tid] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (p < k) {
+            uint g = p / gs;
+            for (uint t = 0u; t < TM; ++t) {
+                uint row = row0 + t;
+                if (row < m) {
+                    uint e = uint(e_idx[row] + 0.5f);
+                    device const uchar* wqe = wq + e * slab_bytes;
+                    uint sc_off = e * n * n_groups;
+                    float w_dq = mlx_grouped_w(wqe, scales, biases, sc_off, col, p, g, n_groups, gs, kind, bits, scale_bf16, k);
+                    acc[t] += xs[t * tpg + tid] * w_dq;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6424,34 +7604,44 @@ kernel void layer_norm(
     uint tsize [[threads_per_threadgroup]]
 ) {
     threadgroup float partial_sum[256];
-    threadgroup float partial_sumsq[256];
+    threadgroup float partial_dev[256];
 
-    // Pass 1: compute mean + variance via reduction
+    // TWO-PASS: var = mean((x−mean)²). The one-pass E[x²]−mean² catastrophically
+    // cancels in f32 on rows with a large DC offset (pre-norm ViT/DINOv2) — this
+    // matches the CPU oracle.
+    // Pass 1: mean.
     float local_sum = 0.0;
-    float local_sumsq = 0.0;
     for (uint i = tid; i < h; i += tsize) {
-        float v = input[row * h + i];
-        local_sum += v;
-        local_sumsq += v * v;
+        local_sum += input[row * h + i];
     }
     partial_sum[tid] = local_sum;
-    partial_sumsq[tid] = local_sumsq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Reduction within threadgroup
     for (uint stride = tsize / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             partial_sum[tid] += partial_sum[tid + stride];
-            partial_sumsq[tid] += partial_sumsq[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
     float mean = partial_sum[0] / float(h);
-    float var = fmax(0.0f, partial_sumsq[0] / float(h) - mean * mean);
+
+    // Pass 2: mean of squared deviation (separate array → no extra barrier).
+    float local_dev = 0.0;
+    for (uint i = tid; i < h; i += tsize) {
+        float d = input[row * h + i] - mean;
+        local_dev += d * d;
+    }
+    partial_dev[tid] = local_dev;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial_dev[tid] += partial_dev[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float var = fmax(0.0f, partial_dev[0] / float(h));
     float inv_std = rsqrt(var + eps);
 
-    // Pass 2: normalize
+    // Pass 3: normalize.
     for (uint i = tid; i < h; i += tsize) {
         float v = input[row * h + i];
         output[row * h + i] = (v - mean) * inv_std * gamma[i] + beta[i];
@@ -6477,21 +7667,40 @@ kernel void rms_norm(
     device const float* gamma = (device const float*)(arena + g_off);
     device const float* beta = (device const float*)(arena + b_off);
     device float* output = (device float*)(arena + out_off);
-    threadgroup float partial_sumsq[256];
-    float local_sumsq = 0.0f;
+    threadgroup float partial[256];
+    // Two-pass: mean(x²) = mean((x−mean)²) + mean². Subtract the row mean first
+    // so the deviation sum stays well-conditioned under a large DC offset (the
+    // canonical form CPU + all backends match).
+    // Pass 1: row mean.
+    float local_sum = 0.0f;
     for (uint i = tid; i < h; i += tsize) {
-        float v = input[row * h + i];
-        local_sumsq += v * v;
+        local_sum += input[row * h + i];
     }
-    partial_sumsq[tid] = local_sumsq;
+    partial[tid] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tsize / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
-            partial_sumsq[tid] += partial_sumsq[tid + stride];
+            partial[tid] += partial[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv_rms = rsqrt(partial_sumsq[0] / float(h) + eps);
+    float mean = partial[0] / float(h);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Pass 2: mean of squared deviation.
+    float local_sumsq = 0.0f;
+    for (uint i = tid; i < h; i += tsize) {
+        float d = input[row * h + i] - mean;
+        local_sumsq += d * d;
+    }
+    partial[tid] = local_sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(partial[0] / float(h) + mean * mean + eps);
     for (uint i = tid; i < h; i += tsize) {
         output[row * h + i] = input[row * h + i] * inv_rms * gamma[i] + beta[i];
     }
@@ -7195,11 +8404,14 @@ kernel void selective_scan(
     }
 }
 
-// Single-layer unidirectional LSTM (gate order i, f, g, o; h0 = c0 = 0).
-// One threadgroup per batch item; thread `k` owns hidden unit `k` and
-// keeps c[k] in a register; h_prev lives in threadgroup memory so every
-// thread can read it for the w_hh matvec. Requires hidden <= LSTM_MAX_H.
-// Matches `execute_lstm_f32` on CPU.
+// LSTM (gate order i, f, g, o; single merged bias). Dispatched once per (layer,
+// direction) by `encode_lstm`, which loops layers×dirs and ping-pongs
+// intermediate layer outputs through an in-arena scratch region (x_off/dst_off
+// are absolute arena word offsets). One threadgroup per batch item; thread `k`
+// owns hidden unit `k`, keeps `c[k]` in a register, shares `h_prev` in
+// threadgroup memory. `h0_off`/`c0_off` (0 → 0) seed hidden/cell state; `more` =
+// (h0_off, out_width, dir_off, reverse). Single-layer/unidir/no-carry reduces to
+// the plain kernel. Matches `execute_lstm_f32` on CPU. hidden ≤ LSTM_MAX_H.
 #define LSTM_MAX_H 1024u
 kernel void lstm(
     device float* arena      [[buffer(0)]],
@@ -7208,7 +8420,9 @@ kernel void lstm(
     constant uint& whh_off   [[buffer(3)]],
     constant uint& bias_off  [[buffer(4)]],
     constant uint& dst_off   [[buffer(5)]],
-    constant uint4& dims     [[buffer(6)]], // batch, seq, input, hidden
+    constant uint4& dims     [[buffer(6)]], // batch, seq, in_l, hidden
+    constant uint4& more     [[buffer(7)]], // h0_off, out_width, dir_off, reverse
+    constant uint& c0_off    [[buffer(8)]],
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
@@ -7216,13 +8430,15 @@ kernel void lstm(
     if (h > LSTM_MAX_H || gid >= b || tid >= h) return;
     uint bi = gid;
     uint k = tid;
+    uint h0_off = more.x, out_width = more.y, dir_off = more.z, reverse = more.w;
 
     threadgroup float h_sh[LSTM_MAX_H];
-    h_sh[k] = 0.0f;
-    float c_k = 0.0f;
+    h_sh[k] = (h0_off != 0u) ? arena[h0_off + bi * h + k] : 0.0f;
+    float c_k = (c0_off != 0u) ? arena[c0_off + bi * h + k] : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t = 0; t < s; ++t) {
+    for (uint step = 0; step < s; ++step) {
+        uint t = (reverse != 0u) ? (s - 1u - step) : step;
         uint x_base = x_off + (bi * s + t) * in_sz;
         // Gate pre-activations for hidden unit k: rows i=k, f=h+k, g=2h+k, o=3h+k.
         float z[4];
@@ -7249,7 +8465,7 @@ kernel void lstm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         h_sh[k] = h_k;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        arena[dst_off + (bi * s + t) * h + k] = h_k;
+        arena[dst_off + (bi * s + t) * out_width + dir_off + k] = h_k;
     }
 }
 
@@ -7257,6 +8473,14 @@ kernel void lstm(
 // separate b_ih/b_hh; h0 = 0). One threadgroup per batch item; thread `k` owns
 // hidden unit `k`. Matches `execute_gru_f32` on CPU.
 #define GRU_MAX_H 1024u
+// GRU dispatched once per (layer, direction) — the caller (`encode_gru`) loops
+// layers×dirs, ping-ponging intermediate layer outputs through an in-arena
+// scratch region (x_off/dst_off are absolute arena word offsets, possibly into
+// scratch). `dims.z` = in_l (input_size for layer 0, else dirs·hidden). `more`
+// carries h0_off (0 → h0=0, else seed from arena[h0_off+bi·h+k]), out_width =
+// dirs·hidden, dir_off = dir·hidden (this dir owns [dir_off,dir_off+h)), and
+// reverse (walk the sequence backwards). Single-layer/unidir/no-carry reduces to
+// the original kernel (h0_off=0, out_width=h, dir_off=0, reverse=0).
 kernel void gru(
     device float* arena      [[buffer(0)]],
     constant uint& x_off     [[buffer(1)]],
@@ -7265,19 +8489,22 @@ kernel void gru(
     constant uint& bih_off   [[buffer(4)]],
     constant uint& bhh_off   [[buffer(5)]],
     constant uint& dst_off   [[buffer(6)]],
-    constant uint4& dims     [[buffer(7)]], // batch, seq, input, hidden
+    constant uint4& dims     [[buffer(7)]], // batch, seq, in_l, hidden
+    constant uint4& more     [[buffer(8)]], // h0_off, out_width, dir_off, reverse
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
     uint b = dims.x, s = dims.y, in_sz = dims.z, h = dims.w;
     if (h > GRU_MAX_H || gid >= b || tid >= h) return;
     uint bi = gid, k = tid;
+    uint h0_off = more.x, out_width = more.y, dir_off = more.z, reverse = more.w;
 
     threadgroup float h_sh[GRU_MAX_H];
-    h_sh[k] = 0.0f;
+    h_sh[k] = (h0_off != 0u) ? arena[h0_off + bi * h + k] : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t = 0; t < s; ++t) {
+    for (uint step = 0; step < s; ++step) {
+        uint t = (reverse != 0u) ? (s - 1u - step) : step;
         uint x_base = x_off + (bi * s + t) * in_sz;
         // Gate rows r=k, z=h+k, n=2h+k. Input and hidden parts kept separate
         // because the reset gate multiplies the hidden term after its bias.
@@ -7305,13 +8532,14 @@ kernel void gru(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         h_sh[k] = h_k;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        arena[dst_off + (bi * s + t) * h + k] = h_k;
+        arena[dst_off + (bi * s + t) * out_width + dir_off + k] = h_k;
     }
 }
 
-// Single-layer unidirectional Elman RNN (`relu_flag` ? relu : tanh; h0 = 0).
-// One threadgroup per batch item; thread `k` owns hidden unit `k`. Matches
-// `execute_rnn_f32` on CPU.
+// Elman RNN (`relu_flag` ? relu : tanh). Dispatched once per (layer, direction)
+// by `encode_rnn` — same in-arena scratch ping-pong and `dims.z`=in_l / `more`
+// convention as `gru` above. Single-layer/unidir/no-carry reduces to the
+// original kernel. Matches `execute_rnn_f32` on CPU.
 #define RNN_MAX_H 1024u
 kernel void rnn(
     device float* arena       [[buffer(0)]],
@@ -7320,20 +8548,23 @@ kernel void rnn(
     constant uint& whh_off    [[buffer(3)]],
     constant uint& bias_off   [[buffer(4)]],
     constant uint& dst_off    [[buffer(5)]],
-    constant uint4& dims      [[buffer(6)]], // batch, seq, input, hidden
+    constant uint4& dims      [[buffer(6)]], // batch, seq, in_l, hidden
     constant uint& relu_flag  [[buffer(7)]],
+    constant uint4& more      [[buffer(8)]], // h0_off, out_width, dir_off, reverse
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
     uint b = dims.x, s = dims.y, in_sz = dims.z, h = dims.w;
     if (h > RNN_MAX_H || gid >= b || tid >= h) return;
     uint bi = gid, k = tid;
+    uint h0_off = more.x, out_width = more.y, dir_off = more.z, reverse = more.w;
 
     threadgroup float h_sh[RNN_MAX_H];
-    h_sh[k] = 0.0f;
+    h_sh[k] = (h0_off != 0u) ? arena[h0_off + bi * h + k] : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint t = 0; t < s; ++t) {
+    for (uint step = 0; step < s; ++step) {
+        uint t = (reverse != 0u) ? (s - 1u - step) : step;
         uint x_base = x_off + (bi * s + t) * in_sz;
         float acc = arena[bias_off + k];
         uint wih_row = wih_off + k * in_sz;
@@ -7348,7 +8579,7 @@ kernel void rnn(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         h_sh[k] = h_k;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        arena[dst_off + (bi * s + t) * h + k] = h_k;
+        arena[dst_off + (bi * s + t) * out_width + dir_off + k] = h_k;
     }
 }
 
@@ -7663,6 +8894,36 @@ kernel void layer_norm_bwd_gamma_reduce_f32(
         acc += dy[row * inner + i] * xh;
     }
     dgamma[i] = acc;
+}
+
+// SIMD-parallel variant: one 32-wide threadgroup (== 1 SIMD group) per column
+// `i`; the 32 lanes split the `rows` reduction and combine with simd_sum. The
+// scalar kernel above dispatches ONE thread per column, each serially summing
+// all rows (batch·seq ≈ 1024) — low occupancy + a fully serial reduction. This
+// adds 32× row parallelism (same win as `sdpa_simd`'s softmax).
+kernel void layer_norm_bwd_gamma_reduce_simd(
+    device const float* x [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device const float* stats [[buffer(2)]],
+    device float* dgamma [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& inner [[buffer(5)]],
+    uint i [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    if (i >= inner) return;
+    float local = 0.0f;
+    for (uint row = tid; row < rows; row += tsize) {
+        float mean = stats[row * 2u + 0u];
+        float inv_std = stats[row * 2u + 1u];
+        float xh = (x[row * inner + i] - mean) * inv_std;
+        local += dy[row * inner + i] * xh;
+    }
+    float total = simd_sum(local);
+    if (tid == 0) {
+        dgamma[i] = total;
+    }
 }
 
 // GroupNorm (NCHW) backward — matches CPU `training_bwd::group_norm_backward_*`.
@@ -8330,6 +9591,400 @@ kernel void attn_bwd_dk_f32(
     out[ki * hs + d] = acc;
 }
 
+// ── Batched attention-backward kernels ────────────────────────────────────
+// One 3D dispatch (grid.z = head-slot) processes MANY (batch,head) pairs in
+// parallel instead of the per-(b,h) host loop, which serialized on the shared
+// scratch (Metal hazard-tracks at buffer granularity). Per-slot pointers are
+// computed in-kernel from `tile_base + slot`; scratch is laid out as
+// `[tile][sq][sk]` (scores/dp/ds each a `tile*ss` region). `hs = heads*head_dim`.
+kernel void attn_bwd_scores_batched_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant float& scale [[buffer(7)]],
+    constant uint& mask_kind [[buffer(8)]],
+    constant uint& window [[buffer(9)]],
+    constant uint& tile_base [[buffer(10)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint ki = gid.x, qi = gid.y, slot = gid.z;
+    if (qi >= sq || ki >= sk) return;
+    // Causal / sliding-window: masked pairs become 0 after softmax
+    // (exp(-1e4)=0 in f32), so write -1e4 and SKIP the dot — ~half the work.
+    bool masked = (mask_kind == 1u && ki > qi)
+        || (mask_kind == 3u && (ki > qi || (qi > window && ki < qi - window)));
+    if (masked) {
+        scores[slot * sq * sk + qi * sk + ki] = -1e4f;
+        return;
+    }
+    uint hs = heads * head_dim;
+    uint gp = tile_base + slot;
+    uint bi = gp / heads, hi = gp % heads;
+    uint qbase = bi * sq * hs + hi * head_dim;
+    uint kbase = bi * sk * hs + hi * head_dim;
+    float dot = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) {
+        dot += q[qbase + qi * hs + d] * k[kbase + ki * hs + d];
+    }
+    scores[slot * sq * sk + qi * sk + ki] = dot * scale;
+}
+
+kernel void attn_bwd_dp_batched_f32(
+    device const float* dy [[buffer(0)]],
+    device const float* v [[buffer(1)]],
+    device float* dp [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& tile_base [[buffer(7)]],
+    constant uint& mask_kind [[buffer(8)]],
+    constant uint& window [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint ki = gid.x, qi = gid.y, slot = gid.z;
+    if (qi >= sq || ki >= sk) return;
+    // Masked pairs contribute 0 to ds (scores=0); write 0, skip the dot.
+    bool masked = (mask_kind == 1u && ki > qi)
+        || (mask_kind == 3u && (ki > qi || (qi > window && ki < qi - window)));
+    if (masked) {
+        dp[slot * sq * sk + qi * sk + ki] = 0.0f;
+        return;
+    }
+    uint hs = heads * head_dim;
+    uint gp = tile_base + slot;
+    uint bi = gp / heads, hi = gp % heads;
+    uint qbase = bi * sq * hs + hi * head_dim;
+    uint kbase = bi * sk * hs + hi * head_dim;
+    float acc = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) {
+        acc += dy[qbase + qi * hs + d] * v[kbase + ki * hs + d];
+    }
+    dp[slot * sq * sk + qi * sk + ki] = acc;
+}
+
+// Per-row softmax-jacobian; one threadgroup per (slot,row). `row = slot*sq + lr`.
+kernel void attn_bwd_ds_batched_f32(
+    device const float* scores [[buffer(0)]],
+    device const float* dp [[buffer(1)]],
+    device float* ds [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant float& scale [[buffer(5)]],
+    constant uint& mask_kind [[buffer(6)]],
+    constant uint& window [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    uint slot = row / sq;
+    uint lr = row % sq;
+    uint base = slot * sq * sk + lr * sk;
+    // Only the causal/window band contributes (masked scores are 0); bound the
+    // reduction AND the write to `[ki_lo, ki_hi]`. dq/dk are bounded the same
+    // way, so they never read the un-written masked entries.
+    uint ki_lo = 0u;
+    uint ki_hi = sk - 1u;
+    if (mask_kind == 1u) {
+        ki_hi = min(lr, sk - 1u);
+    } else if (mask_kind == 3u) {
+        ki_hi = min(lr, sk - 1u);
+        ki_lo = lr > window ? lr - window : 0u;
+    }
+    float row_sum = 0.0f;
+    for (uint ki = ki_lo + tid; ki <= ki_hi; ki += tsize) {
+        row_sum += scores[base + ki] * dp[base + ki];
+    }
+    threadgroup float partial[256];
+    partial[tid] = row_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum = partial[0];
+    for (uint ki = ki_lo + tid; ki <= ki_hi; ki += tsize) {
+        uint idx = base + ki;
+        ds[idx] = scores[idx] * (dp[idx] - sum) * scale;
+    }
+}
+
+kernel void attn_bwd_dv_batched_f32(
+    device const float* scores [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& tile_base [[buffer(7)]],
+    constant uint& mask_kind [[buffer(8)]],
+    constant uint& window [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x, ki = gid.y, slot = gid.z;
+    if (ki >= sk || d >= head_dim) return;
+    // scores[qi,ki] is 0 unless ki is in qi's causal/window band ⇒ qi ≥ ki
+    // (and qi ≤ ki+window for sliding). Bound the qi accumulation to that band.
+    uint qi_lo = 0u;
+    uint qi_hi = sq - 1u;
+    if (mask_kind == 1u) {
+        qi_lo = ki;
+    } else if (mask_kind == 3u) {
+        qi_lo = ki;
+        qi_hi = min(sq - 1u, ki + window);
+    }
+    uint hs = heads * head_dim;
+    uint gp = tile_base + slot;
+    uint bi = gp / heads, hi = gp % heads;
+    uint qbase = bi * sq * hs + hi * head_dim;
+    uint kbase = bi * sk * hs + hi * head_dim;
+    float acc = 0.0f;
+    for (uint qi = qi_lo; qi <= qi_hi; ++qi) {
+        acc += scores[slot * sq * sk + qi * sk + ki] * dy[qbase + qi * hs + d];
+    }
+    out[kbase + ki * hs + d] = acc;
+}
+
+kernel void attn_bwd_dq_batched_f32(
+    device const float* ds [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& tile_base [[buffer(7)]],
+    constant uint& mask_kind [[buffer(8)]],
+    constant uint& window [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x, qi = gid.y, slot = gid.z;
+    if (qi >= sq || d >= head_dim) return;
+    // ds[qi,ki] is 0 outside qi's causal/window band ⇒ ki ≤ qi (and ki ≥
+    // qi-window for sliding). Bound the ki accumulation to that band.
+    uint ki_lo = 0u;
+    uint ki_hi = sk - 1u;
+    if (mask_kind == 1u) {
+        ki_hi = min(qi, sk - 1u);
+    } else if (mask_kind == 3u) {
+        ki_hi = min(qi, sk - 1u);
+        ki_lo = qi > window ? qi - window : 0u;
+    }
+    uint hs = heads * head_dim;
+    uint gp = tile_base + slot;
+    uint bi = gp / heads, hi = gp % heads;
+    uint qbase = bi * sq * hs + hi * head_dim;
+    uint kbase = bi * sk * hs + hi * head_dim;
+    float acc = 0.0f;
+    for (uint ki = ki_lo; ki <= ki_hi; ++ki) {
+        acc += ds[slot * sq * sk + qi * sk + ki] * k[kbase + ki * hs + d];
+    }
+    out[qbase + qi * hs + d] = acc;
+}
+
+kernel void attn_bwd_dk_batched_f32(
+    device const float* ds [[buffer(0)]],
+    device const float* q [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& sq [[buffer(3)]],
+    constant uint& sk [[buffer(4)]],
+    constant uint& heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& tile_base [[buffer(7)]],
+    constant uint& mask_kind [[buffer(8)]],
+    constant uint& window [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x, ki = gid.y, slot = gid.z;
+    if (ki >= sk || d >= head_dim) return;
+    // ds[qi,ki] is 0 unless ki is in qi's causal/window band ⇒ qi ≥ ki (and
+    // qi ≤ ki+window for sliding). Bound the qi accumulation to that band.
+    uint qi_lo = 0u;
+    uint qi_hi = sq - 1u;
+    if (mask_kind == 1u) {
+        qi_lo = ki;
+    } else if (mask_kind == 3u) {
+        qi_lo = ki;
+        qi_hi = min(sq - 1u, ki + window);
+    }
+    uint hs = heads * head_dim;
+    uint gp = tile_base + slot;
+    uint bi = gp / heads, hi = gp % heads;
+    uint qbase = bi * sq * hs + hi * head_dim;
+    uint kbase = bi * sk * hs + hi * head_dim;
+    float acc = 0.0f;
+    for (uint qi = qi_lo; qi <= qi_hi; ++qi) {
+        acc += ds[slot * sq * sk + qi * sk + ki] * q[qbase + qi * hs + d];
+    }
+    out[kbase + ki * hs + d] = acc;
+}
+
+// ── Fused flash-attention backward (single kernel) ──────────────────────────
+// One threadgroup per (query-tile of Br rows, head, batch). Recomputes S=QKᵀ·scale
+// and the row softmax P entirely in THREADGROUP memory (never written to device —
+// no scores/dp/ds S² scratch buffers), then:
+//   dQ[qi] = Σ_ki dS[qi,ki]·K[ki]          — written directly (each query once)
+//   dV[ki] += Σ_qi P[qi,ki]·dO[qi]          — atomic-add across query-tiles
+//   dK[ki] += Σ_qi dS[qi,ki]·Q[qi]          — atomic-add across query-tiles
+// where dS = P∘(dP - rowsum(P∘dP))·scale, dP = dO·Vᵀ. dK/dV MUST be pre-zeroed.
+// Same math as the 6-pass attn_bwd_* kernels, fused. Causal (mask_kind==1) bounds
+// ki to [0, qi_abs]. Requires sk ≤ MAX_SK and head_dim ≤ MAX_DH (threadgroup tiles).
+// mask_kind ∈ {0,1} only (padding/bias fall back to the 6-pass path).
+kernel void attn_bwd_fused_f32(
+    device const float* q    [[buffer(0)]],
+    device const float* k    [[buffer(1)]],
+    device const float* v    [[buffer(2)]],
+    device const float* dy   [[buffer(3)]],
+    device float*        dq  [[buffer(4)]],
+    device atomic_float* dk  [[buffer(5)]],
+    device atomic_float* dv  [[buffer(6)]],
+    constant uint&  sq        [[buffer(7)]],
+    constant uint&  sk        [[buffer(8)]],
+    constant uint&  heads     [[buffer(9)]],
+    constant uint&  head_dim  [[buffer(10)]],
+    constant float& scale     [[buffer(11)]],
+    constant uint&  mask_kind [[buffer(12)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]]
+) {
+    constexpr uint Br = 8u;
+    constexpr uint MAX_SK = 256u;
+    constexpr uint MAX_DH = 64u;
+    constexpr uint THREADS = 64u;
+
+    threadgroup float Ptile[Br * MAX_SK];    // S, then softmax P
+    threadgroup float dStile[Br * MAX_SK];   // dP, then dS
+    threadgroup float Qtile[Br * MAX_DH];
+    threadgroup float dOtile[Br * MAX_DH];
+    threadgroup float Drow[Br];
+
+    uint q_tile = tgid.x, hi = tgid.y, bi = tgid.z;
+    uint qi0 = q_tile * Br;
+    uint hs = heads * head_dim;
+    uint qbase = bi * sq * hs + hi * head_dim;
+    uint kbase = bi * sk * hs + hi * head_dim;
+    bool causal = (mask_kind == 1u);
+
+    // Load Q, dO tiles (Br × head_dim), zero-pad rows past sq.
+    for (uint i = tid; i < Br * head_dim; i += THREADS) {
+        uint qi = i / head_dim, d = i % head_dim;
+        uint pos = qi0 + qi;
+        Qtile[qi * MAX_DH + d]  = (pos < sq) ? q[qbase + pos * hs + d]  : 0.0f;
+        dOtile[qi * MAX_DH + d] = (pos < sq) ? dy[qbase + pos * hs + d] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 1: S[qi,ki] = scale·(Q·K), causal-masked to -INF. Store in Ptile.
+    for (uint c = tid; c < Br * sk; c += THREADS) {
+        uint qi = c / sk, ki = c % sk;
+        uint pos = qi0 + qi;
+        float s = -INFINITY;
+        if (pos < sq && !(causal && ki > pos)) {
+            float acc = 0.0f;
+            for (uint d = 0; d < head_dim; ++d)
+                acc = fma(Qtile[qi * MAX_DH + d], k[kbase + ki * hs + d], acc);
+            s = acc * scale;
+        }
+        Ptile[qi * MAX_SK + ki] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Softmax each row over its causal band [0, khi]; Br threads.
+    if (tid < Br) {
+        uint qi = tid;
+        uint pos = qi0 + qi;
+        if (pos < sq) {
+            uint khi = causal ? min(pos, sk - 1u) : (sk - 1u);
+            float m = -INFINITY;
+            for (uint ki = 0; ki <= khi; ++ki) m = max(m, Ptile[qi * MAX_SK + ki]);
+            float l = 0.0f;
+            for (uint ki = 0; ki <= khi; ++ki) {
+                float e = exp(Ptile[qi * MAX_SK + ki] - m);
+                Ptile[qi * MAX_SK + ki] = e;
+                l += e;
+            }
+            float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+            for (uint ki = 0; ki <= khi; ++ki) Ptile[qi * MAX_SK + ki] *= inv;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 2: dP[qi,ki] = dO[qi]·V[ki] over the band (else 0). Store in dStile.
+    for (uint c = tid; c < Br * sk; c += THREADS) {
+        uint qi = c / sk, ki = c % sk;
+        uint pos = qi0 + qi;
+        float acc = 0.0f;
+        if (pos < sq && !(causal && ki > pos)) {
+            for (uint d = 0; d < head_dim; ++d)
+                acc = fma(dOtile[qi * MAX_DH + d], v[kbase + ki * hs + d], acc);
+        }
+        dStile[qi * MAX_SK + ki] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Drow[qi] = Σ_ki P·dP over the band; Br threads.
+    if (tid < Br) {
+        uint qi = tid;
+        uint pos = qi0 + qi;
+        float D = 0.0f;
+        if (pos < sq) {
+            uint khi = causal ? min(pos, sk - 1u) : (sk - 1u);
+            for (uint ki = 0; ki <= khi; ++ki)
+                D += Ptile[qi * MAX_SK + ki] * dStile[qi * MAX_SK + ki];
+        }
+        Drow[qi] = D;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // dS[qi,ki] = P·(dP - D)·scale, in place in dStile (0 outside band).
+    for (uint c = tid; c < Br * sk; c += THREADS) {
+        uint qi = c / sk, ki = c % sk;
+        uint pos = qi0 + qi;
+        float ds = 0.0f;
+        if (pos < sq && !(causal && ki > pos))
+            ds = Ptile[qi * MAX_SK + ki] * (dStile[qi * MAX_SK + ki] - Drow[qi]) * scale;
+        dStile[qi * MAX_SK + ki] = ds;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // dQ[qi,d] = Σ_ki dS·K — direct write (each query row owned by this tile).
+    for (uint c = tid; c < Br * head_dim; c += THREADS) {
+        uint qi = c / head_dim, d = c % head_dim;
+        uint pos = qi0 + qi;
+        if (pos < sq) {
+            uint khi = causal ? min(pos, sk - 1u) : (sk - 1u);
+            float acc = 0.0f;
+            for (uint ki = 0; ki <= khi; ++ki)
+                acc = fma(dStile[qi * MAX_SK + ki], k[kbase + ki * hs + d], acc);
+            dq[qbase + pos * hs + d] = acc;
+        }
+    }
+
+    // dV[ki,d] += Σ_qi P·dO ; dK[ki,d] += Σ_qi dS·Q — atomic across query-tiles.
+    for (uint c = tid; c < sk * head_dim; c += THREADS) {
+        uint ki = c / head_dim, d = c % head_dim;
+        float dvacc = 0.0f, dkacc = 0.0f;
+        for (uint qi = 0; qi < Br; ++qi) {
+            uint pos = qi0 + qi;
+            if (pos < sq && !(causal && ki > pos)) {
+                dvacc = fma(Ptile[qi * MAX_SK + ki], dOtile[qi * MAX_DH + d], dvacc);
+                dkacc = fma(dStile[qi * MAX_SK + ki], Qtile[qi * MAX_DH + d], dkacc);
+            }
+        }
+        if (dvacc != 0.0f)
+            atomic_fetch_add_explicit(&dv[kbase + ki * hs + d], dvacc, memory_order_relaxed);
+        if (dkacc != 0.0f)
+            atomic_fetch_add_explicit(&dk[kbase + ki * hs + d], dkacc, memory_order_relaxed);
+    }
+}
+
 kernel void gather_bwd_zero(
     device float* dst [[buffer(0)]],
     constant uint& n [[buffer(1)]],
@@ -8358,12 +10013,173 @@ kernel void gather_bwd_acc(
         }
     }
 }
+
+// ── On-device Philox4x32-10 RNG ──────────────────────────────────────────
+// Bit-matched to `rlx_ir::Philox4x32` / the shared `rng_philox.cu` (CUDA/ROCm):
+// normal sample i reads Philox block i/2 lanes {0,1}|{2,3}; uniform i reads
+// block i/4 lane i%4; `u32_to_unit=(bits>>8)/2^24`. The arena buffer is bound
+// at the destination byte offset, so each entry writes `out[i]`.
+static inline void rlx_philox_round(thread uint* s, uint k0, uint k1) {
+    const ulong M0 = 0xD2561A75UL;
+    const ulong M1 = 0xCD9E8D57UL;
+    ulong p0 = (ulong)s[0] * M0;
+    ulong p1 = (ulong)s[2] * M1;
+    uint hi0 = (uint)(p0 >> 32); uint lo0 = (uint)p0;
+    uint hi1 = (uint)(p1 >> 32); uint lo1 = (uint)p1;
+    s[0] = hi1 ^ s[1] ^ k0;
+    s[1] = lo1;
+    s[2] = hi0 ^ s[3] ^ k1;
+    s[3] = lo0;
+}
+static inline void rlx_philox_10(uint blk, uint seed_lo, uint seed_hi, thread uint* out) {
+    // Counter for block `blk` (blk < 2^31 for u32 len → high words zero).
+    uint s[4] = { blk, 0u, 0u, 0u };
+    uint k0 = seed_lo, k1 = seed_hi;
+    for (int i = 0; i < 10; ++i) {
+        rlx_philox_round(s, k0, k1);
+        k0 += 0x9E3779B9u;
+        k1 += 0xBB67AE85u;
+    }
+    out[0] = s[0]; out[1] = s[1]; out[2] = s[2]; out[3] = s[3];
+}
+static inline float rlx_u32_to_unit(uint bits) {
+    return (float)(bits >> 8) / (float)(1u << 24);
+}
+kernel void rng_normal_philox(
+    device float* out [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    constant float& mean [[buffer(2)]],
+    constant float& scale [[buffer(3)]],
+    constant uint& seed_lo [[buffer(4)]],
+    constant uint& seed_hi [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= len) return;
+    uint lane0 = (i & 1u) ? 2u : 0u;
+    uint buf[4];
+    rlx_philox_10(i / 2u, seed_lo, seed_hi, buf);
+    float u1 = rlx_u32_to_unit(buf[lane0]);
+    float u2 = rlx_u32_to_unit(buf[lane0 + 1u]);
+    if (u1 < 1.17549435e-38f) u1 = 1.17549435e-38f; // f32::MIN_POSITIVE
+    float r = sqrt(-2.0f * log(u1));
+    float theta = 6.283185307179586f * u2;
+    out[i] = mean + scale * (r * cos(theta));
+}
+kernel void rng_uniform_philox(
+    device float* out [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    constant float& low [[buffer(2)]],
+    constant float& high [[buffer(3)]],
+    constant uint& seed_lo [[buffer(4)]],
+    constant uint& seed_hi [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= len) return;
+    uint buf[4];
+    rlx_philox_10(i / 4u, seed_lo, seed_hi, buf);
+    float u = rlx_u32_to_unit(buf[i & 3u]);
+    out[i] = low + u * (high - low);
+}
+kernel void rng_fill_zero(
+    device float* out [[buffer(0)]],
+    constant uint& len [[buffer(1)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= len) return;
+    out[i] = 0.0f;
+}
 "#;
 
 const RLX_KERNELS_MSL_DEQUANT: &str = include_str!("dequant_gguf.msl");
 const RLX_KERNELS_MSL_FFT_GPU: &str = include_str!("fft_gpu.msl");
 const RLX_KERNELS_MSL_SPLAT: &str = include_str!("splat.msl");
 const RLX_KERNELS_MSL_SPLAT_CONIC: &str = include_str!("splat_conic_bin.msl");
+
+// ── Register-blocked simdgroup GEMM tile configs (macro-generated) ──────────
+// One MSL template per structure (plain / split-K), parameterized by tile:
+//   {NAME}  kernel name          {NACC}  8×8-col accumulators / simdgroup
+//   {TROWS} rows per threadgroup  {TCOLS} cols per threadgroup (= NACC*8)
+// A config is TROWS×TCOLS output, (TROWS/8) simdgroups × NACC accumulators.
+// `sgemm_tile_variant!(name, trows, nacc)` stamps a config; add a tile size by
+// adding one call in `msl_source`. Keeps the kernel families DRY + tunable.
+const SGEMM_TILE_TMPL: &str = r#"
+kernel void {NAME}(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M [[buffer(3)]], constant uint& K [[buffer(4)]], constant uint& N [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]]
+) {
+    uint row0 = tgid.y * {TROWS} + sgid * 8;
+    uint col0 = tgid.x * {TCOLS};
+    simdgroup_float8x8 acc[{NACC}];
+    for (int j = 0; j < {NACC}; j++) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0);
+    for (uint kk = 0; kk < K; kk += 8) {
+        simdgroup_float8x8 a, b[{NACC}];
+        simdgroup_load(a, A + row0 * K + kk, K);
+        for (int j = 0; j < {NACC}; j++) simdgroup_load(b[j], B + kk * N + col0 + j * 8, N);
+        for (int j = 0; j < {NACC}; j++) simdgroup_multiply_accumulate(acc[j], a, b[j], acc[j]);
+    }
+    for (int j = 0; j < {NACC}; j++) simdgroup_store(acc[j], C + row0 * N + col0 + j * 8, N);
+}
+"#;
+
+// Split-K variant: grid gains a Ksplits z-axis; each z-slice sums a K-chunk into
+// its tile, then hardware-atomic-adds into a pre-zeroed C. For fat-K / small-MN.
+const SGEMM_SPLITK_TMPL: &str = r#"
+kernel void {NAME}(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device atomic_float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]], constant uint& K [[buffer(4)]], constant uint& N [[buffer(5)]],
+    constant uint& Ksplits [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    uint row0 = tgid.y * {TROWS} + sgid * 8;
+    uint col0 = tgid.x * {TCOLS};
+    uint kchunk = K / Ksplits;
+    uint kstart = tgid.z * kchunk;
+    simdgroup_float8x8 acc[{NACC}];
+    for (int j = 0; j < {NACC}; j++) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0);
+    for (uint kk = kstart; kk < kstart + kchunk; kk += 8) {
+        simdgroup_float8x8 a, b[{NACC}];
+        simdgroup_load(a, A + row0 * K + kk, K);
+        for (int j = 0; j < {NACC}; j++) simdgroup_load(b[j], B + kk * N + col0 + j * 8, N);
+        for (int j = 0; j < {NACC}; j++) simdgroup_multiply_accumulate(acc[j], a, b[j], acc[j]);
+    }
+    threadgroup float scratch[{TROWS} * {TCOLS}];
+    for (int j = 0; j < {NACC}; j++) simdgroup_store(acc[j], scratch + (sgid * 8) * {TCOLS} + j * 8, {TCOLS});
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint tile_elems = {TROWS} * {TCOLS};
+    uint threads = ({TROWS} / 8) * 32;
+    for (uint idx = sgid * 32 + slid; idx < tile_elems; idx += threads) {
+        uint r = idx / {TCOLS}, c = idx % {TCOLS};
+        atomic_fetch_add_explicit(&C[(tgid.y * {TROWS} + r) * N + col0 + c], scratch[idx],
+                                  memory_order_relaxed);
+    }
+}
+"#;
+
+macro_rules! sgemm_tile_variant {
+    ($name:literal, $trows:expr, $nacc:expr) => {
+        SGEMM_TILE_TMPL
+            .replace("{NAME}", $name)
+            .replace("{NACC}", &($nacc).to_string())
+            .replace("{TROWS}", &($trows).to_string())
+            .replace("{TCOLS}", &(($nacc) * 8).to_string())
+    };
+}
+macro_rules! sgemm_splitk_variant {
+    ($name:literal, $trows:expr, $nacc:expr) => {
+        SGEMM_SPLITK_TMPL
+            .replace("{NAME}", $name)
+            .replace("{NACC}", &($nacc).to_string())
+            .replace("{TROWS}", &($trows).to_string())
+            .replace("{TCOLS}", &(($nacc) * 8).to_string())
+    };
+}
 
 /// Single source of truth for Metal's scalar activation kernels. Each entry
 /// `(Variant, "name", "msl_expr")` generates an f32 + f16 in-place MSL kernel
@@ -8425,6 +10241,590 @@ scalar_activation_kernels! {
     Mish,        "mish";
     Softsign,    "softsign";
     LogSigmoid,  "logsigmoid";
+}
+
+/// MSL template for the split-K codebook weight-synthesis kernel (decode). `{S}`
+/// = name suffix, `{T}` = x/dst element type (`float` or `half`); accumulation
+/// is always f32 and the codebook stays f32 (only x/dst change precision).
+const SYNTH_SPLITK_TMPL: &str = r#"
+kernel void synth_matmul_codebook{S}(
+    device float* arena          [[buffer(0)]],
+    constant ulong& x_off        [[buffer(1)]],
+    constant ulong& idx_off      [[buffer(2)]],
+    constant ulong& cb_off       [[buffer(3)]],
+    constant ulong& dst_off      [[buffer(4)]],
+    constant uint& k_dim         [[buffer(5)]],
+    constant uint& n_dim         [[buffer(6)]],
+    constant uint& entry_dim     [[buffer(7)]],
+    constant uint& num_entries   [[buffer(8)]],
+    constant uint& m_dim         [[buffer(9)]],
+    uint3 gid                    [[thread_position_in_grid]]
+) {
+    uint split = gid.x; uint j = gid.y; uint r = gid.z;
+    if (j >= n_dim || r >= m_dim) return;
+    (void)num_entries;
+    uint nb = k_dim / entry_dim;
+    device const {T}* xr    = (device const {T}*)((device const char*)arena + x_off) + (ulong)r * k_dim;
+    device const uchar* idx = (device const uchar*)arena + idx_off + (ulong)j * nb;
+    device const float* cb  = (device const float*)((device const char*)arena + cb_off);
+    device {T}*         dst  = (device {T}*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    for (uint b = split; b < nb; b += 32u) {
+        uint code = uint(idx[b]);
+        device const float* c = cb + (ulong)code * entry_dim;
+        uint base = b * entry_dim;
+        for (uint t = 0u; t < entry_dim; ++t) acc += float(xr[base + t]) * c[t];
+    }
+    acc = simd_sum(acc);
+    if (split == 0u) dst[(ulong)r * n_dim + j] = ({T})acc;
+}
+"#;
+
+/// MSL template for the one-thread-per-output prefill kernel. NOTE: register-
+/// tiling (reuse centroids across a row tile) was measured SLOWER here — the 4 KB
+/// codebook is L1-resident so there's nothing to amortize, and tiling hurts x
+/// coalescing + occupancy. A fused GPU kernel can't beat MPS for prefill anyway
+/// (reconstruction is cache-cheap; MPS is a world-class tiled GEMM); the fast
+/// prefill path is reconstruct→f32→MPS/AMX (see the CPU m>1 path). `{S}`=suffix,
+/// `{T}`=x/dst element type.
+const SYNTH_MM_TMPL: &str = r#"
+kernel void synth_matmul_codebook_mm{S}(
+    device float* arena          [[buffer(0)]],
+    constant ulong& x_off        [[buffer(1)]],
+    constant ulong& idx_off      [[buffer(2)]],
+    constant ulong& cb_off       [[buffer(3)]],
+    constant ulong& dst_off      [[buffer(4)]],
+    constant uint& k_dim         [[buffer(5)]],
+    constant uint& n_dim         [[buffer(6)]],
+    constant uint& entry_dim     [[buffer(7)]],
+    constant uint& num_entries   [[buffer(8)]],
+    constant uint& m_dim         [[buffer(9)]],
+    uint2 gid                    [[thread_position_in_grid]]
+) {
+    uint j = gid.x; uint r = gid.y;
+    if (j >= n_dim || r >= m_dim) return;
+    (void)num_entries;
+    uint nb = k_dim / entry_dim;
+    device const {T}* xr    = (device const {T}*)((device const char*)arena + x_off) + (ulong)r * k_dim;
+    device const uchar* idx = (device const uchar*)arena + idx_off + (ulong)j * nb;
+    device const float* cb  = (device const float*)((device const char*)arena + cb_off);
+    device {T}*         dst  = (device {T}*)((device char*)arena + dst_off);
+    float acc = 0.0f;
+    for (uint b = 0u; b < nb; ++b) {
+        uint code = uint(idx[b]);
+        device const float* c = cb + (ulong)code * entry_dim;
+        uint base = b * entry_dim;
+        for (uint t = 0u; t < entry_dim; ++t) acc += float(xr[base + t]) * c[t];
+    }
+    dst[(ulong)r * n_dim + j] = ({T})acc;
+}
+"#;
+
+/// Generate the codebook weight-synthesis MSL kernels for each
+/// `(suffix => element-type)` pair from ONE template, so the f32 and f16
+/// variants can't drift (mirrors `scalar_activation_kernels!`).
+/// MSL kernel that reconstructs the dense f32 weight Wᵀ [n, k] (row-major,
+/// contiguous) from u8 codebook indices — the weight-only half used by the m>8
+/// prefill path (reconstruct → MPS sgemm, which beats any fused kernel). One
+/// thread per (kb block, column j) writes entry_dim contiguous weights:
+/// W[j, kb·entry_dim + t] = codebook[indices[j,kb], t]. Not dtype-templated
+/// (MPS consumes f32); paired with `encode_mps_sgemm_bt` (B stored [n,k]).
+const SYNTH_RECON_MSL: &str = r#"
+kernel void synth_reconstruct(
+    device float* arena          [[buffer(0)]],
+    constant ulong& idx_off      [[buffer(1)]],
+    constant ulong& cb_off       [[buffer(2)]],
+    constant ulong& w_off        [[buffer(3)]],
+    constant uint& k_dim         [[buffer(4)]],
+    constant uint& n_dim         [[buffer(5)]],
+    constant uint& entry_dim     [[buffer(6)]],
+    uint2 gid                    [[thread_position_in_grid]]
+) {
+    uint nb = k_dim / entry_dim;
+    uint kb = gid.x;
+    uint j = gid.y;
+    if (kb >= nb || j >= n_dim) return;
+    device const uchar* idx = (device const uchar*)arena + idx_off + (ulong)j * nb;
+    device const float* cb  = (device const float*)((device const char*)arena + cb_off);
+    device float* w = (device float*)((device char*)arena + w_off)
+                    + (ulong)j * k_dim + (ulong)kb * entry_dim;
+    uint code = uint(idx[kb]);
+    device const float* c = cb + (ulong)code * entry_dim;
+    for (uint t = 0u; t < entry_dim; ++t) w[t] = c[t];
+}
+"#;
+
+/// f16 reconstruct for the RLX_METAL_SYNTH_RECON_F16 prefill path: writes the dense
+/// weight W[k,n] (row-major, stride n — the NON-transposed layout MPS `hgemm` reads)
+/// as `half` from u8 indices + f32 codebook. Half the scratch bytes of the f32
+/// reconstruct; paired with `encode_mps_hgemm` after casting x→f16. `W[b·d+t, j] =
+/// codebook[indices[j,b], t]`.
+const SYNTH_RECON_H_MSL: &str = r#"
+kernel void synth_reconstruct_h(
+    device float* arena          [[buffer(0)]],
+    constant ulong& idx_off      [[buffer(1)]],
+    constant ulong& cb_off       [[buffer(2)]],
+    constant ulong& w_off        [[buffer(3)]],
+    constant uint& k_dim         [[buffer(4)]],
+    constant uint& n_dim         [[buffer(5)]],
+    constant uint& entry_dim     [[buffer(6)]],
+    uint2 gid                    [[thread_position_in_grid]]
+) {
+    uint nb = k_dim / entry_dim;
+    uint kb = gid.x, j = gid.y;
+    if (kb >= nb || j >= n_dim) return;
+    device const uchar* idx = (device const uchar*)arena + idx_off + (ulong)j * nb;
+    device const float* cb  = (device const float*)((device const char*)arena + cb_off);
+    device half* w = (device half*)((device char*)arena + w_off);
+    uint code = uint(idx[kb]);
+    device const float* c = cb + (ulong)code * entry_dim;
+    for (uint t = 0u; t < entry_dim; ++t) w[(ulong)(kb * entry_dim + t) * n_dim + j] = (half)c[t];
+}
+"#;
+
+/// Threadgroup-tiled FUSED codebook matmul via `simdgroup_float8x8` MMAs. A 4×4
+/// grid of 16 simdgroups (512 threads) computes a 32×32 output tile. Each K-step
+/// stages the x tile (A) into threadgroup memory AND reconstructs the weight tile
+/// (Bᵀ) from u8 indices + the L1-resident codebook directly into threadgroup memory
+/// — the dense weight is NEVER materialized to DRAM. Bounds-checked on all three
+/// dims (zero-fill loads, staged bounds-safe store), so it handles M/N/K not
+/// multiples of 32. f32 only. Pairs with `encode_synth_matmul_tiled`.
+///
+/// MEASURED (M4 Pro, `synth_m_sweep_bench`): register blocking (this 64×64/2×2
+/// version) cut large-M time ~15–20% vs the first 32×32/1×1 tiling (M=256: 1.5→1.27
+/// ms) — but it STILL does NOT beat recon→MPS (M=256: 1.27 vs 0.71 ms; ~1.8× off
+/// MPS's tuned GEMM). Two honest kernel iterations confirm the physics: at large M
+/// you can't out-GEMM MPS by hand and the ceiling (dense-MPS) is only ~20% under
+/// recon→MPS; at small/medium M the theoretical win is bigger (16× fewer weight
+/// bytes) but a big register-blocked tile wastes rows + starves occupancy there — it
+/// wants a different small-M split-K GEMM. Diminishing returns, so recon→MPS stays
+/// the DEFAULT for m>8. Kept opt-in (`RLX_METAL_SYNTH_TILED`) for its non-speed wins:
+/// zero scratch DRAM (recon→MPS needs a k·n·4 scratch — 16 MB at 2048²) and a single
+/// capture-friendly pure-MSL dispatch (no MPS call). Next lever if ever needed:
+/// double-buffer the K-panel (blocked here by the 32 KB threadgroup budget) +
+/// a small-M split-K variant.
+const SYNTH_TILED_MSL: &str = r#"
+kernel void synth_matmul_codebook_tiled(
+    device float* arena          [[buffer(0)]],
+    constant ulong& x_off        [[buffer(1)]],
+    constant ulong& idx_off      [[buffer(2)]],
+    constant ulong& cb_off       [[buffer(3)]],
+    constant ulong& dst_off      [[buffer(4)]],
+    constant uint& k_dim         [[buffer(5)]],
+    constant uint& n_dim         [[buffer(6)]],
+    constant uint& entry_dim     [[buffer(7)]],
+    constant uint& num_entries   [[buffer(8)]],
+    constant uint& m_dim         [[buffer(9)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    (void)num_entries;
+    // 64×64 output tile per threadgroup, K-panel 32. 16 simdgroups (4×4); each owns
+    // a 16×16 sub-tile = a 2×2 grid of 8×8 accumulators, so every A/B tile load feeds
+    // FOUR MMAs (4× the arithmetic intensity of one 8×8 per load).
+    uint sg_row = sgid / 4;            // 0..3
+    uint sg_col = sgid % 4;            // 0..3
+    uint tg_row_base = tgid.y * 64;    // output rows = m
+    uint tg_col_base = tgid.x * 64;    // output cols = n
+    uint nb = k_dim / entry_dim;
+
+    threadgroup float A_tg[64 * 32];   // [m64][k32]
+    threadgroup float B_tg[32 * 64];   // [k32][n64]
+
+    simdgroup_float8x8 c00 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 c01 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 c10 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 c11 = simdgroup_float8x8(0.0f);
+
+    device const float* xbase   = (device const float*)((device const char*)arena + x_off);
+    device const uchar* idxbase = (device const uchar*)arena + idx_off;
+    device const float* cb      = (device const float*)((device const char*)arena + cb_off);
+
+    uint linear = sgid * 32 + slid;    // 0..511
+
+    for (uint kk = 0; kk < k_dim; kk += 32) {
+        // A tile (x): 64×32 = 2048 elems, 4 per thread.
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = i * 512 + linear;
+            uint ar = idx / 32, ac = idx % 32;
+            uint r = tg_row_base + ar;
+            uint kcol = kk + ac;
+            A_tg[idx] = (r < m_dim && kcol < k_dim) ? xbase[(ulong)r * k_dim + kcol] : 0.0f;
+        }
+        // B tile (Wᵀ) reconstructed on-chip: B[k,j] = codebook[indices[j,k/D]*D + k%D].
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = i * 512 + linear;
+            uint br = idx / 64, bc = idx % 64;
+            uint krow = kk + br;
+            uint j = tg_col_base + bc;
+            float w = 0.0f;
+            if (j < n_dim && krow < k_dim) {
+                uint blk = krow / entry_dim;
+                uint t   = krow % entry_dim;
+                uint code = uint(idxbase[(ulong)j * nb + blk]);
+                w = cb[(ulong)code * entry_dim + t];
+            }
+            B_tg[idx] = w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kin = 0; kin < 32; kin += 8) {
+            simdgroup_float8x8 a0, a1, b0, b1;
+            simdgroup_load(a0, &A_tg[(sg_row * 16 + 0) * 32 + kin], 32);
+            simdgroup_load(a1, &A_tg[(sg_row * 16 + 8) * 32 + kin], 32);
+            simdgroup_load(b0, &B_tg[kin * 64 + sg_col * 16 + 0], 64);
+            simdgroup_load(b1, &B_tg[kin * 64 + sg_col * 16 + 8], 64);
+            simdgroup_multiply_accumulate(c00, a0, b0, c00);
+            simdgroup_multiply_accumulate(c01, a0, b1, c01);
+            simdgroup_multiply_accumulate(c10, a1, b0, c10);
+            simdgroup_multiply_accumulate(c11, a1, b1, c11);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Bounds-safe store of the four 8×8 blocks via a reused staging buffer.
+    threadgroup float stage[16 * 64];
+    device float* dst = (device float*)((device char*)arena + dst_off);
+#define SYNTH_STORE_BLOCK(CC, DI, DJ)                                              \
+    simdgroup_store(CC, &stage[sgid * 64], 8);                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                               \
+    {                                                                             \
+        uint row_base = tg_row_base + sg_row * 16 + (DI) * 8;                      \
+        uint col_base = tg_col_base + sg_col * 16 + (DJ) * 8;                      \
+        for (uint e = slid; e < 64; e += 32) {                                    \
+            uint rr = e / 8, cc2 = e % 8;                                         \
+            uint r = row_base + rr, col = col_base + cc2;                          \
+            if (r < m_dim && col < n_dim)                                          \
+                dst[(ulong)r * n_dim + col] = stage[sgid * 64 + rr * 8 + cc2];     \
+        }                                                                         \
+    }                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    SYNTH_STORE_BLOCK(c00, 0, 0)
+    SYNTH_STORE_BLOCK(c01, 0, 1)
+    SYNTH_STORE_BLOCK(c10, 1, 0)
+    SYNTH_STORE_BLOCK(c11, 1, 1)
+#undef SYNTH_STORE_BLOCK
+}
+"#;
+
+/// f16 ("relaxed precision") variant of the tiled kernel: identical 64×64/2×2
+/// structure, but the A/B threadgroup tiles are `half` and the MMAs use
+/// `simdgroup_half8x8` inputs with an f32 accumulator — the fast path Apple's
+/// matrix units + MPS/`matmul2d` actually take (`dv_f16_dv_f16_dv_f32`). External
+/// I/O stays f32 (x/codebook cast to half on load; f32 accumulate → f32 dst), so it
+/// drops into the same dispatch/bench harness. Half-width tiles also HALVE the
+/// threadgroup-memory footprint (8 KB vs 16 KB), the headroom double-buffering needs.
+/// Opt-in via `RLX_METAL_SYNTH_TILED` + `RLX_METAL_SYNTH_TILED_F16`.
+///
+/// MEASURED: correct (rel err ~1e-4 vs f32 CPU) but ~0 speedup over the f32 tiled
+/// kernel (M=256: 1.24 vs 1.22 ms). That's the tell: this kernel is bound by the
+/// SYNCHRONOUS-load + barrier stall (see the note on `simdgroup_async_copy`), NOT
+/// matrix-ALU throughput — so switching to the faster f16 MMA path moves nothing.
+/// It still loses to recon→MPS. The freed SRAM would let double-buffering hide some
+/// of that stall (the one remaining lever short of the async-copy intrinsic).
+const SYNTH_TILED_H_MSL: &str = r#"
+kernel void synth_matmul_codebook_tiled_h(
+    device float* arena          [[buffer(0)]],
+    constant ulong& x_off        [[buffer(1)]],
+    constant ulong& idx_off      [[buffer(2)]],
+    constant ulong& cb_off       [[buffer(3)]],
+    constant ulong& dst_off      [[buffer(4)]],
+    constant uint& k_dim         [[buffer(5)]],
+    constant uint& n_dim         [[buffer(6)]],
+    constant uint& entry_dim     [[buffer(7)]],
+    constant uint& num_entries   [[buffer(8)]],
+    constant uint& m_dim         [[buffer(9)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    (void)num_entries;
+    uint sg_row = sgid / 4;
+    uint sg_col = sgid % 4;
+    uint tg_row_base = tgid.y * 64;
+    uint tg_col_base = tgid.x * 64;
+    uint nb = k_dim / entry_dim;
+
+    threadgroup half A_tg[64 * 32];    // f16 tiles (half the SRAM of the f32 kernel)
+    threadgroup half B_tg[32 * 64];
+
+    simdgroup_float8x8 c00 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 c01 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 c10 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 c11 = simdgroup_float8x8(0.0f);
+
+    device const float* xbase   = (device const float*)((device const char*)arena + x_off);
+    device const uchar* idxbase = (device const uchar*)arena + idx_off;
+    device const float* cb      = (device const float*)((device const char*)arena + cb_off);
+
+    uint linear = sgid * 32 + slid;
+
+    for (uint kk = 0; kk < k_dim; kk += 32) {
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = i * 512 + linear;
+            uint ar = idx / 32, ac = idx % 32;
+            uint r = tg_row_base + ar;
+            uint kcol = kk + ac;
+            A_tg[idx] = (r < m_dim && kcol < k_dim) ? (half)xbase[(ulong)r * k_dim + kcol] : (half)0.0h;
+        }
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = i * 512 + linear;
+            uint br = idx / 64, bc = idx % 64;
+            uint krow = kk + br;
+            uint j = tg_col_base + bc;
+            half w = (half)0.0h;
+            if (j < n_dim && krow < k_dim) {
+                uint blk = krow / entry_dim;
+                uint t   = krow % entry_dim;
+                uint code = uint(idxbase[(ulong)j * nb + blk]);
+                w = (half)cb[(ulong)code * entry_dim + t];
+            }
+            B_tg[idx] = w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kin = 0; kin < 32; kin += 8) {
+            simdgroup_half8x8 a0, a1, b0, b1;
+            simdgroup_load(a0, &A_tg[(sg_row * 16 + 0) * 32 + kin], 32);
+            simdgroup_load(a1, &A_tg[(sg_row * 16 + 8) * 32 + kin], 32);
+            simdgroup_load(b0, &B_tg[kin * 64 + sg_col * 16 + 0], 64);
+            simdgroup_load(b1, &B_tg[kin * 64 + sg_col * 16 + 8], 64);
+            simdgroup_multiply_accumulate(c00, a0, b0, c00);
+            simdgroup_multiply_accumulate(c01, a0, b1, c01);
+            simdgroup_multiply_accumulate(c10, a1, b0, c10);
+            simdgroup_multiply_accumulate(c11, a1, b1, c11);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float stage[16 * 64];
+    device float* dst = (device float*)((device char*)arena + dst_off);
+#define SYNTH_STORE_BLOCK_H(CC, DI, DJ)                                            \
+    simdgroup_store(CC, &stage[sgid * 64], 8);                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                               \
+    {                                                                             \
+        uint row_base = tg_row_base + sg_row * 16 + (DI) * 8;                      \
+        uint col_base = tg_col_base + sg_col * 16 + (DJ) * 8;                      \
+        for (uint e = slid; e < 64; e += 32) {                                    \
+            uint rr = e / 8, cc2 = e % 8;                                         \
+            uint r = row_base + rr, col = col_base + cc2;                          \
+            if (r < m_dim && col < n_dim)                                          \
+                dst[(ulong)r * n_dim + col] = stage[sgid * 64 + rr * 8 + cc2];     \
+        }                                                                         \
+    }                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    SYNTH_STORE_BLOCK_H(c00, 0, 0)
+    SYNTH_STORE_BLOCK_H(c01, 0, 1)
+    SYNTH_STORE_BLOCK_H(c10, 1, 0)
+    SYNTH_STORE_BLOCK_H(c11, 1, 1)
+#undef SYNTH_STORE_BLOCK_H
+}
+"#;
+
+/// Fused backward of `Op::SynthMatMul` (`SynthKind::Codebook`) — the two
+/// gradients as single dispatches each, replacing the ~11-op decomposition.
+/// Arena-buffer + byte-offset convention (matches `synth_reconstruct`); f32.
+const SYNTH_BWD_MSL: &str = r#"
+// dx[m,k] = upstream[m,n] · Ŵᵀ[n,k], where Ŵᵀ[j, kb·d+t] = codebook[idx[j·nb+kb]][t].
+// One thread per output element (i,p); the codebook entry is reconstructed in the
+// inner loop over n — no materialized weight, no separate gather.
+kernel void synth_bwd_dx(
+    device float* arena     [[buffer(0)]],
+    constant ulong& up_off  [[buffer(1)]],   // upstream [m,n] f32
+    constant ulong& idx_off [[buffer(2)]],   // indices  [n,nb] u8
+    constant ulong& cb_off  [[buffer(3)]],   // codebook [ne,d] f32
+    constant ulong& dst_off [[buffer(4)]],   // dx       [m,k] f32
+    constant uint& m [[buffer(5)]],
+    constant uint& n [[buffer(6)]],
+    constant uint& k [[buffer(7)]],
+    constant uint& d [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint p = gid.x;
+    uint i = gid.y;
+    if (i >= m || p >= k) return;
+    device const float* up  = (device const float*)((device const char*)arena + up_off);
+    device const uchar* idx = (device const uchar*)arena + idx_off;
+    device const float* cb  = (device const float*)((device const char*)arena + cb_off);
+    device float* dx        = (device float*)((device char*)arena + dst_off);
+    uint nb = k / d;
+    uint kb = p / d;
+    uint t  = p - kb * d;
+    float acc = 0.0f;
+    for (uint j = 0; j < n; ++j) {
+        uint code = uint(idx[j * nb + kb]);
+        acc += up[i * n + j] * cb[code * d + t];
+    }
+    dx[i * k + p] = acc;
+}
+
+// d_codebook[ne,d]: each entry gets the summed weight-gradient of the blocks that
+// index it. grad_W = upstreamᵀ·x; block bi=j·nb+kb contributes
+// grad_W_block[bi][t] = Σ_i upstream[i,j]·x[i, kb·d+t] to codebook[idx[bi]][t].
+// One thread per output (e,t) scans all blocks — no atomics, no pre-zero.
+kernel void synth_bwd_codebook(
+    device float* arena     [[buffer(0)]],
+    constant ulong& up_off  [[buffer(1)]],   // upstream [m,n] f32
+    constant ulong& idx_off [[buffer(2)]],   // indices  [n,nb] u8
+    constant ulong& x_off   [[buffer(3)]],   // x        [m,k] f32
+    constant ulong& dst_off [[buffer(4)]],   // d_codebook [ne,d] f32
+    constant uint& m  [[buffer(5)]],
+    constant uint& n  [[buffer(6)]],
+    constant uint& k  [[buffer(7)]],
+    constant uint& d  [[buffer(8)]],
+    constant uint& ne [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint t = gid.x;
+    uint e = gid.y;
+    if (e >= ne || t >= d) return;
+    device const float* up  = (device const float*)((device const char*)arena + up_off);
+    device const uchar* idx = (device const uchar*)arena + idx_off;
+    device const float* x   = (device const float*)((device const char*)arena + x_off);
+    device float* dcb       = (device float*)((device char*)arena + dst_off);
+    uint nb = k / d;
+    float acc = 0.0f;
+    for (uint j = 0; j < n; ++j) {
+        for (uint kb = 0; kb < nb; ++kb) {
+            if (uint(idx[j * nb + kb]) != e) continue;
+            uint col = kb * d + t;
+            float g = 0.0f;
+            for (uint i = 0; i < m; ++i) {
+                g += up[i * n + j] * x[i * k + col];
+            }
+            acc += g;
+        }
+    }
+    dcb[e * d + t] = acc;
+}
+"#;
+
+/// Register-blocked simdgroup GEMM with a bias + activation epilogue folded into
+/// the store (one dispatch, no separate epilogue pass). 64×64 tile, 4×4
+/// simdgroups × 2×2 accumulators — MPS-class arithmetic intensity (measured).
+/// Arena-buffer + byte-offset convention; f32; m,n multiple of 64, k of 16.
+/// `act`: 0 = none, 1 = ReLU. Beats MPS+separate-epilogue on small/aligned shapes
+/// (2.14× on 192²) — the win on kernels MPS can't fuse. Opt-in via encode gate.
+const RB_GEMM_BIAS_MSL: &str = r#"
+kernel void gemm_rb_bias(
+    device const float* A    [[buffer(0)]],   // A [M,K] f32 (arena)
+    device const float* B    [[buffer(1)]],   // B [K,N] f32 (arena or weight buf)
+    device const float* bias [[buffer(2)]],   // bias [N] f32
+    device float* C          [[buffer(3)]],   // C [M,N] f32 (arena)
+    constant uint& M [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& act [[buffer(7)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    const uint KT = 16;
+    uint sg_row = sgid / 4, sg_col = sgid % 4;
+    uint rbase = tgid.y * 64, cbase = tgid.x * 64;
+    threadgroup float A_tg[64 * 16];
+    threadgroup float B_tg[16 * 64];
+    threadgroup float C_tg[64 * 64];
+    simdgroup_float8x8 c00 = simdgroup_float8x8(0.0f), c01 = c00, c10 = c00, c11 = c00;
+    uint lin = sgid * 32 + slid;
+    for (uint kk = 0; kk < K; kk += KT) {
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 512 + lin;
+            uint ar = idx / KT, ac = idx % KT;
+            A_tg[idx] = A[(rbase + ar) * K + (kk + ac)];
+        }
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 512 + lin;
+            uint br = idx / 64, bc = idx % 64;
+            B_tg[br * 64 + bc] = B[(kk + br) * N + (cbase + bc)];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ki = 0; ki < KT; ki += 8) {
+            simdgroup_float8x8 a0, a1, b0, b1;
+            simdgroup_load(a0, &A_tg[(sg_row * 16 + 0) * KT + ki], KT);
+            simdgroup_load(a1, &A_tg[(sg_row * 16 + 8) * KT + ki], KT);
+            simdgroup_load(b0, &B_tg[ki * 64 + sg_col * 16 + 0], 64);
+            simdgroup_load(b1, &B_tg[ki * 64 + sg_col * 16 + 8], 64);
+            simdgroup_multiply_accumulate(c00, a0, b0, c00);
+            simdgroup_multiply_accumulate(c01, a0, b1, c01);
+            simdgroup_multiply_accumulate(c10, a1, b0, c10);
+            simdgroup_multiply_accumulate(c11, a1, b1, c11);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint cr = sg_row * 16, cc = sg_col * 16;
+    simdgroup_store(c00, &C_tg[(cr + 0) * 64 + cc + 0], 64);
+    simdgroup_store(c01, &C_tg[(cr + 0) * 64 + cc + 8], 64);
+    simdgroup_store(c10, &C_tg[(cr + 8) * 64 + cc + 0], 64);
+    simdgroup_store(c11, &C_tg[(cr + 8) * 64 + cc + 8], 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 8; ++i) {
+        uint idx = i * 512 + lin;
+        uint r = idx / 64, cn = idx % 64;
+        uint gc = cbase + cn;
+        float v = C_tg[idx] + bias[gc];
+        if (act == 1u) v = max(v, 0.0f);
+        C[(rbase + r) * N + gc] = v;
+    }
+}
+"#;
+
+/// Fused reconstruct of the dense weight `W[k,n]` directly (coalesced write over
+/// n) from u8 indices + codebook — one dispatch replacing cast+gather+reshape+
+/// transpose. `W[kb·d+t, j] = codebook[idx[j·nb+kb], t]`, `nb=k/d`.
+// Fused reconstruct of the codebook weight in the BACKWARD-friendly `w_bt[n,k]`
+// layout (cast+gather+reshape in one dispatch, no transpose). The model emits
+// `W[k,n] = Transpose(this)`, so the forward transpose is the only conversion and
+// the backward `dx = dy·w_bt` reuses this buffer for free (AD cancels `Transposeᵀ`).
+// Coalesced write over the fast `k` axis.
+const SYNTH_RECON_NK_MSL: &str = r#"
+kernel void synth_reconstruct_nk(
+    device float* arena     [[buffer(0)]],
+    constant ulong& idx_off [[buffer(1)]],
+    constant ulong& cb_off  [[buffer(2)]],
+    constant ulong& w_off   [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& k [[buffer(5)]],
+    constant uint& d [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint j = gid.x;   // k (fast → coalesced write)
+    uint i = gid.y;   // n
+    if (j >= k || i >= n) return;
+    uint nb = k / d;
+    device const uchar* idx = (device const uchar*)arena + idx_off;
+    device const float* cb  = (device const float*)((device const char*)arena + cb_off);
+    device float* w         = (device float*)((device char*)arena + w_off);
+    uint kb = j / d, t = j - kb * d;
+    uint code = uint(idx[i * nb + kb]);
+    w[i * k + j] = cb[code * d + t];
+}
+"#;
+
+macro_rules! synth_matmul_kernels {
+    ( $( $suffix:literal => $elem:literal );+ $(;)? ) => {
+        fn synth_matmul_msl() -> String {
+            let mut src = String::new();
+            $(
+                src.push_str(&SYNTH_SPLITK_TMPL.replace("{S}", $suffix).replace("{T}", $elem));
+                src.push_str(&SYNTH_MM_TMPL.replace("{S}", $suffix).replace("{T}", $elem));
+            )+
+            src.push_str(SYNTH_RECON_MSL);
+            src.push_str(SYNTH_RECON_H_MSL);
+            src.push_str(SYNTH_TILED_MSL);
+            src.push_str(SYNTH_TILED_H_MSL);
+            src.push_str(SYNTH_BWD_MSL);
+            src.push_str(RB_GEMM_BIAS_MSL);
+            src.push_str(SYNTH_RECON_NK_MSL);
+            src
+        }
+    };
+}
+
+synth_matmul_kernels! {
+    ""   => "float";
+    "_h" => "half";
 }
 
 /// The core scalar activations paired with their Metal kernel base name — the
@@ -8515,7 +10915,226 @@ fn pow_scalar_fn_msl() -> String {
     )
 }
 
-fn msl_source() -> String {
+/// f32 + f16-KV decode SDPA generated from ONE template (below): the K/V
+/// buffers are `__KV__` (`float` or `half`), while Q, the online-softmax
+/// accumulation, and the output stay f32 — so `sdpa_decode_m1_f16kv` reads a
+/// half-sized KV cache with no accumulation-precision change. `float()` /
+/// `float4()` are no-ops on the f32 variant.
+const SDPA_DECODE_M1_TEMPLATE: &str = r####"kernel void __NAME__(
+    device const float* arena_q   [[buffer(0)]],
+    device const __KV__* arena_k   [[buffer(1)]],
+    device const __KV__* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& heads       [[buffer(6)]],
+    constant uint& head_dim    [[buffer(7)]],
+    constant uint& q_stride    [[buffer(8)]],
+    constant uint& mask_kind   [[buffer(9)]],
+    constant uint& seq_k       [[buffer(10)]],
+    constant uint& k_stride    [[buffer(11)]],
+    constant uint& bhsd        [[buffer(12)]],
+    constant uint& window      [[buffer(13)]],
+    constant float& score_scale  [[buffer(14)]],
+    constant float& attn_softcap [[buffer(15)]],
+    constant SdpaOffsets& byte_offs [[buffer(16)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const __KV__* K = (device const __KV__*)((device const char*)arena_k + byte_offs.k);
+    device const __KV__* V = (device const __KV__*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+
+    // TG=32 × dh≤128 → 16 KiB for partial O; fits Apple7/8 32 KiB tg limit.
+    constexpr uint MAX_DH = 128u;
+    constexpr uint TG = 32u;
+    threadgroup float tg_m[TG];
+    threadgroup float tg_l[TG];
+    threadgroup float tg_o[TG * MAX_DH];
+
+    uint bi = tgid / heads;
+    uint hi = tgid % heads;
+    if (bi >= batch) return;
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint q_offset = seq_k - 1u;
+    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+    // V/output per-head width (asymmetric MLA; == head_dim for symmetric).
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+
+    // Large head_dim OR v_head_dim: one thread walks all of K (rare for LLM
+    // decode; Gemma-4, and MLA where qk=192 exceeds MAX_DH).
+    if (head_dim > MAX_DH || vdh > MAX_DH || tsize < 2u) {
+        if (tid != 0u) return;
+        float q_reg[512];
+        for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
+        float m_acc = -1e30f;
+        float l_acc = 0.0f;
+        float o_acc[512];
+        for (uint d = 0; d < vdh; ++d) o_acc[d] = 0.0f;
+        for (uint ki = 0; ki < seq_k; ++ki) {
+            uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) dot += q_reg[d] * float(K[k_base + d]);
+            float s = dot * scale;
+            if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+            if (mask_kind == 1u) {
+                if (ki > q_offset) s = -1e9f;
+            } else if (mask_kind == 2u) {
+                if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
+            } else if (mask_kind == 4u) {
+                uint lo = q_offset > window ? q_offset - window : 0u;
+                if (ki < lo || ki > q_offset) s = -1e9f;
+            }
+            // Masked positions contribute 0; skip them so a masked V slot holding
+            // inf (uninitialized f16 KV padding) can't poison the accumulator via
+            // 0*inf = NaN. Bit-identical for finite (f32) padding.
+            if (s <= -1.0e9f) continue;
+            float m_new = max(m_acc, s);
+            float e_old = exp(m_acc - m_new);
+            float e_cur = exp(s - m_new);
+            l_acc = e_old * l_acc + e_cur;
+            uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+            for (uint d = 0; d < vdh; ++d) {
+                o_acc[d] = e_old * o_acc[d] + e_cur * float(V[v_base + d]);
+            }
+            m_acc = m_new;
+        }
+        float inv_l = 1.0f / l_acc;
+        uint o_base = qkv_out_offset(bi, hi, 0u, heads, 1u, vdh, q_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) OUT[o_base + d] = o_acc[d] * inv_l;
+        return;
+    }
+
+    float q_reg[MAX_DH];
+    for (uint d = tid; d < head_dim; d += tsize) tg_o[d] = Q[q_base + d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = 0; d < head_dim; ++d) q_reg[d] = tg_o[d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_acc = -1e30f;
+    float l_acc = 0.0f;
+    float o_acc[MAX_DH];
+    for (uint d = 0; d < vdh; ++d) o_acc[d] = 0.0f;
+
+    for (uint ki = tid; ki < seq_k; ki += tsize) {
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; d += 4u) {
+            if (d + 3u < head_dim) {
+                float4 qv = float4(q_reg[d], q_reg[d + 1u], q_reg[d + 2u], q_reg[d + 3u]);
+                float4 kv = float4(*(device const __KV__4*)(K + k_base + d));
+                dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            } else {
+                for (uint dd = d; dd < head_dim; ++dd) dot += q_reg[dd] * float(K[k_base + dd]);
+            }
+        }
+        float s = dot * scale;
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+        if (mask_kind == 1u) {
+            if (ki > q_offset) s = -1e9f;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
+        } else if (mask_kind == 4u) {
+            uint lo = q_offset > window ? q_offset - window : 0u;
+            if (ki < lo || ki > q_offset) s = -1e9f;
+        }
+        // Skip masked positions (contribute 0) so an inf in a masked V slot
+        // (uninitialized f16 KV padding) can't poison the accumulator via
+        // 0*inf = NaN. Bit-identical for finite (f32) padding.
+        if (s <= -1.0e9f) continue;
+        float m_new = max(m_acc, s);
+        float e_old = exp(m_acc - m_new);
+        float e_cur = exp(s - m_new);
+        l_acc = e_old * l_acc + e_cur;
+        uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) {
+            o_acc[d] = e_old * o_acc[d] + e_cur * float(V[v_base + d]);
+        }
+        m_acc = m_new;
+    }
+
+    // Idle lanes beyond TG keep identity merge state (already set if tid>=TG).
+    if (tid < TG) {
+        tg_m[tid] = m_acc;
+        tg_l[tid] = l_acc;
+        for (uint d = 0; d < vdh; ++d) tg_o[tid * MAX_DH + d] = o_acc[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = TG / 2u; stride > 0u; stride /= 2u) {
+        if (tid < stride) {
+            float m1 = tg_m[tid];
+            float m2 = tg_m[tid + stride];
+            float m_new = max(m1, m2);
+            float e1 = exp(m1 - m_new);
+            float e2 = exp(m2 - m_new);
+            tg_l[tid] = e1 * tg_l[tid] + e2 * tg_l[tid + stride];
+            tg_m[tid] = m_new;
+            for (uint d = 0; d < vdh; ++d) {
+                tg_o[tid * MAX_DH + d] =
+                    e1 * tg_o[tid * MAX_DH + d] + e2 * tg_o[(tid + stride) * MAX_DH + d];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        float inv_l = 1.0f / tg_l[0];
+        uint o_base = qkv_out_offset(bi, hi, 0u, heads, 1u, vdh, q_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) OUT[o_base + d] = tg_o[d] * inv_l;
+    }
+}"####;
+
+macro_rules! sdpa_decode_m1_variant {
+    ($name:expr, $kv:expr) => {
+        SDPA_DECODE_M1_TEMPLATE
+            .replace("__NAME__", $name)
+            .replace("__KV__", $kv)
+    };
+}
+
+/// Mid-axis concat segment, parameterized by input (`__IN__`) and output
+/// (`__OUT__`) element type. The write casts `(__OUT__)(src)`, so a mismatched
+/// pair converts precision (f32↔f16) instead of reinterpreting raw bytes.
+const CONCAT_MIDAXIS_SEG_TMPL: &str = r####"kernel void __NAME__(
+    device char* arena       [[buffer(0)]],
+    constant ulong& dst_byte [[buffer(1)]],
+    constant ulong& src_byte [[buffer(2)]],
+    constant uint& outer     [[buffer(3)]],
+    constant uint& dst_axis  [[buffer(4)]],
+    constant uint& src_axis  [[buffer(5)]],
+    constant uint& inner     [[buffer(6)]],
+    constant uint& dst_col   [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = outer * src_axis * inner;
+    if (gid >= total) return;
+    uint ii = gid % inner;
+    uint tmp = gid / inner;
+    uint a = tmp % src_axis;
+    uint o = tmp / src_axis;
+    device const __IN__* src = (device const __IN__*)(arena + src_byte);
+    device __OUT__* dst      = (device __OUT__*)(arena + dst_byte);
+    dst[(o * dst_axis + dst_col + a) * inner + ii] = (__OUT__)(src[(o * src_axis + a) * inner + ii]);
+}
+"####;
+
+/// Generate one concat-midaxis kernel `$name` reading `$in`, writing `$out`.
+macro_rules! concat_midaxis_variant {
+    ($name:expr, $in:expr, $out:expr) => {
+        CONCAT_MIDAXIS_SEG_TMPL
+            .replace("__NAME__", $name)
+            .replace("__IN__", $in)
+            .replace("__OUT__", $out)
+    };
+}
+
+pub(crate) fn msl_source() -> String {
     // Substitute the generated dispatch/kernels at their markers. The backward
     // derivative dispatch must be defined before the `activation_backward` kernel
     // that calls it; the in-place activation kernels are standalone entry points.
@@ -8532,21 +11151,54 @@ fn msl_source() -> String {
         .replace(
             "// @@RLX_COMPARE_FN@@",
             &rlxsl::compare::msl_compare_module(),
+        )
+        .replace(
+            "// @@RLX_SDPA_DECODE_M1@@",
+            &format!(
+                "{}\n{}",
+                sdpa_decode_m1_variant!("sdpa_decode_m1", "float"),
+                sdpa_decode_m1_variant!("sdpa_decode_m1_f16kv", "half"),
+            ),
+        )
+        .replace(
+            "// @@RLX_CONCAT_MIDAXIS@@",
+            &format!(
+                "{}\n{}\n{}\n{}",
+                concat_midaxis_variant!("concat_midaxis_seg", "float", "float"),
+                concat_midaxis_variant!("concat_midaxis_seg_h", "half", "half"),
+                concat_midaxis_variant!("concat_midaxis_seg_f32_to_f16", "float", "half"),
+                concat_midaxis_variant!("concat_midaxis_seg_f16_to_f32", "half", "float"),
+            ),
+        )
+        .replace(
+            "// @@RLX_SGEMM_TILES@@",
+            // 64×64 tile config (TROWS=64 → 8 simdgroups, NACC=8 → TCOLS=64).
+            // Add a config (e.g. 64×128: trows=64, nacc=16) in one line + a pipeline.
+            &format!(
+                "{}\n{}",
+                sgemm_tile_variant!("sgemm_simd64", 64, 8),
+                sgemm_splitk_variant!("sgemm_simd64_splitk", 64, 8),
+            ),
         );
     format!(
-        "{core}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}\n{}",
-        scalar_act_msl()
+        "{core}\n{RLX_KERNELS_MSL_DEQUANT}\n{RLX_KERNELS_MSL_FFT_GPU}\n{RLX_KERNELS_MSL_SPLAT}\n{RLX_KERNELS_MSL_SPLAT_CONIC}\n{}\n{}",
+        scalar_act_msl(),
+        synth_matmul_msl()
     )
 }
 
 pub struct Kernels {
     pub library: Library,
     pub sgemm: ComputePipelineState,
+    pub sgemm_f16a: ComputePipelineState,
     pub sgemm_f16w: ComputePipelineState,
     pub sgemm_f16w_small_m: ComputePipelineState,
     pub sgemm_simd: ComputePipelineState,
     pub sgemm_simd_bias: ComputePipelineState,
     pub sgemm_simd_4x4: ComputePipelineState,
+    pub sgemm_simd64: ComputePipelineState,
+    pub sgemm_simd64_splitk: ComputePipelineState,
+    pub zero_f32: ComputePipelineState,
     pub sgemm_simd_4x4_bias: ComputePipelineState,
     pub hgemm_simd_4x4: ComputePipelineState,
     pub hgemm_simd_4x4_bias: ComputePipelineState,
@@ -8593,7 +11245,9 @@ pub struct Kernels {
     pub copy_f32: ComputePipelineState,
     pub copy4: ComputePipelineState,
     pub sgemm_simd_padded: ComputePipelineState,
+    pub sgemm_simd_padded_residual: ComputePipelineState,
     pub sgemm_simd_padded_f16w: ComputePipelineState,
+    pub gemv_f16w_splitk: ComputePipelineState,
     pub sgemm_simd_padded_bias: ComputePipelineState,
     pub sgemm_tiled: ComputePipelineState,
     pub bias_add: ComputePipelineState,
@@ -8645,9 +11299,16 @@ pub struct Kernels {
     pub gated_residual_backward: ComputePipelineState,
     pub gated_residual_backward_h: ComputePipelineState,
     pub sdpa: ComputePipelineState,
+    pub sdpa_simd: ComputePipelineState,
+    pub sdpa_simd_h16: ComputePipelineState,
     pub sdpa_long: ComputePipelineState,
+    pub sdpa_long_occpad: ComputePipelineState,
     pub sdpa_decode_m1: ComputePipelineState,
+    pub sdpa_decode_m1_f16kv: ComputePipelineState,
     pub sdpa_fa_f32: ComputePipelineState,
+    pub sdpa_splitk: ComputePipelineState,
+    pub sdpa_fa2: ComputePipelineState,
+    pub sdpa_mma: ComputePipelineState,
     pub argreduce: ComputePipelineState,
     /// Cooperative last-axis ArgMax/ArgMin (one threadgroup per row) — used
     /// for `inner == 1` (decode logits) instead of the serial `argreduce`.
@@ -8657,6 +11318,9 @@ pub struct Kernels {
     /// On-GPU temperature/top-k/top-p/Philox logit sampler (one threadgroup
     /// per batch row). Replaces the unified-memory host fallback.
     pub sample_logits: ComputePipelineState,
+    pub rng_normal_philox: ComputePipelineState,
+    pub rng_uniform_philox: ComputePipelineState,
+    pub rng_fill_zero: ComputePipelineState,
     pub dequant_matmul_int8: ComputePipelineState,
     pub dequant_matmul_int4: ComputePipelineState,
     pub dequant_matmul_fp8: ComputePipelineState,
@@ -8664,6 +11328,8 @@ pub struct Kernels {
     pub dequant_matmul_mxfp4x2: ComputePipelineState,
     pub dequant_matmul_mlx_gemv: ComputePipelineState,
     pub dequant_matmul_mlx_gemm: ComputePipelineState,
+    pub grouped_dequant_matmul_mlx_gemv: ComputePipelineState,
+    pub grouped_dequant_matmul_mlx_gemm: ComputePipelineState,
     pub rope: ComputePipelineState,
     pub fused_swiglu: ComputePipelineState,
     pub fused_swiglu_h: ComputePipelineState,
@@ -8680,6 +11346,8 @@ pub struct Kernels {
     pub concat_segment_lastax_h: ComputePipelineState,
     pub concat_midaxis_seg: ComputePipelineState,
     pub concat_midaxis_seg_h: ComputePipelineState,
+    pub concat_midaxis_seg_f32_to_f16: ComputePipelineState,
+    pub concat_midaxis_seg_f16_to_f32: ComputePipelineState,
     pub elem_sub: ComputePipelineState,
     pub elem_div: ComputePipelineState,
     pub elem_max: ComputePipelineState,
@@ -8701,6 +11369,7 @@ pub struct Kernels {
     pub fake_quantize_fixed: ComputePipelineState,
     pub fake_quantize_perbatch: ComputePipelineState,
     pub reduce_axes: ComputePipelineState,
+    pub reduce_axes_sum_simd: ComputePipelineState,
     /// Double-single (2× f32 ≈ f64) full-sum reduction — high-precision
     /// `Op::Reduce{Sum}` on Metal (opt-in via `RLX_METAL_DW_SUM`).
     pub dw_sum_arena: ComputePipelineState,
@@ -8709,6 +11378,7 @@ pub struct Kernels {
     pub scatter_add_zero: ComputePipelineState,
     pub scatter_add_accumulate: ComputePipelineState,
     pub transpose_nd: ComputePipelineState,
+    pub transpose_nd_h: ComputePipelineState,
     pub transpose_2d_f32: ComputePipelineState,
     pub transpose_2d_tiled_f32: ComputePipelineState,
     pub transpose_last2_batched_f32: ComputePipelineState,
@@ -8750,6 +11420,7 @@ pub struct Kernels {
     pub tan_inplace: ComputePipelineState,
     pub atan_inplace: ComputePipelineState,
     pub softmax_lastax: ComputePipelineState,
+    pub softmax_lastax_causal: ComputePipelineState,
     pub softmax_cross_entropy_dense: ComputePipelineState,
     pub softmax_cross_entropy_with_logits: ComputePipelineState,
     pub softmax_cross_entropy_backward: ComputePipelineState,
@@ -8783,6 +11454,10 @@ pub struct Kernels {
     /// for `m == 1` (decode) GgufQ4K matmuls; m > 1 still goes through
     /// `dequant_gguf + encode_mps_sgemm_bt`.
     pub q4k_mv_f32: ComputePipelineState,
+    /// Fused single-pass Q3_K decode GEMV (`m == 1`); mirrors `q4k_mv_f32`.
+    pub q3k_mv_f32: ComputePipelineState,
+    /// Fused single-pass Q6_K decode GEMV (`m == 1`) — the Q6_K LM head.
+    pub q6k_mv_f32: ComputePipelineState,
     pub q4_0_mv_f32: ComputePipelineState,
     pub q4_1_mv_f32: ComputePipelineState,
     pub q8_0_mv_f32: ComputePipelineState,
@@ -8801,6 +11476,21 @@ pub struct Kernels {
     pub q2_0_mm_f32: ComputePipelineState,
     pub iq4_nl_mv_f32: ComputePipelineState,
     pub iq2_xxs_mv_f32: ComputePipelineState,
+    pub synth_matmul_codebook: ComputePipelineState,
+    pub gemm_rb_bias: ComputePipelineState,
+    pub synth_reconstruct_nk: ComputePipelineState,
+    pub synth_bwd_dx: ComputePipelineState,
+    pub synth_bwd_codebook: ComputePipelineState,
+    pub synth_matmul_codebook_mm: ComputePipelineState,
+    pub synth_matmul_codebook_h: ComputePipelineState,
+    pub synth_matmul_codebook_mm_h: ComputePipelineState,
+    pub synth_matmul_codebook_tiled: ComputePipelineState,
+    pub synth_matmul_codebook_tiled_h: ComputePipelineState,
+    pub synth_reconstruct: ComputePipelineState,
+    pub synth_reconstruct_h: ComputePipelineState,
+    pub spline_activation: ComputePipelineState,
+    pub spline_activation_backward_x: ComputePipelineState,
+    pub spline_activation_backward_coeff: ComputePipelineState,
     pub iq2_xs_mv_f32: ComputePipelineState,
     pub iq2_s_mv_f32: ComputePipelineState,
     pub iq3_xxs_mv_f32: ComputePipelineState,
@@ -8847,6 +11537,7 @@ pub struct Kernels {
     pub layer_norm_bwd_gamma: ComputePipelineState,
     pub layer_norm_bwd_stats_f32: ComputePipelineState,
     pub layer_norm_bwd_gamma_reduce_f32: ComputePipelineState,
+    pub layer_norm_bwd_gamma_reduce_simd: ComputePipelineState,
     pub group_norm_bwd_input: ComputePipelineState,
     pub group_norm_bwd_gamma: ComputePipelineState,
     pub group_norm_bwd_beta: ComputePipelineState,
@@ -8864,6 +11555,13 @@ pub struct Kernels {
     pub attn_bwd_dv_f32: ComputePipelineState,
     pub attn_bwd_dq_f32: ComputePipelineState,
     pub attn_bwd_dk_f32: ComputePipelineState,
+    pub attn_bwd_scores_batched_f32: ComputePipelineState,
+    pub attn_bwd_dp_batched_f32: ComputePipelineState,
+    pub attn_bwd_ds_batched_f32: ComputePipelineState,
+    pub attn_bwd_dv_batched_f32: ComputePipelineState,
+    pub attn_bwd_dq_batched_f32: ComputePipelineState,
+    pub attn_bwd_dk_batched_f32: ComputePipelineState,
+    pub attn_bwd_fused_f32: ComputePipelineState,
     pub gather_bwd_zero: ComputePipelineState,
     pub gather_bwd_acc: ComputePipelineState,
     /// Native Gaussian splat tile raster (see `splat.msl`).
@@ -8928,6 +11626,11 @@ kernel void dw_sum_arena(device const float* x [[buffer(0)]],
 impl Kernels {
     fn new() -> Self {
         let dev = metal_device().expect("Metal device required");
+        if let Some(path) = rlx_ir::env::var("RLX_METAL_DUMP_MSL") {
+            let s = msl_source();
+            let _ = std::fs::write(&path, &s);
+            eprintln!("[msl-dump] wrote {} bytes of MSL source to {path}", s.len());
+        }
         let library = crate::pipeline_cache::load_or_compile_library(&dev.device, &msl_source());
         let pipeline = |name: &str| -> ComputePipelineState {
             let f = library.get_function(name, None).expect(name);
@@ -8957,11 +11660,15 @@ impl Kernels {
         Self {
             dw_sum_arena,
             sgemm: pipeline("sgemm"),
+            sgemm_f16a: pipeline("sgemm_f16a"),
             sgemm_f16w: pipeline("sgemm_f16w"),
             sgemm_f16w_small_m: pipeline("sgemm_f16w_small_m"),
             sgemm_simd: pipeline("sgemm_simd"),
             sgemm_simd_bias: pipeline("sgemm_simd_bias"),
             sgemm_simd_4x4: pipeline("sgemm_simd_4x4"),
+            sgemm_simd64: pipeline("sgemm_simd64"),
+            sgemm_simd64_splitk: pipeline("sgemm_simd64_splitk"),
+            zero_f32: pipeline("zero_f32"),
             sgemm_simd_4x4_bias: pipeline("sgemm_simd_4x4_bias"),
             hgemm_simd_4x4: pipeline("hgemm_simd_4x4"),
             hgemm_simd_4x4_bias: pipeline("hgemm_simd_4x4_bias"),
@@ -9007,7 +11714,9 @@ impl Kernels {
             copy_f32: pipeline("copy_f32"),
             copy4: pipeline("copy4"),
             sgemm_simd_padded: pipeline("sgemm_simd_padded"),
+            sgemm_simd_padded_residual: pipeline("sgemm_simd_padded_residual"),
             sgemm_simd_padded_f16w: pipeline("sgemm_simd_padded_f16w"),
+            gemv_f16w_splitk: pipeline("gemv_f16w_splitk"),
             sgemm_simd_padded_bias: pipeline("sgemm_simd_padded_bias"),
             sgemm_tiled: pipeline("sgemm_tiled"),
             bias_add: pipeline("bias_add"),
@@ -9059,13 +11768,23 @@ impl Kernels {
             gated_residual_backward: pipeline("gated_residual_backward"),
             gated_residual_backward_h: pipeline("gated_residual_backward_h"),
             sdpa: pipeline("sdpa"),
+            sdpa_simd: pipeline("sdpa_simd"),
+            sdpa_simd_h16: pipeline("sdpa_simd_h16"),
             sdpa_long: pipeline("sdpa_long"),
+            sdpa_long_occpad: pipeline("sdpa_long_occpad"),
             sdpa_decode_m1: pipeline("sdpa_decode_m1"),
+            sdpa_decode_m1_f16kv: pipeline("sdpa_decode_m1_f16kv"),
             sdpa_fa_f32: pipeline("sdpa_fa_f32"),
+            sdpa_splitk: pipeline("sdpa_splitk"),
+            sdpa_fa2: pipeline("sdpa_fa2"),
+            sdpa_mma: pipeline("sdpa_mma"),
             argreduce: pipeline("argreduce"),
             argreduce_lastaxis: pipeline("argreduce_lastaxis"),
             vq_assign: pipeline("vq_assign"),
             sample_logits: pipeline("sample_logits"),
+            rng_normal_philox: pipeline("rng_normal_philox"),
+            rng_uniform_philox: pipeline("rng_uniform_philox"),
+            rng_fill_zero: pipeline("rng_fill_zero"),
             dequant_matmul_int8: pipeline("dequant_matmul_int8"),
             dequant_matmul_int4: pipeline("dequant_matmul_int4"),
             dequant_matmul_fp8: pipeline("dequant_matmul_fp8"),
@@ -9073,6 +11792,8 @@ impl Kernels {
             dequant_matmul_mxfp4x2: pipeline("dequant_matmul_mxfp4x2"),
             dequant_matmul_mlx_gemv: pipeline("dequant_matmul_mlx_gemv"),
             dequant_matmul_mlx_gemm: pipeline("dequant_matmul_mlx_gemm"),
+            grouped_dequant_matmul_mlx_gemv: pipeline("grouped_dequant_matmul_mlx_gemv"),
+            grouped_dequant_matmul_mlx_gemm: pipeline("grouped_dequant_matmul_mlx_gemm"),
             rope: pipeline("rope"),
             fused_swiglu: pipeline("fused_swiglu"),
             fused_swiglu_h: pipeline("fused_swiglu_h"),
@@ -9087,6 +11808,8 @@ impl Kernels {
             concat_segment_lastax_h: pipeline("concat_segment_lastax_h"),
             concat_midaxis_seg: pipeline("concat_midaxis_seg"),
             concat_midaxis_seg_h: pipeline("concat_midaxis_seg_h"),
+            concat_midaxis_seg_f32_to_f16: pipeline("concat_midaxis_seg_f32_to_f16"),
+            concat_midaxis_seg_f16_to_f32: pipeline("concat_midaxis_seg_f16_to_f32"),
             elem_sub: pipeline("elem_sub"),
             elem_div: pipeline("elem_div"),
             elem_max: pipeline("elem_max"),
@@ -9108,11 +11831,13 @@ impl Kernels {
             fake_quantize_fixed: pipeline("fake_quantize_fixed"),
             fake_quantize_perbatch: pipeline("fake_quantize_perbatch"),
             reduce_axes: pipeline("reduce_axes"),
+            reduce_axes_sum_simd: pipeline("reduce_axes_sum_simd"),
             topk_lastax: pipeline("topk_lastax"),
             grouped_matmul: pipeline("grouped_matmul"),
             scatter_add_zero: pipeline("scatter_add_zero"),
             scatter_add_accumulate: pipeline("scatter_add_accumulate"),
             transpose_nd: pipeline("transpose_nd"),
+            transpose_nd_h: pipeline("transpose_nd_h"),
             transpose_2d_f32: pipeline("transpose_2d_f32"),
             transpose_2d_tiled_f32: pipeline("transpose_2d_tiled_f32"),
             transpose_last2_batched_f32: pipeline("transpose_last2_batched_f32"),
@@ -9156,6 +11881,7 @@ impl Kernels {
             tan_inplace: pipeline("tan_inplace"),
             atan_inplace: pipeline("atan_inplace"),
             softmax_lastax: pipeline("softmax_lastax"),
+            softmax_lastax_causal: pipeline("softmax_lastax_causal"),
             softmax_cross_entropy_dense: pipeline("softmax_cross_entropy_dense"),
             softmax_cross_entropy_with_logits: pipeline("softmax_cross_entropy_with_logits"),
             softmax_cross_entropy_backward: pipeline("softmax_cross_entropy_backward"),
@@ -9181,6 +11907,8 @@ impl Kernels {
             mamba2: pipeline("mamba2"),
             dequant_gguf: pipeline("dequant_gguf"),
             q4k_mv_f32: pipeline("q4k_mv_f32"),
+            q3k_mv_f32: pipeline("q3k_mv_f32"),
+            q6k_mv_f32: pipeline("q6k_mv_f32"),
             q1_0_mv_f32: pipeline("q1_0_mv_f32"),
             q1_0_mv_f32_sg: pipeline("q1_0_mv_f32_sg"),
             q1_0_dual_mv_f32_sg: pipeline("q1_0_dual_mv_f32_sg"),
@@ -9194,6 +11922,21 @@ impl Kernels {
             q8_0_mv_f32: pipeline("q8_0_mv_f32"),
             iq4_nl_mv_f32: pipeline("iq4_nl_mv_f32"),
             iq2_xxs_mv_f32: pipeline("iq2_xxs_mv_f32"),
+            synth_matmul_codebook: pipeline("synth_matmul_codebook"),
+            gemm_rb_bias: pipeline("gemm_rb_bias"),
+            synth_reconstruct_nk: pipeline("synth_reconstruct_nk"),
+            synth_bwd_dx: pipeline("synth_bwd_dx"),
+            synth_bwd_codebook: pipeline("synth_bwd_codebook"),
+            synth_matmul_codebook_mm: pipeline("synth_matmul_codebook_mm"),
+            synth_matmul_codebook_h: pipeline("synth_matmul_codebook_h"),
+            synth_matmul_codebook_mm_h: pipeline("synth_matmul_codebook_mm_h"),
+            synth_matmul_codebook_tiled: pipeline("synth_matmul_codebook_tiled"),
+            synth_matmul_codebook_tiled_h: pipeline("synth_matmul_codebook_tiled_h"),
+            synth_reconstruct: pipeline("synth_reconstruct"),
+            synth_reconstruct_h: pipeline("synth_reconstruct_h"),
+            spline_activation: pipeline("spline_activation"),
+            spline_activation_backward_x: pipeline("spline_activation_backward_x"),
+            spline_activation_backward_coeff: pipeline("spline_activation_backward_coeff"),
             iq2_xs_mv_f32: pipeline("iq2_xs_mv_f32"),
             iq2_s_mv_f32: pipeline("iq2_s_mv_f32"),
             iq3_xxs_mv_f32: pipeline("iq3_xxs_mv_f32"),
@@ -9226,6 +11969,7 @@ impl Kernels {
             layer_norm_bwd_gamma: pipeline("layer_norm_bwd_gamma"),
             layer_norm_bwd_stats_f32: pipeline("layer_norm_bwd_stats_f32"),
             layer_norm_bwd_gamma_reduce_f32: pipeline("layer_norm_bwd_gamma_reduce_f32"),
+            layer_norm_bwd_gamma_reduce_simd: pipeline("layer_norm_bwd_gamma_reduce_simd"),
             group_norm_bwd_input: pipeline("group_norm_bwd_input"),
             group_norm_bwd_gamma: pipeline("group_norm_bwd_gamma"),
             group_norm_bwd_beta: pipeline("group_norm_bwd_beta"),
@@ -9243,6 +11987,13 @@ impl Kernels {
             attn_bwd_dv_f32: pipeline("attn_bwd_dv_f32"),
             attn_bwd_dq_f32: pipeline("attn_bwd_dq_f32"),
             attn_bwd_dk_f32: pipeline("attn_bwd_dk_f32"),
+            attn_bwd_scores_batched_f32: pipeline("attn_bwd_scores_batched_f32"),
+            attn_bwd_dp_batched_f32: pipeline("attn_bwd_dp_batched_f32"),
+            attn_bwd_ds_batched_f32: pipeline("attn_bwd_ds_batched_f32"),
+            attn_bwd_dv_batched_f32: pipeline("attn_bwd_dv_batched_f32"),
+            attn_bwd_dq_batched_f32: pipeline("attn_bwd_dq_batched_f32"),
+            attn_bwd_dk_batched_f32: pipeline("attn_bwd_dk_batched_f32"),
+            attn_bwd_fused_f32: pipeline("attn_bwd_fused_f32"),
             gather_bwd_zero: pipeline("gather_bwd_zero"),
             gather_bwd_acc: pipeline("gather_bwd_acc"),
             gaussian_splat_rasterize: pipeline("gaussian_splat_rasterize"),
@@ -9285,6 +12036,101 @@ impl Kernels {
     /// Device buffer holding the IQ grid LUTs (see field docs).
     pub fn iq_grid_buffer(&self) -> &Buffer {
         &self.iq_grid_lut
+    }
+
+    /// Dump compiled-pipeline occupancy characteristics for the training-hot
+    /// kernels (`RLX_METAL_KERNEL_STATS=1`). Reports, per kernel:
+    ///   maxTG   = maxTotalThreadsPerThreadgroup — the register-limited ceiling
+    ///             on threads/threadgroup (low ⇒ high register pressure).
+    ///   simdW   = threadExecutionWidth (32 on Apple).
+    ///   tgMem   = staticThreadgroupMemoryLength (bytes) — more ⇒ fewer
+    ///             concurrent threadgroups per core (occupancy).
+    ///   dispatch= threads/threadgroup we actually launch → occupancy vs maxTG.
+    pub fn dump_stats(&self) {
+        let rows: &[(&str, &ComputePipelineState, u64)] = &[
+            // (name, pipeline, threads/threadgroup we dispatch)
+            ("sdpa (serial softmax)", &self.sdpa, 32),
+            ("sdpa_simd (parallel)", &self.sdpa_simd, 32),
+            ("sdpa_simd_h16 (f16 scores)", &self.sdpa_simd_h16, 32),
+            ("sdpa_long (baseline fwd, seq>64)", &self.sdpa_long, 64),
+            (
+                "sdpa_long_occpad (same work +20KB tg)",
+                &self.sdpa_long_occpad,
+                64,
+            ),
+            ("sdpa_splitk (V1 split-K)", &self.sdpa_splitk, 32),
+            ("sdpa_fa2 (V2 flash-tile)", &self.sdpa_fa2, 64),
+            ("sdpa_mma (V3 simdgroup)", &self.sdpa_mma, 32),
+            (
+                "attn_bwd_dv_batched (6-pass bwd)",
+                &self.attn_bwd_dv_batched_f32,
+                64,
+            ),
+            (
+                "attn_bwd_dq_batched (6-pass bwd)",
+                &self.attn_bwd_dq_batched_f32,
+                64,
+            ),
+            (
+                "attn_bwd_fused (Level 2 fused bwd)",
+                &self.attn_bwd_fused_f32,
+                64,
+            ),
+            ("sgemm_simd_4x4", &self.sgemm_simd_4x4, 64),
+            ("sgemm_simd", &self.sgemm_simd, 64),
+            ("sgemm_tiled", &self.sgemm_tiled, 256),
+            ("layer_norm (fwd)", &self.layer_norm, 128),
+            ("layer_norm_bwd (dx)", &self.layer_norm_bwd, 128),
+            (
+                "layer_norm_bwd_gamma_reduce_f32 (serial)",
+                &self.layer_norm_bwd_gamma_reduce_f32,
+                128,
+            ),
+            (
+                "layer_norm_bwd_gamma_reduce_simd",
+                &self.layer_norm_bwd_gamma_reduce_simd,
+                32,
+            ),
+            ("reduce_axes (serial)", &self.reduce_axes, 256),
+            ("reduce_axes_sum_simd", &self.reduce_axes_sum_simd, 32),
+            (
+                "attn_bwd_scores_batched",
+                &self.attn_bwd_scores_batched_f32,
+                64,
+            ),
+            ("attn_bwd_ds_batched", &self.attn_bwd_ds_batched_f32, 256),
+            ("gather_axis0 (embed fwd)", &self.gather_axis0, 64),
+            (
+                "scatter_add_accumulate (embed bwd)",
+                &self.scatter_add_accumulate,
+                64,
+            ),
+            ("softmax_lastax (lm head)", &self.softmax_lastax, 256),
+            (
+                "softmax_cross_entropy_dense",
+                &self.softmax_cross_entropy_dense,
+                256,
+            ),
+        ];
+        eprintln!("[kernel-stats] compiled-pipeline occupancy (Apple SIMD width 32):");
+        eprintln!(
+            "  {:42}  {:>6} {:>6} {:>7}  {:>8}  {:>6}",
+            "kernel", "maxTG", "simdW", "tgMem", "dispatch", "occ%"
+        );
+        for (name, p, disp) in rows {
+            let maxtg = p.max_total_threads_per_threadgroup();
+            let simdw = p.thread_execution_width();
+            let tgmem = p.static_threadgroup_memory_length();
+            let occ = if maxtg > 0 {
+                (*disp as f64) / (maxtg as f64) * 100.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  {:42}  {:>6} {:>6} {:>6}B  {:>8} {:>6.1}",
+                name, maxtg, simdw, tgmem, disp, occ
+            );
+        }
     }
 }
 
@@ -9331,7 +12177,12 @@ fn build_iq_grid_lut(device: &metal::DeviceRef) -> Buffer {
 /// Get or compile the global kernel library.
 pub fn kernels() -> &'static Kernels {
     static K: OnceLock<Kernels> = OnceLock::new();
-    K.get_or_init(Kernels::new)
+    let k = K.get_or_init(Kernels::new);
+    if rlx_ir::env::flag("RLX_METAL_KERNEL_STATS") {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| k.dump_stats());
+    }
+    k
 }
 
 /// Force MSL/metallib + pipeline state init (call once at process load).

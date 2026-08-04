@@ -743,11 +743,22 @@ pub(crate) fn exec_rms_norm(t: &Thunk, base: *mut u8) {
                 let in_row = &input[row * h..(row + 1) * h];
                 let out_row = &mut output[row * h..(row + 1) * h];
                 // RMS = sqrt(mean(x^2) + eps); scale = 1/RMS.
+                // Two-pass: mean(x²) = mean((x−mean)²) + mean². Subtracting the
+                // row mean first keeps the deviation sum well-conditioned when a
+                // large per-row DC offset (pre-norm residual streams) otherwise
+                // swamps the small variations in the one-pass f32 Σx². This is
+                // the canonical form all backends match.
+                let mut sum = 0f32;
+                for &v in in_row {
+                    sum += v;
+                }
+                let mean = sum * inv_h;
                 let mut sumsq = 0f32;
                 for &v in in_row {
-                    sumsq += v * v;
+                    let d = v - mean;
+                    sumsq += d * d;
                 }
-                let inv_rms = (sumsq * inv_h + *eps).sqrt().recip();
+                let inv_rms = (sumsq * inv_h + mean * mean + *eps).sqrt().recip();
                 for i in 0..h {
                     out_row[i] = in_row[i] * inv_rms * gamma[i] + beta[i];
                 }

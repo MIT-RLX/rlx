@@ -21,7 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use rlx_ir::{Graph, NodeId, Op};
-use rlx_runtime::{CompiledGraph, Device, Session};
+use rlx_runtime::{CompiledGraph, Device, PrecisionPolicy, Session};
 
 /// Clear the cache once it grows past this many distinct graphs, a simple
 /// backstop against unbounded growth in long-lived threads.
@@ -72,8 +72,27 @@ fn lookup(key: u64) -> Option<Rc<RefCell<CompiledGraph>>> {
     hit
 }
 
+/// Opt-in mixed-precision policy from `RLX_PRECISION` (default: F32, unchanged).
+/// `auto` = the Metal-safe policy (elementwise/reduction in F16, **matmul stays
+/// F32** — F16 matmul diverges on the residual/RoPE/gather paths); `f16`/`bf16`
+/// push matmul into low precision too (faster, but numerically riskier — bf16
+/// keeps F32's exponent range so it's the safer of the two).
+fn precision_policy_from_env() -> Option<PrecisionPolicy> {
+    match rlx_ir::env::var("RLX_PRECISION").as_deref() {
+        Some("auto") => Some(PrecisionPolicy::AutoMixed),
+        Some("f16") => Some(PrecisionPolicy::AutoMixedConservative),
+        Some("bf16") => Some(PrecisionPolicy::AutoMixedBf16),
+        Some("f16-all") => Some(PrecisionPolicy::AlwaysF16),
+        _ => None,
+    }
+}
+
 fn store(key: u64, device: Device, graph: Graph) -> Rc<RefCell<CompiledGraph>> {
-    let compiled = Rc::new(RefCell::new(Session::new(device).compile(graph)));
+    let mut session = Session::new(device);
+    if let Some(policy) = precision_policy_from_env() {
+        session = session.with_policy(policy);
+    }
+    let compiled = Rc::new(RefCell::new(session.compile(graph)));
     CACHE.with(|c| {
         let mut map = c.borrow_mut();
         if map.len() >= MAX_ENTRIES {

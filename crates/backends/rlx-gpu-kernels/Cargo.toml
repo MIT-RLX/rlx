@@ -16,7 +16,7 @@ documentation.workspace = true
 [build-dependencies]
 # Generates the shared unary/activation CUDA switch from the scalar-expression
 # manifest (single source across backends; native `erff` on this target).
-rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
+rlxsl = { workspace = true }
 
 [features]
 default = []

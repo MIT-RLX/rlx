@@ -42,8 +42,9 @@ pub use arch::{
 pub use config::{MlxArchConfig, MlxConfig, MlxQuantConfig, MlxQuantMode};
 pub use dequant::{
     QuantizedLayer, dequant_affine_f32, dequant_matmul_affine, dequant_matmul_mxfp4,
-    dequant_matvec_affine, dequant_mxfp4_f32, dequant_mxfp8_f32, mxfp4_scale_e8m0_to_f32,
-    pack_factor, validate_dequant_matmul_dims,
+    dequant_matvec_affine, dequant_matvec_mxfp4, dequant_mxfp4_f32, dequant_mxfp4_weights_f32,
+    dequant_mxfp8_f32, grouped_matmul_mxfp4_bt, mxfp4_scale_e8m0_to_f32, pack_factor,
+    validate_dequant_matmul_dims,
 };
 pub use graph::{
     PackedLinearBinding, build_mlp_chain_graph, build_parallel_dequant_graph,
@@ -54,7 +55,8 @@ pub use hf::{
     write_fetch_ok,
 };
 pub use load::{
-    LazyMlxWeights, MlxPackedLinear, MlxRead, MlxTensor, MlxWeights, load_path, load_path_lazy,
+    LazyMlxWeights, MlxPackedLinear, MlxRead, MlxTensor, MlxWeights, PackedMlxBorrow, load_path,
+    load_path_lazy,
 };
 pub use rope::{build_default_tables, default_inv_freq};
 

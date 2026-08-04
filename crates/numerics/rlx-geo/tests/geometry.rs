@@ -98,7 +98,7 @@ fn all_collinear(points: &[[i32; 2]]) -> bool {
 }
 
 fn check(points: &[[i32; 2]]) {
-    let tris = triangulate(points);
+    let tris = triangulate(points).unwrap();
     if all_collinear(points) {
         assert!(tris.is_empty(), "collinear input should yield no triangles");
         return;

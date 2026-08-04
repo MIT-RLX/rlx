@@ -60,7 +60,10 @@ struct Params {
     mask_batch_stride: u32,
     mask_head_stride: u32,
     kv_heads: u32,     // GQA/MQA: #KV heads query heads share (heads=MHA, 0=unset→MHA)
-    _pad_mask_1: u32,
+    // Asymmetric SDPA (DeepSeek/Kimi MLA): V rows + output are `v_head_dim`
+    // wide while Q/K scores still use `head_dim`. Equals `head_dim` for
+    // ordinary symmetric attention; 0 (zero-init) falls back to `head_dim`.
+    v_head_dim: u32,
     _pad_mask_2: u32,
 
     // Per-tensor strides (in f32 elements). Q/K/V/out can be in either
@@ -118,7 +121,12 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         + qi * params.o_seq_stride;
 
     let hd = params.head_dim;
-    if (hd > MAX_HEAD_DIM) { return; }
+    // V/output per-head width. For symmetric SDPA this equals `head_dim`;
+    // for MLA the V rows and output are `v_head_dim` wide while the Q·K
+    // score still contracts over `head_dim`. A zero-init params value
+    // (older callers / defaulted uniforms) falls back to `head_dim`.
+    let hd_v = select(params.v_head_dim, hd, params.v_head_dim == 0u);
+    if (hd > MAX_HEAD_DIM || hd_v > MAX_HEAD_DIM) { return; }
 
     // Cache Q[qi, :] in registers — read seq_k times by the dot product.
     var q_reg: array<f32, MAX_HEAD_DIM>;
@@ -126,11 +134,11 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         q_reg[d] = arena[q_base + d];
     }
 
-    // Online softmax accumulators.
+    // Online softmax accumulators. `o` spans the V-width `hd_v`.
     var m: f32 = -3.4e38;
     var l: f32 = 0.0;
     var o: array<f32, MAX_HEAD_DIM>;
-    for (var d: u32 = 0u; d < hd; d = d + 1u) { o[d] = 0.0; }
+    for (var d: u32 = 0u; d < hd_v; d = d + 1u) { o[d] = 0.0; }
 
     for (var s: u32 = 0u; s < params.seq_k; s = s + 1u) {
         // Score: scale * Q · K[s] + mask
@@ -162,16 +170,18 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         let e_old = exp(m - m_new);
         let e_cur = exp(score - m_new);
         l = e_old * l + e_cur;
+        // V rows are `hd_v` wide (v_seq_stride already reflects that width).
         let v_base = v_bh + s * params.v_seq_stride;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) {
+        for (var d: u32 = 0u; d < hd_v; d = d + 1u) {
             o[d] = e_old * o[d] + e_cur * arena[v_base + d];
         }
         m = m_new;
     }
 
-    // Normalize and emit. l is guaranteed > 0 (at least one finite score).
+    // Normalize and emit `hd_v`-wide output rows. l is guaranteed > 0
+    // (at least one finite score).
     let inv_l = 1.0 / l;
-    for (var d: u32 = 0u; d < hd; d = d + 1u) {
+    for (var d: u32 = 0u; d < hd_v; d = d + 1u) {
         arena[o_base + d] = o[d] * inv_l;
     }
 }

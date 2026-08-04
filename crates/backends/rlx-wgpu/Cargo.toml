@@ -25,16 +25,16 @@ native-gpu-fft = []
 [build-dependencies]
 # Generates the standalone unary/activation WGSL switch from the shared
 # scalar-expression manifest (single source across backends).
-rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
+rlxsl = { workspace = true }
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
-rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.14" }
+rlx-ir = { workspace = true }
+rlx-unfuse = { workspace = true }
 rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14", default-features = false, features = ["compile"] }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.14" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", features = ["splat"] }
-rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.14" }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
+rlx-compile = { workspace = true }
+rlx-cpu = { workspace = true, features = ["splat"] }
+rlx-gpu-host = { workspace = true }
+rlx-gguf = { workspace = true }
 
 # wgpu 30: WebGPU-spec dispatch/present renames, `get_mapped_range` → Result,
 # signed `%` fix on Vulkan SPIR-V, Metal bindless storage buffers, etc.
@@ -61,8 +61,8 @@ serde_json = "1"
 # so this never resolves against crates.io and needs no per-release pin bump.
 rlx = { path = "../../rlx", default-features = false, features = ["cpu", "gpu"] }
 rlx-runtime = { path = "../../core/rlx-runtime", features = ["gpu"] }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-gguf = { workspace = true }
+rlx-ir = { workspace = true }
 half = "2"
 pollster = "0.3"
 bytemuck = "1"

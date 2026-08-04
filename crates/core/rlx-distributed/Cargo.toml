@@ -13,10 +13,10 @@ homepage.workspace      = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir      = { path = "../rlx-ir", version = "0.2.14", features = ["serialize"] }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.14" }
+rlx-ir      = { workspace = true, features = ["serialize"] }
+rlx-runtime = { workspace = true }
 # Layer-block seam: transports (TCP / Thunderbolt / MLX) + ProcessGroup.
-rlx-driver  = { path = "../rlx-driver", version = "0.2.14" }
+rlx-driver  = { workspace = true }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 anyhow      = "1"

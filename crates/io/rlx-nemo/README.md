@@ -27,6 +27,27 @@ The pickle / storage / dtype plumbing (`pickle`, `torch`, `storage`, `dtype`
 modules) reads the `torch.save` container format directly — a minimal pickle VM
 plus the tensor-storage layout — so weights map straight to `f32` buffers.
 
+## Architecture → graph
+
+- **`build_nemo_encoder_graph`** reconstructs the **Conformer / FastConformer
+  encoder** (the architecture behind essentially every modern NeMo ASR `.nemo`)
+  as primitive rlx ops, binding the checkpoint's weights by name: Macaron
+  feed-forwards, relative-position multi-head attention (Transformer-XL
+  `pos_bias_u/v` + `rel_shift`), the convolution module (pointwise → GLU →
+  depthwise → BatchNorm/LayerNorm → Swish → pointwise), every LayerNorm +
+  residual, and the `√d_model` input scaling. Set `EncoderOpts::mel_frames` to
+  also prepend the `dw_striding` conv subsampling so the graph runs straight
+  from mel features. The graph is shape-specialized (rlx graphs are static);
+  geometry is read from the YAML config with fall-backs derived from the weight
+  shapes.
+- **`build_nemo_probe_graph`** returns the full encoder for a Conformer
+  checkpoint, else falls back to a single-Linear probe — so callers such as
+  `rlx-pkg`'s `nemo_to_rlxp(include_graph = true)` always get a valid graph.
+
+The mapping is structurally faithful to the NeMo reference; numerical parity
+against a reference forward pass is not asserted here (no bundled checkpoint) —
+the tests verify structure and end-to-end shape inference.
+
 ## Install
 
 ```toml

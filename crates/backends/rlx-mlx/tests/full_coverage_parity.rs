@@ -122,6 +122,33 @@ fn conv_transpose2d_matches_cpu() {
 }
 
 #[test]
+fn conv_transpose2d_depthwise_matches_cpu() {
+    // Grouped/depthwise transpose-conv: MLX's native grouped CT mixes channels
+    // ACROSS groups (kokoro ISTFTNet upsampler g=512 → output ~25× too large →
+    // garbage audio). We host-eval groups>1. This guards both that it's routed
+    // to host AND that the host result matches CPU (the groups=1 test above did
+    // not cover grouped, which is how the regression slipped through).
+    let mut g = Graph::new("ct2d_dw");
+    let x = g.input("x", Shape::new(&[1, 2, 1, 2], DType::F32));
+    let w = g.input("w", Shape::new(&[2, 1, 1, 2], DType::F32));
+    let y = g.conv_transpose2d(x, w, [1, 2], [1, 1], [0, 0], [1, 1], [0, 0], 2);
+    g.set_outputs(vec![y]);
+    assert!(
+        rlx_mlx::lower::first_host_eval_op(&g).is_some(),
+        "grouped ConvTranspose2d must host-eval (MLX native grouped CT mixes channels)"
+    );
+    // ch0 x=[1,2] w=[1,0.5]; ch1 x=[3,4] w=[2,3] — channels stay independent.
+    let xv: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+    let wv: Vec<f32> = vec![1.0, 0.5, 2.0, 3.0];
+    let want = cpu_run(&g, &[("x", xv.clone()), ("w", wv.clone())]);
+    let got = mlx_run(g, &[("x", &xv), ("w", &wv)]);
+    assert!(
+        close(&got, &want, 1e-4),
+        "depthwise ConvTranspose2d mismatch:\n got={got:?}\nwant={want:?}"
+    );
+}
+
+#[test]
 fn conv_transpose3d_matches_cpu() {
     let mut g = Graph::new("ct3d");
     let x = g.input("x", Shape::new(&[1, 1, 2, 2, 2], DType::F32));
@@ -952,5 +979,74 @@ fn scaled_matmul_per_tensor_matches_cpu() {
     assert!(
         close(&got_f, &want_f, 1e-4),
         "ScaledMatMul mismatch:\n got={got_f:?}\nwant={want_f:?}"
+    );
+}
+
+// Asymmetric SDPA (MLA): Q/K scores use `head_dim`, V is read and the
+// output written with a *different* `v_head_dim`. DeepSeek/Kimi MLA runs
+// qk_head_dim=192, v_head_dim=128. MLX's fast::scaled_dot_product_attention
+// supports V having a different last dim natively — the output inherits V's
+// head_dim. Here head_dim=8, v_head_dim=4, 2 heads, rank-3, Causal.
+#[test]
+fn attention_asymmetric_v_head_dim_matches_cpu() {
+    use rlx_ir::op::MaskKind;
+    let b = 1usize;
+    let s = 3usize;
+    let nh = 2usize;
+    let hd = 8usize; // Q/K head_dim (score width)
+    let vhd = 4usize; // V/output head_dim (asymmetric)
+
+    let mut g = Graph::new("attn_mla");
+    // rank-3 [B, S, H*D]: Q/K carry head_dim, V carries v_head_dim.
+    let q = g.input("q", Shape::new(&[b, s, nh * hd], DType::F32));
+    let k = g.input("k", Shape::new(&[b, s, nh * hd], DType::F32));
+    let v = g.input("v", Shape::new(&[b, s, nh * vhd], DType::F32));
+    let o = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: hd,
+            v_head_dim: Some(vhd),
+            mask_kind: MaskKind::Causal,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        // Output is v_head_dim-wide: [B, S, H*v_head_dim].
+        Shape::new(&[b, s, nh * vhd], DType::F32),
+    );
+    g.set_outputs(vec![o]);
+
+    // Deterministic, mildly varied inputs (avoid the degenerate all-equal
+    // case where every V head_dim would be indistinguishable).
+    let qv: Vec<f32> = (0..b * s * nh * hd)
+        .map(|i| ((i as f32) * 0.13).sin() * 0.5)
+        .collect();
+    let kv: Vec<f32> = (0..b * s * nh * hd)
+        .map(|i| ((i as f32) * 0.17 + 1.0).cos() * 0.5)
+        .collect();
+    let vv: Vec<f32> = (0..b * s * nh * vhd)
+        .map(|i| ((i as f32) * 0.29 + 0.3).sin())
+        .collect();
+
+    let want = cpu_run(
+        &g,
+        &[("q", qv.clone()), ("k", kv.clone()), ("v", vv.clone())],
+    );
+    let got = mlx_run(g, &[("q", &qv), ("k", &kv), ("v", &vv)]);
+
+    // Output must be v_head_dim-wide, not head_dim-wide.
+    assert_eq!(
+        got.len(),
+        b * s * nh * vhd,
+        "asymmetric attention output width should be num_heads*v_head_dim"
+    );
+    let max_delta = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_delta < 1e-3,
+        "asymmetric v_head_dim attention MLX-vs-CPU max|Δ|={max_delta} too large:\n got={got:?}\nwant={want:?}"
     );
 }

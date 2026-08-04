@@ -108,15 +108,24 @@ impl BlockStage for Qwen3DecoderStage {
             .rope_sin
             .ok_or_else(|| anyhow::anyhow!("Qwen3Decoder requires RopeTables"))?;
 
+        // Same opt-in `RLX_QWEN3_F16_WEIGHTS` as the decode block: F16-resident
+        // projection weights halve the prefill weight-read bytes (M>1 routes to
+        // Metal's `sgemm_simd_padded_f16w`). Matmuls still accumulate in f32, so
+        // KV/hidden outputs stay f32 — token-identical to bf16. Norms/biases F32.
+        let w_dt = if rlx_ir::env::flag("RLX_QWEN3_F16_WEIGHTS") {
+            rlx_ir::DType::F16
+        } else {
+            rlx_ir::DType::F32
+        };
         let in_ln_g = ctx.load_param(&format!("{lp}.input_layernorm.weight"), false)?;
-        let q_w = ctx.load_param(&format!("{lp}.self_attn.q_proj.weight"), true)?;
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
-        let v_w = ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?;
-        let o_w = ctx.load_param(&format!("{lp}.self_attn.o_proj.weight"), true)?;
+        let q_w = ctx.load_param_typed(&format!("{lp}.self_attn.q_proj.weight"), true, w_dt)?;
+        let k_w = ctx.load_param_typed(&format!("{lp}.self_attn.k_proj.weight"), true, w_dt)?;
+        let v_w = ctx.load_param_typed(&format!("{lp}.self_attn.v_proj.weight"), true, w_dt)?;
+        let o_w = ctx.load_param_typed(&format!("{lp}.self_attn.o_proj.weight"), true, w_dt)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
-        let gate_w = ctx.load_param(&format!("{lp}.mlp.gate_proj.weight"), true)?;
-        let up_w = ctx.load_param(&format!("{lp}.mlp.up_proj.weight"), true)?;
-        let down_w = ctx.load_param(&format!("{lp}.mlp.down_proj.weight"), true)?;
+        let gate_w = ctx.load_param_typed(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?;
+        let up_w = ctx.load_param_typed(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?;
+        let down_w = ctx.load_param_typed(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?;
         let (q_bias, k_bias, v_bias) = if spec.attention_bias {
             (
                 Some(ctx.load_param(&format!("{lp}.self_attn.q_proj.bias"), false)?),

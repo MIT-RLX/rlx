@@ -318,7 +318,14 @@ pub fn lower_qwen35_mtp_head(
         Shape::new(&[batch, seq, kv_dim], f)
     };
     let attn_out = g.add_node(
-        crate::ops::attention::attention_kind_op(num_heads, head_dim, MaskKind::Causal, None, None),
+        crate::ops::attention::attention_kind_op(
+            num_heads,
+            head_dim,
+            None,
+            MaskKind::Causal,
+            None,
+            None,
+        ),
         vec![q_rot, k_full, v_full],
         attn_shape,
     );

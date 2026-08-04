@@ -299,6 +299,26 @@ pub fn check_node(
         .find(|(_, buf)| first_bad(buf).is_some())
         .map(|(id, _)| *id);
     let op = &graph.node(node).op;
+    // DEBUG: on a culprit (inputs clean but output bad), dump the node and each
+    // input's op + shape/dtype so an f16/f32 dtype mismatch is visible — the
+    // op that mis-reads an operand of the wrong width shows up as a clean-input
+    // NaN manufacturer.
+    if source_input.is_none() {
+        let n = graph.node(node);
+        eprintln!(
+            "[nan-detail] culprit {node} {} out={:?}",
+            op_short(op),
+            n.shape
+        );
+        for &inid in &n.inputs {
+            let inn = graph.node(inid);
+            eprintln!(
+                "[nan-detail]   in {inid} {} {:?}",
+                op_short(&inn.op),
+                inn.shape
+            );
+        }
+    }
     Err(NanReport {
         node,
         label: node_label(graph, node),

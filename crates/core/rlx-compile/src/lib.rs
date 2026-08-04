@@ -8,6 +8,7 @@
 pub mod algebraic_simplify;
 pub mod compiler;
 pub mod const_fold;
+pub mod cse;
 pub mod dce;
 pub mod dispatch_report;
 pub mod fusion_benefit;
@@ -37,6 +38,7 @@ pub mod training_compile;
 pub use algebraic_simplify::{AlgebraicSimplify, algebraic_simplify};
 pub use compiler::{CompilePipeline, CompileResult};
 pub use const_fold::ConstantFolding;
+pub use cse::CommonSubexpressionElimination;
 pub use dce::DeadCodeElimination;
 pub use dispatch_report::{
     DispatchPath, KernelDispatchReport, KindDispatchSummary, analyze_dispatch,
@@ -60,8 +62,9 @@ pub use io_output_gate::SelectPeaksOnlyOutputs;
 pub use legalize::{LegalizeResult, format_legalize_error, legalize_for_backend};
 pub use legalize_broadcast::LegalizeBroadcast;
 pub use memory::{
-    MemoryPlanOptions, SharedWeightLayout, WeightSlot, is_pure_view, plan_memory_backward,
-    plan_memory_f32_uniform, plan_memory_with_options,
+    ArenaWidthPolicy, MemoryPlanOptions, SharedWeightLayout, WeightSlot, is_pure_view,
+    plan_memory_backward, plan_memory_f32_uniform, plan_memory_hybrid, plan_memory_native,
+    plan_memory_with_options,
 };
 pub use numeric_lint::{NumericLint, lint_numerics};
 pub use param_hoist::{HoistSplit, split_param_invariant};

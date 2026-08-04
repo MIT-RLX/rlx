@@ -10,14 +10,14 @@ repository.workspace   = true
 description = "In-graph collective ops (all-reduce) for tensor-parallel RLX execution"
 
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.14" }
+rlx-ir = { workspace = true }
 # default-features off: the collective's CPU kernel only needs rlx-cpu's
 # op-registry, not BLAS. Dropping the `blas` feature keeps the openblas link
 # out of the build so it cross-compiles to aarch64 (Raspberry Pi / qemu),
 # where no OpenBLAS exists. (rlx-runtime already links platform BLAS for the
 # actual matmul path where it's wanted.)
 rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14", default-features = false }
-rlx-driver = { path = "../rlx-driver", version = "0.2.14" }
+rlx-driver = { workspace = true }
 
 [features]
 default = []

@@ -20,8 +20,8 @@ default = ["cpu"]
 cpu = ["dep:rlx-cpu"]
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14", optional = true }
+rlx-ir = { workspace = true }
+rlx-cpu = { workspace = true, optional = true }
 
 [lints]
 workspace = true

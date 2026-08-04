@@ -104,3 +104,22 @@ fn reused_operand_across_exprs() {
     let out = &lhs + &rhs; // [21, 62]
     approx(&out.to_vec(), &[21.0, 62.0]);
 }
+
+#[test]
+fn model_handle_binds_by_name_and_runs() {
+    use rlx_tensor::{Model, graph, shape};
+    let g = graph("lin", |s| {
+        let x = s.input("x", shape![1, 2]);
+        let w = s.param("w", shape![2, 2]);
+        let b = s.param("b", shape![2]);
+        &x.matmul(&w) + &b
+    });
+    let mut m = Model::new(g);
+    assert_eq!(m.unbound().len(), 2); // w, b
+    m.set("w", &[1.0, 0.0, 0.0, 1.0]).set("b", &[10.0, 20.0]);
+    assert!(m.unbound().is_empty(), "still unbound: {:?}", m.unbound());
+    // Binding an unknown name is a harmless no-op.
+    m.set("does_not_exist", &[0.0]);
+    let out = m.run(&[("x", &[3.0, 4.0][..])]);
+    approx(&out[0], &[13.0, 24.0]); // x·I + b
+}

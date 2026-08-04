@@ -647,6 +647,7 @@ pub fn lower_with_env(
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap: _,
@@ -664,6 +665,12 @@ pub fn lower_with_env(
 
                 let nh = *num_heads as i32;
                 let hd = *head_dim as i32;
+                // V/output per-head width. == head_dim in the symmetric case;
+                // for MLA (DeepSeek/Kimi) Q/K scores use `head_dim` (e.g. 192)
+                // while V is read and the output written with `v_head_dim`
+                // (e.g. 128). MLX's SDPA supports V having a different last dim
+                // natively — the output inherits V's head_dim.
+                let vhd = v_head_dim.unwrap_or(*head_dim) as i32;
                 // Respect `score_scale` when the IR specifies one — Gemma 4
                 // sets `Some(1.0)` because Q is per-head RMS-normed before
                 // attention, so the standard `1/sqrt(head_dim)` factor
@@ -677,7 +684,9 @@ pub fn lower_with_env(
                 let geom = rlx_ir::attention_geom(&q_ir, &k_ir, *num_heads, *head_dim);
                 let bshd_rank4 = q_shape.len() == 4 && !geom.bhsd;
 
-                let to_bhsd = |t: &Array, sh: &[i32]| -> Result<Array, MlxError> {
+                // `dh` is the per-head last-dim used for the rank-3 reshape:
+                // `head_dim` for Q/K, `v_head_dim` for V (asymmetric MLA).
+                let to_bhsd = |t: &Array, sh: &[i32], dh: i32| -> Result<Array, MlxError> {
                     if sh.len() == 4 {
                         if sh[1] == nh {
                             return t.clone_handle();
@@ -691,13 +700,13 @@ pub fn lower_with_env(
                     // [B, S, H*D] → [B, S, H, D] → [B, H, S, D]
                     let b = sh[0];
                     let s = sh[1];
-                    let r = ops::reshape(t, &[b, s, nh, hd])?;
+                    let r = ops::reshape(t, &[b, s, nh, dh])?;
                     let t = ops::transpose(&r, &[0, 2, 1, 3])?;
                     ops::contiguous(&t)
                 };
-                let q = to_bhsd(q_in, &q_shape)?;
-                let k = to_bhsd(k_in, &k_shape)?;
-                let v = to_bhsd(v_in, &node_input_shape(graph, node.inputs[2]))?;
+                let q = to_bhsd(q_in, &q_shape, hd)?;
+                let k = to_bhsd(k_in, &k_shape, hd)?;
+                let v = to_bhsd(v_in, &node_input_shape(graph, node.inputs[2]), vhd)?;
 
                 // Mask must promote to Q/output dtype — MLX's SDPA
                 // rejects an f32 mask when Q is f16/bf16. AutoMixed
@@ -784,11 +793,12 @@ pub fn lower_with_env(
                 };
 
                 if q_shape.len() == 3 {
-                    // [B, H, S, D] → [B, S, H, D] → [B, S, H*D]
+                    // [B, H, S, Dv] → [B, S, H, Dv] → [B, S, H*Dv]
+                    // Output width uses V's head_dim (== head_dim unless MLA).
                     let b = q_shape[0];
                     let s = q_shape[1];
                     let bsd = ops::transpose(&attn_out, &[0, 2, 1, 3])?;
-                    ops::reshape(&bsd, &[b, s, nh * hd])?
+                    ops::reshape(&bsd, &[b, s, nh * vhd])?
                 } else if bshd_rank4 {
                     let t = ops::transpose(&attn_out, &[0, 2, 1, 3])?;
                     ops::contiguous(&t)?
@@ -1440,7 +1450,12 @@ pub fn lower_with_env(
                 // MLX expects NHWC and weight [C_out, kH, kW, C_in/g].
                 // Oversized ISTFT heads (k≈1024, huge out spatial) still
                 // host-eval — same im2col ceiling as forward Conv.
-                if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) {
+                // MLX's native grouped/depthwise transpose-conv mixes channels
+                // across groups (kokoro ISTFTNet upsampler g=512 → output ~25×
+                // too large → garbage audio; same class as the CT3d groups>1
+                // host fallback). Host-eval for groups>1 (correct; the layers
+                // are small) and keep the native GPU path only for groups==1.
+                if *groups > 1 || mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) {
                     host_eval_op_f32(graph, node, &env)?
                 } else {
                     let in_shape = node_input_shape(graph, node.inputs[0]);
@@ -1779,19 +1794,10 @@ pub fn lower_with_env(
                 Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
             }
             Op::DequantGroupedMatMulMlx { scheme } => {
-                // MLX-affine MoE grouped matmul: host-dequant the routed expert
-                // per row (mirrors the GGUF grouped path above). Inputs:
+                // MLX MoE grouped matmul: host-dequant the routed expert per row
+                // (mirrors the GGUF grouped path above). Supports MlxAffine and
+                // MlxMxfp4 (DeepSeek-V4 per-expert). Inputs:
                 // [input, w_q, scales, biases, expert_idx].
-                let (bits, group_size) = match scheme {
-                    rlx_ir::QuantScheme::MlxAffine { bits, group_size } => {
-                        (*bits as u32, *group_size as usize)
-                    }
-                    other => {
-                        return Err(MlxError(format!(
-                            "DequantGroupedMatMulMlx: expected MlxAffine, got {other:?}"
-                        )));
-                    }
-                };
                 // `contiguous` FIRST: `expert_idx` (and often `input`) arrive as
                 // strided views (narrow/reshape of the top-k indices); a bare
                 // `to_f32()` on a non-contiguous MLX array yields wrong data for
@@ -1810,24 +1816,106 @@ pub fn lower_with_env(
                 let num_experts = graph.node(node.inputs[2]).shape.dim(0).unwrap_static();
                 let w_bytes = wq.to_bytes()?;
                 let scales = sc.to_f32()?;
-                let biases = bs.to_f32()?;
-                let idx_f32 = idx.to_f32()?;
-                let mut out_host = vec![0f32; m * n];
-                rlx_cpu::thunk::dequant_grouped_matmul_affine_bt(
-                    &x_f32,
-                    &w_bytes,
-                    &scales,
-                    &biases,
-                    &idx_f32,
-                    &mut out_host,
-                    m,
-                    k,
-                    n,
-                    num_experts,
-                    bits,
-                    group_size,
-                );
-                Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+                // ── On-device path (OPT-IN, decode / small M) ──
+                // Dequant the expert bank → f32 `[E, n, k]` ONCE (cached by the
+                // weight bytes), GATHER each row's expert weight, batched-matmul —
+                // stays inside the MLX graph. MEASURED SLOWER than the host-dequant
+                // fallback for large-dim experts (the `[M,n,k]` gather materializes
+                // M full weight copies: ~800 MB at M=24, n=2048, k=4096), so it is
+                // OFF BY DEFAULT; the host-fused per-row matvec below wins. Enable to
+                // experiment: `RLX_MLX_GROUPED_ONDEVICE=1` (budget-guarded by
+                // `RLX_MLX_GROUPED_ONDEVICE_MAX_BYTES`). MLX's genuinely fast MoE
+                // would need its native int4-affine quant / a custom e2m1 kernel.
+                let budget: usize = std::env::var("RLX_MLX_GROUPED_ONDEVICE_MAX_BYTES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2_000_000_000);
+                let gather_bytes = m.saturating_mul(n).saturating_mul(k).saturating_mul(4);
+                let ondevice =
+                    std::env::var("RLX_MLX_GROUPED_ONDEVICE").is_ok() && gather_bytes <= budget;
+                if ondevice {
+                    let name = match &graph.node(node.inputs[1]).op {
+                        rlx_ir::Op::Param { name } => name.clone(),
+                        _ => "grpmoe".to_string(),
+                    };
+                    let key = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        w_bytes.hash(&mut h);
+                        scales.iter().for_each(|s| s.to_bits().hash(&mut h));
+                        format!("{name}#grpbank:{num_experts}x{n}x{k}:{scheme:?}:{}", h.finish())
+                    };
+                    let bank = if let Some(a) = mlx_dequant_cache_get(&key)? {
+                        a
+                    } else {
+                        let slab = w_bytes.len() / num_experts.max(1);
+                        let sb = scales.len() / num_experts.max(1);
+                        let biases = matches!(scheme, rlx_ir::QuantScheme::MlxAffine { .. })
+                            .then(|| bs.to_f32())
+                            .transpose()?;
+                        let mut bankv = vec![0f32; num_experts * n * k];
+                        for e in 0..num_experts {
+                            let ws = &w_bytes[e * slab..(e + 1) * slab];
+                            let ss = &scales[e * sb..(e + 1) * sb];
+                            let we = match scheme {
+                                rlx_ir::QuantScheme::MlxMxfp4 { group_size } => {
+                                    rlx_mlx_io::dequant_mxfp4_weights_f32(ws, ss, *group_size, n, k)
+                                        .map_err(|e| MlxError(format!("mxfp4 bank: {e:#}")))?
+                                }
+                                rlx_ir::QuantScheme::MlxAffine { bits, group_size } => {
+                                    let bb = &biases.as_ref().unwrap()[e * sb..(e + 1) * sb];
+                                    rlx_mlx_io::dequant_affine_f32(
+                                        ws, ss, bb, *bits as u32, *group_size, n,
+                                        k / (*group_size as usize),
+                                    )
+                                    .map_err(|e| MlxError(format!("affine bank: {e:#}")))?
+                                }
+                                other => {
+                                    return Err(MlxError(format!(
+                                        "DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4, got {other:?}"
+                                    )));
+                                }
+                            };
+                            bankv[e * n * k..(e + 1) * n * k].copy_from_slice(&we);
+                        }
+                        let arr = Array::from_f32_slice(&bankv, &[num_experts, n, k], DType::F32)?;
+                        mlx_dequant_cache_put(key, arr.clone_handle()?, num_experts * n * k * 4);
+                        arr
+                    };
+                    // Gather each row's expert weight `[M, n, k]` and batched-matmul
+                    // it against the row as a column: `W[M,n,k] @ x[M,k,1] = [M,n,1]`.
+                    // (Computing `W @ xᵀ` avoids transposing the big `[M,n,k]` gather.)
+                    let idx_i64 = mlx_indices_i64(&idx)?;
+                    let w_sel = ops::take(&bank, &idx_i64, 0)?;
+                    let x_col = ops::reshape(&x, &[m as i32, k as i32, 1])?;
+                    let out3 = ops::matmul(&w_sel, &x_col)?;
+                    ops::reshape(&out3, &[m as i32, n as i32])?
+                } else {
+                    // ── Host-dequant fallback (large-M prefill) ──
+                    let idx_f32 = idx.to_f32()?;
+                    let mut out_host = vec![0f32; m * n];
+                    match scheme {
+                        rlx_ir::QuantScheme::MlxAffine { bits, group_size } => {
+                            let biases = bs.to_f32()?;
+                            rlx_cpu::thunk::dequant_grouped_matmul_affine_bt(
+                                &x_f32, &w_bytes, &scales, &biases, &idx_f32, &mut out_host,
+                                m, k, n, num_experts, *bits as u32, *group_size as usize,
+                            );
+                        }
+                        rlx_ir::QuantScheme::MlxMxfp4 { group_size } => {
+                            rlx_cpu::thunk::dequant_grouped_matmul_mxfp4_bt(
+                                &x_f32, &w_bytes, &scales, &idx_f32, &mut out_host,
+                                m, k, n, num_experts, *group_size as usize,
+                            );
+                        }
+                        other => {
+                            return Err(MlxError(format!(
+                                "DequantGroupedMatMulMlx: expected MlxAffine/MlxMxfp4, got {other:?}"
+                            )));
+                        }
+                    }
+                    Array::from_f32_slice(&out_host, &out_shape, DType::F32)?
+                }
             }
             Op::DequantMatMul { scheme } => {
                 if scheme.is_gguf() {
@@ -4981,7 +5069,26 @@ pub fn lower_with_env(
                 .unwrap_or_else(|| format!("{id:?}"));
             if let Some(a) = env.get(&id) {
                 eval(&[a]).map_err(|e| MlxError(format!("eval at {label}: {e}")))?;
-                eprintln!("rlx-mlx: {label} {:?} -> {:?}", node.op.kind(), a.shape()?);
+                // Per-node max|x| + nonzero (mirror of RLX_CPU_DUMP_NODES) so a
+                // CPU-vs-MLX diff pinpoints the first diverging node.
+                match a.to_f32() {
+                    Ok(v) => {
+                        let mx = v.iter().fold(0f32, |m, &x| m.max(x.abs()));
+                        let nz = v.iter().filter(|&&x| x != 0.0).count();
+                        eprintln!(
+                            "rlx-mlx-dump: id={id:?} name={:?} {:?} shape={:?} max={mx:.6} nonzero={nz}/{}",
+                            node.name,
+                            node.op.kind(),
+                            a.shape()?,
+                            v.len()
+                        );
+                    }
+                    Err(_) => eprintln!(
+                        "rlx-mlx-dump: id={id:?} {:?} shape={:?} (non-f32)",
+                        node.op.kind(),
+                        a.shape()?
+                    ),
+                }
             }
         } else if eval_barriers {
             if is_fusable(&node.op) {

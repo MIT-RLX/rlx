@@ -625,9 +625,26 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
                     return false;
                 }
             }
-            // Gather operates on axis 0 of its lookup table; the
-            // batch contract isn't compatible with bucket slicing.
-            Op::Gather { .. } => return false,
+            // Gather is unsafe when it touches the bucket dim (it reads axis 0
+            // of its table, which the slice trick can't track). But a gather that
+            // is entirely INDEPENDENT of `upper` — neither its output nor any
+            // input carries a bucket-sized axis — runs identically at any active
+            // extent, so active-extent slicing never touches it and it is safe.
+            // The decode graph's single-token embedding lookup is exactly this
+            // (table [vocab,H], idx [1,1] → [1,1,H]); allowing it lets qwen3-style
+            // decode graphs qualify for on-device K/V active-extent decode.
+            Op::Gather { .. } => {
+                let has_upper = |s: &Shape| {
+                    s.dims()
+                        .iter()
+                        .any(|d| d.is_static() && d.unwrap_static() == upper)
+                };
+                if has_upper(&node.shape)
+                    || node.inputs.iter().any(|&i| has_upper(graph.shape(i)))
+                {
+                    return false;
+                }
+            }
             // Conservatively unsafe — these have batch-touching
             // semantics (or sub-graph leaves) that the slice trick
             // doesn't handle.

@@ -7,9 +7,14 @@ __kernel void rmsnorm(__global float* arena,
     uint row = get_global_id(0);
     if (row >= rows) return;
     uint base = off_x + row * n;
-    float ss = 0.0f;
-    for (uint j = 0; j < n; j++) { float v = arena[base + j]; ss += v * v; }
-    float inv = rsqrt(ss / (float)n + eps);
+    float n_inv = 1.0f / (float)n;
+    // Two-pass: mean(x²) = mean((x−mean)²) + mean². Matches the CPU oracle.
+    float sum = 0.0f;
+    for (uint j = 0; j < n; j++) { sum += arena[base + j]; }
+    float mean = sum * n_inv;
+    float dev = 0.0f;
+    for (uint j = 0; j < n; j++) { float d = arena[base + j] - mean; dev += d * d; }
+    float inv = rsqrt(dev * n_inv + mean * mean + eps);
     uint obase = off_out + row * n;
     for (uint j = 0; j < n; j++)
         arena[obase + j] = arena[base + j] * inv * arena[off_gamma + j] + arena[off_beta + j];

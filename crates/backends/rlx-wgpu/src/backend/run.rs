@@ -17,7 +17,7 @@ use crate::kernels::{
     AttentionBwdParams, AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams,
     Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
     ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedDeltaNetParams,
+    FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
     GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
     GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams, LayerNormParams,
     Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
@@ -34,25 +34,26 @@ use crate::kernels::{
     cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
     fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
-    fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
-    gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
+    fma_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
+    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
     group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
     group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
     layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
-    layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
-    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    layer_norm_backward_input_kernel, layernorm_kernel, lstm_kernel, mamba2_kernel,
+    matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
     maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
     reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_kernel, selective_scan_kernel,
-    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
-    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scaled_grouped_matmul_decode_kernel,
+    scatter_add_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
+    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
+    welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -433,6 +434,12 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::FusedSwiGLU { params } => {
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::RmsNormBackwardInput { params }
                     | Step::RmsNormBackwardGamma { params }
                     | Step::RmsNormBackwardBeta { params } => {
@@ -709,6 +716,12 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::FusedConvBiasAct { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Pool1d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
@@ -774,6 +787,12 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::ScaledGroupedMatmul { params } => {
+                        let mut p = *params;
+                        p.m = scale(p.m);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Sample { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -800,6 +819,12 @@ impl WgpuExecutable {
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Rnn { params } => {
+                        let mut p = *params;
+                        p.seq = scale(p.seq);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::LstmGpu { params } => {
                         let mut p = *params;
                         p.seq = scale(p.seq);
                         dev.queue
@@ -942,6 +967,7 @@ impl WgpuExecutable {
         let mm_k = matmul_kernel(&dev.device);
         let mm_w_active = matmul_wide_active_kernel(&dev.device);
         let mm_f16w = matmul_f16w_kernel(&dev.device);
+        let mm_bf16w = matmul_bf16w_kernel(&dev.device);
         let mm_f16c = matmul_f16_compute_kernel(&dev.device);
         let mm_coop = matmul_coop16_kernel(&dev.device);
         let mm_coop_f16_vk = matmul_coop_f16_vulkan_kernel(&dev.device);
@@ -1078,7 +1104,17 @@ impl WgpuExecutable {
                                 //   3. wide-N (m≥32, n≥64)   → matmul_wide
                                 //   4. otherwise            → matmul (small/skinny)
                                 let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
-                                if let Some(coop) = mm_coop.as_ref()
+                                if *b_is_param && *compute_precision == MatmulCompute::Bf16Packed {
+                                    // Packed-BF16 weight, unpacked in-shader.
+                                    // Same 32×32-tile grid as the plain matmul.
+                                    crate::backend::bf16_packed_dispatch_inc();
+                                    pass.set_pipeline(&mm_bf16w.pipeline);
+                                    pass.dispatch_workgroups(
+                                        n.div_ceil(32),
+                                        m_s.div_ceil(32),
+                                        *batch,
+                                    );
+                                } else if let Some(coop) = mm_coop.as_ref()
                                     && *b_is_param
                                     && *compute_precision == MatmulCompute::Coop16
                                 {
@@ -1275,7 +1311,9 @@ impl WgpuExecutable {
                                 let sk = softmax_kernel(&dev.device);
                                 pass.set_pipeline(&sk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // One workgroup (64 threads) per row → shared-mem
+                                // reduction over the softmax axis.
+                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::SoftmaxCrossEntropy { params } => {
@@ -1319,7 +1357,22 @@ impl WgpuExecutable {
                                 let lk = layernorm_kernel(&dev.device);
                                 pass.set_pipeline(&lk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // One workgroup (64 threads) per row → tree
+                                // reduction over the feature dim.
+                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::FusedSwiGLU { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 {
+                                    continue;
+                                }
+                                let k = fused_swiglu_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // One thread per output element (outer * n_half).
+                                let (gx, gy, gz) =
+                                    dispatch_dims(outer_s.saturating_mul(params.n_half), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::RmsNormBackwardInput { params } => {
@@ -1878,6 +1931,22 @@ impl WgpuExecutable {
                                 let (gx, gy, gz) = dispatch_dims(total, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
+                            Step::FusedConvBiasAct { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    continue;
+                                }
+                                let ck = fused_conv_bias_act_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // Same grid as conv2d: TILE (== CONV2D_TILE) output
+                                // spatial positions per thread.
+                                let spatial = params.h_out * params.w_out;
+                                let sp_tiles = spatial.div_ceil(CONV2D_TILE);
+                                let total = n_s * params.c_out * sp_tiles;
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
                             Step::Im2ColGpu { params } => {
                                 // One thread per col element (k_total * spatial);
                                 // the following Step::Matmul consumes the col matrix.
@@ -2025,6 +2094,16 @@ impl WgpuExecutable {
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
                             }
+                            Step::ScaledGroupedMatmul { params } => {
+                                let m_s = scale(params.m);
+                                if m_s == 0 {
+                                    continue;
+                                }
+                                let sk = scaled_grouped_matmul_decode_kernel(&dev.device);
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
+                            }
                             Step::Sample { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
@@ -2077,6 +2156,13 @@ impl WgpuExecutable {
                             Step::Rnn { params } => {
                                 let rk = rnn_kernel(&dev.device);
                                 pass.set_pipeline(&rk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.batch, 1, 1);
+                            }
+                            Step::LstmGpu { params } => {
+                                // One workgroup per batch item (workgroup_size=256).
+                                let lk = lstm_kernel(&dev.device);
+                                pass.set_pipeline(&lk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 pass.dispatch_workgroups(params.batch, 1, 1);
                             }
@@ -3716,18 +3802,52 @@ impl WgpuExecutable {
                     op_seed,
                 } => {
                     let opts = *self.rng.read().expect("rng lock");
-                    crate::rng_host::run_rng_normal(
-                        &self.arena,
-                        &dev.device,
-                        &dev.queue,
-                        *dst_byte_off as usize,
-                        *len as usize,
-                        *mean,
-                        *scale,
-                        *key,
-                        *op_seed,
-                        opts,
-                    );
+                    match opts.backend {
+                        // On-device Philox / Zero — one-shot compute dispatch, no
+                        // D2H→CPU→H2D bubble.
+                        rlx_ir::RngBackend::Philox | rlx_ir::RngBackend::Zero => {
+                            let zero = matches!(opts.backend, rlx_ir::RngBackend::Zero);
+                            let (seed_lo, seed_hi) = if zero {
+                                (0u32, 0u32)
+                            } else {
+                                let seed = rlx_ir::combine_seed(opts.seed, *key);
+                                ((seed & 0xFFFF_FFFF) as u32, (seed >> 32) as u32)
+                            };
+                            let kern = if zero {
+                                crate::kernels::rng_fill_zero_kernel(&dev.device)
+                            } else {
+                                crate::kernels::rng_normal_philox_kernel(&dev.device)
+                            };
+                            wgpu_rng_dispatch(
+                                &dev.device,
+                                &dev.queue,
+                                &self.arena,
+                                &mut host_cache,
+                                kern,
+                                *dst_byte_off,
+                                *len,
+                                *mean,
+                                *scale,
+                                seed_lo,
+                                seed_hi,
+                            );
+                        }
+                        // Ort / Bnns parity streams: host fill → H2D.
+                        rlx_ir::RngBackend::Ort | rlx_ir::RngBackend::Bnns => {
+                            crate::rng_host::run_rng_normal(
+                                &self.arena,
+                                &dev.device,
+                                &dev.queue,
+                                *dst_byte_off as usize,
+                                *len as usize,
+                                *mean,
+                                *scale,
+                                *key,
+                                *op_seed,
+                                opts,
+                            );
+                        }
+                    }
                 }
                 Step::RngUniformHost {
                     dst_byte_off,
@@ -3738,18 +3858,49 @@ impl WgpuExecutable {
                     op_seed,
                 } => {
                     let opts = *self.rng.read().expect("rng lock");
-                    crate::rng_host::run_rng_uniform(
-                        &self.arena,
-                        &dev.device,
-                        &dev.queue,
-                        *dst_byte_off as usize,
-                        *len as usize,
-                        *low,
-                        *high,
-                        *key,
-                        *op_seed,
-                        opts,
-                    );
+                    match opts.backend {
+                        rlx_ir::RngBackend::Philox | rlx_ir::RngBackend::Zero => {
+                            let zero = matches!(opts.backend, rlx_ir::RngBackend::Zero);
+                            let (seed_lo, seed_hi) = if zero {
+                                (0u32, 0u32)
+                            } else {
+                                let seed = rlx_ir::combine_seed(opts.seed, *key);
+                                ((seed & 0xFFFF_FFFF) as u32, (seed >> 32) as u32)
+                            };
+                            let kern = if zero {
+                                crate::kernels::rng_fill_zero_kernel(&dev.device)
+                            } else {
+                                crate::kernels::rng_uniform_philox_kernel(&dev.device)
+                            };
+                            wgpu_rng_dispatch(
+                                &dev.device,
+                                &dev.queue,
+                                &self.arena,
+                                &mut host_cache,
+                                kern,
+                                *dst_byte_off,
+                                *len,
+                                *low,
+                                *high,
+                                seed_lo,
+                                seed_hi,
+                            );
+                        }
+                        rlx_ir::RngBackend::Ort | rlx_ir::RngBackend::Bnns => {
+                            crate::rng_host::run_rng_uniform(
+                                &self.arena,
+                                &dev.device,
+                                &dev.queue,
+                                *dst_byte_off as usize,
+                                *len as usize,
+                                *low,
+                                *high,
+                                *key,
+                                *op_seed,
+                                opts,
+                            );
+                        }
+                    }
                 }
                 #[cfg(feature = "splat")]
                 Step::GaussianSplatRender {
@@ -4094,4 +4245,72 @@ impl WgpuExecutable {
             &mut self.readback_staging,
         )
     }
+}
+
+/// One-shot on-device Philox / Zero RNG fill (no host round-trip): binds a
+/// 256-byte-aligned arena window plus a params uniform, dispatches `kern`
+/// (`rng_philox.wgsl`), then marks the region GPU-dirty so later host reads
+/// re-fetch. Mirrors the `arena_copy` self-contained dispatch.
+#[allow(clippy::too_many_arguments)]
+fn wgpu_rng_dispatch(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    arena: &Arena,
+    host_cache: &mut rlx_gpu_host::HostTensorCache,
+    kern: &crate::kernels::Kernel,
+    dst_byte_off: u32,
+    len: u32,
+    a: f32,
+    b: f32,
+    seed_lo: u32,
+    seed_hi: u32,
+) {
+    if len == 0 {
+        return;
+    }
+    let dst = dst_byte_off as u64;
+    let max_binding = device.limits().max_storage_buffer_binding_size;
+    let hi = dst + (len as u64) * 4;
+    let mut base = (dst / 256) * 256;
+    let span = hi.saturating_sub(base).max(1);
+    let mut size = span.div_ceil(256) * 256;
+    size = size.max(256).min(max_binding);
+    if base.saturating_add(size) > arena.size as u64 {
+        base = (arena.size as u64).saturating_sub(size);
+        base = (base / 256) * 256;
+    }
+    let p = crate::kernels::RngParams {
+        n: len,
+        out_off: ((dst - base) / 4) as u32,
+        a,
+        b,
+        seed_lo,
+        seed_hi,
+        _p0: 0,
+        _p1: 0,
+    };
+    let u = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rlx-wgpu rng uniform"),
+        size: std::mem::size_of::<crate::kernels::RngParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+    let bg = bind_arena_window(device, kern, arena, base, size, &u);
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("rlx-wgpu rng"),
+    });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rlx-wgpu rng pass"),
+            ..Default::default()
+        });
+        pass.set_pipeline(&kern.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        let (gx, gy, gz) = dispatch_dims(len, 64);
+        pass.dispatch_workgroups(gx, gy, gz);
+    }
+    queue.submit(std::iter::once(enc.finish()));
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    host_cache.invalidate(dst as usize);
 }

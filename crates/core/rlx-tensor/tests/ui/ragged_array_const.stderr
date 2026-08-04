@@ -1,0 +1,5 @@
+error: ragged array `const` — every row must have the same shape
+ --> tests/ui/ragged_array_const.rs:6:35
+  |
+6 |         const mask = [[1.0, 0.0], [0.0]] : F32;   // ragged rows
+  |                                   ^^^^^

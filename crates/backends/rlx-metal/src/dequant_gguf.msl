@@ -301,13 +301,18 @@ kernel void dequant_gguf(
             uint aux2 = uint(w_base[scales_off + 8u]) | (uint(w_base[scales_off + 9u]) << 8u)
                       | (uint(w_base[scales_off + 10u]) << 16u) | (uint(w_base[scales_off + 11u]) << 24u);
             uint tmp = aux2;
+            // 16 six-bit sub-block scales (QK_K=256 → is runs 0..15). aux2/aux3
+            // must be derived from the ORIGINAL aux0/aux1 before they are
+            // overwritten below (matches ggml `dequantize_row_q3_K`).
             aux2 = ((aux0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
-            // aux3 unused after KMASK split — sub-blocks 12-15 unused on QK_K=256.
+            uint aux3 = ((aux1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
             aux0 = (aux0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
             aux1 = (aux1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
-            thread char scales[8];
+            thread char scales[16];
             *((thread uint*)&scales[0]) = aux0;
             *((thread uint*)&scales[4]) = aux1;
+            *((thread uint*)&scales[8]) = aux2;
+            *((thread uint*)&scales[12]) = aux3;
             uint is = 0u; uchar m = 1u; uint out_i = 0u;
             for (uint sb = 0u; sb < 2u; ++sb) {
                 uint shift = 0u;
@@ -1367,6 +1372,153 @@ kernel void q4k_mv_f32(
     dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
 }
 
+// ── Fused single-pass Q3_K GEMV (one output row per thread) ────────────
+// Reads the PACKED Q3_K row (110 B / 256 elems) and dequantizes each block
+// in-register while accumulating dot(w, x) — replaces the "dequant the whole
+// weight to an f32 scratch, then MPS sgemm" path that made Q3_K_S decode
+// ~60× slower than the memory-bandwidth ceiling. Math mirrors the scheme_id==5
+// block dequant above (ggml `dequantize_row_q3_K`), so it is bit-identical.
+// Decode-only (m==1), k % 256 == 0 (always true for GGUF Q3_K).
+kernel void q3k_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+
+    const uint nblocks   = k_dim / DQ_QK_K;
+    // hmask[QK_K/8] | qs[QK_K/4] | scales[12] | d(f16) = 110
+    const uint BLK_BYTES = DQ_QK_K / 8u + DQ_QK_K / 4u + DQ_K_SCALE_SIZE + 2u;
+    const uint KMASK1 = 0x03030303u;
+    const uint KMASK2 = 0x0f0f0f0fu;
+
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + (ulong)gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    float4 acc4 = float4(0.0f);
+    uint  x_base = 0u;
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off        = b * BLK_BYTES;
+        uint qs_off     = off + DQ_QK_K / 8u;        // +32
+        uint scales_off = qs_off + DQ_QK_K / 4u;     // +96
+        uint d_off      = scales_off + DQ_K_SCALE_SIZE; // +108
+        float d_all = dq_read_f16(w0, d_off);
+        device const uchar* hm = w0 + off;
+        device const uchar* q  = w0 + qs_off;
+
+        uint aux0 = uint(w0[scales_off + 0u]) | (uint(w0[scales_off + 1u]) << 8u)
+                  | (uint(w0[scales_off + 2u]) << 16u) | (uint(w0[scales_off + 3u]) << 24u);
+        uint aux1 = uint(w0[scales_off + 4u]) | (uint(w0[scales_off + 5u]) << 8u)
+                  | (uint(w0[scales_off + 6u]) << 16u) | (uint(w0[scales_off + 7u]) << 24u);
+        uint aux2 = uint(w0[scales_off + 8u]) | (uint(w0[scales_off + 9u]) << 8u)
+                  | (uint(w0[scales_off + 10u]) << 16u) | (uint(w0[scales_off + 11u]) << 24u);
+        uint tmp = aux2;
+        aux2 = ((aux0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        uint aux3 = ((aux1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux0 = (aux0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        aux1 = (aux1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        thread char scales[16];
+        *((thread uint*)&scales[0])  = aux0;
+        *((thread uint*)&scales[4])  = aux1;
+        *((thread uint*)&scales[8])  = aux2;
+        *((thread uint*)&scales[12]) = aux3;
+
+        uint is = 0u; uchar m = 1u; uint out_i = 0u;
+        for (uint sb = 0u; sb < 2u; ++sb) {
+            uint shift = 0u;
+            for (uint t = 0u; t < 4u; ++t) {
+                // Low 16 (q[0..16]) and high 16 (q[16..32]) of this 32-lane
+                // sub-block, 4-wide. x rows are 16B-aligned (out_i steps by 4);
+                // q/hm stay per-byte reads — the 110-byte block is not u32-aligned.
+                float dl0 = d_all * float(int(scales[is]) - 32); is += 1u;
+                for (uint l = 0u; l < 16u; l += 4u) {
+                    float4 ww;
+                    ww.x = dl0 * (float((q[l]      >> shift) & 3u) - ((hm[l]      & m) != 0u ? 0.0f : 4.0f));
+                    ww.y = dl0 * (float((q[l + 1u] >> shift) & 3u) - ((hm[l + 1u] & m) != 0u ? 0.0f : 4.0f));
+                    ww.z = dl0 * (float((q[l + 2u] >> shift) & 3u) - ((hm[l + 2u] & m) != 0u ? 0.0f : 4.0f));
+                    ww.w = dl0 * (float((q[l + 3u] >> shift) & 3u) - ((hm[l + 3u] & m) != 0u ? 0.0f : 4.0f));
+                    acc4 += ww * (*(device const float4*)(x + x_base + out_i)); out_i += 4u;
+                }
+                float dl1 = d_all * float(int(scales[is]) - 32); is += 1u;
+                for (uint l = 0u; l < 16u; l += 4u) {
+                    float4 ww;
+                    ww.x = dl1 * (float((q[l + 16u] >> shift) & 3u) - ((hm[l + 16u] & m) != 0u ? 0.0f : 4.0f));
+                    ww.y = dl1 * (float((q[l + 17u] >> shift) & 3u) - ((hm[l + 17u] & m) != 0u ? 0.0f : 4.0f));
+                    ww.z = dl1 * (float((q[l + 18u] >> shift) & 3u) - ((hm[l + 18u] & m) != 0u ? 0.0f : 4.0f));
+                    ww.w = dl1 * (float((q[l + 19u] >> shift) & 3u) - ((hm[l + 19u] & m) != 0u ? 0.0f : 4.0f));
+                    acc4 += ww * (*(device const float4*)(x + x_base + out_i)); out_i += 4u;
+                }
+                shift += 2u; m <<= 1;
+            }
+            q += 32u;
+        }
+        x_base += DQ_QK_K;
+    }
+
+    dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
+}
+
+// ── Fused single-pass Q6_K GEMV (one output row per thread) ────────────
+// The Q6_K LM head (`output.weight`, 5120×248320) otherwise dequantized ~5 GB
+// to an f32 scratch + MPS sgemm every decode step. Reads the packed row
+// (210 B / 256 elems) and dequantizes in-register. Math mirrors scheme_id==2.
+kernel void q6k_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint ql_len = DQ_QK_K / 2u;  // 128
+    const uint qh_len = DQ_QK_K / 4u;  // 64
+    const uint sc_len = DQ_QK_K / 16u; // 16
+    const uint BLK_BYTES = ql_len + qh_len + sc_len + 2u; // 210
+
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + (ulong)gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    float acc    = 0.0f;
+    uint  x_base = 0u;
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint off = b * BLK_BYTES;
+        device const uchar* ql = w0 + off;
+        device const uchar* qh = w0 + off + ql_len;
+        device const uchar* sc = w0 + off + ql_len + qh_len;
+        float d = dq_read_f16(w0, off + ql_len + qh_len + sc_len);
+        for (uint hh = 0u; hh < 2u; ++hh) {
+            uint dst_base = hh * 128u, ql_off = hh * 64u, qh_off_h = hh * 32u, sc_off = hh * 8u;
+            for (uint l = 0u; l < 32u; ++l) {
+                uint is = l / 16u;
+                uchar qh_b = qh[qh_off_h + l];
+                float q1 = float(int(((ql[ql_off + l]       & 0x0Fu) | (((qh_b >> 0) & 3u) << 4u)) - 32));
+                float q2 = float(int(((ql[ql_off + l + 32u] & 0x0Fu) | (((qh_b >> 2) & 3u) << 4u)) - 32));
+                float q3 = float(int(((ql[ql_off + l]       >> 4)    | (((qh_b >> 4) & 3u) << 4u)) - 32));
+                float q4 = float(int(((ql[ql_off + l + 32u] >> 4)    | (((qh_b >> 6) & 3u) << 4u)) - 32));
+                acc += (d * float(int8_t(sc[sc_off + is]))      * q1) * x[x_base + dst_base + l];
+                acc += (d * float(int8_t(sc[sc_off + is + 2u])) * q2) * x[x_base + dst_base + l + 32u];
+                acc += (d * float(int8_t(sc[sc_off + is + 4u])) * q3) * x[x_base + dst_base + l + 64u];
+                acc += (d * float(int8_t(sc[sc_off + is + 6u])) * q4) * x[x_base + dst_base + l + 96u];
+            }
+        }
+        x_base += DQ_QK_K;
+    }
+
+    dst[gid] = acc;
+}
+
 // ── Simdgroup-cooperative Q4_K_M GEMV (8 outputs per simdgroup) ─────────
 //
 // Same math as `q4k_mv_f32` but 32 threads cooperate on 8 output columns
@@ -1740,6 +1892,113 @@ kernel void iq2_xxs_mv_f32(
         }
     }
     dst[gid] = acc;
+}
+
+// NOTE: the codebook weight-synthesis kernels — synth_matmul_codebook{,_h}
+// (split-K, decode) and synth_matmul_codebook_mm{,_h} (one-per-output, prefill)
+// — are generated from ONE template for both f32 and f16 by the
+// `synth_matmul_kernels!` Rust macro in kernels.rs (so the dtype variants can't
+// drift), and appended to the library by `msl_source()`.
+
+// KAN Gaussian-RBF spline activation. One thread per output element
+// `gid ∈ [0, total)` (total = rows·channels); channel `c = gid % channels`.
+//   y[gid] = Σ_g coeff[c,g] · exp(-((x[gid] - center_g) · inv_h)²)
+// with centers uniform on [grid_min, grid_max]. All operands are f32 arena
+// tensors. Avoids materializing the [.., C, num_basis] basis intermediate.
+kernel void spline_activation(
+    device float* arena          [[buffer(0)]],
+    constant ulong& x_off        [[buffer(1)]],
+    constant ulong& coeff_off    [[buffer(2)]],
+    constant ulong& dst_off      [[buffer(3)]],
+    constant uint& total         [[buffer(4)]],
+    constant uint& channels      [[buffer(5)]],
+    constant uint& num_basis     [[buffer(6)]],
+    constant float& grid_min     [[buffer(7)]],
+    constant float& grid_max     [[buffer(8)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    uint c = gid % channels;
+    device const float* x     = (device const float*)((device const char*)arena + x_off);
+    device const float* coeff = (device const float*)((device const char*)arena + coeff_off)
+                              + (ulong)c * num_basis;
+    device float*       dst   = (device float*)((device char*)arena + dst_off);
+    float step = (num_basis > 1u) ? (grid_max - grid_min) / (float(num_basis) - 1.0f) : 1.0f;
+    float inv_h = 1.0f / step;
+    float xv = x[gid];
+    float acc = 0.0f;
+    for (uint g = 0u; g < num_basis; ++g) {
+        float center = grid_min + float(g) * step;
+        float z = (xv - center) * inv_h;
+        acc += coeff[g] * exp(-(z * z));
+    }
+    dst[gid] = acc;
+}
+
+// Fused KAN spline VJP → dx. Builds basis + derivative in registers (loop over
+// num_basis), no materialized [.., C, G] tensor. dx = upstream·Σ_g coeff·B_g'.
+kernel void spline_activation_backward_x(
+    device float* arena          [[buffer(0)]],
+    constant ulong& x_off        [[buffer(1)]],
+    constant ulong& coeff_off    [[buffer(2)]],
+    constant ulong& up_off       [[buffer(3)]],
+    constant ulong& dx_off       [[buffer(4)]],
+    constant uint& total         [[buffer(5)]],
+    constant uint& channels      [[buffer(6)]],
+    constant uint& num_basis     [[buffer(7)]],
+    constant float& grid_min     [[buffer(8)]],
+    constant float& grid_max     [[buffer(9)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    uint c = gid % channels;
+    device const float* x     = (device const float*)((device const char*)arena + x_off);
+    device const float* coeff = (device const float*)((device const char*)arena + coeff_off)
+                              + (ulong)c * num_basis;
+    device const float* up    = (device const float*)((device const char*)arena + up_off);
+    device float*       dx    = (device float*)((device char*)arena + dx_off);
+    float step = (num_basis > 1u) ? (grid_max - grid_min) / (float(num_basis) - 1.0f) : 1.0f;
+    float inv_h = 1.0f / step;
+    float xv = x[gid];
+    float s = 0.0f;
+    for (uint g = 0u; g < num_basis; ++g) {
+        float center = grid_min + float(g) * step;
+        float z = (xv - center) * inv_h;
+        float B = exp(-(z * z));
+        float Bp = B * (-2.0f * z * inv_h);   // d/dx exp(-z²)
+        s += coeff[g] * Bp;
+    }
+    dx[gid] = up[gid] * s;
+}
+
+// Fused KAN spline VJP → dcoeff[C, num_basis] (atomic-accumulate; caller pre-zeros).
+kernel void spline_activation_backward_coeff(
+    device float* arena          [[buffer(0)]],
+    constant ulong& x_off        [[buffer(1)]],
+    constant ulong& up_off       [[buffer(2)]],
+    constant ulong& dcoeff_off   [[buffer(3)]],
+    constant uint& total         [[buffer(4)]],
+    constant uint& channels      [[buffer(5)]],
+    constant uint& num_basis     [[buffer(6)]],
+    constant float& grid_min     [[buffer(7)]],
+    constant float& grid_max     [[buffer(8)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    uint c = gid % channels;
+    device const float* x  = (device const float*)((device const char*)arena + x_off);
+    device const float* up = (device const float*)((device const char*)arena + up_off);
+    device atomic_float* dcoeff = (device atomic_float*)((device char*)arena + dcoeff_off)
+                                + (ulong)c * num_basis;
+    float step = (num_basis > 1u) ? (grid_max - grid_min) / (float(num_basis) - 1.0f) : 1.0f;
+    float inv_h = 1.0f / step;
+    float xv = x[gid], u = up[gid];
+    for (uint g = 0u; g < num_basis; ++g) {
+        float center = grid_min + float(g) * step;
+        float z = (xv - center) * inv_h;
+        float B = exp(-(z * z));
+        atomic_fetch_add_explicit(&dcoeff[g], u * B, memory_order_relaxed);
+    }
 }
 
 kernel void iq2_xs_mv_f32(

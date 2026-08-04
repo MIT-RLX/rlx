@@ -23,6 +23,15 @@ float arena_load_f(uint tagged_off) {
     return uintBitsToFloat(arena_load_u(tagged_off));
 }
 
+// bf16 element `e` from a tagged u32-WORD base (2 bf16 packed per word: element
+// `e` even → low 16 bits, odd → high 16 bits). bf16 is the high half of an f32,
+// so the value is `uintBitsToFloat(bits << 16)` — exact, no f16 dependency.
+float arena_load_bf16(uint tagged_word_base, uint e) {
+    uint w = arena_load_u(tagged_word_base + (e >> 1u));
+    uint bits = ((e & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+    return uintBitsToFloat(bits << 16u);
+}
+
 void arena_store_f(uint tagged_off, float val) {
     arena_store_u(tagged_off, floatBitsToUint(val));
 }

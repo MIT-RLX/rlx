@@ -22,6 +22,28 @@ pub struct Arena {
 impl Arena {
     /// Allocate arena from a memory plan.
     pub fn from_plan(plan: MemoryPlan) -> Self {
+        if std::env::var_os("RLX_ARENA_CHECK").is_some() {
+            let mut worst = 0usize;
+            for (id, s) in &plan.assignments {
+                let end = s.offset + s.size;
+                if end > plan.arena_size {
+                    eprintln!(
+                        "[arena] node {id} slot [{}..{}] EXCEEDS arena_size {} by {}",
+                        s.offset,
+                        end,
+                        plan.arena_size,
+                        end - plan.arena_size
+                    );
+                }
+                worst = worst.max(end);
+            }
+            eprintln!(
+                "[arena] {} slots, arena_size={}, max slot-end={worst} ({} slack)",
+                plan.assignments.len(),
+                plan.arena_size,
+                plan.arena_size as isize - worst as isize
+            );
+        }
         let buf = vec![0u8; plan.arena_size];
         Self { buf, plan }
     }
@@ -126,6 +148,11 @@ impl Arena {
             .get(&id)
             .map(|s| s.offset)
             .unwrap_or(usize::MAX)
+    }
+
+    /// Byte size of a node's arena slot (0 if unassigned / aliased view).
+    pub fn byte_size(&self, id: NodeId) -> usize {
+        self.plan.assignments.get(&id).map(|s| s.size).unwrap_or(0)
     }
 
     /// Raw mutable access to the arena buffer (for thunk executor).

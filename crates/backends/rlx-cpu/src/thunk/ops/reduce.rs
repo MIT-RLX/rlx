@@ -402,6 +402,75 @@ pub(crate) fn compile_reduce(
     }
 }
 
+/// Compile `Op::Histogram` to a `Thunk::Histogram`. The input's static element
+/// count is folded in at compile time; the kernel is a single O(n) pass.
+pub(crate) fn compile_histogram(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+) -> Thunk {
+    let Op::Histogram { bins, min, max } = &node.op else {
+        unreachable!()
+    };
+    let in_shape = &graph.node(node.inputs[0]).shape;
+    let n = in_shape.num_elements().unwrap_or(0);
+    Thunk::Histogram {
+        src: node_offset(arena, node.inputs[0]),
+        dst: node_offset(arena, node.id),
+        n: n as u32,
+        bins: *bins as u32,
+        min: *min,
+        max: *max,
+    }
+}
+
+/// Bucket `n` input elements into `bins` equal-width buckets over `[min, max]`.
+/// Half-open buckets closed at the top: out-of-range elements (and NaNs) are
+/// dropped, and `v == max` lands in the last bin (matches `numpy.histogram`).
+#[inline(always)]
+pub(crate) fn exec_histogram(t: &Thunk, base: *mut u8) {
+    let Thunk::Histogram {
+        src,
+        dst,
+        n,
+        bins,
+        min,
+        max,
+    } = t
+    else {
+        unreachable!()
+    };
+    let n = *n as usize;
+    let bins = *bins as usize;
+    let min = *min;
+    let max = *max;
+    unsafe {
+        let inp = sl(*src, base, n);
+        let out = sl_mut(*dst, base, bins);
+        for b in out.iter_mut() {
+            *b = 0.0;
+        }
+        // Degenerate range (bins == 0 or max <= min): leave counts at zero.
+        // `max > min` is also false when a bound is NaN, so this bails then too.
+        let range_valid = max > min;
+        if bins == 0 || !range_valid {
+            return;
+        }
+        let inv_width = bins as f32 / (max - min);
+        for &v in inp {
+            if v.is_nan() || v < min || v > max {
+                continue;
+            }
+            // `(f32 as usize)` truncates toward zero == floor for v >= min.
+            let mut idx = ((v - min) * inv_width) as usize;
+            if idx >= bins {
+                idx = bins - 1; // v == max (or FP rounding at the top edge)
+            }
+            out[idx] += 1.0;
+        }
+    }
+}
+
 #[allow(unused_variables)]
 pub(crate) fn compile_cumsum_backward(
     node: &rlx_ir::Node,

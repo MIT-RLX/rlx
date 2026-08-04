@@ -95,52 +95,76 @@ pub struct YarnScaling {
     pub beta_fast: f32,
     pub beta_slow: f32,
     pub original_max_position_embeddings: u32,
+    /// Explicit `attention_factor` from config; `None` ⇒ derive `0.1·ln(factor)+1`.
+    pub attention_factor: Option<f32>,
 }
 
-/// YaRN scaling (Peng et al. 2023). Smooth ramp between extrapolated
-/// and NTK-scaled regimes per inverse frequency.
+/// YaRN "NTK-by-parts" scaling (Peng et al. 2023), matching HuggingFace
+/// `_compute_yarn_parameters`. Per rotary pair `i`, blend between the
+/// **extrapolated** frequency (original `1/θ^(2i/d)`, kept for high-frequency /
+/// low-index dims so short-range detail survives) and the **interpolated**
+/// frequency (`freq / factor`, linear position interpolation, for low-frequency /
+/// high-index dims) across the correction range `[low, high]` set by
+/// `beta_fast` / `beta_slow`.
+///
+/// (Note: YaRN interpolates with `freq/factor`, *not* an NTK theta rescale — an
+/// earlier version of this fn used NTK and an inverted ramp; both were wrong.)
 pub fn yarn_scaled_inv_freq(base_theta: f64, head_dim: usize, s: &YarnScaling) -> Vec<f64> {
-    let base = default_inv_freq(base_theta, head_dim);
-    let ntk = ntk_scaled_inv_freq(base_theta, head_dim, s.factor);
-
+    let base = default_inv_freq(base_theta, head_dim); // extrapolation
+    let factor = s.factor as f64;
     let low = yarn_correction_dim(
         s.beta_fast,
         head_dim,
         base_theta,
         s.original_max_position_embeddings as f64,
-    );
+    )
+    .floor();
     let high = yarn_correction_dim(
         s.beta_slow,
         head_dim,
         base_theta,
         s.original_max_position_embeddings as f64,
-    );
-    let (low, high) = if low > high { (high, low) } else { (low, high) };
+    )
+    .ceil();
+    let (low, high) = (low.max(0.0), high.min(head_dim as f64 / 2.0 - 1.0));
 
     base.iter()
-        .zip(ntk.iter())
         .enumerate()
-        .map(|(i, (b, n))| {
-            let mask = yarn_linear_ramp_mask(low, high, i as f64);
-            *n * (1.0 - mask) + *b * mask
+        .map(|(i, &ext)| {
+            let interp = ext / factor;
+            // ramp: 0 at `low` (extrapolate) → 1 at `high` (interpolate).
+            let ramp = yarn_linear_ramp_mask(low, high, i as f64);
+            interp * ramp + ext * (1.0 - ramp)
         })
         .collect()
 }
 
+/// YaRN attention temperature (`mscale`) baked into the cos/sin tables so the
+/// attention logits are scaled by `mscale²` — the length-extrapolation
+/// correction. Uses the explicit `attention_factor` if set, else HF's default
+/// `0.1·ln(factor) + 1` (and `1.0` when `factor ≤ 1`).
+pub fn yarn_mscale(s: &YarnScaling) -> f64 {
+    if let Some(a) = s.attention_factor {
+        return a as f64;
+    }
+    let f = s.factor as f64;
+    if f <= 1.0 { 1.0 } else { 0.1 * f.ln() + 1.0 }
+}
+
+/// Correction dimension for `num_rot` rotations (HF `find_correction_dim`).
 fn yarn_correction_dim(num_rot: f32, dim: usize, base: f64, max_pos: f64) -> f64 {
     let num = (max_pos / (num_rot as f64 * 2.0 * PI)).ln();
-    let den = (base.ln()) * 2.0;
-    (dim as f64 * num / den)
-        .floor()
-        .max(0.0)
-        .min(dim as f64 / 2.0 - 1.0)
+    let den = base.ln() * 2.0;
+    dim as f64 * num / den
 }
 
 fn yarn_linear_ramp_mask(low: f64, high: f64, i: f64) -> f64 {
-    if (high - low).abs() < f64::EPSILON {
-        return 1.0;
-    }
-    ((i - low) / (high - low)).clamp(0.0, 1.0)
+    let denom = if (high - low).abs() < 1e-9 {
+        0.001
+    } else {
+        high - low
+    };
+    ((i - low) / denom).clamp(0.0, 1.0)
 }
 
 /// Build `[max_pos, head_dim/2]` cos/sin tables from inverse frequencies.
@@ -170,6 +194,30 @@ pub fn build_default_tables(
     max_pos: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     build_tables(&default_inv_freq(rope_theta, head_dim), max_pos)
+}
+
+/// Build **YaRN-scaled** cos/sin tables: YaRN NTK-by-parts inv_freq with the
+/// attention `mscale` baked into every entry (so the rotated q·k logits pick up
+/// `mscale²`, YaRN's length-extrapolation temperature). `max_pos` should be the
+/// *extended* window (e.g. `factor × original_max_position_embeddings`).
+pub fn build_yarn_tables(
+    base_theta: f64,
+    head_dim: usize,
+    s: &YarnScaling,
+    max_pos: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let inv = yarn_scaled_inv_freq(base_theta, head_dim, s);
+    let (mut cos, mut sin) = build_tables(&inv, max_pos);
+    let m = yarn_mscale(s) as f32;
+    if (m - 1.0).abs() > 1e-9 {
+        for c in cos.iter_mut() {
+            *c *= m;
+        }
+        for si in sin.iter_mut() {
+            *si *= m;
+        }
+    }
+    (cos, sin)
 }
 
 /// MRoPE section schedule (Qwen 2-VL / Qwen 3.5 / Qwen 3-VL).
@@ -433,5 +481,86 @@ mod tests {
     fn mrope_sections_clamp() {
         assert_eq!(mrope_sections4(&[24, 20, 20, 0, 5]), [24, 20, 20, 0]);
         assert_eq!(mrope_sections4(&[8]), [8, 0, 0, 0]);
+    }
+
+    #[test]
+    fn yarn_endpoints_extrapolate_high_freq_interpolate_low_freq() {
+        let (theta, head_dim) = (10_000.0f64, 128usize);
+        let s = YarnScaling {
+            factor: 4.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position_embeddings: 8192,
+            attention_factor: None,
+        };
+        let base = default_inv_freq(theta, head_dim);
+        let yarn = yarn_scaled_inv_freq(theta, head_dim, &s);
+        assert_eq!(yarn.len(), base.len());
+        // Highest-frequency pair (i=0) is EXTRAPOLATED → unchanged.
+        assert!(
+            (yarn[0] - base[0]).abs() < 1e-9,
+            "high-freq should be untouched"
+        );
+        // Lowest-frequency pair (last i) is INTERPOLATED → base / factor.
+        let last = base.len() - 1;
+        assert!(
+            (yarn[last] - base[last] / 4.0).abs() < 1e-9,
+            "low-freq should be base/factor: {} vs {}",
+            yarn[last],
+            base[last] / 4.0
+        );
+        // Monotone: every YaRN freq is between interp (base/factor) and extrap (base).
+        for (i, (&y, &b)) in yarn.iter().zip(base.iter()).enumerate() {
+            assert!(
+                y <= b + 1e-9 && y >= b / 4.0 - 1e-9,
+                "pair {i} out of [base/factor, base]"
+            );
+        }
+    }
+
+    #[test]
+    fn yarn_mscale_matches_hf_default() {
+        let s = YarnScaling {
+            factor: 4.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position_embeddings: 8192,
+            attention_factor: None,
+        };
+        // HF default: 0.1·ln(4)+1 ≈ 1.13863.
+        assert!((yarn_mscale(&s) - (0.1 * 4.0f64.ln() + 1.0)).abs() < 1e-12);
+        // Explicit attention_factor overrides.
+        let s2 = YarnScaling {
+            attention_factor: Some(1.5),
+            ..s
+        };
+        assert!((yarn_mscale(&s2) - 1.5).abs() < 1e-9);
+        // factor ≤ 1 ⇒ no temperature change.
+        let s3 = YarnScaling {
+            factor: 1.0,
+            attention_factor: None,
+            ..s
+        };
+        assert!((yarn_mscale(&s3) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn yarn_tables_bake_mscale() {
+        let (theta, head_dim, max_pos) = (10_000.0f64, 64usize, 8usize);
+        let s = YarnScaling {
+            factor: 4.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position_embeddings: 4096,
+            attention_factor: None,
+        };
+        let (cos, _sin) = build_yarn_tables(theta, head_dim, &s, max_pos);
+        // pos=0 → angle 0 → cos = mscale (1·mscale), sin = 0.
+        let m = yarn_mscale(&s) as f32;
+        assert!(
+            (cos[0] - m).abs() < 1e-5,
+            "cos[0] should equal mscale {m}, got {}",
+            cos[0]
+        );
     }
 }

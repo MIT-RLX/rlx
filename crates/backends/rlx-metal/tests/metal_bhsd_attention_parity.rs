@@ -20,6 +20,7 @@ fn build_bhsd_attn(b: usize, h: usize, s: usize, d: usize) -> Graph {
         rlx_ir::Op::Attention {
             num_heads: h,
             head_dim: d,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,

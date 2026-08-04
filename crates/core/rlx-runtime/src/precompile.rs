@@ -36,6 +36,13 @@ pub fn post_fusion_cleanup(graph: Graph, options: &CompileOptions) -> Graph {
 
 fn post_specialize_cleanup(graph: Graph, options: &CompileOptions) -> Graph {
     let mut graph = rlx_opt::AlgebraicSimplify.run(graph);
+    // Value-number away structurally-identical nodes (bit-exact). Backward graphs
+    // are the big beneficiary — reverse-mode AD re-emits the same subexpression
+    // per use, e.g. multi-stage weight synthesis recomputes `upstreamᵀ·x` (a
+    // Transpose + GEMM) once per stage. `RLX_DISABLE_CSE=1` opts out for A/B.
+    if rlx_ir::env::var("RLX_DISABLE_CSE").as_deref() != Some("1") {
+        graph = rlx_opt::CommonSubexpressionElimination.run(graph);
+    }
     if options.dce {
         graph = rlx_opt::DeadCodeElimination.run(graph);
     }

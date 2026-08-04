@@ -163,9 +163,13 @@ extern "C" __global__ void elementwise_region(
             }
             result = (cond != 0.0f) ? lhs : on_false;
         } else if (op_kind == 0u) {
-            // Activation. op_sub: 0=Gelu, 1=GeluApprox, 2=Silu, 3=Relu,
-            // 4=Sigmoid, 5=Tanh, 6=Exp, 7=Log, 8=Sqrt, 9=Rsqrt,
-            // 10=Neg, 11=Abs.
+            // Activation. op_sub (gelu-first): 0=Gelu, 1=GeluApprox, 2=Silu,
+            // 3=Relu, 4=Sigmoid, 5=Tanh, 6=Exp, 7=Log, 8=Sqrt, 9=Rsqrt,
+            // 10=Neg, 11=Abs, 12=Sin, 13=Cos, 14=Tan, 15=Atan, 16=Round,
+            // 17=Recip, 18=Floor, 19=Ceil, 20=Sign, 21=Softplus, 22=Elu,
+            // 23=Erf, 24=HardSwish, 25=HardSigmoid, 26=Mish, 27=Softsign,
+            // 28=LogSigmoid. (12..28 were missing → identity → broke fused
+            // Sin/Cos/Round, e.g. the StyleTTS2/Kokoro harmonic source.)
             if      (op_sub == 3u) result = fmaxf(lhs, 0.0f);
             else if (op_sub == 0u) { result = gelu_erf(lhs); }
             else if (op_sub == 1u) { result = gelu_approx(lhs); }
@@ -178,6 +182,23 @@ extern "C" __global__ void elementwise_region(
             else if (op_sub == 9u) result = rsqrtf(lhs);
             else if (op_sub == 10u) result = -lhs;
             else if (op_sub == 11u) result = fabsf(lhs);
+            else if (op_sub == 12u) result = sinf(lhs);
+            else if (op_sub == 13u) result = cosf(lhs);
+            else if (op_sub == 14u) result = tanf(lhs);
+            else if (op_sub == 15u) result = atanf(lhs);
+            else if (op_sub == 16u) result = rintf(lhs);
+            else if (op_sub == 17u) result = 1.0f / lhs;
+            else if (op_sub == 18u) result = floorf(lhs);
+            else if (op_sub == 19u) result = ceilf(lhs);
+            else if (op_sub == 20u) result = (float)(lhs > 0.0f) - (float)(lhs < 0.0f);
+            else if (op_sub == 21u) result = fmaxf(lhs, 0.0f) + logf(1.0f + expf(-fabsf(lhs)));
+            else if (op_sub == 22u) result = (lhs > 0.0f) ? lhs : (expf(lhs) - 1.0f);
+            else if (op_sub == 23u) result = erff(lhs);
+            else if (op_sub == 24u) result = (lhs * fminf(fmaxf(lhs + 3.0f, 0.0f), 6.0f)) / 6.0f;
+            else if (op_sub == 25u) result = fminf(fmaxf(lhs / 6.0f + 0.5f, 0.0f), 1.0f);
+            else if (op_sub == 26u) { float sp = fmaxf(lhs, 0.0f) + logf(1.0f + expf(-fabsf(lhs))); result = lhs * tanhf(sp); }
+            else if (op_sub == 27u) result = lhs / (1.0f + fabsf(lhs));
+            else if (op_sub == 28u) result = fminf(lhs, 0.0f) - logf(1.0f + expf(-fabsf(lhs)));
             else                    result = lhs;
         } else if (op_kind == 1u) {
             // Cast — at the f32-arena layer this is identity. The

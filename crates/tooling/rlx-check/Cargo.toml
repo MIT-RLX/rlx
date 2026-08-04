@@ -24,14 +24,14 @@ path = "src/bin/cargo-rlx.rs"
 # reachable from the `#[rlx_model(check)]` hook). This crate is the CLI + demos.
 # rlx-runtime default = ["cpu"], portable everywhere; other backends' execution
 # legality is opt-in below and needs that backend's build deps.
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14" }
+rlx-runtime = { workspace = true }
 # serialize: serde derives on Graph/Op/Shape so the CLI can load a graph from JSON.
-rlx-ir      = { path = "../../core/rlx-ir", version = "0.2.14", features = ["serialize"] }
+rlx-ir      = { workspace = true, features = ["serialize"] }
 serde_json  = "1"
 
 [dev-dependencies]
 # End-to-end test of the `#[rlx_model(check)]` self-check hook.
-rlx-macros = { path = "../../core/rlx-macros", version = "0.2.14" }
+rlx-macros = { workspace = true }
 
 [features]
 default = []

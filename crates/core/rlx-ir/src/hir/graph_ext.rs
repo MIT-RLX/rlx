@@ -52,6 +52,34 @@ impl<'a> HirMut<'a> {
         self.0.set_outputs(outputs);
     }
 
+    /// Asymmetric SDPA: V/output per-head width `v_head_dim` differs from the
+    /// Q/K score width `head_dim` (MLA). Q/K/V only; kernel-synthesized mask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kind_vdim(
+        &mut self,
+        q: HirNodeId,
+        k: HirNodeId,
+        v: HirNodeId,
+        num_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        mask_kind: MaskKind,
+        shape: Shape,
+    ) -> HirNodeId {
+        self.0.mir(
+            crate::ops::attention::attention_kind_op(
+                num_heads,
+                head_dim,
+                Some(v_head_dim),
+                mask_kind,
+                None,
+                None,
+            ),
+            vec![q, k, v],
+            shape,
+        )
+    }
+
     /// Scaled dot-product attention with a caller-supplied mask tensor
     /// (matches legacy [`crate::Graph::attention`]).
     pub fn attention(
@@ -68,6 +96,7 @@ impl<'a> HirMut<'a> {
             crate::ops::attention::attention_kind_op(
                 num_heads,
                 head_dim,
+                None,
                 MaskKind::Custom,
                 None,
                 None,
@@ -92,6 +121,7 @@ impl<'a> HirMut<'a> {
             crate::ops::attention::attention_kind_op(
                 num_heads,
                 head_dim,
+                None,
                 MaskKind::Bias,
                 None,
                 None,
@@ -894,6 +924,11 @@ pub trait HirGraphExt {
 
     fn reshape_(&mut self, x: HirNodeId, new_shape: Vec<i64>) -> HirNodeId;
     fn transpose_(&mut self, x: HirNodeId, perm: Vec<usize>) -> HirNodeId;
+    /// Broadcast `x` to `target_shape` (standard NumPy rules — size-1 axes
+    /// expand). One native kernel on every backend; lets callers replace
+    /// narrow+concat replication patterns (e.g. GQA KV-head repeat) with a
+    /// single expand.
+    fn expand_(&mut self, x: HirNodeId, target_shape: Vec<i64>) -> HirNodeId;
     fn narrow_(&mut self, x: HirNodeId, axis: usize, start: usize, len: usize) -> HirNodeId;
     /// Pad each axis by `[low, high]` using `mode` (twin of `Graph::pad_`).
     /// MLA uses it to zero-pad V's `v_head_dim` up to the QK `head_dim` so the
@@ -1261,6 +1296,11 @@ impl HirGraphExt for HirMut<'_> {
         self.0.mir(Op::Reshape { new_shape }, vec![x], s)
     }
 
+    fn expand_(&mut self, x: HirNodeId, target_shape: Vec<i64>) -> HirNodeId {
+        let s = shape::expand_shape(self.shape(x), &target_shape).expect("expand shape inference");
+        self.0.mir(Op::Expand { target_shape }, vec![x], s)
+    }
+
     fn transpose_(&mut self, x: HirNodeId, perm: Vec<usize>) -> HirNodeId {
         let s = shape::transpose_shape(self.shape(x), &perm).expect("transpose shape inference");
         self.0.mir(Op::Transpose { perm }, vec![x], s)
@@ -1340,6 +1380,7 @@ impl HirGraphExt for HirMut<'_> {
             crate::ops::attention::attention_kind_op(
                 num_heads,
                 head_dim,
+                None,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,

@@ -22,7 +22,7 @@
 //!   count the host→device→host transfer. It wins only when the points already
 //!   live in GPU memory — call [`triangulate_on_gpu`] explicitly for that.
 
-use crate::triangulate::{PARALLEL_MIN, triangulate, triangulate_par};
+use crate::triangulate::{GeoError, parallel_min, triangulate, triangulate_par};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
@@ -43,11 +43,14 @@ impl Backend {
 
 /// Triangulate with the fastest CPU backend for the input size. Returns the
 /// triangles and which backend was chosen.
-pub fn triangulate_fastest(points: &[[i32; 2]]) -> (Vec<[u32; 3]>, Backend) {
-    if points.len() < PARALLEL_MIN {
-        (triangulate(points), Backend::CpuSerial)
+///
+/// # Errors
+/// Propagates [`GeoError`] from the underlying triangulator (oversized span).
+pub fn triangulate_fastest(points: &[[i32; 2]]) -> Result<(Vec<[u32; 3]>, Backend), GeoError> {
+    if points.len() < parallel_min() {
+        Ok((triangulate(points)?, Backend::CpuSerial))
     } else {
-        (triangulate_par(points, 0), Backend::CpuParallel)
+        Ok((triangulate_par(points, 0)?, Backend::CpuParallel))
     }
 }
 

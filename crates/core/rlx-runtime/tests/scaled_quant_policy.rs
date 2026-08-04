@@ -66,3 +66,51 @@ fn session_scaled_quant_policy_f4e3m0_tracks_f32() {
     eprintln!("scaled_quant mxfp8 policy: cosine_vs_f32={cos8:.5}");
     assert!(cos8 >= 0.99, "mxfp8 policy cosine {cos8} < 0.99");
 }
+
+/// Per-tensor FP8 `ScaledMatMul` on CUDA. This is the NATIVE cuBLASLt FP8
+/// tensor-core path — which only exists on Ada (sm_89) / Hopper (sm_90)+. On
+/// Ampere (sm_86, e.g. the msi RTX 3080 Ti) the cuBLASLt FP8 GEMM returns
+/// NOT_SUPPORTED and USED TO PANIC; it now falls back to the software
+/// decode-and-accumulate path. Either way it must run + track f32. On an FP8-TC
+/// GPU this validates the tensor-core GEMM numerically. Runs on the msi rig
+/// (`RLX_PARITY_DEVICE` selects the device); no-ops without CUDA.
+#[test]
+fn cuda_per_tensor_fp8_scaled_matmul_runs_and_tracks_f32() {
+    let dev = match std::env::var("RLX_PARITY_DEVICE") {
+        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        Err(_) => Device::Cuda,
+    };
+    if !rlx_runtime::is_available(dev) {
+        eprintln!("skip cuda_per_tensor_fp8 ({dev:?} unavailable)");
+        return;
+    }
+    let (m, k, n) = (8usize, 128usize, 16usize);
+    let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.11).sin() * 1.3).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.05).cos()).collect();
+
+    let reference = Session::new(Device::Cpu)
+        .compile(build(m, k, n))
+        .run(&[("x", &x), ("w", &w)])
+        .remove(0);
+
+    let cfg = ScaledQuantConfig {
+        lhs_format: ScaledFormat::F8E4M3,
+        rhs_format: ScaledFormat::F8E4M3,
+        scale_layout: ScaleLayout::PerTensor,
+    };
+    let opts = CompileOptions::new().scaled_quant(cfg);
+    // MUST NOT panic on non-Ada CUDA (the pre-fix behavior was `.expect`).
+    let out = Session::new(dev)
+        .compile_with(build(m, k, n), &opts)
+        .run(&[("x", &x), ("w", &w)])
+        .remove(0);
+
+    assert_eq!(out.len(), m * n);
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "per-tensor fp8 non-finite"
+    );
+    let cos = cosine(&out, &reference);
+    eprintln!("[cuda] per-tensor fp8 ScaledMatMul: cosine_vs_f32={cos:.4}");
+    assert!(cos >= 0.95, "per-tensor fp8 cosine {cos} < 0.95");
+}

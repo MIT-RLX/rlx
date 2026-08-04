@@ -20,6 +20,7 @@ fn build_bshd_attn(b: usize, s: usize, nh: usize, dh: usize) -> Graph {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,

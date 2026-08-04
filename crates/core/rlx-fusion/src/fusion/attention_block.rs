@@ -116,6 +116,7 @@ impl Pass for FuseAttentionBlock {
             let Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
@@ -124,10 +125,12 @@ impl Pass for FuseAttentionBlock {
                 continue;
             };
             // Only the BERT-style mask form (caller-supplied [B, S] tensor),
-            // no score scale tweaks, no soft-cap.
+            // no score scale tweaks, no soft-cap, and symmetric V (the fused
+            // block assumes output width == num_heads*head_dim).
             if !matches!(mask_kind, MaskKind::Custom)
                 || score_scale.is_some()
                 || attn_logit_softcap.is_some()
+                || v_head_dim.is_some_and(|v| v != *head_dim)
                 || node.inputs.len() != 4
             {
                 continue;

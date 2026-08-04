@@ -14,7 +14,7 @@
 
 use rlx_ir::{Graph, NodeId};
 use rlx_opt::memory::MemoryPlan;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Process-wide reuse of weight buffers across prefill/decode compiles.
@@ -33,6 +33,13 @@ struct SharedWeightBuffers {
     shard_size: usize,
     logical_bytes: usize,
 }
+
+// The browser WebGPU backend's `wgpu::Buffer` is `!Send` (holds an `Rc`), but
+// wasm is single-threaded so the shared static is never actually accessed from
+// another thread — assert `Send` there so it fits the `static Mutex`. On native
+// `wgpu::Buffer` is already `Send` (no impl needed / would conflict).
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for SharedWeightBuffers {}
 
 static SHARED_WEIGHTS: Mutex<Option<SharedWeightBuffers>> = Mutex::new(None);
 
@@ -309,6 +316,21 @@ pub struct Arena {
     /// `f16_buffer` (for f16 weights). Halves global memory traffic
     /// on the dominant matmul reads.
     pub f16_buffer: Option<wgpu::Buffer>,
+    /// Optional PACKED-BF16 weight side-buffer (raw bf16 bits, 2 per u32
+    /// word). Holds `Op::MatMul` weight params whose IR dtype is BF16 that
+    /// would otherwise widen to f32 in `buffer`. Indexed by the SAME logical
+    /// element index as `buffer` (bf16 element i ↔ f32 element i), so the
+    /// packed matmul kernel (`matmul_bf16w`) reads B at `b_off` = the global
+    /// arena f32-word index and byte offset `f32_byte_off / 2`. Written by
+    /// [`Arena::write_bf16_packed`] (and mirrored from [`Arena::write_f32`]);
+    /// the shader unpacks `bitcast<f32>(bits << 16)`. Allocated on first
+    /// [`Arena::register_bf16_packed`]. Halves B read bandwidth AND avoids the
+    /// host bf16→f32 widen + ne*4 arena upload for these params.
+    pub bf16_weight_buffer: Option<wgpu::Buffer>,
+    /// Node ids stored PACKED in `bf16_weight_buffer` (not widened into
+    /// `buffer`). Lets the runtime wrapper decide, at `set_param_typed(BF16)`
+    /// time, whether to pack (2 B/elem) or widen to f32.
+    pub bf16_packed_nodes: HashSet<NodeId>,
     /// Per-node byte offset into the logical arena (or weight buffer).
     pub offsets: HashMap<NodeId, usize>,
     /// Per-node byte length.
@@ -347,8 +369,13 @@ pub struct ArenaBindSpec<'a> {
 }
 
 /// High bit tagging a byte offset as living in [`Arena::weight_buffer`] rather
-/// than the main arena buffer. Real arena offsets are < 4 GiB, so bit 62 is free.
+/// than the main arena buffer. Real arena offsets are < 4 GiB, so a high bit is
+/// free. On 64-bit use bit 62; on 32-bit wasm (`usize` = 32 bits, `1 << 62`
+/// overflows) use bit 31 — browser WebGPU arenas are far below 2 GiB.
+#[cfg(target_pointer_width = "64")]
 pub const WEIGHT_BUF_TAG: usize = 1usize << 62;
+#[cfg(not(target_pointer_width = "64"))]
+pub const WEIGHT_BUF_TAG: usize = 1usize << 31;
 
 #[inline]
 pub fn is_weight_off(off: usize) -> bool {
@@ -363,6 +390,21 @@ pub fn raw_weight_off(off: usize) -> usize {
 /// with liveness-aware slot reuse (see `rlx_compile::memory::plan_memory_f32_uniform`).
 pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     rlx_compile::memory::plan_memory_f32_uniform(graph, align)
+}
+
+/// Native-width sibling of [`plan_f32_uniform`] — every slot at its true dtype
+/// byte width (bf16/f16 = 2 B). For a uniformly low-precision graph whose kernels
+/// all run native dtypes; do NOT use when bool/int activations widen to f32.
+pub fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
+    rlx_compile::memory::plan_memory_native(graph, align)
+}
+
+/// Hybrid sibling of [`plan_f32_uniform`] — packs `Param` weights + F16/BF16
+/// activations at native width, keeps everything else f32-uniform. Lets a
+/// mixed-precision wgpu graph (e.g. a packed bf16 LM head + bf16 hidden states)
+/// halve those slots while bool/int activations stay f32-safe.
+pub fn plan_hybrid(graph: &Graph, align: usize) -> MemoryPlan {
+    rlx_compile::memory::plan_memory_hybrid(graph, align)
 }
 
 impl Arena {
@@ -623,6 +665,8 @@ impl Arena {
             extra_shards,
             shard_size,
             f16_buffer,
+            bf16_weight_buffer: None,
+            bf16_packed_nodes: HashSet::new(),
             offsets,
             lens,
             size,
@@ -1181,6 +1225,14 @@ impl Arena {
     /// bindings can read directly from there at half the bandwidth.
     pub fn write_f32(&self, queue: &wgpu::Queue, id: NodeId, data: &[f32]) {
         let off = self.offset(id);
+        // PACKED-BF16 params live ONLY in `bf16_weight_buffer`; do not widen
+        // them into the f32 arena slot. Downcast f32→bf16 (lossless for a
+        // bf16-origin value) and write packed. Safety net for any f32-path
+        // upload (e.g. deferred-graph pending replay) of a packed param.
+        if self.bf16_packed_nodes.contains(&id) && !is_weight_off(off) {
+            self.write_bf16_packed_at(queue, off, data);
+            return;
+        }
         let bytes: &[u8] = bytemuck::cast_slice(data);
         // Route through chunked/shard-safe writer — large uploads (params,
         // ConcatHost, cross-shard staging) used to truncate on Metal.
@@ -1188,6 +1240,99 @@ impl Arena {
         if !is_weight_off(off) {
             self.write_f16_shadow_at(queue, off, data);
         }
+    }
+
+    /// True iff `id` is stored in the packed-bf16 weight side-buffer.
+    #[inline]
+    pub fn is_bf16_packed(&self, id: NodeId) -> bool {
+        self.bf16_packed_nodes.contains(&id)
+    }
+
+    /// Total bytes of the packed-bf16 weight side-buffer (`None` if unused).
+    pub fn bf16_weight_buffer_bytes(&self) -> Option<u64> {
+        self.bf16_weight_buffer.as_ref().map(|b| b.size())
+    }
+
+    /// Register `id` (a BF16 `Op::MatMul` weight Param) to live PACKED in the
+    /// bf16 side-buffer, allocating that buffer on first use. Sized at half
+    /// the arena byte budget — one bf16 element per f32 slot at the same
+    /// logical index, mirroring the f16 shadow. Only valid for un-tagged,
+    /// unsharded arena params (callers gate on [`Self::bf16_packed_eligible`]).
+    pub fn register_bf16_packed(&mut self, device: &wgpu::Device, id: NodeId) {
+        if self.bf16_weight_buffer.is_none() {
+            // Half the arena: bf16 element i pairs with f32 element i, so the
+            // packed buffer must span up to the highest weight element index.
+            let bytes = (self.size / 2).max(256);
+            self.bf16_weight_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rlx-wgpu arena bf16 packed weights"),
+                size: bytes as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        self.bf16_packed_nodes.insert(id);
+    }
+
+    /// Whether `id` can be stored packed: unsharded main-arena param whose
+    /// packed byte range fits one storage-binding window.
+    pub fn bf16_packed_eligible(&self, device: &wgpu::Device, id: NodeId) -> bool {
+        if self.is_sharded() {
+            return false;
+        }
+        let Some(&off) = self.offsets.get(&id) else {
+            return false;
+        };
+        if is_weight_off(off) {
+            return false;
+        }
+        let max_binding = device.limits().max_storage_buffer_binding_size as usize;
+        // Whole packed buffer is bound at offset 0 (global bf16 indexing), so
+        // it must fit one binding.
+        (self.size / 2).max(256) <= max_binding
+    }
+
+    /// Write raw bf16 weight bytes for `id` into the packed side-buffer.
+    /// `data` is the native little-endian bf16 byte stream (`ne*2` bytes).
+    pub fn write_bf16_packed(&self, queue: &wgpu::Queue, id: NodeId, data: &[u8]) {
+        let off = self.offset(id);
+        if is_weight_off(off) {
+            return;
+        }
+        self.write_bf16_packed_bytes_at(queue, off, data);
+    }
+
+    /// Downcast host f32 → bf16 and write into the packed side-buffer at the
+    /// slot for f32-byte-offset `off` (packed byte offset `off / 2`).
+    fn write_bf16_packed_at(&self, queue: &wgpu::Queue, off: usize, data: &[f32]) {
+        let mut bytes: Vec<u8> = Vec::with_capacity(data.len() * 2);
+        for &v in data {
+            bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
+        }
+        self.write_bf16_packed_bytes_at(queue, off, &bytes);
+    }
+
+    /// Write a raw bf16 byte stream into the packed side-buffer. The packed
+    /// slot begins at byte `off / 2` (bf16 element i ↔ f32 element i). Pads to
+    /// a u32-word boundary so the shader's `array<u32>` view is well-formed.
+    fn write_bf16_packed_bytes_at(&self, queue: &wgpu::Queue, off: usize, data: &[u8]) {
+        let Some(buf) = &self.bf16_weight_buffer else {
+            return;
+        };
+        let packed_off = off / 2; // f32 byte off → bf16 byte off (parallel index)
+        // Round the write up to a multiple of 4 bytes (one u32 word) so a
+        // trailing odd bf16 element still lands in a fully-written word.
+        let mut owned;
+        let bytes: &[u8] = if data.len().is_multiple_of(4) {
+            data
+        } else {
+            owned = data.to_vec();
+            owned.resize(data.len().div_ceil(4) * 4, 0);
+            &owned
+        };
+        if packed_off.saturating_add(bytes.len()) > buf.size() as usize {
+            return;
+        }
+        queue.write_buffer(buf, packed_off as u64, bytes);
     }
 
     /// Downcast host f32 data into the f16 shadow buffer at `id`'s slot.

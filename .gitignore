@@ -41,3 +41,13 @@ crates/bindings/pyrlx/examples/out_*/
 *.skin
 data/t10k-images-idx3-ubyte
 data/t10k-images-idx3-ubyte.gz
+
+# clippy output log (machine-specific absolute paths)
+clippy.log
+
+# compiled GPU shader artifacts (built at runtime / by microbenches; never checked in)
+*.metallib
+*.air
+# Metal pipeline cache (RLX_METAL_PIPELINE_CACHE default lives in the temp dir,
+# but guard against an in-tree override leaking compiled kernels)
+rlx-metal-pipelines/

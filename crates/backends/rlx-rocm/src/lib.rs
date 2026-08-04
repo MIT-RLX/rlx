@@ -47,6 +47,7 @@ pub mod iq_grid;
 pub mod im2col_host {
     pub use super::host_ops::run_im2col;
 }
+pub mod hc_sinkhorn_gate;
 pub mod kernels;
 pub mod launch;
 pub mod rocm_gpu_kernels;

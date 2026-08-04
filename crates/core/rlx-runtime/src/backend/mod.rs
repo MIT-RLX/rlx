@@ -12,7 +12,11 @@ use crate::CompileOptions;
 use rlx_ir::Graph;
 use rlx_ir::hir::HirModule;
 use rlx_ir::lir::LirModule;
+// Used only by `cpu`-gated backend machinery (every real backend implies `cpu`);
+// gated so the backend-less build stays warning-clean.
+#[cfg(feature = "cpu")]
 use std::collections::HashMap;
+#[cfg(feature = "cpu")]
 use std::sync::Arc;
 
 use crate::cpu_low_precision;
@@ -51,12 +55,25 @@ pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
         DType::F16 => {
             let n = data.len() / 2;
             let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, n) };
-            s.iter().map(|h| h.to_f32()).collect()
+            // Parallel for large buffers (e.g. the MXFP4 expert scales: ~124M
+            // elements/layer — serial was the measured ~1.9s upload). Elementwise
+            // + order-independent → bit-identical to the serial map.
+            if n >= 1 << 20 {
+                use rayon::prelude::*;
+                s.par_iter().map(|h| h.to_f32()).collect()
+            } else {
+                s.iter().map(|h| h.to_f32()).collect()
+            }
         }
         DType::BF16 => {
             let n = data.len() / 2;
             let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, n) };
-            s.iter().map(|h| h.to_f32()).collect()
+            if n >= 1 << 20 {
+                use rayon::prelude::*;
+                s.par_iter().map(|h| h.to_f32()).collect()
+            } else {
+                s.iter().map(|h| h.to_f32()).collect()
+            }
         }
         // Integer I/O (token ids, durations, masks) widened to f32 for the
         // f32-uniform arena — same convention wgpu already uses. Values are
@@ -349,6 +366,16 @@ pub trait ExecutableGraph: Send {
     /// Set a named parameter (weight) buffer.
     fn set_param(&mut self, name: &str, data: &[f32]);
 
+    /// Incrementally write raw `data` into a named param starting `byte_offset`
+    /// bytes into its storage. Returns true if the backend performed the partial
+    /// write; false means "unsupported / not applicable" and the caller must fall
+    /// back to a whole-buffer [`Self::set_param_typed`]. Lets a large packed
+    /// residency buffer (paged MoE experts) upload only the ONE changed slot
+    /// instead of re-copying the whole buffer each step. Default: unsupported.
+    fn set_param_range(&mut self, _name: &str, _byte_offset: usize, _data: &[u8]) -> bool {
+        false
+    }
+
     /// Called after all params are uploaded (`set_param` / `set_param_typed`).
     /// Backends may warm caches (e.g. Metal QMatMul weight dequant).
     fn finalize_params(&mut self) {}
@@ -382,6 +409,24 @@ pub trait ExecutableGraph: Send {
                 ix.iter().filter_map(|&i| all.get(i).cloned()).collect()
             }
         }
+    }
+
+    /// ZERO-COPY in-place optimizer step over GPU-resident weights. For each
+    /// `trainable[i] = (weight_input_name, shape)` — a resident arena Input (see
+    /// [`Self::bind_gpu_handle`]) whose gradient is at output slot `1 + i`
+    /// (backward outputs `[loss, grad0, …]`) — `step` is invoked with the param
+    /// `&mut [f32]` and grad `&[f32]` ALIASED into the unified-memory arena, so
+    /// the optimizer writes the weight in place: no host `Vec`, no D2H/H2D copy.
+    /// The updated weight stays resident, so the next forward reads it with no
+    /// re-upload — killing the GPU→host→optimizer→host→GPU roundtrip. Returns
+    /// false on backends without GPU-resident support (caller falls back to a
+    /// host-copy optimizer step). Default: unsupported.
+    fn optimizer_step_resident(
+        &mut self,
+        _trainable: &[(String, Vec<usize>)],
+        _step: &mut dyn FnMut(&str, &[usize], &mut [f32], &[f32]),
+    ) -> bool {
+        false
     }
 
     /// Execute and return raw pointers to output data in arena (zero-copy).
@@ -420,6 +465,16 @@ pub trait ExecutableGraph: Send {
     fn set_active_extent(&mut self, extent: Option<(usize, usize)>) {
         let _ = extent;
     }
+
+    /// Return this graph's idle scratch (activation) memory to the OS while its
+    /// compiled form stays cached — for a multi-subgraph pipeline (e.g. a TTS
+    /// duration→encoder→flow→vocoder chain) whose stages run sequentially and
+    /// would otherwise each pin a multi-hundred-MB activation arena resident at
+    /// once. Params/weights stay resident; the next run transparently refaults +
+    /// re-zeros scratch. Purely advisory — safe to leave as a no-op.
+    /// Call only when the graph won't run again immediately (not inside a hot
+    /// loop). Default: no-op; CPU overrides.
+    fn release_scratch(&mut self) {}
 
     /// Override RNG policy for in-graph random ops without recompiling.
     fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
@@ -835,9 +890,13 @@ fn prepare_fused_graph(
 }
 
 /// Short-length + small-budget Scan unroll so GPU backends run the body on-device.
+#[cfg_attr(not(feature = "cpu"), allow(unused_variables))]
 fn apply_scan_device_preference(graph: Graph, options: &CompileOptions) -> Graph {
-    let g = rlx_cpu::rlx_maybe_unroll_scans!(graph, options.scan_unroll_max_length);
-    rlx_opt::maybe_unroll_scans_budget(g, 4096)
+    // The short-length unroll macro lives in rlx-cpu; without it, fall through
+    // to the budget-only unroll (both are pure IR rewrites).
+    #[cfg(feature = "cpu")]
+    let graph = rlx_cpu::rlx_maybe_unroll_scans!(graph, options.scan_unroll_max_length);
+    rlx_opt::maybe_unroll_scans_budget(graph, 4096)
 }
 
 #[allow(dead_code)]

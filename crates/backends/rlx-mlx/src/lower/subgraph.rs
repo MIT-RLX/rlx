@@ -136,6 +136,13 @@ pub fn build_leaf_for(
                 if dtype == DType::C128 {
                     return mlx_c128_leaf_from_bytes(bytes);
                 }
+                let want: usize = shape.iter().product::<usize>() * dt.size_bytes();
+                if bytes.len() != want && std::env::var_os("RLX_DIM_DBG").is_some() {
+                    eprintln!(
+                        "[leaf] input '{name}' static_shape={shape:?} bytes={} want={want}",
+                        bytes.len()
+                    );
+                }
                 return Array::from_bytes(bytes, &shape, dtype);
             }
             let data = inputs

@@ -13,14 +13,14 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14" }
-rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.14" }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", features = ["cpu"] }
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14" }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
-rlx-driver = { path = "../../core/rlx-driver", version = "0.2.14" }
-rlx-mlx = { path = "../../backends/rlx-mlx", version = "0.2.14", optional = true }
+rlx-ir = { workspace = true }
+rlx-opt = { workspace = true }
+rlx-fusion = { workspace = true }
+rlx-runtime = { workspace = true, features = ["cpu"] }
+rlx-cpu = { workspace = true }
+rlx-gguf = { workspace = true }
+rlx-driver = { workspace = true }
+rlx-mlx = { workspace = true, optional = true }
 
 # `rlx-gpu`: read-only GPU temperature/power monitor. Reaches hardware
 # only when built with a backend feature (`--features cuda` / `rocm`);

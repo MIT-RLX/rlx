@@ -181,6 +181,7 @@ pub fn build_llama_decoder_layer(
         Op::Attention {
             num_heads: nh,
             head_dim: hd,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,
@@ -350,6 +351,7 @@ fn build_llama_decode_layer(
         Op::Attention {
             num_heads: nh,
             head_dim: hd,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,

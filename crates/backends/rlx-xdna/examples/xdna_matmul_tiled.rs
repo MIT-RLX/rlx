@@ -112,8 +112,7 @@ fn main() {
 
     // ---- vectorized (aievec.matmul), tile-contiguous ----
     let insts = compile("vec", &emit_matmul_tiled(m, k, n));
-    let mm =
-        NpuGemm::open("", &format!("/tmp/rlx_mmt_vec/k.xclbin"), &insts, m, k, n).expect("open");
+    let mm = NpuGemm::open("", "/tmp/rlx_mmt_vec/k.xclbin", &insts, m, k, n).expect("open");
     let (at, bt) = (tile_a(&a, m, k), tile_b(&b, k, n));
     let ct = mm.run(&at, &bt).expect("run");
     let mut c = untile_c(&ct, m, n);
@@ -160,15 +159,7 @@ fn main() {
 
     // ---- scalar (emit_matmul), for comparison ----
     let insts = compile("scalar", &emit_matmul(m, k, n));
-    let sm = NpuGemm::open(
-        "",
-        &format!("/tmp/rlx_mmt_scalar/k.xclbin"),
-        &insts,
-        m,
-        k,
-        n,
-    )
-    .expect("open");
+    let sm = NpuGemm::open("", "/tmp/rlx_mmt_scalar/k.xclbin", &insts, m, k, n).expect("open");
     let sc = sm.run(&a, &b).expect("run"); // scalar uses row-major (no tiling)
     let smism = (0..m * n).filter(|&i| sc[i] != cref[i]).count();
     let mut sbest = f64::MAX;

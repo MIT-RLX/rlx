@@ -13,6 +13,29 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_openblas)");
     println!("cargo:rustc-check-cfg=cfg(rlx_cpu_blas_mkl)");
 
+    // Apple AMX / SME matrix-coprocessor fast paths (see Cargo.toml). Each
+    // `amx-*` cargo feature lights the matching `rlx_cpu_amx_*` cfg — but ONLY
+    // on `target_vendor = "apple"`, since the underlying hardware (AMX / SME)
+    // exists nowhere else. Enabling the feature on a non-Apple target compiles
+    // cleanly and the path is simply never taken (the cfg stays unset). Runtime
+    // sysctl probes gate the actual dispatch on top of these compile cfgs.
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_amx_bnns)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_amx_dense)");
+    println!("cargo:rustc-check-cfg=cfg(rlx_cpu_amx_sme)");
+    {
+        let is_apple = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default() == "apple";
+        for (feat, cfg) in [
+            ("CARGO_FEATURE_AMX_BNNS", "rlx_cpu_amx_bnns"),
+            ("CARGO_FEATURE_AMX_DENSE", "rlx_cpu_amx_dense"),
+            ("CARGO_FEATURE_AMX_SME", "rlx_cpu_amx_sme"),
+        ] {
+            println!("cargo:rerun-if-env-changed={feat}");
+            if is_apple && std::env::var_os(feat).is_some() {
+                println!("cargo:rustc-cfg={cfg}");
+            }
+        }
+    }
+
     // The `blas` feature is the top-level switch; `--no-default-features`
     // (or a target with no BLAS) falls back to the portable gemm.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BLAS");

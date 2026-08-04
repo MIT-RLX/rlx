@@ -21,6 +21,7 @@ fn build_decode_attn(b: usize, lq: usize, lk: usize, nh: usize, dh: usize) -> Gr
         rlx_ir::Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -109,6 +110,7 @@ fn cuda_causal_decode_attn_hd128_matches_cpu() {
         rlx_ir::Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,

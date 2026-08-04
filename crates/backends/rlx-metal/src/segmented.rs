@@ -302,6 +302,7 @@ mod tests {
             Op::Attention {
                 num_heads: 2,
                 head_dim: 4,
+                v_head_dim: None,
                 mask_kind: MaskKind::Custom,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -364,6 +365,7 @@ mod tests {
             Op::Attention {
                 num_heads: 2,
                 head_dim: 4,
+                v_head_dim: None,
                 mask_kind: MaskKind::Custom,
                 score_scale: None,
                 attn_logit_softcap: None,

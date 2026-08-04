@@ -35,14 +35,36 @@ parity-gemm = ["dep:gemm"]
 # 3D Gaussian splat (`Op::GaussianSplatRender*`) — executors registered from `rlx-splat`.
 splat = []
 
+# ── Apple AMX / SME matrix-coprocessor fast paths (Apple Silicon only) ──
+# Three independent, opt-in paths onto the Apple matrix hardware. Each is
+# gated so the base build never pays for them; build.rs only lights the
+# matching `rlx_cpu_amx_*` cfg on `target_vendor = "apple"`, so enabling a
+# feature on a non-Apple target is a harmless no-op (code compiles, path is
+# never taken). Runtime probes (sysctl `hw.optional.arm.FEAT_*`) then decide
+# whether the current chip actually has the unit before dispatching.
+#
+# `amx-bnns`  — BNNS-backed low-precision (int8 W8A8) matmul for quantized
+#               inference. Apple auto-dispatches BNNS to AMX (M1–M3) or SME
+#               (M4+), so we don't own undocumented asm. Not bit-exact with
+#               the f32 weight-only oracle — it's a genuine W8A8 mode.
+# `amx-dense` — Verification + benchmark harness proving Accelerate's sgemm
+#               already IS the AMX path for dense f32/f64; nothing to beat
+#               there, this just measures it (vs SIMD fallback, vs SME).
+# `amx-sme`   — Direct ARM SME2 GEMM microkernel (FMOPA outer products) via
+#               `global_asm!`, runtime-gated on FEAT_SME2. The M4+ documented
+#               path; hand-written, so feature-gated and parity-checked.
+amx-bnns = []
+amx-dense = []
+amx-sme = []
+
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14" }
+rlx-ir = { workspace = true }
+rlx-opt = { workspace = true }
 # GGUF K-quant block decoders — used by Op::DequantMatMul's GGUF
 # schemes so packed weight bytes can stay in the arena until matmul
 # time instead of round-tripping through f32 at load.
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
-rlx-mlx-io = { path = "../../io/rlx-mlx-io", version = "0.2.14" }
+rlx-gguf = { workspace = true }
+rlx-mlx-io = { workspace = true }
 # F16/BF16 conversion for the CastDtype thunk (and any future
 # half-precision kernel work). Already in the workspace via
 # rlx-runtime / rlx-metal.
@@ -50,6 +72,10 @@ half = "2"
 # Work-stealing parallelism for elementwise kernels, BLAS tiling, and
 # Qwen3.5 `Op::GatedDeltaNet` head scans.
 rayon = "1.10"
+# Derives a zero-alloc `&'static str` variant name for EVERY `Thunk` variant
+# (profiler / tracing labels) so no op can silently fall into an "Other"
+# bucket — the hand-maintained match previously hid slow backward thunks.
+strum_macros = "0.28"
 # Optional same-as-candle CPU sgemm; gated behind `parity-gemm`.
 gemm = { version = "0.19", optional = true }
 

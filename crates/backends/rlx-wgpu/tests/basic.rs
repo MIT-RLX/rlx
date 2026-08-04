@@ -771,6 +771,7 @@ fn eeg_attention_with_cpu_qkv_matches_cpu() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -902,6 +903,7 @@ fn attention_in_graph_does_not_change_qkv_activations() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -1027,6 +1029,7 @@ fn detect_packed_bshd_on_eeg_chain_graph() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -1111,6 +1114,7 @@ fn wgpu_chain_attention_uses_packed_qkv_stride() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -1209,6 +1213,7 @@ fn wgpu_packed_attn_matches_strided_cpu_ref() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -1285,6 +1290,7 @@ fn encoder_qkv_attention_chain_matches_cpu() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -1345,6 +1351,7 @@ fn attention_bshd_eeg_shape_matches_cpu() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -1388,6 +1395,7 @@ fn attention_no_mask_matches_reference() {
         Op::Attention {
             num_heads: 1,
             head_dim: 2,
+            v_head_dim: None,
             mask_kind: MaskKind::None,
             score_scale: None,
             attn_logit_softcap: None,
@@ -2194,6 +2202,7 @@ fn attention_rank3_with_2d_mask_produces_finite_output() {
         Op::Attention {
             num_heads: h,
             head_dim: d,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -3279,6 +3288,7 @@ fn attention_causal_mask_zeros_future_tokens() {
         Op::Attention {
             num_heads: 1,
             head_dim: 2,
+            v_head_dim: None,
             mask_kind: MaskKind::Causal,
             score_scale: None,
             attn_logit_softcap: None,
@@ -3324,6 +3334,7 @@ fn attention_sliding_window_limits_lookback() {
         Op::Attention {
             num_heads: 1,
             head_dim: 2,
+            v_head_dim: None,
             mask_kind: MaskKind::SlidingWindow(0),
             score_scale: None,
             attn_logit_softcap: None,
@@ -3695,6 +3706,7 @@ fn bisect_wgpu_attention_with_qkv_chain() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -3829,6 +3841,7 @@ fn bisect_wgpu_full_bert_layer() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -4005,6 +4018,7 @@ fn bisect_wgpu_full_bert_realistic_dim() {
         Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -4178,6 +4192,7 @@ fn bisect_wgpu_full_bert_layer_stack() {
             Op::Attention {
                 num_heads: nh,
                 head_dim: dh,
+                v_head_dim: None,
                 mask_kind: MaskKind::Custom,
                 score_scale: None,
                 attn_logit_softcap: None,

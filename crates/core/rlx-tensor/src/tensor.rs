@@ -4,6 +4,13 @@
 
 //! Symbolic tensor handle — zero payload bytes until compile + run.
 
+// The binary/compare builder methods take `impl Into<BinaryRhs>` so callers can
+// pass `&Tensor` or a scalar literal. `BinaryRhs` / `Scalar` are sealed
+// conversion targets — deliberately reachable only through `Into`, never named
+// by callers — so we accept them appearing in these public bounds/signatures.
+// (`impl Into<BinaryRhs>` is a *bound*, hence `private_bounds`.)
+#![allow(private_bounds, private_interfaces)]
+
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -30,13 +37,15 @@ macro_rules! unary_ops {
 }
 
 /// Generate elementwise comparison methods (`name => Variant`) → `Bool` tensor.
+/// Each accepts a `&Tensor` or a scalar (`x.gt(0.0)`), so masks read naturally
+/// (both directly and from the `rlx!` DSL's `x > 0.0`).
 macro_rules! cmp_ops {
     ($( $(#[$doc:meta])* $name:ident => $variant:ident ),+ $(,)?) => {
         impl Tensor {
             $(
                 $(#[$doc])*
-                pub fn $name(&self, rhs: &Tensor) -> Self {
-                    self.map_cmp(BinaryRhs::Tensor(rhs), CmpOp::$variant)
+                pub fn $name<'r>(&self, rhs: impl Into<BinaryRhs<'r>>) -> Self {
+                    self.map_cmp(rhs.into(), CmpOp::$variant)
                 }
             )+
         }
@@ -585,6 +594,56 @@ impl Tensor {
         Self::new(self.handle.clone(), id)
     }
 
+    /// Fused softmax + cross-entropy against a dense (soft / one-hot) target
+    /// distribution — the standard classifier / language-model loss, in one
+    /// differentiable op (native CPU & Metal kernels; lowered to primitives on
+    /// other backends). `self` are logits `[N, C]`, `targets` a probability
+    /// distribution `[N, C]` (one-hot, or label-smoothed). Returns the per-row
+    /// loss `[N]`: `loss[n] = logsumexp(logits[n]) − Σ_c targets[n,c]·logits[n,c]`.
+    /// Reduce it to a scalar training loss with [`mean_all`](Self::mean_all) —
+    /// `mean(cross_entropy(logits, targets))` in the `rlx!` DSL. Gradients flow
+    /// to both `self` and `targets`.
+    pub fn cross_entropy(&self, targets: &Tensor) -> Self {
+        let t_id = self.adopt(targets);
+        let id = self
+            .handle
+            .with_graph(|g| g.softmax_cross_entropy(self.id, t_id));
+        Self::new(self.handle.clone(), id)
+    }
+
+    /// Fused softmax + cross-entropy with integer class labels — PyTorch
+    /// `cross_entropy(logits, labels, reduction="none")`. `self` are logits
+    /// `[N, C]`, `labels` the f32-encoded class ids `[N]`. Returns the per-row
+    /// loss `[N]`; reduce with [`mean_all`](Self::mean_all) for a scalar loss.
+    pub fn softmax_cross_entropy_with_logits(&self, labels: &Tensor) -> Self {
+        let l_id = self.adopt(labels);
+        let id = self
+            .handle
+            .with_graph(|g| g.softmax_cross_entropy_with_logits(self.id, l_id));
+        Self::new(self.handle.clone(), id)
+    }
+
+    /// Mean over *every* axis → a scalar (rank-0). The idiomatic loss reduction
+    /// — `mean(cross_entropy(logits, targets))` in the `rlx!` DSL, or
+    /// `loss.mean_all()` in Rust. A rank-0 input is returned unchanged.
+    pub fn mean_all(&self) -> Self {
+        let r = self.rank();
+        if r == 0 {
+            return self.clone();
+        }
+        self.mean((0..r).collect::<Vec<usize>>(), false)
+    }
+
+    /// Sum over *every* axis → a scalar (rank-0). A rank-0 input is returned
+    /// unchanged.
+    pub fn sum_all(&self) -> Self {
+        let r = self.rank();
+        if r == 0 {
+            return self.clone();
+        }
+        self.sum((0..r).collect::<Vec<usize>>(), false)
+    }
+
     pub fn conv2d(
         &self,
         weight: &Tensor,
@@ -626,6 +685,171 @@ impl Tensor {
         Self::new(self.handle.clone(), id)
     }
 
+    /// On-chip codebook weight-synthesis matmul (`Op::SynthMatMul`): `y = x·Wᵀ`
+    /// where the weight `[n, k]` is reconstructed inside the matmul from `indices`
+    /// `[n, k/entry_dim]` (u8, fixed quantization structure) + `codebook`
+    /// `[num_entries, entry_dim]` (f32, trained). `x` is `[m, k]`, output `[m, n]`.
+    /// The codebook is a tiny trainable param; the full weight is never stored —
+    /// "functions not data". Backs `rlx-tiny`.
+    pub fn synth_matmul(
+        &self,
+        indices: &Tensor,
+        codebook: &Tensor,
+        entry_dim: u32,
+        num_entries: u32,
+    ) -> Self {
+        let idx_id = self.adopt(indices);
+        let cb_id = self.adopt(codebook);
+        let id = self.handle.with_graph(|g| {
+            let m = g.shape(self.id).dim(0).unwrap_static();
+            let n = g.shape(idx_id).dim(0).unwrap_static();
+            let out = rlx_ir::Shape::new(&[m, n], rlx_ir::DType::F32);
+            g.synth_matmul(
+                self.id,
+                idx_id,
+                cb_id,
+                rlx_ir::SynthKind::Codebook {
+                    entry_dim,
+                    num_entries,
+                },
+                out,
+            )
+        });
+        Self::new(self.handle.clone(), id)
+    }
+
+    /// Reconstruct the dense weight `W [k,n]` from `self` = indices `[n, k/entry_dim]`
+    /// + `codebook [num_entries, entry_dim]` (the same gather the SynthMatMul
+    /// decompose uses, WITHOUT the matmul). Lets a model fold multi-stage VQ + LoRA
+    /// into ONE effective weight (`W_eff = Σ reconstruct + A·Bᵀ`) so `x·W_eff` is a
+    /// single GEMM — dense-speed forward AND a 2-GEMM backward (the multi-stage /
+    /// LoRA gradients collapse to codebook scatters + rank-r products with no batch
+    /// dim). For training/prefill (large m); decode keeps `synth_matmul` in-kernel.
+    pub fn synth_reconstruct(&self, codebook: &Tensor, entry_dim: u32) -> Self {
+        let cb_id = self.adopt(codebook);
+        let id = self.handle.with_graph(|g| {
+            use rlx_ir::{DType, Op, Shape};
+            // DECOMPOSED reconstruction (Cast→Reshape→Gather→Reshape→Transpose →
+            // W[k,n]), NOT the native `Op::SynthReconstruct` fused kernel. MEASURED
+            // (both `[k,n]` and `[n,k]` native layouts): the fused kernel wins the
+            // FORWARD (~35 vs 47ms — one dispatch vs cast+gather+reshape) but LOSES
+            // the backward by more (~+20ms), because the opaque op hides structure
+            // from the backward CSE + transpose-simplification that dedups the
+            // per-stage `grad_W` transposes and makes `dx=dy·w_bt` free. Net-worse
+            // for TRAINING → keep the transparent primitives here. The native op +
+            // kernel + `LowerSynthReconstruct` oracle stay in-tree (dormant) for a
+            // future INFERENCE-only path (forward win, no backward to regress).
+            let d = entry_dim as usize;
+            let idx_shape = g.shape(self.id);
+            let n = idx_shape.dim(0).unwrap_static();
+            let kb = idx_shape.dim(1).unwrap_static();
+            let (k, p) = (kb * d, n * kb);
+            let idx_i64 = g.add_node(
+                Op::Cast { to: DType::I64 },
+                vec![self.id],
+                Shape::new(&[n, kb], DType::I64),
+            );
+            let idx_flat = g.add_node(
+                Op::Reshape {
+                    new_shape: vec![p as i64],
+                },
+                vec![idx_i64],
+                Shape::new(&[p], DType::I64),
+            );
+            let rows = g.add_node(
+                Op::Gather { axis: 0 },
+                vec![cb_id, idx_flat],
+                Shape::new(&[p, d], DType::F32),
+            );
+            let w_bt = g.add_node(
+                Op::Reshape {
+                    new_shape: vec![n as i64, k as i64],
+                },
+                vec![rows],
+                Shape::new(&[n, k], DType::F32),
+            );
+            g.add_node(
+                Op::Transpose { perm: vec![1, 0] },
+                vec![w_bt],
+                Shape::new(&[k, n], DType::F32),
+            )
+        });
+        Self::new(self.handle.clone(), id)
+    }
+
+    /// KAN learnable per-channel spline activation (`Op::SplineActivation`): each
+    /// channel `c` of the last axis gets its own univariate function, a Gaussian-RBF
+    /// expansion `Σ_g coeff[c,g]·exp(-((x−center_g)·inv_h)²)`. `coeff` is
+    /// `[C, num_basis]` (trained); output matches `self`. A learnable activation
+    /// replacing a fixed GELU/ReLU. Backs `rlx-tiny`.
+    pub fn spline_activation(
+        &self,
+        coeff: &Tensor,
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
+    ) -> Self {
+        let c_id = self.adopt(coeff);
+        let id = self
+            .handle
+            .with_graph(|g| g.spline_activation(self.id, c_id, num_basis, grid_min, grid_max));
+        Self::new(self.handle.clone(), id)
+    }
+
+    /// HuggingFace-style linear `x · Wᵀ + b` where `w` is stored `[out, in]`,
+    /// as a single fused matmul+bias node (`Op::FusedMatMulBiasAct`). The
+    /// weight transpose is emitted in-graph so callers bind the raw `[out, in]`
+    /// checkpoint tensor directly (no host pre-transpose). Backs the `rlx!`
+    /// `linear(x, w, b)` / `x @t w` sugar.
+    pub fn linear(&self, w: &Tensor, b: &Tensor) -> Self {
+        self.linear_act(w, b, None)
+    }
+
+    /// [`linear`](Self::linear) with a fused elementwise activation applied to
+    /// the result — `act(x · Wᵀ + b)` in one op. Backs `gelu(linear(..))` etc.
+    pub fn linear_act(&self, w: &Tensor, b: &Tensor, act: Option<Activation>) -> Self {
+        let w_id = self.adopt(w);
+        let b_id = self.adopt(b);
+        let id = self.handle.with_graph(|g| {
+            let rank = g.shape(w_id).rank();
+            let wt = g.transpose_(w_id, vec![rank - 1, rank - 2]);
+            let s = rlx_ir::shape::matmul_shape(g.shape(self.id), g.shape(wt))
+                .expect("linear shape inference");
+            g.fused_matmul_bias_act(self.id, wt, b_id, act, s)
+        });
+        Self::new(self.handle.clone(), id)
+    }
+
+    /// Matrix multiply against a transposed right operand: `self · rhsᵀ`
+    /// (`x @t w` in the DSL). Avoids a separate `.t()` at call sites; the
+    /// transpose is emitted in-graph.
+    pub fn matmul_t(&self, rhs: &Tensor) -> Self {
+        self.matmul(&rhs.t())
+    }
+
+    /// Scaled dot-product attention with an explicit `[batch, key_len]` padding
+    /// mask (`1.0` = valid, `<0.5` = ignored) — the 4-input `MaskKind::Custom`
+    /// form that [`attention`](Self::attention) (kernel-synthesized masks) can't
+    /// express. Backs the `rlx!` `attention(q, k, v, mask, heads, head_dim)`
+    /// sugar.
+    pub fn attention_masked(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        mask: &Tensor,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let k_id = self.adopt(k);
+        let v_id = self.adopt(v);
+        let m_id = self.adopt(mask);
+        let id = self.handle.with_graph(|g| {
+            let s = rlx_ir::shape::attention_shape(g.shape(self.id));
+            g.attention(self.id, k_id, v_id, m_id, num_heads, head_dim, s)
+        });
+        Self::new(self.handle.clone(), id)
+    }
+
     pub fn rope(&self, cos: &Tensor, sin: &Tensor, head_dim: usize) -> Self {
         let cos_id = self.adopt(cos);
         let sin_id = self.adopt(sin);
@@ -635,15 +859,41 @@ impl Tensor {
         Self::new(self.handle.clone(), id)
     }
 
-    pub fn where_(&self, on_true: &Tensor, on_false: &Tensor) -> Self {
-        let t_id = self.adopt(on_true);
-        let f_id = self.adopt(on_false);
+    /// Select `on_true` where `self` (a mask) is true, else `on_false`. Each
+    /// branch is a `&Tensor` or a scalar (`mask.where_(&x, 0.0)`), so the
+    /// `rlx!` DSL's `select(mask, x, 0.0)` lowers here directly. A scalar
+    /// branch is promoted to the other branch's dtype (else `F32`).
+    pub fn where_<'t, 'f>(
+        &self,
+        on_true: impl Into<BinaryRhs<'t>>,
+        on_false: impl Into<BinaryRhs<'f>>,
+    ) -> Self {
+        let t = on_true.into();
+        let f = on_false.into();
+        let hint = if let BinaryRhs::Tensor(x) = &t {
+            x.dtype()
+        } else if let BinaryRhs::Tensor(x) = &f {
+            x.dtype()
+        } else {
+            DType::F32
+        };
+        let t_id = self.where_branch(t, hint);
+        let f_id = self.where_branch(f, hint);
         let id = self.handle.with_graph(|g| {
             let s = rlx_ir::shape::binary_shape(g.shape(t_id), g.shape(f_id))
                 .expect("where shape inference");
             g.add_node(Op::Where, vec![self.id, t_id, f_id], s)
         });
         Self::new(self.handle.clone(), id)
+    }
+
+    /// Resolve a `where_` branch to a node id in this graph — adopting a tensor
+    /// or promoting a scalar to `hint`'s dtype.
+    fn where_branch(&self, rhs: BinaryRhs<'_>, hint: DType) -> NodeId {
+        match rhs {
+            BinaryRhs::Tensor(t) => self.adopt(t),
+            BinaryRhs::Scalar(s) => self.handle.with_graph(|g| promote_scalar(g, s, hint)),
+        }
     }
 
     /// Replace entries of `self` where `mask` is true with `value` (NumPy
@@ -663,14 +913,24 @@ impl Tensor {
         mask.where_(&fill, self)
     }
 
-    /// Elementwise maximum.
-    pub fn maximum(&self, rhs: &Tensor) -> Self {
-        self.map_binary_op(BinaryRhs::Tensor(rhs), BinaryOp::Max)
+    /// Elementwise maximum (accepts a `&Tensor` or a scalar).
+    pub fn maximum<'r>(&self, rhs: impl Into<BinaryRhs<'r>>) -> Self {
+        self.map_binary_op(rhs.into(), BinaryOp::Max)
     }
 
-    /// Elementwise minimum.
-    pub fn minimum(&self, rhs: &Tensor) -> Self {
-        self.map_binary_op(BinaryRhs::Tensor(rhs), BinaryOp::Min)
+    /// Elementwise minimum (accepts a `&Tensor` or a scalar).
+    pub fn minimum<'r>(&self, rhs: impl Into<BinaryRhs<'r>>) -> Self {
+        self.map_binary_op(rhs.into(), BinaryOp::Min)
+    }
+
+    /// Elementwise `atan2(self, rhs)` — quadrant-aware arctangent.
+    pub fn atan2<'r>(&self, rhs: impl Into<BinaryRhs<'r>>) -> Self {
+        self.map_binary_op(rhs.into(), BinaryOp::Atan2)
+    }
+
+    /// Elementwise `self % rhs` (C `fmod`; accepts a `&Tensor` or a scalar).
+    pub fn rem<'r>(&self, rhs: impl Into<BinaryRhs<'r>>) -> Self {
+        self.map_binary_op(rhs.into(), BinaryOp::Mod)
     }
 
     /// Clamp values to `[min, max]`.
@@ -688,8 +948,9 @@ impl Tensor {
         self.map_binary_op(BinaryRhs::Scalar(max.into()), BinaryOp::Min)
     }
 
-    pub fn pow(&self, rhs: &Tensor) -> Self {
-        self.map_binary_op(BinaryRhs::Tensor(rhs), BinaryOp::Pow)
+    /// Elementwise power `self ^ rhs` (accepts a `&Tensor` or a scalar).
+    pub fn pow<'r>(&self, rhs: impl Into<BinaryRhs<'r>>) -> Self {
+        self.map_binary_op(rhs.into(), BinaryOp::Pow)
     }
 
     pub fn pow_scalar(&self, exp: f64) -> Self {
@@ -730,6 +991,30 @@ unary_ops! {
     atan => Atan,
     /// Round to nearest (half-to-even); straight-through gradient.
     round => Round,
+    /// Reciprocal `1 / x`.
+    recip => Recip,
+    /// `floor(x)` (piecewise-constant gradient).
+    floor => Floor,
+    /// `ceil(x)`.
+    ceil => Ceil,
+    /// `sign(x)` = -1/0/+1.
+    sign => Sign,
+    /// Softplus `ln(1 + eˣ)`.
+    softplus => Softplus,
+    /// ELU (α=1): `x if x>0 else eˣ-1`.
+    elu => Elu,
+    /// Gauss error function `erf(x)`.
+    erf => Erf,
+    /// HardSwish `x·clamp(x+3,0,6)/6`.
+    hard_swish => HardSwish,
+    /// HardSigmoid `clamp(x/6+0.5,0,1)`.
+    hard_sigmoid => HardSigmoid,
+    /// Mish `x·tanh(softplus(x))`.
+    mish => Mish,
+    /// Softsign `x/(1+|x|)`.
+    softsign => Softsign,
+    /// LogSigmoid `log(σ(x))`.
+    log_sigmoid => LogSigmoid,
 }
 
 cmp_ops! {
@@ -1014,6 +1299,12 @@ pub(crate) enum BinaryRhs<'a> {
 impl<'a> BinaryRhs<'a> {
     fn scalar(s: Scalar) -> Self {
         Self::Scalar(s)
+    }
+}
+
+impl<'a> From<&'a Tensor> for BinaryRhs<'a> {
+    fn from(v: &'a Tensor) -> Self {
+        Self::Tensor(v)
     }
 }
 

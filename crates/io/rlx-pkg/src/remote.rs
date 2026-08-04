@@ -53,7 +53,18 @@ impl RemoteFlat {
         let header = FlatHeader::decode(&prefix)?;
         let toc_end = (FlatHeader::SIZE as u64) + header.toc_len - 1;
         let hdr_toc = http_range(url, 0, toc_end)?;
-        let toc_bytes = &hdr_toc[FlatHeader::SIZE..FlatHeader::SIZE + header.toc_len as usize];
+        // The server's response length is untrusted: a short reply (fewer bytes
+        // than the header-declared TOC) would panic the slice below. Bounds-check
+        // it (checked_add guards the usize overflow) and error cleanly instead.
+        let toc_end_idx = match FlatHeader::SIZE.checked_add(header.toc_len as usize) {
+            Some(e) if e <= hdr_toc.len() => e,
+            _ => bail!(
+                "remote TOC truncated: header declares {} TOC bytes but the server returned {}",
+                header.toc_len,
+                hdr_toc.len()
+            ),
+        };
+        let toc_bytes = &hdr_toc[FlatHeader::SIZE..toc_end_idx];
         let mut toc: FlatToc = if header.is_bincode_toc() {
             let wire: crate::flat::FlatTocBin = bincode::deserialize(toc_bytes)?;
             wire.into_toc()?

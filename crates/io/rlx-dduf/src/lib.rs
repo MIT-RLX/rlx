@@ -246,11 +246,22 @@ fn visit_f32_tensors_reader<R: Read + Seek>(
     })
 }
 
+/// Cap for the up-front capacity *hint* when reading a ZIP member. `entry.size()`
+/// is the archive's **declared** uncompressed size, which is attacker-controlled
+/// (a zip bomb can claim gigabytes behind a few KB of deflate). Pre-allocating it
+/// verbatim lets a tiny hostile `.dduf` force a multi-GB up-front allocation
+/// (capacity-overflow panic / OOM) before any backing bytes are read.
+const MEMBER_CAP_HINT: u64 = 64 * 1024 * 1024; // 64 MiB
+
 fn read_member<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>> {
     let mut entry = zip
         .by_name(name)
         .with_context(|| format!("zip member {name}"))?;
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    // Clamp the hint to a sane bound; `read_to_end` still grows the Vec to fit the
+    // real decompressed bytes, so legitimate large safetensors members work — we
+    // just never trust the declared size for the initial allocation.
+    let hint = entry.size().min(MEMBER_CAP_HINT) as usize;
+    let mut bytes = Vec::with_capacity(hint);
     entry
         .read_to_end(&mut bytes)
         .with_context(|| format!("read {name}"))?;

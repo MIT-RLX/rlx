@@ -151,9 +151,10 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Pool,
         ResizeNearest2x,
         Interpolate3d,
-        Conv,          // reductions / vision
-        GroupedMatMul, // MoE
-        SelectiveScan, // SSM / Mamba
+        Conv,                // reductions / vision
+        GroupedMatMul,       // MoE
+        ScaledGroupedMatMul, // native MXFP4 grouped MoE decode-GEMM
+        SelectiveScan,       // SSM / Mamba
         Im2Col,
         ScatterAdd,
         ScatterNd,
@@ -470,6 +471,10 @@ pub struct VulkanExecutable {
     cached: bool,
     input_ids: HashMap<String, NodeId>,
     param_ids: HashMap<String, NodeId>,
+    /// Param names stored PACKED as raw bf16 bytes (matmul weights unpacked in
+    /// the `matmul_bf16` shader). The runtime wrapper feeds these via
+    /// `set_param_bytes` instead of host-widening to f32.
+    packed_bf16_params: HashSet<String>,
     output_ids: Vec<NodeId>,
     output_dtypes: Vec<DType>,
     desc_pool: vk::DescriptorPool,
@@ -505,6 +510,21 @@ unsafe impl Send for VulkanExecutable {}
 
 fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     rlx_compile::memory::plan_memory_f32_uniform(graph, align)
+}
+
+/// Native-width sibling of [`plan_f32_uniform`] — every slot at its true dtype
+/// byte width. For a uniformly low-precision graph run with native-dtype kernels.
+#[allow(dead_code)]
+fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
+    rlx_compile::memory::plan_memory_native(graph, align)
+}
+
+/// Hybrid sibling of [`plan_f32_uniform`] — packs `Param` weights + F16/BF16
+/// activations at native width, keeps bool/int (widen-at-compute) tensors
+/// f32-uniform. Best-of-both for a mixed-precision Vulkan graph.
+#[allow(dead_code)]
+fn plan_hybrid(graph: &Graph, align: usize) -> MemoryPlan {
+    rlx_compile::memory::plan_memory_hybrid(graph, align)
 }
 
 // ── small shape helpers ────────────────────────────────────────────────────
@@ -857,6 +877,8 @@ impl VulkanExecutable {
 
         let mut input_ids = HashMap::new();
         let mut param_ids = HashMap::new();
+        let packed_ids = crate::buffer::bf16_packed_matmul_weights(&graph);
+        let mut packed_bf16_params = HashSet::new();
         for node in graph.nodes() {
             match &node.op {
                 Op::Input { name } => {
@@ -864,6 +886,9 @@ impl VulkanExecutable {
                 }
                 Op::Param { name } => {
                     param_ids.insert(name.clone(), node.id);
+                    if packed_ids.contains(&node.id) {
+                        packed_bf16_params.insert(name.clone());
+                    }
                 }
                 _ => {}
             }
@@ -1021,6 +1046,7 @@ impl VulkanExecutable {
             cached,
             input_ids,
             param_ids,
+            packed_bf16_params,
             output_ids,
             output_dtypes,
             desc_pool,
@@ -1046,6 +1072,13 @@ impl VulkanExecutable {
         if let Some(&id) = self.param_ids.get(name) {
             self.arena.write_bytes(id, data);
         }
+    }
+
+    /// Whether `name` is a bf16 matmul weight stored PACKED (raw bf16 bytes,
+    /// unpacked in the `matmul_bf16` shader). Such a param is fed via
+    /// [`set_param_bytes`] (raw) instead of host-widening to f32.
+    pub fn is_packed_bf16_param(&self, name: &str) -> bool {
+        self.packed_bf16_params.contains(name)
     }
 
     pub fn output_dtypes(&self) -> Vec<DType> {
@@ -2089,6 +2122,8 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
     let mut steps = Vec::new();
     let mut deps: Vec<StepDep> = Vec::new();
     let mut binder = ActBinder::new();
+    // BF16 matmul weights stored packed (2 bytes/elem) → `matmul_bf16` kernel.
+    let bf16_weights = crate::buffer::bf16_packed_matmul_weights(graph);
     if std::env::var("RLX_VULKAN_DUMP_OPS").as_deref() == Ok("1") {
         let mut hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut host_n = 0usize;
@@ -2534,7 +2569,11 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     .u(b_bs as u32)
                     .u((m * n) as u32)
                     .bytes();
-                let kernel = if is_weight_elem(binder.off(arena, a))
+                let kernel = if bf16_weights.contains(&b) {
+                    // Packed bf16 rhs — unpacked in-shader (b_off is a u32-word
+                    // base, tagged when in the weight buffer).
+                    "matmul_bf16"
+                } else if is_weight_elem(binder.off(arena, a))
                     || is_weight_elem(binder.off(arena, b))
                 {
                     "matmul"
@@ -2591,7 +2630,9 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     .u(b_bs as u32)
                     .u((m * n) as u32)
                     .bytes();
-                let kernel = if is_weight_elem(binder.off(arena, a))
+                let kernel = if bf16_weights.contains(&b) {
+                    "matmul_bf16"
+                } else if is_weight_elem(binder.off(arena, a))
                     || is_weight_elem(binder.off(arena, b))
                 {
                     "matmul"
@@ -3617,10 +3658,15 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 ..
             } => {
+                assert!(
+                    v_head_dim.is_none_or(|v| v == *head_dim),
+                    "rlx-vulkan: asymmetric v_head_dim (MLA) not yet supported"
+                );
                 let q = node.inputs[0];
                 let k = node.inputs[1];
                 let v = node.inputs[2];
@@ -4335,6 +4381,65 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     &mut steps,
                     &mut deps,
                     "grouped_matmul",
+                    push,
+                    (ceil_div(n, 16), ceil_div(m, 16), 1),
+                );
+            }
+
+            Op::ScaledGroupedMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } => {
+                // Native MXFP4 (E2M1) grouped decode-GEMM. The .comp specializes
+                // the FP4 E2M1 codec (the MX default); other ScaledFormats are
+                // not lowered natively on Vulkan.
+                assert!(
+                    *lhs_format == rlx_ir::ScaledFormat::F4E2M1
+                        && *rhs_format == rlx_ir::ScaledFormat::F4E2M1,
+                    "rlx-vulkan: ScaledGroupedMatMul native path is MXFP4 (F4E2M1) only, got \
+                     {lhs_format:?}×{rhs_format:?}"
+                );
+                // input codes [M,K], weight codes [E,N,K], input_s, weight_s,
+                // expert_idx [M], (bias [E,N]).
+                let input = node.inputs[0];
+                let weight = node.inputs[1];
+                let is = node.inputs[2];
+                let ws = node.inputs[3];
+                let idx = node.inputs[4];
+                let id = dims(graph, input);
+                let wd = dims(graph, weight);
+                let (m, k) = (id[id.len() - 2], id[id.len() - 1]);
+                let n = wd[wd.len() - 2]; // weight [E, N, K]
+                let ne = wd[0];
+                let (scale_mode, block) = scale_layout.mode_block();
+                let bias_off = if *has_bias {
+                    binder.off(arena, node.inputs[5])
+                } else {
+                    0
+                };
+                let push = Push::default()
+                    .u(m as u32)
+                    .u(k as u32)
+                    .u(n as u32)
+                    .u(ne as u32)
+                    .u(binder.off(arena, input))
+                    .u(binder.off(arena, weight))
+                    .u(binder.off(arena, is))
+                    .u(binder.off(arena, ws))
+                    .u(binder.off(arena, idx))
+                    .u(binder.off(arena, out))
+                    .u(bias_off)
+                    .u(scale_mode)
+                    .u(block)
+                    .u(u32::from(*has_bias))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "scaled_grouped_matmul_decode",
                     push,
                     (ceil_div(n, 16), ceil_div(m, 16), 1),
                 );

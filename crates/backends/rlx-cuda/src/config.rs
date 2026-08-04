@@ -8,10 +8,35 @@ use std::sync::{OnceLock, RwLock};
 
 use crate::{CompileMode, ExecMode};
 
+/// Which attention kernel variant to run (`RLX_CUDA_ATTENTION`). `Auto` is
+/// shape-aware: the Tensor-Core (WMMA) kernel when it's eligible AND the
+/// workload is big enough to amortize its per-block overhead, else the scalar
+/// flash / row kernel. `Scalar`/`Wmma`/`Row` force one variant (with a scalar
+/// fallback when a forced variant can't handle the shape). See
+/// `backend::run` dispatch + `docs/attention-variants.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttentionVariant {
+    #[default]
+    Auto,
+    Scalar,
+    Wmma,
+    Row,
+}
+
 /// CUDA backend options (hot-path flags loaded once per process by default).
 #[derive(Debug, Clone)]
 pub struct CudaRuntimeConfig {
     pub wmma: bool,
+    /// Attention kernel variant policy (`RLX_CUDA_ATTENTION=auto|scalar|wmma|row`).
+    pub attention: AttentionVariant,
+    /// `Auto`-mode threshold: only pick the WMMA attention kernel when
+    /// `batch * heads * seq_q >= this` (below it the scalar kernel is as fast
+    /// or faster — the WMMA per-block overhead doesn't amortize). Tunable via
+    /// `RLX_CUDA_ATTENTION_WMMA_MIN_WORK` (default 12288).
+    pub attention_wmma_min_work: u64,
+    /// Opt-in Hopper TMA/wgmma kernel variants (`RLX_CUDA_TMA`). Default off;
+    /// only takes effect on sm_90 (see `backend::helpers::tma_arch`).
+    pub tma: bool,
     pub no_tf32: bool,
     pub parity: bool,
     pub no_cublaslt: bool,
@@ -75,8 +100,23 @@ impl CudaRuntimeConfig {
             }
             None => ExecMode::Stream,
         };
+        let attention = match reg::var("RLX_CUDA_ATTENTION").as_deref() {
+            Some(v) if v.eq_ignore_ascii_case("scalar") => AttentionVariant::Scalar,
+            Some(v) if v.eq_ignore_ascii_case("wmma") => AttentionVariant::Wmma,
+            Some(v) if v.eq_ignore_ascii_case("row") => AttentionVariant::Row,
+            Some(v) if v.eq_ignore_ascii_case("auto") => AttentionVariant::Auto,
+            // Back-compat: the old boolean opt-in forces the WMMA variant.
+            _ if reg::flag("RLX_CUDA_ATTENTION_WMMA") => AttentionVariant::Wmma,
+            _ => AttentionVariant::Auto,
+        };
+        let attention_wmma_min_work = reg::var("RLX_CUDA_ATTENTION_WMMA_MIN_WORK")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(12288);
         Self {
             wmma: reg::flag("RLX_CUDA_WMMA"),
+            attention,
+            attention_wmma_min_work,
+            tma: reg::flag("RLX_CUDA_TMA"),
             no_tf32: reg::flag("RLX_CUDA_NO_TF32"),
             parity: reg::flag("RLX_CUDA_PARITY"),
             no_cublaslt: reg::flag("RLX_CUDA_NO_CUBLASLT"),

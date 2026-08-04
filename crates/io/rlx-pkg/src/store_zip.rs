@@ -83,7 +83,12 @@ pub fn read_member_bytes(path: impl AsRef<Path>, name: &str) -> Result<Vec<u8>> 
     let mut zf = archive
         .by_name(name)
         .with_context(|| format!("member {name} in {}", path.display()))?;
-    let mut buf = Vec::with_capacity(zf.size() as usize);
+    // `zf.size()` is the archive's declared uncompressed size (untrusted /
+    // zip-bomb). Clamp the capacity hint so a bogus huge size can't trigger a
+    // capacity-overflow panic or giant up-front allocation; `read_to_end`
+    // still grows the buffer to the real byte count for legit members.
+    let cap = (zf.size() as usize).min(16 << 20);
+    let mut buf = Vec::with_capacity(cap);
     zf.read_to_end(&mut buf)
         .with_context(|| format!("reading member {name}"))?;
     Ok(buf)

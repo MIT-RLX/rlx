@@ -280,7 +280,47 @@ pub(super) fn lower_conv(
         .unwrap_or(0) as usize;
     let in_s0 = m.shape(x0).clone();
     let rank0 = in_s0.rank();
-    let x = ensure_nchw_4d(m, x0);
+    // `ensure_nchw_4d` re-guesses NCL-vs-BLC via `is_vocoder_blc`, which decides on
+    // `is_typical_channel(last) && mid > last`. That misfires when a genuine NCL
+    // input `[1, C, L]` has a length `L` that is itself a power-of-2 "typical
+    // channel" value — e.g. a ConvNeXt depthwise input padded to `[1, 256, 64]`
+    // (supertonic/luxtts text-encoder, the dilation-2 pad grows 56→64). It then
+    // transposes to `[1, 64, 256]`, so at the conv `c_in/groups = 64/256 = 0`, the
+    // im2col is empty, and the op degenerates to a bias-only (constant) output —
+    // which the flow ODE amplifies into babble. The weight gives the CONCRETE
+    // in_channels, so when the middle axis already equals it the tensor is
+    // unambiguously NCL (a genuine BLC block has the *sequence length* there, which
+    // never equals in_channels): insert the unit H axis directly and skip the
+    // heuristic. Forward convs only — a ConvTranspose weight is `[Cin, Cout/g, k]`,
+    // so `dim(1)` is not in_channels there.
+    // Covers BOTH conv directions: a forward Conv weight is `[Cout, Cin/g, k]`
+    // (in_channels = `dim(1)*groups`), a ConvTranspose weight is `[Cin, Cout/g, k]`
+    // (in_channels = `dim(0)`). E.g. the MioTTS `wave_conv_upsample` ConvTranspose
+    // input `[1, 512, 100]` was flipped to `[1, 100, 512]` because length 100 is a
+    // "typical channel" value — corrupting the whole vocoder (output cos 0.038).
+    let x = {
+        let s = m.shape(x0).clone();
+        let w_s = m.shape(w).clone();
+        let in_ch = if transpose {
+            w_s.dim(0).unwrap_static()
+        } else {
+            w_s.dim(1).unwrap_static() * groups
+        };
+        let is_known_ncl = s.rank() == 3
+            && w_s.rank() >= 2
+            && s.dim(1).unwrap_static() == in_ch
+            && s.dim(1).unwrap_static() != s.dim(2).unwrap_static();
+        if is_known_ncl {
+            let (n, c, l) = (
+                s.dim(0).unwrap_static() as i64,
+                s.dim(1).unwrap_static() as i64,
+                s.dim(2).unwrap_static() as i64,
+            );
+            m.reshape_(x0, vec![n, c, 1, l])
+        } else {
+            ensure_nchw_4d(m, x0)
+        }
+    };
     let in_s = m.shape(x).clone();
     let rank = in_s.rank();
     let meta_empty = node

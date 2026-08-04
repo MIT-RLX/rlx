@@ -96,6 +96,26 @@ pub(crate) enum Step {
         has_bias: u32,
         bias_off_f32: u32,
     },
+    /// Native low-precision *grouped* (MoE) decode-GEMM — expert-indexed
+    /// `ScaledMatMulDecode`. Weight codes `[E,N,K]`, per-expert scales/bias.
+    ScaledGroupedMatMulDecode {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        input_byte_off: u64,
+        weight_byte_off: u64,
+        input_scale_byte_off: u64,
+        weight_scale_byte_off: u64,
+        idx_off_f32: u32,
+        out_off_f32: u32,
+        bias_off_f32: u32,
+        lhs_fmt: u32,
+        rhs_fmt: u32,
+        scale_mode: u32,
+        block: u32,
+        has_bias: u32,
+    },
     /// General (all-format/all-layout) scale producer.
     ScaledQuantScaleGeneral {
         x_off_f32: u32,
@@ -560,6 +580,21 @@ pub(crate) enum Step {
         out_byte_off: u64,
         scale_bf16: bool,
     },
+    /// Native on-device MXFP4 grouped (MoE) decode-GEMM — replaces the host-delegate
+    /// for the `MlxMxfp4` scheme (decodes e2m1 nibbles in registers during the GEMM,
+    /// no host round-trip, no f32 weight). Scales are f32 in the arena.
+    DequantGroupedMatmulMlxNative {
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
+        group_size: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
+    },
     Sample {
         outer: u32,
         inner: u32,
@@ -571,7 +606,9 @@ pub(crate) enum Step {
         seed_lo: u32,
         seed_hi: u32,
     },
-    /// Host fill for [`Op::RngNormal`].
+    /// [`Op::RngNormal`] fill — dispatched on-device (Philox / Zero, which are
+    /// graph-capture-safe) or via a host cold-fill (Ort / Bnns). See
+    /// [`Step::graph_capture_safe`].
     RngNormal {
         dst_byte_off: u64,
         len: u32,
@@ -580,6 +617,8 @@ pub(crate) enum Step {
         key: u64,
         op_seed: Option<f32>,
     },
+    /// [`Op::RngUniform`] fill — see [`Step::RngNormal`] for the dispatch /
+    /// capture-safety contract.
     RngUniform {
         dst_byte_off: u64,
         len: u32,
@@ -813,8 +852,12 @@ pub(crate) enum Step {
         seq: u32,
         input_size: u32,
         hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        /// h0 (carry) byte offset; 0 = no carry (h0 = 0).
+        h0_byte_off: u64,
     },
-    /// Host-staged GRU fallback (multi-layer / bidir / carry / hidden > 1024).
+    /// Host-staged GRU fallback (hidden > 1024).
     GruHost {
         x_byte_off: u64,
         w_ih_byte_off: u64,
@@ -831,7 +874,7 @@ pub(crate) enum Step {
         bidirectional: bool,
         carry: bool,
     },
-    /// Native CUDA Elman RNN (L=1 / unidir / no-carry / hidden ≤ 1024).
+    /// Native CUDA Elman RNN (any layers / dirs / carry, hidden ≤ 1024).
     Rnn {
         x_byte_off: u64,
         w_ih_byte_off: u64,
@@ -842,9 +885,13 @@ pub(crate) enum Step {
         seq: u32,
         input_size: u32,
         hidden: u32,
+        num_layers: u32,
+        bidirectional: bool,
+        /// h0 (carry) byte offset; 0 = no carry (h0 = 0).
+        h0_byte_off: u64,
         relu: bool,
     },
-    /// Host-staged Elman RNN fallback.
+    /// Host-staged Elman RNN fallback (hidden > 1024).
     RnnHost {
         x_byte_off: u64,
         w_ih_byte_off: u64,
@@ -1903,6 +1950,7 @@ impl Step {
                 | Step::DequantMatmulMxFp4x2 { .. }
                 | Step::DequantGroupedMatmulGguf { .. }
                 | Step::DequantGroupedMatmulMlxHost { .. }
+                | Step::DequantGroupedMatmulMlxNative { .. }
                 | Step::Narrow { .. }
                 | Step::Concat { .. }
                 | Step::Gather { .. }
@@ -1918,11 +1966,18 @@ impl Step {
     }
 
     /// False when the step performs host-side work or stream sync during dispatch.
-    pub fn graph_capture_safe(&self) -> bool {
+    pub fn graph_capture_safe(&self, rng_on_device: bool) -> bool {
         match self {
             Step::Im2ColHost { use_gpu, .. }
             | Step::Fft { use_gpu, .. }
             | Step::GatedDeltaNet { use_gpu, .. } => *use_gpu,
+            // Philox / Zero RNG fills run entirely on-device (capture-safe);
+            // Ort / Bnns take a cold-path host fill, so only the on-device
+            // policies may be captured. `rng_on_device` reflects the live RNG
+            // policy at capture-eligibility time; `set_rng` drops any captured
+            // graph on a policy change, so a captured Philox/Zero fill never
+            // replays a stale seed (eager re-reads the policy every run).
+            Step::RngNormal { .. } | Step::RngUniform { .. } => rng_on_device,
             Step::Llada2GroupLimitedGate { .. }
             | Step::MsDeformAttnHost { .. }
             | Step::CustomHost { .. }
@@ -1931,8 +1986,6 @@ impl Step {
             | Step::LogMelHost { .. }
             | Step::LogMelBackwardHost { .. }
             | Step::WelchPeaksHost { .. }
-            | Step::RngNormal { .. }
-            | Step::RngUniform { .. }
             | Step::ReverseHost { .. }
             | Step::PadHost { .. }
             | Step::SliceHost { .. }
@@ -1956,24 +2009,158 @@ impl Step {
     }
 }
 
-pub(crate) fn schedule_graph_capture_safe(schedule: &[Step]) -> bool {
-    let safe = schedule.iter().all(Step::graph_capture_safe);
+pub(crate) fn schedule_graph_capture_safe(schedule: &[Step], rng_on_device: bool) -> bool {
+    let safe = schedule.iter().all(|s| s.graph_capture_safe(rng_on_device));
     if !safe && rlx_ir::env::flag("RLX_CUDA_CAPTURE_DEBUG") {
         use std::collections::BTreeMap;
         let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-        for s in schedule.iter().filter(|s| !s.graph_capture_safe()) {
+        for s in schedule
+            .iter()
+            .filter(|s| !s.graph_capture_safe(rng_on_device))
+        {
             *counts.entry(step_name(s)).or_insert(0) += 1;
         }
+        // Report what segmented capture WOULD recover from this all-or-nothing
+        // give-up: how many of the steps land in worthwhile GPU segments vs stay
+        // eager. This quantifies the segmentation opportunity per real model.
+        let segs = segment_schedule_for_capture(schedule, rng_on_device, SEGMENT_MIN_RUN);
+        let captured: usize = segs
+            .iter()
+            .filter_map(|s| match s {
+                CaptureSegment::Gpu { start, end } => Some(end - start),
+                _ => None,
+            })
+            .sum();
+        let gpu_segs = segs
+            .iter()
+            .filter(|s| matches!(s, CaptureSegment::Gpu { .. }))
+            .count();
         eprintln!(
-            "rlx-cuda: graph capture DISABLED; non-capture-safe steps: {}",
+            "rlx-cuda: graph capture DISABLED; non-capture-safe steps: {} \
+             | segmented capture would replay {captured}/{} steps across {gpu_segs} \
+             graph(s) ({})",
             counts
                 .iter()
                 .map(|(k, v)| format!("{k}×{v}"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            schedule.len(),
+            if segments_beat_all_or_nothing(&segs) {
+                "recoverable"
+            } else {
+                "no worthwhile segment"
+            },
         );
     }
     safe
+}
+
+/// Minimum length of a capture-safe run to be worth its own `CUgraphExec`
+/// (instantiate + launch overhead beats replaying 1–2 raw kernels below this).
+pub(crate) const SEGMENT_MIN_RUN: usize = 3;
+
+/// One contiguous span of the schedule for **segmented** CUDA-graph capture.
+///
+/// The whole-schedule `schedule_graph_capture_safe` gate is all-or-nothing: a
+/// single host step (LSTM/GRU/Scan/Mamba2/SpdHost/…) anywhere forces every step
+/// — often an entire transformer — onto eager per-launch dispatch. Segmenting
+/// lets each maximal run of capture-safe steps replay from its own
+/// `CUgraphExec` while the host steps (and sub-threshold GPU runs) execute
+/// eagerly in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureSegment {
+    /// A maximal run of capture-safe steps `[start, end)` — captured once and
+    /// replayed. `end - start >= min_run`.
+    Gpu { start: usize, end: usize },
+    /// Steps `[start, end)` run eagerly: host steps, and any capture-safe run
+    /// too short to be worth an instantiate + launch.
+    Eager { start: usize, end: usize },
+}
+
+impl CaptureSegment {
+    // Consumed by the segmented replay loop (pending) + the coverage test.
+    #[allow(dead_code)]
+    pub(crate) fn range(&self) -> std::ops::Range<usize> {
+        match *self {
+            CaptureSegment::Gpu { start, end } | CaptureSegment::Eager { start, end } => start..end,
+        }
+    }
+}
+
+/// Core segmentation over a per-step capturability mask. Factored out from
+/// [`segment_schedule_for_capture`] so it is unit-testable without building
+/// `Step`s. Coalesces adjacent eager spans (a sub-threshold GPU run folds into
+/// the neighbouring host steps) so the result strictly alternates Gpu/Eager.
+fn segment_mask(safe: &[bool], min_run: usize) -> Vec<CaptureSegment> {
+    let min_run = min_run.max(1);
+    let mut segs: Vec<CaptureSegment> = Vec::new();
+    // Push an eager span, merging with a trailing eager segment if adjacent.
+    let push_eager = |segs: &mut Vec<CaptureSegment>, start: usize, end: usize| {
+        if start >= end {
+            return;
+        }
+        if let Some(CaptureSegment::Eager { end: prev_end, .. }) = segs.last_mut() {
+            if *prev_end == start {
+                *prev_end = end;
+                return;
+            }
+        }
+        segs.push(CaptureSegment::Eager { start, end });
+    };
+    let mut i = 0;
+    while i < safe.len() {
+        if safe[i] {
+            let start = i;
+            while i < safe.len() && safe[i] {
+                i += 1;
+            }
+            let end = i;
+            if end - start >= min_run {
+                segs.push(CaptureSegment::Gpu { start, end });
+            } else {
+                push_eager(&mut segs, start, end);
+            }
+        } else {
+            let start = i;
+            while i < safe.len() && !safe[i] {
+                i += 1;
+            }
+            push_eager(&mut segs, start, i);
+        }
+    }
+    segs
+}
+
+/// Partition a schedule into maximal capture-safe GPU runs (each its own CUDA
+/// graph) interleaved with eager spans. Capture-safe runs shorter than
+/// `min_run` stay eager — instantiating a graph for 1–2 kernels rarely beats
+/// its launch overhead. A fully-safe schedule yields a single `Gpu` segment
+/// (identical to the whole-schedule fast path); a fully-host one yields a
+/// single `Eager` segment (no capture).
+pub(crate) fn segment_schedule_for_capture(
+    schedule: &[Step],
+    rng_on_device: bool,
+    min_run: usize,
+) -> Vec<CaptureSegment> {
+    let mask: Vec<bool> = schedule
+        .iter()
+        .map(|s| s.graph_capture_safe(rng_on_device))
+        .collect();
+    segment_mask(&mask, min_run)
+}
+
+/// True when segmentation would capture strictly less than the whole schedule
+/// yet still find at least one worthwhile GPU segment — i.e. the case the
+/// whole-schedule gate gives up on but segmented capture can still accelerate.
+pub(crate) fn segments_beat_all_or_nothing(segs: &[CaptureSegment]) -> bool {
+    let gpu = segs
+        .iter()
+        .filter(|s| matches!(s, CaptureSegment::Gpu { .. }))
+        .count();
+    let has_eager = segs
+        .iter()
+        .any(|s| matches!(s, CaptureSegment::Eager { .. }));
+    gpu >= 1 && has_eager
 }
 
 pub(crate) fn step_is_tail_host(step: &Step) -> bool {
@@ -2077,6 +2264,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScaledQuantScale { .. } => "rlx::ScaledQuantScale",
         Step::ScaledQuantizeFp8 { .. } => "rlx::ScaledQuantizeFp8",
         Step::ScaledMatMulDecode { .. } => "rlx::ScaledMatMulDecode",
+        Step::ScaledGroupedMatMulDecode { .. } => "rlx::ScaledGroupedMatMulDecode",
         Step::ScaledQuantScaleGeneral { .. } => "rlx::ScaledQuantScaleGeneral",
         Step::ScaledQuantizeGeneral { .. } => "rlx::ScaledQuantizeGeneral",
         Step::ScaledDequantizeGeneral { .. } => "rlx::ScaledDequantizeGeneral",
@@ -2123,6 +2311,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::DequantMatmulMxFp4x2 { .. } => "rlx::DequantMatmulMxFp4x2",
         Step::DequantGroupedMatmulGguf { .. } => "rlx::DequantGroupedMatmulGguf",
         Step::DequantGroupedMatmulMlxHost { .. } => "rlx::DequantGroupedMatmulMlxHost",
+        Step::DequantGroupedMatmulMlxNative { .. } => "rlx::DequantGroupedMatmulMlxNative",
         Step::Sample { .. } => "rlx::Sample",
         Step::RngNormal { .. } => "rlx::RngNormal",
         Step::RngUniform { .. } => "rlx::RngUniform",
@@ -2403,6 +2592,29 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
                 (*rhs_byte_off / 4) as u32,
                 (*lhs_scale_byte_off / 4) as u32,
                 (*rhs_scale_byte_off / 4) as u32,
+            ];
+            if *has_bias != 0 {
+                r.push(*bias_off_f32);
+            }
+            (r, vec![*out_off_f32])
+        }
+        Step::ScaledGroupedMatMulDecode {
+            input_byte_off,
+            weight_byte_off,
+            input_scale_byte_off,
+            weight_scale_byte_off,
+            idx_off_f32,
+            out_off_f32,
+            has_bias,
+            bias_off_f32,
+            ..
+        } => {
+            let mut r = vec![
+                (*input_byte_off / 4) as u32,
+                (*weight_byte_off / 4) as u32,
+                (*input_scale_byte_off / 4) as u32,
+                (*weight_scale_byte_off / 4) as u32,
+                *idx_off_f32,
             ];
             if *has_bias != 0 {
                 r.push(*bias_off_f32);
@@ -2778,6 +2990,22 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
                 (*w_byte_off / 4) as u32,
                 (*scale_byte_off / 4) as u32,
                 (*zp_byte_off / 4) as u32,
+                (*idx_byte_off / 4) as u32,
+            ],
+            vec![(*out_byte_off / 4) as u32],
+        ),
+        Step::DequantGroupedMatmulMlxNative {
+            x_byte_off,
+            w_byte_off,
+            scale_byte_off,
+            idx_byte_off,
+            out_byte_off,
+            ..
+        } => (
+            vec![
+                (*x_byte_off / 4) as u32,
+                (*w_byte_off / 4) as u32,
+                (*scale_byte_off / 4) as u32,
                 (*idx_byte_off / 4) as u32,
             ],
             vec![(*out_byte_off / 4) as u32],
@@ -3541,5 +3769,164 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![(prep_off / 4) as u32, (meta_off / 4) as u32],
             vec![(dst_off / 4) as u32],
         ),
+    }
+}
+
+#[cfg(test)]
+mod graph_capture_tests {
+    use super::*;
+
+    fn rng_normal_step() -> Step {
+        Step::RngNormal {
+            dst_byte_off: 0,
+            len: 8,
+            mean: 0.0,
+            scale: 1.0,
+            key: 1,
+            op_seed: None,
+        }
+    }
+
+    fn rng_uniform_step() -> Step {
+        Step::RngUniform {
+            dst_byte_off: 0,
+            len: 8,
+            low: 0.0,
+            high: 1.0,
+            key: 1,
+            op_seed: None,
+        }
+    }
+
+    #[test]
+    fn rng_steps_capture_safe_only_on_device() {
+        // Philox / Zero fill entirely on-device → capturable.
+        assert!(rng_normal_step().graph_capture_safe(true));
+        assert!(rng_uniform_step().graph_capture_safe(true));
+        // Ort / Bnns take a cold-path host fill → never capturable.
+        assert!(!rng_normal_step().graph_capture_safe(false));
+        assert!(!rng_uniform_step().graph_capture_safe(false));
+    }
+
+    #[test]
+    fn schedule_capture_gated_by_rng_policy() {
+        let sched = vec![rng_normal_step(), rng_uniform_step()];
+        assert!(schedule_graph_capture_safe(&sched, true));
+        assert!(!schedule_graph_capture_safe(&sched, false));
+    }
+
+    use super::{CaptureSegment, segment_mask, segments_beat_all_or_nothing};
+
+    #[test]
+    fn all_safe_is_one_gpu_segment() {
+        // Matches the whole-schedule fast path exactly — no regression.
+        let segs = segment_mask(&[true; 8], 2);
+        assert_eq!(segs, vec![CaptureSegment::Gpu { start: 0, end: 8 }]);
+        assert!(!segments_beat_all_or_nothing(&segs));
+    }
+
+    #[test]
+    fn all_host_is_one_eager_segment() {
+        let segs = segment_mask(&[false; 5], 2);
+        assert_eq!(segs, vec![CaptureSegment::Eager { start: 0, end: 5 }]);
+        assert!(!segments_beat_all_or_nothing(&segs));
+    }
+
+    #[test]
+    fn one_host_step_splits_around_it() {
+        // The payoff case: a big GPU run, one host op, another big GPU run.
+        // Whole-schedule gate gives up entirely; segmentation keeps both runs.
+        let mut mask = vec![true; 10];
+        mask[5] = false;
+        let segs = segment_mask(&mask, 2);
+        assert_eq!(
+            segs,
+            vec![
+                CaptureSegment::Gpu { start: 0, end: 5 },
+                CaptureSegment::Eager { start: 5, end: 6 },
+                CaptureSegment::Gpu { start: 6, end: 10 },
+            ]
+        );
+        assert!(segments_beat_all_or_nothing(&segs));
+    }
+
+    #[test]
+    fn subthreshold_gpu_run_folds_into_eager() {
+        // GPU run of length 1 (< min_run=2) between two host steps must not be
+        // captured; it coalesces into one eager span with its neighbours.
+        let mask = [false, false, true, false, false];
+        let segs = segment_mask(&mask, 2);
+        assert_eq!(segs, vec![CaptureSegment::Eager { start: 0, end: 5 }]);
+        assert!(!segments_beat_all_or_nothing(&segs));
+    }
+
+    #[test]
+    fn subthreshold_run_between_captured_runs_stays_eager() {
+        // [GGG] h [G] h [GGG] with min_run=2: the lone middle G is eager and
+        // merges with the host steps flanking it → G, Eager, G.
+        let mask = [true, true, true, false, true, false, true, true, true];
+        let segs = segment_mask(&mask, 2);
+        assert_eq!(
+            segs,
+            vec![
+                CaptureSegment::Gpu { start: 0, end: 3 },
+                CaptureSegment::Eager { start: 3, end: 6 },
+                CaptureSegment::Gpu { start: 6, end: 9 },
+            ]
+        );
+        assert!(segments_beat_all_or_nothing(&segs));
+    }
+
+    #[test]
+    fn segments_cover_schedule_contiguously() {
+        // Whatever the pattern, segment ranges must tile [0, n) with no gaps or
+        // overlaps — the replay loop relies on this.
+        for pattern in [
+            vec![true, false, true, true, false, false, true],
+            vec![false, true, true, true, true, false],
+            vec![true; 6],
+            vec![false; 4],
+        ] {
+            let n = pattern.len();
+            let segs = segment_mask(&pattern, 2);
+            let mut next = 0;
+            for s in &segs {
+                let r = s.range();
+                assert_eq!(r.start, next, "gap/overlap in {pattern:?} → {segs:?}");
+                next = r.end;
+            }
+            assert_eq!(next, n, "segments must reach the end for {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn min_run_one_captures_singletons() {
+        // With min_run=1 even lone GPU steps capture.
+        let mask = [true, false, true];
+        let segs = segment_mask(&mask, 1);
+        assert_eq!(
+            segs,
+            vec![
+                CaptureSegment::Gpu { start: 0, end: 1 },
+                CaptureSegment::Eager { start: 1, end: 2 },
+                CaptureSegment::Gpu { start: 2, end: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn step_wrapper_uses_capture_safety() {
+        use super::segment_schedule_for_capture;
+        // Two RNG steps: capture-safe iff rng_on_device. On-device → one Gpu
+        // segment; host RNG → one Eager segment.
+        let sched = vec![rng_normal_step(), rng_uniform_step()];
+        assert_eq!(
+            segment_schedule_for_capture(&sched, true, 1),
+            vec![CaptureSegment::Gpu { start: 0, end: 2 }]
+        );
+        assert_eq!(
+            segment_schedule_for_capture(&sched, false, 1),
+            vec![CaptureSegment::Eager { start: 0, end: 2 }]
+        );
     }
 }

@@ -26,6 +26,15 @@ impl Graph {
         self.push(Op::Softmax { axis }, vec![input], shape, None)
     }
 
+    /// Histogram of `input` into `bins` equal-width buckets over `[min, max]`.
+    /// Output is a 1-D f32 tensor `[bins]` of counts. Elements outside the
+    /// range are dropped and `x == max` lands in the last bin (matches
+    /// `numpy.histogram`). Non-differentiable.
+    pub fn histogram(&mut self, input: NodeId, bins: usize, min: f32, max: f32) -> NodeId {
+        let out = Shape::new(&[bins], crate::DType::F32);
+        self.push(Op::Histogram { bins, min, max }, vec![input], out, None)
+    }
+
     /// Cumulative sum along an axis (output shape == input shape).
     pub fn cumsum(&mut self, input: NodeId, axis: i32, exclusive: bool, shape: Shape) -> NodeId {
         self.push(Op::Cumsum { axis, exclusive }, vec![input], shape, None)

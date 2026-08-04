@@ -189,9 +189,11 @@ impl MetalExecutable {
         // Memory plan with GPU-aligned cache lines (128B on Apple Silicon)
         let gdn_scratch = gdn_ephemeral_state_bytes(&fused);
         let dequant_scratch = dequant_gguf_scratch_bytes(&fused);
+        let synth_mm_scratch = synth_matmul_scratch_bytes(&fused);
         let conv_bwd_scratch = conv_bwd_scratch_bytes(&fused);
         let attn_bwd_scratch = crate::attention_bwd_gpu::scratch_bytes(&fused);
         let rms_norm_bwd_scratch = rms_norm_bwd_scratch_bytes(&fused);
+        let rnn_gru_scratch = rnn_gru_scratch_bytes(&fused);
         let onnx_qmatmul_act_scratch = if crate::onnx_qmatmul::ingraph_gpu_enabled() {
             crate::onnx_qmatmul::act_scratch_bytes(&fused)
         } else {
@@ -229,6 +231,10 @@ impl MetalExecutable {
                 // ops that reused those slots. Slot reuse is unsafe in that mix;
                 // RLX_ARENA_NO_REUSE pins every buffer to avoid the clobber.
                 arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
+                // DIAG: force liveness-based slot reuse in the initial plan (drop
+                // the output-ancestor pin unconditionally) to measure the true
+                // reuse-enabled footprint vs the pinned default.
+                pin_output_ancestors: !rlx_ir::env::flag("RLX_METAL_UNPIN_ALL"),
                 ..Default::default()
             },
         );
@@ -497,6 +503,14 @@ impl MetalExecutable {
         } else {
             0
         };
+        let synth_matmul_scratch_off = if synth_mm_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + synth_mm_scratch;
+            off
+        } else {
+            0
+        };
         let conv_bwd_scratch_off = if conv_bwd_scratch > 0 {
             tail = (tail + 127) & !127;
             let off = tail;
@@ -517,6 +531,14 @@ impl MetalExecutable {
             tail = (tail + 127) & !127;
             let off = tail;
             tail = off + rms_norm_bwd_scratch;
+            off
+        } else {
+            0
+        };
+        let rnn_gru_scratch_off = if rnn_gru_scratch > 0 {
+            tail = (tail + 127) & !127;
+            let off = tail;
+            tail = off + rnn_gru_scratch;
             off
         } else {
             0
@@ -767,6 +789,10 @@ impl MetalExecutable {
             && mps_plan.is_none()
             && !crate::runtime_config().disable_mpsgraph
             && !crate::runtime_config().disable_mpsgraph_hybrid
+            // The interior rank≥4 reduction (HC / KV-pool) that makes the full plan
+            // bail also miscompiles inside a hybrid MPSGraph segment — keep the
+            // whole graph on the correct thunk path.
+            && !crate::mps_graph_lower::graph_has_mps_hostile_reduce(&fused)
         {
             crate::mps_graph_hybrid::build_hybrid_plan(&fused, None)
                 .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
@@ -802,6 +828,7 @@ impl MetalExecutable {
         };
 
         let max_matmul_flops = max_matmul_flops_in(&fused);
+        let has_bf16_matmul = graph_has_bf16_matmul(&fused);
 
         let mut me = Self {
             graph: fused,
@@ -820,14 +847,18 @@ impl MetalExecutable {
             pending_cmd_bufs: Vec::new(),
             active_extent: None,
             max_matmul_flops,
+            has_bf16_matmul,
             mps_params_frozen: false,
             gdn_scratch_off,
             dequant_scratch_off,
+            synth_matmul_scratch_off,
             conv_bwd_scratch_off,
             attn_bwd_scratch_off,
             rms_norm_bwd_scratch_off,
+            rnn_gru_scratch_off,
             onnx_qmatmul_act_scratch_off,
             f16_weight_scratch: std::cell::RefCell::new(None),
+            baked_weight_concats: std::cell::RefCell::new(std::collections::HashSet::new()),
             qmatmul_weight_cache: std::cell::RefCell::new(
                 crate::onnx_qmatmul::QMatMulWeightCache::new(),
             ),
@@ -852,6 +883,18 @@ impl MetalExecutable {
 /// through f32 regardless). Packed/quantized weights (`Op::Param`, e.g. GGUF
 /// U8/I8 blocks read raw by DequantMatMul) are handled elsewhere and must keep
 /// their true byte width, so U8/I8 are deliberately excluded here.
+/// True when any `Op::MatMul` in the graph has a BF16 input operand. Such
+/// matmuls are correct only on the MPSGraph path (which casts bf16→f32); the
+/// thunk `Sgemm` has no bf16-weight kernel and would misread the bytes as f32.
+fn graph_has_bf16_matmul(graph: &Graph) -> bool {
+    graph.nodes().iter().any(|n| {
+        matches!(n.op, Op::MatMul)
+            && n.inputs
+                .iter()
+                .any(|&i| graph.node(i).shape.dtype() == rlx_ir::DType::BF16)
+    })
+}
+
 #[inline]
 fn metal_widened_dtype(dt: rlx_ir::DType) -> bool {
     matches!(

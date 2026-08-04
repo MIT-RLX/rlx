@@ -47,6 +47,15 @@ pub fn __rlx_build(item: TokenStream) -> TokenStream {
     graph_dsl::rlx_build_impl(item.into()).into()
 }
 
+/// Engine behind `rlx_tensor::rlx_expr!` — one `rlx!`-grammar expression over
+/// in-scope Rust `Tensor` variables (the "Rust bridge"). Same wrapper split as
+/// `__rlx_build` for `$crate` path hygiene.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __rlx_expr(item: TokenStream) -> TokenStream {
+    graph_dsl::rlx_expr_impl(item.into()).into()
+}
+
 /// Compile-time pipeline scheduler (plan #11). See `pipeline_schedule_impl`
 /// in this crate's private `pipeline` module for the full grammar.
 ///

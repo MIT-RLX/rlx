@@ -2,11 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Single-layer unidirectional GRU (gate order r, z, n; linear_before_reset=1;
-// separate b_ih/b_hh; h0 = 0). One workgroup per batch item; thread `k` owns
-// hidden unit `k`, shared hidden state in workgroup memory. hidden ≤ 256
-// (larger / multi-layer / bidir / carry take the host fallback). Barriers sit
-// in uniform control flow (outside the active-thread guard).
+// GRU (gate order r, z, n; linear_before_reset=1; separate b_ih/b_hh).
+// Dispatched once per (layer, direction) by the lowering, which loops
+// layers×dirs and ping-pongs intermediate layer outputs through an in-arena
+// scratch region (x_off/out_off are absolute arena word offsets). One workgroup
+// per batch item; thread `k` owns hidden unit `k`, shared hidden state. `h0_off`
+// (0 → h0=0) seeds the state; `out_width`=dirs·hidden, `dir_off`=dir·hidden and
+// `reverse` place this direction's output. hidden ≤ 256 (else host fallback).
+// Single-layer/unidir/no-carry reduces to the original kernel. Barriers sit in
+// uniform control flow (outside the active-thread guard).
 
 struct Params {
     batch: u32,
@@ -20,7 +24,11 @@ struct Params {
     bhh_off: u32,
     out_off: u32,
     seq_stride: u32,
-    _p1: u32, _p2: u32, _p3: u32, _p4: u32, _p5: u32,
+    h0_off: u32,
+    out_width: u32,
+    dir_off: u32,
+    reverse: u32,
+    _p5: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -37,10 +45,18 @@ fn gru(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid:
     let in_sz = params.input_size;
     let lane_on = (bi < params.batch) && (k < h) && (h <= MAX_H);
 
-    if (k < MAX_H) { h_sh[k] = 0.0; }
+    if (k < MAX_H) {
+        var seed: f32 = 0.0;
+        if (params.h0_off != 0u && lane_on) {
+            seed = arena[params.h0_off + bi * h + k];
+        }
+        h_sh[k] = seed;
+    }
     workgroupBarrier();
 
-    for (var t: u32 = 0u; t < params.seq; t = t + 1u) {
+    for (var step: u32 = 0u; step < params.seq; step = step + 1u) {
+        var t = step;
+        if (params.reverse != 0u) { t = params.seq - 1u - step; }
         var h_k: f32 = 0.0;
         if (lane_on) {
             let x_base = params.x_off + (bi * params.seq_stride + t) * in_sz;
@@ -70,7 +86,7 @@ fn gru(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid:
         workgroupBarrier();
         if (lane_on) {
             h_sh[k] = h_k;
-            arena[params.out_off + (bi * params.seq_stride + t) * h + k] = h_k;
+            arena[params.out_off + (bi * params.seq_stride + t) * params.out_width + params.dir_off + k] = h_k;
         }
         workgroupBarrier();
     }

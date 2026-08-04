@@ -129,10 +129,15 @@ pub fn unfuse(graph: Graph) -> Graph {
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
             } => {
+                assert!(
+                    v_head_dim.is_none_or(|v| v == *head_dim),
+                    "rlx-tpu: asymmetric v_head_dim (MLA) not yet supported"
+                );
                 let q_dims = graph.node(node.inputs[0]).shape.dims();
                 if q_dims.len() == 3 {
                     expand_attention_rank3(
@@ -143,6 +148,7 @@ pub fn unfuse(graph: Graph) -> Graph {
                         &node.shape,
                         *num_heads,
                         *head_dim,
+                        *v_head_dim,
                         *mask_kind,
                         *score_scale,
                         *attn_logit_softcap,
@@ -471,6 +477,7 @@ fn expand_fab(
         Op::Attention {
             num_heads,
             head_dim,
+            v_head_dim: None,
             mask_kind: rlx_ir::op::MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -653,6 +660,7 @@ fn expand_ftl(
         Op::Attention {
             num_heads,
             head_dim,
+            v_head_dim: None,
             mask_kind: rlx_ir::op::MaskKind::Custom,
             score_scale: None,
             attn_logit_softcap: None,
@@ -945,6 +953,7 @@ fn expand_attention_rank3(
     out_shape: &Shape,
     num_heads: usize,
     head_dim: usize,
+    v_head_dim: Option<usize>,
     mask_kind: MaskKind,
     score_scale: Option<f32>,
     attn_logit_softcap: Option<f32>,
@@ -1038,6 +1047,7 @@ fn expand_attention_rank3(
         Op::Attention {
             num_heads,
             head_dim,
+            v_head_dim,
             mask_kind,
             score_scale,
             attn_logit_softcap,

@@ -96,6 +96,49 @@ fn gdn_ephemeral_state_bytes(graph: &rlx_ir::Graph) -> usize {
     max
 }
 
+/// Scratch bytes for native multi-layer GRU / Elman RNN / LSTM: a ping-pong pair
+/// of `[batch, seq, dirs·hidden]` f32 buffers holding intermediate layer outputs
+/// (the LSTM cell state stays in registers, so no extra scratch). Only
+/// `num_layers > 1` needs it (single-layer writes straight to its output slot;
+/// both directions own disjoint output slices). Shared/reused across ops
+/// (sequential execution) → the max over nodes.
+fn rnn_gru_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
+    let mut max = 0usize;
+    for node in graph.nodes() {
+        let (hidden, num_layers, bidirectional) = match &node.op {
+            Op::Gru {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                ..
+            }
+            | Op::Rnn {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                ..
+            }
+            | Op::Lstm {
+                hidden_size,
+                num_layers,
+                bidirectional,
+                ..
+            } => (*hidden_size, *num_layers, *bidirectional),
+            _ => continue,
+        };
+        if num_layers <= 1 {
+            continue;
+        }
+        let x_shape = &graph.node(node.inputs[0]).shape;
+        let batch = x_shape.dim(0).unwrap_static();
+        let seq = x_shape.dim(1).unwrap_static();
+        let dirs = if bidirectional { 2 } else { 1 };
+        let layer_elems = batch * seq * dirs * hidden;
+        max = max.max(2 * layer_elems * std::mem::size_of::<f32>());
+    }
+    max
+}
+
 /// Hard cap on the col scratch matrix (bytes). Convs whose col would exceed
 /// this fall back to the direct conv kernel (keeps the arena well under the
 /// 4 GiB storage-binding limit).
@@ -336,6 +379,22 @@ mod test;
 pub(crate) use helpers::*;
 pub(crate) use step::*;
 
+/// Process-wide count of packed-BF16 (`matmul_bf16w`) matmul dispatches.
+/// Test/telemetry hook proving the packed path was actually taken.
+pub(crate) static BF16_PACKED_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Increment the packed-BF16 dispatch counter (called from the run loop).
+#[inline]
+pub(crate) fn bf16_packed_dispatch_inc() {
+    BF16_PACKED_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total packed-BF16 matmul dispatches since process start.
+pub fn bf16_packed_dispatch_count() -> u64 {
+    BF16_PACKED_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl WgpuExecutable {
     /// Resolve the deferred graph against bindings inferred from
     /// `inputs`, recompile the inner state if the bindings changed
@@ -422,6 +481,8 @@ impl WgpuExecutable {
             extra_shards: Vec::new(),
             shard_size: 0,
             f16_buffer: None,
+            bf16_weight_buffer: None,
+            bf16_packed_nodes: std::collections::HashSet::new(),
             offsets: HashMap::new(),
             lens: HashMap::new(),
             size: 0,
@@ -2015,6 +2076,17 @@ fn derive_matmul_compute(
     let b_dt = graph.node(b_id).shape.dtype();
     let any_low =
         matches!(a_dt, DType::F16 | DType::BF16) || matches!(b_dt, DType::F16 | DType::BF16);
+    // A genuine BF16 weight (e.g. a bf16-resident LM head fed via
+    // `set_param_typed(name, bytes, DType::BF16)`) is already widened to
+    // f32 in the f32-uniform arena — the plain F32 kernel reads correct
+    // values and is bit-exact. It must NOT be routed to the f16-shadow
+    // coop path: (a) the f16 shadow downcast (f32→f16) discards bf16's
+    // wider exponent range, and (b) the `matmul_coop16` kernel produced
+    // orthogonal garbage on Metal for aligned bf16-tagged weights. Keep
+    // bf16 in `any_low` (so it never falls into the `!any_low`
+    // CoopF16Vk branch) but exclude it from Coop16 below → it lands on
+    // F32 (or opt-in CoopF32, which reads the correct f32 arena weight).
+    let any_bf16 = matches!(a_dt, DType::BF16) || matches!(b_dt, DType::BF16);
     // CoopF32 (`simdgroup_float8x8`) needs K and N aligned to 8 and 32
     // (one micro-tile per K-iter, one 32-col workgroup per N-tile).
     // M can be arbitrary — the kernel pads to the next multiple of 32
@@ -2036,6 +2108,7 @@ fn derive_matmul_compute(
     // overflow f16, so we only enter on F16/BF16 IR tags — AutoMixed
     // users have already opted into the precision tradeoff.
     if any_low
+        && !any_bf16
         && has_coop
         && dev.features().contains(wgpu::Features::SHADER_F16)
         && traces_to_param(graph, b_id)
@@ -2737,6 +2810,7 @@ fn build_matmul_bind_group(
     mm_k: &Kernel,
     _mm_w: &Kernel,
     mm_f16w: &Option<&'static Kernel>,
+    mm_bf16w: &'static Kernel,
     mm_f16c: &Option<&'static Kernel>,
     mm_coop: &Option<&'static Kernel>,
     mm_coop_f32: &Option<&'static Kernel>,
@@ -2752,6 +2826,39 @@ fn build_matmul_bind_group(
     b_off: u32,
     b_batch_stride: u32,
 ) -> (wgpu::BindGroup, u32) {
+    // PACKED-BF16 weight: 3-binding layout (arena rw for A/C, params, packed
+    // bf16 weight buffer bound WHOLE at offset 0 so `b_off` stays the global
+    // bf16-element index). No f16 shadow / rebase.
+    if b_is_param
+        && compute_precision == MatmulCompute::Bf16Packed
+        && let Some(bf16_buf) = &arena.bf16_weight_buffer
+    {
+        return (
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rlx-wgpu matmul_bf16w bg"),
+                layout: &mm_bf16w.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
+                            size: NonZeroU64::new(arena_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: bf16_buf.as_entire_binding(),
+                    },
+                ],
+            }),
+            b_off,
+        );
+    }
     let f16_bind = |b_off: u32| -> (wgpu::BindingResource<'_>, u32) {
         let f16_buf = arena
             .f16_buffer

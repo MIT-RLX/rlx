@@ -14,11 +14,11 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-ir = { workspace = true }
 # Op legalization: lower composite/backward ops to the primitive set below.
-rlx-autodiff = { path = "../../core/rlx-autodiff", version = "0.2.14" }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.14" }
-rlx-fusion = { path = "../../core/rlx-fusion", version = "0.2.14" }
+rlx-autodiff = { workspace = true }
+rlx-compile = { workspace = true }
+rlx-fusion = { workspace = true }
 
 # Host/transport `collective.*` ops delegate to the one shared CPU kernel via
 # `rlx_cpu::op_registry::run_f32_custom_op_host`. This is NATIVE-only: the

@@ -101,6 +101,17 @@ impl ExecutableGraph for RocmExecutableWrapper {
     fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle(name)
     }
+    fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+        self.inner.register_kv_row_feed(handle_name, output_index);
+        true
+    }
+    fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
+        self.inner.feed_kv_row(src_row, dst_row, row_elems);
+        true
+    }
+    fn read_output_row(&self, out_idx: usize, row: usize, row_inner: usize) -> Option<Vec<f32>> {
+        self.inner.read_output_row(out_idx, row, row_inner)
+    }
     fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
         self.inner.run_slots(inputs)
     }

@@ -7,7 +7,7 @@
 //! of a checkpoint across a distributed pipeline: give each node its stage's
 //! layer range and it fetches only the shards those layers touch.
 
-use anyhow::{Result, anyhow};
+use crate::error::{HubError, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 
@@ -24,7 +24,7 @@ impl SafetensorsIndex {
         let wm = v
             .get("weight_map")
             .and_then(|m| m.as_object())
-            .ok_or_else(|| anyhow!("index.json has no `weight_map`"))?;
+            .ok_or_else(|| HubError::Index("has no `weight_map`".to_string()))?;
         let weight_map = wm
             .iter()
             .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))

@@ -52,6 +52,14 @@ pub enum SgemmVariant {
     /// 32×32 output per threadgroup; 16 simdgroups cooperate via threadgroup memory.
     /// Best throughput for our hand-rolled path. Requires M%32==K%32==N%32==0.
     Simd4x4,
+    /// 64×64 output per threadgroup; 8 simdgroups, each an 8×64 strip (8 accumulators).
+    /// ~1.8× Simd4x4 and beats MPS on TALL / short-K aligned shapes (measured).
+    /// Requires M%64==0 && N%64==0 && K%8==0 and enough row-tiles for occupancy.
+    Simd64,
+    /// Split-K 64×64 tile for FAT-K / small-MN (dW=xᵀ·dq): grid adds a Ksplits z-axis
+    /// so few output tiles still fill the GPU; partials hardware-atomic-add into a
+    /// pre-zeroed C. Beats MPS ~1.5× on the dW shape. Requires 64-align + K%(S*8)==0.
+    Simd64SplitK,
     /// 8×8 output per threadgroup. Requires M%8==K%8==N%8==0.
     Simd,
     /// simdgroup tensor units with bounds-checked partial-tile load/store.
@@ -60,6 +68,22 @@ pub enum SgemmVariant {
     Tiled,
     /// One thread per output element; for very small dims.
     Naive,
+}
+
+/// Split count for `Simd64SplitK`: the largest `S ∈ {32,16,8,4}` with `k%(S*8)==0`
+/// and total threadgroups `(m/64)*(n/64)*S ≤ 256` (caps per-output atomic
+/// contention while filling the GPU). Returns 0 when no useful split exists.
+pub(crate) fn pick_ksplits(m: usize, k: usize, n: usize) -> u32 {
+    if !m.is_multiple_of(64) || !n.is_multiple_of(64) {
+        return 0;
+    }
+    let tiles = (m / 64) * (n / 64);
+    for s in [32usize, 16, 8, 4] {
+        if k.is_multiple_of(s * 8) && tiles * s <= 256 {
+            return s as u32;
+        }
+    }
+    0
 }
 
 /// Metal hardware model — built once at startup from device properties.
@@ -152,6 +176,13 @@ impl MetalHwModel {
 
     // ── Dispatch decisions ──────────────────────────────────────────
 
+    /// Split count for `Simd64SplitK` (0 = don't split). Largest S in {32,16,8,4}
+    /// with `k % (S*8) == 0` and total threadgroups `(m/64)*(n/64)*S <= 256` (caps
+    /// per-output atomic contention while filling the GPU). See [`pick_ksplits`].
+    pub fn ksplits(&self, m: usize, k: usize, n: usize) -> u32 {
+        pick_ksplits(m, k, n)
+    }
+
     /// Pick the best sgemm variant for these dimensions.
     /// Higher-throughput variants have stricter alignment requirements.
     pub fn pick_sgemm(&self, m: usize, k: usize, n: usize) -> SgemmVariant {
@@ -175,6 +206,34 @@ impl MetalHwModel {
             && flop >= self.mps_threshold_flop
         {
             return SgemmVariant::Mps;
+        }
+
+        // 64×64 big-tile: ~1.8× Simd4x4 (and beats MPS) on TALL aligned shapes
+        // (measured — MPS's async-copy pipeline can't amortize at short K).
+        // Default-on for qualifying shapes; the occupancy gate ((m/64)*(n/64)>=32)
+        // excludes fat-K/small-MN like dW = xᵀ·dq (m=192) where too few threadgroups
+        // underutilize the GPU. No partial-tile handling → strict 64/8 alignment.
+        // Opt out: RLX_METAL_NO_SGEMM64. Measured: transformer forward ~11% faster,
+        // bit-exact. See cse_and_backward_timing.
+        if !rlx_ir::env::flag("RLX_METAL_NO_SGEMM64")
+            && m.is_multiple_of(64)
+            && n.is_multiple_of(64)
+            && k.is_multiple_of(8)
+            && (m / 64) * (n / 64) >= 32
+        {
+            return SgemmVariant::Simd64;
+        }
+
+        // Split-K big-tile for FAT-K / small-MN (too few output tiles for Simd64,
+        // but K large enough to parallelize). Opt-in (RLX_METAL_SGEMM_SPLITK) while
+        // the atomic-accumulate path is validated. Only when a good split exists.
+        if rlx_ir::env::flag("RLX_METAL_SGEMM_SPLITK")
+            && m.is_multiple_of(64)
+            && n.is_multiple_of(64)
+            && (m / 64) * (n / 64) < 32
+            && pick_ksplits(m, k, n) >= 4
+        {
+            return SgemmVariant::Simd64SplitK;
         }
 
         if k.is_multiple_of(32) && n.is_multiple_of(32) && m.is_multiple_of(32) {
@@ -217,6 +276,10 @@ impl MetalHwModel {
             // MPS hits roughly 1.5–2.5× our hand-rolled simd_4x4 throughput
             // on M3/M4 once it's past the bridging-cost threshold.
             SgemmVariant::Mps => self.sgemm_simd_4x4_flops * 2.0,
+            // ~1.8× Simd4x4 on the tall aligned shapes it's gated to (measured).
+            SgemmVariant::Simd64 => self.sgemm_simd_4x4_flops * 1.8,
+            // Fat-K split beats MPS ~1.5× (≈3× Simd4x4) on the dW shape (measured).
+            SgemmVariant::Simd64SplitK => self.sgemm_simd_4x4_flops * 3.0,
             SgemmVariant::Simd4x4 => self.sgemm_simd_4x4_flops,
             SgemmVariant::Simd => self.sgemm_simd_flops,
             SgemmVariant::SimdPadded => self.sgemm_padded_flops,

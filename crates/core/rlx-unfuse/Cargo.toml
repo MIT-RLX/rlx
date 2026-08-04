@@ -12,7 +12,7 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../rlx-ir", version = "0.2.14" }
+rlx-ir = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

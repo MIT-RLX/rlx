@@ -28,6 +28,7 @@
 
 pub mod cluster;
 pub mod config;
+pub mod experts;
 pub mod graph;
 pub mod launch;
 pub mod partition;
@@ -39,6 +40,11 @@ pub use config::{DistConfig, Hostfile, ParallelMode, TransportBackend};
 pub use launch::{LocalCluster, WorkerArgs, free_loopback_ports, worker_args};
 pub use partition::{BlockRole, block_role, pipeline_layer_range};
 pub use pipeline::{BlockInput, BlockOutput, BlockRunner, PipelineCoordinator};
+
+// ── MoE expert-parallel offload seam (model-agnostic; DeepSeek / Llama-4 / Kimi) ──
+pub use experts::{
+    ExpertProvider, ExpertShards, dispatch_experts, serve_expert_worker, shutdown_expert_workers,
+};
 
 // Re-export the transport primitives so model crates depend only on
 // `rlx-distributed`, not `rlx-driver` directly.

@@ -213,9 +213,16 @@ pub fn run_dequant_grouped_matmul_mlx<A: DeviceArena>(
     out_byte_off: usize,
     scale_bf16: bool,
 ) {
-    let (bits, group_size) = match scheme {
-        QuantScheme::MlxAffine { bits, group_size } => (bits, group_size as usize),
-        other => panic!("rlx-gpu-host grouped mlx: expected MlxAffine, got {other:?}"),
+    // MXFP4 (Kimi-K3 MoE experts) shares this host path with affine: same
+    // per-routed-expert slab copyback, only the final dequant-matmul differs
+    // (E2M1 nibbles + group scale, no zero-point/bias). `bits` is unused for
+    // mxfp4 (the E2M1 LUT is fixed) — carried only for the affine branch.
+    let (bits, group_size, is_mxfp4) = match scheme {
+        QuantScheme::MlxAffine { bits, group_size } => (bits, group_size as usize, false),
+        QuantScheme::MlxMxfp4 { group_size } => (4, group_size as usize, true),
+        other => {
+            panic!("rlx-gpu-host grouped mlx: expected MlxAffine or MlxMxfp4, got {other:?}")
+        }
     };
     let n_groups = k / group_size.max(1);
     let per_expert_w = match mlx_weight_bytes(scheme, k, n) {
@@ -295,20 +302,36 @@ pub fn run_dequant_grouped_matmul_mlx<A: DeviceArena>(
 
     let tt = std::time::Instant::now();
     let mut out_host = vec![0f32; m * n];
-    rlx_cpu::thunk::dequant_grouped_matmul_affine_bt(
-        x_host,
-        &w_host,
-        scales,
-        biases,
-        &idx_compact,
-        &mut out_host,
-        m,
-        k,
-        n,
-        ne,
-        bits as u32,
-        group_size,
-    );
+    if is_mxfp4 {
+        // MXFP4 has no per-group bias; `biases` (zeroed) is ignored.
+        rlx_cpu::thunk::dequant_grouped_matmul_mxfp4_bt(
+            x_host,
+            &w_host,
+            scales,
+            &idx_compact,
+            &mut out_host,
+            m,
+            k,
+            n,
+            ne,
+            group_size,
+        );
+    } else {
+        rlx_cpu::thunk::dequant_grouped_matmul_affine_bt(
+            x_host,
+            &w_host,
+            scales,
+            biases,
+            &idx_compact,
+            &mut out_host,
+            m,
+            k,
+            n,
+            ne,
+            bits as u32,
+            group_size,
+        );
+    }
     if prof {
         HD_COMPUTE_NS.fetch_add(tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }

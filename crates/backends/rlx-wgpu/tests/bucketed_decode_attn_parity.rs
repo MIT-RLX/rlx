@@ -19,6 +19,7 @@ fn build_decode_attn(b: usize, lq: usize, lk: usize, nh: usize, dh: usize) -> Gr
         rlx_ir::Op::Attention {
             num_heads: nh,
             head_dim: dh,
+            v_head_dim: None,
             mask_kind: MaskKind::Custom,
             score_scale: Some(1.0),
             attn_logit_softcap: None,

@@ -178,6 +178,31 @@ pub enum Thunk {
         dt: HalfFlag,
         /// RHS weight matrix stored as F16; promote to F32 via scratch before sgemm.
         b_f16: bool,
+        /// LHS activation stored as F16 (mixed-precision training backward); read
+        /// as half in-kernel with f32 accumulate instead of misreading its bytes.
+        a_f16: bool,
+        /// Fold a materialized last-two-swap `Transpose` on the LHS into the GEMM:
+        /// `a` points at the *pre*-transpose source ([k,m]) and the GEMM reads it
+        /// transposed (MPS `transposeLeft`). The autodiff `dW = Xᵀ·dY` emits this.
+        ta: bool,
+        /// Same for the RHS (`transposeRight`); the autodiff `dX = dY·Wᵀ` emits it.
+        tb: bool,
+    },
+    /// `C = A·B + R` — f32 matmul with a full `[m,n]` residual added in the
+    /// sgemm store (from [`rlx_ir::op::Op::FusedMatMulResidual`]). One dispatch
+    /// instead of matmul + separate elementwise-add. `r` is the residual arena
+    /// offset. Falls back to a separate add for sgemm variants without a
+    /// residual-epilogue kernel (non-`SimdPadded` shapes); see
+    /// `blas::metal_sgemm_residual_bufs`.
+    SgemmResidual {
+        a: usize,
+        b: usize,
+        c: usize,
+        r: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        dt: HalfFlag,
     },
     /// Batched f32 matmul — per-batch independent `Sgemm`. Used for 3-D
     /// `[batch, M, K] @ [batch, K, N]` where both operands carry a batch
@@ -462,6 +487,10 @@ pub enum Thunk {
         eps: f32,
         has_bias: bool,
         dt: HalfFlag,
+        /// Dual output: when non-zero, also write the pre-norm sum `x+res` here
+        /// (the residual/skip stream). Lets the fusion fire on the per-layer
+        /// residuals whose sum feeds BOTH the norm and the next residual.
+        sum_out: usize,
     },
     /// DiT adaLN-Zero: `out = norm(x)·(1+scale)+shift` with broadcast scale/shift.
     /// `lead_pack`: `[lead_rank, x_lead[8], mod_lead[8]]` (17 u32s).
@@ -598,12 +627,20 @@ pub enum Thunk {
         /// (K/V packed as `kv_heads * head_dim` without host-side repeat).
         kv_heads: u32,
         head_dim: u32,
+        /// V/output per-head width. Equal to `head_dim` for symmetric SDPA;
+        /// smaller for asymmetric MLA (DeepSeek/Kimi qk_head_dim=192,
+        /// v_head_dim=128) where V is read `v_head_dim`-wide and the output
+        /// is `heads * v_head_dim` wide, while Q/K scores still use `head_dim`.
+        v_head_dim: u32,
         mask_kind: u32,
         /// Lookback distance for `mask_kind == 4` (SlidingWindow); 0
         /// for every other mask kind. Visible range per query at
         /// absolute position `abs_q` is `[abs_q - window, abs_q]`.
         window: u32,
         dt: HalfFlag,
+        /// K/V read from an F16-resident cache (Q, softmax accumulation, and
+        /// output stay f32). Routes decode SDPA to `sdpa_decode_m1_f16kv`.
+        kv_f16: bool,
         /// 1 iff Q/K/V are `[B, H, S, D]` (dim1 == num_heads).
         bhsd: u32,
         /// Op::Attention.score_scale. Sentinel `0.0` means "use the kernel default
@@ -654,6 +691,26 @@ pub enum Thunk {
         wrt: u32,
         /// 1 iff Q/K/V are `[B, H, S, D]` (dim1 == num_heads).
         bhsd: u32,
+    },
+    /// Fused backward for all three attention gradients — collapses the three
+    /// `Op::AttentionBackward{Query,Key,Value}` siblings the autodiff emits into
+    /// one pass that recomputes scores/dp/ds once. GPU-only; the sibling group
+    /// falls back to per-`wrt` `AttentionBackward` when the GPU path is off.
+    AttentionBackwardAll {
+        q: usize,
+        k: usize,
+        v: usize,
+        dy: usize,
+        out_dq: usize,
+        out_dk: usize,
+        out_dv: usize,
+        batch: u32,
+        seq: u32,
+        kv_seq: u32,
+        heads: u32,
+        head_dim: u32,
+        mask_kind: u32,
+        window: u32,
     },
     /// RoPE. `src_row_stride` is elements per source row (defaults to
     /// `hidden`); the Narrow→Rope thunk fusion at the end of Metal
@@ -759,6 +816,15 @@ pub enum Thunk {
         inner: u32,
         dt: HalfFlag,
         inputs: Vec<(usize, u32)>,
+        /// Per-input source dtype, parallel to `inputs`. When a source dtype
+        /// differs from the output `dt` (e.g. an F32 `k_rope` feeding an F16 KV
+        /// concat after an upstream pass dropped the cast), the encode converts
+        /// that segment instead of raw-copying — otherwise the f16 kernel reads
+        /// f32 bytes as half (→ inf/NaN saturation).
+        input_dts: Vec<HalfFlag>,
+        /// All inputs are constant weights (Param/Constant) — the output is
+        /// invariant across steps. Lets `RLX_QWEN3_BAKE_WEIGHTS` compute it once.
+        weight_const: bool,
     },
     /// Element-wise comparison: out = (lhs CMP rhs) ? 1.0 : 0.0.
     /// `lhs_scalar` / `rhs_scalar` broadcast a 1-element operand across `len`
@@ -848,6 +914,9 @@ pub enum Thunk {
         total: u32,
         out_dims: Vec<u32>,
         in_strides: Vec<u32>,
+        /// F16 elements (2 bytes) — routes to `transpose_nd_h`. For F16-resident
+        /// KV, `repeat_kv`'s Expand lowers here.
+        half: bool,
     },
     /// Gather along arbitrary axis. See CPU's Thunk::GatherAxis.
     GatherAxis {
@@ -1194,6 +1263,88 @@ pub enum Thunk {
         x_f16: bool,
         /// Matmul output stored as f16 (AMP residual stream).
         dst_f16: bool,
+    },
+    /// Codebook weight-synthesis matmul (native MSL): reconstructs each
+    /// `entry_dim`-vector of the transposed weight from `codebook[indices[..]]`
+    /// inside the matmul inner loop (never materialized). See the CPU oracle
+    /// `rlx_cpu` `Thunk::SynthMatMul` for the reference numerics.
+    SynthMatMul {
+        x: usize,
+        indices: usize,
+        codebook: usize,
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        entry_dim: u32,
+        num_entries: u32,
+        /// x and dst are f16 (activation/output half-precision) — selects the
+        /// `_h` MSL kernel variant. Codebook + accumulation stay f32.
+        half: bool,
+    },
+    /// Fused backward of `Op::SynthMatMul` — one dispatch per gradient (dx or
+    /// d_codebook) instead of the ~11-op decomposition. See MSL `synth_bwd_dx` /
+    /// `synth_bwd_codebook`; the `LowerSynthMatMulBackward` oracle is the parity
+    /// reference. Inputs are arena byte offsets; f32.
+    SynthMatMulBackward {
+        x: usize,
+        indices: usize,
+        codebook: usize,
+        upstream: usize,
+        dst: usize,
+        m: u32,
+        n: u32,
+        k: u32,
+        entry_dim: u32,
+        num_entries: u32,
+        /// `true` → dx `[m,k]`; `false` → d_codebook `[num_entries, entry_dim]`.
+        dx: bool,
+    },
+    /// Fused reconstruct of the dense weight `W[k,n]` from u8 indices + codebook
+    /// (native MSL `synth_reconstruct_kn`), one dispatch. Arena byte offsets.
+    SynthReconstruct {
+        indices: usize,
+        codebook: usize,
+        dst: usize,
+        k: u32,
+        n: u32,
+        entry_dim: u32,
+    },
+    /// KAN Gaussian-RBF spline activation (native MSL). Per-channel learned
+    /// basis; shape-preserving. See CPU `Thunk::SplineActivation` for numerics.
+    SplineActivation {
+        x: usize,
+        coeff: usize,
+        dst: usize,
+        rows: u32,
+        channels: u32,
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
+    },
+    /// Fused KAN spline VJP → dx (native MSL `spline_activation_backward_x`).
+    SplineActivationBackwardX {
+        x: usize,
+        coeff: usize,
+        upstream: usize,
+        dst: usize,
+        rows: u32,
+        channels: u32,
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
+    },
+    /// Fused KAN spline VJP → dcoeff (native MSL `spline_activation_backward_coeff`,
+    /// atomic-accumulate into a pre-zeroed dst).
+    SplineActivationBackwardCoeff {
+        x: usize,
+        upstream: usize,
+        dst: usize,
+        rows: u32,
+        channels: u32,
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
     },
     /// Legacy Int8 block matmul — CPU host fallback on unified memory.
     DequantMatMulInt8 {
@@ -1875,6 +2026,208 @@ pub struct ThunkSchedule {
     pub rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
 }
 
+/// DRAM traffic (read bytes, write bytes) a thunk moves, from its shapes.
+/// Analytic — the *ideal* bytes each op touches (weights, activations, KV),
+/// not counting cache. `RLX_METAL_DUMP_BYTES` sums these per op type so the
+/// data-movement bottleneck is visible directly. Covers the decode-relevant
+/// thunks; anything else returns (0,0) and is grouped under "(other)".
+fn thunk_bytes(t: &Thunk) -> (u64, u64) {
+    let sz = |dt: HalfFlag| -> u64 { if matches!(dt, HalfFlag::F16) { 2 } else { 4 } };
+    let e = |n: u64, dt: HalfFlag| n * sz(dt); // n elements at dt
+    match t {
+        // A[m,k] f32 · B[k,n] (f16 if weight-split) → C[m,n] f32
+        Thunk::Sgemm {
+            m, k, n, dt, b_f16, ..
+        } => {
+            let (m, k, n) = (*m as u64, *k as u64, *n as u64);
+            let b = k * n * if *b_f16 { 2 } else { sz(*dt) };
+            (e(m * k, *dt) + b, e(m * n, *dt))
+        }
+        Thunk::SgemmResidual { m, k, n, dt, .. } => {
+            let (m, k, n) = (*m as u64, *k as u64, *n as u64);
+            (e(m * k, *dt) + e(k * n, *dt) + e(m * n, *dt), e(m * n, *dt))
+        }
+        Thunk::BinaryFull { len, dt, .. } => (e(2 * *len as u64, *dt), e(*len as u64, *dt)),
+        Thunk::RmsNorm { rows, h, dt, .. } => {
+            let n = *rows as u64 * *h as u64;
+            (e(n, *dt) + e(*h as u64, *dt), e(n, *dt))
+        }
+        Thunk::FusedResidualRmsNorm {
+            rows,
+            h,
+            dt,
+            sum_out,
+            ..
+        } => {
+            let n = *rows as u64 * *h as u64;
+            let w = if *sum_out != 0 {
+                2 * e(n, *dt)
+            } else {
+                e(n, *dt)
+            };
+            (2 * e(n, *dt) + e(*h as u64, *dt), w)
+        }
+        Thunk::Rope {
+            batch,
+            seq,
+            hidden,
+            dt,
+            ..
+        } => {
+            let n = *batch as u64 * *seq as u64 * *hidden as u64;
+            (e(n, *dt), e(n, *dt))
+        }
+        Thunk::Transpose { total, half, .. } => {
+            let d = if *half { HalfFlag::F16 } else { HalfFlag::F32 };
+            (e(*total as u64, d), e(*total as u64, d))
+        }
+        Thunk::Concat {
+            outer,
+            inner,
+            dt,
+            inputs,
+            ..
+        } => {
+            let axis: u64 = inputs.iter().map(|(_, l)| *l as u64).sum();
+            let n = *outer as u64 * axis * *inner as u64;
+            (e(n, *dt), e(n, *dt))
+        }
+        Thunk::SplitLastAxis {
+            outer,
+            dt,
+            segments,
+            ..
+        } => {
+            let w: u64 = segments.iter().map(|(_, _, wd)| *wd as u64).sum();
+            let n = *outer as u64 * w;
+            (e(n, *dt), e(n, *dt))
+        }
+        Thunk::FusedSwiGLU {
+            total,
+            src_dt,
+            dst_dt,
+            ..
+        } => (e(2 * *total as u64, *src_dt), e(*total as u64, *dst_dt)),
+        Thunk::Attention {
+            batch,
+            seq,
+            kv_seq,
+            heads,
+            kv_heads,
+            head_dim,
+            v_head_dim,
+            dt,
+            kv_f16,
+            ..
+        } => {
+            let kvsz = if *kv_f16 { HalfFlag::F16 } else { *dt };
+            let q = *batch as u64 * *seq as u64 * *heads as u64 * *head_dim as u64;
+            let k = *batch as u64 * *kv_seq as u64 * *kv_heads as u64 * *head_dim as u64;
+            let v = *batch as u64 * *kv_seq as u64 * *kv_heads as u64 * *v_head_dim as u64;
+            let o = *batch as u64 * *seq as u64 * *heads as u64 * *v_head_dim as u64;
+            (e(q, *dt) + e(k, kvsz) + e(v, kvsz), e(o, *dt))
+        }
+        Thunk::Gather {
+            num_idx,
+            trailing,
+            dt,
+            ..
+        } => {
+            let n = *num_idx as u64 * *trailing as u64;
+            (e(n, *dt), e(n, *dt))
+        }
+        Thunk::Narrow { .. } => (0, 0),
+        _ => (0, 0),
+    }
+}
+
+/// Print per-op-type DRAM traffic for one step (`RLX_METAL_DUMP_BYTES`).
+pub fn dump_thunk_bytes(thunks: &[Thunk]) {
+    use std::collections::BTreeMap;
+    let mut agg: BTreeMap<&'static str, (u64, u64, u64)> = BTreeMap::new(); // (reads, writes, count)
+    let baking = rlx_ir::env::flag("RLX_QWEN3_BAKE_WEIGHTS");
+    for t in thunks {
+        if matches!(t, Thunk::Nop) {
+            continue;
+        }
+        let (r, w) = thunk_bytes(t);
+        // Under Option A, a weight-const concat runs ONCE — bucket it separately
+        // so the steady-state (per-token) traffic is clear.
+        let baked = baking
+            && matches!(
+                t,
+                Thunk::Concat {
+                    weight_const: true,
+                    ..
+                }
+            );
+        let name = if baked {
+            "concat_weight (baked ×1)"
+        } else if r == 0 && w == 0 {
+            "(other)"
+        } else {
+            thunk_name(t)
+        };
+        let e = agg.entry(name).or_insert((0, 0, 0));
+        e.0 += r;
+        e.1 += w;
+        e.2 += 1;
+    }
+    // Calibration: show the shape of the first concat and first few sgemms.
+    let mut shown_c = 0;
+    let mut shown_s = 0;
+    for t in thunks {
+        match t {
+            Thunk::Concat {
+                outer,
+                inner,
+                inputs,
+                dt,
+                ..
+            } if shown_c < 2 => {
+                let axis: u64 = inputs.iter().map(|(_, l)| *l as u64).sum();
+                eprintln!(
+                    "  [calib] concat outer={outer} inner={inner} axis={axis} n_in={} dt={dt:?}",
+                    inputs.len()
+                );
+                shown_c += 1;
+            }
+            Thunk::Sgemm { m, k, n, b_f16, .. } if shown_s < 6 => {
+                eprintln!("  [calib] sgemm m={m} k={k} n={n} b_f16={b_f16}");
+                shown_s += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut rows: Vec<_> = agg.into_iter().collect();
+    rows.sort_by_key(|(_, (r, w, _))| std::cmp::Reverse(r + w));
+    let tot: u64 = rows.iter().map(|(_, (r, w, _))| r + w).sum();
+    eprintln!("[metal-bytes] per-op DRAM traffic for one decode step (analytic, ideal):");
+    eprintln!(
+        "  {:<22} {:>5} {:>12} {:>12} {:>12} {:>6}",
+        "op", "count", "read MB", "write MB", "total MB", "%"
+    );
+    for (name, (r, w, c)) in &rows {
+        let t = r + w;
+        eprintln!(
+            "  {:<22} {:>5} {:>12.2} {:>12.2} {:>12.2} {:>5.1}%",
+            name,
+            c,
+            *r as f64 / 1e6,
+            *w as f64 / 1e6,
+            t as f64 / 1e6,
+            100.0 * t as f64 / tot.max(1) as f64
+        );
+    }
+    eprintln!(
+        "  {:<22} {:>5} {:>39} {:>12.2}",
+        "TOTAL",
+        "",
+        "",
+        tot as f64 / 1e6
+    );
+}
+
 /// Static-string name for each Thunk variant — used by the Perfetto
 /// trace layer (PLAN L3) to label per-step events without allocating.
 pub fn thunk_name(t: &Thunk) -> &'static str {
@@ -1888,6 +2241,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::ScaledDequantize { .. } => "scaled_dequantize",
         Thunk::ScaledQuantScale { .. } => "scaled_quant_scale",
         Thunk::Sgemm { .. } => "sgemm",
+        Thunk::SgemmResidual { .. } => "sgemm_residual",
         Thunk::BatchedSgemm { .. } => "batched_sgemm",
         Thunk::FusedMmBiasAct { .. } => "fused_mm_bias_act",
         Thunk::FusedBinaryActivation { .. } => "fused_binary_activation",
@@ -1922,6 +2276,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Attention { .. } => "attention",
         Thunk::FusedAttn { .. } => "fused_attn",
         Thunk::AttentionBackward { .. } => "attention_bwd",
+        Thunk::AttentionBackwardAll { .. } => "attention_bwd_all",
         Thunk::RmsNormBackwardInput { .. } => "rms_norm_backward_input",
         Thunk::RmsNormBackwardGamma { .. } => "rms_norm_backward_gamma",
         Thunk::RmsNormBackwardBeta { .. } => "rms_norm_backward_beta",
@@ -2000,6 +2355,18 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Rnn { .. } => "rnn",
         Thunk::Mamba2 { .. } => "mamba2",
         Thunk::DequantMatMulGguf { .. } => "dequant_matmul_gguf",
+        Thunk::SynthMatMul { .. } => "synth_matmul_codebook",
+        Thunk::SynthMatMulBackward { dx, .. } => {
+            if *dx {
+                "synth_bwd_dx"
+            } else {
+                "synth_bwd_codebook"
+            }
+        }
+        Thunk::SynthReconstruct { .. } => "synth_reconstruct_nk",
+        Thunk::SplineActivation { .. } => "spline_activation",
+        Thunk::SplineActivationBackwardX { .. } => "spline_activation_backward_x",
+        Thunk::SplineActivationBackwardCoeff { .. } => "spline_activation_backward_coeff",
         Thunk::DequantGroupedMatMulGguf { .. } => "dequant_grouped_matmul_gguf",
         Thunk::DequantGroupedMatMulMlx { .. } => "dequant_grouped_matmul_mlx",
         Thunk::DequantMatMulInt8 { .. } => "dequant_matmul_int8",
@@ -2082,6 +2449,7 @@ impl Thunk {
             // at any batch.
             Thunk::Attention { .. } => true,
             Thunk::AttentionBackward { .. } => true,
+            Thunk::AttentionBackwardAll { .. } => true,
             Thunk::RmsNormBackwardInput { .. }
             | Thunk::RmsNormBackwardGamma { .. }
             | Thunk::RmsNormBackwardBeta { .. }
@@ -2736,9 +3104,42 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
             table, idx, dst, ..
         } => (vec![*table, *idx], vec![*dst]),
         Sgemm { a, b, c, .. } => (vec![*a, *b], vec![*c]),
+        SgemmResidual { a, b, c, r, .. } => (vec![*a, *b, *r], vec![*c]),
         BatchedSgemm { a, b, c, .. } => (vec![*a, *b], vec![*c]),
         FusedMmBiasAct { a, w, bias, c, .. } => (vec![*a, *w, *bias], vec![*c]),
         DequantMatMulGguf { x, w_q, dst, .. } => (vec![*x, *w_q], vec![*dst]),
+        SynthMatMul {
+            x,
+            indices,
+            codebook,
+            dst,
+            ..
+        } => (vec![*x, *indices, *codebook], vec![*dst]),
+        SynthMatMulBackward {
+            x,
+            indices,
+            codebook,
+            upstream,
+            dst,
+            ..
+        } => (vec![*x, *indices, *codebook, *upstream], vec![*dst]),
+        SynthReconstruct {
+            indices,
+            codebook,
+            dst,
+            ..
+        } => (vec![*indices, *codebook], vec![*dst]),
+        SplineActivation { x, coeff, dst, .. } => (vec![*x, *coeff], vec![*dst]),
+        SplineActivationBackwardX {
+            x,
+            coeff,
+            upstream,
+            dst,
+            ..
+        } => (vec![*x, *coeff, *upstream], vec![*dst]),
+        SplineActivationBackwardCoeff {
+            x, upstream, dst, ..
+        } => (vec![*x, *upstream], vec![*dst]),
         FusedMlpGateUpSwiGLU {
             x,
             gate_w,
@@ -3758,10 +4159,21 @@ fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collection
             Some(c) => vec![c, i],
             None => vec![i],
         };
-        if !mlp_value_dead_in_range(thunks, add_i, src, &add_readers, thunks.len()) {
+        // Dual-output (opt-in `RLX_METAL_FUSE_RESIDUAL_DUAL`): when the sum is
+        // ALSO consumed downstream (the per-layer residual `h+=attn; n=rms(h);
+        // h+=ffn(n)`), don't bail — emit the sum from the fused op to `src` so
+        // the skip stream still gets it, and drop the standalone add. Only for
+        // the simple (no reshape-copy) f32 case; `src` must be the add's dst.
+        let sum_live = !mlp_value_dead_in_range(thunks, add_i, src, &add_readers, thunks.len());
+        let dual_ok = sum_live
+            && copy_i.is_none()
+            && !output_offsets.contains(&src)
+            && rlx_ir::env::flag("RLX_METAL_FUSE_RESIDUAL_DUAL");
+        if sum_live && !dual_ok {
             i += 1;
             continue;
         }
+        let sum_out = if dual_ok { src } else { 0 };
         if let Some(c) = copy_i {
             let copy_dst = match &thunks[c] {
                 Thunk::Copy { dst, .. } => *dst,
@@ -3789,6 +4201,7 @@ fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collection
             eps,
             has_bias: false,
             dt,
+            sum_out,
         };
         fused += 1;
         FUSED_RESIDUAL_RMS_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4465,6 +4878,7 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             }
             v
         }
+        Thunk::AttentionBackwardAll { q, k, v, dy, .. } => vec![*q, *k, *v, *dy],
         Thunk::Rope { src, cos, sin, .. } => vec![*src, *cos, *sin],
         Thunk::RmsNormBackwardInput {
             x, gamma, beta, dy, ..

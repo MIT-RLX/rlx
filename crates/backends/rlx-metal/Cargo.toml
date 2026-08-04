@@ -13,23 +13,24 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-ir = { workspace = true }
+rayon = "1"
 # Single-source scalar-activation math: `scalar_activation_kernels!` builds the
 # per-activation MSL from this manifest at runtime (the A&S erf polynomial lives
 # once in rlxsl — MSL has no erf builtin).
-rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14" }
+rlxsl = { workspace = true }
+rlx-opt = { workspace = true }
 # `spd` host-fallback (and shared GGUF scheme ids) via rlx-gpu-host.
-rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.14" }
+rlx-gpu-host = { workspace = true }
 # rlx-cpu is pulled in solely for its FFT host-fallback kernels
 # (`execute_fft1d_f32` / `execute_fft1d_f64`) — Apple Silicon's
 # unified memory lets us run them against the Metal arena pointer
 # with no copies. A native Metal FFT kernel will replace this when a
 # real workload justifies the .metal kernel work.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", features = ["splat"] }
+rlx-cpu = { workspace = true, features = ["splat"] }
 # IQ-family grid LUTs (KGRID_IQ2XXS, etc.) staged into a Metal device
 # buffer for the IQ2/IQ3/IQ1 dequant kernels.
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
+rlx-gguf = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 # rlx-splat moved out of tree; restore with the native-splat feature below.
 # rlx-splat = { path = "../rlx-splat", version = "0.2.14", optional = true, default-features = false, features = ["reference", "metal"] }
@@ -61,9 +62,10 @@ half = "2"
 # `cargo publish -p rlx-metal` never resolves runtime against crates.io. The
 # path dep wins for local/workspace tests.
 rlx-runtime = { path = "../../core/rlx-runtime", features = ["metal"] }
-rlx-gguf = { path = "../../io/rlx-gguf", version = "0.2.14" }
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.14" }
-rlx-mlx-io = { path = "../../io/rlx-mlx-io", version = "0.2.14" }
+rlx-gguf = { workspace = true }
+rlx-cpu = { workspace = true }
+rlx-mlx-io = { workspace = true }
+rlx-optim = { workspace = true }
 tempfile = "3"
 safetensors = "0.7"
 half = "2"

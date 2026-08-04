@@ -87,8 +87,8 @@ fn dwyer_matches_reference() {
     for _ in 0..40 {
         let n = 4 + (r.n() % 400) as usize;
         let p = pts(&mut r, n, 29_000);
-        let a = triangulate(&p);
-        let d = triangulate_dwyer(&p);
+        let a = triangulate(&p).unwrap();
+        let d = triangulate_dwyer(&p).unwrap();
         validate(&p, &d).unwrap_or_else(|e| panic!("dwyer invalid ({} pts): {e}", p.len()));
         assert_eq!(
             a.len(),
@@ -104,7 +104,7 @@ fn dwyer_matches_reference() {
 fn dwyer_big() {
     let mut r = Lcg(0xb16_d1e);
     let p = pts(&mut r, 50_000, 29_000);
-    let d = triangulate_dwyer(&p);
+    let d = triangulate_dwyer(&p).unwrap();
     validate(&p, &d).expect("dwyer 50k invalid");
-    assert_eq!(triangulate(&p).len(), d.len());
+    assert_eq!(triangulate(&p).unwrap().len(), d.len());
 }

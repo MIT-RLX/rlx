@@ -1,0 +1,44 @@
+#version 450
+// Batched matmul C[b,m,n] = sum_k A[b,m,k] * B[b,k,n] with a PACKED bf16 rhs
+// weight B (2 bytes/elem, 2 bf16 per u32 word) unpacked in-shader — the GPU
+// streams HALF the weight bytes of the f32-widened arena. A (lhs) and C (out)
+// are f32 in the activation arena; B is the packed bf16 weight (its `b_off`
+// carries the WEIGHT_TAG when it lives in binding 1). bf16 → f32 is exact
+// (bf16 = high 16 bits of f32); accumulation is f32, so the result matches a
+// bf16-rounded-weight f32 matmul.
+//
+// Same maximal-occupancy scalar mapping as matmul.comp (one output element per
+// invocation) — the MoltenVK-friendly portability path; each invocation bounds-
+// checks its (row, col, batch) so any M/N/K/batch is correct.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint k;
+    uint n;
+    uint a_off;   // A (f32, activation)          — element/word offset
+    uint b_off;   // B (packed bf16) — u32-WORD base of the weight slot (tagged)
+    uint c_off;   // C (f32, activation)          — element/word offset
+    uint batch;
+    uint a_bs;    // A batch stride in elements     (0 ⇒ broadcast)
+    uint b_bs;    // B batch stride in bf16 ELEMENTS (0 ⇒ broadcast)
+    uint c_bs;    // C batch stride in elements
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x; // n
+    uint row = gl_GlobalInvocationID.y; // m
+    uint bz  = gl_GlobalInvocationID.z; // batch
+    if (col >= pc.n || row >= pc.m || bz >= pc.batch) { return; }
+
+    uint a_base = pc.a_off + bz * pc.a_bs + row * pc.k;
+    uint b_elem = bz * pc.b_bs + col; // bf16 element index within the weight slot
+    float acc = 0.0;
+    for (uint kk = 0u; kk < pc.k; kk++) {
+        float av = arena_load_f(a_base + kk);
+        float bv = arena_load_bf16(pc.b_off, b_elem + kk * pc.n);
+        acc += av * bv;
+    }
+    arena_store_f(pc.c_off + bz * pc.c_bs + row * pc.n + col, acc);
+}

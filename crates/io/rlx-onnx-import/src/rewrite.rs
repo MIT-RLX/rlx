@@ -967,14 +967,16 @@ mod rewrite_tests {
     #[test]
     fn kokoro_decoder_atan2_greater_promoted_when_weights_present() {
         // Weights live in the sibling rlx-models repo; try a repo-relative
-        // path first, then a common absolute location, and skip if absent.
+        // path first, then $RLX_MODELS_DIR, and skip if absent.
         let rel = "weights/tts/kokoro-82m/onnx/rlx-split/decoder_raw.onnx";
-        let candidates = [
+        let mut candidates = vec![
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../../rlx-models")
                 .join(rel),
-            std::path::PathBuf::from("/Users/Shared/rlx-models").join(rel),
         ];
+        if let Some(dir) = std::env::var_os("RLX_MODELS_DIR") {
+            candidates.push(std::path::PathBuf::from(dir).join(rel));
+        }
         let Some(onnx) = candidates.into_iter().find(|p| p.is_file()) else {
             eprintln!("skip: kokoro-82m decoder_raw.onnx not present");
             return;

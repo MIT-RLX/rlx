@@ -56,6 +56,27 @@ extern "C" __global__ void fused_binary_unary(
                 float nx = fminf(fmaxf(-v, -88.0f), 88.0f);
                 v = v / (1.0f + expf(nx));
             } break;
+            // 12..28 (relu-first, matches unary.cu). Previously absent + no
+            // default → un_op>=12 left `v` unchanged (identity), silently
+            // breaking any fused Binary→Sin/Cos/Round/… — e.g. the StyleTTS2 /
+            // Kokoro sine source `sin(2*pi*phase)` fusing Mul→Sin.
+            case 12: v = rintf(v); break;                                    // Round
+            case 13: v = sinf(v); break;                                     // Sin
+            case 14: v = cosf(v); break;                                     // Cos
+            case 15: v = tanf(v); break;                                     // Tan
+            case 16: v = atanf(v); break;                                    // Atan
+            case 17: v = 1.0f / v; break;                                    // Recip
+            case 18: v = floorf(v); break;                                   // Floor
+            case 19: v = ceilf(v); break;                                    // Ceil
+            case 20: v = (float)(v > 0.0f) - (float)(v < 0.0f); break;       // Sign
+            case 21: v = fmaxf(v, 0.0f) + logf(1.0f + expf(-fabsf(v))); break; // Softplus
+            case 22: v = (v > 0.0f) ? v : (expf(v) - 1.0f); break;           // Elu
+            case 23: v = erff(v); break;                                     // Erf
+            case 24: v = (v * fminf(fmaxf(v + 3.0f, 0.0f), 6.0f)) / 6.0f; break; // HardSwish
+            case 25: v = fminf(fmaxf(v / 6.0f + 0.5f, 0.0f), 1.0f); break;   // HardSigmoid
+            case 26: { float sp = fmaxf(v, 0.0f) + logf(1.0f + expf(-fabsf(v))); v = v * tanhf(sp); } break; // Mish
+            case 27: v = v / (1.0f + fabsf(v)); break;                       // Softsign
+            case 28: v = fminf(v, 0.0f) - logf(1.0f + expf(-fabsf(v))); break; // LogSigmoid
         }
     }
 

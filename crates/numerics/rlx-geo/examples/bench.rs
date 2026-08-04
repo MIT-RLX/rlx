@@ -44,45 +44,51 @@ fn main() {
     let pts = read_points(path);
     let n = pts.len();
 
-    // Exact serial Guibas-Stolfi (same algorithm class as C++ delaunay32).
-    let tris = triangulate(&pts).len();
-    let mut s = Vec::new();
-    for _ in 0..runs {
-        let t = Instant::now();
-        let r = triangulate(&pts);
-        std::hint::black_box(&r);
-        s.push(t.elapsed().as_secs_f64() * 1e3);
-    }
-    println!("geo_gs,{n},{tris},{:.3}", median(s));
+    // GEO_BENCH_FAST=1 times only the auto-dispatched fastest path — for the
+    // contention-matched A/B loop, where the slow serial paths just waste wall time.
+    let fast_only = std::env::var_os("GEO_BENCH_FAST").is_some();
 
-    // Serial Dwyer (Morton alternating-cut) build.
-    let _ = triangulate_dwyer(&pts);
-    let mut s = Vec::new();
-    for _ in 0..runs {
-        let t = Instant::now();
-        let r = triangulate_dwyer(&pts);
-        std::hint::black_box(&r);
-        s.push(t.elapsed().as_secs_f64() * 1e3);
+    // Exact serial Guibas-Stolfi (same algorithm class as C++ delaunay32).
+    let tris = triangulate(&pts).unwrap().len();
+    if !fast_only {
+        let mut s = Vec::new();
+        for _ in 0..runs {
+            let t = Instant::now();
+            let r = triangulate(&pts).unwrap();
+            std::hint::black_box(&r);
+            s.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("geo_gs,{n},{tris},{:.3}", median(s));
+
+        // Serial Dwyer (Morton alternating-cut) build.
+        let _ = triangulate_dwyer(&pts).unwrap();
+        let mut s = Vec::new();
+        for _ in 0..runs {
+            let t = Instant::now();
+            let r = triangulate_dwyer(&pts).unwrap();
+            std::hint::black_box(&r);
+            s.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("geo_dwyer,{n},{tris},{:.3}", median(s));
     }
-    println!("geo_dwyer,{n},{tris},{:.3}", median(s));
 
     // Parallel CPU divide-and-conquer.
-    let _ = triangulate_par(&pts, 0);
+    let _ = triangulate_par(&pts, 0).unwrap();
     let mut s = Vec::new();
     for _ in 0..runs {
         let t = Instant::now();
-        let r = triangulate_par(&pts, 0);
+        let r = triangulate_par(&pts, 0).unwrap();
         std::hint::black_box(&r);
         s.push(t.elapsed().as_secs_f64() * 1e3);
     }
     println!("geo_par,{n},{tris},{:.3}", median(s));
 
     // Auto-dispatched fastest backend.
-    let (_, backend) = triangulate_fastest(&pts);
+    let (_, backend) = triangulate_fastest(&pts).unwrap();
     let mut s = Vec::new();
     for _ in 0..runs {
         let t = Instant::now();
-        let (r, _) = triangulate_fastest(&pts);
+        let (r, _) = triangulate_fastest(&pts).unwrap();
         std::hint::black_box(&r);
         s.push(t.elapsed().as_secs_f64() * 1e3);
     }
@@ -93,7 +99,7 @@ fn main() {
     );
 
     // CPU Lawson flip pipeline: hull_seed + flip_to_delaunay. O(n^2)-ish, skip at scale.
-    if n <= 100_000 {
+    if !fast_only && n <= 100_000 {
         let _ = flip_to_delaunay(hull_seed(&pts), &pts);
         let mut s = Vec::new();
         for _ in 0..runs {
@@ -107,10 +113,12 @@ fn main() {
         println!("geo_flip_cpu,{n},{tris},SKIP_LARGE");
     }
 
-    // GPU Lawson flip pipeline (feature gpu): hull_seed (CPU) + on-device flip.
-    #[cfg(feature = "gpu")]
+    // GPU Lawson flip pipeline: hull_seed (CPU) + on-device flip. Uses the
+    // rlx-wgpu device helper, so it's gated on `gpu-ops`; the `examples/flip_gpu_bench`
+    // harness benchmarks the same flip with only the decoupled `gpu` feature.
+    #[cfg(feature = "gpu-ops")]
     {
-        if n < (1 << 16) {
+        if !fast_only && n < (1 << 16) {
             if let Some(dev) = rlx_wgpu::device::wgpu_device() {
                 let seed = hull_seed(&pts);
                 let _ =

@@ -17,10 +17,10 @@ documentation.workspace = true
 default = []
 
 [dependencies]
-rlx-ir = { path = "../../core/rlx-ir", version = "0.2.14" }
+rlx-ir = { workspace = true }
 rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14", default-features = false, features = ["compile", "training"] }
-rlx-unfuse = { path = "../../core/rlx-unfuse", version = "0.2.14" }
-rlx-compile = { path = "../../core/rlx-compile", version = "0.2.14" }
+rlx-unfuse = { workspace = true }
+rlx-compile = { workspace = true }
 # CPU reference kernels for the host-fallback path. On a host with no Intel
 # Level Zero device (this macOS dev box, CI), the whole legalized graph runs on
 # the `rlx-cpu` reference so results are bit-for-bit the ground truth; on Intel
@@ -40,7 +40,7 @@ rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false, f
     "blas",
     "splat",
 ] }
-rlx-gpu-host = { path = "../rlx-gpu-host", version = "0.2.14" }
+rlx-gpu-host = { workspace = true }
 
 # The Level Zero loader (`libze_loader.so.1` / `ze_loader.dll`) is opened at
 # runtime with `libloading` — no link-time dependency on the oneAPI runtime, so
@@ -57,7 +57,7 @@ half = "2"
 # Single source for the warm-tier activation math: the unary + activation-backward
 # OpenCL-C kernels are @generated from the shared rlxsl manifest at build time
 # (see build.rs), instead of a hand-maintained copy of every activation's erf etc.
-rlxsl = { path = "../../tooling/rlxsl", version = "0.2.14" }
+rlxsl = { workspace = true }
 
 [lints]
 workspace = true

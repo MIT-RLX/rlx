@@ -424,6 +424,7 @@ fn attention_causal_bshd() {
             Op::Attention {
                 num_heads: nh,
                 head_dim: dh,
+                v_head_dim: None,
                 mask_kind: MaskKind::Causal,
                 score_scale: None,
                 attn_logit_softcap: None,
@@ -607,6 +608,7 @@ fn attention_masks_and_layout() {
                 Op::Attention {
                     num_heads: nh,
                     head_dim: dh,
+                    v_head_dim: None,
                     mask_kind: mask,
                     score_scale: None,
                     attn_logit_softcap: None,
@@ -635,6 +637,7 @@ fn attention_masks_and_layout() {
             Op::Attention {
                 num_heads: nh,
                 head_dim: dh,
+                v_head_dim: None,
                 mask_kind: MaskKind::Causal,
                 score_scale: Some(0.5),
                 attn_logit_softcap: None,
@@ -958,6 +961,7 @@ fn transformer_attention_block_parity() {
             Op::Attention {
                 num_heads: nh,
                 head_dim: dh,
+                v_head_dim: None,
                 mask_kind: MaskKind::Causal,
                 score_scale: None,
                 attn_logit_softcap: None,

@@ -53,6 +53,9 @@ impl GraphBuilder {
 
     /// Register a graph input and bind it to `name`.
     pub fn input(&mut self, name: &str, shape: Shape) -> HirNodeId {
+        if std::env::var_os("RLX_DIM_DBG").is_some() {
+            eprintln!("[input-build] '{name}' shape={:?}", shape.dims());
+        }
         let id = {
             let mut m = HirMut::new(&mut self.hir);
             m.input(name, shape)

@@ -150,6 +150,9 @@ impl ExecutableGraph for MlxExecutableWrapper {
     fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle(name).ok()
     }
+    fn read_output_row(&self, out_idx: usize, row: usize, row_inner: usize) -> Option<Vec<f32>> {
+        self.inner.read_output_row(out_idx, row, row_inner)
+    }
     fn run_feed_gpu_handle(
         &mut self,
         inputs: &[(&str, &[f32])],

@@ -415,6 +415,105 @@ pub fn dequant_matmul_mxfp4(
     Ok(out)
 }
 
+/// **FUSED GROUPED MXFP4 matmul** — the MoE analogue of [`dequant_matvec_mxfp4`]:
+/// `out[r] = x[r] @ dequant(W_{e(r)})ᵀ` for `m` routed rows, each picking expert
+/// `e(r) = idx[r]`. Decodes the packed e2m1 codes inline into the accumulate — NO
+/// per-row `[n,k]` f32 weight materialization (the old grouped path called
+/// `dequant_matmul_mxfp4` with m=1 per row, allocating + decoding ~`n·k·4` bytes of
+/// f32 weight FOR EVERY TOKEN). Parallel over ALL `m·n` outputs, so it saturates cores
+/// even when `m` is tiny (decode) — the per-row-parallel form left most cores idle.
+/// `scales` = decoded f32 `[num_experts, n, n_groups]`; `idx` = `[m]` f32 expert ids;
+/// writes `out` = `[m, n]`. Same accumulation order as [`dequant_matvec_mxfp4`].
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_matmul_mxfp4_bt(
+    x: &[f32],
+    w_bytes: &[u8],
+    scales: &[f32],
+    idx: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    group_size: usize,
+) {
+    use rayon::prelude::*;
+    debug_assert_eq!(out.len(), m * n, "output buffer must be m×n");
+    let gs = group_size.max(1);
+    let n_groups = k / gs;
+    let slab = w_bytes.len() / num_experts.max(1); // n·k/2 packed bytes / expert
+    let sb = n * n_groups; // scale f32 / expert
+    let bpr = k / 2; // packed bytes / output row (within a slab)
+    out.par_iter_mut().enumerate().for_each(|(flat, o)| {
+        let r = flat / n;
+        let j = flat % n;
+        let e = (idx[r] as usize).min(num_experts.saturating_sub(1));
+        let w_slab = &w_bytes[e * slab..(e + 1) * slab];
+        let s_base = e * sb + j * n_groups;
+        let row = &x[r * k..(r + 1) * k];
+        let mut acc = 0f32;
+        let mut w_off = j * bpr;
+        for g in 0..n_groups {
+            let scale = scales[s_base + g];
+            let base = g * gs;
+            let mut p = 0;
+            while p < gs {
+                let b = w_slab[w_off];
+                w_off += 1;
+                acc += row[base + p] * FP4_LUT[(b & 0x0f) as usize] * scale;
+                acc += row[base + p + 1] * FP4_LUT[(b >> 4) as usize] * scale;
+                p += 2;
+            }
+        }
+        *o = acc;
+    });
+}
+
+/// **FUSED MXFP4 matvec**: `out[n] = x[k] @ dequant(W)ᵀ` reading the packed e2m1
+/// codes ONCE and accumulating in-place — NO `[n,k]` f32 materialization (the
+/// `dequant_matmul_mxfp4` path allocs + reads `n·k·4` bytes; this reads the packed
+/// `n·k/2` bytes only, ~8× less traffic + no big alloc). Rows parallelized. `scales`
+/// = decoded f32 `[n, k/group_size]`. Bit-exact with the materialize path.
+pub fn dequant_matvec_mxfp4(
+    x: &[f32],
+    w: &[u8],
+    scales: &[f32],
+    group_size: u32,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>> {
+    use rayon::prelude::*;
+    let gs = group_size as usize;
+    if gs == 0 || !k.is_multiple_of(gs) {
+        bail!("mxfp4 matvec: k={k} not divisible by group_size={gs}");
+    }
+    let n_groups = k / gs;
+    if w.len() < n * k / 2 {
+        bail!("mxfp4 matvec: weight bytes {} < {}", w.len(), n * k / 2);
+    }
+    if scales.len() < n * n_groups {
+        bail!("mxfp4 matvec: scales {} < {}", scales.len(), n * n_groups);
+    }
+    let bpr = k / 2; // packed bytes per output row
+    let mut out = vec![0f32; n];
+    out.par_iter_mut().enumerate().for_each(|(j, o)| {
+        let mut acc = 0f32;
+        let mut w_off = j * bpr;
+        for g in 0..n_groups {
+            let scale = scales[j * n_groups + g];
+            let base = g * gs;
+            for p in (0..gs).step_by(2) {
+                let b = w[w_off];
+                w_off += 1;
+                acc += x[base + p] * FP4_LUT[(b & 0x0f) as usize] * scale;
+                acc += x[base + p + 1] * FP4_LUT[(b >> 4) as usize] * scale;
+            }
+        }
+        *o = acc;
+    });
+    Ok(out)
+}
+
 /// Decode an MLX E8M0 uint8 group scale to f32 (public for grouped-MoE loaders
 /// that pre-convert MXFP4 scales so the matmul op stays f32-uniform).
 pub fn mxfp4_scale_e8m0_to_f32(s: u8) -> f32 {
@@ -458,6 +557,45 @@ fn dequant_scale_fp8_e4m3(s: u8) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Dequantize a packed MXFP4 weight matrix (codes + **already-decoded f32** group
+/// scales, e.g. `sc.to_f32()` in a backend lowering) to row-major `[n, k]` F32 — the
+/// weight-only half of [`dequant_matmul_mxfp4`], for backends that build an f32
+/// expert bank once and then gather + matmul on-device.
+pub fn dequant_mxfp4_weights_f32(
+    w: &[u8],
+    scales: &[f32],
+    group_size: u32,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    let gs = group_size as usize;
+    if gs == 0 || !k.is_multiple_of(gs) {
+        bail!("mxfp4 weights: k={k} not divisible by group_size={gs}");
+    }
+    let n_groups = k / gs;
+    if w.len() < n * k / 2 {
+        bail!("mxfp4 weights: bytes {} < {}", w.len(), n * k / 2);
+    }
+    if scales.len() < n * n_groups {
+        bail!("mxfp4 weights: scales {} < {}", scales.len(), n * n_groups);
+    }
+    let mut w_f = vec![0f32; n * k];
+    let mut w_off = 0usize;
+    for r in 0..n {
+        for gidx in 0..n_groups {
+            let scale = scales[r * n_groups + gidx];
+            let base = r * k + gidx * gs;
+            for p in (0..gs).step_by(2) {
+                let b = w[w_off];
+                w_off += 1;
+                w_f[base + p] = FP4_LUT[(b & 0x0f) as usize] * scale;
+                w_f[base + p + 1] = FP4_LUT[(b >> 4) as usize] * scale;
+            }
+        }
+    }
+    Ok(w_f)
+}
+
 /// Dequantize MLX `mxfp4` packs: nibbles → FP4 LUT × per-group scale.
 ///
 /// `scales_u8` length = `rows * n_groups`. `group_size` is typically 32
@@ -480,23 +618,26 @@ pub fn dequant_mxfp4_f32(
         bail!("mxfp4: scales too short");
     }
     let mut out = vec![0f32; rows * cols];
-    let mut w_off = 0usize;
-    for r in 0..rows {
+    // Rows are independent (each reads its own `cols/2` packed bytes) → parallelize.
+    let bpr = cols / 2; // packed bytes per row
+    use rayon::prelude::*;
+    out.par_chunks_mut(cols).enumerate().for_each(|(r, orow)| {
+        let mut w_off = r * bpr;
         for g in 0..n_groups {
             let scale = if gs == 16 {
                 dequant_scale_fp8_e4m3(scales_u8[r * n_groups + g])
             } else {
                 dequant_scale_e8m0(scales_u8[r * n_groups + g])
             };
-            let base = r * cols + g * gs;
+            let base = g * gs;
             for p in (0..gs).step_by(2) {
                 let b = w[w_off];
                 w_off += 1;
-                out[base + p] = FP4_LUT[(b & 0x0f) as usize] * scale;
-                out[base + p + 1] = FP4_LUT[(b >> 4) as usize] * scale;
+                orow[base + p] = FP4_LUT[(b & 0x0f) as usize] * scale;
+                orow[base + p + 1] = FP4_LUT[(b >> 4) as usize] * scale;
             }
         }
-    }
+    });
     Ok(out)
 }
 

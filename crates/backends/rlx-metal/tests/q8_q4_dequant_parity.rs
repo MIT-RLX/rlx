@@ -70,6 +70,10 @@ fn parity(scheme_id: u32, packed: &[u8], elems: usize, tol: f32, name: &str) {
     let num_blocks = (elems / scheme_block_elems(scheme_id)) as u32;
     let metal_out = run_metal_dequant(scheme_id, packed, num_blocks);
     let cpu_out = match scheme_id {
+        0 => rlx_gguf::dequant_q4_k(packed, elems).unwrap(),
+        1 => rlx_gguf::dequant_q5_k(packed, elems).unwrap(),
+        2 => rlx_gguf::dequant_q6_k(packed, elems).unwrap(),
+        5 => rlx_gguf::dequant_q3_k(packed, elems).unwrap(),
         19 => rlx_gguf::dequant_q4_0(packed, elems).unwrap(),
         20 => rlx_gguf::dequant_q8_0(packed, elems).unwrap(),
         21 => rlx_gguf::dequant_q4_1(packed, elems).unwrap(),
@@ -100,6 +104,82 @@ fn q8_0_msl_matches_cpu_reference() {
         packed.extend_from_slice(&block);
     }
     parity(20, &packed, 512, 1e-5, "Q8_0");
+}
+
+#[test]
+fn q3_k_msl_matches_cpu_reference() {
+    // Regression guard for the Metal Q3_K kernel that previously stored only
+    // 8 of the 16 six-bit sub-block scales (aux2/aux3 dropped), so the second
+    // 128 elements of every super-block dequantized with garbage scales.
+    // Vary magnitude per 16-elem sub-block so all 16 scales differ, forcing
+    // scales[8..15] to matter.
+    // Raw 110-byte blocks: hmask[0..32] | qs[32..96] | scales[96..108] | d[108..110].
+    // Both paths decode the SAME bytes; varied scale bytes make all 16 six-bit
+    // scales distinct so scales[8..15] must be right.
+    let mut packed = Vec::new();
+    for b in 0..8u32 {
+        let mut block = vec![0u8; 110];
+        for (i, byte) in block[..108].iter_mut().enumerate() {
+            *byte = ((i as u32)
+                .wrapping_mul(37)
+                .wrapping_add(b.wrapping_mul(101))
+                & 0xff) as u8;
+        }
+        block[108..110]
+            .copy_from_slice(&half::f16::from_f32(0.03 * (b as f32 + 1.0)).to_le_bytes());
+        packed.extend_from_slice(&block);
+    }
+    // Same packed bytes decoded by both paths → identical up to f16 scale
+    // conversion; a mismatch means the MSL scale unpacking is wrong.
+    parity(5, &packed, 8 * 256, 1e-3, "Q3_K");
+}
+
+// K-quants used alongside Q3_K in a Q3_K_S GGUF (Q4_K/Q5_K attention+ffn,
+// Q6_K output.weight). Same class of Metal-vs-CPU dequant parity as Q3_K.
+fn kquant_block(total: usize, d_off: usize, dmin_off: Option<usize>, b: u32) -> Vec<u8> {
+    let mut blk = vec![0u8; total];
+    for (i, byte) in blk.iter_mut().enumerate() {
+        *byte = ((i as u32)
+            .wrapping_mul(37)
+            .wrapping_add(b.wrapping_mul(101))
+            & 0xff) as u8;
+    }
+    blk[d_off..d_off + 2]
+        .copy_from_slice(&half::f16::from_f32(0.03 * (b as f32 + 1.0)).to_le_bytes());
+    if let Some(o) = dmin_off {
+        blk[o..o + 2].copy_from_slice(&half::f16::from_f32(0.01 * (b as f32 + 1.0)).to_le_bytes());
+    }
+    blk
+}
+
+#[test]
+fn q4_k_msl_matches_cpu_reference() {
+    // Q4_K: d(f16)|dmin(f16)|scales[12]|qs[128] = 144 B / 256 elems.
+    let mut packed = Vec::new();
+    for b in 0..8u32 {
+        packed.extend_from_slice(&kquant_block(144, 0, Some(2), b));
+    }
+    parity(0, &packed, 8 * 256, 1e-3, "Q4_K");
+}
+
+#[test]
+fn q5_k_msl_matches_cpu_reference() {
+    // Q5_K: d(f16)|dmin(f16)|scales[12]|qh[32]|qs[128] = 176 B / 256 elems.
+    let mut packed = Vec::new();
+    for b in 0..8u32 {
+        packed.extend_from_slice(&kquant_block(176, 0, Some(2), b));
+    }
+    parity(1, &packed, 8 * 256, 1e-3, "Q5_K");
+}
+
+#[test]
+fn q6_k_msl_matches_cpu_reference() {
+    // Q6_K: ql[128]|qh[64]|scales[16]|d(f16) = 210 B / 256 elems (d at end).
+    let mut packed = Vec::new();
+    for b in 0..8u32 {
+        packed.extend_from_slice(&kquant_block(210, 208, None, b));
+    }
+    parity(2, &packed, 8 * 256, 1e-3, "Q6_K");
 }
 
 #[test]

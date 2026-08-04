@@ -13,7 +13,12 @@ pub static FUSED_NOMIC_LAYER_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// A pre-compiled kernel call with all args resolved to arena offsets.
-#[derive(Clone)]
+///
+/// `IntoStaticStr` gives every variant a zero-alloc `&'static str` name (its
+/// identifier) via `<&'static str>::from(&thunk)`, used by the profiler and
+/// tracer (`thunk_kind_name`). Deriving it means a newly added variant is
+/// labeled automatically instead of silently landing in an `"Other"` bucket.
+#[derive(Clone, strum_macros::IntoStaticStr)]
 pub enum Thunk {
     /// Skip (Input/Param already in arena)
     Nop,
@@ -35,6 +40,17 @@ pub enum Thunk {
     },
     /// C = A @ B (BLAS sgemm)
     Sgemm {
+        a: usize,
+        b: usize,
+        c: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+    },
+    /// `C[m,n] = A[m,k](f32) @ B[k,n](BF16)` — dequant-on-the-fly GEMM with a
+    /// BF16 right-hand (half the weight memory traffic; used for a bf16-resident
+    /// LM head). `b` is a BF16 arena buffer (`k*n` `u16`), `a`/`c` are f32.
+    SgemmBf16 {
         a: usize,
         b: usize,
         c: usize,
@@ -1231,6 +1247,36 @@ pub enum Thunk {
         is_asymmetric: bool,
     },
 
+    /// Codebook weight-synthesis matmul (single-level vector quant).
+    /// Weight is stored transposed `[n, k]`; each contiguous
+    /// `entry_dim`-length sub-vector along `k` is replaced by a learned
+    /// codebook centroid `codebook[index]`. The centroid is reconstructed
+    /// inside the matmul inner loop — the weight is never materialized.
+    SynthMatMul {
+        x: usize,        // [m, k] f32 activations
+        indices: usize,  // [n, k/entry_dim] u8 codebook indices
+        codebook: usize, // [num_entries, entry_dim] f32 centroids
+        dst: usize,      // [m, n] f32 output
+        m: u32,
+        k: u32,
+        n: u32,
+        entry_dim: u32,
+        num_entries: u32,
+    },
+
+    /// KAN Gaussian-RBF spline activation (per-channel learned basis).
+    /// Shape-preserving: `y[.., c] = Σ_g coeff[c,g]·exp(-((x−center_g)·inv_h)²)`.
+    SplineActivation {
+        x: usize,     // [rows, channels] f32
+        coeff: usize, // [channels, num_basis] f32
+        dst: usize,   // [rows, channels] f32
+        rows: u32,
+        channels: u32,
+        num_basis: u32,
+        grid_min: f32,
+        grid_max: f32,
+    },
+
     /// GGUF-format dequant + matmul. Weight is a packed byte tensor
     /// in one of the K-quant super-block layouts (Q4_K, Q5_K, Q6_K,
     /// Q8_K). Scales / mins live inside the packed bytes — no
@@ -1326,6 +1372,26 @@ pub enum Thunk {
         m: u32,
         k: u32,
         n: u32,
+        lhs_fmt: rlx_ir::ScaledFormat,
+        rhs_fmt: rlx_ir::ScaledFormat,
+        layout: rlx_ir::ScaleLayout,
+        has_bias: bool,
+    },
+
+    /// Native low-precision *grouped* (MoE) TN GEMM — expert-indexed
+    /// `ScaledMatMul`. `weight [E,n,k]` codes, per-expert scales/bias.
+    ScaledGroupedMatMul {
+        input: usize,
+        weight: usize,
+        input_scale: usize,
+        weight_scale: usize,
+        expert_idx: usize,
+        bias: usize, // valid iff has_bias
+        dst: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        num_experts: u32,
         lhs_fmt: rlx_ir::ScaledFormat,
         rhs_fmt: rlx_ir::ScaledFormat,
         layout: rlx_ir::ScaleLayout,
@@ -1437,6 +1503,10 @@ pub enum Thunk {
         /// the non-fused standalone `Op::Attention` path.
         kv_heads: u32,
         head_dim: u32,
+        /// V/output per-head width. Equals `head_dim` for symmetric SDPA; only
+        /// `!= head_dim` for MLA-style asymmetric attention (V read + output
+        /// write use this; Q/K scores still use `head_dim`).
+        v_head_dim: u32,
         mask_kind: rlx_ir::op::MaskKind,
         /// Softmax score scale (`Op::Attention::score_scale`). `head_dim^-0.5`
         /// when the op left it unset. Must be honored — Gemma 4 uses `1.0`
@@ -1473,6 +1543,28 @@ pub enum Thunk {
         head_dim: u32,
         mask_kind: rlx_ir::op::MaskKind,
         wrt: rlx_ir::op::AttentionBwdWrt,
+        bhsd: bool,
+    },
+    /// [`rlx_ir::Op::AttentionBackwardAll`] — computes dQ, dK and dV from ONE
+    /// score+softmax recompute, writing them into three disjoint sub-ranges of
+    /// this node's own packed `[3B,S,H,D]` output slot (`out_q`/`out_k`/`out_v`
+    /// are byte offsets into the same slot, so the planner manages it as one
+    /// buffer). Downstream axis-0 `Narrow`s (view ops) recover dQ/dK/dV.
+    AttentionBackwardAll {
+        q: usize,
+        k: usize,
+        v: usize,
+        dy: usize,
+        mask: usize,
+        out_q: usize,
+        out_k: usize,
+        out_v: usize,
+        batch: u32,
+        seq: u32,
+        kv_seq: u32,
+        heads: u32,
+        head_dim: u32,
+        mask_kind: rlx_ir::op::MaskKind,
         bhsd: bool,
     },
     /// RoPE (rotary position embeddings).
@@ -1522,6 +1614,14 @@ pub enum Thunk {
         hs: u32,
         nh: u32,
         dh: u32,
+        /// QKV-projection input width (`in_dim`) and output-projection output
+        /// width (`out_dim`). Both equal `hs` in the BERT case; MoonViT-style
+        /// attention has `in_dim != hs` (input hidden ≠ nh·dh) and/or
+        /// `out_dim != hs`. The kernel reads the input as `m·in_dim`, runs the
+        /// QKV GEMM with K=in_dim, the out GEMM with N=out_dim, and writes
+        /// `m·out_dim`; the attention core still works on the `hs`-wide qkv.
+        in_dim: u32,
+        out_dim: u32,
         has_bias: bool,
         has_rope: bool,
         /// RoPE pairing: `true` = GPT-J interleaved `(2i,2i+1)`, `false` = NeoX
@@ -1632,6 +1732,20 @@ pub enum Thunk {
         dst_elem_bytes: u8,
         lhs_scalar: bool,
         rhs_scalar: bool,
+        /// TRUE element counts of each operand. Needed when an operand is a
+        /// *partial* broadcast (`[.,L,1]` into `[.,L,L]`): its numel is neither
+        /// 1 (scalar) nor `len` (full), so the flat fast path would read past
+        /// it into adjacent arena memory.
+        lhs_len: u32,
+        rhs_len: u32,
+        /// Shape-aware broadcast metadata (mirrors `BinaryFull`). Empty
+        /// `out_dims_bcast` selects the flat scalar/full fast path; when
+        /// non-empty, each output element indexes its operands via row-major
+        /// coords · strides — the ONLY correct path for a trailing/partial
+        /// size-1 broadcast, which the flat path silently miscomputes.
+        out_dims_bcast: Vec<u32>,
+        bcast_lhs_strides: Vec<u32>,
+        bcast_rhs_strides: Vec<u32>,
     },
     /// Reduction along a contiguous range of axes. Input layout (after
     /// shape decomposition) is `[outer, reduced, inner]`; output is
@@ -1647,6 +1761,17 @@ pub enum Thunk {
         reduced: u32,
         inner: u32,
         op: ReduceOp,
+    },
+    /// Histogram: bucket `n` input elements into `bins` equal-width buckets over
+    /// `[min, max]` and write f32 counts into `dst[bins]`. Out-of-range elements
+    /// are dropped; `x == max` lands in the last bin. See `Op::Histogram`.
+    Histogram {
+        src: usize,
+        dst: usize,
+        n: u32,
+        bins: u32,
+        min: f32,
+        max: f32,
     },
     /// Index of the max (`is_max`) or min along the reduced axis; writes the
     /// winning index as an f32 into `dst`.
@@ -2672,6 +2797,7 @@ pub(crate) fn node_offset(arena: &Arena, id: NodeId) -> usize {
 pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
     match t {
         Thunk::Sgemm { a, b, .. } => vec![*a, *b],
+        Thunk::SgemmBf16 { a, b, .. } => vec![*a, *b],
         Thunk::SgemmT { a, b, .. } => vec![*a, *b],
         Thunk::SgdMomentum {
             param, vel, grad, ..
@@ -2773,6 +2899,13 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::DequantMatMul {
             x, w_q, scale, zp, ..
         } => vec![*x, *w_q, *scale, *zp],
+        Thunk::SynthMatMul {
+            x,
+            indices,
+            codebook,
+            ..
+        } => vec![*x, *indices, *codebook],
+        Thunk::SplineActivation { x, coeff, .. } => vec![*x, *coeff],
         Thunk::DequantMatMulGguf { x, w_q, .. } => vec![*x, *w_q],
         Thunk::DequantMatMulInt4 {
             x, w_q, scale, zp, ..
@@ -2855,6 +2988,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::Narrow { src, .. } => vec![*src],
         Thunk::Copy { src, .. } => vec![*src],
         Thunk::Gather { table, idx, .. } => vec![*table, *idx],
+        Thunk::Histogram { src, .. } => vec![*src],
         // Anything not enumerated → return the dst as a "read" too,
         // forcing the fusion to bail (read_count >= 2 → skip). Keeps
         // this list safe to be incomplete.

@@ -43,6 +43,16 @@ impl LmHeadStage {
 
 impl BlockStage for LmHeadStage {
     fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
+        // The LM head is the single largest weight read per decoded token
+        // ([hidden, vocab]); store it F16-resident to halve that bandwidth on
+        // batch-1 decode. Same opt-in as the projection weights; the backend
+        // converts the f32 bytes at bind. (Only the head weight — the embed
+        // table used by the token gather stays F32.)
+        let w_dt = if rlx_ir::env::flag("RLX_QWEN3_F16_WEIGHTS") {
+            DType::F16
+        } else {
+            DType::F32
+        };
         let lm_head_w = if self.tie_word_embeddings {
             let embed_key = "model.embed_tokens.weight";
             let embed = ctx
@@ -60,14 +70,14 @@ impl BlockStage for LmHeadStage {
             ctx.synth_param(
                 &self.tied_param_name,
                 transposed,
-                Shape::new(&[hidden_size, vocab], DType::F32),
+                Shape::new(&[hidden_size, vocab], w_dt),
             )
         } else {
             let key = self
                 .weight_key
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("LmHead: weight_key required when not tied"))?;
-            ctx.load_param(key, true)?
+            ctx.load_param_typed(key, true, w_dt)?
         };
 
         let mut gb = HirMut::new(ctx.hir());

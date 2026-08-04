@@ -688,10 +688,15 @@ impl<'a> LowerCtx<'a> {
             Op::Attention {
                 num_heads,
                 head_dim,
+                v_head_dim,
                 mask_kind,
                 score_scale,
                 attn_logit_softcap,
             } => {
+                assert!(
+                    v_head_dim.is_none_or(|v| v == *head_dim),
+                    "rlx-coreml: asymmetric v_head_dim (MLA) not yet supported"
+                );
                 self.lower_attention(
                     id,
                     *num_heads,

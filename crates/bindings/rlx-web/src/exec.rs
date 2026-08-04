@@ -6,6 +6,10 @@
 
 use rlx_ir::Graph;
 use rlx_runtime::{CompiledGraph, Device, Session};
+// Browser (async, GPU-readback-safe) session — only the webgpu/webgl wasm entry
+// points below use it.
+#[cfg(all(any(feature = "webgpu", feature = "webgl"), target_arch = "wasm32"))]
+use rlx_runtime::BrowserSession;
 
 use crate::vision::{self, BATCH, ModelMeta, VisionModelId};
 

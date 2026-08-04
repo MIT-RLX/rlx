@@ -162,9 +162,163 @@ impl ThunkSchedule {
             (srcmap, skip)
         };
 
+        // Group the autodiff's three `AttentionBackward{Query,Key,Value}`
+        // siblings (same q,k,v,dy) so the Query node can emit ONE fused
+        // `AttentionBackwardAll` (scores/dp/ds recomputed once) and Key/Value
+        // become Nop. Keyed on the shared inputs; value = per-wrt node id.
+        let attn_bwd_groups: std::collections::HashMap<
+            (
+                rlx_ir::NodeId,
+                rlx_ir::NodeId,
+                rlx_ir::NodeId,
+                rlx_ir::NodeId,
+            ),
+            [Option<rlx_ir::NodeId>; 3],
+        > = {
+            use rlx_ir::op::AttentionBwdWrt;
+            let mut g: std::collections::HashMap<_, [Option<rlx_ir::NodeId>; 3]> =
+                std::collections::HashMap::new();
+            for node in graph.nodes() {
+                if let Op::AttentionBackward { wrt, .. } = &node.op {
+                    let key = (
+                        node.inputs[0],
+                        node.inputs[1],
+                        node.inputs[2],
+                        node.inputs[3],
+                    );
+                    let idx = match wrt {
+                        AttentionBwdWrt::Query => 0,
+                        AttentionBwdWrt::Key => 1,
+                        AttentionBwdWrt::Value => 2,
+                    };
+                    g.entry(key).or_insert([None; 3])[idx] = Some(node.id);
+                }
+            }
+            g
+        };
+
+        // Fold a materialized last-two-swap `Transpose` on a rank-2 MatMul operand
+        // into the GEMM (MPS `transposeLeft`/`transposeRight`), eliminating the
+        // transpose's arena buffer and its memory-bound copy. The autodiff VJP
+        // emits `dW = Xᵀ·dY` and `dX = dY·Wᵀ`. Mirrors the CPU `matmul_fold`.
+        //
+        // OPT-IN (default OFF), enable with RLX_METAL_MATMUL_TRANSPOSE_FOLD=1.
+        // Measured net-neutral-to-negative on real workloads: the transposes are
+        // cheap (~1% of a training step — the custom small-matrix GEMM + a cheap
+        // transpose beats routing through MPS, whose per-call overhead exceeds the
+        // saved copy). The MPS-only gate below already limits it to shapes where
+        // MPS is fastest, yet even there it doesn't win at tested scales. Kept
+        // behind the flag as a correct (bit-exact) mechanism for potential
+        // large-transposed-matmul cases (e.g. big tied LM heads), not a default.
+        // Restricted to f32, arena-resident operands (MPS is single-buffer, so
+        // weight-buffer-tagged sources stay materialized). Map: matmul id →
+        // (a_src, ta, b_src, tb); `folded_transpose`: transpose ids to Nop.
+        let (matmul_fold, folded_transpose): (
+            std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+            std::collections::HashSet<NodeId>,
+        ) = {
+            let mut fold = std::collections::HashMap::new();
+            let mut folded = std::collections::HashSet::new();
+            let enabled =
+                rlx_ir::env::var("RLX_METAL_MATMUL_TRANSPOSE_FOLD").as_deref() == Some("1");
+            // Opt-in extension: also fold a `matmul_t(weight)` transpose (e.g. the
+            // big tied LM head) by reading the weight buffer directly with MPS
+            // transposeRight (`encode_mps_sgemm_t_bufs`), instead of requiring
+            // arena-resident operands. Default off; the MPS-shape gate below still
+            // applies, so only large weight-transposed matmuls (LM heads) qualify.
+            let fold_weights =
+                rlx_ir::env::var("RLX_METAL_MATMUL_TRANSPOSE_FOLD_WEIGHTS").as_deref() == Some("1");
+            if enabled {
+                let mut uses: std::collections::HashMap<NodeId, u32> =
+                    std::collections::HashMap::new();
+                for node in graph.nodes() {
+                    for &inp in &node.inputs {
+                        *uses.entry(inp).or_insert(0) += 1;
+                    }
+                }
+                // A rank-2 [1,0]-Transpose used exactly once, whose pre-transpose
+                // source is arena-resident → returns that source id.
+                let foldable_t = |id: NodeId| -> Option<NodeId> {
+                    let n = graph.node(id);
+                    let Op::Transpose { perm } = &n.op else {
+                        return None;
+                    };
+                    if perm.as_slice() != [1, 0] || n.shape.rank() != 2 {
+                        return None;
+                    }
+                    if uses.get(&id) != Some(&1) {
+                        return None;
+                    }
+                    let so = off(n.inputs[0]);
+                    (so != usize::MAX && (fold_weights || !is_weight_off(so)))
+                        .then_some(n.inputs[0])
+                };
+                for node in graph.nodes() {
+                    if !matches!(node.op, Op::MatMul) {
+                        continue;
+                    }
+                    let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
+                    if graph.node(a_id).shape.rank() != 2
+                        || graph.node(b_id).shape.rank() != 2
+                        || node.shape.dtype() != DType::F32
+                    {
+                        continue;
+                    }
+                    let co = off(node.id);
+                    if co == usize::MAX || is_weight_off(co) {
+                        continue; // MPS single-buffer: output must be arena
+                    }
+                    // Only fold when MPS is already the fastest GEMM for this shape.
+                    // The fold routes through MPS (the only transpose-capable path);
+                    // for small matmuls the custom kernel wins and MPS's per-call
+                    // overhead would exceed the (tiny) transpose cost — measured a
+                    // ~3% net loss on small-model training. Large matmuls (e.g. LM
+                    // heads) both prefer MPS AND materialize a big transpose, so
+                    // there the fold is a clear win. `crate::cost` decides.
+                    let n_dim = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let m_dim = node.shape.num_elements().unwrap() / n_dim.max(1);
+                    let k_dim = graph.node(a_id).shape.num_elements().unwrap() / m_dim.max(1);
+                    if crate::cost::hw_model().pick_sgemm(m_dim, k_dim, n_dim)
+                        != crate::cost::SgemmVariant::Mps
+                    {
+                        continue;
+                    }
+                    let (fa, fb) = (foldable_t(a_id), foldable_t(b_id));
+                    if fa.is_none() && fb.is_none() {
+                        continue;
+                    }
+                    let (asrc, ta) = fa.map_or((a_id, false), |s| (s, true));
+                    let (bsrc, tb) = fb.map_or((b_id, false), |s| (s, true));
+                    // The non-folded operand must be arena-resident — unless the
+                    // weight-fold extension is on, in which case the buffer-aware
+                    // encode reads it from the weight buffer.
+                    let (ao, bo) = (off(asrc), off(bsrc));
+                    if ao == usize::MAX
+                        || bo == usize::MAX
+                        || (!fold_weights && (is_weight_off(ao) || is_weight_off(bo)))
+                    {
+                        continue;
+                    }
+                    fold.insert(node.id, (asrc, ta, bsrc, tb));
+                    if ta {
+                        folded.insert(a_id);
+                    }
+                    if tb {
+                        folded.insert(b_id);
+                    }
+                }
+            }
+            (fold, folded)
+        };
+
         for node in graph.nodes() {
             #[cfg(feature = "native-gpu-fft")]
             if fft_real_skip.contains(&node.id) {
+                thunks.push(Thunk::Nop);
+                continue;
+            }
+            // Folded into a downstream MatMul's transposed GEMM — drop the copy.
+            if folded_transpose.contains(&node.id) {
                 thunks.push(Thunk::Nop);
                 continue;
             }
@@ -275,6 +429,9 @@ impl ThunkSchedule {
                         n: (3 * inner) as u32,
                         dt,
                         b_f16: false,
+                        a_f16: false,
+                        ta: false,
+                        tb: false,
                     });
                     // 2. attn = fused RoPE + SDPA(qkv, mask) → attn scratch.
                     let (cos_off, sin_off) = if *has_rope {
@@ -307,6 +464,9 @@ impl ThunkSchedule {
                         n: inner as u32,
                         dt,
                         b_f16: false,
+                        a_f16: false,
+                        ta: false,
+                        tb: false,
                     });
                     continue;
                 }
@@ -319,6 +479,7 @@ impl ThunkSchedule {
                     let a_shape = &graph.node(node.inputs[0]).shape;
                     let b_shape = &graph.node(node.inputs[1]).shape;
                     let b_f16 = matches!(b_shape.dtype(), rlx_ir::DType::F16);
+                    let a_f16 = matches!(a_shape.dtype(), rlx_ir::DType::F16);
                     // Any-rank batched matmul: all leading dims (except the
                     // last 2) match between A, B, and output, and the last
                     // 2 dims form [M, K] @ [K, N] = [M, N]. The 2-D Sgemm
@@ -379,15 +540,26 @@ impl ThunkSchedule {
                         let m = total / n;
                         let a_total = a_shape.num_elements().unwrap();
                         let k = a_total / m;
+                        // Transpose-fold: read the pre-transpose source(s) with an
+                        // MPS transpose flag; `m/k/n` are the logical (post-transpose)
+                        // dims, unchanged (derived from the output and A's element
+                        // count, which the swap preserves).
+                        let (a, ta, b, tb) = match matmul_fold.get(&node.id) {
+                            Some(&(asrc, ta, bsrc, tb)) => (off(asrc), ta, off(bsrc), tb),
+                            None => (off(node.inputs[0]), false, off(node.inputs[1]), false),
+                        };
                         Thunk::Sgemm {
-                            a: off(node.inputs[0]),
-                            b: off(node.inputs[1]),
+                            a,
+                            b,
                             c: off(node.id),
                             m: m as u32,
                             k: k as u32,
                             n: n as u32,
                             dt: shape.dtype().into(),
                             b_f16,
+                            a_f16,
+                            ta,
+                            tb,
                         }
                     }
                 }
@@ -412,23 +584,86 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::FusedMatMulResidual => {
+                    let shape = &node.shape;
+                    let n = shape.dim(shape.rank() - 1).unwrap_static();
+                    let total = shape.num_elements().unwrap();
+                    let m = total / n;
+                    let a_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                    let k = a_total / m;
+                    Thunk::SgemmResidual {
+                        a: off(node.inputs[0]),
+                        b: off(node.inputs[1]),
+                        c: off(node.id),
+                        r: off(node.inputs[2]),
+                        m: m as u32,
+                        k: k as u32,
+                        n: n as u32,
+                        dt: shape.dtype().into(),
+                    }
+                }
+
                 Op::Cast { to } => {
                     let len = node.shape.num_elements().unwrap();
                     let src_dtype = graph.node(node.inputs[0]).shape.dtype();
                     let dst_dtype = *to;
                     let out_dtype = node.shape.dtype();
+                    // A packed sub-4-byte integer SOURCE (a U8/I8 *Param* — e.g. VQ
+                    // codebook indices) is stored 1-byte-packed in the f32-uniform
+                    // arena, NOT widened. The CastTruncF32 fast path below reads the
+                    // source as `*const f32` (4 B/elem), so it would mis-read a
+                    // packed u8 param (garbage indices → SynthMatMul decompose/VJP
+                    // failure). Route such sources through the generic host cast,
+                    // which reads the source at its true width and writes the widened
+                    // f32 slot — integer codes have no fractional part, so the f32
+                    // result equals the index exactly and downstream Gather/ScatterAdd
+                    // (which read f32 indices) stay correct.
+                    //
+                    // Gate on the source being an `Op::Param` OR `Op::Constant`:
+                    // both are stored PACKED at native (sub-4-byte) width. A non-f32
+                    // *param* is packed by `plan_memory`'s `node_slot_bytes`
+                    // (`non_f32_param`); a U8/I8 *constant* is packed too — the
+                    // widen pass (`widen_integer_activations_to_f32`) only widens
+                    // I64/I32/U32/Bool (`metal_widened_dtype`), NOT U8/I8, so a u8
+                    // constant keeps DType::U8 and its literal bytes are copied 1-B/elem
+                    // into the slot start (see the `Op::Constant` init in
+                    // `backend/compile.rs`). The forward SynthMatMul kernel reads those
+                    // indices as packed u8; the VJP's `Cast(u8→i64)→Gather` must too.
+                    // Without Constant here, the CastTruncF32 fast path below read the
+                    // 1-byte-packed u8 index constant as 4-B f32 → garbage indices →
+                    // the SynthMatMul-backprop Gather reconstructed Wᵀ from wrong rows
+                    // (rlx-tiny: layer grads exploded to 1e22 → NaN on Metal only).
+                    // (A widened U8/I8 tensor arrives as src_dtype==F32, excluded here;
+                    // a Custom-op operand keeps its dtype but its literal bytes are
+                    // likewise packed, so the true-width host read stays correct.)
+                    let packed_int_src = matches!(src_dtype, DType::U8 | DType::I8)
+                        && matches!(
+                            graph.node(node.inputs[0]).op,
+                            Op::Param { .. } | Op::Constant { .. }
+                        );
                     // Widened arena: Cast→int kept `to` as integer for truncation
                     // semantics but the tensor slot is F32. Emit f32 trunc-in-place
                     // so Unsqueeze/Gather/fringe-mask stay on f32 paths.
                     let trunc_to_int = matches!(
                         dst_dtype,
                         DType::I64 | DType::I32 | DType::U32 | DType::Bool
-                    ) && out_dtype == DType::F32;
+                    ) && out_dtype == DType::F32
+                        && !packed_int_src;
                     if trunc_to_int {
                         Thunk::CastTruncF32 {
                             src: off(node.inputs[0]),
                             dst: off(node.id),
                             len: len as u32,
+                        }
+                    } else if packed_int_src && out_dtype == DType::F32 {
+                        // U8/I8 source into a widened f32 slot: read true 1-byte width,
+                        // write f32 (identical machinery to the working Cast(u8→f32)).
+                        Thunk::CastHost {
+                            src: off(node.inputs[0]),
+                            dst: off(node.id),
+                            len: len as u32,
+                            src_dt: src_dtype,
+                            dst_dt: DType::F32,
                         }
                     } else {
                         let half_ok = matches!(
@@ -766,6 +1001,7 @@ impl ThunkSchedule {
                         eps: *eps,
                         has_bias: *has_bias,
                         dt: node.shape.dtype().into(),
+                        sum_out: 0,
                     }
                 }
 
@@ -1049,16 +1285,32 @@ impl ThunkSchedule {
                         total,
                         out_dims,
                         in_strides,
+                        half: node.shape.dtype() == rlx_ir::DType::F16,
                     }
                 }
 
                 Op::Attention {
                     num_heads,
                     head_dim,
+                    v_head_dim,
                     mask_kind,
                     score_scale,
                     attn_logit_softcap,
                 } => {
+                    // V/output per-head width; == head_dim unless asymmetric (MLA).
+                    let v_head_dim = v_head_dim.unwrap_or(*head_dim);
+                    // The f16 SDPA kernel (`sdpa_h`) is symmetric-only; MLA's
+                    // asymmetric V/output width is an f32 feature (DeepSeek/Kimi).
+                    // Guard the untouched f16 path rather than silently miscompute.
+                    assert!(
+                        v_head_dim == *head_dim
+                            || !matches!(
+                                crate::thunk::HalfFlag::from(node.shape.dtype()),
+                                crate::thunk::HalfFlag::F16
+                            ),
+                        "rlx-metal: asymmetric v_head_dim (MLA) requires f32 attention \
+                         (f16 sdpa_h path unmodified)"
+                    );
                     let (mask_kind_u32, window): (u32, u32) = match mask_kind {
                         rlx_ir::op::MaskKind::None => (0, 0),
                         rlx_ir::op::MaskKind::Causal => (1, 0),
@@ -1150,9 +1402,11 @@ impl ThunkSchedule {
                         heads: *num_heads as u32,
                         kv_heads: kv_heads as u32,
                         head_dim: *head_dim as u32,
+                        v_head_dim: v_head_dim as u32,
                         mask_kind: mask_kind_u32,
                         window,
                         dt: node.shape.dtype().into(),
+                        kv_f16: graph.node(node.inputs[1]).shape.dtype() == rlx_ir::DType::F16,
                         bhsd,
                         score_scale: score_scale.unwrap_or(0.0),
                         attn_logit_softcap: attn_logit_softcap.unwrap_or(0.0),
@@ -1219,13 +1473,155 @@ impl ThunkSchedule {
                         AttentionBwdWrt::Key => 1u32,
                         AttentionBwdWrt::Value => 2u32,
                     };
-                    Thunk::AttentionBackward {
+                    // Fuse the three sibling grads into one pass when the whole
+                    // group is present and GPU-eligible (no custom/bias mask,
+                    // not [B,H,S,D]). Emitted at the **last** sibling (max node
+                    // id) — by then the planner has reserved all three output
+                    // slots (each from its own node position), so writing dq/dk/dv
+                    // together lands inside every slot's live range. Earlier
+                    // siblings collapse to Nop. `RLX_METAL_ATTN_BWD_FUSE=0` opts
+                    // out (per-wrt path, for parity checks).
+                    let group_key = (
+                        node.inputs[0],
+                        node.inputs[1],
+                        node.inputs[2],
+                        node.inputs[3],
+                    );
+                    let group = attn_bwd_groups.get(&group_key);
+                    let fusable = group.is_some_and(|g| g.iter().all(Option::is_some))
+                        && bhsd == 0
+                        && !matches!(mask_kind_u32, 2 | 4)
+                        && rlx_ir::env::var("RLX_METAL_ATTN_BWD_FUSE").as_deref() != Some("0");
+                    let _ = wrt_id;
+                    if fusable {
+                        let g = group.unwrap();
+                        let primary = g.iter().flatten().copied().max().unwrap();
+                        if node.id == primary {
+                            // Last sibling → emit the fused all-grads thunk.
+                            Thunk::AttentionBackwardAll {
+                                q: off(node.inputs[0]),
+                                k: off(node.inputs[1]),
+                                v: off(node.inputs[2]),
+                                dy: off(node.inputs[3]),
+                                out_dq: off(g[0].unwrap()),
+                                out_dk: off(g[1].unwrap()),
+                                out_dv: off(g[2].unwrap()),
+                                batch: batch as u32,
+                                seq: seq as u32,
+                                kv_seq: kv_seq as u32,
+                                heads: *num_heads as u32,
+                                head_dim: *head_dim as u32,
+                                mask_kind: mask_kind_u32,
+                                window,
+                            }
+                        } else {
+                            // Earlier siblings → handled by the primary thunk.
+                            Thunk::Nop
+                        }
+                    } else {
+                        Thunk::AttentionBackward {
+                            q: off(node.inputs[0]),
+                            k: off(node.inputs[1]),
+                            v: off(node.inputs[2]),
+                            dy: off(node.inputs[3]),
+                            mask: mask_off,
+                            out: off(node.id),
+                            batch: batch as u32,
+                            seq: seq as u32,
+                            kv_seq: kv_seq as u32,
+                            heads: *num_heads as u32,
+                            head_dim: *head_dim as u32,
+                            mask_kind: mask_kind_u32,
+                            window,
+                            wrt: wrt_id,
+                            bhsd,
+                        }
+                    }
+                }
+
+                // IR-level fused variant (from `FuseAttentionBackwardAll`, opt-in
+                // via `RLX_CPU_ATTN_BWD_FUSE=1`). Distinct from the thunk-level
+                // fusion above: the pass already collapsed the three siblings into
+                // one packed-`[3B,…]`-output node + three axis-0 `Narrow`s. dQ/dK/dV
+                // live contiguously in that one buffer, so the outputs are the packed
+                // base and the two per-narrow strides (matching the narrow starts
+                // 0 / b / 2b). Reuses the same `encode_attention_bwd_all` kernel as
+                // mechanism-2, so it inherits its correctness.
+                Op::AttentionBackwardAll {
+                    num_heads,
+                    head_dim,
+                    mask_kind,
+                } => {
+                    if node.shape.dtype() != rlx_ir::DType::F32 {
+                        panic!(
+                            "rlx-metal AttentionBackwardAll: F32 only (use CPU for f16 training)"
+                        );
+                    }
+                    let (mask_kind_u32, window) = match mask_kind {
+                        rlx_ir::op::MaskKind::None => (0u32, 0u32),
+                        rlx_ir::op::MaskKind::Causal => (1u32, 0u32),
+                        rlx_ir::op::MaskKind::SlidingWindow(w) => (3u32, *w as u32),
+                        rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias => panic!(
+                            "rlx-metal AttentionBackwardAll: custom/bias mask is not GPU-fusable \
+                             (the fusion pass should not have emitted it)"
+                        ),
+                    };
+                    let q_shape = &graph.node(node.inputs[0]).shape;
+                    let k_shape = &graph.node(node.inputs[1]).shape;
+                    let rank = q_shape.rank();
+                    // Same [B,S,H,D]/[B,H,S,D]/rank-3/rank-2 derivation as the
+                    // per-`wrt` arm; the kernel assumes the [B,S,H,D] layout, so
+                    // only bhsd==0 is fusable (guaranteed: the thunk-level path
+                    // that also feeds these kernels gates on `bhsd == 0`).
+                    let (batch, seq, kv_seq, bhsd) = if rank == 4 {
+                        let d1 = q_shape.dim(1).unwrap_static();
+                        let d2 = q_shape.dim(2).unwrap_static();
+                        if d1 == *num_heads {
+                            (
+                                q_shape.dim(0).unwrap_static(),
+                                d2,
+                                k_shape.dim(2).unwrap_static(),
+                                1u32,
+                            )
+                        } else {
+                            (
+                                q_shape.dim(0).unwrap_static(),
+                                d1,
+                                k_shape.dim(1).unwrap_static(),
+                                0u32,
+                            )
+                        }
+                    } else if rank >= 3 {
+                        (
+                            q_shape.dim(0).unwrap_static(),
+                            q_shape.dim(1).unwrap_static(),
+                            k_shape.dim(1).unwrap_static(),
+                            0u32,
+                        )
+                    } else {
+                        (
+                            1,
+                            q_shape.dim(0).unwrap_static(),
+                            k_shape.dim(0).unwrap_static(),
+                            0u32,
+                        )
+                    };
+                    debug_assert_eq!(
+                        bhsd, 0,
+                        "rlx-metal AttentionBackwardAll: [B,H,S,D] layout not supported by the \
+                         fused kernel"
+                    );
+                    // Packed output is [3B,…]; each dQ/dK/dV narrow is a third of it.
+                    let per = node.shape.num_elements().unwrap() / 3 * 4;
+                    let base = off(node.id);
+                    Thunk::AttentionBackwardAll {
                         q: off(node.inputs[0]),
                         k: off(node.inputs[1]),
                         v: off(node.inputs[2]),
                         dy: off(node.inputs[3]),
-                        mask: mask_off,
-                        out: off(node.id),
+                        out_dq: base,
+                        out_dk: base + per,
+                        out_dv: base + 2 * per,
                         batch: batch as u32,
                         seq: seq as u32,
                         kv_seq: kv_seq as u32,
@@ -1233,8 +1629,6 @@ impl ThunkSchedule {
                         head_dim: *head_dim as u32,
                         mask_kind: mask_kind_u32,
                         window,
-                        wrt: wrt_id,
-                        bhsd,
                     }
                 }
 
@@ -1373,6 +1767,17 @@ impl ThunkSchedule {
                             (off(in_id), in_axis as u32)
                         })
                         .collect();
+                    let input_dts: Vec<HalfFlag> = node
+                        .inputs
+                        .iter()
+                        .map(|&in_id| graph.node(in_id).shape.dtype().into())
+                        .collect();
+                    let weight_const = node.inputs.iter().all(|&in_id| {
+                        matches!(
+                            graph.node(in_id).op,
+                            rlx_ir::op::Op::Param { .. } | rlx_ir::op::Op::Constant { .. }
+                        )
+                    });
                     Thunk::Concat {
                         dst: off(node.id),
                         outer: outer as u32,
@@ -1380,6 +1785,8 @@ impl ThunkSchedule {
                         inner: inner as u32,
                         dt: out_shape.dtype().into(),
                         inputs,
+                        input_dts,
+                        weight_const,
                     }
                 }
 
@@ -1548,6 +1955,7 @@ impl ThunkSchedule {
                         total,
                         out_dims,
                         in_strides,
+                        half: node.shape.dtype() == rlx_ir::DType::F16,
                     }
                 }
 
@@ -2873,6 +3281,139 @@ impl ThunkSchedule {
                                  is CPU-only unless Int4/FP8/NVFP4/MLX; use GGUF K-quants or Device::Cpu."
                             ),
                         }
+                    }
+                }
+
+                Op::SynthReconstruct {
+                    kind: rlx_ir::SynthKind::Codebook { entry_dim, .. },
+                } => {
+                    let idx_shape = &graph.node(node.inputs[0]).shape;
+                    let n = idx_shape.dim(0).unwrap_static();
+                    let k = idx_shape.dim(1).unwrap_static() * *entry_dim as usize;
+                    Thunk::SynthReconstruct {
+                        indices: off(node.inputs[0]),
+                        codebook: off(node.inputs[1]),
+                        dst: off(node.id),
+                        k: k as u32,
+                        n: n as u32,
+                        entry_dim: *entry_dim,
+                    }
+                }
+
+                Op::SynthMatMul {
+                    kind:
+                        rlx_ir::SynthKind::Codebook {
+                            entry_dim,
+                            num_entries,
+                        },
+                } => {
+                    let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+                    let total = node.shape.num_elements().unwrap();
+                    let m = total / n.max(1);
+                    let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
+                    let k = x_total / m.max(1);
+                    Thunk::SynthMatMul {
+                        x: off(node.inputs[0]),
+                        indices: off(node.inputs[1]),
+                        codebook: off(node.inputs[2]),
+                        dst: off(node.id),
+                        m: m as u32,
+                        k: k as u32,
+                        n: n as u32,
+                        entry_dim: *entry_dim,
+                        num_entries: *num_entries,
+                        half: graph.node(node.inputs[0]).shape.dtype() == rlx_ir::DType::F16
+                            && node.shape.dtype() == rlx_ir::DType::F16,
+                    }
+                }
+
+                Op::SynthMatMulBackward {
+                    kind:
+                        rlx_ir::SynthKind::Codebook {
+                            entry_dim,
+                            num_entries,
+                        },
+                    wrt,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let idx_shape = &graph.node(node.inputs[1]).shape;
+                    let m = x_shape.dim(0).unwrap_static();
+                    let k = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                    let n = idx_shape.dim(0).unwrap_static();
+                    Thunk::SynthMatMulBackward {
+                        x: off(node.inputs[0]),
+                        indices: off(node.inputs[1]),
+                        codebook: off(node.inputs[2]),
+                        upstream: off(node.inputs[3]),
+                        dst: off(node.id),
+                        m: m as u32,
+                        n: n as u32,
+                        k: k as u32,
+                        entry_dim: *entry_dim,
+                        num_entries: *num_entries,
+                        dx: matches!(wrt, rlx_ir::SynthBwdWrt::Dx),
+                    }
+                }
+
+                Op::SplineActivation {
+                    num_basis,
+                    grid_min,
+                    grid_max,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let channels = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                    let total = x_shape.num_elements().unwrap();
+                    let rows = total / channels.max(1);
+                    Thunk::SplineActivation {
+                        x: off(node.inputs[0]),
+                        coeff: off(node.inputs[1]),
+                        dst: off(node.id),
+                        rows: rows as u32,
+                        channels: channels as u32,
+                        num_basis: *num_basis,
+                        grid_min: *grid_min,
+                        grid_max: *grid_max,
+                    }
+                }
+
+                Op::SplineActivationBackwardX {
+                    num_basis,
+                    grid_min,
+                    grid_max,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let channels = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                    let rows = x_shape.num_elements().unwrap() / channels.max(1);
+                    Thunk::SplineActivationBackwardX {
+                        x: off(node.inputs[0]),
+                        coeff: off(node.inputs[1]),
+                        upstream: off(node.inputs[2]),
+                        dst: off(node.id),
+                        rows: rows as u32,
+                        channels: channels as u32,
+                        num_basis: *num_basis,
+                        grid_min: *grid_min,
+                        grid_max: *grid_max,
+                    }
+                }
+
+                Op::SplineActivationBackwardCoeff {
+                    num_basis,
+                    grid_min,
+                    grid_max,
+                } => {
+                    let x_shape = &graph.node(node.inputs[0]).shape;
+                    let channels = x_shape.dim(x_shape.rank() - 1).unwrap_static();
+                    let rows = x_shape.num_elements().unwrap() / channels.max(1);
+                    Thunk::SplineActivationBackwardCoeff {
+                        x: off(node.inputs[0]),
+                        upstream: off(node.inputs[1]),
+                        dst: off(node.id),
+                        rows: rows as u32,
+                        channels: channels as u32,
+                        num_basis: *num_basis,
+                        grid_min: *grid_min,
+                        grid_max: *grid_max,
                     }
                 }
 

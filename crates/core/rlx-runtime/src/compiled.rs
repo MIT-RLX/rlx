@@ -241,6 +241,30 @@ impl CompiledGraph {
         self.inner.bind_gpu_handle(name, data)
     }
 
+    /// ZERO-COPY in-place optimizer step over GPU-resident weights: the
+    /// optimizer reads gradients and writes params directly on the unified-memory
+    /// arena (no GPU→host→GPU roundtrip). `trainable[i] = (input_name, shape)`;
+    /// the gradient is read from output slot `1 + i` (backward outputs
+    /// `[loss, grad0, …]`). Pair with [`Self::bind_gpu_handle`] (weight resident)
+    /// and `run_read_outputs(_, Some(&[0]))` (read only the loss). Returns false
+    /// on backends without GPU-resident support — fall back to a host step.
+    ///
+    /// ```ignore
+    /// compiled.bind_gpu_handle("W", &w_init);
+    /// let mut muon = Muon::new(lr);
+    /// for _ in 0..steps {
+    ///     compiled.run_read_outputs(&[("d_output", &[1.0])], Some(&[0]));
+    ///     compiled.optimizer_step_resident(&trainable, &mut |n, s, p, g| muon.step(n, s, p, g));
+    /// }
+    /// ```
+    pub fn optimizer_step_resident(
+        &mut self,
+        trainable: &[(String, Vec<usize>)],
+        step: &mut dyn FnMut(&str, &[usize], &mut [f32], &[f32]),
+    ) -> bool {
+        self.inner.optimizer_step_resident(trainable, step)
+    }
+
     pub fn has_gpu_handle(&self, name: &str) -> bool {
         self.inner.has_gpu_handle(name)
     }
@@ -387,6 +411,14 @@ impl CompiledGraph {
         self.inner.set_active_extent(extent);
     }
 
+    /// Return this graph's idle scratch (activation) pages to the OS while it stays
+    /// cached — for multi-subgraph pipelines whose stages run sequentially. Weights
+    /// stay resident; the next run refaults + re-zeros scratch transparently. Call
+    /// only between stages, never inside a hot loop. Advisory no-op off CPU.
+    pub fn release_scratch(&mut self) {
+        self.inner.release_scratch();
+    }
+
     /// TIDE merged MoE placement (`mask[expert]` device-resident if any layer has it).
     pub fn set_moe_resident_experts(&mut self, mask: &[bool]) {
         self.inner.set_moe_resident_experts(mask);
@@ -452,6 +484,26 @@ impl CompiledGraph {
             }
         } else {
             self.inner.set_param_typed(name, data, dtype);
+        }
+    }
+
+    /// Incrementally write raw `data` into a named param starting `byte_offset`
+    /// bytes into its storage. Returns true if the backend did the partial write;
+    /// false → caller must fall back to a whole-buffer [`Self::set_param_typed`].
+    /// Used by paged-MoE residency to upload only the changed expert slot.
+    pub fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        if let Some(st) = self.staging.as_mut() {
+            let mut done = false;
+            if st.prepare_params.contains(name) {
+                done |= st.prepare.set_param_range(name, byte_offset, data);
+                st.prepared = false;
+            }
+            if st.main_params.contains(name) {
+                done |= self.inner.set_param_range(name, byte_offset, data);
+            }
+            done
+        } else {
+            self.inner.set_param_range(name, byte_offset, data)
         }
     }
 

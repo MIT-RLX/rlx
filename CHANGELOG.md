@@ -1,9 +1,25 @@
 # Changelog
 
-All notable changes to RLX. Format loosely follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
-tracks SemVer with the understanding that any `0.x → 0.(x+1)`
-bump may carry breaking changes per `0.x`-semver convention.
+All notable changes to RLX are recorded here. The format follows
+[Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) and the project
+tracks [Semantic Versioning](https://semver.org/) — while pre-1.0, any
+`0.x → 0.(x+1)` bump may carry breaking changes, per the `0.x` SemVer convention.
+
+**Adding an entry.** Put user-visible changes under `## [Unreleased]`, newest
+first, in the category that fits. Use these categories, in this order (omit any
+that are empty):
+
+- **Added** — new features, ops, or backends.
+- **Changed** — changes in existing behavior.
+- **Deprecated** — features headed for removal.
+- **Removed** — features dropped in this release.
+- **Fixed** — bug fixes.
+- **Security** — vulnerability fixes (coordinate via [`SECURITY.md`](SECURITY.md) first).
+- **Performance** — measured speedups on a backend's hot path; cite the before/after.
+
+Version headings are `## [x.y.z] — YYYY-MM-DD` (ISO date, em-dash separator). On
+release, rename `[Unreleased]` to the new version and add a fresh empty
+`[Unreleased]` above it, then update the compare links at the bottom of the file.
 
 ## [Unreleased]
 

@@ -75,6 +75,49 @@ pub fn run_dequant_grouped_matmul_gguf(
     );
 }
 
+/// MLX-affine/MXFP4 MoE grouped matmul on the host (packed expert stacks) — the ROCm
+/// host-delegate for `Op::DequantGroupedMatMulMlx` (mirrors the CUDA path; ROCm has no
+/// native grouped-MLX kernel yet, so the shared CPU implementation runs against the
+/// device arena via [`RocmArena`]).
+#[allow(clippy::too_many_arguments)]
+pub fn run_dequant_grouped_matmul_mlx(
+    ctx: &RocmContext,
+    buffer: &HipBuffer<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    scheme: rlx_ir::quant::QuantScheme,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    scale_byte_off: usize,
+    zp_byte_off: usize,
+    idx_byte_off: usize,
+    out_byte_off: usize,
+    scale_bf16: bool,
+) {
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_dequant_grouped_matmul_mlx(
+        &mut arena,
+        m,
+        k,
+        n,
+        num_experts,
+        scheme,
+        x_byte_off,
+        w_byte_off,
+        scale_byte_off,
+        zp_byte_off,
+        idx_byte_off,
+        out_byte_off,
+        scale_bf16,
+    );
+}
+
 pub fn upload_param_bytes(
     ctx: &RocmContext,
     buffer: &mut HipBuffer<f32>,

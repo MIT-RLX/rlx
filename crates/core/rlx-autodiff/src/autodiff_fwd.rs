@@ -808,7 +808,8 @@ fn jvp_rule(
             }
         }
 
-        Op::Compare(_) => None, // discrete output, zero tangent
+        Op::Compare(_) => None,       // discrete output, zero tangent
+        Op::Histogram { .. } => None, // discrete counts, zero tangent
         Op::Cast { to } => {
             let t_x = t_inputs[0]?;
             Some(bwd.add_node(Op::Cast { to: *to }, vec![t_x], node.shape.clone()))
@@ -1050,6 +1051,7 @@ fn jvp_rule(
         Op::Attention {
             num_heads,
             head_dim,
+            v_head_dim,
             mask_kind,
             score_scale,
             attn_logit_softcap,
@@ -1071,6 +1073,7 @@ fn jvp_rule(
                 Op::Attention {
                     num_heads: *num_heads,
                     head_dim: *head_dim,
+                    v_head_dim: *v_head_dim,
                     mask_kind: *mask_kind,
                     score_scale: *score_scale,
                     attn_logit_softcap: *attn_logit_softcap,

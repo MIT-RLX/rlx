@@ -105,6 +105,95 @@ impl Func {
             .map(|(_, d)| d.as_slice())
     }
 
+    /// The names of every trainable parameter (`Op::Param`) in the graph, in
+    /// declaration order — exactly the `wrt` list a full-model training step
+    /// needs, so you never hand-maintain it. Powers [`init_params`], the
+    /// `*_all` training steps, and checkpoint round-trips.
+    pub fn param_names(&self) -> Vec<String> {
+        self.graph
+            .nodes()
+            .iter()
+            .filter_map(|n| match &n.op {
+                rlx_ir::Op::Param { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The static shape (dims) of a parameter by name, or `None` if there is no
+    /// such param. A dynamic axis reads as `0`.
+    pub fn param_shape_of(&self, name: &str) -> Option<Vec<usize>> {
+        self.graph.nodes().iter().find_map(|n| match &n.op {
+            rlx_ir::Op::Param { name: pn } if pn == name => Some(
+                n.shape
+                    .dims()
+                    .iter()
+                    .map(|d| match d {
+                        rlx_ir::Dim::Static(s) => *s,
+                        rlx_ir::Dim::Dynamic(_) => 0,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+    }
+
+    /// Bind every declared parameter by calling `init(name, &static_dims)` and
+    /// using the returned `Vec<f32>` — one call seeds a whole model's weights,
+    /// instead of a [`with_param`](Func::with_param) per tensor. Overwrites any
+    /// existing bindings. Builder-style: chain before `train_step`.
+    ///
+    /// ```ignore
+    /// let model = Func::from_graph(rlx! { … }).init_params(|name, dims| {
+    ///     if name.ends_with(".bias") { vec![0.0; dims.iter().product()] }
+    ///     else { he_init(dims) }
+    /// });
+    /// ```
+    pub fn init_params(mut self, mut init: impl FnMut(&str, &[usize]) -> Vec<f32>) -> Self {
+        let specs: Vec<(String, Vec<usize>)> = self
+            .param_names()
+            .into_iter()
+            .map(|n| {
+                let dims = self.param_shape_of(&n).unwrap_or_default();
+                (n, dims)
+            })
+            .collect();
+        for (name, dims) in specs {
+            let data = init(&name, &dims);
+            self = self.with_param(name, data);
+        }
+        self
+    }
+
+    /// Seed every parameter with i.i.d. Gaussian noise `N(0, stddev²)` from a
+    /// deterministic SplitMix64 + Box–Muller stream keyed by `seed`
+    /// (reproducible, no `rand` dependency). A one-liner for a from-scratch
+    /// model; for per-tensor schemes (zeroed biases, fan-in scaling) pass your
+    /// own closure to [`init_params`](Func::init_params).
+    pub fn init_randn(self, seed: u64, stddev: f32) -> Self {
+        // SplitMix64 → uniform in [0, 1).
+        fn u01(state: &mut u64) -> f64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut x = *state;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^= x >> 31;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        }
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        self.init_params(move |_name, dims| {
+            let n: usize = dims.iter().map(|&d| d.max(1)).product();
+            (0..n)
+                .map(|_| {
+                    let u1 = u01(&mut state).max(1e-12);
+                    let u2 = u01(&mut state);
+                    let g = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                    (g as f32) * stddev
+                })
+                .collect()
+        })
+    }
+
     /// Carry the bound params onto a transformed graph.
     #[cfg(feature = "autodiff")]
     fn derive(&self, graph: Graph) -> Func {
@@ -157,6 +246,22 @@ impl Func {
         let mut bwd = rlx_autodiff::grad_with_loss(&self.graph, &ids);
         crate::tensor::bake_unit_seed(&mut bwd);
         self.derive(bwd)
+    }
+
+    /// [`value_and_grad`](Func::value_and_grad) w.r.t. **every** parameter in
+    /// the graph — no hand-maintained name list. Outputs `[loss, ∂loss/∂p …]`
+    /// ordered like [`param_names`](Func::param_names).
+    pub fn value_and_grad_all(&self) -> Func {
+        let names = self.param_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.value_and_grad(&refs)
+    }
+
+    /// [`grad`](Func::grad) w.r.t. every parameter in the graph.
+    pub fn grad_all(&self) -> Func {
+        let names = self.param_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.grad(&refs)
     }
 
     /// Vectorize over a leading batch axis on the named inputs (`out_axes = 0`).
@@ -253,19 +358,208 @@ impl Func {
         inputs: &[(&str, &[f32])],
     ) -> (Func, Vec<f32>) {
         let outputs = self.value_and_grad(wrt).run(inputs);
-        let loss = outputs[0].clone();
-        let mut updated = self.clone();
-        for (i, name) in wrt.iter().enumerate() {
-            let grad = &outputs[i + 1];
-            let shape = self.param_shape(name);
-            let mut data = self
+        self.apply_optimizer_step(opt, wrt, &outputs)
+    }
+
+    /// [`train_step`](Func::train_step) pinned to an explicit `device` instead
+    /// of the auto-selected fastest backend — the one call you need to train a
+    /// whole run on, say, Metal (no hand-rolled `value_and_grad().run_on()` +
+    /// optimizer loop).
+    pub fn train_step_on(
+        &self,
+        device: rlx_runtime::Device,
+        opt: &mut dyn rlx_optim::Optimizer,
+        wrt: &[&str],
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        let outputs = self.value_and_grad(wrt).run_on(device, inputs);
+        self.apply_optimizer_step(opt, wrt, &outputs)
+    }
+
+    /// [`train_step_on`](Func::train_step_on) with a learning-rate schedule.
+    pub fn train_step_at_on(
+        &self,
+        device: rlx_runtime::Device,
+        opt: &mut dyn rlx_optim::Optimizer,
+        schedule: &crate::LrSchedule,
+        step: usize,
+        wrt: &[&str],
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        opt.set_lr(schedule.lr_at(step));
+        self.train_step_on(device, opt, wrt, inputs)
+    }
+
+    /// [`train_step`](Func::train_step) w.r.t. **every** parameter — the `wrt`
+    /// list is [`param_names`](Func::param_names), so the call is just
+    /// `(opt, inputs)`.
+    pub fn train_step_all(
+        &self,
+        opt: &mut dyn rlx_optim::Optimizer,
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        let names = self.param_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.train_step(opt, &refs, inputs)
+    }
+
+    /// All-parameter [`train_step_at`](Func::train_step_at).
+    pub fn train_step_all_at(
+        &self,
+        opt: &mut dyn rlx_optim::Optimizer,
+        schedule: &crate::LrSchedule,
+        step: usize,
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        opt.set_lr(schedule.lr_at(step));
+        self.train_step_all(opt, inputs)
+    }
+
+    /// All-parameter [`train_step_on`](Func::train_step_on).
+    pub fn train_step_all_on(
+        &self,
+        device: rlx_runtime::Device,
+        opt: &mut dyn rlx_optim::Optimizer,
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        let names = self.param_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.train_step_on(device, opt, &refs, inputs)
+    }
+
+    /// The full-model, device-pinned, scheduled training step — the whole loop
+    /// body for a from-scratch model is `model.train_step_all_at_on(dev, &mut
+    /// opt, &sched, step, feed)`.
+    pub fn train_step_all_at_on(
+        &self,
+        device: rlx_runtime::Device,
+        opt: &mut dyn rlx_optim::Optimizer,
+        schedule: &crate::LrSchedule,
+        step: usize,
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        opt.set_lr(schedule.lr_at(step));
+        self.train_step_all_on(device, opt, inputs)
+    }
+
+    /// [`train_step_all_at_on`](Func::train_step_all_at_on) with **global-L2-norm
+    /// gradient clipping** to `max_grad_norm` — the standard cure for the loss
+    /// spikes that can blow a run up to NaN late in training (~1.0 is typical).
+    /// A non-positive `max_grad_norm` disables clipping (identical to the
+    /// unclipped variant).
+    pub fn train_step_all_at_on_clipped(
+        &self,
+        device: rlx_runtime::Device,
+        opt: &mut dyn rlx_optim::Optimizer,
+        schedule: &crate::LrSchedule,
+        step: usize,
+        max_grad_norm: f32,
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        opt.set_lr(schedule.lr_at(step));
+        let names = self.param_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut outputs = self.value_and_grad(&refs).run_on(device, inputs);
+        let scale = grad_clip_scale(&outputs, max_grad_norm);
+        if scale < 1.0 {
+            for g in outputs.iter_mut().skip(1) {
+                for x in g.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
+        self.apply_optimizer_step(opt, &refs, &outputs)
+    }
+
+    /// **Quantization-aware** full-model step: each parameter is passed through
+    /// `quant` (an in-place quantizer) before the forward, and the gradient is
+    /// taken at that quantized point — but applied to the f32 **master** weights
+    /// (a straight-through estimator). This trains the model at whatever emulated
+    /// precision `quant` imposes, on any backend. Pair with [`crate::lowp`] for
+    /// `fXmYeZ` / nvf4 / f8 / bf8 formats:
+    ///
+    /// ```ignore
+    /// let (e, m, max) = rlx_tensor::lowp::parse_format("nvf4").unwrap();
+    /// let (next, loss) = model.train_step_all_at_on_qat(
+    ///     dev, &mut opt, &sched, step, 1.0,
+    ///     |w| rlx_tensor::lowp::quantize_slice(w, e, m, max), feed);
+    /// ```
+    pub fn train_step_all_at_on_qat(
+        &self,
+        device: rlx_runtime::Device,
+        opt: &mut dyn rlx_optim::Optimizer,
+        schedule: &crate::LrSchedule,
+        step: usize,
+        max_grad_norm: f32,
+        quant: impl Fn(&mut [f32]),
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
+        opt.set_lr(schedule.lr_at(step));
+        let names = self.param_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        // Quantized forward model (STE): weights rounded to the target grid.
+        let mut q = self.clone();
+        for name in &names {
+            let mut w = self
                 .param_binding(name)
-                .unwrap_or_else(|| panic!("train_step: param {name:?} is not bound"))
+                .unwrap_or_else(|| panic!("qat: param {name:?} is not bound"))
                 .to_vec();
-            opt.step(name, &shape, &mut data, grad);
+            quant(&mut w);
+            q = q.with_param(name.clone(), w);
+        }
+        let mut outputs = q.value_and_grad(&refs).run_on(device, inputs);
+        let scale = grad_clip_scale(&outputs, max_grad_norm);
+        if scale < 1.0 {
+            for g in outputs.iter_mut().skip(1) {
+                for x in g.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
+        // Optimizer updates SELF's f32 masters (not the quantized copy).
+        self.apply_optimizer_step(opt, &refs, &outputs)
+    }
+
+    /// Apply `opt` to each `wrt` param given a `[loss, grad…]` output vector,
+    /// returning the updated `Func` and the loss. Shared by every `train_step*`.
+    fn apply_optimizer_step(
+        &self,
+        opt: &mut dyn rlx_optim::Optimizer,
+        wrt: &[&str],
+        outputs: &[Vec<f32>],
+    ) -> (Func, Vec<f32>) {
+        let loss = outputs[0].clone();
+        // Collect every parameter's data + shape up front, then hand the whole
+        // batch to `step_batch` (default = the same serial loop; overriding
+        // optimizers can parallelize independent groups). Keeping the owned data
+        // alive lets us build `&mut` OptItems without per-param `with_param`
+        // clones inside the hot loop.
+        let mut datas: Vec<Vec<f32>> = wrt
+            .iter()
+            .map(|name| {
+                self.param_binding(name)
+                    .unwrap_or_else(|| panic!("train_step: param {name:?} is not bound"))
+                    .to_vec()
+            })
+            .collect();
+        let shapes: Vec<Vec<usize>> = wrt.iter().map(|name| self.param_shape(name)).collect();
+        let mut items: Vec<rlx_optim::OptItem> = datas
+            .iter_mut()
+            .enumerate()
+            .map(|(i, data)| rlx_optim::OptItem {
+                name: wrt[i],
+                shape: &shapes[i],
+                param: data.as_mut_slice(),
+                grad: &outputs[i + 1],
+            })
+            .collect();
+        opt.step_batch(&mut items);
+        drop(items);
+        opt.end_iteration();
+        let mut updated = self.clone();
+        for (name, data) in wrt.iter().zip(datas) {
             updated = updated.with_param(*name, data);
         }
-        opt.end_iteration();
         (updated, loss)
     }
 
@@ -288,6 +582,29 @@ impl Func {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("train_step: no param named {name:?}"))
+    }
+}
+
+/// Global-L2-norm gradient-clip factor for a `[loss, grad…]` output vector:
+/// `min(1, max_norm / ‖grads‖₂)` over the concatenation of every gradient
+/// tensor (indices `1..`). Returns `1.0` (no clip) when `max_norm <= 0` or the
+/// grad norm is within budget. Accumulated in `f64` for numerical safety.
+#[cfg(feature = "optim")]
+fn grad_clip_scale(outputs: &[Vec<f32>], max_norm: f32) -> f32 {
+    if max_norm <= 0.0 {
+        return 1.0;
+    }
+    let mut sumsq = 0f64;
+    for g in outputs.iter().skip(1) {
+        for &x in g {
+            sumsq += (x as f64) * (x as f64);
+        }
+    }
+    let norm = sumsq.sqrt() as f32;
+    if norm.is_finite() && norm > max_norm {
+        max_norm / norm
+    } else {
+        1.0
     }
 }
 

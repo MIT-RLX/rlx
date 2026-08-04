@@ -1,0 +1,88 @@
+#version 450
+// Native low-precision *grouped* (MoE) decode-GEMM for Op::ScaledGroupedMatMul
+// — the Vulkan MXFP4 analogue of the CUDA/wgpu scaled_grouped_matmul_decode
+// kernel. One invocation per output C[row=token, col=out]; the token's expert
+// picks the weight slab and only that routed expert's FP4 (E2M1) codes are
+// decoded on the fly (no f32 weight materialization). TN per expert:
+//   out[i,j] = sum_p decode(input[i,p])*s_in * decode(weight[e,j,p])*s_w (+bias)
+// Offsets are f32-word offsets into the arena; U8 code/scale tensors are read
+// packed (4 codes / word). scale_mode: 0 per-tensor f32, 1 block E8M0 (MXFP4).
+// Uses the uint arena view (`arena_u32.inc`, selected by the "scaled_grouped"
+// name prefix in build.rs).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint k;
+    uint n;
+    uint num_experts;
+    uint input_off;
+    uint weight_off;
+    uint input_scale_off;
+    uint weight_scale_off;
+    uint idx_off;
+    uint out_off;
+    uint bias_off;
+    uint scale_mode;
+    uint block;
+    uint has_bias;
+} pc;
+
+// Unsigned byte `byte_idx` relative to a word-aligned tensor base `word_off`.
+uint rd_byte(uint word_off, uint byte_idx) {
+    uint w = arena_load_u(word_off + (byte_idx >> 2u));
+    return (w >> ((byte_idx & 3u) * 8u)) & 0xFFu;
+}
+
+// FP4 E2M1 code → f32 (matches rlx_ir FP4_E2M1_LUT bit-for-bit).
+float decode_e2m1(uint code) {
+    uint c = code & 0xFu;
+    float mag;
+    switch (c & 0x7u) {
+        case 0u: mag = 0.0; break;
+        case 1u: mag = 0.5; break;
+        case 2u: mag = 1.0; break;
+        case 3u: mag = 1.5; break;
+        case 4u: mag = 2.0; break;
+        case 5u: mag = 3.0; break;
+        case 6u: mag = 4.0; break;
+        default: mag = 6.0; break;
+    }
+    return ((c & 0x8u) != 0u) ? -mag : mag;
+}
+
+// E8M0 scale byte → 2^(byte-127) via exponent bit placement.
+float decode_e8m0(uint s) {
+    return uintBitsToFloat(s << 23u);
+}
+
+void main() {
+    uint col = gl_GlobalInvocationID.x; // output j
+    uint row = gl_GlobalInvocationID.y; // token i
+    if (col >= pc.n || row >= pc.m) { return; }
+    uint e = uint(arena_load_f(pc.idx_off + row) + 0.5);
+    if (e >= pc.num_experts) { return; }
+
+    uint k = pc.k;
+    uint nblk = (pc.scale_mode == 0u) ? 1u : ((k + pc.block - 1u) / pc.block);
+    uint wrow = e * pc.n + col;
+
+    float acc = 0.0;
+    for (uint p = 0u; p < k; p++) {
+        float ls;
+        float ws;
+        if (pc.scale_mode == 0u) {
+            ls = arena_load_f(pc.input_scale_off);
+            ws = arena_load_f(pc.weight_scale_off);
+        } else {
+            uint blk = p / pc.block;
+            ls = decode_e8m0(rd_byte(pc.input_scale_off, row * nblk + blk));
+            ws = decode_e8m0(rd_byte(pc.weight_scale_off, wrow * nblk + blk));
+        }
+        float a = decode_e2m1(rd_byte(pc.input_off, row * k + p)) * ls;
+        float b = decode_e2m1(rd_byte(pc.weight_off, wrow * k + p)) * ws;
+        acc += a * b;
+    }
+    if (pc.has_bias != 0u) { acc += arena_load_f(pc.bias_off + wrow); }
+    arena_store_f(pc.out_off + row * pc.n + col, acc);
+}

@@ -108,7 +108,10 @@ impl ExecutableGraph for VulkanExecutableWrapper {
         self.inner.read_gpu_handle_row(name, row, row_inner)
     }
 
-    /// The Vulkan arena is f32-uniform: widen F16/BF16/int params to f32.
+    /// The Vulkan arena is f32-uniform: widen F16/BF16/int params to f32. The
+    /// exception is a bf16 **matmul weight** — kept PACKED (raw bf16 bytes, 2
+    /// bytes/elem) in the arena and unpacked in the `matmul_bf16` shader, so its
+    /// bytes go through untouched (halves the weight the GPU streams).
     fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
         match dtype {
             rlx_ir::DType::U8 | rlx_ir::DType::I8 => self.inner.set_param_bytes(name, data),
@@ -116,6 +119,9 @@ impl ExecutableGraph for VulkanExecutableWrapper {
                 let n = data.len() / 4;
                 let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
                 self.inner.set_param(name, s);
+            }
+            rlx_ir::DType::BF16 if self.inner.is_packed_bf16_param(name) => {
+                self.inner.set_param_bytes(name, data);
             }
             other => {
                 let f = super::widen_bytes_to_f32(data, other);

@@ -71,7 +71,7 @@ pub fn mps_supports_matmul() -> bool {
 /// the same shapes recur every layer, so caching reduces per-call objc
 /// overhead.
 struct KernelCache {
-    map: Mutex<HashMap<(usize, usize, usize, bool), usize>>,
+    map: Mutex<HashMap<(usize, usize, usize, bool, bool), usize>>,
 }
 unsafe impl Send for KernelCache {}
 unsafe impl Sync for KernelCache {}
@@ -196,10 +196,16 @@ fn release_cached_ptrs(ptrs: impl Iterator<Item = usize>) {
     }
 }
 
-unsafe fn get_or_build_kernel(m: usize, k: usize, n: usize, transpose_b: bool) -> *mut Object {
+unsafe fn get_or_build_kernel(
+    m: usize,
+    k: usize,
+    n: usize,
+    transpose_a: bool,
+    transpose_b: bool,
+) -> *mut Object {
     let cache = kernel_cache();
     let mut map = cache.map.lock().expect("kernel cache poisoned");
-    if let Some(&p) = map.get(&(m, k, n, transpose_b)) {
+    if let Some(&p) = map.get(&(m, k, n, transpose_a, transpose_b)) {
         return p as *mut Object;
     }
     use crate::device::metal_device;
@@ -209,7 +215,7 @@ unsafe fn get_or_build_kernel(m: usize, k: usize, n: usize, transpose_b: bool) -
     let dev_ref: &metal::DeviceRef = &dev.device;
     let kernel: *mut Object = msg_send![alloc,
         initWithDevice: dev_ref
-        transposeLeft: NO as BOOL
+        transposeLeft: if transpose_a { YES } else { NO } as BOOL
         transposeRight: if transpose_b { YES } else { NO } as BOOL
         resultRows: m as u64
         resultColumns: n as u64
@@ -217,7 +223,7 @@ unsafe fn get_or_build_kernel(m: usize, k: usize, n: usize, transpose_b: bool) -
         alpha: 1.0_f64
         beta: 0.0_f64
     ];
-    map.insert((m, k, n, transpose_b), kernel as usize);
+    map.insert((m, k, n, transpose_a, transpose_b), kernel as usize);
     kernel
 }
 
@@ -246,6 +252,7 @@ pub fn encode_mps_sgemm(
         n,
         mps_dtype::Float32,
         false,
+        false,
     );
 }
 
@@ -270,6 +277,7 @@ pub fn encode_mps_sgemm_bt(
         k,
         n,
         mps_dtype::Float32,
+        false,
         true,
     );
 }
@@ -296,9 +304,11 @@ pub fn encode_mps_hgemm(
         n,
         mps_dtype::Float16,
         false,
+        false,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_mps_matmul(
     cmd_buf: &CommandBufferRef,
     arena: &Buffer,
@@ -309,17 +319,93 @@ fn encode_mps_matmul(
     k: usize,
     n: usize,
     dtype: u32,
+    transpose_a: bool,
     transpose_b: bool,
 ) {
     // Shared: pins the cached MPSMatrix / kernel pointers alive for the whole
     // encode so a concurrent `invalidate_caches` cannot free them under us.
     let _guard = CACHE_GUARD.read().expect("MPS cache guard poisoned");
     unsafe {
-        let a_mat = get_or_build_matrix(arena, a_off, m, k, dtype);
+        // With transposeLeft, MPS reads A stored as [k, m] and treats it as [m, k].
+        let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
+        let a_mat = get_or_build_matrix(arena, a_off, a_rows, a_cols, dtype);
         let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
         let b_mat = get_or_build_matrix(arena, b_off, b_rows, b_cols, dtype);
         let c_mat = get_or_build_matrix(arena, c_off, m, n, dtype);
-        let kernel = get_or_build_kernel(m, k, n, transpose_b);
+        let kernel = get_or_build_kernel(m, k, n, transpose_a, transpose_b);
+        let _: () = msg_send![kernel,
+            encodeToCommandBuffer: cmd_buf
+            leftMatrix: a_mat
+            rightMatrix: b_mat
+            resultMatrix: c_mat
+        ];
+    }
+}
+
+/// `C = op(A) · op(B)` where `op` transposes per flag — folds a materialized
+/// last-two-swap `Transpose` on either operand into the GEMM (the autodiff VJP
+/// emits `dW = Xᵀ·dY` and `dX = dY·Wᵀ`). Shapes: `m`,`k`,`n` describe the
+/// logical (post-transpose) `[m,k]·[k,n]=[m,n]`; buffers hold the pre-transpose
+/// operands. Arena-only (callers must ensure no operand is weight-buffer-tagged).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mps_sgemm_t(
+    cmd_buf: &CommandBufferRef,
+    arena: &Buffer,
+    a_off: usize,
+    b_off: usize,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    transpose_a: bool,
+    transpose_b: bool,
+) {
+    encode_mps_matmul(
+        cmd_buf,
+        arena,
+        a_off,
+        b_off,
+        c_off,
+        m,
+        k,
+        n,
+        mps_dtype::Float32,
+        transpose_a,
+        transpose_b,
+    );
+}
+
+/// Buffer-aware transpose-folded GEMM: like [`encode_mps_sgemm_t`] but each
+/// operand carries its **own** `MTLBuffer` (activation arena OR the weight
+/// buffer). This lets a folded `matmul_t(weight)` read the weight directly with
+/// `transposeRight` instead of materializing a transposed copy — the arena-only
+/// [`encode_mps_sgemm_t`] can't, since it assumes a single buffer.
+/// `get_or_build_matrix` already keys its cache by buffer pointer, so mixing an
+/// arena operand with a weight-buffer operand is safe. Passing the same arena
+/// buffer for all three is byte-identical to [`encode_mps_sgemm_t`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mps_sgemm_t_bufs(
+    cmd_buf: &CommandBufferRef,
+    a_buf: &Buffer,
+    a_off: usize,
+    b_buf: &Buffer,
+    b_off: usize,
+    c_buf: &Buffer,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    transpose_a: bool,
+    transpose_b: bool,
+) {
+    let _guard = CACHE_GUARD.read().expect("MPS cache guard poisoned");
+    unsafe {
+        let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
+        let a_mat = get_or_build_matrix(a_buf, a_off, a_rows, a_cols, mps_dtype::Float32);
+        let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+        let b_mat = get_or_build_matrix(b_buf, b_off, b_rows, b_cols, mps_dtype::Float32);
+        let c_mat = get_or_build_matrix(c_buf, c_off, m, n, mps_dtype::Float32);
+        let kernel = get_or_build_kernel(m, k, n, transpose_a, transpose_b);
         let _: () = msg_send![kernel,
             encodeToCommandBuffer: cmd_buf
             leftMatrix: a_mat

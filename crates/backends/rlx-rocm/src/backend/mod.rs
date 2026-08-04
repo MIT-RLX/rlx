@@ -110,6 +110,12 @@ pub struct RocmExecutable {
     /// Persistent KV inputs (host mirror + device upload each run).
     gpu_handles: HashMap<String, Vec<f32>>,
     gpu_handle_feeds: HashMap<String, usize>,
+    /// Resident-KV row feeds: `output_index` per `past_k/v` handle. `feed_kv_row`
+    /// copies one row (the new token) from that output into the handle in-arena.
+    kv_row_feeds: HashMap<String, usize>,
+    /// Handles updated in place in the arena by `feed_kv_row` (device D2D) — they
+    /// must NOT be re-uploaded from the (now-stale) host mirror in `stage_gpu_handle_inputs`.
+    gpu_handle_resident: std::collections::HashSet<String>,
     /// When set, only these output indices (+ feed outputs) are read back from device.
     pending_read_indices: Option<Vec<usize>>,
     /// Graph input names in declaration order (parallel to `input_slots`).
@@ -126,6 +132,21 @@ pub struct RocmExecutable {
 
 impl RocmExecutable {
     pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
+        // A captured hipGraph bakes the Philox seed / backend into kernel args,
+        // so a policy change must drop (and destroy) the capture: the next run
+        // re-captures or falls back to eager under the new policy, matching
+        // eager dispatch which re-reads the policy every run.
+        let changed = *self.rng.read().expect("rng lock") != rng;
+        if changed {
+            if let Some(g) = self.captured_graph.take() {
+                // SAFETY: `g` is a live hipGraphExec captured by this
+                // executable; destroy it before dropping the handle (mirrors
+                // `Drop`).
+                unsafe {
+                    let _ = (self.ctx.runtime.hip_graph_exec_destroy)(g);
+                }
+            }
+        }
         *self.rng.write().expect("rng lock") = rng;
     }
 
@@ -217,8 +238,106 @@ impl RocmExecutable {
         if !self.input_offsets.contains_key(name) {
             return false;
         }
+        // Rebinding re-seeds the handle from host → it is no longer resident-only.
+        self.gpu_handle_resident.remove(name);
         self.gpu_handles.insert(name.to_string(), data.to_vec());
         true
+    }
+
+    /// Register a resident-KV row feed (see [`Self::feed_kv_row`]).
+    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.kv_row_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    /// Device-side D2D copy of one KV row (the new token, output row `src_row`) from
+    /// each registered decode output into its resident `past_k/v` handle, in the
+    /// arena — no host round-trip. Marks the handle resident so
+    /// `stage_gpu_handle_inputs` won't re-upload a stale host mirror over it. This
+    /// is the ROCm twin of rlx-cuda's `feed_kv_row`.
+    pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) {
+        if row_elems == 0 {
+            return;
+        }
+        use crate::kernels::*;
+        let stream = self.ctx.default_stream;
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, out_idx) in &feeds {
+            let Some(&in_id) = self.input_offsets.get(name.as_str()) else {
+                continue;
+            };
+            if *out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[*out_idx];
+            if in_id == out_id || !self.arena.has(in_id) || !self.arena.has(out_id) {
+                continue;
+            }
+            let base_out = self.arena.offset(out_id) / 4;
+            let base_in = self.arena.offset(in_id) / 4;
+            let rel_src = src_row * row_elems;
+            let rel_dst = dst_row * row_elems;
+            let cap_in = self.arena.len_of(in_id) / 4;
+            let cap_out = self.arena.len_of(out_id) / 4;
+            if rel_src + row_elems > cap_out || rel_dst + row_elems > cap_in {
+                continue;
+            }
+            let src_off = (base_out + rel_src) as u32;
+            let dst_off = (base_in + rel_dst) as u32;
+            let n = row_elems as u32;
+            let kernel = copy_kernel(&self.ctx);
+            let mut arena_ptr = self.arena.buffer.ptr;
+            let (grid, block) = dispatch_grid_1d(n, 256);
+            crate::launch_kernel!(
+                kernel,
+                stream,
+                (grid, 1, 1),
+                (block, 1, 1),
+                [&mut arena_ptr, &n, &src_off, &dst_off]
+            );
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+        unsafe {
+            let _ = (self.ctx.runtime.hip_stream_sync)(stream);
+        }
+    }
+
+    /// Read one `row_inner`-wide row from output `out_idx` of the last run (a D2H of
+    /// just that row). Caller must ensure the run has synced.
+    pub fn read_output_row(
+        &self,
+        out_idx: usize,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        if row_inner == 0 || out_idx >= self.graph.outputs.len() {
+            return None;
+        }
+        let id = self.graph.outputs[out_idx];
+        if !self.arena.has(id) {
+            return None;
+        }
+        let cap = self.arena.len_of(id) / 4;
+        let rel = row * row_inner;
+        if rel + row_inner > cap {
+            return None;
+        }
+        let base = self.arena.offset(id) / 4;
+        let off = base + rel;
+        let src = self.arena.buffer.ptr + (off as u64) * 4;
+        let mut host = vec![0f32; row_inner];
+        let bytes = row_inner * 4;
+        let ok = unsafe {
+            (self.ctx.runtime.hip_memcpy_dtoh)(host.as_mut_ptr() as *mut _, src, bytes)
+                .ok()
+                .is_ok()
+        };
+        if ok { Some(host) } else { None }
     }
 
     pub fn has_gpu_handle(&self, name: &str) -> bool {
@@ -265,6 +384,11 @@ impl RocmExecutable {
         let arena_base = self.arena.buffer.ptr;
         for (name, data) in &self.gpu_handles {
             if inputs.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            // Resident handles are updated in place in the arena by `feed_kv_row`;
+            // their host mirror is stale (empty) — do NOT re-upload over the device data.
+            if self.gpu_handle_resident.contains(name) {
                 continue;
             }
             if let Some(&id) = self.input_offsets.get(name.as_str())

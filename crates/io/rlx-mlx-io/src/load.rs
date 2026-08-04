@@ -393,6 +393,18 @@ pub struct MlxPackedLinear {
     pub out_shape: Vec<usize>,
 }
 
+/// **Zero-copy** borrow of a packed MLX linear's raw bytes straight from the mmap
+/// shard — no owned [`MlxPackedLinear`] `Vec`. `w_q`/`scales` are `&[u8]` views into
+/// the read-only mmap, valid for `&self`; the caller writes them directly to a
+/// device (paged MoE). Only mxfp byte-payload tensors (`u8` codes + `u8` e8m0
+/// scales) qualify; affine (`f32` scales, needs conversion) returns `None` so the
+/// caller falls back to the owned copy path.
+#[derive(Debug)]
+pub struct PackedMlxBorrow<'a> {
+    pub w_q: &'a [u8],
+    pub scales: &'a [u8],
+}
+
 impl MlxPackedLinear {
     /// DType for the scale param (F32 affine, U8 mxfp).
     pub fn scale_dtype(&self) -> DType {
@@ -547,6 +559,13 @@ pub trait MlxRead: Send {
     /// the caller compiles its stage (overlap IO with compute). Default no-op
     /// (eager loaders already hold the data); the lazy mmap loader overrides it.
     fn prewarm(&self, _keys: &[&str]) {}
+    /// Zero-copy borrow of a packed mxfp linear's mmap bytes (default: unsupported).
+    fn borrow_packed(&self, _key: &str) -> Option<PackedMlxBorrow<'_>> {
+        None
+    }
+    /// Drop a borrowed packed tensor's mmap pages after it's been copied elsewhere
+    /// (pairs with [`Self::borrow_packed`] to bound the page cache). Default no-op.
+    fn dontneed_packed(&self, _key: &str) {}
 }
 
 impl MlxRead for MlxWeights {
@@ -580,6 +599,15 @@ fn libc_madv_willneed() -> i32 {
 #[inline]
 fn libc_madv_willneed() -> i32 {
     0
+}
+
+/// `RLX_MLX_KEEP_WARM=1` — skip the per-tensor WILLNEED/DONTNEED madvise in
+/// [`LazyMlxWeights::materialize`] so repeated-read decode keeps its active-expert
+/// pages resident across tokens (read once from env).
+fn keep_warm() -> bool {
+    use std::sync::OnceLock;
+    static KW: OnceLock<bool> = OnceLock::new();
+    *KW.get_or_init(|| std::env::var("RLX_MLX_KEEP_WARM").is_ok())
 }
 
 /// Cached location of one tensor within its shard mmap — parsed ONCE at open so
@@ -650,6 +678,16 @@ impl LazyMlxWeights {
             .get(name)
             .with_context(|| format!("mlx tensor not found: {name}"))?;
         let data = &self.shards[loc.shard][loc.begin..loc.end];
+        // KEEP-WARM (`RLX_MLX_KEEP_WARM=1`, for repeated-read DECODE): skip the
+        // per-tensor WILLNEED/DONTNEED madvise. The DONTNEED that bounds the BUILD's
+        // page-cache (below) is exactly wrong for decode — it DROPS each expert's
+        // pages right after reading, so the next token re-faults them COLD off the
+        // shard (SSD/Thunderbolt). Skipping it keeps the ~active-expert working set
+        // resident across tokens (file-backed, reclaimable under real pressure), and
+        // drops 2 syscalls/tensor; the parallel `prewarm` handles the first fault.
+        if keep_warm() {
+            return tensor_from_view(name, loc.shape.clone(), loc.dtype, data);
+        }
         // Hint the OS to prefetch this tensor's pages (overlap readahead with the
         // copy) just before touching them.
         Self::advise(data, libc_madv_willneed());
@@ -665,18 +703,73 @@ impl LazyMlxWeights {
         out
     }
 
-    /// `MADV_WILLNEED`-prefetch a batch of tensors before a stage build so their
-    /// pages read ahead while the graph compiles (overlap IO with compute). No-op
-    /// on non-unix. Safe to call with names this loader doesn't hold.
+    /// Prefetch a batch of tensors before a serial gather by **parallel page
+    /// faulting**: a rayon thread pool touches one byte per page of each tensor's
+    /// mmap range concurrently, so N faults are outstanding to the SSD/Thunderbolt
+    /// link at once (using its queue depth) instead of one blocking fault at a time.
+    /// macOS effectively serializes `MADV_WILLNEED`, so a real touch is what turns
+    /// the scattered per-expert MoE reads from latency-bound (~1k IOPS, ~50 MB/s)
+    /// into bandwidth-bound. The mmap is read-only `&[u8]` (Sync), so this is safe;
+    /// the serial `materialize` that follows then copies from warm cache. No-op on
+    /// names this loader doesn't hold.
     pub fn prewarm(&self, names: &[&str]) {
+        use rayon::prelude::*;
+        // Use the GLOBAL rayon pool (~#cores) — measured ~130 MB/s parallel bursts
+        // vs ~18-30 serial. Heavy oversubscription (a dedicated 64-thread pool) was
+        // COUNTERPRODUCTIVE: it prefetches a whole proj's 256 experts faster than the
+        // serial `materialize` copy consumes them, so with the arena growing +
+        // `MADV_DONTNEED` churn the prefetched pages get evicted and re-faulted → the
+        // load collapsed to ~2 MB/s. #cores threads keep the SSD queue busy without
+        // outrunning the consumer.
+        names.par_iter().for_each(|n| {
+            if let Some(loc) = self.locs.get(*n) {
+                let data = &self.shards[loc.shard][loc.begin..loc.end];
+                let mut acc = 0u8;
+                let mut i = 0;
+                while i < data.len() {
+                    acc ^= data[i];
+                    i += 4096;
+                }
+                std::hint::black_box(acc);
+            }
+        });
+    }
+
+    /// Drop these tensors' pages from the page cache (`MADV_DONTNEED`) — the evict
+    /// side of mmap weight-streaming (bounds resident to the working set; cold pages
+    /// re-fault from the file on next touch). No-op on names this loader doesn't hold.
+    pub fn evict(&self, names: &[&str]) {
         for n in names {
             if let Some(loc) = self.locs.get(*n) {
-                Self::advise(
-                    &self.shards[loc.shard][loc.begin..loc.end],
-                    libc_madv_willneed(),
-                );
+                Self::advise_dontneed(&self.shards[loc.shard][loc.begin..loc.end]);
             }
         }
+    }
+
+    /// On-disk byte length of a tensor's data (0 if absent) — no read, from the
+    /// cached header offsets.
+    pub fn tensor_len_bytes(&self, name: &str) -> u64 {
+        self.locs
+            .get(name)
+            .map(|l| (l.end - l.begin) as u64)
+            .unwrap_or(0)
+    }
+
+    /// Fold this tensor's bytes ZERO-COPY straight from the mmap (fault + read, no
+    /// materialize) — the "use the weights" proxy for mmap-page streaming benches.
+    /// Returns 0 if absent.
+    pub fn fold_bytes(&self, name: &str) -> u64 {
+        let Some(loc) = self.locs.get(name) else {
+            return 0;
+        };
+        let data = &self.shards[loc.shard][loc.begin..loc.end];
+        let mut acc = 0u64;
+        let mut i = 0;
+        while i < data.len() {
+            acc = acc.wrapping_add(data[i] as u64);
+            i += 64; // one read per cache line — faults every page, touches real data
+        }
+        acc
     }
 
     /// `madvise` a byte slice (page-aligned inward so we never advise a neighbour's
@@ -775,6 +868,47 @@ impl LazyMlxWeights {
             self.temp_with(&[key, &format!("{base}.scales"), &format!("{base}.biases")])?;
         temp.take_packed_linear(key)
     }
+
+    /// Zero-copy [`PackedMlxBorrow`] into the mmap for a packed mxfp linear — the
+    /// codes and e8m0 scale bytes without the owned-`Vec` copy `take_packed_linear`
+    /// makes. Returns `None` (→ caller uses the owned path) for non-quant layers or
+    /// non-`u8` scale payloads (affine). The pages must be resident (a prior
+    /// `prewarm`, or the consumer's read faults them).
+    pub fn borrow_packed(&self, key: &str) -> Option<PackedMlxBorrow<'_>> {
+        if !self.is_quantized_layer(key) {
+            return None;
+        }
+        let base = key.trim_end_matches(".weight");
+        let wl = self.locs.get(key)?;
+        let sl = self.locs.get(&format!("{base}.scales"))?;
+        // Only when the scales are raw bytes (mxfp e8m0 u8); affine f32 scales need
+        // conversion, so fall back to the owned decode there.
+        if !matches!(sl.dtype, safetensors::Dtype::U8 | safetensors::Dtype::I8) {
+            return None;
+        }
+        Some(PackedMlxBorrow {
+            w_q: &self.shards[wl.shard][wl.begin..wl.end],
+            scales: &self.shards[sl.shard][sl.begin..sl.end],
+        })
+    }
+
+    /// Drop a packed tensor's mmap pages (`MADV_DONTNEED`) after a zero-copy
+    /// [`borrow_packed`] consumer has copied them elsewhere (e.g. onto the device).
+    /// Mirrors the `DONTNEED` that [`materialize`](Self::materialize) does on the
+    /// owned path — WITHOUT it the borrowed pages accumulate in the page cache
+    /// ALONGSIDE the arena and the OS swaps (a documented 10×-wall regression).
+    /// No-op under `RLX_MLX_KEEP_WARM=1` (caller wants pages resident for reuse).
+    pub fn dontneed_packed(&self, key: &str) {
+        if keep_warm() {
+            return;
+        }
+        let base = key.trim_end_matches(".weight");
+        for name in [key.to_string(), format!("{base}.scales")] {
+            if let Some(loc) = self.locs.get(&name) {
+                Self::advise_dontneed(&self.shards[loc.shard][loc.begin..loc.end]);
+            }
+        }
+    }
 }
 
 impl MlxRead for LazyMlxWeights {
@@ -792,6 +926,12 @@ impl MlxRead for LazyMlxWeights {
     }
     fn prewarm(&self, keys: &[&str]) {
         LazyMlxWeights::prewarm(self, keys)
+    }
+    fn borrow_packed(&self, key: &str) -> Option<PackedMlxBorrow<'_>> {
+        LazyMlxWeights::borrow_packed(self, key)
+    }
+    fn dontneed_packed(&self, key: &str) {
+        LazyMlxWeights::dontneed_packed(self, key)
     }
 }
 

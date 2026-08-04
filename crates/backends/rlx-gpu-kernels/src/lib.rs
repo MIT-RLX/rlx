@@ -52,6 +52,13 @@ pub const MATMUL_CU: &str = include_str!("../kernels/matmul.cu");
 pub const MATMUL_BT_CU: &str = include_str!("../kernels/matmul_bt.cu");
 pub const MATMUL_EPILOGUE_CU: &str = include_str!("../kernels/matmul_epilogue.cu");
 pub const MATMUL_WMMA_CU: &str = include_str!("../kernels/matmul_wmma.cu");
+/// Hopper (sm_90) TMA-staged fp32 GEMM. Bulk-copies A/B tiles global->shared
+/// via the Tensor Memory Accelerator + mbarrier, then register-blocked FMA.
+/// Compiled only under `compute_90a`; opt-in via `RLX_CUDA_TMA` (CUDA-only).
+pub const MATMUL_TMA_CU: &str = include_str!("../kernels/matmul_tma.cu");
+/// TMA-staged NT GEMM `C = A·Wᵀ` (transposed-B twin of `MATMUL_TMA_CU`) for the
+/// GGUF prefill path's post-dequant matmul. Same Hopper-only constraints.
+pub const MATMUL_BT_TMA_CU: &str = include_str!("../kernels/matmul_bt_tma.cu");
 pub const COMPARE_CU: &str = include_str!(concat!(env!("OUT_DIR"), "/compare.cu"));
 pub const WHERE_CU: &str = include_str!("../kernels/where_select.cu");
 pub const FMA_CU: &str = include_str!("../kernels/fma.cu");
@@ -90,6 +97,11 @@ pub const CONCAT_CU: &str = include_str!("../kernels/concat.cu");
 pub const TRANSPOSE_CU: &str = include_str!("../kernels/transpose.cu");
 pub const EXPAND_CU: &str = include_str!("../kernels/expand.cu");
 pub const ATTENTION_CU: &str = include_str!("../kernels/attention.cu");
+/// Tensor-Core (fp16 WMMA) FlashAttention — a CUDA-only drop-in for `attention`
+/// (same signature/entry `attention_wmma`). Uses `nvcuda::wmma`, so it is only
+/// ever NVRTC-compiled by rlx-cuda; rlx-rocm never references it (this const is
+/// just embedded text, harmless in the shared crate).
+pub const ATTENTION_WMMA_CU: &str = include_str!("../kernels/attention_wmma.cu");
 pub const FUSED_ATTN_CU: &str = include_str!("../kernels/fused_attn.cu");
 pub const ATTENTION_ROW_CU: &str = include_str!("../kernels/attention_row.cu");
 pub const ATTENTION_BWD_CU: &str = include_str!("../kernels/attention_bwd.cu");
@@ -186,4 +198,7 @@ cuda_src_with_gelu!(
 #[cfg(feature = "rocm")]
 pub mod rocm {
     pub const MATMUL_MFMA_CU: &str = include_str!("../kernels/rocm/matmul_mfma.cu");
+    /// Skinny-m split-K GEMV — better fallback than the tiled GEMM when a vendor
+    /// BLAS is unavailable and m is small (decode under-occupies the CU array).
+    pub const GEMV_SPLITK_CU: &str = include_str!("../kernels/rocm/gemv_splitk.cu");
 }
