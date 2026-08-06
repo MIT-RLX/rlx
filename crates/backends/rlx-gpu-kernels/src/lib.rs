@@ -122,6 +122,8 @@ pub const DEQUANT_MATMUL_MLX_CU: &str = include_str!("../kernels/dequant_matmul_
 pub const SAMPLE_CU: &str = include_str!("../kernels/sample.cu");
 pub const SELECTIVE_SCAN_CU: &str = include_str!("../kernels/selective_scan.cu");
 pub const GATED_DELTA_NET_CU: &str = include_str!("../kernels/gated_delta_net.cu");
+/// FlashKDA-style chunked-parallel gated-delta-net (Kimi Delta Attention).
+pub const KIMI_DELTA_CHUNK_CU: &str = include_str!("../kernels/kimi_delta_chunk.cu");
 pub const POOL1D_CU: &str = include_str!("../kernels/pool1d.cu");
 pub const POOL2D_CU: &str = include_str!("../kernels/pool2d.cu");
 pub const POOL3D_CU: &str = include_str!("../kernels/pool3d.cu");

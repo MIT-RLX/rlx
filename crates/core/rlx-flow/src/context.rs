@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use anyhow::Result;
 use rlx_ir::hir::{HirModule, HirMut, HirNodeId};
 use rlx_ir::op::Activation;
-use rlx_ir::{DType, GraphModule, HirGraphExt, Shape};
+use rlx_ir::quant::QuantScheme;
+use rlx_ir::{DType, Dim, GraphModule, HirGraphExt, Shape};
 
+use crate::GgufPackedLinear;
 use crate::profile::CompileProfile;
 use crate::value::FlowValue;
 use crate::weight::WeightSource;
@@ -51,6 +53,16 @@ pub struct FlowState {
     /// [`FlowCtx::publish_side_output`] (KV taps, aux heads). Appended after the
     /// primary output by [`crate::ModelFlow::build`].
     pub side_outputs: Vec<(String, HirNodeId)>,
+    /// Packed U8 quant blobs registered by [`FlowCtx::linear`] for packed
+    /// weights (GGUF/MLX). Drained into [`crate::BuiltModel::typed_params`] at
+    /// build end and uploaded at session time via `set_param_typed`.
+    pub typed_params: Vec<(String, Vec<u8>, DType)>,
+    /// Packed-linear dedup: `weight_key` → (registered U8 param node, out_dim,
+    /// scheme). Lets a projection loaded by more than one stage (KV tap +
+    /// decoder) reuse the same node without re-`take_packed`-ing a *consuming*
+    /// loader — the second load would otherwise see `None` and wrongly fall
+    /// back to F32.
+    pub packed_linears: HashMap<String, (HirNodeId, usize, QuantScheme)>,
 }
 
 /// KV-cache decode inputs bound by [`crate::blocks::BindDecodeInputsStage`].
@@ -156,6 +168,43 @@ impl FlowCtx<'_> {
     }
 }
 
+/// A linear projection weight resolved for emission *inside* a hand-rolled
+/// [`HirMut`] block. Such blocks (e.g. the qwen3 decode/prefill layers) can't
+/// call [`FlowCtx::linear`] once a `HirMut` borrows the ctx, so they resolve
+/// each projection to a `LinearWeight` up front via [`FlowCtx::resolve_linear`]
+/// and then [`LinearWeight::emit`] the matmul into the live `HirMut`.
+pub enum LinearWeight {
+    /// Dense F32/F16 weight param → plain `mm`.
+    Dense(HirNodeId),
+    /// Packed U8 quant blob → fused `DequantMatMul` (no F32 materialization).
+    Packed {
+        wq: HirNodeId,
+        out_dim: usize,
+        scheme: QuantScheme,
+    },
+}
+
+impl LinearWeight {
+    /// Emit `input @ W` into `gb`, choosing `mm` vs fused `DequantMatMul`. The
+    /// packed output shape is `input`'s shape with the last dim set to `out_dim`
+    /// (the GGUF blob is `[out_dim, in_dim]` and the op transposes internally).
+    pub fn emit(&self, gb: &mut HirMut<'_>, input: HirNodeId) -> HirNodeId {
+        match *self {
+            LinearWeight::Dense(w) => gb.mm(input, w),
+            LinearWeight::Packed {
+                wq,
+                out_dim,
+                scheme,
+            } => {
+                let out = gb.shape(input).clone();
+                let last = out.rank() - 1;
+                let out = out.with_dim(last, Dim::Static(out_dim));
+                gb.0.dequant_matmul(input, wq, None, None, scheme, out)
+            }
+        }
+    }
+}
+
 /// Primitive builders — the composition surface for [`crate::LayerStage`]
 /// authors. Each wraps the HIR builder and returns a [`FlowValue`] with its
 /// inferred shape, so a downstream block composes ops (`ctx.matmul`,
@@ -176,14 +225,120 @@ impl FlowCtx<'_> {
     }
 
     /// Linear projection `input @ W[weight_key]` (loads the weight).
+    ///
+    /// If the [`WeightSource`] hands out a packed (quantized) weight for this
+    /// key via [`WeightSource::take_packed`], emits a fused `DequantMatMul` over
+    /// the U8 quant blob — same topology, no F32 weight materialization, so
+    /// decode runs at `m=1` instead of re-projecting a padded window. Otherwise
+    /// falls back to a plain F32 matmul. Gated: F32-only sources (the default
+    /// `take_packed` returns `None`) never enter the packed path, so existing
+    /// models are byte-for-byte unchanged.
     pub fn linear(
         &mut self,
         input: &FlowValue,
         weight_key: &str,
         transpose: bool,
     ) -> Result<FlowValue> {
+        // Reuse an already-registered packed projection (a prior stage loaded
+        // it) without re-`take_packed`-ing a consuming loader.
+        if let Some(&(wq_id, out_dim, scheme)) = self.state.packed_linears.get(weight_key) {
+            return self.emit_dequant(input, weight_key, wq_id, out_dim, scheme);
+        }
+        if let Some(packed) = self.weights.take_packed(weight_key)? {
+            return self.register_packed_linear(input, weight_key, packed);
+        }
         let w = self.load_param(weight_key, transpose)?;
         Ok(self.binary_shaped(|gb| gb.mm(input.id, w)))
+    }
+
+    /// First load of a packed weight: register the U8 quant blob as a graph
+    /// param (bytes attached at session time via `set_param_typed`), remember
+    /// it for later stages, then emit the `DequantMatMul`.
+    fn register_packed_linear(
+        &mut self,
+        input: &FlowValue,
+        weight_key: &str,
+        packed: GgufPackedLinear,
+    ) -> Result<FlowValue> {
+        let GgufPackedLinear {
+            w_q,
+            scheme,
+            out_dim,
+            ..
+        } = packed;
+        let wq_key = format!("{weight_key}\0q");
+        let wq_shape = Shape::new(&[w_q.len()], DType::U8);
+        let wq_id = self.hir().param(&wq_key, wq_shape);
+        self.state.typed_params.push((wq_key, w_q, DType::U8));
+        self.state
+            .packed_linears
+            .insert(weight_key.to_string(), (wq_id, out_dim, scheme));
+        self.emit_dequant(input, weight_key, wq_id, out_dim, scheme)
+    }
+
+    /// Emit a fused `DequantMatMul` for a registered packed weight. The output
+    /// shape is `input`'s shape with the last dim replaced by `out_dim`; leading
+    /// dims — including a dynamic `m` — are preserved, so the same packed graph
+    /// runs at any sequence length. The GGUF blob is already `[out_dim, in_dim]`
+    /// and the op transposes internally, so `transpose` does not apply here.
+    fn emit_dequant(
+        &mut self,
+        input: &FlowValue,
+        weight_key: &str,
+        wq_id: HirNodeId,
+        out_dim: usize,
+        scheme: QuantScheme,
+    ) -> Result<FlowValue> {
+        if input.shape.rank() == 0 {
+            return Err(anyhow::anyhow!(
+                "linear: cannot project scalar input for '{weight_key}'"
+            ));
+        }
+        let mut dims: Vec<Dim> = input.shape.dims().to_vec();
+        let last = dims.len() - 1;
+        dims[last] = Dim::Static(out_dim);
+        let out_shape = Shape::from_dims(&dims, input.shape.dtype());
+        let out_for_op = out_shape.clone();
+        let id = self
+            .hir()
+            .dequant_matmul(input.id, wq_id, None, None, scheme, out_for_op);
+        Ok(self.wrap(id, out_shape))
+    }
+
+    /// Resolve a projection weight for a hand-rolled [`HirMut`] block (see
+    /// [`LinearWeight`]). Mirrors [`Self::linear`]'s packed dispatch: if the
+    /// [`WeightSource`] hands out a quant blob for `key`, register the U8 param
+    /// and return [`LinearWeight::Packed`] (emit becomes a fused
+    /// `DequantMatMul`); otherwise load a dense F32/F16 param (`dtype`,
+    /// `transpose`). F32-only sources (default `take_packed` → `None`) always
+    /// take the dense branch, so non-packed builds are byte-for-byte unchanged.
+    pub fn resolve_linear(
+        &mut self,
+        key: &str,
+        transpose: bool,
+        dtype: DType,
+    ) -> Result<LinearWeight> {
+        if let Some(packed) = self.weights.take_packed(key)? {
+            let GgufPackedLinear {
+                w_q,
+                scheme,
+                out_dim,
+                ..
+            } = packed;
+            let wq_key = format!("{key}\0q");
+            let wq = self
+                .hir()
+                .param(&wq_key, Shape::new(&[w_q.len()], DType::U8));
+            self.state.typed_params.push((wq_key, w_q, DType::U8));
+            return Ok(LinearWeight::Packed {
+                wq,
+                out_dim,
+                scheme,
+            });
+        }
+        Ok(LinearWeight::Dense(
+            self.load_param_typed(key, transpose, dtype)?,
+        ))
     }
 
     /// Elementwise add (`a + b`, broadcasting).

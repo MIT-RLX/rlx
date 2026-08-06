@@ -373,6 +373,7 @@ pub enum OpKind {
     Transpose,
     Narrow,
     Concat,
+    KvAppend,
     Expand,
     Gather,
     Reverse,
@@ -1140,6 +1141,16 @@ pub enum Op {
     /// Concatenate along an axis.
     Concat {
         axis: usize,
+    },
+    /// In-place KV-cache append: write `row` (input 1) into `cache` (input 0)
+    /// at index `pos` along `axis`, and return the `[..pos+1..]` prefix of
+    /// `cache` — the output **aliases `cache`'s buffer** (no copy). Replaces the
+    /// decode `concat(past_kv, new_row)` whose full-cache copy is O(context);
+    /// this writes a single row (O(1)). The planner assigns the output `cache`'s
+    /// slot (see `collect_view_aliases`); backends encode a 1-row write.
+    KvAppend {
+        axis: usize,
+        pos: usize,
     },
     /// Expand (broadcast) to a target shape.
     Expand {
@@ -2912,6 +2923,7 @@ impl Op {
             Op::Transpose { .. } => OpKind::Transpose,
             Op::Narrow { .. } => OpKind::Narrow,
             Op::Concat { .. } => OpKind::Concat,
+            Op::KvAppend { .. } => OpKind::KvAppend,
             Op::Expand { .. } => OpKind::Expand,
             Op::Gather { .. } => OpKind::Gather,
             Op::Reverse { .. } => OpKind::Reverse,
@@ -3281,6 +3293,7 @@ impl Op {
             Op::SoftmaxCrossEntropyWithLogits => 2,          // logits, labels
             Op::SoftmaxCrossEntropyBackward => 3,            // logits, labels, d_loss
             Op::Concat { .. } => 0,                          // variadic — checked at graph level
+            Op::KvAppend { .. } => 2,                        // cache, row
             Op::DotGeneral { .. } => 2,
             Op::DenseSolve => 2,             // A, b
             Op::BatchedDenseSolve => 2,      // A [B,N,N], b [B,N] or [B,N,K]
@@ -3489,6 +3502,7 @@ impl std::fmt::Display for Op {
             Op::Reverse { axes } => write!(f, "reverse({axes:?})"),
             Op::Pad { pads, mode } => write!(f, "pad({pads:?},{mode:?})"),
             Op::Concat { axis } => write!(f, "concat(axis={axis})"),
+            Op::KvAppend { axis, pos } => write!(f, "kv_append(axis={axis}, pos={pos})"),
             Op::Expand { .. } => write!(f, "expand"),
             Op::Gather { axis } => write!(f, "gather(axis={axis})"),
             Op::Reduce { op, axes, .. } => write!(f, "reduce_{op:?}({axes:?})"),

@@ -24,6 +24,7 @@ android/**/intermediates/
 .DS_Store
 /weights
 .venv-sam3/
+.tmp/
 
 # Python bytecode cache
 __pycache__/

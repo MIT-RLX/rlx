@@ -5,6 +5,12 @@ How batch-1 (KV-cache) decode of qwen3-0.6B on the Metal backend went from
 as usefully — which "obvious" optimizations turned out to be **neutral or
 negative** and why.
 
+> This doc covers the **F16-weight** (dequant-at-load) single-stream path. For
+> the **packed Q4** decode runner (emit `Op::DequantMatMul`, SIMD quant GEMV
+> kernels, resident KV, flash-decode) and the **batched / serving throughput**
+> stack (uniform + ragged, packed + resident-KV), see
+> [`rlx-models/docs/qwen3-packed-decode-throughput.md`](../../rlx-models/docs/qwen3-packed-decode-throughput.md).
+
 Bench: `rlx-models` `qwen_quant_bench kvbench metal` (median per-step decode
 tps). All flags are opt-in / default-off unless noted.
 

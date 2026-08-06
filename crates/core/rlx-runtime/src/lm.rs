@@ -123,6 +123,13 @@ pub trait LmRunner: Send {
         false
     }
 
+    /// Long-context KV context-store occupancy `(blocks, tokens, disk_bytes)`
+    /// when a store is enabled (e.g. rlx-qwen3 HNSW memory), else `None`. Lets a
+    /// host inspect/track how the store grows without knowing the concrete runner.
+    fn kv_store_stats(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+
     /// Whether this runner supports multimodal (image+text) generation.
     fn supports_multimodal(&self) -> bool {
         false

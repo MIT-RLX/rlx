@@ -313,6 +313,51 @@ impl CompiledGraph {
             .feed_kv_batch_major(dst_row, batch, seq_cap, row_elems)
     }
 
+    /// Strided-source batch-major resident KV feed: fold the new token from a
+    /// `[B, src_seq_cap, row_elems]` output at `src_row` into the resident input
+    /// handle `[B, dst_seq_cap, row_elems]` at `dst_row`. For decode graphs that
+    /// emit the whole appended cache (new token at output row `upper`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn feed_kv_batch_major_src(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_row: usize,
+        batch: usize,
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) -> bool {
+        self.inner.feed_kv_batch_major_src(
+            src_row,
+            src_seq_cap,
+            dst_row,
+            batch,
+            dst_seq_cap,
+            row_elems,
+        )
+    }
+
+    /// Ragged resident KV feed: each batch element folds the new token from a
+    /// `[B, src_seq_cap, row_elems]` output at `src_row` into its own resident
+    /// handle row `dst_rows[b]` (the sequence's `past_len`). For fused decode of
+    /// sequences at MIXED cache lengths.
+    pub fn feed_kv_batch_major_ragged(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_rows: &[usize],
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) -> bool {
+        self.inner.feed_kv_batch_major_ragged(
+            src_row,
+            src_seq_cap,
+            dst_rows,
+            dst_seq_cap,
+            row_elems,
+        )
+    }
+
     /// Mark a graph input as device-resident without host staging.
     pub fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
         self.inner.prepare_resident_gpu_handle(name)

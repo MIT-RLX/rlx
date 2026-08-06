@@ -12,6 +12,24 @@ use crate::kernels::kernels;
 use crate::thunk::{Thunk, ThunkSchedule};
 use rlx_ir::{Graph, NodeId, Op};
 use rlx_opt::memory;
+
+/// GPU execution time (seconds) of a *completed* command buffer, from the
+/// `GPUStartTime`/`GPUEndTime` ObjC properties the `metal` crate doesn't wrap.
+/// This is the on-GPU window only — it excludes the CPU-side encode +
+/// `wait_until_completed` cost a wall-clock `Instant` folds into every op, which
+/// otherwise over-weights tiny m=1 decode kernels. Caller must have waited for
+/// completion (values read 0 otherwise).
+fn gpu_cmd_buf_seconds(cb: &metal::CommandBufferRef) -> f64 {
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    // A `foreign_types` Ref is a newtype over the opaque ObjC object, so a
+    // pointer to the Ref IS the object pointer.
+    let obj = cb as *const metal::CommandBufferRef as *mut Object;
+    unsafe {
+        let start: f64 = msg_send![obj, GPUStartTime];
+        let end: f64 = msg_send![obj, GPUEndTime];
+        end - start
+    }
+}
 use std::collections::HashMap;
 
 use super::*;
@@ -292,19 +310,33 @@ impl MetalExecutable {
             .collect()
     }
 
-    /// Sequential per-thunk GPU timing (`RLX_METAL_THUNK_PROFILE=1`).
+    /// Sequential per-thunk timing (`RLX_METAL_THUNK_PROFILE=1`).
+    ///
+    /// Times each op by its **GPU execution window** (`GPUEndTime -
+    /// GPUStartTime`) rather than CPU `Instant::now()`. The CPU clock
+    /// double-counts the per-op encode + `wait_until_completed` overhead (tens
+    /// of µs) onto every tiny m=1 decode op, which massively over-weights them
+    /// and — on the very first op — folds in one-time mmap page-ins (the ~600 ms
+    /// "gather" artifact). A warm-up forward runs first so weights / the embed
+    /// table are resident before any op is measured.
     pub(crate) fn run_thunk_profile(&mut self) {
-        use std::time::Instant;
         crate::thunk_profile::reset();
         let n = self.schedule.thunks.len();
+        // Warm: make every arena region + weight page resident so the timed
+        // per-op runs measure steady-state GPU work, not first-touch faults.
+        let _ = self.encode_commit(true, None, None);
         for i in 0..n {
             let name = crate::thunk::thunk_name(&self.schedule.thunks[i]);
             if name == "nop" {
                 continue;
             }
-            let t0 = Instant::now();
-            let _ = self.encode_commit(true, None, Some(i..i + 1));
-            crate::thunk_profile::record(name, t0.elapsed());
+            // wait=false hands back the committed buffer (wait=true consumes it
+            // and returns None); wait here, then read its GPU window.
+            if let Some(cb) = self.encode_commit(false, None, Some(i..i + 1)) {
+                cb.wait_until_completed();
+                let secs = gpu_cmd_buf_seconds(&cb).max(0.0);
+                crate::thunk_profile::record(name, std::time::Duration::from_secs_f64(secs));
+            }
         }
         crate::thunk_profile::print_summary();
     }

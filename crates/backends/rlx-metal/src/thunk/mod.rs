@@ -604,6 +604,20 @@ pub enum Thunk {
         len: u32,
         dt: HalfFlag,
     },
+    /// In-place KV append (`Op::KvAppend`). Write `row` (`src`, `outer*inner`
+    /// elems) into `dst` (the cache buffer, aliased to input 0) at sequence
+    /// index `pos`: for each of `outer` batches, copy `inner` elems to
+    /// `dst[(o*seq_cap + pos)*inner ..]`. `inner`/`pos`/`seq_cap` are NOT
+    /// active-extent-scaled (fixed row write), unlike a plain Copy.
+    KvAppend {
+        src: usize,
+        dst: usize,
+        outer: u32,
+        seq_cap: u32,
+        pos: u32,
+        inner: u32,
+        dt: HalfFlag,
+    },
     /// SDPA. `mask_kind` encodes how to apply masking inside the
     /// kernel:
     ///   0 = None           (no masking)
@@ -2273,6 +2287,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Narrow { .. } => "narrow",
         Thunk::SplitLastAxis { .. } => "split_lastax",
         Thunk::Copy { .. } => "copy",
+        Thunk::KvAppend { .. } => "kv_append",
         Thunk::Attention { .. } => "attention",
         Thunk::FusedAttn { .. } => "fused_attn",
         Thunk::AttentionBackward { .. } => "attention_bwd",
@@ -2396,6 +2411,7 @@ impl Thunk {
             | Thunk::CastHost { .. }
             | Thunk::CastTruncF32 { .. }
             | Thunk::Copy { .. }
+            | Thunk::KvAppend { .. }
             | Thunk::ActivationInPlace { .. }
             | Thunk::ActivationOut { .. }
             | Thunk::GeluApproxOut { .. }
@@ -2981,6 +2997,7 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
             (vec![*src], vec![*dst])
         }
         Copy { src, dst, .. } => (vec![*src], vec![*dst]),
+        KvAppend { src, dst, .. } => (vec![*src, *dst], vec![*dst]),
         ActivationInPlace { data, .. } => (vec![*data], vec![*data]),
         ActivationOut { src, dst, .. } => (vec![*src], vec![*dst]),
         GeluApproxOut { src, dst, .. } | GeluApproxHost { src, dst, .. } => {
@@ -3160,6 +3177,65 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
         _ => return None,
     };
     Some(io)
+}
+
+/// Concurrent-dispatch hazard analysis. Given the thunk slice and the
+/// `[start, end)` range being encoded, return the set of thunk indices that
+/// must be preceded by a `memoryBarrier` when the compute encoder runs in
+/// `MTLDispatchType::Concurrent` (where consecutive dispatches may otherwise
+/// overlap with no ordering guarantee).
+///
+/// A barrier is required before thunk `i` iff it has a RAW / WAR / WAW hazard
+/// against any thunk dispatched since the last barrier (the current "wave").
+/// Mutually-independent thunks (e.g. the q/k/v projections that all read the
+/// same normed input and write disjoint slots) share a wave and overlap on the
+/// GPU. Opaque thunks (`mlp_io == None`) might touch anything, so they are
+/// fenced on both sides (barrier before, and the next op barriers too).
+///
+/// Sound on base offsets alone: the arena assigns non-overlapping bases and
+/// recycles a freed slot at the *same* base, so an alias always collides on the
+/// exact offset the hazard test compares. Weight offsets are tag-disjoint from
+/// arena offsets and never written, so weight reads never create a false
+/// hazard. Being conservative (an extra barrier) only costs a little overlap;
+/// a missed barrier would be a correctness bug, so every `Some` variant of
+/// `mlp_io` must report a complete read set (already an invariant there).
+pub(crate) fn concurrent_barrier_set(
+    thunks: &[Thunk],
+    start: usize,
+    end: usize,
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let mut barriers: HashSet<usize> = HashSet::new();
+    let mut wave_reads: HashSet<usize> = HashSet::new();
+    let mut wave_writes: HashSet<usize> = HashSet::new();
+    let mut prev_opaque = false;
+    for i in start..end.min(thunks.len()) {
+        match mlp_io(&thunks[i]) {
+            None => {
+                // Opaque: potential reader/writer of anything. Fence before it,
+                // and force the following op to fence too (its wave is empty
+                // but the opaque op's writes are unknown).
+                barriers.insert(i);
+                wave_reads.clear();
+                wave_writes.clear();
+                prev_opaque = true;
+            }
+            Some((reads, writes)) => {
+                let raw = reads.iter().any(|r| wave_writes.contains(r));
+                let war = writes.iter().any(|w| wave_reads.contains(w));
+                let waw = writes.iter().any(|w| wave_writes.contains(w));
+                if prev_opaque || raw || war || waw {
+                    barriers.insert(i);
+                    wave_reads.clear();
+                    wave_writes.clear();
+                }
+                prev_opaque = false;
+                wave_reads.extend(reads);
+                wave_writes.extend(writes);
+            }
+        }
+    }
+    barriers
 }
 
 const SENTINEL_OFF: usize = usize::MAX;

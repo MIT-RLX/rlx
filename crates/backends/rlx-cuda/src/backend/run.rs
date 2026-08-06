@@ -34,13 +34,14 @@ use crate::kernels::{
     gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
     group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
     group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
-    layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
-    layernorm_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_tma_kernel, matmul_wmma_kernel,
-    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel,
-    pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
-    reduce_kernel, relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
-    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, slice_kernel,
+    kimi_delta_chunk_kernel, layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel,
+    layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel, matmul_kernel,
+    matmul_tma_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel, maxpool3d_backward_kernel,
+    narrow_kernel, pad_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
+    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, relu_backward_kernel,
+    resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
+    scatter_add_zero_kernel, selective_scan_kernel, slice_kernel,
     softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     unary_kernel, where_kernel,
@@ -3945,7 +3946,16 @@ impl CudaExecutable {
                         self.gdn_scratch_off
                     };
                     if *use_gpu {
-                        let kernel = gated_delta_net_kernel(&self.ctx);
+                        // Opt-in FlashKDA-style chunked-parallel kernel (per-channel
+                        // gate, n=128). Same arena+offset ABI; 128-thread block.
+                        let use_chunk = *gate_per_channel
+                            && *state_size == 128
+                            && rlx_ir::env::flag("RLX_CUDA_KDA_CHUNK");
+                        let kernel = if use_chunk {
+                            kimi_delta_chunk_kernel(&self.ctx)
+                        } else {
+                            gated_delta_net_kernel(&self.ctx)
+                        };
                         let cfg = LaunchConfig {
                             grid_dim: (*batch * *heads, 1, 1),
                             block_dim: (*state_size, 1, 1),

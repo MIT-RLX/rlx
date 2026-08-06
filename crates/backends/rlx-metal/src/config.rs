@@ -31,6 +31,13 @@ pub struct MetalRuntimeConfig {
     pub concat_host: bool,
     pub fuse_decode: bool,
     pub fuse_decode_log: bool,
+    pub sdpa_flash_decode: Option<bool>,
+    pub sdpa_flash_partitions: Option<u32>,
+    pub sdpa_tune_cache_path: Option<String>,
+    pub sdpa_tune_cache_load: bool,
+    pub sdpa_tune_cache_persist: bool,
+    pub sdpa_tune_cache_max_entries: usize,
+    pub sdpa_tune_cache_eviction: crate::kernel_plan::TuneCacheEviction,
 }
 
 impl Default for MetalRuntimeConfig {
@@ -67,7 +74,63 @@ impl MetalRuntimeConfig {
             concat_host: reg::flag("RLX_METAL_CONCAT_HOST"),
             fuse_decode: reg::var("RLX_METAL_FUSE_DECODE").as_deref() != Some("0"),
             fuse_decode_log: reg::flag("RLX_METAL_FUSE_DECODE_LOG"),
+            sdpa_flash_decode: reg::var("RLX_METAL_SDPA_FLASH_DECODE").map(|v| v != "0"),
+            sdpa_flash_partitions: reg::var("RLX_METAL_SDPA_FLASH_P")
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&p| p > 0),
+            sdpa_tune_cache_path: reg::var("RLX_METAL_SDPA_TUNE_CACHE"),
+            sdpa_tune_cache_load: reg::var("RLX_METAL_SDPA_TUNE_CACHE_LOAD")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            sdpa_tune_cache_persist: reg::var("RLX_METAL_SDPA_TUNE_CACHE_PERSIST")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            sdpa_tune_cache_max_entries: reg::var("RLX_METAL_SDPA_TUNE_CACHE_MAX_ENTRIES")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(256)
+                .max(1),
+            sdpa_tune_cache_eviction: parse_sdpa_cache_eviction(reg::var(
+                "RLX_METAL_SDPA_TUNE_CACHE_EVICTION",
+            )),
         }
+    }
+
+    pub fn with_sdpa_flash(mut self, enabled: Option<bool>, partitions: Option<u32>) -> Self {
+        self.sdpa_flash_decode = enabled;
+        self.sdpa_flash_partitions = partitions.filter(|&p| p > 0);
+        self
+    }
+
+    pub fn with_sdpa_tune_cache(
+        mut self,
+        path: Option<String>,
+        load: bool,
+        persist: bool,
+        max_entries: usize,
+    ) -> Self {
+        self.sdpa_tune_cache_path = path;
+        self.sdpa_tune_cache_load = load;
+        self.sdpa_tune_cache_persist = persist;
+        self.sdpa_tune_cache_max_entries = max_entries.max(1);
+        self
+    }
+
+    pub fn with_sdpa_tune_cache_eviction(
+        mut self,
+        eviction: crate::kernel_plan::TuneCacheEviction,
+    ) -> Self {
+        self.sdpa_tune_cache_eviction = eviction;
+        self
+    }
+}
+
+fn parse_sdpa_cache_eviction(v: Option<String>) -> crate::kernel_plan::TuneCacheEviction {
+    match v.as_deref() {
+        Some("keep-high") | Some("keep_high") | Some("high") => {
+            crate::kernel_plan::TuneCacheEviction::KeepHighBuckets
+        }
+        Some("lru") => crate::kernel_plan::TuneCacheEviction::Lru,
+        _ => crate::kernel_plan::TuneCacheEviction::KeepLowBuckets,
     }
 }
 

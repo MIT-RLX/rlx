@@ -224,6 +224,60 @@ kernel void gemv_f16w_splitk(
     }
 }
 
+// K-partitioned F16 GEMV — CEILING PROBE for small-N decode projections.
+// gemv_f16w_splitk launches only N/64 threadgroups (o_proj/down_proj n=1024 →
+// 16 tgs), under-occupying the GPU. This variant adds a Kparts z-axis so each
+// (col-block, k-partition) tg attends a K-slice and atomic-adds its partial
+// into a pre-zeroed C — raising the tg count to (N/64)*Kparts. NOTE: float
+// atomic-add is order-nondeterministic, so this is a measurement probe; a
+// production version must reduce partials deterministically (scratch + fixed
+// order) to stay token-identical.
+kernel void gemv_f16w_kpart(
+    device const float* A [[buffer(0)]],
+    device const half*  B [[buffer(1)]],
+    device atomic_float* C [[buffer(2)]],
+    constant uint& K      [[buffer(3)]],
+    constant uint& N      [[buffer(4)]],
+    constant uint& Kparts [[buffer(5)]],
+    uint3 tid  [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    constexpr uint KSPLIT = 32u;
+    threadgroup float2 partial[32][32];
+    uint col = tgid.x * 64u + tid.x * 2u;
+    uint ks = tid.y;
+    uint kchunk = (K + Kparts - 1u) / Kparts;
+    uint kstart = tgid.z * kchunk;
+    uint kend = min(kstart + kchunk, K);
+    float2 acc = float2(0.0f);
+    if (col < N) {
+        device const half2* Bp = (device const half2*)(B + col);
+        for (uint k = kstart + ks; k < kend; k += KSPLIT) {
+            float a = A[k];
+            half2 b = Bp[k * (N / 2u)];
+            acc.x += a * float(b.x);
+            acc.y += a * float(b.y);
+        }
+    }
+    partial[tid.x][ks] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0u && col < N) {
+        float2 s = float2(0.0f);
+        for (uint j = 0u; j < KSPLIT; ++j) s += partial[tid.x][j];
+        atomic_fetch_add_explicit(&C[col], s.x, memory_order_relaxed);
+        if (col + 1u < N) atomic_fetch_add_explicit(&C[col + 1u], s.y, memory_order_relaxed);
+    }
+}
+
+// Zero N floats of an atomic_float region (pre-zero for gemv_f16w_kpart).
+kernel void gemv_zero_f32(
+    device atomic_float* C [[buffer(0)]],
+    constant uint& N      [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < N) atomic_store_explicit(&C[gid], 0.0f, memory_order_relaxed);
+}
+
 // Padded simdgroup with F16 B (same staging as sgemm_simd_padded).
 kernel void sgemm_simd_padded_f16w(
     device const float* A [[buffer(0)]],
@@ -280,6 +334,66 @@ kernel void sgemm_simd_padded_f16w(
         if (out_row < M && out_col < N) {
             C[out_row * N + out_col] = C_pad[idx];
         }
+    }
+}
+
+// 64×64 F16-weight GEMM tile (8 simdgroups) — the prefill fix.
+// sgemm_simd_padded_f16w computes one 8×8 output tile per threadgroup (1 MMA
+// per K-step, A re-loaded per column block) → ~650 GFLOPS, 4–10× slower than
+// MPS per the mps_re_bench RE. This computes a 64×64 tile per threadgroup:
+// 8 simdgroups × 8 column-block accumulators, with half→float A/B staged
+// cooperatively by 256 threads into threadgroup memory (bounds-zeroed, so any
+// M/N/K works) — each staged A/B slab feeds 64 MMAs/K-step, the register-reuse
+// MPS exploits. F32 accumulate (more accurate than MPS's f16). Grid
+// (ceil(N/64), ceil(M/64)); dispatch with 256 threads/threadgroup.
+kernel void sgemm_wide8x64_f16w(
+    device const float* A [[buffer(0)]],
+    device const half*  B [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint sgid  [[simdgroup_index_in_threadgroup]],
+    uint slid  [[thread_index_in_simdgroup]]
+) {
+    constexpr uint TR = 64u, TC = 64u, NACC = 8u;
+    uint row0 = tgid.y * TR;
+    uint col0 = tgid.x * TC;
+    uint tix = sgid * 32u + slid; // 0..255
+    threadgroup float As[64u * 8u]; // 64 rows(M) × 8 (K)
+    threadgroup float Bs[8u * 64u]; // 8 (K) × 64 cols(N)
+    threadgroup float Cs[64u * 64u]; // 64×64 output tile
+    simdgroup_float8x8 acc[NACC];
+    for (uint j = 0; j < NACC; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint kk = 0; kk < K; kk += 8u) {
+        // Stage A [64×8] and B [8×64], 512 elems each, 256 threads → 2 each.
+        for (uint i = 0; i < 2u; ++i) {
+            uint idx = i * 256u + tix;
+            uint ar = idx / 8u, ac = idx % 8u;
+            uint sr = row0 + ar, sc = kk + ac;
+            As[idx] = (sr < M && sc < K) ? A[sr * K + sc] : 0.0f;
+            uint br = idx / 64u, bc = idx % 64u;
+            uint tr = kk + br, tc = col0 + bc;
+            Bs[idx] = (tr < K && tc < N) ? float(B[tr * N + tc]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, As + sgid * 8u * 8u, 8); // this simdgroup's 8 rows
+        for (uint j = 0; j < NACC; ++j) {
+            simdgroup_load(b, Bs + j * 8u, 64);
+            simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = 0; j < NACC; ++j) simdgroup_store(acc[j], Cs + (sgid * 8u) * 64u + j * 8u, 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Guarded write Cs → C: 4096 elems / 256 threads = 16 each.
+    for (uint i = 0; i < 16u; ++i) {
+        uint idx = i * 256u + tix;
+        uint cr = idx / 64u, cc = idx % 64u;
+        uint orow = row0 + cr, ocol = col0 + cc;
+        if (orow < M && ocol < N) C[orow * N + ocol] = Cs[idx];
     }
 }
 
@@ -11098,6 +11212,787 @@ macro_rules! sdpa_decode_m1_variant {
     };
 }
 
+// ── Flash-decoding (split-KV) for m=1 decode ────────────────────────────────
+// The base `sdpa_decode_m1` launches exactly `batch*heads` threadgroups (one
+// per head), each 32 threads walking ALL of K. At batch=1 that's ~16 tgs —
+// far too few to fill the GPU, so decode attention is occupancy-starved (~37%
+// of decode GPU time for trivial FLOPs). Flash-decoding adds a KV-partition
+// axis: `batch*heads*P` threadgroups each attend one KV slice and write a
+// partial online-softmax state {m, l, o[vdh]} to `scratch`; a tiny combine
+// kernel then merges the P partials per head. Raises tg count 16→16*P.
+//
+// Scratch layout: float[(bi*heads+hi)*n_part + part][SLOT], SLOT = 2 + MAX_DH
+// (m at +0, l at +1, un-normalized o at +2+d). Partial writes o WITHOUT the
+// 1/l divide; combine does the cross-partition rescale then normalizes.
+const SDPA_DECODE_M1_PARTIAL_TEMPLATE: &str = r####"kernel void __NAME__(
+    device const float* arena_q   [[buffer(0)]],
+    device const __KV__* arena_k   [[buffer(1)]],
+    device const __KV__* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& heads       [[buffer(6)]],
+    constant uint& head_dim    [[buffer(7)]],
+    constant uint& q_stride    [[buffer(8)]],
+    constant uint& mask_kind   [[buffer(9)]],
+    constant uint& seq_k       [[buffer(10)]],
+    constant uint& k_stride    [[buffer(11)]],
+    constant uint& bhsd        [[buffer(12)]],
+    constant uint& window      [[buffer(13)]],
+    constant float& score_scale  [[buffer(14)]],
+    constant float& attn_softcap [[buffer(15)]],
+    constant SdpaOffsets& byte_offs [[buffer(16)]],
+    device float* scratch      [[buffer(17)]],
+    constant uint& n_part      [[buffer(18)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const __KV__* K = (device const __KV__*)((device const char*)arena_k + byte_offs.k);
+    device const __KV__* V = (device const __KV__*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+
+    constexpr uint MAX_DH = 128u;
+    constexpr uint SLOT = 2u + MAX_DH;
+    // No threadgroup memory: the threadgroup is exactly one simdgroup (32
+    // threads), so the online-softmax reduction below uses simd_max/simd_sum
+    // (warp-level) instead of a threadgroup-memory tree. This frees the old
+    // 16 KB tg_o[32*128] scratch — the real occupancy limiter — so many more
+    // decode-attention threadgroups stay resident per core, and it drops the
+    // reduction barriers. Numerically identical to the tree merge.
+
+    uint part = tgid % n_part;
+    uint t    = tgid / n_part;
+    uint hi   = t % heads;
+    uint bi   = t / heads;
+    if (bi >= batch) return;
+
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint slot = (bi * heads + hi) * n_part + part;
+
+    uint chunk = (seq_k + n_part - 1u) / n_part;
+    uint start = part * chunk;
+    uint end   = min(start + chunk, seq_k);
+    if (start >= seq_k) {
+        if (tid == 0u) {
+            scratch[slot * SLOT + 0u] = -1e30f;
+            scratch[slot * SLOT + 1u] = 0.0f;
+            for (uint d = 0; d < vdh; ++d) scratch[slot * SLOT + 2u + d] = 0.0f;
+        }
+        return;
+    }
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint q_offset = seq_k - 1u;
+    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+
+    // Each lane loads the full query row directly (≤128 floats, L1-cached — the
+    // 32× redundancy is far cheaper than tg-memory staging + two barriers).
+    float q_reg[MAX_DH];
+    for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
+
+    float m_acc = -1e30f;
+    float l_acc = 0.0f;
+    float o_acc[MAX_DH];
+    for (uint d = 0; d < vdh; ++d) o_acc[d] = 0.0f;
+
+    for (uint ki = start + tid; ki < end; ki += tsize) {
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; d += 4u) {
+            if (d + 3u < head_dim) {
+                float4 qv = float4(q_reg[d], q_reg[d + 1u], q_reg[d + 2u], q_reg[d + 3u]);
+                float4 kv = float4(*(device const __KV__4*)(K + k_base + d));
+                dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            } else {
+                for (uint dd = d; dd < head_dim; ++dd) dot += q_reg[dd] * float(K[k_base + dd]);
+            }
+        }
+        float s = dot * scale;
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+        if (mask_kind == 1u) {
+            if (ki > q_offset) s = -1e9f;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
+        } else if (mask_kind == 4u) {
+            uint lo = q_offset > window ? q_offset - window : 0u;
+            if (ki < lo || ki > q_offset) s = -1e9f;
+        }
+        if (s <= -1.0e9f) continue;
+        float m_new = max(m_acc, s);
+        float e_old = exp(m_acc - m_new);
+        float e_cur = exp(s - m_new);
+        l_acc = e_old * l_acc + e_cur;
+        uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) o_acc[d] = e_old * o_acc[d] + e_cur * float(V[v_base + d]);
+        m_acc = m_new;
+    }
+
+    // Warp-level online-softmax reduction across the 32 lanes: global max, then
+    // rescale each lane by exp(m_lane - m_global) and sum l + each o dim.
+    // Identical to the tree merge; no threadgroup memory, no barriers.
+    float m_g = simd_max(m_acc);
+    float resc = exp(m_acc - m_g);          // lanes with no keys (m_acc=-1e30) → 0
+    float l_g = simd_sum(l_acc * resc);
+    if (tid == 0u) {
+        scratch[slot * SLOT + 0u] = m_g;
+        scratch[slot * SLOT + 1u] = l_g;
+    }
+    for (uint d = 0; d < vdh; ++d) {
+        float og = simd_sum(o_acc[d] * resc);
+        if (tid == 0u) scratch[slot * SLOT + 2u + d] = og;
+    }
+}"####;
+
+macro_rules! sdpa_decode_m1_partial_variant {
+    ($name:expr, $kv:expr) => {
+        SDPA_DECODE_M1_PARTIAL_TEMPLATE
+            .replace("__NAME__", $name)
+            .replace("__KV__", $kv)
+    };
+}
+
+// ── Head-dim-split flash-decode partial (register-pressure fix) ─────────────
+// The KV-split partial above has every lane hold the FULL q_reg[head_dim] +
+// o_acc[vdh] (256 regs/thread at D=128) → occupancy is register-capped. This
+// variant splits head_dim ACROSS the 32 lanes instead: each lane owns
+// `head_dim/32` dims (4 at D=128), all lanes process each key in lockstep, a
+// `simd_sum` forms the full q·k score (broadcast to every lane), and each lane
+// accumulates only its o-slice — so q_reg[4]+o_acc[4] = 8 regs/thread and the
+// final o needs NO cross-lane reduction (m/l are identical on every lane; each
+// lane writes its disjoint o dims). K/V reads are coalesced (consecutive lanes →
+// consecutive addresses). Requires head_dim % 32 == 0 and vdh % 32 == 0 (caller
+// guards; else the KV-split kernel above is used). Port of the llama.cpp
+// `flash_attn_ext_vec` thread mapping. `MAX_DPL` = 128/32.
+const SDPA_DECODE_M1_PARTIAL_HD_TEMPLATE: &str = r####"kernel void __NAME__(
+    device const float* arena_q   [[buffer(0)]],
+    device const __KV__* arena_k   [[buffer(1)]],
+    device const __KV__* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& heads       [[buffer(6)]],
+    constant uint& head_dim    [[buffer(7)]],
+    constant uint& q_stride    [[buffer(8)]],
+    constant uint& mask_kind   [[buffer(9)]],
+    constant uint& seq_k       [[buffer(10)]],
+    constant uint& k_stride    [[buffer(11)]],
+    constant uint& bhsd        [[buffer(12)]],
+    constant uint& window      [[buffer(13)]],
+    constant float& score_scale  [[buffer(14)]],
+    constant float& attn_softcap [[buffer(15)]],
+    constant SdpaOffsets& byte_offs [[buffer(16)]],
+    device float* scratch      [[buffer(17)]],
+    constant uint& n_part      [[buffer(18)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const __KV__* K = (device const __KV__*)((device const char*)arena_k + byte_offs.k);
+    device const __KV__* V = (device const __KV__*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+
+    constexpr uint MAX_DPL = 4u;
+    constexpr uint SLOT = 2u + 128u;
+
+    uint part = tgid % n_part;
+    uint t    = tgid / n_part;
+    uint hi   = t % heads;
+    uint bi   = t / heads;
+    if (bi >= batch) return;
+
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint slot = (bi * heads + hi) * n_part + part;
+
+    uint chunk = (seq_k + n_part - 1u) / n_part;
+    uint start = part * chunk;
+    uint end   = min(start + chunk, seq_k);
+    if (start >= seq_k) {
+        if (tid == 0u) {
+            scratch[slot * SLOT + 0u] = -1e30f;
+            scratch[slot * SLOT + 1u] = 0.0f;
+            for (uint d = 0; d < vdh; ++d) scratch[slot * SLOT + 2u + d] = 0.0f;
+        }
+        return;
+    }
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint q_offset = seq_k - 1u;
+    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+
+    // This lane owns dims [d0, d0+dpl) of q/k and [vd0, vd0+vdpl) of v/o.
+    uint dpl  = head_dim / 32u;   // head_dim % 32 == 0 guaranteed by the caller
+    uint d0   = tid * dpl;
+    uint vdpl = vdh / 32u;
+    uint vd0  = tid * vdpl;
+
+    float q_reg[MAX_DPL];
+    for (uint j = 0; j < dpl; ++j) q_reg[j] = Q[q_base + d0 + j];
+
+    float o_acc[MAX_DPL];
+    for (uint j = 0; j < vdpl; ++j) o_acc[j] = 0.0f;
+    float m_acc = -1e30f;
+    float l_acc = 0.0f;
+
+    // All 32 lanes walk the SAME key range in lockstep; the score reduction is a
+    // per-key simd_sum (barrier-free warp op), so m/l stay identical on every lane.
+    for (uint ki = start; ki < end; ++ki) {
+        uint k_base = qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        float pd = 0.0f;
+        for (uint j = 0; j < dpl; ++j) pd += q_reg[j] * float(K[k_base + d0 + j]);
+        float s = simd_sum(pd) * scale;
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+        if (mask_kind == 1u) {
+            if (ki > q_offset) s = -1e9f;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
+        } else if (mask_kind == 4u) {
+            uint lo = q_offset > window ? q_offset - window : 0u;
+            if (ki < lo || ki > q_offset) s = -1e9f;
+        }
+        if (s <= -1.0e9f) continue;
+        float m_new = max(m_acc, s);
+        float e_old = exp(m_acc - m_new);
+        float e_cur = exp(s - m_new);
+        l_acc = e_old * l_acc + e_cur;
+        uint v_base = qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+        for (uint j = 0; j < vdpl; ++j) o_acc[j] = e_old * o_acc[j] + e_cur * float(V[v_base + vd0 + j]);
+        m_acc = m_new;
+    }
+
+    if (tid == 0u) {
+        scratch[slot * SLOT + 0u] = m_acc;
+        scratch[slot * SLOT + 1u] = l_acc;
+    }
+    for (uint j = 0; j < vdpl; ++j) scratch[slot * SLOT + 2u + vd0 + j] = o_acc[j];
+}"####;
+
+macro_rules! sdpa_decode_m1_partial_hd_variant {
+    ($name:expr, $kv:expr) => {
+        SDPA_DECODE_M1_PARTIAL_HD_TEMPLATE
+            .replace("__NAME__", $name)
+            .replace("__KV__", $kv)
+    };
+}
+
+// Combine the P partial online-softmax states per (batch, head) → final OUT.
+// One threadgroup per (bi,hi); threads parallelize over vdh. m_g/l_g are cheap
+// (loop over n_part ≤ ~16) so each thread recomputes them rather than sharing.
+const SDPA_DECODE_M1_COMBINE: &str = r####"kernel void sdpa_decode_m1_combine(
+    device const float* scratch [[buffer(0)]],
+    device float*       arena_o [[buffer(1)]],
+    constant uint& batch     [[buffer(2)]],
+    constant uint& heads     [[buffer(3)]],
+    constant uint& n_part    [[buffer(4)]],
+    constant uint& head_dim  [[buffer(5)]],
+    constant uint& q_stride  [[buffer(6)]],
+    constant uint& bhsd      [[buffer(7)]],
+    constant SdpaOffsets& byte_offs [[buffer(8)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    constexpr uint MAX_DH = 128u;
+    constexpr uint SLOT = 2u + MAX_DH;
+    device float* OUT = (device float*)((device char*)arena_o + byte_offs.o);
+    uint hi = tgid % heads;
+    uint bi = tgid / heads;
+    if (bi >= batch) return;
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint base = (bi * heads + hi) * n_part;
+
+    float m_g = -1e30f;
+    for (uint p = 0; p < n_part; ++p) m_g = max(m_g, scratch[(base + p) * SLOT + 0u]);
+    float l_g = 0.0f;
+    for (uint p = 0; p < n_part; ++p) {
+        float mp = scratch[(base + p) * SLOT + 0u];
+        float lp = scratch[(base + p) * SLOT + 1u];
+        l_g += exp(mp - m_g) * lp;
+    }
+    float inv_l = (l_g > 0.0f) ? (1.0f / l_g) : 0.0f;
+    uint o_base = qkv_out_offset(bi, hi, 0u, heads, 1u, vdh, q_stride, bhsd);
+    for (uint d = tid; d < vdh; d += tsize) {
+        float acc = 0.0f;
+        for (uint p = 0; p < n_part; ++p) {
+            float mp = scratch[(base + p) * SLOT + 0u];
+            float op = scratch[(base + p) * SLOT + 2u + d];
+            acc += exp(mp - m_g) * op;
+        }
+        OUT[o_base + d] = acc * inv_l;
+    }
+}"####;
+
+// ── W8A8 decode attention (int8 Q·K integer dot + int8 V) ───────────────────
+// Quantize one KV row to int8 (contiguous kv-major) + a per-row f32 absmax
+// scale, for the W8A8 flash-decode path. One thread per row;
+// gid = (bi*kv_heads + hkv)*seq + ki. The arena K/V may be f32 or f16 (__KV__);
+// the int8 output layout is always contiguous [row][dh] so the partial reads it
+// independently of the arena's BSNH/BHSD layout. `src_off` is a BYTE offset.
+const KV_QUANT_I8_TEMPLATE: &str = r####"kernel void __NAME__(
+    device const void*  arena_raw [[buffer(0)]],
+    device char*        i8out     [[buffer(1)]],
+    device float*       scout     [[buffer(2)]],
+    constant ulong& src_off       [[buffer(3)]],
+    constant uint&  nrows         [[buffer(4)]],
+    constant uint&  dh            [[buffer(5)]],
+    constant uint&  bhsd          [[buffer(6)]],
+    constant uint&  kv_heads      [[buffer(7)]],
+    constant uint&  seq           [[buffer(8)]],
+    constant uint&  kstride        [[buffer(9)]],
+    constant uint&  blk           [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= nrows) return;
+    uint ki  = gid % seq;
+    uint bh  = gid / seq;
+    uint hkv = bh % kv_heads;
+    uint bi  = bh / kv_heads;
+    device const __KV__* src = (device const __KV__*)((device const char*)arena_raw + src_off);
+    uint aoff;
+    if (bhsd != 0u) aoff = (bi * kv_heads + hkv) * seq * dh + ki * dh;
+    else            aoff = bi * kstride * kv_heads * dh + ki * kv_heads * dh + hkv * dh;
+    // blk=0: one absmax scale per `dh` row. blk=1: one scale per 32-element
+    // sub-block (Q8_0-style) → ~4-8× lower rounding error at 4 scales/row.
+    uint nb = (blk != 0u) ? (dh / 32u) : 1u;
+    uint bs = (blk != 0u) ? 32u : dh;
+    device char* dst = i8out + (ulong)gid * dh;
+    for (uint b = 0; b < nb; ++b) {
+        float amax = 0.0f;
+        for (uint j = 0; j < bs; ++j) amax = max(amax, fabs(float(src[aoff + b * bs + j])));
+        float s = amax * (1.0f / 127.0f);
+        scout[(ulong)gid * nb + b] = s;
+        float inv = (s > 1e-20f) ? (1.0f / s) : 0.0f;
+        for (uint j = 0; j < bs; ++j)
+            dst[b * bs + j] = char(clamp(round(float(src[aoff + b * bs + j]) * inv), -127.0f, 127.0f));
+    }
+}"####;
+
+macro_rules! kv_quant_i8_variant {
+    ($name:expr, $kv:expr) => {
+        KV_QUANT_I8_TEMPLATE
+            .replace("__NAME__", $name)
+            .replace("__KV__", $kv)
+    };
+}
+
+// W8A8 flash-decode partial: identical online-softmax / warp-reduction / scratch
+// layout to `sdpa_decode_m1_partial` (so the SAME combine kernel merges it), but
+// K/V come from the int8 scratch (contiguous kv-major) + per-row scales, and the
+// query row is quantized to int8 in-kernel so the Q·K score is an INTEGER dot
+// (int8×int8→int32 on the int ALU — ~1.6× the f32 dot on M-series). Score =
+// int_dot * qscale * kscale * scale; V is dequantized per element (int8 * vscale).
+// Gated by RLX_METAL_W8A8_ATTN; f32 KV only (arena K/V pre-quantized by kv_quant_i8).
+const SDPA_DECODE_M1_PARTIAL_W8A8: &str = r####"kernel void sdpa_decode_m1_partial_w8a8(
+    device const float* arena_q [[buffer(0)]],
+    device const char*  i8k     [[buffer(1)]],
+    device const char*  i8v     [[buffer(2)]],
+    device const float* arena_m [[buffer(3)]],
+    device const float* ksc     [[buffer(4)]],
+    device const float* vsc     [[buffer(5)]],
+    constant uint& batch        [[buffer(6)]],
+    constant uint& heads        [[buffer(7)]],
+    constant uint& head_dim     [[buffer(8)]],
+    constant uint& q_stride     [[buffer(9)]],
+    constant uint& mask_kind    [[buffer(10)]],
+    constant uint& seq_k        [[buffer(11)]],
+    constant uint& k_stride     [[buffer(12)]],
+    constant uint& bhsd         [[buffer(13)]],
+    constant uint& window       [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    device float* scratch       [[buffer(18)]],
+    constant uint& packed       [[buffer(19)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    // n_part + mode flags packed into one slot: Metal's arg-table aliases
+    // individual set_bytes past index 16, so separate flag slots (20/21/22)
+    // clobber each other. Unpack: n_part = low 16b; q_i8/v_i8/blk = bits 16/17/18.
+    uint n_part = packed & 0xFFFFu;
+    uint q_i8   = (packed >> 16) & 1u;
+    uint v_i8   = (packed >> 17) & 1u;
+    uint blk    = (packed >> 18) & 1u;
+    uint k_i8   = (packed >> 19) & 1u;
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    // {k,v}_i8==0: read K/V straight from the f32 arena (exact) instead of the int8
+    // scratch — isolates each operand's quant error. arena_q is the arena base.
+    device const float* Vf = (device const float*)((device const char*)arena_q + byte_offs.v);
+    device const float* Kf = (device const float*)((device const char*)arena_q + byte_offs.k);
+    constexpr uint MAX_DH = 128u;
+    constexpr uint SLOT = 2u + MAX_DH;
+    uint part = tgid % n_part;
+    uint t    = tgid / n_part;
+    uint hi   = t % heads;
+    uint bi   = t / heads;
+    if (bi >= batch) return;
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint slot = (bi * heads + hi) * n_part + part;
+    uint chunk = (seq_k + n_part - 1u) / n_part;
+    uint start = part * chunk;
+    uint end   = min(start + chunk, seq_k);
+    if (start >= seq_k) {
+        if (tid == 0u) {
+            scratch[slot * SLOT + 0u] = -1e30f;
+            scratch[slot * SLOT + 1u] = 0.0f;
+            for (uint d = 0; d < vdh; ++d) scratch[slot * SLOT + 2u + d] = 0.0f;
+        }
+        return;
+    }
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint q_offset = seq_k - 1u;
+    uint q_base = qkv_q_offset(bi, hi, 0u, heads, 1u, head_dim, q_stride, bhsd);
+
+    // Sub-block layout (blk=1 → 32-elem blocks, one scale each; blk=0 → whole row).
+    uint nb = (blk != 0u) ? (head_dim / 32u) : 1u;
+    uint bs = (blk != 0u) ? 32u : head_dim;
+    uint vnb = (blk != 0u) ? (vdh / 32u) : 1u;
+
+    // Load the query row; quantize to int8 per-block when q_i8 (else f32 Q is kept
+    // and dotted against dequantized int8 K — isolates whether int8-Q matters).
+    float q_reg[MAX_DH];
+    for (uint d = 0; d < head_dim; ++d) q_reg[d] = Q[q_base + d];
+    float qs_b[4];
+    char qi[MAX_DH];
+    if (q_i8 != 0u) {
+        for (uint b = 0; b < nb; ++b) {
+            float am = 0.0f;
+            for (uint j = 0; j < bs; ++j) am = max(am, fabs(q_reg[b * bs + j]));
+            qs_b[b] = am * (1.0f / 127.0f);
+            float inv = (qs_b[b] > 1e-20f) ? (1.0f / qs_b[b]) : 0.0f;
+            for (uint j = 0; j < bs; ++j)
+                qi[b * bs + j] = char(clamp(round(q_reg[b * bs + j] * inv), -127.0f, 127.0f));
+        }
+    }
+
+    // GQA kv head + contiguous int8 row base (matches kv_quant_i8's gid layout).
+    uint nkv   = (byte_offs.kv_heads == 0u) ? heads : byte_offs.kv_heads;
+    uint group = heads / nkv;
+    uint hkv   = (group > 1u) ? (hi / group) : hi;
+    uint rb    = (bi * nkv + hkv) * seq_k;
+
+    float m_acc = -1e30f;
+    float l_acc = 0.0f;
+    float o_acc[MAX_DH];
+    for (uint d = 0; d < vdh; ++d) o_acc[d] = 0.0f;
+
+    for (uint ki = start + tid; ki < end; ki += tsize) {
+        device const char* kr = i8k + (ulong)(rb + ki) * head_dim;
+        ulong kscrow = (ulong)(rb + ki) * nb;
+        uint k_base = (k_i8 != 0u)
+            ? 0u
+            : qkv_kv_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd);
+        float s = 0.0f;
+        // Per-block score. Fast path (int8 Q & int8 K): integer dot × block scales.
+        // Otherwise an f32 accumulate so any exact operand (q_i8/k_i8==0) is used
+        // directly — lets the all-exact case validate the kernel vs CPU (~1e-5).
+        for (uint b = 0; b < nb; ++b) {
+            if (q_i8 != 0u && k_i8 != 0u) {
+                int idot = 0;
+                for (uint j = 0; j < bs; ++j) idot += int(qi[b * bs + j]) * int(kr[b * bs + j]);
+                s += float(idot) * qs_b[b] * ksc[kscrow + b];
+            } else {
+                float bd = 0.0f;
+                for (uint j = 0; j < bs; ++j) {
+                    uint d = b * bs + j;
+                    float qv = (q_i8 != 0u) ? (float(qi[d]) * qs_b[b]) : q_reg[d];
+                    float kv = (k_i8 != 0u) ? (float(kr[d]) * ksc[kscrow + b]) : Kf[k_base + d];
+                    bd += qv * kv;
+                }
+                s += bd;
+            }
+        }
+        s *= scale;
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+        if (mask_kind == 1u) {
+            if (ki > q_offset) s = -1e9f;
+        } else if (mask_kind == 2u) {
+            if (M[bi * k_stride + ki] < 0.5f) s = -1e9f;
+        } else if (mask_kind == 4u) {
+            uint lo = q_offset > window ? q_offset - window : 0u;
+            if (ki < lo || ki > q_offset) s = -1e9f;
+        }
+        if (s <= -1.0e9f) continue;
+        float m_new = max(m_acc, s);
+        float e_old = exp(m_acc - m_new);
+        float e_cur = exp(s - m_new);
+        l_acc = e_old * l_acc + e_cur;
+        // V: int8 (per-block or per-row scale) from scratch, or exact f32 from arena.
+        device const char* vr = i8v + (ulong)(rb + ki) * vdh;
+        ulong vscrow = (ulong)(rb + ki) * vnb;
+        uint v_base = (v_i8 != 0u)
+            ? 0u
+            : qkv_v_offset(bi, hi, ki, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd);
+        for (uint d = 0; d < vdh; ++d) {
+            float vval;
+            if (v_i8 != 0u) {
+                uint b = (blk != 0u) ? (d >> 5) : 0u;
+                vval = float(vr[d]) * vsc[vscrow + b];
+            } else {
+                vval = Vf[v_base + d];
+            }
+            o_acc[d] = e_old * o_acc[d] + e_cur * vval;
+        }
+        m_acc = m_new;
+    }
+
+    float m_g  = simd_max(m_acc);
+    float resc = exp(m_acc - m_g);
+    float l_g  = simd_sum(l_acc * resc);
+    if (tid == 0u) {
+        scratch[slot * SLOT + 0u] = m_g;
+        scratch[slot * SLOT + 1u] = l_g;
+    }
+    for (uint d = 0; d < vdh; ++d) {
+        float og = simd_sum(o_acc[d] * resc);
+        if (tid == 0u) scratch[slot * SLOT + 2u + d] = og;
+    }
+}"####;
+
+// Flash-attention-2 PREFILL kernel (seq_q>1) supporting head_dim ≤ 128 + GQA.
+// Fixes the O(seq²) DRAM bottleneck of the scalar `sdpa_long` at qwen3's
+// head_dim=128 (which no existing tiled FA kernel handles: sdpa_fa_f32 caps at
+// MAX_DH=32, sdpa_fa2 at 64). Each threadgroup owns Br=8 query rows of one
+// (batch, head) and streams the K/V sequence in Bc=16 tiles staged to
+// threadgroup memory — so each K/V element is read once per 8-query tile, not
+// once per query (≈Br× less DRAM traffic). Online softmax, F32 accumulate.
+// Uses the sdpa_long/FA arg layout (buffers 0-17, SdpaOffsets @17 → byte
+// offsets + kv_heads for GQA + v_head_dim). tg mem @ Br=8,Bc=16,MAX_DH=128:
+// Q 4KB + K 8KB + V 8KB + o 4KB + S 0.5KB ≈ 24.5KB < 32KB. Dispatch 128 threads,
+// grid (ceil(seq_q/8), heads, batch).
+// Shared skeleton for the flash-attention prefill kernels. The staging, online
+// softmax, causal early-exit and emit are identical across variants; only the
+// score (Q@Kᵀ) and P@V matmuls differ (scalar FMA vs simdgroup-matrix MMA), and
+// the tile sizes (Br/Bc/MAX_DH) are parameters — so both kernels are generated
+// from this one template via `sdpa_prefill_fa_variant!` instead of being
+// hand-duplicated. Placeholders: __NAME__, __SG_DECL__ (extra sig params),
+// __EXTRA_TG__ (extra threadgroup buffers), __BR__/__BC__/__MDH__ (tile dims),
+// __SCORE_IMPL__ (fills masked/scaled S_tg), __PV_IMPL__ (updates o_row from P).
+const SDPA_PREFILL_FA_SKELETON: &str = r####"kernel void __NAME__(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& seq_q       [[buffer(6)]],
+    constant uint& heads       [[buffer(7)]],
+    constant uint& head_dim    [[buffer(8)]],
+    constant uint& q_stride    [[buffer(9)]],
+    constant uint& mask_kind   [[buffer(10)]],
+    constant uint& seq_k       [[buffer(11)]],
+    constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint3 tid3  [[thread_position_in_threadgroup]],
+    uint3 tsz   [[threads_per_threadgroup]]__SG_DECL__
+) {
+    uint tid = tid3.x;
+    uint tsize = tsz.x;
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+
+    constexpr uint Br = __BR__u;
+    constexpr uint Bc = __BC__u;
+    constexpr uint MAX_DH = __MDH__u;
+    threadgroup float Q_tg[Br * MAX_DH];
+    threadgroup float K_tg[Bc * MAX_DH];
+    threadgroup float V_tg[Bc * MAX_DH];
+    threadgroup float S_tg[Br * Bc];__EXTRA_TG__
+    threadgroup float m_row[Br];
+    threadgroup float l_row[Br];
+    threadgroup float o_row[Br * MAX_DH];
+    threadgroup float m_new_tg[Br];
+    threadgroup float e_old_tg[Br];
+
+    uint q_tile = tgid.x;
+    uint hi     = tgid.y;
+    uint bi     = tgid.z;
+    if (bi >= batch) return;
+    uint q_start = q_tile * Br;
+
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint q_off = seq_k - seq_q;
+
+    for (uint i = tid; i < Br * head_dim; i += tsize) {
+        uint qi = i / head_dim, di = i % head_dim;
+        uint pos = q_start + qi;
+        Q_tg[qi * MAX_DH + di] = (pos < seq_q)
+            ? Q[qkv_q_offset(bi, hi, pos, heads, seq_q, head_dim, q_stride, bhsd) + di]
+            : 0.0f;
+    }
+    if (tid < Br) { m_row[tid] = -1e30f; l_row[tid] = 0.0f; }
+    for (uint i = tid; i < Br * vdh; i += tsize) o_row[(i / vdh) * MAX_DH + (i % vdh)] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kt_end = seq_k;
+    if (mask_kind == 1u) kt_end = min(seq_k, q_off + q_start + Br);
+
+    for (uint kt = 0; kt < kt_end; kt += Bc) {
+        for (uint i = tid; i < Bc * head_dim; i += tsize) {
+            uint ki = i / head_dim, di = i % head_dim;
+            uint pos = kt + ki;
+            bool ok = pos < seq_k;
+            uint koff = ok ? qkv_kv_offset(bi, hi, pos, heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd) : 0u;
+            K_tg[ki * MAX_DH + di] = ok ? K[koff + di] : 0.0f;
+        }
+        for (uint i = tid; i < Bc * vdh; i += tsize) {
+            uint ki = i / vdh, di = i % vdh;
+            uint pos = kt + ki;
+            bool ok = pos < seq_k;
+            uint voff = ok ? qkv_v_offset(bi, hi, pos, heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd) : 0u;
+            V_tg[ki * MAX_DH + di] = ok ? V[voff + di] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+__SCORE_IMPL__
+
+        // Online softmax: (A) running max, (B) P=exp(S-m), (C) row-sum l.
+        if (tid < Br) {
+            uint qi = tid;
+            float m_prev = m_row[qi];
+            float m_new = m_prev;
+            for (uint ki = 0; ki < Bc; ++ki) m_new = max(m_new, S_tg[qi * Bc + ki]);
+            m_new_tg[qi] = m_new;
+            e_old_tg[qi] = exp(m_prev - m_new);
+            m_row[qi] = m_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c = tid; c < Br * Bc; c += tsize) {
+            uint qi = c / Bc;
+            S_tg[c] = exp(S_tg[c] - m_new_tg[qi]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < Br) {
+            uint qi = tid;
+            float lsum = 0.0f;
+            for (uint ki = 0; ki < Bc; ++ki) lsum += S_tg[qi * Bc + ki];
+            l_row[qi] = e_old_tg[qi] * l_row[qi] + lsum;
+        }
+
+__PV_IMPL__
+    }
+
+    for (uint i = tid; i < Br * vdh; i += tsize) {
+        uint qi = i / vdh, di = i % vdh;
+        uint pos = q_start + qi;
+        if (pos < seq_q) {
+            float l = l_row[qi];
+            float o = (l > 0.0f) ? (o_row[qi * MAX_DH + di] / l) : 0.0f;
+            OUT[qkv_out_offset(bi, hi, pos, heads, seq_q, vdh, q_stride, bhsd) + di] = o;
+        }
+    }
+}"####;
+
+// Scalar score: fused Q·K dot + scale + mask → S_tg.
+const FA_SCORE_SCALAR: &str = r####"        for (uint c = tid; c < Br * Bc; c += tsize) {
+            uint qi = c / Bc, ki = c % Bc;
+            uint qpos = q_start + qi, kpos = kt + ki;
+            float s;
+            if (qpos < seq_q && kpos < seq_k) {
+                float dot = 0.0f;
+                for (uint di = 0; di < head_dim; ++di) dot += Q_tg[qi * MAX_DH + di] * K_tg[ki * MAX_DH + di];
+                s = dot * scale;
+                if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+                if (mask_kind == 1u) { if (kpos > q_off + qpos) s = -1e9f; }
+                else if (mask_kind == 2u) { if (M[bi * k_stride + kpos] < 0.5f) s = -1e9f; }
+                else if (mask_kind == 4u) { uint hp = q_off + qpos; uint lo = hp > window ? hp - window : 0u; if (kpos < lo || kpos > hp) s = -1e9f; }
+            } else { s = -1e9f; }
+            S_tg[c] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);"####;
+
+// MMA score: simdgroups 0..Bc/8 compute raw Q@Kᵀ via tensor units → S_tg, then
+// scalar scale+mask. Bc/8 n-tiles; one simdgroup each.
+const FA_SCORE_MMA: &str = r####"        if (sgid < (Bc / 8u)) {
+            simdgroup_float8x8 sacc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint kd = 0; kd < head_dim; kd += 8u) {
+                simdgroup_float8x8 qa, kb;
+                simdgroup_load(qa, Q_tg + kd, MAX_DH);
+                simdgroup_load(kb, K_tg + sgid * 8u * MAX_DH + kd, MAX_DH, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sacc, qa, kb, sacc);
+            }
+            simdgroup_store(sacc, S_tg + sgid * 8u, Bc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c = tid; c < Br * Bc; c += tsize) {
+            uint qi = c / Bc, ki = c % Bc;
+            uint qpos = q_start + qi, kpos = kt + ki;
+            float s = S_tg[c] * scale;
+            if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap;
+            if (!(qpos < seq_q && kpos < seq_k)) { s = -1e9f; }
+            else if (mask_kind == 1u) { if (kpos > q_off + qpos) s = -1e9f; }
+            else if (mask_kind == 2u) { if (M[bi * k_stride + kpos] < 0.5f) s = -1e9f; }
+            else if (mask_kind == 4u) { uint hp = q_off + qpos; uint lo = hp > window ? hp - window : 0u; if (kpos < lo || kpos > hp) s = -1e9f; }
+            S_tg[c] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);"####;
+
+// Scalar P@V: each thread accumulates its o_row dims (rescaled by e_old) over Bc.
+const FA_PV_SCALAR: &str = r####"        for (uint i = tid; i < Br * vdh; i += tsize) {
+            uint qi = i / vdh, di = i % vdh;
+            float o = o_row[qi * MAX_DH + di] * e_old_tg[qi];
+            for (uint ki = 0; ki < Bc; ++ki) o += S_tg[qi * Bc + ki] * V_tg[ki * MAX_DH + di];
+            o_row[qi * MAX_DH + di] = o;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);"####;
+
+// MMA P@V: 16 n-tiles (MAX_DH/8) striped across the 4 simdgroups → PV_tg, then
+// scalar per-row rescale o = o·e_old + PV.
+const FA_PV_MMA: &str = r####"        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint mm = 0; mm < (MAX_DH / 32u); ++mm) {
+            uint n = (sgid + mm * 4u) * 8u;
+            if (n < vdh) {
+                simdgroup_float8x8 pacc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                for (uint kk = 0; kk < Bc; kk += 8u) {
+                    simdgroup_float8x8 pa, vb;
+                    simdgroup_load(pa, S_tg + kk, Bc);
+                    simdgroup_load(vb, V_tg + kk * MAX_DH + n, MAX_DH);
+                    simdgroup_multiply_accumulate(pacc, pa, vb, pacc);
+                }
+                simdgroup_store(pacc, PV_tg + n, MAX_DH);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < Br * vdh; i += tsize) {
+            uint qi = i / vdh, di = i % vdh;
+            o_row[qi * MAX_DH + di] = o_row[qi * MAX_DH + di] * e_old_tg[qi] + PV_tg[qi * MAX_DH + di];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);"####;
+
+/// Generate one prefill flash-attention kernel from the shared skeleton with
+/// the given name, extra signature/threadgroup decls, tile sizes, and score/PV
+/// matmul implementations.
+macro_rules! sdpa_prefill_fa_variant {
+    ($name:expr, $sg_decl:expr, $extra_tg:expr, $br:expr, $bc:expr, $mdh:expr, $score:expr, $pv:expr) => {
+        SDPA_PREFILL_FA_SKELETON
+            .replace("__SCORE_IMPL__", $score)
+            .replace("__PV_IMPL__", $pv)
+            .replace("__NAME__", $name)
+            .replace("__SG_DECL__", $sg_decl)
+            .replace("__EXTRA_TG__", $extra_tg)
+            .replace("__BR__", $br)
+            .replace("__BC__", $bc)
+            .replace("__MDH__", $mdh)
+    };
+}
+
 /// Mid-axis concat segment, parameterized by input (`__IN__`) and output
 /// (`__OUT__`) element type. The write casts `(__OUT__)(src)`, so a mismatched
 /// pair converts precision (f32↔f16) instead of reinterpreting raw bytes.
@@ -11155,9 +12050,37 @@ pub(crate) fn msl_source() -> String {
         .replace(
             "// @@RLX_SDPA_DECODE_M1@@",
             &format!(
-                "{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 sdpa_decode_m1_variant!("sdpa_decode_m1", "float"),
                 sdpa_decode_m1_variant!("sdpa_decode_m1_f16kv", "half"),
+                sdpa_decode_m1_partial_variant!("sdpa_decode_m1_partial", "float"),
+                sdpa_decode_m1_partial_variant!("sdpa_decode_m1_partial_f16kv", "half"),
+                sdpa_decode_m1_partial_hd_variant!("sdpa_decode_m1_partial_hd", "float"),
+                sdpa_decode_m1_partial_hd_variant!("sdpa_decode_m1_partial_hd_f16kv", "half"),
+                SDPA_DECODE_M1_COMBINE,
+                sdpa_prefill_fa_variant!(
+                    "sdpa_prefill_fa",
+                    "",
+                    "",
+                    "8",
+                    "16",
+                    "128",
+                    FA_SCORE_SCALAR,
+                    FA_PV_SCALAR
+                ),
+                sdpa_prefill_fa_variant!(
+                    "sdpa_prefill_fa_mma",
+                    ",\n    uint sgid   [[simdgroup_index_in_threadgroup]]",
+                    "\n    threadgroup float PV_tg[Br * MAX_DH];",
+                    "8",
+                    "16",
+                    "128",
+                    FA_SCORE_MMA,
+                    FA_PV_MMA
+                ),
+                kv_quant_i8_variant!("kv_quant_i8", "float"),
+                kv_quant_i8_variant!("kv_quant_i8_f16", "half"),
+                SDPA_DECODE_M1_PARTIAL_W8A8,
             ),
         )
         .replace(
@@ -11247,7 +12170,10 @@ pub struct Kernels {
     pub sgemm_simd_padded: ComputePipelineState,
     pub sgemm_simd_padded_residual: ComputePipelineState,
     pub sgemm_simd_padded_f16w: ComputePipelineState,
+    pub sgemm_wide8x64_f16w: ComputePipelineState,
     pub gemv_f16w_splitk: ComputePipelineState,
+    pub gemv_f16w_kpart: ComputePipelineState,
+    pub gemv_zero_f32: ComputePipelineState,
     pub sgemm_simd_padded_bias: ComputePipelineState,
     pub sgemm_tiled: ComputePipelineState,
     pub bias_add: ComputePipelineState,
@@ -11305,6 +12231,19 @@ pub struct Kernels {
     pub sdpa_long_occpad: ComputePipelineState,
     pub sdpa_decode_m1: ComputePipelineState,
     pub sdpa_decode_m1_f16kv: ComputePipelineState,
+    pub sdpa_decode_m1_partial: ComputePipelineState,
+    pub sdpa_decode_m1_partial_f16kv: ComputePipelineState,
+    /// Head-dim-split flash-decode partials (`head_dim % 32 == 0`): split D
+    /// across the 32 lanes → 8 regs/thread vs 256, no cross-lane o reduction,
+    /// coalesced K/V. Off-switch RLX_METAL_SDPA_HDSPLIT=0.
+    pub sdpa_decode_m1_partial_hd: ComputePipelineState,
+    pub sdpa_decode_m1_partial_hd_f16kv: ComputePipelineState,
+    pub sdpa_decode_m1_combine: ComputePipelineState,
+    pub sdpa_decode_m1_partial_w8a8: ComputePipelineState,
+    pub kv_quant_i8: ComputePipelineState,
+    pub kv_quant_i8_f16: ComputePipelineState,
+    pub sdpa_prefill_fa: ComputePipelineState,
+    pub sdpa_prefill_fa_mma: ComputePipelineState,
     pub sdpa_fa_f32: ComputePipelineState,
     pub sdpa_splitk: ComputePipelineState,
     pub sdpa_fa2: ComputePipelineState,
@@ -11495,12 +12434,31 @@ pub struct Kernels {
     pub iq2_s_mv_f32: ComputePipelineState,
     pub iq3_xxs_mv_f32: ComputePipelineState,
     pub iq3_s_mv_f32: ComputePipelineState,
+    /// Simdgroup-cooperative IQ3_XXS / IQ3_S GEMV — distributing the codebook
+    /// LUT lookups across 32 lanes (the serial bottleneck in the 1-thread
+    /// kernels) makes these ~2× Q3_K, second only to Q4_K.
+    pub iq3_xxs_mv_f32_sg: ComputePipelineState,
+    pub iq3_s_mv_f32_sg: ComputePipelineState,
     pub iq1_s_mv_f32: ComputePipelineState,
     pub iq1_m_mv_f32: ComputePipelineState,
     /// Simdgroup-cooperative Q4_K_M GEMV: 32 threads cooperate on 8
     /// output columns with `simd_sum`. Better x cache reuse than the
     /// single-thread-per-output `q4k_mv_f32`. Used when `n_dim % 8 == 0`.
     pub q4k_mv_f32_sg: ComputePipelineState,
+    /// Simdgroup-cooperative Q6_K GEMV (32 threads reduce one output row via
+    /// `simd_sum`; `Q6K_NSG` rows per threadgroup) and Q8_0 GEMV (32 threads →
+    /// `Q8_0_NR0` rows). Replace the occupancy-starved one-thread-per-row
+    /// `q6k_mv_f32` / `q8_0_mv_f32` on decode. Off: RLX_METAL_Q6K_SG_DISABLE /
+    /// RLX_METAL_Q8_0_SG_DISABLE.
+    pub q6k_mv_f32_sg: ComputePipelineState,
+    pub q8_0_mv_f32_sg: ComputePipelineState,
+    /// Simdgroup-cooperative Q4_0 / Q4_1 (32 threads → 4 rows) and Q3_K (one
+    /// row per simdgroup) decode GEMVs — same simd_sum treatment as Q4_K/Q6_K,
+    /// replacing the one-thread-per-row kernels. Off: RLX_METAL_Q40_SG_DISABLE /
+    /// RLX_METAL_Q41_SG_DISABLE / RLX_METAL_Q3K_SG_DISABLE.
+    pub q4_0_mv_f32_sg: ComputePipelineState,
+    pub q4_1_mv_f32_sg: ComputePipelineState,
+    pub q3k_mv_f32_sg: ComputePipelineState,
     /// Fused Q4_K / Q6_K GEMM (m > 1, prefill) — reads packed weight directly,
     /// dequants in-register and accumulates a row tile, replacing the
     /// `dequant_gguf` f32 scratch + MPS sgemm path for these two schemes.
@@ -11716,7 +12674,10 @@ impl Kernels {
             sgemm_simd_padded: pipeline("sgemm_simd_padded"),
             sgemm_simd_padded_residual: pipeline("sgemm_simd_padded_residual"),
             sgemm_simd_padded_f16w: pipeline("sgemm_simd_padded_f16w"),
+            sgemm_wide8x64_f16w: pipeline("sgemm_wide8x64_f16w"),
             gemv_f16w_splitk: pipeline("gemv_f16w_splitk"),
+            gemv_f16w_kpart: pipeline("gemv_f16w_kpart"),
+            gemv_zero_f32: pipeline("gemv_zero_f32"),
             sgemm_simd_padded_bias: pipeline("sgemm_simd_padded_bias"),
             sgemm_tiled: pipeline("sgemm_tiled"),
             bias_add: pipeline("bias_add"),
@@ -11774,6 +12735,16 @@ impl Kernels {
             sdpa_long_occpad: pipeline("sdpa_long_occpad"),
             sdpa_decode_m1: pipeline("sdpa_decode_m1"),
             sdpa_decode_m1_f16kv: pipeline("sdpa_decode_m1_f16kv"),
+            sdpa_decode_m1_partial: pipeline("sdpa_decode_m1_partial"),
+            sdpa_decode_m1_partial_f16kv: pipeline("sdpa_decode_m1_partial_f16kv"),
+            sdpa_decode_m1_partial_hd: pipeline("sdpa_decode_m1_partial_hd"),
+            sdpa_decode_m1_partial_hd_f16kv: pipeline("sdpa_decode_m1_partial_hd_f16kv"),
+            sdpa_decode_m1_combine: pipeline("sdpa_decode_m1_combine"),
+            sdpa_decode_m1_partial_w8a8: pipeline("sdpa_decode_m1_partial_w8a8"),
+            kv_quant_i8: pipeline("kv_quant_i8"),
+            kv_quant_i8_f16: pipeline("kv_quant_i8_f16"),
+            sdpa_prefill_fa: pipeline("sdpa_prefill_fa"),
+            sdpa_prefill_fa_mma: pipeline("sdpa_prefill_fa_mma"),
             sdpa_fa_f32: pipeline("sdpa_fa_f32"),
             sdpa_splitk: pipeline("sdpa_splitk"),
             sdpa_fa2: pipeline("sdpa_fa2"),
@@ -11909,6 +12880,11 @@ impl Kernels {
             q4k_mv_f32: pipeline("q4k_mv_f32"),
             q3k_mv_f32: pipeline("q3k_mv_f32"),
             q6k_mv_f32: pipeline("q6k_mv_f32"),
+            q6k_mv_f32_sg: pipeline("q6k_mv_f32_sg"),
+            q8_0_mv_f32_sg: pipeline("q8_0_mv_f32_sg"),
+            q4_0_mv_f32_sg: pipeline("q4_0_mv_f32_sg"),
+            q4_1_mv_f32_sg: pipeline("q4_1_mv_f32_sg"),
+            q3k_mv_f32_sg: pipeline("q3k_mv_f32_sg"),
             q1_0_mv_f32: pipeline("q1_0_mv_f32"),
             q1_0_mv_f32_sg: pipeline("q1_0_mv_f32_sg"),
             q1_0_dual_mv_f32_sg: pipeline("q1_0_dual_mv_f32_sg"),
@@ -11941,6 +12917,8 @@ impl Kernels {
             iq2_s_mv_f32: pipeline("iq2_s_mv_f32"),
             iq3_xxs_mv_f32: pipeline("iq3_xxs_mv_f32"),
             iq3_s_mv_f32: pipeline("iq3_s_mv_f32"),
+            iq3_xxs_mv_f32_sg: pipeline("iq3_xxs_mv_f32_sg"),
+            iq3_s_mv_f32_sg: pipeline("iq3_s_mv_f32_sg"),
             iq1_s_mv_f32: pipeline("iq1_s_mv_f32"),
             iq1_m_mv_f32: pipeline("iq1_m_mv_f32"),
             q4k_mv_f32_sg: pipeline("q4k_mv_f32_sg"),

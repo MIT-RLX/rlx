@@ -6,6 +6,8 @@
 
 use anyhow::Result;
 
+use crate::GgufPackedLinear;
+
 /// Abstract weight source for block emission. Keeps `rlx-flow` independent of
 /// safetensors / GGUF file formats.
 pub trait WeightSource {
@@ -15,6 +17,25 @@ pub trait WeightSource {
     fn has(&self, key: &str) -> bool {
         let _ = key;
         false
+    }
+
+    /// Optional packed (quantized) weight for the linear projection `key`.
+    ///
+    /// When this returns `Some`, [`crate::FlowCtx::linear`] emits a fused
+    /// `DequantMatMul` over the U8 quant blob instead of loading an F32 weight —
+    /// the *same* flow topology then runs packed at any `m` (m=1 decode, m=N
+    /// prefill) with no F32 weight ever materialized. Default: `None`, so
+    /// F32-only sources are unaffected. Any model whose loader can hand out
+    /// GGUF/MLX quant blobs opts into packed matmuls just by overriding this —
+    /// no per-model graph surgery.
+    ///
+    /// May be called more than once for the same `key` (KV-tap + decoder stages
+    /// both load a projection); implementations should return the same weight
+    /// each time. The flow dedups the underlying graph param, so the U8 bytes
+    /// are registered only once.
+    fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
+        let _ = key;
+        Ok(None)
     }
 }
 

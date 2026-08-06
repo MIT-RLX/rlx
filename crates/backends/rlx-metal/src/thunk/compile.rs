@@ -1738,6 +1738,32 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::KvAppend { axis, pos } => {
+                    // In-place append: write input[1] (the new row) into the
+                    // output buffer (aliased to `cache`) at sequence index `pos`.
+                    // Output shape == cache shape, so `seq_cap` = output's axis
+                    // dim (the buffer's true seq stride).
+                    let out_shape = &node.shape;
+                    let rank = out_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| out_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| out_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let seq_cap = out_shape.dim(*axis).unwrap_static();
+                    Thunk::KvAppend {
+                        src: off(node.inputs[1]),
+                        dst: off(node.id),
+                        outer: outer as u32,
+                        seq_cap: seq_cap as u32,
+                        pos: *pos as u32,
+                        inner: inner as u32,
+                        dt: out_shape.dtype().into(),
+                    }
+                }
                 Op::Concat { axis } => {
                     // Generalized to any axis. `outer` is the product of
                     // dims preceding the concat axis, `inner` is the

@@ -694,6 +694,12 @@ kernel_cache!(
     GATED_DELTA_NET_CU,
     "gated_delta_net"
 );
+kernel_cache!(
+    KIMI_DELTA_CHUNK,
+    kimi_delta_chunk_kernel,
+    KIMI_DELTA_CHUNK_CU,
+    "kimi_delta_chunk"
+);
 kernel_cache!(POOL1D, pool1d_kernel, POOL1D_CU, "pool1d");
 kernel_cache!(POOL2D, pool2d_kernel, POOL2D_CU, "pool2d");
 kernel_cache!(

@@ -139,6 +139,13 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             let inputs: Vec<&Shape> = node.inputs.iter().map(|&id| graph.shape(id)).collect();
             shape::concat_shape(&inputs, *axis).ok()
         }
+        // In-place append: output is the [0..pos+1] prefix of `cache` (input 0)
+        // along `axis`; it aliases cache's buffer.
+        Op::KvAppend { axis, pos } => Some(
+            in_shape(0)
+                .clone()
+                .with_dim(*axis, crate::shape::Dim::Static(*pos + 1)),
+        ),
         Op::Gather { axis } => shape::gather_shape(in_shape(0), in_shape(1), *axis).ok(),
         // ScatterND / ScatterElements output matches `data` (input 0).
         Op::ScatterNd { .. } | Op::ScatterElements { .. } => Some(shape::unary_shape(in_shape(0))),

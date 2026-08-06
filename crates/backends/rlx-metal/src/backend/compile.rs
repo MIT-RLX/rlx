@@ -808,8 +808,8 @@ impl MetalExecutable {
         // an IndirectCommandBuffer at compile time so encode_and_run can
         // issue them as one `executeCommandsInBuffer` call instead of N
         // individual `set_pipeline + set_buffer + dispatch` round-trips.
-        // Skip when large weights live in a separate MTLBuffer (ICB pins one
-        // arena buffer only).
+        // Skip when large weights live in a separate MTLBuffer; the current
+        // ICB path is only validated on the arena-only schedules below.
         let icb_segments = if rlx_ir::env::flag("RLX_USE_ICB") && weight_buffer.is_none() {
             let dev_ref = metal_device().expect("Metal device required");
             let segs =
@@ -829,8 +829,27 @@ impl MetalExecutable {
 
         let max_matmul_flops = max_matmul_flops_in(&fused);
         let has_bf16_matmul = graph_has_bf16_matmul(&fused);
+        let cfg = crate::runtime_config();
+
+        let cache_load = cfg.sdpa_tune_cache_load;
+        let cache_persist = cfg.sdpa_tune_cache_persist;
+        let cache_max_entries = cfg.sdpa_tune_cache_max_entries.max(1);
+        let cache_eviction = cfg.sdpa_tune_cache_eviction;
+        let sdpa_kernel_plan = crate::kernel_plan::KernelPlanBuilder::new(
+            crate::kernel_plan::KernelFamily::SdpaDecode,
+        )
+        .autotune(crate::kernel_plan::TunePolicy::balanced_defaults())
+        .tune_cache(cache_load, cache_persist, cache_max_entries)
+        .tune_cache_eviction(cache_eviction)
+        .build_plan()
+        .expect("rlx-metal: valid sdpa kernel plan");
 
         let mut me = Self {
+            sdpa_kernel_plan,
+            sdpa_tune_winners: std::cell::RefCell::new(HashMap::new()),
+            sdpa_tune_last_used: std::cell::RefCell::new(HashMap::new()),
+            sdpa_tune_tick: std::cell::Cell::new(0),
+            sdpa_tune_loaded: std::cell::Cell::new(false),
             graph: fused,
             arena,
             schedule,
@@ -859,6 +878,8 @@ impl MetalExecutable {
             onnx_qmatmul_act_scratch_off,
             f16_weight_scratch: std::cell::RefCell::new(None),
             baked_weight_concats: std::cell::RefCell::new(std::collections::HashSet::new()),
+            sdpa_flash_scratch: std::cell::RefCell::new(None),
+            sdpa_w8a8_scratch: std::cell::RefCell::new(None),
             qmatmul_weight_cache: std::cell::RefCell::new(
                 crate::onnx_qmatmul::QMatMulWeightCache::new(),
             ),

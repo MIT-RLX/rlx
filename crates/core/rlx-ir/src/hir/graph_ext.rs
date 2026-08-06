@@ -935,6 +935,12 @@ pub trait HirGraphExt {
     /// asymmetric-head attention can still ride the symmetric [`Op::Attention`].
     fn pad_(&mut self, x: HirNodeId, pads: Vec<[usize; 2]>, mode: PadMode) -> HirNodeId;
     fn concat_(&mut self, inputs: Vec<HirNodeId>, axis: usize) -> HirNodeId;
+    /// In-place KV append: write `row` into `cache` at index `pos` along `axis`,
+    /// returning cache's `[..pos+1..]` prefix (aliases cache's buffer). `cache`
+    /// must be sized `≥ pos+1` along `axis`. Replaces `concat_(cache,row)`'s
+    /// O(context) copy with a single-row write.
+    fn kv_append(&mut self, cache: HirNodeId, row: HirNodeId, axis: usize, pos: usize)
+    -> HirNodeId;
     fn gather_(&mut self, table: HirNodeId, indices: HirNodeId, axis: usize) -> HirNodeId;
 
     fn eq(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId;
@@ -1320,6 +1326,20 @@ impl HirGraphExt for HirMut<'_> {
         let shapes: Vec<&Shape> = inputs.iter().map(|&id| self.shape(id)).collect();
         let s = shape::concat_shape(&shapes, axis).expect("concat shape inference");
         self.0.mir(Op::Concat { axis }, inputs, s)
+    }
+
+    fn kv_append(
+        &mut self,
+        cache: HirNodeId,
+        row: HirNodeId,
+        axis: usize,
+        pos: usize,
+    ) -> HirNodeId {
+        let s = self
+            .shape(cache)
+            .clone()
+            .with_dim(axis, shape::Dim::Static(pos + 1));
+        self.0.mir(Op::KvAppend { axis, pos }, vec![cache, row], s)
     }
 
     fn gather_(&mut self, table: HirNodeId, indices: HirNodeId, axis: usize) -> HirNodeId {

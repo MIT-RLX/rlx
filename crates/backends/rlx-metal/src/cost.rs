@@ -192,18 +192,19 @@ impl MetalHwModel {
 
         let aligned_8 = m.is_multiple_of(8) && k.is_multiple_of(8) && n.is_multiple_of(8);
 
-        // MPS pays encoder end + objc bridging per call. On backward graphs with
-        // hundreds of matmuls that cost dominates even when compute would win.
-        // Opt in with RLX_METAL_SGEMM_MPS=1; RLX_MPS_THRESHOLD_FLOP still applies.
+        // MPS pays encoder end + objc bridging per call. Past the threshold,
+        // the measured chip-tuned path wins for the large prefill and large-
+        // decode matmuls we care about here, so use it by default unless the
+        // caller disables it. `RLX_METAL_SGEMM_MPS=1` still forces it on for
+        // smaller shapes, and `RLX_DISABLE_MPS=1` remains the opt-out.
         let mps_enabled = rlx_ir::env::flag("RLX_METAL_SGEMM_MPS");
         let mps_disabled = rlx_ir::env::var("RLX_DISABLE_MPS")
             .map(|v| v == "1")
             .unwrap_or(false);
         let flop = (m as u64) * (k as u64) * (n as u64);
-        if mps_enabled
-            && !mps_disabled
+        if !mps_disabled
             && crate::mps_blas::mps_supports_matmul()
-            && flop >= self.mps_threshold_flop
+            && (mps_enabled || flop >= self.mps_threshold_flop)
         {
             return SgemmVariant::Mps;
         }
@@ -401,8 +402,9 @@ mod tests {
         rlx_ir::env::set("RLX_DISABLE_MPS", "1");
         rlx_ir::env::unset("RLX_METAL_SGEMM_VARIANT");
         let hw = MetalHwModel::detect();
-        // Fully 32-aligned (m, k, n) → simd4x4's 32×32 tiles fit exactly.
-        assert_eq!(hw.pick_sgemm(64, 768, 2304), SgemmVariant::Simd4x4);
+        // Fully 64-aligned with enough tiles to saturate the GPU → the 64×64
+        // tile path should win before the 32×32 fallback.
+        assert_eq!(hw.pick_sgemm(64, 768, 2304), SgemmVariant::Simd64);
         // m=750 is NOT a multiple of 32, so the 32-row simd4x4 tiles would
         // overflow C past row m-1 — fall back to the padded simd kernel.
         assert_eq!(hw.pick_sgemm(750, 768, 2304), SgemmVariant::SimdPadded);

@@ -34,57 +34,104 @@
 use anyhow::{Result, anyhow, bail};
 use rlx_gguf::{GgmlType, quantize};
 
-/// Quantization scheme for cache rows. Restricted to the three
-/// q-formats whose blocks are 32 elements wide and stable across
-/// llama.cpp versions. The K-quants (Q4_K etc.) require 256-element
-/// blocks, which doesn't compose cleanly with typical kv_dim values
-/// (e.g. 128 head dim) so we don't expose them here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KvQuant {
-    /// `f16` — lossless storage of f32→f16 (no quantization). Kept as a
-    /// useful baseline; 2 bytes per element.
-    F16,
-    Q8_0,
-    Q4_0,
-    Q5_0,
+macro_rules! define_kv_quant {
+    ($( $variant:ident, $dtype:path, $dequant:path, $qk:expr, [$($alias:literal),+]; )+) => {
+        /// Quantization scheme for cache rows.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum KvQuant {
+            /// `f16` — lossless storage of f32→f16 (no quantization). Kept as a
+            /// useful baseline; 2 bytes per element.
+            F16,
+            $( $variant, )+
+        }
+
+        impl KvQuant {
+            /// Parse a quantization name (case-insensitive aliases accepted).
+            pub fn from_name(name: &str) -> Option<Self> {
+                let n = name.trim().to_ascii_lowercase();
+                if n == "f16" {
+                    return Some(Self::F16);
+                }
+                match n.as_str() {
+                    $( $( $alias => Some(Self::$variant), )+ )+
+                    _ => None,
+                }
+            }
+
+            /// On-disk block size in elements.
+            pub const fn block_elements(self) -> usize {
+                match self {
+                    Self::F16 => 1,
+                    $( Self::$variant => $qk, )+
+                }
+            }
+
+            /// On-disk block size in bytes.
+            pub fn block_bytes(self) -> usize {
+                match self {
+                    Self::F16 => 2,
+                    _ => {
+                        let gg = self.ggml_type().expect("non-F16 scheme must map to ggml type");
+                        rlx_gguf::bytes_for_public(gg, self.block_elements())
+                            .expect("ggml block size must be valid for kv quant scheme")
+                    }
+                }
+            }
+
+            fn ggml_type(self) -> Option<GgmlType> {
+                match self {
+                    Self::F16 => None,
+                    $( Self::$variant => Some($dtype), )+
+                }
+            }
+
+            fn dequant_dispatch(self, bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+                match self {
+                    Self::F16 => unreachable!("F16 dequant is handled in dequant_rows"),
+                    $( Self::$variant => {
+                        let expected = self.bytes_for(n)?;
+                        Ok($dequant(&bytes[..expected], n)?)
+                    } )+
+                }
+            }
+
+            /// Bytes required to store `n_elements` quantized.
+            pub fn bytes_for(self, n_elements: usize) -> Result<usize> {
+                let blk = self.block_elements();
+                if !n_elements.is_multiple_of(blk) {
+                    bail!("{self:?}: element count {n_elements} not aligned to block size {blk}");
+                }
+                Ok((n_elements / blk) * self.block_bytes())
+            }
+        }
+    };
 }
 
-impl KvQuant {
-    /// On-disk block size in elements.
-    pub const fn block_elements(self) -> usize {
-        match self {
-            Self::F16 => 1,
-            Self::Q8_0 | Self::Q4_0 | Self::Q5_0 => 32,
-        }
-    }
-
-    /// On-disk block size in bytes.
-    pub const fn block_bytes(self) -> usize {
-        match self {
-            Self::F16 => 2,
-            Self::Q8_0 => 2 + 32,
-            Self::Q4_0 => 2 + 32 / 2,
-            Self::Q5_0 => 2 + 4 + 32 / 2,
-        }
-    }
-
-    fn ggml_type(self) -> Option<GgmlType> {
-        match self {
-            Self::F16 => None, // direct f16 path
-            Self::Q8_0 => Some(GgmlType::Q8_0),
-            Self::Q4_0 => Some(GgmlType::Q4_0),
-            Self::Q5_0 => Some(GgmlType::Q5_0),
-        }
-    }
-
-    /// Bytes required to store `n_elements` quantized.
-    pub fn bytes_for(self, n_elements: usize) -> Result<usize> {
-        let blk = self.block_elements();
-        if !n_elements.is_multiple_of(blk) {
-            bail!("{self:?}: element count {n_elements} not aligned to block size {blk}");
-        }
-        Ok((n_elements / blk) * self.block_bytes())
-    }
+define_kv_quant! {
+    Q8_0, GgmlType::Q8_0, rlx_gguf::dequant_q8_0, 32, ["q8", "q8_0"];
+    Q4_0, GgmlType::Q4_0, rlx_gguf::dequant_q4_0, 32, ["q4", "q4_0"];
+    Q5_0, GgmlType::Q5_0, rlx_gguf::dequant_q5_0, 32, ["q5", "q5_0"];
+    Q4_1, GgmlType::Q4_1, rlx_gguf::dequant_q4_1, 32, ["q4_1"];
+    Q5_1, GgmlType::Q5_1, rlx_gguf::dequant_q5_1, 32, ["q5_1"];
+    Q1_0, GgmlType::Q1_0, rlx_gguf::q1_dequant::dequant_q1_0, 128, ["q1", "q1_0"];
+    Q2_0, GgmlType::Q2_0, rlx_gguf::q2_dequant::dequant_q2_0, 128, ["q2", "q2_0"];
+    Q2K, GgmlType::Q2K, rlx_gguf::dequant_q2_k, 256, ["q2k", "q2_k"];
+    Q3K, GgmlType::Q3K, rlx_gguf::dequant_q3_k, 256, ["q3k", "q3_k"];
+    Q4K, GgmlType::Q4K, rlx_gguf::dequant_q4_k, 256, ["q4k", "q4_k"];
+    Q5K, GgmlType::Q5K, rlx_gguf::dequant_q5_k, 256, ["q5k", "q5_k"];
+    Q6K, GgmlType::Q6K, rlx_gguf::dequant_q6_k, 256, ["q6k", "q6_k"];
+    Q8K, GgmlType::Q8K, rlx_gguf::dequant_q8_k, 256, ["q8k", "q8_k"];
+    IQ4NL, GgmlType::IQ4NL, rlx_gguf::iq_dequant::dequant_iq4_nl, 32, ["iq4_nl", "iq4nl"];
+    IQ4XS, GgmlType::IQ4XS, rlx_gguf::iq_dequant::dequant_iq4_xs, 256, ["iq4_xs", "iq4xs"];
+    IQ2XXS, GgmlType::IQ2XXS, rlx_gguf::iq_dequant::dequant_iq2_xxs, 256, ["iq2_xxs", "iq2xxs"];
+    IQ2XS, GgmlType::IQ2XS, rlx_gguf::iq_dequant::dequant_iq2_xs, 256, ["iq2_xs", "iq2xs"];
+    IQ2S, GgmlType::IQ2S, rlx_gguf::iq_dequant::dequant_iq2_s, 256, ["iq2_s", "iq2s"];
+    IQ3XXS, GgmlType::IQ3XXS, rlx_gguf::iq_dequant::dequant_iq3_xxs, 256, ["iq3_xxs", "iq3xxs"];
+    IQ3S, GgmlType::IQ3S, rlx_gguf::iq_dequant::dequant_iq3_s, 256, ["iq3_s", "iq3s"];
+    IQ1S, GgmlType::IQ1S, rlx_gguf::iq_dequant::dequant_iq1_s, 256, ["iq1_s", "iq1s"];
+    IQ1M, GgmlType::IQ1M, rlx_gguf::iq_dequant::dequant_iq1_m, 256, ["iq1_m", "iq1m"];
+    TQ1_0, GgmlType::TQ1_0, rlx_gguf::tq_dequant::dequant_tq1_0, 256, ["tq1_0", "tq1"];
+    TQ2_0, GgmlType::TQ2_0, rlx_gguf::tq_dequant::dequant_tq2_0, 256, ["tq2_0", "tq2"];
 }
 
 /// One layer's quantized K/V buffers.
@@ -99,6 +146,7 @@ pub struct QuantizedKvLayer {
     pub past_len: usize,
     pub kv_dim: usize,
     pub scheme: KvQuant,
+    pub bytes_per_row: usize,
 }
 
 impl QuantizedKvLayer {
@@ -107,12 +155,14 @@ impl QuantizedKvLayer {
         if !kv_dim.is_multiple_of(blk) {
             bail!("kv_dim ({kv_dim}) must be a multiple of {scheme:?} block size ({blk})");
         }
+        let bytes_per_row = (kv_dim / blk) * scheme.block_bytes();
         Ok(Self {
             k: Vec::new(),
             v: Vec::new(),
             past_len: 0,
             kv_dim,
             scheme,
+            bytes_per_row,
         })
     }
 
@@ -161,9 +211,7 @@ impl QuantizedKvLayer {
                 self.past_len
             );
         }
-        let blk = self.scheme.block_elements();
-        let bytes_per_row = (self.kv_dim / blk) * self.scheme.block_bytes();
-        let start_byte = start * bytes_per_row;
+        let start_byte = start * self.bytes_per_row;
         let n = count * self.kv_dim;
         let k = dequant_rows(&self.k[start_byte..], self.scheme, n)?;
         let v = dequant_rows(&self.v[start_byte..], self.scheme, n)?;
@@ -184,9 +232,7 @@ impl QuantizedKvLayer {
         if n_rows == 0 {
             return Ok(());
         }
-        let blk = self.scheme.block_elements();
-        let blocks_per_row = self.kv_dim / blk;
-        let drop_bytes = n_rows * blocks_per_row * self.scheme.block_bytes();
+        let drop_bytes = n_rows * self.bytes_per_row;
         self.k.drain(..drop_bytes);
         self.v.drain(..drop_bytes);
         self.past_len -= n_rows;
@@ -345,65 +391,8 @@ fn dequant_rows(bytes: &[u8], scheme: KvQuant, n: usize) -> Result<Vec<f32>> {
             }
             Ok(out)
         }
-        KvQuant::Q8_0 => {
-            let expected = scheme.bytes_for(n)?;
-            Ok(rlx_gguf::dequant_q8_0(&bytes[..expected], n)?)
-        }
-        KvQuant::Q4_0 => {
-            let expected = scheme.bytes_for(n)?;
-            Ok(rlx_gguf::dequant_q4_0(&bytes[..expected], n)?)
-        }
-        KvQuant::Q5_0 => {
-            // Q5_0 doesn't have a top-level `dequant_q5_0` export — call the
-            // private path via dequant_f32 by building a one-shot GgufFile?
-            // Cleaner: use the per-block helper exposed indirectly through
-            // bytes_for + a hand-written loop. For now we use the public
-            // `dequant_q8_0`-style path which is exposed; Q5_0 needs the
-            // same. Until the gguf crate exposes a public `dequant_q5_0`,
-            // route through the same block-by-block decoder lifted from
-            // ggml-quants.c.
-            decode_q5_0(bytes, n)
-        }
+        _ => scheme.dequant_dispatch(bytes, n),
     }
-}
-
-fn decode_q5_0(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
-    const QK5_0: usize = 32;
-    let blk_bytes = 2 + 4 + QK5_0 / 2;
-    if !n.is_multiple_of(QK5_0) {
-        bail!("Q5_0: n={n} not divisible by {QK5_0}");
-    }
-    let nb = n / QK5_0;
-    if bytes.len() < nb * blk_bytes {
-        bail!(
-            "Q5_0: expected {} bytes, got {}",
-            nb * blk_bytes,
-            bytes.len()
-        );
-    }
-    let mut out = Vec::with_capacity(n);
-    for i in 0..nb {
-        let off = i * blk_bytes;
-        let d = half::f16::from_le_bytes([bytes[off], bytes[off + 1]]).to_f32();
-        let qh = u32::from_le_bytes([
-            bytes[off + 2],
-            bytes[off + 3],
-            bytes[off + 4],
-            bytes[off + 5],
-        ]);
-        let qs = &bytes[off + 6..off + 6 + QK5_0 / 2];
-        for j in 0..QK5_0 / 2 {
-            let xh0 = (((qh >> j) & 1) as u8) << 4;
-            let v0 = ((qs[j] & 0x0F) | xh0) as i32 - 16;
-            out.push(d * v0 as f32);
-        }
-        for j in 0..QK5_0 / 2 {
-            let xh1 = (((qh >> (j + 16)) & 1) as u8) << 4;
-            let v1 = ((qs[j] >> 4) | xh1) as i32 - 16;
-            out.push(d * v1 as f32);
-        }
-    }
-    Ok(out)
 }
 
 // ─── mmap-backed storage (feature = "mmap-kv") ───────────────────────
@@ -478,6 +467,49 @@ pub mod mmap {
                 .truncate(true)
                 .open(&path)?;
             file.set_len(total as u64)?;
+            let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
+            Ok(Self {
+                mmap,
+                past_len: 0,
+                capacity_rows,
+                kv_dim,
+                scheme,
+                bytes_per_row,
+                k_offset: 0,
+                v_offset: capacity_rows * bytes_per_row,
+                path: Some(path.as_ref().to_path_buf()),
+                file: Some(file),
+                pread: std::env::var_os("RLX_KVSTORE_PREAD").is_some(),
+            })
+        }
+
+        /// File-backed mapping that preserves existing contents. Opens `path`
+        /// read/write without truncating and maps `2 × capacity_rows × bytes_per_row`.
+        ///
+        /// This is used by KV-store reuse flows that rebuild retrieval metadata
+        /// and indexes without rewriting persisted K/V rows.
+        pub fn open_existing<P: AsRef<Path>>(
+            path: P,
+            kv_dim: usize,
+            scheme: KvQuant,
+            capacity_rows: usize,
+        ) -> Result<Self> {
+            let blk = scheme.block_elements();
+            if !kv_dim.is_multiple_of(blk) {
+                bail!("kv_dim ({kv_dim}) must be a multiple of {scheme:?} block size ({blk})");
+            }
+            let bytes_per_row = (kv_dim / blk) * scheme.block_bytes();
+            let total = 2 * capacity_rows * bytes_per_row;
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let cur_len = file.metadata()?.len() as usize;
+            if cur_len < total {
+                bail!(
+                    "open_existing: file too small ({} < expected {}): {}",
+                    cur_len,
+                    total,
+                    path.as_ref().display()
+                );
+            }
             let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
             Ok(Self {
                 mmap,
@@ -843,6 +875,71 @@ mod tests {
         dot / (na.sqrt() * nb.sqrt() + 1e-12)
     }
 
+    fn mae(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len()).max(1) as f32;
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .sum::<f32>()
+            / n
+    }
+
+    fn rmse(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len()).max(1) as f32;
+        (a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| {
+                let d = x - y;
+                d * d
+            })
+            .sum::<f32>()
+            / n)
+            .sqrt()
+    }
+
+    fn attention_reference(
+        q: &[f32],
+        k_all: &[f32],
+        v_all: &[f32],
+        n_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        past: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let kv_dim = kv_heads * head_dim;
+        let group = n_heads / kv_heads;
+        let mut out = vec![0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let kvh = h / group;
+            let mut sc = vec![0f32; past];
+            for p in 0..past {
+                let qh = &q[h * head_dim..(h + 1) * head_dim];
+                let base = p * kv_dim + kvh * head_dim;
+                let kh = &k_all[base..base + head_dim];
+                let dot: f32 = qh.iter().zip(kh).map(|(a, b)| a * b).sum();
+                sc[p] = dot * scale;
+            }
+            let max = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0;
+            for x in sc.iter_mut() {
+                *x = (*x - max).exp();
+                sum += *x;
+            }
+            for x in sc.iter_mut() {
+                *x /= sum;
+            }
+            for p in 0..past {
+                let base = p * kv_dim + kvh * head_dim;
+                let vh = &v_all[base..base + head_dim];
+                for d in 0..head_dim {
+                    out[h * head_dim + d] += sc[p] * vh[d];
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn block_size_invariants() {
         assert_eq!(KvQuant::F16.block_bytes(), 2);
@@ -1011,5 +1108,78 @@ mod tests {
         }
         assert!(q8.bytes() < f16.bytes());
         assert!(q4.bytes() < q8.bytes());
+    }
+
+    #[test]
+    fn q_variant_precision_report() {
+        // kv_dim must satisfy the largest block requirement (256 for K/IQ/TQ).
+        let (n_heads, kv_heads, head_dim) = (4usize, 2usize, 128usize);
+        let kv_dim = kv_heads * head_dim;
+        let past = 8usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let k_data: Vec<f32> = (0..past * kv_dim)
+            .map(|i| {
+                let x = i as f32;
+                (x * 0.017).sin() * 2.3 + (x * 0.003).cos() * 0.7
+            })
+            .collect();
+        let v_data: Vec<f32> = (0..past * kv_dim)
+            .map(|i| {
+                let x = i as f32;
+                (x * 0.013).cos() * 1.9 + (x * 0.005).sin() * 0.6
+            })
+            .collect();
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.021).sin() * 1.1)
+            .collect();
+        let ref_attn = attention_reference(
+            &q, &k_data, &v_data, n_heads, kv_heads, head_dim, past, scale,
+        );
+
+        let schemes = vec![
+            ("f16", KvQuant::F16),
+            ("q8_0", KvQuant::Q8_0),
+            ("q8k", KvQuant::Q8K),
+            ("q6k", KvQuant::Q6K),
+            ("q5_1", KvQuant::Q5_1),
+            ("q5_0", KvQuant::Q5_0),
+            ("q5k", KvQuant::Q5K),
+            ("q4_1", KvQuant::Q4_1),
+            ("q4_0", KvQuant::Q4_0),
+            ("q4k", KvQuant::Q4K),
+            ("q3k", KvQuant::Q3K),
+            ("q2k", KvQuant::Q2K),
+            ("q2_0", KvQuant::Q2_0),
+            ("q1_0", KvQuant::Q1_0),
+            ("iq4_nl", KvQuant::IQ4NL),
+            ("iq4_xs", KvQuant::IQ4XS),
+            ("iq3_s", KvQuant::IQ3S),
+            ("iq2_s", KvQuant::IQ2S),
+            ("iq1_s", KvQuant::IQ1S),
+            ("tq2_0", KvQuant::TQ2_0),
+            ("tq1_0", KvQuant::TQ1_0),
+        ];
+
+        println!("scheme,k_cos,v_cos,k_mae,v_mae,attn_cos,attn_rmse,bytes_per_row");
+        for (name, scheme) in schemes {
+            let mut layer = QuantizedKvLayer::new(kv_dim, scheme).unwrap();
+            layer.append_rows(&k_data, &v_data).unwrap();
+            let (kr, vr) = layer.read_all().unwrap();
+            let attn = attend_quantized(&q, &layer, n_heads, kv_heads, head_dim, scale).unwrap();
+
+            let k_cos = cosine(&kr, &k_data);
+            let v_cos = cosine(&vr, &v_data);
+            let k_mae = mae(&kr, &k_data);
+            let v_mae = mae(&vr, &v_data);
+            let a_cos = cosine(&attn, &ref_attn);
+            let a_rmse = rmse(&attn, &ref_attn);
+
+            assert!(k_cos.is_finite() && v_cos.is_finite() && a_cos.is_finite());
+            println!(
+                "{name},{k_cos:.6},{v_cos:.6},{k_mae:.6},{v_mae:.6},{a_cos:.6},{a_rmse:.6},{}",
+                layer.bytes_per_row
+            );
+        }
     }
 }

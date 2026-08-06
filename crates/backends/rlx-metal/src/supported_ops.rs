@@ -65,6 +65,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Transpose,
         Narrow,
         Concat,
+        KvAppend,
         Expand,
         Gather,
         Reverse,

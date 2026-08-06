@@ -104,14 +104,18 @@ impl BlockStage for Qwen3DecodeLayerStage {
             rlx_ir::DType::F32
         };
         let in_ln_g = ctx.load_param(&format!("{lp}.input_layernorm.weight"), false)?;
-        let q_w = ctx.load_param_typed(&format!("{lp}.self_attn.q_proj.weight"), true, w_dt)?;
-        let k_w = ctx.load_param_typed(&format!("{lp}.self_attn.k_proj.weight"), true, w_dt)?;
-        let v_w = ctx.load_param_typed(&format!("{lp}.self_attn.v_proj.weight"), true, w_dt)?;
-        let o_w = ctx.load_param_typed(&format!("{lp}.self_attn.o_proj.weight"), true, w_dt)?;
+        // Projections route through `resolve_linear`: a packed `WeightSource`
+        // (K-quant GGUF) yields a fused `DequantMatMul` over the U8 blob (no F32
+        // weight residency — the low-memory packed decode path); an F32 source
+        // falls back to a dense `mm`, byte-identical to the default runner.
+        let q_w = ctx.resolve_linear(&format!("{lp}.self_attn.q_proj.weight"), true, w_dt)?;
+        let k_w = ctx.resolve_linear(&format!("{lp}.self_attn.k_proj.weight"), true, w_dt)?;
+        let v_w = ctx.resolve_linear(&format!("{lp}.self_attn.v_proj.weight"), true, w_dt)?;
+        let o_w = ctx.resolve_linear(&format!("{lp}.self_attn.o_proj.weight"), true, w_dt)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
-        let gate_w = ctx.load_param_typed(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?;
-        let up_w = ctx.load_param_typed(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?;
-        let down_w = ctx.load_param_typed(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?;
+        let gate_w = ctx.resolve_linear(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?;
+        let up_w = ctx.resolve_linear(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?;
+        let down_w = ctx.resolve_linear(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?;
         let (q_bias, k_bias, v_bias) = if spec.attention_bias {
             (
                 Some(ctx.load_param(&format!("{lp}.self_attn.q_proj.bias"), false)?),
@@ -136,9 +140,9 @@ impl BlockStage for Qwen3DecodeLayerStage {
         let mut gb = HirMut::new(ctx.hir());
         let skip = input.id;
         let normed_in = gb.rms_norm(skip, in_ln_g, zero_beta_h, spec.eps);
-        let mut q = gb.mm(normed_in, q_w);
-        let mut k = gb.mm(normed_in, k_w);
-        let mut v = gb.mm(normed_in, v_w);
+        let mut q = q_w.emit(&mut gb, normed_in);
+        let mut k = k_w.emit(&mut gb, normed_in);
+        let mut v = v_w.emit(&mut gb, normed_in);
 
         if let (Some(qb), Some(kb), Some(vb)) = (q_bias, k_bias, v_bias) {
             q = gb.add(q, qb);
@@ -170,8 +174,22 @@ impl BlockStage for Qwen3DecodeLayerStage {
             (k_rope, v)
         };
 
-        let new_k = gb.concat_(vec![past_k, k_rope], 1);
-        let new_v = gb.concat_(vec![past_v, v], 1);
+        // In-place KV append (opt-in `RLX_QWEN3_INPLACE_KV`): write the new row
+        // into `past_k/v` at index `past_seq` instead of concat-copying the whole
+        // O(context) cache. Requires the flow to declare `past_k/v` one row
+        // larger (`[batch, past_seq+1, kv_dim]`) so the aliased output fits.
+        let (new_k, new_v) = if rlx_ir::env::flag("RLX_QWEN3_INPLACE_KV") {
+            let pos = gb.shape(past_k).dim(1).unwrap_static() - 1;
+            (
+                gb.kv_append(past_k, k_rope, 1, pos),
+                gb.kv_append(past_v, v, 1, pos),
+            )
+        } else {
+            (
+                gb.concat_(vec![past_k, k_rope], 1),
+                gb.concat_(vec![past_v, v], 1),
+            )
+        };
         self.kv_out.lock().expect("kv out").push(new_k);
         self.kv_out.lock().expect("kv out").push(new_v);
 
@@ -204,14 +222,14 @@ impl BlockStage for Qwen3DecodeLayerStage {
             gb.attention_kind(q_rope, k_attn, v_attn, nh, dh, MaskKind::Causal, attn_shape)
         };
 
-        let attn_out = gb.mm(attn, o_w);
+        let attn_out = o_w.emit(&mut gb, attn);
         let post_attn = gb.add(skip, attn_out);
         let normed_post = gb.rms_norm(post_attn, post_ln_g, zero_beta_h, spec.eps);
-        let gate = gb.mm(normed_post, gate_w);
-        let up = gb.mm(normed_post, up_w);
+        let gate = gate_w.emit(&mut gb, normed_post);
+        let up = up_w.emit(&mut gb, normed_post);
         let gate_act = gb.silu(gate);
         let swiglu = gb.mul(gate_act, up);
-        let ffn_out = gb.mm(swiglu, down_w);
+        let ffn_out = down_w.emit(&mut gb, swiglu);
         let h_id = gb.add(post_attn, ffn_out);
 
         Ok(Some(ctx.wrap(h_id, spec.hidden_shape.clone())))

@@ -155,6 +155,42 @@ impl ExecutableGraph for MetalExecutableWrapper {
             .feed_kv_batch_major(dst_row, batch, seq_cap, row_elems);
         true
     }
+    fn feed_kv_batch_major_src(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_row: usize,
+        batch: usize,
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) -> bool {
+        self.inner.feed_kv_batch_major_src(
+            src_row,
+            src_seq_cap,
+            dst_row,
+            batch,
+            dst_seq_cap,
+            row_elems,
+        );
+        true
+    }
+    fn feed_kv_batch_major_ragged(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_rows: &[usize],
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) -> bool {
+        self.inner.feed_kv_batch_major_ragged(
+            src_row,
+            src_seq_cap,
+            dst_rows,
+            dst_seq_cap,
+            row_elems,
+        );
+        true
+    }
     fn read_output_row(&self, out_idx: usize, row: usize, row_inner: usize) -> Option<Vec<f32>> {
         Some(self.inner.read_graph_output_row(out_idx, row, row_inner))
     }

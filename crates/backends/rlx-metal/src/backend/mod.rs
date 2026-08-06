@@ -12,6 +12,7 @@
 
 use rlx_ir::{Graph, NodeId};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::arena::Arena;
 use crate::device::metal_device;
@@ -113,6 +114,13 @@ pub struct MetalExecutable {
     /// already computed once. On later steps those concats are skipped — the
     /// fused (constant) weight is left in place, saving the per-token re-copy.
     baked_weight_concats: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// Persistent scratch for flash-decode SDPA partials (`RLX_METAL_SDPA_FLASH_DECODE`):
+    /// float[(bi*heads+hi)*n_part + part][2 + 128]. Lazily sized/grown per call.
+    sdpa_flash_scratch: std::cell::RefCell<Option<metal::Buffer>>,
+    /// Persistent int8 scratch for the W8A8 decode-attention path
+    /// (`RLX_METAL_W8A8_ATTN`): int8 K ‖ int8 V ‖ f32 K-scales ‖ f32 V-scales,
+    /// each 256-B aligned. Lazily sized/grown per call.
+    sdpa_w8a8_scratch: std::cell::RefCell<Option<metal::Buffer>>,
     /// Persistent F32 scratch for promoting F16 Linear weights before sgemm
     /// (legacy path; prefer native `sgemm_f16w`).
     #[allow(dead_code)]
@@ -128,11 +136,261 @@ pub struct MetalExecutable {
     /// `concat(past_k, k_new)`). Driven via [`feed_kv_row`]; kept separate from
     /// `gpu_handle_feeds` so the generic prefix propagation never fires for these.
     kv_row_feeds: HashMap<String, usize>,
+    /// Planner for decode-attention kernel variant selection.
+    sdpa_kernel_plan: crate::kernel_plan::KernelPlan,
+    /// Persisted winner table: token bucket → preferred SDPA decode candidate.
+    sdpa_tune_winners: std::cell::RefCell<HashMap<u16, crate::kernel_plan::SdpaDecodeCandidate>>,
+    /// Per-bucket recency ticks for LRU eviction.
+    sdpa_tune_last_used: std::cell::RefCell<HashMap<u16, u64>>,
+    /// Monotonic counter used to stamp accesses/updates in LRU mode.
+    sdpa_tune_tick: std::cell::Cell<u64>,
+    /// True once the winner table has been loaded from disk (best-effort).
+    sdpa_tune_loaded: std::cell::Cell<bool>,
 }
 
 unsafe impl Send for MetalExecutable {}
 
+fn sdpa_tune_drop_keys(
+    table: &HashMap<u16, crate::kernel_plan::SdpaDecodeCandidate>,
+    last_used: &HashMap<u16, u64>,
+    max_entries: usize,
+    eviction: crate::kernel_plan::TuneCacheEviction,
+) -> Vec<u16> {
+    if table.len() <= max_entries {
+        return Vec::new();
+    }
+    let drop_n = table.len() - max_entries;
+    match eviction {
+        crate::kernel_plan::TuneCacheEviction::KeepLowBuckets => {
+            let mut keys: Vec<u16> = table.keys().copied().collect();
+            keys.sort_unstable();
+            keys.into_iter().rev().take(drop_n).collect()
+        }
+        crate::kernel_plan::TuneCacheEviction::KeepHighBuckets => {
+            let mut keys: Vec<u16> = table.keys().copied().collect();
+            keys.sort_unstable();
+            keys.into_iter().take(drop_n).collect()
+        }
+        crate::kernel_plan::TuneCacheEviction::Lru => {
+            let mut ranked: Vec<(u16, u64)> = table
+                .keys()
+                .copied()
+                .map(|k| (k, last_used.get(&k).copied().unwrap_or(0)))
+                .collect();
+            ranked.sort_by_key(|(k, ts)| (*ts, *k));
+            ranked.into_iter().take(drop_n).map(|(k, _)| k).collect()
+        }
+    }
+}
+
+fn parse_sdpa_tune_table_text(
+    text: &str,
+) -> (
+    HashMap<u16, crate::kernel_plan::SdpaDecodeCandidate>,
+    HashMap<u16, u64>,
+    u64,
+) {
+    let mut table: HashMap<u16, crate::kernel_plan::SdpaDecodeCandidate> = HashMap::new();
+    let mut last_used: HashMap<u16, u64> = HashMap::new();
+    let mut max_tick = 0u64;
+    for line in text.lines() {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        let mut cols = s.split('\t');
+        let bucket = cols.next().and_then(|v| v.parse::<u16>().ok());
+        let tag = cols.next();
+        let tick = cols.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        if let (Some(bucket), Some(tag)) = (bucket, tag)
+            && let Some(candidate) = crate::kernel_plan::SdpaDecodeCandidate::from_tag(tag)
+        {
+            table.insert(bucket, candidate);
+            last_used.insert(bucket, tick);
+            max_tick = max_tick.max(tick);
+        }
+    }
+    (table, last_used, max_tick)
+}
+
+fn render_sdpa_tune_table_text(
+    table: &HashMap<u16, crate::kernel_plan::SdpaDecodeCandidate>,
+    last_used: &HashMap<u16, u64>,
+) -> String {
+    let mut rows: Vec<(u16, crate::kernel_plan::SdpaDecodeCandidate)> =
+        table.iter().map(|(k, v)| (*k, *v)).collect();
+    rows.sort_by_key(|(k, _)| *k);
+    let mut out = String::from("# token_bucket\tcandidate\tlast_used_tick\n");
+    for (bucket, cand) in rows {
+        let tick = last_used.get(&bucket).copied().unwrap_or(0);
+        out.push_str(&format!("{bucket}\t{}\t{tick}\n", cand.tag()));
+    }
+    out
+}
+
+fn load_sdpa_tune_table_file(
+    path: &std::path::Path,
+    max_entries: usize,
+    eviction: crate::kernel_plan::TuneCacheEviction,
+) -> (
+    HashMap<u16, crate::kernel_plan::SdpaDecodeCandidate>,
+    HashMap<u16, u64>,
+    u64,
+) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (HashMap::new(), HashMap::new(), 0);
+    };
+    let (mut table, mut last_used, max_tick) = parse_sdpa_tune_table_text(&text);
+    let to_drop = sdpa_tune_drop_keys(&table, &last_used, max_entries.max(1), eviction);
+    for key in to_drop {
+        table.remove(&key);
+        last_used.remove(&key);
+    }
+    (table, last_used, max_tick)
+}
+
+fn persist_sdpa_tune_table_file(
+    path: &std::path::Path,
+    table: &HashMap<u16, crate::kernel_plan::SdpaDecodeCandidate>,
+    last_used: &HashMap<u16, u64>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let out = render_sdpa_tune_table_text(table, last_used);
+    std::fs::write(path, out)
+}
+
 impl MetalExecutable {
+    fn sdpa_tune_cache_path(&self) -> PathBuf {
+        if let Some(p) = crate::runtime_config().sdpa_tune_cache_path {
+            return PathBuf::from(p);
+        }
+        std::env::temp_dir().join("rlx-metal-sdpa-tune-v1.tsv")
+    }
+
+    fn sdpa_tune_cache_load_enabled(&self) -> bool {
+        crate::runtime_config().sdpa_tune_cache_load && self.sdpa_kernel_plan.tune_policy.cache_load
+    }
+
+    fn sdpa_tune_cache_persist_enabled(&self) -> bool {
+        crate::runtime_config().sdpa_tune_cache_persist
+            && self.sdpa_kernel_plan.tune_policy.persist_cache
+    }
+
+    fn sdpa_tune_cache_max_entries(&self) -> usize {
+        crate::runtime_config()
+            .sdpa_tune_cache_max_entries
+            .max(1)
+            .min(self.sdpa_kernel_plan.tune_policy.cache_max_entries.max(1))
+    }
+
+    fn sdpa_tune_cache_eviction(&self) -> crate::kernel_plan::TuneCacheEviction {
+        crate::runtime_config().sdpa_tune_cache_eviction
+    }
+
+    fn next_sdpa_tune_tick(&self) -> u64 {
+        let next = self.sdpa_tune_tick.get().saturating_add(1);
+        self.sdpa_tune_tick.set(next);
+        next
+    }
+
+    fn mark_sdpa_tune_used(&self, token_bucket: u16) {
+        let tick = self.next_sdpa_tune_tick();
+        self.sdpa_tune_last_used
+            .borrow_mut()
+            .insert(token_bucket, tick);
+    }
+
+    fn trim_sdpa_tune_table(&self) {
+        let max_entries = self.sdpa_tune_cache_max_entries();
+        let eviction = self.sdpa_tune_cache_eviction();
+        let mut table = self.sdpa_tune_winners.borrow_mut();
+        if table.len() <= max_entries {
+            return;
+        }
+        let last_used_snapshot = self.sdpa_tune_last_used.borrow().clone();
+        let mut to_drop = sdpa_tune_drop_keys(&table, &last_used_snapshot, max_entries, eviction);
+
+        if !to_drop.is_empty() {
+            let mut last_used = self.sdpa_tune_last_used.borrow_mut();
+            for key in to_drop.drain(..) {
+                table.remove(&key);
+                last_used.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn sdpa_tuned_candidate(
+        &self,
+        token_bucket: u16,
+    ) -> Option<crate::kernel_plan::SdpaDecodeCandidate> {
+        if !self.sdpa_tune_cache_load_enabled() {
+            return None;
+        }
+        if !self.sdpa_tune_loaded.get() {
+            self.load_sdpa_tune_table();
+        }
+        let candidate = self.sdpa_tune_winners.borrow().get(&token_bucket).copied();
+        if candidate.is_some() {
+            self.mark_sdpa_tune_used(token_bucket);
+        }
+        candidate
+    }
+
+    pub(crate) fn sdpa_record_candidate(
+        &self,
+        token_bucket: u16,
+        candidate: crate::kernel_plan::SdpaDecodeCandidate,
+    ) {
+        if !self.sdpa_tune_loaded.get() {
+            self.load_sdpa_tune_table();
+        }
+        let mut table = self.sdpa_tune_winners.borrow_mut();
+        let changed = table.get(&token_bucket).copied() != Some(candidate);
+        if changed {
+            table.insert(token_bucket, candidate);
+            drop(table);
+            self.mark_sdpa_tune_used(token_bucket);
+            self.trim_sdpa_tune_table();
+            if self.sdpa_tune_cache_persist_enabled() {
+                self.persist_sdpa_tune_table();
+            }
+        } else {
+            drop(table);
+            self.mark_sdpa_tune_used(token_bucket);
+        }
+    }
+
+    fn load_sdpa_tune_table(&self) {
+        self.sdpa_tune_loaded.set(true);
+        if !self.sdpa_tune_cache_load_enabled() {
+            return;
+        }
+        let path = self.sdpa_tune_cache_path();
+        let (table, last_used, max_tick) = load_sdpa_tune_table_file(
+            &path,
+            self.sdpa_tune_cache_max_entries(),
+            self.sdpa_tune_cache_eviction(),
+        );
+        *self.sdpa_tune_winners.borrow_mut() = table;
+        *self.sdpa_tune_last_used.borrow_mut() = last_used;
+        self.sdpa_tune_tick.set(max_tick);
+    }
+
+    fn persist_sdpa_tune_table(&self) {
+        if !self.sdpa_tune_cache_persist_enabled() {
+            return;
+        }
+        let path = self.sdpa_tune_cache_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let table = self.sdpa_tune_winners.borrow();
+        let last_used = self.sdpa_tune_last_used.borrow();
+        let _ = persist_sdpa_tune_table_file(&path, &table, &last_used);
+    }
+
     /// Resolve a thunk offset that may be tagged for the weight MTLBuffer.
     #[inline]
     pub(crate) fn resolve_off(&self, tagged: usize) -> (&metal::Buffer, usize) {
@@ -217,11 +475,159 @@ impl MetalExecutable {
 
 impl Drop for MetalExecutable {
     fn drop(&mut self) {
+        crate::prefill_stats::maybe_report_delta("drop");
         // Drain deferred commits before releasing MTL buffers / MPSGraph
         // executables — otherwise Metal logs "operations may not have completed".
         self.sync_pending();
         crate::device::drain_command_queue();
         crate::mps_blas::invalidate_caches();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand0() -> crate::kernel_plan::SdpaDecodeCandidate {
+        crate::kernel_plan::SdpaDecodeVariant::BaseF32.candidate()
+    }
+
+    fn cand1() -> crate::kernel_plan::SdpaDecodeCandidate {
+        crate::kernel_plan::SdpaDecodeVariant::PartialF16Kv.candidate()
+    }
+
+    #[test]
+    fn eviction_keep_low_buckets_drops_highest_keys() {
+        let mut table = HashMap::new();
+        table.insert(0u16, cand0());
+        table.insert(2u16, cand0());
+        table.insert(5u16, cand1());
+        let last_used = HashMap::new();
+        let dropped = sdpa_tune_drop_keys(
+            &table,
+            &last_used,
+            2,
+            crate::kernel_plan::TuneCacheEviction::KeepLowBuckets,
+        );
+        assert_eq!(dropped, vec![5u16]);
+    }
+
+    #[test]
+    fn eviction_keep_high_buckets_drops_lowest_keys() {
+        let mut table = HashMap::new();
+        table.insert(0u16, cand0());
+        table.insert(2u16, cand0());
+        table.insert(5u16, cand1());
+        let last_used = HashMap::new();
+        let dropped = sdpa_tune_drop_keys(
+            &table,
+            &last_used,
+            2,
+            crate::kernel_plan::TuneCacheEviction::KeepHighBuckets,
+        );
+        assert_eq!(dropped, vec![0u16]);
+    }
+
+    #[test]
+    fn eviction_lru_drops_oldest_tick() {
+        let mut table = HashMap::new();
+        table.insert(1u16, cand0());
+        table.insert(2u16, cand0());
+        table.insert(3u16, cand1());
+        let mut last_used = HashMap::new();
+        last_used.insert(1u16, 30u64);
+        last_used.insert(2u16, 10u64);
+        last_used.insert(3u16, 20u64);
+        let dropped = sdpa_tune_drop_keys(
+            &table,
+            &last_used,
+            2,
+            crate::kernel_plan::TuneCacheEviction::Lru,
+        );
+        assert_eq!(dropped, vec![2u16]);
+    }
+
+    #[test]
+    fn tune_table_text_roundtrip_keeps_ticks() {
+        let mut table = HashMap::new();
+        table.insert(1u16, cand0());
+        table.insert(4u16, cand1());
+        let mut last_used = HashMap::new();
+        last_used.insert(1u16, 5u64);
+        last_used.insert(4u16, 12u64);
+
+        let text = render_sdpa_tune_table_text(&table, &last_used);
+        let (parsed_table, parsed_last_used, max_tick) = parse_sdpa_tune_table_text(&text);
+
+        assert_eq!(parsed_table, table);
+        assert_eq!(parsed_last_used, last_used);
+        assert_eq!(max_tick, 12u64);
+    }
+
+    #[test]
+    fn tune_table_text_parses_legacy_two_column_rows() {
+        let c0 = cand0();
+        let c1 = cand1();
+        let text = format!(
+            "# token_bucket\tcandidate\n2\t{}\n6\t{}\n",
+            c0.tag(),
+            c1.tag()
+        );
+
+        let (parsed_table, parsed_last_used, max_tick) = parse_sdpa_tune_table_text(&text);
+
+        assert_eq!(parsed_table.get(&2), Some(&c0));
+        assert_eq!(parsed_table.get(&6), Some(&c1));
+        assert_eq!(parsed_last_used.get(&2), Some(&0u64));
+        assert_eq!(parsed_last_used.get(&6), Some(&0u64));
+        assert_eq!(max_tick, 0u64);
+    }
+
+    #[test]
+    fn tune_table_file_load_trim_persist_with_lru() {
+        let c0 = cand0();
+        let c1 = cand1();
+        let mut input_table = HashMap::new();
+        input_table.insert(1u16, c0);
+        input_table.insert(2u16, c1);
+        input_table.insert(3u16, c0);
+        let mut input_last_used = HashMap::new();
+        input_last_used.insert(1u16, 30u64);
+        input_last_used.insert(2u16, 10u64);
+        input_last_used.insert(3u16, 20u64);
+
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "rlx-metal-sdpa-cache-test-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        path.push(unique);
+
+        persist_sdpa_tune_table_file(&path, &input_table, &input_last_used).expect("persist");
+
+        let (loaded_table, loaded_last_used, max_tick) =
+            load_sdpa_tune_table_file(&path, 2, crate::kernel_plan::TuneCacheEviction::Lru);
+
+        assert_eq!(loaded_table.len(), 2);
+        assert!(loaded_table.contains_key(&1));
+        assert!(loaded_table.contains_key(&3));
+        assert!(!loaded_table.contains_key(&2));
+        assert_eq!(loaded_last_used.get(&1), Some(&30u64));
+        assert_eq!(loaded_last_used.get(&3), Some(&20u64));
+        assert_eq!(max_tick, 30u64);
+
+        persist_sdpa_tune_table_file(&path, &loaded_table, &loaded_last_used).expect("persist");
+        let (roundtrip_table, roundtrip_last_used, roundtrip_max_tick) =
+            parse_sdpa_tune_table_text(&std::fs::read_to_string(&path).expect("read"));
+        assert_eq!(roundtrip_table, loaded_table);
+        assert_eq!(roundtrip_last_used, loaded_last_used);
+        assert_eq!(roundtrip_max_tick, 30u64);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -655,6 +1061,93 @@ impl MetalExecutable {
                 for b in 0..batch {
                     let src_elem = b * row_elems;
                     let dst_elem = b * seq_cap * row_elems + dst_row * row_elems;
+                    self.arena
+                        .copy_node_f32_range(in_id, dst_elem, out_id, src_elem, row_elems);
+                }
+            }
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+    }
+
+    /// Strided-source batch-major resident KV feed: fold the new token from a
+    /// registered output shaped `[B, src_seq_cap, row_elems]` (new token at
+    /// `src_row` within each batch block — e.g. the FULL appended cache `[B,
+    /// upper+1, kv_dim]` with `src_row = upper`) into the resident input handle
+    /// `[B, dst_seq_cap, row_elems]` at `dst_row`. Generalizes
+    /// [`Self::feed_kv_batch_major`] (which assumes a new-token-only `[B, 1]`
+    /// output) to decode graphs that emit the whole cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn feed_kv_batch_major_src(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_row: usize,
+        batch: usize,
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) {
+        if batch == 0 || row_elems == 0 {
+            return;
+        }
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, out_idx) in feeds {
+            if out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[out_idx];
+            let Some(&in_id) = self.input_ids.get(name.as_str()) else {
+                continue;
+            };
+            if in_id != out_id {
+                for b in 0..batch {
+                    let src_elem = (b * src_seq_cap + src_row) * row_elems;
+                    let dst_elem = (b * dst_seq_cap + dst_row) * row_elems;
+                    self.arena
+                        .copy_node_f32_range(in_id, dst_elem, out_id, src_elem, row_elems);
+                }
+            }
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+    }
+
+    /// Ragged batch-major resident KV feed: like [`Self::feed_kv_batch_major_src`]
+    /// but each batch element folds into its OWN `dst_rows[b]` (its sequence's
+    /// current `past_len`) — for fused decode of sequences at MIXED cache lengths.
+    pub fn feed_kv_batch_major_ragged(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_rows: &[usize],
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) {
+        let batch = dst_rows.len();
+        if batch == 0 || row_elems == 0 {
+            return;
+        }
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, out_idx) in feeds {
+            if out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[out_idx];
+            let Some(&in_id) = self.input_ids.get(name.as_str()) else {
+                continue;
+            };
+            if in_id != out_id {
+                for (b, &dst_row) in dst_rows.iter().enumerate() {
+                    let src_elem = (b * src_seq_cap + src_row) * row_elems;
+                    let dst_elem = (b * dst_seq_cap + dst_row) * row_elems;
                     self.arena
                         .copy_node_f32_range(in_id, dst_elem, out_id, src_elem, row_elems);
                 }

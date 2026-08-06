@@ -57,6 +57,10 @@ fn boundary_tail_guard(op: &rlx_ir::Op, alignment: usize) -> usize {
 fn pure_view_offset(graph: &Graph, node: &rlx_ir::Node) -> Option<(NodeId, usize)> {
     match &node.op {
         Op::Reshape { .. } => Some((node.inputs[0], 0)),
+        // KvAppend's output aliases `cache` (input 0) at offset 0 — the planner
+        // gives it cache's slot (no copy). Unlike a pure view it still WRITES a
+        // row, so `is_pure_view` (the backend Nop predicate) excludes it below.
+        Op::KvAppend { .. } => Some((node.inputs[0], 0)),
         Op::Cast { to } => {
             let parent = graph.node(node.inputs[0]);
             if parent.shape.dtype() == *to {
@@ -86,7 +90,9 @@ fn pure_view_offset(graph: &Graph, node: &rlx_ir::Node) -> Option<(NodeId, usize
 /// a Nop because its output aliases a parent buffer (the memory
 /// planner has already aliased its slot).
 pub fn is_pure_view(graph: &Graph, node: &rlx_ir::Node) -> bool {
-    pure_view_offset(graph, node).is_some()
+    // KvAppend aliases its parent's slot (so it's in `pure_view_offset`) but is
+    // NOT a no-op — the backend must still encode the single-row write.
+    !matches!(node.op, Op::KvAppend { .. }) && pure_view_offset(graph, node).is_some()
 }
 
 /// A buffer slot in the memory arena.

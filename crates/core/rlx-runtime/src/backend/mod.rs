@@ -574,6 +574,37 @@ pub trait ExecutableGraph: Send {
         false
     }
 
+    /// Strided-source batch-major KV feed (folds the new token from a
+    /// `[B, src_seq_cap, row_elems]` output at `src_row` into a `[B, dst_seq_cap,
+    /// row_elems]` resident handle at `dst_row`). Default: unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn feed_kv_batch_major_src(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_row: usize,
+        batch: usize,
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) -> bool {
+        let _ = (src_row, src_seq_cap, dst_row, batch, dst_seq_cap, row_elems);
+        false
+    }
+
+    /// Ragged variant of [`Self::feed_kv_batch_major_src`]: each batch element
+    /// folds into its own `dst_rows[b]`. Default: unsupported.
+    fn feed_kv_batch_major_ragged(
+        &mut self,
+        src_row: usize,
+        src_seq_cap: usize,
+        dst_rows: &[usize],
+        dst_seq_cap: usize,
+        row_elems: usize,
+    ) -> bool {
+        let _ = (src_row, src_seq_cap, dst_rows, dst_seq_cap, row_elems);
+        false
+    }
+
     /// Mark a graph input as a device-resident handle with no host mirror.
     fn prepare_resident_gpu_handle(&mut self, _name: &str) -> bool {
         false

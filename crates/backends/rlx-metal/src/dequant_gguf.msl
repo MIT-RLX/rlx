@@ -68,19 +68,14 @@ constant int kvalues_iq4nl_lut[16] = {
 };
 
 inline float dq_read_f16(device const uchar* b, uint off) {
+    // Hardware half decode: reinterpret the two raw bytes as `half` (a native
+    // Apple-GPU type) instead of reconstructing sign/exp/mantissa in software.
+    // The old path had data-dependent branches + two `exp2()` transcendentals
+    // per scale, and it runs 2×/block inside the Q4_K/Q6_K dequant GEMV — the
+    // decode hot path. `as_type<half>` is a zero-cost bitcast; `float(half)` is
+    // one hardware convert.
     ushort bits = ushort(b[off]) | (ushort(b[off + 1u]) << 8u);
-    uint sign = (uint(bits) >> 15u) & 1u;
-    uint exp  = (uint(bits) >> 10u) & 0x1Fu;
-    uint mant = uint(bits) & 0x3FFu;
-    float v;
-    if (exp == 0u) {
-        v = float(mant) / 1024.0f * exp2(-14.0f);
-    } else if (exp == 31u) {
-        v = (mant == 0u) ? INFINITY : 0.0f;
-    } else {
-        v = (1.0f + float(mant) / 1024.0f) * exp2(float(int(exp) - 15));
-    }
-    return (sign != 0u) ? -v : v;
+    return float(as_type<half>(bits));
 }
 
 inline void dq_get_scale_min_k4(device const uchar* q, uint j, thread uint& sc, thread uint& mn) {
@@ -901,6 +896,136 @@ kernel void q4_1_mv_f32(
     dst[gid] = acc;
 }
 
+// ── Simdgroup-cooperative Q4_0 / Q4_1 GEMV ─────────────────────────────────
+//
+// 32 threads reduce Q40_NR0 output rows via `simd_sum`; Q40_NSG simdgroups per
+// threadgroup. Each thread owns 4 CONTIGUOUS packed bytes (il = tiisg%4 → bytes
+// il*4 .. +3) and reads each byte ONCE, extracting BOTH nibbles: low nibble →
+// element `j`, high nibble → element `j+16` (GGML Q4_0/Q4_1 layout). Reading the
+// byte once (vs the earlier low/high split, where two threads re-read the same
+// bytes) halves the weight traffic → bandwidth-bound like Q8_0. Strides 8 blocks.
+// Replaces the one-thread-per-row q4_0_mv_f32 / q4_1_mv_f32. `encode_q4_0_mv_f32_sg`
+// / `_q4_1_` MUST match.
+constant uint Q40_NR0 = 4u;
+constant uint Q40_NSG = 2u;
+
+kernel void q4_0_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = k_dim / 32u;
+    const uint first_row = (tgpig.x * Q40_NSG + sgitg) * Q40_NR0;
+    if (first_row >= n_dim) return;
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* w_base = (device const uchar*)arena + w_off;
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+
+    const uint ix    = (uint)tiisg / 4u;   // 0..7 : block stride
+    const uint il    = (uint)tiisg % 4u;   // 0..3 : 4-byte group
+    const uint bbase = il * 4u;            // byte base (0,4,8,12) → elems bbase / bbase+16
+
+    float yl[4];   // low-nibble y  (elements bbase .. bbase+3)
+    float yh[4];   // high-nibble y (elements bbase+16 .. bbase+19)
+    float sumf[Q40_NR0] = {0.f};
+    device const float* yblo = x_base + ix * 32u + bbase;
+    device const float* ybhi = x_base + ix * 32u + bbase + 16u;
+
+    for (uint ib = ix; ib < nb; ib += 8u) {
+        #pragma unroll
+        for (short i = 0; i < 4; ++i) { yl[i] = yblo[i]; yh[i] = ybhi[i]; }
+        #pragma unroll
+        for (ushort row = 0; row < Q40_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const uchar* blk = w_base + (row_idx * nb + ib) * 18u;
+            const float d = dq_read_f16(blk, 0u);
+            device const uchar* qs = blk + 2u + bbase;
+            float sumq = 0.f;
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                const uchar b = qs[i];
+                sumq += yl[i] * (float(int(b & 0x0Fu)) - 8.0f)
+                      + yh[i] * (float(int(b >> 4)) - 8.0f);
+            }
+            sumf[row] += sumq * d;
+        }
+        yblo += 32u * 8u;
+        ybhi += 32u * 8u;
+    }
+    for (ushort row = 0; row < Q40_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) dst[row_idx] = total;
+    }
+}
+
+kernel void q4_1_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = k_dim / 32u;
+    const uint first_row = (tgpig.x * Q40_NSG + sgitg) * Q40_NR0;
+    if (first_row >= n_dim) return;
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* w_base = (device const uchar*)arena + w_off;
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+
+    const uint ix    = (uint)tiisg / 4u;
+    const uint il    = (uint)tiisg % 4u;
+    const uint bbase = il * 4u;
+
+    float yl[4];
+    float yh[4];
+    float sumf[Q40_NR0] = {0.f};
+    device const float* yblo = x_base + ix * 32u + bbase;
+    device const float* ybhi = x_base + ix * 32u + bbase + 16u;
+
+    for (uint ib = ix; ib < nb; ib += 8u) {
+        #pragma unroll
+        for (short i = 0; i < 4; ++i) { yl[i] = yblo[i]; yh[i] = ybhi[i]; }
+        #pragma unroll
+        for (ushort row = 0; row < Q40_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const uchar* blk = w_base + (row_idx * nb + ib) * 20u;
+            const float d = dq_read_f16(blk, 0u);
+            const float m = dq_read_f16(blk, 2u);
+            device const uchar* qs = blk + 4u + bbase;
+            float sumq = 0.f, sumy = 0.f;
+            #pragma unroll
+            for (short i = 0; i < 4; ++i) {
+                const uchar b = qs[i];
+                sumq += yl[i] * float(int(b & 0x0Fu)) + yh[i] * float(int(b >> 4));
+                sumy += yl[i] + yh[i];
+            }
+            sumf[row] += sumq * d + sumy * m;
+        }
+        yblo += 32u * 8u;
+        ybhi += 32u * 8u;
+    }
+    for (ushort row = 0; row < Q40_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) dst[row_idx] = total;
+    }
+}
+
 kernel void q8_0_mv_f32(
     device float* arena         [[buffer(0)]],
     constant ulong& x_off         [[buffer(1)]],
@@ -934,6 +1059,74 @@ kernel void q8_0_mv_f32(
         }
     }
     dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
+}
+
+// ── Simdgroup-cooperative Q8_0 GEMV ────────────────────────────────────────
+//
+// Same math as `q8_0_mv_f32` but 32 threads cooperate on Q8_0_NR0 output rows
+// (NSG simdgroups per threadgroup), each thread summing NB=8 of the 32 block
+// elements and striding 8 blocks, then `simd_sum` reduces. Replaces the
+// one-thread-per-row `q8_0_mv_f32` (occupancy-starved at small n — a 1024-wide
+// projection launches only ~n threads). Port of llama.cpp's
+// `kernel_mul_mv_q8_0_f32_impl` (N_DST=4, N_SIMDGROUP=2, NB=8).
+// `encode_q8_0_mv_f32_sg` (ops.rs) MUST match these constants.
+constant uint Q8_0_NR0 = 4u;
+constant uint Q8_0_NSG = 2u;
+constant uint Q8_0_NB  = 8u;
+constant uint Q8_0_BLK_BYTES = 34u;
+
+kernel void q8_0_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = k_dim / 32u;                 // blocks per row
+    const uint first_row = (tgpig.x * Q8_0_NSG + sgitg) * Q8_0_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* w_base = (device const uchar*)arena + w_off;
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+
+    const uint ix = (uint)tiisg / 4u;            // 0..7 : block stride
+    const uint il = (uint)tiisg % 4u;            // 0..3 : which 8 of the 32 elems
+
+    float yl[8];
+    float sumf[Q8_0_NR0] = {0.f};
+
+    device const float* yb = x_base + ix * 32u + il * Q8_0_NB;
+
+    for (uint ib = ix; ib < nb; ib += 8u) {
+        #pragma unroll
+        for (short i = 0; i < 8; ++i) yl[i] = yb[i];
+
+        #pragma unroll
+        for (ushort row = 0; row < Q8_0_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const char* qs = (device const char*)(w_base
+                + (row_idx * nb + ib) * Q8_0_BLK_BYTES) + 2 + il * Q8_0_NB;
+            const float d = dq_read_f16(w_base + (row_idx * nb + ib) * Q8_0_BLK_BYTES, 0u);
+            float sumq = 0.f;
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) sumq += float(qs[i]) * yl[i];
+            sumf[row] += sumq * d;
+        }
+        yb += 32u * 8u;                          // stride 8 blocks
+    }
+
+    for (ushort row = 0; row < Q8_0_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) dst[row_idx] = total;
+    }
 }
 
 // ── Fused Q1_0 GEMV (prism-ml Bonsai-27B): dst[n] = sum_k x[k]*dequant(w[n,k])
@@ -1464,6 +1657,112 @@ kernel void q3k_mv_f32(
     dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
 }
 
+// ── Simdgroup-cooperative Q3_K GEMV ────────────────────────────────────────
+//
+// Same dequant math as the validated `q3k_mv_f32` (ggml `dequantize_row_q3_K`).
+// Thread `tiisg` owns the 8 consecutive elements `g0=tiisg*8 ..+7` of every
+// 256-elem super-block; because `g0` is a multiple of 8 they share one (sub-
+// block, group t, low/high half) → one scale index, shift and hmask bit, all
+// hoisted. `Q3K_NR0` output rows share the query load `yl[8]` (2 accumulators
+// for ILP); hmask is branchless (`low2 + 4*hbit - 4`) and `dl` is factored out.
+//
+// RE NOTE — this is Q3_K's floor at ~48 GB/s (vs Q4_K ~185): it is DEQUANT-ALU
+// bound, not read-bound. A "byte-once" rewrite (each thread reads its qs/hmask
+// bytes once, extracts all 8 values, killing the 4×/8× redundant reads) was
+// tried and measured SLOWER (~42) — the redundant reads are cache-cheap, and it
+// added the 16-scale reconstruction. Q6_K (also 2-array ql+qh) hits ~161 because
+// its values are cheap 4-bit nibbles; Q3_K's 2-bit-shift + hmask-bit-test +
+// offset per value is ~4× the arithmetic and irreducible. So Q3_K stays ~2.8×
+// slower than Q4_K regardless of kernel structure. `encode_q3k_mv_f32_sg` MUST
+// match `Q3K_NSG`/`Q3K_NR0`.
+constant uint Q3K_NSG = 4u;
+constant uint Q3K_NR0 = 2u;
+
+kernel void q3k_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint KMASK1 = 0x03030303u;
+    const uint KMASK2 = 0x0f0f0f0fu;
+    const uint BLK_BYTES = 110u;              // hmask[32] | qs[64] | scales[12] | d(f16)
+    const uint nb = k_dim / DQ_QK_K;
+
+    const uint first_row = (tgpig.x * Q3K_NSG + sgitg) * Q3K_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* y_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* w_base = (device const uchar*)arena + w_off;
+    device float*       dst     = (device float*)((device char*)arena + dst_off);
+
+    const uint g0    = (uint)tiisg * 8u;      // 0,8,...,248
+    const uint sb    = g0 / 128u;             // 0 or 1
+    const uint loc0  = g0 % 128u;
+    const uint t     = loc0 / 32u;            // 0..3 : shift group
+    const uint hf    = (loc0 % 32u) / 16u;    // 0 = low 16, 1 = high 16 (`half` is reserved)
+    const uint l0    = loc0 % 16u;            // 0 or 8
+    const uint shift = 2u * t;
+    const uint hmbit = sb * 4u + t;
+    const uint is    = sb * 8u + t * 2u + hf;
+    const uint qbase = sb * 32u + hf * 16u + l0;
+    const uint hmbase = hf * 16u + l0;
+    // This thread needs exactly ONE of the 16 unpacked scales (`is`, constant).
+    const uint sgrp = is / 4u;              // which packed aux word (0..3)
+    const uint sbsh = (is % 4u) * 8u;       // byte position within it
+
+    float sumf[Q3K_NR0] = {0.f};
+    for (uint b = 0u; b < nb; ++b) {
+        // Query slice loaded ONCE per block, reused across the NR0 output rows.
+        float yl[8];
+        device const float* y = y_base + b * DQ_QK_K + g0;
+        #pragma unroll
+        for (uint e = 0u; e < 8u; ++e) yl[e] = y[e];
+
+        #pragma unroll
+        for (ushort row = 0u; row < Q3K_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const uchar* blk = w_base + ((ulong)row_idx * nb + b) * BLK_BYTES;
+            device const uchar* hm  = blk;        // hmask[32]
+            device const uchar* q   = blk + 32u;  // qs[64]
+            const float d_all = dq_read_f16(blk, 108u);
+
+            // Reconstruct only the aux word `sgrp` holding this thread's scale.
+            const uint raw0 = uint(blk[96]) | (uint(blk[97]) << 8) | (uint(blk[98]) << 16) | (uint(blk[99]) << 24);
+            const uint raw1 = uint(blk[100]) | (uint(blk[101]) << 8) | (uint(blk[102]) << 16) | (uint(blk[103]) << 24);
+            const uint raw2 = uint(blk[104]) | (uint(blk[105]) << 8) | (uint(blk[106]) << 16) | (uint(blk[107]) << 24);
+            uint aux;
+            if (sgrp == 0u)      aux = (raw0 & KMASK2) | (((raw2 >> 0) & KMASK1) << 4);
+            else if (sgrp == 1u) aux = (raw1 & KMASK2) | (((raw2 >> 2) & KMASK1) << 4);
+            else if (sgrp == 2u) aux = ((raw0 >> 4) & KMASK2) | (((raw2 >> 4) & KMASK1) << 4);
+            else                 aux = ((raw1 >> 4) & KMASK2) | (((raw2 >> 6) & KMASK1) << 4);
+            const float dl = d_all * float(int((aux >> sbsh) & 0xFFu) - 32);
+
+            float s = 0.f;
+            #pragma unroll
+            for (uint e = 0u; e < 8u; ++e) {
+                const int low2 = int((q[qbase + e] >> shift) & 3u);
+                const float hbit = float((hm[hmbase + e] >> hmbit) & 1u);
+                s += yl[e] * (float(low2) + 4.0f * hbit - 4.0f);  // ≡ low2 - (hbit?0:4)
+            }
+            sumf[row] += dl * s;
+        }
+    }
+    #pragma unroll
+    for (ushort row = 0u; row < Q3K_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) dst[row_idx] = total;
+    }
+}
+
 // ── Fused single-pass Q6_K GEMV (one output row per thread) ────────────
 // The Q6_K LM head (`output.weight`, 5120×248320) otherwise dequantized ~5 GB
 // to an f32 scratch + MPS sgemm every decode step. Reads the packed row
@@ -1519,6 +1818,77 @@ kernel void q6k_mv_f32(
     dst[gid] = acc;
 }
 
+// ── Simdgroup-cooperative Q6_K GEMV ────────────────────────────────────────
+//
+// Same math as `q6k_mv_f32` (validated, used for the Q6_K LM head) but 32
+// threads cooperate on ONE output row via `simd_sum`: `tid = tiisg/2` (0..15)
+// picks a (ip,il) partition of the 256-wide super-block, `ix = tiisg%2` splits
+// blocks even/odd, so the 32 lanes reduce a full row. NSG simdgroups per
+// threadgroup → NSG rows. Replaces the one-thread-per-row `q6k_mv_f32`
+// (occupancy-starved at small n). Port of llama.cpp `kernel_mul_mv_q6_K_f32_impl`
+// (its `kmask` high-bit extraction is bit-identical to the shift form above).
+// `encode_q6k_mv_f32_sg` (ops.rs) MUST match `Q6K_NSG`.
+constant uint Q6K_NSG = 4u;
+
+kernel void q6k_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const ushort kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
+    const uint BLK_BYTES = 210u;
+    const uint nb = k_dim / DQ_QK_K;
+
+    const uint row_idx = tgpig.x * Q6K_NSG + sgitg;
+    if (row_idx >= n_dim) return;
+
+    device const float* y_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* xrow   = (device const uchar*)arena + w_off
+                               + (ulong)row_idx * nb * BLK_BYTES;
+    device float*       dst     = (device float*)((device char*)arena + dst_off);
+
+    const uint tid = (uint)tiisg / 2u;   // 0..15 : super-block partition
+    const uint ix  = (uint)tiisg % 2u;   // 0..1  : block parity (even/odd)
+    const uint ip  = tid / 8u;           // 0 or 1 : which 128-half
+    const uint il  = tid % 8u;           // 0..7
+    const uint l0  = 4u * il;            // 0,4,...,28
+    const uint is       = 8u * ip + l0 / 16u;
+    const uint y_offset = 128u * ip + l0;
+    const uint q_off_l  = 64u * ip + l0;
+    const uint q_off_h  = 32u * ip + l0;
+
+    float sumf = 0.f;
+    for (uint i = ix; i < nb; i += 2u) {
+        device const uchar* blk = xrow + i * BLK_BYTES;
+        device const uchar* q1  = blk + q_off_l;              // ql  (bytes 0..127)
+        device const uchar* q2  = q1 + 32u;
+        device const uchar* qh  = blk + 128u + q_off_h;       // qh  (bytes 128..191)
+        device const char*  sc  = (device const char*)(blk + 192u) + is; // int8 scales
+        device const float* y   = y_base + i * DQ_QK_K + y_offset;
+        const float dall = dq_read_f16(blk, 208u);
+
+        float4 sums = float4(0.f);
+        #pragma unroll
+        for (uint l = 0u; l < 4u; ++l) {
+            sums[0] += y[l +  0] * float(int((q1[l] & 0x0Fu) | ((qh[l] & kmask1) << 4)) - 32);
+            sums[1] += y[l + 32] * float(int((q2[l] & 0x0Fu) | ((qh[l] & kmask2) << 2)) - 32);
+            sums[2] += y[l + 64] * float(int((q1[l] >>   4)  | ((qh[l] & kmask3) >> 0)) - 32);
+            sums[3] += y[l + 96] * float(int((q2[l] >>   4)  | ((qh[l] & kmask4) >> 2)) - 32);
+        }
+        sumf += dall * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+                      + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+    }
+
+    const float total = simd_sum(sumf);
+    if (tiisg == 0u) dst[row_idx] = total;
+}
+
 // ── Simdgroup-cooperative Q4_K_M GEMV (8 outputs per simdgroup) ─────────
 //
 // Same math as `q4k_mv_f32` but 32 threads cooperate on 8 output columns
@@ -1531,7 +1901,12 @@ kernel void q6k_mv_f32(
 //
 // Grid: one threadgroup per group-of-8 outputs. Threadgroup size = 32
 // (one simdgroup). `tgpig.x` = output-group index.
-constant uint Q4K_NR0 = 8u;
+// Rows per simdgroup. Small (2) keeps the m=1 decode GEMV from starving the
+// GPU: at NR0=8 a 1024-wide projection launched only ~32 threadgroups → 8% of
+// peak bandwidth (measured); NR0=2 → ~128 threadgroups → 38-42% (5× faster).
+// Large-n (lm_head) is already bandwidth-saturated either way. Dispatch grid in
+// `encode_q4k_mv_f32_sg` (ops.rs) MUST match this.
+constant uint Q4K_NR0 = 2u;
 constant uint Q4K_BLK_BYTES = 144u;
 constant uint Q4K_KSCALE_OFF = 4u;
 constant uint Q4K_QS_OFF     = 4u + 12u;
@@ -2099,6 +2474,72 @@ kernel void iq3_xxs_mv_f32(
     dst[gid] = acc;
 }
 
+// ── Simdgroup-cooperative IQ3_XXS GEMV ──────────────────────────────────────
+// Same codebook dequant as `iq3_xxs_mv_f32` but 32 threads reduce ONE row via
+// `simd_sum` (`IQ3XXS_NSG` rows/tg). Thread `tiisg` owns one (ib32, l) → the 8
+// output elements at `ib32*32 + l*8 + j` (j=0..7): 2 grid lookups (4 int8 each)
+// + sign plane. Fair-fight `_sg` for the "is any 3-bit format faster" question.
+constant uint IQ3XXS_NSG = 4u;
+
+kernel void iq3_xxs_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut    [[buffer(6)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint BLK_BYTES = 98u;
+    const uint nb = k_dim / DQ_QK_K;
+    const uint row_idx = tgpig.x * IQ3XXS_NSG + sgitg;
+    if (row_idx >= n_dim) return;
+
+    device const float* y_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* xrow   = (device const uchar*)arena + w_off + (ulong)row_idx * nb * BLK_BYTES;
+    device float*       dst     = (device float*)((device char*)arena + dst_off);
+
+    const uint ib32  = (uint)tiisg / 4u;   // 0..7 : 32-element sub-group
+    const uint l     = (uint)tiisg % 4u;   // 0..3
+    const uint ebase = ib32 * 32u + l * 8u;
+
+    float sumf = 0.f;
+    for (uint b = 0u; b < nb; ++b) {
+        device const uchar* blk = xrow + b * BLK_BYTES;
+        const float d = dq_read_f16(blk, 0u);
+        device const uchar* qs  = blk + 2u;
+        device const uchar* sas = blk + 2u + 64u;
+        device const float* y   = y_base + b * DQ_QK_K + ebase;
+
+        const uint aux32 = uint(sas[ib32 * 4u]) | (uint(sas[ib32 * 4u + 1u]) << 8)
+                         | (uint(sas[ib32 * 4u + 2u]) << 16) | (uint(sas[ib32 * 4u + 3u]) << 24);
+        const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+        const uchar signs = lut_u8(iq_lut, IQ_GRID_OFF_KSIGNS + ((aux32 >> (7u * l)) & 127u));
+        const uint g1_off = IQ_GRID_OFF_IQ3XXS + uint(qs[ib32 * 8u + 2u * l]) * 4u;
+        const uint g2_off = IQ_GRID_OFF_IQ3XXS + uint(qs[ib32 * 8u + 2u * l + 1u]) * 4u;
+
+        float s = 0.f;
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const int g1 = lut_i8(iq_lut, g1_off + j);
+            const float s0 = (signs & lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j)) != 0u ? -1.0f : 1.0f;
+            s += y[j] * (float(g1) * s0);
+        }
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const int g2 = lut_i8(iq_lut, g2_off + j);
+            const float s1 = (signs & lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j + 4u)) != 0u ? -1.0f : 1.0f;
+            s += y[4u + j] * (float(g2) * s1);
+        }
+        sumf += db * s;
+    }
+    const float total = simd_sum(sumf);
+    if (tiisg == 0u) dst[row_idx] = total;
+}
+
 kernel void iq2_s_mv_f32(
     device float* arena         [[buffer(0)]],
     constant ulong& x_off         [[buffer(1)]],
@@ -2209,6 +2650,80 @@ kernel void iq3_s_mv_f32(
         }
     }
     dst[gid] = acc;
+}
+
+// ── Simdgroup-cooperative IQ3_S GEMV ────────────────────────────────────────
+// Same codebook dequant as `iq3_s_mv_f32`, distributed 32-way. Thread `tiisg`
+// owns one (ip, half_iter, l) group → 8 output elements at
+// `ip*64 + half_iter*32 + l*8 + j` (j=0..7). ip=tiisg/8, half_iter=(tiisg%8)/4,
+// l=tiisg%4. `simd_sum` reduces the row. `IQ3S_NSG` rows/tg.
+constant uint IQ3S_NSG = 4u;
+
+kernel void iq3_s_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    device const uchar* iq_lut    [[buffer(6)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint BLK_BYTES = 110u;
+    const uint nb = k_dim / DQ_QK_K;
+    const uint row_idx = tgpig.x * IQ3S_NSG + sgitg;
+    if (row_idx >= n_dim) return;
+
+    device const float* y_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* xrow   = (device const uchar*)arena + w_off + (ulong)row_idx * nb * BLK_BYTES;
+    device float*       dst     = (device float*)((device char*)arena + dst_off);
+
+    const uint ip  = (uint)tiisg / 8u;         // 0..3 (ib32 = ip*2)
+    const uint hi2 = ((uint)tiisg % 8u) / 4u;  // half_iter 0/1
+    const uint l   = (uint)tiisg % 4u;         // 0..3
+    const uint ebase     = ip * 64u + hi2 * 32u + l * 8u;
+    const uint qs_base    = (ip * 2u + hi2) * 8u;
+    const uint signs_base = (ip * 2u + hi2) * 4u;
+
+    float sumf = 0.f;
+    for (uint b = 0u; b < nb; ++b) {
+        device const uchar* blk = xrow + b * BLK_BYTES;
+        const float d = dq_read_f16(blk, 0u);
+        device const uchar* qs     = blk + 2u;
+        device const uchar* qh     = blk + 2u + 64u;
+        device const uchar* signs  = blk + 2u + 64u + 8u;
+        device const uchar* scales = blk + 2u + 64u + 8u + 32u;
+        device const float* y = y_base + b * DQ_QK_K + ebase;
+
+        const uchar sc = scales[ip];
+        const float dl = (hi2 == 0u) ? d * (1.0f + 2.0f * float(sc & 0xFu))
+                                     : d * (1.0f + 2.0f * float(sc >> 4u));
+        const uint qh_byte = uint(qh[ip * 2u + hi2]);
+        const uint idx1 = uint(qs[qs_base + 2u * l]) | ((qh_byte << (8u - 2u * l)) & 256u);
+        const uint idx2 = uint(qs[qs_base + 2u * l + 1u]) | ((qh_byte << (7u - 2u * l)) & 256u);
+        const uint g1_off = IQ_GRID_OFF_IQ3S + idx1 * 4u;
+        const uint g2_off = IQ_GRID_OFF_IQ3S + idx2 * 4u;
+        const uchar sign = signs[signs_base + l];
+
+        float s = 0.f;
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const int g1 = lut_i8(iq_lut, g1_off + j);
+            const float s0 = (sign & lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j)) != 0u ? -1.0f : 1.0f;
+            s += y[j] * (float(g1) * s0);
+        }
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const int g2 = lut_i8(iq_lut, g2_off + j);
+            const float s1 = (sign & lut_u8(iq_lut, IQ_GRID_OFF_KMASK + j + 4u)) != 0u ? -1.0f : 1.0f;
+            s += y[4u + j] * (float(g2) * s1);
+        }
+        sumf += dl * s;
+    }
+    const float total = simd_sum(sumf);
+    if (tiisg == 0u) dst[row_idx] = total;
 }
 
 kernel void iq1_s_mv_f32(

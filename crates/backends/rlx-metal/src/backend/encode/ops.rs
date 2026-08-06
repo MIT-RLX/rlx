@@ -2060,6 +2060,404 @@ pub(crate) fn encode_fused_residual_rms_norm(
     enc.dispatch_thread_groups(tg_count, tg);
 }
 
+/// Choose the flash-decode partition count `P` for an m=1 decode attention:
+/// enough `heads*P` threadgroups to fill the GPU, but ≥32 keys/partition so
+/// each partition does real work. `RLX_METAL_SDPA_FLASH_P` overrides.
+pub(crate) fn sdpa_flash_partitions(batch: u32, heads: u32, kv_seq: u32) -> u32 {
+    sdpa_flash_partitions_tuned(batch, heads, kv_seq, 128, 32, 1)
+}
+
+/// Tile-aware partition chooser for m=1 flash decode. `tile_n` tunes
+/// occupancy target (threadgroups in flight), `tile_k` tunes desired keys per
+/// partition (granularity of KV slicing).
+pub(crate) fn sdpa_flash_partitions_tuned(
+    batch: u32,
+    heads: u32,
+    kv_seq: u32,
+    tile_n: u32,
+    tile_k: u32,
+    pad_kv: u32,
+) -> u32 {
+    if let Some(p) = crate::runtime_config().sdpa_flash_partitions {
+        return p.max(1);
+    }
+    let bh = (batch * heads).max(1);
+    // ~128 threadgroups fills the M4 Pro; past that the combine + redundant-Q
+    // overhead outweighs the occupancy gain (measured P-sweep @4k ctx: P=8→13.0,
+    // P=16→12.3, P=32→11.6 tok/s at 16 heads).
+    let target_tg = 128u32.max(tile_n.clamp(32, 1024));
+    let by_occupancy = target_tg.div_ceil(bh).max(1);
+    // ≥64 keys/partition — measured sweet spot for m=1 decode (M4 Pro): at ~256
+    // ctx, P=4 (64 keys/part) beats P=8 (32/part → combine overhead ≈ base
+    // kernel) and P=2; attention 6.4→3.75ms. Fewer, fatter partitions keep the
+    // combine cheap while still filling the GPU; occupancy still caps P at long ctx.
+    let keys_per_part = tile_k.clamp(64, 1024);
+    let padded_kv = kv_seq.div_ceil(pad_kv.max(1)) * pad_kv.max(1);
+    let by_keys = (padded_kv / keys_per_part).max(1);
+    by_occupancy.min(by_keys).max(1).min(64)
+}
+
+/// Flash-decoding (split-KV) SDPA for m=1 decode: `batch*heads*n_part`
+/// threadgroups each attend one KV slice and write a partial online-softmax
+/// state to `scratch`; `sdpa_decode_m1_combine` then merges the partials into
+/// OUT. Raises the decode-attention threadgroup count from `batch*heads` (≈16)
+/// to `batch*heads*n_part`, fixing the occupancy starvation. Numerically equal
+/// to `sdpa_decode_m1` (same online-softmax math, just partitioned).
+///
+/// `scratch` must hold ≥ `batch*heads*n_part*(2+128)` floats. Requires
+/// head_dim ≤ 128 and v_head_dim ≤ 128 (per-thread register accumulators).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_sdpa_flash_decode(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    scratch: &metal::Buffer,
+    n_part: u32,
+    q: usize,
+    k_off: usize,
+    v: usize,
+    mask: usize,
+    out: usize,
+    batch: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    v_head_dim: u32,
+    seq_stride: u32,
+    mask_kind: u32,
+    window: u32,
+    kv_seq: u32,
+    kv_stride: u32,
+    bhsd: u32,
+    score_scale: f32,
+    attn_logit_softcap: f32,
+    kv_f16: bool,
+) {
+    let kv_heads = if kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
+        heads
+    } else {
+        kv_heads
+    };
+    let v_head_dim = if v_head_dim == 0 {
+        head_dim
+    } else {
+        v_head_dim
+    };
+    let kv_v_pack: u64 = (kv_heads as u64) | ((v_head_dim as u64) << 32);
+    let offs_pack: [u64; 6] = [
+        q as u64,
+        k_off as u64,
+        v as u64,
+        mask as u64,
+        out as u64,
+        kv_v_pack,
+    ];
+    let u4 = std::mem::size_of::<u32>() as u64;
+    let f4 = std::mem::size_of::<f32>() as u64;
+
+    // ── Pass 1: partials ────────────────────────────────────────────────
+    // Head-dim-split variant (OPT-IN: RLX_METAL_SDPA_HDSPLIT=1) when D and vdh
+    // are multiples of 32: 8 regs/thread vs 256, coalesced K/V, no cross-lane o
+    // reduce. Token-identical, but MEASURED NEUTRAL on qwen3-0.6B decode — flash
+    // already yields 64-128 tgs, so occupancy isn't register-limited here, and
+    // it adds a per-key simd_sum. Kept for few-head / low-P models where the tg
+    // count IS register-bound. Default = the proven KV-split kernel.
+    let hd_split = head_dim.is_multiple_of(32)
+        && v_head_dim.is_multiple_of(32)
+        && rlx_ir::env::var("RLX_METAL_SDPA_HDSPLIT").as_deref() == Some("1");
+    let partial = match (hd_split, kv_f16) {
+        (true, true) => &k.sdpa_decode_m1_partial_hd_f16kv,
+        (true, false) => &k.sdpa_decode_m1_partial_hd,
+        (false, true) => &k.sdpa_decode_m1_partial_f16kv,
+        (false, false) => &k.sdpa_decode_m1_partial,
+    };
+    enc.set_compute_pipeline_state(partial);
+    for i in 0..5u64 {
+        enc.set_buffer(i, Some(buffer), 0);
+    }
+    enc.set_bytes(5, u4, &batch as *const u32 as *const _);
+    enc.set_bytes(6, u4, &heads as *const u32 as *const _);
+    enc.set_bytes(7, u4, &head_dim as *const u32 as *const _);
+    enc.set_bytes(8, u4, &seq_stride as *const u32 as *const _);
+    enc.set_bytes(9, u4, &mask_kind as *const u32 as *const _);
+    enc.set_bytes(10, u4, &kv_seq as *const u32 as *const _);
+    enc.set_bytes(11, u4, &kv_stride as *const u32 as *const _);
+    enc.set_bytes(12, u4, &bhsd as *const u32 as *const _);
+    enc.set_bytes(13, u4, &window as *const u32 as *const _);
+    enc.set_bytes(14, f4, &score_scale as *const f32 as *const _);
+    enc.set_bytes(15, f4, &attn_logit_softcap as *const f32 as *const _);
+    enc.set_bytes(
+        16,
+        (6 * std::mem::size_of::<u64>()) as u64,
+        offs_pack.as_ptr() as *const _,
+    );
+    enc.set_buffer(17, Some(scratch), 0);
+    enc.set_bytes(18, u4, &n_part as *const u32 as *const _);
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (batch as u64) * (heads as u64) * (n_part as u64),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    // ── Pass 2: combine (reads scratch written above; Serial-ordered) ────
+    enc.set_compute_pipeline_state(&k.sdpa_decode_m1_combine);
+    enc.set_buffer(0, Some(scratch), 0);
+    enc.set_buffer(1, Some(buffer), 0);
+    enc.set_bytes(2, u4, &batch as *const u32 as *const _);
+    enc.set_bytes(3, u4, &heads as *const u32 as *const _);
+    enc.set_bytes(4, u4, &n_part as *const u32 as *const _);
+    enc.set_bytes(5, u4, &head_dim as *const u32 as *const _);
+    enc.set_bytes(6, u4, &seq_stride as *const u32 as *const _);
+    enc.set_bytes(7, u4, &bhsd as *const u32 as *const _);
+    enc.set_bytes(
+        8,
+        (6 * std::mem::size_of::<u64>()) as u64,
+        offs_pack.as_ptr() as *const _,
+    );
+    let combine_threads = (v_head_dim.max(1) as u64).min(128);
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (batch as u64) * (heads as u64),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: combine_threads,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// W8A8 flash-decode: quantize the KV cache to int8 (into `i8scratch`), then run
+/// the int8 Q·K integer-dot partial + the SHARED f32 combine. Same math/shape as
+/// `encode_sdpa_flash_decode` but the score dot is integer (int8×int8→int32).
+/// `i8scratch` holds, in order (each 256-B aligned): int8 K, int8 V, f32 K-scales,
+/// f32 V-scales. The Serial encoder guarantees quantize → partial → combine order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_sdpa_flash_decode_w8a8(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    scratch: &metal::Buffer,
+    i8scratch: &metal::Buffer,
+    n_part: u32,
+    q: usize,
+    k_off: usize,
+    v: usize,
+    mask: usize,
+    out: usize,
+    batch: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    v_head_dim: u32,
+    seq_stride: u32,
+    mask_kind: u32,
+    window: u32,
+    kv_seq: u32,
+    kv_stride: u32,
+    bhsd: u32,
+    score_scale: f32,
+    attn_logit_softcap: f32,
+    kv_f16: bool,
+) {
+    let kv_heads = if kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
+        heads
+    } else {
+        kv_heads
+    };
+    let v_head_dim = if v_head_dim == 0 {
+        head_dim
+    } else {
+        v_head_dim
+    };
+    let kv_v_pack: u64 = (kv_heads as u64) | ((v_head_dim as u64) << 32);
+    let offs_pack: [u64; 6] = [
+        q as u64,
+        k_off as u64,
+        v as u64,
+        mask as u64,
+        out as u64,
+        kv_v_pack,
+    ];
+    let u4 = std::mem::size_of::<u32>() as u64;
+    let f4 = std::mem::size_of::<f32>() as u64;
+
+    // Scaling / V-source modes (env-gated probes). blk=1: per-32-block scales;
+    // v_i8=0 (RLX_METAL_W8A8_VMODE=f32): exact f32 V from arena (isolates K error).
+    let blk: u32 = if rlx_ir::env::flag("RLX_METAL_W8A8_BLOCK") {
+        1
+    } else {
+        0
+    };
+    let v_i8: u32 = if rlx_ir::env::var("RLX_METAL_W8A8_VMODE").as_deref() == Some("f32") {
+        0
+    } else {
+        1
+    };
+    let nbk = if blk != 0 { head_dim as u64 / 32 } else { 1 };
+
+    // int8-scratch section offsets (each 256-B aligned for set_buffer). Scales are
+    // nbk/nbv per row (per-32-block when blk=1, else 1 per row).
+    let align256 = |x: u64| (x + 255) & !255u64;
+    let nrows = (batch as u64) * (kv_heads as u64) * (kv_seq as u64);
+    let i8k_off: u64 = 0;
+    let i8v_off = align256(nrows * head_dim as u64);
+    let ksc_off = align256(i8v_off + nrows * v_head_dim as u64);
+    let vsc_off = align256(ksc_off + nrows * nbk * f4);
+
+    // Incremental-quantize TIMING probe: RLX_METAL_W8A8_INCR=<tokens> dispatches
+    // the quantize over only the last <tokens> rows instead of the whole cache —
+    // GPU op timing is value-independent, so the tps is FAITHFUL to a real
+    // persistent-int8-cache + incremental-append design (tokens are wrong, timing
+    // is not). Answers "does incremental flip W8A8 positive" without the full
+    // (RoPE-timing/prefill-seed/bucket-transition) cache-lifecycle integration.
+    let incr_tokens: u64 = rlx_ir::env::var("RLX_METAL_W8A8_INCR")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let quant_rows = if incr_tokens > 0 {
+        (incr_tokens * kv_heads as u64 * batch as u64).min(nrows)
+    } else {
+        nrows
+    };
+
+    // ── Pass 0: quantize K (and V unless v_i8==0) into the int8 scratch ──
+    let quant = if kv_f16 {
+        &k.kv_quant_i8_f16
+    } else {
+        &k.kv_quant_i8
+    };
+    let quant_kv = |src_off: usize, i8_off: u64, sc_off: u64, dh: u32| {
+        enc.set_compute_pipeline_state(quant);
+        enc.set_buffer(0, Some(buffer), 0);
+        enc.set_buffer(1, Some(i8scratch), i8_off);
+        enc.set_buffer(2, Some(i8scratch), sc_off);
+        let src = src_off as u64;
+        enc.set_bytes(
+            3,
+            std::mem::size_of::<u64>() as u64,
+            &src as *const u64 as *const _,
+        );
+        let nrows32 = nrows as u32;
+        enc.set_bytes(4, u4, &nrows32 as *const u32 as *const _);
+        enc.set_bytes(5, u4, &dh as *const u32 as *const _);
+        enc.set_bytes(6, u4, &bhsd as *const u32 as *const _);
+        enc.set_bytes(7, u4, &kv_heads as *const u32 as *const _);
+        enc.set_bytes(8, u4, &kv_seq as *const u32 as *const _);
+        enc.set_bytes(9, u4, &kv_stride as *const u32 as *const _);
+        enc.set_bytes(10, u4, &blk as *const u32 as *const _);
+        let tg = 64u64;
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: quant_rows.div_ceil(tg),
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
+        );
+    };
+    quant_kv(k_off, i8k_off, ksc_off, head_dim);
+    if v_i8 != 0 {
+        quant_kv(v, i8v_off, vsc_off, v_head_dim);
+    }
+
+    // ── Pass 1: W8A8 partials (int8 Q·K integer dot) ────────────────────
+    enc.set_compute_pipeline_state(&k.sdpa_decode_m1_partial_w8a8);
+    enc.set_buffer(0, Some(buffer), 0); // Q (arena)
+    enc.set_buffer(1, Some(i8scratch), i8k_off);
+    enc.set_buffer(2, Some(i8scratch), i8v_off);
+    enc.set_buffer(3, Some(buffer), 0); // mask (arena)
+    enc.set_buffer(4, Some(i8scratch), ksc_off);
+    enc.set_buffer(5, Some(i8scratch), vsc_off);
+    enc.set_bytes(6, u4, &batch as *const u32 as *const _);
+    enc.set_bytes(7, u4, &heads as *const u32 as *const _);
+    enc.set_bytes(8, u4, &head_dim as *const u32 as *const _);
+    enc.set_bytes(9, u4, &seq_stride as *const u32 as *const _);
+    enc.set_bytes(10, u4, &mask_kind as *const u32 as *const _);
+    enc.set_bytes(11, u4, &kv_seq as *const u32 as *const _);
+    enc.set_bytes(12, u4, &kv_stride as *const u32 as *const _);
+    enc.set_bytes(13, u4, &bhsd as *const u32 as *const _);
+    enc.set_bytes(14, u4, &window as *const u32 as *const _);
+    enc.set_bytes(15, f4, &score_scale as *const f32 as *const _);
+    enc.set_bytes(16, f4, &attn_logit_softcap as *const f32 as *const _);
+    enc.set_bytes(
+        17,
+        (6 * std::mem::size_of::<u64>()) as u64,
+        offs_pack.as_ptr() as *const _,
+    );
+    enc.set_buffer(18, Some(scratch), 0);
+    // q_i8: 1 = int8 Q integer dot (W8A8); 0 (RLX_METAL_W8A8_QMODE=f32) = f32 Q ·
+    // dequant int8 K. Packed with n_part + v_i8 + blk into one slot (buffer 19) —
+    // Metal aliases separate set_bytes past index 16.
+    let q_i8: u32 = if rlx_ir::env::var("RLX_METAL_W8A8_QMODE").as_deref() == Some("f32") {
+        0
+    } else {
+        1
+    };
+    // k_i8=0 (RLX_METAL_W8A8_KMODE=f32): exact K from arena — diagnostic isolation.
+    let k_i8: u32 = if rlx_ir::env::var("RLX_METAL_W8A8_KMODE").as_deref() == Some("f32") {
+        0
+    } else {
+        1
+    };
+    let packed19: u32 =
+        (n_part & 0xFFFF) | (q_i8 << 16) | (v_i8 << 17) | (blk << 18) | (k_i8 << 19);
+    enc.set_bytes(19, u4, &packed19 as *const u32 as *const _);
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (batch as u64) * (heads as u64) * (n_part as u64),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    // ── Pass 2: combine (shared with the f32 flash path) ────────────────
+    enc.set_compute_pipeline_state(&k.sdpa_decode_m1_combine);
+    enc.set_buffer(0, Some(scratch), 0);
+    enc.set_buffer(1, Some(buffer), 0);
+    enc.set_bytes(2, u4, &batch as *const u32 as *const _);
+    enc.set_bytes(3, u4, &heads as *const u32 as *const _);
+    enc.set_bytes(4, u4, &n_part as *const u32 as *const _);
+    enc.set_bytes(5, u4, &head_dim as *const u32 as *const _);
+    enc.set_bytes(6, u4, &seq_stride as *const u32 as *const _);
+    enc.set_bytes(7, u4, &bhsd as *const u32 as *const _);
+    enc.set_bytes(
+        8,
+        (6 * std::mem::size_of::<u64>()) as u64,
+        offs_pack.as_ptr() as *const _,
+    );
+    let combine_threads = (v_head_dim.max(1) as u64).min(128);
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (batch as u64) * (heads as u64),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: combine_threads,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_sdpa(
     enc: &metal::ComputeCommandEncoderRef,
@@ -2161,6 +2559,29 @@ pub(crate) fn encode_sdpa(
             && head_dim <= 128
             && v_head_dim <= 128
             && rlx_ir::env::flag("RLX_METAL_SDPA_SPLITK");
+        // Tiled flash-attention prefill (fixes O(seq²) sdpa_long at head_dim=128).
+        // Default for multi-row F32 prefill; the K/V tile is staged to tg memory
+        // (≈Br× less DRAM than sdpa_long). Handles causal / padding / sliding /
+        // no-mask; additive-bias (mask_kind==3) still uses sdpa_long. Off with
+        // RLX_METAL_PREFILL_FA=0.
+        let use_prefill_fa = seq > 1
+            && !use_mma
+            && !use_fa2
+            && !use_splitk
+            && !use_fa
+            && matches!(dt, HalfFlag::F32)
+            && head_dim <= 128
+            && v_head_dim <= 128
+            && mask_kind != 3
+            && rlx_ir::env::var("RLX_METAL_PREFILL_FA").as_deref() != Some("0");
+        // simdgroup-MMA variant (score/PV matmuls on the Apple tensor units).
+        // Opt-in (RLX_METAL_PREFILL_FA_MMA=1): measured a WASH vs the scalar FA
+        // at head_dim=128 — the kernel is barrier/softmax-bound, not matmul-bound,
+        // so the tensor units have nothing to bite on. Kept for other shapes/HW.
+        let use_prefill_fa_mma = use_prefill_fa
+            && head_dim.is_multiple_of(8)
+            && v_head_dim.is_multiple_of(8)
+            && rlx_ir::env::var("RLX_METAL_PREFILL_FA_MMA").as_deref() == Some("1");
         let pipeline = if use_mma {
             &k.sdpa_mma
         } else if use_fa2 {
@@ -2168,7 +2589,17 @@ pub(crate) fn encode_sdpa(
         } else if use_splitk {
             &k.sdpa_splitk
         } else if use_fa {
+            if seq > 1 {
+                crate::prefill_stats::record_sdpa_prefill_fa();
+            }
             &k.sdpa_fa_f32
+        } else if use_prefill_fa {
+            crate::prefill_stats::record_sdpa_prefill_fa();
+            if use_prefill_fa_mma {
+                &k.sdpa_prefill_fa_mma
+            } else {
+                &k.sdpa_prefill_fa
+            }
         } else if use_decode_m1 {
             // F16-resident KV cache: read K/V as half (f32 Q/accum/out).
             if kv_f16 {
@@ -2177,9 +2608,13 @@ pub(crate) fn encode_sdpa(
                 &k.sdpa_decode_m1
             }
         } else if seq > 1 && rlx_ir::env::flag("RLX_METAL_SDPA_OCCPAD") {
+            crate::prefill_stats::record_sdpa_long();
             // Occupancy probe: sdpa_long + 20 KB dummy tgMem (same work, lower occupancy).
             &k.sdpa_long_occpad
         } else {
+            if seq > 1 {
+                crate::prefill_stats::record_sdpa_long();
+            }
             &k.sdpa_long
         };
         enc.set_compute_pipeline_state(pipeline);
@@ -2390,6 +2825,23 @@ pub(crate) fn encode_sdpa(
             };
             let tg = metal::MTLSize {
                 width: 64,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_thread_groups(grid, tg);
+        } else if use_prefill_fa {
+            // Br=8 query rows per threadgroup; grid = (q_tiles, heads, batch).
+            // Scalar variant: 128 threads to stage the K/V tiles. MMA variant:
+            // 32 threads (one simdgroup owns the tensor-unit matmuls).
+            const BR: u32 = 8;
+            let q_tiles = seq.div_ceil(BR);
+            let grid = metal::MTLSize {
+                width: q_tiles as u64,
+                height: heads as u64,
+                depth: batch as u64,
+            };
+            let tg = metal::MTLSize {
+                width: 128, // 4 simdgroups: staging/scalar use all; MMA distributes
                 height: 1,
                 depth: 1,
             };
@@ -4416,10 +4868,12 @@ pub(crate) fn encode_q4k_mv_f32_sg(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-    // 4 simdgroups per threadgroup → 32 outputs per threadgroup.
-    // Threadgroup size = 128, grid sized to cover all output groups.
+    // 4 simdgroups per threadgroup; each simdgroup handles Q4K_NR0 output rows.
+    // MUST match `Q4K_NR0` in dequant_gguf.msl (2 → more threadgroups → the m=1
+    // decode GEMV fills the GPU instead of starving it at 8% of peak).
     const NSG: u64 = 4;
-    let n_output_groups = (n_dim.div_ceil(8)) as u64;
+    const Q4K_NR0: u64 = 2;
+    let n_output_groups = (n_dim.div_ceil(Q4K_NR0 as usize)) as u64;
     let n_threadgroups = n_output_groups.div_ceil(NSG);
     let grid = metal::MTLSize {
         width: n_threadgroups * NSG * 32,
@@ -4433,6 +4887,65 @@ pub(crate) fn encode_q4k_mv_f32_sg(
     };
     enc.dispatch_threads(grid, tg);
 }
+
+/// Generate a simdgroup-cooperative decode-GEMV encoder. Every `_sg` GEMV
+/// kernel takes the identical 6 buffers (arena, x_off, w_off, dst_off, k_dim,
+/// n_dim) and dispatches `NSG` simdgroups per threadgroup, each producing `NR0`
+/// output rows via `simd_sum`; only the pipeline field + `(NSG, NR0)` differ.
+/// `(NSG, NR0)` MUST match the kernel's constants in `dequant_gguf.msl`. One
+/// invocation per scheme (Q6_K/Q3_K reduce one row per simdgroup → NR0 = 1).
+macro_rules! sg_mv_encoder {
+    ($fn_name:ident, $pipe:ident, $nsg:expr, $nr0:expr) => {
+        pub(crate) fn $fn_name(
+            enc: &metal::ComputeCommandEncoderRef,
+            k: &crate::kernels::Kernels,
+            buffer: &metal::Buffer,
+            x: usize,
+            w_q: usize,
+            dst: usize,
+            k_dim: usize,
+            n_dim: usize,
+        ) {
+            enc.set_compute_pipeline_state(&k.$pipe);
+            enc.set_buffer(0, Some(buffer), 0);
+            let x_u = x as u64;
+            enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+            let w_u = w_q as u64;
+            enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+            let d_u = dst as u64;
+            enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+            let k_u = k_dim as u32;
+            enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+            let n_u = n_dim as u32;
+            enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+            const NSG: u64 = $nsg;
+            const NR0: u64 = $nr0;
+            let n_output_groups = (n_dim.div_ceil(NR0 as usize)) as u64;
+            let n_threadgroups = n_output_groups.div_ceil(NSG);
+            let grid = metal::MTLSize {
+                width: n_threadgroups * NSG * 32,
+                height: 1,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: NSG * 32,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_threads(grid, tg);
+        }
+    };
+}
+
+// One simdgroup-cooperative GEMV encoder per quant scheme. `_sg` kernels adapted
+// from llama.cpp's `mul_mv_q*_f32` (32-thread `simd_sum` reduction). NR0 = rows
+// per simdgroup; Q6_K/Q3_K reduce a whole 256-wide super-block row per simdgroup
+// so they emit one row each (NR0 = 1).
+sg_mv_encoder!(encode_q8_0_mv_f32_sg, q8_0_mv_f32_sg, 2, 4);
+sg_mv_encoder!(encode_q4_0_mv_f32_sg, q4_0_mv_f32_sg, 2, 4);
+sg_mv_encoder!(encode_q4_1_mv_f32_sg, q4_1_mv_f32_sg, 2, 4);
+sg_mv_encoder!(encode_q6k_mv_f32_sg, q6k_mv_f32_sg, 4, 1);
+sg_mv_encoder!(encode_q3k_mv_f32_sg, q3k_mv_f32_sg, 4, 2);
 
 /// Fused Q4_K / Q6_K GEMM (`m > 1`, prefill): `C[m,n] = A[m,k] @ dequant(w)^T`
 /// straight from the packed weight — no f32 scratch, no MPS sgemm. Grid is

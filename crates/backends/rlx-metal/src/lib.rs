@@ -128,6 +128,9 @@ pub mod async_copy;
 pub mod op_registry;
 
 #[cfg(rlx_metal_host)]
+pub mod prefill_stats;
+
+#[cfg(rlx_metal_host)]
 pub mod collective;
 
 /// Legalization op claim — always available (no Metal device required).
@@ -142,6 +145,10 @@ pub use supported_ops::SUPPORTED_OPS;
 /// segmenter + 3 unit tests); executor wiring + per-segment plan
 /// compilation is the next chunk.
 pub mod segmented;
+
+/// Typed kernel planning, precision legality, token bucketing, and two-stage
+/// build/launch configuration for Metal kernel families.
+pub mod kernel_plan;
 
 /// Whether a usable Metal device is present. `rlx-metal` is a Metal-only
 /// dependency (its consumers gate it to `cfg(all(target_vendor = "apple",

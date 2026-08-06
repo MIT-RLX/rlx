@@ -96,6 +96,120 @@ fn run_fused_mv(
     }
 }
 
+/// Simdgroup-cooperative IQ GEMV parity: dispatches `NSG` simdgroups/tg × 1 row
+/// (matches `iq3_xxs_mv_f32_sg`), binds the LUT at buffer 6, compares to CPU.
+fn run_iq_sg_mv(
+    pipeline: &metal::ComputePipelineState,
+    scheme: QuantScheme,
+    x: &[f32],
+    packed: &[u8],
+    k: usize,
+    n: usize,
+    lut: &Buffer,
+    nsg: u64,
+) {
+    let device = Device::system_default().expect("no Metal device");
+    let cmd_q = device.new_command_queue();
+    let x_bytes = x.len() * 4;
+    let w_bytes = packed.len();
+    let arena_bytes = (x_bytes + w_bytes + n * 4).div_ceil(16) * 16;
+    let arena: Buffer =
+        device.new_buffer(arena_bytes as u64, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        let p = arena.contents() as *mut u8;
+        std::ptr::write_bytes(p, 0, arena_bytes);
+        std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, p, x_bytes);
+        std::ptr::copy_nonoverlapping(packed.as_ptr(), p.add(x_bytes), w_bytes);
+    }
+    let (x_u, w_u, dst_u) = (0u64, x_bytes as u64, (x_bytes + w_bytes) as u64);
+    let (k_u, n_u) = (k as u32, n as u32);
+    let cmd_buf = cmd_q.new_command_buffer();
+    let enc = cmd_buf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(&arena), 0);
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    enc.set_bytes(3, 8, &dst_u as *const u64 as *const _);
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    enc.set_buffer(6, Some(lut), 0);
+    let tgs = (n as u64).div_ceil(nsg);
+    enc.dispatch_threads(
+        MTLSize {
+            width: tgs * nsg * 32,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: nsg * 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.end_encoding();
+    cmd_buf.commit();
+    cmd_buf.wait_until_completed();
+    let mut out = vec![0.0f32; n];
+    unsafe {
+        let src = (arena.contents() as *const u8).add(x_bytes + w_bytes) as *const f32;
+        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+    }
+    let mut cpu_out = vec![0f32; n];
+    rlx_cpu::gguf_matmul::gguf_matmul_bt(x, packed, &mut cpu_out, 1, k, n, scheme);
+    for j in 0..n {
+        assert!(
+            (out[j] - cpu_out[j]).abs() <= 5e-3,
+            "row {j}: sg={} ref={}",
+            out[j],
+            cpu_out[j]
+        );
+    }
+}
+
+#[test]
+fn iq3_xxs_mv_sg_matches_cpu_reference() {
+    let k = 512usize;
+    let n = 13usize; // not a multiple of NSG → exercises the row guard
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.031).sin()).collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+        .collect();
+    let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::IQ3XXS).unwrap();
+    let kerns = kernels();
+    run_iq_sg_mv(
+        &kerns.iq3_xxs_mv_f32_sg,
+        QuantScheme::GgufIQ3XXS,
+        &x,
+        &packed,
+        k,
+        n,
+        kerns.iq_grid_buffer(),
+        4,
+    );
+}
+
+#[test]
+fn iq3_s_mv_sg_matches_cpu_reference() {
+    let k = 512usize;
+    let n = 13usize;
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.027).sin()).collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i as f32) * 0.013).cos() * 0.5)
+        .collect();
+    let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::IQ3S).unwrap();
+    let kerns = kernels();
+    run_iq_sg_mv(
+        &kerns.iq3_s_mv_f32_sg,
+        QuantScheme::GgufIQ3S,
+        &x,
+        &packed,
+        k,
+        n,
+        kerns.iq_grid_buffer(),
+        4,
+    );
+}
+
 #[test]
 fn iq4_nl_mv_matches_cpu_reference() {
     let k = 64usize;

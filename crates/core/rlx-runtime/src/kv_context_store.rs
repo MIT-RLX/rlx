@@ -112,6 +112,7 @@ pub enum KeyMode {
 pub struct KvContextStore {
     kv_dim: usize,
     n_layers: usize,
+    #[allow(dead_code)]
     scheme: KvQuant,
     /// One append-only quantized mmap per layer.
     layers: Vec<MmapKvLayer>,
@@ -188,17 +189,49 @@ impl KvContextStore {
         centroids_per_block: usize,
         decay: f32,
     ) -> Result<Self> {
+        Self::new_with_reuse(
+            n_layers,
+            kv_dim,
+            scheme,
+            capacity_rows,
+            dir,
+            hnsw_cfg,
+            ef_search,
+            centroids_per_block,
+            decay,
+            false,
+        )
+    }
+
+    /// Like [`new`](Self::new), with optional reuse of existing mmap layer files.
+    ///
+    /// When `reuse_existing_files` is true and `dir` contains prior `ctx_kv_*.bin`
+    /// files of the expected size, mappings are opened without truncation so
+    /// persisted K/V rows can be read again while retrieval metadata is rebuilt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_reuse(
+        n_layers: usize,
+        kv_dim: usize,
+        scheme: KvQuant,
+        capacity_rows: usize,
+        dir: Option<&Path>,
+        hnsw_cfg: HnswConfig,
+        ef_search: usize,
+        centroids_per_block: usize,
+        decay: f32,
+        reuse_existing_files: bool,
+    ) -> Result<Self> {
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let layer = match dir {
                 Some(d) => {
                     std::fs::create_dir_all(d).ok();
-                    MmapKvLayer::open(
-                        d.join(format!("ctx_kv_{i}.bin")),
-                        kv_dim,
-                        scheme,
-                        capacity_rows,
-                    )?
+                    let path = d.join(format!("ctx_kv_{i}.bin"));
+                    if reuse_existing_files && path.exists() {
+                        MmapKvLayer::open_existing(path, kv_dim, scheme, capacity_rows)?
+                    } else {
+                        MmapKvLayer::open(path, kv_dim, scheme, capacity_rows)?
+                    }
                 }
                 None => MmapKvLayer::anonymous(kv_dim, scheme, capacity_rows)?,
             };
@@ -234,6 +267,47 @@ impl KvContextStore {
             read_blocks_ct: std::sync::atomic::AtomicU64::new(0),
             read_nanos: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Import block metadata for an already-persisted K/V span without writing
+    /// any new rows. This is intended for store-reuse flows that reconstruct
+    /// retrieval state from a sidecar manifest.
+    ///
+    /// `rows` rows are assumed to already exist at the next contiguous store
+    /// offset (`total_rows`) in every layer file.
+    pub fn import_block(
+        &mut self,
+        start_pos: usize,
+        rows: usize,
+        origin: Origin,
+        source_id: u32,
+    ) -> Result<usize> {
+        if rows == 0 {
+            return Ok(usize::MAX);
+        }
+        if self.total_rows + rows > self.layers[0].capacity_rows {
+            anyhow::bail!(
+                "import_block: would exceed capacity ({} + {} > {})",
+                self.total_rows,
+                rows,
+                self.layers[0].capacity_rows
+            );
+        }
+        let start_row = self.total_rows;
+        let block_id = self.blocks.len() as u32;
+        self.blocks.push(BlockRef {
+            start_row,
+            rows,
+            start_pos,
+            origin,
+            source_id,
+        });
+        self.last_used.push(self.clock);
+        self.total_rows += rows;
+        for layer in &mut self.layers {
+            layer.past_len = self.total_rows;
+        }
+        Ok(block_id as usize)
     }
 
     /// Choose how per-block HNSW keys are derived. Call before appending blocks
@@ -757,13 +831,13 @@ impl KvContextStore {
         k: usize,
         keep: impl Fn(Origin) -> bool,
     ) -> Vec<RetrievedBlock> {
-        self.block_hits(query, k * 2)
+        let hits: Vec<(u32, f32)> = self
+            .block_hits(query, k * 2)
             .into_iter()
             .filter(|&(b, _)| self.blocks.get(b as usize).is_some_and(|x| keep(x.origin)))
             .take(k)
-            .inspect(|&(b, _)| self.prefetch(b))
-            .filter_map(|(b, score)| self.read_block(b, score, false))
-            .collect()
+            .collect();
+        self.read_blocks_batched(hits)
     }
 
     /// Exact **MaxSim** (late-interaction) score of a block against `query`:
@@ -825,11 +899,7 @@ impl KvContextStore {
                 .then(a.0.cmp(&b.0))
         });
         scored.truncate(k);
-        scored
-            .into_iter()
-            .inspect(|&(b, _)| self.prefetch(b))
-            .filter_map(|(b, score)| self.read_block(b, score, false))
-            .collect()
+        self.read_blocks_batched(scored)
     }
 
     /// **Exact** retrieval: brute-force MaxSim over EVERY block (no HNSW
@@ -850,11 +920,7 @@ impl KvContextStore {
                 .then(a.0.cmp(&b.0))
         });
         scored.truncate(k);
-        scored
-            .into_iter()
-            .inspect(|&(b, _)| self.prefetch(b))
-            .filter_map(|(b, score)| self.read_block(b, score, false))
-            .collect()
+        self.read_blocks_batched(scored)
     }
 
     /// All-layer MaxSim of a block: for each row, sum the per-layer dot
@@ -918,11 +984,7 @@ impl KvContextStore {
                 .then(a.0.cmp(&b.0))
         });
         scored.truncate(k);
-        scored
-            .into_iter()
-            .inspect(|&(b, _)| self.prefetch(b))
-            .filter_map(|(b, score)| self.read_block(b, score, false))
-            .collect()
+        self.read_blocks_batched(scored)
     }
 
     /// **Fuzzy** retrieval: top-k blocks whose relevance clears `min_score`.
@@ -931,11 +993,8 @@ impl KvContextStore {
         let raw = self
             .hnsw
             .search_fuzzy(query, want, self.ef_search.max(want), min_score);
-        self.dedup_to_blocks(raw)
-            .into_iter()
-            .take(k)
-            .filter_map(|(b, score)| self.read_block(b, score, false))
-            .collect()
+        let hits: Vec<(u32, f32)> = self.dedup_to_blocks(raw).into_iter().take(k).collect();
+        self.read_blocks_batched(hits)
     }
 
     /// **Radius / range** retrieval: every block within similarity `threshold`.
@@ -949,11 +1008,8 @@ impl KvContextStore {
         let raw = self
             .hnsw
             .search_radius(query, threshold, want, self.ef_search.max(want));
-        self.dedup_to_blocks(raw)
-            .into_iter()
-            .take(max)
-            .filter_map(|(b, score)| self.read_block(b, score, false))
-            .collect()
+        let hits: Vec<(u32, f32)> = self.dedup_to_blocks(raw).into_iter().take(max).collect();
+        self.read_blocks_batched(hits)
     }
 
     /// **Memory-decayed** retrieval: re-rank the candidate blocks by relevance ×

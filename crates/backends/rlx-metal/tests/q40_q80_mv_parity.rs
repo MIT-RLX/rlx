@@ -196,3 +196,208 @@ fn q8_0_mv_matches_cpu_reference() {
         None,
     );
 }
+
+/// Simdgroup-cooperative GEMV dispatch (threadgroup-per-output-group grid).
+/// `nsg` simdgroups per threadgroup, each producing `nr0` output rows — MUST
+/// match the kernel's constants + `encode_q*_mv_f32_sg`. Compares to
+/// `gguf_matmul_bt` with a tolerance loose enough for the simd_sum reduction
+/// order to differ from the scalar CPU reference.
+fn run_sg_mv(
+    pipeline: &metal::ComputePipelineState,
+    scheme: QuantScheme,
+    x: &[f32],
+    packed: &[u8],
+    k: usize,
+    n: usize,
+    nsg: u64,
+    nr0: u64,
+) {
+    let device = Device::system_default().expect("no Metal device");
+    let cmd_q = device.new_command_queue();
+    let x_bytes = x.len() * 4;
+    let w_bytes = packed.len();
+    let out_bytes = n * 4;
+    let arena_bytes = (x_bytes + w_bytes + out_bytes).div_ceil(16) * 16;
+    let arena: Buffer =
+        device.new_buffer(arena_bytes as u64, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        let p = arena.contents() as *mut u8;
+        std::ptr::write_bytes(p, 0, arena_bytes);
+        std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, p, x_bytes);
+        std::ptr::copy_nonoverlapping(packed.as_ptr(), p.add(x_bytes), w_bytes);
+    }
+    let x_u = 0u64;
+    let w_u = x_bytes as u64;
+    let dst_u = (x_bytes + w_bytes) as u64;
+    let k_u = k as u32;
+    let n_u = n as u32;
+
+    let cmd_buf = cmd_q.new_command_buffer();
+    let enc = cmd_buf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(&arena), 0);
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    enc.set_bytes(3, 8, &dst_u as *const u64 as *const _);
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let n_output_groups = (n as u64).div_ceil(nr0);
+    let n_threadgroups = n_output_groups.div_ceil(nsg);
+    let grid = MTLSize {
+        width: n_threadgroups * nsg * 32,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: nsg * 32,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+    enc.end_encoding();
+    cmd_buf.commit();
+    cmd_buf.wait_until_completed();
+
+    let mut out = vec![0.0f32; n];
+    unsafe {
+        let src = (arena.contents() as *const u8).add(x_bytes + w_bytes) as *const f32;
+        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+    }
+    let mut cpu_out = vec![0f32; n];
+    rlx_cpu::gguf_matmul::gguf_matmul_bt(x, packed, &mut cpu_out, 1, k, n, scheme);
+    for j in 0..n {
+        let exp = cpu_out[j];
+        assert!(
+            (out[j] - exp).abs() <= 1e-3 + 1e-3 * exp.abs(),
+            "row {j}: sg={} ref={exp}",
+            out[j]
+        );
+    }
+}
+
+/// Pack `[n, k]` f32 (row-major) as Q6_K (256-elem super-blocks, 210 B each).
+fn pack_q6_k(w: &[f32], k: usize, n: usize) -> Vec<u8> {
+    let nb = k / 256;
+    let blk = 210usize;
+    let mut out = vec![0u8; n * nb * blk];
+    for row in 0..n {
+        for b in 0..nb {
+            let src = &w[row * k + b * 256..row * k + (b + 1) * 256];
+            let off = (row * nb + b) * blk;
+            rlx_gguf::quantize::quantize_q6_k_block(src, &mut out[off..off + blk]);
+        }
+    }
+    out
+}
+
+#[test]
+fn q8_0_mv_sg_matches_cpu_reference() {
+    // n = 14 (not a multiple of NR0*NSG=8) exercises the row-index guard.
+    let k = 256usize;
+    let n = 14usize;
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.017).cos()).collect();
+    let packed = rlx_gguf::quantize::quantize_q8_0(&w).unwrap();
+    run_sg_mv(
+        &kernels().q8_0_mv_f32_sg,
+        QuantScheme::GgufQ8_0,
+        &x,
+        &packed,
+        k,
+        n,
+        2, // Q8_0_NSG
+        4, // Q8_0_NR0
+    );
+}
+
+/// Pack `[n, k]` f32 (row-major) as Q3_K (256-elem super-blocks, 110 B each).
+fn pack_q3_k(w: &[f32], k: usize, n: usize) -> Vec<u8> {
+    let nb = k / 256;
+    let blk = 110usize;
+    let mut out = vec![0u8; n * nb * blk];
+    for row in 0..n {
+        for b in 0..nb {
+            let src = &w[row * k + b * 256..row * k + (b + 1) * 256];
+            let off = (row * nb + b) * blk;
+            rlx_gguf::quantize::quantize_q3_k_block(src, &mut out[off..off + blk]);
+        }
+    }
+    out
+}
+
+#[test]
+fn q4_0_mv_sg_matches_cpu_reference() {
+    let k = 256usize;
+    let n = 14usize; // not a multiple of NR0*NSG=8 → exercises the row guard
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.05).sin()).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.019).cos()).collect();
+    let packed = rlx_gguf::quantize::quantize_q4_0(&w).unwrap();
+    run_sg_mv(
+        &kernels().q4_0_mv_f32_sg,
+        QuantScheme::GgufQ4_0,
+        &x,
+        &packed,
+        k,
+        n,
+        2,
+        4,
+    );
+}
+
+#[test]
+fn q4_1_mv_sg_matches_cpu_reference() {
+    let k = 256usize;
+    let n = 14usize;
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.041).sin()).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.023).cos()).collect();
+    let packed = rlx_gguf::quantize::quantize_q4_1(&w).unwrap();
+    run_sg_mv(
+        &kernels().q4_1_mv_f32_sg,
+        QuantScheme::GgufQ4_1,
+        &x,
+        &packed,
+        k,
+        n,
+        2,
+        4,
+    );
+}
+
+#[test]
+fn q3k_mv_sg_matches_cpu_reference() {
+    let k = 512usize;
+    let n = 13usize; // not a multiple of NSG=4 → exercises the row guard
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.027).sin()).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.015).cos()).collect();
+    let packed = pack_q3_k(&w, k, n);
+    run_sg_mv(
+        &kernels().q3k_mv_f32_sg,
+        QuantScheme::GgufQ3K,
+        &x,
+        &packed,
+        k,
+        n,
+        4,
+        2,
+    );
+}
+
+#[test]
+fn q6k_mv_sg_matches_cpu_reference() {
+    // n = 13 (not a multiple of NSG=4) exercises the row-index guard.
+    let k = 512usize;
+    let n = 13usize;
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.031).sin()).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.013).cos()).collect();
+    let packed = pack_q6_k(&w, k, n);
+    run_sg_mv(
+        &kernels().q6k_mv_f32_sg,
+        QuantScheme::GgufQ6K,
+        &x,
+        &packed,
+        k,
+        n,
+        4, // Q6K_NSG
+        1, // one row per simdgroup
+    );
+}

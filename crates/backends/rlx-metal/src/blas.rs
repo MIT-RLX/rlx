@@ -380,6 +380,58 @@ pub fn metal_sgemm_f16w_bufs(
     // with `RLX_METAL_GEMV_SPLITK=0`.
     // half2 loads need an even N (2 columns/thread, aligned); all transformer
     // projection widths are even. Odd N falls through to the scalar kernel.
+    // CEILING PROBE (RLX_METAL_GEMV_KPART): K-partition small-N GEMVs across
+    // extra threadgroups (atomic-add, order-nondeterministic → probe only) to
+    // measure whether more occupancy beats the N/64-threadgroup splitk kernel.
+    let kpart_env = rlx_ir::env::var("RLX_METAL_GEMV_KPART");
+    let base_tg = (n as u64).div_ceil(64);
+    if m == 1 && n >= 64 && n.is_multiple_of(2) && kpart_env.is_some() && base_tg < 48
+    // only the under-occupied small-N projections
+    {
+        let kparts: u64 = kpart_env
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&p| p > 1)
+            .unwrap_or(8)
+            .min((k as u64 / 64).max(1));
+        // Pre-zero C[0..n].
+        enc.set_compute_pipeline_state(&kk.gemv_zero_f32);
+        enc.set_buffer(0, Some(c), c_off as u64);
+        enc.set_bytes(1, 4, &n_u as *const _ as *const _);
+        enc.dispatch_threads(
+            MTLSize {
+                width: n as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64u64.min(n as u64),
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.set_compute_pipeline_state(&kk.gemv_f16w_kpart);
+        enc.set_buffer(0, Some(a), a_off as u64);
+        enc.set_buffer(1, Some(b), b_off as u64);
+        enc.set_buffer(2, Some(c), c_off as u64);
+        enc.set_bytes(3, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &n_u as *const _ as *const _);
+        let kparts_u = kparts as u32;
+        enc.set_bytes(5, 4, &kparts_u as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: (n as u64).div_ceil(64),
+                height: 1,
+                depth: kparts,
+            },
+            MTLSize {
+                width: 32,
+                height: 32,
+                depth: 1,
+            },
+        );
+        return;
+    }
     if m == 1
         && n >= 64
         && n.is_multiple_of(2)
@@ -421,6 +473,13 @@ pub fn metal_sgemm_f16w_bufs(
         enc.dispatch_threads(grid, tg);
         return;
     }
+    if m > 1 && rlx_ir::env::flag("RLX_METAL_PREFILL_TRACE") {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            eprintln!("[prefill-trace] metal_sgemm_f16w_bufs m={m} k={k} n={n} → padded kernel");
+        }
+    }
     // Prefer padded simd for large decode Linears; naive for tiny dims.
     let use_padded = matches!(
         hw_model().pick_sgemm(m, k, n),
@@ -432,7 +491,43 @@ pub fn metal_sgemm_f16w_bufs(
     ) && k >= 256
         && n >= 256;
     if use_padded {
+        // Wide 64×64 tile: auto-enable for prefill-like aligned shapes where it
+        // consistently outperforms the padded path on this device class.
+        // Controls:
+        // - RLX_METAL_WIDE_GEMM=1 forces wide path when eligible by M.
+        // - RLX_METAL_NO_AUTO_WIDE_GEMM=1 disables the auto-selection.
+        let force_wide = rlx_ir::env::flag("RLX_METAL_WIDE_GEMM");
+        let auto_wide = !rlx_ir::env::flag("RLX_METAL_NO_AUTO_WIDE_GEMM")
+            && m > 1
+            && m >= 64
+            && k >= 512
+            && n >= 1024
+            && k.is_multiple_of(8)
+            && n.is_multiple_of(64);
+        if (force_wide && m >= 48) || auto_wide {
+            if m > 1 {
+                crate::prefill_stats::record_f16_wide();
+            }
+            enc.set_compute_pipeline_state(&kk.sgemm_wide8x64_f16w);
+            let tg_count = MTLSize {
+                width: (n as u64).div_ceil(64),
+                height: (m as u64).div_ceil(64),
+                depth: 1,
+            };
+            enc.dispatch_thread_groups(
+                tg_count,
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return;
+        }
         enc.set_compute_pipeline_state(&kk.sgemm_simd_padded_f16w);
+        if m > 1 {
+            crate::prefill_stats::record_f16_padded();
+        }
         let tg_count = MTLSize {
             width: n.div_ceil(8) as u64,
             height: m.div_ceil(8) as u64,

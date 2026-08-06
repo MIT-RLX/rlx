@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::Result;
-use rlx_ir::HirGraphExt;
-use rlx_ir::hir::HirMut;
 
 use super::BlockStage;
 use crate::context::FlowCtx;
@@ -27,10 +25,13 @@ impl LinearStage {
 
 impl BlockStage for LinearStage {
     fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
-        let w = ctx.load_param(&self.weight_key, self.transpose)?;
-        let mut gb = HirMut::new(ctx.hir());
-        let id = gb.mm(input.id, w);
-        let out_shape = gb.shape(id).clone();
-        Ok(Some(ctx.wrap(id, out_shape)))
+        // Delegate to `FlowCtx::linear` so packed (GGUF/MLX) weights lower to a
+        // fused `DequantMatMul` and F32 weights to a plain matmul — one code
+        // path for every model that uses this stage.
+        Ok(Some(ctx.linear(
+            &input,
+            &self.weight_key,
+            self.transpose,
+        )?))
     }
 }

@@ -146,6 +146,10 @@ impl ModelFlow {
             .collect();
         outputs.extend(ctx.state.side_outputs.iter().map(|(_, id)| *id));
 
+        // Packed U8 quant blobs registered by `FlowCtx::linear` for packed
+        // weights — carried out to be uploaded at session time.
+        let typed_params = std::mem::take(&mut ctx.state.typed_params);
+
         ctx.module.set_outputs(outputs);
         module = ctx.module;
         if let Some(hir) = module.as_hir_mut() {
@@ -158,16 +162,19 @@ impl ModelFlow {
         Ok(BuiltModel {
             module,
             params,
-            typed_params: Vec::new(),
+            typed_params,
             profile: self.profile,
             output_names,
             primary_shape: primary.shape,
         })
     }
 
-    /// Compatibility shim: older callers passed GGUF packed matmul params.
-    ///
-    /// The current flow builder ignores packed params; packed lowering lives in model crates.
+    /// Compatibility shim: older callers passed GGUF packed matmul params
+    /// out-of-band. Packed lowering now lives in the flow builder itself — a
+    /// [`WeightSource`] that implements [`WeightSource::take_packed`] gets fused
+    /// `DequantMatMul` projections automatically — so the extra argument is
+    /// ignored. Prefer calling [`build`](Self::build) with a packed-aware
+    /// weight source.
     pub fn build_with(
         self,
         weights: &mut dyn WeightSource,
@@ -321,6 +328,70 @@ mod tests {
         let built = flow.build(&mut w).unwrap();
         let hir = built.into_hir().unwrap();
         assert!(hir.len() >= 3);
+    }
+
+    #[test]
+    fn packed_linear_emits_dequant_matmul() {
+        use crate::weight::WeightSource;
+        use rlx_ir::hir::HirOp;
+        use rlx_ir::quant::QuantScheme;
+
+        // A WeightSource that only serves a GGUF-packed blob (no F32 fallback),
+        // so reaching `DequantMatMul` proves `linear` took the packed branch.
+        struct PackedOnly {
+            in_dim: usize,
+            out_dim: usize,
+        }
+        impl WeightSource for PackedOnly {
+            fn take(&mut self, key: &str, _t: bool) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
+                Err(anyhow::anyhow!(
+                    "no F32 weight for '{key}' (packed-only source)"
+                ))
+            }
+            fn take_packed(
+                &mut self,
+                _key: &str,
+            ) -> anyhow::Result<Option<crate::GgufPackedLinear>> {
+                // Q4_K: 256 elems / 144 bytes per super-block, one block per row.
+                let blocks = (self.in_dim / 256).max(1);
+                let n_bytes = self.out_dim * blocks * 144;
+                Ok(Some(crate::GgufPackedLinear {
+                    w_q: vec![0u8; n_bytes],
+                    scheme: QuantScheme::GgufQ4K,
+                    in_dim: self.in_dim,
+                    out_dim: self.out_dim,
+                    bias: Vec::new(),
+                }))
+            }
+        }
+
+        let mut w = PackedOnly {
+            in_dim: 256,
+            out_dim: 8,
+        };
+        let flow = ModelFlow::new("packed_smoke")
+            .input("x", Shape::new(&[1, 1, 256], DType::F32))
+            .linear("proj.weight", false);
+
+        let built = flow.build(&mut w).unwrap();
+
+        // Output shape: last dim → out_dim (8), leading dims preserved.
+        let ps = built.primary_shape();
+        assert_eq!(ps.rank(), 3);
+        assert_eq!(ps.dim(2).unwrap_static(), 8);
+
+        // The U8 quant blob rode out as a typed_param (uploaded at session time).
+        assert_eq!(built.typed_params.len(), 1);
+        assert_eq!(built.typed_params[0].2, DType::U8);
+        assert_eq!(built.typed_params[0].1.len(), 8 * 144);
+
+        // The graph carries a fused DequantMatMul — not a plain MatMul.
+        let hir = built.into_hir().unwrap();
+        let has_dqmm = hir
+            .nodes()
+            .iter()
+            .any(|n| matches!(&n.op, HirOp::DequantMatMul { .. }));
+        assert!(has_dqmm, "packed linear must emit a DequantMatMul node");
     }
 
     #[test]

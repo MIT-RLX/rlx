@@ -567,6 +567,29 @@ impl MetalExecutable {
         let mut tail_host: Vec<TailHostOp> = Vec::new();
         let mut narrow_batch: Option<PendingNarrowBatch> = None;
 
+        // Concurrent dispatch (RLX_METAL_CONCURRENT): open compute encoders in
+        // `Concurrent` dispatch mode so independent decode dispatches (q/k/v,
+        // gate/up …) overlap on the GPU, and insert a `memoryBarrier` only
+        // before a dispatch that data-depends on the current wave. The hazard
+        // set is precomputed below from `mlp_io`. Off ⇒ classic Serial encoder.
+        let concurrent = rlx_ir::env::flag("RLX_METAL_CONCURRENT");
+        // Diagnostics (RLX_METAL_CONCURRENT_STATS): how fragmented is the
+        // encoder stream? If `enc_opened` ≈ thunks, ops each get their own
+        // encoder and Concurrent can't overlap anything; if `enc_opened` ≪
+        // thunks, dispatches share encoders and overlap is actually in play.
+        let concurrent_stats = rlx_ir::env::flag("RLX_METAL_CONCURRENT_STATS");
+        // Diagnostic-only: run concurrent with NO hazard barriers. Output is
+        // INCORRECT (races), but it measures the wall-clock ceiling of full
+        // dispatch overlap — if this is no faster than the barriered/serial
+        // path, overlap fundamentally can't help this workload.
+        let concurrent_no_barrier = rlx_ir::env::flag("RLX_METAL_CONCURRENT_NOBARRIER");
+        #[allow(unused_assignments)]
+        let mut enc_opened = 0usize;
+        #[allow(unused_assignments)]
+        let mut barriers_emitted = 0usize;
+        #[allow(unused_assignments)]
+        let mut thunks_dispatched = 0usize;
+
         let flush_deferred_host =
             |cmd_buf: &mut metal::CommandBuffer,
              enc: &mut Option<metal::ComputeCommandEncoder>,
@@ -1276,13 +1299,18 @@ impl MetalExecutable {
             () => {{
                 flush_deferred_host(&mut cmd_buf, &mut enc, &mut deferred_host);
                 if enc.is_none() {
+                    let dispatch_ty = if concurrent {
+                        metal::MTLDispatchType::Concurrent
+                    } else {
+                        metal::MTLDispatchType::Serial
+                    };
                     enc = Some(
                         cmd_buf
-                            .compute_command_encoder_with_dispatch_type(
-                                metal::MTLDispatchType::Serial,
-                            )
+                            .compute_command_encoder_with_dispatch_type(dispatch_ty)
                             .to_owned(),
                     );
+                    enc_opened += 1;
+                    let _ = enc_opened;
                 }
                 enc.as_deref().unwrap()
             }};
@@ -1358,6 +1386,25 @@ impl MetalExecutable {
                 }
             }
         }
+        // Same dump but gated to a DECODE step (>10 m==1 sgemms), so it prints
+        // the hot m=1 schedule rather than the one-shot prefill schedule.
+        if rlx_ir::env::flag("RLX_DUMP_SCHED_DECODE") {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DONE_D: AtomicBool = AtomicBool::new(false);
+            let m1 = thunks
+                .iter()
+                .filter(|t| matches!(t, crate::thunk::Thunk::Sgemm { m: 1, .. }))
+                .count();
+            if m1 > 10 && !DONE_D.swap(true, Ordering::Relaxed) {
+                eprintln!("[sched-decode] {} thunks, {m1} m=1 sgemms", thunks.len());
+                for (i, t) in thunks.iter().enumerate() {
+                    let nm = crate::thunk::thunk_name(t);
+                    if nm != "nop" {
+                        eprintln!("[dsched {i}] {nm}");
+                    }
+                }
+            }
+        }
         let mut seg_iter = segments.iter().peekable();
         let loop_end = thunk_range.as_ref().map(|r| r.end).unwrap_or(thunks.len());
         let mut i = thunk_range.as_ref().map(|r| r.start).unwrap_or(0);
@@ -1365,6 +1412,15 @@ impl MetalExecutable {
         let mut skip_thunks: HashSet<usize> = HashSet::new();
         let dual_q1_log = rlx_ir::env::flag("RLX_METAL_FUSE_DECODE_LOG");
         let mut dual_q1_fused = 0usize;
+        // Concurrent-dispatch hazard set: thunk indices that must be preceded by
+        // a memoryBarrier (RAW/WAR/WAW vs the current wave). Empty in Serial
+        // mode, so the per-op check below is a cheap HashSet miss.
+        let barrier_set = if concurrent {
+            let start = thunk_range.as_ref().map(|r| r.start).unwrap_or(0);
+            crate::thunk::concurrent_barrier_set(thunks, start, loop_end)
+        } else {
+            HashSet::new()
+        };
         while i < loop_end {
             if skip_thunks.contains(&i) {
                 i += 1;
@@ -1372,6 +1428,7 @@ impl MetalExecutable {
             }
             if thunk_range.is_none()
                 && active.is_none()
+                && !concurrent
                 && let Some(range) = seg_iter.peek()
                 && range.start == i
             {
@@ -1380,12 +1437,36 @@ impl MetalExecutable {
                 seg_iter.next();
                 continue;
             }
+            let idx = i;
             let thunk = thunks[i].clone();
             i += 1;
             if !matches!(thunk, Thunk::Narrow { .. } | Thunk::SplitLastAxis { .. })
                 && narrow_batch.is_some()
             {
                 flush_pending_narrow_batch(e!(), k, &self.arena.buffer, &mut narrow_batch);
+            }
+            // Concurrent dispatch: order this op after the current wave iff it
+            // data-depends on it. Only meaningful while an encoder is open —
+            // end_msl!/sync_gpu! start a fresh encoder, which Metal already
+            // orders after the previous one (a stronger barrier), so a redundant
+            // memoryBarrier is skipped here when `enc` is None.
+            if concurrent && !concurrent_no_barrier && barrier_set.contains(&idx) {
+                if let Some(active_enc) = enc.as_deref() {
+                    // memoryBarrierWithScope: MTLBarrierScopeBuffers (=1) — covers
+                    // the arena (the only writable buffer; weights are read-only).
+                    // metal-rs 0.30 exposes no scope-barrier wrapper, so message
+                    // it directly (same objc path as the GPU-timestamp probe).
+                    unsafe {
+                        use objc::{msg_send, runtime::Object, sel, sel_impl};
+                        let obj =
+                            active_enc as *const metal::ComputeCommandEncoderRef as *mut Object;
+                        let _: () = msg_send![obj, memoryBarrierWithScope: 1u64];
+                    }
+                    barriers_emitted += 1;
+                }
+            }
+            if concurrent_stats {
+                thunks_dispatched += 1;
             }
             // PLAN L3: per-thunk Perfetto span. No-op when env var
             // RLX_TRACE_PERFETTO unset.
@@ -3213,6 +3294,32 @@ impl MetalExecutable {
                         encode_copy(e!(), k, &self.arena.buffer, *src, *dst, len, *dt);
                     }
                 }
+                Thunk::KvAppend {
+                    src,
+                    dst,
+                    outer,
+                    seq_cap,
+                    pos,
+                    inner,
+                    dt,
+                } => {
+                    // Fixed single-row write into the aliased cache buffer — NOT
+                    // active-extent-scaled (the new K always lands at row `pos`,
+                    // the bucket end; the mask covers the padded gap). Per batch:
+                    // copy `inner` elems to dst[(o*seq_cap + pos)*inner ..].
+                    let dt_bytes = match dt {
+                        crate::thunk::HalfFlag::F16 => 2usize,
+                        _ => 4usize,
+                    };
+                    let inner = *inner as usize;
+                    let pos = *pos as usize;
+                    let seq_cap = *seq_cap as usize;
+                    for o in 0..*outer as usize {
+                        let s = *src + o * inner * dt_bytes;
+                        let d = *dst + (o * seq_cap + pos) * inner * dt_bytes;
+                        encode_copy(e!(), k, &self.arena.buffer, s, d, inner as u32, *dt);
+                    }
+                }
                 Thunk::AttentionBackwardAll {
                     q,
                     k: kk,
@@ -4170,32 +4277,204 @@ impl MetalExecutable {
                     // dispatch site and the consumer Op::DequantMatMul (o_proj) when the
                     // latter falls back to deferred-host execution (`RLX_METAL_DEQUANT_
                     // GPU_DISABLE=1`). Task #50 follow-up.
-                    encode_sdpa(
-                        e!(),
-                        k,
-                        &self.arena.buffer,
-                        *q,
-                        *kk,
-                        *v,
-                        *mask,
-                        *out,
-                        *batch,
-                        seq,
-                        *heads,
-                        *kv_heads,
-                        *head_dim,
-                        *v_head_dim,
-                        *dt,
-                        seq_stride,
-                        *mask_kind,
-                        *window,
-                        kv_seq_eff,
-                        kv_stride,
-                        *bhsd,
-                        *score_scale,
-                        *attn_logit_softcap,
-                        *kv_f16,
-                    );
+                    let token_bucket = self.sdpa_kernel_plan.token_buckets.bucket_of(kv_seq_eff);
+                    let mut launch_builder =
+                        crate::kernel_plan::LaunchBuilder::from_plan(&self.sdpa_kernel_plan)
+                            .m(seq)
+                            .tokens(kv_seq_eff)
+                            .batch(*batch)
+                            .num_heads(*heads)
+                            .head_dim(*head_dim)
+                            .seq_q(seq)
+                            .seq_kv(kv_seq_eff);
+                    if let Some(tuned) = self.sdpa_tuned_candidate(token_bucket) {
+                        launch_builder = launch_builder.candidate(tuned);
+                    }
+                    let launch = launch_builder.build().ok();
+
+                    // Split-KV path guard: must satisfy kernel shape constraints.
+                    let flash_ok = matches!(*dt, crate::thunk::HalfFlag::F32)
+                        && seq == 1
+                        && *head_dim <= 128
+                        && (*v_head_dim == 0 || *v_head_dim <= 128);
+
+                    let mut want_flash =
+                        launch.as_ref().is_some_and(|l| l.candidate.partial_reduce) && flash_ok;
+
+                    // Config override keeps existing operational behavior.
+                    if let Some(v) = crate::runtime_config().sdpa_flash_decode {
+                        want_flash = v && flash_ok && kv_seq_eff > 64;
+                    }
+
+                    let kernel_name = launch
+                        .as_ref()
+                        .map(|l| l.kernel_name.as_str())
+                        .unwrap_or("sdpa_decode_default");
+                    if rlx_ir::env::flag("RLX_METAL_ATTN_TRACE") {
+                        eprintln!("[metal-attn] kernel={kernel_name}");
+                    }
+
+                    if let Some(l) = &launch {
+                        self.sdpa_record_candidate(token_bucket, l.candidate);
+                    }
+
+                    if want_flash {
+                        let hinted_parts =
+                            launch.as_ref().map(|l| l.candidate.split_k).unwrap_or(1);
+                        let (tile_n, tile_k, pad_kv) = launch
+                            .as_ref()
+                            .map(|l| (l.candidate.tile_n, l.candidate.tile_k, l.candidate.pad_kv))
+                            .unwrap_or((128, 32, 1));
+                        let n_part = sdpa_flash_partitions_tuned(
+                            *batch, *heads, kv_seq_eff, tile_n, tile_k, pad_kv,
+                        )
+                        .max(hinted_parts);
+                        const SLOT: u64 = 2 + 128;
+                        let need_bytes = (*batch as u64)
+                            * (*heads as u64)
+                            * (n_part as u64)
+                            * SLOT
+                            * std::mem::size_of::<f32>() as u64;
+                        {
+                            let mut sc = self.sdpa_flash_scratch.borrow_mut();
+                            let grow = sc.as_ref().map(|b| b.length() < need_bytes).unwrap_or(true);
+                            if grow {
+                                *sc = Some(dev.device.new_buffer(
+                                    need_bytes,
+                                    metal::MTLResourceOptions::StorageModeShared,
+                                ));
+                            }
+                        }
+                        let sc = self.sdpa_flash_scratch.borrow();
+                        let scratch = sc.as_ref().unwrap();
+                        // W8A8 decode attention (int8 Q·K integer dot + int8 V):
+                        // opt-in via RLX_METAL_W8A8_ATTN, decode-only (seq==1),
+                        // head_dim ≤ 128 (guaranteed by flash_ok). ~1.5–1.8× at
+                        // long ctx; ~1e-4 attention-output drift (approximation).
+                        let use_w8a8 = seq == 1
+                            && *head_dim <= 128
+                            && (*v_head_dim == 0 || *v_head_dim <= 128)
+                            && rlx_ir::env::flag("RLX_METAL_W8A8_ATTN");
+                        if use_w8a8 && rlx_ir::env::flag("RLX_METAL_ATTN_TRACE") {
+                            eprintln!(
+                                "[metal-attn] W8A8 ACTIVE kv_seq={kv_seq_eff} n_part={n_part} kv_f16={kv_f16}"
+                            );
+                        }
+                        if use_w8a8 {
+                            let kvh = if *kv_heads == 0 || !heads.is_multiple_of(*kv_heads) {
+                                *heads
+                            } else {
+                                *kv_heads
+                            };
+                            let vhd = if *v_head_dim == 0 {
+                                *head_dim
+                            } else {
+                                *v_head_dim
+                            };
+                            let blk = rlx_ir::env::flag("RLX_METAL_W8A8_BLOCK");
+                            let nbk = if blk { *head_dim as u64 / 32 } else { 1 };
+                            let nbv = if blk { vhd as u64 / 32 } else { 1 };
+                            let align256 = |x: u64| (x + 255) & !255u64;
+                            let nrows = (*batch as u64) * (kvh as u64) * (kv_seq_eff as u64);
+                            let i8v_off = align256(nrows * *head_dim as u64);
+                            let ksc_off = align256(i8v_off + nrows * vhd as u64);
+                            let vsc_off = align256(ksc_off + nrows * nbk * 4);
+                            let need_i8 = align256(vsc_off + nrows * nbv * 4).max(256);
+                            {
+                                let mut b = self.sdpa_w8a8_scratch.borrow_mut();
+                                let grow = b.as_ref().map(|x| x.length() < need_i8).unwrap_or(true);
+                                if grow {
+                                    *b = Some(dev.device.new_buffer(
+                                        need_i8,
+                                        metal::MTLResourceOptions::StorageModeShared,
+                                    ));
+                                }
+                            }
+                            let i8b = self.sdpa_w8a8_scratch.borrow();
+                            let i8scratch = i8b.as_ref().unwrap();
+                            encode_sdpa_flash_decode_w8a8(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                scratch,
+                                i8scratch,
+                                n_part,
+                                *q,
+                                *kk,
+                                *v,
+                                *mask,
+                                *out,
+                                *batch,
+                                *heads,
+                                *kv_heads,
+                                *head_dim,
+                                *v_head_dim,
+                                seq_stride,
+                                *mask_kind,
+                                *window,
+                                kv_seq_eff,
+                                kv_stride,
+                                *bhsd,
+                                *score_scale,
+                                *attn_logit_softcap,
+                                *kv_f16,
+                            );
+                        } else {
+                            encode_sdpa_flash_decode(
+                                e!(),
+                                k,
+                                &self.arena.buffer,
+                                scratch,
+                                n_part,
+                                *q,
+                                *kk,
+                                *v,
+                                *mask,
+                                *out,
+                                *batch,
+                                *heads,
+                                *kv_heads,
+                                *head_dim,
+                                *v_head_dim,
+                                seq_stride,
+                                *mask_kind,
+                                *window,
+                                kv_seq_eff,
+                                kv_stride,
+                                *bhsd,
+                                *score_scale,
+                                *attn_logit_softcap,
+                                *kv_f16,
+                            );
+                        }
+                    } else {
+                        encode_sdpa(
+                            e!(),
+                            k,
+                            &self.arena.buffer,
+                            *q,
+                            *kk,
+                            *v,
+                            *mask,
+                            *out,
+                            *batch,
+                            seq,
+                            *heads,
+                            *kv_heads,
+                            *head_dim,
+                            *v_head_dim,
+                            *dt,
+                            seq_stride,
+                            *mask_kind,
+                            *window,
+                            kv_seq_eff,
+                            kv_stride,
+                            *bhsd,
+                            *score_scale,
+                            *attn_logit_softcap,
+                            *kv_f16,
+                        );
+                    }
                     // Keep Serial encoder open for following MSL ops (Q1 GEMV /
                     // GDN). Host dequant still flushes via `e!()` / deferred_host.
                 }
@@ -7018,6 +7297,20 @@ impl MetalExecutable {
                     let use_q4k_mv_sg = use_fused_q4k_mv
                         && n_u.is_multiple_of(8)
                         && !rlx_ir::env::flag("RLX_METAL_Q4K_SG_DISABLE");
+                    // Simdgroup-cooperative Q6_K / Q8_0 decode GEMV: 32 threads
+                    // reduce each output row via simd_sum instead of one thread
+                    // per row (occupancy-starved at small n). Row-guarded, so no
+                    // n-divisibility constraint. Off-switches below.
+                    let use_q6k_mv_sg =
+                        use_fused_q6k_mv && !rlx_ir::env::flag("RLX_METAL_Q6K_SG_DISABLE");
+                    let use_q8_0_mv_sg =
+                        use_fused_q8_0_mv && !rlx_ir::env::flag("RLX_METAL_Q8_0_SG_DISABLE");
+                    let use_q4_0_mv_sg =
+                        use_fused_q4_0_mv && !rlx_ir::env::flag("RLX_METAL_Q40_SG_DISABLE");
+                    let use_q4_1_mv_sg =
+                        use_fused_q4_1_mv && !rlx_ir::env::flag("RLX_METAL_Q41_SG_DISABLE");
+                    let use_q3k_mv_sg =
+                        use_fused_q3k_mv && !rlx_ir::env::flag("RLX_METAL_Q3K_SG_DISABLE");
                     // Fused Q4_K / Q6_K prefill GEMM (m > 1): reads packed
                     // weight directly, dequants in-register, accumulates a row
                     // tile — replaces the dequant-to-f32-scratch + MPS sgemm
@@ -7090,15 +7383,30 @@ impl MetalExecutable {
                     } else if use_fused_q4k_mv {
                         let enc = e!();
                         encode_q4k_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_q3k_mv_sg {
+                        let enc = e!();
+                        encode_q3k_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
                     } else if use_fused_q3k_mv {
                         let enc = e!();
                         encode_q3k_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_q6k_mv_sg {
+                        let enc = e!();
+                        encode_q6k_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
                     } else if use_fused_q6k_mv {
                         let enc = e!();
                         encode_q6k_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_q8_0_mv_sg {
+                        let enc = e!();
+                        encode_q8_0_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_q4_0_mv_sg {
+                        let enc = e!();
+                        encode_q4_0_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
                     } else if use_fused_q4_0_mv {
                         let enc = e!();
                         encode_q4_0_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_q4_1_mv_sg {
+                        let enc = e!();
+                        encode_q4_1_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
                     } else if use_fused_q4_1_mv {
                         let enc = e!();
                         encode_q4_1_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
@@ -7741,6 +8049,13 @@ impl MetalExecutable {
                         && !rlx_gpu_host::mlx_dequant_gpu_disabled();
                     if use_gpu {
                         if *m == 1 {
+                            crate::prefill_stats::record_dequant_gemv();
+                            if rlx_ir::env::flag("RLX_METAL_PREFILL_TRACE") {
+                                eprintln!(
+                                    "[prefill-trace] dequant_mlx m=1 k={} n={} kind={} bits={} group={} -> gemv",
+                                    *kk, *n, kind, bits, group_size
+                                );
+                            }
                             encode_dequant_matmul_mlx_gemv(
                                 e!(),
                                 &k.dequant_matmul_mlx_gemv,
@@ -7757,6 +8072,13 @@ impl MetalExecutable {
                                 group_size,
                             );
                         } else {
+                            crate::prefill_stats::record_dequant_gemm();
+                            if rlx_ir::env::flag("RLX_METAL_PREFILL_TRACE") {
+                                eprintln!(
+                                    "[prefill-trace] dequant_mlx m={} k={} n={} kind={} bits={} group={} -> gemm",
+                                    *m, *kk, *n, kind, bits, group_size
+                                );
+                            }
                             encode_dequant_matmul_mlx_gemm(
                                 e!(),
                                 &k.dequant_matmul_mlx_gemm,
@@ -7968,6 +8290,15 @@ impl MetalExecutable {
 
         if dual_q1_log && dual_q1_fused > 0 {
             eprintln!("[rlx-metal] encode dual Q1 shared-x: {dual_q1_fused} pairs fused this run");
+        }
+
+        let _ = (enc_opened, barriers_emitted, thunks_dispatched);
+        if concurrent_stats {
+            let shared = thunks_dispatched.saturating_sub(enc_opened);
+            eprintln!(
+                "[rlx-metal] concurrent: {thunks_dispatched} thunks, {enc_opened} encoders opened \
+                 ({shared} dispatches shared an encoder), {barriers_emitted} barriers emitted"
+            );
         }
 
         end_msl!();
