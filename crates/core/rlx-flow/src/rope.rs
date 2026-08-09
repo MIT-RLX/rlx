@@ -381,7 +381,12 @@ pub fn build_mrope_tables(
     positions: &[[usize; 4]],
     interleaved: bool,
 ) -> (Vec<f32>, Vec<f32>) {
-    let half = head_dim / 2;
+    // Row stride = n_rot/2 (the RoPE kernel indexes cos/sin with an n_rot/2 stride).
+    // A head_dim/2 stride only rotates seq position 0 for partial rope
+    // (n_rot < head_dim); later positions read the previous token's identity tail.
+    // For full rope (n_rot == head_dim) this equals head_dim/2 — unchanged.
+    let _ = head_dim; // kept for API stability; stride is n_rot-derived now.
+    let half = n_rot / 2;
     let seq = positions.len();
     let mut cos = vec![1f32; seq * half];
     let mut sin = vec![0f32; seq * half];

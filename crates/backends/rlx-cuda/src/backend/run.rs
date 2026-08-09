@@ -542,6 +542,10 @@ impl CudaExecutable {
         // `nvToolsExt.dll`; cudarc panics on first call when the lib
         // isn't loadable. A range `for` (not `while`) so the many inner
         // `continue`s in the match auto-advance the index.
+        // Monotonic plain-GroupedMatmul ordinal within this forward → MoE layer
+        // index (= ord/3) for the hot/cold residency table. Only counts plain
+        // `Step::GroupedMatmul` (f32 experts), matching the CPU dispatch.
+        let mut moe_gmm_ord = 0usize;
         for step_i in 0..self.schedule.len() {
             // Segmented capture: close a finished capture FIRST (robust to an
             // inner `continue` in the previous step leaving it open), then run
@@ -2338,6 +2342,9 @@ impl CudaExecutable {
                     out_off,
                     meta_idx,
                 } => {
+                    if rlx_ir::env::flag("RLX_CUDA_TRANSPOSE_SHAPES") {
+                        eprintln!("[transpose] rank={rank} out_total={out_total}");
+                    }
                     let kernel = transpose_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(*out_total, 256);
                     let cfg = LaunchConfig {
@@ -2816,6 +2823,102 @@ impl CudaExecutable {
                     idx_off,
                     out_off,
                 } => {
+                    // Hot-on-GPU / cold-on-CPU split. When a residency mask is
+                    // installed for this MoE layer (and cuBLAS is available), the
+                    // hot (resident) experts run on-device and the cold experts are
+                    // offloaded to the host — so cold expert weights need not occupy
+                    // VRAM. Layer index = plain-GroupedMatmul ordinal / 3.
+                    let moe_layer = moe_gmm_ord / 3;
+                    moe_gmm_ord += 1;
+                    let split_mask = self
+                        .blas
+                        .as_ref()
+                        .and(self.moe_resident_for_layer(moe_layer));
+                    if let Some(mask) = split_mask {
+                        stream
+                            .synchronize()
+                            .expect("rlx-cuda: sync before MoE split idx download");
+                        let idx_host = {
+                            let idx_slot = self
+                                .arena
+                                .f32_buf()
+                                .slice(*idx_off as usize..(idx_off + m) as usize);
+                            stream.clone_dtoh(&idx_slot).ok()
+                        };
+                        if let Some(idx_vec) = idx_host {
+                            // Contiguous runs of identical expert ids (decode m==1 →
+                            // one run; the standard expert-sorted batch → few runs).
+                            let mn = *m as usize;
+                            let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+                            let mut i = 0usize;
+                            while i < mn {
+                                let e = idx_vec[i] as u32;
+                                let mut j = i + 1;
+                                while j < mn && (idx_vec[j] as u32) == e {
+                                    j += 1;
+                                }
+                                if e < *num_experts {
+                                    runs.push((i as u32, j as u32, e));
+                                }
+                                i = j;
+                            }
+                            // Hot runs → cuBLAS over the on-device expert stack.
+                            if let Some(blas) = self.blas.as_ref() {
+                                let blas = blas.lock().unwrap();
+                                let (arena_ptr, _record) =
+                                    self.arena.f32_buf_mut().device_ptr_mut(&stream);
+                                let alpha: f32 = 1.0;
+                                let beta: f32 = 0.0;
+                                for (lo, hi, e) in &runs {
+                                    // Cold experts are handled on the host below.
+                                    if !mask.get(*e as usize).copied().unwrap_or(true) {
+                                        continue;
+                                    }
+                                    let rows = hi - lo;
+                                    let a_dev = arena_ptr + ((*in_off + lo * k) as u64) * 4;
+                                    let b_dev = arena_ptr + ((*w_off + e * k * n) as u64) * 4;
+                                    let c_dev = arena_ptr + ((*out_off + lo * n) as u64) * 4;
+                                    unsafe {
+                                        cudarc::cublas::result::sgemm(
+                                            *blas.handle(),
+                                            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                                            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                                            *n as i32,
+                                            rows as i32,
+                                            *k as i32,
+                                            &alpha as *const f32,
+                                            b_dev as *const f32,
+                                            *n as i32,
+                                            a_dev as *const f32,
+                                            *k as i32,
+                                            &beta as *const f32,
+                                            c_dev as *mut f32,
+                                            *n as i32,
+                                        )
+                                        .expect("rlx-cuda: MoE-split hot cuBLAS sgemm failed");
+                                    }
+                                }
+                            }
+                            // Cold experts → host round-trip (reads their weight
+                            // slabs back from the arena, computes on CPU, writes the
+                            // cold output rows; hot rows are left as the device wrote).
+                            crate::gguf_host::run_moe_cold_experts_from_arena(
+                                &stream,
+                                self.arena.f32_buf_mut(),
+                                *m as usize,
+                                *k as usize,
+                                *n as usize,
+                                *num_experts as usize,
+                                *in_off as usize * 4,
+                                *w_off as usize * 4,
+                                *idx_off as usize * 4,
+                                *out_off as usize * 4,
+                                &mask,
+                            );
+                            continue;
+                        }
+                        // idx download failed → fall through to the normal path.
+                    }
                     // Tier 1: sorted-batch dispatch via cuBLAS. Reads
                     // the idx buffer back to host, finds runs of
                     // identical consecutive expert ids, and issues one

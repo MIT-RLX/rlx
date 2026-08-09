@@ -193,6 +193,14 @@ impl ExecutableGraph for CudaExecutableWrapper {
         self.inner.rng()
     }
 
+    fn set_moe_resident_experts(&mut self, mask: &[bool]) {
+        self.inner.set_moe_resident_experts(mask);
+    }
+
+    fn set_moe_resident_experts_per_layer(&mut self, masks: &[&[bool]]) {
+        self.inner.set_moe_resident_experts_per_layer(masks);
+    }
+
     fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
         self.inner.run_slots(inputs)
     }

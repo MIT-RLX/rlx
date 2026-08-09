@@ -108,9 +108,32 @@ impl BlockStage for Qwen3DecodeLayerStage {
         // (K-quant GGUF) yields a fused `DequantMatMul` over the U8 blob (no F32
         // weight residency — the low-memory packed decode path); an F32 source
         // falls back to a dense `mm`, byte-identical to the default runner.
-        let q_w = ctx.resolve_linear(&format!("{lp}.self_attn.q_proj.weight"), true, w_dt)?;
-        let k_w = ctx.resolve_linear(&format!("{lp}.self_attn.k_proj.weight"), true, w_dt)?;
-        let v_w = ctx.resolve_linear(&format!("{lp}.self_attn.v_proj.weight"), true, w_dt)?;
+        // Fused QKV (opt-in `RLX_QWEN3_FUSED_QKV`, packed only): one DequantMatMul
+        // over the concatenated q/k/v weights instead of 3 GEMVs → 2 fewer kernel
+        // dispatches per layer. `None` on dense/non-packed → per-key path below.
+        let use_fused_qkv = rlx_ir::env::flag("RLX_QWEN3_FUSED_QKV");
+        let qkv_fused = if use_fused_qkv {
+            Some(ctx.resolve_linear_fused(
+                &[
+                    &format!("{lp}.self_attn.q_proj.weight"),
+                    &format!("{lp}.self_attn.k_proj.weight"),
+                    &format!("{lp}.self_attn.v_proj.weight"),
+                ],
+                true,
+                w_dt,
+            )?)
+        } else {
+            None
+        };
+        let (q_w, k_w, v_w) = if use_fused_qkv {
+            (None, None, None)
+        } else {
+            (
+                Some(ctx.resolve_linear(&format!("{lp}.self_attn.q_proj.weight"), true, w_dt)?),
+                Some(ctx.resolve_linear(&format!("{lp}.self_attn.k_proj.weight"), true, w_dt)?),
+                Some(ctx.resolve_linear(&format!("{lp}.self_attn.v_proj.weight"), true, w_dt)?),
+            )
+        };
         let o_w = ctx.resolve_linear(&format!("{lp}.self_attn.o_proj.weight"), true, w_dt)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
         let gate_w = ctx.resolve_linear(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?;
@@ -140,9 +163,29 @@ impl BlockStage for Qwen3DecodeLayerStage {
         let mut gb = HirMut::new(ctx.hir());
         let skip = input.id;
         let normed_in = gb.rms_norm(skip, in_ln_g, zero_beta_h, spec.eps);
-        let mut q = q_w.emit(&mut gb, normed_in);
-        let mut k = k_w.emit(&mut gb, normed_in);
-        let mut v = v_w.emit(&mut gb, normed_in);
+        use crate::context::FusedProj;
+        let (mut q, mut k, mut v) = match &qkv_fused {
+            Some(FusedProj::Fused { weight, dims }) => {
+                // One GEMV → [.., Σ out], then narrow_-split into q ‖ k ‖ v (the
+                // combined weight rows are stacked in that order).
+                let qkv = weight.emit(&mut gb, normed_in);
+                let la = gb.shape(qkv).rank() - 1;
+                let q = gb.narrow_(qkv, la, 0, dims[0]);
+                let k = gb.narrow_(qkv, la, dims[0], dims[1]);
+                let v = gb.narrow_(qkv, la, dims[0] + dims[1], dims[2]);
+                (q, k, v)
+            }
+            Some(FusedProj::Separate(ws)) => (
+                ws[0].emit(&mut gb, normed_in),
+                ws[1].emit(&mut gb, normed_in),
+                ws[2].emit(&mut gb, normed_in),
+            ),
+            None => (
+                q_w.as_ref().unwrap().emit(&mut gb, normed_in),
+                k_w.as_ref().unwrap().emit(&mut gb, normed_in),
+                v_w.as_ref().unwrap().emit(&mut gb, normed_in),
+            ),
+        };
 
         if let (Some(qb), Some(kb), Some(vb)) = (q_bias, k_bias, v_bias) {
             q = gb.add(q, qb);

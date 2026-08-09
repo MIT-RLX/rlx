@@ -8,6 +8,12 @@
 // hardware ceiling (bandwidth-bound) and the gap is elsewhere (op count).
 //
 //   cargo run --release -p rlx-metal --example mps_re_bench
+
+// `objc`'s `msg_send!` expands to `cfg(feature = "cargo-clippy")` checks that
+// modern rustc doesn't recognize. Third-party noise; mirrors the crate-root
+// allow in `src/lib.rs`.
+#![allow(unexpected_cfgs)]
+
 #[cfg(not(target_os = "macos"))]
 fn main() {}
 
@@ -125,7 +131,7 @@ fn main() {
             }
             let b16 = base.add(b_f16_off) as *mut f16;
             for i in 0..k * n {
-                *b16.add(i) = f16::from_f32(rnd(0x1234 ^ i as u64 * 40503));
+                *b16.add(i) = f16::from_f32(rnd(0x1234 ^ (i as u64 * 40503)));
             }
         }
 

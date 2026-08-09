@@ -222,6 +222,22 @@ impl MetalExecutable {
                     | Op::GatherElements { .. }
             )
         });
+        // The DequantMatMul activation-input liveness extension (memory.rs,
+        // task #50) guards ONLY the deferred-host dequant flush. When EVERY
+        // dequant matmul runs on-GPU (GPU dequant enabled + every scheme has a
+        // Metal kernel; scratch is always allocated when a scratch-needing dequant
+        // exists), there is no host flush to guard, so keep the extension OFF to
+        // restore slot reuse. Without this, the chain-walk pins nearly every
+        // activation in a packed prefill to the graph end (qwen3.5 8K packed
+        // prefill: 61.9 GB pinned → OOM, vs ~4 GB reused). Matches the runtime
+        // deferred condition in encode (`!use_gpu_dequant || !has_metal_dequant_kernel`).
+        let dequant_host_fallback = crate::runtime_config().dequant_gpu_disable
+            || fused.nodes().iter().any(|n| match &n.op {
+                Op::DequantMatMul { scheme, .. } | Op::DequantGroupedMatMul { scheme, .. } => {
+                    !crate::backend::has_metal_dequant_kernel(*scheme)
+                }
+                _ => false,
+            });
         let mut plan = memory::plan_memory_with_options(
             &fused,
             128,
@@ -235,6 +251,7 @@ impl MetalExecutable {
                 // the output-ancestor pin unconditionally) to measure the true
                 // reuse-enabled footprint vs the pinned default.
                 pin_output_ancestors: !rlx_ir::env::flag("RLX_METAL_UNPIN_ALL"),
+                dequant_host_fallback,
                 ..Default::default()
             },
         );
@@ -280,6 +297,7 @@ impl MetalExecutable {
                 memory::MemoryPlanOptions {
                     pin_output_ancestors: false,
                     arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
+                    dequant_host_fallback,
                     ..Default::default()
                 },
             );
@@ -348,6 +366,7 @@ impl MetalExecutable {
                     allocate_params: false,
                     pin_output_ancestors: pin_act,
                     arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
+                    dequant_host_fallback,
                     ..Default::default()
                 },
             );

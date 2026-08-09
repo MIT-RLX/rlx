@@ -364,7 +364,11 @@ fn is_static_weight_tensor(graph: &Graph, id: NodeId, memo: &mut HashMap<NodeId,
 
 /// Keep primary data inputs alive through graph end for `Op::Custom("onnx.*")`
 /// thunks that read activations after parallel branches would otherwise reuse slots.
-fn extend_custom_op_input_liveness(graph: &Graph, ranges: &mut HashMap<NodeId, (usize, usize)>) {
+fn extend_custom_op_input_liveness(
+    graph: &Graph,
+    ranges: &mut HashMap<NodeId, (usize, usize)>,
+    dequant_host_fallback: bool,
+) {
     let last_step = graph.len();
     for node in graph.nodes() {
         let Op::Custom {
@@ -394,19 +398,26 @@ fn extend_custom_op_input_liveness(graph: &Graph, ranges: &mut HashMap<NodeId, (
     // (task #50). The fix is conservative — extends only the direct
     // activation input (operand 0), not the whole ancestor chain — because
     // weights (operand 1+) are always Params and already pinned.
-    for node in graph.nodes() {
-        match &node.op {
-            Op::DequantMatMul { .. } => {
-                if let Some(&x) = node.inputs.first() {
-                    extend_node_chain_liveness_to_end(graph, ranges, x, last_step);
+    // GATE: only needed when a dequant matmul can hit the deferred-host flush.
+    // A backend that runs ALL dequant matmuls on-GPU passes
+    // `dequant_host_fallback=false`; skipping this restores slot reuse (the
+    // chain-walk otherwise pins nearly every activation in a packed prefill to
+    // the graph end — qwen3.5 8K packed prefill: 61.9 GB pinned vs ~4 GB reused).
+    if dequant_host_fallback {
+        for node in graph.nodes() {
+            match &node.op {
+                Op::DequantMatMul { .. } => {
+                    if let Some(&x) = node.inputs.first() {
+                        extend_node_chain_liveness_to_end(graph, ranges, x, last_step);
+                    }
                 }
-            }
-            Op::DequantGroupedMatMul { .. } => {
-                if let Some(&x) = node.inputs.first() {
-                    extend_node_chain_liveness_to_end(graph, ranges, x, last_step);
+                Op::DequantGroupedMatMul { .. } => {
+                    if let Some(&x) = node.inputs.first() {
+                        extend_node_chain_liveness_to_end(graph, ranges, x, last_step);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -548,6 +559,14 @@ pub struct MemoryPlanOptions {
     /// this false: only the output nodes are pinned (read-back protection), which
     /// is sufficient and keeps the arena small.
     pub pin_output_ancestors: bool,
+    /// When true (default), pin every `DequantMatMul`/`DequantGroupedMatMul`
+    /// activation input (operand 0) live-to-end — guards the deferred-host dequant
+    /// path (task #50: the host o_proj flush reads an activation a later GPU op
+    /// would otherwise have reused → exact-zero downstream). A backend that runs
+    /// ALL dequant matmuls on-GPU (no host flush) sets this false to restore slot
+    /// reuse: without it, packed prefills pin nearly every activation to the graph
+    /// end (qwen3.5 8K packed prefill: 61.9 GB pinned vs ~4 GB reused).
+    pub dequant_host_fallback: bool,
 }
 
 impl MemoryPlanOptions {
@@ -560,6 +579,7 @@ impl MemoryPlanOptions {
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             pin_output_ancestors: true,
+            dequant_host_fallback: true,
         }
     }
 
@@ -573,6 +593,7 @@ impl MemoryPlanOptions {
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             pin_output_ancestors: true,
+            dequant_host_fallback: true,
         }
     }
 }
@@ -830,7 +851,7 @@ fn plan_memory_aligned_inner(
 ) -> MemoryPlan {
     let mut ranges = compute_live_ranges_opts(graph, opts.pin_output_ancestors);
     extend_packed_qkv_parent_liveness(graph, &mut ranges);
-    extend_custom_op_input_liveness(graph, &mut ranges);
+    extend_custom_op_input_liveness(graph, &mut ranges, opts.dequant_host_fallback);
     extend_bert_hidden_liveness(graph, &mut ranges);
     extend_onnx_duration_epilogue_liveness(graph, &mut ranges);
     extend_static_weight_pack_liveness(graph, &mut ranges);

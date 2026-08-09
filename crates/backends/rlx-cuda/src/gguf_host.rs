@@ -116,6 +116,42 @@ pub fn run_dequant_grouped_matmul_mlx(
     );
 }
 
+/// Host half of the hot-on-GPU / cold-on-CPU MoE split: compute the cold
+/// (non-resident) experts' grouped-matmul rows on the CPU, reading their weights
+/// back from the arena. Returns the number of cold tokens processed.
+#[allow(clippy::too_many_arguments)]
+pub fn run_moe_cold_experts_from_arena(
+    stream: &Arc<CudaStream>,
+    buffer: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    num_experts: usize,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    idx_byte_off: usize,
+    out_byte_off: usize,
+    resident: &[bool],
+) -> usize {
+    let mut arena = CudaArena {
+        stream,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_moe_cold_experts_from_arena(
+        &mut arena,
+        m,
+        k,
+        n,
+        num_experts,
+        x_byte_off,
+        w_byte_off,
+        idx_byte_off,
+        out_byte_off,
+        resident,
+    )
+}
+
 /// Upload raw U8 param bytes into the f32 arena slot at `byte_off`.
 pub fn upload_param_bytes(
     stream: &Arc<CudaStream>,

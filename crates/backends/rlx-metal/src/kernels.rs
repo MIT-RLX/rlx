@@ -881,8 +881,12 @@ kernel void rope_h(
     constant uint& interleaved    [[buffer(12)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
-    uint half_dh = head_dim / 2;
     uint rot_half = n_rot / 2;
+    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
+    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
+    // row stride overruns into the next token's angles from position 1 onward,
+    // which is why this indexes by `rot_half`. Full rope has n_rot == head_dim,
+    // so rot_half == head_dim/2 and nothing changes there.
     if (gid.x >= head_dim) return;
 
     uint bs = gid.z;
@@ -910,8 +914,8 @@ kernel void rope_h(
             uint b = 2u * d + 1u;
             float x1 = float(x[src_base + a]);
             float x2 = float(x[src_base + b]);
-            float c = float(cos[cos_row * half_dh + d]);
-            float s = float(sin[cos_row * half_dh + d]);
+            float c = float(cos[cos_row * rot_half + d]);
+            float s = float(sin[cos_row * rot_half + d]);
             out[dst_base + a] = half(x1 * c - x2 * s);
             out[dst_base + b] = half(x2 * c + x1 * s);
         } else if (d >= n_rot) {
@@ -920,8 +924,8 @@ kernel void rope_h(
     } else if (d < rot_half) {
         float x1 = float(x[src_base + d]);
         float x2 = float(x[src_base + rot_half + d]);
-        float c = float(cos[cos_row * half_dh + d]);
-        float s = float(sin[cos_row * half_dh + d]);
+        float c = float(cos[cos_row * rot_half + d]);
+        float s = float(sin[cos_row * rot_half + d]);
         out[dst_base + d] = half(x1 * c - x2 * s);
         out[dst_base + rot_half + d] = half(x2 * c + x1 * s);
     } else if (d >= n_rot) {
@@ -6415,8 +6419,12 @@ kernel void rope(
     // gid.x = dim index within head (0..head_dim)
     // gid.y = head index
     // gid.z = batch * seq + seq pos (linearized)
-    uint half_dh = head_dim / 2;
     uint rot_half = n_rot / 2;
+    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
+    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
+    // row stride overruns into the next token's angles from position 1 onward,
+    // which is why this indexes by `rot_half`. Full rope has n_rot == head_dim,
+    // so rot_half == head_dim/2 and nothing changes there.
     if (gid.x >= head_dim) return;
 
     uint bs = gid.z;
@@ -6448,8 +6456,8 @@ kernel void rope(
             uint b = 2u * d + 1u;
             float x1 = x[src_base + a];
             float x2 = x[src_base + b];
-            float c = cos[cos_row * half_dh + d];
-            float s = sin[cos_row * half_dh + d];
+            float c = cos[cos_row * rot_half + d];
+            float s = sin[cos_row * rot_half + d];
             out[dst_base + a] = x1 * c - x2 * s;
             out[dst_base + b] = x2 * c + x1 * s;
         } else if (d >= n_rot) {
@@ -6458,8 +6466,8 @@ kernel void rope(
     } else if (d < rot_half) {
         float x1 = x[src_base + d];
         float x2 = x[src_base + rot_half + d];
-        float c = cos[cos_row * half_dh + d];
-        float s = sin[cos_row * half_dh + d];
+        float c = cos[cos_row * rot_half + d];
+        float s = sin[cos_row * rot_half + d];
         out[dst_base + d] = x1 * c - x2 * s;
         out[dst_base + rot_half + d] = x2 * c + x1 * s;
     } else if (d >= n_rot) {
@@ -9236,8 +9244,12 @@ kernel void rope_bwd(
     uint bi = bs / seq;
     uint si = bs % seq;
     uint rot_half = n_rot / 2u;
-    uint half_dh = head_dim / 2u;
-    uint tab_off = (si * half_dh) % max(cos_len, 1u);
+    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
+    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
+    // row stride overruns into the next token's angles from position 1 onward,
+    // which is why this indexes by `rot_half`. Full rope has n_rot == head_dim,
+    // so rot_half == head_dim/2 and nothing changes there.
+    uint tab_off = (si * rot_half) % max(cos_len, 1u);
     uint dy_base = bi * seq * hidden + si * hidden + hi * head_dim;
     uint dx_base = dy_base;
     if (d < rot_half) {
@@ -11395,8 +11407,8 @@ const SDPA_DECODE_M1_PARTIAL_HD_TEMPLATE: &str = r####"kernel void __NAME__(
     device const __KV__* V = (device const __KV__*)((device const char*)arena_v + byte_offs.v);
     device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
 
-    constexpr uint MAX_DPL = 4u;
-    constexpr uint SLOT = 2u + 128u;
+    constexpr uint MAX_DPL = __MAX_DPL__u;
+    constexpr uint SLOT = 2u + __MAX_DH__u;
 
     uint part = tgid % n_part;
     uint t    = tgid / n_part;
@@ -11472,17 +11484,19 @@ const SDPA_DECODE_M1_PARTIAL_HD_TEMPLATE: &str = r####"kernel void __NAME__(
 }"####;
 
 macro_rules! sdpa_decode_m1_partial_hd_variant {
-    ($name:expr, $kv:expr) => {
+    ($name:expr, $kv:expr, $dpl:expr, $dh:expr) => {
         SDPA_DECODE_M1_PARTIAL_HD_TEMPLATE
             .replace("__NAME__", $name)
             .replace("__KV__", $kv)
+            .replace("__MAX_DPL__", $dpl)
+            .replace("__MAX_DH__", $dh)
     };
 }
 
 // Combine the P partial online-softmax states per (batch, head) → final OUT.
 // One threadgroup per (bi,hi); threads parallelize over vdh. m_g/l_g are cheap
 // (loop over n_part ≤ ~16) so each thread recomputes them rather than sharing.
-const SDPA_DECODE_M1_COMBINE: &str = r####"kernel void sdpa_decode_m1_combine(
+const SDPA_DECODE_M1_COMBINE_TEMPLATE: &str = r####"kernel void __NAME__(
     device const float* scratch [[buffer(0)]],
     device float*       arena_o [[buffer(1)]],
     constant uint& batch     [[buffer(2)]],
@@ -11496,7 +11510,7 @@ const SDPA_DECODE_M1_COMBINE: &str = r####"kernel void sdpa_decode_m1_combine(
     uint tgid [[threadgroup_position_in_grid]],
     uint tsize [[threads_per_threadgroup]]
 ) {
-    constexpr uint MAX_DH = 128u;
+    constexpr uint MAX_DH = __MAX_DH__u;
     constexpr uint SLOT = 2u + MAX_DH;
     device float* OUT = (device float*)((device char*)arena_o + byte_offs.o);
     uint hi = tgid % heads;
@@ -11524,6 +11538,125 @@ const SDPA_DECODE_M1_COMBINE: &str = r####"kernel void sdpa_decode_m1_combine(
         }
         OUT[o_base + d] = acc * inv_l;
     }
+}"####;
+
+macro_rules! sdpa_decode_m1_combine_variant {
+    ($name:expr, $dh:expr) => {
+        SDPA_DECODE_M1_COMBINE_TEMPLATE
+            .replace("__NAME__", $name)
+            .replace("__MAX_DH__", $dh)
+    };
+}
+
+// ── Prefill flash attention, head-dim-split for head_dim=256 (qwen3.5) ───────
+// The tiled prefill FA + splitk kernels cap at head_dim<=128 (per-lane q_reg),
+// so head_dim=256 prefill fell to `sdpa_long` at 1 thread/threadgroup (single-
+// threaded per head → ~1.3s/layer @4K, 55% of TTFT). This kernel is the decode
+// flash-256 head-dim-split applied per query row: one threadgroup per (b,h,qi),
+// 32 lanes each own head_dim/32 dims; the Q·K dot is a per-key simd_sum
+// (barrier-free), online-softmax accumulates each lane's own output dims. Causal
+// breaks past the query position (halves the walk). No scores matrix, O(D/32)
+// registers/lane. Token-identical to sdpa_long.
+const SDPA_PREFILL_HD256: &str = r####"kernel void sdpa_prefill_hd256(
+    device const float* arena_q   [[buffer(0)]],
+    device const float* arena_k   [[buffer(1)]],
+    device const float* arena_v   [[buffer(2)]],
+    device const float* arena_m   [[buffer(3)]],
+    device float*       arena_o   [[buffer(4)]],
+    constant uint& batch       [[buffer(5)]],
+    constant uint& seq_q       [[buffer(6)]],
+    constant uint& heads       [[buffer(7)]],
+    constant uint& head_dim    [[buffer(8)]],
+    constant uint& q_stride    [[buffer(9)]],
+    constant uint& mask_kind   [[buffer(10)]],
+    constant uint& seq_k       [[buffer(11)]],
+    constant uint& k_stride    [[buffer(12)]],
+    constant uint& bhsd        [[buffer(13)]],
+    constant uint& window      [[buffer(14)]],
+    constant float& score_scale  [[buffer(15)]],
+    constant float& attn_softcap [[buffer(16)]],
+    constant SdpaOffsets& byte_offs [[buffer(17)]],
+    uint tgid_x [[threadgroup_position_in_grid]],
+    uint lane   [[thread_index_in_threadgroup]]
+) {
+    device const float* Q = (device const float*)((device const char*)arena_q + byte_offs.q);
+    device const float* K = (device const float*)((device const char*)arena_k + byte_offs.k);
+    device const float* V = (device const float*)((device const char*)arena_v + byte_offs.v);
+    device const float* M = (device const float*)((device const char*)arena_m + byte_offs.m);
+    device float* OUT     = (device float*)((device char*)arena_o + byte_offs.o);
+
+    constexpr uint MAX_DPL = 8u; // head_dim=256 / 32 lanes
+
+    uint total_rows = batch * heads * seq_q;
+    if (tgid_x >= total_rows) return;
+    uint qi = tgid_x % seq_q;
+    uint bh = tgid_x / seq_q;
+    uint hi = bh % heads;
+    uint bi = bh / heads;
+
+    float scale = (score_scale > 0.0f) ? score_scale : rsqrt(float(head_dim));
+    float softcap_inv = (attn_softcap > 0.0f) ? (1.0f / attn_softcap) : 0.0f;
+    uint vdh = (byte_offs.v_head_dim == 0u) ? head_dim : byte_offs.v_head_dim;
+    uint q_offset = seq_k - seq_q;
+    uint abs_q = q_offset + qi;
+
+    // This lane owns dims [d0, d0+dpl) of q/k and [vd0, vd0+vdpl) of v/o.
+    uint dpl  = head_dim / 32u;   // head_dim % 32 == 0 guaranteed by the caller
+    uint d0   = lane * dpl;
+    uint vdpl = vdh / 32u;
+    uint vd0  = lane * vdpl;
+
+    float q_reg[MAX_DPL];
+    uint q_base = qkv_q_offset(bi, hi, qi, heads, seq_q, head_dim, q_stride, bhsd);
+    for (uint j = 0; j < dpl; ++j) q_reg[j] = Q[q_base + d0 + j];
+
+    float o_acc[MAX_DPL];
+    for (uint j = 0; j < vdpl; ++j) o_acc[j] = 0.0f;
+    float m_acc = -1e30f;
+    float l_acc = 0.0f;
+    uint bias_row_base = ((bi * heads + hi) * seq_q + qi) * seq_k;
+
+    // Sliding window (mask_kind==4): START the key scan at the window lower
+    // bound and (with causal) break at `abs_q`, so each query iterates only
+    // ~`window` keys instead of all `seq_k` → prefill attention is O(seq·window)
+    // (LINEAR in seq) instead of O(seq²). The prior code masked with `continue`
+    // but still iterated every key (quadratic). Other mask kinds start at 0.
+    uint ki_start = (mask_kind == 4u && abs_q > window) ? (abs_q - window) : 0u;
+    // Attention sinks (StreamingLLM): the first few tokens anchor the softmax, so
+    // keep attending them even after the sliding window scrolls past. Only for
+    // SWA (mask_kind==4), and only the sinks that fall before the window start.
+    // All 32 lanes share `ki` (cooperative simd_sum), so this control flow is
+    // uniform — no divergence.
+    const uint SINKS = 4u;
+    uint sink_end = (mask_kind == 4u) ? min(SINKS, ki_start) : 0u;
+    #define HD256_KV_STEP(KI) { \
+        uint k_base = qkv_kv_offset(bi, hi, (KI), heads, byte_offs.kv_heads, seq_k, head_dim, k_stride, bhsd); \
+        float pd = 0.0f; \
+        for (uint j = 0; j < dpl; ++j) pd += q_reg[j] * K[k_base + d0 + j]; \
+        float s = simd_sum(pd) * scale; \
+        if (softcap_inv > 0.0f) s = precise::tanh(s * softcap_inv) * attn_softcap; \
+        if (mask_kind == 3u) s += M[bias_row_base + (KI)]; \
+        float m_new = max(m_acc, s); \
+        float e_old = precise::exp(m_acc - m_new); \
+        float e_cur = precise::exp(s - m_new); \
+        l_acc = e_old * l_acc + e_cur; \
+        uint v_base = qkv_v_offset(bi, hi, (KI), heads, byte_offs.kv_heads, seq_k, vdh, k_stride, bhsd); \
+        for (uint j = 0; j < vdpl; ++j) o_acc[j] = e_old * o_acc[j] + e_cur * V[v_base + vd0 + j]; \
+        m_acc = m_new; \
+    }
+    // Sink pass (SWA only): [0, sink_end) — the anchor tokens.
+    for (uint ki = 0; ki < sink_end; ++ki) HD256_KV_STEP(ki)
+    // Window / causal pass: [ki_start, abs_q].
+    for (uint ki = ki_start; ki < seq_k; ++ki) {
+        if ((mask_kind == 1u || mask_kind == 4u) && ki > abs_q) break;
+        if (mask_kind == 2u && M[bi * k_stride + ki] < 0.5f) continue;
+        HD256_KV_STEP(ki)
+    }
+    #undef HD256_KV_STEP
+
+    uint o_base = qkv_out_offset(bi, hi, qi, heads, seq_q, vdh, q_stride, bhsd);
+    float inv_l = (l_acc > 0.0f) ? (1.0f / l_acc) : 0.0f;
+    for (uint j = 0; j < vdpl; ++j) OUT[o_base + vd0 + j] = o_acc[j] * inv_l;
 }"####;
 
 // ── W8A8 decode attention (int8 Q·K integer dot + int8 V) ───────────────────
@@ -12050,14 +12183,38 @@ pub(crate) fn msl_source() -> String {
         .replace(
             "// @@RLX_SDPA_DECODE_M1@@",
             &format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                SDPA_PREFILL_HD256,
                 sdpa_decode_m1_variant!("sdpa_decode_m1", "float"),
                 sdpa_decode_m1_variant!("sdpa_decode_m1_f16kv", "half"),
                 sdpa_decode_m1_partial_variant!("sdpa_decode_m1_partial", "float"),
                 sdpa_decode_m1_partial_variant!("sdpa_decode_m1_partial_f16kv", "half"),
-                sdpa_decode_m1_partial_hd_variant!("sdpa_decode_m1_partial_hd", "float"),
-                sdpa_decode_m1_partial_hd_variant!("sdpa_decode_m1_partial_hd_f16kv", "half"),
-                SDPA_DECODE_M1_COMBINE,
+                sdpa_decode_m1_partial_hd_variant!(
+                    "sdpa_decode_m1_partial_hd",
+                    "float",
+                    "4",
+                    "128"
+                ),
+                sdpa_decode_m1_partial_hd_variant!(
+                    "sdpa_decode_m1_partial_hd_f16kv",
+                    "half",
+                    "4",
+                    "128"
+                ),
+                sdpa_decode_m1_partial_hd_variant!(
+                    "sdpa_decode_m1_partial_hd_256",
+                    "float",
+                    "8",
+                    "256"
+                ),
+                sdpa_decode_m1_partial_hd_variant!(
+                    "sdpa_decode_m1_partial_hd_256_f16kv",
+                    "half",
+                    "8",
+                    "256"
+                ),
+                sdpa_decode_m1_combine_variant!("sdpa_decode_m1_combine", "128"),
+                sdpa_decode_m1_combine_variant!("sdpa_decode_m1_combine_256", "256"),
                 sdpa_prefill_fa_variant!(
                     "sdpa_prefill_fa",
                     "",
@@ -12238,7 +12395,11 @@ pub struct Kernels {
     /// coalesced K/V. Off-switch RLX_METAL_SDPA_HDSPLIT=0.
     pub sdpa_decode_m1_partial_hd: ComputePipelineState,
     pub sdpa_decode_m1_partial_hd_f16kv: ComputePipelineState,
+    pub sdpa_decode_m1_partial_hd_256: ComputePipelineState,
+    pub sdpa_decode_m1_partial_hd_256_f16kv: ComputePipelineState,
     pub sdpa_decode_m1_combine: ComputePipelineState,
+    pub sdpa_decode_m1_combine_256: ComputePipelineState,
+    pub sdpa_prefill_hd256: ComputePipelineState,
     pub sdpa_decode_m1_partial_w8a8: ComputePipelineState,
     pub kv_quant_i8: ComputePipelineState,
     pub kv_quant_i8_f16: ComputePipelineState,
@@ -12468,10 +12629,15 @@ pub struct Kernels {
     /// Q4_K / Q5_0 / Q6_K down + residual. Produced by `fuse_decode_mlp*`
     /// (off-switch `RLX_METAL_FUSE_DECODE=0`).
     pub q4k_swiglu_mv_f32: ComputePipelineState,
+    /// Simdgroup-cooperative Q4_K gate+up+SwiGLU (`_sg`): ~40% of peak vs the
+    /// naive `q4k_swiglu_mv_f32`'s ~8% (one-thread-per-row).
+    pub q4k_swiglu_mv_f32_sg: ComputePipelineState,
     pub q4k_gelu_mv_f32: ComputePipelineState,
     pub q5_0_swiglu_mv_f32: ComputePipelineState,
     pub q5_0_gelu_mv_f32: ComputePipelineState,
     pub q4k_mv_residual_f32: ComputePipelineState,
+    /// Simdgroup-cooperative Q4_K down+residual (`_sg`), sibling of the above.
+    pub q4k_mv_residual_f32_sg: ComputePipelineState,
     pub q6k_mv_residual_f32: ComputePipelineState,
     pub q5_0_mv_residual_f32: ComputePipelineState,
     /// Fused Q1_0 decode MLP (Bonsai): gate+up+SwiGLU and down+residual.
@@ -12739,7 +12905,11 @@ impl Kernels {
             sdpa_decode_m1_partial_f16kv: pipeline("sdpa_decode_m1_partial_f16kv"),
             sdpa_decode_m1_partial_hd: pipeline("sdpa_decode_m1_partial_hd"),
             sdpa_decode_m1_partial_hd_f16kv: pipeline("sdpa_decode_m1_partial_hd_f16kv"),
+            sdpa_decode_m1_partial_hd_256: pipeline("sdpa_decode_m1_partial_hd_256"),
+            sdpa_decode_m1_partial_hd_256_f16kv: pipeline("sdpa_decode_m1_partial_hd_256_f16kv"),
             sdpa_decode_m1_combine: pipeline("sdpa_decode_m1_combine"),
+            sdpa_decode_m1_combine_256: pipeline("sdpa_decode_m1_combine_256"),
+            sdpa_prefill_hd256: pipeline("sdpa_prefill_hd256"),
             sdpa_decode_m1_partial_w8a8: pipeline("sdpa_decode_m1_partial_w8a8"),
             kv_quant_i8: pipeline("kv_quant_i8"),
             kv_quant_i8_f16: pipeline("kv_quant_i8_f16"),
@@ -12925,10 +13095,12 @@ impl Kernels {
             q4k_mm_f32: pipeline("q4k_mm_f32"),
             q6k_mm_f32: pipeline("q6k_mm_f32"),
             q4k_swiglu_mv_f32: pipeline("q4k_swiglu_mv_f32"),
+            q4k_swiglu_mv_f32_sg: pipeline("q4k_swiglu_mv_f32_sg"),
             q4k_gelu_mv_f32: pipeline("q4k_gelu_mv_f32"),
             q5_0_swiglu_mv_f32: pipeline("q5_0_swiglu_mv_f32"),
             q5_0_gelu_mv_f32: pipeline("q5_0_gelu_mv_f32"),
             q4k_mv_residual_f32: pipeline("q4k_mv_residual_f32"),
+            q4k_mv_residual_f32_sg: pipeline("q4k_mv_residual_f32_sg"),
             q6k_mv_residual_f32: pipeline("q6k_mv_residual_f32"),
             q5_0_mv_residual_f32: pipeline("q5_0_mv_residual_f32"),
             q1_0_swiglu_mv_f32: pipeline("q1_0_swiglu_mv_f32"),

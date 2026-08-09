@@ -2022,6 +2022,193 @@ kernel void q4k_mv_f32_sg(
     }
 }
 
+// One Q4_K super-block's contribution to a simdgroup-cooperative GEMV row.
+// Factors the inner dequant/dot out of `q4k_mv_f32_sg` so the fused MLP `_sg`
+// kernels (residual, swiglu) reuse the identical block math with a different
+// epilogue. `yl`/`yh` are this thread's 32-of-256 x slice (already loaded);
+// `sumy` its partial x sums; `(iq, ir)` its partition. Returns the block dot.
+static inline float q4k_block_dot_sg(
+    device const uchar* blk,
+    thread const float* yl,
+    thread const float* yh,
+    float4 sumy,
+    short iq,
+    short ir
+) {
+    const ushort kmask1 = 0x3f3fu;
+    const ushort kmask2 = 0x0f0fu;
+    const ushort kmask3 = 0xc0c0u;
+    uint16_t sc16[4];
+    thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+    const float d    = dq_read_f16(blk, 0u);
+    const float dmin = dq_read_f16(blk, 2u);
+
+    device const uint16_t* sc = (device const uint16_t*)(blk + Q4K_KSCALE_OFF) + iq;
+    sc16[0] = sc[0] & kmask1;
+    sc16[1] = sc[2] & kmask1;
+    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+    device const uint16_t* q1 = (device const uint16_t*)(blk + Q4K_QS_OFF) + 16u * iq + 4u * ir;
+    device const uint16_t* q2 = q1 + 32u;
+
+    float4 acc1 = float4(0.f);
+    float4 acc2 = float4(0.f);
+    #pragma unroll
+    for (short i = 0; i < 4; ++i) {
+        acc1[0] += yl[2*i + 0] * (q1[i] & 0x000Fu);
+        acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00u);
+        acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0u);
+        acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000u);
+        acc2[0] += yh[2*i + 0] * (q2[i] & 0x000Fu);
+        acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00u);
+        acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0u);
+        acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000u);
+    }
+    return d * ((acc1[0] + acc1[1] * (1.f/256.f)) * sc8[0] +
+                (acc1[2] + acc1[3] * (1.f/256.f)) * sc8[1] * (1.f/16.f) +
+                (acc2[0] + acc2[1] * (1.f/256.f)) * sc8[4] +
+                (acc2[2] + acc2[3] * (1.f/256.f)) * sc8[5] * (1.f/16.f))
+         - dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3]
+                 + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+}
+
+// Fused down_proj + residual add (Q4_K, m == 1) — SIMDGROUP-COOPERATIVE.
+//   dst[j] = res[j] + sum_k h[k] * dequant(w[j,k])
+// Same block-strided `simd_sum` reduction as `q4k_mv_f32_sg` (NSG=4 simdgroups
+// per tg, Q4K_NR0=2 rows each, 32 lanes cooperate per row → ~40% of peak) but
+// the epilogue adds the residual. Replaces the naive one-thread-per-row
+// `q4k_mv_residual_f32` (~8% of peak). Dispatch in `encode_q4k_mv_residual_f32_sg`
+// MUST match (grid = ceil(n/NR0/NSG)*NSG*32, tg = NSG*32).
+kernel void q4k_mv_residual_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant ulong& res_off       [[buffer(4)]],
+    constant uint& k_dim          [[buffer(5)]],
+    constant uint& n_dim          [[buffer(6)]],
+    uint3 tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiisg                 [[thread_index_in_simdgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]]
+) {
+    const short ix = (short)(tiisg / 8u);
+    const short it = (short)(tiisg % 8u);
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const uint nb = k_dim / DQ_QK_K;
+
+    const uint NSG = 4u;
+    const uint first_row = (tgpig.x * NSG + sgitg) * Q4K_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+    device const float* res    = (device const float*)((device char*)arena + res_off);
+    device const uchar* w_base = (device const uchar*)arena + w_off;
+
+    float yl[16];
+    float yh[16];
+    float sumf[Q4K_NR0] = {0.f};
+    device const float* y4 = x_base + ix * DQ_QK_K + 64u * iq + 8u * ir;
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        float4 sumy = float4(0.f);
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+        for (ushort row = 0; row < Q4K_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const uchar* blk = w_base + (row_idx * nb + ib) * Q4K_BLK_BYTES;
+            sumf[row] += q4k_block_dot_sg(blk, yl, yh, sumy, iq, ir);
+        }
+        y4 += 4u * DQ_QK_K;
+    }
+
+    for (ushort row = 0; row < Q4K_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) {
+            dst[row_idx] = res[row_idx] + total;
+        }
+    }
+}
+
+// Fused gate_proj + up_proj + SwiGLU (Q4_K, m == 1) — SIMDGROUP-COOPERATIVE.
+//   dst[i] = up[i] * (gate[i] / (1 + exp(-gate[i])))
+// Runs the `q4k_mv_f32_sg` cooperative reduction for BOTH the gate and up
+// weights, sharing this thread's x slice (`yl`/`yh`) across both, then applies
+// SwiGLU. Replaces the naive one-thread-per-row `q4k_swiglu_mv_f32` (~8% of
+// peak). Dispatch in `encode_q4k_swiglu_mv_f32_sg` MUST match.
+kernel void q4k_swiglu_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& gate_off      [[buffer(2)]],
+    constant ulong& up_off        [[buffer(3)]],
+    constant ulong& dst_off       [[buffer(4)]],
+    constant uint& k_dim          [[buffer(5)]],
+    constant uint& n_dim          [[buffer(6)]],
+    uint3 tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiisg                 [[thread_index_in_simdgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]]
+) {
+    const short ix = (short)(tiisg / 8u);
+    const short it = (short)(tiisg % 8u);
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const uint nb = k_dim / DQ_QK_K;
+
+    const uint NSG = 4u;
+    const uint first_row = (tgpig.x * NSG + sgitg) * Q4K_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+    device const uchar* g_base = (device const uchar*)arena + gate_off;
+    device const uchar* u_base = (device const uchar*)arena + up_off;
+
+    float yl[16];
+    float yh[16];
+    float sumg[Q4K_NR0] = {0.f};
+    float sumu[Q4K_NR0] = {0.f};
+    device const float* y4 = x_base + ix * DQ_QK_K + 64u * iq + 8u * ir;
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        float4 sumy = float4(0.f);
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+        for (ushort row = 0; row < Q4K_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const uchar* gblk = g_base + (row_idx * nb + ib) * Q4K_BLK_BYTES;
+            device const uchar* ublk = u_base + (row_idx * nb + ib) * Q4K_BLK_BYTES;
+            sumg[row] += q4k_block_dot_sg(gblk, yl, yh, sumy, iq, ir);
+            sumu[row] += q4k_block_dot_sg(ublk, yl, yh, sumy, iq, ir);
+        }
+        y4 += 4u * DQ_QK_K;
+    }
+
+    for (ushort row = 0; row < Q4K_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float g = simd_sum(sumg[row]);
+        const float u = simd_sum(sumu[row]);
+        if (tiisg == 0u) {
+            dst[row_idx] = u * (g / (1.0f + exp(-g)));
+        }
+    }
+}
+
 // ── Fused Q4_K / Q6_K GEMM (m > 1, prefill) ────────────────────────────────
 //
 // Computes C[m,n] = A[m,k] @ dequant(B)[n,k]^T directly from the packed GGUF

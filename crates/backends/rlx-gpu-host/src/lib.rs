@@ -22,6 +22,7 @@ mod collective;
 mod custom;
 mod gguf;
 mod mlx;
+mod moe;
 mod rng;
 mod scan;
 mod spd;
@@ -38,6 +39,7 @@ pub use gguf::{
     upload_param_bytes,
 };
 pub use mlx::{mlx_dequant_gpu_disabled, run_dequant_grouped_matmul_mlx, run_dequant_matmul_mlx};
+pub use moe::{run_moe_cold_experts, run_moe_cold_experts_from_arena};
 pub use rng::{run_rng_normal, run_rng_uniform};
 pub use scan::{
     HostTensorCache, run_host_op, run_host_op_packed, run_host_op_packed_cached, run_host_op_span,

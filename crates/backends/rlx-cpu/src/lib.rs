@@ -40,6 +40,7 @@ pub mod kernels;
 pub mod llada2_gate;
 pub mod lm_head;
 pub mod moe_residency;
+pub mod moe_split;
 pub mod moe_topk_capture;
 pub mod ms_deform_attn;
 pub mod naive;

@@ -2094,7 +2094,7 @@ pub(crate) fn sdpa_flash_partitions_tuned(
     let keys_per_part = tile_k.clamp(64, 1024);
     let padded_kv = kv_seq.div_ceil(pad_kv.max(1)) * pad_kv.max(1);
     let by_keys = (padded_kv / keys_per_part).max(1);
-    by_occupancy.min(by_keys).max(1).min(64)
+    by_occupancy.min(by_keys).clamp(1, 64)
 }
 
 /// Flash-decoding (split-KV) SDPA for m=1 decode: `batch*heads*n_part`
@@ -2162,14 +2162,22 @@ pub(crate) fn encode_sdpa_flash_decode(
     // already yields 64-128 tgs, so occupancy isn't register-limited here, and
     // it adds a per-key simd_sum. Kept for few-head / low-P models where the tg
     // count IS register-bound. Default = the proven KV-split kernel.
+    // head_dim > 128 (e.g. qwen3.5-0.8B: 256) cannot use the KV-split kernels —
+    // their q_reg[128]/o_acc[128] register arrays overflow. The head-dim-split
+    // kernel keeps only head_dim/32 dims per lane, so a 256-wide variant fits in
+    // 8 regs/thread. For 256 we FORCE hd-split (not opt-in); the gate guarantees
+    // f32 KV (no f16kv-256 variant), head_dim%32==0, v_head_dim%32==0.
+    let hd256 = head_dim > 128;
     let hd_split = head_dim.is_multiple_of(32)
         && v_head_dim.is_multiple_of(32)
-        && rlx_ir::env::var("RLX_METAL_SDPA_HDSPLIT").as_deref() == Some("1");
-    let partial = match (hd_split, kv_f16) {
-        (true, true) => &k.sdpa_decode_m1_partial_hd_f16kv,
-        (true, false) => &k.sdpa_decode_m1_partial_hd,
-        (false, true) => &k.sdpa_decode_m1_partial_f16kv,
-        (false, false) => &k.sdpa_decode_m1_partial,
+        && (hd256 || rlx_ir::env::var("RLX_METAL_SDPA_HDSPLIT").as_deref() == Some("1"));
+    let partial = match (hd_split, hd256, kv_f16) {
+        (true, true, true) => &k.sdpa_decode_m1_partial_hd_256_f16kv,
+        (true, true, false) => &k.sdpa_decode_m1_partial_hd_256,
+        (true, false, true) => &k.sdpa_decode_m1_partial_hd_f16kv,
+        (true, false, false) => &k.sdpa_decode_m1_partial_hd,
+        (false, _, true) => &k.sdpa_decode_m1_partial_f16kv,
+        (false, _, false) => &k.sdpa_decode_m1_partial,
     };
     enc.set_compute_pipeline_state(partial);
     for i in 0..5u64 {
@@ -2207,7 +2215,13 @@ pub(crate) fn encode_sdpa_flash_decode(
     );
 
     // ── Pass 2: combine (reads scratch written above; Serial-ordered) ────
-    enc.set_compute_pipeline_state(&k.sdpa_decode_m1_combine);
+    // Must match the partial's per-partition SLOT stride (2 + MAX_DH).
+    let combine = if hd256 {
+        &k.sdpa_decode_m1_combine_256
+    } else {
+        &k.sdpa_decode_m1_combine
+    };
+    enc.set_compute_pipeline_state(combine);
     enc.set_buffer(0, Some(scratch), 0);
     enc.set_buffer(1, Some(buffer), 0);
     enc.set_bytes(2, u4, &batch as *const u32 as *const _);
@@ -2221,7 +2235,8 @@ pub(crate) fn encode_sdpa_flash_decode(
         (6 * std::mem::size_of::<u64>()) as u64,
         offs_pack.as_ptr() as *const _,
     );
-    let combine_threads = (v_head_dim.max(1) as u64).min(128);
+    let combine_cap = if hd256 { 256 } else { 128 };
+    let combine_threads = (v_head_dim.max(1) as u64).min(combine_cap);
     enc.dispatch_thread_groups(
         metal::MTLSize {
             width: (batch as u64) * (heads as u64),
@@ -2582,6 +2597,17 @@ pub(crate) fn encode_sdpa(
             && head_dim.is_multiple_of(8)
             && v_head_dim.is_multiple_of(8)
             && rlx_ir::env::var("RLX_METAL_PREFILL_FA_MMA").as_deref() == Some("1");
+        // head_dim=256 prefill (qwen3.5): none of the FA paths above apply
+        // (head_dim>128), so it fell to `sdpa_long` at 1 thread/tg (single-threaded
+        // per head → 55% of TTFT). Route it to the head-dim-split prefill kernel
+        // (32 lanes each own head_dim/32 dims, per-key simd_sum). F32 only,
+        // dims %32-aligned; off with RLX_METAL_PREFILL_HD256=0.
+        let use_prefill_hd256 = seq > 1
+            && head_dim > 128
+            && head_dim.is_multiple_of(32)
+            && v_head_dim.is_multiple_of(32)
+            && matches!(dt, HalfFlag::F32)
+            && rlx_ir::env::var("RLX_METAL_PREFILL_HD256").as_deref() != Some("0");
         let pipeline = if use_mma {
             &k.sdpa_mma
         } else if use_fa2 {
@@ -2600,6 +2626,8 @@ pub(crate) fn encode_sdpa(
             } else {
                 &k.sdpa_prefill_fa
             }
+        } else if use_prefill_hd256 {
+            &k.sdpa_prefill_hd256
         } else if use_decode_m1 {
             // F16-resident KV cache: read K/V as half (f32 Q/accum/out).
             if kv_f16 {
@@ -2842,6 +2870,22 @@ pub(crate) fn encode_sdpa(
             };
             let tg = metal::MTLSize {
                 width: 128, // 4 simdgroups: staging/scalar use all; MMA distributes
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_thread_groups(grid, tg);
+        } else if use_prefill_hd256 {
+            // One SIMD group (32 threads) per (batch, head, query row) —
+            // head-dim-split flash for head_dim>128 (replaces sdpa_long's 1-thread
+            // fallback). Same grid as the splitk decode path.
+            let n_rows = (batch as u64) * (heads as u64) * (seq as u64);
+            let grid = metal::MTLSize {
+                width: n_rows,
+                height: 1,
+                depth: 1,
+            };
+            let tg = metal::MTLSize {
+                width: 32,
                 height: 1,
                 depth: 1,
             };
@@ -5575,6 +5619,98 @@ pub(crate) fn encode_q4k_mv_residual_f32(
     };
     let tg = metal::MTLSize {
         width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Simdgroup-cooperative Q4_K down+residual GEMV (`m == 1`). Same result as
+/// `encode_q4k_mv_residual_f32` but ~5× the bandwidth: NSG=4 simdgroups per
+/// threadgroup, Q4K_NR0=2 rows each, 32 lanes cooperate per row. Dispatch grid
+/// MUST match `q4k_mv_residual_f32_sg` in dequant_gguf.msl.
+pub(crate) fn encode_q4k_mv_residual_f32_sg(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    w_q: usize,
+    res: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q4k_mv_residual_f32_sg);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let r_u = res as u64;
+    enc.set_bytes(4, 8, &r_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+    const NSG: u64 = 4;
+    const NR0: u64 = 2;
+    let n_output_groups = (n_dim as u64).div_ceil(NR0);
+    let n_threadgroups = n_output_groups.div_ceil(NSG);
+    let grid = metal::MTLSize {
+        width: n_threadgroups * NSG * 32,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: NSG * 32,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Simdgroup-cooperative Q4_K gate+up+SwiGLU GEMV (`m == 1`). Same result as
+/// `encode_fused_mlp_gate_up_swiglu` (Q4_K path) but ~5× the bandwidth; shares
+/// the x slice across the gate and up reductions. Dispatch grid MUST match
+/// `q4k_swiglu_mv_f32_sg` in dequant_gguf.msl.
+pub(crate) fn encode_q4k_swiglu_mv_f32_sg(
+    enc: &metal::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &metal::Buffer,
+    x: usize,
+    gate_w: usize,
+    up_w: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q4k_swiglu_mv_f32_sg);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let g_u = gate_w as u64;
+    enc.set_bytes(2, 8, &g_u as *const u64 as *const _);
+    let u_u = up_w as u64;
+    enc.set_bytes(3, 8, &u_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(4, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+    const NSG: u64 = 4;
+    const NR0: u64 = 2;
+    let n_output_groups = (n_dim as u64).div_ceil(NR0);
+    let n_threadgroups = n_output_groups.div_ceil(NSG);
+    let grid = metal::MTLSize {
+        width: n_threadgroups * NSG * 32,
+        height: 1,
+        depth: 1,
+    };
+    let tg = metal::MTLSize {
+        width: NSG * 32,
         height: 1,
         depth: 1,
     };

@@ -1015,7 +1015,14 @@ impl MetalExecutable {
             let Some(&in_id) = self.input_ids.get(name.as_str()) else {
                 continue;
             };
-            if in_id != out_id {
+            // Copy the new-token row (src_row of the output) into the resident
+            // handle at dst_row. Skip ONLY a genuine no-op (same buffer AND same
+            // row). When the output ALIASES the input handle (in-place KvAppend:
+            // out_id == in_id), a `src_row != dst_row` copy is a valid INTRA-buffer
+            // relocate (the graph writes the new token at a fixed `upper` row; this
+            // moves it to the growing `past_seq` row so the resident cache
+            // accumulates) — the old `in_id != out_id` guard wrongly skipped it.
+            if in_id != out_id || src_row != dst_row {
                 self.arena.copy_node_f32_range(
                     in_id,
                     dst_row * row_elems,

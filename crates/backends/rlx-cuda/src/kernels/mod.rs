@@ -681,6 +681,12 @@ kernel_cache!(
     DEQUANT_MATMUL_GGUF_CU,
     "dequant_matmul_gguf_q1_gemv"
 );
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_Q4K_GEMV,
+    dequant_matmul_gguf_q4k_gemv_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_q4k_gemv"
+);
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 kernel_cache!(
     SELECTIVE_SCAN,

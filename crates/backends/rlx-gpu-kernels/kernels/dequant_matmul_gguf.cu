@@ -253,3 +253,92 @@ extern "C" __global__ void dequant_matmul_gguf_q1_gemv(
         arena[out_off + j] = smem_acc[0] + smem_comp[0];
     }
 }
+
+// Cooperative Q4_K GEMV: one block per output row, threads split the k/256
+// super-blocks (contiguous in the row-major weight → coalesced loads, unlike
+// the one-thread-per-row `dequant_matmul_gguf` whose 32 lanes each stride a
+// whole row). Dequant is fused into the dot on-the-fly (no `float blk[256]`
+// local slab → no local-memory spill). Neumaier-compensated accumulation +
+// tree reduce, matching the Q1_0 path — tighter than the plain-f32 `acc +=`
+// of the scalar kernel, so decode argmaxes stay on the reference token path.
+// 64-bit offsets for packed arenas > 4 GiB. Block size ≤ 256 (smem sizing).
+extern "C" __global__ void dequant_matmul_gguf_q4k_gemv(
+    float* arena,
+    unsigned long long n,
+    unsigned long long k,
+    unsigned long long x_off,
+    unsigned long long w_byte_off,
+    unsigned long long out_off
+) {
+    unsigned long long j = blockIdx.x;
+    if (j >= n) return;
+
+    unsigned long long w_word = w_byte_off / 4ull;
+    unsigned long long blocks_per_row = k / 256ull;
+    float acc = 0.0f;
+    float comp = 0.0f;
+
+    for (unsigned long long r = threadIdx.x; r < blocks_per_row; r += blockDim.x) {
+        unsigned long long base = (j * blocks_per_row + r) * 144ull;
+        float d = rd_f16(arena, w_word, base);
+        float dmin = rd_f16(arena, w_word, base + 2ull);
+        unsigned int sc_base = (unsigned int)(base + 4ull); // within-tensor byte off
+        unsigned long long qs_base = base + 16ull;
+        unsigned long long xb = x_off + r * 256ull;
+        unsigned int out_i = 0u;
+        unsigned int is = 0u;
+        for (unsigned int jj = 0u; jj < 8u; jj += 2u) {
+            unsigned int sc0, m0, sc1, m1;
+            scale_min_k4(arena, w_word, jj, sc_base, sc0, m0);
+            scale_min_k4(arena, w_word, jj + 1u, sc_base, sc1, m1);
+            float d0 = d * (float)sc0;
+            float m0f = dmin * (float)m0;
+            float d1 = d * (float)sc1;
+            float m1f = dmin * (float)m1;
+            for (unsigned int l = 0u; l < 32u; l++) {
+                unsigned int q = rd_byte(arena, w_word, qs_base + (unsigned long long)(is + l));
+                float w = d0 * (float)(q & 0x0Fu) - m0f;
+                float xv = arena[xb + (unsigned long long)out_i];
+                float p = xv * w;
+                float e = __fmaf_rn(xv, w, -p);
+                neumaier_add(acc, comp, p);
+                comp += e;
+                out_i++;
+            }
+            for (unsigned int l = 0u; l < 32u; l++) {
+                unsigned int q = rd_byte(arena, w_word, qs_base + (unsigned long long)(is + l));
+                float w = d1 * (float)(q >> 4u) - m1f;
+                float xv = arena[xb + (unsigned long long)out_i];
+                float p = xv * w;
+                float e = __fmaf_rn(xv, w, -p);
+                neumaier_add(acc, comp, p);
+                comp += e;
+                out_i++;
+            }
+            is += 32u;
+        }
+    }
+
+    __shared__ float smem_acc[256];
+    __shared__ float smem_comp[256];
+    unsigned int tid = threadIdx.x;
+    smem_acc[tid] = acc;
+    smem_comp[tid] = comp;
+    __syncthreads();
+    for (unsigned int s = blockDim.x >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float a = smem_acc[tid];
+            float c = smem_comp[tid];
+            float a2 = smem_acc[tid + s];
+            float c2 = smem_comp[tid + s];
+            float ssum = a + a2;
+            float err = (fabsf(a) >= fabsf(a2)) ? ((a - ssum) + a2) : ((a2 - ssum) + a);
+            smem_acc[tid] = ssum;
+            smem_comp[tid] = c + c2 + err;
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        arena[out_off + j] = smem_acc[0] + smem_comp[0];
+    }
+}

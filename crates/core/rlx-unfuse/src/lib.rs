@@ -305,7 +305,52 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
     }
 
     out.set_outputs(graph.outputs.iter().map(|&id| id_map[&id]).collect());
-    out
+    elide_layout_preserving_transposes(out)
+}
+
+/// Rewrite layout-preserving `Transpose` nodes into zero-copy `Reshape`s.
+///
+/// A permutation is a pure relabel — the row-major bytes are unchanged — when
+/// every axis of size > 1 keeps its original relative order (only size-1 axes
+/// move). This is the common DECODE case (`seq == 1`): the attention rank-4
+/// promotion's `[0,2,1,3]` swaps between `[B,S,H,D]` and `[B,H,S,D]` become
+/// no-ops. `Reshape` is a free arena alias on every backend (unlike `Transpose`,
+/// which always emits a copy kernel), so this is bit-identical and removes a real
+/// per-step op — the single largest CUDA decode cost on attention/hybrid models.
+/// `RLX_DISABLE_TRANSPOSE_ELISION=1` keeps the transposes (A/B + safety valve).
+pub fn elide_layout_preserving_transposes(mut graph: Graph) -> Graph {
+    if rlx_ir::env::flag("RLX_DISABLE_TRANSPOSE_ELISION") {
+        return graph;
+    }
+    let mut rewrites: Vec<(NodeId, Vec<i64>)> = Vec::new();
+    for node in graph.nodes() {
+        let Op::Transpose { perm } = &node.op else {
+            continue;
+        };
+        // Complex tensors pack `[re, im]` lanes as innermost f32s; leave their
+        // transposes to the backend's lane-aware kernel.
+        if node.shape.dtype().is_complex() {
+            continue;
+        }
+        let in_shape = &graph.node(node.inputs[0]).shape;
+        if !in_shape.is_static() || perm.len() != in_shape.rank() {
+            continue;
+        }
+        let in_dims: Vec<usize> = in_shape.dims().iter().map(|d| d.unwrap_static()).collect();
+        // Layout-preserving ⇔ the axes of size > 1 keep ascending original order
+        // (only size-1 axes are permuted relative to them).
+        let non_unit: Vec<usize> = (0..in_dims.len()).filter(|&i| in_dims[i] != 1).collect();
+        let permuted: Vec<usize> = perm.iter().copied().filter(|&i| in_dims[i] != 1).collect();
+        if non_unit != permuted {
+            continue;
+        }
+        let new_shape: Vec<i64> = perm.iter().map(|&i| in_dims[i] as i64).collect();
+        rewrites.push((node.id, new_shape));
+    }
+    for (id, new_shape) in rewrites {
+        graph.node_mut(id).op = Op::Reshape { new_shape };
+    }
+    graph
 }
 
 /// Collapse redundant `Reshape`s and drop the ones that become dead.

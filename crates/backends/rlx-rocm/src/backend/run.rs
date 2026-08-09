@@ -155,6 +155,9 @@ impl RocmExecutable {
             std::collections::HashMap::new();
         let mut prof_last = std::time::Instant::now();
         let mut prof_prev: Option<String> = None;
+        // Monotonic plain-GroupedMatmul ordinal within this forward → MoE layer
+        // index (= ord/3) for the hot/cold residency table. Matches rlx-cuda + CPU.
+        let mut moe_gmm_ord = 0usize;
         for step in &self.schedule {
             if profile_steps {
                 unsafe {
@@ -2152,6 +2155,101 @@ impl RocmExecutable {
                     idx_off,
                     out_off,
                 } => {
+                    // Hot-on-GPU / cold-on-CPU split (mirrors rlx-cuda). When a
+                    // residency mask is installed for this MoE layer (and hipBLAS is
+                    // available), hot experts run on-device and cold experts are
+                    // offloaded to the host, so cold weights needn't occupy VRAM.
+                    let moe_layer = moe_gmm_ord / 3;
+                    moe_gmm_ord += 1;
+                    let split_mask = self
+                        .blas
+                        .as_ref()
+                        .and(self.moe_resident_for_layer(moe_layer));
+                    if let Some(mask) = split_mask {
+                        unsafe {
+                            let _ = (self.ctx.runtime.hip_stream_sync)(stream);
+                        }
+                        let mn = *m as usize;
+                        let mut idx_host = vec![0.0_f32; mn];
+                        let idx_dev = arena_base + (*idx_off as u64) * 4;
+                        let dtoh_ok = unsafe {
+                            (self.ctx.runtime.hip_memcpy_dtoh)(
+                                idx_host.as_mut_ptr() as *mut _,
+                                idx_dev,
+                                mn * 4,
+                            )
+                            .ok()
+                            .is_ok()
+                        };
+                        if dtoh_ok {
+                            let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+                            let mut i = 0usize;
+                            while i < mn {
+                                let e = idx_host[i] as u32;
+                                let mut j = i + 1;
+                                while j < mn && (idx_host[j] as u32) == e {
+                                    j += 1;
+                                }
+                                if e < *num_experts {
+                                    runs.push((i as u32, j as u32, e));
+                                }
+                                i = j;
+                            }
+                            // Hot runs → hipBLAS over the on-device expert stack.
+                            if let Some(blas) = self.blas.as_ref() {
+                                let blas = blas.lock().unwrap();
+                                let alpha: f32 = 1.0;
+                                let beta: f32 = 0.0;
+                                for (lo, hi, e) in &runs {
+                                    // Cold experts handled on the host below.
+                                    if !mask.get(*e as usize).copied().unwrap_or(true) {
+                                        continue;
+                                    }
+                                    let rows = hi - lo;
+                                    let a_dev = arena_base + ((*in_off + lo * k) as u64) * 4;
+                                    let b_dev = arena_base + ((*w_off + e * k * n) as u64) * 4;
+                                    let c_dev = arena_base + ((*out_off + lo * n) as u64) * 4;
+                                    let r = unsafe {
+                                        (blas.runtime.sgemm)(
+                                            blas.handle,
+                                            HipblasOperation::N,
+                                            HipblasOperation::N,
+                                            *n as i32,
+                                            rows as i32,
+                                            *k as i32,
+                                            &alpha as *const f32,
+                                            b_dev as *const f32,
+                                            *n as i32,
+                                            a_dev as *const f32,
+                                            *k as i32,
+                                            &beta as *const f32,
+                                            c_dev as *mut f32,
+                                            *n as i32,
+                                        )
+                                    };
+                                    if r.ok().is_err() {
+                                        log_fallback("grouped_matmul.hipblas.split", r);
+                                    }
+                                }
+                            }
+                            // Cold experts → host round-trip.
+                            crate::gguf_host::run_moe_cold_experts_from_arena(
+                                &self.ctx,
+                                &self.arena.buffer,
+                                *m as usize,
+                                *k as usize,
+                                *n as usize,
+                                *num_experts as usize,
+                                *in_off as usize * 4,
+                                *w_off as usize * 4,
+                                *idx_off as usize * 4,
+                                *out_off as usize * 4,
+                                &mask,
+                            );
+                            continue;
+                        }
+                        // idx dtoh failed → fall through to the normal path.
+                    }
                     // Tier 1: sorted-batch dispatch via hipBLAS. Direct
                     // port from rlx-cuda — sync the stream so prior
                     // writes to idx are visible, dtoh-copy the idx

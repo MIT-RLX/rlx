@@ -65,7 +65,9 @@ impl RopeTablesStage {
             interleaved,
         );
         let max_positions = positions.len();
-        let half_dim = head_dim / 2;
+        // Table row stride now matches `build_mrope_tables` (n_rot/2), which the
+        // RoPE kernel indexes by. Equals head_dim/2 for full rope.
+        let half_dim = n_rot / 2;
         match named_slot {
             Some(slot) => Self::param_named(slot, max_positions, half_dim, cos_data, sin_data),
             None => Self::param(max_positions, half_dim, cos_data, sin_data),

@@ -130,6 +130,14 @@ impl ExecutableGraph for RocmExecutableWrapper {
         self.inner.rng()
     }
 
+    fn set_moe_resident_experts(&mut self, mask: &[bool]) {
+        self.inner.set_moe_resident_experts(mask);
+    }
+
+    fn set_moe_resident_experts_per_layer(&mut self, masks: &[&[bool]]) {
+        self.inner.set_moe_resident_experts_per_layer(masks);
+    }
+
     /// Typed param upload. F16/BF16 Linear weights go through
     /// `set_param_half` (hipBLAS GemmEx) to match Metal/CPU f16 matmul;
     /// f32 slot filled as fallback for non-matmul readers.

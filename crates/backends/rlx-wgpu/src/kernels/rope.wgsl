@@ -9,8 +9,8 @@
 //
 // Inputs (offsets in f32 elements):
 //   in_off:  [..., seq, last_dim]  where last_dim % head_dim == 0
-//   cos_off: [max_seq, half]
-//   sin_off: [max_seq, half]
+//   cos_off: [max_seq, rot_half]
+//   sin_off: [max_seq, rot_half]
 // Output:
 //   out_off: same shape as input
 //
@@ -47,7 +47,7 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
     let bi = q1 / params.seq;                 // batch index
     let si = q1 % params.seq;                 // active position within seq
     let pos = si;
-    let half = params.half;
+    let rot_half = params.rot_half;
     let d_in_head = d % params.head_dim;
     // Map to underlying full-extent buffer offset using seq_stride.
     let buf_q1 = bi * params.seq_stride + si;
@@ -56,7 +56,6 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 
     // Partial rotary (Gemma 4 global layers use n_rot < head_dim): only the
     // first n_rot = 2*rot_half dims rotate; the trailing dims pass through.
-    let rot_half = params.rot_half;
     let n_rot = rot_half * 2u;
     if (d_in_head >= n_rot) {
         arena[params.out_off + buf_idx] = arena[params.in_off + buf_idx];
@@ -65,12 +64,12 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 
     if (params.style == 1u) {
         // GPT-J / llama.cpp-NORM: adjacent pairs (2i, 2i+1) rotate by angle i.
-        // cos/sin row index is the freq i = d_in_head / 2 (0..half). One thread
+        // cos/sin row index is the freq i = d_in_head / 2 (0..rot_half). One thread
         // per output element: even lane writes the first of its pair, odd lane
         // the second, mirroring the CPU reference exactly.
         let i = d_in_head / 2u;
-        let c = arena[params.cos_off + pos * half + i];
-        let s = arena[params.sin_off + pos * half + i];
+        let c = arena[params.cos_off + pos * rot_half + i];
+        let s = arena[params.sin_off + pos * rot_half + i];
         if ((d_in_head & 1u) == 0u) {
             let x1 = arena[params.in_off + buf_idx];        // x[2i]
             let x2 = arena[params.in_off + buf_idx + 1u];   // x[2i+1]
@@ -83,21 +82,22 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         return;
     }
 
-    // NeoX rotate-half: pair (i, i+rot_half). cos/sin row stride is `half`
-    // (head_dim/2) — matches the CPU reference (tab_half), where only the first
-    // rot_half columns are read.
+    // NeoX rotate-half: pair (i, i+rot_half). The cos/sin row stride is
+    // `rot_half` (n_rot/2), matching the CPU reference: the table stores exactly
+    // the rotation angles, not head_dim/2 of them. Striding by head_dim/2 under
+    // PARTIAL rope reads into the next token's angles from position 1 onward.
     if (d_in_head < rot_half) {
         let xf = arena[params.in_off + buf_idx];
         let xs = arena[params.in_off + head_base + d_in_head + rot_half];
-        let c  = arena[params.cos_off + pos * half + d_in_head];
-        let s  = arena[params.sin_off + pos * half + d_in_head];
+        let c  = arena[params.cos_off + pos * rot_half + d_in_head];
+        let s  = arena[params.sin_off + pos * rot_half + d_in_head];
         arena[params.out_off + buf_idx] = xf * c - xs * s;
     } else {
         let dl = d_in_head - rot_half;
         let xs = arena[params.in_off + buf_idx];
         let xf = arena[params.in_off + head_base + dl];
-        let c  = arena[params.cos_off + pos * half + dl];
-        let s  = arena[params.sin_off + pos * half + dl];
+        let c  = arena[params.cos_off + pos * rot_half + dl];
+        let s  = arena[params.sin_off + pos * rot_half + dl];
         arena[params.out_off + buf_idx] = xs * c + xf * s;
     }
 }

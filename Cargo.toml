@@ -153,7 +153,8 @@ incremental = false
 [workspace.package]
 version       = "0.2.14"
 edition       = "2024"
-rust-version  = "1.87"  # edition=2024 needs ≥1.85; we use `is_multiple_of` (stable in 1.87)
+rust-version  = "1.89"  # edition=2024 needs ≥1.85; `is_multiple_of` ≥1.87; AVX-VNNI
+                        # `_mm256_dpbusd_*` intrinsics (rlx-cpu x86 Q2_0 dot) ≥1.89
 license       = "MIT OR Apache-2.0"
 authors       = ["Eugene Hauptmann", "Nataliya Kosmyna"]
 repository    = "https://github.com/MIT-RLX/rlx"

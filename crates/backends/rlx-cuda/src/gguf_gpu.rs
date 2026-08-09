@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
     dequant_gguf_kernel, dequant_matmul_gguf_kernel, dequant_matmul_gguf_q1_gemv_kernel,
-    matmul_bt_kernel, matmul_bt_tma_kernel,
+    dequant_matmul_gguf_q4k_gemv_kernel, matmul_bt_kernel, matmul_bt_tma_kernel,
 };
 
 fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usize {
@@ -144,6 +144,42 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
             launcher
                 .launch(cfg)
                 .expect("rlx-cuda: dequant_matmul_gguf_q1_gemv launch failed");
+        }
+        return;
+    }
+
+    // Q4_K: OPT-IN cooperative block-per-row GEMV (`RLX_CUDA_Q4K_GEMV_COOP=1`).
+    // Coalesced weight loads (contiguous super-blocks per row) + fused dequant
+    // (no local slab) + Neumaier reduce — vs the default one-thread-per-row
+    // scalar path whose 32 lanes each stride a whole row. Left opt-in because
+    // (a) it's Neumaier-compensated so NOT bit-identical to the scalar path
+    // (validated coherent only on LFM2.5-Q4_K so far — this kernel is shared by
+    // every CUDA GGUF model), and (b) at small k (few super-blocks/row) the
+    // coalescing win is modest. Enable once validated across more models.
+    if scheme_id == 0 && rlx_ir::env::flag("RLX_CUDA_Q4K_GEMV_COOP") {
+        let kernel = dequant_matmul_gguf_q4k_gemv_kernel(ctx);
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (128u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_u = n as u64;
+        let k_u = k as u64;
+        let x_u = x_off as u64;
+        let w_u = w_byte_off as u64;
+        let out_u = out_off as u64;
+        let mut launcher = stream.launch_builder(&kernel.function);
+        launcher
+            .arg(&mut *buffer)
+            .arg(&n_u)
+            .arg(&k_u)
+            .arg(&x_u)
+            .arg(&w_u)
+            .arg(&out_u);
+        unsafe {
+            launcher
+                .launch(cfg)
+                .expect("rlx-cuda: dequant_matmul_gguf_q4k_gemv launch failed");
         }
         return;
     }

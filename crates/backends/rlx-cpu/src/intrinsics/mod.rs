@@ -26,6 +26,11 @@
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
 
+/// x86-64 VNNI (`VPDPBUSD`) int8 dot kernels for low-bit quant matmul.
+/// Runtime-detected (AVX-512-VNNI or AVX-VNNI); scalar fallback inside.
+#[cfg(target_arch = "x86_64")]
+pub mod vnni;
+
 /// Apple AMX / SME matrix-coprocessor fast paths. Only compiled on Apple
 /// platforms; the `amx-*` cargo features light the per-path submodules within.
 #[cfg(target_vendor = "apple")]

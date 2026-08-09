@@ -8,6 +8,12 @@
 // exact f32-vs-W8A8 attention-output comparison.
 //
 //   cargo run --release -p rlx-metal --example w8a8_decode_bench
+
+// `objc`'s `msg_send!` expands to `cfg(feature = "cargo-clippy")` checks that
+// modern rustc doesn't recognize. Third-party noise; mirrors the crate-root
+// allow in `src/lib.rs`.
+#![allow(unexpected_cfgs)]
+
 #[cfg(not(target_os = "macos"))]
 fn main() {}
 

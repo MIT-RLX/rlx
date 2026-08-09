@@ -18,7 +18,7 @@ git clone --recurse-submodules https://github.com/MIT-RLX/rlx
 git submodule update --init --recursive
 ```
 
-You need a Rust toolchain that satisfies the workspace MSRV — **1.87**, edition
+You need a Rust toolchain that satisfies the workspace MSRV — **1.89**, edition
 2024 (see `rust-version` in [`Cargo.toml`](Cargo.toml)) — plus
 [`just`](https://github.com/casey/just) for the task recipes. Install the
 pre-commit hook so formatting and lint run before every commit:

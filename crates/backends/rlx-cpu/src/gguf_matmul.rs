@@ -11,6 +11,7 @@
 //! at a time into stack storage.
 
 use rlx_gguf::QK_K;
+use rlx_gguf::q2_dequant::{Q2_0_BLOCK_BYTES, Q8_0_G128_BYTES, QK2_0};
 use rlx_ir::quant::QuantScheme;
 
 pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; QK_K]) {
@@ -247,6 +248,22 @@ pub fn gguf_matmul_use_legacy() -> bool {
 /// Minimum `k*n` for cached dequant + BLAS (tiny tiles stay on fused path).
 const CACHED_BLAS_MIN_WEIGHT_ELEMS: usize = 32 * 32;
 
+/// Crossover `n` above which the parallel int8 Q4_K decode GEMV beats
+/// cached-f32-BLAS (Accelerate/AMX). Measured on Apple: BLAS ahead at n≈1k,
+/// tie at n≈3k, fused ~3× ahead at n≈128k → `n≥4096` captures the wide matmuls
+/// (LM head, large FFN) for a ~15–25% CPU decode speedup.
+///
+/// **Opt-in** (default disabled): the fused path quantizes the *activation* to
+/// Q8_K (llama.cpp-style), which is not bit-identical to the f32 cached-BLAS
+/// path and flips occasional near-tie greedy tokens — rlx keeps decode on f32
+/// for fidelity (and decode↔prefill parity) by default. Set
+/// `RLX_Q4K_FUSED_MIN_N=4096` (or another crossover) to trade that for speed.
+fn q4k_fused_decode_min_n() -> usize {
+    rlx_ir::env::var("RLX_Q4K_FUSED_MIN_N")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
 #[inline]
 fn prefer_cached_blas(k: usize, n: usize, m: usize) -> bool {
     !gguf_matmul_use_legacy() && (m > 1 || k.saturating_mul(n) >= CACHED_BLAS_MIN_WEIGHT_ELEMS)
@@ -316,6 +333,27 @@ pub fn gguf_matmul_bt_dispatch_at(
     scheme: QuantScheme,
     w_off: usize,
 ) {
+    // Q2_0 decode GEMV: int8 VNNI/NEON dot (llama.cpp-style) beats
+    // dequant→f32→BLAS and stays on the int path even for large `k*n`, so it
+    // bypasses `prefer_cached_blas`. Default-on, runtime-detected.
+    if m == 1 && scheme == QuantScheme::GgufQ2_0 && k.is_multiple_of(QK2_0) {
+        q2_0_gemv_parallel(x, w_bytes, out, k);
+        return;
+    }
+    // Large Q4_K decode GEMV: the parallel int8 (Q8_K-dot) kernel beats
+    // cached-f32-BLAS (single-thread AMX) once `n` is big — measured ~3× at
+    // n≈128k, ~tie at n≈3k, BLAS ahead below. So route wide matmuls (LM head,
+    // large FFN gate/up) to the fused path; narrow ones stay on AMX. Tune the
+    // crossover with `RLX_Q4K_FUSED_MIN_N` (set huge to disable).
+    if m == 1
+        && scheme == QuantScheme::GgufQ4K
+        && k.is_multiple_of(QK_K)
+        && n >= q4k_fused_decode_min_n()
+        && crate::pool::num_threads() > 1
+    {
+        gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
+        return;
+    }
     if prefer_cached_blas(k, n, m) {
         gguf_matmul_bt_cached(x, w_bytes, out, m, k, n, scheme, w_off);
     } else {
@@ -836,9 +874,144 @@ fn q4k_group32_q8_dot_neon(qs: *const u8, q8: *const i8, high_nibble: bool) -> i
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q2_0 int8 dot GEMV (llama.cpp-style): activations quantized once to int8 per
+// 128-group, then dotted directly against the packed 2-bit codes — VNNI on
+// x86-64, NEON on aarch64, scalar elsewhere. See `intrinsics::vnni` and
+// `rlx_gguf::q2_dequant`.
+// ---------------------------------------------------------------------------
+
+/// One `Q2_0` weight block (34 B) dotted with one packed int8 activation block.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn q2_0_dot_q8_block(w: &[u8], a: &[u8]) -> f32 {
+    crate::intrinsics::vnni::q2_0_dot_q8_g128(w, a)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn q2_0_dot_q8_block(w: &[u8], a: &[u8]) -> f32 {
+    q2_0_dot_q8_block_neon(w, a)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn q2_0_dot_q8_block(w: &[u8], a: &[u8]) -> f32 {
+    rlx_gguf::q2_dequant::q2_0_dot_q8_g128(w, a)
+}
+
+#[inline]
+fn q2_0_dot_row_q8(row: &[u8], x_q8: &[u8], blocks_per_row: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for b in 0..blocks_per_row {
+        let w = &row[b * Q2_0_BLOCK_BYTES..(b + 1) * Q2_0_BLOCK_BYTES];
+        let a = &x_q8[b * Q8_0_G128_BYTES..(b + 1) * Q8_0_G128_BYTES];
+        acc += q2_0_dot_q8_block(w, a);
+    }
+    acc
+}
+
+/// `C[n] = x[k] @ W[n,k]^T` for `Q2_0` with `k` a multiple of [`QK2_0`].
+///
+/// Activations are quantized once to int8 per 128-group; each output row then
+/// uses the int8 dot (VNNI/NEON/scalar). Rows are independent — no n-wide
+/// partial reduction.
+fn q2_0_gemv_parallel(x: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize) {
+    let n = out.len();
+    let blocks_per_row = k / QK2_0;
+    let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+    debug_assert!(x.len() >= k);
+    debug_assert!(w_bytes.len() >= n * row_bytes);
+
+    let mut x_q8 = vec![0u8; blocks_per_row * Q8_0_G128_BYTES];
+    rlx_gguf::q2_dequant::quantize_q8_0_g128_row(&x[..k], &mut x_q8);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        out.par_iter_mut().enumerate().for_each(|(j, slot)| {
+            let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+            *slot = q2_0_dot_row_q8(row, &x_q8, blocks_per_row);
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (j, slot) in out.iter_mut().enumerate() {
+            let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+            *slot = q2_0_dot_row_q8(row, &x_q8, blocks_per_row);
+        }
+    }
+}
+
+/// NEON `Q2_0 × int8` block dot (aarch64). Uses signed weights `(q−1)` so no
+/// `xsum` term; widening `vmull`/`vpadal` (no `dotprod` requirement).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn q2_0_dot_q8_block_neon(w: &[u8], a: &[u8]) -> f32 {
+    use std::arch::aarch64::*;
+    // SAFETY: fixed-size Q2_0 (34 B) / Q8_0_G128 blocks; NEON baseline on aarch64.
+    unsafe {
+        let d = half::f16::from_le_bytes([w[0], w[1]]).to_f32();
+        let dx = f32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+        let qs = w.as_ptr().add(2);
+        let acts = a.as_ptr().add(4) as *const i8;
+        let mask = vdupq_n_u8(0x03);
+        let one = vdupq_n_s8(1);
+        let mut acc = vdupq_n_s32(0);
+        // 128 codes = 32 packed bytes; 16 packed bytes (64 codes) per iter.
+        for blk in 0..2 {
+            let pk = vld1q_u8(qs.add(blk * 16)); // 16 bytes → 64 codes
+            // Code (q−1) at natural position 4i+r for r = 0..3.
+            let w0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(pk, mask)), one);
+            let w1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(pk, 2), mask)), one);
+            let w2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(pk, 4), mask)), one);
+            let w3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(pk, 6), mask)), one);
+            // vld4 deinterleaves: av.i[j] = acts[4j+i] — matches wi ordering.
+            let av = vld4q_s8(acts.add(blk * 64));
+            for (wr, ar) in [(w0, av.0), (w1, av.1), (w2, av.2), (w3, av.3)] {
+                let lo = vmull_s8(vget_low_s8(wr), vget_low_s8(ar));
+                let hi = vmull_s8(vget_high_s8(wr), vget_high_s8(ar));
+                acc = vpadalq_s16(acc, lo);
+                acc = vpadalq_s16(acc, hi);
+            }
+        }
+        d * dx * vaddvq_s32(acc) as f32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q2_0_gemv_matches_f32_reference() {
+        let k = 256; // 2 groups of 128
+        let n = 48;
+        let w: Vec<f32> = (0..k * n)
+            .map(|i| (((i * 3) % 3) as i32 - 1) as f32 * ((i % 5) as f32 * 0.1 + 0.1))
+            .collect();
+        let packed = rlx_gguf::q2_dequant::quantize_q2_0(&w).unwrap();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.017).sin() * 2.0).collect();
+
+        // int8 dot GEMV (dispatch entry).
+        let mut got = vec![0f32; n];
+        gguf_matmul_bt_dispatch(&x, &packed, &mut got, 1, k, n, QuantScheme::GgufQ2_0);
+
+        // Reference: dequant weight to f32, plain dot.
+        let wd = rlx_gguf::q2_dequant::dequant_q2_0(&packed, k * n).unwrap();
+        for j in 0..n {
+            let mut acc = 0f32;
+            for p in 0..k {
+                acc += x[p] * wd[j * k + p];
+            }
+            // int8 activation quant → small relative tolerance.
+            assert!(
+                (got[j] - acc).abs() < 2e-2 * (1.0 + acc.abs()),
+                "row {j}: {} vs {acc}",
+                got[j]
+            );
+        }
+    }
 
     #[test]
     fn cached_blas_matches_fused_q4k_decode() {
@@ -967,6 +1140,11 @@ mod tests {
             // int8 Q4_K GEMV (serial int8 Q8_K dots — the path SDOT would speed up).
             time("int8 q4k gemv (serial)", &mut || {
                 super::q4k_gemv_rowmajor(&x, &packed, &mut out, k)
+            });
+            // int8 Q4_K GEMV (parallel, rayon over rows) — the actual decode path
+            // when routed to the fused kernel; the real competitor to single-AMX.
+            time("int8 q4k gemv (parallel)", &mut || {
+                gguf_matmul_bt(&x, &packed, &mut out, 1, k, n, QuantScheme::GgufQ4K)
             });
             // cached-f32-BLAS = what the model actually runs (Accelerate/AMX).
             clear_dequant_cache();

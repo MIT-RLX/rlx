@@ -8,6 +8,12 @@
 // context and reports the speedup + max output error.
 //
 //   cargo run --release -p rlx-metal --example int8_kv_bench
+
+// `objc`'s `msg_send!` expands to `cfg(feature = "cargo-clippy")` checks that
+// modern rustc doesn't recognize. Third-party noise; mirrors the crate-root
+// allow in `src/lib.rs`.
+#![allow(unexpected_cfgs)]
+
 #[cfg(not(target_os = "macos"))]
 fn main() {}
 

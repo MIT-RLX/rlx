@@ -1614,8 +1614,12 @@ impl CudaExecutable {
                     let v_id = node.inputs[2];
                     let q_shape = graph.node(q_id).shape.dims();
                     let k_shape = graph.node(k_id).shape.dims();
-                    if q_shape.len() != 4 {
-                        panic!("rlx-cuda Attention: unfuse should have promoted to rank-4");
+                    // rank-4 [B,H,S,D] (legacy transpose-promoted) or rank-3
+                    // [B,S,H·D] seq-major (CudaPolicy::attention_accepts_rank3 —
+                    // the kernels are stride-driven, so `attention_launch_strides`
+                    // + `attention_geom` handle both; rank-3 avoids the KV transpose).
+                    if q_shape.len() != 3 && q_shape.len() != 4 {
+                        panic!("rlx-cuda Attention: expected rank-3 or rank-4 Q, got {q_shape:?}");
                     }
                     let q_ir = graph.node(q_id).shape.clone();
                     let k_ir = graph.node(k_id).shape.clone();
@@ -4637,6 +4641,8 @@ impl CudaExecutable {
             output_slots,
             host_arena,
             rng: std::sync::Arc::new(std::sync::RwLock::new(rng)),
+            moe_resident_layers: None,
+            moe_resident_merged: None,
         }
     }
 

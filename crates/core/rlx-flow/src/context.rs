@@ -205,6 +205,17 @@ impl LinearWeight {
     }
 }
 
+/// Result of [`FlowCtx::resolve_linear_fused`]. `Fused` = one combined GEMV to
+/// emit then `narrow_`-split by `dims`; `Separate` = the projections could not be
+/// fused (mixed packed quant schemes) so emit each weight on its own input.
+pub enum FusedProj {
+    Fused {
+        weight: LinearWeight,
+        dims: Vec<usize>,
+    },
+    Separate(Vec<LinearWeight>),
+}
+
 /// Primitive builders — the composition surface for [`crate::LayerStage`]
 /// authors. Each wraps the HIR builder and returns a [`FlowValue`] with its
 /// inferred shape, so a downstream block composes ops (`ctx.matmul`,
@@ -339,6 +350,109 @@ impl FlowCtx<'_> {
         Ok(LinearWeight::Dense(
             self.load_param_typed(key, transpose, dtype)?,
         ))
+    }
+
+    /// Fused multi-projection resolve: concatenate several PACKED weights that
+    /// share an input dim + quant scheme (e.g. q/k/v projected from the same
+    /// hidden) into ONE `DequantMatMul` — one GEMV dispatch instead of N, cutting
+    /// per-token kernel launches on the decode path. The GGUF blobs are
+    /// `[out_i, in_dim]` row-major, so the fused weight is just their bytes
+    /// concatenated (`out = Σ out_i`). Returns the combined [`LinearWeight`] plus
+    /// each part's `out_dim` (to `narrow_`-split the result). Returns `None` when
+    /// the weights are not packed — `take_packed` on an F32 source yields `None`
+    /// WITHOUT consuming, so the caller safely falls back to per-key `resolve_linear`.
+    pub fn resolve_linear_fused(
+        &mut self,
+        keys: &[&str],
+        transpose: bool,
+        dtype: DType,
+    ) -> Result<FusedProj> {
+        // `take_packed` on a GGUF source CONSUMES (returns None without consuming
+        // for F32/F16 sources). So this method fully owns q/k/v resolution — the
+        // caller must NOT also `resolve_linear` these keys, or the loader double-
+        // takes. Probe the first key to pick the packed vs dense branch.
+        match self.weights.take_packed(keys[0])? {
+            Some(first) => {
+                let mut parts = vec![first];
+                for &key in &keys[1..] {
+                    parts.push(self.weights.take_packed(key)?.ok_or_else(|| {
+                        anyhow::anyhow!("resolve_linear_fused: mixed packed/dense for {keys:?}")
+                    })?);
+                }
+                let scheme = parts[0].scheme;
+                if parts.iter().all(|p| p.scheme == scheme) {
+                    // Uniform scheme → byte-concat the [out_i, in] blobs → one GEMV.
+                    let mut dims = Vec::with_capacity(keys.len());
+                    let mut bytes = Vec::new();
+                    for p in &parts {
+                        dims.push(p.out_dim);
+                        bytes.extend_from_slice(&p.w_q);
+                    }
+                    let out_dim: usize = dims.iter().sum();
+                    let wq_key = format!("{}\0fused", keys[0]);
+                    let wq = self
+                        .hir()
+                        .param(&wq_key, Shape::new(&[bytes.len()], DType::U8));
+                    self.state.typed_params.push((wq_key, bytes, DType::U8));
+                    Ok(FusedProj::Fused {
+                        weight: LinearWeight::Packed {
+                            wq,
+                            out_dim,
+                            scheme,
+                        },
+                        dims,
+                    })
+                } else {
+                    // Mixed K-quant schemes (Q4_K_M) — can't concat differing block
+                    // formats. Register each as its own packed weight (== unfused).
+                    let mut ws = Vec::with_capacity(keys.len());
+                    for (i, p) in parts.into_iter().enumerate() {
+                        let wq_key = format!("{}\0q", keys[i]);
+                        let wq = self
+                            .hir()
+                            .param(&wq_key, Shape::new(&[p.w_q.len()], DType::U8));
+                        self.state.typed_params.push((wq_key, p.w_q, DType::U8));
+                        ws.push(LinearWeight::Packed {
+                            wq,
+                            out_dim: p.out_dim,
+                            scheme: p.scheme,
+                        });
+                    }
+                    Ok(FusedProj::Separate(ws))
+                }
+            }
+            None => {
+                // Dense (F16/F32): concat the [in, out_i] weight nodes along the out
+                // axis → one `mm`. Weight-only concat bakes once (RLX_QWEN3_BAKE_WEIGHTS).
+                let mut nodes = Vec::with_capacity(keys.len());
+                let mut dims = Vec::with_capacity(keys.len());
+                for &key in keys {
+                    let n = self.load_param_typed(key, transpose, dtype)?;
+                    match self.node_shape(n)?.dims().last() {
+                        Some(Dim::Static(d)) => dims.push(*d),
+                        _ => {
+                            // Unknown out dim → emit unfused rather than guess.
+                            let mut ws: Vec<LinearWeight> =
+                                nodes.into_iter().map(LinearWeight::Dense).collect();
+                            ws.push(LinearWeight::Dense(n));
+                            for &k2 in &keys[ws.len()..] {
+                                ws.push(LinearWeight::Dense(
+                                    self.load_param_typed(k2, transpose, dtype)?,
+                                ));
+                            }
+                            return Ok(FusedProj::Separate(ws));
+                        }
+                    }
+                    nodes.push(n);
+                }
+                let last_ax = self.node_shape(nodes[0])?.rank() - 1;
+                let concat = HirMut::new(self.hir()).concat_(nodes, last_ax);
+                Ok(FusedProj::Fused {
+                    weight: LinearWeight::Dense(concat),
+                    dims,
+                })
+            }
+        }
     }
 
     /// Elementwise add (`a + b`, broadcasting).

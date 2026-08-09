@@ -201,3 +201,83 @@ fn metal_rope_ragged_per_token_matches_cpu() {
     let differ = row0.iter().zip(row1).any(|(a, b)| (a - b).abs() > 1e-3);
     assert!(differ, "rows identical ⇒ per-token RoPE not applied");
 }
+
+/// Partial rotary: `n_rot < head_dim`, the shape Gemma 4 global layers,
+/// DeepSeek-V4 MLA and MiniMax-H3 all use.
+///
+/// The cos/sin table holds exactly `n_rot/2` angles per token. Striding it by
+/// `head_dim/2` instead reads into the *next* token's angles from position 1
+/// onward — every position but the first comes out wrong, and the failure is a
+/// plausible-looking rotation rather than a crash.
+fn build_rope_partial(b: usize, s: usize, h: usize, d: usize, n_rot: usize) -> Graph {
+    let f = DType::F32;
+    let w = h * d;
+    let rot_half = n_rot / 2;
+    let mut g = Graph::new("rope_partial");
+    let x = g.input("x", Shape::new(&[b, s, w], f));
+    // One row of `n_rot/2` per position — NOT head_dim/2.
+    let cos = g.input("cos", Shape::new(&[s, rot_half], f));
+    let sin = g.input("sin", Shape::new(&[s, rot_half], f));
+    let y = g.add_node(
+        rlx_ir::Op::Rope {
+            head_dim: d,
+            n_rot,
+            style: rlx_ir::RopeStyle::NeoX,
+        },
+        vec![x, cos, sin],
+        Shape::new(&[b, s, w], f),
+    );
+    g.set_outputs(vec![y]);
+    g
+}
+
+#[test]
+fn metal_partial_rope_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Metal) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    // 96 of 128 (MiniMax-H3 DiT) and 48 of 64 (its video VAE decoder).
+    for (d, n_rot) in [(128usize, 96usize), (64, 48), (128, 64)] {
+        let (b, s, h) = (1usize, 16usize, 4usize);
+        let rot_half = n_rot / 2;
+        let x: Vec<f32> = (0..b * s * h * d)
+            .map(|i| ((i as f32) * 0.0011).sin())
+            .collect();
+        let mut cos = vec![0f32; s * rot_half];
+        let mut sin = vec![0f32; s * rot_half];
+        for p in 0..s {
+            for j in 0..rot_half {
+                let freq = 1.0f32 / (10_000.0f32).powf((2 * j) as f32 / n_rot as f32);
+                let ang = p as f32 * freq;
+                cos[p * rot_half + j] = ang.cos();
+                sin[p * rot_half + j] = ang.sin();
+            }
+        }
+        let inputs: Vec<(&str, &[f32])> = vec![("x", &x), ("cos", &cos), ("sin", &sin)];
+
+        let mut cpu = Session::new(Device::Cpu).compile(build_rope_partial(b, s, h, d, n_rot));
+        let want = cpu.run(&inputs).remove(0);
+        let mut gpu = Session::new(Device::Metal).compile(build_rope_partial(b, s, h, d, n_rot));
+        let got = gpu.run(&inputs).remove(0);
+
+        assert_eq!(got.len(), want.len());
+        let max = want
+            .iter()
+            .zip(&got)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            max < 1e-5,
+            "partial rope head_dim={d} n_rot={n_rot}: max abs diff {max} vs CPU"
+        );
+        // The pass-through tail must be copied verbatim.
+        for t in 0..s {
+            for hi in 0..h {
+                for j in n_rot..d {
+                    let i = ((t * h) + hi) * d + j;
+                    assert_eq!(got[i], x[i], "channel {j} should pass through unrotated");
+                }
+            }
+        }
+    }
+}

@@ -4293,15 +4293,35 @@ impl MetalExecutable {
                     let launch = launch_builder.build().ok();
 
                     // Split-KV path guard: must satisfy kernel shape constraints.
+                    // head_dim ≤ 128 → KV-split kernel (q_reg[128] arrays).
+                    // head_dim in (128,256] → head-dim-split 256 kernel (f32 or
+                    // f16 KV variant), which needs both dims %32-aligned.
+                    // Enables flash on qwen3.5-0.8B (head_dim=256, f16 KV cache).
+                    let hd_over_128 = *head_dim > 128 || *v_head_dim > 128;
                     let flash_ok = matches!(*dt, crate::thunk::HalfFlag::F32)
                         && seq == 1
-                        && *head_dim <= 128
-                        && (*v_head_dim == 0 || *v_head_dim <= 128);
+                        && *head_dim <= 256
+                        && (*v_head_dim == 0 || *v_head_dim <= 256)
+                        && (!hd_over_128
+                            || (head_dim.is_multiple_of(32)
+                                && (*v_head_dim == 0 || v_head_dim.is_multiple_of(32))));
 
                     let mut want_flash =
                         launch.as_ref().is_some_and(|l| l.candidate.partial_reduce) && flash_ok;
 
-                    // Config override keeps existing operational behavior.
+                    // head_dim > 128 (qwen3.5: 256) has NO fast non-flash decode
+                    // path — the base kernel's threadgroup-atomic reduction is
+                    // 4-10× slower and degrades with kv_seq. Default the hd-split
+                    // flash path ON for it (kv_seq_eff>64 so partitioning pays).
+                    // Token-identical to the atomic path; measured 3.9×@2K,
+                    // 6.4×@4K, 10.1×@8K on qwen3.5-0.8B.
+                    if hd_over_128 && flash_ok && kv_seq_eff > 64 {
+                        want_flash = true;
+                    }
+
+                    // Config override keeps existing operational behavior
+                    // (RLX_METAL_SDPA_FLASH_DECODE=0 forces the atomic path for
+                    // A/B; =1 forces flash).
                     if let Some(v) = crate::runtime_config().sdpa_flash_decode {
                         want_flash = v && flash_ok && kv_seq_eff > 64;
                     }
@@ -4318,6 +4338,22 @@ impl MetalExecutable {
                         self.sdpa_record_candidate(token_bucket, l.candidate);
                     }
 
+                    if want_flash && rlx_ir::env::flag("RLX_METAL_ATTN_TRACE") {
+                        let variant = match (hd_over_128, *kv_f16) {
+                            (true, true) => "flash hd_256_f16kv + combine_256",
+                            (true, false) => "flash hd_256 (f32) + combine_256",
+                            (false, true) => "flash partial_f16kv + combine",
+                            (false, false) => "flash partial + combine",
+                        };
+                        eprintln!(
+                            "[metal-attn] PATH=flash-decode variant='{variant}' head_dim={head_dim} kv_f16={kv_f16} kv_seq={kv_seq_eff}"
+                        );
+                    } else if !want_flash && rlx_ir::env::flag("RLX_METAL_ATTN_TRACE") {
+                        eprintln!(
+                            "[metal-attn] PATH=non-flash (base atomic sdpa_decode_m1) head_dim={head_dim} kv_f16={kv_f16} kv_seq={kv_seq_eff}"
+                        );
+                    }
+
                     if want_flash {
                         let hinted_parts =
                             launch.as_ref().map(|l| l.candidate.split_k).unwrap_or(1);
@@ -4329,11 +4365,13 @@ impl MetalExecutable {
                             *batch, *heads, kv_seq_eff, tile_n, tile_k, pad_kv,
                         )
                         .max(hinted_parts);
-                        const SLOT: u64 = 2 + 128;
+                        // SLOT stride = 2 (m,l) + MAX_DH; must match the
+                        // partial/combine kernels' per-partition layout.
+                        let slot: u64 = if hd_over_128 { 2 + 256 } else { 2 + 128 };
                         let need_bytes = (*batch as u64)
                             * (*heads as u64)
                             * (n_part as u64)
-                            * SLOT
+                            * slot
                             * std::mem::size_of::<f32>() as u64;
                         {
                             let mut sc = self.sdpa_flash_scratch.borrow_mut();
@@ -7316,13 +7354,24 @@ impl MetalExecutable {
                     // tile — replaces the dequant-to-f32-scratch + MPS sgemm
                     // path. Off-switch: RLX_METAL_Q4K_GEMM_DISABLE /
                     // RLX_METAL_Q6K_GEMM_DISABLE (→ legacy MPS path).
+                    // The fused per-tile dequant+GEMM wins for small m (batched
+                    // decode) but is ~2.4× SLOWER than dequant-scratch + MPS sgemm
+                    // for large m (prefill: qwen3.5 4K TTFT 8.8s→3.7s). Cap it at
+                    // `RLX_METAL_Q4K_GEMM_MAX_M` (default 32) so prefill routes to
+                    // MPS while small-m stays fused. Decode (m==1) uses the GEMV
+                    // path and is unaffected.
+                    let fused_gemm_max_m: usize = rlx_ir::env::var("RLX_METAL_Q4K_GEMM_MAX_M")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(32);
                     let use_fused_q4k_mm = use_gpu_dequant
                         && m_u > 1
+                        && m_u <= fused_gemm_max_m
                         && k_u.is_multiple_of(256)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufQ4K)
                         && !rlx_ir::env::flag("RLX_METAL_Q4K_GEMM_DISABLE");
                     let use_fused_q6k_mm = use_gpu_dequant
                         && m_u > 1
+                        && m_u <= fused_gemm_max_m
                         && k_u.is_multiple_of(256)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufQ6K)
                         && !rlx_ir::env::flag("RLX_METAL_Q6K_GEMM_DISABLE");
@@ -7649,6 +7698,25 @@ impl MetalExecutable {
                             *x_f16,
                             *dst_f16,
                         );
+                    } else if matches!(scheme, rlx_ir::QuantScheme::GgufQ4K)
+                        && !*x_f16
+                        && !*dst_f16
+                        && rlx_ir::env::var("RLX_METAL_MLP_SG").as_deref() != Some("0")
+                    {
+                        // Simdgroup-cooperative Q4_K swiglu (~5× the naive
+                        // one-thread-per-row path). f32 x/dst only.
+                        let enc = e!();
+                        encode_q4k_swiglu_mv_f32_sg(
+                            enc,
+                            k,
+                            &self.arena.buffer,
+                            *x,
+                            *gate_w,
+                            *up_w,
+                            *dst,
+                            *kk as usize,
+                            *n as usize,
+                        );
                     } else {
                         let enc = e!();
                         encode_fused_mlp_gate_up_swiglu(
@@ -7724,6 +7792,27 @@ impl MetalExecutable {
                             *dst_f16,
                             *res_f16,
                         );
+                    } else if matches!(scheme, rlx_ir::QuantScheme::GgufQ4K)
+                        && !*x_f16
+                        && !*dst_f16
+                        && !*res_f16
+                        && rlx_ir::env::var("RLX_METAL_MLP_SG").as_deref() != Some("0")
+                    {
+                        // Simdgroup-cooperative Q4_K down+residual (~5× the naive
+                        // one-thread-per-row path). f32 x/dst/res only.
+                        let enc = e!();
+                        encode_q4k_mv_residual_f32_sg(
+                            enc,
+                            k,
+                            &self.arena.buffer,
+                            *x,
+                            *w,
+                            *res,
+                            *dst,
+                            *kk as usize,
+                            *n as usize,
+                        );
+                        end_msl!();
                     } else {
                         let pipeline = match scheme {
                             rlx_ir::QuantScheme::GgufQ4K => &k.q4k_mv_residual_f32,
@@ -8048,29 +8137,45 @@ impl MetalExecutable {
                         && !crate::runtime_config().dequant_gpu_disable
                         && !rlx_gpu_host::mlx_dequant_gpu_disabled();
                     if use_gpu {
-                        if *m == 1 {
+                        // RLX_METAL_DEQUANT_FORCE_GEMV: run m>1 as a per-ROW loop of
+                        // the m==1 GEMV kernel so every row is bit-identical to the
+                        // single-token decode path. The GEMM kernel reduces K in a
+                        // different order (~1e-5 per row), which a recurrence (e.g.
+                        // qwen3.5 GDN delta-rule) then amplifies — this flag makes a
+                        // batched forward bit-match sequential decode (slow; exact).
+                        let force_gemv =
+                            *m > 1 && rlx_ir::env::flag("RLX_METAL_DEQUANT_FORCE_GEMV");
+                        if *m == 1 || force_gemv {
                             crate::prefill_stats::record_dequant_gemv();
                             if rlx_ir::env::flag("RLX_METAL_PREFILL_TRACE") {
                                 eprintln!(
-                                    "[prefill-trace] dequant_mlx m=1 k={} n={} kind={} bits={} group={} -> gemv",
-                                    *kk, *n, kind, bits, group_size
+                                    "[prefill-trace] dequant_mlx m={} k={} n={} kind={} bits={} group={} -> gemv{}",
+                                    *m,
+                                    *kk,
+                                    *n,
+                                    kind,
+                                    bits,
+                                    group_size,
+                                    if force_gemv { " (per-row)" } else { "" }
                                 );
                             }
-                            encode_dequant_matmul_mlx_gemv(
-                                e!(),
-                                &k.dequant_matmul_mlx_gemv,
-                                &self.arena.buffer,
-                                *x,
-                                *w_q,
-                                *scale,
-                                *zp,
-                                *dst,
-                                *kk,
-                                *n,
-                                kind,
-                                bits,
-                                group_size,
-                            );
+                            for r in 0..(*m as usize) {
+                                encode_dequant_matmul_mlx_gemv(
+                                    e!(),
+                                    &k.dequant_matmul_mlx_gemv,
+                                    &self.arena.buffer,
+                                    *x + r * (*kk as usize),
+                                    *w_q,
+                                    *scale,
+                                    *zp,
+                                    *dst + r * (*n as usize),
+                                    *kk,
+                                    *n,
+                                    kind,
+                                    bits,
+                                    group_size,
+                                );
+                            }
                         } else {
                             crate::prefill_stats::record_dequant_gemm();
                             if rlx_ir::env::flag("RLX_METAL_PREFILL_TRACE") {

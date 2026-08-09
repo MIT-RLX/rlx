@@ -130,6 +130,72 @@ pub fn gather_rows_q2_0(bytes: &[u8], row_len: usize, indices: &[usize]) -> Resu
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// int8 dot path (llama.cpp-style): quantize activations to int8 per 128-group,
+// then dot directly against the packed 2-bit codes. Mirrors the Q4_K×Q8_K seam
+// in rlx-cpu, but the single-scale Q2_0 layout maps 1:1 onto one VNNI
+// `VPDPBUSD` loop (u8 codes × i8 activations). See rlx-cpu `intrinsics::vnni`.
+// ---------------------------------------------------------------------------
+
+/// Byte offset of the group-sum field inside a packed activation block.
+const Q8_0_G128_XSUM_OFF: usize = 4 + QK2_0;
+
+/// Packed int8 activation block for the `Q2_0` int-dot path (one 128-group):
+/// `d_x` f32 scale · `QK2_0`×i8 codes · `xsum` i32 (Σ of the i8 codes).
+///
+/// `xsum` lets the VNNI kernel fold the `−1` weight offset with a single
+/// subtract, so the unsigned codes `{0,1,2,3}` can feed `VPDPBUSD` directly.
+pub const Q8_0_G128_BYTES: usize = 4 + QK2_0 + 4; // 136
+
+/// Quantize a row of activations (`x.len()` a multiple of [`QK2_0`]) into the
+/// packed int8 group format consumed by the `Q2_0` int-dot kernels.
+///
+/// Per group: `d_x = amax/127`, `a_j = round(x_j·127/amax)` clamped to
+/// `[-127,127]`, and `xsum = Σ a_j`. Quantized once per GEMV and reused across
+/// every output row.
+pub fn quantize_q8_0_g128_row(x: &[f32], out: &mut [u8]) {
+    assert!(
+        x.len().is_multiple_of(QK2_0),
+        "q8_0_g128: len not multiple of {QK2_0}"
+    );
+    let nb = x.len() / QK2_0;
+    assert_eq!(out.len(), nb * Q8_0_G128_BYTES);
+    for b in 0..nb {
+        let g = &x[b * QK2_0..(b + 1) * QK2_0];
+        let dst = &mut out[b * Q8_0_G128_BYTES..(b + 1) * Q8_0_G128_BYTES];
+        let amax = g.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let dx = amax / 127.0;
+        let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        dst[0..4].copy_from_slice(&dx.to_le_bytes());
+        let mut xsum = 0i32;
+        for (j, &v) in g.iter().enumerate() {
+            let q = (v * id).round().clamp(-127.0, 127.0) as i32;
+            dst[4 + j] = q as i8 as u8;
+            xsum += q;
+        }
+        dst[Q8_0_G128_XSUM_OFF..Q8_0_G128_XSUM_OFF + 4].copy_from_slice(&xsum.to_le_bytes());
+    }
+}
+
+/// Scalar reference dot of one packed `Q2_0` weight block (34 B) with one
+/// packed int8 activation block ([`Q8_0_G128_BYTES`]).
+///
+/// Bit-matches the SIMD kernels by construction: integer accumulation of
+/// `Σ_j (q_j − 1)·a_j`, then a single f32 scale `d·d_x`. (SIMD paths instead
+/// compute `Σ q_j·a_j − xsum`, which is the identical integer.)
+pub fn q2_0_dot_q8_g128(w: &[u8], a: &[u8]) -> f32 {
+    let d = read_f16_le(&w[0..2]);
+    let dx = f32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+    let qs = &w[2..2 + QK2_0 / 4];
+    let acts = &a[4..4 + QK2_0];
+    let mut raw = 0i32;
+    for j in 0..QK2_0 {
+        let q = ((qs[j / 4] >> ((j % 4) * 2)) & 0x03) as i32;
+        raw += (q - 1) * (acts[j] as i8 as i32);
+    }
+    d * dx * raw as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +252,34 @@ mod tests {
         let full = dequant_q2_0(&packed, src.len()).unwrap();
         assert_eq!(&got[..256], &full[256..512]);
         assert_eq!(&got[256..], &full[4 * 256..5 * 256]);
+    }
+
+    #[test]
+    fn int_dot_matches_f32_reference() {
+        // One 128-group: ternary-ish weights, arbitrary activations.
+        let mut wf = [0f32; QK2_0];
+        let mut xf = [0f32; QK2_0];
+        for j in 0..QK2_0 {
+            wf[j] = (((j * 7) % 3) as i32 - 1) as f32 * 0.5; // -0.5 / 0 / 0.5
+            xf[j] = ((j as f32) * 0.013).sin() * 3.0;
+        }
+        let w = quantize_q2_0(&wf).unwrap();
+        let mut a = vec![0u8; Q8_0_G128_BYTES];
+        quantize_q8_0_g128_row(&xf, &mut a);
+
+        // Reference: dequant both sides to f32 and dot.
+        let mut wd = [0f32; QK2_0];
+        dequant_q2_0_block(&w, &mut wd);
+        let dx = f32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+        let mut ref_dot = 0f32;
+        for j in 0..QK2_0 {
+            ref_dot += wd[j] * (a[4 + j] as i8 as f32 * dx);
+        }
+        let got = q2_0_dot_q8_g128(&w, &a);
+        // int8 activation quant → small tolerance vs full-f32 dot.
+        assert!(
+            (got - ref_dot).abs() < 1e-2 * (1.0 + ref_dot.abs()),
+            "{got} vs {ref_dot}"
+        );
     }
 }

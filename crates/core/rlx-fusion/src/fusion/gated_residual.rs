@@ -72,6 +72,22 @@ fn try_match(graph: &Graph, out: &Node, is_output: &HashMap<NodeId, ()>) -> Opti
     if !matches!(out.op, Op::Binary(BinaryOp::Add)) || out.inputs.len() != 2 {
         return None;
     }
+    // **F32 only.** Every backend's `GatedResidual` kernel is f32: the CPU one
+    // reads and writes through the f32 slice helpers (`sl` / `sl_mut`), and
+    // Metal's takes `device const float*`. Neither checks the node dtype, so
+    // fusing an F64 `Add(x, Mul(gate, y))` here produces a kernel that walks
+    // 4-byte lanes over 8-byte data and returns garbage — silently, since the
+    // shapes all still agree.
+    //
+    // Declining to fuse leaves the plain `Mul` + `Add`, which do have correct
+    // per-dtype kernels (`BinaryFullF64`), so this costs a fusion opportunity
+    // that no backend can currently take anyway. Same guard, same reason, as
+    // `ConstantFolding`'s `node.shape.dtype() != DType::F32` bail-out.
+    //
+    // Regression test: `does_not_fuse_non_f32` below.
+    if out.shape.dtype() != DType::F32 {
+        return None;
+    }
     let (a, b) = (out.inputs[0], out.inputs[1]);
     if let Some(m) = match_add_mul(graph, out.id, a, b, is_output) {
         return Some(m);
@@ -179,4 +195,72 @@ fn strict_modulation_broadcast(gate: &Shape, x: &Shape) -> bool {
     shape::broadcast(gate, x)
         .map(|b| b.dims() == x.dims())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build(dtype: DType) -> Graph {
+        // `Add(b, Mul(a, gate))` with a `[1]` gate broadcasting over `[2, 1]` —
+        // the shape the LEiDA voxel pipeline produces when it scales a per-row
+        // reduction by a scalar constant.
+        let mut g = Graph::new("gr");
+        let a = g.input("a", Shape::new(&[2, 1], dtype));
+        let b = g.input("b", Shape::new(&[2, 1], dtype));
+        let gate = g.input("gate", Shape::new(&[1], dtype));
+        let mul = g.add_node(
+            Op::Binary(BinaryOp::Mul),
+            vec![a, gate],
+            Shape::new(&[2, 1], dtype),
+        );
+        let add = g.add_node(
+            Op::Binary(BinaryOp::Add),
+            vec![mul, b],
+            Shape::new(&[2, 1], dtype),
+        );
+        g.set_outputs(vec![add]);
+        g
+    }
+
+    fn fused_count(g: &Graph) -> usize {
+        g.nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::GatedResidual))
+            .count()
+    }
+
+    #[test]
+    fn fuses_f32() {
+        let out = FuseGatedResidual.run(build(DType::F32));
+        assert_eq!(fused_count(&out), 1, "f32 should still fuse");
+    }
+
+    /// Every backend's `GatedResidual` kernel is f32-only and does not check the
+    /// node dtype, so fusing a non-F32 graph silently walks 4-byte lanes over
+    /// wider data. Leaving `Mul` + `Add` in place routes to the correct
+    /// per-dtype kernels instead.
+    #[test]
+    fn does_not_fuse_non_f32() {
+        for dtype in [DType::F64, DType::F16, DType::BF16, DType::I32] {
+            let out = FuseGatedResidual.run(build(dtype));
+            assert_eq!(
+                fused_count(&out),
+                0,
+                "{dtype:?} must not fuse into GatedResidual"
+            );
+            // ...and the original ops survive so the graph still computes.
+            let muls = out
+                .nodes()
+                .iter()
+                .filter(|n| matches!(n.op, Op::Binary(BinaryOp::Mul)))
+                .count();
+            let adds = out
+                .nodes()
+                .iter()
+                .filter(|n| matches!(n.op, Op::Binary(BinaryOp::Add)))
+                .count();
+            assert_eq!((muls, adds), (1, 1), "{dtype:?} should keep Mul + Add");
+        }
+    }
 }

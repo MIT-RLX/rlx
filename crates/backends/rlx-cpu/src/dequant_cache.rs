@@ -85,8 +85,7 @@ fn scheme_tag(scheme: QuantScheme) -> u8 {
     }
 }
 
-fn dequant_gguf(w_bytes: &[u8], k: usize, n: usize, scheme: QuantScheme) -> Vec<f32> {
-    let n_elems = k * n;
+fn dequant_gguf_serial(w_bytes: &[u8], n_elems: usize, scheme: QuantScheme) -> Vec<f32> {
     match scheme {
         QuantScheme::GgufQ4K => rlx_gguf::dequant_q4_k(w_bytes, n_elems),
         QuantScheme::GgufQ5K => rlx_gguf::dequant_q5_k(w_bytes, n_elems),
@@ -119,6 +118,56 @@ fn dequant_gguf(w_bytes: &[u8], k: usize, n: usize, scheme: QuantScheme) -> Vec<
         other => panic!("dequant_cache: unsupported GGUF scheme {other:?}"),
     }
     .expect("GGUF dequant failed")
+}
+
+/// GGUF dequant, parallelized **in place** across cores on block boundaries.
+///
+/// Each GGUF block dequants independently into its own 256-elem output slice,
+/// so per-block parallelism is **bit-identical** to the serial path with no
+/// intermediate copy — it just spreads the (compute-bound) work across the pool,
+/// which speeds the one-time dequant-cache warmup by ~cores×. Wired for the
+/// 256-elem K-quants with in-place block kernels (Q4_K / Q6_K — the LFM2.5
+/// linears + embed); every other scheme uses the serial path unchanged. Opt out
+/// with `RLX_DEQUANT_PARALLEL=0`.
+fn dequant_gguf(w_bytes: &[u8], k: usize, n: usize, scheme: QuantScheme) -> Vec<f32> {
+    use rayon::prelude::*;
+    const QK_K: usize = 256;
+    let n_elems = k * n;
+    let parallel = n_elems >= QK_K * 512
+        && n_elems.is_multiple_of(QK_K)
+        && matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K)
+        && rlx_ir::env::var("RLX_DEQUANT_PARALLEL").as_deref() != Some("0");
+    if parallel {
+        let block_bytes = scheme.gguf_block_bytes() as usize;
+        let n_blocks = n_elems / QK_K;
+        if w_bytes.len() >= n_blocks * block_bytes {
+            let wb = &w_bytes[..n_blocks * block_bytes];
+            let mut out = vec![0f32; n_elems];
+            // A few coarse chunks (≈ one per thread), each dequanting its blocks
+            // in place — avoids both the per-block rayon task overhead and any
+            // intermediate copy.
+            let threads = rayon::current_num_threads().max(1);
+            let blocks_per_chunk = n_blocks.div_ceil(threads).max(1);
+            out.par_chunks_mut(blocks_per_chunk * QK_K)
+                .enumerate()
+                .for_each(|(ci, out_chunk)| {
+                    let base = ci * blocks_per_chunk;
+                    for j in 0..(out_chunk.len() / QK_K) {
+                        let bb = &wb[(base + j) * block_bytes..(base + j + 1) * block_bytes];
+                        let arr: &mut [f32; QK_K] = (&mut out_chunk[j * QK_K..(j + 1) * QK_K])
+                            .try_into()
+                            .expect("256-elem block");
+                        match scheme {
+                            QuantScheme::GgufQ4K => rlx_gguf::dequant_q4_k_block(bb, arr),
+                            QuantScheme::GgufQ6K => rlx_gguf::dequant_q6_k_block(bb, arr),
+                            _ => unreachable!(),
+                        }
+                    }
+                });
+            return out;
+        }
+    }
+    dequant_gguf_serial(w_bytes, n_elems, scheme)
 }
 
 /// One cached slab plus its size and a last-touch tick for LRU ordering.

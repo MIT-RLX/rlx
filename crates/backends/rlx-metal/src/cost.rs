@@ -237,6 +237,15 @@ impl MetalHwModel {
             return SgemmVariant::Simd64SplitK;
         }
 
+        // Tiny-n m=1 GEMVs (e.g. the fused GDN ssm_alpha/beta [K → 2·n_v_heads]
+        // projections, n=32): no fast GEMV kernel applies (splitk/kpart need
+        // n>=64) and the fallthrough (Naive/SimdPadded) is occupancy-starved —
+        // 1 threadgroup, serial K-loop → ~0.33 ms each on qwen3.5. MPS is
+        // ~5-10× faster for these. Measured +25% on qwen3.5-0.8B decode.
+        if m == 1 && n < 64 && !mps_disabled && crate::mps_blas::mps_supports_matmul() {
+            return SgemmVariant::Mps;
+        }
+
         if k.is_multiple_of(32) && n.is_multiple_of(32) && m.is_multiple_of(32) {
             // simd4x4 dispatches an integer number of 32×32 tiles. The MSL
             // kernel writes 32 rows × 32 cols per threadgroup unconditionally

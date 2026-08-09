@@ -68,6 +68,7 @@ pub mod expert_pool;
 pub mod export;
 pub mod graph_io;
 pub mod hnsw;
+pub mod hot_expert_cache;
 #[cfg(feature = "hwprofile")]
 pub mod hwprofile_select;
 pub mod jacfwd;
@@ -183,7 +184,7 @@ pub use device_policy::{
 pub use device_router::DeviceRouter;
 pub use expert_pool::{
     ExpertPool, ExpertPoolConfig, ExpertPoolStats, ExpertRefreshPolicy, ExpertRefreshResult,
-    MoEExecMode, gpu_expert_budget_from_vram,
+    HysteresisConfig, MoEExecMode, gpu_expert_budget_from_vram,
 };
 pub use export::{ExportOptions, ExportTarget, ExportedArtifacts, export_graph};
 #[cfg(feature = "fpga")]
@@ -191,6 +192,7 @@ pub use export::{ExportSession, export_tinyconv_mnist};
 pub use flexible_session::FlexibleSession;
 pub use graph_devices::{GraphDevices, graph_param_names};
 pub use hetero::{DeviceMap, HeteroExecutable};
+pub use hot_expert_cache::{HotExpertCache, SlotLoad, SlotRoute, reconcile_layers};
 pub use hwinfo::{
     GpuThermal, HwSnapshot, ThermalError, ThermalState, all_gpu_thermal, device_thermal,
     device_thermal_count, power_cap_range, reset_fan, reset_locked_clocks, set_fan_percent,

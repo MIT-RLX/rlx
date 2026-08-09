@@ -78,8 +78,16 @@ impl ModelExecutionConfig {
     }
 
     pub fn qwen35_decode(batch: usize, past_seq: usize) -> Self {
+        Self::qwen35_decode_n(batch, past_seq, 1)
+    }
+
+    /// Qwen3.5 decode with `new_tokens` processed per forward (`1` = normal
+    /// decode; `>1` = a continued multi-token verify). `past_seq` is dynamic
+    /// (in the dim binding); `new_tokens` distinguishes the graph in the cache
+    /// key, so one dynamic verify graph is compiled+weight-shared across prefixes.
+    pub fn qwen35_decode_n(batch: usize, past_seq: usize, new_tokens: usize) -> Self {
         Self::from_component(
-            ModelComponent::new(ModelVariant::decode(batch, past_seq, 1))
+            ModelComponent::new(ModelVariant::decode(batch, past_seq, new_tokens))
                 .with_profile_key(ExecutionPreset::Qwen35Decode.profile_key()),
             ExecutionPreset::Qwen35Decode,
         )

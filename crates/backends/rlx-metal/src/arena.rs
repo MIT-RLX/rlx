@@ -43,6 +43,35 @@ impl Arena {
                     ""
                 }
             );
+            // RE arena blowups: aggregate total bytes + count by (op-kind, shape).
+            if let Some(g) = graph {
+                let mut agg: std::collections::HashMap<String, (u64, usize)> =
+                    std::collections::HashMap::new();
+                for (nid, slot) in &plan.assignments {
+                    let n = g.node(*nid);
+                    let kind = format!("{:?}", n.op);
+                    let kind = kind
+                        .split(['{', '('])
+                        .next()
+                        .unwrap_or(&kind)
+                        .trim()
+                        .to_string();
+                    let key = format!("{kind} {:?}", n.shape.dims());
+                    let e = agg.entry(key).or_insert((0, 0));
+                    e.0 += slot.size as u64;
+                    e.1 += 1;
+                }
+                let mut rows: Vec<_> = agg.into_iter().collect();
+                rows.sort_by_key(|r| std::cmp::Reverse(r.1.0));
+                eprintln!("[rlx-metal] arena by (op,shape) — top 10 by total bytes:");
+                for (key, (bytes, count)) in rows.iter().take(10) {
+                    eprintln!(
+                        "  {:>8.2} GiB  ×{:<4}  {key}",
+                        *bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        count,
+                    );
+                }
+            }
         }
         let buffer = dev.alloc_shared(plan.arena_size.max(64));
 

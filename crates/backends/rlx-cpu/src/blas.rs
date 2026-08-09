@@ -2092,7 +2092,13 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
     // `parity-gemm` feature swaps in the same Rust `gemm` crate that
     // candle uses, yielding bit-exact reduction order. Useful for
     // parity tests and reproducibility-critical workloads; loses AMX.
+    //
+    // The `return` reads as needless to clippy because every path below is
+    // `cfg(not(feature = "parity-gemm"))`, making this the function tail under
+    // this feature. Keep it explicit: an unguarded path added below must not
+    // silently run a second GEMM over `c`.
     #[cfg(feature = "parity-gemm")]
+    #[allow(clippy::needless_return)]
     {
         sgemm_via_gemm_crate(a, b, c, m, k, n);
         return;

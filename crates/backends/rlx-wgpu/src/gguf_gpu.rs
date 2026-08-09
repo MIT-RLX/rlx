@@ -620,77 +620,107 @@ fn encode_dequant_matmul_gguf_gemv_one(
 
     let (w_buf, w_raw) = arena.resolve_w(w_byte_off);
     let w_buf_size = w_buf.size();
-    let w0 = w_raw as u64;
-    let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
-    let w_size = ((w0 + w_total_bytes as u64 - w_base).div_ceil(16) * 16).min(w_buf_size - w_base);
+    let w0_all = w_raw as u64;
 
-    let max_bind = device.limits().max_storage_buffer_binding_size;
+    // Packed-weight bytes per output row. Output rows are independent (each is a
+    // separate dot product over k), so when the full weight window would exceed
+    // `max_storage_buffer_binding_size` (128 MiB minimum on wgpu — hit by llvmpipe /
+    // min-spec adapters, or large models on any GPU) we split the GEMV along N and
+    // bind only each chunk's rows. `w_total_bytes / n` is the exact per-row stride
+    // (matches the shader's `j * nbk * blk` indexing).
+    let row_bytes = (w_total_bytes / n.max(1)) as u64;
+
+    // `RLX_WGPU_MAX_BIND_MB` artificially caps the binding size to exercise the
+    // split path on GPUs whose real limit is large (validation/testing).
+    let max_bind = std::env::var("RLX_WGPU_MAX_BIND_MB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(device.limits().max_storage_buffer_binding_size);
     assert!(
-        x_size <= max_bind && w_size <= max_bind,
-        "rlx-wgpu gguf gemv: window too large (x={x_size}, w={w_size}, max={max_bind})"
+        x_size <= max_bind,
+        "rlx-wgpu gguf gemv: x window {x_size} > max_bind {max_bind}"
     );
+    // Rows per chunk so the bound weight window — including the align-down base
+    // slack (< STORAGE_ALIGN) and the 16-byte round-up — stays within max_bind.
+    let budget = max_bind.saturating_sub(STORAGE_ALIGN + 16).max(row_bytes);
+    let rows_per_chunk = ((budget / row_bytes.max(1)) as usize).max(1);
 
     let out_bytes = ((n * 4).max(4) as u64).div_ceil(16) * 16;
     with_pooled_out_buf(device, out_bytes, |out_buf| {
-        let p = DequantGemvGgufParams {
-            k: k as u32,
-            n: n as u32,
-            scheme_id,
-            x_f32_off: ((x0 - x_base) / 4) as u32,
-            w_byte_off: (w0 - w_base) as u32,
-            out_f32_off: 0,
-            _p0: 0,
-            _p1: 0,
-        };
-
         let dk = dequant_gemv_gguf_kernel(device);
-        let u = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rlx-wgpu dequant_gemv_gguf uniform"),
-            size: std::mem::size_of::<DequantGemvGgufParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+        let mut n0 = 0usize;
+        while n0 < n {
+            let n_chunk = (n - n0).min(rows_per_chunk);
+            let w0 = w0_all + n0 as u64 * row_bytes;
+            let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
+            let chunk_bytes = n_chunk as u64 * row_bytes;
+            let w_size = ((w0 + chunk_bytes - w_base).div_ceil(16) * 16).min(w_buf_size - w_base);
+            debug_assert!(
+                w_size <= max_bind,
+                "rlx-wgpu gguf gemv chunk window {w_size} > max_bind {max_bind}"
+            );
 
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rlx-wgpu dequant_gemv_gguf bg"),
-            layout: &dk.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: x_buf,
-                        offset: x_local,
-                        size: wgpu::BufferSize::new(x_size),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: u.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: w_buf,
-                        offset: w_base,
-                        size: wgpu::BufferSize::new(w_size),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: out_buf.as_entire_binding(),
-                },
-            ],
-        });
+            let p = DequantGemvGgufParams {
+                k: k as u32,
+                n: n_chunk as u32,
+                scheme_id,
+                x_f32_off: ((x0 - x_base) / 4) as u32,
+                w_byte_off: (w0 - w_base) as u32,
+                out_f32_off: n0 as u32,
+                _p0: 0,
+                _p1: 0,
+            };
 
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rlx-wgpu dequant_gemv_gguf pass"),
-                timestamp_writes: None,
+            let u = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rlx-wgpu dequant_gemv_gguf uniform"),
+                size: std::mem::size_of::<DequantGemvGgufParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
-            pass.set_pipeline(&dk.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
+            queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rlx-wgpu dequant_gemv_gguf bg"),
+                layout: &dk.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: x_buf,
+                            offset: x_local,
+                            size: wgpu::BufferSize::new(x_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: u.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: w_buf,
+                            offset: w_base,
+                            size: wgpu::BufferSize::new(w_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rlx-wgpu dequant_gemv_gguf pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&dk.pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((n_chunk as u32).div_ceil(64), 1, 1);
+            }
+            n0 += n_chunk;
         }
         let (dst, dst_off) = arena.resolve_act(out_byte_off);
         enc.copy_buffer_to_buffer(out_buf, 0, dst, dst_off as u64, (n * 4) as u64);

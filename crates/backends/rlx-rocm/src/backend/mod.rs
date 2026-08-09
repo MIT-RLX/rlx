@@ -128,9 +128,38 @@ pub struct RocmExecutable {
     host_arena: Vec<f32>,
     /// Runtime-mutable RNG policy for in-graph random ops.
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    /// Per-MoE-layer GPU residency mask (hot experts). When set, the plain
+    /// `GroupedMatmul` step computes the hot (resident) experts on-device and
+    /// offloads the cold (non-resident) experts to the host via
+    /// `rlx_gpu_host::run_moe_cold_experts_from_arena` — the hot-on-GPU /
+    /// cold-on-CPU split. Layer index = (plain-GroupedMatmul ordinal) / 3.
+    moe_resident_layers: Option<Vec<std::sync::Arc<[bool]>>>,
+    /// Merged (union) residency mask, used when no per-layer table is set.
+    moe_resident_merged: Option<std::sync::Arc<[bool]>>,
 }
 
 impl RocmExecutable {
+    /// Install a per-MoE-layer GPU residency table (hot experts). Enables the
+    /// hot-on-GPU / cold-on-CPU split in the plain `GroupedMatmul` step.
+    pub fn set_moe_resident_experts_per_layer(&mut self, masks: &[&[bool]]) {
+        self.moe_resident_merged = None;
+        self.moe_resident_layers = Some(masks.iter().map(|m| std::sync::Arc::from(*m)).collect());
+    }
+
+    /// Install a merged (union) residency mask applied to every MoE layer.
+    pub fn set_moe_resident_experts(&mut self, mask: &[bool]) {
+        self.moe_resident_layers = None;
+        self.moe_resident_merged = Some(std::sync::Arc::from(mask));
+    }
+
+    /// Residency mask for MoE `layer` (per-layer table, else merged, else none).
+    fn moe_resident_for_layer(&self, layer: usize) -> Option<std::sync::Arc<[bool]>> {
+        if let Some(layers) = self.moe_resident_layers.as_ref() {
+            return layers.get(layer).cloned();
+        }
+        self.moe_resident_merged.clone()
+    }
+
     pub fn set_rng(&mut self, rng: rlx_ir::RngOptions) {
         // A captured hipGraph bakes the Philox seed / backend into kernel args,
         // so a policy change must drop (and destroy) the capture: the next run
@@ -358,6 +387,8 @@ impl RocmExecutable {
             exe.set_gpu_handle_feed(k, idx);
         }
         exe.set_active_extent(self.active_extent);
+        exe.moe_resident_layers = self.moe_resident_layers.clone();
+        exe.moe_resident_merged = self.moe_resident_merged.clone();
         exe
     }
 

@@ -48,6 +48,18 @@ impl DecomposePolicy for CudaPolicy {
         true
     }
 
+    /// The CUDA forward Attention kernels (row / scalar / WMMA / WMMA-d128) are
+    /// all fully stride-driven, so they read seq-major rank-3 `[B, S, H·D]`
+    /// Q/K/V directly via `attention_launch_strides` — no rank-4 `[0,2,1,3]`
+    /// transpose. Accepting rank-3 elides the per-step transpose of the *entire*
+    /// KV cache (`[1,S,H·D] → [1,H,S,D]`), the single largest CUDA decode cost on
+    /// attention/hybrid models. Matches the Vulkan/wgpu policy. (Backward stays
+    /// rank-4 via `promote_attention_backward`.) `RLX_CUDA_ATTN_RANK4=1` forces
+    /// the legacy rank-4 promotion (A/B + safety valve).
+    fn attention_accepts_rank3(&self) -> bool {
+        !rlx_ir::env::flag("RLX_CUDA_ATTN_RANK4")
+    }
+
     fn swiglu_native(&self) -> bool {
         true
     }

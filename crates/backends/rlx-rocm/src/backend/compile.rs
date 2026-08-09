@@ -4029,6 +4029,8 @@ impl RocmExecutable {
             output_slots,
             host_arena,
             rng: std::sync::Arc::new(std::sync::RwLock::new(rng)),
+            moe_resident_layers: None,
+            moe_resident_merged: None,
         }
     }
 

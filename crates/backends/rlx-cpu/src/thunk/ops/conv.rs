@@ -1303,7 +1303,10 @@ pub(crate) fn exec_conv2_d(t: &Thunk, base: *mut u8) {
             let col_elems = (c_in_per_g * kh * kw).saturating_mul(h_out * w_out);
             if fast_conv_enabled() && winograd_enabled() && winograd_ok {
                 conv2d_forward_winograd(inp, wt, out, n, c_in, h, w, c_out, h_out, w_out);
-            } else if fast_conv_enabled() && direct_conv_enabled() && s1_nopad {
+            } else if fast_conv_enabled()
+                && (direct_conv_enabled() || im2col_gemm_is_degenerate(c_out, groups, kh, kw))
+                && s1_nopad
+            {
                 conv2d_forward_direct(
                     inp, wt, out, n, c_in, h, w, c_out, h_out, w_out, kh, kw, groups,
                 );
@@ -2408,6 +2411,41 @@ pub(crate) fn winograd_enabled() -> bool {
 
 /// Direct (no-im2col) forward conv enabled? `RLX_DIRECT_CONV`. Off by default —
 /// im2col+BLAS is faster for low-channel convs; this wins only at high channels.
+/// Whether im2col + GEMM is a poor fit for this convolution's shape.
+///
+/// im2col pays for itself by turning a convolution into a GEMM that has data
+/// reuse. That reuse lives in the M dimension — `c_out` per group — because
+/// every output channel re-reads the same patch matrix. When `c_out` is tiny
+/// the GEMM degenerates toward a matrix-*vector* product: no blocking, no
+/// register tiling, AMX idle. Meanwhile im2col still materialises a
+/// `[c_in_per_g·kh·kw] x [h_out·w_out]` buffer, expanding the input by
+/// `kh·kw`.
+///
+/// Single-channel image filtering is the pathological case. A 1280x720 7x7
+/// convolution with `c_in = c_out = 1` expands a 3.7 MB image into a 181 MB
+/// patch matrix in order to run a `[1x49] @ [49x921600]` matvec — pure memory
+/// bandwidth, no arithmetic intensity. Measured on an M-series Mac (3 planes,
+/// padded 720p):
+///
+/// ```text
+///        im2col    direct
+/// 3x3   11.60ms    1.17ms    9.9x
+/// 7x7   61.75ms    4.49ms   13.8x
+/// ```
+///
+/// The direct kernel needs zero scratch and keeps the input in cache, so it
+/// wins by an order of magnitude whenever the GEMM would be this thin. This
+/// only redirects shapes the GEMM path handles badly; wide-channel ML
+/// convolutions still take im2col, which remains the measured optimum there.
+#[inline]
+pub(crate) fn im2col_gemm_is_degenerate(c_out: usize, groups: usize, kh: usize, kw: usize) -> bool {
+    let gemm_m = c_out / groups.max(1);
+    // Thresholds: a GEMM with M <= 4 has essentially no reuse to amortise the
+    // patch matrix, and an expansion factor below 9 (a 3x3 kernel) is too
+    // small for the scratch to hurt.
+    gemm_m <= 4 && kh.saturating_mul(kw) >= 9
+}
+
 pub(crate) fn direct_conv_enabled() -> bool {
     use std::sync::OnceLock;
     static D: OnceLock<bool> = OnceLock::new();
