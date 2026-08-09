@@ -826,8 +826,10 @@ impl CpuExecutable {
     /// which made large models swap-thrash.
     /// Sorted, merged persistent (param + constant) byte ranges in the arena.
     /// These live for the whole execution; everything else is ephemeral scratch.
-    /// Shared by `restore_arena_baseline` (zeros the complement) and
-    /// `release_scratch_pages` (returns the complement's pages to the OS).
+    /// Used by `release_scratch_pages` (returns the complement's pages to the
+    /// OS), which is `cfg(unix)` — hence the same gate here.
+    /// `restore_arena_baseline` computes its own persistent set inline.
+    #[cfg(unix)]
     fn persistent_keep_ranges(&self) -> Vec<(usize, usize)> {
         let persistent: std::collections::HashSet<NodeId> = {
             let mut s: std::collections::HashSet<NodeId> =

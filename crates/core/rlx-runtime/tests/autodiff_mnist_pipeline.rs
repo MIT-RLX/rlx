@@ -152,10 +152,23 @@ fn assert_grads_close(a: &[Vec<f32>], b: &[Vec<f32>], rtol: f32) {
     assert_eq!(a.len(), b.len(), "param count");
     for (i, (ga, gb)) in a.iter().zip(b.iter()).enumerate() {
         assert_eq!(ga.len(), gb.len(), "param {i} length");
+        // Absolute floor scaled by the TENSOR's magnitude, not just the
+        // element's. A near-zero entry inside a gradient still carries the
+        // accumulated rounding of the whole reduction, so judging it against
+        // `rtol` of its own tiny value demands sub-f32 precision: a 4.1e-6
+        // element differing by 4.7e-10 is 1.12e-4 relative and tripped
+        // `rtol = 1e-4` only when thread count changed the reduction order.
+        // Comparing against the largest entry keeps real regressions (order-1
+        // relative on a significant element) failing.
+        let scale = ga
+            .iter()
+            .chain(gb.iter())
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        let atol = rtol * scale.max(1e-6);
         for (j, (&va, &vb)) in ga.iter().zip(gb.iter()).enumerate() {
-            let denom = va.abs().max(vb.abs()).max(1e-6);
+            let denom = va.abs().max(vb.abs());
             assert!(
-                (va - vb).abs() <= rtol * denom,
+                (va - vb).abs() <= atol + rtol * denom,
                 "param {i}[{j}]: {va} vs {vb}"
             );
         }

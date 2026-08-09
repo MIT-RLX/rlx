@@ -13,6 +13,15 @@ use rlx_runtime::{Device, Session};
 
 static PATH_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialize every test that runs a conv3d. `RLX_CUDA_NO_CUDNN` is a
+/// process-global env var and `last_conv3d_path()` a process-global tracker, so
+/// a concurrent conv3d clobbers the path another test is about to assert on.
+/// Every conv3d test must hold this — not only the ones reading the path back.
+/// Poison-tolerant so one failure can't cascade into the rest.
+fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+    PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
 }
@@ -39,6 +48,7 @@ fn make_conv3d_case() -> (Graph, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn conv3d_matches_cpu() {
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda conv3d] no CUDA device — skipping");
         return;
@@ -59,7 +69,7 @@ fn conv3d_matches_cpu() {
 
 #[test]
 fn conv3d_cudnn_matches_cpu() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda conv3d.cudnn] no CUDA device — skipping");
         return;
@@ -98,7 +108,7 @@ fn conv3d_cudnn_matches_cpu() {
 
 #[test]
 fn conv3d_kernel_matches_cpu_when_no_cudnn() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda conv3d.kernel] no CUDA device — skipping");
         return;
@@ -130,6 +140,7 @@ fn conv3d_kernel_matches_cpu_when_no_cudnn() {
 
 #[test]
 fn conv3d_identity_1x1x1_matches_input() {
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda conv3d] no CUDA device — skipping identity");
         return;

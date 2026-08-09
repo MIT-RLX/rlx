@@ -25,6 +25,61 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Added
 
+- **MoE hot-on-GPU / cold-on-CPU expert offload (`rlx_runtime::hot_expert_cache`).**
+  Runs a MoE layer whose expert stack does not fit in VRAM by keeping only the
+  *hot* experts device-resident. `HotExpertCache` models one layer as `num_slots`
+  device slots drawn from `num_experts`, tracks which expert occupies which slot,
+  and emits the minimal host→device copies (`SlotLoad`) to match the pool's
+  resident set; `SlotRoute` splits per-token routing into device slots plus a
+  `(token, expert)` cold list. `reconcile_layers` drives a whole model. The cold
+  half runs on the host via `rlx_cpu::moe_split::cold_grouped_matmul`, shared by
+  CUDA and ROCm through `rlx_gpu_host::moe`. Because MoE residency is *per
+  expert* — never per token — every output row is still produced by exactly one
+  sgemm over one expert's weights, so the split is **byte-identical** to the
+  full-stack grouped matmul; `grouped_matmul_split_reference` makes that testable
+  on CPU, and `moe_hot_cold_parity` covers CUDA + ROCm.
+
+- **Expert-placement hysteresis (`rlx_runtime::HysteresisConfig`).** `ExpertPool`
+  gained two gates that damp slot thrash when expert popularity is near-tied:
+  `margin` (a challenger must be a given *fraction* hotter than the incumbent
+  before it may evict it) and `min_dwell` (an incumbent is held for a minimum
+  number of refreshes). Both default to **off**, so existing callers keep the
+  plain top-S paired-swap behavior. Adds `refresh_from_counts`, `resident_since`,
+  and `with_hysteresis`.
+
+- **`Q2_0` int8 dot path + x86-64 VNNI kernels (`rlx_cpu::intrinsics::vnni`).**
+  The 2-bit `Q2_0` format (ggml type 42) gained a packed int8 activation block
+  (`Q8_0_G128_BYTES` = f32 scale · 128×i8 · i32 group sum) plus
+  `quantize_q8_0_g128_row`, so low-bit GEMV keeps weights in their packed byte
+  form instead of materializing an f32 slab. The x86 kernels run `VPDPBUSD`
+  directly on the 2-bit codes, selected at runtime between AVX-512-VNNI+VL
+  (`_mm256_dpbusd_epi32`) and AVX-VNNI (`_mm256_dpbusd_avx_epi32`); the stored
+  group sum folds the `−1` weight offset into one subtract so unsigned codes feed
+  the instruction directly. Neither encoding saturates, so results are
+  bit-identical to the scalar reference.
+
+- **Cooperative Q4_K GEMV kernels (CUDA/HIP + Metal).**
+  `dequant_matmul_gguf_q4k_gemv` assigns one block per output row with threads
+  splitting the k/256 super-blocks, so loads are coalesced (unlike the
+  one-thread-per-row kernel whose lanes each stride a whole row) and dequant is
+  fused into the dot with no local `float[256]` slab to spill. Accumulation is
+  Neumaier-compensated and tree-reduced. Metal gains the simdgroup-cooperative
+  equivalent (`q4k_mv_f32_sg`) plus fused-epilogue variants that reuse the
+  identical block math for down-proj+residual and SwiGLU.
+
+- **Fused QKV projection (`FlowCtx::resolve_linear_fused`).** Concatenates
+  several packed weights that share an input dim and quant scheme into one
+  `DequantMatMul`, then `narrow_`-splits the result — one GEMV dispatch instead
+  of N. GGUF blobs are `[out, in]` row-major, so the fused weight is just their
+  bytes concatenated. Returns `None` on non-packed weights *without* consuming
+  them, so callers fall back to per-key `resolve_linear` safely. Opt-in for
+  qwen3 decode via `RLX_QWEN3_FUSED_QKV` (2 fewer dispatches per layer).
+
+- **Opt-in fused Q4_K int8 decode GEMV on CPU (`RLX_Q4K_FUSED_MIN_N`).** Default
+  **disabled**: the fused path quantizes the activation to Q8_K, which is not
+  bit-identical to the f32 cached-BLAS path and flips occasional near-tie greedy
+  tokens, so rlx keeps decode on f32 for fidelity and decode↔prefill parity.
+
 - **GPU thermal/power monitoring + control (`rlx_runtime::hwinfo`, `Device::Cuda`
   & `Device::Rocm`).** Cross-backend, read-only telemetry —
   `device_thermal(device, index) -> Option<GpuThermal>`, `device_thermal_count`,
@@ -155,6 +210,32 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Changed
 
+- **MSRV raised to Rust 1.89** (was 1.87). The `Q2_0` VNNI kernels call
+  `_mm256_dpbusd_epi32` / `_mm256_dpbusd_avx_epi32`, stabilized in 1.89; on
+  x86-64 the crate did not build on the previously declared minimum.
+
+- **Layout-preserving `Transpose` → `Reshape` (`rlx-unfuse`).** A permutation is
+  a pure relabel — row-major bytes unchanged — when every axis of size > 1 keeps
+  its relative order and only size-1 axes move. That is the common **decode**
+  case (`seq == 1`), where the attention rank-4 promotion's `[0,2,1,3]` between
+  `[B,S,H,D]` and `[B,H,S,D]` is a no-op. `Reshape` is a free arena alias on
+  every backend while `Transpose` always emits a copy kernel, so this is
+  bit-identical and removes real dispatches.
+
+- **im2col/GEMM degenerate-shape guard (CPU conv).** im2col pays for itself
+  through M-dimension reuse (`c_out` per group). When `c_out` is tiny the GEMM
+  degenerates toward a matrix-*vector* product — no blocking, no register
+  tiling, AMX idle — while im2col still materializes the full patch matrix. Such
+  shapes now bypass im2col; wide-channel ML convolutions keep it, which remains
+  their measured optimum.
+
+- **Memory planner: custom-op liveness extension is now gated.**
+  `extend_custom_op_input_liveness` only runs when a dequant matmul can reach the
+  deferred-host flush. A backend that runs *all* dequant matmuls on-GPU passes
+  `dequant_host_fallback = false`, restoring slot reuse that the chain-walk
+  otherwise defeats by pinning nearly every activation in a packed prefill to the
+  end of the graph.
+
 - **`RLX_*` unification (phased).** Single registry in
   [`crates/core/rlx-ir/src/env_registry.rs`](crates/core/rlx-ir/src/env_registry.rs)
   (`kind` / `stability` / `aliases` / `layer`); Public catalog via
@@ -168,6 +249,54 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   `RLX_METAL_DEQUANT_GPU_DISABLE` (warn with `RLX_ENV_DEPRECATIONS=1` or
   `RLX_VERBOSE=1`). Prefer `CompileOptions` for compile semantics; env remains
   the CLI/bisect surface.
+
+### Fixed
+
+- **Partial RoPE read the wrong cos/sin table row (`rlx-flow`, wgpu).** The
+  tables store exactly the rotation angles — `n_rot/2` per row — but both the
+  builder and the WGSL kernel strided by `head_dim/2`. Whenever `n_rot <
+  head_dim` that stride overshoots, so every sequence position from 1 onward
+  indexed into a *later* token's angles; only position 0 was correct, and the
+  result was a plausible-looking rotation rather than a crash. Affects the
+  partial-rotary shape used by Gemma 4 global layers, DeepSeek-V4 MLA and
+  MiniMax-H3. Stride is now `n_rot`-derived throughout, which equals `head_dim/2`
+  for full RoPE, so that case is unchanged. Covered by
+  `metal_partial_rope_matches_cpu`.
+
+- **Partial-RoPE *backward* read the wrong cos/sin row on CPU, CUDA/ROCm and
+  wgpu.** The mirror of the forward bug above, and the same failure mode as the
+  `rms_norm_backward` `1/r` bug: the forward kernels index the table by
+  `n_rot/2` but these three backward kernels strided by `head_dim/2`, so under
+  partial rotary every position ≥1 differentiated against a later token's
+  angles. Metal's `rope_bwd` was already correct, which is why cross-backend
+  parity never caught it — three backends agreed with each other and disagreed
+  with the forward pass. Caught by `cpu_rope_backward_matches_finite_difference`
+  (finite differences of the forward are the independent check). Full rope
+  (`n_rot == head_dim`) is bit-identical to before.
+
+- **`GatedResidual` fusion no longer fires on non-F32.** Every backend's
+  `GatedResidual` kernel is f32 (CPU reads through the f32 slice helpers, Metal
+  takes `device const float*`) and none checked the node dtype, so fusing an F64
+  `Add(x, Mul(gate, y))` produced a kernel walking 4-byte lanes over 8-byte data
+  and returned garbage — silently, since the shapes still agreed. The pass now
+  declines, leaving the plain `Mul` + `Add`, which do have correct per-dtype
+  kernels. Regression test: `does_not_fuse_non_f32`.
+
+### Performance
+
+- **Metal: MPS for tiny-`n` decode GEMVs.** At `m == 1, n < 64` no fast GEMV
+  kernel applies (splitk/kpart need `n >= 64`) and the fallthrough is
+  occupancy-starved — one threadgroup with a serial K-loop, ~0.33 ms each on
+  qwen3.5. These now route to MPS: **+25% on qwen3.5-0.8B decode**.
+
+- **Memory planner: packed-prefill arena reuse.** Gating the custom-op liveness
+  extension cuts qwen3.5 8K packed prefill from **61.9 GB pinned to ~4 GB
+  reused**.
+
+- **CPU: opt-in fused Q4_K int8 decode GEMV.** Measured on Apple, BLAS leads at
+  `n ≈ 1k`, ties at `n ≈ 3k`, and the fused path is ~3× ahead at `n ≈ 128k`;
+  `n >= 4096` captures the wide matmuls (LM head, large FFN) for a **~15–25% CPU
+  decode speedup**. Off by default (see `RLX_Q4K_FUSED_MIN_N` above).
 
 ## [0.2.13] - 2026-07-18
 

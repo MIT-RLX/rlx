@@ -190,7 +190,11 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         BatchNormInferenceBackwardBeta,
         CumsumBackward,
         GatherBackward,
-        PartitionedConv,
+        // NOT PartitionedConv: there is no MLX lowering for it — the native
+        // attempt dies inside its Constant operands ("leaf node not bound in
+        // env"). Declining the claim lets the shared unfuse decompose it into
+        // rfft → complex-GEMM → irfft, all of which MLX does implement (`Fft`
+        // above, via the `rlx_mlx_op_fft` shim).
         QMatMul,
         QConv2d,
         ScaledMatMul,

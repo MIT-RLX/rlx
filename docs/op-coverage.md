@@ -50,18 +50,18 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 
 ### Coverage at a glance
 
-| Backend | Ops claimed | of 183 |
+| Backend | Ops claimed | of 184 |
 |---------|------------:|-------:|
 | CPU  | **173** | reference (full OpKind surface; fused/control expand before thunks) |
-| MLX  | **168** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
-| MTL  | **176** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
-| WGPU  | **169** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
+| MLX  | **167** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
+| MTL  | **177** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
+| WGPU  | **168** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
 | CUDA  | **171** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
 | ROCm  | **169** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
 | TPU  | **163** | full OpKind surface (HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd/AxialRope/Im2Col/ConvTranspose/PerTensor-FP8 Scaled* + host for SPD / splat / FftButterfly / DenseSolve) |
 | ANE  | **165** | static inference compiler + hybrid host segments (linalg batch host-staged; `CumProd`/`CumMax` still lag) |
 
-*(Total **183** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
+*(Total **184** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
 
 **Also at ~169 (EXTRA backends, not in the 8-column matrix):** **Vulkan** and **OneAPI** — claim parity with CUDA; native SPIR-V/OpenCL for norms/fused/RNN/vision-bwd/FFT/I8 quant + host/unfuse for specialty ops.
 

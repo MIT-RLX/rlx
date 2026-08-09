@@ -1437,8 +1437,13 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     1
                 };
                 let s = if rank >= 2 { x_dims[rank - 2] } else { 1 }.max(1);
-                let tab_half = (head_dim / 2).max(1);
+                // Table row stride is `n_rot/2` — the table holds exactly the
+                // rotation angles, NOT head_dim/2 of them. Striding by
+                // head_dim/2 overshoots under PARTIAL rope (n_rot < head_dim),
+                // so every position ≥1 reads a later token's angles. Equal for
+                // full rope (n_rot == head_dim). Matches the CPU reference.
                 let rot_half = n_rot / 2;
+                let tab_half = rot_half.max(1);
                 let cos_rows = cos_dims.first().copied().unwrap_or(1).max(1);
 
                 let mut cos_idx = vec![0u32; n];

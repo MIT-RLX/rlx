@@ -14,6 +14,13 @@ use rlx_ir::residual::{residual_dequantize, residual_quantize};
 fn mxfp4x2_cuda_decode_matches_cpu_oracle() {
     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
 
+    // `CudaContext::new` does not merely return `Err` without a driver — cudarc
+    // *panics* when it cannot dlopen libcuda (as on macOS). Gate on the
+    // dlopen-safe probe first so this skips instead of failing the suite.
+    if !rlx_cuda::is_available() {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
     let ctx = match CudaContext::new(0) {
         Ok(c) => c,
         Err(_) => {

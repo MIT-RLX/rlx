@@ -203,12 +203,11 @@ fn amdgpu_gtt_total() -> u64 {
             continue;
         }
         let p = ent.path().join("device/mem_info_gtt_total");
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            if let Ok(v) = s.trim().parse::<u64>() {
-                if v > 0 {
-                    return v;
-                }
-            }
+        if let Ok(s) = std::fs::read_to_string(&p)
+            && let Ok(v) = s.trim().parse::<u64>()
+            && v > 0
+        {
+            return v;
         }
     }
     0

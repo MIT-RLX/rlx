@@ -31,8 +31,11 @@ fn rope_bwd(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
     let si = q2 % params.seq;
     let bi = q2 / params.seq;
     let rot_half = params.n_rot / 2u;
-    let half_dh = params.head_dim / 2u;
-    let tab_off = (si * half_dh) % max(params.cos_len, 1u);
+    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
+    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
+    // stride overshoots into a later token's angles for every position ≥1.
+    // Full rope has n_rot == head_dim, so rot_half == head_dim/2: unchanged.
+    let tab_off = (si * rot_half) % max(params.cos_len, 1u);
 
     let dy_base = params.dy_off + bi * params.seq * params.hidden + si * params.hidden + hi * params.head_dim;
     let dx_base = params.dx_off + bi * params.seq * params.hidden + si * params.hidden + hi * params.head_dim;

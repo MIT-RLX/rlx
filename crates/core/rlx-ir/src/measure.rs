@@ -31,8 +31,7 @@ use std::time::Instant;
 pub struct Tick {
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     cycles: u64,
-    #[cfg(target_arch = "wasm32")]
-    millis: f64,
+    // wasm32 carries no field: the tick is a no-op (see `now`/`elapsed_ns`).
     #[cfg(all(
         not(all(target_arch = "aarch64", target_vendor = "apple")),
         not(target_arch = "wasm32")
@@ -52,8 +51,10 @@ impl Tick {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            // `std::time::Instant` panics on wasm32-unknown-unknown.
-            Tick { millis: 0.0 }
+            // `std::time::Instant` panics on wasm32-unknown-unknown, and a real
+            // clock here would mean a JS `performance.now()` binding. Until one
+            // exists the tick reads nothing and `elapsed_ns` reports 0.
+            Tick {}
         }
         #[cfg(all(
             not(all(target_arch = "aarch64", target_vendor = "apple")),

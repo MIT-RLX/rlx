@@ -157,11 +157,10 @@ impl Cluster {
                 None => {
                     let mut c = std::process::Command::new(std::env::current_exe()?);
                     c.args(&argv).stdout(Stdio::piped());
-                    if let Ok(dir) = std::env::var("RLX_WORKER_ERR_DIR") {
-                        if let Ok(f) = std::fs::File::create(format!("{dir}/local_worker_{i}.err"))
-                        {
-                            c.stderr(Stdio::from(f));
-                        }
+                    if let Ok(dir) = std::env::var("RLX_WORKER_ERR_DIR")
+                        && let Ok(f) = std::fs::File::create(format!("{dir}/local_worker_{i}.err"))
+                    {
+                        c.stderr(Stdio::from(f));
                     }
                     c.spawn()?
                 }

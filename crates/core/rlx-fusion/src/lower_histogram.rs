@@ -38,6 +38,8 @@ pub fn lower_histogram(g: &mut Graph, x: NodeId, bins: usize, min: f32, max: f32
     let rank = g.shape(x).rank();
     let all_axes: Vec<usize> = (0..rank).collect();
     let count_shape = Shape::new(&[1], DType::F32);
+    // All-axes reduce with `keep_dim` → one entry per input axis, all 1.
+    let keepdim_shape = Shape::new(&vec![1usize; rank], DType::F32);
     let x_f32 = g.shape(x).clone().with_dtype(DType::F32);
     let x_bool = g.shape(x).clone().with_dtype(DType::Bool);
     let width = (max - min) / bins as f32;
@@ -59,14 +61,21 @@ pub fn lower_histogram(g: &mut Graph, x: NodeId, bins: usize, min: f32, max: f32
         let ge_f = g.add_node(Op::Cast { to: DType::F32 }, vec![ge], x_f32.clone());
         let lt_f = g.add_node(Op::Cast { to: DType::F32 }, vec![lt], x_f32.clone());
         let inb = g.add_node(Op::Binary(BinaryOp::Mul), vec![ge_f, lt_f], x_f32.clone());
-        // Sum over every axis → a single count, kept as shape [1] for concat.
+        // Sum over every axis → a single count. `keep_dim` so the result stays
+        // rank-`rank` ([1,1,…,1]) rather than collapsing to rank-0: shape
+        // inference rewrites a `keep_dim: false` all-axes reduce to `dims: []`,
+        // and concatenating rank-0 operands along axis 0 is invalid — wgpu
+        // indexes `in_shape[axis]` out of bounds and MLX rejects it outright
+        // ("Axis 0 is out of bounds for array with 0 dimensions"). Reshape to
+        // `[1]` so `concat_` sees honest rank-1 inputs on every backend.
         let cnt = g.reduce(
             inb,
             ReduceOp::Sum,
             all_axes.clone(),
-            false,
-            count_shape.clone(),
+            true,
+            keepdim_shape.clone(),
         );
+        let cnt = g.reshape(cnt, vec![1], count_shape.clone());
         counts.push(cnt);
     }
     g.concat_(counts, 0)

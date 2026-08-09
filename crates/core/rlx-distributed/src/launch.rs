@@ -183,10 +183,10 @@ impl LocalCluster {
         // Drain the captured rank's stdout to EOF (it closes when that worker
         // exits); the other ranks run concurrently meanwhile.
         let mut lines = Vec::new();
-        if let Some((_, child)) = children.iter_mut().find(|(r, _)| *r == self.capture_rank) {
-            if let Some(out) = child.stdout.take() {
-                lines.extend(BufReader::new(out).lines().map_while(Result::ok));
-            }
+        if let Some((_, child)) = children.iter_mut().find(|(r, _)| *r == self.capture_rank)
+            && let Some(out) = child.stdout.take()
+        {
+            lines.extend(BufReader::new(out).lines().map_while(Result::ok));
         }
 
         let mut failures = Vec::new();

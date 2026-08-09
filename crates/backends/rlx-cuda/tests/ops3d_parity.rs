@@ -16,6 +16,16 @@ use rlx_runtime::{Device, Session};
 
 static PATH_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialize every test that runs a ConvTranspose3d. `RLX_CUDA_NO_CUDNN` is a
+/// process-global env var and `last_conv_transpose3d_path()` a process-global
+/// tracker, so a concurrent CT3d run clobbers the path another test is about to
+/// assert on. Every CT3d test must hold this — not only the ones that read the
+/// path back. Poison-tolerant so one failure can't cascade `PoisonError` into
+/// the rest and bury the real cause.
+fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+    PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
 }
@@ -42,6 +52,7 @@ fn make_ct3d_case() -> (Graph, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn conv_transpose3d_matches_cpu() {
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda ct3d] no CUDA device — skipping");
         return;
@@ -62,7 +73,7 @@ fn conv_transpose3d_matches_cpu() {
 
 #[test]
 fn conv_transpose3d_cudnn_matches_cpu() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda ct3d.cudnn] no CUDA device — skipping");
         return;
@@ -95,7 +106,7 @@ fn conv_transpose3d_cudnn_matches_cpu() {
 
 #[test]
 fn conv_transpose3d_kernel_matches_cpu_when_no_cudnn() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda ct3d.kernel] no CUDA device — skipping");
         return;

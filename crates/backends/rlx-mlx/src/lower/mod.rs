@@ -152,13 +152,21 @@ pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
             Op::GatherNd { .. } => return Some("GatherNd (host reference)"),
             Op::GatherElements { .. } => return Some("GatherElements (host reference)"),
             // Oversized CT2d (Vocos/ISTFT k≈1024) — MLX im2col OOMs; small
-            // CT2d lowers natively via `ops::conv_transpose2d`.
+            // groups=1 CT2d lowers natively via `ops::conv_transpose2d`.
+            // Grouped/depthwise CT2d must ALSO host-eval: MLX's native grouped
+            // transpose-conv mixes channels across groups (kokoro ISTFTNet
+            // upsampler g=512 → output ~25× too large → garbage audio). Mirrors
+            // the `groups > 1` guard on ConvTranspose3d below.
             Op::ConvTranspose2d {
                 kernel_size,
                 groups,
                 ..
-            } if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) => {
-                return Some("ConvTranspose2d (oversized im2col → host)");
+            } if *groups > 1 || mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) => {
+                return Some(if *groups > 1 {
+                    "ConvTranspose2d (grouped → host; MLX native mixes groups)"
+                } else {
+                    "ConvTranspose2d (oversized im2col → host)"
+                });
             }
             // Oversized / grouped CT3d — MLX 3D transpose is groups=1 only;
             // oversized im2col still host-evals like forward Conv.

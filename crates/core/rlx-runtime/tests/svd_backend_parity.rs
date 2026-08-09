@@ -8,7 +8,7 @@
 
 use rlx_ir::op::SvdPart;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
 
 const M: usize = 4;
 const N: usize = 3;
@@ -53,7 +53,7 @@ macro_rules! backend_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !is_available($dev) {
+            if !rlx_runtime::is_available($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

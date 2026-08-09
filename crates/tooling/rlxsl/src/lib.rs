@@ -287,10 +287,7 @@ pub fn activation_expr(act: Activation) -> Sx {
             let_(
                 "inner",
                 clamp(
-                    mul(
-                        lit(std::f32::consts::FRAC_2_SQRT_PI),
-                        add(x(), mul(lit(0.044715), var("x3"))),
-                    ),
+                    mul(lit(SQRT_2_OVER_PI), add(x(), mul(lit(0.044715), var("x3")))),
                     -15.0,
                     15.0,
                 ),
@@ -431,6 +428,15 @@ pub fn eval_activation(act: Activation, xv: f32) -> f32 {
 
 /// `2/√π`, the constant in `d/dx erf(x) = (2/√π)·e^(-x²)`.
 const TWO_OVER_SQRT_PI: f32 = std::f32::consts::FRAC_2_SQRT_PI;
+
+/// `√(2/π)`, the constant inside the tanh of the GELU approximation
+/// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715x³)))`.
+///
+/// Deliberately NOT [`std::f32::consts::FRAC_2_SQRT_PI`], which is the
+/// different constant `2/√π ≈ 1.128` (see [`TWO_OVER_SQRT_PI`] above). Using
+/// that one here makes `gelu_approx(-2)` return `-0.0097` instead of `-0.0454`.
+/// Matches `GC` in rlx-cpu's `elementwise.rs`, the reference implementation.
+const SQRT_2_OVER_PI: f32 = 0.797_884_6;
 
 /// Substitute every [`Sx::Let`] binding into its uses, returning a `let`-free
 /// tree. (Differentiation is simplest on a flat expression; the shared subterms
@@ -1335,8 +1341,7 @@ mod tests {
             Activation::Gelu => 0.5 * x * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2)),
             Activation::Silu => x / (1.0 + (-x).exp()),
             Activation::GeluApprox => {
-                let inner = (std::f32::consts::FRAC_2_SQRT_PI * (x + 0.044715 * x * x * x))
-                    .clamp(-15.0, 15.0);
+                let inner = (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).clamp(-15.0, 15.0);
                 0.5 * x * (1.0 + inner.tanh())
             }
             Activation::Round => x.round_ties_even(),

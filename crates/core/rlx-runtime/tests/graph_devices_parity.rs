@@ -90,8 +90,19 @@ fn graph_devices_run_try_falls_back_to_cpu() {
     let x = g.input("x", Shape::new(&[2], DType::F32));
     g.set_outputs(vec![x]);
     let mut runner = GraphDevices::new(g);
+    // Lead with a device THIS BUILD genuinely cannot run, so the fallback path
+    // is exercised on every host. Hard-coding `Device::Cuda` only passed on
+    // machines without CUDA — on the CUDA rig `run_try` correctly selected Cuda
+    // and the unconditional `== Cpu` assertion failed.
+    let chain: Vec<Device> = match [Device::Cuda, Device::Rocm, Device::Vulkan, Device::Metal]
+        .into_iter()
+        .find(|d| !is_available(*d))
+    {
+        Some(unavailable) => vec![unavailable, Device::Cpu],
+        None => vec![Device::Cpu],
+    };
     let (dev, out) = runner
-        .run_try(&[Device::Cuda, Device::Cpu], &[("x", &[3.0, 4.0])])
+        .run_try(&chain, &[("x", &[3.0, 4.0])])
         .expect("fallback");
     assert_eq!(dev, Device::Cpu);
     assert_eq!(out[0], vec![3.0, 4.0]);

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use rlx_flow::MapWeights;
 use rlx_flow::prelude::*;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
 
 const B: usize = 1;
 const S: usize = 4;
@@ -134,7 +134,7 @@ macro_rules! backend_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !is_available($dev) {
+            if !rlx_runtime::is_available($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

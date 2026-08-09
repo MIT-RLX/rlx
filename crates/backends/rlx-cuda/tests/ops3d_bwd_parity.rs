@@ -15,6 +15,20 @@ use rlx_runtime::{Device, Session};
 
 static PATH_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serialize every test that runs a conv3d backward. `RLX_CUDA_CONV_FORCE_GATHER`
+/// / `RLX_CUDA_NO_CUDNN` are process-global env vars and `last_conv3d_bwd_path()`
+/// is a process-global tracker, so two conv3d tests running concurrently clobber
+/// each other: one sets force-gather, another dispatches via cuDNN in between,
+/// and the first reads back `Some("cudnn")`. Every conv3d test must hold this —
+/// not just the ones that assert on the path.
+///
+/// Poison-tolerant on purpose: an assertion failure inside the guard would
+/// otherwise cascade a `PoisonError` unwrap panic into every later test here,
+/// masking the one real failure behind several fake ones.
+fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+    PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
 }
@@ -83,6 +97,7 @@ fn make_maxpool3d_bwd() -> (Graph, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn conv3d_backward_input_matches_cpu() {
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda c3d_bwd_in] no CUDA device — skipping");
         return;
@@ -103,7 +118,7 @@ fn conv3d_backward_input_matches_cpu() {
 
 #[test]
 fn conv3d_backward_input_cudnn_matches_cpu() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda c3d_bwd_in.cudnn] no CUDA device — skipping");
         return;
@@ -136,7 +151,7 @@ fn conv3d_backward_input_cudnn_matches_cpu() {
 
 #[test]
 fn conv3d_backward_input_kernel_matches_cpu() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda c3d_bwd_in.kernel] no CUDA device — skipping");
         return;
@@ -165,6 +180,7 @@ fn conv3d_backward_input_kernel_matches_cpu() {
 
 #[test]
 fn conv3d_backward_weight_matches_cpu() {
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda c3d_bwd_w] no CUDA device — skipping");
         return;
@@ -185,7 +201,7 @@ fn conv3d_backward_weight_matches_cpu() {
 
 #[test]
 fn conv3d_backward_weight_cudnn_matches_cpu() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = path_lock();
     if !rlx_cuda::is_available() {
         eprintln!("[rlx-cuda c3d_bwd_w.cudnn] no CUDA device — skipping");
         return;

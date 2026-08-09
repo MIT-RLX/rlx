@@ -173,14 +173,15 @@ pub fn verify_file_hashed(
     expected_sha256: Option<&str>,
 ) -> Result<()> {
     let len = fs::metadata(path)?.len();
-    if let Some(sz) = expected_size {
-        if sz != 0 && len != sz {
-            return Err(HubError::SizeMismatch {
-                path: path.display().to_string(),
-                got: len,
-                want: sz,
-            });
-        }
+    if let Some(sz) = expected_size
+        && sz != 0
+        && len != sz
+    {
+        return Err(HubError::SizeMismatch {
+            path: path.display().to_string(),
+            got: len,
+            want: sz,
+        });
     }
     if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
         verify_safetensors_structure(path, len)?;

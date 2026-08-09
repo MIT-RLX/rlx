@@ -8,7 +8,7 @@
 
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
 
 const N: usize = 64;
 
@@ -61,7 +61,7 @@ macro_rules! backend_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !is_available($dev) {
+            if !rlx_runtime::is_available($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

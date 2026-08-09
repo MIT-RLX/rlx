@@ -416,6 +416,9 @@ impl CompilePipeline {
             let dump = crate::inspect::inspect_pipeline(self, hir.clone())?;
             crate::inspect::maybe_dump_pipeline(&dump, &name);
         }
+        // Phase timing needs `Instant`, which panics on wasm32-unknown-unknown;
+        // the whole block is cfg'd out there, so the flag would be unread.
+        #[cfg(not(target_arch = "wasm32"))]
         let dbg = rlx_ir::env::var("RLX_PHASE_TIMING").is_some();
         #[cfg(not(target_arch = "wasm32"))]
         let t = if dbg {

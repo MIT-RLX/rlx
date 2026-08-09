@@ -27,9 +27,12 @@ extern "C" __global__ void rlx_rope_bwd(
     unsigned int q2 = q1 / nh;
     unsigned int si = q2 % seq;
     unsigned int bi = q2 / seq;
-    unsigned int half_dh = head_dim / 2u;
     unsigned int rot_half = n_rot / 2u;
-    unsigned int tab_off = (si * half_dh) % cos_len;
+    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
+    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
+    // stride overshoots into a later token's angles for every position ≥1.
+    // Full rope has n_rot == head_dim, so rot_half == head_dim/2: unchanged.
+    unsigned int tab_off = (si * rot_half) % cos_len;
 
     unsigned int dy_base = dy_off + bi * seq * hidden + si * hidden + hi * head_dim;
     unsigned int dx_base = dx_off + bi * seq * hidden + si * hidden + hi * head_dim;

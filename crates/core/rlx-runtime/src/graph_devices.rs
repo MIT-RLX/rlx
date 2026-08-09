@@ -366,7 +366,17 @@ mod tests {
     #[test]
     fn run_try_falls_back_to_cpu() {
         let mut runner = GraphDevices::new(identity_graph());
-        let chain = [Device::Cuda, Device::Cpu];
+        // Lead with a device THIS BUILD genuinely cannot run, so the fallback
+        // path is exercised on every host. Hard-coding `Device::Cuda` only
+        // passed where CUDA was absent — on a CUDA host `run_try` correctly
+        // selects Cuda and an unconditional `== Cpu` assertion fails.
+        let chain: Vec<Device> = match [Device::Cuda, Device::Rocm, Device::Vulkan, Device::Metal]
+            .into_iter()
+            .find(|d| !crate::is_available(*d))
+        {
+            Some(unavailable) => vec![unavailable, Device::Cpu],
+            None => vec![Device::Cpu],
+        };
         let (dev, out) = runner
             .run_try(&chain, &[("x", &[1.0, 2.0, 3.0, 4.0])])
             .expect("fallback");

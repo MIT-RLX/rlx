@@ -70,7 +70,6 @@ pub fn rope_backward_row(
     head_dim: usize,
     n_rot: usize,
 ) {
-    let tab_half = head_dim / 2;
     let rot_half = n_rot / 2;
     debug_assert!(dy.len() >= head_dim && dx.len() >= head_dim);
     for i in 0..rot_half {
@@ -82,7 +81,6 @@ pub fn rope_backward_row(
         dx[rot_half + i] = -y1 * sv + y2 * cv;
     }
     dx[n_rot..head_dim].copy_from_slice(&dy[n_rot..head_dim]);
-    let _ = tab_half;
 }
 
 /// GroupNorm (NCHW) backward w.r.t. input.

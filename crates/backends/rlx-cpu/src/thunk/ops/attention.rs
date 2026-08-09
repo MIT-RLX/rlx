@@ -912,7 +912,12 @@ pub(crate) fn exec_rope_backward(t: &Thunk, base: *mut u8) {
             *cos_len as usize,
         );
         let nh = hs / dh;
-        let tab_half = dh / 2;
+        // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
+        // token, NOT head_dim/2 (same convention as the forward kernel and
+        // Metal's `rope_bwd`). Striding by head_dim/2 under PARTIAL rope
+        // (n_rot < head_dim) overshoots into a later token's angles for every
+        // position ≥1. Full rope has n_rot == head_dim, so this is unchanged.
+        let rot_half = nr / 2;
         unsafe {
             let dys = sl(*dy, base, b * s * hs);
             let cos_tab = sl(*cos, base, cl);
@@ -920,9 +925,9 @@ pub(crate) fn exec_rope_backward(t: &Thunk, base: *mut u8) {
             let out = sl_mut(*dx, base, b * s * hs);
             for bi in 0..b {
                 for si in 0..s {
-                    let tab_off = si.saturating_mul(tab_half) % cl.max(1);
-                    let cp = &cos_tab[tab_off..tab_off + tab_half.min(cl)];
-                    let sp = &sin_tab[tab_off..tab_off + tab_half.min(cl)];
+                    let tab_off = si.saturating_mul(rot_half) % cl.max(1);
+                    let cp = &cos_tab[tab_off..tab_off + rot_half.min(cl)];
+                    let sp = &sin_tab[tab_off..tab_off + rot_half.min(cl)];
                     for hi in 0..nh {
                         let base_idx = bi * s * hs + si * hs + hi * dh;
                         crate::training_bwd::rope_backward_row(

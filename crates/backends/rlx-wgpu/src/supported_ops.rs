@@ -215,7 +215,10 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     // Remaining QAT / INT8 / fuse forms (HostOp → CPU).
     OpKind::LoraMatMul,
     OpKind::FusedConvBiasAct,
-    OpKind::PartitionedConv,
+    // NOT PartitionedConv: the HostOp path returned zeros (cpu=0.4 vs gpu=0),
+    // and declining the claim lets the shared unfuse decompose it into the
+    // rfft → complex-GEMM → irfft primitives it already has WGSL kernels for —
+    // which runs on the GPU instead of staging back to the host.
     OpKind::CustomFn,
     // Session + WgpuExecutable compile run LowerControlFlow first.
     OpKind::If,

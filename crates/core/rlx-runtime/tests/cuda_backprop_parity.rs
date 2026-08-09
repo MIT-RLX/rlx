@@ -90,14 +90,23 @@ fn parity(
     for (i, (c, g)) in cpu.iter().zip(&cuda).enumerate() {
         let e = max_err(c, g);
         let (nc, ng) = (l2(c), l2(g));
+        // `tol` is absolute, which is meaningless once a conv weight-gradient
+        // accumulates to ‖dW‖ ~1e7: one f32 ULP there is already ~2, so CPU and
+        // CUDA summing the same values in a different order differ by more than
+        // any fixed epsilon. Allow a magnitude-proportional slack (~8 ULP of the
+        // reference norm) alongside the absolute floor, which still keeps small
+        // tensors as strict as before and still catches the real failures this
+        // guards — those are order-1 relative (CUDA≈0 / wrong shape), not 1 ULP.
+        let limit = tol.max(1e-6 * nc);
+        let ok = e < limit;
         // relative: is the CUDA output ~zero while CPU is not? (the zero-dW bug)
         let zero = ng < 1e-4 * nc.max(1e-9);
         eprintln!(
-            "  {name}[{i}] max_err={e:.6} |cpu|={nc:.5} |cuda|={ng:.5}{} {}",
+            "  {name}[{i}] max_err={e:.6} (limit={limit:.6}) |cpu|={nc:.5} |cuda|={ng:.5}{} {}",
             if zero { " CUDA≈0!" } else { "" },
-            if e < tol { "ok" } else { "MISMATCH" }
+            if ok { "ok" } else { "MISMATCH" }
         );
-        bad |= e >= tol;
+        bad |= !ok;
     }
     bad
 }

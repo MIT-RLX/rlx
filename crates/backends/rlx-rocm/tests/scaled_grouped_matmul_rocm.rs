@@ -22,6 +22,14 @@ fn build(m: usize, k: usize, n: usize, e_cnt: usize) -> Graph {
 }
 
 fn parity(m: usize, k: usize, n: usize, e_cnt: usize, idx: Vec<f32>) {
+    // `Session::new(Device::Rocm)` panics both without ROCm hardware AND when
+    // rlx-runtime was built without its `rocm` feature — the latter is what a
+    // plain `cargo test -p rlx-rocm` does even on a ROCm host. The runtime's
+    // own probe covers both; `rlx_rocm::is_available()` would not.
+    if !rlx_runtime::is_available(Device::Rocm) {
+        eprintln!("skip: ROCm unavailable (no device, or runtime built without `rocm`)");
+        return;
+    }
     let x: Vec<f32> = (0..m * k)
         .map(|i| ((i as f32) * 0.031).sin() * 1.2)
         .collect();
