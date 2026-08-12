@@ -49,8 +49,11 @@
 #      before issuing the next publish. After the last crate of a
 #      tier the loop additionally sleeps `BETWEEN_DELAY` to let
 #      downstream crates' dep resolution catch up.
-#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer) are
-#      skipped automatically by cargo — this script lists the rest.
+#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer,
+#      rlx-opscope) are skipped automatically by cargo — this script lists
+#      the rest. Keep the `SKIPPED` array below in sync with them:
+#      `validate_tier_coverage` requires every workspace member to be either
+#      in a tier or in `SKIPPED`.
 #
 # Usage:
 #
@@ -195,7 +198,12 @@ TIERS=(
 )
 
 usage() {
-    sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the whole header comment block (line 2 through the last `#` line
+    # before `set -euo pipefail`) — a hard-coded end line silently truncated
+    # `--help` mid-section as the header grew.
+    local last
+    last="$(grep -n -m1 '^set -euo pipefail' "$0" | cut -d: -f1)"
+    sed -n "2,$((last - 2))p" "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -299,11 +307,13 @@ validate_tier_coverage() {
 validate_tier_coverage
 
 # Every rlx-* path dep in [dependencies] must appear in an earlier tier
-# (or the same tier, listed before this crate). Dev-dependencies are
-# skipped here but cargo publish still resolves them against crates.io —
-# keep test-only cycles on an already-published version (metal dev-dep
-# rlx-runtime stays at the prior release 0.2.7 while runtime optional-dep's
-# metal tracks the workspace version 0.2.8).
+# (or the same tier, listed before this crate). Dev-dependencies are skipped
+# here because the test-only back-edges — rlx-metal → rlx-runtime, and
+# rlx-autodiff / rlx-wgpu → the umbrella `rlx` — are declared PATH-ONLY (no
+# `version =` field). cargo strips path-only dev-deps from the published
+# manifest, so `cargo publish` never resolves them against crates.io and they
+# need no per-release pin bump. Add a `version =` to one of those back-edges
+# and it immediately starts gating the publish order — keep them path-only.
 validate_publish_order() {
     if ! command -v python3 >/dev/null 2>&1; then
         yellow "python3 not found — skipping publish-order check (install python3 to enable)."
@@ -326,24 +336,56 @@ for i, line in enumerate(tier_lines):
     for j, c in enumerate(line.split()):
         crate_tier[c] = (i, j)
 
+def table_body(text: str, header_re: str):
+    for hm in re.finditer(header_re, text):
+        start = hm.end()
+        nxt = re.search(r"(?m)^\[", text[start:])
+        yield text[start : start + (nxt.start() if nxt else len(text))]
+
+def dep_lines(body: str):
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            continue
+        m2 = re.match(r"^(rlx[a-z0-9-]*)\s*=\s*(.*)$", s)
+        if m2:
+            yield m2.group(1), m2.group(2)
+
+# rlx-* entries in [workspace.dependencies] that carry a `version` field. A
+# member writing `{ workspace = true }` inherits that version, so cargo keeps
+# the dep in the published manifest and resolves it against crates.io.
+ws_versioned = {
+    name
+    for body in table_body((root / "Cargo.toml").read_text(),
+                           r"(?m)^\[workspace\.dependencies\]")
+    for name, rhs in dep_lines(body)
+    if "version" in rhs
+}
+
 def parse_rlx_deps(toml_path: Path) -> set[str]:
     # Every rlx-* dep cargo publish resolves against crates.io: [dependencies]
     # AND target-cfg dependencies (e.g. rlx-metal on Apple); optional deps too.
-    # [dev-dependencies] are excluded: cargo strips path-only dev-deps from the
-    # published manifest.
     text = toml_path.read_text()
     deps: set[str] = set()
-    for hm in re.finditer(r"(?m)^\[(?:dependencies|target\.[^\]]+\.dependencies)\]", text):
-        start = hm.end()
-        nxt = re.search(r"(?m)^\[", text[start:])
-        body = text[start : start + (nxt.start() if nxt else len(text))]
-        for line in body.splitlines():
-            s = line.strip()
-            if s.startswith("#"):
-                continue
-            m2 = re.match(r"^(rlx-[a-z0-9-]+)\s*=", s)
-            if m2:
-                deps.add(m2.group(1))
+    for body in table_body(text, r"(?m)^\[(?:dependencies|target\.[^\]]+\.dependencies)\]"):
+        for name, _rhs in dep_lines(body):
+            deps.add(name)
+    return deps
+
+def parse_resolved_rlx_dev_deps(toml_path: Path) -> set[str]:
+    # [dev-dependencies] are only exempt while they are PATH-ONLY: cargo strips
+    # those from the published manifest. A dev-dep carrying a `version` (directly
+    # or inherited via `{ workspace = true }`) IS resolved against crates.io, so
+    # it gates publish order exactly like a normal dep. Missing this is what let
+    # the rlx-flow dev-dep `rlx-opt = { workspace = true }` reach a real publish
+    # run and fail there with "candidate versions found which did not match".
+    text = toml_path.read_text()
+    deps: set[str] = set()
+    for body in table_body(text, r"(?m)^\[(?:dev-dependencies|target\.[^\]]+\.dev-dependencies)\]"):
+        for name, rhs in dep_lines(body):
+            inherits = re.search(r"\bworkspace\s*=\s*true\b", rhs) and name in ws_versioned
+            if "version" in rhs or inherits:
+                deps.add(name)
     return deps
 
 violations: list[str] = []
@@ -366,6 +408,17 @@ for toml in sorted(root.glob("crates/*/rlx-*/Cargo.toml")) + [root / "crates/rlx
             violations.append(
                 f"{name} (tier {dep_tier} pos {dep_pos} needs {dep} before it): "
                 f"publish {dep} before {name}"
+            )
+    for dep in sorted(parse_resolved_rlx_dev_deps(toml)):
+        if dep not in crate_tier:
+            continue
+        dep_tier, dep_pos = crate_tier[dep]
+        if dep_tier > my_tier or (dep_tier == my_tier and dep_pos >= my_pos):
+            violations.append(
+                f"{name}: dev-dep {dep} carries a `version` (tier {dep_tier} "
+                f"publishes after {name} tier {my_tier}) — cargo publish will try "
+                f"to resolve it on crates.io. Make it path-only: "
+                f'{dep} = {{ path = "..." }}'
             )
 
 if violations:
@@ -597,8 +650,11 @@ if (( ! NO_GATE )); then
     bold "[2/3] cargo clippy --workspace --all-targets -- -D warnings"
     cargo clippy --workspace --all-targets -- -D warnings
 
-    bold "[3/3] cargo test --workspace --release"
-    cargo test --workspace --release
+    # --no-fail-fast: cargo stops at the first failing *binary* otherwise, so a
+    # single early break hides every later crate's result. A release gate wants
+    # the whole picture in one run; the non-zero exit still aborts the publish.
+    bold "[3/3] cargo test --workspace --release --no-fail-fast"
+    cargo test --workspace --release --no-fail-fast
     green "Pre-flight gates passed."
 fi
 

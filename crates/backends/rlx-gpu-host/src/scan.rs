@@ -84,8 +84,21 @@ pub fn run_host_op_span<A: DeviceArena>(a: &mut A, desc: HostOpDesc) {
 #[derive(Default)]
 pub struct HostTensorCache {
     map: std::collections::HashMap<usize, std::sync::Arc<[f32]>>,
-    /// Byte offsets that exist in `map` but may not yet be on the device.
-    dirty: std::collections::HashSet<usize>,
+    /// Byte offsets that exist in `map` but may not yet be on the device, in
+    /// **host write order** (`dirty_set` mirrors it for O(1) membership).
+    ///
+    /// Order is load-bearing, not cosmetic: mirror entries routinely *overlap*
+    /// in the arena — a view aliasing its parent's slot (see [`Self::insert`]),
+    /// or a slot the memory planner reused after its first tenant died. Two
+    /// overlapping deferred writes must reach the device in the order the host
+    /// produced them, exactly as the eager (non-deferred) path would, otherwise
+    /// a stale longer entry lands *after* the live shorter one inside its span
+    /// and silently clobbers it. A `HashSet` here made that a per-process coin
+    /// flip (randomly-seeded iteration order): `Cholesky`'s dead `[5,5]` L slot
+    /// overwrote the live `LogDet` scalar the planner had placed inside it, so
+    /// wgpu linalg parity failed ~47% of runs with `logdet == 0.0`.
+    dirty: Vec<usize>,
+    dirty_set: std::collections::HashSet<usize>,
 }
 
 impl HostTensorCache {
@@ -96,6 +109,7 @@ impl HostTensorCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.dirty.clear();
+        self.dirty_set.clear();
     }
 
     pub fn has_deferred_writes(&self) -> bool {
@@ -122,19 +136,40 @@ impl HostTensorCache {
     }
 
     pub fn is_dirty(&self, byte_off: usize) -> bool {
-        self.dirty.contains(&byte_off)
+        self.dirty_set.contains(&byte_off)
+    }
+
+    /// Queue `byte_off` as the most recent deferred write. Re-writing an offset
+    /// moves it to the back so the flush keeps matching host program order.
+    fn mark_dirty(&mut self, byte_off: usize) {
+        if !self.dirty_set.insert(byte_off) {
+            if let Some(pos) = self.dirty.iter().position(|&o| o == byte_off) {
+                self.dirty.remove(pos);
+            }
+        }
+        self.dirty.push(byte_off);
+    }
+
+    fn unmark_dirty(&mut self, byte_off: usize) -> bool {
+        if !self.dirty_set.remove(&byte_off) {
+            return false;
+        }
+        if let Some(pos) = self.dirty.iter().position(|&o| o == byte_off) {
+            self.dirty.remove(pos);
+        }
+        true
     }
 
     pub fn invalidate(&mut self, byte_off: usize) {
         self.map.remove(&byte_off);
-        self.dirty.remove(&byte_off);
+        self.unmark_dirty(byte_off);
     }
 
     pub fn insert(&mut self, byte_off: usize, data: Vec<f32>, defer_htod: bool) {
         if defer_htod {
-            self.dirty.insert(byte_off);
+            self.mark_dirty(byte_off);
         } else {
-            self.dirty.remove(&byte_off);
+            self.unmark_dirty(byte_off);
         }
         // Preserve a longer entry's tail. The cache is keyed by byte offset,
         // but *views alias their parent's slot*: a `Narrow(start=0)` of a
@@ -158,12 +193,13 @@ impl HostTensorCache {
         self.map.insert(byte_off, merged);
     }
 
-    /// Write all deferred host outputs to the device (call before a GPU pass).
+    /// Write all deferred host outputs to the device (call before a GPU pass),
+    /// oldest write first — see the `dirty` field docs for why order matters.
     pub fn flush_to_device<A: DeviceArena>(&mut self, a: &mut A) {
         if self.dirty.is_empty() {
             return;
         }
-        let offs: Vec<usize> = self.dirty.iter().copied().collect();
+        let offs = std::mem::take(&mut self.dirty);
         for off in offs {
             if let Some(v) = self.map.get(&off) {
                 if !v.is_empty() {
@@ -171,13 +207,13 @@ impl HostTensorCache {
                 }
             }
         }
-        self.dirty.clear();
+        self.dirty_set.clear();
     }
 
     /// Flush one deferred offset (before a cache-miss D2H that would otherwise
     /// read zeros for a HostOp that deferred its write).
     pub fn flush_offset<A: DeviceArena>(&mut self, a: &mut A, byte_off: usize) {
-        if !self.dirty.remove(&byte_off) {
+        if !self.unmark_dirty(byte_off) {
             return;
         }
         if let Some(v) = self.map.get(&byte_off) {
@@ -437,5 +473,123 @@ mod host_cache_tests {
         c.insert(64, vec![1.0, 2.0], true);
         c.insert(64, vec![9.0, 8.0, 7.0], true);
         assert_eq!(&c.get_arc(64).unwrap()[..], &[9.0, 8.0, 7.0]);
+    }
+
+    /// Byte-addressed arena double that records the H2D order.
+    struct VecArena {
+        bytes: Vec<u8>,
+        writes: Vec<(usize, usize)>,
+    }
+
+    impl VecArena {
+        fn new(n: usize) -> Self {
+            Self {
+                bytes: vec![0u8; n],
+                writes: Vec::new(),
+            }
+        }
+
+        fn f32_at(&self, byte_off: usize) -> f32 {
+            f32::from_le_bytes(self.bytes[byte_off..byte_off + 4].try_into().unwrap())
+        }
+    }
+
+    impl crate::DeviceArena for VecArena {
+        fn arena_bytes(&self) -> usize {
+            self.bytes.len()
+        }
+        fn sync(&mut self) {}
+        fn dtoh(&mut self, byte_off: usize, dst: &mut [u8]) {
+            dst.copy_from_slice(&self.bytes[byte_off..byte_off + dst.len()]);
+        }
+        fn htod(&mut self, byte_off: usize, src: &[u8]) {
+            self.writes.push((byte_off, src.len()));
+            self.bytes[byte_off..byte_off + src.len()].copy_from_slice(src);
+        }
+    }
+
+    /// Overlapping deferred writes must reach the device in host write order.
+    ///
+    /// The memory planner reuses a dead tensor's slot, so a later, smaller live
+    /// tensor can sit *inside* an earlier entry's span. This is the real layout
+    /// from `linalg_backend_parity`: `Cholesky`'s `[5,5]` L at byte 240 (100 B)
+    /// dies at the `TriangularSolve`, and the planner puts the `LogDet` scalar at
+    /// byte 256 — 16 B into L's slot. Flushing L *after* the scalar overwrites it
+    /// with `L[4]`, the upper-triangle zero. While `dirty` was a `HashSet` its
+    /// randomly-seeded iteration order made that a ~47%-per-process coin flip.
+    #[test]
+    fn overlapping_deferred_writes_flush_in_write_order() {
+        let mut c = HostTensorCache::new();
+        // Cholesky L: 25 f32 at 240. Index 4 is an upper-triangle zero.
+        let mut l = vec![0f32; 25];
+        l[0] = 2.35;
+        c.insert(240, l, true);
+        // TriangularSolve x: 5 f32 at 512 (disjoint).
+        c.insert(512, vec![0.4, 0.25, 0.16, -0.02, -0.31], true);
+        // LogDet scalar at 256 — inside L's dead slot, written last.
+        c.insert(256, vec![8.534641], true);
+
+        let mut a = VecArena::new(1024);
+        c.flush_to_device(&mut a);
+
+        assert_eq!(
+            a.writes,
+            vec![(240, 100), (512, 20), (256, 4)],
+            "deferred writes must flush oldest-first, not in hash order"
+        );
+        assert_eq!(
+            a.f32_at(256),
+            8.534641,
+            "stale L slot clobbered the live LogDet scalar"
+        );
+        assert!(!c.has_deferred_writes(), "flush must drain the dirty list");
+    }
+
+    /// Re-writing an offset moves it to the back: last host write still wins.
+    #[test]
+    fn rewriting_an_offset_flushes_it_last() {
+        let mut c = HostTensorCache::new();
+        c.insert(0, vec![1.0; 8], true); // spans bytes 0..32
+        c.insert(16, vec![7.0], true); // interior of the above
+        c.insert(0, vec![2.0; 8], true); // re-write of the parent, newest
+
+        let mut a = VecArena::new(64);
+        c.flush_to_device(&mut a);
+
+        assert_eq!(a.writes, vec![(16, 4), (0, 32)]);
+        assert_eq!(a.f32_at(16), 2.0, "newest write to the span must win");
+    }
+
+    /// `flush_offset` drains just that offset and leaves the rest ordered.
+    #[test]
+    fn flush_offset_drains_one_entry_and_keeps_order() {
+        let mut c = HostTensorCache::new();
+        c.insert(0, vec![1.0], true);
+        c.insert(64, vec![2.0], true);
+        c.insert(128, vec![3.0], true);
+
+        let mut a = VecArena::new(256);
+        c.flush_offset(&mut a, 64);
+        assert_eq!(a.writes, vec![(64, 4)]);
+        assert!(!c.is_dirty(64));
+
+        c.flush_to_device(&mut a);
+        assert_eq!(a.writes, vec![(64, 4), (0, 4), (128, 4)]);
+    }
+
+    /// A non-deferred (eager) write clears any pending deferred entry for it.
+    #[test]
+    fn eager_write_unmarks_a_pending_deferred_entry() {
+        let mut c = HostTensorCache::new();
+        c.insert(32, vec![1.0], true);
+        assert!(c.is_dirty(32));
+        // Caller already wrote this one straight to the device.
+        c.insert(32, vec![5.0], false);
+        assert!(!c.is_dirty(32));
+        assert!(!c.has_deferred_writes());
+
+        let mut a = VecArena::new(64);
+        c.flush_to_device(&mut a);
+        assert!(a.writes.is_empty(), "eager write must not re-flush");
     }
 }

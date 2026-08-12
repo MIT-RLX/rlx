@@ -20,8 +20,16 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 [dev-dependencies]
-rlx-opt = { workspace = true }
-rlx-runtime = { workspace = true, features = ["cpu", "training"] }
+# Back-edges: rlx-opt (tier 4) and rlx-runtime (tier 7) both publish AFTER
+# rlx-flow (tier 1), and rlx-runtime depends on rlx-flow, so the cycle cannot be
+# broken by retiering. Keep these PATH-ONLY (no `version`): cargo strips
+# path-only dev-deps from the published manifest, so `cargo publish -p rlx-flow`
+# never resolves them against crates.io. `{ workspace = true }` does NOT work
+# here — it inherits the workspace `version = "0.2.14"`, which cargo then tries
+# to resolve and fails on ("candidate versions found which didn't match").
+# The path still wins for local `cargo test`.
+rlx-opt = { path = "../rlx-opt" }
+rlx-runtime = { path = "../rlx-runtime", features = ["cpu", "training"] }
 
 [lints]
 workspace = true
