@@ -49,8 +49,11 @@
 #      before issuing the next publish. After the last crate of a
 #      tier the loop additionally sleeps `BETWEEN_DELAY` to let
 #      downstream crates' dep resolution catch up.
-#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer) are
-#      skipped automatically by cargo — this script lists the rest.
+#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer,
+#      rlx-opscope) are skipped automatically by cargo — this script lists
+#      the rest. Keep the `SKIPPED` array below in sync with them:
+#      `validate_tier_coverage` requires every workspace member to be either
+#      in a tier or in `SKIPPED`.
 #
 # Usage:
 #
@@ -195,7 +198,12 @@ TIERS=(
 )
 
 usage() {
-    sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the whole header comment block (line 2 through the last `#` line
+    # before `set -euo pipefail`) — a hard-coded end line silently truncated
+    # `--help` mid-section as the header grew.
+    local last
+    last="$(grep -n -m1 '^set -euo pipefail' "$0" | cut -d: -f1)"
+    sed -n "2,$((last - 2))p" "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -299,11 +307,13 @@ validate_tier_coverage() {
 validate_tier_coverage
 
 # Every rlx-* path dep in [dependencies] must appear in an earlier tier
-# (or the same tier, listed before this crate). Dev-dependencies are
-# skipped here but cargo publish still resolves them against crates.io —
-# keep test-only cycles on an already-published version (metal dev-dep
-# rlx-runtime stays at the prior release 0.2.7 while runtime optional-dep's
-# metal tracks the workspace version 0.2.8).
+# (or the same tier, listed before this crate). Dev-dependencies are skipped
+# here because the test-only back-edges — rlx-metal → rlx-runtime, and
+# rlx-autodiff / rlx-wgpu → the umbrella `rlx` — are declared PATH-ONLY (no
+# `version =` field). cargo strips path-only dev-deps from the published
+# manifest, so `cargo publish` never resolves them against crates.io and they
+# need no per-release pin bump. Add a `version =` to one of those back-edges
+# and it immediately starts gating the publish order — keep them path-only.
 validate_publish_order() {
     if ! command -v python3 >/dev/null 2>&1; then
         yellow "python3 not found — skipping publish-order check (install python3 to enable)."
@@ -597,8 +607,11 @@ if (( ! NO_GATE )); then
     bold "[2/3] cargo clippy --workspace --all-targets -- -D warnings"
     cargo clippy --workspace --all-targets -- -D warnings
 
-    bold "[3/3] cargo test --workspace --release"
-    cargo test --workspace --release
+    # --no-fail-fast: cargo stops at the first failing *binary* otherwise, so a
+    # single early break hides every later crate's result. A release gate wants
+    # the whole picture in one run; the non-zero exit still aborts the publish.
+    bold "[3/3] cargo test --workspace --release --no-fail-fast"
+    cargo test --workspace --release --no-fail-fast
     green "Pre-flight gates passed."
 fi
 
