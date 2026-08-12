@@ -34,6 +34,12 @@ struct FuseInfo {
 }
 
 impl Pass for FuseAttentionBackwardAll {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::AttentionBackward]
+    }
+
     fn name(&self) -> &str {
         "fuse_attention_backward_all"
     }

@@ -4,7 +4,7 @@
 
 // Multi-kernel f32 FFT dispatch for Metal (mirrors rlx-cuda/src/fft_dispatch.rs).
 
-use metal::{ComputeCommandEncoderRef, MTLSize};
+use crate::mtl::{ComputeCommandEncoderRef, MTLSize};
 
 use crate::kernels::Kernels;
 
@@ -53,7 +53,7 @@ fn fft_max_radix() -> u32 {
 pub fn run_fft_gpu(
     k: &Kernels,
     enc: &ComputeCommandEncoderRef,
-    arena: &metal::Buffer,
+    arena: &crate::mtl::Buffer,
     src_off: u32,
     dst_off: u32,
     outer: u32,

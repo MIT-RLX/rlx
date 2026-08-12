@@ -18,7 +18,7 @@
 #[cfg(target_os = "macos")]
 fn main() {
     use half::f16;
-    use metal::MTLSize;
+    use rlx_metal::mtl::MTLSize;
     use std::time::Instant;
 
     let dev = rlx_metal::device::metal_device().expect("no Metal device");
@@ -122,7 +122,7 @@ kernel void gemv_idx4_cbf16(HEAD) {        // L2+L4 stacked
 }
 "#;
     let lib = device
-        .new_library_with_source(decode_src, &metal::CompileOptions::new())
+        .new_library_with_source(decode_src, &rlx_metal::mtl::CompileOptions::new())
         .expect("decode MSL compile");
     let pipe = |name: &str| {
         let f = lib.get_function(name, None).unwrap();
@@ -158,7 +158,10 @@ kernel void gemv_idx4_cbf16(HEAD) {        // L2+L4 stacked
     let dst_off = align(cbf16_off + cb_f16.len() * 2);
     let total = align(dst_off + N * 4);
 
-    let buffer = device.new_buffer(total as u64, metal::MTLResourceOptions::StorageModeShared);
+    let buffer = device.new_buffer(
+        total as u64,
+        rlx_metal::mtl::MTLResourceOptions::StorageModeShared,
+    );
     unsafe {
         let base = buffer.contents() as *mut u8;
         std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, base.add(x_off), x.len() * 4);
@@ -176,54 +179,55 @@ kernel void gemv_idx4_cbf16(HEAD) {        // L2+L4 stacked
         );
     }
 
-    let run = |pipe: &metal::ComputePipelineState, idxo: usize, cbo: usize| -> (f64, Vec<f32>) {
-        // Encode `count` dispatches into ONE command buffer, single commit+wait —
-        // amortizes the ~0.1 ms commit/wait so we time the KERNEL, not dispatch.
-        let batch = |count: usize| {
-            let cb = queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pipe);
-            enc.set_buffer(0, Some(&buffer), 0);
-            for (i, v) in [x_off as u64, idxo as u64, cbo as u64, dst_off as u64]
-                .iter()
-                .enumerate()
-            {
-                enc.set_bytes(1 + i as u64, 8, v as *const u64 as *const _);
+    let run =
+        |pipe: &rlx_metal::mtl::ComputePipelineState, idxo: usize, cbo: usize| -> (f64, Vec<f32>) {
+            // Encode `count` dispatches into ONE command buffer, single commit+wait —
+            // amortizes the ~0.1 ms commit/wait so we time the KERNEL, not dispatch.
+            let batch = |count: usize| {
+                let cb = queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&buffer), 0);
+                for (i, v) in [x_off as u64, idxo as u64, cbo as u64, dst_off as u64]
+                    .iter()
+                    .enumerate()
+                {
+                    enc.set_bytes(1 + i as u64, 8, v as *const u64 as *const _);
+                }
+                for (i, v) in [K as u32, N as u32, D as u32].iter().enumerate() {
+                    enc.set_bytes(5 + i as u64, 4, v as *const u32 as *const _);
+                }
+                for _ in 0..count {
+                    enc.dispatch_threads(
+                        MTLSize {
+                            width: 32,
+                            height: N as u64,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 32,
+                            height: 8,
+                            depth: 1,
+                        },
+                    );
+                }
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            batch(WARMUP);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                batch(ITERS);
+                best = best.min(t0.elapsed().as_secs_f64() * 1e3 / ITERS as f64);
             }
-            for (i, v) in [K as u32, N as u32, D as u32].iter().enumerate() {
-                enc.set_bytes(5 + i as u64, 4, v as *const u32 as *const _);
-            }
-            for _ in 0..count {
-                enc.dispatch_threads(
-                    MTLSize {
-                        width: 32,
-                        height: N as u64,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 32,
-                        height: 8,
-                        depth: 1,
-                    },
-                );
-            }
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
+            let out = unsafe {
+                let p = (buffer.contents() as *const u8).add(dst_off) as *const f32;
+                (0..N).map(|i| *p.add(i)).collect()
+            };
+            (best, out)
         };
-        batch(WARMUP);
-        let mut best = f64::INFINITY;
-        for _ in 0..3 {
-            let t0 = Instant::now();
-            batch(ITERS);
-            best = best.min(t0.elapsed().as_secs_f64() * 1e3 / ITERS as f64);
-        }
-        let out = unsafe {
-            let p = (buffer.contents() as *const u8).add(dst_off) as *const f32;
-            (0..N).map(|i| *p.add(i)).collect()
-        };
-        (best, out)
-    };
 
     // CPU reference for correctness.
     let mut want = vec![0f32; N];
@@ -288,8 +292,8 @@ kernel void gemv_idx4_cbf16(HEAD) {        // L2+L4 stacked
     //     batched (N dispatches, one commit/wait) — isolates the kernel-LAUNCH tax that
     //     dominates real decode (dozens of kernels/token). This is the #1 lever: ICB /
     //     graph capture amortizes it across the whole step.
-    let run_ub = |pipe: &metal::ComputePipelineState| -> f64 {
-        let one = |pipe: &metal::ComputePipelineState| {
+    let run_ub = |pipe: &rlx_metal::mtl::ComputePipelineState| -> f64 {
+        let one = |pipe: &rlx_metal::mtl::ComputePipelineState| {
             let cb = queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(pipe);
@@ -419,7 +423,7 @@ kernel void castf16f32(device float* arena [[buffer(0)]], constant ulong& s_off 
 }
 "#;
     let rlib = device
-        .new_library_with_source(recon_src, &metal::CompileOptions::new())
+        .new_library_with_source(recon_src, &rlx_metal::mtl::CompileOptions::new())
         .unwrap();
     let rpipe = |n: &str| {
         let f = rlib.get_function(n, None).unwrap();
@@ -444,7 +448,10 @@ kernel void castf16f32(device float* arena [[buffer(0)]], constant ulong& s_off 
     let xp16_off = a2(dstp_off + MP * NP * 4); // f16 activation scratch (for MPS-f16 path)
     let dst16_off = a2(xp16_off + MP * KP * 2);
     let ptot = a2(dst16_off + MP * NP * 2);
-    let pbuf = device.new_buffer(ptot as u64, metal::MTLResourceOptions::StorageModeShared);
+    let pbuf = device.new_buffer(
+        ptot as u64,
+        rlx_metal::mtl::MTLResourceOptions::StorageModeShared,
+    );
     unsafe {
         let base = pbuf.contents() as *mut u8;
         std::ptr::copy_nonoverlapping(xp.as_ptr() as *const u8, base.add(xp_off), xp.len() * 4);
@@ -455,8 +462,8 @@ kernel void castf16f32(device float* arena [[buffer(0)]], constant ulong& s_off 
             cb_f32.len() * 4,
         );
     }
-    let recon_dispatch = |enc: &metal::ComputeCommandEncoderRef,
-                          pipe: &metal::ComputePipelineState,
+    let recon_dispatch = |enc: &rlx_metal::mtl::ComputeCommandEncoderRef,
+                          pipe: &rlx_metal::mtl::ComputePipelineState,
                           w_off: usize| {
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(&pbuf), 0);
@@ -509,8 +516,8 @@ kernel void castf16f32(device float* arena [[buffer(0)]], constant ulong& s_off 
         (0..MP * NP).map(|i| *p.add(i)).collect::<Vec<f32>>()
     };
 
-    let cast = |enc: &metal::ComputeCommandEncoderRef,
-                pipe: &metal::ComputePipelineState,
+    let cast = |enc: &rlx_metal::mtl::ComputeCommandEncoderRef,
+                pipe: &rlx_metal::mtl::ComputePipelineState,
                 s: usize,
                 d: usize,
                 n: usize| {
@@ -693,14 +700,14 @@ kernel void tiled_db(THEAD) {
 }
 "#;
     let tlib = device
-        .new_library_with_source(tiled_src, &metal::CompileOptions::new())
+        .new_library_with_source(tiled_src, &rlx_metal::mtl::CompileOptions::new())
         .expect("tiled MSL");
     let tpipe = |n: &str| {
         let f = tlib.get_function(n, None).unwrap();
         device.new_compute_pipeline_state_with_function(&f).unwrap()
     };
     let (p_sb, p_db) = (tpipe("tiled_sb"), tpipe("tiled_db"));
-    let run_tiled = |pipe: &metal::ComputePipelineState| -> (f64, Vec<f32>) {
+    let run_tiled = |pipe: &rlx_metal::mtl::ComputePipelineState| -> (f64, Vec<f32>) {
         let batch = |count: usize| {
             let cbuf = queue.new_command_buffer();
             let enc = cbuf.new_compute_command_encoder();

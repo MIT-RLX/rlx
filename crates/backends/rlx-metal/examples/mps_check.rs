@@ -8,9 +8,9 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use metal::MTLResourceOptions;
     use rlx_metal::device::metal_device;
     use rlx_metal::mps_blas::{encode_mps_sgemm, mps_supports_matmul};
+    use rlx_metal::mtl::MTLResourceOptions;
 
     if !mps_supports_matmul() {
         eprintln!("MPS not available");

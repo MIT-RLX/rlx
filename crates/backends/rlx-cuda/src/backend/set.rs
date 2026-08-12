@@ -59,6 +59,12 @@ impl CudaExecutable {
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
         {
+            // Already resident in the shared param region courtesy of an earlier
+            // executable — re-uploading would just re-send the same bytes to the
+            // same physical pages.
+            if self.arena.shared_skip_upload.contains(&id) {
+                return;
+            }
             let off_f32 = self.arena.offset(id) / 4;
             let stream = self.ctx.default_stream();
             let mut slot = self
@@ -87,6 +93,9 @@ impl CudaExecutable {
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
         {
+            if self.arena.shared_skip_upload.contains(&id) {
+                return;
+            }
             let byte_off = self.arena.offset(id);
             let stream = self.ctx.default_stream();
             crate::gguf_host::upload_param_bytes(&stream, self.arena.f32_buf_mut(), byte_off, data);

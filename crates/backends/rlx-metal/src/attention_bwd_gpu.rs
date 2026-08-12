@@ -5,7 +5,7 @@
 //! GPU scaled dot-product attention backward (recomputes scores + softmax).
 
 use crate::kernels::Kernels;
-use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+use crate::mtl::{Buffer, ComputeCommandEncoderRef, MTLSize};
 use rlx_ir::Graph;
 use rlx_ir::op::{AttentionBwdWrt, Op};
 

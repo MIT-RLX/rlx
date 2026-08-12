@@ -2873,6 +2873,85 @@ pub enum Op {
 }
 
 impl Op {
+    /// Every nested [`Graph`](crate::Graph) this op carries, in field order.
+    ///
+    /// Empty for all but the control-flow / custom-body ops
+    /// ([`Op::If`], [`Op::While`], [`Op::Scan`], [`Op::ScanBackward`],
+    /// [`Op::ScanBackwardXs`], [`Op::CustomFn`]). The empty `Vec` does not
+    /// allocate, so the common path is free.
+    pub fn subgraphs(&self) -> Vec<&crate::Graph> {
+        match self {
+            Op::If {
+                then_branch,
+                else_branch,
+            } => vec![then_branch, else_branch],
+            Op::While { cond, body, .. } => vec![cond, body],
+            Op::Scan { body, .. } => vec![body],
+            Op::ScanBackward {
+                body_vjp,
+                forward_body,
+                ..
+            }
+            | Op::ScanBackwardXs {
+                body_vjp,
+                forward_body,
+                ..
+            } => match forward_body {
+                Some(fwd) => vec![body_vjp, fwd],
+                None => vec![body_vjp],
+            },
+            Op::CustomFn {
+                fwd_body,
+                vjp_body,
+                jvp_body,
+                ..
+            } => {
+                let mut out = vec![&**fwd_body];
+                out.extend(vjp_body.as_deref());
+                out.extend(jvp_body.as_deref());
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Mutable counterpart of [`Op::subgraphs`], same order.
+    pub fn subgraphs_mut(&mut self) -> Vec<&mut crate::Graph> {
+        match self {
+            Op::If {
+                then_branch,
+                else_branch,
+            } => vec![then_branch, else_branch],
+            Op::While { cond, body, .. } => vec![cond, body],
+            Op::Scan { body, .. } => vec![body],
+            Op::ScanBackward {
+                body_vjp,
+                forward_body,
+                ..
+            }
+            | Op::ScanBackwardXs {
+                body_vjp,
+                forward_body,
+                ..
+            } => match forward_body {
+                Some(fwd) => vec![&mut **body_vjp, &mut **fwd],
+                None => vec![&mut **body_vjp],
+            },
+            Op::CustomFn {
+                fwd_body,
+                vjp_body,
+                jvp_body,
+                ..
+            } => {
+                let mut out = vec![&mut **fwd_body];
+                out.extend(vjp_body.as_deref_mut());
+                out.extend(jvp_body.as_deref_mut());
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// PLAN L4: discriminant for backend-supported-set checks.
     /// Stable, parameter-free identity per variant — `Op::Activation(_)`
     /// and `Op::Activation(Relu)` share the same `OpKind::Activation`.
@@ -3065,77 +3144,10 @@ impl Op {
         }
     }
 
-    /// True if this op is element-wise (same shape in, same shape out).
-    /// Element-wise ops are prime fusion candidates.
-    pub fn is_elementwise(&self) -> bool {
-        matches!(
-            self,
-            Op::Activation(_)
-                | Op::Cast { .. }
-                | Op::StopGradient
-                | Op::Binary(_)
-                | Op::Compare(_)
-                | Op::Where
-                | Op::Fma
-                | Op::ElementwiseRegion { .. }
-                | Op::BatchElementwiseRegion { .. }
-        )
-    }
-
-    /// True if this op may appear in a [`Op::TransformRegion`] chain.
-    pub fn is_transform_eligible(&self) -> bool {
-        matches!(self, Op::ResizeNearest2x)
-    }
-
-    /// True if this op is a BLAS/compute-intensive op that forms a fusion boundary.
-    pub fn is_blas(&self) -> bool {
-        matches!(
-            self,
-            Op::MatMul
-                | Op::DotGeneral { .. }
-                | Op::DenseSolve
-                | Op::BatchedDenseSolve
-                | Op::Conv { .. }
-                | Op::Im2Col { .. }
-                | Op::ConvTranspose2d { .. }
-                | Op::Conv3d { .. }
-                | Op::ConvTranspose3d { .. }
-                | Op::FusedMatMulBiasAct { .. }
-                | Op::FusedMatMulResidual
-                | Op::FusedConvBiasAct { .. }
-                | Op::GroupedMatMul
-                | Op::DequantGroupedMatMul { .. }
-                | Op::DequantGroupedMatMulMlx { .. }
-                | Op::DequantMoEWeights { .. }
-                | Op::ScaledGroupedMatMul { .. }
-                | Op::LoraMatMul { .. }
-                | Op::DequantMatMul { .. }
-                | Op::SynthMatMul { .. }
-                | Op::QMatMul { .. }
-                | Op::QConv2d { .. }
-                | Op::ScaledMatMul { .. }
-        )
-    }
-
-    /// True if element-wise fusion must not span across this op.
-    pub fn is_fusion_boundary(&self) -> bool {
-        self.is_blas()
-            || matches!(
-                self,
-                Op::GaussianSplatRender { .. }
-                    | Op::GaussianSplatRenderBackward { .. }
-                    | Op::GaussianSplatPrepare { .. }
-                    | Op::GaussianSplatRasterize { .. }
-            )
-    }
-
-    /// True if this op is a reduction (drives loop iteration in fused kernels).
-    pub fn is_reduction(&self) -> bool {
-        matches!(
-            self,
-            Op::Reduce { .. } | Op::Softmax { .. } | Op::TopK { .. }
-        )
-    }
+    // Capability predicates (`is_elementwise`, `is_blas`,
+    // `is_fusion_boundary`, `is_reduction`, `is_transform_eligible`, …)
+    // live in `crate::capability`, which classifies every `OpKind`
+    // exhaustively instead of via open `matches!` lists.
 
     /// Number of tensor inputs this op expects.
     pub fn num_inputs(&self) -> usize {
@@ -4086,5 +4098,57 @@ impl std::fmt::Display for Op {
             Op::GatedResidual => write!(f, "gated_residual"),
             Op::GatedResidualBackward => write!(f, "gated_residual_backward"),
         }
+    }
+}
+
+#[cfg(test)]
+mod subgraph_accessor_tests {
+    use super::*;
+
+    /// Number of boxed nested-graph fields declared across the whole [`Op`]
+    /// enum. Every consumer that recurses into nested IR (structural hashing,
+    /// verification, capability queries) goes through [`Op::subgraphs`], so a
+    /// variant missing from the accessor would silently skip its body.
+    const SUBGRAPH_FIELD_COUNT: usize = 12;
+
+    /// Drift guard, in the spirit of the `opcodes.rs` bijection tests: a new
+    /// variant that gains a nested graph must also appear in [`Op::subgraphs`]
+    /// / [`Op::subgraphs_mut`], or every recursive consumer silently skips it.
+    ///
+    /// The needle is assembled with `concat!` so this test file's own source
+    /// text does not match it.
+    #[test]
+    fn subgraph_accessor_covers_every_nested_graph() {
+        let src = include_str!("op.rs");
+        let needle = concat!("Box<crate::", "Graph>");
+        let declared = src.matches(needle).count();
+        assert_eq!(
+            declared, SUBGRAPH_FIELD_COUNT,
+            "an Op variant gained or lost a nested graph field ({declared} found, \
+             {SUBGRAPH_FIELD_COUNT} expected): update Op::subgraphs, \
+             Op::subgraphs_mut and SUBGRAPH_FIELD_COUNT together"
+        );
+    }
+
+    #[test]
+    fn ops_without_bodies_report_no_subgraphs() {
+        assert!(Op::StopGradient.subgraphs().is_empty());
+        assert!(Op::MatMul.subgraphs().is_empty());
+    }
+
+    #[test]
+    fn scan_exposes_its_body() {
+        let body = crate::Graph::new("body");
+        let op = Op::Scan {
+            body: Box::new(body),
+            length: 4,
+            save_trajectory: false,
+            num_bcast: 0,
+            num_xs: 0,
+            num_checkpoints: 0,
+        };
+        let subs = op.subgraphs();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].name, "body");
     }
 }

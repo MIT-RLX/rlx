@@ -198,6 +198,42 @@ pub trait OpExtension: Send + Sync {
     fn vmap(&self, _node: &Node, _ctx: &mut VmapContext) -> Option<NodeId> {
         None
     }
+
+    /// Op-local invariants, checked by [`crate::verify`].
+    ///
+    /// Default: nothing beyond the generic arity/shape checks every node
+    /// gets. Override to state what a *well-formed* instance of this op looks
+    /// like — operand dtypes, rank relationships, attribute ranges — so that a
+    /// violation is reported **at the offending node**, at the pass boundary
+    /// that introduced it, instead of surfacing later as a wrong shape or a
+    /// kernel launch failure.
+    ///
+    /// `inputs` are the shapes of the op's operands, in order; read
+    /// per-instance configuration from `node`'s `Op::Custom` `attrs`. Return
+    /// one message per violation.
+    ///
+    /// ```
+    /// # use rlx_ir::{Node, OpExtension, Shape};
+    /// # struct MyOp;
+    /// # impl OpExtension for MyOp {
+    /// #     fn name(&self) -> &str { "my.op" }
+    /// #     fn num_inputs(&self) -> usize { 2 }
+    /// #     fn infer_shape(&self, i: &[&Shape], _: &[u8]) -> Shape { i[0].clone() }
+    /// fn verify(&self, _node: &Node, inputs: &[&Shape]) -> Vec<String> {
+    ///     if inputs[0].dtype() != inputs[1].dtype() {
+    ///         return vec![format!(
+    ///             "operand dtypes differ: {} vs {}",
+    ///             inputs[0].dtype(),
+    ///             inputs[1].dtype()
+    ///         )];
+    ///     }
+    ///     Vec::new()
+    /// }
+    /// # }
+    /// ```
+    fn verify(&self, _node: &Node, _inputs: &[&Shape]) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Global registry. Read-mostly: backed by `RwLock` over a name-keyed

@@ -115,12 +115,12 @@ impl MetalGpuKernel for HcSinkhornGateMetal {
             .set_bytes(7, 4, &eps as *const f32 as *const std::ffi::c_void);
         let tew = pipe.thread_execution_width().max(1).min(rows.max(1) as u64);
         d.encoder.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: rows as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tew,
                 height: 1,
                 depth: 1,

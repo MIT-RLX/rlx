@@ -4,8 +4,9 @@
 
 //! Fuse DiT gated residual `x + gate·y` into [`Op::GatedResidual`].
 
+use crate::analysis::{AnalysisManager, LazyUseCounts, OpKindIndex, UseCounts};
 use crate::graph_rewrite::Rewriter;
-use crate::pass::Pass;
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -16,12 +17,16 @@ use std::collections::HashMap;
 /// broadcast `[B,1,D]` over `[B,S,D]` without materializing the expand.
 pub struct FuseGatedResidual;
 
-impl Pass for FuseGatedResidual {
-    fn name(&self) -> &str {
-        "fuse_gated_residual"
-    }
+impl FuseGatedResidual {
+    /// The pass body, parameterised over where its use-counts come from.
+    ///
+    /// `shared` carries the pipeline-wide relation when one is cached, so a
+    /// run of ~20 fusion passes builds it once rather than once per pass.
+    /// `None` falls back to a deferred per-pass build, which is what a direct
+    /// `pass.run(graph)` call gets.
+    fn fuse_with(&self, graph: Graph, shared: Option<&UseCounts>) -> PassResult {
+        let uses = LazyUseCounts::from_shared(shared, &graph);
 
-    fn run(&self, graph: Graph) -> Graph {
         let mut is_output: HashMap<NodeId, ()> = HashMap::new();
         for &oid in &graph.outputs {
             is_output.insert(oid, ());
@@ -31,7 +36,7 @@ impl Pass for FuseGatedResidual {
         let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
 
         for node in graph.nodes() {
-            if let Some(m) = try_match(&graph, node, &is_output) {
+            if let Some(m) = try_match(&graph, &uses, node, &is_output) {
                 for &id in &m.interior {
                     fused_away.insert(id, ());
                 }
@@ -39,6 +44,13 @@ impl Pass for FuseGatedResidual {
             }
         }
 
+        // Nothing matched: hand back the original graph instead of rebuilding
+        // it node-for-node into an identical copy. On a graph that merely
+        // *contains* this pass's anchor op without the full pattern, that
+        // rebuild was the pass's entire cost.
+        if matches.is_empty() {
+            return PassResult::unchanged(graph);
+        }
         let mut rw = Rewriter::new(&graph.name);
         for node in graph.nodes() {
             if fused_away.contains_key(&node.id) {
@@ -56,7 +68,35 @@ impl Pass for FuseGatedResidual {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
+    }
+}
+
+impl Pass for FuseGatedResidual {
+    fn name(&self) -> &str {
+        "fuse_gated_residual"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        self.fuse_with(graph, None).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
+        if !self.can_fire(&graph) {
+            return PassResult::unchanged(graph);
+        }
+        self.fuse_with(graph, None)
+    }
+
+    fn run_with_analyses(&self, graph: Graph, analyses: &mut AnalysisManager) -> PassResult {
+        // Answer the trigger check from the shared op-kind index first: a pass
+        // whose anchor op is absent must not even pay for the use relation.
+        let triggers = self.trigger_kinds();
+        if !triggers.is_empty() && !analyses.get::<OpKindIndex>(&graph).contains_any(triggers) {
+            return PassResult::unchanged(graph);
+        }
+        let shared = analyses.get::<UseCounts>(&graph);
+        self.fuse_with(graph, Some(shared))
     }
 }
 
@@ -68,7 +108,12 @@ struct Match {
     interior: Vec<NodeId>,
 }
 
-fn try_match(graph: &Graph, out: &Node, is_output: &HashMap<NodeId, ()>) -> Option<Match> {
+fn try_match(
+    graph: &Graph,
+    uses: &LazyUseCounts,
+    out: &Node,
+    is_output: &HashMap<NodeId, ()>,
+) -> Option<Match> {
     if !matches!(out.op, Op::Binary(BinaryOp::Add)) || out.inputs.len() != 2 {
         return None;
     }
@@ -89,14 +134,15 @@ fn try_match(graph: &Graph, out: &Node, is_output: &HashMap<NodeId, ()>) -> Opti
         return None;
     }
     let (a, b) = (out.inputs[0], out.inputs[1]);
-    if let Some(m) = match_add_mul(graph, out.id, a, b, is_output) {
+    if let Some(m) = match_add_mul(graph, uses, out.id, a, b, is_output) {
         return Some(m);
     }
-    match_add_mul(graph, out.id, b, a, is_output)
+    match_add_mul(graph, uses, out.id, b, a, is_output)
 }
 
 fn match_add_mul(
     graph: &Graph,
+    uses: &LazyUseCounts,
     out_id: NodeId,
     x_id: NodeId,
     mul_id: NodeId,
@@ -106,7 +152,7 @@ fn match_add_mul(
     if !matches!(mul.op, Op::Binary(BinaryOp::Mul)) || mul.inputs.len() != 2 {
         return None;
     }
-    if is_output.contains_key(&mul_id) || graph.use_count(mul_id) != 1 {
+    if is_output.contains_key(&mul_id) || uses.use_count(mul_id) != 1 {
         return None;
     }
 
@@ -114,14 +160,15 @@ fn match_add_mul(
     let (p, q) = (mul.inputs[0], mul.inputs[1]);
 
     // Prefer: Mul(Expand(gate), y) where y matches x shape.
-    if let Some(m) = classify_gate_y(graph, out_id, x_id, x_shape, p, q, mul_id, is_output) {
+    if let Some(m) = classify_gate_y(graph, uses, out_id, x_id, x_shape, p, q, mul_id, is_output) {
         return Some(m);
     }
-    classify_gate_y(graph, out_id, x_id, x_shape, q, p, mul_id, is_output)
+    classify_gate_y(graph, uses, out_id, x_id, x_shape, q, p, mul_id, is_output)
 }
 
 fn classify_gate_y(
     graph: &Graph,
+    uses: &LazyUseCounts,
     out_id: NodeId,
     x_id: NodeId,
     x_shape: &Shape,
@@ -154,7 +201,7 @@ fn classify_gate_y(
     // Expand may still be live as a VJP operand (Mul backward reads the
     // forward expanded gate). Only absorb it when mul is the sole consumer.
     if let Some(e) = gate_expand {
-        if is_output.contains_key(&e) || graph.use_count(e) != 1 {
+        if is_output.contains_key(&e) || uses.use_count(e) != 1 {
             return None;
         }
     }

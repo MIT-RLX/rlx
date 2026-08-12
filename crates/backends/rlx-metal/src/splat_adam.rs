@@ -7,7 +7,7 @@
 
 use crate::device::metal_device;
 use crate::kernels::kernels;
-use metal::{Buffer, ComputePipelineState, MTLResourceOptions};
+use crate::mtl::{Buffer, ComputePipelineState, MTLResourceOptions};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -131,8 +131,8 @@ pub fn adam_step_metal(
     let tg = pipeline.thread_execution_width().max(1);
     let groups = (n as u64 + tg as u64 - 1) / tg as u64;
     enc.dispatch_thread_groups(
-        metal::MTLSize::new(groups, 1, 1),
-        metal::MTLSize::new(tg, 1, 1),
+        crate::mtl::MTLSize::new(groups, 1, 1),
+        crate::mtl::MTLSize::new(tg, 1, 1),
     );
     enc.end_encoding();
     cmd.commit();
@@ -230,7 +230,7 @@ pub struct FusedAdamHostArgs {
 /// Adam inside an existing command encoder (fused training).
 #[allow(clippy::too_many_arguments)]
 pub fn adam_encode_step(
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: &crate::mtl::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     params_buf: &Buffer,
     grads_buf: &Buffer,
@@ -248,8 +248,8 @@ pub fn adam_encode_step(
     let tg = pipeline.thread_execution_width().max(1);
     let groups = (param_count as u64 + tg as u64 - 1) / tg as u64;
     encoder.dispatch_thread_groups(
-        metal::MTLSize::new(groups, 1, 1),
-        metal::MTLSize::new(tg, 1, 1),
+        crate::mtl::MTLSize::new(groups, 1, 1),
+        crate::mtl::MTLSize::new(tg, 1, 1),
     );
 }
 

@@ -35,11 +35,21 @@ impl Session {
     /// Create a session targeting a specific numeric precision.
     /// Backends fall back to F32 if the requested precision isn't supported.
     pub fn new_with_precision(device: Device, precision: Precision) -> Self {
+        // Availability has two halves — feature compiled in, and device present.
+        // Name the one that is actually missing: "enable the `gpu` feature" is
+        // wrong (and misleading) on a headless host where it already is enabled.
         assert!(
             crate::device_ext::is_available(device),
-            "device {} is not available — enable the `{}` Cargo feature",
+            "device {} is not available — {}",
             device,
-            feature_name(device)
+            if crate::device_ext::feature_compiled(device) {
+                format!(
+                    "the `{}` feature is enabled but no such device/driver was found on this host",
+                    feature_name(device)
+                )
+            } else {
+                format!("enable the `{}` Cargo feature", feature_name(device))
+            }
         );
         Self {
             device,

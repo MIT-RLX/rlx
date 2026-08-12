@@ -268,6 +268,13 @@ impl MetalExecutable {
         // buffer base + absolute offsets). Large Linear / embedding weights go
         // to a separate MTLBuffer so the act arena can drop under 4 GiB.
         const EXTERNAL_WEIGHT_MIN: usize = 256 * 1024;
+        /// Whether this scheme's fused Metal encoders bind the external weight
+        /// buffer (rather than offsetting into the activation arena). Only these
+        /// may have their packed weights externalized; anything else silently
+        /// reads the wrong memory. Extend as encoders grow a `w_buffer` arg.
+        fn metal_encoder_binds_weight_buffer(scheme: rlx_ir::quant::QuantScheme) -> bool {
+            matches!(scheme, rlx_ir::quant::QuantScheme::GgufQ1_0)
+        }
         let mut weight_layout: Vec<(rlx_ir::NodeId, usize, usize, rlx_ir::DType)> = Vec::new();
         let force_pin = rlx_ir::env::flag("RLX_METAL_FORCE_PIN_OUTPUT_ANCESTORS");
         // Debug / regression: force the pre-fix unpin path even on ScatterNd
@@ -391,13 +398,35 @@ impl MetalExecutable {
                 // activation arena. The external weight buffer is only wired for
                 // the MPS/F16-Linear path; a quant weight parked there reads back
                 // wrong (Bonsai-27B Q1_0 → coarse-lower projections → "a a a…").
-                // Keep quant weights in the arena regardless of size.
-                // EXPERIMENTAL (opt-in, default OFF): allow U8/I8 packed GGUF
-                // weights (fused DequantMatMul) into the dedicated weight buffer
-                // so it can be SHARED across executables. Correct for the prefill
-                // GEMM (m>1) path, but NOT for fused decode kernels (see the
-                // `ext_quant_split` note above) — hence off by default. Enable
-                // with RLX_METAL_EXTERNALIZE_QUANT=1.
+                // Packed quant weights ALWAYS stay in the activation arena.
+                //
+                // There used to be an opt-in (RLX_METAL_EXTERNALIZE_QUANT) that
+                // let U8/I8 packed GGUF weights into the shared weight buffer,
+                // documented as "correct for the prefill GEMM (m>1) path". It
+                // is not correct for any path: measured on the 1.63 GB
+                // dflash-kquant checkpoint (m=16, so squarely the m>1 GEMM), the
+                // split fires — 36 params, 1.62 GB weight buffer, act arena
+                // 0.01 GB — and the forward comes out non-finite. Disabling the
+                // fused GEMMs so it routes through dequant-scratch + MPS instead
+                // gives the same non-finite result, so BOTH paths ignore the tag.
+                //
+                // Cause: `DequantMatMul` was listed as tag-aware below, but every
+                // GGUF encoder binds a single buffer (`self.arena.buffer`) with
+                // x, w and dst all offset into it — none of them call
+                // `resolve_off`. Externalizing therefore silently redirects each
+                // packed weight read into the activation arena.
+                //
+                // Externalizing quant is still the thing that would let
+                // `share_weights_from` back prefill and every decode bucket with
+                // ONE copy. The prerequisite is a second buffer binding on the
+                // fused GGUF kernels (weights from the weight buffer, x/dst from
+                // the arena) — until that exists this must stay off, and an env
+                // flag that silently corrupts is worse than no flag.
+                //
+                // Q1_0 is the exception and stays enabled: its encoders
+                // (`encode_q1_0_mv_f32_sg_flags` and friends) already take a
+                // separate `w_buffer` argument, which is exactly the shape the
+                // K-quant encoders need to grow.
                 let ext_quant = rlx_ir::env::flag("RLX_METAL_EXTERNALIZE_QUANT");
                 let is_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) && !ext_quant;
                 // The external weight buffer is only read back correctly by ops
@@ -413,13 +442,19 @@ impl MetalExecutable {
                 for c in fused.nodes() {
                     if c.inputs.contains(&node.id) {
                         has_consumer = true;
+                        // Only ops whose Metal encoder actually binds the
+                        // weight buffer. DequantMatMul qualifies ONLY for the
+                        // schemes whose encoders take a `w_buffer` — see the
+                        // `is_quant` note above for what happens otherwise.
                         let tag_aware =
                             matches!(c.op, Op::MatMul | Op::DotGeneral { .. } | Op::Gather { .. })
                                 || (ext_quant
-                                    && matches!(
-                                        c.op,
-                                        Op::DequantMatMul { .. } | Op::DequantGroupedMatMul { .. }
-                                    ));
+                                    && match &c.op {
+                                        Op::DequantMatMul { scheme } => {
+                                            metal_encoder_binds_weight_buffer(*scheme)
+                                        }
+                                        _ => false,
+                                    });
                         if !tag_aware {
                             all_consumers_tag_aware = false;
                             break;
@@ -479,6 +514,17 @@ impl MetalExecutable {
                     act_plan.arena_size as f64 / 1e9
                 );
             }
+            // NOTE: do NOT relax `weight_padded < MPS_BIND_CLIFF` to let a
+            // multi-GB packed checkpoint into the external weight buffer.
+            // Tried it: with RLX_METAL_EXTERNALIZE_QUANT=1 the split does fire
+            // (417 params, 15.10 GB weight buf, act arena 0.01 GB) and the model
+            // then emits pure garbage. `DequantMatMul` is listed as tag-aware
+            // above, but the FUSED GGUF encoders bind `self.arena.buffer`
+            // directly and never resolve WEIGHT_BUF_TAG, so every packed weight
+            // read lands in the activation arena. Enabling weight-buffer sharing
+            // for packed models needs those encoders taught to bind the weight
+            // buffer first; until then this cap is what keeps the flag inert
+            // (and therefore harmless) on big models.
             if act_plan.arena_size < MPS_BIND_CLIFF
                 && weight_padded < MPS_BIND_CLIFF
                 && !external.is_empty()

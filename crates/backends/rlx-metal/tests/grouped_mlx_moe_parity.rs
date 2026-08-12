@@ -5,6 +5,12 @@
 //! agree, proving the on-GPU expert dequant+matmul matches the CPU host path it
 //! replaces.
 
+// Compares against a live Metal device, so it can only run on macOS — same
+// gate the rest of this directory uses. Without it the test reaches
+// `Session::new(Device::Metal)` on a Linux host and trips the availability
+// assert instead of skipping.
+#![cfg(target_os = "macos")]
+
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};

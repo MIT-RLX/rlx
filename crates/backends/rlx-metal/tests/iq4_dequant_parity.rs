@@ -12,8 +12,8 @@
 
 #![cfg(target_os = "macos")]
 
-use metal::{Buffer, Device, MTLResourceOptions, MTLSize};
 use rlx_metal::kernels::kernels;
+use rlx_metal::mtl::{Buffer, Device, MTLResourceOptions, MTLSize};
 
 // Per-scheme block-element counts. Mirrors `gguf_block_size()`.
 fn scheme_block_elems(scheme_id: u32) -> usize {

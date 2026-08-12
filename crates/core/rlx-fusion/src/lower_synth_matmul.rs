@@ -30,6 +30,12 @@ use std::collections::HashMap;
 pub struct LowerSynthMatMul;
 
 impl Pass for LowerSynthMatMul {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::SynthMatMul]
+    }
+
     fn name(&self) -> &str {
         "lower_synth_matmul"
     }

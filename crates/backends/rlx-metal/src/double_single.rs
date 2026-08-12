@@ -12,7 +12,7 @@
 //! uses default options). This is mandatory: Metal defaults to fast-math, whose
 //! algebraic reassociation collapses `dw_two_sum`'s error term to zero.
 
-use metal::{CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
+use crate::mtl::{CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 
 const THREADS: u64 = 256;

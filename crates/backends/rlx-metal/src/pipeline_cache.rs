@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use metal::{CompileOptions, DeviceRef, Library};
+use crate::mtl::{CompileOptions, DeviceRef, Library};
 
 pub fn cache_enabled() -> bool {
     !matches!(

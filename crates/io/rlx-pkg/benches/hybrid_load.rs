@@ -39,9 +39,20 @@ fn fixtures() -> &'static Fixtures {
             g.set_outputs(vec![y]);
             g
         };
+        // Fill every byte from a deterministic xorshift, not a sparse pattern
+        // over zeros. Two reasons, both load-bearing:
+        //   * a 32 MiB mostly-zero blob deflates to ~18 KiB (≈1855:1) and trips
+        //     the decompression-bomb guard in `tier.rs`
+        //     (`MAX_WARM_DECOMPRESS_RATIO = 1000`), so the bench panics;
+        //   * even without the guard, inflating 1855:1 data measures nothing
+        //     like real warm-tier weights, which are near-incompressible.
         let mut warm = vec![0u8; WARM_BYTES];
-        for i in (0..WARM_BYTES).step_by(64) {
-            warm[i] = (i % 255) as u8;
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        for b in warm.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = (s >> 24) as u8;
         }
         let weights = [
             PackedWeight {

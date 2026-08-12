@@ -10,7 +10,7 @@
 //! Mirrors rlx-cpu/src/kernels.rs but for GPU.
 
 use crate::device::metal_device;
-use metal::{Buffer, ComputePipelineState, Library, MTLResourceOptions};
+use crate::mtl::{Buffer, ComputePipelineState, Library, MTLResourceOptions};
 use std::sync::OnceLock;
 
 /// Inline MSL source for all kernels — compiled once at startup.
@@ -3521,6 +3521,93 @@ kernel void scatter_add_accumulate(
 // Indexed batched matmul (MoE GEMM). One thread per output element
 // (i, j). Token i looks up its expert via expert_idx, then dot-products
 // the row of `input` against the column of `weight[expert_idx[i]]`.
+// F32-weight GEMV with K-splitting — the plain-`sgemm` counterpart of
+// `gemv_f16w_splitk` and `grouped_gemv_splitk`. `sgemm` launches one thread per
+// output element, so at decode (M == 1) that is only N threads: not enough
+// outstanding loads to use the bandwidth. KSPLIT threads cooperate per column,
+// each striding `k` and summing a K/KSPLIT slice, then partials reduce through
+// threadgroup memory. Scalar columns already give a full 128-byte coalesced line
+// for f32 (32 threads x 4 B), so no vector loads are needed.
+//
+// Deterministic: partials are summed in fixed order (unlike the atomic-accumulate
+// `Simd64SplitK` variant). Reassociating K moves results ~1 ulp from the
+// sequential kernel.
+kernel void gemv_f32_splitk(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float*       C [[buffer(2)]],
+    constant uint& K      [[buffer(3)]],
+    constant uint& N      [[buffer(4)]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    constexpr uint KSPLIT = 32u;
+    threadgroup float partial[32][KSPLIT];
+    uint col = tgid.x * 32u + tid.x;
+    uint ks  = tid.y;
+    float acc = 0.0f;
+    if (col < N) {
+        for (uint k = ks; k < K; k += KSPLIT) {
+            acc += A[k] * B[k * N + col];
+        }
+    }
+    partial[tid.x][ks] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0u && col < N) {
+        float s = 0.0f;
+        for (uint j = 0u; j < KSPLIT; ++j) s += partial[tid.x][j];
+        C[col] = s;
+    }
+}
+
+// MoE GEMV with K-splitting — the `grouped_matmul` counterpart of
+// `gemv_f16w_splitk`, and for the same reason. `grouped_matmul` launches one
+// thread per output element, so at DECODE (m == 1) that is only `n` threads
+// (~1-1.5k for MoE expert projections): far too few outstanding loads to use the
+// bandwidth. Here KSPLIT threads cooperate per column — each strides `k` by
+// KSPLIT and sums a K/KSPLIT slice, then partials reduce through threadgroup
+// memory. The threadgroup is (32 cols x KSPLIT) and a simdgroup is the 32 columns
+// for one `ks`, so `weight[e*K*N + k*N + col .. col+31]` is a fully coalesced
+// 128-byte line — 32x the threads at identical DRAM traffic.
+//
+// Split-K reassociates the K reduction, so results differ from the sequential
+// kernel by ~1 ulp (partials are summed in a fixed order, so it stays
+// deterministic and run-to-run identical).
+kernel void grouped_gemv_splitk(
+    device const float* input      [[buffer(0)]],
+    device const float* weight     [[buffer(1)]],
+    device const float* expert_idx [[buffer(2)]],
+    device float* dst              [[buffer(3)]],
+    constant uint& k_dim           [[buffer(4)]],
+    constant uint& n               [[buffer(5)]],
+    constant uint& num_experts     [[buffer(6)]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    constexpr uint KSPLIT = 32u;
+    threadgroup float partial[32][KSPLIT];
+    uint col = tgid.x * 32u + tid.x;
+    uint row = tgid.y;
+    uint ks  = tid.y;
+    uint e = (uint)(expert_idx[row]);
+    float acc = 0.0f;
+    bool live = (col < n) && (e < num_experts);
+    if (live) {
+        uint w_base = e * k_dim * n;
+        uint in_base = row * k_dim;
+        for (uint kk = ks; kk < k_dim; kk += KSPLIT) {
+            acc += input[in_base + kk] * weight[w_base + kk * n + col];
+        }
+    }
+    partial[tid.x][ks] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0u && live) {
+        float s = 0.0f;
+        for (uint j = 0u; j < KSPLIT; ++j) s += partial[tid.x][j];
+        dst[row * n + col] = s;
+    }
+}
+
 kernel void grouped_matmul(
     device const float* input      [[buffer(0)]],
     device const float* weight     [[buffer(1)]],
@@ -3539,8 +3626,22 @@ kernel void grouped_matmul(
     if (e >= num_experts) return;          // OOB safety
     uint w_base = e * k_dim * n;
     uint in_base = i * k_dim;
-    float acc = 0.0f;
-    for (uint kk = 0; kk < k_dim; ++kk) {
+    // Four independent accumulators. The single-chain version serialises on the
+    // FMA dependency, so with only `n` threads at decode (m == 1) there are never
+    // enough loads in flight to use the bandwidth — this kernel measured ~21 GB/s
+    // where Metal's tuned sgemm gets ~60 GB/s on the same shapes. Unrolling breaks
+    // the chain and quadruples outstanding loads; `weight` reads stay coalesced
+    // across `j` exactly as before.
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint kk = 0;
+    for (; kk + 4u <= k_dim; kk += 4u) {
+        acc0 += input[in_base + kk + 0u] * weight[w_base + (kk + 0u) * n + j];
+        acc1 += input[in_base + kk + 1u] * weight[w_base + (kk + 1u) * n + j];
+        acc2 += input[in_base + kk + 2u] * weight[w_base + (kk + 2u) * n + j];
+        acc3 += input[in_base + kk + 3u] * weight[w_base + (kk + 3u) * n + j];
+    }
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (; kk < k_dim; ++kk) {
         acc += input[in_base + kk] * weight[w_base + kk * n + j];
     }
     dst[i * n + j] = acc;
@@ -7327,19 +7428,28 @@ kernel void dequant_matmul_mlx_gemm(
     uint gs = group_size;
     uint n_groups = k / gs;
     device const uchar* scale_u = (device const uchar*)scales;
-    threadgroup float xs[8 * 256];
+    // Only the final cross-thread reduction needs threadgroup memory. X used to
+    // be staged here too (`xs[t*tpg+tid]`), but every thread wrote and read back
+    // its OWN slot — a no-op round-trip costing 8 KB of occupancy-limiting
+    // threadgroup memory plus a barrier per K-chunk. It lives in registers now.
+    //
+    // X stays f32 there. Staging it as `half` looks safe per-term — its partner
+    // is a 3.3-mantissa-bit MXFP4 weight, so f16's 11 bits are far more than one
+    // product can resolve — but this is a DOT product, and per-term rounding is
+    // amplified by Σ|terms| / |result| wherever the sum cancels. Measured, that
+    // pushed CPU-parity error to 2.9e-4 … 6.5e-4 (f16 eps is 4.9e-4) against the
+    // 1e-4 bound the mlx parity tests hold this kernel to. The ACCUMULATOR stays
+    // f32 for the same reason — k runs to 1536 terms and would lose the tail.
     threadgroup float smem[8 * 256];
     float acc[8];
     for (uint t = 0u; t < TM; ++t) acc[t] = 0.0f;
     for (uint p0 = 0u; p0 < k; p0 += tpg) {
         uint p = p0 + tid;
+        float xv[8];
         for (uint t = 0u; t < TM; ++t) {
             uint row = row0 + t;
-            float v = 0.0f;
-            if (row < m && p < k) v = x[row * k + p];
-            xs[t * tpg + tid] = v;
+            xv[t] = (row < m && p < k) ? x[row * k + p] : 0.0f;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (p < k) {
             uint g = p / gs;
             float w_dq;
@@ -7408,10 +7518,9 @@ kernel void dequant_matmul_mlx_gemm(
                 w_dq = dq_fp8_e4m3(wq[col * k + p]) * mlx_group_scale(uint(scale_u[col * n_groups + g]), gs);
             }
             for (uint t = 0u; t < TM; ++t) {
-                acc[t] += xs[t * tpg + tid] * w_dq;
+                acc[t] += float(xv[t]) * w_dq;
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint t = 0u; t < TM; ++t) smem[t * tpg + tid] = acc[t];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -7544,19 +7653,28 @@ kernel void grouped_dequant_matmul_mlx_gemm(
     if (col >= n) return;
     uint gs = group_size;
     uint n_groups = k / gs;
-    threadgroup float xs[8 * 256];
+    // Only the final cross-thread reduction needs threadgroup memory. X used to
+    // be staged here too (`xs[t*tpg+tid]`), but every thread wrote and read back
+    // its OWN slot — a no-op round-trip costing 8 KB of occupancy-limiting
+    // threadgroup memory plus a barrier per K-chunk. It lives in registers now.
+    //
+    // X stays f32 there. Staging it as `half` looks safe per-term — its partner
+    // is a 3.3-mantissa-bit MXFP4 weight, so f16's 11 bits are far more than one
+    // product can resolve — but this is a DOT product, and per-term rounding is
+    // amplified by Σ|terms| / |result| wherever the sum cancels. Measured, that
+    // pushed CPU-parity error to 2.9e-4 … 6.5e-4 (f16 eps is 4.9e-4) against the
+    // 1e-4 bound the mlx parity tests hold this kernel to. The ACCUMULATOR stays
+    // f32 for the same reason — k runs to 1536 terms and would lose the tail.
     threadgroup float smem[8 * 256];
     float acc[8];
     for (uint t = 0u; t < TM; ++t) acc[t] = 0.0f;
     for (uint p0 = 0u; p0 < k; p0 += tpg) {
         uint p = p0 + tid;
+        float xv[8];
         for (uint t = 0u; t < TM; ++t) {
             uint row = row0 + t;
-            float v = 0.0f;
-            if (row < m && p < k) v = x[row * k + p];
-            xs[t * tpg + tid] = v;
+            xv[t] = (row < m && p < k) ? x[row * k + p] : 0.0f;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (p < k) {
             uint g = p / gs;
             for (uint t = 0u; t < TM; ++t) {
@@ -7566,11 +7684,10 @@ kernel void grouped_dequant_matmul_mlx_gemm(
                     device const uchar* wqe = wq + e * slab_bytes;
                     uint sc_off = e * n * n_groups;
                     float w_dq = mlx_grouped_w(wqe, scales, biases, sc_off, col, p, g, n_groups, gs, kind, bits, scale_bf16, k);
-                    acc[t] += xs[t * tpg + tid] * w_dq;
+                    acc[t] += float(xv[t]) * w_dq;
                 }
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint t = 0u; t < TM; ++t) smem[t * tpg + tid] = acc[t];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -12475,6 +12592,8 @@ pub struct Kernels {
     pub dw_sum_arena: ComputePipelineState,
     pub topk_lastax: ComputePipelineState,
     pub grouped_matmul: ComputePipelineState,
+    pub grouped_gemv_splitk: ComputePipelineState,
+    pub gemv_f32_splitk: ComputePipelineState,
     pub scatter_add_zero: ComputePipelineState,
     pub scatter_add_accumulate: ComputePipelineState,
     pub transpose_nd: ComputePipelineState,
@@ -12606,6 +12725,8 @@ pub struct Kernels {
     /// output columns with `simd_sum`. Better x cache reuse than the
     /// single-thread-per-output `q4k_mv_f32`. Used when `n_dim % 8 == 0`.
     pub q4k_mv_f32_sg: ComputePipelineState,
+    pub q5k_mv_f32: ComputePipelineState,
+    pub q2k_mv_f32: ComputePipelineState,
     /// Simdgroup-cooperative Q6_K GEMV (32 threads reduce one output row via
     /// `simd_sum`; `Q6K_NSG` rows per threadgroup) and Q8_0 GEMV (32 threads →
     /// `Q8_0_NR0` rows). Replace the occupancy-starved one-thread-per-row
@@ -12624,6 +12745,10 @@ pub struct Kernels {
     /// dequants in-register and accumulates a row tile, replacing the
     /// `dequant_gguf` f32 scratch + MPS sgemm path for these two schemes.
     pub q4k_mm_f32: ComputePipelineState,
+    pub q4k_mm_f32_xs: ComputePipelineState,
+    pub q5k_mm_f32_xs: ComputePipelineState,
+    pub q6k_mm_f32_xs: ComputePipelineState,
+    pub q8_0_mm_f32_xs: ComputePipelineState,
     pub q6k_mm_f32: ComputePipelineState,
     /// Fused decode-layer MLP GEMVs (m == 1). Q4_K / Q5_0 gate+up + silu/gelu;
     /// Q4_K / Q5_0 / Q6_K down + residual. Produced by `fuse_decode_mlp*`
@@ -12768,7 +12893,7 @@ impl Kernels {
                 "#include <metal_stdlib>\nusing namespace metal;\n{}\n{DW_SUM_ARENA_MSL}",
                 rlxsl::dw::double_single_prelude(rlxsl::Lang::Msl)
             );
-            let opts = metal::CompileOptions::new();
+            let opts = crate::mtl::CompileOptions::new();
             opts.set_fast_math_enabled(false);
             let lib = dev
                 .device
@@ -12975,6 +13100,8 @@ impl Kernels {
             reduce_axes_sum_simd: pipeline("reduce_axes_sum_simd"),
             topk_lastax: pipeline("topk_lastax"),
             grouped_matmul: pipeline("grouped_matmul"),
+            grouped_gemv_splitk: pipeline("grouped_gemv_splitk"),
+            gemv_f32_splitk: pipeline("gemv_f32_splitk"),
             scatter_add_zero: pipeline("scatter_add_zero"),
             scatter_add_accumulate: pipeline("scatter_add_accumulate"),
             transpose_nd: pipeline("transpose_nd"),
@@ -13092,7 +13219,13 @@ impl Kernels {
             iq1_s_mv_f32: pipeline("iq1_s_mv_f32"),
             iq1_m_mv_f32: pipeline("iq1_m_mv_f32"),
             q4k_mv_f32_sg: pipeline("q4k_mv_f32_sg"),
+            q5k_mv_f32: pipeline("q5k_mv_f32"),
+            q2k_mv_f32: pipeline("q2k_mv_f32"),
             q4k_mm_f32: pipeline("q4k_mm_f32"),
+            q4k_mm_f32_xs: pipeline("q4k_mm_f32_xs"),
+            q5k_mm_f32_xs: pipeline("q5k_mm_f32_xs"),
+            q6k_mm_f32_xs: pipeline("q6k_mm_f32_xs"),
+            q8_0_mm_f32_xs: pipeline("q8_0_mm_f32_xs"),
             q6k_mm_f32: pipeline("q6k_mm_f32"),
             q4k_swiglu_mv_f32: pipeline("q4k_swiglu_mv_f32"),
             q4k_swiglu_mv_f32_sg: pipeline("q4k_swiglu_mv_f32_sg"),
@@ -13287,7 +13420,7 @@ impl Kernels {
 /// Concatenate every IQ LUT into one shared Metal buffer in the layout
 /// declared at the top of `dequant_gguf.msl`. Offsets must match the
 /// `IQ_GRID_OFF_*` constants.
-fn build_iq_grid_lut(device: &metal::DeviceRef) -> Buffer {
+fn build_iq_grid_lut(device: &crate::mtl::DeviceRef) -> Buffer {
     use rlx_gguf::iq_grids::{
         IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
         KSIGNS_IQ2XS,
@@ -13338,4 +13471,153 @@ pub fn kernels() -> &'static Kernels {
 /// Force MSL/metallib + pipeline state init (call once at process load).
 pub fn prewarm() -> &'static Kernels {
     kernels()
+}
+
+/// Buffer indices each kernel declares, parsed from the assembled MSL.
+///
+/// Feeds `mtl::bind_validate`, which cross-checks these against what an encoder
+/// actually bound. Metal's own pipeline reflection would be the natural source,
+/// but requesting it (`MTLPipelineOptionArgumentInfo`) perturbs pipeline
+/// creation badly enough to abort unrelated encoders, so we read the signatures
+/// straight from the source we compiled.
+///
+/// Limitation vs real reflection: this cannot tell whether an argument survived
+/// optimisation. A declared-but-unused buffer would be reported active here and
+/// flagged if unbound. In practice these kernels don't carry unused parameters,
+/// and a false positive is loud and immediate rather than silent.
+pub(crate) fn declared_buffer_indices(kernel: &str) -> Option<std::collections::BTreeSet<u64>> {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<HashMap<String, BTreeSet<u64>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let src = msl_source();
+        let mut out: HashMap<String, BTreeSet<u64>> = HashMap::new();
+        let mut rest = src.as_str();
+        while let Some(pos) = rest.find("kernel void ") {
+            rest = &rest[pos + "kernel void ".len()..];
+            let Some(paren) = rest.find('(') else { break };
+            let name = rest[..paren].trim().to_string();
+            // Parameter list ends at the closing paren before the body.
+            let body = rest.find(") {").unwrap_or(rest.len().min(4096));
+            let params = &rest[paren..body.max(paren)];
+            let mut idxs = BTreeSet::new();
+            let mut scan = params;
+            while let Some(b) = scan.find("[[buffer(") {
+                scan = &scan[b + "[[buffer(".len()..];
+                if let Some(close) = scan.find(')')
+                    && let Ok(i) = scan[..close].trim().parse::<u64>()
+                {
+                    idxs.insert(i);
+                }
+            }
+            if !name.is_empty() {
+                out.insert(name, idxs);
+            }
+        }
+        out
+    });
+    table.get(kernel).cloned()
+}
+
+#[cfg(test)]
+mod msl_audit_tests {
+    /// Every `kernel void NAME(` in the assembled source, in declaration order.
+    fn kernel_names(src: &str) -> Vec<String> {
+        src.lines()
+            .filter_map(|l| l.trim().strip_prefix("kernel void "))
+            .filter_map(|rest| rest.split('(').next())
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+
+    /// The first `[[buffer(0)]]` parameter of `name`, as written.
+    fn buffer0_decl(src: &str, name: &str) -> Option<String> {
+        let start = src.find(&format!("kernel void {name}("))?;
+        let tail = &src[start..];
+        let end = tail.find(") {").unwrap_or(tail.len().min(2000));
+        tail[..end]
+            .lines()
+            .find(|l| l.contains("[[buffer(0)]]"))
+            .map(|l| l.trim().trim_end_matches(',').to_string())
+    }
+
+    /// The whole MSL blob must compile, and every kernel it declares must be
+    /// retrievable by name.
+    ///
+    /// The source is assembled at *runtime* from string constants plus
+    /// generated fragments, so nothing checks it until a pipeline is first
+    /// built — a syntax error, or a kernel referencing a helper that moved,
+    /// ships fine and fails on first use of that one op. Compiling the whole
+    /// thing here moves that to the gate.
+    #[test]
+    fn msl_source_compiles_and_all_kernels_resolve() {
+        let Some(dev) = crate::device::metal_device() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let src = super::msl_source();
+        let opts = crate::mtl::CompileOptions::new();
+        let lib = match dev.device.new_library_with_source(&src, &opts) {
+            Ok(l) => l,
+            Err(e) => panic!("assembled MSL failed to compile: {e}"),
+        };
+
+        let names = kernel_names(&src);
+        assert!(
+            names.len() > 100,
+            "kernel scrape found only {} — parser is out of date, not the source",
+            names.len()
+        );
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|n| lib.get_function(n, None).is_err())
+            .collect();
+        assert!(missing.is_empty(), "declared but unresolvable: {missing:?}");
+    }
+
+    /// The kernels `icb.rs` encodes must keep the buffer-0 ABI that encoder
+    /// assumes.
+    ///
+    /// Two conventions coexist in this file: "arena-base" takes
+    /// `device char* arena` plus explicit `ulong` byte offsets, and
+    /// "offset-pointer" takes a typed pointer already offset to the data. They
+    /// are indistinguishable by name, and `icb.rs` binds by *index*, so moving
+    /// a kernel from one to the other silently shifts every later index — the
+    /// unbound one reads 0, `len` comes back 0, and the dispatch writes
+    /// nothing. That is a real bug this repo shipped. If this test fails,
+    /// update the matching arm in `icb.rs` rather than the expectation here.
+    #[test]
+    fn icb_encoded_kernels_keep_their_buffer0_abi() {
+        let src = super::msl_source();
+        // (kernel, buffer-0 is the arena base rather than a typed data pointer)
+        let expected: &[(&str, bool)] = &[
+            ("elem_add", true),
+            ("elem_mul", true),
+            ("copy_f32", true),
+            ("gelu_inplace", true),
+            ("narrow_lastax", true),
+            ("silu_inplace", false),
+            ("bias_add", false),
+            ("layer_norm", false),
+            ("fused_residual_ln", false),
+            ("rope", false),
+        ];
+        let mut wrong = Vec::new();
+        for &(name, want_arena_base) in expected {
+            let decl = buffer0_decl(&src, name)
+                .unwrap_or_else(|| panic!("kernel `{name}` not found — icb.rs references it"));
+            let is_arena_base = decl.contains("char*");
+            if is_arena_base != want_arena_base {
+                wrong.push(format!(
+                    "{name}: expected arena_base={want_arena_base}, found `{decl}`"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "ICB kernel ABI drift:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
 }

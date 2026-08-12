@@ -64,6 +64,12 @@ fn broadcast_channel_param(g: &mut Graph, param: NodeId, like: NodeId) -> NodeId
 pub struct LowerBatchNormInference;
 
 impl Pass for LowerBatchNormInference {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::BatchNormInference]
+    }
+
     fn name(&self) -> &str {
         "lower_batch_norm_inference"
     }
@@ -141,6 +147,12 @@ fn lower_batch_norm_inference(
 pub struct LowerGroupNorm;
 
 impl Pass for LowerGroupNorm {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::GroupNorm]
+    }
+
     fn name(&self) -> &str {
         "lower_group_norm"
     }
@@ -253,6 +265,12 @@ fn lower_group_norm(
 pub struct LowerResizeNearest2x;
 
 impl Pass for LowerResizeNearest2x {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::ResizeNearest2x]
+    }
+
     fn name(&self) -> &str {
         "lower_resize_nearest_2x"
     }

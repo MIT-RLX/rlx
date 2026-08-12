@@ -229,9 +229,9 @@ unsafe fn cblas_sgemm(
     c: *mut f32,
     ldc: i32,
 ) {
-    // Row-major scalar fallback. _order is ignored — every call site in
-    // this file passes ROW_MAJOR (101). Supports both NoTrans/Trans on
-    // either operand and arbitrary positive lda/ldb/ldc.
+    // Row-major fallback. _order is ignored — every call site in this file
+    // passes ROW_MAJOR (101). Supports both NoTrans/Trans on either operand
+    // and arbitrary positive lda/ldb/ldc.
     let m = m as usize;
     let n = n as usize;
     let k = k as usize;
@@ -240,6 +240,41 @@ unsafe fn cblas_sgemm(
     let ldc = ldc as usize;
     let trans_a = transa != NO_TRANS;
     let trans_b = transb != NO_TRANS;
+
+    // Fast path: the common NoTrans×NoTrans case, reordered i→p→j so the
+    // inner j-loop is unit-stride in both B and C. The compiler
+    // auto-vectorizes it (NEON / AVX) and it stays cache-resident — several×
+    // to an order of magnitude over the naive p-innermost loop (whose B
+    // access strides by ldb) on a BLAS-less Pi-class CPU. This is a
+    // different summation order than the scalar path below, but every GEMM
+    // caller here already tolerates the vendor-BLAS order too. Transposed
+    // cases (rare in-tree) fall through to the general scalar loop.
+    if !trans_a && !trans_b {
+        for i in 0..m {
+            let crow = unsafe { c.add(i * ldc) };
+            if beta == 0.0 {
+                for j in 0..n {
+                    unsafe { *crow.add(j) = 0.0 };
+                }
+            } else if beta != 1.0 {
+                for j in 0..n {
+                    unsafe { *crow.add(j) *= beta };
+                }
+            }
+            for p in 0..k {
+                let aip = alpha * unsafe { *a.add(i * lda + p) };
+                if aip == 0.0 {
+                    continue;
+                }
+                let brow = unsafe { b.add(p * ldb) };
+                for j in 0..n {
+                    unsafe { *crow.add(j) += aip * *brow.add(j) };
+                }
+            }
+        }
+        return;
+    }
+
     for i in 0..m {
         for j in 0..n {
             let mut acc: f32 = 0.0;
@@ -930,180 +965,906 @@ const CBLAS_NON_UNIT: i32 = 131;
 #[allow(dead_code)]
 const CBLAS_UNIT: i32 = 132;
 
-// ── LAPACK fallback stubs (no-blas builds) ───────────────────────
+// ── Pure-Rust LAPACK fallback (no linked BLAS) ───────────────────
 //
-// The new linalg ops (Cholesky / eigh / QR / SVD / dtrsm) require
-// LAPACK and CBLAS Level 3 — implementing pure-Rust fallbacks is
-// substantial work that's out of scope for a v1. On builds with no
-// linked BLAS/LAPACK (`rlx_cpu_blas` unset — feature off, or an aarch64
-// / wasm target with no backend) these wrappers are panic stubs; the
-// matmul and distributed paths never call them, so the panic only fires
-// if a linalg wrapper is invoked where no backend exists.
+// When `rlx_cpu_blas` is unset — the `blas` feature is off, or the
+// target has no linked BLAS/LAPACK (a bare aarch64 / Raspberry Pi with
+// no OpenBLAS, wasm, …) — the linalg ops route through these instead of
+// panicking. They are dependency-free reference implementations that
+// match the column-major Fortran ABI the row-major wrappers above
+// expect, so those wrappers stay backend-agnostic. Correct but not
+// tuned; the linked-BLAS path remains the fast default where present.
+//
+// Numerics: Cholesky (Banachiewicz), LU (partial-pivot), symmetric
+// eigendecomposition (cyclic Jacobi), QR (Householder + `dorg2r`), thin
+// SVD (one-sided Jacobi); least-squares and `dtrsm` build on those.
+
+/// Cholesky of a packed column-major `n×n` SPD matrix (`lda = n`).
+/// `upper` ⇒ factor `Uᵀ·U` into the upper triangle, else `L·Lᵀ` into the
+/// lower. Returns 0, or `k>0` if the leading minor of order `k` is not
+/// positive-definite. Mirrors LAPACK `dpotrf`.
+#[cfg(not(rlx_cpu_blas))]
+fn cholesky_colmajor(a: &mut [f64], n: usize, upper: bool) -> i32 {
+    let at = |i: usize, j: usize| i + j * n; // column-major, lda = n
+    if upper {
+        for j in 0..n {
+            for i in 0..=j {
+                let mut sum = a[at(i, j)];
+                for l in 0..i {
+                    sum -= a[at(l, i)] * a[at(l, j)];
+                }
+                if i < j {
+                    let d = a[at(i, i)];
+                    a[at(i, j)] = sum / d;
+                } else {
+                    if sum <= 0.0 {
+                        return (j + 1) as i32;
+                    }
+                    a[at(j, j)] = sum.sqrt();
+                }
+            }
+        }
+    } else {
+        for j in 0..n {
+            for i in j..n {
+                let mut sum = a[at(i, j)];
+                for l in 0..j {
+                    sum -= a[at(i, l)] * a[at(j, l)];
+                }
+                if i == j {
+                    if sum <= 0.0 {
+                        return (j + 1) as i32;
+                    }
+                    a[at(j, j)] = sum.sqrt();
+                } else {
+                    let d = a[at(j, j)];
+                    a[at(i, j)] = sum / d;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// LU with partial pivoting of a packed column-major `m×n` matrix
+/// (`lda = m`): unit-lower `L` below the diagonal, `U` on and above,
+/// 1-based row pivots in `ipiv`. Returns 0, or the 1-based index of the
+/// first zero pivot. Mirrors LAPACK `dgetrf`.
+#[cfg(not(rlx_cpu_blas))]
+fn lu_colmajor(a: &mut [f64], m: usize, n: usize, ipiv: &mut [i32]) -> i32 {
+    let at = |i: usize, j: usize| i + j * m;
+    let mut info = 0;
+    for j in 0..m.min(n) {
+        let mut p = j;
+        let mut maxv = a[at(j, j)].abs();
+        for i in (j + 1)..m {
+            let v = a[at(i, j)].abs();
+            if v > maxv {
+                maxv = v;
+                p = i;
+            }
+        }
+        ipiv[j] = (p + 1) as i32;
+        if a[at(p, j)] != 0.0 {
+            if p != j {
+                for c in 0..n {
+                    a.swap(at(j, c), at(p, c));
+                }
+            }
+            let d = a[at(j, j)];
+            for i in (j + 1)..m {
+                a[at(i, j)] /= d;
+            }
+        } else if info == 0 {
+            info = (j + 1) as i32;
+        }
+        for c in (j + 1)..n {
+            let ajc = a[at(j, c)];
+            if ajc != 0.0 {
+                for i in (j + 1)..m {
+                    a[at(i, c)] -= a[at(i, j)] * ajc;
+                }
+            }
+        }
+    }
+    info
+}
+
+/// Symmetric eigendecomposition via cyclic Jacobi. `s` is a row-major
+/// `n×n` symmetric matrix (consumed). Returns `(eigenvalues ascending,
+/// eigenvectors)`, where eigenvector `j` is column `j` of the row-major
+/// `n×n` result (`evec[i*n + j]`). Orthonormal by construction.
+#[cfg(not(rlx_cpu_blas))]
+fn sym_eig_jacobi(mut s: Vec<f64>, n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut v = vec![0f64; n * n];
+    for i in 0..n {
+        v[i * n + i] = 1.0;
+    }
+    if n <= 1 {
+        let w = if n == 1 { vec![s[0]] } else { vec![] };
+        return (w, v);
+    }
+    for _sweep in 0..100 {
+        let mut off = 0.0;
+        for p in 0..n {
+            for q in (p + 1)..n {
+                off += s[p * n + q] * s[p * n + q];
+            }
+        }
+        if off <= 1e-300 {
+            break;
+        }
+        let mut rotated = false;
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let apq = s[p * n + q];
+                let app = s[p * n + p];
+                let aqq = s[q * n + q];
+                if apq.abs() <= f64::EPSILON * (app.abs() + aqq.abs()).max(f64::MIN_POSITIVE) {
+                    continue;
+                }
+                rotated = true;
+                // Rotation angle that annihilates s[p][q]: solves
+                // t² + 2θt − 1 = 0 for the smaller |t| (stable form).
+                let theta = (aqq - app) / (2.0 * apq);
+                let t = if theta == 0.0 {
+                    1.0
+                } else {
+                    theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt())
+                };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let sn = t * c;
+                // s ← Gᵀ s G: column update (s·G) then row update (Gᵀ·).
+                for i in 0..n {
+                    let sip = s[i * n + p];
+                    let siq = s[i * n + q];
+                    s[i * n + p] = c * sip - sn * siq;
+                    s[i * n + q] = sn * sip + c * siq;
+                }
+                for i in 0..n {
+                    let spi = s[p * n + i];
+                    let sqi = s[q * n + i];
+                    s[p * n + i] = c * spi - sn * sqi;
+                    s[q * n + i] = sn * spi + c * sqi;
+                }
+                // Accumulate eigenvectors: V ← V·G.
+                for i in 0..n {
+                    let vip = v[i * n + p];
+                    let viq = v[i * n + q];
+                    v[i * n + p] = c * vip - sn * viq;
+                    v[i * n + q] = sn * vip + c * viq;
+                }
+            }
+        }
+        if !rotated {
+            break;
+        }
+    }
+    let evals: Vec<f64> = (0..n).map(|i| s[i * n + i]).collect();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        evals[a]
+            .partial_cmp(&evals[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let w: Vec<f64> = idx.iter().map(|&i| evals[i]).collect();
+    let mut vout = vec![0f64; n * n];
+    for (newj, &oldj) in idx.iter().enumerate() {
+        for i in 0..n {
+            vout[i * n + newj] = v[i * n + oldj];
+        }
+    }
+    (w, vout)
+}
+
+/// Thin SVD `A = U·diag(s)·Vᵀ` of a row-major `m×n` matrix via one-sided
+/// Jacobi. Returns `(U row-major m×k, s descending, Vᵀ row-major k×n)`,
+/// `k = min(m,n)`; singular values ≥ 0, `U`/`V` orthonormal.
+#[cfg(not(rlx_cpu_blas))]
+fn svd_thin_rowmajor(am: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let k = m.min(n);
+    // One-sided Jacobi orthogonalizes columns, so work on the tall side.
+    let (rows, cols, transposed) = if m >= n { (m, n, false) } else { (n, m, true) };
+    let mut w = vec![0f64; rows * cols];
+    if transposed {
+        for i in 0..rows {
+            for j in 0..cols {
+                w[i * cols + j] = am[j * n + i];
+            }
+        }
+    } else {
+        w.copy_from_slice(am);
+    }
+    let mut vv = vec![0f64; cols * cols];
+    for i in 0..cols {
+        vv[i * cols + i] = 1.0;
+    }
+    for _ in 0..60 {
+        let mut changed = false;
+        for p in 0..cols {
+            for q in (p + 1)..cols {
+                let (mut alpha, mut beta, mut gamma) = (0.0, 0.0, 0.0);
+                for r in 0..rows {
+                    let wp = w[r * cols + p];
+                    let wq = w[r * cols + q];
+                    alpha += wp * wp;
+                    beta += wq * wq;
+                    gamma += wp * wq;
+                }
+                if gamma.abs() <= 1e-15 * (alpha * beta).sqrt() {
+                    continue;
+                }
+                changed = true;
+                let zeta = (beta - alpha) / (2.0 * gamma);
+                let t = if zeta == 0.0 {
+                    1.0
+                } else {
+                    zeta.signum() / (zeta.abs() + (1.0 + zeta * zeta).sqrt())
+                };
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let sn = c * t;
+                for r in 0..rows {
+                    let wp = w[r * cols + p];
+                    let wq = w[r * cols + q];
+                    w[r * cols + p] = c * wp - sn * wq;
+                    w[r * cols + q] = sn * wp + c * wq;
+                }
+                for r in 0..cols {
+                    let vp = vv[r * cols + p];
+                    let vq = vv[r * cols + q];
+                    vv[r * cols + p] = c * vp - sn * vq;
+                    vv[r * cols + q] = sn * vp + c * vq;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut sigma = vec![0f64; cols];
+    for c in 0..cols {
+        let mut nrm = 0.0;
+        for r in 0..rows {
+            nrm += w[r * cols + c] * w[r * cols + c];
+        }
+        sigma[c] = nrm.sqrt();
+    }
+    let mut idx: Vec<usize> = (0..cols).collect();
+    idx.sort_by(|&a, &b| {
+        sigma[b]
+            .partial_cmp(&sigma[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut uw = vec![0f64; rows * cols]; // U in W-space (rows×cols)
+    let mut vp = vec![0f64; cols * cols];
+    let mut ss = vec![0f64; cols];
+    for (newj, &oldj) in idx.iter().enumerate() {
+        let sv = sigma[oldj];
+        ss[newj] = sv;
+        for r in 0..rows {
+            uw[r * cols + newj] = if sv > 1e-300 {
+                w[r * cols + oldj] / sv
+            } else {
+                0.0
+            };
+        }
+        for r in 0..cols {
+            vp[r * cols + newj] = vv[r * cols + oldj];
+        }
+    }
+    let mut u_out = vec![0f64; m * k];
+    let mut vt_out = vec![0f64; k * n];
+    let s_out = ss[0..k].to_vec();
+    if transposed {
+        // W = Aᵀ = U_w·Σ·V_permᵀ ⇒ A = V_perm·Σ·U_wᵀ.
+        for r in 0..m {
+            for cc in 0..k {
+                u_out[r * k + cc] = vp[r * cols + cc];
+            }
+        }
+        for i in 0..k {
+            for j in 0..n {
+                vt_out[i * n + j] = uw[j * cols + i];
+            }
+        }
+    } else {
+        // W = A = U_w·Σ·V_permᵀ.
+        for r in 0..m {
+            for cc in 0..k {
+                u_out[r * k + cc] = uw[r * cols + cc];
+            }
+        }
+        for i in 0..k {
+            for j in 0..n {
+                vt_out[i * n + j] = vp[j * cols + i];
+            }
+        }
+    }
+    (u_out, s_out, vt_out)
+}
+
+/// Householder QR of a packed column-major `m×n` matrix (`lda = m`),
+/// LAPACK `dgeqrf` layout: `R` in the upper triangle, reflector `v_j`
+/// below the diagonal of column `j`, `tau[j]` its scalar.
+#[cfg(not(rlx_cpu_blas))]
+fn qr_householder_colmajor(a: &mut [f64], m: usize, n: usize, tau: &mut [f64]) {
+    let at = |i: usize, j: usize| i + j * m;
+    for j in 0..m.min(n) {
+        let alpha = a[at(j, j)];
+        let mut xn2 = 0.0;
+        for i in (j + 1)..m {
+            xn2 += a[at(i, j)] * a[at(i, j)];
+        }
+        if xn2 == 0.0 {
+            tau[j] = 0.0;
+            continue;
+        }
+        let norm = (alpha * alpha + xn2).sqrt();
+        let beta = if alpha >= 0.0 { -norm } else { norm };
+        let tj = (beta - alpha) / beta;
+        let inv = 1.0 / (alpha - beta);
+        for i in (j + 1)..m {
+            a[at(i, j)] *= inv;
+        }
+        tau[j] = tj;
+        a[at(j, j)] = beta; // R(j,j)
+        for c in (j + 1)..n {
+            let mut wsum = a[at(j, c)];
+            for i in (j + 1)..m {
+                wsum += a[at(i, j)] * a[at(i, c)];
+            }
+            let f = tj * wsum;
+            a[at(j, c)] -= f;
+            for i in (j + 1)..m {
+                a[at(i, c)] -= f * a[at(i, j)];
+            }
+        }
+    }
+}
+
+/// Form the `m×n` matrix `Q` (first `n` columns of `H_0···H_{k-1}`) in
+/// place from the reflectors + `tau` left by [`qr_householder_colmajor`].
+/// LAPACK `dorgqr` / `dorg2r`, column-major.
+#[cfg(not(rlx_cpu_blas))]
+fn form_q_colmajor(a: &mut [f64], m: usize, n: usize, k: usize, tau: &[f64]) {
+    let at = |i: usize, j: usize| i + j * m;
+    for j in k..n {
+        for i in 0..m {
+            a[at(i, j)] = 0.0;
+        }
+        if j < m {
+            a[at(j, j)] = 1.0;
+        }
+    }
+    for j in (0..k).rev() {
+        let tj = tau[j];
+        if j < n {
+            a[at(j, j)] = 1.0;
+            for c in (j + 1)..n {
+                let mut wsum = a[at(j, c)];
+                for i in (j + 1)..m {
+                    wsum += a[at(i, j)] * a[at(i, c)];
+                }
+                let f = tj * wsum;
+                a[at(j, c)] -= f;
+                for i in (j + 1)..m {
+                    a[at(i, c)] -= f * a[at(i, j)];
+                }
+            }
+        }
+        for i in (j + 1)..m {
+            a[at(i, j)] *= -tj;
+        }
+        a[at(j, j)] = 1.0 - tj;
+        for i in 0..j {
+            a[at(i, j)] = 0.0;
+        }
+    }
+}
 
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
-unsafe fn lapack_dpotrf(_: *const i8, _: *const i32, _: *mut f64, _: *const i32, info: *mut i32) {
+unsafe fn lapack_dpotrf(
+    uplo: *const i8,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    info: *mut i32,
+) {
+    let (uplo, n, lda) = unsafe { (*uplo as u8, *n as usize, *lda as usize) };
+    let mut buf = vec![0f64; n * n];
     unsafe {
-        *info = -1;
+        for j in 0..n {
+            for i in 0..n {
+                buf[i + j * n] = *a.add(i + j * lda);
+            }
+        }
     }
-    panic!("rlx-cpu: dpotrf requires a linked LAPACK backend (unavailable on this target)");
+    let rc = cholesky_colmajor(&mut buf, n, uplo == b'U');
+    unsafe {
+        *info = rc;
+        if rc == 0 {
+            for j in 0..n {
+                for i in 0..n {
+                    *a.add(i + j * lda) = buf[i + j * n];
+                }
+            }
+        }
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgetrf(
-    _: *const i32,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut i32,
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    ipiv: *mut i32,
     info: *mut i32,
 ) {
+    let (m, n, lda) = unsafe { (*m as usize, *n as usize, *lda as usize) };
+    let mut buf = vec![0f64; m * n];
     unsafe {
-        *info = -1;
+        for j in 0..n {
+            for i in 0..m {
+                buf[i + j * m] = *a.add(i + j * lda);
+            }
+        }
     }
-    panic!("rlx-cpu: dgetrf requires a linked LAPACK backend (unavailable on this target)");
+    let mut ip = vec![0i32; m.min(n)];
+    let rc = lu_colmajor(&mut buf, m, n, &mut ip);
+    unsafe {
+        for j in 0..n {
+            for i in 0..m {
+                *a.add(i + j * lda) = buf[i + j * m];
+            }
+        }
+        for (i, &p) in ip.iter().enumerate() {
+            *ipiv.add(i) = p;
+        }
+        *info = rc;
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dsyevd(
-    _: *const i8,
-    _: *const i8,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut i32,
-    _: *const i32,
+    jobz: *const i8,
+    uplo: *const i8,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    w: *mut f64,
+    work: *mut f64,
+    lwork: *const i32,
+    iwork: *mut i32,
+    _liwork: *const i32,
     info: *mut i32,
 ) {
-    unsafe {
-        *info = -1;
+    let (jobz, uplo, n, lda, lwork) =
+        unsafe { (*jobz as u8, *uplo as u8, *n as usize, *lda as usize, *lwork) };
+    if lwork == -1 {
+        unsafe {
+            *work = 1.0;
+            *iwork = 1;
+            *info = 0;
+        }
+        return;
     }
-    panic!("rlx-cpu: dsyevd requires a linked LAPACK backend (unavailable on this target)");
+    let mut full = vec![0f64; n * n];
+    unsafe {
+        for j in 0..n {
+            for i in 0..n {
+                let v = if uplo == b'U' {
+                    if i <= j {
+                        *a.add(i + j * lda)
+                    } else {
+                        *a.add(j + i * lda)
+                    }
+                } else if i >= j {
+                    *a.add(i + j * lda)
+                } else {
+                    *a.add(j + i * lda)
+                };
+                full[i * n + j] = v;
+            }
+        }
+    }
+    let (evals, evecs) = sym_eig_jacobi(full, n);
+    unsafe {
+        for (i, &e) in evals.iter().enumerate() {
+            *w.add(i) = e;
+        }
+        if jobz == b'V' {
+            for j in 0..n {
+                for i in 0..n {
+                    *a.add(i + j * lda) = evecs[i * n + j];
+                }
+            }
+        }
+        *info = 0;
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgeqrf(
-    _: *const i32,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *mut f64,
-    _: *const i32,
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    tau: *mut f64,
+    work: *mut f64,
+    lwork: *const i32,
     info: *mut i32,
 ) {
-    unsafe {
-        *info = -1;
+    let (m, n, lda, lwork) = unsafe { (*m as usize, *n as usize, *lda as usize, *lwork) };
+    if lwork == -1 {
+        unsafe {
+            *work = n.max(1) as f64;
+            *info = 0;
+        }
+        return;
     }
-    panic!("rlx-cpu: dgeqrf requires a linked LAPACK backend (unavailable on this target)");
+    let mut buf = vec![0f64; m * n];
+    unsafe {
+        for j in 0..n {
+            for i in 0..m {
+                buf[i + j * m] = *a.add(i + j * lda);
+            }
+        }
+    }
+    let k = m.min(n);
+    let mut tv = vec![0f64; k];
+    qr_householder_colmajor(&mut buf, m, n, &mut tv);
+    unsafe {
+        for j in 0..n {
+            for i in 0..m {
+                *a.add(i + j * lda) = buf[i + j * m];
+            }
+        }
+        for (i, &t) in tv.iter().enumerate() {
+            *tau.add(i) = t;
+        }
+        *info = 0;
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dorgqr(
-    _: *const i32,
-    _: *const i32,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *const f64,
-    _: *mut f64,
-    _: *const i32,
+    m: *const i32,
+    n: *const i32,
+    k: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    tau: *const f64,
+    work: *mut f64,
+    lwork: *const i32,
     info: *mut i32,
 ) {
-    unsafe {
-        *info = -1;
+    let (m, n, k, lda, lwork) =
+        unsafe { (*m as usize, *n as usize, *k as usize, *lda as usize, *lwork) };
+    if lwork == -1 {
+        unsafe {
+            *work = n.max(1) as f64;
+            *info = 0;
+        }
+        return;
     }
-    panic!("rlx-cpu: dorgqr requires a linked LAPACK backend (unavailable on this target)");
+    let mut buf = vec![0f64; m * n];
+    let mut tv = vec![0f64; k];
+    unsafe {
+        for j in 0..n {
+            for i in 0..m {
+                buf[i + j * m] = *a.add(i + j * lda);
+            }
+        }
+        for (i, t) in tv.iter_mut().enumerate() {
+            *t = *tau.add(i);
+        }
+    }
+    form_q_colmajor(&mut buf, m, n, k, &tv);
+    unsafe {
+        for j in 0..n {
+            for i in 0..m {
+                *a.add(i + j * lda) = buf[i + j * m];
+            }
+        }
+        *info = 0;
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgesvd(
-    _: *const i8,
-    _: *const i8,
-    _: *const i32,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
+    _jobu: *const i8,
+    _jobvt: *const i8,
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    s: *mut f64,
+    u: *mut f64,
+    ldu: *const i32,
+    vt: *mut f64,
+    ldvt: *const i32,
+    work: *mut f64,
+    lwork: *const i32,
     info: *mut i32,
 ) {
-    unsafe {
-        *info = -1;
+    // The wrappers always request thin `S`/`S` mode, which is what this
+    // computes; `_jobu`/`_jobvt` are accepted for ABI parity.
+    let (m, n, lda, ldu, ldvt, lwork) = unsafe {
+        (
+            *m as usize,
+            *n as usize,
+            *lda as usize,
+            *ldu as usize,
+            *ldvt as usize,
+            *lwork,
+        )
+    };
+    if lwork == -1 {
+        unsafe {
+            *work = 1.0;
+            *info = 0;
+        }
+        return;
     }
-    panic!("rlx-cpu: dgesvd requires a linked LAPACK backend (unavailable on this target)");
+    let k = m.min(n);
+    let mut am = vec![0f64; m * n];
+    unsafe {
+        for i in 0..m {
+            for j in 0..n {
+                am[i * n + j] = *a.add(i + j * lda);
+            }
+        }
+    }
+    let (u_rm, s_v, vt_rm) = svd_thin_rowmajor(&am, m, n);
+    unsafe {
+        for (i, &sv) in s_v.iter().enumerate() {
+            *s.add(i) = sv;
+        }
+        for j in 0..k {
+            for i in 0..m {
+                *u.add(i + j * ldu) = u_rm[i * k + j];
+            }
+        }
+        for j in 0..n {
+            for i in 0..k {
+                *vt.add(i + j * ldvt) = vt_rm[i * n + j];
+            }
+        }
+        *info = 0;
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgesdd(
-    _: *const i8,
-    _: *const i32,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut i32,
+    _jobz: *const i8,
+    m: *const i32,
+    n: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    s: *mut f64,
+    u: *mut f64,
+    ldu: *const i32,
+    vt: *mut f64,
+    ldvt: *const i32,
+    work: *mut f64,
+    lwork: *const i32,
+    _iwork: *mut i32,
     info: *mut i32,
 ) {
-    unsafe {
-        *info = -1;
+    // Divide-and-conquer SVD driver; the fallback shares the one-sided
+    // Jacobi thin-SVD used by `dgesvd` (same I/O contract, thin mode).
+    let (m, n, lda, ldu, ldvt, lwork) = unsafe {
+        (
+            *m as usize,
+            *n as usize,
+            *lda as usize,
+            *ldu as usize,
+            *ldvt as usize,
+            *lwork,
+        )
+    };
+    if lwork == -1 {
+        unsafe {
+            *work = 1.0;
+            *info = 0;
+        }
+        return;
     }
-    panic!("rlx-cpu: dgesdd requires a linked LAPACK backend (unavailable on this target)");
+    let k = m.min(n);
+    let mut am = vec![0f64; m * n];
+    unsafe {
+        for i in 0..m {
+            for j in 0..n {
+                am[i * n + j] = *a.add(i + j * lda);
+            }
+        }
+    }
+    let (u_rm, s_v, vt_rm) = svd_thin_rowmajor(&am, m, n);
+    unsafe {
+        for (i, &sv) in s_v.iter().enumerate() {
+            *s.add(i) = sv;
+        }
+        for j in 0..k {
+            for i in 0..m {
+                *u.add(i + j * ldu) = u_rm[i * k + j];
+            }
+        }
+        for j in 0..n {
+            for i in 0..k {
+                *vt.add(i + j * ldvt) = vt_rm[i * n + j];
+            }
+        }
+        *info = 0;
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn lapack_dgelsd(
-    _: *const i32,
-    _: *const i32,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut f64,
-    _: *const f64,
-    _: *mut i32,
-    _: *mut f64,
-    _: *const i32,
-    _: *mut i32,
+    m: *const i32,
+    n: *const i32,
+    nrhs: *const i32,
+    a: *mut f64,
+    lda: *const i32,
+    b: *mut f64,
+    ldb: *const i32,
+    s: *mut f64,
+    rcond: *const f64,
+    rank: *mut i32,
+    work: *mut f64,
+    lwork: *const i32,
+    _iwork: *mut i32,
     info: *mut i32,
 ) {
-    unsafe {
-        *info = -1;
+    // Minimum-norm least squares via the thin SVD: X = V·Σ⁺·Uᵀ·B, with
+    // singular values ≤ rcond·σ_max (machine eps when rcond < 0) dropped.
+    let (m, n, nrhs, lda, ldb, lwork, rcond) = unsafe {
+        (
+            *m as usize,
+            *n as usize,
+            *nrhs as usize,
+            *lda as usize,
+            *ldb as usize,
+            *lwork,
+            *rcond,
+        )
+    };
+    if lwork == -1 {
+        unsafe {
+            *work = 1.0;
+            *info = 0;
+        }
+        return;
     }
-    panic!("rlx-cpu: dgelsd requires a linked LAPACK backend (unavailable on this target)");
+    let k = m.min(n);
+    let mut am = vec![0f64; m * n];
+    unsafe {
+        for i in 0..m {
+            for j in 0..n {
+                am[i * n + j] = *a.add(i + j * lda);
+            }
+        }
+    }
+    let (u_rm, s_v, vt_rm) = svd_thin_rowmajor(&am, m, n);
+    let smax = if k > 0 { s_v[0] } else { 0.0 };
+    let eff = if rcond < 0.0 { f64::EPSILON } else { rcond };
+    let thresh = eff * smax;
+    let mut rk = 0i32;
+    for &sv in &s_v {
+        if sv > thresh {
+            rk += 1;
+        }
+    }
+    // Solution written row-major first, then marshalled to B (col-major).
+    let mut xout = vec![0f64; n * nrhs];
+    unsafe {
+        for c in 0..nrhs {
+            let mut z = vec![0f64; k];
+            for i in 0..k {
+                if s_v[i] > thresh {
+                    let mut y = 0.0;
+                    for l in 0..m {
+                        y += u_rm[l * k + i] * *b.add(l + c * ldb);
+                    }
+                    z[i] = y / s_v[i];
+                }
+            }
+            for r in 0..n {
+                let mut xr = 0.0;
+                for i in 0..k {
+                    xr += vt_rm[i * n + r] * z[i];
+                }
+                xout[r * nrhs + c] = xr;
+            }
+        }
+        for c in 0..nrhs {
+            for r in 0..n {
+                *b.add(r + c * ldb) = xout[r * nrhs + c];
+            }
+        }
+        for (i, &sv) in s_v.iter().enumerate() {
+            *s.add(i) = sv;
+        }
+        *rank = rk;
+        *info = 0;
+    }
 }
 #[cfg(not(rlx_cpu_blas))]
 #[allow(non_snake_case, clippy::too_many_arguments)]
 unsafe fn cblas_dtrsm(
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: f64,
-    _: *const f64,
-    _: i32,
-    _: *mut f64,
-    _: i32,
+    order: i32,
+    side: i32,
+    uplo: i32,
+    transa: i32,
+    diag: i32,
+    m: i32,
+    n: i32,
+    alpha: f64,
+    a: *const f64,
+    lda: i32,
+    b: *mut f64,
+    ldb: i32,
 ) {
-    panic!("rlx-cpu: cblas_dtrsm requires a linked BLAS backend (unavailable on this target)");
+    // Solve op(A)·X = alpha·B in place. Covers the sole in-tree caller
+    // (`dtrsm_lower_or_upper`): row-major, left side, both triangles /
+    // transpose / unit-diagonal. Col-major or right-side are never used.
+    debug_assert!(
+        order == ROW_MAJOR && side == CBLAS_LEFT,
+        "rlx-cpu dtrsm fallback: only row-major left-side is exercised"
+    );
+    let _ = (order, side);
+    let m = m as usize;
+    let n = n as usize;
+    let lda = lda as usize;
+    let ldb = ldb as usize;
+    let unit = diag == CBLAS_UNIT;
+    let upper = uplo == CBLAS_UPPER;
+    let trans = transa != NO_TRANS;
+    let op_lower = upper == trans; // op(A) lower ⇔ (A upper) XOR-not (transpose)
+    let aat = |i: usize, l: usize| unsafe {
+        if trans {
+            *a.add(l * lda + i)
+        } else {
+            *a.add(i * lda + l)
+        }
+    };
+    unsafe {
+        if alpha != 1.0 {
+            for i in 0..m {
+                for j in 0..n {
+                    *b.add(i * ldb + j) *= alpha;
+                }
+            }
+        }
+        if op_lower {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut val = *b.add(i * ldb + j);
+                    for l in 0..i {
+                        val -= aat(i, l) * *b.add(l * ldb + j);
+                    }
+                    if !unit {
+                        val /= aat(i, i);
+                    }
+                    *b.add(i * ldb + j) = val;
+                }
+            }
+        } else {
+            for i in (0..m).rev() {
+                for j in 0..n {
+                    let mut val = *b.add(i * ldb + j);
+                    for l in (i + 1)..m {
+                        val -= aat(i, l) * *b.add(l * ldb + j);
+                    }
+                    if !unit {
+                        val /= aat(i, i);
+                    }
+                    *b.add(i * ldb + j) = val;
+                }
+            }
+        }
+    }
 }
 
 // ── Linalg row-major wrappers ────────────────────────────────────
@@ -2839,6 +3600,50 @@ pub fn sgemm_bf16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n
     }
 }
 
+/// `acc[nn] += scale · f16(b[nn])` over a contiguous IEEE-half row — the SAXPY
+/// inner of [`sgemm_f16_rhs`]. f16→f32 widen accumulates in f32 (exact promotion).
+#[inline]
+fn saxpy_f16(scale: f32, b: &[u16], acc: &mut [f32]) {
+    for (v, &bw) in acc.iter_mut().zip(b) {
+        *v += scale * half::f16::from_bits(bw).to_f32();
+    }
+}
+
+/// GEMM `C[m,n] = A[m,k](f32) · B[k,n](F16)`, the IEEE-half twin of
+/// [`sgemm_bf16_rhs`]. `B` is a `k*n` `u16` (f16-bit) buffer in the standard
+/// `[K, N]` row-major layout every backend's native matmul consumes; `A`/`C` are
+/// f32; `B` is dequant-on-the-fly with f32 accumulate (so bit-parity with an f32
+/// GEMM over the same f16-valued weights). Fixes generic `Op::MatMul` reading an
+/// F16 weight as f32 garbage (there was only a BF16 path before).
+pub fn sgemm_f16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
+    use rayon::prelude::*;
+    if m == 1 {
+        let nthreads = rayon::current_num_threads().max(1);
+        let kchunk = k.div_ceil(nthreads).max(1);
+        let partials: Vec<Vec<f32>> = (0..nthreads)
+            .into_par_iter()
+            .map(|t| {
+                let (k0, k1) = ((t * kchunk).min(k), ((t + 1) * kchunk).min(k));
+                let mut acc = vec![0f32; n];
+                for kk in k0..k1 {
+                    saxpy_f16(a[kk], &b[kk * n..kk * n + n], &mut acc);
+                }
+                acc
+            })
+            .collect();
+        c.par_iter_mut().enumerate().for_each(|(j, cj)| {
+            *cj = partials.iter().map(|p| p[j]).sum();
+        });
+    } else {
+        c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
+            crow.iter_mut().for_each(|v| *v = 0.0);
+            for kk in 0..k {
+                saxpy_f16(a[i * k + kk], &b[kk * n..kk * n + n], crow);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod bf16_gemm_tests {
     use super::*;
@@ -2910,6 +3715,328 @@ mod bf16_bench {
         eprintln!(
             "HEAD GEMV [1,{k}]x[{k},{n}]: cblas-f32 {f32_ms:.1}ms  bf16-neon {bf16_ms:.1}ms  ({:.2}x)",
             f32_ms / bf16_ms
+        );
+    }
+}
+
+#[cfg(test)]
+mod linalg_fallback_tests {
+    use super::*;
+
+    // ── Linalg wrappers: reference-reconstruction tests ──────────────
+    //
+    // These exercise the public row-major wrappers, so they validate BOTH
+    // the linked-BLAS/LAPACK path (default) AND the dependency-free
+    // fallback (`--no-default-features`, `rlx_cpu_blas` unset). Both must
+    // agree with the independent reference here.
+
+    fn matmul_rm(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
+        let mut c = vec![0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0;
+                for p in 0..k {
+                    s += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = s;
+            }
+        }
+        c
+    }
+
+    fn transpose_rm(a: &[f64], r: usize, c: usize) -> Vec<f64> {
+        let mut t = vec![0f64; r * c];
+        for i in 0..r {
+            for j in 0..c {
+                t[j * r + i] = a[i * c + j];
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn dpotrf_lower_reconstructs_spd() {
+        // A = Mᵀ·M is SPD; Cholesky L must satisfy L·Lᵀ = A.
+        let m = [2.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.3, 1.5];
+        let mt = transpose_rm(&m, 3, 3);
+        let a = matmul_rm(&mt, &m, 3, 3, 3);
+        let mut lf = a.clone();
+        let info = dpotrf(&mut lf, 3, true);
+        assert_eq!(info, 0, "dpotrf flagged non-SPD");
+        let lt = transpose_rm(&lf, 3, 3);
+        let recon = matmul_rm(&lf, &lt, 3, 3, 3);
+        for i in 0..9 {
+            assert!(
+                (recon[i] - a[i]).abs() < 1e-9,
+                "L·Lᵀ[{i}]={} A={}",
+                recon[i],
+                a[i]
+            );
+        }
+    }
+
+    #[test]
+    fn dpotrf_rejects_non_spd() {
+        // Indefinite: leading 2×2 minor is fine but full matrix isn't SPD.
+        let mut a = [1.0, 2.0, 2.0, 1.0];
+        let info = dpotrf(&mut a, 2, true);
+        assert!(info > 0, "expected non-SPD signal, got {info}");
+    }
+
+    #[test]
+    fn dsyevd_eigenpairs_ascending() {
+        // 1-D Laplacian-ish tridiagonal; eigenvalues 2−√2, 2, 2+√2.
+        let a = [2.0, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0, 1.0, 2.0];
+        let a_orig = a;
+        let mut af = a;
+        let mut w = [0.0; 3];
+        let info = dsyevd(&mut af, &mut w, 3);
+        assert_eq!(info, 0);
+        let want = [2.0 - 2f64.sqrt(), 2.0, 2.0 + 2f64.sqrt()];
+        for i in 0..3 {
+            if i > 0 {
+                assert!(w[i] >= w[i - 1] - 1e-12, "eigenvalues not ascending");
+            }
+            assert!(
+                (w[i] - want[i]).abs() < 1e-9,
+                "w[{i}]={} want {}",
+                w[i],
+                want[i]
+            );
+        }
+        // Eigenvector j is column j of the col-major output, i.e. the
+        // CONTIGUOUS triple `af[j*n + i]` (== `spd.rs`'s `evecs[k*n+i]`
+        // convention), NOT the strided `af[i*n + j]`. Validate both
+        // A·v = w·v (per-column, sign-invariant) and the full spectral
+        // reconstruction Σ_j w_j·v_j·v_jᵀ = A (fully sign-invariant, so
+        // it holds regardless of each backend's eigenvector-sign choice).
+        let mut recon = [0.0f64; 9];
+        for j in 0..3 {
+            let v: Vec<f64> = (0..3).map(|i| af[j * 3 + i]).collect();
+            for i in 0..3 {
+                let av: f64 = (0..3).map(|l| a_orig[i * 3 + l] * v[l]).sum();
+                assert!((av - w[j] * v[i]).abs() < 1e-9, "A·v≠w·v j={j} i={i}");
+                for c in 0..3 {
+                    recon[i * 3 + c] += w[j] * v[i] * v[c];
+                }
+            }
+        }
+        for idx in 0..9 {
+            assert!(
+                (recon[idx] - a_orig[idx]).abs() < 1e-9,
+                "spectral recon[{idx}]={} A={}",
+                recon[idx],
+                a_orig[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn dgeqrf_full_reconstructs_and_orthonormal() {
+        let (m, n, k) = (4usize, 3usize, 3usize);
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 1.0, 0.0, 1.0];
+        let mut af = a;
+        let mut q = vec![0.0; m * k];
+        let mut r = vec![0.0; k * n];
+        let info = dgeqrf_full(&mut af, m, n, &mut q, &mut r);
+        assert_eq!(info, 0);
+        let recon = matmul_rm(&q, &r, m, k, n);
+        for i in 0..m * n {
+            assert!((recon[i] - a[i]).abs() < 1e-9, "Q·R[{i}]");
+        }
+        let qt = transpose_rm(&q, m, k);
+        let qtq = matmul_rm(&qt, &q, k, m, k);
+        for i in 0..k {
+            for j in 0..k {
+                let e = if i == j { 1.0 } else { 0.0 };
+                assert!((qtq[i * k + j] - e).abs() < 1e-9, "Qᵀ·Q[{i},{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn dgesvd_thin_reconstructs_both_shapes() {
+        for &(m, n) in &[(4usize, 2usize), (2usize, 4usize), (3, 3)] {
+            let k = m.min(n);
+            let a: Vec<f64> = (0..m * n)
+                .map(|i| ((i * 7 % 11) as f64) - 5.0 + 0.25 * i as f64)
+                .collect();
+            let mut af = a.clone();
+            let mut s = vec![0.0; k];
+            let mut u = vec![0.0; m * k];
+            let mut vt = vec![0.0; k * n];
+            let info = dgesvd_thin(&mut af, m, n, &mut s, &mut u, &mut vt);
+            assert_eq!(info, 0, "svd info m={m} n={n}");
+            for i in 1..k {
+                assert!(s[i] <= s[i - 1] + 1e-12, "s not descending");
+            }
+            let mut us = vec![0.0; m * k];
+            for i in 0..m {
+                for j in 0..k {
+                    us[i * k + j] = u[i * k + j] * s[j];
+                }
+            }
+            let recon = matmul_rm(&us, &vt, m, k, n);
+            for i in 0..m * n {
+                assert!(
+                    (recon[i] - a[i]).abs() < 1e-8,
+                    "SVD recon m={m} n={n} [{i}] got {} want {}",
+                    recon[i],
+                    a[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dgesdd_thin_reconstructs() {
+        let (m, n, k) = (5usize, 3usize, 3usize);
+        let a: Vec<f64> = (0..m * n).map(|i| (i as f64).sin() * 3.0 + 1.0).collect();
+        let mut af = a.clone();
+        let mut s = vec![0.0; k];
+        let mut u = vec![0.0; m * k];
+        let mut vt = vec![0.0; k * n];
+        let info = dgesdd_thin(&mut af, m, n, &mut s, &mut u, &mut vt);
+        assert_eq!(info, 0);
+        let mut us = vec![0.0; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                us[i * k + j] = u[i * k + j] * s[j];
+            }
+        }
+        let recon = matmul_rm(&us, &vt, m, k, n);
+        for i in 0..m * n {
+            assert!((recon[i] - a[i]).abs() < 1e-8, "dgesdd recon[{i}]");
+        }
+    }
+
+    #[test]
+    fn dgelsd_overdetermined_lstsq() {
+        // Fit y = 2x + 1; design columns [x, 1], exact solution [2, 1].
+        let xs = [0.0, 1.0, 2.0, 3.0];
+        let mut a = vec![0.0; 4 * 2];
+        let mut b = vec![0.0; 4];
+        for (i, &x) in xs.iter().enumerate() {
+            a[i * 2] = x;
+            a[i * 2 + 1] = 1.0;
+            b[i] = 2.0 * x + 1.0;
+        }
+        let mut x = vec![0.0; 2];
+        let info = dgelsd_solve(&a, &b, 4, 2, 1, -1.0, &mut x);
+        assert_eq!(info, 0);
+        assert!(
+            (x[0] - 2.0).abs() < 1e-9 && (x[1] - 1.0).abs() < 1e-9,
+            "lstsq x={x:?}"
+        );
+    }
+
+    #[test]
+    fn lu_slogdet_diagonal_known() {
+        let mut a = [2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0];
+        let (logabs, sign, det) = lu_slogdet(&mut a, 3);
+        assert!((det - 24.0).abs() < 1e-9, "det={det}");
+        assert!((sign - 1.0).abs() < 1e-12);
+        assert!((logabs - 24f64.ln()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dtrsm_lower_solve_roundtrips() {
+        let l = [2.0, 0.0, 0.0, 1.0, 3.0, 0.0, 0.5, -1.0, 4.0]; // 3×3 lower
+        let xtrue = [1.0, 2.0, 3.0, -1.0, 0.5, 0.5]; // 3×2
+        let mut b = matmul_rm(&l, &xtrue, 3, 3, 2); // B = L·X
+        dtrsm_lower_or_upper(&l, &mut b, 3, 2, true, false);
+        for i in 0..6 {
+            assert!(
+                (b[i] - xtrue[i]).abs() < 1e-9,
+                "dtrsm X[{i}]={} want {}",
+                b[i],
+                xtrue[i]
+            );
+        }
+    }
+
+    /// The no-BLAS `sgemm` fast path (i→p→j) must agree with a naive `ijk`
+    /// reference on a non-trivial shape with non-unit `alpha`/`beta`, and
+    /// (when built `--no-default-features`) be markedly faster. Correctness
+    /// runs always; the timing print is informational.
+    #[test]
+    fn sgemm_fallback_ikj_matches_and_timing() {
+        let (m, k, n) = (96usize, 128usize, 112usize);
+        let mut s: u32 = 0x9e37_79b9;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) - 0.5
+        };
+        let a: Vec<f32> = (0..m * k).map(|_| rng()).collect();
+        let b: Vec<f32> = (0..k * n).map(|_| rng()).collect();
+        // Naive ijk reference: C = A·B.
+        let mut want = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += a[i * k + p] * b[p * n + j];
+                }
+                want[i * n + j] = acc;
+            }
+        }
+        let mut got = vec![0f32; m * n];
+        sgemm(&a, &b, &mut got, m, k, n);
+        // Same math, possibly a different summation order → allow a small
+        // relative slack rather than bit-exactness.
+        for idx in 0..m * n {
+            let tol = 1e-4 * (1.0 + want[idx].abs());
+            assert!(
+                (got[idx] - want[idx]).abs() <= tol,
+                "sgemm[{idx}]={} want {}",
+                got[idx],
+                want[idx]
+            );
+        }
+
+        // Informational A/B (only meaningful in a no-BLAS build; on a
+        // vendor-BLAS build `sgemm` dispatches to Accelerate/OpenBLAS/MKL).
+        // Times the fast `sgemm` fallback vs the naive p-innermost loop on
+        // the same shape so the reorder's win is visible directly.
+        use std::time::Instant;
+        let (bm, bk, bn) = (256usize, 256usize, 256usize);
+        let ba: Vec<f32> = (0..bm * bk).map(|_| rng()).collect();
+        let bb: Vec<f32> = (0..bk * bn).map(|_| rng()).collect();
+        let mut bc = vec![0f32; bm * bn];
+        let flop = 2.0 * bm as f64 * bk as f64 * bn as f64;
+        let naive = |a: &[f32], b: &[f32], c: &mut [f32]| {
+            for i in 0..bm {
+                for j in 0..bn {
+                    let mut acc = 0f32;
+                    for p in 0..bk {
+                        acc += a[i * bk + p] * b[p * bn + j];
+                    }
+                    c[i * bn + j] = acc;
+                }
+            }
+        };
+        for _ in 0..2 {
+            sgemm(&ba, &bb, &mut bc, bm, bk, bn);
+            naive(&ba, &bb, &mut bc);
+        }
+        let iters = 20;
+        let tf = Instant::now();
+        for _ in 0..iters {
+            sgemm(&ba, &bb, &mut bc, bm, bk, bn);
+        }
+        let fast_ms = tf.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let tn = Instant::now();
+        for _ in 0..iters {
+            naive(&ba, &bb, &mut bc);
+        }
+        let naive_ms = tn.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        eprintln!(
+            "SGEMM [{bm}x{bk}x{bn}]: fast {fast_ms:.2}ms ({:.2} GFLOP/s)  naive-ijk {naive_ms:.2}ms ({:.2} GFLOP/s)  speedup {:.1}x",
+            flop / (fast_ms * 1e-3) / 1e9,
+            flop / (naive_ms * 1e-3) / 1e9,
+            naive_ms / fast_ms
         );
     }
 }

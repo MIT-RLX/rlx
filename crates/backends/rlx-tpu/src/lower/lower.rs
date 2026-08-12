@@ -3163,11 +3163,15 @@ impl<'a> LowerCtx<'a> {
         let weight = self.hlo(weight_id);
         let exp_idx = self.hlo(expert_id);
         let exp_dt = self.dtype(expert_id);
-        let m_dims = self.ir_shape_dims(input_id); // [M, K]
-        let w_dims = self.ir_shape_dims(weight_id); // [E, K, N]
-        let m = m_dims[0];
-        let k = m_dims[1];
-        let n = w_dims[2];
+        // Checked, not trusted: a bank still in `[E, N, K]` order has the right
+        // rank and element count, so nothing else would reject it.
+        let gd = rlx_ir::shape::grouped_matmul_dims(
+            &self.graph.node(input_id).shape,
+            &self.graph.node(weight_id).shape,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("rlx-tpu: node {weight_id:?}: {e}"));
+        let (m, k, n) = (gd.m as i64, gd.k as i64, gd.n as i64);
 
         let exp_s32 = if matches!(exp_dt, DType::I32 | DType::I64 | DType::U32) {
             exp_idx

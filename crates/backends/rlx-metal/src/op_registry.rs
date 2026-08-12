@@ -224,9 +224,9 @@ pub fn lookup_metal_kernel(name: &str) -> Option<Arc<dyn MetalKernel>> {
 pub struct MetalGpuDispatch<'a> {
     /// Live compute encoder — encode your dispatch here. Do **not** end it,
     /// commit, or wait; the executor owns command-buffer lifetime.
-    pub encoder: &'a metal::ComputeCommandEncoderRef,
+    pub encoder: &'a crate::mtl::ComputeCommandEncoderRef,
     /// The `StorageModeShared` arena buffer holding every operand.
-    pub arena: &'a metal::BufferRef,
+    pub arena: &'a crate::mtl::BufferRef,
     /// Per-input `(byte offset into arena, element count, shape)`.
     pub inputs: &'a [(usize, u32, Shape)],
     /// Output `(byte offset, element count, shape)`.

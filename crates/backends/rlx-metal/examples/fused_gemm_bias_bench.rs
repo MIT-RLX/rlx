@@ -7,11 +7,21 @@
 //! dispatch (two dispatches — what MPS forces, since it can't fuse). Measures the
 //! end-to-end win on the kernels we're required to hand-roll. `C = relu(A·B + bias)`.
 
-use metal::MTLSize;
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("Metal only on macOS");
+}
+
+#[cfg(target_os = "macos")]
 use rlx_metal::device::metal_device;
+#[cfg(target_os = "macos")]
 use rlx_metal::mps_blas::encode_mps_sgemm_t;
+#[cfg(target_os = "macos")]
+use rlx_metal::mtl::MTLSize;
+#[cfg(target_os = "macos")]
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
 const KSRC: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -87,11 +97,12 @@ kernel void bias_relu(device const float* tmp [[buffer(0)]], device const float*
 }
 "#;
 
+#[cfg(target_os = "macos")]
 fn main() {
     let dev = metal_device().expect("no Metal device");
     let lib = dev
         .device
-        .new_library_with_source(KSRC, &metal::CompileOptions::new())
+        .new_library_with_source(KSRC, &rlx_metal::mtl::CompileOptions::new())
         .expect("compile");
     let pso_fused = dev
         .device
@@ -156,8 +167,10 @@ fn main() {
         };
 
         // (b) fused: one dispatch.
-        let enc_fused = |cb: &metal::CommandBufferRef| {
-            let e = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+        let enc_fused = |cb: &rlx_metal::mtl::CommandBufferRef| {
+            let e = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             e.set_compute_pipeline_state(&pso_fused);
             for (i, o) in [x_o, w_o, bias_o, c_o].iter().enumerate() {
                 e.set_buffer(i as u64, Some(&buf), *o as u64);
@@ -180,9 +193,11 @@ fn main() {
             e.end_encoding();
         };
         // MPS GEMM (x·W, no transpose) + SEPARATE bias+relu dispatch.
-        let enc_mps = |cb: &metal::CommandBufferRef| {
+        let enc_mps = |cb: &rlx_metal::mtl::CommandBufferRef| {
             encode_mps_sgemm_t(cb, &buf, x_o, w_o, tmp_o, m, kk, n, false, false);
-            let e = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+            let e = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             e.set_compute_pipeline_state(&pso_ep);
             e.set_buffer(0, Some(&buf), tmp_o as u64);
             e.set_buffer(1, Some(&buf), bias_o as u64);
@@ -227,11 +242,12 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn time(
     dev: &rlx_metal::device::MetalDevice,
     warm: usize,
     n: usize,
-    enc: impl Fn(&metal::CommandBufferRef),
+    enc: impl Fn(&rlx_metal::mtl::CommandBufferRef),
 ) -> f64 {
     for _ in 0..warm {
         let cb = dev.queue.new_command_buffer();

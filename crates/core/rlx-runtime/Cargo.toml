@@ -266,7 +266,9 @@ safetensors = "0.7"
 rlx-sparse = { path = "../../numerics/rlx-sparse", default-features = false, features = ["metal", "mlx"] }
 # For the raw-GPU custom-kernel test (metal_gpu_custom_op.rs): construct MTLSize
 # / call the compute encoder directly, exactly as a downstream MetalGpuKernel would.
-metal = "0.30"
+# The custom-kernel seam now hands out `rlx_metal::mtl` types, so the test
+# uses those directly — no metal-rs dev-dependency needed.
+
 
 [lints]
 workspace = true

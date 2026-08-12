@@ -270,8 +270,11 @@ fn fab_oneapi_parity() {
     fab_suite(Device::OneApi, 1e-2, "oneapi");
 }
 
+// CoreML/ANE only exist on Apple platforms; workspace feature unification
+// otherwise enables the feature on a Linux host, where the run fails with
+// "device ANE cannot lower this graph under the active policy".
 #[test]
-#[cfg(any(feature = "coreml", feature = "ane"))]
+#[cfg(all(any(feature = "coreml", feature = "ane"), target_vendor = "apple"))]
 fn fab_coreml_parity() {
     fab_suite(Device::Ane, 1e-2, "coreml");
 }

@@ -530,6 +530,25 @@ fn dequant_grouped_matmul_iq3_xxs_cuda_matches_cpu() {
     );
 }
 
+/// Non-IQ scheme on the ROCm grouped path.
+///
+/// The grouped ROCm coverage used to be IQ-only, which made a plain
+/// wrong-transpose bug in the shared sgemm read like an IQ/LUT problem. A
+/// non-IQ case pins the matmul itself.
+#[test]
+#[cfg(feature = "rocm")]
+fn dequant_grouped_matmul_q4_0_rocm_matches_cpu() {
+    if !rlx_runtime::is_available(Device::Rocm) {
+        eprintln!("ROCm unavailable, skipping");
+        return;
+    }
+    run_grouped_iq_case(
+        Device::Rocm,
+        QuantScheme::GgufQ4_0,
+        rlx_gguf::GgmlType::Q4_0,
+    );
+}
+
 #[test]
 #[cfg(feature = "rocm")]
 fn dequant_grouped_matmul_iq2_xxs_rocm_matches_cpu() {

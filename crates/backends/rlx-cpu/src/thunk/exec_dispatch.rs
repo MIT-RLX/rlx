@@ -225,6 +225,24 @@ pub fn dump_thunk_profile() {
     }
 }
 
+/// Do the arena byte ranges `[a, a + a_elems*4)` and `[c, c + c_elems*4)`
+/// overlap at all?
+///
+/// The BLAS aliasing guard has to compare *ranges*, not pointers. When a
+/// fusion folds a `Transpose` into a matmul, the surviving operand is the
+/// transpose's *source* buffer, which the planner scored as dead at the
+/// transpose — so its slot is free to be reused for the matmul's own output.
+/// That leaves an operand sitting strictly inside the destination (WavTokenizer
+/// attention: `probs @ V` reads a 256 B `probs` from the middle of its own
+/// 24 KB output slot). `ptr::eq` sees two different addresses and waves it
+/// through, after which cblas streams `probs` while overwriting it. Accelerate
+/// happens to pack its operands up front and survives; OpenBLAS does not, which
+/// is why this only ever corrupted x86_64.
+#[inline]
+fn arena_ranges_overlap(a: usize, a_elems: usize, c: usize, c_elems: usize) -> bool {
+    a < c + c_elems * 4 && c < a + a_elems * 4
+}
+
 pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     crate::moe_residency::reset_gmm_counters();
     if let Some(layers) = schedule.moe_resident_layers.clone() {
@@ -336,6 +354,17 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     // giant match's many arms). The last thunk's tail is folded into the next
     // step's first sample — negligible over a training run.
     let mut prof_prev: Option<(&'static str, std::time::Instant)> = None;
+    // Byte-range write tracer (`RLX_ARENA_WRITE_TRACE=1`). Snapshots the arena
+    // around every thunk and reports the exact range each one dirtied, so a
+    // kernel that writes past its planned slot — the classic SIMD-tail overrun
+    // that corrupts whichever buffer the planner reused next — is named
+    // directly instead of inferred. O(arena) per thunk, so diagnostics only.
+    let write_trace = std::env::var_os("RLX_ARENA_WRITE_TRACE").is_some();
+    let mut wt_before: Vec<u8> = if write_trace {
+        arena_buf.to_vec()
+    } else {
+        Vec::new()
+    };
     for i in 0..len {
         if profile {
             if let Some((pn, pt)) = prof_prev.take() {
@@ -384,8 +413,8 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let a_sl = sl(*a, base, a_len);
                     let b_sl = sl(*b, base, b_len);
                     let c_sl = sl_mut(*c, base, c_len);
-                    if std::ptr::eq(a_sl.as_ptr(), c_sl.as_ptr())
-                        || std::ptr::eq(b_sl.as_ptr(), c_sl.as_ptr())
+                    if arena_ranges_overlap(*a, a_len, *c, c_len)
+                        || arena_ranges_overlap(*b, b_len, *c, c_len)
                     {
                         let mut tmp = vec![0.0f32; c_len];
                         crate::blas::sgemm_auto(a_sl, b_sl, &mut tmp, m, k, n);
@@ -409,6 +438,19 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 }
             }
 
+            Thunk::SgemmF16 { a, b, c, m, k, n } => {
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let c_len = m.saturating_mul(n);
+                let a_len = m.saturating_mul(k);
+                let bn = k.saturating_mul(n);
+                unsafe {
+                    let a_sl = sl(*a, base, a_len);
+                    let b16 = sl_typed::<u16>(*b, base, bn);
+                    let c_sl = sl_mut(*c, base, c_len);
+                    crate::blas::sgemm_f16_rhs(a_sl, b16, c_sl, m, k, n);
+                }
+            }
+
             Thunk::SgemmT {
                 a,
                 b,
@@ -426,6 +468,14 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let (m, k, n) = (*m as usize, *k as usize, *n as usize);
                 let lda = if *ta { m } else { k };
                 let ldb = if *tb { k } else { n };
+                if trace_thunks {
+                    eprintln!(
+                        "[sgemmT] m={m} k={k} n={n} ta={ta} tb={tb} a={a}..{} b={b}..{} c={c}..{}",
+                        a + m * k * 4,
+                        b + k * n * 4,
+                        c + m * n * 4
+                    );
+                }
                 let arena_len = arena_buf.len();
                 let a_len = (m * k).min((arena_len.saturating_sub(*a)) / 4);
                 let b_len = (k * n).min((arena_len.saturating_sub(*b)) / 4);
@@ -435,7 +485,9 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let b_sl = sl(*b, base, b_len);
                     let c_sl = sl_mut(*c, base, c_len);
                     let (ap, bp) = (a_sl.as_ptr(), b_sl.as_ptr());
-                    if std::ptr::eq(ap, c_sl.as_ptr()) || std::ptr::eq(bp, c_sl.as_ptr()) {
+                    if arena_ranges_overlap(*a, a_len, *c, c_len)
+                        || arena_ranges_overlap(*b, b_len, *c, c_len)
+                    {
                         let mut tmp = vec![0.0f32; c_len];
                         crate::blas::sgemm_general(
                             ap,
@@ -3183,6 +3235,11 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 &wt[e * expert_stride..(e + 1) * expert_stride]
                             };
                         let out_slice = &mut packed_out[in_start * n..(in_start + count) * n];
+                        // Measured: routing this through `par_sgemm` REGRESSES decode
+                        // (0.069 -> 0.085 s/token). At m == 1 the per-call work is a
+                        // 1.5 MFLOP matvec, and decode issues 368 of these per token,
+                        // so ~368 Rayon hand-offs cost more than the extra memory
+                        // parallelism buys. Keep the serial call.
                         crate::blas::sgemm(in_slice, w_slab, out_slice, count, k_dim, n);
                     }
 
@@ -3885,6 +3942,39 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
         }
         if trace_done {
             eprintln!("[thunk {i} done]");
+        }
+        if write_trace {
+            let lo = wt_before
+                .iter()
+                .zip(arena_buf.iter())
+                .position(|(a, b)| a != b);
+            match lo {
+                None => eprintln!("[wt {i}] {} wrote nothing", thunk_kind_name(thunk)),
+                Some(lo) => {
+                    let hi = wt_before.len()
+                        - wt_before
+                            .iter()
+                            .zip(arena_buf.iter())
+                            .rev()
+                            .position(|(a, b)| a != b)
+                            .unwrap();
+                    // Hash the CONTENT, not the offsets: under
+                    // `RLX_ARENA_NO_REUSE` every slot moves, so only a
+                    // content checksum lines up thunk-for-thunk between the
+                    // two layouts and pins down the first op that diverges.
+                    let h = arena_buf[lo..hi]
+                        .iter()
+                        .fold(0xcbf2_9ce4_8422_2325u64, |a, b| {
+                            (a ^ *b as u64).wrapping_mul(0x1000_0000_01b3)
+                        });
+                    eprintln!(
+                        "[wt {i}] {} wrote [{lo},{hi}) len={} hash={h:016x}",
+                        thunk_kind_name(thunk),
+                        hi - lo
+                    );
+                    wt_before.copy_from_slice(arena_buf);
+                }
+            }
         }
     }
     if profile {

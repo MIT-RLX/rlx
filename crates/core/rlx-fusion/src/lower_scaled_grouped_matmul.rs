@@ -32,6 +32,12 @@ use std::collections::HashMap;
 pub struct LowerScaledGroupedMatMul;
 
 impl Pass for LowerScaledGroupedMatMul {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::ScaledGroupedMatMul]
+    }
+
     fn name(&self) -> &str {
         "lower_scaled_grouped_matmul"
     }

@@ -72,9 +72,12 @@ impl<'a> LowerCtx<'a> {
         let node = self.graph.node(id);
         let shape = node.shape.clone(); // [M, N]
         let in_shape = self.graph.shape(node.inputs[0]).clone();
-        let m = dim_static(&in_shape, in_shape.rank() - 2)?;
-        let k = dim_static(&in_shape, in_shape.rank() - 1)?;
-        let n = dim_static(&shape, shape.rank() - 1)?;
+        // `n` is taken from the declared output; check the expert bank agrees
+        // with it (and with K) rather than letting a `[E, N, K]` bank through.
+        let w_shape = self.graph.shape(node.inputs[1]).clone();
+        let gd = rlx_ir::shape::grouped_matmul_dims(&in_shape, &w_shape, Some(&shape))
+            .map_err(|e| CoremlError::Unsupported(format!("node {id:?}: {e}")))?;
+        let (m, k, n) = (gd.m, gd.k, gd.n);
 
         let input = self.val(node.inputs[0]);
         let weight = self.val(node.inputs[1]);
@@ -106,6 +109,9 @@ impl<'a> LowerCtx<'a> {
                 ("x", bind_name(&weight)),
                 ("indices", bind_name(&eidx_i32)),
                 ("axis", bind_value(scalar_i32(0))),
+                // Required by the iOS17+ MIL opset; the older-opset
+                // post-pass in mod.rs strips it back out when unsupported.
+                ("validate_indices", bind_value(scalar_bool(false))),
             ],
         )?;
         // input [M,K] -> [M,1,K]
@@ -164,8 +170,20 @@ impl<'a> LowerCtx<'a> {
             )));
         }
         let half = last / 2;
+        // `gate_first` swaps the halves: default (false) is `[up | gate]`, true is
+        // `[gate | up]` — what a builder emits when gate_proj precedes up_proj
+        // (DeepSeek / Bailing MoE). Dropping it computes `gate · silu(up)`.
+        let gate_first = matches!(
+            node.op,
+            rlx_ir::Op::FusedSwiGLU {
+                gate_first: true,
+                ..
+            }
+        );
+        let (up_off, gate_off) = if gate_first { (half, 0) } else { (0, half) };
         let x = self.val(node.inputs[0]);
-        let begin_up = vec![0i32; rank];
+        let mut begin_up = vec![0i32; rank];
+        begin_up[rank - 1] = up_off as i32;
         let mut size_up: Vec<i32> = in_shape
             .dims()
             .iter()
@@ -173,7 +191,7 @@ impl<'a> LowerCtx<'a> {
             .collect();
         size_up[rank - 1] = half as i32;
         let mut begin_g = vec![0i32; rank];
-        begin_g[rank - 1] = half as i32;
+        begin_g[rank - 1] = gate_off as i32;
         let size_g = size_up.clone();
         let up = format!("{out_name}_up");
         self.emit(

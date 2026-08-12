@@ -309,6 +309,18 @@ fn lower_gelu_approx_backward(g: &mut Graph, x: NodeId, dy: NodeId, _out_shape: 
 pub struct LowerBackwardOps;
 
 impl Pass for LowerBackwardOps {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[
+            OpKind::ReluBackward,
+            OpKind::ActivationBackward,
+            OpKind::BatchNormInferenceBackwardInput,
+            OpKind::BatchNormInferenceBackwardGamma,
+            OpKind::BatchNormInferenceBackwardBeta,
+        ]
+    }
+
     fn name(&self) -> &str {
         "lower_backward_ops"
     }

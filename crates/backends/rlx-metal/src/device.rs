@@ -4,7 +4,7 @@
 
 //! Metal device discovery + capabilities.
 
-use metal::{CommandQueue, Device, MTLResourceOptions};
+use crate::mtl::{CommandQueue, Device, MTLResourceOptions};
 use std::sync::OnceLock;
 
 /// Detected Metal device properties (read once at startup).
@@ -39,7 +39,7 @@ impl MetalDevice {
 
     /// Allocate a shared (CPU+GPU accessible) buffer. On Apple Silicon
     /// unified memory, this is zero-copy.
-    pub fn alloc_shared(&self, bytes: usize) -> metal::Buffer {
+    pub fn alloc_shared(&self, bytes: usize) -> crate::mtl::Buffer {
         let buf = self
             .device
             .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
@@ -77,7 +77,7 @@ impl MetalDevice {
     }
 
     /// Allocate a private (GPU-only) buffer. Lower latency for GPU access.
-    pub fn alloc_private(&self, bytes: usize) -> metal::Buffer {
+    pub fn alloc_private(&self, bytes: usize) -> crate::mtl::Buffer {
         self.device
             .new_buffer(bytes as u64, MTLResourceOptions::StorageModePrivate)
     }

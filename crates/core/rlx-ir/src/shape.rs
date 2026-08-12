@@ -272,6 +272,90 @@ fn broadcast_dim(a: Dim, b: Dim) -> Result<Dim, String> {
     }
 }
 
+/// Operand dims of a [`crate::op::Op::GroupedMatMul`], as every backend needs
+/// them: `input [.., M, K] · weight[idx[r]] [K, N] → out [M, N]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupedMatMulDims {
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub num_experts: usize,
+}
+
+/// Validate a [`crate::op::Op::GroupedMatMul`]'s operands and derive `(M, K, N, E)`.
+///
+/// The expert bank is `[E, K, N]` — K **second**, N last — which is the
+/// transpose of the `[out, in]` layout checkpoints ship. Getting that backwards
+/// is the classic MoE porting bug and, until this check existed, an entirely
+/// silent one: a bank left in `[E, N, K]` has the right rank and the right
+/// element count, so nothing rejects it. The kernels then read `N` off
+/// `weight.dim(2)` — which is really K — and write `M·K` floats into the `M·N`
+/// slot the planner sized from the declared output shape. When `K < N` that
+/// leaves the tail of every output row holding whatever the arena had (looks
+/// like a non-causal model); when `K > N` it runs off the end of the slot and
+/// corrupts the neighbouring tensor.
+///
+/// So: K must agree between the input and the bank, and — when `out` is given —
+/// the declared output must be `M × N`.
+pub fn grouped_matmul_dims(
+    input: &Shape,
+    weight: &Shape,
+    out: Option<&Shape>,
+) -> Result<GroupedMatMulDims, String> {
+    if input.rank() < 2 {
+        return Err(format!(
+            "GroupedMatMul input must be rank >= 2 ([.., M, K]), got {input}"
+        ));
+    }
+    if weight.rank() != 3 {
+        return Err(format!(
+            "GroupedMatMul expert bank must be rank 3 ([E, K, N]), got {weight}"
+        ));
+    }
+    let statics = |d: Dim, what: &str| match d {
+        Dim::Static(v) => Ok(v),
+        Dim::Dynamic(s) => Err(format!(
+            "GroupedMatMul {what} must be static, got dynamic symbol {s}"
+        )),
+    };
+    let m = statics(input.dim(input.rank() - 2), "M")?;
+    let k = statics(input.dim(input.rank() - 1), "K")?;
+    let num_experts = statics(weight.dim(0), "E")?;
+    let k_w = statics(weight.dim(1), "the bank's K axis")?;
+    let n = statics(weight.dim(2), "N")?;
+
+    if k != k_w {
+        return Err(format!(
+            "GroupedMatMul K mismatch: input is {input} (K={k}) but the expert bank \
+             is {weight} (K={k_w}, N={n}). The bank must be [E, K, N]; a checkpoint \
+             tensor stored [E, N, K] ([out, in], the usual `x @ W.T` layout) has to \
+             be transposed before it reaches this op"
+        ));
+    }
+    if let Some(out) = out {
+        let out_n = statics(out.dim(out.rank().saturating_sub(1)), "the output's N")?;
+        let out_elems = out.num_elements().unwrap_or(0);
+        if out_n != n || out_elems != m * n {
+            return Err(format!(
+                "GroupedMatMul output shape mismatch: declared {out} but the operands \
+                 give [{m}, {n}] (input {input}, bank {weight})"
+            ));
+        }
+    }
+    Ok(GroupedMatMulDims {
+        m,
+        k,
+        n,
+        num_experts,
+    })
+}
+
+/// `[.., M, K]` × `[E, K, N]` → `[M, N]`. See [`grouped_matmul_dims`].
+pub fn grouped_matmul_shape(input: &Shape, weight: &Shape) -> Result<Shape, String> {
+    let d = grouped_matmul_dims(input, weight, None)?;
+    Ok(Shape::new(&[d.m, d.n], input.dtype()))
+}
+
 /// MatMul output shape: `[..,M,K] × [..,K,N] → [..,M,N]`.
 pub fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape, String> {
     if lhs.rank() < 2 || rhs.rank() < 2 {
@@ -945,6 +1029,62 @@ mod tests {
         assert_eq!(s.size_bytes(), Some(4 * 15 * 384 * 4));
         assert!(s.is_static());
         assert_eq!(format!("{s}"), "[4, 15, 384] f32");
+    }
+
+    // ── GroupedMatMul operand checks ─────────────────────────
+
+    #[test]
+    fn grouped_matmul_derives_m_and_n() {
+        let input = Shape::new(&[5, 6], DType::F32);
+        let bank = Shape::new(&[8, 6, 12], DType::F32); // [E, K, N]
+        let d = grouped_matmul_dims(&input, &bank, Some(&Shape::new(&[5, 12], DType::F32)))
+            .expect("valid");
+        assert_eq!(
+            d,
+            GroupedMatMulDims {
+                m: 5,
+                k: 6,
+                n: 12,
+                num_experts: 8
+            }
+        );
+        assert_eq!(
+            grouped_matmul_shape(&input, &bank).unwrap(),
+            Shape::new(&[5, 12], DType::F32)
+        );
+    }
+
+    /// The whole point: a bank still in the checkpoint's `[E, N, K]` order has
+    /// the right rank and element count, so only the K axis gives it away.
+    #[test]
+    fn grouped_matmul_rejects_an_untransposed_bank() {
+        let input = Shape::new(&[5, 6], DType::F32);
+        let bank = Shape::new(&[8, 12, 6], DType::F32); // [E, N, K] — wrong way round
+        let err = grouped_matmul_dims(&input, &bank, None).unwrap_err();
+        assert!(err.contains("K mismatch"), "unhelpful: {err}");
+        assert!(err.contains("[E, N, K]"), "should name the cause: {err}");
+    }
+
+    /// `2·inter == hidden` makes both bank layouts the *same shape*, so the K
+    /// check passes and only the declared output catches it. This is the case
+    /// that silently under-writes half of every output row.
+    #[test]
+    fn grouped_matmul_rejects_a_square_bank_by_output_shape() {
+        let input = Shape::new(&[4, 12, 12], DType::F32);
+        let bank = Shape::new(&[8, 12, 12], DType::F32);
+        // K and N agree, so operand-only validation cannot object…
+        assert!(grouped_matmul_dims(&input, &bank, None).is_ok());
+        // …but a declared output of a different width is still caught.
+        let err = grouped_matmul_dims(&input, &bank, Some(&Shape::new(&[12, 6], DType::F32)))
+            .unwrap_err();
+        assert!(err.contains("output shape mismatch"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn grouped_matmul_rejects_a_non_bank_weight() {
+        let input = Shape::new(&[5, 6], DType::F32);
+        let err = grouped_matmul_dims(&input, &Shape::new(&[6, 12], DType::F32), None).unwrap_err();
+        assert!(err.contains("rank 3"), "unhelpful: {err}");
     }
 
     // ── Shape inference tests ────────────────────────────────

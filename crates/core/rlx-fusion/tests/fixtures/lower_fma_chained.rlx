@@ -1,0 +1,19 @@
+// Two Fmas, the second consuming the first, sharing operand %1.
+// RUN: lower_fma
+graph @chain {
+  %0 = {"Input":{"name":"a"}} : [2] f32
+  %1 = {"Input":{"name":"b"}} : [2] f32
+  %2 = Fma(%0, %1, %1) : [2] f32
+  %3 = Fma(%2, %1, %0) : [2] f32
+  return %3
+}
+// EXPECT
+graph @chain {
+  %0 = {"Input":{"name":"a"}} : [2] f32
+  %1 = {"Input":{"name":"b"}} : [2] f32
+  %2 = {"Binary":"Mul"}(%0, %1) : [2] f32
+  %3 = {"Binary":"Add"}(%2, %1) : [2] f32
+  %4 = {"Binary":"Mul"}(%3, %1) : [2] f32
+  %5 = {"Binary":"Add"}(%4, %0) : [2] f32
+  return %5
+}

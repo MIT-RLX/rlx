@@ -19,14 +19,14 @@ fn main() {}
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use metal::{MTLResourceOptions, MTLSize};
     use rlx_metal::blas::metal_sgemm_f16w_bufs;
+    use rlx_metal::mtl::{MTLResourceOptions, MTLSize};
 
     let dev = rlx_metal::device::metal_device().expect("metal device");
     let device = &dev.device;
-    unsafe fn gpu_secs(cb: &metal::CommandBufferRef) -> f64 {
+    unsafe fn gpu_secs(cb: &rlx_metal::mtl::CommandBufferRef) -> f64 {
         use objc::{msg_send, runtime::Object, sel, sel_impl};
-        let obj = cb as *const metal::CommandBufferRef as *mut Object;
+        let obj = cb as *const rlx_metal::mtl::CommandBufferRef as *mut Object;
         let s: f64 = msg_send![obj, GPUStartTime];
         let e: f64 = msg_send![obj, GPUEndTime];
         (e - s).max(0.0)
@@ -103,7 +103,7 @@ kernel void attn_w8a8(
 }
 "#;
     let lib = device
-        .new_library_with_source(src, &metal::CompileOptions::new())
+        .new_library_with_source(src, &rlx_metal::mtl::CompileOptions::new())
         .expect("msl");
     let mk = |n: &str| {
         device

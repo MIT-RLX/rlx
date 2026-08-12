@@ -43,35 +43,19 @@ use crate::legalize::legalize_for_backend;
 // Not all are "fused" — `LoraMatMul`/`FakeQuantize`/`AxialRope2d` are plain ops
 // whose decomposition lives in `unfuse` and would otherwise never fire on a
 // backend that lacks a native kernel (the op would hard-fail at legalization).
-const FUSED_KINDS: &[OpKind] = &[
-    OpKind::FusedMatMulBiasAct,
-    OpKind::FusedConvBiasAct,
-    OpKind::FusedSwiGLU,
-    OpKind::FusedResidualLN,
-    OpKind::FusedResidualRmsNorm,
-    OpKind::FusedAttentionBlock,
-    OpKind::FusedTransformerLayer,
-    OpKind::GatedDeltaNet,
-    OpKind::Lstm,
-    OpKind::Gru,
-    OpKind::Rnn,
-    OpKind::Mamba2,
-    OpKind::SelectiveScan,
-    OpKind::LoraMatMul,
-    OpKind::PartitionedConv,
-    OpKind::AdaLayerNorm,
-    OpKind::GatedResidual,
-];
+//
+// The membership itself lives in `rlx_ir::capability` as `OpCaps::FUSED`, so a
+// new composite op is classified once, next to every other categorisation,
+// rather than in a list here that nobody thinks to update.
+fn needs_unfuse(kinds: &HashSet<OpKind>) -> bool {
+    kinds.iter().any(|k| k.has(rlx_ir::OpCaps::FUSED))
+}
 
 fn unsupported_kinds(graph: &Graph, supported: &[OpKind]) -> HashSet<OpKind> {
     legalize_for_backend(graph, supported)
         .err()
         .map(|bad| bad.into_iter().map(|(_, k)| k).collect())
         .unwrap_or_default()
-}
-
-fn needs_unfuse(kinds: &HashSet<OpKind>) -> bool {
-    kinds.iter().any(|k| FUSED_KINDS.contains(k))
 }
 
 #[cfg(feature = "training")]
@@ -114,6 +98,37 @@ fn needs_backward_decompose(bad: &HashSet<OpKind>) -> bool {
                 | GatedResidualBackward
         )
     })
+}
+
+/// Run `pass` over `graph` in place, recording whether it *actually* rewrote
+/// anything.
+///
+/// The decomposition loop below dispatches a lowering whenever the offending
+/// `OpKind` is present, but presence does not guarantee progress: a pass can
+/// decline every node it sees (wrong dtype, unsupported configuration, an
+/// already-lowered form). Reporting `changed` from the dispatch decision
+/// rather than the outcome meant such a case spun the loop to its 16-round
+/// cap before giving up. [`Pass::run_with_status`] answers the real question,
+/// so the loop now terminates on the first round that makes no progress —
+/// same final graph, same legalization error, without the wasted rounds.
+fn apply(graph: &mut Graph, changed: &mut bool, pass: &dyn Pass) {
+    let taken = std::mem::replace(graph, Graph::new(""));
+    // Fingerprint-based detection is worth its cost here specifically: a
+    // spurious `changed` keeps this loop rebuilding the whole graph for up to
+    // 16 rounds, which dwarfs two hashes.
+    let result = pass.run_detecting_change(taken);
+    *graph = result.graph;
+    *changed |= result.ir_changed.changed();
+}
+
+/// [`apply`] for the lowerings that are plain functions rather than [`Pass`]
+/// implementations.
+fn apply_fn(graph: &mut Graph, changed: &mut bool, lower: impl FnOnce(Graph) -> Graph) {
+    let taken = std::mem::replace(graph, Graph::new(""));
+    let before = taken.fingerprint();
+    let out = lower(taken);
+    *changed |= out.fingerprint() != before;
+    *graph = out;
 }
 
 /// Copy a node into `out`, preserving its debug `name` and `origin`.
@@ -228,144 +243,122 @@ pub fn rewrite_for_backend_with_config(
         let mut changed = false;
 
         if bad.contains(&OpKind::GroupNorm) {
-            graph = LowerGroupNorm.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerGroupNorm);
         }
         if bad.contains(&OpKind::BatchNormInference) {
-            graph = LowerBatchNormInference.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerBatchNormInference);
         }
         if bad.contains(&OpKind::ResizeNearest2x) {
-            graph = LowerResizeNearest2x.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerResizeNearest2x);
         }
         if bad.contains(&OpKind::Pad) {
             // Every backend except Metal/CUDA (which claim `OpKind::Pad`) lowers
             // pad to full/narrow/reverse/expand/concat here.
-            graph = LowerPad.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerPad);
         }
         if bad.contains(&OpKind::Slice) {
             // Non-native backends lower strided slice to narrow/reverse/gather.
-            graph = LowerSlice.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSlice);
         }
         if bad.contains(&OpKind::AxialRope2d) {
             // Non-native backends lower SAM2 axial 2-D RoPE to a constant-table
             // `gather` + `mul`/`add` (bit-exact vs the CPU kernel).
-            graph = LowerAxialRope2d.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerAxialRope2d);
         }
         if bad.contains(&OpKind::FakeQuantize) {
             // Non-native backends lower PerBatch fake-quant to
             // `round`/`clamp`/`mul` (one canonical `Round` → consistent ties).
-            graph = LowerFakeQuantize.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerFakeQuantize);
         }
         if bad.contains(&OpKind::Clamp)
             || bad.contains(&OpKind::Tile)
             || bad.contains(&OpKind::Trilu)
         {
             // Clamp/Tile/Trilu decompose to max/min, concat, mul-by-mask.
-            graph = LowerStructural.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerStructural);
         }
         if bad.contains(&OpKind::CumProd) || bad.contains(&OpKind::CumMax) {
             // CumProd/CumMax decompose to a masked reduce over an inserted
             // query axis (CPU/Metal/CUDA claim them natively).
-            graph = LowerCumulative.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerCumulative);
         }
         if bad.contains(&OpKind::Histogram) {
             // Only CPU claims Histogram natively; everywhere else it decomposes
             // to Compare + mul + Reduce::Sum + Concat.
-            graph = LowerHistogram.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerHistogram);
         }
         if bad.contains(&OpKind::DotGeneral) {
-            graph = LowerDotGeneral.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerDotGeneral);
         }
         if bad.contains(&OpKind::ScaledGroupedMatMul) {
             // Backends without a native FP4-grouped kernel decompose to
             // ScaledDequantize (both operands) + Transpose + GroupedMatMul
             // (+ per-expert bias gather/add). Runs on every backend that
             // supports the portable GroupedMatMul segmented GEMM.
-            graph = LowerScaledGroupedMatMul.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerScaledGroupedMatMul);
         }
         if bad.contains(&OpKind::SynthMatMul) {
             // Backends without a native codebook-synthesis kernel decompose to
             // Cast + Reshape + Gather (reconstruct the dense weight) + Transpose
             // + MatMul. Runs on every backend with the portable MatMul.
-            graph = LowerSynthMatMul.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSynthMatMul);
         }
         if bad.contains(&OpKind::SynthMatMulBackward) {
             // Backends without the fused synth-backward kernel decompose it to the
             // same primitives the generic VJP used to emit (Gather + MatMul +
             // Transpose + ScatterAdd) — bit-identical, runs everywhere.
-            graph = LowerSynthMatMulBackward.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSynthMatMulBackward);
         }
         if bad.contains(&OpKind::SynthReconstruct) {
-            graph = LowerSynthReconstruct.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSynthReconstruct);
         }
         if bad.contains(&OpKind::SplineActivation) {
             // Backends without a native KAN spline kernel decompose to the RBF
             // basis expansion (Reshape/Expand/Sub/Mul/Exp) + ReduceSum. All-f32,
             // so this runs on GPU backends too.
-            graph = LowerSplineActivation.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSplineActivation);
         }
         if bad.contains(&OpKind::SplineActivationBackwardX)
             || bad.contains(&OpKind::SplineActivationBackwardCoeff)
         {
             // Backends without the fused KAN spline-backward kernels decompose to
             // the same RBF basis + contraction the generic VJP used to emit.
-            graph = LowerSplineActivationBackward.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSplineActivationBackward);
         }
         if bad.contains(&OpKind::Fma) {
             // Backends without a native single-rounding FMA fall back to
             // mul+add (two roundings — loses the compensated-arithmetic benefit).
-            graph = LowerFma.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerFma);
         }
         if bad.contains(&OpKind::If) || bad.contains(&OpKind::While) {
-            graph = LowerControlFlow.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerControlFlow);
         }
         if bad.contains(&OpKind::ReEig) || bad.contains(&OpKind::LogEig) {
             // A backend that doesn't even claim the f64 host-fallback for ReEig/
             // LogEig: lower f32 nodes to the Jacobi eigensolver (f64 nodes remain
             // and will surface as a clear legalize error — f64 SPD needs CPU).
-            graph = LowerSpectral.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSpectral);
         }
         if bad.contains(&OpKind::Scan) {
             // Backends without a native scan (HLO/codegen: TPU, QNN, Cerebras,
             // WebGL) get Op::Scan unrolled into inlined body replicas. Backends
             // that list `Scan` in their supported set keep it and host-fallback.
-            graph = LowerScan.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerScan);
         }
         if bad.contains(&OpKind::ElementwiseRegion) {
-            graph = UnfuseElementwiseRegions::FOR_CPU.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &UnfuseElementwiseRegions::FOR_CPU);
         }
         if bad.contains(&OpKind::SoftmaxCrossEntropy)
             || bad.contains(&OpKind::SoftmaxCrossEntropyWithLogits)
             || bad.contains(&OpKind::SoftmaxCrossEntropyBackward)
         {
-            graph = LowerSoftmaxCrossEntropy.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerSoftmaxCrossEntropy);
         }
         #[cfg(feature = "training")]
         if needs_backward_decompose(&bad) {
-            graph = rlx_autodiff::decompose_backward_ops_except(graph, supported);
-            changed = true;
+            apply_fn(&mut graph, &mut changed, |g| {
+                rlx_autodiff::decompose_backward_ops_except(g, supported)
+            });
         }
         if bad.contains(&OpKind::ReluBackward)
             || bad.contains(&OpKind::ActivationBackward)
@@ -373,8 +366,7 @@ pub fn rewrite_for_backend_with_config(
             || bad.contains(&OpKind::BatchNormInferenceBackwardGamma)
             || bad.contains(&OpKind::BatchNormInferenceBackwardBeta)
         {
-            graph = LowerBackwardOps.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerBackwardOps);
         }
         if bad.contains(&OpKind::Reduce)
             || graph.nodes().iter().any(|n| {
@@ -384,12 +376,10 @@ pub fn rewrite_for_backend_with_config(
                 })
             })
         {
-            graph = LowerNonLastAxisReduce.run(graph);
-            changed = true;
+            apply(&mut graph, &mut changed, &LowerNonLastAxisReduce);
         }
         if needs_unfuse(&bad) {
-            graph = unfuse_fused_for_autodiff(graph);
-            changed = true;
+            apply_fn(&mut graph, &mut changed, unfuse_fused_for_autodiff);
         }
 
         if !changed {

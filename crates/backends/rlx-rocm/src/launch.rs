@@ -31,13 +31,13 @@ macro_rules! launch_kernel {
         let mut params: Vec<*mut c_void> = vec![
             $( $arg as *const _ as *mut c_void, )*
         ];
-        let params_ptr = if params.is_empty() {
-            core::ptr::null_mut()
-        } else {
-            params.as_mut_ptr()
-        };
+        // Slice form: the arity is checked against the kernel's own
+        // `__global__` signature under `RLX_GPU_VALIDATE_PARAMS=1`. This macro
+        // is where most launches funnel through, so it is the highest-value
+        // place for that check — a count mismatch here is invisible to HIP and
+        // has already shipped once (see `gguf_gpu::launch_dequant_gguf`).
         let _result = unsafe {
-            kernel.launch(stream, grid, block, 0, params_ptr)
+            kernel.launch_checked(stream, grid, block, 0, &mut params)
         };
         // Errors swallowed silently for parity with cudarc's
         // launch_builder — surface via dispatch-time assertions.

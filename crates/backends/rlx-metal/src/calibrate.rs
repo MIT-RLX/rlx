@@ -83,8 +83,9 @@ impl Calibration {
             // Warmup (kernels JIT on first dispatch)
             {
                 let cb = dev.queue.new_command_buffer();
-                let enc =
-                    cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+                let enc = cb.compute_command_encoder_with_dispatch_type(
+                    crate::mtl::MTLDispatchType::Serial,
+                );
                 for _ in 0..2 {
                     metal_sgemm(enc, &buffer, a_off, b_off, c_off, m, k, n);
                 }
@@ -97,7 +98,8 @@ impl Calibration {
             // 50 iterations × ~50µs compute = ~2.5ms, dwarfing dispatch.
             let n_iter = 50;
             let cb = dev.queue.new_command_buffer();
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+            let enc =
+                cb.compute_command_encoder_with_dispatch_type(crate::mtl::MTLDispatchType::Serial);
             let t0 = Tick::now();
             for _ in 0..n_iter {
                 metal_sgemm(enc, &buffer, a_off, b_off, c_off, m, k, n);

@@ -166,10 +166,49 @@ pub fn sync_reshape_ops(graph: &mut Graph) {
 }
 
 /// Recompute all inferrable output shapes after binding (propagates concat fixes).
+///
+/// Refining a shape is the point of this pass, but *replacing* a fully-static
+/// declaration with a different fully-static one is not a refinement — it is the
+/// graph telling us two incompatible things, and the planner has already sized
+/// arena slots from the declaration. Silently taking the inferred side is how a
+/// mis-shaped `GroupedMatMul` bank (`[E, N, K]` for `[E, K, N]`) used to sail
+/// through: the check in each backend's lowering compares the declared shape
+/// against the operands, so rewriting the declaration first makes that check
+/// compare a value with itself. In debug the IR verifier caught it; release
+/// builds — the ones that ship — had no guard at all.
+///
+/// So: refine freely where the declaration was dynamic or absent, and reject a
+/// static-vs-static contradiction — comparing only the non-unit extents, because
+/// `[]` and `[1]` are the same scalar and the graph uses both spellings
+/// interchangeably (a rank-0 `Reduce` result feeding a rank-1 consumer). Across
+/// the workspace suite that distinction is the whole story: comparing raw dims
+/// flags 20 of these harmless scalar-rank pairs for every real conflict.
 pub fn sync_graph_shapes(graph: &mut Graph) {
+    // Extents that actually address memory — unit axes carry no elements, so
+    // they cannot be the difference between a correct and an overrunning kernel.
+    fn extents(s: &Shape) -> Vec<usize> {
+        s.dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .filter(|&v| v != 1)
+            .collect()
+    }
     let nodes = graph.nodes().to_vec();
     for node in &nodes {
         if let Some(shape) = crate::infer_shape::infer_output_shape(graph, node) {
+            if node.shape.is_static()
+                && shape.is_static()
+                && extents(&node.shape) != extents(&shape)
+            {
+                panic!(
+                    "rlx-ir: node {:?} ({:?}) output shape mismatch: declares {} but its \
+                     operands give {}. These disagree and both are static, so this is a \
+                     malformed graph, not a shape that needs refining — the arena is sized \
+                     from the declaration while kernels read their extents from the operands, \
+                     so letting it through under- or over-writes the output slot",
+                    node.id, node.op, node.shape, shape
+                );
+            }
             graph.node_mut(node.id).shape = shape;
         }
     }

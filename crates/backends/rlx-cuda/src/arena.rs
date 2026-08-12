@@ -17,7 +17,7 @@
 //! the bandwidth-sensitive softmax / norm / residual paths.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -63,6 +63,15 @@ pub struct Arena {
     pub half_by_f32_off: HashMap<u32, (usize, HalfDtype)>,
     /// Total half-buffer size in u16 elements.
     pub half_size: usize,
+
+    /// Present when this arena is backed by a CUDA virtual-memory range whose
+    /// front is the device-wide shared parameter region ([`crate::vmem`]).
+    /// `buffer` is then a *view* over mapped memory, not an owned allocation —
+    /// `Drop` must leak the `CudaSlice` and let this unmap instead.
+    pub vmem: Option<crate::vmem::VirtualArena>,
+    /// Param nodes whose bytes another executable already uploaded into the
+    /// shared region. `set_param` skips these — that skip IS the dedup.
+    pub shared_skip_upload: HashSet<NodeId>,
 }
 
 static F32_ARENA_POOL: OnceLock<Mutex<Vec<(usize, CudaSlice<f32>)>>> = OnceLock::new();
@@ -347,16 +356,55 @@ pub(crate) fn cast_is_kernel(graph: &Graph, node: &rlx_ir::Node) -> bool {
     }
 }
 
-/// A view (arena-aliased, no kernel): Reshape / StopGradient always, and Cast
-/// only when it is an identity relabel. float→int / →Bool casts get their own
-/// slot (see [`cast_is_kernel`]).
+/// Arena-**aliased**: the node shares its first input's slot instead of getting a
+/// fresh one. Reshape / StopGradient always, and Cast only when it is an identity
+/// relabel. float→int / →Bool casts get their own slot (see [`cast_is_kernel`]).
+///
+/// NOTE: aliasing is not the same as "no kernel". Reshape / StopGradient / identity
+/// Cast are both aliased AND no-ops, but [`Op::KvAppend`] is aliased and still
+/// encodes a `Step::KvAppend` row write — that is the whole point of the op (grow
+/// the cache in place). This mirrors the shared planner's split between
+/// `pure_view_offset` (aliases KvAppend) and `rlx_opt::is_pure_view` (excludes it
+/// from the backend Nop predicate) in `rlx-compile/src/memory.rs`. Leaving
+/// KvAppend out here silently gave its output a fresh, uninitialised slot, so the
+/// one written row landed in a buffer whose other rows were garbage.
 #[inline]
 fn is_arena_view(graph: &Graph, node: &rlx_ir::Node) -> bool {
     match &node.op {
-        Op::Reshape { .. } | Op::StopGradient => true,
+        Op::Reshape { .. } | Op::StopGradient | Op::KvAppend { .. } => true,
         Op::Cast { .. } => !cast_is_kernel(graph, node),
         _ => false,
     }
+}
+
+/// Nodes that reach one of `roots` through a pure view chain (Reshape /
+/// StopGradient / identity Cast), mapped to the root they alias.
+///
+/// The shared-parameter path needs this: hoisting a `Op::Param` out of the arena
+/// plan also orphans every view of it, because the planner's alias pass resolves
+/// views by looking their root up in `assignments`. `Op::KvAppend` is
+/// deliberately NOT followed here — it aliases its input but *writes* to it, so
+/// it must never be folded onto shared, read-only parameter storage.
+pub fn view_alias_closure(graph: &Graph, roots: &HashSet<NodeId>) -> HashMap<NodeId, NodeId> {
+    let mut root_of: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut out = HashMap::new();
+    for node in graph.nodes() {
+        let is_view = matches!(&node.op, Op::Reshape { .. } | Op::StopGradient)
+            || matches!(&node.op, Op::Cast { .. } if !cast_is_kernel(graph, node));
+        let r = if is_view {
+            match node.inputs.first() {
+                Some(in_id) => *root_of.get(in_id).unwrap_or(in_id),
+                None => node.id,
+            }
+        } else {
+            node.id
+        };
+        root_of.insert(node.id, r);
+        if r != node.id && roots.contains(&r) {
+            out.insert(node.id, r);
+        }
+    }
+    out
 }
 
 /// Same f32-uniform layout as rlx-wgpu (every tensor is f32; Reshape/Cast/
@@ -377,6 +425,19 @@ fn is_arena_view(graph: &Graph, node: &rlx_ir::Node) -> bool {
 /// consumer keeps the underlying buffer alive. Set `RLX_CUDA_ARENA_NO_REUSE=1` to
 /// fall back to the old unique-slot-per-node behaviour.
 pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
+    plan_f32_uniform_excluding(graph, align, &HashSet::new())
+}
+
+/// Same planner, but `exclude`d nodes get NO slot in this arena — their storage
+/// lives elsewhere. Used by the shared-parameter path ([`crate::vmem`]): params
+/// are hoisted into a device-wide region mapped in front of every arena, so
+/// leaving their slots here would waste exactly the bytes we set out to save.
+/// The caller must supply offsets for every excluded node.
+pub fn plan_f32_uniform_excluding(
+    graph: &Graph,
+    align: usize,
+    exclude: &HashSet<NodeId>,
+) -> MemoryPlan {
     let align = align.max(1);
     let nodes = graph.nodes();
     let n = nodes.len();
@@ -461,7 +522,7 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     }
     let mut bufs: Vec<Buf> = Vec::new();
     for node in nodes {
-        if root(node.id) != node.id {
+        if root(node.id) != node.id || exclude.contains(&node.id) {
             continue;
         }
         // A float→int / →Bool Cast writes f32 lanes via the unary kernel, so its
@@ -714,7 +775,7 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     // dedicated aligned byte at the end of the arena (LuxTTS fm_decoder panic).
     let mut orphan_off = arena_size.div_ceil(align) * align;
     for node in nodes {
-        if assignments.contains_key(&node.id) {
+        if assignments.contains_key(&node.id) || exclude.contains(&node.id) {
             continue;
         }
         let size = arena_slot_bytes(node, align).max(align);
@@ -755,7 +816,67 @@ impl Arena {
             half_offsets: HashMap::new(),
             half_by_f32_off: HashMap::new(),
             half_size: 0,
+            vmem: None,
+            shared_skip_upload: HashSet::new(),
         }
+    }
+
+    /// Arena backed by a shared-parameter VMM range: the device-wide param
+    /// region is mapped at the front and this executable's activations follow.
+    ///
+    /// `param_offsets` are byte offsets *within the region* (identical across
+    /// executables); planner offsets are relative and get shifted by `act_base`.
+    pub fn from_plan_vmem(
+        ctx: &Arc<CudaContext>,
+        plan: &MemoryPlan,
+        snap: &crate::vmem::RegionSnapshot,
+        param_offsets: &HashMap<NodeId, (usize, usize)>,
+        skip_upload: HashSet<NodeId>,
+    ) -> Result<Self, cudarc::driver::sys::CUresult> {
+        let va = crate::vmem::VirtualArena::new(ctx.cu_device(), snap, plan.arena_size)?;
+        let act_base = va.act_base;
+        let total = va.total_bytes();
+        let mut buffer = unsafe {
+            ctx.default_stream()
+                .upgrade_device_ptr::<f32>(va.device_ptr(), total / 4)
+        };
+        // Zero ONLY the activation half. The param region is shared, so zeroing
+        // it here would wipe weights another executable already uploaded.
+        if zero_arena_enabled() && total > act_base {
+            let mut acts = buffer.slice_mut(act_base / 4..total / 4);
+            let _ = ctx.default_stream().memset_zeros(&mut acts);
+        }
+        let mut offsets = HashMap::new();
+        let mut lens = HashMap::new();
+        for (id, slot) in &plan.assignments {
+            offsets.insert(*id, act_base + slot.offset);
+            lens.insert(*id, slot.size);
+        }
+        for (id, (off, len)) in param_offsets {
+            offsets.insert(*id, *off);
+            lens.insert(*id, *len);
+        }
+        Ok(Self {
+            buffer: ManuallyDrop::new(buffer),
+            offsets,
+            lens,
+            size: total,
+            half_buffer: None,
+            half_offsets: HashMap::new(),
+            half_by_f32_off: HashMap::new(),
+            half_size: 0,
+            vmem: Some(va),
+            shared_skip_upload: skip_upload,
+        })
+    }
+
+    /// Byte offset at which this arena's ACTIVATION space begins. Non-zero only
+    /// for a shared-param arena, where the device-wide parameter region is
+    /// mapped in front. Anything that computes a raw arena offset from
+    /// `MemoryPlan::arena_size` (the scratch regions in `backend/compile.rs`)
+    /// must add this.
+    pub fn act_base(&self) -> usize {
+        self.vmem.as_ref().map_or(0, |v| v.act_base)
     }
 
     pub fn has(&self, id: NodeId) -> bool {
@@ -880,8 +1001,18 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        let cap_f32 = self.size.div_ceil(4).max(4);
         let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
+        if self.vmem.is_some() {
+            // VMM-backed: `buffer` is a view over a mapped range, not an owned
+            // allocation — freeing it would be wrong, and pooling it would hand
+            // a stale mapping to the next graph. `leak` waits on pending work
+            // and drops ownership; the `vmem` field then unmaps and frees the
+            // reservation. Shared param pages survive: the region still holds
+            // their handles.
+            let _ = buffer.leak();
+            return;
+        }
+        let cap_f32 = self.size.div_ceil(4).max(4);
         pool_release_f32(cap_f32, buffer);
     }
 }

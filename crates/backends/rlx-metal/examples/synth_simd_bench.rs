@@ -7,14 +7,26 @@
 //! W, no W DRAM read) vs the decompose path (GPU reconstruct → MPS sgemm).
 //! `y = x[m,k] · Ŵ[k,n]`, Ŵ[p,j] = codebook[indices[j, p/d]][p%d]. All f32.
 
-use metal::MTLSize;
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("Metal only on macOS");
+}
+
+#[cfg(target_os = "macos")]
 use rlx_metal::device::metal_device;
+#[cfg(target_os = "macos")]
 use rlx_metal::mps_blas::encode_mps_sgemm_t;
+#[cfg(target_os = "macos")]
+use rlx_metal::mtl::MTLSize;
+#[cfg(target_os = "macos")]
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
 const D: usize = 4;
+#[cfg(target_os = "macos")]
 const NE: usize = 256;
 
+#[cfg(target_os = "macos")]
 const KSRC: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -134,13 +146,14 @@ kernel void synth_matmul_simd_rb(
 }
 "#;
 
+#[cfg(target_os = "macos")]
 fn main() {
     let dev = metal_device().expect("no Metal device");
     let k = rlx_metal::kernels::kernels();
     println!("device: {}\n", dev.name);
     let lib = dev
         .device
-        .new_library_with_source(KSRC, &metal::CompileOptions::new())
+        .new_library_with_source(KSRC, &rlx_metal::mtl::CompileOptions::new())
         .expect("compile");
     let func = lib.get_function("synth_matmul_simd", None).unwrap();
     let simd_pso = dev
@@ -224,8 +237,10 @@ fn main() {
         };
 
         // ── (1) fused reconstruct-in-tile simdgroup GEMM (one dispatch) ──
-        let enc_simd = |cb: &metal::CommandBufferRef| {
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+        let enc_simd = |cb: &rlx_metal::mtl::CommandBufferRef| {
+            let enc = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             enc.set_compute_pipeline_state(&simd_pso);
             enc.set_buffer(0, Some(&buf), x_o as u64);
             enc.set_buffer(1, Some(&buf), idx_o as u64);
@@ -252,8 +267,10 @@ fn main() {
         let simd_err = maxerr(dst_o);
 
         // ── (1b) register-blocked (64×64 tile, 2×2 accumulators/simdgroup) ──
-        let enc_rb = |cb: &metal::CommandBufferRef| {
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+        let enc_rb = |cb: &rlx_metal::mtl::CommandBufferRef| {
+            let enc = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             enc.set_compute_pipeline_state(&rb_pso);
             enc.set_buffer(0, Some(&buf), x_o as u64);
             enc.set_buffer(1, Some(&buf), idx_o as u64);
@@ -281,8 +298,10 @@ fn main() {
 
         // ── (2) decompose: GPU reconstruct Ŵᵀ[n,k] → scratch, then MPS sgemm
         //        (transposeRight so x·(Ŵᵀ)ᵀ = x·Ŵ). ──
-        let enc_dec = |cb: &metal::CommandBufferRef| {
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+        let enc_dec = |cb: &rlx_metal::mtl::CommandBufferRef| {
+            let enc = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             enc.set_compute_pipeline_state(&k.synth_reconstruct);
             enc.set_buffer(0, Some(&buf), 0);
             for (i, v) in [idx_o as u64, cb_o as u64, w_o as u64].iter().enumerate() {
@@ -344,11 +363,12 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn time(
     dev: &rlx_metal::device::MetalDevice,
     warm: usize,
     n: usize,
-    enc: impl Fn(&metal::CommandBufferRef),
+    enc: impl Fn(&rlx_metal::mtl::CommandBufferRef),
 ) -> f64 {
     for _ in 0..warm {
         let cb = dev.queue.new_command_buffer();

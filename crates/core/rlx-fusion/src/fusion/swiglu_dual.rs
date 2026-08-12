@@ -6,7 +6,8 @@
 
 #![allow(unused_imports)]
 
-use crate::pass::Pass;
+use crate::analysis::{AnalysisManager, LazyUseCounts, OpKindIndex, UseCounts};
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ use crate::graph_rewrite::Rewriter;
 // ── Pass 1: MatMul + Bias + Activation → FusedMatMulBiasAct ─────────────
 
 use super::*;
+use rlx_ir::OpKind;
 
 /// Fuses the common LLM FFN pattern in one rewrite:
 ///   gate = matmul(x, wg); up = matmul(x, wu); out = mul(silu(gate), up)
@@ -33,6 +35,7 @@ pub struct FuseSwiGLUDualMatmul;
 impl FuseSwiGLUDualMatmul {
     fn match_dual_swiglu(
         graph: &Graph,
+        uses: &LazyUseCounts,
         mul_node: &Node,
     ) -> Option<(NodeId, NodeId, NodeId, NodeId, NodeId)> {
         if !matches!(mul_node.op, Op::Binary(BinaryOp::Mul)) {
@@ -57,25 +60,29 @@ impl FuseSwiGLUDualMatmul {
         if up_mm.inputs[0] != gate_mm.inputs[0] {
             return None;
         }
-        if graph.use_count(silu_id) != 1 {
+        if uses.use_count(silu_id) != 1 {
             return None;
         }
         Some((mul_node.id, gate_mm.id, up_mm.id, up_mm.inputs[0], silu_id))
     }
 }
 
-impl Pass for FuseSwiGLUDualMatmul {
-    fn name(&self) -> &str {
-        "fuse_swiglu_dual_matmul"
-    }
+impl FuseSwiGLUDualMatmul {
+    /// The pass body, parameterised over where its use-counts come from.
+    ///
+    /// `shared` carries the pipeline-wide relation when one is cached, so a
+    /// run of ~20 fusion passes builds it once rather than once per pass.
+    /// `None` falls back to a deferred per-pass build, which is what a direct
+    /// `pass.run(graph)` call gets.
+    fn fuse_with(&self, graph: Graph, shared: Option<&UseCounts>) -> PassResult {
+        let uses = LazyUseCounts::from_shared(shared, &graph);
 
-    fn run(&self, graph: Graph) -> Graph {
         let mut matches: Vec<(NodeId, NodeId, NodeId, NodeId, NodeId)> = Vec::new();
         let mut consumed: HashMap<NodeId, ()> = HashMap::new();
 
         for node in graph.nodes() {
             if let Some((mul_id, gate_mm, up_mm, _, silu_id)) =
-                Self::match_dual_swiglu(&graph, node)
+                Self::match_dual_swiglu(&graph, &uses, node)
             {
                 matches.push((mul_id, gate_mm, up_mm, graph.node(up_mm).inputs[0], silu_id));
                 consumed.insert(gate_mm, ());
@@ -85,7 +92,7 @@ impl Pass for FuseSwiGLUDualMatmul {
         }
 
         if matches.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         let match_by_mul: HashMap<NodeId, (NodeId, NodeId, NodeId)> = matches
@@ -137,7 +144,40 @@ impl Pass for FuseSwiGLUDualMatmul {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
+    }
+}
+
+impl Pass for FuseSwiGLUDualMatmul {
+    // Required by construction: both the up and gate branches must be MatMuls.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::MatMul]
+    }
+
+    fn name(&self) -> &str {
+        "fuse_swiglu_dual_matmul"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        self.fuse_with(graph, None).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
+        if !self.can_fire(&graph) {
+            return PassResult::unchanged(graph);
+        }
+        self.fuse_with(graph, None)
+    }
+
+    fn run_with_analyses(&self, graph: Graph, analyses: &mut AnalysisManager) -> PassResult {
+        // Answer the trigger check from the shared op-kind index first: a pass
+        // whose anchor op is absent must not even pay for the use relation.
+        let triggers = self.trigger_kinds();
+        if !triggers.is_empty() && !analyses.get::<OpKindIndex>(&graph).contains_any(triggers) {
+            return PassResult::unchanged(graph);
+        }
+        let shared = analyses.get::<UseCounts>(&graph);
+        self.fuse_with(graph, Some(shared))
     }
 }
 

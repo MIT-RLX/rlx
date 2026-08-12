@@ -11,7 +11,7 @@
 use crate::cost::{SgemmVariant, hw_model};
 use crate::device::metal_device;
 use crate::kernels::kernels;
-use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+use crate::mtl::{Buffer, ComputeCommandEncoderRef, MTLSize};
 
 fn dispatch_sgemm_variant(enc: &ComputeCommandEncoderRef, m: usize, k: usize, n: usize) {
     let kk = kernels();
@@ -219,6 +219,31 @@ pub fn metal_sgemm_bufs(
         std::mem::size_of::<u32>() as u64,
         &n_u as *const _ as *const _,
     );
+    // Decode GEMV: one thread per output column leaves only N threads in flight,
+    // which does not saturate bandwidth. Route to the deterministic K-split kernel
+    // (threadgroup reduction, not the atomic-accumulate Simd64SplitK). Mirrors the
+    // f16 gate above. `RLX_METAL_GEMV_SPLITK=0` opts out.
+    if m == 1 && n >= 64 && rlx_ir::env::var("RLX_METAL_GEMV_SPLITK").as_deref() != Some("0") {
+        const KSPLIT: u64 = 32;
+        let kk = kernels();
+        enc.set_compute_pipeline_state(&kk.gemv_f32_splitk);
+        // Buffers 0-2 are bound above; this kernel takes K,N at 3,4 (no M).
+        enc.set_bytes(3, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &n_u as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: (n as u64).div_ceil(32),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: KSPLIT,
+                depth: 1,
+            },
+        );
+        return;
+    }
     // Split-K needs a pre-zeroed C (atomic accumulate) + a 3D grid + the split
     // count — handle it here where we hold the C buffer; other variants dispatch
     // straight through. pick_sgemm only returns SplitK when ksplits >= 4.
@@ -867,7 +892,7 @@ pub fn metal_hgemm_bias(
 }
 
 /// Helper: create a new command buffer from the global queue.
-pub fn new_command_buffer() -> metal::CommandBuffer {
+pub fn new_command_buffer() -> crate::mtl::CommandBuffer {
     let dev = metal_device().expect("Metal device required");
     dev.queue.new_command_buffer().to_owned()
 }

@@ -6,7 +6,7 @@
 
 use crate::fusion_fragment::{prologue_for_transform_op, transform_chain_eligible};
 use crate::graph_rewrite::Rewriter;
-use crate::pass::Pass;
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::{Graph, NodeId, Op, Shape};
 use std::collections::HashMap;
@@ -107,6 +107,10 @@ impl Pass for MarkTransformRegions {
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         let consumers = consumer_counts(&graph);
         let mut chain_members: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
 
@@ -138,7 +142,7 @@ impl Pass for MarkTransformRegions {
         }
 
         if chain_members.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
@@ -175,7 +179,7 @@ impl Pass for MarkTransformRegions {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }
 
@@ -267,6 +271,10 @@ impl Pass for FuseRegionPrologue {
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         let consumers = consumer_counts(&graph);
         let mut rw = Rewriter::new(&graph.name);
         let mut fused_resize: HashMap<NodeId, ()> = HashMap::new();
@@ -355,7 +363,7 @@ impl Pass for FuseRegionPrologue {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }
 
@@ -453,6 +461,10 @@ impl Pass for MarkBatchSliceRegions {
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         let consumers = consumer_counts(&graph);
         let mut rewrites: Vec<(NodeId, NodeId, Vec<ChainStep>)> = Vec::new();
 
@@ -520,7 +532,7 @@ impl Pass for MarkBatchSliceRegions {
         }
 
         if rewrites.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         let mut rw = Rewriter::new(&graph.name);
@@ -550,7 +562,7 @@ impl Pass for MarkBatchSliceRegions {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }
 
@@ -571,6 +583,10 @@ impl Pass for FuseBatchPreprocess {
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         let mut groups: HashMap<RegionSignature, Vec<NodeId>> = HashMap::new();
         for node in graph.nodes() {
             if let Some(sig) = region_signature(&node.op) {
@@ -608,7 +624,7 @@ impl Pass for FuseBatchPreprocess {
         }
 
         if batch_groups.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
@@ -668,7 +684,7 @@ impl Pass for FuseBatchPreprocess {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }
 
@@ -681,6 +697,10 @@ impl Pass for DecomposeFusionRegions {
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         let any = graph.nodes().iter().any(|n| {
             matches!(
                 n.op,
@@ -688,7 +708,7 @@ impl Pass for DecomposeFusionRegions {
             )
         });
         if !any {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         let mut rw = Rewriter::new(&graph.name);
@@ -792,7 +812,7 @@ impl Pass for DecomposeFusionRegions {
                 }
             }
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }
 

@@ -45,7 +45,7 @@ fn launch_dequant_gguf(
     ];
     unsafe {
         kernel
-            .launch(stream, (grid, 1, 1), (block, 1, 1), 0, params.as_mut_ptr())
+            .launch_checked(stream, (grid, 1, 1), (block, 1, 1), 0, &mut params)
             .expect("rlx-rocm: dequant_gguf launch failed");
     }
 }
@@ -85,6 +85,54 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
 }
 
 /// Launch `dequant_gguf` into arena scratch, then `C = X @ W^T` via hipBLAS.
+/// Whether the fused `m == 1` GEMV covers this scheme — mirrors rlx-cuda's
+/// `gguf_fused_gemv_m1_supported`. Q4_K only for now (scheme id 0), which is the
+/// bulk of a K-quant checkpoint; everything else keeps the dequant-to-scratch
+/// path.
+pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool {
+    m == 1 && scheme_id == 0 && k.is_multiple_of(256)
+}
+
+/// Fused GGUF Q4_K GEMV: one CTA per output row, reading the packed weight
+/// directly — no f32 scratch, so it avoids ~4x the checkpoint in scratch traffic
+/// per token. Uses the SAME shared kernel as rlx-cuda.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn run_dequant_matmul_gguf_gemv_m1(
+    ctx: &Arc<RocmContext>,
+    stream: crate::hip::HipStream,
+    buffer: &HipBuffer<f32>,
+    n: usize,
+    k: usize,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) {
+    use core::ffi::c_void;
+    let kernel = crate::kernels::dequant_matmul_gguf_q4k_gemv_kernel(ctx);
+    let mut dev = buffer.ptr;
+    let n_u = n as u64;
+    let k_u = k as u64;
+    let x_u = (x_byte_off / 4) as u64;
+    let w_u = w_byte_off as u64;
+    let out_u = (out_byte_off / 4) as u64;
+    let mut params: [*mut c_void; 6] = [
+        &mut dev as *mut _ as *mut c_void,
+        &n_u as *const _ as *mut c_void,
+        &k_u as *const _ as *mut c_void,
+        &x_u as *const _ as *mut c_void,
+        &w_u as *const _ as *mut c_void,
+        &out_u as *const _ as *mut c_void,
+    ];
+    // One block per output row; 128 threads split the k/256 super-blocks.
+    unsafe {
+        kernel
+            .launch_checked(stream, (n as u32, 1, 1), (128, 1, 1), 0, &mut params)
+            .expect("rlx-rocm: dequant_matmul_gguf_q4k_gemv launch failed");
+    }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // stream is opaque; we only pass it to FFI
 pub fn run_dequant_matmul_gguf_gpu(
     ctx: &Arc<RocmContext>,
     stream: crate::hip::HipStream,
@@ -123,17 +171,45 @@ pub fn run_dequant_matmul_gguf_gpu(
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
     let blas = blas.lock().unwrap();
+    // Bind hipBLAS to the SAME stream the dequant kernel above was launched on.
+    //
+    // Without this the gemm runs on whatever stream the handle was created
+    // against, so it can read `scratch` BEFORE `launch_dequant_gguf` has written
+    // it — and the arena is zero-initialized, so the model silently produces
+    // exactly 0.0 for every logit instead of failing. That is what
+    // Muse-Glimmer-30B did on an MI100 while `muse_glimmer_arch` (F32, no
+    // dequant) passed 6/6, which is what localized it here.
+    //
+    // `run.rs` already does this for its own gemm path (`blas.set_stream`);
+    // this file was the one that never did. SAFETY: `stream` belongs to this
+    // context and we hold the `HipblasContext` lock, per `set_stream`'s docs.
+    unsafe {
+        let _ = blas.set_stream(stream);
+    }
+    // The GGUF dequant kernel writes the weight as **`[n, k]` row-major**
+    // (see the header of `matmul_bt.cu`: "B is stored row-major as [n,k]
+    // (GGUF dequant layout)") — which is why every CUDA GGUF path goes
+    // through `run_matmul_bt`, a B-transposed matmul.
+    //
+    // hipBLAS is column-major, so a row-major `[n,k]` weight is a
+    // column-major `[k,n]` with `lda = k`, and recovering `[n,k]` needs
+    // `op(A) = T`. Passing `N` with `lda = n` instead reinterprets the
+    // weight as `[k,n]` and silently computes against a transposed matrix.
+    //
+    // NOTE this is *not* the same as the MxFp4x2 path below, which uses
+    // `sgemm(N, N)` correctly because its dequant kernel really does emit
+    // `[k, n]`.
     let result = unsafe {
         (blas.runtime.sgemm)(
             blas.handle,
-            HipblasOperation::N,
+            HipblasOperation::T,
             HipblasOperation::N,
             n as i32,
             m as i32,
             k as i32,
             &alpha as *const f32,
             w_dev as *const f32,
-            n as i32,
+            k as i32,
             x_dev as *const f32,
             k as i32,
             &beta as *const f32,
@@ -188,7 +264,7 @@ pub fn run_dequant_matmul_mxfp4x2_gpu(
     ];
     unsafe {
         kernel
-            .launch(stream, (grid, 1, 1), (block, 1, 1), 0, params.as_mut_ptr())
+            .launch_checked(stream, (grid, 1, 1), (block, 1, 1), 0, &mut params)
             .expect("rlx-rocm: mxfp4x2_dequant launch failed");
     }
 
@@ -198,6 +274,10 @@ pub fn run_dequant_matmul_mxfp4x2_gpu(
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
     let blas = blas.lock().unwrap();
+    // Same stream-binding requirement as the GGUF path above.
+    unsafe {
+        let _ = blas.set_stream(stream);
+    }
     let result = unsafe {
         (blas.runtime.sgemm)(
             blas.handle,
@@ -310,17 +390,18 @@ pub unsafe fn run_dequant_grouped_matmul_gguf_gpu(
         let a_dev = buffer.ptr + ((pack_in_off / 4 + in_start * k) as u64) * 4;
         let b_dev = buffer.ptr + (dequant_off as u64);
         let c_dev = buffer.ptr + ((pack_out_off / 4 + in_start * n) as u64) * 4;
+        // Same `[n, k]` GGUF dequant layout as the single path above.
         let result = unsafe {
             (blas.runtime.sgemm)(
                 blas.handle,
-                HipblasOperation::N,
+                HipblasOperation::T,
                 HipblasOperation::N,
                 n as i32,
                 count as i32,
                 k as i32,
                 &alpha as *const f32,
                 b_dev as *const f32,
-                n as i32,
+                k as i32,
                 a_dev as *const f32,
                 k as i32,
                 &beta as *const f32,

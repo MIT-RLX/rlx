@@ -223,6 +223,7 @@ impl DequantCache {
                 Some(v) => {
                     if let Some(e) = self.map.remove(&v) {
                         self.total_bytes -= e.bytes;
+                        EVICTED_BYTES.fetch_add(e.bytes as u64, Ordering::Relaxed);
                     }
                 }
                 None => break,
@@ -234,6 +235,36 @@ impl DequantCache {
 static CACHE: OnceLock<RwLock<DequantCache>> = OnceLock::new();
 /// Global monotonic clock for LRU recency.
 static TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes evicted over the process lifetime — the thrash signal below.
+static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Set once the cache has been purged after thrash detection (see `gguf_weight_f32`).
+static THRASH_PURGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the cache is THRASHING: the f32 working set does not fit the budget,
+/// so entries are evicted before they are ever reused and every lookup pays a
+/// full re-dequant.
+///
+/// True once cumulative evictions exceed the budget itself, i.e. we have churned
+/// more than one whole cache — a model whose f32 form fits never trips this.
+///
+/// Callers use it to route around the cache. Measured on Muse-Glimmer-30B
+/// UD-Q4_K_XL (27.85B params ⇒ ~111 GB of f32 against a 15 GB budget): a
+/// decode-shaped `m = 1` forward took 43.1 s cached-and-thrashing vs 0.76 s on
+/// the fused int8 path — 57x. Repeat passes showed 43.1 / 43.2 / 43.5 s, i.e.
+/// the cache never paid for itself at all.
+pub fn cache_thrashing() -> bool {
+    match max_cache_bytes() {
+        // Trip at a QUARTER of the budget rather than a full one. Everything
+        // evicted before the verdict is wasted dequant work sitting directly in
+        // TTFT, so detecting sooner is a latency win; and a model whose f32 form
+        // fits never evicts at all, so no amount of lowering this can misfire on
+        // one. A quarter still demands real, sustained eviction pressure.
+        Some(max) => EVICTED_BYTES.load(Ordering::Relaxed) > (max as u64) / 4,
+        None => false,
+    }
+}
 
 fn cache_enabled() -> bool {
     !matches!(
@@ -250,10 +281,76 @@ fn cache_enabled() -> bool {
 /// little re-dequant work on eviction misses for a predictable footprint.
 /// Prefer this over `RLX_DEQUANT_CACHE=0` (which disables caching entirely and
 /// re-dequantizes every matmul).
+/// Physical RAM in bytes, or `None` when it can't be determined. Self-contained
+/// on purpose: `rlx-runtime` has richer helpers but depends on this crate, not
+/// the other way round.
+fn physical_ram_bytes() -> Option<usize> {
+    static RAM: OnceLock<Option<usize>> = OnceLock::new();
+    *RAM.get_or_init(physical_ram_bytes_uncached)
+}
+
+fn physical_ram_bytes_uncached() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        // `sysctl -n hw.memsize` rather than an `extern "C" sysctlbyname`: a
+        // local extern decl collides with the one another crate in the graph
+        // already declares. Called once and memoized by the OnceLock below.
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        None
+    }
+}
+
+/// Fraction of physical RAM the dequant cache may hold by default.
+///
+/// This cache stores an f32 copy of every K-quant weight it touches, so it
+/// converges on the WHOLE model in f32 — 4 B/param no matter how small the
+/// quantized file is. Fine at 0.6B (~2.5 GiB); fatal at 30B: Muse-Glimmer-30B
+/// is 27.85B params ⇒ ~111 GB of cache, which OOM-killed a 61 GB box mid-prefill
+/// even though its packed arena was only 14.3 GB. A quarter of RAM keeps small
+/// models fully resident while bounding large ones to LRU churn.
+const DEFAULT_CACHE_RAM_FRACTION: f64 = 0.25;
+
+/// Total-bytes budget for the dequant cache. Resolution order:
+///   * `RLX_DEQUANT_CACHE_MAX_BYTES=<n>` — explicit cap.
+///   * `RLX_DEQUANT_CACHE_MAX_BYTES=0|unbounded|off` — no cap (the historical
+///     behavior; only safe when the f32 model comfortably fits RAM).
+///   * unset — [`DEFAULT_CACHE_RAM_FRACTION`] of physical RAM.
+///   * unset and RAM unknown — no cap.
+///
+/// Over-budget slabs are LRU-evicted, trading a little re-dequant work on a miss
+/// for a predictable footprint. Prefer this over `RLX_DEQUANT_CACHE=0`, which
+/// disables caching entirely and re-dequantizes on every matmul.
 fn max_cache_bytes() -> Option<usize> {
-    rlx_ir::env::var("RLX_DEQUANT_CACHE_MAX_BYTES")
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&b| b > 0)
+    match rlx_ir::env::var("RLX_DEQUANT_CACHE_MAX_BYTES") {
+        Some(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            if s == "0" || s == "unbounded" || s == "off" {
+                return None;
+            }
+            s.parse::<usize>().ok().filter(|&b| b > 0)
+        }
+        None => physical_ram_bytes()
+            .map(|ram| (ram as f64 * DEFAULT_CACHE_RAM_FRACTION) as usize)
+            .filter(|&b| b > 0),
+    }
 }
 
 /// Return dense `[k×n]` weights (GGUF row-major `[n,k]` layout) for `w_bytes`.
@@ -299,6 +396,23 @@ pub fn gguf_weight_f32(
     }
     let bytes = std::mem::size_of_val(&dense[..]);
     let arc: Arc<[f32]> = Arc::from(dense.into_boxed_slice());
+    // Once thrashing, inserting is strictly negative-value: the slab is evicted
+    // before it can be reused, and we pay a write-lock plus an eviction scan on
+    // every miss. Hand the caller its dequant and skip the bookkeeping. The
+    // GEMV path avoids this entirely (see `prefer_cached_blas`); this keeps GEMM
+    // prefill, which still wants dequant+BLAS, from paying cache overhead too.
+    if cache_thrashing() {
+        // First time we notice, drop everything already cached: those slabs will
+        // never be reused (that is what thrashing means) and they are holding the
+        // full budget — 15 GB on a 61 GB box for Muse-Glimmer-30B, which pushed
+        // the bench to 60 GB RSS and into swap. Reclaiming it is free speed.
+        if !THRASH_PURGED.swap(true, Ordering::Relaxed) {
+            let mut w = cache.write().expect("dequant cache poisoned");
+            w.map.clear();
+            w.total_bytes = 0;
+        }
+        return arc;
+    }
     {
         let mut w = cache.write().expect("dequant cache poisoned");
         // A racing thread may have inserted while we were dequantizing.

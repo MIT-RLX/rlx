@@ -10,6 +10,17 @@
 
 // 64-bit weight-base index: packed 27B arenas exceed 4 GiB, so a u32
 // `w_word + (rel>>2)` truncates and the GEMV reads the wrong bytes.
+// Portable full-lane shuffle mask. HIP static_asserts that the mask is a
+// 64-BIT integer (AMD wavefronts are 64 lanes), so the CUDA-idiomatic
+// `0xFFFFFFFFu` fails to compile under hipRTC with
+// "The mask must be a 64-bit integer" — which kept this whole translation
+// unit, and therefore the fused GEMV, off ROCm entirely.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_DEVICE_COMPILE__)
+#define RLX_SHFL_ALL_LANES 0xFFFFFFFFFFFFFFFFull
+#else
+#define RLX_SHFL_ALL_LANES 0xFFFFFFFFu
+#endif
+
 __device__ __forceinline__ unsigned int rd_byte(
     const float* arena,
     unsigned long long w_word,
@@ -340,5 +351,69 @@ extern "C" __global__ void dequant_matmul_gguf_q4k_gemv(
     }
     if (tid == 0u) {
         arena[out_off + j] = smem_acc[0] + smem_comp[0];
+    }
+}
+
+// Warp-per-row Q4_K GEMV: one WARP (32 lanes) per output row; the 32 lanes
+// split the 256 elements of each super-block (strided -> coalesced x + qs loads),
+// so occupancy stays full at small k (k=1024 -> 4 super-blocks/row would leave
+// the block-per-row `..._q4k_gemv` kernel with only 4 active lanes of 128).
+// Same fused dequant math + per-lane Neumaier accumulation; warp-shuffle reduce.
+// One thread block holds `blockDim.x / 32` output rows.
+extern "C" __global__ void dequant_matmul_gguf_q4k_gemv_warp(
+    float* arena,
+    unsigned long long n,
+    unsigned long long k,
+    unsigned long long x_off,
+    unsigned long long w_byte_off,
+    unsigned long long out_off
+) {
+    const unsigned int WARP = 32u;
+    unsigned int warps_per_block = blockDim.x / WARP;
+    unsigned int lane = threadIdx.x & 31u;
+    unsigned int warp_id = threadIdx.x >> 5u;
+    unsigned long long j = (unsigned long long)blockIdx.x * warps_per_block + warp_id;
+    if (j >= n) return;
+
+    unsigned long long w_word = w_byte_off / 4ull;
+    unsigned long long blocks_per_row = k / 256ull;
+    float acc = 0.0f;
+    float comp = 0.0f;
+
+    for (unsigned long long r = 0ull; r < blocks_per_row; r++) {
+        unsigned long long base = (j * blocks_per_row + r) * 144ull;
+        float d = rd_f16(arena, w_word, base);
+        float dmin = rd_f16(arena, w_word, base + 2ull);
+        unsigned int sc_base = (unsigned int)(base + 4ull);
+        unsigned long long qs_base = base + 16ull;
+        unsigned long long xb = x_off + r * 256ull;
+        // lane strides the 256 elements: oi = lane, lane+32, ... (8 per lane).
+        for (unsigned int oi = lane; oi < 256u; oi += WARP) {
+            unsigned int pair = oi >> 6u;      // 0..3 (which 64-elem low/high pair)
+            unsigned int wp = oi & 63u;        // 0..63 within the pair
+            unsigned int hi = wp >> 5u;        // 0 = low nibble, 1 = high nibble
+            unsigned int l = wp & 31u;         // 0..31 byte index within sub-block
+            unsigned int sub = pair * 2u + hi; // 0..7 sub-block (scale/min index)
+            unsigned int sc, mn;
+            scale_min_k4(arena, w_word, sub, sc_base, sc, mn);
+            unsigned int q = rd_byte(arena, w_word, qs_base + (unsigned long long)(pair * 32u + l));
+            unsigned int nib = hi ? (q >> 4u) : (q & 0x0Fu);
+            float w = d * (float)sc * (float)nib - dmin * (float)mn;
+            float xv = arena[xb + (unsigned long long)oi];
+            float p = xv * w;
+            float e = __fmaf_rn(xv, w, -p);
+            neumaier_add(acc, comp, p);
+            comp += e;
+        }
+    }
+
+    // Warp-shuffle reduce acc and comp separately, then combine (mirrors the
+    // block kernel's smem_acc[0] + smem_comp[0]).
+    for (unsigned int off = WARP >> 1u; off > 0u; off >>= 1u) {
+        acc += __shfl_down_sync(RLX_SHFL_ALL_LANES, acc, off);
+        comp += __shfl_down_sync(RLX_SHFL_ALL_LANES, comp, off);
+    }
+    if (lane == 0u) {
+        arena[out_off + j] = acc + comp;
     }
 }

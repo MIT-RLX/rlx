@@ -7,7 +7,7 @@
 #![cfg(feature = "cpu")]
 
 use rlx_ir::{DType, Graph, GraphExt, Shape};
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use rlx_runtime::is_available;
 use rlx_runtime::{Device, Session};
 
@@ -68,7 +68,7 @@ fn cpu_f64_constant_broadcasts() {
     assert!((got[1] - 1.5).abs() < 1e-12);
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_mul_by_graphext_constant_matches_cpu() {
     if !is_available(Device::Metal) {

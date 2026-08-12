@@ -140,7 +140,7 @@ pub fn training_raster_backward_metal_ca_grad(
     let count = scene.count();
     let ca_grad_buf = dev.device.new_buffer(
         (count * 4 * 4) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
+        crate::mtl::MTLResourceOptions::StorageModeShared,
     );
     let bwd = SplatRasterBwdParams {
         width,
@@ -193,7 +193,7 @@ pub fn training_backward_metal_cached(
     let count = scene.count();
     let ca_grad_buf = dev.device.new_buffer(
         (count * 4 * 4) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
+        crate::mtl::MTLResourceOptions::StorageModeShared,
     );
     let bwd = SplatRasterBwdParams {
         width,

@@ -30,6 +30,7 @@ pub mod quant_insert;
 pub mod quant_propagate;
 pub mod rewrite;
 pub mod scaled_quant_insert;
+pub mod sccp;
 pub mod svg;
 
 #[cfg(feature = "training")]
@@ -64,7 +65,7 @@ pub use legalize_broadcast::LegalizeBroadcast;
 pub use memory::{
     ArenaWidthPolicy, MemoryPlanOptions, SharedWeightLayout, WeightSlot, is_pure_view,
     plan_memory_backward, plan_memory_f32_uniform, plan_memory_hybrid, plan_memory_native,
-    plan_memory_with_options,
+    plan_memory_native_in_order, plan_memory_with_options,
 };
 pub use numeric_lint::{NumericLint, lint_numerics};
 pub use param_hoist::{HoistSplit, split_param_invariant};

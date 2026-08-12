@@ -25,7 +25,7 @@ fn launch_fft(
     args: &mut [*mut core::ffi::c_void],
 ) {
     unsafe {
-        let _ = kernel.launch(stream, grid, block, shared_mem_bytes, args.as_mut_ptr());
+        let _ = kernel.launch_checked(stream, grid, block, shared_mem_bytes, args);
     }
 }
 

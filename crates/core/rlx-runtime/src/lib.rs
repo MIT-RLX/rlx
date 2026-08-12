@@ -41,6 +41,25 @@
 // Driver-layer concerns (device, arena, handle, stream, buffer)
 // live in rlx-driver as of plan #58; re-exported below so
 // existing callers compile unchanged.
+/// Declare which compiles belong to the same model, for backends that can share
+/// parameter storage between executables.
+///
+/// A model that compiles several graphs (a prefill graph plus decode buckets)
+/// otherwise re-uploads every weight per graph. Sharing that storage means
+/// skipping the re-upload, which is only sound when the same parameter name and
+/// size really is the same tensor — and nothing in a graph establishes that,
+/// since parameter *content* arrives later via `set_param`. So the caller
+/// declares it: pass a stable label per model (a weights path works well).
+///
+/// No-op unless a backend that supports sharing is compiled in. Today that is
+/// CUDA, additionally gated behind `RLX_CUDA_SHARED_PARAMS=1`.
+pub fn set_param_sharing_scope(label: &str) {
+    #[cfg(feature = "cuda")]
+    rlx_cuda::vmem::set_scope_from_label(label);
+    #[cfg(not(feature = "cuda"))]
+    let _ = label;
+}
+
 pub mod aot_cache;
 pub mod attn_mask;
 pub mod backend;
@@ -168,11 +187,11 @@ pub use device_ext::available_apple_devices;
 pub use device_ext::{
     BROWSER_DEVICE_PRIORITY, available_browser_devices, available_devices,
     detected_unavailable_devices, devices_for, dispatch_report_for_device,
-    dispatch_report_for_device_with_options, fastest_device, first_unsupported_op,
-    first_unsupported_op_with_options, full_name, is_available, legalize_graph_for_device,
-    legalize_graph_for_device_with_options, legalize_graph_for_device_with_report,
-    preferred_browser_device, supports, supports_graph, supports_graph_with_options,
-    supports_run_slots, trim_accelerator_arena_pool,
+    dispatch_report_for_device_with_options, fastest_device, feature_compiled,
+    first_unsupported_op, first_unsupported_op_with_options, full_name, is_available,
+    legalize_graph_for_device, legalize_graph_for_device_with_options,
+    legalize_graph_for_device_with_report, preferred_browser_device, supports, supports_graph,
+    supports_graph_with_options, supports_run_slots, trim_accelerator_arena_pool,
 };
 pub use device_parse::{ParseDeviceError, device_label, parse_device, parse_device_list};
 pub use device_policy::{

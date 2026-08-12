@@ -14,7 +14,7 @@ use crate::host_staging::F32HostSlot;
 use crate::kernels::{
     activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
     argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
-    attention_wmma_d128_kernel, attention_wmma_kernel, axial_rope2d_kernel,
+    attention_warp_kernel, attention_wmma_d128_kernel, attention_wmma_kernel, axial_rope2d_kernel,
     batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_broadcast_kernel, binary_c64_kernel, binary_kernel,
@@ -34,14 +34,14 @@ use crate::kernels::{
     gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
     group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
     group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
-    kimi_delta_chunk_kernel, layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel,
-    layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel, matmul_kernel,
-    matmul_tma_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel, maxpool3d_backward_kernel,
-    narrow_kernel, pad_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
-    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, relu_backward_kernel,
-    resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
-    scatter_add_zero_kernel, selective_scan_kernel, slice_kernel,
+    kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
+    layer_norm_bwd_input_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
+    matmul_kernel, matmul_tma_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel, pool2d_kernel,
+    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
+    relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
+    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, slice_kernel,
     softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     unary_kernel, where_kernel,
@@ -2275,6 +2275,39 @@ impl CudaExecutable {
                             .expect("rlx-cuda: gather_axis launch failed");
                     }
                 }
+                Step::KvAppend {
+                    src_off,
+                    dst_off,
+                    outer,
+                    seq_cap,
+                    pos,
+                    inner,
+                } => {
+                    let total = outer.saturating_mul(*inner);
+                    if total > 0 {
+                        let kernel = kv_append_kernel(&self.ctx);
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        let cfg = LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(src_off)
+                            .arg(dst_off)
+                            .arg(outer)
+                            .arg(seq_cap)
+                            .arg(pos)
+                            .arg(inner);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: kv_append launch failed");
+                        }
+                    }
+                }
                 Step::Narrow {
                     total,
                     outer,
@@ -2521,9 +2554,20 @@ impl CudaExecutable {
                         0
                     };
                     let use_row_final = wmma_kind == 0 && (use_row || pol == AttentionVariant::Row);
+                    // `attention_row` runs one THREAD per (batch, head, q_row).
+                    // At decode seq_q == 1, so the whole launch is `heads`
+                    // live threads on a single SM, and its head-dim
+                    // accumulators (sized at MAX_HEAD_DIM, indexed by the
+                    // runtime head_dim) spill to local memory.
+                    // `attention_warp` is a drop-in with the identical
+                    // parameter list that gives each row a 32-lane group.
+                    // A/B escape hatch: RLX_CUDA_LEGACY_ATTENTION_ROW=1.
+                    let use_warp =
+                        use_row_final && !rlx_ir::env::flag("RLX_CUDA_LEGACY_ATTENTION_ROW");
                     let mut launcher = stream.launch_builder(match wmma_kind {
                         1 => &attention_wmma_kernel(&self.ctx).function,
                         2 => &attention_wmma_d128_kernel(&self.ctx).function,
+                        _ if use_warp => &attention_warp_kernel(&self.ctx).function,
                         _ if use_row_final => &attention_row_kernel(&self.ctx).function,
                         _ => &attention_kernel(&self.ctx).function,
                     });
@@ -2559,7 +2603,20 @@ impl CudaExecutable {
                         .arg(o_head_stride)
                         .arg(o_seq_stride)
                         .arg(softcap_bits);
-                    let cfg = if use_row_final {
+                    let cfg = if use_warp {
+                        // One 32-lane group per query row; 4 groups per block.
+                        // Groups are carved from threadIdx.x (not the hardware
+                        // warp), so the same geometry is correct on AMD
+                        // wave32 and wave64.
+                        const LANES: u32 = 32;
+                        const GROUPS_PER_BLOCK: u32 = 4;
+                        let total = batch * heads * seq_q_eff;
+                        LaunchConfig {
+                            grid_dim: (total.div_ceil(GROUPS_PER_BLOCK), 1, 1),
+                            block_dim: (GROUPS_PER_BLOCK * LANES, 1, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    } else if use_row_final {
                         let total = batch * heads * seq_q_eff;
                         let block = 256u32;
                         LaunchConfig {
@@ -3007,12 +3064,28 @@ impl CudaExecutable {
                         continue;
                     }
 
-                    // Fallback: per-token expert lookup kernel.
-                    let kernel = grouped_matmul_kernel(&self.ctx);
-                    let cfg = LaunchConfig {
-                        grid_dim: ((*n).div_ceil(8), (*m).div_ceil(8), 1),
-                        block_dim: (8, 8, 1),
-                        shared_mem_bytes: 0,
+                    // Fallback: per-token expert lookup kernel. At decode (small m)
+                    // the 8x8 block wastes 7 of 8 y-threads and the grid is only
+                    // n/8 blocks — use the K-split GEMV instead, which gives 32
+                    // threads per output column at the same DRAM traffic.
+                    let small_m = *m <= 4;
+                    let kernel = if small_m {
+                        grouped_gemv_splitk_kernel(&self.ctx)
+                    } else {
+                        grouped_matmul_kernel(&self.ctx)
+                    };
+                    let cfg = if small_m {
+                        LaunchConfig {
+                            grid_dim: ((*n).div_ceil(32), *m, 1),
+                            block_dim: (32, 32, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    } else {
+                        LaunchConfig {
+                            grid_dim: ((*n).div_ceil(8), (*m).div_ceil(8), 1),
+                            block_dim: (8, 8, 1),
+                            shared_mem_bytes: 0,
+                        }
                     };
                     let mut launcher = stream.launch_builder(&kernel.function);
                     launcher
@@ -3421,15 +3494,57 @@ impl CudaExecutable {
                     // m>1 (prefill) with a register-safe row count → the amortized kernel
                     // (decode each fired expert's weight once, reuse across its rows);
                     // otherwise (decode, m==1) the per-element kernel is optimal.
-                    let amort = *m > 1 && *m <= 16;
-                    let kernel = if amort {
-                        crate::kernels::dequant_grouped_matmul_mlx_mxfp4_amort_kernel(&self.ctx)
+                    //
+                    // The cap is `MLX_AMORT_MAXR = 16` — the kernel holds one
+                    // accumulator per row in registers and silently computes only its
+                    // first 16 rows if handed more, so this guard is a correctness
+                    // guard, not just a heuristic.
+                    //
+                    // MEASURED, do not "fix" by chunking rows into 16-row launches:
+                    // that keeps the amortized kernel legal for any m but LOSES —
+                    // Ling-3.0-tiny seq 64 on a 3080 Ti went 63.4s → 76.3s. The
+                    // amortized kernel launches `ceil(n/256)` blocks (4, at n=1024),
+                    // which cannot fill an SM array; the per-element kernel's
+                    // `(n/16, m/16)` grid can. Both are far off roofline for prefill
+                    // — adjacent threads read weight rows `k/2` bytes apart, so the
+                    // nibble loads are fully uncoalesced. The real fix is a tiled
+                    // MXFP4 GEMM, not a different launch geometry.
+                    // Kernel choice, measured on a 3080 Ti at Ling-3.0-tiny's MoE
+                    // shapes with `rlx-models-core/examples/mxfp4_grouped_bench`
+                    // (gate_up k=1536 n=1024, E=128):
+                    //
+                    //            m=1       m=8       m=64
+                    //   V1     0.13 ms   ~1.0 ms   10.33 ms   per-element, byte-wise
+                    //   V2       —       8.13 ms     —        amortized
+                    //   V3     0.08 ms     —        2.11 ms   per-element, word-wise
+                    //   V4     0.03 ms   0.07 ms   0.46 ms    split-K  ← 22x over V1
+                    //
+                    // Two independent wins, both in V4: one 32-bit load per EIGHT
+                    // nibbles instead of one per nibble (V1's `mlx_rd_byte` loaded a
+                    // whole word to extract one byte), and a warp-per-output split-K
+                    // mapping so the warp's 32 lanes read 128 contiguous bytes
+                    // instead of 32 rows `k/2` bytes apart. V4 reaches ~110 GB/s /
+                    // 439 GFLOP/s and is also slightly MORE accurate than V1 (tree
+                    // reduction: 1.32e-7 vs 1.77e-7 against an f64 reference).
+                    //
+                    // V2 (`_amort`) is deliberately unused: it launches only
+                    // `ceil(n/256)` blocks (4 at n=1024) and cannot fill the SM
+                    // array, so it lost at every m tried — and it silently computes
+                    // just its first 16 rows past `MLX_AMORT_MAXR`. Kept compiled
+                    // for reference; do not re-enable without re-measuring.
+                    let wordwise = k.is_multiple_of(8);
+                    let splitk = wordwise;
+                    let kernel = if splitk {
+                        crate::kernels::dequant_grouped_matmul_mlx_mxfp4_splitk_kernel(&self.ctx)
+                    } else if wordwise {
+                        crate::kernels::dequant_grouped_matmul_mlx_mxfp4_v3_kernel(&self.ctx)
                     } else {
                         crate::kernels::dequant_grouped_matmul_mlx_mxfp4_kernel(&self.ctx)
                     };
-                    let cfg = if amort {
+                    let cfg = if splitk {
+                        // 8 warps/block, one output column each.
                         LaunchConfig {
-                            grid_dim: ((*n).div_ceil(256), 1, 1),
+                            grid_dim: ((*n).div_ceil(8), *m, 1),
                             block_dim: (256, 1, 1),
                             shared_mem_bytes: 0,
                         }

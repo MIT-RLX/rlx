@@ -24,6 +24,12 @@ use std::collections::HashMap;
 pub struct LowerSynthMatMulBackward;
 
 impl Pass for LowerSynthMatMulBackward {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::SynthMatMulBackward]
+    }
+
     fn name(&self) -> &str {
         "lower_synth_matmul_backward"
     }

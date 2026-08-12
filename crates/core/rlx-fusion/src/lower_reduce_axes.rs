@@ -113,6 +113,12 @@ fn lower_reduce(
 pub struct LowerNonLastAxisReduce;
 
 impl Pass for LowerNonLastAxisReduce {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Reduce]
+    }
+
     fn name(&self) -> &str {
         "lower_non_last_axis_reduce"
     }

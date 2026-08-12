@@ -312,6 +312,18 @@ pub(crate) enum Step {
         in_off: u32,
         out_off: u32,
     },
+    /// In-place KV append (`Op::KvAppend`). Writes the new token's row into the
+    /// cache at sequence index `pos`; `dst_off` ALIASES input 0 (the shared
+    /// memory planner gives this op its cache input's slot). Mirrors rlx-cuda's
+    /// `Step::KvAppend` and rlx-metal's `Thunk::KvAppend`.
+    KvAppend {
+        src_off: u32,
+        dst_off: u32,
+        outer: u32,
+        seq_cap: u32,
+        pos: u32,
+        inner: u32,
+    },
     Argmax {
         outer: u32,
         inner: u32,
@@ -468,9 +480,14 @@ pub(crate) enum Step {
         k: u32,
         n: u32,
         scheme_id: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        out_byte_off: u32,
+        // u64, NOT u32: a 30B-class packed GGUF arena is ~15 GB, so any offset
+        // past 4.294 GB wrapped and the step read garbage — which, against a
+        // zero-initialized arena, silently produced 0.0 for every logit rather
+        // than failing. Small models stayed under 4 GB and worked, which is why
+        // the F32 `muse_glimmer_arch` suite passed on the same GPU.
+        x_byte_off: u64,
+        w_byte_off: u64,
+        out_byte_off: u64,
     },
     DequantMatmulMlx {
         m: u32,
@@ -1777,6 +1794,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Gather { .. } => "rlx::Gather",
         Step::GatherAxis { .. } => "rlx::GatherAxis",
         Step::Narrow { .. } => "rlx::Narrow",
+        Step::KvAppend { .. } => "rlx::KvAppend",
         Step::Concat { .. } => "rlx::Concat",
         Step::Transpose { .. } => "rlx::Transpose",
         Step::Expand { .. } => "rlx::Expand",
@@ -2214,6 +2232,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_off,
             ..
         } => (vec![*table_off, *idx_off], vec![*out_off]),
+        Step::KvAppend {
+            src_off, dst_off, ..
+        } => (vec![*src_off, *dst_off], vec![*dst_off]),
         Step::Narrow {
             in_off, out_off, ..
         }
@@ -2298,7 +2319,19 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             w_byte_off,
             out_byte_off,
             ..
-        } => (vec![x_byte_off / 4, w_byte_off / 4], vec![out_byte_off / 4]),
+        } => {
+            // These f32-slot indices feed dependency/aliasing analysis, which is
+            // still u32. SATURATE rather than truncate: if two distinct offsets
+            // ever collided they would look aliased, so the scheduler
+            // over-serializes (safe). Truncation could instead make a real
+            // dependency invisible (unsafe). A 17 GB+ arena is the point at which
+            // this analysis itself needs widening to u64.
+            let slot = |b: u64| (b / 4).min(u32::MAX as u64) as u32;
+            (
+                vec![slot(*x_byte_off), slot(*w_byte_off)],
+                vec![slot(*out_byte_off)],
+            )
+        }
         Step::DequantMatmulMlx {
             x_byte_off,
             w_byte_off,

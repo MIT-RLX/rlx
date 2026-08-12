@@ -112,6 +112,12 @@ pub fn lower_fake_quantize(
 pub struct LowerFakeQuantize;
 
 impl Pass for LowerFakeQuantize {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::FakeQuantize]
+    }
+
     fn name(&self) -> &str {
         "lower_fake_quantize"
     }

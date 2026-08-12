@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use metal::{Buffer, ComputeCommandEncoderRef, MTLResourceOptions};
+use crate::mtl::{Buffer, ComputeCommandEncoderRef, MTLResourceOptions};
 use rlx_ir::{DType, Shape};
 
 use crate::blas::metal_sgemm_bufs;

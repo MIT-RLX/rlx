@@ -297,7 +297,7 @@ fn logeig_lowering_diagonal_no_nan() {
 /// Metal: compile the f32 graph WITH `Op::LogEig` still present — the Metal
 /// backend's own `legalize_or_rewrite` fires `LowerSpectral` at compile time.
 /// Proves the SPD spectral op runs natively on GPU (no CPU host-fallback).
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn logeig_lowering_metal() {
     let a = spd_matrix();
@@ -309,7 +309,7 @@ fn logeig_lowering_metal() {
     assert!(mx < 1e-2, "logeig Metal max_abs={mx}");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn reeig_lowering_metal() {
     let a = spd_matrix();
@@ -414,7 +414,7 @@ fn reeig_batched_cpu() {
     check_batched(&out, &mats, false, "batched reeig CPU");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn logeig_batched_metal() {
     let mats = batched_mats();
@@ -482,7 +482,7 @@ fn batched_matmul_broadcast_cpu() {
     bmm_broadcast_check(Device::Cpu, false, "bmm bcast-rhs CPU");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn batched_matmul_broadcast_metal() {
     bmm_broadcast_check(Device::Metal, true, "bmm bcast-lhs Metal");
@@ -557,7 +557,7 @@ fn bimap_lowering_cpu() {
     assert!(cos > 0.99999 && mx < 1e-3, "bimap CPU cos={cos} mx={mx}");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn bimap_lowering_metal() {
     let (w, x) = (bimap_w(), spd_matrix());
@@ -644,7 +644,7 @@ fn spdbn_lowering_cpu() {
     assert!(cos > 0.9999, "spdbn CPU cos={cos} mx={mx}");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn spdbn_lowering_metal() {
     let (x, mean, gg) = spdbn_inputs();

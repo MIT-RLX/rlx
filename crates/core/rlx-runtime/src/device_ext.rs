@@ -87,6 +87,32 @@ pub fn trim_accelerator_arena_pool(device: Device) {
     let _ = device;
 }
 
+/// Whether this build was *compiled* with the backend feature for `device`.
+///
+/// Distinct from [`is_available`], which additionally requires the hardware /
+/// driver to be present. Splitting the two lets callers say which of the
+/// two is actually missing: "enable the `gpu` feature" is actively misleading
+/// on a headless box where the feature IS on and there is simply no adapter.
+pub fn feature_compiled(device: Device) -> bool {
+    match device {
+        Device::Cpu => true,
+        Device::Metal => cfg!(feature = "metal"),
+        Device::Mlx => cfg!(feature = "mlx"),
+        Device::Ane => cfg!(feature = "ane"),
+        Device::Cuda => cfg!(feature = "cuda"),
+        Device::Rocm => cfg!(feature = "rocm"),
+        Device::Xdna => cfg!(feature = "xdna"),
+        Device::OneApi => cfg!(feature = "oneapi"),
+        Device::Tpu => cfg!(feature = "tpu"),
+        Device::Hexagon => cfg!(feature = "qnn"),
+        Device::Gpu => cfg!(feature = "gpu"),
+        Device::Vulkan => cfg!(feature = "vulkan"),
+        Device::OpenGl => cfg!(feature = "opengl"),
+        Device::DirectX => cfg!(feature = "directx"),
+        Device::WebGpu => cfg!(feature = "webgpu"),
+    }
+}
+
 pub fn is_available(device: Device) -> bool {
     #[cfg(feature = "cuda")]
     if device == Device::Cuda {
@@ -163,7 +189,14 @@ pub fn is_available(device: Device) -> bool {
             not(target_os = "watchos")
         )),
         Device::Mlx => cfg!(feature = "mlx"),
-        Device::Ane => cfg!(any(feature = "coreml", feature = "ane")),
+        // The Neural Engine is Apple hardware, so — like Metal above — the
+        // feature being compiled in is not enough. Workspace feature
+        // unification switches `coreml` on for a Linux build, and without the
+        // target gate every `is_available(Ane)` guard silently passes there.
+        Device::Ane => cfg!(all(
+            any(feature = "coreml", feature = "ane"),
+            target_vendor = "apple"
+        )),
         Device::Cuda => cfg!(feature = "cuda"),
         Device::Rocm => cfg!(feature = "rocm"),
         // Only reached when the `xdna` feature is OFF (the probe above owns the

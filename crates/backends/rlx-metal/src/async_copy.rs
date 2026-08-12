@@ -29,12 +29,12 @@ pub struct MetalBlitCopy {
     counter: AtomicU64,
     /// The single MTLBuffer that backs the runtime arena. Issue/
     /// wait operate on `(offset, len)` pairs into this buffer.
-    arena: metal::Buffer,
+    arena: crate::mtl::Buffer,
 }
 
 impl MetalBlitCopy {
     /// Bind to a pre-existing arena buffer.
-    pub fn new(arena: metal::Buffer) -> Self {
+    pub fn new(arena: crate::mtl::Buffer) -> Self {
         Self {
             counter: AtomicU64::new(0),
             arena,

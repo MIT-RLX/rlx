@@ -206,7 +206,7 @@ fn fk_prologue_chain_fusion_ir() {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_prologue_chain_matches_primitives_on_metal() {
     if !is_available(Device::Metal) {
@@ -229,7 +229,7 @@ fn fk_prologue_chain_matches_primitives_on_metal() {
     assert_close(&ref_out, &fus_out, 1e-4, "metal fused vs cpu primitives");
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_prologue_session_pipeline_keeps_region() {
     if !is_available(Device::Metal) {
@@ -351,7 +351,7 @@ fn fk_batch_region_fusion_ir() {
     );
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_region_matches_primitives_on_metal() {
     if !is_available(Device::Metal) {
@@ -380,7 +380,7 @@ fn fk_batch_region_matches_primitives_on_metal() {
     );
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_single_launch_matches_primitives_on_metal() {
     if !is_available(Device::Metal) {
@@ -502,7 +502,7 @@ fn fk_batch_region_matches_primitives_on_mlx() {
     );
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region() {
     if !is_available(Device::Metal) {
@@ -669,7 +669,7 @@ fn fk_batch_session_default_keeps_batch_region() {
     );
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_session_default_matches_cpu_metal() {
     if !is_available(Device::Metal) {
@@ -829,7 +829,7 @@ fn build_resize_prologue_secondary_input_graph() -> Graph {
     FuseRegionPrologue.run(g)
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_prologue_resize_on_input_one_matches_cpu() {
     if !is_available(Device::Metal) {
@@ -1083,7 +1083,7 @@ fn fused_batch_region_decomposed_before_autodiff() {
     );
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_primitive_batch_session_matches_cpu_metal() {
     if !is_available(Device::Metal) {

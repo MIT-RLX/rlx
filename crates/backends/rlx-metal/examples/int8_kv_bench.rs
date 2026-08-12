@@ -19,14 +19,14 @@ fn main() {}
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use metal::{MTLResourceOptions, MTLSize};
+    use rlx_metal::mtl::{MTLResourceOptions, MTLSize};
 
     let dev = rlx_metal::device::metal_device().expect("metal device");
     let device = &dev.device;
 
-    unsafe fn gpu_secs(cb: &metal::CommandBufferRef) -> f64 {
+    unsafe fn gpu_secs(cb: &rlx_metal::mtl::CommandBufferRef) -> f64 {
         use objc::{msg_send, runtime::Object, sel, sel_impl};
-        let obj = cb as *const metal::CommandBufferRef as *mut Object;
+        let obj = cb as *const rlx_metal::mtl::CommandBufferRef as *mut Object;
         let start: f64 = msg_send![obj, GPUStartTime];
         let end: f64 = msg_send![obj, GPUEndTime];
         (end - start).max(0.0)
@@ -186,7 +186,7 @@ kernel void attn_w8a8(
 }
 "#;
     let lib = device
-        .new_library_with_source(src, &metal::CompileOptions::new())
+        .new_library_with_source(src, &rlx_metal::mtl::CompileOptions::new())
         .expect("compile");
     let mk = |n: &str| {
         device
@@ -281,7 +281,7 @@ kernel void attn_w8a8(
             height: 1,
             depth: 1,
         };
-        let set_common = |enc: &metal::ComputeCommandEncoderRef, np: u32| {
+        let set_common = |enc: &rlx_metal::mtl::ComputeCommandEncoderRef, np: u32| {
             enc.set_bytes(4, 4, &heads as *const u32 as *const _);
             enc.set_bytes(5, 4, &seq as *const u32 as *const _);
             enc.set_bytes(6, 4, &dh as *const u32 as *const _);
@@ -343,8 +343,8 @@ kernel void attn_w8a8(
                 height: 1,
                 depth: 1,
             };
-            let time_k = |pipe: &metal::ComputePipelineState,
-                          bind: &dyn Fn(&metal::ComputeCommandEncoderRef)|
+            let time_k = |pipe: &rlx_metal::mtl::ComputePipelineState,
+                          bind: &dyn Fn(&rlx_metal::mtl::ComputeCommandEncoderRef)|
              -> f64 {
                 let mut us = f64::INFINITY;
                 for _ in 0..20 {
@@ -361,13 +361,13 @@ kernel void attn_w8a8(
                 }
                 us
             };
-            let bind_f32 = |e: &metal::ComputeCommandEncoderRef| {
+            let bind_f32 = |e: &rlx_metal::mtl::ComputeCommandEncoderRef| {
                 e.set_buffer(0, Some(&bq), 0);
                 e.set_buffer(1, Some(&bkf), 0);
                 e.set_buffer(2, Some(&bvf), 0);
                 e.set_buffer(3, Some(&bo_f), 0);
             };
-            let bind_w = |e: &metal::ComputeCommandEncoderRef| {
+            let bind_w = |e: &rlx_metal::mtl::ComputeCommandEncoderRef| {
                 e.set_buffer(0, Some(&bqi), 0);
                 e.set_buffer(1, Some(&bki), 0);
                 e.set_buffer(2, Some(&bvi), 0);

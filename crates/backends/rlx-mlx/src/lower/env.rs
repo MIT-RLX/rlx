@@ -1744,11 +1744,16 @@ pub fn lower_with_env(
                 let x = lookup(&env, node.inputs[0])?; // [M, K]
                 let w = lookup(&env, node.inputs[1])?; // [E, K, N]
                 let idx = mlx_indices_i64(lookup(&env, node.inputs[2])?)?; // [M]
-                let x_shape = node_input_shape(graph, node.inputs[0]); // [M, K]
-                let out_shape = node_input_shape(graph, node.id); // [M, N]
-                let m = x_shape[x_shape.len() - 2];
-                let k = x_shape[x_shape.len() - 1];
-                let n = out_shape[out_shape.len() - 1];
+                // `n` comes from the declared output here, so the bank is only
+                // consistent if K matches too — a `[E, N, K]` bank would produce
+                // the wrong product and then reshape into the right shape.
+                let gd = rlx_ir::shape::grouped_matmul_dims(
+                    &graph.node(node.inputs[0]).shape,
+                    &graph.node(node.inputs[1]).shape,
+                    Some(&graph.node(node.id).shape),
+                )
+                .map_err(|e| MlxError(format!("node {:?}: {e}", node.id)))?;
+                let (m, k, n) = (gd.m as i32, gd.k as i32, gd.n as i32);
                 let w_sel = ops::take(w, &idx, 0)?; // [M, K, N]
                 let x3 = ops::reshape(x, &[m, 1, k])?; // [M, 1, K]
                 let out3 = ops::matmul(&x3, &w_sel)?; // [M, 1, N]
@@ -2562,7 +2567,7 @@ pub fn lower_with_env(
                     y
                 }
             }
-            Op::FusedSwiGLU { cast_to, .. } => {
+            Op::FusedSwiGLU { cast_to, gate_first } => {
                 let src = lookup(&env, node.inputs[0])?;
                 let in_shape = node_input_shape(graph, node.inputs[0]);
                 let last = *in_shape
@@ -2575,12 +2580,19 @@ pub fn lower_with_env(
                 }
                 let half = last / 2;
                 let last_idx = in_shape.len() - 1;
-                let up_start = vec![0i32; in_shape.len()];
+                // `gate_first` swaps which half is the gate: default (false) is
+                // `[up | gate]`, true is `[gate | up]` — the layout a builder
+                // produces when it emits gate_proj before up_proj (DeepSeek /
+                // Bailing MoE). Ignoring it silently computes `gate · silu(up)`.
+                let (up_lo, gate_lo) = if *gate_first { (half, 0) } else { (0, half) };
+                let mut up_start = vec![0i32; in_shape.len()];
+                up_start[last_idx] = up_lo;
                 let mut up_stop = in_shape.clone();
-                up_stop[last_idx] = half;
+                up_stop[last_idx] = up_lo + half;
                 let mut g_start = vec![0i32; in_shape.len()];
-                g_start[last_idx] = half;
-                let g_stop = in_shape.clone();
+                g_start[last_idx] = gate_lo;
+                let mut g_stop = in_shape.clone();
+                g_stop[last_idx] = gate_lo + half;
                 let up = ops::slice(src, &up_start, &up_stop)?;
                 let gate = ops::slice(src, &g_start, &g_stop)?;
                 let silu_g = ops::silu(&gate)?;

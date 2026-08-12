@@ -49,6 +49,12 @@ pub mod mps_graph_lower;
 #[cfg(rlx_metal_host)]
 pub mod mps_gelu;
 
+/// Hand-rolled Metal bindings, replacing the `metal` crate. Public so downstream
+/// `MetalGpuKernel` authors can name the encoder/buffer types they are handed:
+/// `use rlx_metal::mtl as metal;` keeps existing custom kernels source-compatible.
+#[cfg(rlx_metal_host)]
+pub mod mtl;
+
 #[cfg(rlx_metal_host)]
 pub mod icb;
 

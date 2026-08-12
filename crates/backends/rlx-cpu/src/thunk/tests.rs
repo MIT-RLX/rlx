@@ -7526,3 +7526,89 @@ fn gated_residual_decompose_matches_native() {
         );
     }
 }
+
+/// A matmul whose operand sits *inside* its own destination slot must still
+/// compute the right answer.
+///
+/// The Transpose→MatMul fusion rewrites `MatMul(x, Transpose(s))` into a single
+/// `SgemmT` reading `s` directly. The planner scored `s` as dead at the elided
+/// Transpose, so it is free to hand that slot to the matmul's output — leaving
+/// an operand strictly inside the destination. The aliasing guard used to test
+/// `ptr::eq`, which only catches an operand starting at the *same* address, so
+/// this layout went straight to cblas, which streams the operand while
+/// overwriting it. Accelerate packs its operands up front and survived;
+/// OpenBLAS did not, so WavTokenizer's decoder was silently wrong on x86_64
+/// only (`max|Δ|` 1.42 against the reference, vs 8.9e-5 once fixed).
+#[test]
+fn sgemm_operand_inside_destination_is_not_clobbered() {
+    // C[m,n] = A[m,k] @ B[n,k]ᵀ, with B parked in the middle of C's slot —
+    // the exact WavTokenizer attention shape (`probs @ V`).
+    let (m, k, n) = (768usize, 8usize, 8usize);
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
+        .collect();
+    let b: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
+
+    let want = {
+        // Reference: disjoint buffers, so no aliasing is possible.
+        let mut c = vec![0f32; m * n];
+        for r in 0..m {
+            for col in 0..n {
+                let mut acc = 0f64;
+                for i in 0..k {
+                    acc += a[r * k + i] as f64 * b[col * k + i] as f64;
+                }
+                c[r * n + col] = acc as f32;
+            }
+        }
+        c
+    };
+
+    // Arena: [ A | C ], with B written *into* C's slot past its start.
+    let a_off = 0usize;
+    let c_off = m * k * 4;
+    let b_off = c_off + 1024; // strictly interior to C — `ptr::eq` misses this
+    let arena_bytes = c_off + m * n * 4;
+    assert!(b_off + k * n * 4 <= arena_bytes, "B must sit inside C");
+    let mut arena = vec![0u8; arena_bytes];
+    unsafe {
+        let base = arena.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(a.as_ptr(), base.add(a_off) as *mut f32, a.len());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), base.add(b_off) as *mut f32, b.len());
+    }
+
+    let sched = ThunkSchedule {
+        thunks: vec![Thunk::SgemmT {
+            a: a_off,
+            b: b_off,
+            c: c_off,
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            ta: false,
+            tb: true,
+        }],
+        moe_resident: None,
+        moe_resident_layers: None,
+        moe_topk_capture: None,
+        mask_threshold: 0.0,
+        mask_neg_inf: f32::NEG_INFINITY,
+        score_skip: 0.0,
+        compiled_fns: Vec::new(),
+        rng: Arc::new(std::sync::RwLock::new(rlx_ir::RngOptions::default())),
+    };
+    execute_thunks(&sched, &mut arena);
+
+    let got = unsafe {
+        std::slice::from_raw_parts(arena.as_ptr().add(c_off) as *const f32, m * n).to_vec()
+    };
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        worst < 1e-4,
+        "operand inside destination clobbered: max|Δ| = {worst:.3e}"
+    );
+}

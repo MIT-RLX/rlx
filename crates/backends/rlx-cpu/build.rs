@@ -81,23 +81,81 @@ fn main() {
         return;
     }
 
-    // OpenBLAS path (default for non-Apple). Link it only where it actually
-    // exists: x86_64 Linux (dev + CI ship libopenblas), or wherever the user
-    // points us via OPENBLAS_LIB_DIR / OPENBLAS_DIR. On aarch64 Linux with no
-    // OpenBLAS — and on fresh Windows boxes without an OpenBLAS install —
-    // skip the link and fall back to the portable SIMD gemm so the crate
-    // still builds.
+    // BLAS/LAPACK link (non-Apple). rlx-cpu needs BOTH a CBLAS interface
+    // (`cblas_sgemm`) AND LAPACK (`dgesv` / `dsyevd` / …); OpenBLAS ships both
+    // in a single library and is the auto-detected default. Resolution order:
+    //   1. `RLX_BLAS_LINK` — escape hatch for ANY other provider that supplies
+    //      cblas + LAPACK (BLIS + LAPACK, ATLAS, a vendored/tuned build) or to
+    //      link a BLAS for a CROSS build. Space-separated library names, e.g.
+    //      `RLX_BLAS_LINK="blis lapack"`; searched in `RLX_BLAS_SEARCH` /
+    //      `OPENBLAS_LIB_DIR` then the system paths. The caller asserts the set
+    //      provides both interfaces. Only the umbrella `rlx_cpu_blas` cfg is
+    //      set (not the OpenBLAS sub-cfg), so no vendor-specific thread-control
+    //      symbol is referenced — the alt BLAS self-manages threads.
+    //   2. `OPENBLAS_LIB_DIR` / `OPENBLAS_DIR` pins.
+    //   3. Auto-probe for a distro OpenBLAS on a NATIVE build.
+    // If NONE is found the crate still WORKS with no BLAS linked: matmul uses
+    // the auto-vectorized portable gemm and the linalg ops (Cholesky / eigh /
+    // QR / SVD / logdet / pinv / solve_triangular) use the dependency-free
+    // pure-Rust fallbacks in `blas.rs`. A tuned BLAS is only faster, never
+    // required. (Note: the reference `libblas3` is NOT a valid target — it has
+    // no CBLAS or LAPACK — which is why detection is OpenBLAS-specific.)
     println!("cargo:rerun-if-env-changed=OPENBLAS_DIR");
     println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=RLX_BLAS_LINK");
+    println!("cargo:rerun-if-env-changed=RLX_BLAS_SEARCH");
+
+    // (1) Explicit escape hatch. `rustc-link-lib` / `-search` both propagate to
+    // downstream binaries, so BLIS/ATLAS/etc. resolve at the final link.
+    if let Some(spec) = std::env::var("RLX_BLAS_LINK")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        for dir in [
+            std::env::var("RLX_BLAS_SEARCH").ok(),
+            std::env::var("OPENBLAS_LIB_DIR").ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
+        for name in spec.split_whitespace() {
+            println!("cargo:rustc-link-lib={name}");
+        }
+        println!("cargo:rustc-cfg=rlx_cpu_blas"); // generic cblas+lapack ABI
+        return;
+    }
+
     let openblas_lib_dir = std::env::var("OPENBLAS_LIB_DIR").ok();
     let openblas_dir = std::env::var("OPENBLAS_DIR").ok();
     let pinned = openblas_lib_dir.is_some() || openblas_dir.is_some();
-    if target_arch != "x86_64" && !pinned {
+    // (3) Auto-probe on a NATIVE non-x86_64 Linux build (aarch64 Pi / Ampere /
+    // Graviton). Cross-compiling must not pick up the host's OpenBLAS (wrong
+    // arch → link error, worse than the fallback) — use `RLX_BLAS_LINK` or
+    // `OPENBLAS_LIB_DIR` for cross. The Debian multiarch dir isn't derivable
+    // from `target_arch` (32-bit Pi is arch `arm`, dir `arm-linux-gnueabihf`),
+    // so `openblas_search_dirs` enumerates them plus the `openblas-*` variant
+    // subdirs Debian installs the real library into.
+    let host = std::env::var("HOST").unwrap_or_default();
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let native = !host.is_empty() && host == target;
+    let probed_lib_dir = if target_arch != "x86_64" && !pinned && target_os == "linux" && native {
+        openblas_search_dirs()
+            .into_iter()
+            .find(|d| std::path::Path::new(&format!("{d}/libopenblas.so")).exists())
+    } else {
+        None
+    };
+    if let Some(dir) = &probed_lib_dir {
+        println!("cargo:rustc-link-search=native={dir}");
+    } else if target_arch != "x86_64" && !pinned {
         println!(
             "cargo:warning=rlx-cpu: no OpenBLAS for {target_arch}-{target_os}; using the \
-             portable SIMD gemm (set OPENBLAS_LIB_DIR to link one)"
+             pure-Rust fallback (correct but slower — install libopenblas-dev, or set \
+             RLX_BLAS_LINK=\"<libs>\" / OPENBLAS_LIB_DIR to link a tuned BLAS)"
         );
-        return; // leave rlx_cpu_blas unset → SIMD fallback
+        return; // leave rlx_cpu_blas unset → pure-Rust fallback
     }
     // Windows x86_64: only link when an import lib is findable. Fresh VMs
     // and CI images often lack OpenBLAS; LNK1181 is worse than the portable
@@ -134,6 +192,39 @@ fn main() {
     }
     println!("cargo:rustc-cfg=rlx_cpu_blas");
     println!("cargo:rustc-cfg=rlx_cpu_blas_openblas");
+}
+
+/// Library dirs to probe for a distro OpenBLAS on Linux, most-generic first.
+/// Enumerates the Debian/Ubuntu multiarch dirs (the triple isn't derivable
+/// from `target_arch` — 32-bit Pi is arch `arm`, dir `arm-linux-gnueabihf`),
+/// plus the `openblas-{pthread,openmp,serial}` variant subdirs Debian installs
+/// the real `libopenblas.so*` into.
+fn openblas_search_dirs() -> Vec<String> {
+    let mut base = vec!["/usr/lib".to_string(), "/usr/local/lib".to_string()];
+    if let Ok(rd) = std::fs::read_dir("/usr/lib") {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir()
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.contains("-linux-"))
+            {
+                base.push(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(base.len() * 4);
+    for d in base {
+        for variant in [
+            "",
+            "/openblas-pthread",
+            "/openblas-openmp",
+            "/openblas-serial",
+        ] {
+            out.push(format!("{d}{variant}"));
+        }
+    }
+    out
 }
 
 /// `(lib_dir, rustc_link_lib_name)` for a Windows OpenBLAS install.

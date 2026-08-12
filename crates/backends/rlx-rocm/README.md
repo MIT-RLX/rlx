@@ -69,7 +69,7 @@ Feeds `RocmCostModel` in `rlx-runtime` for backend ranking.
   `set_param_half` upload paths fully wired against the HIP shim.
 * **`host_staging.rs`** — pageable or pinned host slots for input upload
   and output download (`RLX_ROCM_PINNED_IO`, always on in graph exec mode).
-* **Attention** — BSHD `[B,S,H,D]` (EEG-DINO) and BHSD both use tiled flash
+* **Attention** — BSHD `[B,S,H,D]` and BHSD both use tiled flash
   (`attention_kernel`) when `head_dim ≤ 128`; `RLX_ROCM_FORCE_ATTENTION_ROW=1`
   forces `attention_row_kernel`. Packed QKV: `RLX_ROCM_NO_PACKED_BSHD_ATTN`.
   `run_slots` + `arena_ptr` mirror `rlx-cuda`.

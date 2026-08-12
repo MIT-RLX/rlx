@@ -91,7 +91,15 @@ impl Backend for CpuBackend {
         // ballooned to 1.36 GB / 1.17 GB from it). `plan_memory_native` keeps the
         // same Native dtype widths but only pins when the graph has host indexing
         // (Scatter/Gather), so ordinary graphs get full liveness-based reuse.
-        let plan = memory::plan_memory_native(&exec_graph, cfg.arena_alignment);
+        //
+        // `_in_order` additionally drops the `dequant_host_fallback` pin for the
+        // same in-order reason: that guard protects GPU backends whose dequant
+        // matmuls flush on a DEFERRED host path, which CPU never takes (it runs
+        // `Thunk::DequantMatMulGguf` inline). Left on, its chain-walk pins nearly
+        // every activation of a packed K-quant prefill to the graph end — the
+        // difference between a ~4 GB reused arena and a 60 GB pinned one on a
+        // 30B-class GGUF.
+        let plan = memory::plan_memory_native_in_order(&exec_graph, cfg.arena_alignment);
         if rlx_ir::env::flag("RLX_CPU_ARENA_REPORT") {
             eprint!("[rlx-arena-report]\n{}", plan.report());
         }
@@ -151,9 +159,10 @@ impl Backend for CpuBackend {
         };
         // LegalizeBroadcast may insert Expand nodes — must replan; the
         // embedded LIR buffer map is from before legalization. In-order CPU
-        // executor → `plan_memory_native` (unpinned unless host indexing) for
-        // full liveness slot reuse; see the note at the other plan site above.
-        let plan = memory::plan_memory_native(&exec_graph, alignment);
+        // executor → `plan_memory_native_in_order` (unpinned unless host
+        // indexing, and no deferred-host dequant pin) for full liveness slot
+        // reuse; see the note at the other plan site above.
+        let plan = memory::plan_memory_native_in_order(&exec_graph, alignment);
         #[cfg(not(target_arch = "wasm32"))]
         let t_plan = t1.map(|t| t.elapsed());
         #[cfg(not(target_arch = "wasm32"))]

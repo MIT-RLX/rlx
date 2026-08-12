@@ -27,6 +27,12 @@ use std::collections::HashMap;
 pub struct LowerSplineActivation;
 
 impl Pass for LowerSplineActivation {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::SplineActivation]
+    }
+
     fn name(&self) -> &str {
         "lower_spline_activation"
     }

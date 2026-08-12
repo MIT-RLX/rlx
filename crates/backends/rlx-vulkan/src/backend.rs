@@ -4363,10 +4363,16 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 let input = node.inputs[0];
                 let weight = node.inputs[1];
                 let idx = node.inputs[2];
-                let id = dims(graph, input);
-                let wd = dims(graph, weight);
-                let (m, k) = (id[id.len() - 2], id[id.len() - 1]);
-                let n = wd[wd.len() - 1];
+                // Checked, not trusted: `n` comes off the expert bank while the
+                // output slot is sized from the node's shape, so a bank still in
+                // `[E, N, K]` order silently under- or over-writes it.
+                let gd = rlx_ir::shape::grouped_matmul_dims(
+                    &graph.node(input).shape,
+                    &graph.node(weight).shape,
+                    Some(&graph.node(out).shape),
+                )
+                .unwrap_or_else(|e| panic!("rlx-vulkan: node {:?}: {e}", out));
+                let (m, k, n) = (gd.m, gd.k, gd.n);
                 let push = Push::default()
                     .u(m as u32)
                     .u(k as u32)

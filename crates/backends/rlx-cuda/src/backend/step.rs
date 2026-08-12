@@ -349,6 +349,20 @@ pub(crate) enum Step {
         in_off: u32,
         out_off: u32,
     },
+    /// In-place KV append (`Op::KvAppend`). Writes the new token's row
+    /// (`src_off`, `outer * inner` elems) into the cache at sequence index
+    /// `pos`. `dst_off` ALIASES input 0 — the shared memory planner maps this
+    /// op's output onto its cache input (`rlx-compile/src/memory.rs`), so the
+    /// write mutates the cache in place and leaves every other row alone.
+    /// Mirrors rlx-metal's `Thunk::KvAppend`.
+    KvAppend {
+        src_off: u32,
+        dst_off: u32,
+        outer: u32,
+        seq_cap: u32,
+        pos: u32,
+        inner: u32,
+    },
     Argmax {
         outer: u32,
         inner: u32,
@@ -2291,6 +2305,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Gather { .. } => "rlx::Gather",
         Step::GatherAxis { .. } => "rlx::GatherAxis",
         Step::Narrow { .. } => "rlx::Narrow",
+        Step::KvAppend { .. } => "rlx::KvAppend",
         Step::Concat { .. } => "rlx::Concat",
         Step::Transpose { .. } => "rlx::Transpose",
         Step::Expand { .. } => "rlx::Expand",
@@ -2819,6 +2834,9 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_off,
             ..
         } => (vec![*table_off, *idx_off], vec![*out_off]),
+        Step::KvAppend {
+            src_off, dst_off, ..
+        } => (vec![*src_off, *dst_off], vec![*dst_off]),
         Step::Narrow {
             in_off, out_off, ..
         }

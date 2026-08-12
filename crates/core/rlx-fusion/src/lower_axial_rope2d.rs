@@ -151,6 +151,12 @@ pub fn lower_axial_rope2d(
 pub struct LowerAxialRope2d;
 
 impl Pass for LowerAxialRope2d {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::AxialRope2d]
+    }
+
     fn name(&self) -> &str {
         "lower_axial_rope2d"
     }

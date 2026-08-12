@@ -23,6 +23,12 @@ pub enum LowerError {
     MissingBias {
         op: &'static str,
     },
+    /// A panic during compilation (e.g. a `debug_assert_valid!` graph check on an
+    /// invalid model graph) was caught and turned into a recoverable error so it
+    /// can't abort the process — see `CompilePipeline::compile_hir`.
+    Panicked {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for LowerError {
@@ -32,6 +38,7 @@ impl std::fmt::Display for LowerError {
                 write!(f, "{op}: expected {expected} inputs, got {got}")
             }
             Self::MissingBias { op } => write!(f, "{op}: bias input required"),
+            Self::Panicked { message } => write!(f, "compilation panicked: {message}"),
         }
     }
 }

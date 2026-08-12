@@ -23,6 +23,12 @@ use std::collections::HashMap;
 pub struct LowerDotGeneral;
 
 impl Pass for LowerDotGeneral {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::DotGeneral]
+    }
+
     fn name(&self) -> &str {
         "lower_dot_general"
     }

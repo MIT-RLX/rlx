@@ -1,0 +1,19 @@
+// MatMul → Add(rank-1 bias) → Gelu collapses into one fused epilogue node.
+// RUN: fuse_matmul_bias_act
+graph @mlp {
+  %0 = {"Input":{"name":"x"}} : [4, 16] f32
+  %1 = {"Param":{"name":"w"}} : [16, 16] f32
+  %2 = {"Param":{"name":"b"}} : [16] f32
+  %3 = MatMul(%0, %1) : [4, 16] f32
+  %4 = {"Binary":"Add"}(%3, %2) : [4, 16] f32
+  %5 = {"Activation":"Gelu"}(%4) : [4, 16] f32
+  return %5
+}
+// EXPECT
+graph @mlp {
+  %0 = {"Input":{"name":"x"}} : [4, 16] f32
+  %1 = {"Param":{"name":"w"}} : [16, 16] f32
+  %2 = {"Param":{"name":"b"}} : [16] f32
+  %3 = {"FusedMatMulBiasAct":{"activation":"Gelu"}}(%0, %1, %2) : [4, 16] f32
+  return %3
+}

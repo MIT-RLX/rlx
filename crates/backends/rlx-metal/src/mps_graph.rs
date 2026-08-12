@@ -22,9 +22,8 @@
 //! This is parallel to our hand-rolled thunk system, not a replacement —
 //! callers opt in via `RLX_USE_MPS_GRAPH=1` for now.
 
-use metal::Buffer;
-use metal::foreign_types::ForeignType;
-use objc::runtime::{BOOL, NO, Object};
+use crate::mtl::Buffer;
+use objc::runtime::{BOOL, Class, NO, Object};
 use objc::{class, msg_send, sel, sel_impl};
 use std::sync::OnceLock;
 
@@ -1529,7 +1528,7 @@ impl MpsGraph {
     /// path stable.
     pub fn run_jit(
         &self,
-        cmd_queue: &metal::CommandQueueRef,
+        cmd_queue: &crate::mtl::CommandQueueRef,
         feed_tensors: &[&MpsTensor],
         feed_buffers: &[&Buffer],
         feed_offsets: &[usize],
@@ -1559,6 +1558,12 @@ impl MpsGraph {
                 }
                 let td = mps_tensor_data_from_buffer(buf, off, shape, dtype);
                 let _: () = msg_send![feeds, setObject: td forKey: tensor.obj];
+                // `mps_tensor_data_from_buffer` hands back +1 (alloc/init) and
+                // the collection takes its own reference, so ours has to go —
+                // otherwise the object bottoms out at refcount 1 and is never
+                // freed. Found by `leaks` on `metal_swiglu_full_parity`, which
+                // reported these as the only root leaks in the backend.
+                let _: () = msg_send![td, release];
             }
 
             if trace {
@@ -1576,6 +1581,7 @@ impl MpsGraph {
                 }
                 let td = mps_tensor_data_from_buffer(buf, off, shape, dtype);
                 let _: () = msg_send![results_dict, setObject: td forKey: tensor.obj];
+                let _: () = msg_send![td, release]; // dict retains; drop our +1
             }
 
             if trace {
@@ -1641,19 +1647,55 @@ impl MpsGraph {
 
             // MPSGraphCompilationDescriptor (nil ⇒ defaults).
             // The "device" arg is the underlying MTLDevice ObjC pointer;
-            // metal::Device wraps it but msg_send needs the raw `id`.
+            // crate::mtl::Device wraps it but msg_send needs the raw `id`.
             // MPSGraph wants an MPSGraphDevice (a thin wrapper around the
             // MTLDevice) — build via +[MPSGraphDevice deviceWithMTLDevice:].
             let dev_cls = class!(MPSGraphDevice);
             let mtl_dev_ptr: *mut Object = dev.device.as_ptr().cast();
             let mpsg_dev: *mut Object = msg_send![dev_cls,
                 deviceWithMTLDevice: mtl_dev_ptr];
+            // Compile synchronously (`waitForCompilationCompletion = YES`).
+            //
+            // With a nil descriptor MPSGraph defers building `GPURegionRuntime`
+            // and its optimizer passes onto its own `MPSGraphExecutable_queue`,
+            // and that deferred path faults at a measured ~2% per executable
+            // init — a null global read at +0x10/+0x18 from `MPSGraphOSLog`,
+            // with no rlx frames, reproducing with nothing else running (so it
+            // is not contention). Keeping the work on the calling thread avoids
+            // it at no measured cost: compile is ~2ms/layer either way, flat to
+            // 28 layers (`examples/mpsgraph_prefill_bench.rs`).
+            //
+            // Best-effort — an OS without the class or setter gets nil, i.e.
+            // the previous behaviour.
+            // `RLX_MPSGRAPH_NO_SYNC_COMPILE=1` restores the old nil-descriptor
+            // behaviour. Only useful to *prove* this mitigation is what stopped
+            // the ~2% crash: zero crashes with it on bounds the rate but says
+            // nothing about cause, since an OS update would look identical.
+            // See scripts/mpsgraph-soak.sh.
+            let force_nil = rlx_ir::env::flag("RLX_MPSGRAPH_NO_SYNC_COMPILE");
+            let desc: *mut Object = match Class::get("MPSGraphCompilationDescriptor")
+                .filter(|_| !force_nil)
+            {
+                Some(c) => {
+                    let d: *mut Object = msg_send![c, new];
+                    let responds: bool =
+                        msg_send![d, respondsToSelector: sel!(setWaitForCompilationCompletion:)];
+                    if responds {
+                        let _: () = msg_send![d, setWaitForCompilationCompletion: true];
+                    }
+                    d
+                }
+                None => std::ptr::null_mut(),
+            };
             let exec: *mut Object = msg_send![self.obj,
                 compileWithDevice: mpsg_dev
                 feeds: feeds
                 targetTensors: targets
                 targetOperations: std::ptr::null::<Object>()
-                compilationDescriptor: std::ptr::null::<Object>()];
+                compilationDescriptor: desc];
+            if !desc.is_null() {
+                let _: () = msg_send![desc, release];
+            }
             if exec.is_null() {
                 return None;
             }
@@ -1789,6 +1831,7 @@ impl MpsGraphExecutable {
                     feed_dtypes[i],
                 );
                 let _: () = msg_send![inputs, addObject: td];
+                let _: () = msg_send![td, release]; // array retains; drop our +1
             }
             let results: *mut Object = msg_send![arr_cls, array];
             for &i in &self.result_perm {
@@ -1799,6 +1842,7 @@ impl MpsGraphExecutable {
                     result_dtypes[i],
                 );
                 let _: () = msg_send![results, addObject: td];
+                let _: () = msg_send![td, release]; // array retains; drop our +1
             }
             // Retain so the arrays survive past the autorelease pool
             // boundary of this call.
@@ -1813,7 +1857,7 @@ impl MpsGraphExecutable {
     /// `bind_arena`. Per-call work is exactly one ObjC message into
     /// MPSGraphExecutable plus the GPU sync — no NSArray builds, no
     /// MPSGraphTensorData allocations.
-    pub fn run_cached(&self, cmd_queue: &metal::CommandQueueRef) {
+    pub fn run_cached(&self, cmd_queue: &crate::mtl::CommandQueueRef) {
         debug_assert!(
             !self.inputs_cache.is_null() && !self.results_cache.is_null(),
             "run_cached called before bind_arena"
@@ -1838,7 +1882,7 @@ impl MpsGraphExecutable {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_to_command_buffer(
         &self,
-        cmd_buf: &metal::CommandBufferRef,
+        cmd_buf: &crate::mtl::CommandBufferRef,
         feed_buffers: &[&Buffer],
         feed_offsets: &[usize],
         feed_shapes: &[Vec<usize>],
@@ -1859,6 +1903,7 @@ impl MpsGraphExecutable {
                     feed_dtypes[i],
                 );
                 let _: () = msg_send![inputs, addObject: td];
+                let _: () = msg_send![td, release]; // array retains; drop our +1
             }
             let results: *mut Object = msg_send![arr_cls, array];
             for &i in &self.result_perm {
@@ -1869,6 +1914,7 @@ impl MpsGraphExecutable {
                     result_dtypes[i],
                 );
                 let _: () = msg_send![results, addObject: td];
+                let _: () = msg_send![td, release]; // array retains; drop our +1
             }
             let mps_cmd = crate::mps_blas::mps_command_buffer_wrap(cmd_buf);
             let _: () = msg_send![self.obj,
@@ -1887,7 +1933,7 @@ impl MpsGraphExecutable {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        cmd_queue: &metal::CommandQueueRef,
+        cmd_queue: &crate::mtl::CommandQueueRef,
         feed_buffers: &[&Buffer],
         feed_offsets: &[usize],
         feed_shapes: &[Vec<usize>],
@@ -1908,6 +1954,7 @@ impl MpsGraphExecutable {
                     feed_dtypes[i],
                 );
                 let _: () = msg_send![inputs, addObject: td];
+                let _: () = msg_send![td, release]; // array retains; drop our +1
             }
             let results: *mut Object = msg_send![arr_cls, array];
             for &i in &self.result_perm {
@@ -1918,6 +1965,7 @@ impl MpsGraphExecutable {
                     result_dtypes[i],
                 );
                 let _: () = msg_send![results, addObject: td];
+                let _: () = msg_send![td, release]; // array retains; drop our +1
             }
 
             // `runWithMTLCommandQueue:inputsArray:resultsArray:executionDescriptor:`
@@ -2065,7 +2113,7 @@ unsafe fn mps_tensor_data_from_buffer(
         let alloc: *mut Object = msg_send![cls, alloc];
 
         if offset == 0 {
-            let buf_ref: &metal::BufferRef = buf;
+            let buf_ref: &crate::mtl::BufferRef = buf;
             msg_send![alloc,
             initWithMTLBuffer: buf_ref
             shape: nsshape
@@ -2083,7 +2131,7 @@ unsafe fn mps_tensor_data_from_buffer(
             };
             let bytes = n_elem * elem_bytes;
             let raw_ptr = (buf.contents() as *mut u8).add(offset);
-            let dev_ref: &metal::DeviceRef =
+            let dev_ref: &crate::mtl::DeviceRef =
                 &crate::device::metal_device().expect("metal device").device;
             let view: *mut Object = msg_send![dev_ref,
             newBufferWithBytesNoCopy: raw_ptr

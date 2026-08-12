@@ -338,6 +338,20 @@ fmt:
 lint:
     cargo clippy --all-targets -- -D warnings
 
+# Cross-check every Metal dispatch's buffer bindings against the kernel's
+# declared parameters. Buffers are bound by integer index against MSL signatures
+# in kernels.rs, and a stale index is not a compile error, not a crash and not a
+# GPU fault — it reads zero, so a kernel whose `len` moved does nothing at all.
+# Off by default (a relaxed atomic load); this turns it on for the suite.
+validate-metal-bindings *ARGS:
+    RLX_METAL_VALIDATE_BINDINGS=1 cargo test --release -j 4 -p rlx-metal --no-fail-fast {{ARGS}}
+
+# Objective-C refcount gate for the Metal backend (macOS; no-ops elsewhere).
+# The test suite cannot see a leak — an over-retained object still computes the
+# right answer — so this runs Metal test binaries under `leaks --atExit`.
+leak-check *TESTS:
+    {{justfile_directory()}}/crates/backends/rlx-metal/scripts/leak-check.sh {{TESTS}}
+
 # Install repo git hooks (auto-fmt + clippy on commit). Safe to re-run.
 install-git-hooks:
     #!/usr/bin/env bash
@@ -467,13 +481,16 @@ run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
 # Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test fmt-check lint check-wasm test-pyrlx test-third-order-gpu test-rocm
+ci: build test fmt-check lint check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 test-rocm:
     cargo check -p rlx-runtime --features cpu,rocm
     cargo test -p rlx-rocm --lib
-    cargo test -p rlx-rocm
+    # Kernel argument-count check on. HIP reads exactly as many pointers as the
+    # kernel declares and cannot see how many were passed, so a mismatch is
+    # silent — this repo shipped one (see `gguf_gpu::launch_dequant_gguf`).
+    RLX_GPU_VALIDATE_PARAMS=1 cargo test -p rlx-rocm
     cargo test -p rlx-runtime --features cpu,rocm --test graph_devices_parity
     cargo test -p rlx-runtime --features cpu,rocm --test rocm_op_parity
 

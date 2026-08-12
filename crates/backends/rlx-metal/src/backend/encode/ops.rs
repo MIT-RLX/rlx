@@ -243,9 +243,9 @@ pub(crate) fn widen_input_bytes_to_f32(data: &[u8], dt: rlx_ir::DType) -> Vec<f3
 }
 
 pub(crate) fn encode_cast(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     len: u32,
@@ -256,11 +256,11 @@ pub(crate) fn encode_cast(
 }
 
 pub(crate) fn encode_cast_bufs(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    src_buf: &metal::Buffer,
+    src_buf: &crate::mtl::Buffer,
     src: usize,
-    dst_buf: &metal::Buffer,
+    dst_buf: &crate::mtl::Buffer,
     dst: usize,
     len: u32,
     src_dt: crate::thunk::HalfFlag,
@@ -282,12 +282,12 @@ pub(crate) fn encode_cast_bufs(
             enc.set_bytes(2, 4, &n as *const u32 as *const _);
             let tg_w = p.thread_execution_width().min(n as u64);
             enc.dispatch_threads(
-                metal::MTLSize {
+                crate::mtl::MTLSize {
                     width: n as u64,
                     height: 1,
                     depth: 1,
                 },
-                metal::MTLSize {
+                crate::mtl::MTLSize {
                     width: tg_w,
                     height: 1,
                     depth: 1,
@@ -303,12 +303,12 @@ pub(crate) fn encode_cast_bufs(
     enc.set_bytes(2, 4, &len as *const u32 as *const _);
     let tg_w = pipeline.thread_execution_width().min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -323,11 +323,11 @@ pub(crate) fn encode_cast_bufs(
 // which converts ALL 12 dtypes correctly against the unified-memory arena.
 
 pub(crate) fn encode_bias_add(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    data_buf: &metal::Buffer,
+    data_buf: &crate::mtl::Buffer,
     data_off: usize,
-    bias_buf: &metal::Buffer,
+    bias_buf: &crate::mtl::Buffer,
     bias_off: usize,
     m: u32,
     n: u32,
@@ -351,12 +351,12 @@ pub(crate) fn encode_bias_add(
         std::mem::size_of::<u32>() as u64,
         &n as *const u32 as *const _,
     );
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n as u64,
         height: m as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 16.min(n as u64),
         height: 16.min(m as u64),
         depth: 1,
@@ -365,9 +365,9 @@ pub(crate) fn encode_bias_add(
 }
 
 pub(crate) fn encode_fused_binary_activation(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -400,12 +400,12 @@ pub(crate) fn encode_fused_binary_activation(
             .thread_execution_width()
             .min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -425,12 +425,12 @@ pub(crate) fn encode_fused_binary_activation(
         .thread_execution_width()
         .min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -439,9 +439,9 @@ pub(crate) fn encode_fused_binary_activation(
 }
 
 pub(crate) fn encode_fused_ternary_activation(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs0: usize,
     rhs1: usize,
@@ -479,12 +479,12 @@ pub(crate) fn encode_fused_ternary_activation(
             .thread_execution_width()
             .min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -506,12 +506,12 @@ pub(crate) fn encode_fused_ternary_activation(
         .thread_execution_width()
         .min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -520,9 +520,9 @@ pub(crate) fn encode_fused_ternary_activation(
 }
 
 pub(crate) fn encode_gelu_approx_out(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     len: u32,
@@ -541,12 +541,12 @@ pub(crate) fn encode_gelu_approx_out(
     enc.set_bytes(3, 4, &len4 as *const u32 as *const _);
     let tg_w = k.gelu_approx_out4.thread_execution_width().min(len4 as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len4 as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -555,9 +555,9 @@ pub(crate) fn encode_gelu_approx_out(
 }
 
 pub(crate) fn encode_activation(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     data_off: usize,
     len: u32,
     act: rlx_ir::op::Activation,
@@ -578,12 +578,12 @@ pub(crate) fn encode_activation(
         enc.set_bytes(2, 4, &len4 as *const u32 as *const _);
         let tg_w = k.gelu_inplace4.thread_execution_width().min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -607,12 +607,12 @@ pub(crate) fn encode_activation(
             .thread_execution_width()
             .min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -633,12 +633,12 @@ pub(crate) fn encode_activation(
         enc.set_bytes(2, 4, &len4 as *const u32 as *const _);
         let tg_w = k.silu_inplace4.thread_execution_width().min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -733,12 +733,12 @@ pub(crate) fn encode_activation(
         );
     }
     let tg_size = pipeline.thread_execution_width().min(len as u64);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: len as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_size,
         height: 1,
         depth: 1,
@@ -747,9 +747,9 @@ pub(crate) fn encode_activation(
 }
 
 pub(crate) fn encode_activation_out(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src_off: usize,
     dst_off: usize,
     len: u32,
@@ -773,12 +773,12 @@ pub(crate) fn encode_activation_out(
         enc.set_bytes(3, 4, &len4 as *const u32 as *const _);
         let tg_w = k.silu_out4.thread_execution_width().min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -796,9 +796,9 @@ pub(crate) fn encode_activation_out(
 }
 
 pub(crate) fn encode_layer_norm(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     g: usize,
     b: usize,
@@ -833,12 +833,12 @@ pub(crate) fn encode_layer_norm(
     while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
         tg_w *= 2;
     }
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -1069,9 +1069,9 @@ pub(crate) fn detect_single_axis_broadcast(
 }
 
 pub(crate) fn encode_binary_broadcast_1ax(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -1097,12 +1097,12 @@ pub(crate) fn encode_binary_broadcast_1ax(
         enc.set_bytes(4, 4, &cols4 as *const u32 as *const _);
         enc.set_bytes(5, 4, &mid as *const u32 as *const _);
         enc.set_bytes(6, 4, &op as *const u32 as *const _);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: cols4 as u64,
             height: rows as u64,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 64.min(cols4 as u64),
             height: 4.min(rows as u64),
             depth: 1,
@@ -1118,12 +1118,12 @@ pub(crate) fn encode_binary_broadcast_1ax(
     enc.set_bytes(4, 4, &cols as *const u32 as *const _);
     enc.set_bytes(5, 4, &mid as *const u32 as *const _);
     enc.set_bytes(6, 4, &op as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: cols as u64,
         height: rows as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 32.min(cols as u64),
         height: 8.min(rows as u64),
         depth: 1,
@@ -1132,9 +1132,9 @@ pub(crate) fn encode_binary_broadcast_1ax(
 }
 
 pub(crate) fn encode_binary_broadcast_rhs_scalar(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -1165,12 +1165,12 @@ pub(crate) fn encode_binary_broadcast_rhs_scalar(
             .thread_execution_width()
             .min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -1193,12 +1193,12 @@ pub(crate) fn encode_binary_broadcast_rhs_scalar(
         .thread_execution_width()
         .min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -1207,9 +1207,9 @@ pub(crate) fn encode_binary_broadcast_rhs_scalar(
 }
 
 pub(crate) fn encode_binary_broadcast_rhs_row(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -1233,12 +1233,12 @@ pub(crate) fn encode_binary_broadcast_rhs_row(
         enc.set_bytes(3, 4, &rows as *const u32 as *const _);
         enc.set_bytes(4, 4, &cols4 as *const u32 as *const _);
         enc.set_bytes(5, 4, &op as *const u32 as *const _);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: cols4 as u64,
             height: rows as u64,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 64.min(cols4 as u64),
             height: 4.min(rows as u64),
             depth: 1,
@@ -1253,12 +1253,12 @@ pub(crate) fn encode_binary_broadcast_rhs_row(
     enc.set_bytes(3, 4, &rows as *const u32 as *const _);
     enc.set_bytes(4, 4, &cols as *const u32 as *const _);
     enc.set_bytes(5, 4, &op as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: cols as u64,
         height: rows as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 32.min(cols as u64),
         height: 8.min(rows as u64),
         depth: 1,
@@ -1267,9 +1267,9 @@ pub(crate) fn encode_binary_broadcast_rhs_row(
 }
 
 pub(crate) fn encode_binary_broadcast_rhs_col(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -1293,12 +1293,12 @@ pub(crate) fn encode_binary_broadcast_rhs_col(
         enc.set_bytes(3, 4, &rows as *const u32 as *const _);
         enc.set_bytes(4, 4, &cols4 as *const u32 as *const _);
         enc.set_bytes(5, 4, &op as *const u32 as *const _);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: cols4 as u64,
             height: rows as u64,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 64.min(cols4 as u64),
             height: 4.min(rows as u64),
             depth: 1,
@@ -1313,12 +1313,12 @@ pub(crate) fn encode_binary_broadcast_rhs_col(
     enc.set_bytes(3, 4, &rows as *const u32 as *const _);
     enc.set_bytes(4, 4, &cols as *const u32 as *const _);
     enc.set_bytes(5, 4, &op as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: cols as u64,
         height: rows as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 32.min(cols as u64),
         height: 8.min(rows as u64),
         depth: 1,
@@ -1327,9 +1327,9 @@ pub(crate) fn encode_binary_broadcast_rhs_col(
 }
 
 pub(crate) fn encode_binary_broadcast_rank2(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -1366,12 +1366,12 @@ pub(crate) fn encode_binary_broadcast_rank2(
             .thread_execution_width()
             .min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -1396,12 +1396,12 @@ pub(crate) fn encode_binary_broadcast_rank2(
         .thread_execution_width()
         .min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -1410,9 +1410,9 @@ pub(crate) fn encode_binary_broadcast_rank2(
 }
 
 pub(crate) fn encode_binary(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -1525,12 +1525,12 @@ pub(crate) fn encode_binary(
         }
     }
     let tg_w = pipeline.thread_execution_width().min(dispatch_len as u64);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: dispatch_len as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -1539,9 +1539,9 @@ pub(crate) fn encode_binary(
 }
 
 pub(crate) fn encode_copy(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     len: u32,
@@ -1559,12 +1559,12 @@ pub(crate) fn encode_copy(
         enc.set_bytes(3, 4, &len4 as *const u32 as *const _);
         let tg_w = k.copy4.thread_execution_width().min(len4 as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -1588,12 +1588,12 @@ pub(crate) fn encode_copy(
     enc.set_bytes(3, 4, &dispatch_len as *const u32 as *const _);
     let tg_w = k.copy_f32.thread_execution_width().min(dispatch_len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: dispatch_len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -1602,13 +1602,13 @@ pub(crate) fn encode_copy(
 }
 
 pub(crate) fn encode_gather(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    table_buf: &metal::Buffer,
+    table_buf: &crate::mtl::Buffer,
     table: usize,
-    idx_buf: &metal::Buffer,
+    idx_buf: &crate::mtl::Buffer,
     idx: usize,
-    dst_buf: &metal::Buffer,
+    dst_buf: &crate::mtl::Buffer,
     dst: usize,
     num_idx: u32,
     trailing: u32,
@@ -1633,12 +1633,12 @@ pub(crate) fn encode_gather(
         std::mem::size_of::<u32>() as u64,
         &trailing as *const u32 as *const _,
     );
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: trailing as u64,
         height: num_idx as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 16.min(trailing as u64),
         height: 16.min(num_idx as u64),
         depth: 1,
@@ -1684,9 +1684,9 @@ pub(crate) fn narrow_segments_partition(src_axis: u32, segments: &[(u32, u32)]) 
 }
 
 pub(crate) fn flush_pending_narrow_batch(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     batch: &mut Option<PendingNarrowBatch>,
 ) {
     let Some(b) = batch.take() else {
@@ -1762,9 +1762,9 @@ pub(crate) fn try_queue_narrow_batch(
 }
 
 pub(crate) fn encode_split_lastax(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     batch: &PendingNarrowBatch,
 ) {
     use crate::thunk::HalfFlag;
@@ -1801,14 +1801,14 @@ pub(crate) fn encode_split_lastax(
         );
         let src_u64 = batch.src as u64;
         enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: max_len4 as u64,
             height: batch.outer as u64,
             depth: num_seg as u64,
         };
         // Task #50: cap total threads per threadgroup at 1024.
         let tg_depth = (1024u64 / (64 * 4)).min(num_seg as u64).max(1);
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 64.min(max_len4 as u64),
             height: 4.min(batch.outer as u64),
             depth: tg_depth,
@@ -1829,13 +1829,13 @@ pub(crate) fn encode_split_lastax(
         );
         let src_u64 = batch.src as u64;
         enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: max_len as u64,
             height: batch.outer as u64,
             depth: num_seg as u64,
         };
         let tg_depth = (1024u64 / (32 * 8)).min(num_seg as u64).max(1);
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 32.min(max_len as u64),
             height: 8.min(batch.outer as u64),
             depth: tg_depth,
@@ -1846,9 +1846,9 @@ pub(crate) fn encode_split_lastax(
 }
 
 pub(crate) fn encode_narrow(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     outer: u32,
@@ -1880,12 +1880,12 @@ pub(crate) fn encode_narrow(
             let dst_u64 = dst as u64;
             enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
             enc.set_bytes(7, 8, &dst_u64 as *const u64 as *const _);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: len4 as u64,
                 height: outer as u64,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 64.min(len4 as u64),
                 height: 4.min(outer as u64),
                 depth: 1,
@@ -1904,12 +1904,12 @@ pub(crate) fn encode_narrow(
             let dst_u64 = dst as u64;
             enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
             enc.set_bytes(7, 8, &dst_u64 as *const u64 as *const _);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: len as u64,
                 height: outer as u64,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 64.min(len as u64),
                 height: 8.min(outer as u64),
                 depth: 1,
@@ -1928,12 +1928,12 @@ pub(crate) fn encode_narrow(
             let dst_u64 = dst as u64;
             enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
             enc.set_bytes(7, 8, &dst_u64 as *const u64 as *const _);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: len as u64,
                 height: outer as u64,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 32.min(len as u64),
                 height: 8.min(outer as u64),
                 depth: 1,
@@ -1944,9 +1944,9 @@ pub(crate) fn encode_narrow(
 }
 
 pub(crate) fn encode_fused_residual_ln(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     res: usize,
     g: usize,
@@ -1982,12 +1982,12 @@ pub(crate) fn encode_fused_residual_ln(
     while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
         tg_w *= 2;
     }
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
     };
-    let tg_count = metal::MTLSize {
+    let tg_count = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
@@ -1996,9 +1996,9 @@ pub(crate) fn encode_fused_residual_ln(
 }
 
 pub(crate) fn encode_fused_residual_rms_norm(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     res: usize,
     g: usize,
@@ -2047,12 +2047,12 @@ pub(crate) fn encode_fused_residual_rms_norm(
     while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
         tg_w *= 2;
     }
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
     };
-    let tg_count = metal::MTLSize {
+    let tg_count = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
@@ -2108,10 +2108,10 @@ pub(crate) fn sdpa_flash_partitions_tuned(
 /// head_dim ≤ 128 and v_head_dim ≤ 128 (per-thread register accumulators).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_sdpa_flash_decode(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
-    scratch: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    scratch: &crate::mtl::Buffer,
     n_part: u32,
     q: usize,
     k_off: usize,
@@ -2202,12 +2202,12 @@ pub(crate) fn encode_sdpa_flash_decode(
     enc.set_buffer(17, Some(scratch), 0);
     enc.set_bytes(18, u4, &n_part as *const u32 as *const _);
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: (batch as u64) * (heads as u64) * (n_part as u64),
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 32,
             height: 1,
             depth: 1,
@@ -2238,12 +2238,12 @@ pub(crate) fn encode_sdpa_flash_decode(
     let combine_cap = if hd256 { 256 } else { 128 };
     let combine_threads = (v_head_dim.max(1) as u64).min(combine_cap);
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: (batch as u64) * (heads as u64),
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: combine_threads,
             height: 1,
             depth: 1,
@@ -2258,11 +2258,11 @@ pub(crate) fn encode_sdpa_flash_decode(
 /// f32 V-scales. The Serial encoder guarantees quantize → partial → combine order.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_sdpa_flash_decode_w8a8(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
-    scratch: &metal::Buffer,
-    i8scratch: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    scratch: &crate::mtl::Buffer,
+    i8scratch: &crate::mtl::Buffer,
     n_part: u32,
     q: usize,
     k_off: usize,
@@ -2371,12 +2371,12 @@ pub(crate) fn encode_sdpa_flash_decode_w8a8(
         enc.set_bytes(10, u4, &blk as *const u32 as *const _);
         let tg = 64u64;
         enc.dispatch_thread_groups(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: quant_rows.div_ceil(tg),
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg,
                 height: 1,
                 depth: 1,
@@ -2431,12 +2431,12 @@ pub(crate) fn encode_sdpa_flash_decode_w8a8(
         (n_part & 0xFFFF) | (q_i8 << 16) | (v_i8 << 17) | (blk << 18) | (k_i8 << 19);
     enc.set_bytes(19, u4, &packed19 as *const u32 as *const _);
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: (batch as u64) * (heads as u64) * (n_part as u64),
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 32,
             height: 1,
             depth: 1,
@@ -2460,12 +2460,12 @@ pub(crate) fn encode_sdpa_flash_decode_w8a8(
     );
     let combine_threads = (v_head_dim.max(1) as u64).min(128);
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: (batch as u64) * (heads as u64),
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: combine_threads,
             height: 1,
             depth: 1,
@@ -2475,9 +2475,9 @@ pub(crate) fn encode_sdpa_flash_decode_w8a8(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_sdpa(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     q: usize,
     k_off: usize,
     v: usize,
@@ -2729,12 +2729,12 @@ pub(crate) fn encode_sdpa(
             // Split-K decode: 32 threads/head (see sdpa_decode_m1). Larger
             // head_dim falls back to tid==0 inside the kernel.
             let threads_per_tg: u64 = if head_dim <= 128 { 32 } else { 1 };
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: n_tg,
                 height: 1,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: threads_per_tg,
                 height: 1,
                 depth: 1,
@@ -2818,12 +2818,12 @@ pub(crate) fn encode_sdpa(
             // fa2 = 64 threads (thread-parallel matmul); mma = 32 (one simdgroup).
             const BR: u32 = 8;
             let q_tiles = seq.div_ceil(BR);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: q_tiles as u64,
                 height: heads as u64,
                 depth: batch as u64,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: if use_mma { 32 } else { 64 },
                 height: 1,
                 depth: 1,
@@ -2832,12 +2832,12 @@ pub(crate) fn encode_sdpa(
         } else if use_splitk {
             // One SIMD group (32 threads) per (batch, head, query-row).
             let n_rows = (batch as u64) * (heads as u64) * (seq as u64);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: n_rows,
                 height: 1,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 32,
                 height: 1,
                 depth: 1,
@@ -2846,12 +2846,12 @@ pub(crate) fn encode_sdpa(
         } else if use_fa {
             const BR: u32 = 8;
             let q_tiles = seq.div_ceil(BR);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: q_tiles as u64,
                 height: heads as u64,
                 depth: batch as u64,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 64,
                 height: 1,
                 depth: 1,
@@ -2863,12 +2863,12 @@ pub(crate) fn encode_sdpa(
             // 32 threads (one simdgroup owns the tensor-unit matmuls).
             const BR: u32 = 8;
             let q_tiles = seq.div_ceil(BR);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: q_tiles as u64,
                 height: heads as u64,
                 depth: batch as u64,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 128, // 4 simdgroups: staging/scalar use all; MMA distributes
                 height: 1,
                 depth: 1,
@@ -2879,12 +2879,12 @@ pub(crate) fn encode_sdpa(
             // head-dim-split flash for head_dim>128 (replaces sdpa_long's 1-thread
             // fallback). Same grid as the splitk decode path.
             let n_rows = (batch as u64) * (heads as u64) * (seq as u64);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: n_rows,
                 height: 1,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 32,
                 height: 1,
                 depth: 1,
@@ -2892,12 +2892,12 @@ pub(crate) fn encode_sdpa(
             enc.dispatch_thread_groups(grid, tg);
         } else {
             let total = (batch as u64) * (heads as u64) * (seq as u64);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: total,
                 height: 1,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 64.min(total).max(1),
                 height: 1,
                 depth: 1,
@@ -3013,12 +3013,12 @@ pub(crate) fn encode_sdpa(
         (6 * std::mem::size_of::<u64>()) as u64,
         offs_pack.as_ptr() as *const _,
     );
-    let tg_count = metal::MTLSize {
+    let tg_count = crate::mtl::MTLSize {
         width: (batch * heads) as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 32,
         height: 1,
         depth: 1,
@@ -3030,9 +3030,9 @@ pub(crate) fn encode_sdpa(
 /// arena. `out[m,n] = x[m,k] @ dequant(wq)`, one GPU thread per output element.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dequant_matmul(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3057,12 +3057,12 @@ pub(crate) fn encode_dequant_matmul(
     enc.set_bytes(8, sz, &block_size as *const u32 as *const _);
     enc.set_bytes(9, sz, &asym as *const u32 as *const _);
     let total = (m * n) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: total.min(256),
         height: 1,
         depth: 1,
@@ -3072,9 +3072,9 @@ pub(crate) fn encode_dequant_matmul(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dequant_matmul_fp8(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3095,12 +3095,12 @@ pub(crate) fn encode_dequant_matmul_fp8(
     enc.set_bytes(7, sz, &n as *const u32 as *const _);
     enc.set_bytes(8, sz, &e5m2 as *const u32 as *const _);
     let total = (m * n) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: total.min(256),
         height: 1,
         depth: 1,
@@ -3110,9 +3110,9 @@ pub(crate) fn encode_dequant_matmul_fp8(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dequant_matmul_nvfp4(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3136,12 +3136,12 @@ pub(crate) fn encode_dequant_matmul_nvfp4(
     let gs = NVFP4_GROUP_SIZE as u32;
     enc.set_bytes(8, sz, &gs as *const u32 as *const _);
     let total = (m * n) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: total.min(256),
         height: 1,
         depth: 1,
@@ -3153,9 +3153,9 @@ pub(crate) fn encode_dequant_matmul_nvfp4(
 /// MSL kernel). `w_q`=[plane0|plane1] nibbles, `scale`=[s0|s1] f32.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dequant_matmul_mxfp4x2(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3176,12 +3176,12 @@ pub(crate) fn encode_dequant_matmul_mxfp4x2(
     enc.set_bytes(6, sz, &n as *const u32 as *const _);
     enc.set_bytes(7, sz, &group as *const u32 as *const _);
     let total = (m * n) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: total.min(256),
         height: 1,
         depth: 1,
@@ -3193,9 +3193,9 @@ pub(crate) fn encode_dequant_matmul_mxfp4x2(
 /// threads split K and stage an X tile in threadgroup memory.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dequant_matmul_mlx_gemm(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3223,12 +3223,12 @@ pub(crate) fn encode_dequant_matmul_mlx_gemm(
     enc.set_bytes(10, sz, &group_size as *const u32 as *const _);
     let n_row_tiles = m.div_ceil(8);
     let total = (n * n_row_tiles) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256,
         height: 1,
         depth: 1,
@@ -3239,9 +3239,9 @@ pub(crate) fn encode_dequant_matmul_mlx_gemm(
 /// Decode GEMV (`m == 1`): one threadgroup per output column.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dequant_matmul_mlx_gemv(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3265,12 +3265,12 @@ pub(crate) fn encode_dequant_matmul_mlx_gemv(
     enc.set_bytes(7, sz, &kind as *const u32 as *const _);
     enc.set_bytes(8, sz, &bits as *const u32 as *const _);
     enc.set_bytes(9, sz, &group_size as *const u32 as *const _);
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256,
         height: 1,
         depth: 1,
     };
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n as u64,
         height: 1,
         depth: 1,
@@ -3282,9 +3282,9 @@ pub(crate) fn encode_dequant_matmul_mlx_gemv(
 /// `e_idx` buffer + `slab_bytes` so the kernel offsets into the stacked expert slab.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_grouped_dequant_matmul_mlx_gemv(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3314,12 +3314,12 @@ pub(crate) fn encode_grouped_dequant_matmul_mlx_gemv(
     enc.set_bytes(10, sz, &group_size as *const u32 as *const _);
     enc.set_bytes(11, sz, &slab_bytes as *const u32 as *const _);
     enc.set_bytes(12, sz, &scale_bf16 as *const u32 as *const _);
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256,
         height: 1,
         depth: 1,
     };
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n as u64,
         height: 1,
         depth: 1,
@@ -3331,9 +3331,9 @@ pub(crate) fn encode_grouped_dequant_matmul_mlx_gemv(
 /// One threadgroup per (col, row_tile of 8).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_grouped_dequant_matmul_mlx_gemm(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     scale: usize,
@@ -3365,13 +3365,13 @@ pub(crate) fn encode_grouped_dequant_matmul_mlx_gemm(
     enc.set_bytes(11, sz, &group_size as *const u32 as *const _);
     enc.set_bytes(12, sz, &slab_bytes as *const u32 as *const _);
     enc.set_bytes(13, sz, &scale_bf16 as *const u32 as *const _);
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256,
         height: 1,
         depth: 1,
     };
     let n_row_tiles = m.div_ceil(8);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: (n * n_row_tiles) as u64,
         height: 1,
         depth: 1,
@@ -3380,9 +3380,9 @@ pub(crate) fn encode_grouped_dequant_matmul_mlx_gemm(
 }
 
 pub(crate) fn encode_rope(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     cos: usize,
     sin: usize,
@@ -3456,12 +3456,12 @@ pub(crate) fn encode_rope(
         &interleaved_u32 as *const u32 as *const _,
     );
     let nh = hidden / head_dim;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: head_dim as u64,
         height: nh as u64,
         depth: (batch * seq) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: head_dim.min(16) as u64,
         height: nh.min(8) as u64,
         depth: 1,
@@ -3470,9 +3470,9 @@ pub(crate) fn encode_rope(
 }
 
 pub(crate) fn encode_rms_norm(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     g: usize,
     b: usize,
@@ -3513,12 +3513,12 @@ pub(crate) fn encode_rms_norm(
     while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
         tg_w *= 2;
     }
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -3527,9 +3527,9 @@ pub(crate) fn encode_rms_norm(
 }
 
 pub(crate) fn encode_ada_layer_norm(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     scale: usize,
     shift: usize,
@@ -3565,12 +3565,12 @@ pub(crate) fn encode_ada_layer_norm(
         tg_w *= 2;
     }
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -3579,9 +3579,9 @@ pub(crate) fn encode_ada_layer_norm(
 }
 
 pub(crate) fn encode_gated_residual(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     y: usize,
     gate: usize,
@@ -3610,12 +3610,12 @@ pub(crate) fn encode_gated_residual(
     let n = rows.saturating_mul(h);
     let tg_w = pipeline.thread_execution_width().min(n as u64).max(1);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: n as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -3624,9 +3624,9 @@ pub(crate) fn encode_gated_residual(
 }
 
 pub(crate) fn encode_ada_layer_norm_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     scale: usize,
     dy: usize,
@@ -3659,12 +3659,12 @@ pub(crate) fn encode_ada_layer_norm_backward(
         tg_w *= 2;
     }
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: mod_rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -3673,9 +3673,9 @@ pub(crate) fn encode_ada_layer_norm_backward(
 }
 
 pub(crate) fn encode_gated_residual_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     y: usize,
     gate: usize,
     dy: usize,
@@ -3703,12 +3703,12 @@ pub(crate) fn encode_gated_residual_backward(
         tg_w *= 2;
     }
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: mod_rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -3717,9 +3717,9 @@ pub(crate) fn encode_gated_residual_backward(
 }
 
 pub(crate) fn encode_rms_norm_mul_silu(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     g: usize,
     b: usize,
@@ -3755,12 +3755,12 @@ pub(crate) fn encode_rms_norm_mul_silu(
     while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
         tg_w *= 2;
     }
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -3770,10 +3770,10 @@ pub(crate) fn encode_rms_norm_mul_silu(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_depthwise_conv1d_bsc(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
-    w_buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     src: usize,
     wt_raw: usize,
     dst: usize,
@@ -3798,12 +3798,12 @@ pub(crate) fn encode_depthwise_conv1d_bsc(
     enc.set_bytes(5, 8, k_silu.as_ptr() as *const _);
     enc.set_buffer(7, Some(w_buffer), 0);
     let total = batch as u64 * out_seq as u64 * channels as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total.max(1),
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(total.max(1)),
         height: 1,
         depth: 1,
@@ -3812,9 +3812,9 @@ pub(crate) fn encode_depthwise_conv1d_bsc(
 }
 
 pub(crate) fn encode_rms_norm_bwd_input(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     gamma: usize,
     beta: usize,
@@ -3839,12 +3839,12 @@ pub(crate) fn encode_rms_norm_bwd_input(
     // with a row-packed grid is unreliable for reduction kernels on this
     // driver — use the uniform dispatch_thread_groups form instead.
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -3853,9 +3853,9 @@ pub(crate) fn encode_rms_norm_bwd_input(
 }
 
 pub(crate) fn encode_rms_norm_bwd_param(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     _gamma: usize,
     _beta: usize,
@@ -3880,12 +3880,12 @@ pub(crate) fn encode_rms_norm_bwd_param(
         enc.set_bytes(7, 4, &eps as *const f32 as *const _);
         enc.set_bytes(8, 4, &wrt as *const u32 as *const _);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 1,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 1,
                 height: 1,
                 depth: 1,
@@ -3901,12 +3901,12 @@ pub(crate) fn encode_rms_norm_bwd_param(
         enc.set_bytes(2, 4, &h as *const u32 as *const _);
         enc.set_bytes(3, 4, &eps as *const f32 as *const _);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: rows as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 256.min(rows as u64).max(1),
                 height: 1,
                 depth: 1,
@@ -3924,12 +3924,12 @@ pub(crate) fn encode_rms_norm_bwd_param(
     enc.set_bytes(6, 4, &wrt as *const u32 as *const _);
     let tg_w = 256u64.min(h as u64).max(1);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: h as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -4299,9 +4299,9 @@ pub(crate) fn rnn_gru_scratch_bytes(graph: &Graph) -> usize {
 }
 
 pub(crate) fn encode_layer_norm_bwd_input(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     gamma: usize,
     dy: usize,
@@ -4322,12 +4322,12 @@ pub(crate) fn encode_layer_norm_bwd_input(
         tg_w *= 2;
     }
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w.max(1),
             height: 1,
             depth: 1,
@@ -4336,9 +4336,9 @@ pub(crate) fn encode_layer_norm_bwd_input(
 }
 
 pub(crate) fn encode_layer_norm_bwd_gamma(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dgamma: usize,
@@ -4357,12 +4357,12 @@ pub(crate) fn encode_layer_norm_bwd_gamma(
         enc.set_bytes(4, 4, &h as *const u32 as *const _);
         enc.set_bytes(5, 4, &eps as *const f32 as *const _);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 1,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 1,
                 height: 1,
                 depth: 1,
@@ -4377,12 +4377,12 @@ pub(crate) fn encode_layer_norm_bwd_gamma(
     enc.set_bytes(2, 4, &h as *const u32 as *const _);
     enc.set_bytes(3, 4, &eps as *const f32 as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 256.min(rows as u64).max(1),
             height: 1,
             depth: 1,
@@ -4403,12 +4403,12 @@ pub(crate) fn encode_layer_norm_bwd_gamma(
         enc.set_bytes(4, 4, &rows as *const u32 as *const _);
         enc.set_bytes(5, 4, &h as *const u32 as *const _);
         enc.dispatch_thread_groups(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: h as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 32,
                 height: 1,
                 depth: 1,
@@ -4425,12 +4425,12 @@ pub(crate) fn encode_layer_norm_bwd_gamma(
     enc.set_bytes(5, 4, &h as *const u32 as *const _);
     let tg_w = 256u64.min(h as u64).max(1);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: h as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -4439,9 +4439,9 @@ pub(crate) fn encode_layer_norm_bwd_gamma(
 }
 
 pub(crate) fn encode_group_norm_bwd_input(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     gamma: usize,
     dy: usize,
@@ -4464,12 +4464,12 @@ pub(crate) fn encode_group_norm_bwd_input(
     enc.set_bytes(6, 4, &eps as *const f32 as *const _);
     let groups = (n * num_groups) as u64;
     enc.dispatch_thread_groups(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: groups.max(1),
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 256,
             height: 1,
             depth: 1,
@@ -4478,9 +4478,9 @@ pub(crate) fn encode_group_norm_bwd_input(
 }
 
 pub(crate) fn encode_group_norm_bwd_gamma(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dgamma: usize,
@@ -4500,12 +4500,12 @@ pub(crate) fn encode_group_norm_bwd_gamma(
     enc.set_bytes(4, 4, &num_groups as *const u32 as *const _);
     enc.set_bytes(5, 4, &eps as *const f32 as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -4514,9 +4514,9 @@ pub(crate) fn encode_group_norm_bwd_gamma(
 }
 
 pub(crate) fn encode_group_norm_bwd_beta(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dy: usize,
     dbeta: usize,
     n: u32,
@@ -4530,12 +4530,12 @@ pub(crate) fn encode_group_norm_bwd_beta(
     enc.set_buffer(1, Some(buffer), dbeta as u64);
     enc.set_bytes(2, 16, nchw.as_ptr() as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -4544,9 +4544,9 @@ pub(crate) fn encode_group_norm_bwd_beta(
 }
 
 pub(crate) fn encode_rope_bwd(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dy: usize,
     cos: usize,
     sin: usize,
@@ -4571,12 +4571,12 @@ pub(crate) fn encode_rope_bwd(
     enc.set_bytes(9, 4, &cos_len as *const u32 as *const _);
     let nh = hidden / head_dim.max(1);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: head_dim as u64,
             height: nh as u64,
             depth: (batch * seq) as u64,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: head_dim.min(16) as u64,
             height: nh.min(8) as u64,
             depth: 1,
@@ -4585,9 +4585,9 @@ pub(crate) fn encode_rope_bwd(
 }
 
 pub(crate) fn encode_cumsum(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     rows: u32,
@@ -4601,12 +4601,12 @@ pub(crate) fn encode_cumsum(
     let ex: u32 = if exclusive { 1 } else { 0 };
     enc.set_bytes(3, 4, &ex as *const u32 as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -4616,9 +4616,9 @@ pub(crate) fn encode_cumsum(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_cum_scan(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     rows: u32,
@@ -4635,12 +4635,12 @@ pub(crate) fn encode_cum_scan(
     let mx: u32 = if is_max { 1 } else { 0 };
     enc.set_bytes(4, 4, &mx as *const u32 as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -4649,9 +4649,9 @@ pub(crate) fn encode_cum_scan(
 }
 
 pub(crate) fn encode_cumsum_bwd(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dy: usize,
     dx: usize,
     rows: u32,
@@ -4665,12 +4665,12 @@ pub(crate) fn encode_cumsum_bwd(
     let ex: u32 = if exclusive { 1 } else { 0 };
     enc.set_bytes(3, 4, &ex as *const u32 as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -4679,9 +4679,9 @@ pub(crate) fn encode_cumsum_bwd(
 }
 
 pub(crate) fn encode_gather_bwd(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dy: usize,
     indices: usize,
     dst: usize,
@@ -4696,12 +4696,12 @@ pub(crate) fn encode_gather_bwd(
         enc.set_buffer(0, Some(buffer), dst as u64);
         enc.set_bytes(1, 4, &n as *const u32 as *const _);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: n as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 256,
                 height: 1,
                 depth: 1,
@@ -4717,12 +4717,12 @@ pub(crate) fn encode_gather_bwd(
     enc.set_bytes(5, 4, &num_idx as *const u32 as *const _);
     enc.set_bytes(6, 4, &trailing as *const u32 as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: outer as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 1,
             depth: 1,
@@ -4763,9 +4763,9 @@ pub(crate) fn synth_matmul_scratch_bytes(graph: &Graph) -> usize {
 /// to f16 and `encode_mps_hgemm`, then cast the f16 result back to f32).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_synth_reconstruct_h(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     indices: usize,
     codebook: usize,
     w_scratch: usize,
@@ -4786,12 +4786,12 @@ pub(crate) fn encode_synth_reconstruct_h(
     enc.set_bytes(6, 4, &entry_dim as *const u32 as *const _);
     let nb = k_dim / entry_dim.max(1);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: nb as u64,
             height: n_dim as u64,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 32u64.min(nb as u64).max(1),
             height: 8u64.min(n_dim as u64).max(1),
             depth: 1,
@@ -4803,9 +4803,9 @@ pub(crate) fn encode_synth_reconstruct_h(
 /// (both arena byte offsets). Used to move x into f16 and the result back to f32 for
 /// the RLX_METAL_SYNTH_RECON_F16 path.
 pub(crate) fn encode_arena_cast(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipe: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipe: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     src_off: usize,
     dst_off: usize,
     len: u32,
@@ -4815,12 +4815,12 @@ pub(crate) fn encode_arena_cast(
     enc.set_buffer(1, Some(buffer), dst_off as u64);
     enc.set_bytes(2, 4, &len as *const u32 as *const _);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 256u64.min(len as u64).max(1),
             height: 1,
             depth: 1,
@@ -4890,9 +4890,9 @@ pub fn has_metal_dequant_kernel(scheme: rlx_ir::quant::QuantScheme) -> bool {
 /// `n_dim % 8 == 0` (caller enforces). Adapted from llama.cpp's
 /// `kernel_mul_mv_q4_K_f32_impl`.
 pub(crate) fn encode_q4k_mv_f32_sg(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -4919,12 +4919,12 @@ pub(crate) fn encode_q4k_mv_f32_sg(
     const Q4K_NR0: u64 = 2;
     let n_output_groups = (n_dim.div_ceil(Q4K_NR0 as usize)) as u64;
     let n_threadgroups = n_output_groups.div_ceil(NSG);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_threadgroups * NSG * 32,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: NSG * 32,
         height: 1,
         depth: 1,
@@ -4941,9 +4941,9 @@ pub(crate) fn encode_q4k_mv_f32_sg(
 macro_rules! sg_mv_encoder {
     ($fn_name:ident, $pipe:ident, $nsg:expr, $nr0:expr) => {
         pub(crate) fn $fn_name(
-            enc: &metal::ComputeCommandEncoderRef,
+            enc: &crate::mtl::ComputeCommandEncoderRef,
             k: &crate::kernels::Kernels,
-            buffer: &metal::Buffer,
+            buffer: &crate::mtl::Buffer,
             x: usize,
             w_q: usize,
             dst: usize,
@@ -4966,12 +4966,12 @@ macro_rules! sg_mv_encoder {
             const NR0: u64 = $nr0;
             let n_output_groups = (n_dim.div_ceil(NR0 as usize)) as u64;
             let n_threadgroups = n_output_groups.div_ceil(NSG);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: n_threadgroups * NSG * 32,
                 height: 1,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: NSG * 32,
                 height: 1,
                 depth: 1,
@@ -4997,9 +4997,9 @@ sg_mv_encoder!(encode_q3k_mv_f32_sg, q3k_mv_f32_sg, 4, 2);
 /// Caller must guarantee `k_dim % 256 == 0`. Used for `m > 1` GgufQ4K/Q6K.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_qk_mm_f32(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -5024,17 +5024,66 @@ pub(crate) fn encode_qk_mm_f32(
     // TM must match Q4K_MM_TM / Q6K_MM_TM in dequant_gguf.msl.
     const TM: u64 = 8;
     let row_tiles = (m_dim as u64).div_ceil(TM);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: row_tiles,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: (n_dim as u64).min(64),
         height: 1,
         depth: 1,
     };
     enc.dispatch_threads(grid, tg);
+}
+
+/// Q4_K / Q5_K GEMM with the x tile staged in threadgroup memory —
+/// `q4k_mm_f32_xs` / `q5k_mm_f32_xs`. Both share this dispatch: same TM, same
+/// threadgroup width, only the packed block layout differs inside the kernel.
+///
+/// Same arguments as [`encode_qk_mm_f32`], but dispatched as THREADGROUPS: the
+/// kernel has `threadgroup_barrier`s in its k loop, so the group size must be
+/// exact and out-of-range columns are clamped inside the kernel rather than
+/// dropped by the dispatch.
+pub(crate) fn encode_qk_mm_f32_xs(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let m_u = m_dim as u32;
+    enc.set_bytes(4, 4, &m_u as *const u32 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+    // Must match Q{4,5}K_MMX_TM / Q{4,5}K_MMX_TG in dequant_gguf.msl.
+    const TM: u64 = 8;
+    const TG: u64 = 64;
+    let grid = crate::mtl::MTLSize {
+        width: (n_dim as u64).div_ceil(TG),
+        height: (m_dim as u64).div_ceil(TM),
+        depth: 1,
+    };
+    let tg = crate::mtl::MTLSize {
+        width: TG,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
 }
 
 /// Fused Q4_K_M GEMV: `dst[n] = sum_k x[k] * dequant(w[n,k])` in one
@@ -5050,9 +5099,9 @@ pub(crate) fn encode_qk_mm_f32(
 macro_rules! fused_mv_encoder {
     ($fn_name:ident, $pipe:ident) => {
         pub(crate) fn $fn_name(
-            enc: &metal::ComputeCommandEncoderRef,
+            enc: &crate::mtl::ComputeCommandEncoderRef,
             k: &crate::kernels::Kernels,
-            buffer: &metal::Buffer,
+            buffer: &crate::mtl::Buffer,
             x: usize,
             w_q: usize,
             dst: usize,
@@ -5071,12 +5120,12 @@ macro_rules! fused_mv_encoder {
             enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
             let n_u = n_dim as u32;
             enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: n_dim as u64,
                 height: 1,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 256.min(n_dim) as u64,
                 height: 1,
                 depth: 1,
@@ -5090,10 +5139,90 @@ macro_rules! fused_mv_encoder {
 fused_mv_encoder!(encode_q3k_mv_f32, q3k_mv_f32); // Q3_K_S trunk bulk weights
 fused_mv_encoder!(encode_q6k_mv_f32, q6k_mv_f32); // Q6_K LM head
 
-pub(crate) fn encode_q4k_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+/// Fused Q5_K GEMV — same launch shape as `encode_q4k_mv_f32`.
+/// Fused Q2_K GEMV — same launch shape as `encode_q4k_mv_f32`.
+pub(crate) fn encode_q2k_mv_f32(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q2k_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let grid = crate::mtl::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = crate::mtl::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Fused Q1_0 GEMV: `dst[n] = sum_k x[k] * dequant(w[n,k])` reading the packed
+/// 1-bit weight directly. Decode-only (`m == 1`); caller guarantees
+/// `k_dim % 128 == 0`. Skips the dequant-scratch + MPS sgemm path (whose shared
+/// scratch races and zeros large-n Q1_0 outputs in the full Bonsai-27B graph).
+pub(crate) fn encode_q5k_mv_f32(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q5k_mv_f32);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let grid = crate::mtl::MTLSize {
+        width: n_dim as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = crate::mtl::MTLSize {
+        width: 256.min(n_dim) as u64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Fused Q1_0 GEMV: `dst[n] = sum_k x[k] * dequant(w[n,k])` reading the packed
+/// 1-bit weight directly. Decode-only (`m == 1`); caller guarantees
+/// `k_dim % 128 == 0`. Skips the dequant-scratch + MPS sgemm path (whose shared
+/// scratch races and zeros large-n Q1_0 outputs in the full Bonsai-27B graph).
+pub(crate) fn encode_q4k_mv_f32(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -5112,12 +5241,12 @@ pub(crate) fn encode_q4k_mv_f32(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5130,11 +5259,11 @@ pub(crate) fn encode_q4k_mv_f32(
 /// `k_dim % 128 == 0`. Skips the dequant-scratch + MPS sgemm path (whose shared
 /// scratch races and zeros large-n Q1_0 outputs in the full Bonsai-27B graph).
 pub(crate) fn encode_q1_0_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     scheme: rlx_ir::QuantScheme,
-    buffer: &metal::Buffer,
-    w_buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     x: usize,
     w_raw: usize,
     dst: usize,
@@ -5161,12 +5290,12 @@ pub(crate) fn encode_q1_0_mv_f32(
     // Weight may live in the external weight buffer (large params) or the arena
     // (small params) — the caller resolves the tag and passes the raw offset.
     enc.set_buffer(7, Some(w_buffer), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5178,11 +5307,11 @@ pub(crate) fn encode_q1_0_mv_f32(
 /// 32 threads share x reads and produce 8 outputs via `simd_sum`.
 /// Constraint: `n_dim % 8 == 0` (caller enforces).
 pub(crate) fn encode_q1_0_mv_f32_sg_flags(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     scheme: rlx_ir::QuantScheme,
-    buffer: &metal::Buffer,
-    w_buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     x: usize,
     w_raw: usize,
     dst: usize,
@@ -5215,12 +5344,12 @@ pub(crate) fn encode_q1_0_mv_f32_sg_flags(
     const NSG: u64 = 2;
     let n_output_groups = (n_dim.div_ceil(8)) as u64;
     let n_threadgroups = n_output_groups.div_ceil(NSG);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_threadgroups * NSG * 32,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: NSG * 32,
         height: 1,
         depth: 1,
@@ -5231,11 +5360,11 @@ pub(crate) fn encode_q1_0_mv_f32_sg_flags(
 /// Shared-x dual Q1_0 GEMV (simdgroup): one `x` feed, two weight matrices.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q1_0_dual_mv_f32_sg_flags(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     scheme: rlx_ir::QuantScheme,
-    buffer: &metal::Buffer,
-    w_buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     x: usize,
     w0_raw: usize,
     w1_raw: usize,
@@ -5276,12 +5405,12 @@ pub(crate) fn encode_q1_0_dual_mv_f32_sg_flags(
     let n_max = n0.max(n1);
     let n_output_groups = (n_max.div_ceil(8)) as u64;
     let n_threadgroups = n_output_groups.div_ceil(NSG);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_threadgroups * NSG * 32,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: NSG * 32,
         height: 1,
         depth: 1,
@@ -5293,11 +5422,11 @@ pub(crate) fn encode_q1_0_dual_mv_f32_sg_flags(
 /// accumulating a TM=8 row tile per thread — replaces the dequant-to-f32 scratch
 /// + MPS sgemm path for Q1_0. Caller guarantees `k_dim % 128 == 0`.
 pub(crate) fn encode_q1_0_mm_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     scheme: rlx_ir::QuantScheme,
-    buffer: &metal::Buffer,
-    w_buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     x: usize,
     w_raw: usize,
     dst: usize,
@@ -5327,12 +5456,12 @@ pub(crate) fn encode_q1_0_mm_f32(
     enc.set_buffer(7, Some(w_buffer), 0);
     const TM: u64 = 8;
     let row_tiles = (m_dim as u64).div_ceil(TM);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: row_tiles,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: (n_dim as u64).min(64),
         height: 1,
         depth: 1,
@@ -5343,9 +5472,9 @@ pub(crate) fn encode_q1_0_mm_f32(
 /// Fused decode MLP gate+up packed GEMV dispatch (`m == 1`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fused_mlp_gate_up_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     gate_w: usize,
     up_w: usize,
@@ -5367,12 +5496,12 @@ pub(crate) fn encode_fused_mlp_gate_up_mv_f32(
     enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5383,9 +5512,9 @@ pub(crate) fn encode_fused_mlp_gate_up_mv_f32(
 /// Fused decode MLP gate+up packed GEMV with SwiGLU epilogue (`m == 1`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fused_mlp_gate_up_swiglu(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     scheme: rlx_ir::quant::QuantScheme,
     x: usize,
     gate_w: usize,
@@ -5407,11 +5536,11 @@ pub(crate) fn encode_fused_mlp_gate_up_swiglu(
 /// Uses simdgroup cooperative GEMV when `n_dim % 8 == 0` (Bonsai dims).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q1_0_swiglu_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     scheme: rlx_ir::QuantScheme,
-    buffer: &metal::Buffer,
-    w_buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     x: usize,
     gate_raw: usize,
     up_raw: usize,
@@ -5455,24 +5584,24 @@ pub(crate) fn encode_q1_0_swiglu_mv_f32(
         const NSG: u64 = 2;
         let n_output_groups = (n_dim.div_ceil(8)) as u64;
         let n_threadgroups = n_output_groups.div_ceil(NSG);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: n_threadgroups * NSG * 32,
             height: 1,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: NSG * 32,
             height: 1,
             depth: 1,
         };
         enc.dispatch_threads(grid, tg);
     } else {
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: n_dim as u64,
             height: 1,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 256.min(n_dim) as u64,
             height: 1,
             depth: 1,
@@ -5485,11 +5614,11 @@ pub(crate) fn encode_q1_0_swiglu_mv_f32(
 /// Uses simdgroup cooperative GEMV when `n_dim % 8 == 0`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q1_0_mv_residual_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     scheme: rlx_ir::QuantScheme,
-    buffer: &metal::Buffer,
-    w_buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
     x: usize,
     w_raw: usize,
     res: usize,
@@ -5534,24 +5663,24 @@ pub(crate) fn encode_q1_0_mv_residual_f32(
         const NSG: u64 = 2;
         let n_output_groups = (n_dim.div_ceil(8)) as u64;
         let n_threadgroups = n_output_groups.div_ceil(NSG);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: n_threadgroups * NSG * 32,
             height: 1,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: NSG * 32,
             height: 1,
             depth: 1,
         };
         enc.dispatch_threads(grid, tg);
     } else {
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: n_dim as u64,
             height: 1,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 256.min(n_dim) as u64,
             height: 1,
             depth: 1,
@@ -5563,9 +5692,9 @@ pub(crate) fn encode_q1_0_mv_residual_f32(
 /// Fused decode MLP gate+up packed GEMV with GELU-approx epilogue (`m == 1`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fused_mlp_gate_up_gelu(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     scheme: rlx_ir::quant::QuantScheme,
     x: usize,
     gate_w: usize,
@@ -5588,9 +5717,9 @@ pub(crate) fn encode_fused_mlp_gate_up_gelu(
 /// one thread per output column. Caller guarantees `k_dim % 256 == 0`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q4k_mv_residual_f32(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
-    buffer: &metal::Buffer,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    pipeline: &crate::mtl::ComputePipelineState,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     res: usize,
@@ -5612,12 +5741,12 @@ pub(crate) fn encode_q4k_mv_residual_f32(
     enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5630,9 +5759,9 @@ pub(crate) fn encode_q4k_mv_residual_f32(
 /// threadgroup, Q4K_NR0=2 rows each, 32 lanes cooperate per row. Dispatch grid
 /// MUST match `q4k_mv_residual_f32_sg` in dequant_gguf.msl.
 pub(crate) fn encode_q4k_mv_residual_f32_sg(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     res: usize,
@@ -5658,12 +5787,12 @@ pub(crate) fn encode_q4k_mv_residual_f32_sg(
     const NR0: u64 = 2;
     let n_output_groups = (n_dim as u64).div_ceil(NR0);
     let n_threadgroups = n_output_groups.div_ceil(NSG);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_threadgroups * NSG * 32,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: NSG * 32,
         height: 1,
         depth: 1,
@@ -5676,9 +5805,9 @@ pub(crate) fn encode_q4k_mv_residual_f32_sg(
 /// the x slice across the gate and up reductions. Dispatch grid MUST match
 /// `q4k_swiglu_mv_f32_sg` in dequant_gguf.msl.
 pub(crate) fn encode_q4k_swiglu_mv_f32_sg(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     gate_w: usize,
     up_w: usize,
@@ -5704,12 +5833,12 @@ pub(crate) fn encode_q4k_swiglu_mv_f32_sg(
     const NR0: u64 = 2;
     let n_output_groups = (n_dim as u64).div_ceil(NR0);
     let n_threadgroups = n_output_groups.div_ceil(NSG);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_threadgroups * NSG * 32,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: NSG * 32,
         height: 1,
         depth: 1,
@@ -5718,9 +5847,9 @@ pub(crate) fn encode_q4k_swiglu_mv_f32_sg(
 }
 
 pub(crate) fn encode_q4_0_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -5739,12 +5868,12 @@ pub(crate) fn encode_q4_0_mv_f32(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5753,9 +5882,9 @@ pub(crate) fn encode_q4_0_mv_f32(
 }
 
 pub(crate) fn encode_q4_1_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -5774,12 +5903,12 @@ pub(crate) fn encode_q4_1_mv_f32(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5788,9 +5917,9 @@ pub(crate) fn encode_q4_1_mv_f32(
 }
 
 pub(crate) fn encode_q8_0_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -5809,12 +5938,12 @@ pub(crate) fn encode_q8_0_mv_f32(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5823,9 +5952,9 @@ pub(crate) fn encode_q8_0_mv_f32(
 }
 
 pub(crate) fn encode_iq4_nl_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -5844,12 +5973,12 @@ pub(crate) fn encode_iq4_nl_mv_f32(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5858,9 +5987,9 @@ pub(crate) fn encode_iq4_nl_mv_f32(
 }
 
 pub(crate) fn encode_iq2_xxs_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -5880,12 +6009,12 @@ pub(crate) fn encode_iq2_xxs_mv_f32(
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -5898,9 +6027,9 @@ pub(crate) fn encode_iq2_xxs_mv_f32(
 /// arena tensors; `indices` is a packed U8 arena tensor (1 byte/elem).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_synth_matmul(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     indices: usize,
     codebook: usize,
@@ -5940,12 +6069,12 @@ pub(crate) fn encode_synth_matmul(
     let (grid, tg) = if split_k {
         const KSPLIT: u64 = 32;
         (
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: KSPLIT,
                 height: n_dim as u64,
                 depth: m as u64,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: KSPLIT,
                 height: 8u64.min(n_dim as u64).max(1),
                 depth: 1,
@@ -5957,12 +6086,12 @@ pub(crate) fn encode_synth_matmul(
         let tgh = 8u64.min(m as u64).max(1);
         let tgw = (256 / tgh).min(n_dim as u64).max(1);
         (
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: n_dim as u64,
                 height: m as u64,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tgw,
                 height: tgh,
                 depth: 1,
@@ -5979,9 +6108,9 @@ pub(crate) fn encode_synth_matmul(
 /// fixed reconstruct→scratch→MPS cost dominates. f32 only.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_synth_matmul_tiled(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     indices: usize,
     codebook: usize,
@@ -6014,12 +6143,12 @@ pub(crate) fn encode_synth_matmul_tiled(
     enc.set_bytes(9, 4, &m as *const u32 as *const _);
     // One 64×64 output tile per threadgroup; 512 threads = 16 simdgroups (4×4),
     // each computing a 16×16 sub-tile (2×2 grid of 8×8 accumulators).
-    let tg_count = metal::MTLSize {
+    let tg_count = crate::mtl::MTLSize {
         width: n_dim.div_ceil(64) as u64,
         height: m.div_ceil(64) as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 32,
         height: 16,
         depth: 1,
@@ -6032,9 +6161,9 @@ pub(crate) fn encode_synth_matmul_tiled(
 /// prefill path. Pair with `encode_mps_sgemm_bt(x, w_scratch, dst, m, k, n)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_synth_reconstruct(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     indices: usize,
     codebook: usize,
     w_scratch: usize,
@@ -6054,12 +6183,12 @@ pub(crate) fn encode_synth_reconstruct(
     enc.set_bytes(5, 4, &n_dim as *const u32 as *const _);
     enc.set_bytes(6, 4, &entry_dim as *const u32 as *const _);
     let nb = k_dim / entry_dim.max(1);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: nb as u64,
         height: n_dim as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 32u64.min(nb as u64).max(1),
         height: 8u64.min(n_dim as u64).max(1),
         depth: 1,
@@ -6072,9 +6201,9 @@ pub(crate) fn encode_synth_reconstruct(
 /// `dst` are f32 arena tensors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_spline_activation(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     coeff: usize,
     dst: usize,
@@ -6097,12 +6226,12 @@ pub(crate) fn encode_spline_activation(
     enc.set_bytes(6, 4, &num_basis as *const u32 as *const _);
     enc.set_bytes(7, 4, &grid_min as *const f32 as *const _);
     enc.set_bytes(8, 4, &grid_max as *const f32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(total) as u64,
         height: 1,
         depth: 1,
@@ -6115,9 +6244,9 @@ pub(crate) fn encode_spline_activation(
 /// dispatch, no tiling — see MSL `synth_bwd_dx` / `synth_bwd_codebook`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_synth_bwd(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     indices: usize,
     codebook: usize,
@@ -6147,12 +6276,12 @@ pub(crate) fn encode_synth_bwd(
         enc.set_bytes(6, 4, &n as *const u32 as *const _);
         enc.set_bytes(7, 4, &k_dim as *const u32 as *const _);
         enc.set_bytes(8, 4, &d as *const u32 as *const _);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: k_dim as u64,
             height: m as u64,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 16.min(k_dim as u64).max(1),
             height: 16,
             depth: 1,
@@ -6169,12 +6298,12 @@ pub(crate) fn encode_synth_bwd(
         enc.set_bytes(7, 4, &k_dim as *const u32 as *const _);
         enc.set_bytes(8, 4, &d as *const u32 as *const _);
         enc.set_bytes(9, 4, &num_entries as *const u32 as *const _);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: d as u64,
             height: num_entries as u64,
             depth: 1,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: (d as u64).max(1),
             height: 64,
             depth: 1,
@@ -6184,9 +6313,9 @@ pub(crate) fn encode_synth_bwd(
 }
 
 pub(crate) fn encode_iq2_xs_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -6206,12 +6335,12 @@ pub(crate) fn encode_iq2_xs_mv_f32(
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -6220,9 +6349,9 @@ pub(crate) fn encode_iq2_xs_mv_f32(
 }
 
 pub(crate) fn encode_iq3_xxs_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -6242,12 +6371,12 @@ pub(crate) fn encode_iq3_xxs_mv_f32(
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -6256,9 +6385,9 @@ pub(crate) fn encode_iq3_xxs_mv_f32(
 }
 
 pub(crate) fn encode_iq2_s_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -6278,12 +6407,12 @@ pub(crate) fn encode_iq2_s_mv_f32(
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -6292,9 +6421,9 @@ pub(crate) fn encode_iq2_s_mv_f32(
 }
 
 pub(crate) fn encode_iq3_s_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -6314,12 +6443,12 @@ pub(crate) fn encode_iq3_s_mv_f32(
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -6328,9 +6457,9 @@ pub(crate) fn encode_iq3_s_mv_f32(
 }
 
 pub(crate) fn encode_iq1_s_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -6350,12 +6479,12 @@ pub(crate) fn encode_iq1_s_mv_f32(
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -6364,9 +6493,9 @@ pub(crate) fn encode_iq1_s_mv_f32(
 }
 
 pub(crate) fn encode_iq1_m_mv_f32(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     w_q: usize,
     dst: usize,
@@ -6386,12 +6515,12 @@ pub(crate) fn encode_iq1_m_mv_f32(
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(6, Some(k.iq_grid_buffer()), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n_dim as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(n_dim) as u64,
         height: 1,
         depth: 1,
@@ -6400,9 +6529,9 @@ pub(crate) fn encode_iq1_m_mv_f32(
 }
 
 pub(crate) fn encode_dequant_gguf(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     w_q: usize,
     dst: usize,
     scheme: rlx_ir::quant::QuantScheme,
@@ -6430,12 +6559,12 @@ pub(crate) fn encode_dequant_gguf(
     // KGRID_IQ1S). Schemes 0..=11 ignore it. See `crate::kernels::iq_grid_buffer`.
     let lut = k.iq_grid_buffer();
     enc.set_buffer(5, Some(lut), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: num_blocks as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(num_blocks) as u64,
         height: 1,
         depth: 1,
@@ -6472,9 +6601,9 @@ pub(crate) fn dequant_grouped_can_encode_per_row(
 /// (host-uploaded or previously synced).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dequant_grouped_matmul_gguf_per_row(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     input: usize,
     w_q: usize,
     expert_idx: usize,
@@ -6522,9 +6651,9 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf_per_row(
 }
 
 pub(crate) fn encode_dequant_grouped_matmul_gguf(
-    queue: &metal::CommandQueueRef,
+    queue: &crate::mtl::CommandQueueRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     scratch_off: usize,
     input: usize,
     w_q: usize,
@@ -6598,8 +6727,9 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
         let cmd_buf = queue.new_command_buffer();
         if use_fused_gemv {
             // Independent per-expert writes — one Concurrent encoder is enough.
-            let enc = cmd_buf
-                .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+            let enc = cmd_buf.compute_command_encoder_with_dispatch_type(
+                crate::mtl::MTLDispatchType::Concurrent,
+            );
             let use_q4k_sg = use_fused_q4k_gemv
                 && n.is_multiple_of(8)
                 && !rlx_ir::env::flag("RLX_METAL_Q4K_SG_DISABLE");
@@ -6634,8 +6764,9 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
                 rlx_ir::quant::QuantScheme::GgufQ6K => &k.q6k_mm_f32,
                 _ => unreachable!("fused grouped GEMM scheme guard"),
             };
-            let enc = cmd_buf
-                .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+            let enc = cmd_buf.compute_command_encoder_with_dispatch_type(
+                crate::mtl::MTLDispatchType::Concurrent,
+            );
             for e in 0..num_experts {
                 let count = offsets[e + 1] - offsets[e];
                 if count == 0 {
@@ -6660,8 +6791,9 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
                 if count == 0 {
                     continue;
                 }
-                let enc = cmd_buf
-                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+                let enc = cmd_buf.compute_command_encoder_with_dispatch_type(
+                    crate::mtl::MTLDispatchType::Serial,
+                );
                 encode_dequant_gguf(
                     enc,
                     k,
@@ -6725,9 +6857,9 @@ pub(crate) fn gdn_ephemeral_state_bytes(graph: &Graph) -> usize {
 }
 
 pub(crate) fn encode_gated_delta_net(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     q: usize,
     k_off: usize,
     v: usize,
@@ -6778,12 +6910,12 @@ pub(crate) fn encode_gated_delta_net(
     enc.set_bytes(10, 4, &gpc_u as *const u32 as *const _);
     if use_sg {
         const NSG: u64 = 4;
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: (state_size as u64) / NSG,
             height: heads as u64,
             depth: batch as u64,
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 32,
             height: NSG,
             depth: 1,
@@ -6794,12 +6926,12 @@ pub(crate) fn encode_gated_delta_net(
         let threads = (batch * heads).max(1) as u64;
         let tg_w = k.gated_delta_net.thread_execution_width().min(threads);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: threads,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -6813,9 +6945,9 @@ pub(crate) fn encode_gated_delta_net(
 /// scans sequentially over the seq axis. Matches `execute_selective_scan_f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_selective_scan(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     delta: usize,
     a: usize,
@@ -6847,12 +6979,12 @@ pub(crate) fn encode_selective_scan(
     let threads = (batch * hidden) as u64;
     let tg_w = p.thread_execution_width().min(threads.max(1));
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: threads,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -6868,9 +7000,9 @@ pub(crate) fn encode_selective_scan(
 /// `execute_lstm_f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_lstm(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     scratch: usize,
     x: usize,
     w_ih: usize,
@@ -6896,12 +7028,12 @@ pub(crate) fn encode_lstm(
 
     enc.set_compute_pipeline_state(&k.lstm);
     enc.set_buffer(0, Some(buffer), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: batch as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: hidden as u64,
         height: 1,
         depth: 1,
@@ -6962,9 +7094,9 @@ pub(crate) fn encode_lstm(
 /// `execute_gru_f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_gru(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     scratch: usize,
     x: usize,
     w_ih: usize,
@@ -6990,12 +7122,12 @@ pub(crate) fn encode_gru(
 
     enc.set_compute_pipeline_state(&k.gru);
     enc.set_buffer(0, Some(buffer), 0);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: batch as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: hidden as u64,
         height: 1,
         depth: 1,
@@ -7051,9 +7183,9 @@ pub(crate) fn encode_gru(
 /// selects ReLU vs tanh. Bit-for-bit mirror of `execute_rnn_f32`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_rnn(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     scratch: usize,
     x: usize,
     w_ih: usize,
@@ -7079,12 +7211,12 @@ pub(crate) fn encode_rnn(
     enc.set_compute_pipeline_state(&k.rnn);
     enc.set_buffer(0, Some(buffer), 0);
     let relu_u: u32 = if relu { 1 } else { 0 };
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: batch as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: hidden as u64,
         height: 1,
         depth: 1,
@@ -7139,9 +7271,9 @@ pub(crate) fn encode_rnn(
 /// `(batch, head, head_dim_pos)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_mamba2(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dt: usize,
     a: usize,
@@ -7176,12 +7308,12 @@ pub(crate) fn encode_mamba2(
     let threads = (batch * heads * head_dim) as u64;
     let tg_w = p.thread_execution_width().min(threads.max(1));
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: threads,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -7247,9 +7379,9 @@ pub(crate) fn conv_bwd_weight_use_implicit_gemm(m: usize, k: usize, n: usize) ->
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_conv2d_bwd_weight_gemm(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     kk: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dy: usize,
     x: usize,
     dw: usize,
@@ -7279,12 +7411,12 @@ pub(crate) fn encode_conv2d_bwd_weight_gemm(
     if aligned_32 && m >= 32 && n >= 32 {
         enc.set_compute_pipeline_state(&kk.conv2d_bwd_weight_gemm_4x4);
         enc.dispatch_thread_groups(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: n.div_ceil(32) as u64,
                 height: m.div_ceil(32) as u64,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 512,
                 height: 1,
                 depth: 1,
@@ -7293,12 +7425,12 @@ pub(crate) fn encode_conv2d_bwd_weight_gemm(
     } else {
         enc.set_compute_pipeline_state(&kk.conv2d_bwd_weight_gemm);
         enc.dispatch_thread_groups(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: n.div_ceil(8) as u64,
                 height: m.div_ceil(8) as u64,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 32,
                 height: 1,
                 depth: 1,
@@ -7309,9 +7441,9 @@ pub(crate) fn encode_conv2d_bwd_weight_gemm(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_im2col_group(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     col: usize,
     nchw: &[u32; 4],
@@ -7334,12 +7466,12 @@ pub(crate) fn encode_im2col_group(
     enc.set_bytes(5, 16, padd.as_ptr() as *const _);
     let tg_w = 512u64.min(elems).max(1);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: elems,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -7348,9 +7480,9 @@ pub(crate) fn encode_im2col_group(
 }
 
 pub(crate) fn encode_conv2d(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     weight: usize,
     dst: usize,
@@ -7389,26 +7521,26 @@ pub(crate) fn encode_conv2d(
     enc.set_bytes(5, 16, kshape.as_ptr() as *const _);
     enc.set_bytes(6, 16, padd.as_ptr() as *const _);
     let grid = if w1 {
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: h_out as u64,
             depth: (n * c_out) as u64,
         }
     } else {
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: w_out as u64,
             height: h_out as u64,
             depth: (n * c_out) as u64,
         }
     };
     let tg = if w1 {
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 1,
             height: 8.min(h_out as u64),
             depth: 1,
         }
     } else {
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 8.min(w_out as u64),
             height: 8.min(h_out as u64),
             depth: 1,
@@ -7418,9 +7550,9 @@ pub(crate) fn encode_conv2d(
 }
 
 pub(crate) fn encode_group_norm(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     g: usize,
     b: usize,
@@ -7442,14 +7574,14 @@ pub(crate) fn encode_group_norm(
     enc.set_bytes(5, 4, &num_groups as *const u32 as *const _);
     enc.set_bytes(6, 4, &eps as *const f32 as *const _);
     let groups = (n * num_groups) as u64;
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256,
         height: 1,
         depth: 1,
     };
     // Dispatch one threadgroup per (batch, group) along grid *width* so
     // `threadgroup_position_in_grid` (scalar .x) indexes 0..batch*num_groups-1.
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: groups.max(1),
         height: 1,
         depth: 1,
@@ -7458,9 +7590,9 @@ pub(crate) fn encode_group_norm(
 }
 
 pub(crate) fn encode_resize_nearest_2x(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     n: u32,
@@ -7475,12 +7607,12 @@ pub(crate) fn encode_resize_nearest_2x(
     enc.set_buffer(0, Some(buffer), src as u64);
     enc.set_buffer(1, Some(buffer), dst as u64);
     enc.set_bytes(2, 16, nchw.as_ptr() as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w2 as u64,
         height: h2 as u64,
         depth: (n * c) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w2 as u64),
         height: 8.min(h2 as u64),
         depth: 1,
@@ -7489,9 +7621,9 @@ pub(crate) fn encode_resize_nearest_2x(
 }
 
 pub(crate) fn encode_layer_norm2d(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     g: usize,
     b: usize,
@@ -7510,12 +7642,12 @@ pub(crate) fn encode_layer_norm2d(
     enc.set_buffer(3, Some(buffer), dst as u64);
     enc.set_bytes(4, 16, nchw.as_ptr() as *const _);
     enc.set_bytes(5, 4, &eps as *const f32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w as u64,
         height: h as u64,
         depth: n as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w as u64),
         height: 8.min(h as u64),
         depth: 1,
@@ -7524,9 +7656,9 @@ pub(crate) fn encode_layer_norm2d(
 }
 
 pub(crate) fn encode_conv_transpose2d(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     weight: usize,
     dst: usize,
@@ -7559,12 +7691,12 @@ pub(crate) fn encode_conv_transpose2d(
     enc.set_bytes(4, 16, out_dims.as_ptr() as *const _);
     enc.set_bytes(5, 16, kshape.as_ptr() as *const _);
     enc.set_bytes(6, 16, padd.as_ptr() as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w_out as u64,
         height: h_out as u64,
         depth: (n * c_out) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w_out as u64),
         height: 8.min(h_out as u64),
         depth: 1,
@@ -7573,9 +7705,9 @@ pub(crate) fn encode_conv_transpose2d(
 }
 
 pub(crate) fn encode_conv3d(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     weight: usize,
     dst: usize,
@@ -7620,12 +7752,12 @@ pub(crate) fn encode_conv3d(
     enc.set_bytes(8, 16, f.as_ptr() as *const _);
     // Grid: (w_out, h_out, n * c_out * d_out). Kernel decodes
     // d_o = z % d_out, then (n, c_out) from z / d_out.
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w_out as u64,
         height: h_out as u64,
         depth: (n * c_out * d_out) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w_out as u64),
         height: 8.min(h_out as u64),
         depth: 1,
@@ -7634,9 +7766,9 @@ pub(crate) fn encode_conv3d(
 }
 
 pub(crate) fn encode_conv_transpose3d(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     weight: usize,
     dst: usize,
@@ -7679,12 +7811,12 @@ pub(crate) fn encode_conv_transpose3d(
     enc.set_bytes(6, 16, dparams.as_ptr() as *const _);
     enc.set_bytes(7, 16, e.as_ptr() as *const _);
     enc.set_bytes(8, 16, f.as_ptr() as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w_out as u64,
         height: h_out as u64,
         depth: (n * c_out * d_out) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w_out as u64),
         height: 8.min(h_out as u64),
         depth: 1,
@@ -7693,9 +7825,9 @@ pub(crate) fn encode_conv_transpose3d(
 }
 
 pub(crate) fn encode_pool2d(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     n: u32,
@@ -7732,12 +7864,12 @@ pub(crate) fn encode_pool2d(
     enc.set_bytes(4, 16, khsw.as_ptr() as *const _);
     enc.set_bytes(5, 8, pad.as_ptr() as *const _);
     enc.set_bytes(6, 4, &kind_u as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w_out as u64,
         height: h_out as u64,
         depth: (n * c) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w_out as u64),
         height: 8.min(h_out as u64),
         depth: 1,
@@ -7747,9 +7879,9 @@ pub(crate) fn encode_pool2d(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_maxpool2d_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dx: usize,
@@ -7776,12 +7908,12 @@ pub(crate) fn encode_maxpool2d_backward(
     enc.set_bytes(3, 16, p0.as_ptr() as *const _);
     enc.set_bytes(4, 16, p1.as_ptr() as *const _);
     enc.set_bytes(5, 16, p2.as_ptr() as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w as u64,
         height: h as u64,
         depth: (n * c) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w as u64),
         height: 8.min(h as u64),
         depth: 1,
@@ -7791,9 +7923,9 @@ pub(crate) fn encode_maxpool2d_backward(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_maxpool3d_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dx: usize,
@@ -7829,12 +7961,12 @@ pub(crate) fn encode_maxpool3d_backward(
     enc.set_bytes(6, 16, p3.as_ptr() as *const _);
     enc.set_bytes(7, 4, (&pw as *const u32) as *const _);
     let total = (n * c * d * h * w) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total.max(1),
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(total.max(1)),
         height: 1,
         depth: 1,
@@ -7844,9 +7976,9 @@ pub(crate) fn encode_maxpool3d_backward(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_conv3d_backward_input(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dy: usize,
     w: usize,
     dx: usize,
@@ -7890,12 +8022,12 @@ pub(crate) fn encode_conv3d_backward_input(
     enc.set_bytes(7, 16, e.as_ptr() as *const _);
     enc.set_bytes(8, 8, f.as_ptr() as *const _);
     let total = (n * c_in * d * h * w_in) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total.max(1),
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(total.max(1)),
         height: 1,
         depth: 1,
@@ -7905,9 +8037,9 @@ pub(crate) fn encode_conv3d_backward_input(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_conv3d_backward_weight(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dw: usize,
@@ -7952,12 +8084,12 @@ pub(crate) fn encode_conv3d_backward_weight(
     enc.set_bytes(8, 8, f.as_ptr() as *const _);
     let c_in_per_g = c_in / groups.max(1);
     let total = (c_out * c_in_per_g * kd * kh * kw) as u64;
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: total.max(1),
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 256.min(total.max(1)),
         height: 1,
         depth: 1,
@@ -7967,9 +8099,9 @@ pub(crate) fn encode_conv3d_backward_weight(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_conv2d_backward_input(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dy: usize,
     w: usize,
     dx: usize,
@@ -8002,12 +8134,12 @@ pub(crate) fn encode_conv2d_backward_input(
     enc.set_bytes(4, 16, b.as_ptr() as *const _);
     enc.set_bytes(5, 16, cc.as_ptr() as *const _);
     enc.set_bytes(6, 16, d.as_ptr() as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: w_in as u64,
         height: h as u64,
         depth: (n * c_in) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(w_in as u64),
         height: 8.min(h as u64),
         depth: 1,
@@ -8017,9 +8149,9 @@ pub(crate) fn encode_conv2d_backward_input(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_conv2d_backward_weight(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dw: usize,
@@ -8053,12 +8185,12 @@ pub(crate) fn encode_conv2d_backward_weight(
     enc.set_bytes(4, 16, b.as_ptr() as *const _);
     enc.set_bytes(5, 16, cc.as_ptr() as *const _);
     enc.set_bytes(6, 16, d.as_ptr() as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: kw as u64,
         height: kh as u64,
         depth: (c_out * c_in_per_g) as u64,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: kw as u64,
         height: kh as u64,
         depth: 1,
@@ -8073,9 +8205,9 @@ pub(crate) fn encode_conv2d_backward_weight(
 // pass 1's writes with no explicit barrier.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_conv2d_backward_weight_2pass(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     part_off: usize,
     x: usize,
     dy: usize,
@@ -8114,13 +8246,13 @@ pub(crate) fn encode_conv2d_backward_weight_2pass(
     enc.set_bytes(4, 16, b.as_ptr() as *const _);
     enc.set_bytes(5, 16, cc.as_ptr() as *const _);
     enc.set_bytes(6, 16, d.as_ptr() as *const _);
-    let grid1 = metal::MTLSize {
+    let grid1 = crate::mtl::MTLSize {
         width: wsz as u64,
         height: c_out as u64,
         depth: n as u64,
     };
     let tgw = 8.min(wsz as u64).max(1);
-    let tg1 = metal::MTLSize {
+    let tg1 = crate::mtl::MTLSize {
         width: tgw,
         height: 8.min(c_out as u64).max(1),
         depth: 1,
@@ -8133,12 +8265,12 @@ pub(crate) fn encode_conv2d_backward_weight_2pass(
     enc.set_buffer(0, Some(buffer), part_off as u64);
     enc.set_buffer(1, Some(buffer), dw as u64);
     enc.set_bytes(2, 8, dims.as_ptr() as *const _);
-    let grid2 = metal::MTLSize {
+    let grid2 = crate::mtl::MTLSize {
         width: wslab as u64,
         height: 1,
         depth: 1,
     };
-    let tg2 = metal::MTLSize {
+    let tg2 = crate::mtl::MTLSize {
         width: 64.min(wslab as u64).max(1),
         height: 1,
         depth: 1,
@@ -8147,9 +8279,9 @@ pub(crate) fn encode_conv2d_backward_weight_2pass(
 }
 
 pub(crate) fn encode_gather_axis(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     table: usize,
     idx: usize,
     dst: usize,
@@ -8166,7 +8298,7 @@ pub(crate) fn encode_gather_axis(
     enc.set_bytes(4, 4, &axis_dim as *const u32 as *const _);
     enc.set_bytes(5, 4, &num_idx as *const u32 as *const _);
     enc.set_bytes(6, 4, &trailing as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: trailing as u64,
         height: num_idx as u64,
         depth: outer as u64,
@@ -8179,7 +8311,7 @@ pub(crate) fn encode_gather_axis(
     // ~4× more parallel per simdgroup.
     let tg_x = 32.min(trailing as u64).max(1);
     let tg_y = (32 / tg_x).clamp(1, num_idx as u64).max(1);
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_x,
         height: tg_y,
         depth: 1,
@@ -8253,9 +8385,9 @@ pub(crate) fn detect_swap12_batched_trailing(
 }
 
 pub(crate) fn encode_transpose_swap12_batched_trailing(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     batch: u32,
@@ -8273,12 +8405,12 @@ pub(crate) fn encode_transpose_swap12_batched_trailing(
     enc.set_bytes(5, 4, &trail as *const u32 as *const _);
     if use_tiled {
         enc.set_compute_pipeline_state(&k.transpose_swap12_batched_trail_tiled_f32);
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 32,
             height: 8,
             depth: 1,
         };
-        let groups = metal::MTLSize {
+        let groups = crate::mtl::MTLSize {
             width: (rows as u64).div_ceil(32),
             height: (cols as u64).div_ceil(32),
             depth,
@@ -8288,12 +8420,12 @@ pub(crate) fn encode_transpose_swap12_batched_trailing(
     }
     enc.set_compute_pipeline_state(&k.transpose_swap12_batched_trail_f32);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: rows as u64,
             height: cols as u64,
             depth,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: 16.min(rows as u64),
             height: 16.min(cols as u64),
             depth: 1,
@@ -8324,9 +8456,9 @@ pub(crate) fn arena_off_large(off: usize) -> bool {
 }
 
 pub(crate) fn encode_transpose_2d(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     rows: u32,
@@ -8344,12 +8476,12 @@ pub(crate) fn encode_transpose_2d(
     enc.set_bytes(3, 4, &cols as *const u32 as *const _);
     if use_tiled {
         // 32x32 tile, threadgroup (32,8).
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 32,
             height: 8,
             depth: 1,
         };
-        let groups = metal::MTLSize {
+        let groups = crate::mtl::MTLSize {
             width: (rows as u64).div_ceil(32),
             height: (cols as u64).div_ceil(32),
             depth: 1,
@@ -8359,12 +8491,12 @@ pub(crate) fn encode_transpose_2d(
         let tg_w = k.transpose_2d_f32.thread_execution_width().min(cols as u64);
         let tg_h = (256 / tg_w.max(1)).min(rows as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: rows as u64,
                 height: cols as u64,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: tg_h,
                 depth: 1,
@@ -8374,9 +8506,9 @@ pub(crate) fn encode_transpose_2d(
 }
 
 pub(crate) fn encode_transpose_last2_batched(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     batch: u32,
@@ -8395,12 +8527,12 @@ pub(crate) fn encode_transpose_last2_batched(
     enc.set_bytes(3, 4, &rows as *const u32 as *const _);
     enc.set_bytes(4, 4, &cols as *const u32 as *const _);
     if use_tiled {
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 32,
             height: 8,
             depth: 1,
         };
-        let groups = metal::MTLSize {
+        let groups = crate::mtl::MTLSize {
             width: (rows as u64).div_ceil(32),
             height: (cols as u64).div_ceil(32),
             depth: batch as u64,
@@ -8413,12 +8545,12 @@ pub(crate) fn encode_transpose_last2_batched(
             .min(rows as u64);
         let tg_h = (256 / tg_w.max(1)).min(cols as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: rows as u64,
                 height: cols as u64,
                 depth: batch as u64,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: tg_h,
                 depth: 1,
@@ -8428,9 +8560,9 @@ pub(crate) fn encode_transpose_last2_batched(
 }
 
 pub(crate) fn encode_transpose(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     total: u32,
@@ -8455,12 +8587,12 @@ pub(crate) fn encode_transpose(
     enc.set_bytes(4, (meta.len() * 4) as u64, meta.as_ptr() as *const _);
     let tg_w = k.transpose_nd.thread_execution_width().min(total as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: total as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -8469,9 +8601,9 @@ pub(crate) fn encode_transpose(
 }
 
 pub(crate) fn encode_elementwise_region(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     len: u32,
     num_inputs: u32,
     num_steps: u32,
@@ -8557,12 +8689,12 @@ pub(crate) fn encode_elementwise_region(
         &prologue_input as *const u32 as *const _,
     );
     if prologue != 0 && out_h > 0 && out_w > 0 {
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: out_w as u64,
             height: out_h as u64,
             depth: (out_n as u64) * (out_c as u64),
         };
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 8.min(out_w as u64),
             height: 8.min(out_h as u64),
             depth: 1,
@@ -8574,12 +8706,12 @@ pub(crate) fn encode_elementwise_region(
             .thread_execution_width()
             .min(len as u64);
         enc.dispatch_threads(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: len as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: tg_w,
                 height: 1,
                 depth: 1,
@@ -8589,9 +8721,9 @@ pub(crate) fn encode_elementwise_region(
 }
 
 pub(crate) fn encode_batch_elementwise_region(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     slice_len: u32,
     num_batch: u32,
     num_steps: u32,
@@ -8651,12 +8783,12 @@ pub(crate) fn encode_batch_elementwise_region(
         .thread_execution_width()
         .min(slice_len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: slice_len as u64,
             height: 1,
             depth: num_batch as u64,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -8665,9 +8797,9 @@ pub(crate) fn encode_batch_elementwise_region(
 }
 
 pub(crate) fn encode_scatter_add(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     updates: usize,
     indices: usize,
     dst: usize,
@@ -8685,12 +8817,12 @@ pub(crate) fn encode_scatter_add(
         .thread_execution_width()
         .min(out_total as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: out_total as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w0,
             height: 1,
             depth: 1,
@@ -8705,12 +8837,12 @@ pub(crate) fn encode_scatter_add(
     enc.set_bytes(3, 4, &trailing as *const u32 as *const _);
     enc.set_bytes(4, 4, &num_updates as *const u32 as *const _);
     enc.set_bytes(5, 4, &out_dim as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: trailing as u64,
         height: num_updates as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 8.min(trailing as u64),
         height: 8.min(num_updates as u64),
         depth: 1,
@@ -8719,9 +8851,9 @@ pub(crate) fn encode_scatter_add(
 }
 
 pub(crate) fn encode_grouped_matmul(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     input: usize,
     weight: usize,
     expert_idx: usize,
@@ -8731,6 +8863,32 @@ pub(crate) fn encode_grouped_matmul(
     n: u32,
     num_experts: u32,
 ) {
+    // Decode (small m) has too little column parallelism for the one-thread-per-
+    // output kernel; route it to the K-split GEMV instead. Prefill keeps the
+    // simple kernel, where m*n threads is already plenty.
+    if m <= 4 {
+        enc.set_compute_pipeline_state(&k.grouped_gemv_splitk);
+        enc.set_buffer(0, Some(buffer), input as u64);
+        enc.set_buffer(1, Some(buffer), weight as u64);
+        enc.set_buffer(2, Some(buffer), expert_idx as u64);
+        enc.set_buffer(3, Some(buffer), dst as u64);
+        enc.set_bytes(4, 4, &k_dim as *const u32 as *const _);
+        enc.set_bytes(5, 4, &n as *const u32 as *const _);
+        enc.set_bytes(6, 4, &num_experts as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            crate::mtl::MTLSize {
+                width: n.div_ceil(32) as u64,
+                height: m as u64,
+                depth: 1,
+            },
+            crate::mtl::MTLSize {
+                width: 32,
+                height: 32,
+                depth: 1,
+            },
+        );
+        return;
+    }
     enc.set_compute_pipeline_state(&k.grouped_matmul);
     enc.set_buffer(0, Some(buffer), input as u64);
     enc.set_buffer(1, Some(buffer), weight as u64);
@@ -8740,23 +8898,38 @@ pub(crate) fn encode_grouped_matmul(
     enc.set_bytes(5, 4, &k_dim as *const u32 as *const _);
     enc.set_bytes(6, 4, &n as *const u32 as *const _);
     enc.set_bytes(7, 4, &num_experts as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: n as u64,
         height: m as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
-        width: 8.min(n as u64),
-        height: 8.min(m as u64),
+    // Size the threadgroup off the pipeline instead of a fixed 8x8. MoE *decode*
+    // runs this with m == 1, where 8x8 degenerates to an 8-thread threadgroup —
+    // Metal issues in SIMD groups of 32, so 24 of every 32 lanes idled, on 368
+    // dispatches per token. Putting the execution width along `n` (contiguous, so
+    // the weight reads stay coalesced) and filling the rest with rows keeps every
+    // lane busy for both decode (m=1) and prefill (m=seq).
+    let ew = k.grouped_matmul.thread_execution_width().max(1);
+    let max_t = k.grouped_matmul.max_total_threads_per_threadgroup().max(1);
+    // Execution-width along `n` (contiguous, so weight reads stay coalesced) and
+    // fill the rest with rows. Tried instead making this wide-and-shallow (one row
+    // per threadgroup) so each threadgroup streams a single expert slab: MEASURED
+    // WORSE for prefill, 146 -> 127 tok/s. Too few, too large threadgroups costs
+    // more scheduling flexibility than the cache locality wins.
+    let tg_w = ew.min(n as u64).max(1);
+    let tg_h = (max_t / tg_w).min(m as u64).max(1);
+    let tg = crate::mtl::MTLSize {
+        width: tg_w,
+        height: tg_h,
         depth: 1,
     };
     enc.dispatch_threads(grid, tg);
 }
 
 pub(crate) fn encode_topk(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     outer: u32,
@@ -8770,12 +8943,12 @@ pub(crate) fn encode_topk(
     enc.set_bytes(3, 4, &k_val as *const u32 as *const _);
     let tg_w = k.topk_lastax.thread_execution_width().min(outer as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: outer as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -8784,9 +8957,9 @@ pub(crate) fn encode_topk(
 }
 
 pub(crate) fn encode_reduce_axes(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     outer: u32,
@@ -8820,12 +8993,12 @@ pub(crate) fn encode_reduce_axes(
         enc.set_bytes(3, 4, &inner as *const u32 as *const _);
         enc.set_bytes(4, 4, &op_kind as *const u32 as *const _);
         enc.dispatch_thread_groups(
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: inner as u64 * outer as u64,
                 height: 1,
                 depth: 1,
             },
-            metal::MTLSize {
+            crate::mtl::MTLSize {
                 width: 32,
                 height: 1,
                 depth: 1,
@@ -8843,12 +9016,12 @@ pub(crate) fn encode_reduce_axes(
     enc.set_bytes(2, 4, &reduced as *const u32 as *const _);
     enc.set_bytes(3, 4, &inner as *const u32 as *const _);
     enc.set_bytes(4, 4, &op_kind as *const u32 as *const _);
-    let grid = metal::MTLSize {
+    let grid = crate::mtl::MTLSize {
         width: inner as u64,
         height: outer as u64,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: 16.min(inner as u64),
         height: 16.min(outer as u64),
         depth: 1,
@@ -8857,9 +9030,9 @@ pub(crate) fn encode_reduce_axes(
 }
 
 pub(crate) fn encode_compare(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     lhs: usize,
     rhs: usize,
     dst: usize,
@@ -8895,12 +9068,12 @@ pub(crate) fn encode_compare(
     }
     let tg_w = pipeline.thread_execution_width().min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -8909,9 +9082,9 @@ pub(crate) fn encode_compare(
 }
 
 pub(crate) fn encode_where(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     cond: usize,
     on_true: usize,
     on_false: usize,
@@ -8940,12 +9113,12 @@ pub(crate) fn encode_where(
     }
     let tg_w = pipeline.thread_execution_width().min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -8955,9 +9128,9 @@ pub(crate) fn encode_where(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fma(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     a: usize,
     b: usize,
     c: usize,
@@ -8972,12 +9145,12 @@ pub(crate) fn encode_fma(
     enc.set_bytes(4, 4, &len as *const u32 as *const _);
     let tg_w = k.elem_fma.thread_execution_width().min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -8986,9 +9159,9 @@ pub(crate) fn encode_fma(
 }
 
 pub(crate) fn encode_relu_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dx: usize,
@@ -9001,12 +9174,12 @@ pub(crate) fn encode_relu_backward(
     enc.set_bytes(3, 4, &len as *const u32 as *const _);
     let tg_w = k.relu_backward.thread_execution_width().min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9016,9 +9189,9 @@ pub(crate) fn encode_relu_backward(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_activation_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     x: usize,
     dy: usize,
     dx: usize,
@@ -9036,12 +9209,12 @@ pub(crate) fn encode_activation_backward(
         .thread_execution_width()
         .min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9050,9 +9223,9 @@ pub(crate) fn encode_activation_backward(
 }
 
 pub(crate) fn encode_complex_norm_sq(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     len: u32,
@@ -9063,12 +9236,12 @@ pub(crate) fn encode_complex_norm_sq(
     enc.set_bytes(2, 4, &len as *const u32 as *const _);
     let tg_w = k.complex_norm_sq.thread_execution_width().min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9077,9 +9250,9 @@ pub(crate) fn encode_complex_norm_sq(
 }
 
 pub(crate) fn encode_complex_norm_sq_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     z: usize,
     g: usize,
     dz: usize,
@@ -9095,12 +9268,12 @@ pub(crate) fn encode_complex_norm_sq_backward(
         .thread_execution_width()
         .min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9109,9 +9282,9 @@ pub(crate) fn encode_complex_norm_sq_backward(
 }
 
 pub(crate) fn encode_conjugate_c64(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     len: u32,
@@ -9122,12 +9295,12 @@ pub(crate) fn encode_conjugate_c64(
     enc.set_bytes(2, 4, &len as *const u32 as *const _);
     let tg_w = k.conjugate_c64.thread_execution_width().min(len as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: len as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9145,9 +9318,9 @@ struct FftButterflyStageParams {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fft_butterfly_stage(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     state: usize,
     out: usize,
     gate: usize,
@@ -9186,12 +9359,12 @@ pub(crate) fn encode_fft_butterfly_stage(
         .min(n_half as u64)
         .max(1);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: n_half as u64,
             height: batch as u64,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9209,9 +9382,9 @@ struct FakeQuantizeParams {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fake_quantize_fixed(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     scale: usize,
     dst: usize,
@@ -9240,12 +9413,12 @@ pub(crate) fn encode_fake_quantize_fixed(
     );
     let tg_w = k.fake_quantize_fixed.thread_execution_width().min(n as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: n as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9255,9 +9428,9 @@ pub(crate) fn encode_fake_quantize_fixed(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_fake_quantize_perbatch(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     n: u32,
@@ -9287,12 +9460,12 @@ pub(crate) fn encode_fake_quantize_perbatch(
         .thread_execution_width()
         .min(chan_dim as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: chan_dim as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,
@@ -9304,9 +9477,9 @@ pub(crate) fn encode_fake_quantize_perbatch(
 /// Threadgroup size must be a power of 2 and ≤256 (the kernel's reduction
 /// buffer). Picks the largest pow2 ≤ cols, capped at 256.
 pub(crate) fn encode_softmax(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     data: usize,
     rows: u32,
     cols: u32,
@@ -9345,12 +9518,12 @@ pub(crate) fn encode_softmax(
     // (encode_layer_norm, encode_rms_norm, encode_fused_residual_ln) — only
     // encode_softmax and the softmax_cross_entropy_* encoders still used the
     // buggy dispatch_threads form; all are fixed to match.
-    let groups = metal::MTLSize {
+    let groups = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -9364,9 +9537,9 @@ pub(crate) fn encode_softmax(
 /// capped at 256 (the kernel's reduction buffer). f32 only.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_softmax_cross_entropy_dense(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     logits: usize,
     targets: usize,
     dst: usize,
@@ -9388,12 +9561,12 @@ pub(crate) fn encode_softmax_cross_entropy_dense(
     );
     // One threadgroup per row via dispatch_thread_groups (not
     // dispatch_threads with a row-packed grid — see encode_softmax).
-    let groups = metal::MTLSize {
+    let groups = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -9403,9 +9576,9 @@ pub(crate) fn encode_softmax_cross_entropy_dense(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_softmax_cross_entropy_with_logits(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     logits: usize,
     labels: usize,
     dst: usize,
@@ -9422,12 +9595,12 @@ pub(crate) fn encode_softmax_cross_entropy_with_logits(
     enc.set_buffer(2, Some(buffer), dst as u64);
     enc.set_bytes(3, 4, &cols as *const u32 as *const _);
     // One threadgroup per row via dispatch_thread_groups (see encode_softmax).
-    let groups = metal::MTLSize {
+    let groups = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -9437,9 +9610,9 @@ pub(crate) fn encode_softmax_cross_entropy_with_logits(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_softmax_cross_entropy_backward(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     logits: usize,
     labels: usize,
     d_loss: usize,
@@ -9458,12 +9631,12 @@ pub(crate) fn encode_softmax_cross_entropy_backward(
     enc.set_buffer(3, Some(buffer), dlogits as u64);
     enc.set_bytes(4, 4, &cols as *const u32 as *const _);
     // One threadgroup per row via dispatch_thread_groups (see encode_softmax).
-    let groups = metal::MTLSize {
+    let groups = crate::mtl::MTLSize {
         width: rows as u64,
         height: 1,
         depth: 1,
     };
-    let tg = metal::MTLSize {
+    let tg = crate::mtl::MTLSize {
         width: tg_w,
         height: 1,
         depth: 1,
@@ -9496,9 +9669,9 @@ pub(crate) struct ConcatSegGpu {
 /// >4 GiB arenas (task #50). `dst`/`inputs` offsets are byte offsets into the
 /// arena (as stored in the thunk).
 pub(crate) fn encode_concat_midaxis(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dst: usize,
     outer: u32,
     dst_axis: u32,
@@ -9541,12 +9714,12 @@ pub(crate) fn encode_concat_midaxis(
         enc.set_bytes(6, 4, &inner as *const u32 as *const _);
         enc.set_bytes(7, 4, &axis_off as *const u32 as *const _);
         let tg = 256u64.min(total);
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: total,
             height: 1,
             depth: 1,
         };
-        let tgs = metal::MTLSize {
+        let tgs = crate::mtl::MTLSize {
             width: tg.max(1),
             height: 1,
             depth: 1,
@@ -9557,9 +9730,9 @@ pub(crate) fn encode_concat_midaxis(
 }
 
 pub(crate) fn encode_concat_lastax(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     dst: usize,
     outer: u32,
     dst_axis: u32,
@@ -9613,7 +9786,7 @@ pub(crate) fn encode_concat_lastax(
                 (segs.len() * std::mem::size_of::<ConcatSegGpu>()) as u64,
                 segs.as_ptr() as *const _,
             );
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: max_len4 as u64,
                 height: outer as u64,
                 depth: num_seg as u64,
@@ -9625,7 +9798,7 @@ pub(crate) fn encode_concat_lastax(
             // leaving the destination buffer zero, which manifested as the
             // long-standing K_rep / V_rep zero bug on Gemma 4 12B SWA layers.
             let tg_depth = (1024u64 / (64 * 4)).min(num_seg as u64).max(1);
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 64.min(max_len4 as u64),
                 height: 4.min(outer as u64),
                 depth: tg_depth,
@@ -9645,14 +9818,14 @@ pub(crate) fn encode_concat_lastax(
             (segs.len() * std::mem::size_of::<ConcatSegGpu>()) as u64,
             segs.as_ptr() as *const _,
         );
-        let grid = metal::MTLSize {
+        let grid = crate::mtl::MTLSize {
             width: max_len as u64,
             height: outer as u64,
             depth: num_seg as u64,
         };
         // Task #50: cap total threads per threadgroup at 1024.
         let tg_depth = (1024u64 / (32 * 8)).min(num_seg as u64).max(1);
-        let tg = metal::MTLSize {
+        let tg = crate::mtl::MTLSize {
             width: 32.min(max_len as u64),
             height: 8.min(outer as u64),
             depth: tg_depth,
@@ -9690,12 +9863,12 @@ pub(crate) fn encode_concat_lastax(
             let dst_u64 = dst as u64;
             enc.set_bytes(6, 8, &src_off_u64 as *const u64 as *const _);
             enc.set_bytes(7, 8, &dst_u64 as *const u64 as *const _);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: src_axis4 as u64,
                 height: outer as u64,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 64.min(src_axis4 as u64),
                 height: 4.min(outer as u64),
                 depth: 1,
@@ -9714,12 +9887,12 @@ pub(crate) fn encode_concat_lastax(
             let dst_u64 = dst as u64;
             enc.set_bytes(6, 8, &src_off_u64 as *const u64 as *const _);
             enc.set_bytes(7, 8, &dst_u64 as *const u64 as *const _);
-            let grid = metal::MTLSize {
+            let grid = crate::mtl::MTLSize {
                 width: src_axis as u64,
                 height: outer as u64,
                 depth: 1,
             };
-            let tg = metal::MTLSize {
+            let tg = crate::mtl::MTLSize {
                 width: 16.min(src_axis as u64),
                 height: 16.min(outer as u64),
                 depth: 1,
@@ -9733,9 +9906,9 @@ pub(crate) fn encode_concat_lastax(
 /// Dispatch a FusedSwiGLU kernel. Picks the variant matching `(src_dt, dst_dt)`:
 /// f32→f32, f16→f16, f32→f16 (cast), f16→f32 (cast).
 pub(crate) fn encode_fused_swiglu(
-    enc: &metal::ComputeCommandEncoderRef,
+    enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
-    buffer: &metal::Buffer,
+    buffer: &crate::mtl::Buffer,
     src: usize,
     dst: usize,
     n_half: u32,
@@ -9772,12 +9945,12 @@ pub(crate) fn encode_fused_swiglu(
     );
     let tg_w = pipeline.thread_execution_width().min(total as u64);
     enc.dispatch_threads(
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: total as u64,
             height: 1,
             depth: 1,
         },
-        metal::MTLSize {
+        crate::mtl::MTLSize {
             width: tg_w,
             height: 1,
             depth: 1,

@@ -178,6 +178,16 @@ fn lower_softmax_cross_entropy_backward(
 pub struct LowerSoftmaxCrossEntropy;
 
 impl Pass for LowerSoftmaxCrossEntropy {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[
+            OpKind::SoftmaxCrossEntropy,
+            OpKind::SoftmaxCrossEntropyWithLogits,
+            OpKind::SoftmaxCrossEntropyBackward,
+        ]
+    }
+
     fn name(&self) -> &str {
         "lower_softmax_cross_entropy"
     }

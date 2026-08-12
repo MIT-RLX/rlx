@@ -1,0 +1,15 @@
+// No Fma present: the pass must leave the graph exactly as it found it.
+// RUN: lower_fma
+graph @plain {
+  %0 = {"Input":{"name":"a"}} : [4] f32
+  %1 = {"Input":{"name":"b"}} : [4] f32
+  %2 = {"Binary":"Add"}(%0, %1) : [4] f32
+  return %2
+}
+// EXPECT
+graph @plain {
+  %0 = {"Input":{"name":"a"}} : [4] f32
+  %1 = {"Input":{"name":"b"}} : [4] f32
+  %2 = {"Binary":"Add"}(%0, %1) : [4] f32
+  return %2
+}

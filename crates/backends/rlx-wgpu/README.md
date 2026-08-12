@@ -132,7 +132,7 @@ GPU. Host→Host streaks reuse a tensor mirror (`HostTensorCache`) and skip empt
 compute encodes between host steps; deferred H2D batches uploads before the
 next device-reading step.
 
-**EEG-DINO parity notes:** compile runs `LegalizeBroadcast` before fusion
+**Encoder parity notes:** compile runs `LegalizeBroadcast` before fusion
 (mid-axis `[1,C,1,D]+[1,C,P,D]` needs `Expand`) and unfuses
 `ElementwiseRegion` on wgpu (region kernel only supports trailing broadcast).
 `Activation::Gelu` uses exact `erf` in `unary.wgsl` (not the tanh approx).

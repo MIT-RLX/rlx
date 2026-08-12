@@ -21,6 +21,14 @@ __device__ __forceinline__ unsigned int mlx_rd_byte(
     return (w >> ((unsigned int)(byte_off & 3ull) * 8u)) & 0xffu;
 }
 
+/// 32-bit word at a 4-byte-aligned arena byte offset (8 packed E2M1 nibbles).
+__device__ __forceinline__ unsigned int mlx_rd_word(
+    const float* arena,
+    unsigned long long byte_off
+) {
+    return __float_as_uint(arena[byte_off >> 2ull]);
+}
+
 __device__ __forceinline__ float mlx_fp4_lut(unsigned int nib) {
     static const float lut[16] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -339,26 +347,48 @@ extern "C" __global__ void dequant_matmul_mlx_gemm(
     unsigned long long scale_f_off = scale_byte_off / 4ull;
     unsigned long long zp_f_off = zp_byte_off / 4ull;
 
-    // TM * 256 max threadgroup; stage one K-slice of X.
-    __shared__ float xs[MLX_TM * 256];
+    // Only the final cross-thread reduction needs shared memory. X used to be
+    // staged here too (`xs[t*tpg+tid]`), but each thread wrote and read back its
+    // OWN slot — a no-op round-trip that cost 8 KB of occupancy-limiting shared
+    // memory and a `__syncthreads()` per K-chunk. It lives in registers now.
     __shared__ float smem[MLX_TM * 256];
 
     float acc[MLX_TM];
     #pragma unroll
     for (unsigned int t = 0u; t < MLX_TM; ++t) acc[t] = 0.0f;
 
+    // WHERE THIS KERNEL ACTUALLY LOSES: the weight column is re-read once per
+    // ROW-TILE. `MLX_TM = 8`, so an m=64 GEMM launches 8 blocks in y for the same
+    // `col`, and each independently streams that column's whole packed row. Ling's
+    // `lm_head` (m=64, k=1536, n=157184) therefore moves 8 x 120 MB = 960 MB for a
+    // 120 MB weight — measured 58.8 ms, i.e. ~525 GFLOP/s but only ~2.1 GB/s of
+    // USEFUL weight traffic on a card that does ~400 GB/s. The fix is to cover
+    // more rows per block (raise MLX_TM, or stage the decoded column in shared
+    // memory and loop rows over it) so the weight is read once, NOT to change how
+    // each thread walks K.
+    //
+    // MEASURED AND REVERTED — do not re-try the word-wise trick here. Loading
+    // one 32-bit word per EIGHT nibbles (instead of `mlx_rd_byte`'s one word per
+    // nibble) is what took the GROUPED kernel 10.33 ms -> 2.11 ms, but it LOSES
+    // in this one: 3080 Ti, Ling `lm_head` m=64 k=1536 n=157184, 57.7 -> 69.0 ms;
+    // `attn_proj` 0.73 -> 0.89 ms (checksums identical, so it was correct).
+    //
+    // The two kernels get their parallelism from opposite places. The grouped
+    // kernel parallelizes over m*n and each thread already owned a whole K row,
+    // so folding 8 elements into one thread cost nothing. Here the threads SPLIT
+    // K (`p = p0 + tid`), so 8 elements per thread means 8x fewer active
+    // threads — at k=1536 that is 192 of 256 doing all the work, with less
+    // latency to hide the loads. Fixing this kernel means more parallelism
+    // (split n across more blocks), not fewer/fatter threads.
+
     for (unsigned int p0 = 0u; p0 < k; p0 += tpg) {
         unsigned int p = p0 + tid;
+        float xv[MLX_TM];
         #pragma unroll
         for (unsigned int t = 0u; t < MLX_TM; ++t) {
             unsigned int row = row0 + t;
-            float v = 0.0f;
-            if (row < m && p < k) {
-                v = arena[x_off + row * k + p];
-            }
-            xs[t * tpg + tid] = v;
+            xv[t] = (row < m && p < k) ? arena[x_off + row * k + p] : 0.0f;
         }
-        __syncthreads();
 
         if (p < k) {
             unsigned int g = p / gs;
@@ -389,10 +419,9 @@ extern "C" __global__ void dequant_matmul_mlx_gemm(
             }
             #pragma unroll
             for (unsigned int t = 0u; t < MLX_TM; ++t) {
-                acc[t] += xs[t * tpg + tid] * w_dq;
+                acc[t] += xv[t] * w_dq;
             }
         }
-        __syncthreads();
     }
 
     #pragma unroll
@@ -474,6 +503,153 @@ extern "C" __global__ void dequant_grouped_matmul_mlx_mxfp4(
         acc += arena[xrow_f + (unsigned long long)p] * mlx_fp4_lut(nib) * scale;
     }
     arena[out_off + (unsigned long long)row * (unsigned long long)n + (unsigned long long)col] = acc;
+}
+
+// V3 — V1's thread mapping, WORD-WISE inner loop. This is the default whenever
+// `k % 8 == 0` (every real MoE width is).
+//
+// V1 called `mlx_rd_byte` per element, and that helper loads a whole 32-bit word
+// and shifts a byte out of it — so it issued ONE 32-bit load per NIBBLE, i.e. 8x
+// more load instructions than the data requires, plus a per-element scale load.
+// V3 loads each word once and unrolls the 8 nibbles it carries, and hoists the
+// group scale out of the group's inner loop (48 scale loads per row instead of
+// 1536). Same thread mapping, so occupancy and the (uncoalesced) access pattern
+// are unchanged — this is purely about issuing 8x fewer memory instructions.
+//
+// Accumulation is now `sum(x*lut) * scale` per group rather than `sum(x*lut*scale)`;
+// the scale is constant within a group so this is the same value up to f32
+// rounding, and strictly fewer roundings.
+extern "C" __global__ void dequant_grouped_matmul_mlx_mxfp4_v3(
+    float* arena,
+    unsigned int m,
+    unsigned int k,
+    unsigned int n,
+    unsigned int num_experts,
+    unsigned int group_size,
+    unsigned long long x_byte_off,
+    unsigned long long w_byte_off,
+    unsigned long long scale_byte_off,
+    unsigned long long idx_byte_off,
+    unsigned long long out_byte_off
+) {
+    unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m || col >= n) return;
+
+    unsigned int gs = group_size;
+    unsigned int n_groups = k / gs;
+    unsigned long long x_off = x_byte_off / 4ull;
+    unsigned long long out_off = out_byte_off / 4ull;
+    unsigned long long idx_off = idx_byte_off / 4ull;
+    unsigned long long scale_f_off = scale_byte_off / 4ull;
+
+    unsigned int e = (unsigned int)arena[idx_off + (unsigned long long)row];
+    if (e >= num_experts) e = num_experts - 1u;
+
+    unsigned long long half_k = (unsigned long long)(k / 2u);
+    unsigned long long ecol = (unsigned long long)e * (unsigned long long)n + (unsigned long long)col;
+    // Word index: `w_byte_off` is a param offset in an f32-indexed arena (4-byte
+    // aligned) and `half_k` is a multiple of 4 whenever k % 8 == 0, so every
+    // expert-column row starts word-aligned.
+    unsigned long long wrow_w = (w_byte_off + ecol * half_k) >> 2;
+    unsigned long long srow_f = scale_f_off + ecol * (unsigned long long)n_groups;
+    unsigned long long xrow_f = x_off + (unsigned long long)row * (unsigned long long)k;
+
+    unsigned int wpg = gs >> 3; // 32-bit words per group (8 nibbles each)
+    float acc = 0.0f;
+    for (unsigned int g = 0u; g < n_groups; ++g) {
+        float gacc = 0.0f;
+        unsigned long long wbase = wrow_w + (unsigned long long)g * (unsigned long long)wpg;
+        unsigned long long xbase = xrow_f + (unsigned long long)g * (unsigned long long)gs;
+        for (unsigned int wi = 0u; wi < wpg; ++wi) {
+            unsigned int word = __float_as_uint(arena[wbase + (unsigned long long)wi]);
+            unsigned long long xb = xbase + (unsigned long long)wi * 8ull;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 8u; ++j) {
+                gacc = fmaf(arena[xb + (unsigned long long)j],
+                            mlx_fp4_lut((word >> (4u * j)) & 0xfu),
+                            gacc);
+            }
+        }
+        acc = fmaf(gacc, arena[srow_f + (unsigned long long)g], acc);
+    }
+    arena[out_off + (unsigned long long)row * (unsigned long long)n + (unsigned long long)col] = acc;
+}
+
+// V4 — SPLIT-K, one WARP per output element. The coalescing fix, and the default
+// for `k % 8 == 0` on m > 1.
+//
+// V1/V3 give one THREAD per output (r, j), so the 32 lanes of a warp hold 32
+// different columns j — and column j's packed weight row lives at stride
+// `k/2` bytes. Every weight load in the warp therefore lands in a different
+// 32-byte sector: fully uncoalesced, ~32x wasted DRAM traffic. That, not the
+// arithmetic, is why V3 tops out around 24 GB/s on a card that does ~400.
+//
+// Here a whole warp owns one (row, col) and the lanes split K: lane t takes
+// words t, t+32, t+64, ... of that single packed row, so the warp's 32 loads
+// cover 128 CONTIGUOUS bytes — one coalesced transaction. Each word still
+// carries 8 nibbles (V3's other win, kept). The per-lane partials are folded
+// with a warp shuffle reduction.
+//
+// Block = 256 threads = 8 warps = 8 output columns; grid = (ceil(n/8), m).
+extern "C" __global__ void dequant_grouped_matmul_mlx_mxfp4_splitk(
+    float* arena,
+    unsigned int m,
+    unsigned int k,
+    unsigned int n,
+    unsigned int num_experts,
+    unsigned int group_size,
+    unsigned long long x_byte_off,
+    unsigned long long w_byte_off,
+    unsigned long long scale_byte_off,
+    unsigned long long idx_byte_off,
+    unsigned long long out_byte_off
+) {
+    unsigned int lane = threadIdx.x & 31u;
+    unsigned int warp = threadIdx.x >> 5;
+    unsigned int col = blockIdx.x * (blockDim.x >> 5) + warp;
+    unsigned int row = blockIdx.y;
+    if (row >= m || col >= n) return;
+
+    unsigned int gs = group_size;
+    unsigned int n_groups = k / gs;
+    unsigned long long x_off = x_byte_off / 4ull;
+    unsigned long long out_off = out_byte_off / 4ull;
+    unsigned long long idx_off = idx_byte_off / 4ull;
+    unsigned long long scale_f_off = scale_byte_off / 4ull;
+
+    unsigned int e = (unsigned int)arena[idx_off + (unsigned long long)row];
+    if (e >= num_experts) e = num_experts - 1u;
+
+    unsigned long long half_k = (unsigned long long)(k / 2u);
+    unsigned long long ecol = (unsigned long long)e * (unsigned long long)n + (unsigned long long)col;
+    unsigned long long wrow_w = (w_byte_off + ecol * half_k) >> 2;
+    unsigned long long srow_f = scale_f_off + ecol * (unsigned long long)n_groups;
+    unsigned long long xrow_f = x_off + (unsigned long long)row * (unsigned long long)k;
+
+    unsigned int words = k >> 3;      // 32-bit words in the packed row (8 nibbles each)
+    unsigned int wpg = gs >> 3;       // words per scale group
+
+    float acc = 0.0f;
+    for (unsigned int wi = lane; wi < words; wi += 32u) {
+        unsigned int word = __float_as_uint(arena[wrow_w + (unsigned long long)wi]);
+        unsigned long long xb = xrow_f + (unsigned long long)wi * 8ull;
+        float part = 0.0f;
+        #pragma unroll
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            part = fmaf(arena[xb + (unsigned long long)j],
+                        mlx_fp4_lut((word >> (4u * j)) & 0xfu),
+                        part);
+        }
+        acc = fmaf(part, arena[srow_f + (unsigned long long)(wi / wpg)], acc);
+    }
+    #pragma unroll
+    for (unsigned int off = 16u; off > 0u; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0u) {
+        arena[out_off + (unsigned long long)row * (unsigned long long)n + (unsigned long long)col] = acc;
+    }
 }
 
 // V2 — m>1 AMORTIZATION (prefill). Same signature as V1, but one thread per output

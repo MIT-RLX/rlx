@@ -46,10 +46,13 @@ native-splat = []
 native-gpu-fft = []
 
 [target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
-metal = "0.30"
-foreign-types = "0.5"
+# No `metal` (metal-rs) crate: `src/mtl.rs` binds the compute subset we use
+# directly against the Objective-C runtime. metal-rs pins `block 0.1.6` — whose
+# `static` of an uninhabited type is a future-incompatibility error-to-be — and
+# still does at 0.33, while `block` is unmaintained. We install no Metal
+# completion handlers, so that dependency bought us nothing. Dropping metal-rs
+# also drops `foreign-types` and `core-graphics-types`.
 objc = "0.2"
-core-graphics-types = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 half = "2"

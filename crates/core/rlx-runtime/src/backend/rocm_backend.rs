@@ -33,6 +33,9 @@ impl Backend for RocmBackend {
             Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
             None => graph,
         };
+        // Non-trailing `Op::Reduce` is lowered inside `rlx_rocm`'s own compile
+        // entry (mirroring rlx-cuda), so every caller gets it — not just this
+        // wrapper.
         let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
         Box::new(RocmExecutableWrapper {
             inner: RocmExecutable::compile_rng(graph, options.rng),
@@ -41,12 +44,13 @@ impl Backend for RocmBackend {
     }
 
     fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-        let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(prepare_fused_graph(
+        let fused = prepare_fused_graph(
             rlx_rocm::unfuse::unfuse(lir.into_graph()),
             options,
             rlx_rocm::SUPPORTED_OPS,
             "rocm",
-        ));
+        );
+        let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(fused);
         Box::new(RocmExecutableWrapper {
             inner: RocmExecutable::compile_rng(graph, options.rng),
             io_manifest,

@@ -20,6 +20,11 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => None,
 
         Op::MatMul => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
+        // MoE grouped GEMM: input [M,K], expert bank [E,K,N] → [M,N]. Inference
+        // yields None when the operands disagree (the verifier then skips this
+        // node, as it does for any un-inferable op) — the backends reject that
+        // case themselves, with the same message, before a kernel sees it.
+        Op::GroupedMatMul => shape::grouped_matmul_shape(in_shape(0), in_shape(1)).ok(),
         Op::LogMel => crate::audio::log_mel_output_shape(in_shape(0), in_shape(1)).ok(),
         Op::LogMelBackward => Some(shape::unary_shape(in_shape(0))),
         Op::WelchPeaks { k, n_segments } => {

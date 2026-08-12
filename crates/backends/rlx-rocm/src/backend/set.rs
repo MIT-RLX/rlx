@@ -51,6 +51,19 @@ impl RocmExecutable {
         {
             let byte_off = self.arena.offset(id);
             crate::gguf_host::upload_param_bytes(&self.ctx, &mut self.arena.buffer, byte_off, data);
+            return;
+        }
+        // Dropping a packed weight here is INVISIBLE at runtime — the arena is
+        // zero-initialized, so the model simply computes zeros (Muse-Glimmer-30B
+        // on MI100: every logit exactly 0.0). Surface it instead of guessing.
+        if rlx_ir::env::flag("RLX_ROCM_PARAM_DIAG") {
+            eprintln!(
+                "[rlx-rocm] set_param_bytes DROPPED {name}: known={} arena_has={}",
+                self.param_offsets.contains_key(name),
+                self.param_offsets
+                    .get(name)
+                    .is_some_and(|&id| self.arena.has(id)),
+            );
         }
     }
 

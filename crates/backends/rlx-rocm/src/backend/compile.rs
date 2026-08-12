@@ -19,6 +19,8 @@ use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::{Graph, NodeId, Op};
+use rlx_opt::rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
+use rlx_opt::rlx_fusion::pass::Pass as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -81,8 +83,15 @@ impl RocmExecutable {
 
         // Decompose composed ops we don't yet have native kernels for
         // (FusedMatMulBiasAct, canonical DotGeneral) into primitives
-        // before memory planning.
-        let graph = crate::unfuse::unfuse(graph);
+        // before memory planning. Fusion and reverse-mode AD may reintroduce
+        // mid-axis Reduce (a broadcast/bias gradient reduces over axis 0);
+        // ROCm only schedules a contiguous trailing axis block. Same
+        // placement as rlx-cuda, and for the same reason: `SUPPORTED_OPS`
+        // is OpKind-granular, so legalization sees a claimed `Reduce`,
+        // calls the graph legal, and never dispatches its own lowering.
+        // Running it here — the single entrance to this crate's compile —
+        // covers every caller, not just the runtime backend wrapper.
+        let graph = LowerNonLastAxisReduce.run(crate::unfuse::unfuse(graph));
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
         let mut plan = plan_f32_uniform(&graph, 16);
@@ -1122,6 +1131,31 @@ impl RocmExecutable {
                         });
                     }
                 }
+                Op::KvAppend { axis, pos } => {
+                    // In-place append: write input[1] (the new token's row) into
+                    // the output buffer, which the memory planner aliases onto
+                    // input 0 (the cache). Output shape == cache shape, so
+                    // `seq_cap` is the output's own axis dim. Mirrors rlx-cuda.
+                    let out_shape = &node.shape;
+                    let rank = out_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| out_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| out_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let seq_cap = out_shape.dim(*axis).unwrap_static();
+                    schedule.push(Step::KvAppend {
+                        src_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        outer: outer as u32,
+                        seq_cap: seq_cap as u32,
+                        pos: *pos as u32,
+                        inner: inner as u32,
+                    });
+                }
                 Op::Narrow { axis, start, len } => {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
@@ -1208,16 +1242,27 @@ impl RocmExecutable {
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.dims();
                     let rank = target_shape.len();
-                    if rank != in_shape.len() {
+                    // Right-align a lower-rank input by prepending 1s — the
+                    // standard NumPy broadcast rule, and what every other
+                    // backend already does. Rank *promotion* is legitimate
+                    // `Expand` semantics: reverse-mode AD produces rank-0
+                    // scalars that broadcast to rank-1 (a second-derivative
+                    // graph is the usual source). The stride computation below
+                    // then maps each prepended 1 to stride 0, so no element is
+                    // read out of bounds.
+                    //
+                    // Rank *reduction* remains an error: `Expand` can never
+                    // drop axes.
+                    if in_shape.len() > rank {
                         panic!(
-                            "rlx-rocm Expand: rank mismatch (in={}, target={})",
+                            "rlx-rocm Expand: input rank exceeds target (in={}, target={})",
                             in_shape.len(),
                             rank
                         );
                     }
                     let out_dims: Vec<u32> = target_shape.iter().map(|&d| d as u32).collect();
-                    let in_dims: Vec<u32> =
-                        in_shape.iter().map(|d| d.unwrap_static() as u32).collect();
+                    let mut in_dims: Vec<u32> = vec![1; rank - in_shape.len()];
+                    in_dims.extend(in_shape.iter().map(|d| d.unwrap_static() as u32));
                     // Complex tensors pack `lanes` contiguous f32 per element
                     // (C64=2 [re,im], C128=4 df64). The expand kernel copies one
                     // f32 per "element", so append an innermost lane axis (in==out,
@@ -1590,12 +1635,17 @@ impl RocmExecutable {
                     let in_id = node.inputs[0];
                     let w_id = node.inputs[1];
                     let idx_id = node.inputs[2];
-                    let in_dims = graph.node(in_id).shape.dims();
-                    let w_dims = graph.node(w_id).shape.dims();
-                    let m = in_dims[0].unwrap_static() as u32;
-                    let k = in_dims[1].unwrap_static() as u32;
-                    let n = w_dims[2].unwrap_static() as u32;
-                    let ne = w_dims[0].unwrap_static() as u32;
+                    // Checked, not trusted: `n` comes off the expert bank while the
+                    // output slot is sized from `node.shape`, so a bank still in
+                    // `[E, N, K]` order silently under- or over-writes it.
+                    let gd = rlx_ir::shape::grouped_matmul_dims(
+                        &graph.node(in_id).shape,
+                        &graph.node(w_id).shape,
+                        Some(&node.shape),
+                    )
+                    .unwrap_or_else(|e| panic!("rlx-rocm: node {:?}: {e}", node.id));
+                    let (m, k, n, ne) =
+                        (gd.m as u32, gd.k as u32, gd.n as u32, gd.num_experts as u32);
                     schedule.push(Step::GroupedMatmul {
                         m,
                         k,
@@ -1647,9 +1697,9 @@ impl RocmExecutable {
                             k,
                             n,
                             scheme_id: crate::gguf_host::gguf_scheme_id(*scheme),
-                            x_byte_off: arena.offset(x_id) as u32,
-                            w_byte_off: arena.offset(w_id) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(x_id) as u64,
+                            w_byte_off: arena.offset(w_id) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                         });
                     } else {
                         let (block_size, scheme_id) = match scheme {

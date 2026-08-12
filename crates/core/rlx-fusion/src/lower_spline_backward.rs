@@ -16,6 +16,15 @@ use std::collections::HashMap;
 pub struct LowerSplineActivationBackward;
 
 impl Pass for LowerSplineActivationBackward {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[
+            OpKind::SplineActivationBackwardX,
+            OpKind::SplineActivationBackwardCoeff,
+        ]
+    }
+
     fn name(&self) -> &str {
         "lower_spline_activation_backward"
     }

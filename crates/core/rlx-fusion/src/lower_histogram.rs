@@ -15,11 +15,10 @@
 //! lands in the last bin (the top edge is nudged to the next representable f32
 //! so `x <= max` is included exactly, and nothing above `max` leaks in).
 
-use crate::pass::Pass;
+use crate::rewriter::{MatchRewrite, RewriteCtx};
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::{BinaryOp, CmpOp, ReduceOp};
 use rlx_ir::*;
-use std::collections::HashMap;
 
 /// Immediate next f32 toward +∞ (a tight `nextafter(x, +inf)`), so a strict
 /// `< next_up(max)` test is exactly `<= max`.
@@ -84,36 +83,20 @@ pub fn lower_histogram(g: &mut Graph, x: NodeId, bins: usize, min: f32, max: f32
 /// Rewrite every `Op::Histogram` node into primitives.
 pub struct LowerHistogram;
 
-impl Pass for LowerHistogram {
+impl MatchRewrite for LowerHistogram {
     fn name(&self) -> &str {
         "lower_histogram"
     }
 
-    fn run(&self, graph: Graph) -> Graph {
-        if !graph
-            .nodes()
-            .iter()
-            .any(|n| matches!(n.op, Op::Histogram { .. }))
-        {
-            return graph;
-        }
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Histogram]
+    }
 
-        let mut new_graph = Graph::new(&graph.name);
-        let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
-
-        for node in graph.nodes() {
-            let new_id = if let Op::Histogram { bins, min, max } = &node.op {
-                let x = id_map[&node.inputs[0]];
-                lower_histogram(&mut new_graph, x, *bins, *min, *max)
-            } else {
-                let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-                new_graph.add_node(node.op.clone(), inputs, node.shape.clone())
-            };
-            id_map.insert(node.id, new_id);
-        }
-
-        let new_outputs: Vec<NodeId> = graph.outputs.iter().map(|i| id_map[i]).collect();
-        new_graph.set_outputs(new_outputs);
-        new_graph
+    fn rewrite(&self, node: &Node, ctx: &mut RewriteCtx) -> Option<NodeId> {
+        let Op::Histogram { bins, min, max } = &node.op else {
+            return None;
+        };
+        let x = ctx.input(0);
+        Some(lower_histogram(ctx.out, x, *bins, *min, *max))
     }
 }

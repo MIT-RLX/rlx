@@ -641,6 +641,9 @@ impl<'a> LowerCtx<'a> {
                 ("x", bind_name(&weight)),
                 ("indices", bind_name(&eidx_i32)),
                 ("axis", bind_value(scalar_i32(0))),
+                // Required by the iOS17+ MIL opset; the older-opset
+                // post-pass in mod.rs strips it back out when unsupported.
+                ("validate_indices", bind_value(scalar_bool(false))),
             ],
         )?;
         let in3 = format!("{out_name}_in3");
@@ -727,6 +730,9 @@ impl<'a> LowerCtx<'a> {
                 ("x", bind_name(&weight)),
                 ("indices", bind_name(&eidx_i32)),
                 ("axis", bind_value(scalar_i32(0))),
+                // Required by the iOS17+ MIL opset; the older-opset
+                // post-pass in mod.rs strips it back out when unsupported.
+                ("validate_indices", bind_value(scalar_bool(false))),
             ],
         )?;
         // input [M,K] → [M,1,K]; matmul([M,1,K],[M,N,K]ᵀ) → [M,1,N] → [M,N]

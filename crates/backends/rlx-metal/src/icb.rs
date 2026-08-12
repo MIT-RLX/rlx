@@ -5,21 +5,29 @@
 //! Indirect Command Buffer support — pre-encode thunks once at compile
 //! time, re-submit on every forward pass.
 //!
-//! **Status: prototype, deferred (Phase C).**
+//! **Status: working, opt-in (`RLX_USE_ICB=1`), off by default.**
 //!
 //! Phase C trace data (`RLX_METAL_TRACE=1`) showed the per-run cost on
 //! Apple Silicon splits as encode (5–25 µs) + commit (5 µs) +
 //! wait_until_completed (150–200 µs). ICB attacks `encode`; the actual
 //! bottleneck is `wait`, addressed by `commit_no_wait` / `run_pipelined`
-//! in `backend.rs` instead. ICB would still buy ~10–20 µs once the
-//! Apple-platform fault below is resolved, but the win is small relative
-//! to pipelining.
+//! in `backend.rs` instead. ICB buys ~10–20 µs, which is small relative to
+//! pipelining — hence opt-in rather than default.
 //!
-//! Open issue blocking integration: even with the support flag set on
-//! the pipeline descriptor before `new_compute_pipeline_state`,
-//! `set_compute_pipeline_state` on the `IndirectComputeCommand` triggers
-//! a runtime fault. The full investigation notes are below; revisit if
-//! a workload appears that's launch-bound rather than wait-bound.
+//! This was previously recorded as blocked on an Apple-platform fault in
+//! `set_compute_pipeline_state`. That diagnosis was wrong. The real defect
+//! was ABI drift: this file binds kernel buffers *by index*, the MSL
+//! signatures in `kernels.rs` moved (several kernels went from a
+//! `device float*` already offset to the data, to an arena base plus
+//! explicit `ulong` byte offsets), and nothing checks the two agree. A
+//! stale index leaves the kernel's `len` unbound; it reads 0, every thread
+//! returns at `if (gid >= len)`, and the command buffer completes with no
+//! error having written nothing.
+//!
+//! **So: when adding or re-binding a kernel here, read its signature in
+//! `kernels.rs` first — a wrong index is not a compile error, not a crash,
+//! and not even a GPU fault.** `tests/icb_parity.rs` guards the encoders it
+//! covers by asserting on values and rejecting an all-zero result.
 //!
 //! Standard pattern: every `enc.set_pipeline + enc.set_buffer + enc.dispatch`
 //! call costs ~1–5 µs of CPU-side encoding overhead. For a 12-layer BERT
@@ -47,15 +55,13 @@
 //!     in an ICB. The runtime path would keep them on the lazy compute
 //!     encoder, executing ICB segments and MPS calls in interleaved order.
 //!
-//! **Open issue blocking integration:** even with the support flag set on
-//! the pipeline descriptor before `new_compute_pipeline_state`,
-//! `set_compute_pipeline_state` on the `IndirectComputeCommand` triggers
-//! a runtime fault. Suspect an Apple-platform requirement not covered
-//! above (function constants? device feature gate? metal-rs 0.30 missing
-//! a setter?). Future work to investigate before flipping the runtime
-//! switch.
+//! Coverage caveat: `tests/icb_parity.rs` exercises `ActivationInPlace`,
+//! `BinaryFull` and (by construction) the arena-base binding form. The
+//! `BiasAdd`, `Copy`, `LayerNorm`, `FusedResidualLN`, `Narrow` and `Rope`
+//! encoders were corrected by reading their kernel signatures, but are not
+//! yet asserted against a reference — extend the test before relying on them.
 
-use metal::{
+use crate::mtl::{
     Buffer, ComputeCommandEncoderRef, ComputePipelineDescriptor, ComputePipelineState, Device,
     IndirectCommandBuffer, IndirectCommandBufferDescriptor, MTLIndirectCommandType,
     MTLResourceOptions, MTLSize, NSRange,
@@ -86,7 +92,7 @@ unsafe impl Send for IcbKernels {}
 unsafe impl Sync for IcbKernels {}
 
 impl IcbKernels {
-    fn new(dev: &Device, library: &metal::LibraryRef) -> Self {
+    fn new(dev: &Device, library: &crate::mtl::LibraryRef) -> Self {
         let trace = rlx_ir::env::flag("RLX_ICB_TRACE");
         let make = |name: &str| -> ComputePipelineState {
             let f = library.get_function(name, None).expect(name);
@@ -125,7 +131,7 @@ pub fn icb_kernels() -> &'static IcbKernels {
     K.get_or_init(|| {
         use crate::device::metal_device;
         let dev = metal_device().expect("Metal device required");
-        let opts = metal::CompileOptions::new();
+        let opts = crate::mtl::CompileOptions::new();
         // Use the FULLY-ASSEMBLED source (placeholders like `@@RLX_SCALAR_ACT_FNS@@`
         // substituted with the generated `rlx_gelu_scalar` / `rlx_pow_scalar` / …
         // helper bodies) — the same source the regular `kernels()` compiles. The raw
@@ -173,8 +179,8 @@ impl IcbSegment {
             return;
         }
         unsafe {
-            let arena_ref: &metal::BufferRef = arena;
-            let const_ref: &metal::BufferRef = &self.constants;
+            let arena_ref: &crate::mtl::BufferRef = arena;
+            let const_ref: &crate::mtl::BufferRef = &self.constants;
             let _: () = msg_send![enc, useResource: arena_ref
                 usage: (RESOURCE_USAGE_READ | RESOURCE_USAGE_WRITE)];
             let _: () = msg_send![enc, useResource: const_ref
@@ -367,7 +373,10 @@ fn build_segment(icb_thunks: &[&Thunk], arena: &Buffer, dev: &Device) -> Option<
     );
     desc.set_inherit_buffers(false);
     desc.set_inherit_pipeline_state(false);
-    desc.set_max_kernel_buffer_bind_count(8);
+    // Must cover the widest encoder below, not a round number: `rope` binds 13
+    // (4 arena views + 9 constants). Declaring 8 silently drops the binds past
+    // that index, which shows up as wrong output rather than an error.
+    desc.set_max_kernel_buffer_bind_count(16);
     if trace {
         eprintln!("[icb] descriptor configured");
     }
@@ -411,7 +420,7 @@ fn build_segment(icb_thunks: &[&Thunk], arena: &Buffer, dev: &Device) -> Option<
 /// MSL kernel reads via `device const T&` come from `constants_buf`
 /// (offset `cb_off`); all tensor data comes from `arena`.
 fn encode_thunk_into_icb(
-    cmd: &metal::IndirectComputeCommandRef,
+    cmd: &crate::mtl::IndirectComputeCommandRef,
     thunk: &Thunk,
     arena: &Buffer,
     constants_buf: &Buffer,
@@ -430,6 +439,33 @@ fn encode_thunk_into_icb(
         }
     };
     let cb_arg = |slot_idx: usize| -> u64 { (cb_off + slot_idx * 4) as u64 };
+
+    // Kernels that take the arena base plus explicit byte offsets need those
+    // offsets as `ulong`, which Metal will only bind at an 8-byte-aligned
+    // buffer offset. `cb_off` is a multiple of `CONSTANTS_BYTES_PER_CMD` (64),
+    // so laying the u64s down first from `cb_off` keeps every slot aligned;
+    // u32s go after them, addressed by explicit byte offset.
+    let write_u64s = |vals: &[u64]| unsafe {
+        let p = constants_buf.contents() as *mut u8;
+        let dst = p.add(cb_off) as *mut u64;
+        for (i, &v) in vals.iter().enumerate() {
+            *dst.add(i) = v;
+        }
+    };
+    let cb_u64 = |slot_idx: usize| -> u64 { (cb_off + slot_idx * 8) as u64 };
+    // Byte-addressed writers, for encoders that mix widths in one command's
+    // 64-byte slice. The caller picks offsets; `ulong` ones must stay
+    // 8-aligned, and nothing may overlap a slot another `write_*` already used.
+    let write_u64_at = |byte: usize, v: u64| unsafe {
+        debug_assert_eq!(byte % 8, 0, "ulong constant must be 8-byte aligned");
+        let p = constants_buf.contents() as *mut u8;
+        *(p.add(cb_off + byte) as *mut u64) = v;
+    };
+    let write_u32_at = |byte: usize, v: u32| unsafe {
+        let p = constants_buf.contents() as *mut u8;
+        *(p.add(cb_off + byte) as *mut u32) = v;
+    };
+    let cb_at = |byte: usize| -> u64 { (cb_off + byte) as u64 };
 
     match thunk {
         Thunk::BiasAdd {
@@ -469,7 +505,6 @@ fn encode_thunk_into_icb(
             if trace {
                 eprintln!("  [act] write u32");
             }
-            write_u32s(&[*len]);
             let pipeline = match act {
                 Activation::Gelu => &k.gelu_inplace,
                 Activation::Silu => &k.silu_inplace,
@@ -479,16 +514,35 @@ fn encode_thunk_into_icb(
                 eprintln!("  [act] set pipeline");
             }
             cmd.set_compute_pipeline_state(pipeline);
-            if trace {
-                eprintln!("  [act] set buf 0");
+            // Two ABIs live under this arm. `gelu_inplace` is *generated*
+            // (`kernels::gelu_inplace_f32_msl`) and takes the arena base plus a
+            // `ulong` byte offset, with `len` at buffer(2). `silu_inplace` is
+            // hand-written and still takes a `device float*` already offset to
+            // the data, with `len` at buffer(1). Binding the second layout for
+            // both — which this encoder did — leaves gelu's buffer(2) unbound,
+            // so `len` read as 0 and every thread hit `if (gid >= len) return`:
+            // the activation silently did not happen and the value flowed
+            // through un-transformed.
+            match act {
+                Activation::Gelu => {
+                    if trace {
+                        eprintln!("  [act] gelu: arena-base ABI");
+                    }
+                    write_u64s(&[*data as u64]);
+                    write_u32_at(8, *len);
+                    cmd.set_kernel_buffer(0, Some(&**arena), 0);
+                    cmd.set_kernel_buffer(1, Some(&**constants_buf), cb_u64(0));
+                    cmd.set_kernel_buffer(2, Some(&**constants_buf), cb_at(8));
+                }
+                _ => {
+                    if trace {
+                        eprintln!("  [act] silu: offset-pointer ABI");
+                    }
+                    write_u32s(&[*len]);
+                    cmd.set_kernel_buffer(0, Some(&**arena), *data as u64);
+                    cmd.set_kernel_buffer(1, Some(&**constants_buf), cb_arg(0));
+                }
             }
-            let arena_ref: &metal::BufferRef = arena;
-            cmd.set_kernel_buffer(0, Some(arena_ref), *data as u64);
-            if trace {
-                eprintln!("  [act] set buf 1");
-            }
-            let cb_ref: &metal::BufferRef = constants_buf;
-            cmd.set_kernel_buffer(1, Some(cb_ref), cb_arg(0));
             if trace {
                 eprintln!("  [act] dispatch");
             }
@@ -517,17 +571,29 @@ fn encode_thunk_into_icb(
             op,
             ..
         } => {
-            write_u32s(&[*len]);
+            // `elem_add` / `elem_mul` take the arena *base* plus three `ulong`
+            // byte offsets and `len` at buffer(4):
+            //   (device const char* arena, ulong& a_off, ulong& b_off,
+            //    ulong& c_off, uint& len)
+            // This encoder used to bind three arena views at the operand
+            // offsets with `len` at buffer(3) — the older kernel ABI. Against
+            // the current kernels that leaves buffer(4) unbound, so `len` read
+            // as 0, every thread hit `if (gid >= len) return`, and the ICB
+            // completed cleanly having written nothing. That is what made
+            // `icb_check` report all-zero output.
+            write_u64s(&[*lhs as u64, *rhs as u64, *dst as u64]);
+            write_u32_at(24, *len);
             let pipeline = match op {
                 BinaryOp::Add => &k.elem_add,
                 BinaryOp::Mul => &k.elem_mul,
                 _ => return,
             };
             cmd.set_compute_pipeline_state(pipeline);
-            cmd.set_kernel_buffer(0, Some(&**arena), *lhs as u64);
-            cmd.set_kernel_buffer(1, Some(&**arena), *rhs as u64);
-            cmd.set_kernel_buffer(2, Some(&**arena), *dst as u64);
-            cmd.set_kernel_buffer(3, Some(&**constants_buf), cb_arg(0));
+            cmd.set_kernel_buffer(0, Some(&**arena), 0);
+            cmd.set_kernel_buffer(1, Some(&**constants_buf), cb_u64(0));
+            cmd.set_kernel_buffer(2, Some(&**constants_buf), cb_u64(1));
+            cmd.set_kernel_buffer(3, Some(&**constants_buf), cb_u64(2));
+            cmd.set_kernel_buffer(4, Some(&**constants_buf), cb_at(24));
             let tg_w = pipeline.thread_execution_width().min(*len as u64);
             cmd.concurrent_dispatch_threads(
                 MTLSize {
@@ -543,11 +609,18 @@ fn encode_thunk_into_icb(
             );
         }
         Thunk::Copy { src, dst, len, .. } => {
-            write_u32s(&[*len]);
+            // `copy_f32` is the arena-base form, same as `elem_add`/`elem_mul`:
+            //   (device const char* arena, ulong& src_byte_off,
+            //    ulong& dst_byte_off, uint& len)
+            // Binding two offset arena views with `len` at buffer(2) put `len`
+            // where `dst_byte_off` belongs and left buffer(3) unbound.
+            write_u64s(&[*src as u64, *dst as u64]);
+            write_u32_at(16, *len);
             cmd.set_compute_pipeline_state(&k.copy_f32);
-            cmd.set_kernel_buffer(0, Some(&**arena), *src as u64);
-            cmd.set_kernel_buffer(1, Some(&**arena), *dst as u64);
-            cmd.set_kernel_buffer(2, Some(&**constants_buf), cb_arg(0));
+            cmd.set_kernel_buffer(0, Some(&**arena), 0);
+            cmd.set_kernel_buffer(1, Some(&**constants_buf), cb_u64(0));
+            cmd.set_kernel_buffer(2, Some(&**constants_buf), cb_u64(1));
+            cmd.set_kernel_buffer(3, Some(&**constants_buf), cb_at(16));
             let tg_w = k.copy_f32.thread_execution_width().min(*len as u64);
             cmd.concurrent_dispatch_threads(
                 MTLSize {
@@ -586,11 +659,20 @@ fn encode_thunk_into_icb(
             cmd.set_kernel_buffer(3, Some(&**arena), *dst as u64);
             cmd.set_kernel_buffer(4, Some(&**constants_buf), cb_arg(0));
             cmd.set_kernel_buffer(5, Some(&**constants_buf), cb_arg(1));
-            let tg_w = 256u64.min(*h as u64);
-            cmd.concurrent_dispatch_threads(
+            // Mirror `encode_layer_norm`: one *threadgroup* per row along X.
+            // `layer_norm` reads a scalar `threadgroup_position_in_grid`, which
+            // takes the x component — dispatching rows along y (as this did)
+            // pins it at 0, so every row computes row 0's statistics. The
+            // width must also be a power of two: the threadgroup reduction
+            // halves `tsize` down to 1 and a non-power-of-two drops elements.
+            let mut tg_w: u64 = 1;
+            while tg_w * 2 <= *h as u64 && tg_w * 2 <= 256 {
+                tg_w *= 2;
+            }
+            cmd.concurrent_dispatch_threadgroups(
                 MTLSize {
-                    width: tg_w,
-                    height: *rows as u64,
+                    width: *rows as u64,
+                    height: 1,
                     depth: 1,
                 },
                 MTLSize {
@@ -625,11 +707,15 @@ fn encode_thunk_into_icb(
             cmd.set_kernel_buffer(4, Some(&**arena), *out as u64);
             cmd.set_kernel_buffer(5, Some(&**constants_buf), cb_arg(0));
             cmd.set_kernel_buffer(6, Some(&**constants_buf), cb_arg(1));
-            let tg_w = 256u64.min(*h as u64);
+            // Same as `LayerNorm` above — rows go along x, tg width power-of-two.
+            let mut tg_w: u64 = 1;
+            while tg_w * 2 <= *h as u64 && tg_w * 2 <= 256 {
+                tg_w *= 2;
+            }
             cmd.concurrent_dispatch_threadgroups(
                 MTLSize {
-                    width: 1,
-                    height: *rows as u64,
+                    width: *rows as u64,
+                    height: 1,
                     depth: 1,
                 },
                 MTLSize {
@@ -657,6 +743,17 @@ fn encode_thunk_into_icb(
             cmd.set_kernel_buffer(3, Some(&**constants_buf), cb_arg(1));
             cmd.set_kernel_buffer(4, Some(&**constants_buf), cb_arg(2));
             cmd.set_kernel_buffer(5, Some(&**constants_buf), cb_arg(3));
+            // `narrow_lastax` also takes `ulong& src_byte_off [[6]]` and
+            // `ulong& dst_byte_off [[7]]`. The arena views above are already
+            // offset to src/dst, so both are zero — but they must still be
+            // *bound*: `set_inherit_buffers(false)` means an unbound index
+            // reads undefined data, and a non-zero value here would offset the
+            // pointers a second time and walk off the arena.
+            // Bytes 0..16 already hold the four u32s above, so these go after.
+            write_u64_at(16, 0);
+            write_u64_at(24, 0);
+            cmd.set_kernel_buffer(6, Some(&**constants_buf), cb_at(16));
+            cmd.set_kernel_buffer(7, Some(&**constants_buf), cb_at(24));
             let grid = MTLSize {
                 width: *len as u64,
                 height: *outer as u64,

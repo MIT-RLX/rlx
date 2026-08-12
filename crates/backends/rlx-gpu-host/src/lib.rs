@@ -243,18 +243,36 @@ pub fn run_llada2_group_limited_gate<A: DeviceArena>(
     n_elems: usize,
     attrs: &[u8],
 ) {
-    with_whole_arena(a, |host| {
-        let f32s: &mut [f32] = bytemuck::cast_slice_mut(host);
-        rlx_cpu::llada2_gate::execute_gate_in_f32_arena(
-            f32s,
-            sig_f32_off,
-            route_f32_off,
-            out_f32_off,
-            n_elems,
-            attrs,
-        )
+    // Stage ONLY the three regions the gate touches — `sig[n_elems]`,
+    // `route[n_elems]` and the `[rows, 2·top_k]` output.
+    //
+    // This used to go through `with_whole_arena`, which round-trips the ENTIRE
+    // arena device→host→device for what is a top-k over a few thousand floats.
+    // On Ling-3.0-tiny (MXFP4, ~6 GB arena, 23 MoE layers) that was 23 × 2 × 6 GB
+    // ≈ 276 GB of PCIe traffic and measured **61.8 s of a 63.5 s CUDA prefill —
+    // 97%**, dwarfing every actual matmul in the model
+    // (`RLX_CUDA_STEP_PROFILE=1`: `Llada2GroupLimitedGate 2687 ms/call` against
+    // `DequantGroupedMatmulMlxNative 3.9 ms/call`). The staged regions total
+    // ~70 KB for that model.
+    //
+    // The cost scaled with ARENA size, not problem size — invisible on small
+    // models, and worst on exactly the models big enough to need a GPU. Every
+    // crate using `group_limited_gate` was paying it (rlx-ling, rlx-deepseek,
+    // rlx-kimi-k3, rlx-glm4moe) on every host-delegating backend.
+    let ga = rlx_cpu::llada2_gate::GateAttrs::from_bytes(attrs);
+    let rows = n_elems / (ga.num_experts as usize).max(1);
+    let out_len = rows * ga.top_k as usize * 2;
+
+    a.sync();
+    let mut sig = vec![0f32; n_elems];
+    let mut route = vec![0f32; n_elems];
+    a.dtoh(sig_f32_off * 4, bytemuck::cast_slice_mut(&mut sig));
+    a.dtoh(route_f32_off * 4, bytemuck::cast_slice_mut(&mut route));
+    // The output is write-only, so it is never staged in — only written back.
+    let mut out = vec![0f32; out_len];
+    rlx_cpu::llada2_gate::execute_gate_f32(&sig, &route, &mut out, attrs)
         .expect("llada2 group-limited gate host execute failed");
-    });
+    a.htod(out_f32_off * 4, bytemuck::cast_slice(&out));
 }
 
 // ---------------------------------------------------------------------------

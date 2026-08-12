@@ -6,13 +6,15 @@
 
 #![allow(unused_imports)]
 
+use crate::analysis::{AnalysisManager, LazyUseCounts, OpKindIndex, UseCounts};
 use crate::graph_rewrite::Rewriter;
-use crate::pass::Pass;
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
 
 use super::*;
+use rlx_ir::OpKind;
 
 /// Activations `FusedConvBiasAct` folds — ONLY `Relu` (plus identity, i.e. no
 /// activation node). These are exactly what cuDNN's fused
@@ -89,12 +91,16 @@ fn trace_rank1_bias(graph: &Graph, mut id: NodeId, c_out: usize) -> Option<NodeI
 /// the fused op never changes semantics.
 pub struct FuseConvBiasAct;
 
-impl Pass for FuseConvBiasAct {
-    fn name(&self) -> &str {
-        "fuse_conv_bias_act"
-    }
+impl FuseConvBiasAct {
+    /// The pass body, parameterised over where its use-counts come from.
+    ///
+    /// `shared` carries the pipeline-wide relation when one is cached, so a
+    /// run of ~20 fusion passes builds it once rather than once per pass.
+    /// `None` falls back to a deferred per-pass build, which is what a direct
+    /// `pass.run(graph)` call gets.
+    fn fuse_with(&self, graph: Graph, shared: Option<&UseCounts>) -> PassResult {
+        let uses = LazyUseCounts::from_shared(shared, &graph);
 
-    fn run(&self, graph: Graph) -> Graph {
         let mut rw = Rewriter::new(&graph.name);
         let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
 
@@ -119,7 +125,7 @@ impl Pass for FuseConvBiasAct {
                 // conv weight is [C_out, C_in/groups, kH, kW]; C_out = dim 0.
                 let c_out = graph.shape(node.inputs[1]).dim(0).unwrap_static();
                 let conv_id = node.id;
-                let conv_users = graph.users(conv_id);
+                let conv_users = uses.users(conv_id);
 
                 if conv_users.len() == 1 {
                     let add_node = graph.node(conv_users[0]);
@@ -133,7 +139,7 @@ impl Pass for FuseConvBiasAct {
 
                         if let Some(bias_id) = trace_rank1_bias(&graph, bias_operand, c_out) {
                             let add_id = add_node.id;
-                            let add_users = graph.users(add_id);
+                            let add_users = uses.users(add_id);
 
                             // Epilogue activation. A single Relu consumer folds
                             // in; a single NON-fusible activation (sigmoid/tanh/
@@ -193,7 +199,40 @@ impl Pass for FuseConvBiasAct {
             rw.copy_node(node);
         }
 
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
+    }
+}
+
+impl Pass for FuseConvBiasAct {
+    // Required by construction: the scan anchors on `Op::Conv`.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Conv]
+    }
+
+    fn name(&self) -> &str {
+        "fuse_conv_bias_act"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        self.fuse_with(graph, None).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
+        if !self.can_fire(&graph) {
+            return PassResult::unchanged(graph);
+        }
+        self.fuse_with(graph, None)
+    }
+
+    fn run_with_analyses(&self, graph: Graph, analyses: &mut AnalysisManager) -> PassResult {
+        // Answer the trigger check from the shared op-kind index first: a pass
+        // whose anchor op is absent must not even pay for the use relation.
+        let triggers = self.trigger_kinds();
+        if !triggers.is_empty() && !analyses.get::<OpKindIndex>(&graph).contains_any(triggers) {
+            return PassResult::unchanged(graph);
+        }
+        let shared = analyses.get::<UseCounts>(&graph);
+        self.fuse_with(graph, Some(shared))
     }
 }
 
@@ -233,12 +272,16 @@ struct AffineMatch {
     fuse_ids: Vec<NodeId>,
 }
 
-impl Pass for FuseConvAffineAct {
-    fn name(&self) -> &str {
-        "fuse_conv_affine_act"
-    }
+impl FuseConvAffineAct {
+    /// The pass body, parameterised over where its use-counts come from.
+    ///
+    /// `shared` carries the pipeline-wide relation when one is cached, so a
+    /// run of ~20 fusion passes builds it once rather than once per pass.
+    /// `None` falls back to a deferred per-pass build, which is what a direct
+    /// `pass.run(graph)` call gets.
+    fn fuse_with(&self, graph: Graph, shared: Option<&UseCounts>) -> PassResult {
+        let uses = LazyUseCounts::from_shared(shared, &graph);
 
-    fn run(&self, graph: Graph) -> Graph {
         let mut rw = Rewriter::new(&graph.name);
         let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
 
@@ -260,7 +303,7 @@ impl Pass for FuseConvAffineAct {
                 let c_out = graph.shape(w_id).dim(0).unwrap_static();
                 let conv_id = node.id;
 
-                if let Some(m) = match_conv_affine(&graph, conv_id, c_out) {
+                if let Some(m) = match_conv_affine(&graph, &uses, conv_id, c_out) {
                     let x_id = node.inputs[0];
                     let w_shape = graph.shape(w_id).clone();
                     let dtype = w_shape.dtype();
@@ -316,7 +359,40 @@ impl Pass for FuseConvAffineAct {
             rw.copy_node(node);
         }
 
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
+    }
+}
+
+impl Pass for FuseConvAffineAct {
+    // Required by construction: the scan anchors on `Op::Conv`.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Conv]
+    }
+
+    fn name(&self) -> &str {
+        "fuse_conv_affine_act"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        self.fuse_with(graph, None).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
+        if !self.can_fire(&graph) {
+            return PassResult::unchanged(graph);
+        }
+        self.fuse_with(graph, None)
+    }
+
+    fn run_with_analyses(&self, graph: Graph, analyses: &mut AnalysisManager) -> PassResult {
+        // Answer the trigger check from the shared op-kind index first: a pass
+        // whose anchor op is absent must not even pay for the use relation.
+        let triggers = self.trigger_kinds();
+        if !triggers.is_empty() && !analyses.get::<OpKindIndex>(&graph).contains_any(triggers) {
+            return PassResult::unchanged(graph);
+        }
+        let shared = analyses.get::<UseCounts>(&graph);
+        self.fuse_with(graph, Some(shared))
     }
 }
 
@@ -324,8 +400,13 @@ impl Pass for FuseConvAffineAct {
 /// single-use, `scale`/`shift` rank-1 `[C_out]` (traced through Reshape). The
 /// optional residual is a full-shape `[N,C,H,W]` tensor (distinguished from a
 /// per-channel bias by requiring an exact shape match, not a broadcast).
-fn match_conv_affine(graph: &Graph, conv_id: NodeId, c_out: usize) -> Option<AffineMatch> {
-    let conv_users = graph.users(conv_id);
+fn match_conv_affine(
+    graph: &Graph,
+    uses: &LazyUseCounts,
+    conv_id: NodeId,
+    c_out: usize,
+) -> Option<AffineMatch> {
+    let conv_users = uses.users(conv_id);
     if conv_users.len() != 1 {
         return None;
     }
@@ -335,7 +416,7 @@ fn match_conv_affine(graph: &Graph, conv_id: NodeId, c_out: usize) -> Option<Aff
     };
     let scale_id = trace_rank1_bias(graph, other_operand(mul, conv_id), c_out)?;
 
-    let mul_users = graph.users(mul.id);
+    let mul_users = uses.users(mul.id);
     if mul_users.len() != 1 {
         return None;
     }
@@ -345,7 +426,7 @@ fn match_conv_affine(graph: &Graph, conv_id: NodeId, c_out: usize) -> Option<Aff
     };
     let shift_id = trace_rank1_bias(graph, other_operand(shift_add, mul.id), c_out)?;
 
-    let shift_users = graph.users(shift_add.id);
+    let shift_users = uses.users(shift_add.id);
     if shift_users.len() != 1 {
         return None;
     }
@@ -363,7 +444,7 @@ fn match_conv_affine(graph: &Graph, conv_id: NodeId, c_out: usize) -> Option<Aff
         if graph.shape(resid).dims() != shift_add.shape.dims() {
             return None;
         }
-        let res_users = graph.users(after.id);
+        let res_users = uses.users(after.id);
         if res_users.len() != 1 {
             return None;
         }

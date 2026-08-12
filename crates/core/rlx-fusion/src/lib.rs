@@ -7,6 +7,7 @@
 //! Pattern-matching fusion (`FuseMatMulBiasAct`, `FuseSwiGLU`, …) and
 //! the inverse [`unfuse_fused_for_autodiff`] rewrite used before autodiff.
 
+pub mod analysis;
 pub mod control_flow;
 pub mod fk_fusion;
 pub mod fk_graphs;
@@ -37,6 +38,7 @@ pub mod lower_synth_matmul_backward;
 pub mod lower_synth_reconstruct;
 pub mod lower_vae_ops;
 pub mod pass;
+pub mod rewriter;
 pub mod unfuse;
 
 pub use control_flow::{

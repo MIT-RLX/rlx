@@ -72,7 +72,7 @@ impl MetalExecutable {
 
         let arena_buf = &self.arena.buffer;
         let weight_buf = self.weight_buffer.as_ref();
-        let feed_buffers: Vec<&metal::Buffer> = feed_is_weight
+        let feed_buffers: Vec<&crate::mtl::Buffer> = feed_is_weight
             .iter()
             .map(|&w| {
                 if w {
@@ -82,7 +82,7 @@ impl MetalExecutable {
                 }
             })
             .collect();
-        let out_buffers: Vec<&metal::Buffer> = out_offsets.iter().map(|_| arena_buf).collect();
+        let out_buffers: Vec<&crate::mtl::Buffer> = out_offsets.iter().map(|_| arena_buf).collect();
 
         let Some(plan) = self.mps_plan.as_mut() else {
             return;

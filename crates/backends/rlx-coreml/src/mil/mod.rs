@@ -1377,6 +1377,9 @@ impl<'a> LowerCtx<'a> {
                     ("x", bind_name(&xs_names[j])),
                     ("indices", bind_name(&i_int)),
                     ("axis", bind_value(scalar_i32(0))),
+                    // Required by the iOS17+ MIL opset; the older-opset
+                    // post-pass in mod.rs strips it back out when unsupported.
+                    ("validate_indices", bind_value(scalar_bool(false))),
                 ],
             )?;
             self.names.insert(in_id.0, gname);

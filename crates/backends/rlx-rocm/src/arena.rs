@@ -142,8 +142,15 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     for node in graph.nodes() {
         // Reshape / StopGradient, and identity Casts, alias the input slot.
         // float→int / →Bool casts get their own slot + a conversion kernel.
+        //
+        // `Op::KvAppend` is aliased too — its output IS the cache (input 0), per
+        // the shared planner's `pure_view_offset`. Aliased is not the same as
+        // no-op: it still emits a `Step::KvAppend` row write. Leaving it out
+        // here hands the output a fresh uninitialised slot, so the one written
+        // row lands in a buffer of garbage and the model emits a single token
+        // forever with no error (that exact bug, on rlx-cuda).
         let is_view = match &node.op {
-            Op::Reshape { .. } | Op::StopGradient => true,
+            Op::Reshape { .. } | Op::StopGradient | Op::KvAppend { .. } => true,
             Op::Cast { .. } => !cast_is_kernel(graph, node),
             _ => false,
         };

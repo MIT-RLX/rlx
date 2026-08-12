@@ -9,7 +9,7 @@
 //! buffer is accessible from both CPU and GPU with zero copy.
 
 use crate::device::metal_device;
-use metal::Buffer;
+use crate::mtl::Buffer;
 use rlx_ir::{DType, Graph, NodeId};
 use rlx_opt::memory::MemoryPlan;
 use std::collections::HashMap;

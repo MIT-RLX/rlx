@@ -64,7 +64,7 @@ fn scatter_nd_add_cpu() {
     assert_eq!(out, vec![8.0, 1.0]);
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn scatter_nd_none_metal_matches_cpu() {
     let cpu = run(Device::Cpu, ScatterNdReduction::None);

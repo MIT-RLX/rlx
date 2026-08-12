@@ -29,12 +29,14 @@ pub mod apple_bnns;
 pub mod async_copy;
 pub mod attention_layout;
 pub mod audio;
+pub mod capability;
 pub mod const_check;
 pub mod dtype;
 pub mod dynamic;
 pub mod env;
 pub mod env_catalog;
 pub mod env_registry;
+pub mod equivalence;
 pub mod fft;
 pub mod graph;
 pub mod hir;
@@ -73,6 +75,7 @@ pub mod rf;
 pub mod serialize;
 pub mod shape;
 pub mod target;
+pub mod text;
 pub mod variant;
 pub mod verify;
 
@@ -85,6 +88,7 @@ pub use attention_layout::{
     mask_strides_for_shape, packed_bshd_narrow_elidable, packed_bshd_qkv_strides, strides_bhsd,
     strides_bshd, strides_for_shape,
 };
+pub use capability::{N_KINDS, OpCaps, fused_kinds};
 pub use dtype::{DType, Element, ElementSubtype, scalar_constant_bytes};
 pub use dynamic::sym;
 pub use dynamic::{
@@ -104,6 +108,9 @@ pub fn env_catalog() -> &'static [EnvVarDoc] {
     public_catalog_docs()
 }
 
+pub use equivalence::{
+    IgnoreConfig, fingerprint, node_value_key, ops_deep_eq, structural_hash, structurally_eq,
+};
 pub use fft::{FftGpuPlan, FftMeta, FftNorm, fft_meta, fftn_axes_all, normalize_fftn_axes};
 pub use graph::{Graph, Node, NodeId};
 pub use hir::{

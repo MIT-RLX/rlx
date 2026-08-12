@@ -33,6 +33,7 @@
 //! to `captures[i]` when inlined into the parent.
 
 use crate::pass::Pass;
+use rlx_ir::OpKind;
 use rlx_ir::op::BinaryOp;
 use rlx_ir::shape::Dim;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
@@ -43,6 +44,13 @@ use std::collections::HashMap;
 pub struct LowerControlFlow;
 
 impl Pass for LowerControlFlow {
+    // `inline_if` and `unroll_while` each rebuild the graph node-for-node when
+    // their op is absent, so without either kind this pass is a no-op — as its
+    // own doc comment already states.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::If, OpKind::While]
+    }
+
     fn name(&self) -> &str {
         "LowerControlFlow"
     }
@@ -58,6 +66,12 @@ impl Pass for LowerControlFlow {
 pub struct LowerScan;
 
 impl Pass for LowerScan {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Scan]
+    }
+
     fn name(&self) -> &str {
         "LowerScan"
     }

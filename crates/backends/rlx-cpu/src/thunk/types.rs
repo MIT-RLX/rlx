@@ -58,6 +58,17 @@ pub enum Thunk {
         k: u32,
         n: u32,
     },
+    /// `C[m,n] = A[m,k](f32) @ B[k,n](F16)` — IEEE-half twin of [`Self::SgemmBf16`].
+    /// `b` is an F16 arena buffer (`k*n` `u16`), `a`/`c` are f32. Without this a
+    /// generic `Op::MatMul` with an F16 weight read the half bytes as f32 garbage.
+    SgemmF16 {
+        a: usize,
+        b: usize,
+        c: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+    },
     /// `C[m,n] = op(A) @ op(B)` with optional transpose of each operand,
     /// done via cblas trans flags (no materialized transpose). Emitted when
     /// the thunk compiler folds a last-two-axis `Op::Transpose` feeding a
@@ -2798,6 +2809,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
     match t {
         Thunk::Sgemm { a, b, .. } => vec![*a, *b],
         Thunk::SgemmBf16 { a, b, .. } => vec![*a, *b],
+        Thunk::SgemmF16 { a, b, .. } => vec![*a, *b],
         Thunk::SgemmT { a, b, .. } => vec![*a, *b],
         Thunk::SgdMomentum {
             param, vel, grad, ..

@@ -17,6 +17,9 @@ documentation.workspace = true
 rlx-ir = { workspace = true }
 
 [dev-dependencies]
+# Textual-IR fixtures (`tests/text_fixtures.rs`) need rlx-ir's serde derives.
+rlx-ir = { workspace = true, features = ["serialize"] }
+
 # Back-edge dev-deps on later-tier crates: keep these PATH-ONLY (no
 # `version`). cargo strips path-only dev-deps from the published manifest,
 # so `cargo publish -p rlx-fusion` (tier 1) does not try to resolve

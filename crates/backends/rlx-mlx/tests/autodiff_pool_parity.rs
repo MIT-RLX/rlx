@@ -8,7 +8,10 @@
 //! Tiebreaking convention: first hit wins (strict `>`), matching both
 //! the CPU thunk and MLX's `argmax` first-index-on-ties.
 
-#![cfg(rlx_mlx_host)]
+// The op under test is implemented with `mlx::fast::metal_kernel`, which
+// needs a Metal back-end — MLX-on-Linux has none (`[metal_kernel] No Metal
+// back-end`). Apple-only until a portable MLX path exists.
+#![cfg(all(rlx_mlx_host, target_vendor = "apple"))]
 
 use rlx_ir::op::ReduceOp;
 use rlx_ir::{DType, Graph, Op, Shape};

@@ -24,9 +24,9 @@
 
 use std::path::PathBuf;
 
-use metal::{Buffer, Device, MTLResourceOptions, MTLSize};
 use rlx_gguf::{GgmlType, GgufFile};
 use rlx_metal::kernels::kernels;
+use rlx_metal::mtl::{Buffer, Device, MTLResourceOptions, MTLSize};
 
 fn test_dir() -> PathBuf {
     PathBuf::from(

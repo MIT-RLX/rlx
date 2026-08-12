@@ -309,9 +309,48 @@ pub struct GgufFile {
     data: GgufData,
     /// Byte offset of the data segment within the file (for the mmap path).
     data_offset: u64,
+    /// File this was mmap'd from, kept so tensors can be re-read with `pread`
+    /// instead of borrowed from the mapping. See [`Self::read_tensor_bytes_into`].
+    src_path: Option<std::path::PathBuf>,
 }
 
 impl GgufFile {
+    /// Hint to the kernel that the mapped tensor data is no longer needed.
+    ///
+    /// Reading a packed GGUF touches every byte of the file, so after the
+    /// weights have been copied into a backend arena the page cache still holds
+    /// a second full-size copy of the checkpoint — 14.4 GB behind a 14.1 GB
+    /// arena on Muse-Glimmer-30B UD-Q4_K_XL.
+    ///
+    /// **Linux only in practice.** `MADV_DONTNEED` drops resident clean
+    /// file-backed pages there. On macOS it is a documented no-op for file
+    /// mappings, and so is `MADV_FREE` and `msync(MS_INVALIDATE)`: measured on
+    /// a 6 GB mapping, RSS stayed at 5.86 GB through all three and only fell to
+    /// 0 on `munmap`. Freeing this memory on Apple therefore requires dropping
+    /// the mapping itself, not advising it — do not read this call as making
+    /// macOS RSS go down.
+    ///
+    /// Safe and non-destructive either way: the mapping stays valid and any
+    /// later read re-faults from disk. Only call it once the bytes have been
+    /// uploaded.
+    ///
+    /// No-op for the owned-buffer backing and on platforms without `madvise`.
+    pub fn release_mapped_pages(&self) {
+        #[cfg(unix)]
+        if let GgufData::Mmap { map, .. } = &self.data {
+            if map.is_empty() {
+                return;
+            }
+            unsafe {
+                libc::madvise(
+                    map.as_ptr() as *mut libc::c_void,
+                    map.len(),
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    }
+
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -323,6 +362,7 @@ impl GgufFile {
     /// paths that hold packed bytes inline and never touch the GGUF mmap).
     pub fn empty() -> Self {
         Self {
+            src_path: None,
             version: 3,
             alignment: 32,
             metadata: HashMap::new(),
@@ -488,6 +528,7 @@ impl GgufFile {
         }
 
         Ok(Self {
+            src_path: None,
             version,
             alignment,
             metadata,
@@ -524,6 +565,7 @@ impl GgufFile {
             map,
             start: gf.data_offset as usize,
         };
+        gf.src_path = Some(path.to_path_buf());
         Ok(gf)
     }
 
@@ -611,6 +653,54 @@ impl GgufFile {
     /// Slice the raw tensor bytes out of the data segment. Public so
     /// callers writing custom kernels can pass quantized blocks
     /// straight through.
+    /// Read one tensor's raw bytes into `buf` with `pread`, bypassing the mmap.
+    ///
+    /// Borrowing tensor bytes from the mapping makes every page resident: a
+    /// packed upload touches the whole checkpoint, so the process ends up
+    /// holding a full second copy of the model behind the backend arena
+    /// (14.4 GB behind a 14.1 GB arena on Muse-Glimmer-30B UD-Q4_K_XL). On
+    /// macOS that memory cannot be handed back — `MADV_DONTNEED`, `MADV_FREE`
+    /// and `msync(MS_INVALIDATE)` are all no-ops for file mappings, and only
+    /// `munmap` frees it.
+    ///
+    /// Reading instead of mapping sidesteps the problem entirely, because the
+    /// kernel's buffer cache is not charged to the process. Measured on a 6 GB
+    /// read-only file: mmap + touch = 5.93 GB RSS, `pread` through a 64 MB
+    /// buffer = **0.07 GB**. Reuse one `buf` across tensors and the resident
+    /// cost is the largest single tensor rather than the whole file.
+    ///
+    /// Returns `false` when the file was not opened via [`Self::from_path_mmap`]
+    /// (owned backing already holds the bytes, so the caller should just borrow).
+    pub fn read_tensor_bytes_into(&self, t: &GgufTensor, buf: &mut Vec<u8>) -> Result<bool> {
+        let Some(path) = self.src_path.as_ref() else {
+            return Ok(false);
+        };
+        let n = t.n_elements();
+        let nbytes = bytes_for(t.dtype, n)
+            .ok_or_else(|| anyhow!("element count {n} not aligned to block for {:?}", t.dtype))?;
+        let off = self
+            .data_offset
+            .checked_add(t.offset)
+            .ok_or_else(|| anyhow!("tensor {} file offset overflow", t.name))?;
+        buf.clear();
+        buf.resize(nbytes, 0);
+        let f = File::open(path).with_context(|| format!("reopening {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            f.read_exact_at(buf, off)
+                .with_context(|| format!("pread tensor {} at {off}", t.name))?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = f;
+            f.seek(SeekFrom::Start(off))?;
+            f.read_exact(buf)?;
+        }
+        Ok(true)
+    }
+
     pub fn tensor_bytes(&self, t: &GgufTensor) -> Result<&[u8]> {
         let n = t.n_elements();
         let nbytes = bytes_for(t.dtype, n)

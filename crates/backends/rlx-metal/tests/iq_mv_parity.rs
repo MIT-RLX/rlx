@@ -5,12 +5,12 @@
 
 #![cfg(target_os = "macos")]
 
-use metal::{Buffer, Device, MTLResourceOptions, MTLSize};
 use rlx_ir::quant::QuantScheme;
 use rlx_metal::kernels::kernels;
+use rlx_metal::mtl::{Buffer, Device, MTLResourceOptions, MTLSize};
 
 fn run_fused_mv(
-    pipeline: &metal::ComputePipelineState,
+    pipeline: &rlx_metal::mtl::ComputePipelineState,
     scheme: QuantScheme,
     x: &[f32],
     packed: &[u8],
@@ -99,7 +99,7 @@ fn run_fused_mv(
 /// Simdgroup-cooperative IQ GEMV parity: dispatches `NSG` simdgroups/tg × 1 row
 /// (matches `iq3_xxs_mv_f32_sg`), binds the LUT at buffer 6, compares to CPU.
 fn run_iq_sg_mv(
-    pipeline: &metal::ComputePipelineState,
+    pipeline: &rlx_metal::mtl::ComputePipelineState,
     scheme: QuantScheme,
     x: &[f32],
     packed: &[u8],

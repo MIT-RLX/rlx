@@ -9,8 +9,8 @@
 
 #![cfg(target_os = "macos")]
 
-use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use rlx_metal::double_single::DwReduce;
+use rlx_metal::mtl::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 
 /// A stress array: `1e8 + 10000·1 − 1e8` (true = 10000). Each `+1` is below

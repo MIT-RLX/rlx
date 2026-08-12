@@ -8,9 +8,9 @@
 #[cfg(target_os = "macos")]
 fn main() {
     use half::f16;
-    use metal::MTLSize;
     use rlx_metal::device::metal_device;
     use rlx_metal::kernels::kernels;
+    use rlx_metal::mtl::MTLSize;
 
     let dev = metal_device().expect("no Metal device");
     let kk = kernels();

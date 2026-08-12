@@ -91,7 +91,7 @@ fn gather_elements_cpu() {
     assert_eq!(out, vec![1.0, 3.0, 2.0, 4.0, 6.0, 5.0, 8.0, 7.0]);
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn indexing_ops_metal_matches_cpu() {
     assert_eq!(

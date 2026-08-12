@@ -41,13 +41,13 @@ use crate::kernels::{
     fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
     fused_residual_rms_norm_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
     gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, layer_norm2d_kernel, layernorm_kernel,
-    matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel,
-    narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, reduce_kernel,
-    resize_nearest_2x_kernel, rms_norm_backward_kernel, rms_norm_bwd_zero_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scatter_add_acc_kernel,
-    scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    unary_kernel, where_kernel,
+    group_norm_kernel, grouped_gemv_splitk_kernel, grouped_matmul_kernel, im2col_kernel,
+    layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel, matmul_kernel,
+    matmul_wmma_kernel, maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel,
+    pool3d_kernel, reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
+    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, unary_kernel, where_kernel,
 };
 
 mod compile;

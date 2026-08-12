@@ -943,6 +943,24 @@ pub trait HirGraphExt {
     -> HirNodeId;
     fn gather_(&mut self, table: HirNodeId, indices: HirNodeId, axis: usize) -> HirNodeId;
 
+    /// MoE grouped GEMM: `input [M, K]`, expert bank `weight [E, K, N]`,
+    /// `expert_idx [M]` → `[M, N]`, where row `r` uses expert `expert_idx[r]`.
+    ///
+    /// Prefer this over hand-declaring the shape on `add_node`: it derives `[M,
+    /// N]` from the operands via [`crate::shape::grouped_matmul_dims`], which is
+    /// also what rejects a bank still in the checkpoint's `[E, N, K]` order —
+    /// the one mistake this op cannot detect at run time.
+    fn grouped_matmul(
+        &mut self,
+        input: HirNodeId,
+        weight: HirNodeId,
+        expert_idx: HirNodeId,
+    ) -> HirNodeId {
+        let shape = crate::shape::grouped_matmul_shape(self.shape(input), self.shape(weight))
+            .unwrap_or_else(|e| panic!("{e}"));
+        self.add_node(Op::GroupedMatMul, vec![input, weight, expert_idx], shape)
+    }
+
     fn eq(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId;
     fn lt(&mut self, lhs: HirNodeId, rhs: HirNodeId) -> HirNodeId;
 

@@ -41,9 +41,9 @@ pub use ops::*;
 /// GPU failures, not a kernel or dispatch bug. Fail loudly here so a
 /// future occurrence reads as a clear GPU error instead of mysterious
 /// silent output corruption several ops downstream.
-pub(crate) fn check_cmd_buf_status(cmd_buf: &metal::CommandBufferRef, where_: &str) {
+pub(crate) fn check_cmd_buf_status(cmd_buf: &crate::mtl::CommandBufferRef, where_: &str) {
     let status = cmd_buf.status();
-    if status == metal::MTLCommandBufferStatus::Error {
+    if status == crate::mtl::MTLCommandBufferStatus::Error {
         panic!(
             "rlx-metal: command buffer failed ({where_}): status=Error. This is a GPU-side \
              failure (timeout / page fault / device error), not a data bug — it usually means \
@@ -57,7 +57,20 @@ pub(crate) fn check_cmd_buf_status(cmd_buf: &metal::CommandBufferRef, where_: &s
 }
 
 impl MetalExecutable {
+    /// One autorelease pool per forward pass.
+    ///
+    /// The command buffer and every encoder created below are autoreleased, not
+    /// `+1` — anything we keep is retained via `to_owned`, so this is not about
+    /// leaks. It is about *when* the rest is freed: with no pool boundary they
+    /// live until the process-level pool drains, so a decode loop accumulates a
+    /// command buffer and an encoder per token. Draining per call keeps that
+    /// flat. The pool wraps the whole pass rather than each dispatch so
+    /// intra-pass borrows stay valid.
     pub(crate) fn encode_and_run(&mut self) {
+        crate::mtl::autoreleasepool(|| self.encode_and_run_inner())
+    }
+
+    fn encode_and_run_inner(&mut self) {
         if crate::thunk_profile::enabled() {
             self.run_thunk_profile();
             return;
@@ -194,9 +207,9 @@ impl MetalExecutable {
     pub(crate) fn encode_commit(
         &mut self,
         wait: bool,
-        blit_outputs: Option<&[metal::Buffer]>,
+        blit_outputs: Option<&[crate::mtl::Buffer]>,
         thunk_range: Option<std::ops::Range<usize>>,
-    ) -> Option<metal::CommandBuffer> {
+    ) -> Option<crate::mtl::CommandBuffer> {
         /// Host-side thunk queued between GPU segments (unified-memory arena).
         enum DeferredHostOp {
             GatedDeltaNet {
@@ -562,7 +575,7 @@ impl MetalExecutable {
         // bump on `to_owned()`) decouples the lifetime: `enc.take()`
         // releases the encoder fully, after which `cmd_buf` is freely
         // reassignable.
-        let mut enc: Option<metal::ComputeCommandEncoder> = None;
+        let mut enc: Option<crate::mtl::ComputeCommandEncoder> = None;
         let mut deferred_host: Vec<DeferredHostOp> = Vec::new();
         let mut tail_host: Vec<TailHostOp> = Vec::new();
         let mut narrow_batch: Option<PendingNarrowBatch> = None;
@@ -591,8 +604,8 @@ impl MetalExecutable {
         let mut thunks_dispatched = 0usize;
 
         let flush_deferred_host =
-            |cmd_buf: &mut metal::CommandBuffer,
-             enc: &mut Option<metal::ComputeCommandEncoder>,
+            |cmd_buf: &mut crate::mtl::CommandBuffer,
+             enc: &mut Option<crate::mtl::ComputeCommandEncoder>,
              deferred: &mut Vec<DeferredHostOp>| {
                 if deferred.is_empty() {
                     return;
@@ -1300,9 +1313,9 @@ impl MetalExecutable {
                 flush_deferred_host(&mut cmd_buf, &mut enc, &mut deferred_host);
                 if enc.is_none() {
                     let dispatch_ty = if concurrent {
-                        metal::MTLDispatchType::Concurrent
+                        crate::mtl::MTLDispatchType::Concurrent
                     } else {
-                        metal::MTLDispatchType::Serial
+                        crate::mtl::MTLDispatchType::Serial
                     };
                     enc = Some(
                         cmd_buf
@@ -1458,8 +1471,8 @@ impl MetalExecutable {
                     // it directly (same objc path as the GPU-timestamp probe).
                     unsafe {
                         use objc::{msg_send, runtime::Object, sel, sel_impl};
-                        let obj =
-                            active_enc as *const metal::ComputeCommandEncoderRef as *mut Object;
+                        let obj = active_enc as *const crate::mtl::ComputeCommandEncoderRef
+                            as *mut Object;
                         let _: () = msg_send![obj, memoryBarrierWithScope: 1u64];
                     }
                     barriers_emitted += 1;
@@ -1839,12 +1852,12 @@ impl MetalExecutable {
                         let act_id: u32 = u32::from(matches!(act, Some(Activation::Relu)));
                         enc.set_bytes(7, 4, &act_id as *const u32 as *const _);
                         enc.dispatch_thread_groups(
-                            metal::MTLSize {
+                            crate::mtl::MTLSize {
                                 width: (*n as u64) / 64,
                                 height: (m_scaled as u64) / 64,
                                 depth: 1,
                             },
-                            metal::MTLSize {
+                            crate::mtl::MTLSize {
                                 width: 512,
                                 height: 1,
                                 depth: 1,
@@ -2835,7 +2848,7 @@ impl MetalExecutable {
                             rhs_strides.as_ptr() as *const _,
                         );
                         enc.set_bytes(8, 4, &op_id as *const u32 as *const _);
-                        let grid = metal::MTLSize {
+                        let grid = crate::mtl::MTLSize {
                             width: total_out as u64,
                             height: 1,
                             depth: 1,
@@ -2844,7 +2857,7 @@ impl MetalExecutable {
                             .binary_broadcast_f32
                             .thread_execution_width()
                             .min(total_out as u64);
-                        let tg = metal::MTLSize {
+                        let tg = crate::mtl::MTLSize {
                             width: tg_w,
                             height: 1,
                             depth: 1,
@@ -4379,7 +4392,7 @@ impl MetalExecutable {
                             if grow {
                                 *sc = Some(dev.device.new_buffer(
                                     need_bytes,
-                                    metal::MTLResourceOptions::StorageModeShared,
+                                    crate::mtl::MTLResourceOptions::StorageModeShared,
                                 ));
                             }
                         }
@@ -4424,7 +4437,7 @@ impl MetalExecutable {
                                 if grow {
                                     *b = Some(dev.device.new_buffer(
                                         need_i8,
-                                        metal::MTLResourceOptions::StorageModeShared,
+                                        crate::mtl::MTLResourceOptions::StorageModeShared,
                                     ));
                                 }
                             }
@@ -4552,12 +4565,12 @@ impl MetalExecutable {
                     enc.set_bytes(11, u4, has_rope as *const u32 as *const _);
                     let groups = (*batch * *heads).max(1) as u64;
                     enc.dispatch_thread_groups(
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: groups,
                             height: 1,
                             depth: 1,
                         },
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: 256,
                             height: 1,
                             depth: 1,
@@ -5071,8 +5084,8 @@ impl MetalExecutable {
                         let n = *reduced;
                         e.set_bytes(2, 4, &n as *const u32 as *const _);
                         e.dispatch_thread_groups(
-                            metal::MTLSize::new(1, 1, 1),
-                            metal::MTLSize::new(256, 1, 1),
+                            crate::mtl::MTLSize::new(1, 1, 1),
+                            crate::mtl::MTLSize::new(256, 1, 1),
                         );
                     } else {
                         encode_reduce_axes(
@@ -6057,12 +6070,12 @@ impl MetalExecutable {
                     enc.set_bytes(4, 4, &dd as *const u32 as *const _);
                     enc.set_bytes(5, 4, &kk as *const u32 as *const _);
                     enc.set_bytes(6, 4, &mm as *const u32 as *const _);
-                    let grid = metal::MTLSize {
+                    let grid = crate::mtl::MTLSize {
                         width: nn as u64,
                         height: 1,
                         depth: 1,
                     };
-                    let tg = metal::MTLSize {
+                    let tg = crate::mtl::MTLSize {
                         width: 256,
                         height: 1,
                         depth: 1,
@@ -6214,13 +6227,13 @@ impl MetalExecutable {
                                 enc.set_bytes(4, 4, &seed_lo as *const u32 as *const _);
                                 enc.set_bytes(5, 4, &seed_hi as *const u32 as *const _);
                             }
-                            let grid = metal::MTLSize {
+                            let grid = crate::mtl::MTLSize {
                                 width: len_u.max(1) as u64,
                                 height: 1,
                                 depth: 1,
                             };
                             let tg_w = pipe.thread_execution_width().min(len_u.max(1) as u64);
-                            let tg = metal::MTLSize {
+                            let tg = crate::mtl::MTLSize {
                                 width: tg_w,
                                 height: 1,
                                 depth: 1,
@@ -6281,13 +6294,13 @@ impl MetalExecutable {
                                 enc.set_bytes(4, 4, &seed_lo as *const u32 as *const _);
                                 enc.set_bytes(5, 4, &seed_hi as *const u32 as *const _);
                             }
-                            let grid = metal::MTLSize {
+                            let grid = crate::mtl::MTLSize {
                                 width: len_u.max(1) as u64,
                                 height: 1,
                                 depth: 1,
                             };
                             let tg_w = pipe.thread_execution_width().min(len_u.max(1) as u64);
-                            let tg = metal::MTLSize {
+                            let tg = crate::mtl::MTLSize {
                                 width: tg_w,
                                 height: 1,
                                 depth: 1,
@@ -6510,12 +6523,12 @@ impl MetalExecutable {
                         enc.set_bytes(7, 4, &tm as *const f32 as *const _);
                         let sd = *seed;
                         enc.set_bytes(8, 8, &sd as *const u64 as *const _);
-                        let grid = metal::MTLSize {
+                        let grid = crate::mtl::MTLSize {
                             width: bt as u64,
                             height: 1,
                             depth: 1,
                         };
-                        let tg = metal::MTLSize {
+                        let tg = crate::mtl::MTLSize {
                             width: 256,
                             height: 1,
                             depth: 1,
@@ -6620,12 +6633,12 @@ impl MetalExecutable {
                             enc.set_bytes(2, 4, &o as *const u32 as *const _);
                             enc.set_bytes(3, 4, &r as *const u32 as *const _);
                             enc.set_bytes(4, 4, &im as *const u32 as *const _);
-                            let grid = metal::MTLSize {
+                            let grid = crate::mtl::MTLSize {
                                 width: o as u64,
                                 height: 1,
                                 depth: 1,
                             };
-                            let tg = metal::MTLSize {
+                            let tg = crate::mtl::MTLSize {
                                 width: 256,
                                 height: 1,
                                 depth: 1,
@@ -6641,12 +6654,12 @@ impl MetalExecutable {
                             enc.set_bytes(4, 4, &inn as *const u32 as *const _);
                             enc.set_bytes(5, 4, &im as *const u32 as *const _);
                             let total = (o * inn) as u64;
-                            let grid = metal::MTLSize {
+                            let grid = crate::mtl::MTLSize {
                                 width: total,
                                 height: 1,
                                 depth: 1,
                             };
-                            let tg = metal::MTLSize {
+                            let tg = crate::mtl::MTLSize {
                                 width: total.min(256),
                                 height: 1,
                                 depth: 1,
@@ -6983,12 +6996,12 @@ impl MetalExecutable {
                     enc.set_bytes(8, 4, grid_min as *const f32 as *const _);
                     enc.set_bytes(9, 4, grid_max as *const f32 as *const _);
                     enc.dispatch_threads(
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: total as u64,
                             height: 1,
                             depth: 1,
                         },
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: 256.min(total) as u64,
                             height: 1,
                             depth: 1,
@@ -7014,12 +7027,12 @@ impl MetalExecutable {
                     enc.set_buffer(0, Some(&self.arena.buffer), *dst as u64);
                     enc.set_bytes(1, 4, &dcoeff_n as *const u32 as *const _);
                     enc.dispatch_threads(
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: dcoeff_n as u64,
                             height: 1,
                             depth: 1,
                         },
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: 256.min(dcoeff_n) as u64,
                             height: 1,
                             depth: 1,
@@ -7040,12 +7053,12 @@ impl MetalExecutable {
                     enc.set_bytes(7, 4, grid_min as *const f32 as *const _);
                     enc.set_bytes(8, 4, grid_max as *const f32 as *const _);
                     enc.dispatch_threads(
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: total as u64,
                             height: 1,
                             depth: 1,
                         },
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: 256.min(total) as u64,
                             height: 1,
                             depth: 1,
@@ -7075,12 +7088,12 @@ impl MetalExecutable {
                         enc.set_bytes((i + 4) as u64, 4, v as *const u32 as *const _);
                     }
                     enc.dispatch_threads(
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: *k_dim as u64,
                             height: *n as u64,
                             depth: 1,
                         },
-                        metal::MTLSize {
+                        crate::mtl::MTLSize {
                             width: 32,
                             height: 8,
                             depth: 1,
@@ -7259,6 +7272,23 @@ impl MetalExecutable {
                         && k_u.is_multiple_of(256)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufQ4K)
                         && !rlx_ir::env::flag("RLX_METAL_Q4K_FUSED_DISABLE");
+                    // Q5_K previously had no fused kernel and fell to the generic
+                    // dequant-to-scratch path. That is ruinous for an LM head:
+                    // Muse-Glimmer's is Q5_K [6656, 202048], so the scratch is
+                    // 5.4 GB written + read PER TOKEN — 126 ms of a 217 ms decode
+                    // step for 4.8% of the parameters.
+                    // Q2_K had no fused kernel either — that is why UD-Q2_K_XL
+                    // was 2.5x SLOWER than UD-Q4_K_XL despite being smaller.
+                    let use_fused_q2k_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ2K)
+                        && !rlx_ir::env::flag("RLX_METAL_Q2K_FUSED_DISABLE");
+                    let use_fused_q5k_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ5K)
+                        && !rlx_ir::env::flag("RLX_METAL_Q5K_FUSED_DISABLE");
                     // Fused single-pass Q3_K GEMV — the Q3_K_S bulk-weight decode
                     // path. Skips the dequant-to-f32-scratch + MPS sgemm.
                     // Off-switch: RLX_METAL_Q3K_FUSED_DISABLE=1.
@@ -7360,21 +7390,73 @@ impl MetalExecutable {
                     // `RLX_METAL_Q4K_GEMM_MAX_M` (default 32) so prefill routes to
                     // MPS while small-m stays fused. Decode (m==1) uses the GEMV
                     // path and is unaffected.
-                    let fused_gemm_max_m: usize = rlx_ir::env::var("RLX_METAL_Q4K_GEMM_MAX_M")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(32);
+                    let fused_gemm_max_m_env: Option<usize> =
+                        rlx_ir::env::var("RLX_METAL_Q4K_GEMM_MAX_M").and_then(|v| v.parse().ok());
+                    // Stage the x tile in threadgroup memory. `q4k_mm_f32` has
+                    // all 64 threads of a group re-read the SAME activations
+                    // from device memory (they differ only in column) — 128 B of
+                    // x per 4 B of weight, so x traffic is ~64x what one pass
+                    // needs and the kernel is load-bound rather than
+                    // bandwidth-bound. Bit-identical results (same operation
+                    // order, only the load path differs) — see
+                    // `q4k_mm_xs_parity`. Off-switch: RLX_METAL_Q4K_GEMM_XS_DISABLE.
+                    let q4k_xs_ok = !rlx_ir::env::flag("RLX_METAL_Q4K_GEMM_XS_DISABLE");
+                    // The old cap of 32 predates the staged kernels; with them
+                    // the fused GEMM stays ahead of MPS out to ~90-100, so
+                    // anything in 33..96 was being handed to a slower path.
+                    // Muse-Glimmer-30B on M4 Pro, fused vs MPS (ms) —
+                    //   Q4_K_XL: m=42 1136/1745, m=63 1561/1923,
+                    //            m=84 1978/2129, m=126 2814/2197
+                    //   Q6_K_XL: m=42 2341/4507, m=84 4263/5110,
+                    //            m=126 6128/5383
+                    // 96 sits just below both crossovers. Shared by Q4_K, Q5_K,
+                    // Q6_K and Q8_0 — same kernel shape, same measured knee.
+                    let q4k_gemm_max_m = match (fused_gemm_max_m_env, q4k_xs_ok) {
+                        (Some(v), _) => v,
+                        (None, true) => 96,
+                        (None, false) => 32,
+                    };
                     let use_fused_q4k_mm = use_gpu_dequant
                         && m_u > 1
-                        && m_u <= fused_gemm_max_m
+                        && m_u <= q4k_gemm_max_m
                         && k_u.is_multiple_of(256)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufQ4K)
                         && !rlx_ir::env::flag("RLX_METAL_Q4K_GEMM_DISABLE");
+                    let use_fused_q4k_mm_xs = use_fused_q4k_mm && q4k_xs_ok;
+                    // Q5_K had NO GEMM at all, so m>1 fell back to
+                    // dequant-to-f32-scratch + MPS. In a Q4_K_M/XL GGUF the few
+                    // Q5_K tensors are the big ones — Muse-Glimmer-30B puts its
+                    // 6656x202048 LM head there, 5.4 GB of f32 scratch per
+                    // forward. Reuses the Q4_K cap since it is the same kernel
+                    // shape. Off-switch: RLX_METAL_Q5K_GEMM_DISABLE.
+                    // Q8_0 also had no GEMM. Same cap as Q4_K/Q5_K: identical
+                    // kernel shape, and Q8_0 is the widest-used quant of the
+                    // three. Off-switch: RLX_METAL_Q8_0_GEMM_DISABLE.
+                    let use_fused_q8_0_mm_xs = use_gpu_dequant
+                        && m_u > 1
+                        && m_u <= q4k_gemm_max_m
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ8_0)
+                        && !rlx_ir::env::flag("RLX_METAL_Q8_0_GEMM_DISABLE");
+                    let use_fused_q5k_mm_xs = use_gpu_dequant
+                        && m_u > 1
+                        && m_u <= q4k_gemm_max_m
+                        && k_u.is_multiple_of(256)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ5K)
+                        && !rlx_ir::env::flag("RLX_METAL_Q5K_GEMM_DISABLE");
                     let use_fused_q6k_mm = use_gpu_dequant
                         && m_u > 1
-                        && m_u <= fused_gemm_max_m
+                        && m_u <= q4k_gemm_max_m
                         && k_u.is_multiple_of(256)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufQ6K)
                         && !rlx_ir::env::flag("RLX_METAL_Q6K_GEMM_DISABLE");
+                    // Same staging fix; `q6k_mm_f32` had it worse (32 scalar x
+                    // loads per 4 weights) but gains only ~3% here — its strided
+                    // scalar reads already cached well. Kept because it is
+                    // bit-identical and never slower. Off-switch:
+                    // RLX_METAL_Q6K_GEMM_XS_DISABLE.
+                    let use_fused_q6k_mm_xs =
+                        use_fused_q6k_mm && !rlx_ir::env::flag("RLX_METAL_Q6K_GEMM_XS_DISABLE");
                     // Fused Q1_0 (Bonsai-27B 1-bit) GEMV (m==1) / GEMM (m>1):
                     // read packed weight directly, no f32 dequant scratch. The
                     // scratch path shares one buffer across every DequantMatMul
@@ -7432,6 +7514,12 @@ impl MetalExecutable {
                     } else if use_fused_q4k_mv {
                         let enc = e!();
                         encode_q4k_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_fused_q5k_mv {
+                        let enc = e!();
+                        encode_q5k_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_fused_q2k_mv {
+                        let enc = e!();
+                        encode_q2k_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
                     } else if use_q3k_mv_sg {
                         let enc = e!();
                         encode_q3k_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
@@ -7486,11 +7574,63 @@ impl MetalExecutable {
                     } else if use_fused_iq1_m_mv {
                         let enc = e!();
                         encode_iq1_m_mv_f32(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_fused_q4k_mm_xs {
+                        let enc = e!();
+                        encode_qk_mm_f32_xs(
+                            enc,
+                            &k.q4k_mm_f32_xs,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
+                    } else if use_fused_q8_0_mm_xs {
+                        let enc = e!();
+                        encode_qk_mm_f32_xs(
+                            enc,
+                            &k.q8_0_mm_f32_xs,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
+                    } else if use_fused_q5k_mm_xs {
+                        let enc = e!();
+                        encode_qk_mm_f32_xs(
+                            enc,
+                            &k.q5k_mm_f32_xs,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
                     } else if use_fused_q4k_mm {
                         let enc = e!();
                         encode_qk_mm_f32(
                             enc,
                             &k.q4k_mm_f32,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
+                    } else if use_fused_q6k_mm_xs {
+                        let enc = e!();
+                        encode_qk_mm_f32_xs(
+                            enc,
+                            &k.q6k_mm_f32_xs,
                             &self.arena.buffer,
                             *x,
                             *w_q,

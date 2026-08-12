@@ -95,30 +95,92 @@ impl CudaExecutable {
         let (fab_scratch_bytes, fab_scratch_map) = fab_scratch_plan(&graph);
         let gdn_scratch = gdn_ephemeral_state_bytes(&graph);
         t = mark("scratch_plan", t);
-        let mut plan = plan_f32_uniform(&graph, 16);
+        // Shared parameters (`RLX_CUDA_SHARED_PARAMS=1`): hoist every `Op::Param`
+        // slot out of this executable's arena into a device-wide region that is
+        // mapped in front of every arena. Sibling executables compiled from the
+        // same model (prefill-cache + decode buckets) then share ONE physical
+        // copy instead of each uploading its own — measured 3× duplication of a
+        // 1.017 GB embedding on qwen3.5. See `crate::vmem`.
+        let mut shared_param_offsets: HashMap<rlx_ir::NodeId, (usize, usize)> = HashMap::new();
+        let mut shared_skip_upload: std::collections::HashSet<rlx_ir::NodeId> =
+            std::collections::HashSet::new();
+        let mut shared_snapshot: Option<crate::vmem::RegionSnapshot> = None;
+        if crate::vmem::enabled() {
+            let mut params: Vec<(rlx_ir::NodeId, String, usize)> = Vec::new();
+            for node in graph.nodes() {
+                if let Op::Param { name } = &node.op {
+                    let bytes = node
+                        .shape
+                        .size_bytes()
+                        .unwrap_or_else(|| node.shape.num_elements().unwrap_or(0) * 4);
+                    if bytes > 0 {
+                        params.push((node.id, name.clone(), bytes));
+                    }
+                }
+            }
+            if !params.is_empty() {
+                let built =
+                    crate::vmem::with_region(ctx.cu_device(), crate::vmem::scope(), |region| {
+                        let mut offs = HashMap::new();
+                        let mut skip = std::collections::HashSet::new();
+                        for (id, name, bytes) in &params {
+                            let off = region.slot(name, *bytes).ok()?;
+                            offs.insert(*id, (off, *bytes));
+                            // Whoever claims a param first uploads it; everyone else
+                            // skips in `set_param`. That skip is the dedup.
+                            if !region.claim_upload(name, *bytes) {
+                                skip.insert(*id);
+                            }
+                        }
+                        Some((offs, skip, region.snapshot()))
+                    });
+                if let Ok(Some((offs, skip, snap))) = built {
+                    shared_param_offsets = offs;
+                    shared_skip_upload = skip;
+                    shared_snapshot = Some(snap);
+                } else if rlx_ir::env::flag("RLX_CUDA_ARENA_DEBUG") {
+                    eprintln!("[cuda-arena] shared params unavailable — private arena");
+                }
+            }
+        }
+        // Hoisting a Param also orphans every pure view of it (the planner's
+        // alias pass resolves views via `assignments`, which no longer holds the
+        // root). Give those views the root's shared offset and exclude them too.
+        if !shared_param_offsets.is_empty() {
+            let roots: std::collections::HashSet<rlx_ir::NodeId> =
+                shared_param_offsets.keys().copied().collect();
+            for (view, root) in crate::arena::view_alias_closure(&graph, &roots) {
+                if let Some(&(off, len)) = shared_param_offsets.get(&root) {
+                    shared_param_offsets.insert(view, (off, len));
+                }
+            }
+        }
+        let shared_ids: std::collections::HashSet<rlx_ir::NodeId> =
+            shared_param_offsets.keys().copied().collect();
+        let mut plan = crate::arena::plan_f32_uniform_excluding(&graph, 16, &shared_ids);
         t = mark("arena_plan", t);
-        let dequant_scratch_off = if dequant_scratch > 0 {
+        let mut dequant_scratch_off = if dequant_scratch > 0 {
             let aligned = plan.arena_size.div_ceil(16) * 16;
             plan.arena_size = aligned + dequant_scratch;
             aligned
         } else {
             0
         };
-        let fab_scratch_off = if fab_scratch_bytes > 0 {
+        let mut fab_scratch_off = if fab_scratch_bytes > 0 {
             let aligned = plan.arena_size.div_ceil(16) * 16;
             plan.arena_size = aligned + fab_scratch_bytes;
             aligned
         } else {
             0
         };
-        let gdn_scratch_off = if gdn_scratch > 0 {
+        let mut gdn_scratch_off = if gdn_scratch > 0 {
             let aligned = plan.arena_size.div_ceil(16) * 16;
             plan.arena_size = aligned + gdn_scratch;
             aligned
         } else {
             0
         };
-        let fab_scratch_base_f32 = (fab_scratch_off / 4) as u32;
+
         if rlx_ir::env::flag("RLX_CUDA_ARENA_DEBUG") {
             eprintln!(
                 "[cuda-arena] plan.arena_size={:.3} GiB (dequant_scratch={:.3} GiB, fab_scratch={:.3} GiB, gdn_scratch={:.3} GiB)",
@@ -128,7 +190,37 @@ impl CudaExecutable {
                 gdn_scratch as f64 / (1u64 << 30) as f64,
             );
         }
-        let mut arena = Arena::from_plan(&ctx, &plan);
+        let mut arena = match shared_snapshot.as_ref() {
+            Some(snap) => Arena::from_plan_vmem(
+                &ctx,
+                &plan,
+                snap,
+                &shared_param_offsets,
+                shared_skip_upload,
+            )
+            .unwrap_or_else(|e| {
+                panic!("rlx-cuda: shared-param arena mapping failed ({e:?}); unset RLX_CUDA_SHARED_PARAMS")
+            }),
+            None => Arena::from_plan(&ctx, &plan),
+        };
+        // The scratch regions above are carved off the END of `plan.arena_size`,
+        // i.e. they are offsets into the ACTIVATION space. A shared-param arena
+        // puts the param region in front of it, so they must be rebased — left
+        // unshifted they point into the shared weights and the dequant path
+        // reads/writes parameter bytes (caught by mlx_dequant_matmul_parity).
+        let arena_act_base = arena.act_base();
+        if arena_act_base > 0 {
+            if dequant_scratch > 0 {
+                dequant_scratch_off += arena_act_base;
+            }
+            if fab_scratch_bytes > 0 {
+                fab_scratch_off += arena_act_base;
+            }
+            if gdn_scratch > 0 {
+                gdn_scratch_off += arena_act_base;
+            }
+        }
+        let fab_scratch_base_f32 = (fab_scratch_off / 4) as u32;
         for node in graph.nodes() {
             let slot_bytes = node
                 .shape
@@ -167,6 +259,46 @@ impl CudaExecutable {
                     param_offsets.insert(name.clone(), node.id);
                 }
                 _ => {}
+            }
+        }
+
+        // I/O census (`RLX_CUDA_DUMP_IO=1`): how much of this graph arrives
+        // ONCE (Op::Param / Op::Constant, staged at compile) versus PER RUN
+        // (Op::Input, re-staged by `stage_gpu_handle_inputs` on every `run()`).
+        // Weights showing up as Inputs is the difference between uploading them
+        // once and uploading them every decode token.
+        if rlx_ir::env::flag("RLX_CUDA_DUMP_IO") {
+            let mut by_kind: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+            let mut biggest: Vec<(usize, &'static str, String)> = Vec::new();
+            for node in graph.nodes() {
+                let (kind, name): (&'static str, String) = match &node.op {
+                    Op::Input { name } => ("Input", name.clone()),
+                    Op::Param { name } => ("Param", name.clone()),
+                    Op::Constant { .. } => ("Constant", String::from("<const>")),
+                    _ => continue,
+                };
+                let bytes = node.shape.num_elements().unwrap_or(0) * 4;
+                let e = by_kind.entry(kind).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += bytes;
+                biggest.push((bytes, kind, name));
+            }
+            biggest.sort_by_key(|e| std::cmp::Reverse(e.0));
+            eprintln!(
+                "[rlx-cuda][io-census] graph nodes={} ------------------",
+                graph.nodes().len()
+            );
+            for (k, (n, b)) in &by_kind {
+                eprintln!(
+                    "[rlx-cuda][io-census]   {k:<8} count={n:<5} total={:>9.1} MB",
+                    *b as f64 / 1e6
+                );
+            }
+            for (b, k, name) in biggest.iter().take(8) {
+                eprintln!(
+                    "[rlx-cuda][io-census]     {:>8.2} MB  {k:<8} {name}",
+                    *b as f64 / 1e6
+                );
             }
         }
 
@@ -1395,6 +1527,33 @@ impl CudaExecutable {
                         });
                     }
                 }
+                Op::KvAppend { axis, pos } => {
+                    // In-place append: write input[1] (the new token's row) into
+                    // the output buffer, which the shared memory planner aliases
+                    // onto input 0 (the cache) — see `rlx-compile/src/memory.rs`.
+                    // Output shape == cache shape, so `seq_cap` is the output's
+                    // own axis dim (the buffer's true seq stride). Mirrors
+                    // rlx-metal's `Op::KvAppend` lowering.
+                    let out_shape = &node.shape;
+                    let rank = out_shape.rank();
+                    let outer: usize = (0..*axis)
+                        .map(|i| out_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let inner: usize = (*axis + 1..rank)
+                        .map(|i| out_shape.dim(i).unwrap_static())
+                        .product::<usize>()
+                        .max(1);
+                    let seq_cap = out_shape.dim(*axis).unwrap_static();
+                    schedule.push(Step::KvAppend {
+                        src_off: (arena.offset(node.inputs[1]) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        outer: outer as u32,
+                        seq_cap: seq_cap as u32,
+                        pos: *pos as u32,
+                        inner: inner as u32,
+                    });
+                }
                 Op::Narrow { axis, start, len } => {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
@@ -1981,12 +2140,17 @@ impl CudaExecutable {
                     let in_id = node.inputs[0];
                     let w_id = node.inputs[1];
                     let idx_id = node.inputs[2];
-                    let in_dims = graph.node(in_id).shape.dims();
-                    let w_dims = graph.node(w_id).shape.dims();
-                    let m = in_dims[0].unwrap_static() as u32;
-                    let k = in_dims[1].unwrap_static() as u32;
-                    let n = w_dims[2].unwrap_static() as u32;
-                    let ne = w_dims[0].unwrap_static() as u32;
+                    // Checked, not trusted: `n` comes off the expert bank while the
+                    // output slot is sized from `node.shape`, so a bank still in
+                    // `[E, N, K]` order silently under- or over-writes it.
+                    let gd = rlx_ir::shape::grouped_matmul_dims(
+                        &graph.node(in_id).shape,
+                        &graph.node(w_id).shape,
+                        Some(&node.shape),
+                    )
+                    .unwrap_or_else(|e| panic!("rlx-cuda: node {:?}: {e}", node.id));
+                    let (m, k, n, ne) =
+                        (gd.m as u32, gd.k as u32, gd.n as u32, gd.num_experts as u32);
                     schedule.push(Step::GroupedMatmul {
                         m,
                         k,

@@ -19,11 +19,11 @@ use rlx_opt::memory;
 /// `wait_until_completed` cost a wall-clock `Instant` folds into every op, which
 /// otherwise over-weights tiny m=1 decode kernels. Caller must have waited for
 /// completion (values read 0 otherwise).
-fn gpu_cmd_buf_seconds(cb: &metal::CommandBufferRef) -> f64 {
+fn gpu_cmd_buf_seconds(cb: &crate::mtl::CommandBufferRef) -> f64 {
     use objc::{msg_send, runtime::Object, sel, sel_impl};
     // A `foreign_types` Ref is a newtype over the opaque ObjC object, so a
     // pointer to the Ref IS the object pointer.
-    let obj = cb as *const metal::CommandBufferRef as *mut Object;
+    let obj = cb as *const crate::mtl::CommandBufferRef as *mut Object;
     unsafe {
         let start: f64 = msg_send![obj, GPUStartTime];
         let end: f64 = msg_send![obj, GPUEndTime];
@@ -81,7 +81,7 @@ impl MetalExecutable {
             .map(|(_, len)| (*len).max(1) * 4)
             .collect();
 
-        let mut pending: Vec<(metal::CommandBuffer, Vec<metal::Buffer>)> =
+        let mut pending: Vec<(crate::mtl::CommandBuffer, Vec<crate::mtl::Buffer>)> =
             Vec::with_capacity(input_sets.len());
 
         for inputs in input_sets {
@@ -98,7 +98,7 @@ impl MetalExecutable {
             // Allocate per-commit output buffers. Shared storage so the
             // read-back at the end is just a pointer cast on Apple
             // unified memory (no GPU→CPU copy).
-            let dests: Vec<metal::Buffer> =
+            let dests: Vec<crate::mtl::Buffer> =
                 out_sizes.iter().map(|&b| dev.alloc_shared(b)).collect();
             if let Some(cmd_buf) = self.encode_commit(false, Some(&dests), None) {
                 pending.push((cmd_buf, dests));

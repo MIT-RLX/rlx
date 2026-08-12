@@ -60,10 +60,7 @@ fn boundary_name(id: NodeId) -> String {
 }
 
 fn is_leaf(g: &Graph, id: NodeId) -> bool {
-    matches!(
-        g.node(id).op,
-        Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
-    )
+    g.node(id).op.is_leaf()
 }
 
 /// Assign each compute node (index `i` of `m` in topo order) to a stage by
@@ -114,6 +111,21 @@ pub fn partition_with(
     }
 
     let graph_outputs: HashSet<NodeId> = graph.outputs.iter().copied().collect();
+
+    // Consumers of each node, built once. `Graph::users` scans every node to
+    // answer for one, and the boundary scan below asks for every compute node
+    // in every stage — quadratic. One `O(edges)` sweep replaces it.
+    let mut users_of: Vec<Vec<NodeId>> = vec![Vec::new(); n];
+    for node in graph.nodes() {
+        let mut seen: Vec<NodeId> = Vec::with_capacity(node.inputs.len());
+        for &input in &node.inputs {
+            if (input.0 as usize) < n && !seen.contains(&input) {
+                seen.push(input);
+                users_of[input.0 as usize].push(node.id);
+            }
+        }
+    }
+
     let mut stages = Vec::with_capacity(n_stages);
 
     for s in 0..n_stages {
@@ -172,8 +184,7 @@ pub fn partition_with(
         let mut out_shapes = Vec::new();
         for &cid in compute.iter().filter(|&&id| stage_of[&id] == s) {
             let final_out = graph_outputs.contains(&cid);
-            let used_later = graph
-                .users(cid)
+            let used_later = users_of[cid.0 as usize]
                 .iter()
                 .any(|u| stage_of.get(u).is_some_and(|&us| us > s));
             if final_out || used_later {

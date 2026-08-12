@@ -9,9 +9,9 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use metal::{MTLDispatchType, MTLResourceOptions};
     use rlx_metal::device::metal_device;
     use rlx_metal::icb;
+    use rlx_metal::mtl::{MTLDispatchType, MTLResourceOptions};
     use rlx_metal::thunk::Thunk;
 
     let dev = metal_device().expect("metal");
@@ -82,6 +82,10 @@ fn main() {
     cb.commit();
     eprintln!("[check] wait");
     cb.wait_until_completed();
+    eprintln!("[check] status = {:?}", cb.status());
+    if let Some(err) = cb.error_string() {
+        eprintln!("[check] command buffer error: {err}");
+    }
     eprintln!("[check] done");
 
     // Compute reference on CPU.

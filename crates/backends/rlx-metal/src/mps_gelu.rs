@@ -9,7 +9,7 @@
 //! through `newBufferWithBytesNoCopy` (`mps_tensor_data_from_buffer`) and
 //! handles large unified-memory arenas correctly.
 
-use metal::{Buffer, CommandBufferRef, CommandQueueRef};
+use crate::mtl::{Buffer, CommandBufferRef, CommandQueueRef};
 use std::collections::HashMap;
 use std::sync::Mutex;
 

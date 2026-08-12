@@ -7994,12 +7994,16 @@ pub(crate) fn compile_static_inner(
                 let in_id = node.inputs[0];
                 let w_id = node.inputs[1];
                 let idx_id = node.inputs[2];
-                let in_dims = graph.node(in_id).shape.dims();
-                let w_dims = graph.node(w_id).shape.dims();
-                let m = in_dims[0].unwrap_static() as u32;
-                let k = in_dims[1].unwrap_static() as u32;
-                let n = w_dims[2].unwrap_static() as u32;
-                let ne = w_dims[0].unwrap_static() as u32;
+                // Checked, not trusted: `n` comes off the expert bank while the
+                // output slot is sized from `node.shape`, so a bank still in
+                // `[E, N, K]` order silently under- or over-writes it.
+                let gd = rlx_ir::shape::grouped_matmul_dims(
+                    &graph.node(in_id).shape,
+                    &graph.node(w_id).shape,
+                    Some(&node.shape),
+                )
+                .unwrap_or_else(|e| panic!("rlx-wgpu: node {:?}: {e}", node.id));
+                let (m, k, n, ne) = (gd.m as u32, gd.k as u32, gd.n as u32, gd.num_experts as u32);
                 let p = GroupedMatmulParams {
                     m,
                     k,

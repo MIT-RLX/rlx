@@ -46,7 +46,7 @@ pub struct MetalExecutable {
     input_ids: HashMap<String, NodeId>,
     param_ids: HashMap<String, NodeId>,
     /// Large params kept out of the activation arena (under the 4 GiB MPS cliff).
-    weight_buffer: Option<metal::Buffer>,
+    weight_buffer: Option<crate::mtl::Buffer>,
     /// `NodeId` → slot in [`Self::weight_buffer`].
     weight_slots: HashMap<NodeId, WeightParamSlot>,
     /// Pre-resolved (name, byte_offset, max_f32_len) per input — for run_slots.
@@ -70,7 +70,7 @@ pub struct MetalExecutable {
     /// In-flight command buffers from `commit_no_wait`. Drained by
     /// `sync_pending`. Used by callers that pipeline multiple commits
     /// to amortize the GPU sync latency (~150µs/commit on Apple Silicon).
-    pending_cmd_bufs: Vec<metal::CommandBuffer>,
+    pending_cmd_bufs: Vec<crate::mtl::CommandBuffer>,
     /// Active-extent hint (`Some((actual, upper))`) for L1 bucketed
     /// dispatch. When set AND every thunk in `schedule` is in the
     /// safe set, `encode_commit` bypasses MPSGraph + ICB segments
@@ -116,15 +116,15 @@ pub struct MetalExecutable {
     baked_weight_concats: std::cell::RefCell<std::collections::HashSet<usize>>,
     /// Persistent scratch for flash-decode SDPA partials (`RLX_METAL_SDPA_FLASH_DECODE`):
     /// float[(bi*heads+hi)*n_part + part][2 + 128]. Lazily sized/grown per call.
-    sdpa_flash_scratch: std::cell::RefCell<Option<metal::Buffer>>,
+    sdpa_flash_scratch: std::cell::RefCell<Option<crate::mtl::Buffer>>,
     /// Persistent int8 scratch for the W8A8 decode-attention path
     /// (`RLX_METAL_W8A8_ATTN`): int8 K ‖ int8 V ‖ f32 K-scales ‖ f32 V-scales,
     /// each 256-B aligned. Lazily sized/grown per call.
-    sdpa_w8a8_scratch: std::cell::RefCell<Option<metal::Buffer>>,
+    sdpa_w8a8_scratch: std::cell::RefCell<Option<crate::mtl::Buffer>>,
     /// Persistent F32 scratch for promoting F16 Linear weights before sgemm
     /// (legacy path; prefer native `sgemm_f16w`).
     #[allow(dead_code)]
-    f16_weight_scratch: std::cell::RefCell<Option<metal::Buffer>>,
+    f16_weight_scratch: std::cell::RefCell<Option<crate::mtl::Buffer>>,
     /// Persistent KV / state inputs (unified-memory `Vec`, fed into arena each run).
     gpu_handles: HashMap<String, Vec<f32>>,
     /// After each run, copy `graph.outputs[idx]` into the named handle.
@@ -393,7 +393,7 @@ impl MetalExecutable {
 
     /// Resolve a thunk offset that may be tagged for the weight MTLBuffer.
     #[inline]
-    pub(crate) fn resolve_off(&self, tagged: usize) -> (&metal::Buffer, usize) {
+    pub(crate) fn resolve_off(&self, tagged: usize) -> (&crate::mtl::Buffer, usize) {
         use crate::thunk::{is_weight_off, raw_off};
         if is_weight_off(tagged) {
             (
@@ -419,7 +419,7 @@ impl MetalExecutable {
 
     /// Buffer holding a param (activation arena or weight buffer).
     #[inline]
-    pub(crate) fn param_buffer(&self, id: NodeId) -> &metal::Buffer {
+    pub(crate) fn param_buffer(&self, id: NodeId) -> &crate::mtl::Buffer {
         if self.weight_slots.contains_key(&id) {
             self.weight_buffer
                 .as_ref()
@@ -644,7 +644,7 @@ pub(crate) use encode::*;
 
 impl MetalExecutable {
     #[allow(dead_code)]
-    fn ensure_f16_weight_scratch(&self, nbytes: usize) -> metal::Buffer {
+    fn ensure_f16_weight_scratch(&self, nbytes: usize) -> crate::mtl::Buffer {
         let need = nbytes.max(1) as u64;
         let mut slot = self.f16_weight_scratch.borrow_mut();
         let grow = slot.as_ref().map(|b| b.length() < need).unwrap_or(true);
@@ -652,7 +652,7 @@ impl MetalExecutable {
             let dev = metal_device().expect("Metal device");
             *slot = Some(
                 dev.device
-                    .new_buffer(need, metal::MTLResourceOptions::StorageModeShared),
+                    .new_buffer(need, crate::mtl::MTLResourceOptions::StorageModeShared),
             );
         }
         slot.as_ref().expect("f16 weight scratch").clone()
@@ -897,7 +897,7 @@ impl MetalExecutable {
                 _ => return false,
             }
         }
-        // Retain the same MTLBuffer (metal::Buffer::clone bumps the refcount —
+        // Retain the same MTLBuffer (crate::mtl::Buffer::clone bumps the refcount —
         // it does NOT copy the bytes). Dropping our old weight buffer here frees
         // the redundant per-executable copy. When there is NO weight buffer
         // (weights inline in the arena, i.e. externalization off), there is
@@ -1273,39 +1273,43 @@ impl MetalExecutable {
             Staged { idx: usize },
         }
 
-        let mut staged: Vec<metal::Buffer> = Vec::new();
+        let mut staged: Vec<crate::mtl::Buffer> = Vec::new();
         let mut feed_slots: Vec<Slot> = Vec::new();
         let mut feed_shapes: Vec<Vec<usize>> = Vec::new();
         let mut feed_dtypes: Vec<u32> = Vec::new();
 
-        let mut push_feed =
-            |buf: &metal::Buffer, offset: usize, shape: Vec<usize>, dt: u32, from_weight: bool| {
-                let nbytes = tensor_nbytes(&shape, dt);
-                // Separate weight MTLBuffers stay under the 4 GiB cliff by
-                // construction — only activation-arena feeds need staging.
-                let need_stage = !from_weight && needs_staging(offset, nbytes, big_arena);
-                if need_stage {
-                    let staged_buf = dev
-                        .device
-                        .new_buffer(nbytes as u64, metal::MTLResourceOptions::StorageModeShared);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (buf.contents() as *const u8).add(offset),
-                            staged_buf.contents() as *mut u8,
-                            nbytes,
-                        );
-                    }
-                    let idx = staged.len();
-                    staged.push(staged_buf);
-                    feed_slots.push(Slot::Staged { idx });
-                } else if from_weight {
-                    feed_slots.push(Slot::Weight { offset });
-                } else {
-                    feed_slots.push(Slot::Arena { offset });
+        let mut push_feed = |buf: &crate::mtl::Buffer,
+                             offset: usize,
+                             shape: Vec<usize>,
+                             dt: u32,
+                             from_weight: bool| {
+            let nbytes = tensor_nbytes(&shape, dt);
+            // Separate weight MTLBuffers stay under the 4 GiB cliff by
+            // construction — only activation-arena feeds need staging.
+            let need_stage = !from_weight && needs_staging(offset, nbytes, big_arena);
+            if need_stage {
+                let staged_buf = dev.device.new_buffer(
+                    nbytes as u64,
+                    crate::mtl::MTLResourceOptions::StorageModeShared,
+                );
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (buf.contents() as *const u8).add(offset),
+                        staged_buf.contents() as *mut u8,
+                        nbytes,
+                    );
                 }
-                feed_shapes.push(shape);
-                feed_dtypes.push(dt);
-            };
+                let idx = staged.len();
+                staged.push(staged_buf);
+                feed_slots.push(Slot::Staged { idx });
+            } else if from_weight {
+                feed_slots.push(Slot::Weight { offset });
+            } else {
+                feed_slots.push(Slot::Arena { offset });
+            }
+            feed_shapes.push(shape);
+            feed_dtypes.push(dt);
+        };
 
         for (name, _t, shape, dt) in &plan.inputs {
             let off = if name.starts_with("__boundary_") {
@@ -1340,9 +1344,10 @@ impl MetalExecutable {
             let nbytes = tensor_nbytes(&shape, dt);
             out_arena_offsets.push(offset);
             if needs_staging(offset, nbytes, big_arena) {
-                let buf = dev
-                    .device
-                    .new_buffer(nbytes as u64, metal::MTLResourceOptions::StorageModeShared);
+                let buf = dev.device.new_buffer(
+                    nbytes as u64,
+                    crate::mtl::MTLResourceOptions::StorageModeShared,
+                );
                 let idx = staged.len();
                 staged.push(buf);
                 out_slots.push(Slot::Staged { idx });
@@ -1375,7 +1380,7 @@ impl MetalExecutable {
             .any(|s| matches!(s, Slot::Staged { .. }));
 
         let weight_buf = self.weight_buffer.as_ref();
-        let feed_buffers: Vec<&metal::Buffer> = feed_slots
+        let feed_buffers: Vec<&crate::mtl::Buffer> = feed_slots
             .iter()
             .map(|s| match s {
                 Slot::Arena { .. } => arena_buf,
@@ -1390,7 +1395,7 @@ impl MetalExecutable {
                 Slot::Staged { .. } => 0,
             })
             .collect();
-        let out_buffers: Vec<&metal::Buffer> = out_slots
+        let out_buffers: Vec<&crate::mtl::Buffer> = out_slots
             .iter()
             .map(|s| match s {
                 Slot::Arena { .. } | Slot::Weight { .. } => arena_buf,

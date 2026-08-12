@@ -12,56 +12,32 @@
 //! correctness-of-value on FMA-less backends (e.g. CoreML/ANE) so a graph that
 //! uses `Op::Fma` runs everywhere instead of erroring at legalization.
 
-use crate::pass::Pass;
+use crate::rewriter::{MatchRewrite, RewriteCtx};
 use rlx_ir::op::BinaryOp;
 use rlx_ir::*;
-use std::collections::HashMap;
 
 pub struct LowerFma;
 
-impl Pass for LowerFma {
+impl MatchRewrite for LowerFma {
     fn name(&self) -> &str {
         "lower_fma"
     }
 
-    fn run(&self, graph: Graph) -> Graph {
-        if !graph.nodes().iter().any(|n| matches!(n.op, Op::Fma)) {
-            return graph;
-        }
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Fma]
+    }
 
-        let mut new_graph = Graph::new(&graph.name);
-        let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
-
-        for node in graph.nodes() {
-            let new_id = match &node.op {
-                Op::Fma => {
-                    let a = id_map[&node.inputs[0]];
-                    let b = id_map[&node.inputs[1]];
-                    let c = id_map[&node.inputs[2]];
-                    let prod = new_graph.add_node(
-                        Op::Binary(BinaryOp::Mul),
-                        vec![a, b],
-                        node.shape.clone(),
-                    );
-                    new_graph.add_node(Op::Binary(BinaryOp::Add), vec![prod, c], node.shape.clone())
-                }
-                _ => {
-                    let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-                    new_graph.add_node(node.op.clone(), inputs, node.shape.clone())
-                }
-            };
-            id_map.insert(node.id, new_id);
-        }
-
-        let new_outputs: Vec<NodeId> = graph.outputs.iter().map(|i| id_map[i]).collect();
-        new_graph.set_outputs(new_outputs);
-        new_graph
+    fn rewrite(&self, node: &Node, ctx: &mut RewriteCtx) -> Option<NodeId> {
+        let (a, b, c) = (ctx.input(0), ctx.input(1), ctx.input(2));
+        let prod = ctx.emit(Op::Binary(BinaryOp::Mul), vec![a, b], node.shape.clone());
+        Some(ctx.emit(Op::Binary(BinaryOp::Add), vec![prod, c], node.shape.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pass::Pass;
 
     fn f32_shape(dims: &[usize]) -> Shape {
         Shape::new(dims, DType::F32)

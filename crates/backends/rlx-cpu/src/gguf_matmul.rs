@@ -220,6 +220,25 @@ fn gguf_matmul_bt_ex(
         return;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if allow_parallel
+        && k.is_multiple_of(block_elems)
+        && block_elems <= QK_K
+        && crate::pool::num_threads() > 1
+    {
+        gguf_matmul_bt_rows_generic_gemm(
+            x,
+            w_bytes,
+            out,
+            m,
+            k,
+            n,
+            scheme,
+            block_bytes,
+            block_elems,
+        );
+        return;
+    }
     for bi in 0..num_blocks {
         let off = bi * block_bytes;
         dequant_block(scheme, &w_bytes[off..off + block_bytes], &mut block_f32);
@@ -266,7 +285,28 @@ fn q4k_fused_decode_min_n() -> usize {
 
 #[inline]
 fn prefer_cached_blas(k: usize, n: usize, m: usize) -> bool {
-    !gguf_matmul_use_legacy() && (m > 1 || k.saturating_mul(n) >= CACHED_BLAS_MIN_WEIGHT_ELEMS)
+    if gguf_matmul_use_legacy() {
+        return false;
+    }
+    // GEMV (decode) against a THRASHING dequant cache is the worst case: the
+    // slab is evicted before it is reused, so every token re-dequantizes the
+    // whole model AND churns allocations, while the fused int8 kernel reads the
+    // packed bytes in place. Measured on Muse-Glimmer-30B UD-Q4_K_XL (f32 form
+    // ~111 GB vs a 15 GB budget): 43.1 s/token cached vs 0.76 s fused — 57x.
+    //
+    // Only `m == 1` is diverted. For `m > 1` the cached path amortizes ONE
+    // dequant across all rows and hands the work to BLAS, which still wins even
+    // while thrashing (5-token prefill: 61 s cached vs 111 s fused). A model
+    // whose f32 form fits the budget never evicts, so `cache_thrashing()` stays
+    // false and this is inert.
+    // Extended to m > 1 as well: with the row-parallel generic GEMM below, the
+    // fused path no longer loses to BLAS once "cached" means re-dequantizing the
+    // whole model on every call plus allocator churn. Both do the same total
+    // dequant work; only the fused one skips the cache bookkeeping.
+    if crate::dequant_cache::cache_thrashing() {
+        return false;
+    }
+    m > 1 || k.saturating_mul(n) >= CACHED_BLAS_MIN_WEIGHT_ELEMS
 }
 
 /// Dequant once (cached by weight bytes) + Accelerate/OpenBLAS `sgemm_bt`.
@@ -647,6 +687,257 @@ fn gguf_matmul_bt_m1_sequential(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-precision GEMV / GEMM kernels, generated.
+//
+// The dynamic form calls `dequant_block(scheme, ..)` once per 256-element block,
+// which is a runtime `match` on the scheme in the innermost loop: the compiler
+// cannot inline the actual dequant, so it cannot fuse or vectorize across the
+// dequant→dot boundary. Generating one monomorphic kernel per precision makes
+// the dequant a direct call, and lets the dot use four independent accumulators
+// (a single `acc` serializes on FP latency, ~4 cycles per element).
+//
+// Adding a precision is one line in `gguf_qk_kernels!`. Every scheme here uses
+// the 256-element super-block layout and the `(&[u8], &mut [f32; QK_K])` block
+// signature, so the macro body is genuinely shared rather than copy-pasted.
+// ---------------------------------------------------------------------------
+
+/// 256-element dot with 4 independent accumulators.
+///
+/// Both callers are the rayon-parallel `gguf_qk_kernels!` GEMV/GEMM, which are
+/// themselves `cfg(not(wasm32))` — so on wasm this is dead code. Gate it the
+/// same way rather than let it warn there.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn dot256(xs: &[f32], blk: &[f32; QK_K]) -> f32 {
+    let (mut a0, mut a1, mut a2, mut a3) = (0f32, 0f32, 0f32, 0f32);
+    let mut t = 0;
+    while t < QK_K {
+        a0 += xs[t] * blk[t];
+        a1 += xs[t + 1] * blk[t + 1];
+        a2 += xs[t + 2] * blk[t + 2];
+        a3 += xs[t + 3] * blk[t + 3];
+        t += 4;
+    }
+    (a0 + a1) + (a2 + a3)
+}
+
+macro_rules! gguf_qk_kernels {
+    ($( $scheme:path => ($gemv:ident, $gemm:ident, $dq:path) ),+ $(,)?) => {
+        $(
+            /// Row-parallel GEMV (`m == 1`) specialized to one precision.
+            #[cfg(not(target_arch = "wasm32"))]
+            fn $gemv(x_row: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize, block_bytes: usize) {
+                use rayon::prelude::*;
+                let blocks_per_row = k / QK_K;
+                let row_bytes = blocks_per_row * block_bytes;
+                out.par_iter_mut().enumerate().for_each(|(j, slot)| {
+                    let start = j * row_bytes;
+                    let Some(row) = w_bytes.get(start..start + row_bytes) else {
+                        *slot = 0.0;
+                        return;
+                    };
+                    let mut blk = [0f32; QK_K];
+                    let mut acc = 0f32;
+                    for b in 0..blocks_per_row {
+                        $dq(&row[b * block_bytes..(b + 1) * block_bytes], &mut blk);
+                        acc += dot256(&x_row[b * QK_K..(b + 1) * QK_K], &blk);
+                    }
+                    *slot = acc;
+                });
+            }
+
+            /// Row-parallel GEMM (`m > 1`) specialized to one precision. Each block
+            /// is dequantized ONCE and reused across all `m` rows.
+            #[cfg(not(target_arch = "wasm32"))]
+            #[allow(clippy::too_many_arguments)]
+            fn $gemm(
+                x: &[f32], w_bytes: &[u8], out: &mut [f32],
+                m: usize, k: usize, n: usize, block_bytes: usize,
+            ) {
+                use rayon::prelude::*;
+                let blocks_per_row = k / QK_K;
+                let row_bytes = blocks_per_row * block_bytes;
+                let cols: Vec<Vec<f32>> = (0..n).into_par_iter().map(|j| {
+                    let mut acc = vec![0f32; m];
+                    let start = j * row_bytes;
+                    let Some(row) = w_bytes.get(start..start + row_bytes) else { return acc };
+                    let mut blk = [0f32; QK_K];
+                    for b in 0..blocks_per_row {
+                        $dq(&row[b * block_bytes..(b + 1) * block_bytes], &mut blk);
+                        let off = b * QK_K;
+                        for (mi, a) in acc.iter_mut().enumerate() {
+                            *a += dot256(&x[mi * k + off..mi * k + off + QK_K], &blk);
+                        }
+                    }
+                    acc
+                }).collect();
+                for (j, acc) in cols.iter().enumerate() {
+                    for (mi, a) in acc.iter().enumerate() {
+                        out[mi * n + j] = *a;
+                    }
+                }
+            }
+        )+
+
+        /// Route to a specialized GEMV when one exists. `false` ⇒ caller falls back.
+        #[cfg(not(target_arch = "wasm32"))]
+        fn gguf_gemv_specialized(
+            scheme: QuantScheme, x_row: &[f32], w_bytes: &[u8], out: &mut [f32],
+            k: usize, block_bytes: usize,
+        ) -> bool {
+            match scheme {
+                $( $scheme => { $gemv(x_row, w_bytes, out, k, block_bytes); true } )+
+                _ => false,
+            }
+        }
+
+        /// Route to a specialized GEMM when one exists. `false` ⇒ caller falls back.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[allow(clippy::too_many_arguments)]
+        fn gguf_gemm_specialized(
+            scheme: QuantScheme, x: &[f32], w_bytes: &[u8], out: &mut [f32],
+            m: usize, k: usize, n: usize, block_bytes: usize,
+        ) -> bool {
+            match scheme {
+                $( $scheme => { $gemm(x, w_bytes, out, m, k, n, block_bytes); true } )+
+                _ => false,
+            }
+        }
+    };
+}
+
+// NOTE: `GgufQ8K` is deliberately absent — it is the ACTIVATION quantization
+// format, never a weight dtype in these checkpoints, so a weight-GEMV
+// specialization for it would add reassociation risk for no gain.
+gguf_qk_kernels! {
+    QuantScheme::GgufQ2K => (gemv_q2k, gemm_q2k, rlx_gguf::dequant_q2_k_block),
+    QuantScheme::GgufQ3K => (gemv_q3k, gemm_q3k, rlx_gguf::dequant_q3_k_block),
+    QuantScheme::GgufQ4K => (gemv_q4k, gemm_q4k, rlx_gguf::dequant_q4_k_block),
+    QuantScheme::GgufQ5K => (gemv_q5k, gemm_q5k, rlx_gguf::dequant_q5_k_block),
+    QuantScheme::GgufQ6K => (gemv_q6k, gemm_q6k, rlx_gguf::dequant_q6_k_block),
+}
+
+/// Generic decode GEMV (`m == 1`) for ANY GGUF scheme with a row-aligned `k`.
+///
+/// The old generic path was doubly pathological: it walked `k*n` elements
+/// SERIALLY and recovered the output row / input position with `idx / k` and
+/// `idx % k` — two integer divisions PER ELEMENT. Only `Q4_K` (and `Q2_0`) had a
+/// fast row-dot, so every other scheme took it, including `Q5_K`, which is what
+/// unsloth ships the Muse-Glimmer LM head as: `[6656, 202048]` = 1.345B params
+/// on a serial scalar loop.
+///
+/// When `k` is a whole number of blocks, block `b` of row `j` covers input
+/// positions `[b*block_elems, (b+1)*block_elems)` — the row index is structural,
+/// so no division is needed at all. Rows are independent, so this parallelizes
+/// over `n` exactly like the Q4_K path, and the inner loop is a contiguous
+/// f32 dot the autovectorizer can handle.
+#[cfg(not(target_arch = "wasm32"))]
+fn gguf_matmul_bt_m1_rows_generic(
+    x_row: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    k: usize,
+    scheme: QuantScheme,
+    block_bytes: usize,
+    block_elems: usize,
+) {
+    use rayon::prelude::*;
+    if block_elems == QK_K && gguf_gemv_specialized(scheme, x_row, w_bytes, out, k, block_bytes) {
+        return;
+    }
+    let blocks_per_row = k / block_elems;
+    let row_bytes = blocks_per_row * block_bytes;
+    out.par_iter_mut().enumerate().for_each(|(j, slot)| {
+        let start = j * row_bytes;
+        let Some(row) = w_bytes.get(start..start + row_bytes) else {
+            *slot = 0.0;
+            return;
+        };
+        let mut blk = [0f32; QK_K];
+        let mut acc = 0f32;
+        for b in 0..blocks_per_row {
+            dequant_block(
+                scheme,
+                &row[b * block_bytes..(b + 1) * block_bytes],
+                &mut blk,
+            );
+            let xs = &x_row[b * block_elems..(b + 1) * block_elems];
+            for t in 0..block_elems {
+                acc += xs[t] * blk[t];
+            }
+        }
+        *slot = acc;
+    });
+}
+
+/// Generic GEMM (`m > 1`) for any GGUF scheme with a row-aligned `k`.
+///
+/// The stock `m > 1` fallback walks `k*n` elements serially and recovers indices
+/// with `idx / k` + `idx % k` — two integer divisions per element — which is why
+/// fully-fused prefill measured 111 s against 61 s for dequant+BLAS. This does
+/// the same arithmetic without either problem: parallel over output columns,
+/// each block dequantized ONCE and reused across all `m` rows (so total dequant
+/// work matches the cached path), and contiguous inner dots.
+///
+/// The point is to beat cached BLAS *when the dequant cache is thrashing*, where
+/// "cached" degenerates into re-dequantizing the whole model per call plus
+/// allocator churn. With a healthy cache, BLAS still wins and callers keep it.
+#[cfg(not(target_arch = "wasm32"))]
+fn gguf_matmul_bt_rows_generic_gemm(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+    block_bytes: usize,
+    block_elems: usize,
+) {
+    use rayon::prelude::*;
+    if block_elems == QK_K && gguf_gemm_specialized(scheme, x, w_bytes, out, m, k, n, block_bytes) {
+        return;
+    }
+    let blocks_per_row = k / block_elems;
+    let row_bytes = blocks_per_row * block_bytes;
+    // One task per output column; each writes `out[mi * n + j]` for every mi, so
+    // scatter into a per-column buffer then transpose in.
+    let cols: Vec<Vec<f32>> = (0..n)
+        .into_par_iter()
+        .map(|j| {
+            let mut acc = vec![0f32; m];
+            let start = j * row_bytes;
+            let Some(row) = w_bytes.get(start..start + row_bytes) else {
+                return acc;
+            };
+            let mut blk = [0f32; QK_K];
+            for b in 0..blocks_per_row {
+                dequant_block(
+                    scheme,
+                    &row[b * block_bytes..(b + 1) * block_bytes],
+                    &mut blk,
+                );
+                let off = b * block_elems;
+                for (mi, a) in acc.iter_mut().enumerate() {
+                    let xs = &x[mi * k + off..mi * k + off + block_elems];
+                    let mut s = 0f32;
+                    for t in 0..block_elems {
+                        s += xs[t] * blk[t];
+                    }
+                    *a += s;
+                }
+            }
+            acc
+        })
+        .collect();
+    for (j, acc) in cols.iter().enumerate() {
+        for (mi, a) in acc.iter().enumerate() {
+            out[mi * n + j] = *a;
+        }
+    }
+}
+
 /// Decode GEMV (`m == 1`): fold/reduce over GGUF super-blocks across Rayon workers.
 fn gguf_matmul_bt_m1_parallel(
     x_row: &[f32],
@@ -680,6 +971,13 @@ fn gguf_matmul_bt_m1_parallel(
             q4k_gemv_rowmajor(x_row, w_bytes, out, k);
             return;
         }
+    }
+    // Every other scheme (Q5_K / Q6_K / Q2_K / Q3_K / Q8_0 / IQ*): row-parallel,
+    // division-free generic GEMV whenever `k` is a whole number of blocks.
+    #[cfg(not(target_arch = "wasm32"))]
+    if k.is_multiple_of(block_elems) && block_elems <= QK_K && out.len() == n {
+        gguf_matmul_bt_m1_rows_generic(x_row, w_bytes, out, k, scheme, block_bytes, block_elems);
+        return;
     }
     // wasm: single-threaded serial accumulate (no Rayon thread pool).
     #[cfg(target_arch = "wasm32")]
@@ -789,10 +1087,128 @@ fn q4k_dot_q8_block(q4: &[u8], q8: &[u8]) -> f32 {
     {
         q4k_dot_q8_block_neon(q4, q8)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_available() {
+            // SAFETY: gated on runtime AVX2 detection; slabs are full blocks.
+            return unsafe { q4k_dot_q8_block_avx2(q4, q8) };
+        }
+        rlx_gguf::q4_k_dot_q8_k(q4, q8)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         rlx_gguf::q4_k_dot_q8_k(q4, q8)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K x Q8_K block dot, AVX2 (x86-64).
+//
+// aarch64 had a hand-written NEON dot while x86 fell through to the pure-scalar
+// `rlx_gguf::q4_k_dot_q8_k` — a nibble-at-a-time loop over every weight. Since
+// Q4_K is ~95% of a K-quant checkpoint's parameters, that scalar loop WAS the
+// x86 decode cost. This mirrors the NEON structure exactly (same scale/min
+// bookkeeping, same group order), so results are bit-comparable.
+//
+// The inner shape maps cleanly onto AVX2: Q4 nibbles are unsigned 0..15 and Q8
+// activations are signed i8, which is precisely `_mm256_maddubs_epi16`
+// (u8 x i8 -> i16 pairwise sums), then `_mm256_madd_epi16` against ones widens
+// to i32 without overflow (max |sum| per pair = 15*127*2 << i16::MAX).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn q4k_scale_min_x86(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        let d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        (d, m)
+    }
+}
+
+/// Horizontal sum of 8 x i32 in a `__m256i`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_i32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let lo = _mm256_castsi256_si128(v);
+        let hi = _mm256_extracti128_si256(v, 1);
+        let s = _mm_add_epi32(lo, hi);
+        let sh = _mm_shuffle_epi32(s, 0b01_00_11_10);
+        let s = _mm_add_epi32(s, sh);
+        let sh2 = _mm_shuffle_epi32(s, 0b10_11_00_01);
+        _mm_cvtsi128_si32(_mm_add_epi32(s, sh2))
+    }
+}
+
+/// BOTH nibble halves of one 32-byte Q4 group, from a SINGLE load.
+///
+/// The obvious form calls a per-half helper twice, which loads the same 32 `qs`
+/// bytes and rebuilds the mask constants each time. Q4_K stores the low nibbles
+/// of group `j` and the high nibbles of group `j+1` in the same bytes, and their
+/// two Q8 segments are adjacent, so one load feeds both dots. Returns
+/// `(lo_sum, hi_sum)` for the caller to scale by `sc0` / `sc1`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_group32_q8_dot_avx2_both(qs: *const u8, q8_lo: *const i8) -> (i32, i32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let qbytes = _mm256_loadu_si256(qs as *const __m256i);
+        let mask = _mm256_set1_epi8(0x0F);
+        let ones = _mm256_set1_epi16(1);
+        let nib_lo = _mm256_and_si256(qbytes, mask);
+        let nib_hi = _mm256_and_si256(_mm256_srli_epi16(qbytes, 4), mask);
+        // The two activation groups are contiguous: lo uses [0,32), hi [32,64).
+        let y_lo = _mm256_loadu_si256(q8_lo as *const __m256i);
+        let y_hi = _mm256_loadu_si256(q8_lo.add(32) as *const __m256i);
+        let a = _mm256_madd_epi16(_mm256_maddubs_epi16(nib_lo, y_lo), ones);
+        let b = _mm256_madd_epi16(_mm256_maddubs_epi16(nib_hi, y_hi), ones);
+        (hsum_i32_avx2(a), hsum_i32_avx2(b))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_dot_q8_block_avx2(q4: &[u8], q8: &[u8]) -> f32 {
+    unsafe {
+        let d = half::f16::from_le_bytes([q4[0], q4[1]]).to_f32();
+        let dmin = half::f16::from_le_bytes([q4[2], q4[3]]).to_f32();
+        let scales = &q4[4..16];
+        let qs = q4.as_ptr().add(16);
+        let yd = f32::from_le_bytes([q8[0], q8[1], q8[2], q8[3]]);
+        let q8s = q8.as_ptr().add(4) as *const i8;
+        let bsums = q8.as_ptr().add(4 + QK_K);
+
+        let mut sumi_min = 0i32;
+        for j in 0..16 {
+            let (_, m) = q4k_scale_min_x86(j / 2, scales);
+            let bs = i16::from_le_bytes([*bsums.add(j * 2), *bsums.add(j * 2 + 1)]) as i32;
+            sumi_min += m as i32 * bs;
+        }
+
+        let mut sumi = 0i32;
+        let mut is = 0usize;
+        let mut yi = 0usize;
+        for j in (0..8).step_by(2) {
+            let (sc0, _) = q4k_scale_min_x86(j, scales);
+            let (sc1, _) = q4k_scale_min_x86(j + 1, scales);
+            let (p0, p1) = q4k_group32_q8_dot_avx2_both(qs.add(is), q8s.add(yi));
+            sumi += sc0 as i32 * p0 + sc1 as i32 * p1;
+            yi += 64;
+            is += 32;
+        }
+        d * yd * sumi as f32 - dmin * yd * sumi_min as f32
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn avx2_available() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
 
 /// NEON-friendly Q4_K × Q8_K block dot (aarch64).
@@ -848,9 +1264,43 @@ fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
 }
 
 /// Dot 32 Q4 nibbles (lo or hi) with 32 Q8 activations → i32 sum of products.
+/// Cached `dotprod` (ARMv8.2-A) availability — Cortex-A76 (Raspberry Pi 5) /
+/// Apple Silicon / Graviton2+ / most ARM servers have it; Cortex-A72 (Pi 4)
+/// does not. Detected once; the result is a hot-loop branch predictor's dream.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn aarch64_has_dotprod() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    // `RLX_Q4K_NO_DOTPROD=1` forces the baseline path (A/B benchmarking, or a
+    // hedge against a mis-detected feature on an exotic core).
+    *OK.get_or_init(|| {
+        std::env::var_os("RLX_Q4K_NO_DOTPROD").is_none()
+            && std::arch::is_aarch64_feature_detected!("dotprod")
+    })
+}
+
+/// Q4_K 32-nibble × int8 dot. Dispatches to the `vdotq_s32` path on ARMv8.2-A
+/// (one dot instruction per 16 lanes vs a widen-multiply + pairwise-accumulate
+/// chain) or the universal baseline. Both compute the identical *integer* dot
+/// (no rounding), so the choice is purely a throughput detail.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn q4k_group32_q8_dot_neon(qs: *const u8, q8: *const i8, high_nibble: bool) -> i32 {
+    if aarch64_has_dotprod() {
+        // SAFETY: guarded by the runtime `dotprod` detection above.
+        unsafe { q4k_group32_q8_dot_dotprod(qs, q8, high_nibble) }
+    } else {
+        // SAFETY: baseline NEON, present on every aarch64 target.
+        unsafe { q4k_group32_q8_dot_vmull(qs, q8, high_nibble) }
+    }
+}
+
+/// Baseline-NEON (ARMv8.0) Q4_K group dot: `vmull_s8` widen-multiply →
+/// `vpadalq_s16` pairwise-accumulate.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn q4k_group32_q8_dot_vmull(qs: *const u8, q8: *const i8, high_nibble: bool) -> i32 {
     use std::arch::aarch64::*;
     unsafe {
         let mut acc = vdupq_n_s32(0);
@@ -869,6 +1319,42 @@ fn q4k_group32_q8_dot_neon(qs: *const u8, q8: *const i8, high_nibble: bool) -> i
             let hi = vmull_s8(vget_high_s8(q4), vget_high_s8(y));
             acc = vpadalq_s16(acc, lo);
             acc = vpadalq_s16(acc, hi);
+        }
+        vaddvq_s32(acc)
+    }
+}
+
+/// `dotprod`-accelerated Q4_K group dot: one `SDOT` accumulates 16 int8
+/// products per 128-bit register, collapsing the widen-multiply chain above.
+/// The `vdotq_s32` intrinsic is still unstable (`stdarch_neon_dotprod`) on the
+/// pinned stable toolchain, so we emit `SDOT` directly — gated by the
+/// `dotprod` target feature (verified at runtime by [`aarch64_has_dotprod`]).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn q4k_group32_q8_dot_dotprod(qs: *const u8, q8: *const i8, high_nibble: bool) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc = vdupq_n_s32(0);
+        let mask = vdupq_n_u8(0x0F);
+        for i in (0..32).step_by(16) {
+            let qbytes = vld1q_u8(qs.add(i));
+            let nibble = if high_nibble {
+                vshrq_n_u8(qbytes, 4)
+            } else {
+                vandq_u8(qbytes, mask)
+            };
+            // u8 nibbles 0..15 → i8 (still non-negative)
+            let q4 = vreinterpretq_s8_u8(nibble);
+            let y = vld1q_s8(q8.add(i));
+            // acc.4s += dot4(q4.16b, y.16b)
+            std::arch::asm!(
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+                acc = inout(vreg) acc,
+                a = in(vreg) q4,
+                b = in(vreg) y,
+                options(nomem, nostack, preserves_flags),
+            );
         }
         vaddvq_s32(acc)
     }
@@ -1408,6 +1894,34 @@ mod tests {
                 grouped[i],
                 expected[i]
             );
+        }
+    }
+
+    /// The `dotprod` Q4_K group dot must be BYTE-IDENTICAL to the baseline
+    /// `vmull` path — it's a pure integer dot, so there's no rounding slack.
+    /// Guards the runtime dispatch used by the fused int8 decode GEMV.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q4k_group32_dotprod_matches_vmull() {
+        if !super::aarch64_has_dotprod() {
+            return; // ARMv8.0 (e.g. Pi 4) — only the vmull path exists.
+        }
+        let mut s: u32 = 0x1234_5678;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        for _ in 0..256 {
+            let qs: Vec<u8> = (0..32).map(|_| (rng() & 0xFF) as u8).collect();
+            let q8: Vec<i8> = (0..32).map(|_| rng() as i8).collect();
+            for high in [false, true] {
+                let a = unsafe { super::q4k_group32_q8_dot_vmull(qs.as_ptr(), q8.as_ptr(), high) };
+                let b =
+                    unsafe { super::q4k_group32_q8_dot_dotprod(qs.as_ptr(), q8.as_ptr(), high) };
+                assert_eq!(a, b, "dotprod != vmull (high_nibble={high})");
+            }
         }
     }
 }

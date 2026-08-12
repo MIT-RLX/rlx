@@ -141,6 +141,12 @@ pub fn lower_pad(g: &mut Graph, mut cur: NodeId, pads: &[[usize; 2]], mode: PadM
 pub struct LowerPad;
 
 impl Pass for LowerPad {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Pad]
+    }
+
     fn name(&self) -> &str {
         "lower_pad"
     }

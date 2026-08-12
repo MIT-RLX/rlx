@@ -5,9 +5,9 @@
 
 #![cfg(target_os = "macos")]
 
-use metal::{Buffer, Device, MTLResourceOptions, MTLSize};
 use rlx_ir::quant::QuantScheme;
 use rlx_metal::kernels::kernels;
+use rlx_metal::mtl::{Buffer, Device, MTLResourceOptions, MTLSize};
 
 fn read_f16_le(b: &[u8]) -> f32 {
     half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
@@ -36,7 +36,7 @@ fn q4_0_mv_row_ref(x: &[f32], row_packed: &[u8], k: usize) -> f32 {
 }
 
 fn run_fused_mv(
-    pipeline: &metal::ComputePipelineState,
+    pipeline: &rlx_metal::mtl::ComputePipelineState,
     scheme: QuantScheme,
     x: &[f32],
     packed: &[u8],
@@ -203,7 +203,7 @@ fn q8_0_mv_matches_cpu_reference() {
 /// `gguf_matmul_bt` with a tolerance loose enough for the simd_sum reduction
 /// order to differ from the scalar CPU reference.
 fn run_sg_mv(
-    pipeline: &metal::ComputePipelineState,
+    pipeline: &rlx_metal::mtl::ComputePipelineState,
     scheme: QuantScheme,
     x: &[f32],
     packed: &[u8],

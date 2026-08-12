@@ -17,9 +17,9 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use metal::MTLResourceOptions;
     use rlx_metal::device::metal_device;
     use rlx_metal::mps_graph::{MpsGraph, mps_graph_supported};
+    use rlx_metal::mtl::MTLResourceOptions;
 
     if !mps_graph_supported() {
         eprintln!("no MPSGraph");
@@ -39,11 +39,11 @@ fn main() {
     // Allocate one shared MTLBuffer per parameter / activation. Real
     // integration would slice from the arena; here separate buffers
     // simplify the check setup.
-    let alloc_buf = |n_floats: usize| -> metal::Buffer {
+    let alloc_buf = |n_floats: usize| -> rlx_metal::mtl::Buffer {
         dev.device
             .new_buffer((n_floats * 4) as u64, MTLResourceOptions::StorageModeShared)
     };
-    let fill = |buf: &metal::Buffer, n: usize, seed: f32| unsafe {
+    let fill = |buf: &rlx_metal::mtl::Buffer, n: usize, seed: f32| unsafe {
         let p = buf.contents() as *mut f32;
         for i in 0..n {
             *p.add(i) = (seed + i as f32 * 0.01).sin() * 0.05;
@@ -129,7 +129,7 @@ fn main() {
     let _ = qkv_r; // marker that reshape op survived bridge
 
     // ── Run + time ──
-    let bufs: Vec<&metal::Buffer> = vec![
+    let bufs: Vec<&rlx_metal::mtl::Buffer> = vec![
         &buf_x, &buf_qkv_w, &buf_qkv_b, &buf_out_w, &buf_out_b, &buf_ln1_g, &buf_ln1_b, &buf_fc1_w,
         &buf_fc1_b, &buf_fc2_w, &buf_fc2_b, &buf_ln2_g, &buf_ln2_b,
     ];

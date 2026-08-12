@@ -1209,6 +1209,27 @@ impl RocmExecutable {
                         ]
                     );
                 }
+                Step::KvAppend {
+                    src_off,
+                    dst_off,
+                    outer,
+                    seq_cap,
+                    pos,
+                    inner,
+                } => {
+                    let total = outer.saturating_mul(*inner);
+                    if total > 0 {
+                        let kernel = kv_append_kernel(&self.ctx);
+                        let (grid, block) = dispatch_grid_1d(total, 256);
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (grid, 1, 1),
+                            (block, 1, 1),
+                            [&mut arena_ptr, src_off, dst_off, outer, seq_cap, pos, inner]
+                        );
+                    }
+                }
                 Step::Narrow {
                     total,
                     outer,
@@ -1393,12 +1414,37 @@ impl RocmExecutable {
                     );
                     if use_row {
                         let total = batch * heads * seq_q;
-                        let block = 256u32;
+                        // `attention_row` runs one THREAD per (batch, head,
+                        // q_row): at decode seq_q == 1, so the launch is
+                        // `heads` live threads on one CU, and its head-dim
+                        // accumulators (sized at MAX_HEAD_DIM, indexed by the
+                        // runtime head_dim) spill to scratch. `attention_warp`
+                        // is a drop-in with the identical parameter list that
+                        // gives each row a 32-lane group; its butterfly is
+                        // width-32, so it is correct on wave32 and wave64
+                        // alike. A/B: RLX_ROCM_LEGACY_ATTENTION_ROW=1.
+                        let use_warp = !rlx_ir::env::flag("RLX_ROCM_LEGACY_ATTENTION_ROW");
+                        const LANES: u32 = 32;
+                        const GROUPS_PER_BLOCK: u32 = 4;
+                        let (kernel, grid, block_dim) = if use_warp {
+                            (
+                                attention_warp_kernel(&self.ctx),
+                                (total.div_ceil(GROUPS_PER_BLOCK), 1, 1),
+                                (GROUPS_PER_BLOCK * LANES, 1, 1),
+                            )
+                        } else {
+                            let block = 256u32;
+                            (
+                                attention_row_kernel(&self.ctx),
+                                (total.div_ceil(block), 1, 1),
+                                (block, 1, 1),
+                            )
+                        };
                         crate::launch_kernel!(
-                            attention_row_kernel(&self.ctx),
+                            kernel,
                             stream,
-                            (total.div_ceil(block), 1, 1),
-                            (block, 1, 1),
+                            grid,
+                            block_dim,
                             [
                                 &mut arena_ptr,
                                 batch,
@@ -2512,8 +2558,46 @@ impl RocmExecutable {
                     w_byte_off,
                     out_byte_off,
                 } => {
-                    let use_gpu = self.dequant_scratch_off > 0 && self.blas.is_some();
-                    if use_gpu {
+                    // `RLX_ROCM_GGUF_HOST=1` forces the CPU dequant path — the
+                    // twin of rlx-cuda's `RLX_CUDA_GGUF_HOST`, which ROCm lacked.
+                    // Bisects "is the GPU dequant/gemm wrong?" from "are the
+                    // packed weights even right in the arena?".
+                    let use_gpu = self.dequant_scratch_off > 0
+                        && self.blas.is_some()
+                        && !rlx_ir::env::flag("RLX_ROCM_GGUF_HOST");
+                    if rlx_ir::env::flag("RLX_ROCM_GGUF_DIAG") {
+                        eprintln!(
+                            "[rlx-rocm] DequantMatmulGguf m={m} k={k} n={n} scheme={scheme_id} \
+                             use_gpu={use_gpu} scratch_off={} blas={}",
+                            self.dequant_scratch_off,
+                            self.blas.is_some()
+                        );
+                    }
+                    // Fused m==1 GEMV first: reads the packed weight directly,
+                    // so it skips the f32 dequant scratch entirely.
+                    if use_gpu
+                        && crate::gguf_gpu::gguf_fused_gemv_m1_supported(
+                            *scheme_id,
+                            *m as usize,
+                            *k as usize,
+                        )
+                        // Default ON since the shared kernel is now HIP-clean
+                        // (see RLX_SHFL_ALL_LANES in dequant_matmul_gguf.cu).
+                        // 12.5 s -> 1.14 s per token on an MI100, bit-identical
+                        // output. Disable with RLX_ROCM_GGUF_FUSED_DISABLE=1.
+                        && !rlx_ir::env::flag("RLX_ROCM_GGUF_FUSED_DISABLE")
+                    {
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gemv_m1(
+                            &self.ctx,
+                            stream,
+                            &self.arena.buffer,
+                            *n as usize,
+                            *k as usize,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    } else if use_gpu {
                         let blas = self.blas.as_ref().unwrap();
                         crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
                             &self.ctx,

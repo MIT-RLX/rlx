@@ -3361,6 +3361,13 @@ mod tests {
     #[test]
     fn all_reduce_runs_on_cuda_across_ranks() {
         use rlx_runtime::Device;
+        // linux+x86_64 is not the same as "has an NVIDIA GPU" — the AMD/ROCm
+        // rig is both, and `Session::new` asserts on an absent device. Skip
+        // rather than fail where there is no CUDA to exercise.
+        if !rlx_runtime::is_available(Device::Cuda) {
+            eprintln!("all_reduce_runs_on_cuda_across_ranks: no CUDA device — skipping");
+            return;
+        }
         register();
         let world = 2u32;
         let n = 4usize;

@@ -8,9 +8,9 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
-    use metal::MTLResourceOptions;
     use rlx_metal::device::metal_device;
     use rlx_metal::mps_graph::{MpsGraph, mps_graph_supported};
+    use rlx_metal::mtl::MTLResourceOptions;
 
     if !mps_graph_supported() {
         eprintln!("MPSGraph not available");

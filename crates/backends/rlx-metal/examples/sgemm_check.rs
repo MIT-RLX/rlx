@@ -62,7 +62,9 @@ fn main() {
         // Warmup
         for _ in 0..3 {
             let cb = dev.queue.new_command_buffer();
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+            let enc = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             metal_sgemm(enc, &buffer, a_off, b_off, c_off, m, k, n);
             enc.end_encoding();
             cb.commit();
@@ -74,7 +76,9 @@ fn main() {
         let t0 = std::time::Instant::now();
         for _ in 0..n_iter {
             let cb = dev.queue.new_command_buffer();
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+            let enc = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             metal_sgemm(enc, &buffer, a_off, b_off, c_off, m, k, n);
             enc.end_encoding();
             cb.commit();

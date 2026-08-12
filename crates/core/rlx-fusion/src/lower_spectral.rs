@@ -24,6 +24,7 @@
 //! `Narrow(0,0,n²)` that the manifold builder inserts selects `Y` unchanged.
 
 use crate::pass::Pass;
+use rlx_ir::OpKind;
 use rlx_ir::ops::spd_eig::{bimap, spd_batch_norm_transport, spd_jacobi_sweeps, spectral_packed};
 use rlx_ir::{DType, Graph, NodeId, Op};
 use std::collections::HashMap;
@@ -45,6 +46,17 @@ fn is_f32_spd(graph: &Graph, node: &rlx_ir::Node) -> bool {
 pub struct LowerSpectral;
 
 impl Pass for LowerSpectral {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[
+            OpKind::ReEig,
+            OpKind::LogEig,
+            OpKind::BiMap,
+            OpKind::SpdBatchNorm,
+        ]
+    }
+
     fn name(&self) -> &str {
         "lower_spectral"
     }

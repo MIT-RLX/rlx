@@ -98,6 +98,17 @@ pub trait LmRunner: Send {
         ))
     }
 
+    /// Register a callback fired at multimodal-generation **phase boundaries** —
+    /// `"vision"` before the image is encoded and `"prefill"` before the LM
+    /// prefill — so callers can surface real progress during the pre-token
+    /// lead-in (vision encode + prefill are otherwise one opaque blocking call).
+    /// Default: no-op (text-only runners ignore it). Pass `None` to clear.
+    fn set_multimodal_phase_callback(
+        &mut self,
+        _cb: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    ) {
+    }
+
     /// Prefill `prompt` reusing a session snapshot that already covers its
     /// first `reuse_len` tokens — only the suffix is processed. Returns the
     /// last-position logits. The default ignores the snapshot and does a full

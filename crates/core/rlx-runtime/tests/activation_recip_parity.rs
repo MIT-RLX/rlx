@@ -87,7 +87,7 @@ fn backward_dy() -> [f32; 8] {
 }
 
 #[test]
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn reciprocal_matches_cpu_on_metal() {
     check(Device::Metal, Activation::Recip, &recip_x(), 1e-5);
 }
@@ -113,7 +113,7 @@ fn exp_tanh_match_cpu_on_cuda() {
 }
 
 #[test]
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn activation_backward_matches_cpu_on_metal() {
     let dy = backward_dy();
     check_backward(Device::Metal, Activation::Recip, &recip_x(), &dy, 1e-5);

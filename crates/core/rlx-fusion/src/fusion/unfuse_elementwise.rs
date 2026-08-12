@@ -6,7 +6,7 @@
 
 #![allow(unused_imports)]
 
-use crate::pass::Pass;
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -37,17 +37,27 @@ impl UnfuseElementwiseRegions {
 }
 
 impl Pass for UnfuseElementwiseRegions {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::ElementwiseRegion]
+    }
+
     fn name(&self) -> &str {
         "unfuse_elementwise_regions"
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         let any_region = graph
             .nodes()
             .iter()
             .any(|n| matches!(n.op, Op::ElementwiseRegion { .. }));
         if !any_region {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         let mut rw = Rewriter::new(&graph.name);
@@ -246,6 +256,6 @@ impl Pass for UnfuseElementwiseRegions {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }

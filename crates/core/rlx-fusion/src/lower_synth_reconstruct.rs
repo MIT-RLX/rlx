@@ -8,75 +8,61 @@
 //! the `Transpose` to `W[k,n]` separately. Backends with the native fused kernel
 //! (Metal) keep the node.
 
-use crate::pass::Pass;
+use crate::rewriter::{MatchRewrite, RewriteCtx};
 use rlx_ir::*;
-use std::collections::HashMap;
 
 pub struct LowerSynthReconstruct;
 
-impl Pass for LowerSynthReconstruct {
+impl MatchRewrite for LowerSynthReconstruct {
     fn name(&self) -> &str {
         "lower_synth_reconstruct"
     }
 
-    fn run(&self, graph: Graph) -> Graph {
-        if !graph
-            .nodes()
-            .iter()
-            .any(|n| matches!(n.op, Op::SynthReconstruct { .. }))
-        {
-            return graph;
-        }
-        let mut g = Graph::new(&graph.name);
-        let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
-        for node in graph.nodes() {
-            let new_id = match &node.op {
-                Op::SynthReconstruct {
-                    kind: SynthKind::Codebook { entry_dim, .. },
-                } => {
-                    let d = (*entry_dim as usize).max(1);
-                    let indices = id_map[&node.inputs[0]];
-                    let codebook = id_map[&node.inputs[1]];
-                    let idx_shape = &graph.node(node.inputs[0]).shape;
-                    let n = idx_shape.dim(0).unwrap_static();
-                    let kb = idx_shape.dim(1).unwrap_static();
-                    let (k, p) = (kb * d, n * kb);
-                    let idx_i64 = g.add_node(
-                        Op::Cast { to: DType::I64 },
-                        vec![indices],
-                        Shape::new(&[n, kb], DType::I64),
-                    );
-                    let idx_flat = g.add_node(
-                        Op::Reshape {
-                            new_shape: vec![p as i64],
-                        },
-                        vec![idx_i64],
-                        Shape::new(&[p], DType::I64),
-                    );
-                    let rows = g.add_node(
-                        Op::Gather { axis: 0 },
-                        vec![codebook, idx_flat],
-                        Shape::new(&[p, d], DType::F32),
-                    );
-                    // → w_bt[n,k] (node.shape); the forward `Transpose` is emitted by the caller.
-                    let _ = k;
-                    g.add_node(
-                        Op::Reshape {
-                            new_shape: vec![n as i64, (kb * d) as i64],
-                        },
-                        vec![rows],
-                        node.shape.clone(),
-                    )
-                }
-                _ => {
-                    let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-                    g.add_node(node.op.clone(), inputs, node.shape.clone())
-                }
-            };
-            id_map.insert(node.id, new_id);
-        }
-        let new_outputs: Vec<NodeId> = graph.outputs.iter().map(|i| id_map[i]).collect();
-        g.set_outputs(new_outputs);
-        g
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::SynthReconstruct]
+    }
+
+    fn rewrite(&self, node: &Node, ctx: &mut RewriteCtx) -> Option<NodeId> {
+        let Op::SynthReconstruct {
+            kind: SynthKind::Codebook { entry_dim, .. },
+        } = &node.op
+        else {
+            return None;
+        };
+
+        let d = (*entry_dim as usize).max(1);
+        let (indices, codebook) = (ctx.input(0), ctx.input(1));
+        // Index shape comes from the operand as it stands in the output graph;
+        // this rewrite only ever reads it, never the op behind it.
+        let idx_shape = ctx.out.node(indices).shape.clone();
+        let n = idx_shape.dim(0).unwrap_static();
+        let kb = idx_shape.dim(1).unwrap_static();
+        let p = n * kb;
+
+        let idx_i64 = ctx.emit(
+            Op::Cast { to: DType::I64 },
+            vec![indices],
+            Shape::new(&[n, kb], DType::I64),
+        );
+        let idx_flat = ctx.emit(
+            Op::Reshape {
+                new_shape: vec![p as i64],
+            },
+            vec![idx_i64],
+            Shape::new(&[p], DType::I64),
+        );
+        let rows = ctx.emit(
+            Op::Gather { axis: 0 },
+            vec![codebook, idx_flat],
+            Shape::new(&[p, d], DType::F32),
+        );
+        // → w_bt[n,k] (node.shape); the forward `Transpose` is emitted by the caller.
+        Some(ctx.emit(
+            Op::Reshape {
+                new_shape: vec![n as i64, (kb * d) as i64],
+            },
+            vec![rows],
+            node.shape.clone(),
+        ))
     }
 }

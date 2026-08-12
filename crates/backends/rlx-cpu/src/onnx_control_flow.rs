@@ -213,6 +213,29 @@ pub fn resolve_concat_trip_count(
 mod tests {
     use super::*;
 
+    /// Serialises the tests that drive [`set_active_token_count`].
+    ///
+    /// The active-token count is process-wide *by design* — parallel CPU
+    /// kernels must observe the same active width as the caller thread — so
+    /// tests that set it are mutually exclusive, and `cargo test` runs them on
+    /// parallel threads by default. Observed failure without this lock:
+    /// `trip_count_without_active_uses_tensor`'s `set_active_token_count(None)`
+    /// landed between the two assertions of
+    /// `trip_count_clamps_compile_slot_to_active_tokens`, so the second one saw
+    /// no active count and resolved `trip=[1]` to `1` instead of `74`. It
+    /// reproduces roughly once in a heavily-loaded full-workspace run.
+    ///
+    /// Poisoning is ignored deliberately: a panic in one of these tests should
+    /// surface as that test's own failure, not as a cascade of poison errors
+    /// hiding it.
+    static ACTIVE_TOKEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_active_tokens() -> std::sync::MutexGuard<'static, ()> {
+        ACTIVE_TOKEN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn hello_alignment_pattern() {
         let mask = vec![19i64, 2, 1, 2, 3, 2, 3, 2];
@@ -225,6 +248,7 @@ mod tests {
 
     #[test]
     fn trip_count_clamps_compile_slot_to_active_tokens() {
+        let _guard = lock_active_tokens();
         set_active_token_count(Some(74));
         assert_eq!(resolve_concat_trip_count(&[80], 80, 80), 74);
         assert_eq!(resolve_concat_trip_count(&[1], 80, 80), 74);
@@ -257,6 +281,7 @@ mod tests {
 
     #[test]
     fn trip_count_broadcast_split_len() {
+        let _guard = lock_active_tokens();
         set_active_token_count(Some(74));
         assert_eq!(resolve_concat_trip_count(&[1], 80, 1), 74);
         set_active_token_count(None);
@@ -264,6 +289,7 @@ mod tests {
 
     #[test]
     fn trip_count_without_active_uses_tensor() {
+        let _guard = lock_active_tokens();
         set_active_token_count(None);
         assert_eq!(resolve_concat_trip_count(&[8], 8, 8), 8);
     }

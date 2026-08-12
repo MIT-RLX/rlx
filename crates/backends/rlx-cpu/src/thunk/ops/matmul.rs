@@ -146,6 +146,19 @@ pub(crate) fn compile_mat_mul(
                         n: n as u32,
                     };
                 }
+                // F16 weight (rhs) with f32 output → dequant-on-the-fly GEMM,
+                // IEEE-half twin of the BF16 path (else the F16 bytes are read as
+                // f32 garbage — the qwen35 vision F16-weight regression).
+                if b_shape.dtype() == rlx_ir::DType::F16 && shape.dtype() == rlx_ir::DType::F32 {
+                    return Thunk::SgemmF16 {
+                        a: node_offset(arena, node.inputs[0]),
+                        b: node_offset(arena, node.inputs[1]),
+                        c: node_offset(arena, node.id),
+                        m: m as u32,
+                        k: k_dim as u32,
+                        n: n as u32,
+                    };
+                }
                 match shape.dtype() {
                     rlx_ir::DType::F64 => Thunk::Dgemm {
                         a: node_offset(arena, node.inputs[0]),
@@ -235,13 +248,16 @@ pub(crate) fn compile_grouped_mat_mul(
         unreachable!()
     };
     {
-        // Inputs: [input(M, K), weight(E, K, N), expert_idx(M)]
+        // Inputs: [input(M, K), weight(E, K, N), expert_idx(M)]. The dims are
+        // checked against the declared output rather than trusted: `n` comes
+        // off the bank, `dst` is sized from `node.shape`, and a bank still in
+        // `[E, N, K]` order makes those two disagree — under- or over-writing
+        // the output slot with no other symptom. See `grouped_matmul_dims`.
         let in_shape = &graph.node(node.inputs[0]).shape;
         let w_shape = &graph.node(node.inputs[1]).shape;
-        let m = in_shape.dim(in_shape.rank() - 2).unwrap_static();
-        let k_dim = in_shape.dim(in_shape.rank() - 1).unwrap_static();
-        let num_experts = w_shape.dim(0).unwrap_static();
-        let n = w_shape.dim(2).unwrap_static();
+        let dims = rlx_ir::shape::grouped_matmul_dims(in_shape, w_shape, Some(&node.shape))
+            .unwrap_or_else(|e| panic!("rlx-cpu: node {:?}: {e}", node.id));
+        let (m, k_dim, n, num_experts) = (dims.m, dims.k, dims.n, dims.num_experts);
         Thunk::GroupedMatMul {
             input: node_offset(arena, node.inputs[0]),
             weight: node_offset(arena, node.inputs[1]),

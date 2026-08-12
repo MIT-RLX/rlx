@@ -143,11 +143,19 @@ impl ExecutableGraph for WgpuExecutableWrapper {
             rlx_ir::DType::BF16 => {
                 // A BF16 matmul weight is kept PACKED (2 B/elem) in the wgpu
                 // arena's bf16 side-buffer and unpacked in-shader — no host
-                // widen, no ne*4 arena write. Non-matmul BF16 consumers (and
-                // deferred graphs) fall back to the f32-widen path below.
+                // widen, no ne*4 arena write.
                 if !self.inner.set_param_bf16_packed(name, data) {
-                    let f32 = super::widen_bytes_to_f32(data, dtype);
-                    self.inner.set_param(name, &f32);
+                    // Every OTHER BF16 param lands in the main arena, whose slot
+                    // `plan_f32_uniform` sized NATIVE (2 B/elem — `F32Uniform`
+                    // widens activations but keeps non-F32 *params* packed).
+                    // Widening here wrote ne*4 bytes into an ne*2 slot: it
+                    // overran the following param and disagreed with the host
+                    // steps that read the slot back as bf16 (e.g.
+                    // `Step::DequantGroupedMatmulMlxHost { scale_bf16 }`, whose
+                    // flag comes from the IR dtype). MXFP4 MoE scales are the
+                    // first non-matmul BF16 param to hit this. Write raw, like
+                    // the U8 arm above.
+                    self.inner.set_param_bytes(name, data);
                 }
             }
             rlx_ir::DType::F16

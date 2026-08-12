@@ -104,6 +104,22 @@ impl GateAttrs {
 }
 
 /// Run the gate inside a contiguous f32 arena (CUDA/ROCm/WGPU host segments).
+///
+/// **Deprecated — prefer [`execute_gate_f32`].** Taking whole-arena f32 offsets
+/// is what made the wasteful thing the easy thing: the only in-tree caller
+/// (`rlx_gpu_host::run_llada2_group_limited_gate`) staged the ENTIRE device
+/// arena host-side to compute a top-k over a few thousand floats — ~276 GB of
+/// PCIe traffic and 97% of CUDA prefill on Ling-3.0-tiny. It now reads the three
+/// regions it actually touches and calls [`execute_gate_f32`] with plain slices.
+///
+/// Kept because it shipped in the published 0.2.13 API; scheduled for removal in
+/// 0.3. Do not add new callers, and do not add further arena-offset entry points
+/// here — pass slices and let the caller stage only what the gate reads:
+/// `sig[n_elems]`, `route[n_elems]`, and a write-only `[rows, 2*top_k]` output.
+#[deprecated(
+    since = "0.2.14",
+    note = "pass slices to `execute_gate_f32`; whole-arena offsets invite staging the entire device arena"
+)]
 pub fn execute_gate_in_f32_arena(
     host: &mut [f32],
     sig_f32_off: usize,

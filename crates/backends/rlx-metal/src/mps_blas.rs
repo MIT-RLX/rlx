@@ -17,7 +17,7 @@
 //! on the same command buffer before invoking us. The shared-encoder split
 //! is wired in `backend::encode_and_run`.
 
-use metal::{Buffer, CommandBufferRef};
+use crate::mtl::{Buffer, CommandBufferRef};
 use objc::runtime::{BOOL, NO, Object, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use std::collections::HashMap;
@@ -143,7 +143,7 @@ unsafe fn get_or_build_matrix(
         // NaN. To break the aliasing, callers that build new arenas
         // (e.g. `MetalBackend::compile_inner`) call
         // `invalidate_caches()` first so this map is empty.
-        let buf_ptr = (&**buf as *const metal::BufferRef) as usize;
+        let buf_ptr = (&**buf as *const crate::mtl::BufferRef) as usize;
         let key = (buf_ptr, offset, rows, cols * 8 + dtype as usize);
         let mut map = cache.matrices.lock().expect("matrix cache poisoned");
         if let Some(&p) = map.get(&key) {
@@ -152,7 +152,7 @@ unsafe fn get_or_build_matrix(
         let desc = get_or_build_descriptor(rows, cols, dtype);
         let cls = class!(MPSMatrix);
         let alloc: *mut Object = msg_send![cls, alloc];
-        let buf_ref: &metal::BufferRef = buf;
+        let buf_ref: &crate::mtl::BufferRef = buf;
         let mat: *mut Object = msg_send![alloc,
         initWithBuffer: buf_ref
         offset: offset as u64
@@ -212,7 +212,7 @@ unsafe fn get_or_build_kernel(
     let dev = metal_device().expect("Metal device required");
     let cls = class!(MPSMatrixMultiplication);
     let alloc: *mut Object = msg_send![cls, alloc];
-    let dev_ref: &metal::DeviceRef = &dev.device;
+    let dev_ref: &crate::mtl::DeviceRef = &dev.device;
     let kernel: *mut Object = msg_send![alloc,
         initWithDevice: dev_ref
         transposeLeft: if transpose_a { YES } else { NO } as BOOL

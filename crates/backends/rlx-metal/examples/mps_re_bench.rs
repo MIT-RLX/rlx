@@ -20,10 +20,10 @@ fn main() {}
 #[cfg(target_os = "macos")]
 fn main() {
     use half::f16;
-    use metal::MTLResourceOptions;
     use rlx_metal::blas::metal_sgemm_f16w_bufs;
     use rlx_metal::device::metal_device;
     use rlx_metal::mps_blas::{encode_mps_hgemm, mps_supports_matmul};
+    use rlx_metal::mtl::MTLResourceOptions;
 
     if !mps_supports_matmul() {
         eprintln!("MPS not available");
@@ -34,9 +34,9 @@ fn main() {
 
     // GPU-window seconds from a completed command buffer (metal-rs doesn't wrap
     // GPUStartTime/EndTime).
-    unsafe fn gpu_secs(cb: &metal::CommandBufferRef) -> f64 {
+    unsafe fn gpu_secs(cb: &rlx_metal::mtl::CommandBufferRef) -> f64 {
         use objc::{msg_send, runtime::Object, sel, sel_impl};
-        let obj = cb as *const metal::CommandBufferRef as *mut Object;
+        let obj = cb as *const rlx_metal::mtl::CommandBufferRef as *mut Object;
         let start: f64 = msg_send![obj, GPUStartTime];
         let end: f64 = msg_send![obj, GPUEndTime];
         (end - start).max(0.0)
@@ -291,12 +291,12 @@ fn main() {
                         // q4k: 4 simdgroups/tg × 2 rows (encode_q4k_mv_f32_sg).
                         let tgs = (n as u64).div_ceil(2).div_ceil(4);
                         enc.dispatch_threads(
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: tgs * 4 * 32,
                                 height: 1,
                                 depth: 1,
                             },
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: 4 * 32,
                                 height: 1,
                                 depth: 1,
@@ -307,12 +307,12 @@ fn main() {
                         // q8_0: 2 simdgroups/tg × 4 rows (encode_q8_0_mv_f32_sg).
                         let tgs = (n as u64).div_ceil(4).div_ceil(2);
                         enc.dispatch_threads(
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: tgs * 2 * 32,
                                 height: 1,
                                 depth: 1,
                             },
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: 2 * 32,
                                 height: 1,
                                 depth: 1,
@@ -323,12 +323,12 @@ fn main() {
                         // q6k: 4 simdgroups/tg × 1 row (encode_q6k_mv_f32_sg).
                         let tgs = (n as u64).div_ceil(4);
                         enc.dispatch_threads(
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: tgs * 4 * 32,
                                 height: 1,
                                 depth: 1,
                             },
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: 4 * 32,
                                 height: 1,
                                 depth: 1,
@@ -338,12 +338,12 @@ fn main() {
                     _ => {
                         // one thread per output row.
                         enc.dispatch_threads(
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: n as u64,
                                 height: 1,
                                 depth: 1,
                             },
-                            metal::MTLSize {
+                            rlx_metal::mtl::MTLSize {
                                 width: 64.min(n as u64),
                                 height: 1,
                                 depth: 1,

@@ -122,9 +122,14 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|&id| id_map[&id]).collect();
 
         let new_id = match &node.op {
-            Op::FusedSwiGLU { .. } => {
-                expand_swiglu(&mut out, &graph, node.inputs[0], &new_inputs, &node.shape)
-            }
+            Op::FusedSwiGLU { gate_first, .. } => expand_swiglu(
+                &mut out,
+                &graph,
+                node.inputs[0],
+                &new_inputs,
+                &node.shape,
+                *gate_first,
+            ),
             Op::LoraMatMul { scale } => expand_lora(
                 &mut out,
                 &graph,
@@ -527,9 +532,18 @@ fn expand_swiglu(
     orig_src_id: NodeId,
     inputs: &[NodeId],
     out_shape: &Shape,
+    // Must be passed in by the caller: `orig_src_id` is the FusedSwiGLU's *input*
+    // (its shape is what the narrows are cut from), not the FusedSwiGLU node, so
+    // the flag cannot be recovered here.
+    gate_first: bool,
 ) -> NodeId {
     // Op::FusedSwiGLU input is concatenated [up, gate]; output last
     // dim is half. y = up * silu(gate).
+    //
+    // `gate_first` flips that to [gate, up] — the layout a builder produces when
+    // it emits gate_proj before up_proj (DeepSeek / Bailing MoE narrow the fused
+    // expert output as gate=low, up=high). Honour it, or every backend that
+    // decomposes instead of using a native kernel computes `gate · silu(up)`.
     let src_dims = src_graph.node(orig_src_id).shape.dims();
     let last_idx = src_dims.len() - 1;
     let last = src_dims[last_idx].unwrap_static();
@@ -540,10 +554,11 @@ fn expand_swiglu(
     half_dims[last_idx] = half;
     let half_shape = Shape::new(&half_dims, src_graph.node(orig_src_id).shape.dtype());
 
+    let (up_start, gate_start) = if gate_first { (half, 0) } else { (0, half) };
     let up = out.add_node(
         Op::Narrow {
             axis: last_idx,
-            start: 0,
+            start: up_start,
             len: half,
         },
         vec![inputs[0]],
@@ -552,7 +567,7 @@ fn expand_swiglu(
     let gate = out.add_node(
         Op::Narrow {
             axis: last_idx,
-            start: half,
+            start: gate_start,
             len: half,
         },
         vec![inputs[0]],

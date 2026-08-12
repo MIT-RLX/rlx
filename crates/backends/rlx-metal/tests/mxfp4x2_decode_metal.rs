@@ -10,9 +10,9 @@
 
 #![cfg(target_os = "macos")]
 
-use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use rlx_ir::quant::ScaledFormat;
 use rlx_ir::residual::{residual_dequantize, residual_quantize};
+use rlx_metal::mtl::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 
 /// Metal decode kernel — E2M1 LUT matches `rlx_ir::nvfp4::FP4_E2M1_LUT`.
@@ -49,14 +49,14 @@ fn pack_nibbles(codes: &[u8]) -> Vec<u32> {
     out
 }
 
-fn buf_u32(d: &Device, v: &[u32]) -> metal::Buffer {
+fn buf_u32(d: &Device, v: &[u32]) -> rlx_metal::mtl::Buffer {
     d.new_buffer_with_data(
         v.as_ptr() as *const c_void,
         (v.len() * 4).max(4) as u64,
         MTLResourceOptions::StorageModeShared,
     )
 }
-fn buf_f32(d: &Device, v: &[f32]) -> metal::Buffer {
+fn buf_f32(d: &Device, v: &[f32]) -> rlx_metal::mtl::Buffer {
     d.new_buffer_with_data(
         v.as_ptr() as *const c_void,
         (v.len() * 4).max(4) as u64,

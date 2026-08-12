@@ -561,6 +561,7 @@ kernel_cache!(
     "gather_axis"
 );
 kernel_cache!(NARROW, narrow_kernel, NARROW_CU, "narrow");
+kernel_cache!(KV_APPEND, kv_append_kernel, KV_APPEND_CU, "kv_append");
 kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
@@ -593,6 +594,12 @@ kernel_cache!(
     "attention_row"
 );
 kernel_cache!(
+    ATTENTION_WARP,
+    attention_warp_kernel,
+    ATTENTION_WARP_CU,
+    "attention_warp"
+);
+kernel_cache!(
     ATTENTION_BWD,
     attention_bwd_kernel,
     ATTENTION_BWD_CU,
@@ -608,6 +615,12 @@ kernel_cache!(
     grouped_matmul_kernel,
     GROUPED_MATMUL_CU,
     "grouped_matmul"
+);
+kernel_cache!(
+    GROUPED_GEMV_SPLITK,
+    grouped_gemv_splitk_kernel,
+    GROUPED_MATMUL_CU,
+    "grouped_gemv_splitk"
 );
 kernel_cache!(
     SCATTER_ADD_ZERO,
@@ -658,6 +671,18 @@ kernel_cache!(
     "dequant_grouped_matmul_mlx_mxfp4"
 );
 kernel_cache!(
+    DEQUANT_GROUPED_MATMUL_MLX_MXFP4_V3,
+    dequant_grouped_matmul_mlx_mxfp4_v3_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_grouped_matmul_mlx_mxfp4_v3"
+);
+kernel_cache!(
+    DEQUANT_GROUPED_MATMUL_MLX_MXFP4_SPLITK,
+    dequant_grouped_matmul_mlx_mxfp4_splitk_kernel,
+    DEQUANT_MATMUL_MLX_CU,
+    "dequant_grouped_matmul_mlx_mxfp4_splitk"
+);
+kernel_cache!(
     DEQUANT_GROUPED_MATMUL_MLX_MXFP4_AMORT,
     dequant_grouped_matmul_mlx_mxfp4_amort_kernel,
     DEQUANT_MATMUL_MLX_CU,
@@ -686,6 +711,12 @@ kernel_cache!(
     dequant_matmul_gguf_q4k_gemv_kernel,
     DEQUANT_MATMUL_GGUF_CU,
     "dequant_matmul_gguf_q4k_gemv"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_Q4K_GEMV_WARP,
+    dequant_matmul_gguf_q4k_gemv_warp_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_q4k_gemv_warp"
 );
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 kernel_cache!(

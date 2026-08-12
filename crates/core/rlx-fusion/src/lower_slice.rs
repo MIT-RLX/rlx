@@ -47,6 +47,12 @@ pub fn lower_slice(
 pub struct LowerSlice;
 
 impl Pass for LowerSlice {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Slice]
+    }
+
     fn name(&self) -> &str {
         "lower_slice"
     }

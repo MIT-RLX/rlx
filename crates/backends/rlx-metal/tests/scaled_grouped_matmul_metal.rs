@@ -8,6 +8,10 @@
 //! decompose (ScaledDequantize + Transpose + native MPS GroupedMatMul). Same
 //! packed codes + E8M0 block scales pushed through both must agree.
 
+// Compares against a live Metal device, so it can only run on macOS — same
+// gate the rest of this directory uses.
+#![cfg(target_os = "macos")]
+
 use rlx_ir::{DType, Graph, ScaleLayout, ScaledFormat, Shape};
 use rlx_runtime::{Device, Session};
 

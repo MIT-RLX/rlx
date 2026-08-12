@@ -7,7 +7,7 @@
 
 use crate::device::metal_device;
 use crate::kernels::kernels;
-use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
+use crate::mtl::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use rlx_splat::backends::metal_training::{GpuTrainingTraceBuffers, SplatRasterBwdParams};
 use rlx_splat::core::{Camera, GaussianScene};
 use rlx_splat::reference::native_prep::SplatRasterParams;
@@ -562,7 +562,7 @@ impl MetalFusedTraining {
 
     fn dispatch_project_training(
         &self,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &crate::mtl::ComputeCommandEncoderRef,
         pr: &SplatProjectParams,
     ) {
         let k = kernels();
@@ -585,14 +585,14 @@ impl MetalFusedTraining {
             pr as *const _ as *const _,
         );
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(groups, 1, 1),
-            metal::MTLSize::new(tg, 1, 1),
+            crate::mtl::MTLSize::new(groups, 1, 1),
+            crate::mtl::MTLSize::new(tg, 1, 1),
         );
     }
 
     fn dispatch_gpu_conic_project_training_only(
         &self,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &crate::mtl::ComputeCommandEncoderRef,
         pr: &SplatProjectParams,
     ) {
         self.dispatch_project_training(enc, pr);
@@ -600,7 +600,7 @@ impl MetalFusedTraining {
 
     fn dispatch_gpu_conic_screen_ellipse_only(
         &self,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &crate::mtl::ComputeCommandEncoderRef,
         pr: &SplatProjectParams,
     ) {
         let k = kernels();
@@ -623,12 +623,12 @@ impl MetalFusedTraining {
             pr as *const _ as *const _,
         );
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(groups, 1, 1),
-            metal::MTLSize::new(tg, 1, 1),
+            crate::mtl::MTLSize::new(groups, 1, 1),
+            crate::mtl::MTLSize::new(tg, 1, 1),
         );
     }
 
-    fn dispatch_bin_sort_pipeline(&self, enc: &metal::ComputeCommandEncoderRef) {
+    fn dispatch_bin_sort_pipeline(&self, enc: &crate::mtl::ComputeCommandEncoderRef) {
         let k = kernels();
         let list_dispatch = bin_list_dispatch_groups(self.max_list_entries);
         let tile_count = self.tile_count;
@@ -638,20 +638,26 @@ impl MetalFusedTraining {
         enc.set_buffer(1, Some(&self.bin_histogram), 0);
         enc.set_buffer(2, Some(&self.bin_counter), 0);
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(list_dispatch, 1, 1),
-            metal::MTLSize::new(BIN_SORT_THREADS, 1, 1),
+            crate::mtl::MTLSize::new(list_dispatch, 1, 1),
+            crate::mtl::MTLSize::new(BIN_SORT_THREADS, 1, 1),
         );
 
         enc.set_compute_pipeline_state(&k.gaussian_splat_bin_copy_counts);
         enc.set_buffer(0, Some(&self.bin_histogram), 0);
         enc.set_buffer(1, Some(&self.bin_cursor), 0);
         enc.set_bytes(2, 4, &tile_count as *const u32 as *const _);
-        enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1));
+        enc.dispatch_thread_groups(
+            crate::mtl::MTLSize::new(1, 1, 1),
+            crate::mtl::MTLSize::new(1, 1, 1),
+        );
 
         enc.set_compute_pipeline_state(&k.gaussian_splat_bin_prefix_sum);
         enc.set_buffer(0, Some(&self.bin_histogram), 0);
         enc.set_bytes(1, 4, &tile_count as *const u32 as *const _);
-        enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1));
+        enc.dispatch_thread_groups(
+            crate::mtl::MTLSize::new(1, 1, 1),
+            crate::mtl::MTLSize::new(1, 1, 1),
+        );
 
         enc.set_compute_pipeline_state(&k.gaussian_splat_bin_scatter);
         enc.set_buffer(0, Some(&self.bin_keys), 0);
@@ -661,8 +667,8 @@ impl MetalFusedTraining {
         enc.set_buffer(4, Some(&self.bin_histogram), 0);
         enc.set_buffer(5, Some(&self.bin_counter), 0);
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(list_dispatch, 1, 1),
-            metal::MTLSize::new(BIN_SORT_THREADS, 1, 1),
+            crate::mtl::MTLSize::new(list_dispatch, 1, 1),
+            crate::mtl::MTLSize::new(BIN_SORT_THREADS, 1, 1),
         );
 
         enc.set_compute_pipeline_state(&k.gaussian_splat_build_tile_ranges);
@@ -670,12 +676,15 @@ impl MetalFusedTraining {
         enc.set_buffer(1, Some(&self.bin_cursor), 0);
         enc.set_buffer(2, Some(&self.tile_ranges), 0);
         enc.set_bytes(3, 4, &tile_count as *const u32 as *const _);
-        enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1));
+        enc.dispatch_thread_groups(
+            crate::mtl::MTLSize::new(1, 1, 1),
+            crate::mtl::MTLSize::new(1, 1, 1),
+        );
     }
 
     fn dispatch_emit_radius_aabb(
         &self,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &crate::mtl::ComputeCommandEncoderRef,
         bp: &SplatBinParams,
     ) {
         let k = kernels();
@@ -693,14 +702,14 @@ impl MetalFusedTraining {
             bp as *const _ as *const _,
         );
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(groups, 1, 1),
-            metal::MTLSize::new(tg, 1, 1),
+            crate::mtl::MTLSize::new(groups, 1, 1),
+            crate::mtl::MTLSize::new(tg, 1, 1),
         );
     }
 
     fn dispatch_gpu_conic_emit(
         &self,
-        enc: &metal::ComputeCommandEncoderRef,
+        enc: &crate::mtl::ComputeCommandEncoderRef,
         bp: &SplatBinParams,
         emit_count: u32,
     ) {
@@ -728,8 +737,8 @@ impl MetalFusedTraining {
         );
         enc.set_buffer(8, Some(&self.emit_count_buf), 0);
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(emit_groups.max(1), 1, 1),
-            metal::MTLSize::new(tg, 1, 1),
+            crate::mtl::MTLSize::new(emit_groups.max(1), 1, 1),
+            crate::mtl::MTLSize::new(tg, 1, 1),
         );
     }
 
@@ -852,8 +861,8 @@ impl MetalFusedTraining {
         enc.set_buffer(11, Some(&self.traces.hit_splat_ids), 0);
         enc.set_buffer(12, Some(&self.traces.hit_meta), 0);
         enc.dispatch_threads(
-            metal::MTLSize::new(self.width as u64, self.height as u64, 1),
-            metal::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1),
+            crate::mtl::MTLSize::new(self.width as u64, self.height as u64, 1),
+            crate::mtl::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1),
         );
 
         // Photometric loss + pixel grad on GPU (MSE-only or MSE+SSIM blend).
@@ -869,8 +878,9 @@ impl MetalFusedTraining {
         Self::zero_buffer(&self.pixel_rgb_grad);
         Self::zero_buffer(&self.loss_atomic);
         Self::zero_buffer(&self.ssim_sum_atomic);
-        let loss_tg = metal::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1);
-        let loss_threads = metal::MTLSize::new(self.width as u64, self.height as u64, 1);
+        let loss_tg =
+            crate::mtl::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1);
+        let loss_threads = crate::mtl::MTLSize::new(self.width as u64, self.height as u64, 1);
         if loss_p.ssim_weight > 0.0 {
             enc.set_compute_pipeline_state(&k.gaussian_splat_ssim_stats);
             enc.set_buffer(0, Some(&self.rgba), 0);
@@ -937,8 +947,8 @@ impl MetalFusedTraining {
             &bwd as *const _ as *const _,
         );
         enc.dispatch_threads(
-            metal::MTLSize::new(self.width as u64, self.height as u64, 1),
-            metal::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1),
+            crate::mtl::MTLSize::new(self.width as u64, self.height as u64, 1),
+            crate::mtl::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1),
         );
 
         // Splat color backward
@@ -953,8 +963,8 @@ impl MetalFusedTraining {
             .max(1);
         let g2 = (self.count as u64 + tg2 as u64 - 1) / tg2 as u64;
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(g2, 1, 1),
-            metal::MTLSize::new(tg2, 1, 1),
+            crate::mtl::MTLSize::new(g2, 1, 1),
+            crate::mtl::MTLSize::new(tg2, 1, 1),
         );
 
         // Geometry backward (projected)
@@ -978,8 +988,8 @@ impl MetalFusedTraining {
             &bwd as *const _ as *const _,
         );
         enc.dispatch_threads(
-            metal::MTLSize::new(self.width as u64, self.height as u64, 1),
-            metal::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1),
+            crate::mtl::MTLSize::new(self.width as u64, self.height as u64, 1),
+            crate::mtl::MTLSize::new(8.min(self.width as u64), 8.min(self.height as u64), 1),
         );
 
         // Projected → scene grads
@@ -1001,8 +1011,8 @@ impl MetalFusedTraining {
             &pr as *const _ as *const _,
         );
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(g2, 1, 1),
-            metal::MTLSize::new(tg2, 1, 1),
+            crate::mtl::MTLSize::new(g2, 1, 1),
+            crate::mtl::MTLSize::new(tg2, 1, 1),
         );
 
         if let Some(adam_host) = adam {
@@ -1028,8 +1038,8 @@ impl MetalFusedTraining {
                 &pg as *const _ as *const _,
             );
             enc.dispatch_thread_groups(
-                metal::MTLSize::new(g2, 1, 1),
-                metal::MTLSize::new(tg2, 1, 1),
+                crate::mtl::MTLSize::new(g2, 1, 1),
+                crate::mtl::MTLSize::new(tg2, 1, 1),
             );
             let (settings_buf, hyper_buf) = crate::splat_adam::build_adam_gpu_buffers(adam_host);
             crate::splat_adam::adam_encode_step(

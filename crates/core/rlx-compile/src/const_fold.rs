@@ -20,23 +20,18 @@
 //! that asymmetry made F5-TTS text-embed CPU↔CUDA cos collapse to ~0.17).
 
 use rlx_fusion::pass::Pass;
-use rlx_ir::op::{Activation, BinaryOp};
+use rlx_ir::op::{Activation, BinaryOp, CmpOp};
 use rlx_ir::{DType, Dim, Graph, NodeId, Op, Shape};
 use std::collections::{HashMap, HashSet};
 
 pub struct ConstantFolding;
 
 /// True if this op can be evaluated symbolically with no runtime state.
+///
+/// Reads the central capability table rather than keeping a private list —
+/// see [`rlx_ir::capability`] for why the classification is exhaustive.
 pub(crate) fn is_pure(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Activation(_)
-            | Op::Binary(_)
-            | Op::Compare(_)
-            | Op::Reshape { .. }
-            | Op::Expand { .. }
-            | Op::Cast { .. }
-    )
+    op.is_const_foldable()
 }
 
 /// True if the node's inputs are all known constants (Param, Constant, or
@@ -194,6 +189,32 @@ pub(crate) fn evaluate(
                     BinaryOp::Shl => ((lhs[i] as i64) << (rhs[i] as i64)) as f32,
                     BinaryOp::Shr => ((lhs[i] as i64) >> (rhs[i] as i64)) as f32,
                 };
+            }
+            Some(out)
+        }
+        Op::Compare(op) => {
+            // `is_pure` has always listed `Compare`, but there was no arm here,
+            // so a comparison of two constants evaluated to `None` and stayed
+            // in the graph. Harmless for the folder itself (`is_foldable`
+            // refuses non-F32 outputs anyway), but it left every *derived*
+            // boolean opaque — which is exactly the predicate `sccp` needs to
+            // resolve a `Where` or prune an `If`.
+            //
+            // Encoded as 0.0 / 1.0, matching how every backend's compare kernel
+            // materialises a mask.
+            let out_dims = static_dims(&node.shape)?;
+            let lhs = broadcast_to(inputs[0], &in_dims[0], &out_dims)?;
+            let rhs = broadcast_to(inputs[1], &in_dims[1], &out_dims)?;
+            for i in 0..total {
+                let t = match op {
+                    CmpOp::Eq => lhs[i] == rhs[i],
+                    CmpOp::Ne => lhs[i] != rhs[i],
+                    CmpOp::Lt => lhs[i] < rhs[i],
+                    CmpOp::Le => lhs[i] <= rhs[i],
+                    CmpOp::Gt => lhs[i] > rhs[i],
+                    CmpOp::Ge => lhs[i] >= rhs[i],
+                };
+                out[i] = if t { 1.0 } else { 0.0 };
             }
             Some(out)
         }

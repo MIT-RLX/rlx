@@ -33,6 +33,7 @@ pub mod config;
 pub mod supported_ops;
 #[cfg(test)]
 mod tma_validate;
+pub mod vmem;
 pub use config::{
     AttentionVariant, CudaRuntimeConfig, install_runtime_config, reload_runtime_config,
     runtime_config,

@@ -74,7 +74,7 @@ fn main() {
             (false, false) => &k.synth_matmul_codebook_mm,
             (false, true) => &k.synth_matmul_codebook_mm_h,
         };
-        let encode = |enc: &metal::ComputeCommandEncoderRef| {
+        let encode = |enc: &rlx_metal::mtl::ComputeCommandEncoderRef| {
             enc.set_compute_pipeline_state(pso);
             enc.set_buffer(0, Some(&buffer), 0);
             let vals: [u64; 4] = [x_off as u64, idx_off as u64, cb_off as u64, dst_off as u64];
@@ -87,12 +87,12 @@ fn main() {
             }
             let (grid, tg) = if split_k {
                 (
-                    metal::MTLSize {
+                    rlx_metal::mtl::MTLSize {
                         width: 32,
                         height: n as u64,
                         depth: m as u64,
                     },
-                    metal::MTLSize {
+                    rlx_metal::mtl::MTLSize {
                         width: 32,
                         height: 8u64.min(n as u64).max(1),
                         depth: 1,
@@ -102,12 +102,12 @@ fn main() {
                 let tgh = 8u64.min(m as u64).max(1);
                 let tgw = (256 / tgh).min(n as u64).max(1);
                 (
-                    metal::MTLSize {
+                    rlx_metal::mtl::MTLSize {
                         width: n as u64,
                         height: m as u64,
                         depth: 1,
                     },
-                    metal::MTLSize {
+                    rlx_metal::mtl::MTLSize {
                         width: tgw,
                         height: tgh,
                         depth: 1,
@@ -118,14 +118,17 @@ fn main() {
         };
         for _ in 0..warmup {
             let cb = dev.queue.new_command_buffer();
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+            let enc = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             encode(enc);
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
         }
         let cb = dev.queue.new_command_buffer();
-        let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+        let enc =
+            cb.compute_command_encoder_with_dispatch_type(rlx_metal::mtl::MTLDispatchType::Serial);
         let t0 = Instant::now();
         for _ in 0..n_iter {
             encode(enc);
@@ -184,15 +187,18 @@ fn main() {
             let (a_off, b_off, c_off) = (0usize, m * kk * 4, (m * kk + kk * n) * 4);
             for _ in 0..WARMUP {
                 let cb = dev.queue.new_command_buffer();
-                let enc =
-                    cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+                let enc = cb.compute_command_encoder_with_dispatch_type(
+                    rlx_metal::mtl::MTLDispatchType::Serial,
+                );
                 metal_sgemm(enc, &buffer, a_off, b_off, c_off, m, kk, n);
                 enc.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();
             }
             let cb = dev.queue.new_command_buffer();
-            let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Serial);
+            let enc = cb.compute_command_encoder_with_dispatch_type(
+                rlx_metal::mtl::MTLDispatchType::Serial,
+            );
             let t0 = Instant::now();
             for _ in 0..N_ITER {
                 metal_sgemm(enc, &buffer, a_off, b_off, c_off, m, kk, n);

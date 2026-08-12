@@ -287,22 +287,12 @@ Env diagnostics / ablation:
 | `RLX_CUDA_IM2COL_HOST=1` | Force host-side Im2Col for dynamic conv (default: GPU Im2Col in graph mode). |
 | `RLX_TRACE_PERFETTO=<path>` | Chrome trace per schedule step (cross-backend; load in Perfetto UI). |
 
-### EEG-CLIP batch encode note
-
-Fused graphs compiled with `batch > 1` on the EEG projection head (temporal mean over
-`n_preds` on `[B, P, C]`) can diverge from `B` sequential `batch=1` runs on CUDA when the
-full Deep4+projection graph is executed at once. **`eegclip-rs` avoids this** by running
-batched Deep4 only, then `project_eeg_features(..., batch=1)` per window inside
-`EegClipInference::encode_many_windows`. On CUDA, `EegEncoder::run_deep4` defaults to
-`B` sequential `batch=1` Deep4 calls unless `EEGCLIP_CUDA_DEEP4_BATCH=1` (batched conv
-parity still under investigation).
-
 ### `run_slots` / embedder readback
 
 CUDA now implements the same [`run_slots` + `arena_ptr`] contract as Metal/MLX:
 positional inputs, one D2H into a stable **host** buffer (not a GPU-mapped arena).
 Use this for inference loops that want to reuse an output `Vec` without `run()` allocating
-each time (e.g. EEG-DINO `eegdino-rs` encoder).
+each time.
 
 ### Resident K/V (bucketed GGUF decode)
 
@@ -319,7 +309,7 @@ For autoregressive packed decode (`past_k_*` / `past_v_*` resident handles):
 Set `ORPHEUS_RESIDENT_KV=0` or `RLX_CUDA_FULL_KV_READBACK=1` to fall back to full-tensor
 K/V readback per step.
 
-### EEG-DINO encoder notes
+### BSHD encoder notes
 
 - Attention uses **BSHD** `[B,S,H,D]`; CUDA uses tiled flash (`attention_kernel`) for `head_dim ≤ 128`
   (same as wgpu). Set `RLX_CUDA_FORCE_ATTENTION_ROW=1` to fall back to `attention_row_kernel`.

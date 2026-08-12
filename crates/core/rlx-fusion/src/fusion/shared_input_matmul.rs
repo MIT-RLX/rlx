@@ -6,7 +6,7 @@
 
 #![allow(unused_imports)]
 
-use crate::pass::Pass;
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -18,6 +18,7 @@ use crate::graph_rewrite::Rewriter;
 // ── Pass 1: MatMul + Bias + Activation → FusedMatMulBiasAct ─────────────
 
 use super::*;
+use rlx_ir::OpKind;
 
 /// Detects two MatMul nodes with the same input and concatenates their
 /// weight matrices into a single larger MatMul.
@@ -46,11 +47,20 @@ const MAX_SHARED_INPUT_MATMULS: usize = 4;
 const MAX_SHARED_INPUT_WEIGHT_ELEMS: usize = 32 * 1024 * 1024;
 
 impl Pass for FuseSharedInputMatMul {
+    // Required by construction: the pattern groups MatMuls sharing an input.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::MatMul]
+    }
+
     fn name(&self) -> &str {
         "fuse_shared_input_matmul"
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         struct FuseGroup {
             input_id: NodeId,
             matmul_ids: Vec<NodeId>,
@@ -104,7 +114,7 @@ impl Pass for FuseSharedInputMatMul {
         }
 
         if groups.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         let group_by_first: HashMap<NodeId, &FuseGroup> =
@@ -171,7 +181,7 @@ impl Pass for FuseSharedInputMatMul {
             rw.copy_node(node);
         }
 
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }
 

@@ -300,6 +300,15 @@ impl<'a> LowerCtx<'a> {
                 ("interleave", bind_value(scalar_bool(false))),
             ],
         )?;
+        // Publish the final state under the state input's name, so a decode
+        // harness that reads the state node back as a graph output sees the
+        // UPDATED state. Without this the node still resolves to the initial
+        // state and every decode step restarts from it — the recurrence silently
+        // stops carrying. Mirrors rlx-mlx's `env.insert(node.inputs[5], …)`.
+        if carry {
+            let state_in = self.graph.node(id).inputs[5];
+            self.names.insert(state_in.0, state.clone());
+        }
         self.names.insert(id.0, out_name.to_string());
         Ok(())
     }

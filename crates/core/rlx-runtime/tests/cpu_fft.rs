@@ -993,7 +993,7 @@ fn rfft_irfft_roundtrip_mirror_all_backends() {
     };
     #[allow(unused_mut)]
     let mut devs = vec![Device::Cpu];
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     devs.push(Device::Metal);
     #[cfg(feature = "gpu")]
     devs.push(Device::Gpu);

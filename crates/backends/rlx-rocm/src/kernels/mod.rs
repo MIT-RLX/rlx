@@ -87,8 +87,107 @@ pub(crate) fn compile(ctx: &Arc<RocmContext>, src: &str, entry: &str) -> HipKern
         dump_kernel(&dir, entry, &arch, src, &hsaco);
     }
 
-    HipKernel::from_hsaco(&ctx.runtime, &hsaco, entry)
-        .unwrap_or_else(|e| panic!("rlx-rocm: hipModuleLoadData failed for {entry}: {e}"))
+    match HipKernel::from_hsaco(&ctx.runtime, &hsaco, entry) {
+        Ok(k) => {
+            crate::hip::note_proven_arch(&arch);
+            // Record the signature's arity here, where the source is still in
+            // hand, so `launch_checked` can catch an argument-count mismatch
+            // that the HIP driver cannot see.
+            k.with_expected_params(rlx_gpu_kernels::declared_param_count(src, entry))
+        }
+        // `hipErrorNoBinaryForGpu` (209) means this device rejects a code
+        // object built for `arch`. Arch resolution reads
+        // `rocm_agent_enumerator` — an HSA tool listing GPUs in *physical*
+        // order — while the object loads onto a HIP device, and on a
+        // mixed-arch box those orderings need not agree. Rather than fail,
+        // recompile for the other architectures the tools report and keep the
+        // one the device accepts: a load that succeeds is proof of the arch,
+        // which no amount of enumeration ordering can give us.
+        Err(e) if e.to_string().contains("209") => {
+            let mut tried = vec![arch.clone()];
+            for cand in crate::hip::candidate_archs() {
+                if tried.contains(&cand) {
+                    continue;
+                }
+                tried.push(cand.clone());
+                let Ok(blob) = ctx
+                    .runtime
+                    .hiprtc_compile_to_hsaco_for(src, entry, Some(&cand))
+                else {
+                    continue;
+                };
+                if let Ok(k) = HipKernel::from_hsaco(&ctx.runtime, &blob, entry) {
+                    // Remember it so the remaining kernels compile correctly
+                    // the first time — only this one pays the retry.
+                    crate::hip::note_proven_arch(&cand);
+                    eprintln!(
+                        "rlx-rocm: code object for `{arch}` was rejected by this device \
+                         (hipErrorNoBinaryForGpu); recompiled `{entry}` for `{cand}` and \
+                         will use it for subsequent kernels. Set RLX_ROCM_ARCH={cand} to \
+                         skip this probe."
+                    );
+                    if let Some(ref p) = cache_path {
+                        // The cached blob is keyed by the wrong arch; drop it
+                        // so the next process does not reload it.
+                        let _ = std::fs::remove_file(p);
+                    }
+                    return k;
+                }
+            }
+            panic!("{}", load_failure_message(entry, &arch, &e, &tried))
+        }
+        Err(e) => panic!(
+            "{}",
+            load_failure_message(entry, &arch, &e, std::slice::from_ref(&arch))
+        ),
+    }
+}
+
+/// Explain a `hipModuleLoadData` failure in terms of the arch mismatch that
+/// almost always causes it.
+///
+/// `hipError(209)` is `hipErrorNoBinaryForGpu`: the code object was built for
+/// one GPU architecture and handed to a device of another. On a mixed-arch box
+/// (this project's AMD rig pairs a gfx908 MI100 with a gfx1103 780M) that is
+/// easy to hit — set `RLX_ROCM_ARCH` to the wrong value, or point
+/// `HIP_VISIBLE_DEVICES` at one GPU while the arch resolves from another — and
+/// the bare `hipError(209)` gives no hint which knob is wrong. Standalone HIP
+/// is even less forgiving here: a mismatched code object segfaults rather than
+/// returning an error, so a clear message at this boundary is the only warning
+/// anyone gets.
+fn load_failure_message(
+    entry: &str,
+    arch: &str,
+    err: &impl std::fmt::Display,
+    tried: &[String],
+) -> String {
+    // `arch` is already resolved to "default" when hipRTC was given no
+    // `--offload-arch`; say so rather than printing a bare literal.
+    let built_for = if arch == "default" {
+        "<hipRTC default arch>"
+    } else {
+        arch
+    };
+    let mut msg = format!(
+        "rlx-rocm: hipModuleLoadData failed for kernel `{entry}` \
+         (code object built for {built_for}): {err}"
+    );
+    if err.to_string().contains("209") {
+        let visible = std::env::var("HIP_VISIBLE_DEVICES")
+            .or_else(|_| std::env::var("ROCR_VISIBLE_DEVICES"))
+            .unwrap_or_else(|_| "<unset → device 0>".to_string());
+        msg.push_str(&format!(
+            "\n  hipError 209 is hipErrorNoBinaryForGpu: this device does not accept a \
+             {built_for} code object.\
+             \n  Targeted device: HIP_VISIBLE_DEVICES={visible}\
+             \n  Arch resolution order: RLX_ROCM_ARCH > HSA_OVERRIDE_GFX_VERSION > \
+             rocm_agent_enumerator (see rlx_rocm::hip::rocm_target_arch).\
+             \n  On a mixed-arch box, `rocm_agent_enumerator` lists GPUs in physical order; \
+             the arch must match the device HIP_VISIBLE_DEVICES selects.\
+             \n  Recompiled and retried for: {tried:?} — the device accepted none of them."
+        ));
+    }
+    msg
 }
 
 /// Dump one hipRTC translation unit for offline kernel inspection. Writes
@@ -416,6 +515,7 @@ kernel_cache!(
     "gather_axis"
 );
 kernel_cache!(NARROW, narrow_kernel, NARROW_CU, "narrow");
+kernel_cache!(KV_APPEND, kv_append_kernel, KV_APPEND_CU, "kv_append");
 kernel_cache!(CONCAT, concat_kernel, CONCAT_CU, "concat");
 kernel_cache!(TRANSPOSE, transpose_kernel, TRANSPOSE_CU, "transpose");
 kernel_cache!(EXPAND, expand_kernel, EXPAND_CU, "expand");
@@ -425,6 +525,12 @@ kernel_cache!(
     attention_row_kernel,
     ATTENTION_ROW_CU,
     "attention_row"
+);
+kernel_cache!(
+    ATTENTION_WARP,
+    attention_warp_kernel,
+    ATTENTION_WARP_CU,
+    "attention_warp"
 );
 kernel_cache!(
     ATTENTION_BWD,
@@ -496,6 +602,16 @@ kernel_cache!(
     dequant_gguf_kernel,
     DEQUANT_GGUF_CU,
     "dequant_gguf"
+);
+// Fused Q4_K GEMV (m == 1) from the SHARED gpu-kernels source rlx-cuda already
+// uses. Without it every ROCm decode step dequantized each weight into f32
+// scratch and ran a gemm — for Muse-Glimmer-30B that is ~111 GB of scratch
+// traffic per token (measured ~10 s/token on an MI100).
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_Q4K_GEMV,
+    dequant_matmul_gguf_q4k_gemv_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_q4k_gemv"
 );
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 // On-device Philox4×32-10 RNG (shared `rng_philox.cu`, bit-matched to
@@ -776,6 +892,8 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = expand_kernel(ctx);
     let _ = attention_kernel(ctx);
     let _ = attention_row_kernel(ctx);
+    let _ = attention_warp_kernel(ctx);
+    let _ = kv_append_kernel(ctx);
     let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);
     let _ = rope_kernel(ctx);

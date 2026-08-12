@@ -38,7 +38,7 @@
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 
 /// `size_t` for our purposes (HIP's `size_t` is just the C `size_t`).
 type c_size_t = usize;
@@ -297,6 +297,22 @@ impl HipRuntime {
     /// Returns `(blob_bytes, log)` on failure so the caller can
     /// surface diagnostics through `log_fallback`.
     pub fn hiprtc_compile_to_hsaco(&self, src: &str, name: &str) -> Result<Vec<u8>, String> {
+        self.hiprtc_compile_to_hsaco_for(src, name, rocm_target_arch().as_deref())
+    }
+
+    /// [`hiprtc_compile_to_hsaco`](Self::hiprtc_compile_to_hsaco) targeting an
+    /// explicit arch instead of the resolved one.
+    ///
+    /// Exists so a failed load can be retried against another candidate: arch
+    /// resolution reads `rocm_agent_enumerator` (HSA, *physical* order) while
+    /// the code object is loaded onto a HIP device, and those two orderings
+    /// need not agree on a mixed-arch box.
+    pub fn hiprtc_compile_to_hsaco_for(
+        &self,
+        src: &str,
+        name: &str,
+        arch: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
         let src_c = CString::new(src).map_err(|e| e.to_string())?;
         let name_c = CString::new(name).map_err(|e| e.to_string())?;
 
@@ -306,9 +322,7 @@ impl HipRuntime {
         // `hipErrorNoBinaryForGpu` (209) at `hipModuleLoadData` — observed on
         // gfx1103 APUs. Resolve it (env override wins) and pass it explicitly.
         // These backing `CString`s must outlive the compile call below.
-        let arch = rocm_target_arch();
         let mut opt_cstrs: Vec<CString> = arch
-            .as_deref()
             .and_then(|a| CString::new(format!("--offload-arch={a}")).ok())
             .into_iter()
             .collect();
@@ -353,9 +367,13 @@ impl HipRuntime {
                 let mut log = vec![0u8; log_size];
                 (self.hiprtc_get_log)(prog, log.as_mut_ptr() as *mut c_char);
                 let _ = (self.hiprtc_destroy)(&mut prog);
-                let log_str = CStr::from_bytes_with_nul(&log)
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| "<corrupt log>".to_string());
+                // `from_bytes_with_nul` demands EXACTLY one trailing nul, which
+                // hipRTC's buffer does not guarantee (it may be unterminated, or
+                // padded with several). It therefore failed for every real
+                // compile error and printed "<corrupt log>", hiding the actual
+                // compiler diagnostic. Cut at the first nul and lossy-decode.
+                let end = log.iter().position(|&b| b == 0).unwrap_or(log.len());
+                let log_str = String::from_utf8_lossy(&log[..end]).into_owned();
                 return Err(format!("hiprtcCompileProgram: {compile_status}\n{log_str}"));
             }
 
@@ -387,7 +405,62 @@ impl HipRuntime {
 ///      (cached for the process).
 ///   4. `None` — compile with no `--offload-arch` (legacy behaviour; lets
 ///      a host whose hipRTC default already matches keep working).
+/// The arch a code object has actually been observed to load on this device.
+///
+/// Set once, the first time a load succeeds after arch resolution guessed
+/// wrong. From then on it wins over detection, so exactly one kernel pays the
+/// recompile rather than every kernel in the process.
+static PROVEN_ARCH: OnceLock<String> = OnceLock::new();
+
+/// Record an arch that `hipModuleLoadData` accepted.
+pub(crate) fn note_proven_arch(arch: &str) {
+    let _ = PROVEN_ARCH.set(arch.to_string());
+}
+
+/// The arch proven to load, if one has been.
+pub(crate) fn proven_arch() -> Option<String> {
+    PROVEN_ARCH.get().cloned()
+}
+
+/// Every GPU arch the ROCm tools report, in physical device order.
+///
+/// Used as the retry set when the resolved arch is rejected by the device.
+pub(crate) fn candidate_archs() -> Vec<String> {
+    for cmd in [
+        "rocm_agent_enumerator",
+        "/opt/rocm/bin/rocm_agent_enumerator",
+        "rocminfo",
+        "/opt/rocm/bin/rocminfo",
+    ] {
+        if let Ok(out) = std::process::Command::new(cmd).output() {
+            if out.status.success() {
+                let archs = all_gfx_tokens(&String::from_utf8_lossy(&out.stdout));
+                if !archs.is_empty() {
+                    let mut seen = Vec::new();
+                    for a in archs {
+                        if !seen.contains(&a) {
+                            seen.push(a);
+                        }
+                    }
+                    return seen;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
 pub fn rocm_target_arch() -> Option<String> {
+    // An arch the device has *already accepted* outranks every hint below,
+    // including the env overrides. It is only ever set after a successful
+    // `hipModuleLoadData`, so it is observed fact rather than inference — and
+    // when an override is correct this is simply equal to it. Checking it
+    // first is also what makes the retry pay for itself: without this, a
+    // process with a wrong `RLX_ROCM_ARCH` would re-run the probe for every
+    // single kernel instead of just the first.
+    if let Some(a) = proven_arch() {
+        return Some(a);
+    }
     if let Ok(a) = std::env::var("RLX_ROCM_ARCH") {
         let a = a.trim();
         if !a.is_empty() {
@@ -534,6 +607,9 @@ pub struct HipKernel {
     rt: Arc<HipRuntime>,
     pub module: HipModule,
     pub function: HipFunction,
+    /// Parameters the `__global__` signature declares, parsed from the source
+    /// this was compiled from. `None` when it could not be determined.
+    pub expected_params: Option<usize>,
 }
 
 // HIP module + function handles are opaque pointers. The HIP runtime
@@ -566,7 +642,62 @@ impl HipKernel {
                 rt: rt.clone(),
                 module,
                 function,
+                expected_params: None,
             })
+        }
+    }
+
+    /// Attach the parameter count parsed from the source this was compiled
+    /// from, enabling the [`Self::launch_checked`] arity check.
+    #[must_use]
+    pub fn with_expected_params(mut self, n: Option<usize>) -> Self {
+        self.expected_params = n;
+        self
+    }
+
+    /// Launch from a slice, so the argument count is known.
+    ///
+    /// `hipModuleLaunchKernel` takes a bare `void**` and reads exactly as many
+    /// pointers as the compiled kernel declares — it cannot tell how long the
+    /// caller's array is. Too few and it reads past the end; too many and the
+    /// tail is ignored. Neither faults reliably; the usual symptom is a kernel
+    /// that runs and writes nothing. Taking a slice makes the length available,
+    /// and with `RLX_GPU_VALIDATE_PARAMS=1` it is checked against the kernel's
+    /// own signature before the launch rather than debugged afterwards.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::launch`], minus the length obligation: element types
+    /// must still match the signature and the pointees outlive the call.
+    pub unsafe fn launch_checked(
+        &self,
+        stream: HipStream,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem_bytes: u32,
+        kernel_params: &mut [*mut c_void],
+    ) -> Result<(), HipError> {
+        if let Some(expected) = self.expected_params
+            && expected != kernel_params.len()
+            && rlx_ir::env::flag("RLX_GPU_VALIDATE_PARAMS")
+        {
+            panic!(
+                "rlx-rocm: launching a kernel with {} argument(s) but its __global__ \
+                 signature declares {expected}. hipModuleLaunchKernel reads exactly \
+                 {expected} pointers regardless, so this reads past the end of the \
+                 argument array (or silently drops the tail) — typically surfacing as a \
+                 kernel that completes having written nothing.",
+                kernel_params.len()
+            );
+        }
+        unsafe {
+            self.launch(
+                stream,
+                grid,
+                block,
+                shared_mem_bytes,
+                kernel_params.as_mut_ptr(),
+            )
         }
     }
 

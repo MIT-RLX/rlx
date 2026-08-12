@@ -193,6 +193,18 @@ fn fix_import_sequence_axis(graph: &mut Graph) {
     }
 }
 
+/// Extract a human-readable message from a `catch_unwind` panic payload
+/// (`panic!("..")` / `assert!` produce `&str` or `String`).
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 impl CompilePipeline {
     pub fn new(target: FusionTarget) -> Self {
         let mut opts = match target {
@@ -214,11 +226,45 @@ impl CompilePipeline {
         self
     }
 
-    /// HIR → MIR (block lowering only).
+    /// HIR → MIR (block lowering only). **Panic-isolated** (see `compile_hir`):
+    /// `lower_hir` is also called directly (bypassing `compile_hir`) from parallel
+    /// model-build threads, and the `debug_assert_graph!` verifier `panic!`s on an
+    /// invalid graph — catch it here so it returns [`LowerError::Panicked`] rather
+    /// than unwinding into a caller thread and aborting the process.
     pub fn lower_hir(hir: HirModule) -> Result<MirModule, rlx_ir::hir::LowerError> {
+        let name = hir.name.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::lower_hir_inner(hir)))
+        {
+            Ok(r) => r,
+            Err(payload) => Err(rlx_ir::hir::LowerError::Panicked {
+                message: format!("lower of '{name}': {}", panic_payload_message(&payload)),
+            }),
+        }
+    }
+
+    fn lower_hir_inner(hir: HirModule) -> Result<MirModule, rlx_ir::hir::LowerError> {
         let mut mir = hir.lower_to_mir()?;
         rlx_ir::dynamic::sync_graph_shapes(mir.as_graph_mut());
-        debug_assert_graph!(mir.as_graph(), "hir→mir");
+        // Validate the lowered graph. This used to be `debug_assert_graph!`, which
+        // `panic!`s — but callers lower graphs on parallel threads where the panic
+        // can't unwind (`__rust_start_panic` fails → hard process abort, which even
+        // `catch_unwind` can't intercept). Return the verifier failure as an error
+        // instead, so an invalid model graph is a recoverable compile error rather
+        // than a daemon crash. Debug-only, matching the old assert's cost profile.
+        #[cfg(debug_assertions)]
+        {
+            let errors = rlx_ir::verify::verify_all(mir.as_graph());
+            if !errors.is_empty() {
+                let msg = errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n  ");
+                return Err(rlx_ir::hir::LowerError::Panicked {
+                    message: format!("IR verifier failed at `hir→mir`:\n  {msg}"),
+                });
+            }
+        }
         Ok(mir)
     }
 
@@ -410,7 +456,27 @@ impl CompilePipeline {
     }
 
     /// HIR → LIR in one call with fusion report.
+    /// Compile HIR → planned result. **Panic-isolated**: any panic during
+    /// compilation (notably a `debug_assert_valid!` graph check firing on an
+    /// invalid model graph) is caught and returned as
+    /// [`LowerError::Panicked`](rlx_ir::hir::LowerError::Panicked) instead of
+    /// unwinding into the caller. Callers routinely compile many graphs on
+    /// parallel threads (e.g. TTS model build); an escaping panic there aborts
+    /// the whole process ("failed to initiate panic"), so we contain it at the
+    /// compile boundary — below any FFI/thread frame — where the unwind is clean.
     pub fn compile_hir(&self, hir: HirModule) -> Result<CompileResult, rlx_ir::hir::LowerError> {
+        let name = hir.name.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.compile_hir_inner(hir)))
+        {
+            Ok(r) => r,
+            Err(payload) => {
+                let message = format!("compile of '{name}': {}", panic_payload_message(&payload));
+                Err(rlx_ir::hir::LowerError::Panicked { message })
+            }
+        }
+    }
+
+    fn compile_hir_inner(&self, hir: HirModule) -> Result<CompileResult, rlx_ir::hir::LowerError> {
         if rlx_ir::env::var("RLX_IR_DUMP").is_some() {
             let name = hir.name.clone();
             let dump = crate::inspect::inspect_pipeline(self, hir.clone())?;

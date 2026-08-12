@@ -13,12 +13,12 @@ use rlx_splat::reference::native_prep::prepare_raster_from_slices;
 #[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
 fn dispatch_prep(
     prep: &rlx_splat::reference::native_prep::PreparedRaster,
-    arena_buffer: &metal::Buffer,
+    arena_buffer: &crate::mtl::Buffer,
     dst_byte_off: u64,
 ) {
     let dev = metal_device().expect("Metal device required");
     let k = kernels();
-    rlx_splat::backends::metal::dispatch_prepared_raster(
+    rlx_splat::backends::crate::mtl::dispatch_prepared_raster(
         &dev.device,
         &dev.queue,
         &k.gaussian_splat_rasterize,
@@ -55,7 +55,7 @@ pub unsafe fn execute_gaussian_splat_render_native(
     transmittance_threshold: f32,
     max_list_entries: u32,
     arena_base: *mut u8,
-    arena_buffer: &metal::Buffer,
+    arena_buffer: &crate::mtl::Buffer,
 ) {
     let sl = |off: usize, len: usize| {
         std::slice::from_raw_parts((arena_base as *const u8).add(off) as *const f32, len)
@@ -98,7 +98,7 @@ pub unsafe fn execute_gaussian_splat_rasterize_native(
     transmittance_threshold: f32,
     max_list_entries: u32,
     arena_base: *mut u8,
-    arena_buffer: &metal::Buffer,
+    arena_buffer: &crate::mtl::Buffer,
 ) {
     let packed = std::slice::from_raw_parts(
         (arena_base as *const u8).add(prep_off) as *const f32,

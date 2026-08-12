@@ -6,7 +6,8 @@
 
 #![allow(unused_imports)]
 
-use crate::pass::Pass;
+use crate::analysis::{AnalysisManager, LazyUseCounts, OpKindIndex, UseCounts};
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ use crate::graph_rewrite::Rewriter;
 // ── Pass 1: MatMul + Bias + Activation → FusedMatMulBiasAct ─────────────
 
 use super::*;
+use rlx_ir::OpKind;
 
 /// Fuses `matmul(QKV) → narrow(Q,K,V) → [rope] → attention → matmul(out)`
 /// into a single FusedAttentionBlock when batch*seq is small.
@@ -60,16 +62,20 @@ impl FuseAttentionBlock {
     }
 }
 
-impl Pass for FuseAttentionBlock {
-    fn name(&self) -> &str {
-        "fuse_attention_block"
-    }
+impl FuseAttentionBlock {
+    /// The pass body, parameterised over where its use-counts come from.
+    ///
+    /// `shared` carries the pipeline-wide relation when one is cached, so a
+    /// run of ~20 fusion passes builds it once rather than once per pass.
+    /// `None` falls back to a deferred per-pass build, which is what a direct
+    /// `pass.run(graph)` call gets.
+    fn fuse_with(&self, graph: Graph, shared: Option<&UseCounts>) -> PassResult {
+        let uses = LazyUseCounts::from_shared(shared, &graph);
 
-    fn run(&self, graph: Graph) -> Graph {
         // Bail when graph input shape is too large to benefit (the L1-resident
         // / single-dispatch win disappears once Q/K/V no longer fit on-chip).
         if !Self::should_fuse(&graph) {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         // We rewrite the chain
@@ -175,9 +181,9 @@ impl Pass for FuseAttentionBlock {
                 continue;
             }
             // Narrows must be single-consumer to be safely consumed.
-            if graph.use_count(q) != 1
-                || graph.use_count(k) != 1
-                || graph.use_count(v) != 1
+            if uses.use_count(q) != 1
+                || uses.use_count(k) != 1
+                || uses.use_count(v) != 1
                 || is_output.contains_key(&q)
                 || is_output.contains_key(&k)
                 || is_output.contains_key(&v)
@@ -193,12 +199,12 @@ impl Pass for FuseAttentionBlock {
             };
             // The QKV MM must have exactly the three narrows as consumers and
             // must not be a graph output itself.
-            if graph.use_count(qp) != 3 || is_output.contains_key(&qp) {
+            if uses.use_count(qp) != 3 || is_output.contains_key(&qp) {
                 continue;
             }
 
             // Find the OutProj consumer of the Attention.
-            if graph.use_count(node.id) != 1 || is_output.contains_key(&node.id) {
+            if uses.use_count(node.id) != 1 || is_output.contains_key(&node.id) {
                 continue;
             }
             let out_consumer_id = match graph
@@ -242,7 +248,7 @@ impl Pass for FuseAttentionBlock {
         }
 
         if matches.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         // Index matches by the out-projection node id so we can swap it in-place.
@@ -283,7 +289,40 @@ impl Pass for FuseAttentionBlock {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
+    }
+}
+
+impl Pass for FuseAttentionBlock {
+    // Required by construction: the scan matches `Op::Attention` and nothing else.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Attention]
+    }
+
+    fn name(&self) -> &str {
+        "fuse_attention_block"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        self.fuse_with(graph, None).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
+        if !self.can_fire(&graph) {
+            return PassResult::unchanged(graph);
+        }
+        self.fuse_with(graph, None)
+    }
+
+    fn run_with_analyses(&self, graph: Graph, analyses: &mut AnalysisManager) -> PassResult {
+        // Answer the trigger check from the shared op-kind index first: a pass
+        // whose anchor op is absent must not even pay for the use relation.
+        let triggers = self.trigger_kinds();
+        if !triggers.is_empty() && !analyses.get::<OpKindIndex>(&graph).contains_any(triggers) {
+            return PassResult::unchanged(graph);
+        }
+        let shared = analyses.get::<UseCounts>(&graph);
+        self.fuse_with(graph, Some(shared))
     }
 }
 

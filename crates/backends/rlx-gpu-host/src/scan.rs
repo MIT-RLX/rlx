@@ -136,8 +136,26 @@ impl HostTensorCache {
         } else {
             self.dirty.remove(&byte_off);
         }
-        self.map
-            .insert(byte_off, std::sync::Arc::<[f32]>::from(data));
+        // Preserve a longer entry's tail. The cache is keyed by byte offset,
+        // but *views alias their parent's slot*: a `Narrow(start=0)` of a
+        // concat has the parent's exact offset. Replacing outright means the
+        // shorter view write destroys the parent's mirror beyond its own
+        // length, and a sibling view at an interior offset — `Narrow(start=6)`
+        // reading parent+144 — then finds nothing in the cache, nothing dirty
+        // to flush, and reads a device region the deferred parent never wrote:
+        // zeros, which propagate until the whole graph output is zero.
+        //
+        // The arena bytes past `data` are unchanged by this write, so the
+        // mirror must keep showing them.
+        let merged: std::sync::Arc<[f32]> = match self.map.get(&byte_off) {
+            Some(prev) if prev.len() > data.len() => {
+                let mut v = prev.to_vec();
+                v[..data.len()].copy_from_slice(&data);
+                std::sync::Arc::from(v)
+            }
+            _ => std::sync::Arc::<[f32]>::from(data),
+        };
+        self.map.insert(byte_off, merged);
     }
 
     /// Write all deferred host outputs to the device (call before a GPU pass).
@@ -374,4 +392,50 @@ pub fn run_indexing<A: DeviceArena>(
     let (dst_old, dst_nbytes) = indexing_thunk_dst_region(&inner);
     let dst_packed = packed_region_off(&regions, &packed_at, dst_old);
     htod_bytes(a, dst_old, &host[dst_packed..dst_packed + dst_nbytes]);
+}
+
+#[cfg(test)]
+mod host_cache_tests {
+    use super::HostTensorCache;
+
+    /// A shorter write at the same offset must not truncate a longer entry.
+    ///
+    /// The cache is keyed by byte offset, but *views alias their parent's slot*:
+    /// `Narrow(start=0)` of a concat carries the parent's exact offset. If the
+    /// view's write replaced the entry outright, the parent's mirror beyond the
+    /// view's length would be lost — and a sibling view at an interior offset
+    /// (`Narrow(start=6)`, i.e. parent + 144 B) would then miss the cache, find
+    /// nothing dirty to flush, and read a device region the deferred parent
+    /// never wrote. That returned zeros, which propagated until the whole graph
+    /// output was zero: the `logeig`/`reeig`/`biquad`/`iirfilt` failures on
+    /// discrete Vulkan, where these ops all run on the host.
+    #[test]
+    fn shorter_write_preserves_a_longer_entrys_tail() {
+        let mut c = HostTensorCache::new();
+        // Parent: 8 elements at offset 4896.
+        c.insert(4896, (0..8).map(|i| i as f32).collect(), true);
+        // View of its first half, same offset — must not drop elements 4..8.
+        c.insert(4896, vec![100.0, 101.0, 102.0, 103.0], true);
+
+        let got = c.get_arc(4896).expect("entry still present");
+        assert_eq!(
+            &got[..],
+            &[100.0, 101.0, 102.0, 103.0, 4.0, 5.0, 6.0, 7.0],
+            "shorter write truncated the parent's mirror"
+        );
+        // The interior read a sibling view performs must still be satisfied.
+        assert!(
+            c.get_arc_covering(4896, 8).is_some(),
+            "parent no longer covers its full length"
+        );
+    }
+
+    /// A longer write at the same offset legitimately replaces the entry.
+    #[test]
+    fn longer_write_replaces_wholesale() {
+        let mut c = HostTensorCache::new();
+        c.insert(64, vec![1.0, 2.0], true);
+        c.insert(64, vec![9.0, 8.0, 7.0], true);
+        assert_eq!(&c.get_arc(64).unwrap()[..], &[9.0, 8.0, 7.0]);
+    }
 }

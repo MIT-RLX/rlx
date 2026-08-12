@@ -20,22 +20,22 @@ use crate::device::{
 };
 use crate::kernels::{
     ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, attention_row_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
-    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
-    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_kernel,
-    compare_kernel, concat_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel,
-    conv2d_kernel, conv3d_kernel, copy_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel, dispatch_grid_1d,
-    dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
-    fake_quantize_backward_kernel, fake_quantize_ema_kernel, fake_quantize_fixed_kernel,
-    fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
-    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, fused_attn_kernel,
-    fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
-    fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
-    group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
-    group_norm_kernel, grouped_matmul_kernel, gru_kernel, im2col_kernel,
-    layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
+    attention_kernel, attention_row_kernel, attention_warp_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
+    batch_norm_inference_kernel, binary_kernel, compare_kernel, concat_kernel,
+    conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel,
+    copy_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    dequant_matmul_mlx_kernel, dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
+    elementwise_region_kernel, expand_kernel, fake_quantize_backward_kernel,
+    fake_quantize_ema_kernel, fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel,
+    fake_quantize_lsq_bwd_x_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
+    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
+    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
+    gather_backward_kernel, gather_kernel, group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel,
+    group_norm_bwd_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
+    im2col_kernel, layer_norm_bwd_gamma_kernel, layer_norm_bwd_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, mamba2_kernel, matmul_epilogue_kernel, matmul_kernel, matmul_wmma_kernel,
     maxpool2d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
     quantize_i8_kernel, reduce_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
@@ -2314,6 +2314,7 @@ pub(crate) fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = expand_kernel(ctx);
     let _ = attention_kernel(ctx);
     let _ = attention_row_kernel(ctx);
+    let _ = attention_warp_kernel(ctx);
     let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);
     let _ = rope_kernel(ctx);

@@ -2005,12 +2005,16 @@ impl ThunkSchedule {
                 }
 
                 Op::GroupedMatMul => {
-                    let in_shape = &graph.node(node.inputs[0]).shape;
-                    let w_shape = &graph.node(node.inputs[1]).shape;
-                    let m = in_shape.dim(in_shape.rank() - 2).unwrap_static();
-                    let k_dim = in_shape.dim(in_shape.rank() - 1).unwrap_static();
-                    let num_experts = w_shape.dim(0).unwrap_static();
-                    let n = w_shape.dim(2).unwrap_static();
+                    // Checked, not trusted: `n` comes off the expert bank while the
+                    // output slot is sized from `node.shape`, so a bank still in
+                    // `[E, N, K]` order silently under- or over-writes it.
+                    let gd = rlx_ir::shape::grouped_matmul_dims(
+                        &graph.node(node.inputs[0]).shape,
+                        &graph.node(node.inputs[1]).shape,
+                        Some(&node.shape),
+                    )
+                    .unwrap_or_else(|e| panic!("rlx-metal: node {:?}: {e}", node.id));
+                    let (m, k_dim, n, num_experts) = (gd.m, gd.k, gd.n, gd.num_experts);
                     Thunk::GroupedMatMul {
                         input: off(node.inputs[0]),
                         weight: off(node.inputs[1]),

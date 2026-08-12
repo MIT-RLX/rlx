@@ -36,6 +36,15 @@ pub fn post_fusion_cleanup(graph: Graph, options: &CompileOptions) -> Graph {
 
 fn post_specialize_cleanup(graph: Graph, options: &CompileOptions) -> Graph {
     let mut graph = rlx_opt::AlgebraicSimplify.run(graph);
+    // Sparse conditional constant propagation. Runs after `AlgebraicSimplify`
+    // (which manufactures constants via `mul(x, 0)` and friends) and before
+    // `DeadCodeElimination` (which then collects the branch a resolved `Where`
+    // no longer selects). It reaches what neither the folder nor the algebraic
+    // rules can: a `Where` whose predicate is constant but whose arms are not.
+    // `RLX_DISABLE_SCCP=1` opts out for A/B, mirroring `RLX_DISABLE_CSE`.
+    if options.constant_folding && rlx_ir::env::var("RLX_DISABLE_SCCP").as_deref() != Some("1") {
+        graph = rlx_opt::rlx_compile::sccp::SCCPPass.run(graph);
+    }
     // Value-number away structurally-identical nodes (bit-exact). Backward graphs
     // are the big beneficiary — reverse-mode AD re-emits the same subexpression
     // per use, e.g. multi-stage weight synthesis recomputes `upstreamᵀ·x` (a

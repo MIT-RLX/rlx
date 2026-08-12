@@ -19,6 +19,7 @@
 //! returns `None`, so the two never conflict.
 
 use crate::DeadCodeElimination;
+use rlx_fusion::analysis::{Analysis, UseCounts};
 use rlx_fusion::pass::Pass;
 use rlx_ir::{Graph, NodeId, Op};
 use std::collections::{HashMap, HashSet};
@@ -26,17 +27,11 @@ use std::collections::{HashMap, HashSet};
 /// Ops whose output is NOT a deterministic function of their inputs (RNG /
 /// sampling). Treated as dynamic roots so their cone is never hoisted.
 fn is_nondeterministic(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Sample { .. } | Op::RngNormal { .. } | Op::RngUniform { .. }
-    )
+    op.is_nondeterministic()
 }
 
 fn is_leaf(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Param { .. } | Op::Constant { .. } | Op::Input { .. }
-    )
+    op.is_leaf()
 }
 
 /// Result of a param-invariant split.
@@ -72,13 +67,14 @@ pub fn split_param_invariant(graph: &Graph) -> Option<HoistSplit> {
     // 2. Boundary = COMPUTED invariant node (not a leaf) consumed by a dynamic
     //    node, or that is itself a graph output.
     let out_set: HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    // `Graph::users` scans every node to answer for one node, and this filter
+    // asks for *every* node — O(n²). Build the relation once instead.
+    let uses = UseCounts::compute(graph);
     let boundary_ids: Vec<NodeId> = graph
         .nodes()
         .iter()
         .filter(|n| !dynamic.contains(&n.id) && !is_leaf(&n.op))
-        .filter(|n| {
-            out_set.contains(&n.id) || graph.users(n.id).iter().any(|u| dynamic.contains(u))
-        })
+        .filter(|n| out_set.contains(&n.id) || uses.users(n.id).iter().any(|u| dynamic.contains(u)))
         .map(|n| n.id)
         .collect();
     if boundary_ids.is_empty() {

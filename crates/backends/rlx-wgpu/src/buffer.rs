@@ -386,9 +386,32 @@ pub fn raw_weight_off(off: usize) -> usize {
     off & !WEIGHT_BUF_TAG
 }
 
+/// Whether this device runs Expand/Concat/Transpose/Narrow on the *host*.
+///
+/// Mirrors `lower::wgpu_prefer_structure_host`'s device-level conditions. Host
+/// structural steps are deferred — their arena write lands at a later flush —
+/// so the planner has to keep those slots reserved. Without it a subsequent GPU
+/// op takes the slot and the deferred write corrupts whatever now owns it,
+/// nondeterministically, and only on backends that host: Metal keeps these on
+/// the GPU, which is why it presented as a family of Vulkan-only DSP/eig/pad
+/// bugs rather than one allocator issue.
+fn hosts_structural_ops() -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
+        return false;
+    }
+    rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") || crate::device::coop_discrete_backend()
+}
+
+/// Tell the planner about it before every plan — the device is resolved lazily,
+/// so this cannot be done once at startup.
+fn note_structural_hosting() {
+    rlx_compile::memory::set_pin_host_structure(hosts_structural_ops());
+}
+
 /// Plan memory using f32-sized slots regardless of declared IR dtype,
 /// with liveness-aware slot reuse (see `rlx_compile::memory::plan_memory_f32_uniform`).
 pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
+    note_structural_hosting();
     rlx_compile::memory::plan_memory_f32_uniform(graph, align)
 }
 
@@ -396,6 +419,7 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
 /// byte width (bf16/f16 = 2 B). For a uniformly low-precision graph whose kernels
 /// all run native dtypes; do NOT use when bool/int activations widen to f32.
 pub fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
+    note_structural_hosting();
     rlx_compile::memory::plan_memory_native(graph, align)
 }
 
@@ -404,6 +428,7 @@ pub fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
 /// mixed-precision wgpu graph (e.g. a packed bf16 LM head + bf16 hidden states)
 /// halve those slots while bool/int activations stay f32-safe.
 pub fn plan_hybrid(graph: &Graph, align: usize) -> MemoryPlan {
+    note_structural_hosting();
     rlx_compile::memory::plan_memory_hybrid(graph, align)
 }
 

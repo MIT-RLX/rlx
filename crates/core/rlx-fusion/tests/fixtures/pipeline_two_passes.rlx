@@ -1,0 +1,19 @@
+// Passes run in the order given: lower_fma first, then the bias+act fusion
+// picks up the Add it produced.
+// RUN: lower_fma, fuse_matmul_bias_act
+graph @two {
+  %0 = {"Input":{"name":"x"}} : [4, 16] f32
+  %1 = {"Param":{"name":"w"}} : [16, 16] f32
+  %2 = {"Param":{"name":"b"}} : [16] f32
+  %3 = MatMul(%0, %1) : [4, 16] f32
+  %4 = {"Binary":"Add"}(%3, %2) : [4, 16] f32
+  return %4
+}
+// EXPECT
+graph @two {
+  %0 = {"Input":{"name":"x"}} : [4, 16] f32
+  %1 = {"Param":{"name":"w"}} : [16, 16] f32
+  %2 = {"Param":{"name":"b"}} : [16] f32
+  %3 = {"FusedMatMulBiasAct":{"activation":null}}(%0, %1, %2) : [4, 16] f32
+  return %3
+}

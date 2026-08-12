@@ -212,7 +212,7 @@ fn cpu_gated_delta_net_resets_state_between_batches() {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_gated_delta_net_host_matches_cpu_n128() {
     // Default Metal path uses CPU GDN unless RLX_METAL_GDN_NATIVE=1.
@@ -252,7 +252,7 @@ fn metal_gated_delta_net_host_matches_cpu_n128() {
     );
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_gated_delta_net_native_matches_cpu_n128() {
     // Default native path (one thread per head). Bounded inputs — a linear

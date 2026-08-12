@@ -1,0 +1,18 @@
+// Fma(a, b, c) → Add(Mul(a, b), c).
+// RUN: lower_fma
+graph @fma {
+  %0 = {"Input":{"name":"a"}} : [8] f32
+  %1 = {"Input":{"name":"b"}} : [8] f32
+  %2 = {"Input":{"name":"c"}} : [8] f32
+  %3 = Fma(%0, %1, %2) : [8] f32
+  return %3
+}
+// EXPECT
+graph @fma {
+  %0 = {"Input":{"name":"a"}} : [8] f32
+  %1 = {"Input":{"name":"b"}} : [8] f32
+  %2 = {"Input":{"name":"c"}} : [8] f32
+  %3 = {"Binary":"Mul"}(%0, %1) : [8] f32
+  %4 = {"Binary":"Add"}(%3, %2) : [8] f32
+  return %4
+}

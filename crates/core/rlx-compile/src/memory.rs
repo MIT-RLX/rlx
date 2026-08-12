@@ -362,6 +362,30 @@ fn is_static_weight_tensor(graph: &Graph, id: NodeId, memo: &mut HashMap<NodeId,
     v
 }
 
+/// Whether the active backend defers Expand/Concat/Transpose/Narrow to the host.
+///
+/// A device property, not a graph one, so it is set once by the backend at
+/// device init (`rlx_wgpu` does this for discrete Vulkan/DX12) rather than
+/// threaded through every planner entry point. `RLX_ARENA_PIN_HOST_STRUCTURE=1`
+/// forces it on for debugging.
+static PIN_HOST_STRUCTURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that this process's GPU backend runs structural ops on the host.
+///
+/// Their arena writes land at a later flush, so the planner must keep the slots
+/// reserved; without this a subsequent GPU op takes the slot and the deferred
+/// write corrupts it — nondeterministically, and only on backends that host
+/// (Metal keeps these on GPU, which is why it looked Vulkan-specific).
+pub fn set_pin_host_structure(on: bool) {
+    PIN_HOST_STRUCTURE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pin_host_structure() -> bool {
+    PIN_HOST_STRUCTURE.load(std::sync::atomic::Ordering::Relaxed)
+        || rlx_ir::env::flag("RLX_ARENA_PIN_HOST_STRUCTURE")
+}
+
 /// Keep primary data inputs alive through graph end for `Op::Custom("onnx.*")`
 /// thunks that read activations after parallel branches would otherwise reuse slots.
 fn extend_custom_op_input_liveness(
@@ -403,6 +427,33 @@ fn extend_custom_op_input_liveness(
     // `dequant_host_fallback=false`; skipping this restores slot reuse (the
     // chain-walk otherwise pins nearly every activation in a packed prefill to
     // the graph end — qwen3.5 8K packed prefill: 61.9 GB pinned vs ~4 GB reused).
+    // Same hazard, different ops: `rlx-wgpu` lowers Expand / Concat / Transpose
+    // / Narrow to *host* steps on a discrete Vulkan/DX12 backend
+    // (`wgpu_prefer_structure_host`), and those outputs "live only in the mirror
+    // until a device-reading host step or GPU pass needs them" — i.e. the arena
+    // write happens at a later flush. The planner sees them as ordinary
+    // single-step consumers, so a subsequent GPU op takes the slot and the
+    // deferred write lands on a buffer that now belongs to something else. It is
+    // nondeterministic (it depends on when the flush falls) and Vulkan-only
+    // (Metal keeps these on the GPU), which is what made it look like a family
+    // of unrelated DSP/eig/pad bugs.
+    //
+    // Gated because the pin is expensive: only a backend that actually hosts
+    // these ops should ask for it.
+    if pin_host_structure() {
+        for node in graph.nodes() {
+            if matches!(
+                &node.op,
+                Op::Expand { .. } | Op::Concat { .. } | Op::Transpose { .. } | Op::Narrow { .. }
+            ) {
+                for &input in &node.inputs {
+                    extend_node_chain_liveness_to_end(graph, ranges, input, last_step);
+                }
+                extend_node_chain_liveness_to_end(graph, ranges, node.id, last_step);
+            }
+        }
+    }
+
     if dequant_host_fallback {
         for node in graph.nodes() {
             match &node.op {
@@ -726,6 +777,32 @@ pub fn plan_memory_f32_uniform(graph: &Graph, alignment: usize) -> MemoryPlan {
 pub fn plan_memory_native(graph: &Graph, alignment: usize) -> MemoryPlan {
     let opts = MemoryPlanOptions {
         pin_output_ancestors: graph_has_host_indexing(graph),
+        ..MemoryPlanOptions::default()
+    };
+    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Native)
+}
+
+/// [`plan_memory_native`] for a **strictly in-order** backend (CPU).
+///
+/// Adds `dequant_host_fallback: false` on top of the native planner. That flag
+/// exists for GPU backends whose `Op::DequantMatMul` can fall back to a
+/// *deferred* host execution path flushed at a later sync point — there, the
+/// planner must pin each dequant matmul's activation input to graph end or a
+/// subsequent GPU op reuses the slot before the host flush reads it.
+///
+/// A CPU backend executes every thunk in schedule order and runs its dequant
+/// matmuls natively (`Thunk::DequantMatMulGguf` and friends), so nothing is ever
+/// deferred and the pin buys nothing — while costing a great deal. The
+/// chain-walk pins nearly every activation in a packed prefill to the graph end,
+/// destroying slot reuse: the gate's own note measures a qwen3.5 8K packed
+/// prefill at 61.9 GB pinned vs ~4 GB reused.
+///
+/// Same relationship to [`plan_memory_native`] as that function has to
+/// [`plan_memory_aligned`]: identical dtype widths, strictly less pinning.
+pub fn plan_memory_native_in_order(graph: &Graph, alignment: usize) -> MemoryPlan {
+    let opts = MemoryPlanOptions {
+        pin_output_ancestors: graph_has_host_indexing(graph),
+        dequant_host_fallback: false,
         ..MemoryPlanOptions::default()
     };
     plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Native)

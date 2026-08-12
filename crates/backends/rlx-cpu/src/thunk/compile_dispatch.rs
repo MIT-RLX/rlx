@@ -1383,6 +1383,22 @@ pub fn compile_thunks_with_rng(
                     })
                 }
 
+                Thunk::SgemmF16 { a, b, c, m, k, n } => {
+                    let (m, k, n) = (m as usize, k as usize, n as usize);
+                    Arc::new(move |base: *mut u8| unsafe {
+                        // b is an F16 buffer (k*n u16); dequant-on-the-fly GEMM.
+                        let b16 = sl_typed::<u16>(b, base, k * n);
+                        crate::blas::sgemm_f16_rhs(
+                            sl(a, base, m * k),
+                            b16,
+                            sl_mut(c, base, m * n),
+                            m,
+                            k,
+                            n,
+                        );
+                    })
+                }
+
                 Thunk::CgemmC64 { a, b, c, m, k, n } => {
                     let (m, k, n) = (m as usize, k as usize, n as usize);
                     Arc::new(move |base: *mut u8| unsafe {

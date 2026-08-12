@@ -6,7 +6,7 @@
 
 #![allow(unused_imports)]
 
-use crate::pass::Pass;
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -27,6 +27,10 @@ impl Pass for MarkElementwiseRegions {
     }
 
     fn run(&self, graph: Graph) -> Graph {
+        self.run_with_status(graph).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
         // Tally consumer counts for every node id.
         let mut consumers: HashMap<NodeId, usize> = HashMap::new();
         for node in graph.nodes() {
@@ -216,7 +220,7 @@ impl Pass for MarkElementwiseRegions {
             .collect();
 
         if by_region.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         // Rewrite the graph: copy non-region nodes verbatim; for each region,
@@ -371,7 +375,7 @@ impl Pass for MarkElementwiseRegions {
         // which we resolve via `external_inputs` (already correctly
         // mapped via add_fused → map_inputs). So sentinels are safe.
 
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
     }
 }
 

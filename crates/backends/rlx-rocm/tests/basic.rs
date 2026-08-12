@@ -184,6 +184,73 @@ fn gated_delta_net_matches_cpu_reference() {
     );
 }
 
+/// Single-path GGUF dequant-matmul with **n > 1**.
+///
+/// `dequant_matmul_gguf_q8k_matches_reference` below uses `n == 1`, where a
+/// row-major `[n,k]` weight and a `[k,n]` one are the *same* linear buffer —
+/// so it cannot distinguish `sgemm(N, …, lda=n)` from `sgemm(T, …, lda=k)`.
+/// A wrong-transpose bug lived in both ROCm GGUF paths behind exactly that
+/// blind spot. `n = 2` makes the layout observable.
+#[test]
+fn dequant_matmul_gguf_q8k_multi_column_matches_reference() {
+    if !rlx_rocm::is_available() {
+        return;
+    }
+    let k = QK_K;
+    let n = 2;
+    let m = 3;
+    // Two distinct expert columns so a transposed read cannot coincide.
+    let scales = [0.0625f32, -0.03125f32];
+    let mut packed = Vec::new();
+    let mut w = vec![0f32; n * k]; // row-major [n, k] — the GGUF dequant layout
+    for (col, &scale) in scales.iter().enumerate() {
+        let qs: [i8; QK_K] =
+            std::array::from_fn(|i| ((i as i32 * (col as i32 + 1)) % 251 - 128) as i8);
+        packed.extend_from_slice(&scale.to_le_bytes());
+        for &q in &qs {
+            packed.push(q as u8);
+        }
+        for _ in 0..(QK_K / 16) {
+            packed.extend_from_slice(&0i16.to_le_bytes());
+        }
+        for (kk, &q) in qs.iter().enumerate() {
+            w[col * k + kk] = scale * q as f32;
+        }
+    }
+
+    let x: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.0007 - 0.3).collect();
+    let mut expected = vec![0f32; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            let mut acc = 0f32;
+            for kk in 0..k {
+                acc += x[r * k + kk] * w[c * k + kk];
+            }
+            expected[r * n + c] = acc;
+        }
+    }
+
+    let mut g = Graph::new("dq_gguf_q8k_multi");
+    let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+    let w_param = g.param("w_q", Shape::new(&[packed.len()], DType::U8));
+    let y = g.add_node(
+        rlx_ir::Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ8K,
+        },
+        vec![x_in, w_param],
+        Shape::new(&[m, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let mut exe = RocmExecutable::compile(g);
+    exe.set_param_bytes("w_q", &packed);
+    let out = exe.run(&[("x", &x)]);
+    assert!(
+        close(&out[0], &expected, 1e-3),
+        "GGUF Q8K n>1 DequantMatMul mismatch: got {:?} want {expected:?}",
+        out[0]
+    );
+}
+
 #[test]
 fn dequant_matmul_gguf_q8k_matches_reference() {
     if !rlx_rocm::is_available() {

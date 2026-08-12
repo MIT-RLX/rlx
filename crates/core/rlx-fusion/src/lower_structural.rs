@@ -80,6 +80,12 @@ pub fn lower_trilu(g: &mut Graph, x: NodeId, upper: bool, diagonal: i64) -> Node
 pub struct LowerStructural;
 
 impl Pass for LowerStructural {
+    // Lifted from the scan `run` already performs: without these kinds
+    // the pass rebuilds the graph node-for-node and returns it unchanged.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Clamp, OpKind::Tile, OpKind::Trilu]
+    }
+
     fn name(&self) -> &str {
         "lower_structural"
     }

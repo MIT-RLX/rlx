@@ -104,6 +104,15 @@ pub const ATTENTION_CU: &str = include_str!("../kernels/attention.cu");
 pub const ATTENTION_WMMA_CU: &str = include_str!("../kernels/attention_wmma.cu");
 pub const FUSED_ATTN_CU: &str = include_str!("../kernels/fused_attn.cu");
 pub const ATTENTION_ROW_CU: &str = include_str!("../kernels/attention_row.cu");
+/// In-place KV append on the f32 arena. Output aliases input 0 via the shared
+/// memory planner, so this grows the resident cache on-device instead of
+/// re-uploading the padded cache per token.
+pub const KV_APPEND_CU: &str = include_str!("../kernels/kv_append.cu");
+/// Warp-per-row SDPA — drop-in for [`ATTENTION_ROW_CU`] (identical parameter
+/// list). One 32-lane group per (batch, head, q_row) instead of one thread, so
+/// the head-dim accumulators stay in registers instead of spilling to local
+/// memory, and decode (`seq_q == 1`) gets 32x the lanes per row.
+pub const ATTENTION_WARP_CU: &str = include_str!("../kernels/attention_warp.cu");
 pub const ATTENTION_BWD_CU: &str = include_str!("../kernels/attention_bwd.cu");
 pub const ARGMAX_CU: &str = include_str!("../kernels/argmax.cu");
 pub const ROPE_CU: &str = include_str!("../kernels/rope.cu");
@@ -203,4 +212,158 @@ pub mod rocm {
     /// Skinny-m split-K GEMV — better fallback than the tiled GEMM when a vendor
     /// BLAS is unavailable and m is small (decode under-occupies the CU array).
     pub const GEMV_SPLITK_CU: &str = include_str!("../kernels/rocm/gemv_splitk.cu");
+}
+
+/// Replace `//…` and `/*…*/` with spaces, preserving byte offsets is not
+/// required here — only that no comment text survives to be parsed.
+fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            out.push(' ');
+        } else {
+            // Multi-byte UTF-8 (comments carry λ, ∥, ²) must not be split.
+            let ch_len = src[i..].chars().next().map_or(1, |c| c.len_utf8());
+            out.push_str(&src[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+/// Number of parameters `entry`'s `__global__` signature declares in `src`.
+///
+/// CUDA and HIP both launch through a bare `void**` whose length the driver
+/// never sees: `cuLaunchKernel`/`hipModuleLaunchKernel` read exactly as many
+/// pointers as the compiled kernel expects, so passing too few reads past the
+/// end of the caller's array and passing too many silently ignores the tail.
+/// Neither is a compile error, and neither reliably faults — the usual symptom
+/// is a kernel that runs and writes nothing, or writes garbage, which is the
+/// same class of defect that made the Metal ICB path silently produce zeros.
+///
+/// The kernels are plain C (no templates, no default arguments), so counting
+/// top-level commas is exact. Returns `None` when the entry is not found —
+/// callers treat that as "cannot check" rather than as a mismatch.
+pub fn declared_param_count(src: &str, entry: &str) -> Option<usize> {
+    // Comments first. Real signatures document each parameter inline, and those
+    // comments contain both commas and parentheses — e.g.
+    // `const float* eigvec, // [batch,n,n] col-major` and `[λ(n) ∥ U(n²)]` —
+    // which a naive comma count and paren-depth scan both swallow, yielding 9
+    // for a 5-parameter kernel. That is a false positive, and a checker that
+    // cries wolf is worse than none.
+    let src = &strip_comments(src);
+    // Find `__global__ ... <entry> (`, not merely the name, so a call site or a
+    // forward declaration elsewhere in the file cannot be mistaken for it.
+    let mut from = 0usize;
+    let open = loop {
+        let g = src[from..].find("__global__")? + from;
+        let after = &src[g..];
+        let paren_rel = after.find('(')?;
+        let head = &after[..paren_rel];
+        // The token immediately before `(` must be the entry name.
+        let name = head
+            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if name == entry {
+            break g + paren_rel;
+        }
+        from = g + "__global__".len();
+    };
+
+    let bytes = src.as_bytes();
+    let mut depth = 0i32;
+    let mut commas = 0usize;
+    let mut any = false;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Empty parameter list is zero, not one.
+                    let inner = src[open + 1..i].trim();
+                    return Some(if inner.is_empty() || inner == "void" {
+                        0
+                    } else {
+                        commas + 1
+                    });
+                }
+            }
+            b',' if depth == 1 => {
+                commas += 1;
+                any = true;
+            }
+            b if !b.is_ascii_whitespace() => any = any || depth == 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod param_count_tests {
+    use super::declared_param_count;
+
+    #[test]
+    fn counts_plain_signatures() {
+        let src = "__global__ void foo(float* a, int n) {}\n\
+                   __global__ void bar(float* a) {}\n\
+                   __global__ void baz() {}\n";
+        assert_eq!(declared_param_count(src, "foo"), Some(2));
+        assert_eq!(declared_param_count(src, "bar"), Some(1));
+        assert_eq!(declared_param_count(src, "baz"), Some(0));
+        assert_eq!(declared_param_count(src, "missing"), None);
+    }
+
+    /// A name that is a suffix of another must not match it, and a call to the
+    /// kernel elsewhere in the file must not be mistaken for its declaration.
+    #[test]
+    fn does_not_confuse_similar_names_or_call_sites() {
+        let src = "__global__ void my_kernel(float* a, int n, int m) {}\n\
+                   __global__ void kernel(float* a) {}\n\
+                   void host() { my_kernel<<<1,1>>>(nullptr, 0, 0); }\n";
+        assert_eq!(declared_param_count(src, "my_kernel"), Some(3));
+        assert_eq!(declared_param_count(src, "kernel"), Some(1));
+    }
+
+    /// Inline per-parameter comments carry commas and parentheses, and a naive
+    /// scan counts them. This is `eigh_assemble` verbatim: 5 parameters, but
+    /// the comments hold 4 extra commas and unbalanced parens, which read as 9
+    /// and produced a false "argument count mismatch" on the ROCm rig.
+    #[test]
+    fn ignores_commas_and_parens_inside_comments() {
+        let src = "extern \"C\" __global__ void eigh_assemble(\n\
+             const float* __restrict__ eigvec, // [batch,n,n] col-major: eigvec[b*n*n + i + j*n] = comp i of eigvec j\n\
+             const float* __restrict__ eigval, // [batch,n] ascending\n\
+             float* __restrict__ out,          // [batch, n*n+n] packed: [\u{3bb}(n) \u{2225} U(n\u{b2}) row-major]\n\
+             int n, int batch)\n{\n}\n";
+        assert_eq!(declared_param_count(src, "eigh_assemble"), Some(5));
+    }
+
+    /// Block comments too, including one that opens a paren it never closes.
+    #[test]
+    fn ignores_block_comments() {
+        let src = "__global__ void k(float* a, /* shape (n, m) */ int n) {}\n";
+        assert_eq!(declared_param_count(src, "k"), Some(2));
+    }
+
+    /// Real signatures wrap across lines and use qualifiers.
+    #[test]
+    fn handles_multiline_and_qualifiers() {
+        let src = "extern \"C\" __global__ void wide(\n    const float* __restrict__ a,\n\
+                   \n    float* out,\n    unsigned int n)\n{\n}\n";
+        assert_eq!(declared_param_count(src, "wide"), Some(3));
+    }
 }

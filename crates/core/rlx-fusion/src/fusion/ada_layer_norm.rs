@@ -4,8 +4,10 @@
 
 //! Fuse DiT adaLN-Zero `norm(x)·(1+scale)+shift` into [`Op::AdaLayerNorm`].
 
+use crate::analysis::{AnalysisManager, LazyUseCounts, OpKindIndex, UseCounts};
 use crate::graph_rewrite::Rewriter;
-use crate::pass::Pass;
+use crate::pass::{Pass, PassResult};
+use rlx_ir::OpKind;
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -24,12 +26,16 @@ use std::collections::HashMap;
 /// ```
 pub struct FuseAdaLayerNorm;
 
-impl Pass for FuseAdaLayerNorm {
-    fn name(&self) -> &str {
-        "fuse_ada_layer_norm"
-    }
+impl FuseAdaLayerNorm {
+    /// The pass body, parameterised over where its use-counts come from.
+    ///
+    /// `shared` carries the pipeline-wide relation when one is cached, so a
+    /// run of ~20 fusion passes builds it once rather than once per pass.
+    /// `None` falls back to a deferred per-pass build, which is what a direct
+    /// `pass.run(graph)` call gets.
+    fn fuse_with(&self, graph: Graph, shared: Option<&UseCounts>) -> PassResult {
+        let uses = LazyUseCounts::from_shared(shared, &graph);
 
-    fn run(&self, graph: Graph) -> Graph {
         let mut is_output: HashMap<NodeId, ()> = HashMap::new();
         for &oid in &graph.outputs {
             is_output.insert(oid, ());
@@ -40,7 +46,7 @@ impl Pass for FuseAdaLayerNorm {
         let mut fused_away: HashMap<NodeId, ()> = HashMap::new();
 
         for node in graph.nodes() {
-            if let Some(m) = try_match_ada(&graph, node, &is_output) {
+            if let Some(m) = try_match_ada(&graph, &uses, node, &is_output) {
                 for &id in &m.interior {
                     fused_away.insert(id, ());
                 }
@@ -48,6 +54,13 @@ impl Pass for FuseAdaLayerNorm {
             }
         }
 
+        // Nothing matched: hand back the original graph instead of rebuilding
+        // it node-for-node into an identical copy. On a graph that merely
+        // *contains* this pass's anchor op without the full pattern, that
+        // rebuild was the pass's entire cost.
+        if matches.is_empty() {
+            return PassResult::unchanged(graph);
+        }
         let mut rw = Rewriter::new(&graph.name);
         for node in graph.nodes() {
             if fused_away.contains_key(&node.id) {
@@ -71,7 +84,40 @@ impl Pass for FuseAdaLayerNorm {
             }
             rw.copy_node(node);
         }
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
+    }
+}
+
+impl Pass for FuseAdaLayerNorm {
+    // Required by construction: `affine_free_norm` only accepts a LayerNorm or RmsNorm at the centre of the pattern.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::LayerNorm, OpKind::RmsNorm]
+    }
+
+    fn name(&self) -> &str {
+        "fuse_ada_layer_norm"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        self.fuse_with(graph, None).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
+        if !self.can_fire(&graph) {
+            return PassResult::unchanged(graph);
+        }
+        self.fuse_with(graph, None)
+    }
+
+    fn run_with_analyses(&self, graph: Graph, analyses: &mut AnalysisManager) -> PassResult {
+        // Answer the trigger check from the shared op-kind index first: a pass
+        // whose anchor op is absent must not even pay for the use relation.
+        let triggers = self.trigger_kinds();
+        if !triggers.is_empty() && !analyses.get::<OpKindIndex>(&graph).contains_any(triggers) {
+            return PassResult::unchanged(graph);
+        }
+        let shared = analyses.get::<UseCounts>(&graph);
+        self.fuse_with(graph, Some(shared))
     }
 }
 
@@ -86,41 +132,64 @@ struct Match {
     interior: Vec<NodeId>,
 }
 
-fn try_match_ada(graph: &Graph, out: &Node, is_output: &HashMap<NodeId, ()>) -> Option<Match> {
+fn try_match_ada(
+    graph: &Graph,
+    uses: &LazyUseCounts,
+    out: &Node,
+    is_output: &HashMap<NodeId, ()>,
+) -> Option<Match> {
     if !matches!(out.op, Op::Binary(BinaryOp::Add)) || out.inputs.len() != 2 {
         return None;
     }
     // Prefer form: Add(scaled, shift) where scaled = Mul(n, (1+scale))
     // or Add(m, shift) where m = Add(n, Mul(n, scale)).
     let (scaled_or_m, shift_side) = (out.inputs[0], out.inputs[1]);
-    if let Some(m) = match_shift_add(graph, out.id, scaled_or_m, shift_side, is_output) {
+    if let Some(m) = match_shift_add(graph, uses, out.id, scaled_or_m, shift_side, is_output) {
         return Some(m);
     }
-    match_shift_add(graph, out.id, shift_side, scaled_or_m, is_output)
+    match_shift_add(graph, uses, out.id, shift_side, scaled_or_m, is_output)
 }
 
 fn match_shift_add(
     graph: &Graph,
+    uses: &LazyUseCounts,
     out_id: NodeId,
     scaled_id: NodeId,
     shift_id: NodeId,
     is_output: &HashMap<NodeId, ()>,
 ) -> Option<Match> {
-    if is_output.contains_key(&scaled_id) || graph.use_count(scaled_id) != 1 {
+    if is_output.contains_key(&scaled_id) || uses.use_count(scaled_id) != 1 {
         return None;
     }
     let (shift, shift_expand) = peel_expand(graph, shift_id);
 
     // Form A: Mul(n, one_plus_scale)
-    if let Some(m) = match_mul_one_plus(graph, out_id, scaled_id, shift, shift_expand, is_output) {
+    if let Some(m) = match_mul_one_plus(
+        graph,
+        uses,
+        out_id,
+        scaled_id,
+        shift,
+        shift_expand,
+        is_output,
+    ) {
         return Some(m);
     }
     // Form B: Add(n, Mul(n, scale))
-    match_identity_form(graph, out_id, scaled_id, shift, shift_expand, is_output)
+    match_identity_form(
+        graph,
+        uses,
+        out_id,
+        scaled_id,
+        shift,
+        shift_expand,
+        is_output,
+    )
 }
 
 fn match_mul_one_plus(
     graph: &Graph,
+    uses: &LazyUseCounts,
     out_id: NodeId,
     scaled_id: NodeId,
     shift: NodeId,
@@ -134,6 +203,7 @@ fn match_mul_one_plus(
     let (a, b) = (scaled.inputs[0], scaled.inputs[1]);
     if let Some(m) = match_norm_times_mod(
         graph,
+        uses,
         out_id,
         a,
         b,
@@ -146,6 +216,7 @@ fn match_mul_one_plus(
     }
     match_norm_times_mod(
         graph,
+        uses,
         out_id,
         b,
         a,
@@ -158,6 +229,7 @@ fn match_mul_one_plus(
 
 fn match_norm_times_mod(
     graph: &Graph,
+    uses: &LazyUseCounts,
     out_id: NodeId,
     norm_id: NodeId,
     mod_id: NodeId,
@@ -167,17 +239,17 @@ fn match_norm_times_mod(
     is_output: &HashMap<NodeId, ()>,
 ) -> Option<Match> {
     let (x, norm_kind, eps) = affine_free_norm(graph, norm_id)?;
-    if is_output.contains_key(&norm_id) || graph.use_count(norm_id) != 1 {
+    if is_output.contains_key(&norm_id) || uses.use_count(norm_id) != 1 {
         return None;
     }
-    let (scale, scale_expand, one_plus) = peel_one_plus_scale(graph, mod_id, is_output)?;
+    let (scale, scale_expand, one_plus) = peel_one_plus_scale(graph, uses, mod_id, is_output)?;
     if let Some(e) = scale_expand {
-        if is_output.contains_key(&e) || graph.use_count(e) != 1 {
+        if is_output.contains_key(&e) || uses.use_count(e) != 1 {
             return None;
         }
     }
     if let Some(e) = shift_expand {
-        if is_output.contains_key(&e) || graph.use_count(e) != 1 {
+        if is_output.contains_key(&e) || uses.use_count(e) != 1 {
             return None;
         }
     }
@@ -211,6 +283,7 @@ fn match_norm_times_mod(
 
 fn match_identity_form(
     graph: &Graph,
+    uses: &LazyUseCounts,
     out_id: NodeId,
     m_id: NodeId,
     shift: NodeId,
@@ -221,20 +294,39 @@ fn match_identity_form(
     if !matches!(m.op, Op::Binary(BinaryOp::Add)) || m.inputs.len() != 2 {
         return None;
     }
-    if is_output.contains_key(&m_id) || graph.use_count(m_id) != 1 {
+    if is_output.contains_key(&m_id) || uses.use_count(m_id) != 1 {
         return None;
     }
     let (a, b) = (m.inputs[0], m.inputs[1]);
-    if let Some(hit) =
-        match_n_plus_n_scale(graph, out_id, a, b, shift, shift_expand, m_id, is_output)
-    {
+    if let Some(hit) = match_n_plus_n_scale(
+        graph,
+        uses,
+        out_id,
+        a,
+        b,
+        shift,
+        shift_expand,
+        m_id,
+        is_output,
+    ) {
         return Some(hit);
     }
-    match_n_plus_n_scale(graph, out_id, b, a, shift, shift_expand, m_id, is_output)
+    match_n_plus_n_scale(
+        graph,
+        uses,
+        out_id,
+        b,
+        a,
+        shift,
+        shift_expand,
+        m_id,
+        is_output,
+    )
 }
 
 fn match_n_plus_n_scale(
     graph: &Graph,
+    uses: &LazyUseCounts,
     out_id: NodeId,
     n_id: NodeId,
     ns_id: NodeId,
@@ -248,14 +340,14 @@ fn match_n_plus_n_scale(
         return None;
     }
     // n is used by both m and Mul — use_count must be 2.
-    if graph.use_count(n_id) != 2 {
+    if uses.use_count(n_id) != 2 {
         return None;
     }
     let ns = graph.node(ns_id);
     if !matches!(ns.op, Op::Binary(BinaryOp::Mul)) || ns.inputs.len() != 2 {
         return None;
     }
-    if is_output.contains_key(&ns_id) || graph.use_count(ns_id) != 1 {
+    if is_output.contains_key(&ns_id) || uses.use_count(ns_id) != 1 {
         return None;
     }
     let (p, q) = (ns.inputs[0], ns.inputs[1]);
@@ -269,12 +361,12 @@ fn match_n_plus_n_scale(
     let (scale, scale_expand) = peel_expand(graph, scale_side);
     if let Some(e) = scale_expand {
         // VJP for Mul still reads the forward expanded scale.
-        if is_output.contains_key(&e) || graph.use_count(e) != 1 {
+        if is_output.contains_key(&e) || uses.use_count(e) != 1 {
             return None;
         }
     }
     if let Some(e) = shift_expand {
-        if is_output.contains_key(&e) || graph.use_count(e) != 1 {
+        if is_output.contains_key(&e) || uses.use_count(e) != 1 {
             return None;
         }
     }
@@ -323,12 +415,13 @@ fn peel_expand(graph: &Graph, id: NodeId) -> (NodeId, Option<NodeId>) {
 /// Returns `(scale, scale_expand, Some(one_plus_add_id))`.
 fn peel_one_plus_scale(
     graph: &Graph,
+    uses: &LazyUseCounts,
     id: NodeId,
     is_output: &HashMap<NodeId, ()>,
 ) -> Option<(NodeId, Option<NodeId>, Option<NodeId>)> {
     let n = graph.node(id);
     if matches!(n.op, Op::Binary(BinaryOp::Add)) && n.inputs.len() == 2 {
-        if is_output.contains_key(&id) || graph.use_count(id) != 1 {
+        if is_output.contains_key(&id) || uses.use_count(id) != 1 {
             return None;
         }
         let (a, b) = (n.inputs[0], n.inputs[1]);

@@ -23,7 +23,261 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-08-11
+
+### Changed
+
+- **`rlx-metal` no longer depends on `metal-rs`** — it binds the Metal compute
+  API directly, in `rlx_metal::mtl`. The `metal` crate pins `block 0.1.6`, whose
+  `static` of an uninhabited type trips the `static of uninhabited type`
+  future-incompatibility lint (an error in a future rustc); `metal-rs` still pins
+  it at 0.33 and `block` is unmaintained, so no bump cleared it. This backend
+  installs no Metal completion handlers, so nothing in `block` was ever used.
+  Dropping `metal-rs` also drops `foreign-types` and `core-graphics-types`;
+  `objc` stays. Scope is our surface only — compute, no render pipeline, heaps,
+  events, or fences.
+
+  **Downstream `MetalGpuKernel` authors**: the custom-op seam still hands you a
+  live encoder and buffer, but the types now come from `rlx_metal::mtl` rather
+  than `metal`. Names, signatures, and the `Foo`/`FooRef` ownership split are
+  unchanged, so `use rlx_metal::mtl as metal;` is normally the whole migration.
+  The `Ref` types still `impl objc::Message`, so raw `msg_send!` against them
+  keeps working.
+
 ### Added
+
+- **GPU kernel argument-count validation (CUDA + ROCm).** `cuLaunchKernel` and
+  `hipModuleLaunchKernel` read exactly as many pointers as the compiled kernel
+  declares and never see how many the caller supplied: too few reads past the
+  end of the argument array, too many silently drops the tail. Neither is a
+  compile error and neither reliably faults. This repo has already shipped that
+  bug — `gguf_gpu::launch_dequant_gguf` passed 5 arguments to a 6-parameter
+  kernel, misreading the 64-bit arena offsets, so a >4 GB arena overflowed u32
+  into SIGSEGV or garbage.
+  - `rlx_gpu_kernels::declared_param_count` parses arity from the shared `.cu`
+    sources. It strips comments first: real signatures document each parameter
+    inline, and those comments carry commas and unbalanced parens (`// [batch,n,n]`,
+    `[λ(n) ∥ U(n²)]`) that a naive scan counts, which reported 9 for the
+    5-parameter `eigh_assemble` on the ROCm rig.
+  - **ROCm** checks at launch: `HipKernel::launch_checked` takes a *slice*, so
+    the count exists at all — the old `*mut *mut c_void` could not express it —
+    and compares it against the kernel's signature under
+    `RLX_GPU_VALIDATE_PARAMS=1` (now on in `just test-rocm`). Verified on an
+    MI100: 48/48 with the check enabled, no mismatches.
+  - **CUDA** goes through cudarc's typed builder across ~157 sites with no
+    single place to count, so it is checked statically by
+    `tests/launch_arity.rs`, which resolves each launcher back to its kernel and
+    compares `.arg()` count against the `__global__` signature: **151 of 156
+    sites, 5 unresolved and reported rather than silently passed.** Verified by
+    mutation — deleting one `.arg()` is caught. Green on an RTX 3080 Ti.
+- **Metal buffer-binding validation (`RLX_METAL_VALIDATE_BINDINGS=1`,
+  `just validate-metal-bindings`).** The backend binds buffers by integer index
+  against MSL signatures in `kernels.rs`, across ~680 call sites, with nothing
+  connecting the two — the defect class that made the ICB path write nothing for
+  months. Each dispatch is now cross-checked against the indices its kernel
+  declares. Gated by env rather than `debug_assertions` deliberately: the
+  workspace gate runs `--release`, so a `cfg(debug_assertions)` check would be
+  compiled out of the one place it needs to run. Off by default (a relaxed
+  atomic load). Declared indices are parsed from the MSL we compile rather than
+  taken from Metal's pipeline reflection — requesting reflection
+  (`MTLPipelineOptionArgumentInfo`) aborts unrelated encoders. Violations are
+  raised at `endEncoding`, not at the dispatch: unwinding out of an open encoder
+  trips Metal's own dealloc assertion, which aborts the process and destroys the
+  message explaining the bug.
+- **`mtl::autoreleasepool`, one pool per forward pass.** Command buffers and
+  encoders are autoreleased, so with no pool boundary a decode loop accumulated
+  one of each per token for the process lifetime. Correct refcounting does not
+  help; only a pool does.
+- **`just leak-check`** — runs Metal test binaries under `leaks --atExit`. The
+  suite cannot see a refcount bug, since an over-retained object still computes
+  the right answer; this is how the `MPSGraphTensorData` leak below was found.
+- **MSL gate tests** — the assembled source must compile and every kernel it
+  declares must resolve by name (previously only checked when a pipeline was
+  first built, so a bad kernel shipped and failed on first use), plus an
+  assertion that the kernels `icb.rs` encodes keep their buffer-0 ABI.
+- **`decode_overhead_bench`** — steady-state cost of a decode-shaped pass. Every
+  test runs its graph once or twice, so the only `RLX_METAL_TRACE` samples
+  available carried one-time MSL compilation (~790 ms) and said nothing about
+  steady state.
+
+### Performance
+
+- **Measured: a decode-shaped Metal pass is 96% wait.** For `m=1, k=n=768`,
+  200 warm iterations: **encode 6.9 µs, commit 2.0 µs, wait 178.2 µs** (total
+  ~185 µs/iter, p50 159 µs). This confirms the non-monotonic `sgemm_check`
+  curve — `m=6` at 0.374 ms versus `m=60` at 0.278 ms — as a fixed per-pass
+  overhead rather than compute, and bounds what encode-side work can buy:
+  eliminating encoding entirely would save under 4%. Submission batching, not
+  kernel tuning, is where the decode regime improves.
+- **MPSGraph compile-crash mitigation verified.** The
+  `waitForCompilationCompletion` descriptor added earlier was never measured,
+  and at the reported ~2% rate a short run proves nothing (P(0 crashes in 20)
+  ≈ 0.67). A 200-process soak (`scripts/mpsgraph-soak.sh`) recorded **0
+  crashes**, putting a 95% upper bound of ~1.5% on the rate — below the 2%
+  previously observed.
+
+### Fixed
+
+- **wgpu-on-Vulkan wrong results: deferred host writes vs. arena slot reuse.**
+  On a discrete Vulkan/DX12 adapter `rlx-wgpu` lowers Expand / Concat /
+  Transpose / Narrow to *host* steps (`wgpu_prefer_structure_host`), whose
+  outputs "live only in the mirror until a device-reading host step or GPU pass
+  needs them" — the arena write happens at a later flush. The memory planner
+  treated them as ordinary single-step consumers, so liveness-aware reuse handed
+  the slot to another tensor and the deferred write landed on top of it. Those
+  slots are now kept reserved; `rlx-wgpu` declares that it hosts them via
+  `rlx_compile::memory::set_pin_host_structure`.
+
+  This is the same hazard `dequant_host_fallback` already guarded for
+  `Op::DequantMatMul` (task #50, exact-zero downstream values) — it had simply
+  never been generalised to the other host-deferred ops.
+
+  It presented as a family of unrelated Vulkan-only bugs (`pad`, PartitionedConv
+  `conv_reverb`, layer/group-norm second derivatives, `wgpu::all`), because the
+  affected graphs are the structural-op-heavy ones; it was nondeterministic,
+  since it depends on when the flush falls; and it was Vulkan-only because Metal
+  keeps these ops on the GPU. No effect on Metal/CUDA/ROCm, which do not host
+  these ops. Ruled out along the way, for whoever revisits: reuse slack (1 and 2
+  steps), region-fusion decomposition, elementwise-region fusion, and the host
+  concat path — none change the outcome; only reservation does. Regression test:
+  `rlx-runtime/tests/expand_vulkan_repro.rs`.
+
+- **wgpu host-tensor cache truncated a parent buffer when a view wrote over it.**
+  `HostTensorCache` is keyed by byte offset, but *views alias their parent's
+  slot* — `Narrow(start=0)` of a concat carries the parent's exact offset. A
+  shorter view write replaced the entry outright, discarding the parent's mirror
+  beyond the view's length. A sibling view at an interior offset
+  (`Narrow(start=6)`, parent + 144 B) then missed `get_arc_covering` (exact-key),
+  found nothing dirty for `flush_offset` to flush (also exact-key), and fell
+  through to a D2H read of a device region the deferred parent had never
+  written — returning **zeros**, which propagated until the graph output was
+  entirely zero.
+
+  Diagnosed by tracing host writes: the concat computed correctly
+  (`off=4896 len=72 nonzero=42`) and was immediately followed by
+  `off=4896 len=36`, the view clobbering it. `insert` now merges a shorter write
+  into a longer entry instead of replacing it — the arena bytes past the write
+  are unchanged, so the mirror must keep showing them.
+
+  Fixes the remaining four: `logeig_lowering_wgpu`, `reeig_lowering_wgpu`,
+  `wgpu::biquad`, `wgpu::iirfilt`. Together with the pinning fix above, the
+  wgpu-on-Vulkan suite goes from **10 failures to 0** on an RTX 3080 Ti
+  (`rlx-runtime --features cpu,cuda,gpu`: 945/10 → 958/0). Unit guard:
+  `rlx_gpu_host::scan::host_cache_tests`.
+
+- **Metal ICB path produced silently wrong results; now correct and covered by
+  a test.** `rlx-metal`'s indirect-command-buffer encoder (opt-in,
+  `RLX_USE_ICB=1`) binds kernel buffers *by index* against MSL signatures that
+  live in `kernels.rs` — and those signatures had moved. Several kernels went
+  from taking a `device float*` already offset to the data, to taking the arena
+  base plus explicit `ulong` byte offsets, which shifts every later index. The
+  failure is invisible: the unbound index reads 0, `len` comes back 0, every
+  thread hits `if (gid >= len) return`, and the command buffer completes with no
+  error having written nothing. `icb_check` reported all-zero output.
+  - `elem_add`/`elem_mul` and `copy_f32`: rebound to the arena-base form
+    (`arena, ulong a_off, ulong b_off, ulong c_off, uint len`).
+  - `gelu_inplace`: is *generated* (arena-base ABI) while `silu_inplace` is
+    hand-written (offset-pointer ABI) — this arm now binds per activation
+    instead of assuming one layout for both.
+  - `narrow_lastax`: its `src_byte_off`/`dst_byte_off` were left unbound; with
+    `inherit_buffers=false` that reads undefined data.
+  - `rope` binds 13 buffers but the descriptor declared
+    `maxKernelBufferBindCount = 8`, silently dropping the rest.
+  - `layer_norm`/`fused_residual_ln` dispatched rows along **y**, but both
+    kernels read a *scalar* `threadgroup_position_in_grid` (the x component),
+    so every row recomputed row 0; threadgroup width is now a power of two, as
+    the reduction requires.
+  New `icb_parity` test asserts ICB output against a CPU reference — and
+  specifically rejects an all-zero result, which is the signature of an index
+  mismatch and would otherwise slip past a relative-error check.
+- **MPSGraph tensor-data leak.** `mps_tensor_data_from_buffer` returns a `+1`
+  `MPSGraphTensorData`; the eight call sites handed it to an `NSMutableArray` /
+  `NSMutableDictionary` (which retains) and then dropped their own reference on
+  the floor, so every one bottomed out at refcount 1 and was never freed. Found
+  with `leaks` on `metal_swiglu_full_parity` (10 leaks / 4160 bytes → 0). It
+  leaked per executable bind rather than per inference, so it did not grow
+  during decode.
+- **A contradictory output shape is now rejected in release builds too.**
+  `sync_graph_shapes` recomputes inferrable output shapes, but it *replaced* the
+  declared shape unconditionally — including when the declaration was fully
+  static and disagreed with what the operands give. Since every backend's
+  lowering validates the declared shape against the operands, rewriting the
+  declaration first made that check compare a value with itself, so the only
+  thing catching a malformed graph was the debug-only IR verifier: release
+  builds — the ones that ship — had no guard at all. This is how a
+  `GroupedMatMul` expert bank left in `[E, N, K]` order slipped through (right
+  rank, right element count, wrong axes), with the kernel writing `M·K` floats
+  into the `M·N` slot the planner had sized. It now refines freely where the
+  declaration was dynamic, and rejects a static-vs-static contradiction,
+  comparing only non-unit extents so the interchangeable `[]` / `[1]` scalar
+  spellings still pass. Regression test:
+  `square_bank_with_a_wrong_output_is_rejected`.
+- **Compiler panic-isolation (no more process aborts on an invalid graph).**
+  `CompilePipeline::lower_hir` previously `panic!`-ed via the debug graph verifier
+  (`debug_assert_graph!`); on the parallel compile threads that model builds use,
+  that panic can't unwind (`__rust_start_panic` fails → hard `SIGABRT`), taking
+  the whole host process down. It now returns the verifier failure as
+  `LowerError::Panicked` instead, and `compile_hir`/`lower_hir` wrap the pipeline
+  in `catch_unwind` to contain any other (unwindable) compile panic.
+- **IR verifier accepts collapsible affine norm params.** `LayerNorm` / `RmsNorm`
+  `gamma`/`beta` with rank > 1 whose element count collapses to the normalised
+  width (e.g. `[1,1,C]`, as some whisper / TTS graphs build) are now accepted —
+  it's the same flat `[C]` buffer the norm kernels read — rather than rejected as
+  "must be rank-1". A genuinely wrong element count is still flagged.
+- **`rlx-cpu` linalg no longer panics without a linked BLAS.** On a no-BLAS build
+  (`--no-default-features`, or a target with no OpenBLAS/Accelerate/MKL — a bare
+  aarch64 / Raspberry Pi, wasm, …) the LAPACK ops used to be panic-stubs, so
+  Cholesky / eigh / QR / SVD / least-squares (and the `dtrsm` triangular solve)
+  aborted at runtime. They now have dependency-free pure-Rust fallbacks —
+  Cholesky (Banachiewicz), LU (partial-pivot), symmetric eig (cyclic Jacobi), QR
+  (Householder + `dorg2r`), thin SVD (one-sided Jacobi), and lstsq built on them —
+  matching the column-major LAPACK ABI the wrappers expect, so the row-major
+  linalg wrappers are backend-agnostic. Validated against the linked-BLAS path:
+  the full `rlx-cpu` lib suite passes identically with and without BLAS (new
+  reconstruction tests in `blas::linalg_fallback_tests`). The linked-BLAS path is
+  untouched and remains the fast default where present.
+
+### Performance
+
+- **aarch64 `SDOT` fast path for the fused int8 Q4_K decode GEMV.** The NEON
+  Q4_K×Q8 group dot used a baseline `vmull_s8` + `vpadalq_s16` widen-multiply
+  chain; on ARMv8.2-A (Cortex-A76 / Raspberry Pi 5, Apple Silicon, Graviton2+,
+  most ARM servers) it now emits a single `SDOT` per 16 lanes — runtime-detected
+  (`dotprod`), Pi-4-safe (falls back to the baseline), opt-out via
+  `RLX_Q4K_NO_DOTPROD=1`. The intrinsic `vdotq_s32` is still unstable on the
+  pinned stable toolchain, so `SDOT` is emitted with inline `asm!`. It's a pure
+  integer dot, so the output is byte-identical to the baseline (asserted by a new
+  test). Measured on the fused decode path (Qwen3.5-0.8B Q4_K_M, aarch64):
+  **~+12% decode tok/s and faster prefill/TTFT** (prefill gains more — it runs
+  the dot over the whole prompt).
+- **`rlx-cpu` no-BLAS `sgemm` fallback ~8–10× faster.** The BLAS-less f32 GEMM
+  (used on a bare aarch64 / Raspberry Pi, wasm, or `--no-default-features` — where
+  no OpenBLAS/Accelerate/MKL is linked) was a naive `i,j,p` triple loop whose
+  inner reduction strides through B by `ldb`, defeating both vectorization and the
+  cache. The common NoTrans×NoTrans case now uses an `i,p,j` order with a
+  unit-stride inner loop, which the compiler auto-vectorizes (NEON/AVX) and keeps
+  cache-resident. Measured on a 256³ GEMM: **2.8 → 23 GFLOP/s (8.2×) on aarch64**,
+  3.2 → 31 GFLOP/s (9.8×) on Apple Silicon. Transposed cases keep the scalar path;
+  results match the naive reference within tolerance (the summation reorder is the
+  same class of reordering the vendor BLAS path already applies).
+
+### Added
+
+- **`RLX_BLAS_LINK` — link any cblas+LAPACK provider (BLIS / ATLAS / vendored /
+  cross).** `rlx-cpu`'s BLAS auto-detection is OpenBLAS-specific (it's the one
+  distro library that ships both a CBLAS interface and LAPACK in a single `.so`).
+  For anything else — or to link a BLAS into a cross build — set
+  `RLX_BLAS_LINK="<libs>"` (space-separated names, e.g. `"blis lapack"`, searched
+  in `RLX_BLAS_SEARCH` / `OPENBLAS_LIB_DIR`). It sets only the umbrella
+  `rlx_cpu_blas` cfg (not the OpenBLAS thread-control sub-cfg), so no
+  vendor-specific symbol is referenced and the alternative BLAS self-manages
+  threads. The OpenBLAS auto-probe also now searches the Debian `openblas-*`
+  variant subdirs. With none of these, the crate still runs on the pure-Rust
+  fallback. Verified on aarch64: `RLX_BLAS_LINK=openblas` links + passes the
+  `rlx-cpu` linalg suite (10/10) through the generic path.
+- **CUDA opt-in warp-per-row Q4_K decode GEMV** (`RLX_CUDA_Q4K_GEMV_WARP=1`):
+  one warp per output row, lanes split each super-block for full occupancy at
+  small `k`; byte-identical output to the scalar path.
 
 - **MoE hot-on-GPU / cold-on-CPU expert offload (`rlx_runtime::hot_expert_cache`).**
   Runs a MoE layer whose expert stack does not fit in VRAM by keeping only the
@@ -210,6 +464,13 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Changed
 
+- **`Session::new` says which half of "unavailable" is missing.** The panic
+  blamed the Cargo feature unconditionally, which is wrong on a host where the
+  feature *is* compiled in and no such device is present — "enable the `gpu`
+  Cargo feature" on a machine with no GPU adapter. New
+  `rlx_runtime::feature_compiled(device)` separates the two, and the message now
+  distinguishes a missing feature from a missing device/driver.
+
 - **MSRV raised to Rust 1.89** (was 1.87). The `Q2_0` VNNI kernels call
   `_mm256_dpbusd_epi32` / `_mm256_dpbusd_avx_epi32`, stabilized in 1.89; on
   x86-64 the crate did not build on the previously declared minimum.
@@ -251,6 +512,52 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
   the CLI/bisect surface.
 
 ### Fixed
+
+- **`Op::GroupedMatMul` silently miscomputed on a mis-laid-out expert bank.**
+  Every lowering path read `N` off `weight.dim(2)` while the arena sized the
+  output slot from the node's declared shape, and nothing checked the two
+  agreed. An expert stack left in a checkpoint's `[E, N, K]` (`[out, in]`) order
+  has the right rank *and* the right element count, so it passed every existing
+  check: the kernel then wrote `M·K` floats into an `M·N` slot — under-writing
+  (every output row keeps a tail of whatever the arena last held, which reads as
+  a MoE model that is not causal) or, when `K > N`, running past the slot into
+  the neighbouring tensor. `rlx_ir::shape::grouped_matmul_dims` now validates K
+  against the input and the derived `[M, N]` against the declared output; CPU,
+  Metal, MLX, CUDA, ROCm, wgpu, Vulkan, CoreML and TPU all route their dim
+  extraction through it, and `Op::GroupedMatMul` gained shape inference so the
+  IR verifier reports the mismatch first in debug builds. New
+  `HirGraphExt::grouped_matmul(input, weight, expert_idx)` derives the output
+  shape from the operands so a builder cannot declare it wrong;
+  `rlx-deepseek`/`rlx-motif` use it. Covered by
+  `rlx-runtime/tests/grouped_matmul_bank_layout.rs`.
+
+- **Metal: ~2% crash per `MPSGraphExecutable` initialization.** Compiling with a
+  nil `MPSGraphCompilationDescriptor` lets MPSGraph defer `GPURegionRuntime`
+  construction and its optimizer passes onto its own `MPSGraphExecutable_queue`,
+  and that deferred path faults inside MetalPerformanceShadersGraph — a null
+  global read at `+0x10`/`+0x18` from `MPSGraphOSLog`, with no RLX frames on the
+  faulting thread. Measured at ~2% **per process**, reproducing with nothing else
+  running, so it is a hard crash on ordinary Metal model load, not a
+  parallel-test artifact. `compile_executable` now requests
+  `waitForCompilationCompletion = YES`, keeping that work on the calling thread:
+  **0 crashes in ~260 executable initializations** (vs ≈5 expected), with compile
+  time unchanged (~2 ms/layer, flat to 28 layers). Guarded by
+  `respondsToSelector:`, so an OS without the setter keeps the previous
+  behaviour; `RLX_DISABLE_MPSGRAPH_EXECUTABLE=1` remains as a fallback.
+  Write-up for Apple in [`docs/apple-feedback-mpsgraph-crash.md`](docs/apple-feedback-mpsgraph-crash.md).
+
+- **aarch64 / armv7 Linux: every linalg op panicked.** `rlx-cpu`'s `build.rs`
+  skipped the OpenBLAS link on any non-x86_64 target unless `OPENBLAS_LIB_DIR`
+  was pinned, leaving `rlx_cpu_blas` unset. Matmul fell back to the portable SIMD
+  gemm, but Cholesky / eigh / QR / SVD / logdet / pinv / solve_triangular have no
+  pure-Rust fallback and their wrappers are panic stubs — so on Raspberry
+  Pi-class hardware they aborted at runtime (86 tests across 13 binaries). The
+  script now probes the standard multiarch lib dirs, enumerating
+  `/usr/lib/*-linux-*` rather than guessing a triple (32-bit Pi is arch `arm` but
+  the directory is `arm-linux-gnueabihf`). Native builds only — cross-compiles
+  must still pin explicitly, so a host OpenBLAS is never linked for the wrong
+  architecture. aarch64 Linux goes from 13 failing binaries to **225 suites, 0
+  failures**, unpinned.
 
 - **Partial RoPE read the wrong cos/sin table row (`rlx-flow`, wgpu).** The
   tables store exactly the rotation angles — `n_rot/2` per row — but both the

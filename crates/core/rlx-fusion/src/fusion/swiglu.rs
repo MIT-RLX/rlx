@@ -6,7 +6,8 @@
 
 #![allow(unused_imports)]
 
-use crate::pass::Pass;
+use crate::analysis::{AnalysisManager, LazyUseCounts, OpKindIndex, UseCounts};
+use crate::pass::{Pass, PassResult};
 use rlx_ir::op::*;
 use rlx_ir::*;
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ use crate::graph_rewrite::Rewriter;
 // ── Pass 1: MatMul + Bias + Activation → FusedMatMulBiasAct ─────────────
 
 use super::*;
+use rlx_ir::OpKind;
 
 /// Detects the post-`FuseSharedInputMatMul` SwiGLU pattern and replaces it
 /// with a single `Op::FusedSwiGLU` node consuming the concatenated matmul.
@@ -39,12 +41,16 @@ use super::*;
 /// has exactly one consumer. The mul may have any number of consumers.
 pub struct FuseSwiGLU;
 
-impl Pass for FuseSwiGLU {
-    fn name(&self) -> &str {
-        "fuse_swiglu"
-    }
+impl FuseSwiGLU {
+    /// The pass body, parameterised over where its use-counts come from.
+    ///
+    /// `shared` carries the pipeline-wide relation when one is cached, so a
+    /// run of ~20 fusion passes builds it once rather than once per pass.
+    /// `None` falls back to a deferred per-pass build, which is what a direct
+    /// `pass.run(graph)` call gets.
+    fn fuse_with(&self, graph: Graph, shared: Option<&UseCounts>) -> PassResult {
+        let uses = LazyUseCounts::from_shared(shared, &graph);
 
-    fn run(&self, graph: Graph) -> Graph {
         // Scan for Mul nodes whose two inputs match the SwiGLU pattern.
         // Collect rewrites first, then rebuild.
         // up_narrow_id / silu_id / gate_narrow_id are kept for pattern-shape
@@ -118,13 +124,13 @@ impl Pass for FuseSwiGLU {
 
             // Single-use checks: narrows feed only into silu+mul, silu feeds
             // only into mul. The cat itself can have arbitrary other users.
-            if graph.use_count(up_narrow.id) != 1 {
+            if uses.use_count(up_narrow.id) != 1 {
                 continue;
             }
-            if graph.use_count(gate_narrow_id) != 1 {
+            if uses.use_count(gate_narrow_id) != 1 {
                 continue;
             }
-            if graph.use_count(silu_id) != 1 {
+            if uses.use_count(silu_id) != 1 {
                 continue;
             }
 
@@ -143,7 +149,7 @@ impl Pass for FuseSwiGLU {
         }
 
         if matches.is_empty() {
-            return graph;
+            return PassResult::unchanged(graph);
         }
 
         // Rebuild graph, replacing matched mul nodes with FusedSwiGLU.
@@ -178,7 +184,40 @@ impl Pass for FuseSwiGLU {
             rw.copy_node(node);
         }
 
-        rw.finish(&graph.outputs)
+        rw.finish_reporting(&graph.outputs)
+    }
+}
+
+impl Pass for FuseSwiGLU {
+    // Required by construction: both halves of the gate come from `Op::Narrow` slices of one Concat.
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::Narrow]
+    }
+
+    fn name(&self) -> &str {
+        "fuse_swiglu"
+    }
+
+    fn run(&self, graph: Graph) -> Graph {
+        self.fuse_with(graph, None).graph
+    }
+
+    fn run_with_status(&self, graph: Graph) -> PassResult {
+        if !self.can_fire(&graph) {
+            return PassResult::unchanged(graph);
+        }
+        self.fuse_with(graph, None)
+    }
+
+    fn run_with_analyses(&self, graph: Graph, analyses: &mut AnalysisManager) -> PassResult {
+        // Answer the trigger check from the shared op-kind index first: a pass
+        // whose anchor op is absent must not even pay for the use relation.
+        let triggers = self.trigger_kinds();
+        if !triggers.is_empty() && !analyses.get::<OpKindIndex>(&graph).contains_any(triggers) {
+            return PassResult::unchanged(graph);
+        }
+        let shared = analyses.get::<UseCounts>(&graph);
+        self.fuse_with(graph, Some(shared))
     }
 }
 

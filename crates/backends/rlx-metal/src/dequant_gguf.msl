@@ -1061,6 +1061,94 @@ kernel void q8_0_mv_f32(
     dst[gid] = acc4.x + acc4.y + acc4.z + acc4.w;
 }
 
+// Q8_0 GEMM with the x tile staged in threadgroup memory.
+//
+// Q8_0 had a GEMV but NO GEMM, so every m>1 matmul fell back to
+// dequant-to-f32-scratch + MPS sgemm — a 4x blow-up written and re-read per
+// forward. That gap is wider than it looks: "XL"-style GGUFs mix Q8_0 in
+// heavily (Muse-Glimmer-30B's Q6_K_XL is 14.0B Q8_0 params against 13.8B Q6_K),
+// so the missing kernel was masking the Q6_K GEMM's win entirely.
+//
+// Block = 34 B / 32 elems: d(f16) | qs[32] as int8. Simplest quant layout there
+// is — no nibbles, no sub-block scales. Dequant math is copied verbatim from
+// `q8_0_mv_f32` above, including the float4 grouping. Note the block is 32
+// elements while the staged tile is 256, so each tile covers 8 blocks; `qs` is
+// only 2-byte aligned (34 B stride) and must be read as individual `char`, not
+// as a packed uint.
+constant uint Q80_MMX_TM = 8u;
+constant uint Q80_MMX_TG = 64u;
+constant uint Q80_MMX_TILE = 256u;
+
+kernel void q8_0_mm_f32_xs(
+    device float* arena    [[buffer(0)]],
+    constant ulong& x_off  [[buffer(1)]],
+    constant ulong& w_off  [[buffer(2)]],
+    constant ulong& dst_off[[buffer(3)]],
+    constant uint& m_dim   [[buffer(4)]],
+    constant uint& k_dim   [[buffer(5)]],
+    constant uint& n_dim   [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tid  [[thread_index_in_threadgroup]]
+) {
+    threadgroup float xs[Q80_MMX_TM * Q80_MMX_TILE];   // 8 x 256 f32 = 8 KiB
+
+    const uint col  = tgpig.x * Q80_MMX_TG + (uint)tid;
+    const uint row0 = tgpig.y * Q80_MMX_TM;
+    if (row0 >= m_dim) return;
+
+    const uint nblocks   = k_dim / 32u;
+    const uint BLK_BYTES = 34u;
+    const uint ntiles    = k_dim / Q80_MMX_TILE;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    // Clamp rather than return: out-of-range columns must still reach the
+    // barriers. Dropped at the store.
+    const uint colc = min(col, n_dim - 1u);
+    device const uchar* w0 = (device const uchar*)arena + w_off
+                           + (ulong)colc * nblocks * BLK_BYTES;
+
+    float4 acc[Q80_MMX_TM];
+    for (uint r = 0u; r < Q80_MMX_TM; ++r) acc[r] = float4(0.0f);
+
+    const uint VEC_PER_TILE = Q80_MMX_TM * (Q80_MMX_TILE / 4u);
+
+    for (uint t = 0u; t < ntiles; ++t) {
+        const uint p0 = t * Q80_MMX_TILE;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = (uint)tid; i < VEC_PER_TILE; i += Q80_MMX_TG) {
+            const uint r  = i / (Q80_MMX_TILE / 4u);
+            const uint c4 = (i % (Q80_MMX_TILE / 4u)) * 4u;
+            const uint rr = min(row0 + r, m_dim - 1u);
+            *(threadgroup float4*)(xs + r * Q80_MMX_TILE + c4) =
+                *(device const float4*)(x + (ulong)rr * k_dim + p0 + c4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint sb = 0u; sb < Q80_MMX_TILE / 32u; ++sb) {
+            const uint off = (t * (Q80_MMX_TILE / 32u) + sb) * BLK_BYTES;
+            const float d = dq_read_f16(w0, off);
+            device const char* qs = (device const char*)(w0 + off + 2u);
+            const uint lp = sb * 32u;   // k offset of this block WITHIN the tile
+            for (uint l = 0u; l < 32u; l += 4u) {
+                float4 ww;
+                ww.x = d * float(qs[l]);
+                ww.y = d * float(qs[l + 1u]);
+                ww.z = d * float(qs[l + 2u]);
+                ww.w = d * float(qs[l + 3u]);
+                for (uint r = 0u; r < Q80_MMX_TM; ++r)
+                    acc[r] += *(threadgroup const float4*)(xs + r * Q80_MMX_TILE + lp + l) * ww;
+            }
+        }
+    }
+
+    if (col >= n_dim) return;
+    for (uint r = 0u; r < Q80_MMX_TM; ++r) {
+        const uint rr = row0 + r;
+        if (rr < m_dim)
+            dst[(ulong)rr * n_dim + col] = acc[r].x + acc[r].y + acc[r].z + acc[r].w;
+    }
+}
+
 // ── Simdgroup-cooperative Q8_0 GEMV ────────────────────────────────────────
 //
 // Same math as `q8_0_mv_f32` but 32 threads cooperate on Q8_0_NR0 output rows
@@ -1477,6 +1565,151 @@ kernel void q1_0_mm_f32(
         if (rr < m_dim)
             dst[(ulong)rr * n_dim + col] = acc[r];
     }
+}
+
+
+
+// ── Fused Q2_K GEMV: dst[n] = sum_k x[k] * dequant(w[n,k]) ───────────────
+//
+// Q2_K had no fused kernel, so it took the generic dequant-to-f32-scratch
+// path. That is why UD-Q2_K_XL measured 534 ms/token against UD-Q4_K_XL's
+// 218 ms despite being 22% SMALLER on disk — kernel coverage dominates byte
+// count. Mirrors `q5k_mv_f32`.
+//
+// Block layout (84 B): scales[16] | qs[64] | d f16 | dmin f16.
+// Per llama.cpp `dequant_row_q2_K`: two 128-element halves; within each, four
+// shift steps (0,2,4,6), and each step consumes two scale bytes covering
+// q[l] and q[l+16] for l in 0..16. `qs` advances 32 B per half.
+//
+// Grid: one thread per output column. `k_dim % 256 == 0`.
+kernel void q2k_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+
+    const uint nblocks   = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 2u + 2u + DQ_QK_K / 16u + DQ_QK_K / 4u; // 84
+
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    float acc = 0.0f;
+    uint  x_idx = 0u;
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        const uint off       = b * BLK_BYTES;
+        const uint scales_off = off;
+        const uint qs_off     = off + DQ_QK_K / 16u;
+        const uint d_off      = qs_off + DQ_QK_K / 4u;
+        const float d     = dq_read_f16(w0, d_off);
+        const float min_v = dq_read_f16(w0, d_off + 2u);
+
+        device const uchar* q = w0 + qs_off;
+        uint is = 0u;
+        for (uint sb = 0u; sb < 2u; ++sb) {
+            uint shift = 0u;
+            for (uint t = 0u; t < 4u; ++t) {
+                uchar sc = w0[scales_off + is]; is += 1u;
+                float dl = d * float(sc & 0xFu);
+                float ml = min_v * float(sc >> 4);
+                for (uint l = 0u; l < 16u; ++l) {
+                    acc += x[x_idx + l] * (dl * float((q[l] >> shift) & 3u) - ml);
+                }
+                x_idx += 16u;
+
+                sc = w0[scales_off + is]; is += 1u;
+                dl = d * float(sc & 0xFu);
+                ml = min_v * float(sc >> 4);
+                for (uint l = 0u; l < 16u; ++l) {
+                    acc += x[x_idx + l] * (dl * float((q[l + 16u] >> shift) & 3u) - ml);
+                }
+                x_idx += 16u;
+                shift += 2u;
+            }
+            q += 32u;
+        }
+    }
+    dst[gid] = acc;
+}
+
+// ── Fused Q5_K GEMV: dst[n] = sum_k x[k] * dequant(w[n,k]) ───────────────
+//
+// Q5_K had NO fused kernel, so it fell to the generic path: dequantize the
+// whole weight into the f32 scratch, then matmul. On Muse-Glimmer-30B the
+// LM head is Q5_K `[6656, 202048]` = 1.345B params, so that scratch is
+// **5.4 GB written + 5.4 GB read per token** — measured at 126 ms of a 217 ms
+// decode step (58%) for 4.8% of the model's parameters. This streams the
+// packed row through registers instead (~0.9 GB read).
+//
+// Block layout (176 B): d f16 | dmin f16 | scales[12] | qh[32] | ql[128].
+// Per llama.cpp `dequant_row_q5_K`, each 64-element group takes 32 ql bytes
+// (low nibbles then high) and the 5th bit from a FIXED 32-byte qh whose mask
+// shifts left by 2 per group: u1 = 1<<2g, u2 = 2<<2g.
+//
+// Grid: one thread per output column. `k_dim % 256 == 0` (caller guarantees).
+kernel void q5k_mv_f32(
+    device float* arena         [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= n_dim) return;
+
+    const uint nblocks   = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 8u + DQ_QK_K / 2u; // 176
+
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device const uchar* w0  = (device const uchar*)arena + w_off + gid * nblocks * BLK_BYTES;
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    float acc = 0.0f;
+    uint  x_idx = 0u;
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        const uint off = b * BLK_BYTES;
+        const float d    = dq_read_f16(w0, off);
+        const float dmin = dq_read_f16(w0, off + 2u);
+        device const uchar* scales = w0 + off + 4u;
+        device const uchar* qh     = w0 + off + 4u + DQ_K_SCALE_SIZE;
+        device const uchar* ql     = qh + DQ_QK_K / 8u;
+
+        for (uint g = 0u; g < 4u; ++g) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, 2u * g,      sc0, m0);
+            dq_get_scale_min_k4(scales, 2u * g + 1u, sc1, m1);
+            const float d0  = d * float(sc0);
+            const float m0f = dmin * float(m0);
+            const float d1  = d * float(sc1);
+            const float m1f = dmin * float(m1);
+            const uint u1 = 1u << (2u * g);
+            const uint u2 = 2u << (2u * g);
+            device const uchar* qlg = ql + g * 32u;
+
+            for (uint l = 0u; l < 32u; ++l) {
+                const uint hi = (qh[l] & u1) ? 16u : 0u;
+                const float ww = d0 * float((qlg[l] & 0x0Fu) + hi) - m0f;
+                acc += x[x_idx + l] * ww;
+            }
+            x_idx += 32u;
+            for (uint l = 0u; l < 32u; ++l) {
+                const uint hi = (qh[l] & u2) ? 16u : 0u;
+                const float ww = d1 * float((qlg[l] >> 4) + hi) - m1f;
+                acc += x[x_idx + l] * ww;
+            }
+            x_idx += 32u;
+        }
+    }
+    dst[gid] = acc;
 }
 
 // ── Fused Q4_K_M GEMV: dst[n] = sum_k x[k] * dequant(w[n,k]) ─────────────
@@ -2304,6 +2537,243 @@ kernel void q4k_mm_f32(
     }
 }
 
+// Q4_K GEMM with the activation tile staged in threadgroup memory.
+//
+// `q4k_mm_f32` above is ALU/load-bound, not bandwidth-bound: measured on
+// Muse-Glimmer-30B (Q4_K_XL, 27.85B) it costs 333ms + 82ms*m, and that 82ms per
+// ROW equals a full bandwidth-saturated m=1 GEMV pass — so batching bought
+// nothing despite the weight reuse working as designed. The reason is the x
+// side, not the weight side: per 4 dequantized weights each thread issues TM=8
+// device float4 loads of x (128 B of x per 4 B of weight, 32:1), and all 64
+// threads of the threadgroup re-read the SAME x because they differ only in
+// column. Total x traffic is ~64x what one pass needs.
+//
+// Here the threadgroup cooperatively stages x[TM][256] for the current
+// super-block into threadgroup memory once (8 float4 per thread), then every
+// thread reads its activations from there. Weight handling, dequant math and
+// accumulation are identical to `q4k_mm_f32` — this is purely a load-path
+// change, so `q4k_mm_sg_parity` compares the two directly.
+//
+// Grid/threadgroup: x = ceil(n / TG) groups of TG threads, y = ceil(m / TM).
+// Threads with col >= n_dim must still reach every barrier, so they are clamped
+// rather than returned early. Dispatch in `encode_q4k_mm_f32_xs` MUST match.
+constant uint Q4K_MMX_TM = 8u;
+constant uint Q4K_MMX_TG = 64u;
+
+kernel void q4k_mm_f32_xs(
+    device float* arena    [[buffer(0)]],
+    constant ulong& x_off  [[buffer(1)]],
+    constant ulong& w_off  [[buffer(2)]],
+    constant ulong& dst_off[[buffer(3)]],
+    constant uint& m_dim   [[buffer(4)]],
+    constant uint& k_dim   [[buffer(5)]],
+    constant uint& n_dim   [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tid  [[thread_index_in_threadgroup]]
+) {
+    threadgroup float xs[Q4K_MMX_TM * DQ_QK_K];   // 8 x 256 f32 = 8 KiB
+
+    const uint col  = tgpig.x * Q4K_MMX_TG + (uint)tid;
+    const uint row0 = tgpig.y * Q4K_MMX_TM;
+    if (row0 >= m_dim) return;                     // whole group is out of range
+
+    const uint nblocks   = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 144u;        // 2+2+12+128
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    // Clamp instead of returning: an out-of-range column still has to hit the
+    // barriers below, so give it a valid (duplicate) weight row and drop it at
+    // the store.
+    const uint colc = min(col, n_dim - 1u);
+    device const uchar* w0 = (device const uchar*)arena + w_off
+                           + (ulong)colc * nblocks * BLK_BYTES;
+
+    float4 acc[Q4K_MMX_TM];
+    for (uint r = 0u; r < Q4K_MMX_TM; ++r) acc[r] = float4(0.0f);
+
+    const uint VEC_PER_TILE = Q4K_MMX_TM * (DQ_QK_K / 4u);   // 8 * 64 float4
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        const uint p0 = b * DQ_QK_K;
+        // Stage x[row0 .. row0+TM][p0 .. p0+256]. Rows past m_dim clamp to the
+        // last valid row; their accumulators are discarded at the store.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = (uint)tid; i < VEC_PER_TILE; i += Q4K_MMX_TG) {
+            const uint r  = i / (DQ_QK_K / 4u);
+            const uint c4 = (i % (DQ_QK_K / 4u)) * 4u;
+            const uint rr = min(row0 + r, m_dim - 1u);
+            *(threadgroup float4*)(xs + r * DQ_QK_K + c4) =
+                *(device const float4*)(x + (ulong)rr * k_dim + p0 + c4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint off = b * BLK_BYTES;
+        const float d    = dq_read_f16(w0, off);
+        const float dmin = dq_read_f16(w0, off + 2u);
+        device const uchar* scales = w0 + off + 4u;
+        device const uchar* qs     = w0 + off + 4u + DQ_K_SCALE_SIZE;
+        uint lp = 0u;   // k offset WITHIN the staged tile
+        uint is = 0u;
+        for (uint j = 0u; j < 8u; j += 2u) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, j,      sc0, m0);
+            dq_get_scale_min_k4(scales, j + 1u, sc1, m1);
+            const float d0 = d * float(sc0), m0f = dmin * float(m0);
+            const float d1 = d * float(sc1), m1f = dmin * float(m1);
+            // Two separate nibble passes, NOT one fused pass reading both
+            // halves per load: `q4k_mm_f32` accumulates all 32 low-nibble
+            // products before any high-nibble one, and f32 addition is not
+            // associative. Fusing them measured 11 ULP off, which is harmless in
+            // itself but would force this kernel's parity test onto a tolerance
+            // and thereby stop proving that only the LOAD PATH changed.
+            for (uint l = 0u; l < 32u; l += 4u) {   // low nibbles -> k [lp, lp+32)
+                const uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d0 * float(q4         & 0x0Fu) - m0f;
+                ww.y = d0 * float((q4 >>  8) & 0x0Fu) - m0f;
+                ww.z = d0 * float((q4 >> 16) & 0x0Fu) - m0f;
+                ww.w = d0 * float((q4 >> 24) & 0x0Fu) - m0f;
+                for (uint r = 0u; r < Q4K_MMX_TM; ++r)
+                    acc[r] += *(threadgroup const float4*)(xs + r * DQ_QK_K + lp + l) * ww;
+            }
+            lp += 32u;
+            for (uint l = 0u; l < 32u; l += 4u) {   // high nibbles -> k [lp, lp+32)
+                const uint q4 = *(device const uint*)(qs + is + l);
+                float4 ww;
+                ww.x = d1 * float((q4 >>  4) & 0x0Fu) - m1f;
+                ww.y = d1 * float((q4 >> 12) & 0x0Fu) - m1f;
+                ww.z = d1 * float((q4 >> 20) & 0x0Fu) - m1f;
+                ww.w = d1 * float((q4 >> 28) & 0x0Fu) - m1f;
+                for (uint r = 0u; r < Q4K_MMX_TM; ++r)
+                    acc[r] += *(threadgroup const float4*)(xs + r * DQ_QK_K + lp + l) * ww;
+            }
+            lp += 32u;
+            is += 32u;
+        }
+    }
+
+    if (col >= n_dim) return;
+    for (uint r = 0u; r < Q4K_MMX_TM; ++r) {
+        const uint rr = row0 + r;
+        if (rr < m_dim)
+            dst[(ulong)rr * n_dim + col] = acc[r].x + acc[r].y + acc[r].z + acc[r].w;
+    }
+}
+
+// Q5_K GEMM, staged like `q4k_mm_f32_xs`. There was no Q5_K GEMM at all before
+// this, so m>1 fell all the way back to dequant-to-f32-scratch + MPS sgemm —
+// which matters more than the tensor count suggests: in a Q4_K_M/XL GGUF the
+// Q5_K tensors are few but huge. Muse-Glimmer-30B has exactly 8, and one of them
+// is `output.weight`, the 6656x202048 (1.35B param) LM head. Dequanting that to
+// f32 scratch is 5.4 GB written and re-read per forward.
+//
+// Q5_K block = 176 B / 256 elems: d(f16) | dmin(f16) | scales[12] | qh[32] |
+// ql[128]. Each of the 4 groups g covers 64 elements as two 32-element halves
+// sharing `ql[g*32 + l]`: the low nibble takes its 5th bit from `qh[l] & (1<<2g)`
+// and the high nibble from `qh[l] & (2<<2g)`. Dequant math is lifted verbatim
+// from the CPU-validated `q5k_mv_f32` above; only the tiling is new.
+constant uint Q5K_MMX_TM = 8u;
+constant uint Q5K_MMX_TG = 64u;
+
+kernel void q5k_mm_f32_xs(
+    device float* arena    [[buffer(0)]],
+    constant ulong& x_off  [[buffer(1)]],
+    constant ulong& w_off  [[buffer(2)]],
+    constant ulong& dst_off[[buffer(3)]],
+    constant uint& m_dim   [[buffer(4)]],
+    constant uint& k_dim   [[buffer(5)]],
+    constant uint& n_dim   [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tid  [[thread_index_in_threadgroup]]
+) {
+    threadgroup float xs[Q5K_MMX_TM * DQ_QK_K];   // 8 x 256 f32 = 8 KiB
+
+    const uint col  = tgpig.x * Q5K_MMX_TG + (uint)tid;
+    const uint row0 = tgpig.y * Q5K_MMX_TM;
+    if (row0 >= m_dim) return;
+
+    const uint nblocks   = k_dim / DQ_QK_K;
+    const uint BLK_BYTES = 176u;   // 2+2+12+32+128
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    // Clamp rather than return: out-of-range columns still have to reach the
+    // barriers below. Dropped at the store.
+    const uint colc = min(col, n_dim - 1u);
+    device const uchar* w0 = (device const uchar*)arena + w_off
+                           + (ulong)colc * nblocks * BLK_BYTES;
+
+    float4 acc[Q5K_MMX_TM];
+    for (uint r = 0u; r < Q5K_MMX_TM; ++r) acc[r] = float4(0.0f);
+
+    const uint VEC_PER_TILE = Q5K_MMX_TM * (DQ_QK_K / 4u);
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        const uint p0 = b * DQ_QK_K;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = (uint)tid; i < VEC_PER_TILE; i += Q5K_MMX_TG) {
+            const uint r  = i / (DQ_QK_K / 4u);
+            const uint c4 = (i % (DQ_QK_K / 4u)) * 4u;
+            const uint rr = min(row0 + r, m_dim - 1u);
+            *(threadgroup float4*)(xs + r * DQ_QK_K + c4) =
+                *(device const float4*)(x + (ulong)rr * k_dim + p0 + c4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint off = b * BLK_BYTES;
+        const float d    = dq_read_f16(w0, off);
+        const float dmin = dq_read_f16(w0, off + 2u);
+        device const uchar* scales = w0 + off + 4u;
+        device const uchar* qh     = w0 + off + 4u + DQ_K_SCALE_SIZE;
+        device const uchar* ql     = qh + DQ_QK_K / 8u;
+
+        for (uint g = 0u; g < 4u; ++g) {
+            uint sc0, m0, sc1, m1;
+            dq_get_scale_min_k4(scales, 2u * g,      sc0, m0);
+            dq_get_scale_min_k4(scales, 2u * g + 1u, sc1, m1);
+            const float d0 = d * float(sc0), m0f = dmin * float(m0);
+            const float d1 = d * float(sc1), m1f = dmin * float(m1);
+            const uint u1 = 1u << (2u * g);
+            const uint u2 = 2u << (2u * g);
+            device const uchar* qlg = ql + g * 32u;
+            const uint lp = g * 64u;   // k offset of this group WITHIN the tile
+
+            // Low nibbles -> k [lp, lp+32). ql/qh are 4-byte aligned (block
+            // stride 176, qh at +16, ql at +48, all multiples of 4), so the
+            // packed bytes come in one uint load per 4 elements.
+            for (uint l = 0u; l < 32u; l += 4u) {
+                const uint qlv = *(device const uint*)(qlg + l);
+                const uint qhv = *(device const uint*)(qh + l);
+                float4 ww;
+                ww.x = d0 * float((qlv        & 0x0Fu) + (((qhv      ) & u1) ? 16u : 0u)) - m0f;
+                ww.y = d0 * float(((qlv >>  8) & 0x0Fu) + (((qhv >>  8) & u1) ? 16u : 0u)) - m0f;
+                ww.z = d0 * float(((qlv >> 16) & 0x0Fu) + (((qhv >> 16) & u1) ? 16u : 0u)) - m0f;
+                ww.w = d0 * float(((qlv >> 24) & 0x0Fu) + (((qhv >> 24) & u1) ? 16u : 0u)) - m0f;
+                for (uint r = 0u; r < Q5K_MMX_TM; ++r)
+                    acc[r] += *(threadgroup const float4*)(xs + r * DQ_QK_K + lp + l) * ww;
+            }
+            // High nibbles -> k [lp+32, lp+64).
+            for (uint l = 0u; l < 32u; l += 4u) {
+                const uint qlv = *(device const uint*)(qlg + l);
+                const uint qhv = *(device const uint*)(qh + l);
+                float4 ww;
+                ww.x = d1 * float(((qlv       ) >> 4 & 0x0Fu) + (((qhv      ) & u2) ? 16u : 0u)) - m1f;
+                ww.y = d1 * float(((qlv >>  8) >> 4 & 0x0Fu) + (((qhv >>  8) & u2) ? 16u : 0u)) - m1f;
+                ww.z = d1 * float(((qlv >> 16) >> 4 & 0x0Fu) + (((qhv >> 16) & u2) ? 16u : 0u)) - m1f;
+                ww.w = d1 * float(((qlv >> 24) >> 4 & 0x0Fu) + (((qhv >> 24) & u2) ? 16u : 0u)) - m1f;
+                for (uint r = 0u; r < Q5K_MMX_TM; ++r)
+                    acc[r] += *(threadgroup const float4*)(xs + r * DQ_QK_K + lp + 32u + l) * ww;
+            }
+        }
+    }
+
+    if (col >= n_dim) return;
+    for (uint r = 0u; r < Q5K_MMX_TM; ++r) {
+        const uint rr = row0 + r;
+        if (rr < m_dim)
+            dst[(ulong)rr * n_dim + col] = acc[r].x + acc[r].y + acc[r].z + acc[r].w;
+    }
+}
+
 constant uint Q6K_MM_TM = 8u;
 
 kernel void q6k_mm_f32(
@@ -2366,6 +2836,101 @@ kernel void q6k_mm_f32(
     }
 
     for (uint r = 0u; r < Q6K_MM_TM; ++r) {
+        uint rr = row0 + r;
+        if (rr < m_dim) dst[(ulong)rr * n_dim + col] = acc[r];
+    }
+}
+
+// Q6_K GEMM with the x tile staged in threadgroup memory — same fix as
+// `q4k_mm_f32_xs`, and `q6k_mm_f32` above has the problem in a worse form: per 4
+// dequantized weights it issues TM=8 x 4 = 32 SCALAR device loads of x (not even
+// vectorized), and all 64 threads of the threadgroup load the same values
+// because they differ only in output column. Q6_K is worth fixing even though a
+// Q*_K_M GGUF holds few of them: it is the conventional dtype for
+// `output.weight`, i.e. the single widest matmul in the model.
+//
+// Arithmetic, ordering and the 4-term grouping are copied verbatim from
+// `q6k_mm_f32`, so `q6k_mm_xs_parity` asserts bit equality.
+constant uint Q6K_MMX_TM = 8u;
+constant uint Q6K_MMX_TG = 64u;
+
+kernel void q6k_mm_f32_xs(
+    device float* arena    [[buffer(0)]],
+    constant ulong& x_off  [[buffer(1)]],
+    constant ulong& w_off  [[buffer(2)]],
+    constant ulong& dst_off[[buffer(3)]],
+    constant uint& m_dim   [[buffer(4)]],
+    constant uint& k_dim   [[buffer(5)]],
+    constant uint& n_dim   [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tid  [[thread_index_in_threadgroup]]
+) {
+    threadgroup float xs[Q6K_MMX_TM * DQ_QK_K];   // 8 x 256 f32 = 8 KiB
+
+    const uint col  = tgpig.x * Q6K_MMX_TG + (uint)tid;
+    const uint row0 = tgpig.y * Q6K_MMX_TM;
+    if (row0 >= m_dim) return;
+
+    const uint nblocks = k_dim / DQ_QK_K;
+    const uint BLK     = 210u;          // 128 ql + 64 qh + 16 sc + 2 d(f16)
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+    // Clamp rather than return: out-of-range columns must still reach the
+    // barriers. Dropped at the store.
+    const uint colc = min(col, n_dim - 1u);
+    device const uchar* w0 = (device const uchar*)arena + w_off
+                           + (ulong)colc * nblocks * BLK;
+
+    float acc[Q6K_MMX_TM];
+    for (uint r = 0u; r < Q6K_MMX_TM; ++r) acc[r] = 0.0f;
+
+    const uint VEC_PER_TILE = Q6K_MMX_TM * (DQ_QK_K / 4u);
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        const uint pbase = b * DQ_QK_K;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = (uint)tid; i < VEC_PER_TILE; i += Q6K_MMX_TG) {
+            const uint r  = i / (DQ_QK_K / 4u);
+            const uint c4 = (i % (DQ_QK_K / 4u)) * 4u;
+            const uint rr = min(row0 + r, m_dim - 1u);
+            *(threadgroup float4*)(xs + r * DQ_QK_K + c4) =
+                *(device const float4*)(x + (ulong)rr * k_dim + pbase + c4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint off = b * BLK;
+        device const uchar* ql = w0 + off;
+        device const uchar* qh = w0 + off + 128u;
+        device const uchar* sc = w0 + off + 192u;
+        float d = dq_read_f16(w0, off + 208u);
+        for (uint h = 0u; h < 2u; ++h) {
+            uint dst_base = h * 128u, ql_off = h * 64u, qh_off_h = h * 32u, sc_off = h * 8u;
+            for (uint l = 0u; l < 32u; ++l) {
+                uint is = l / 16u;
+                uchar qh_b = qh[qh_off_h + l];
+                float q1 = float(int(((ql[ql_off + l] & 0x0Fu)        | (((qh_b >> 0) & 3u) << 4u))) - 32);
+                float q2 = float(int(((ql[ql_off + l + 32u] & 0x0Fu)  | (((qh_b >> 2) & 3u) << 4u))) - 32);
+                float q3 = float(int(((ql[ql_off + l] >> 4)           | (((qh_b >> 4) & 3u) << 4u))) - 32);
+                float q4 = float(int(((ql[ql_off + l + 32u] >> 4)     | (((qh_b >> 6) & 3u) << 4u))) - 32);
+                float w1 = d * float(int8_t(sc[sc_off + is]))       * q1;
+                float w2 = d * float(int8_t(sc[sc_off + is + 2u]))  * q2;
+                float w3 = d * float(int8_t(sc[sc_off + is + 4u]))  * q3;
+                float w4 = d * float(int8_t(sc[sc_off + is + 6u]))  * q4;
+                // Tile-local k offsets (the device kernel's p1..p4 minus pbase).
+                uint p1 = dst_base + l;
+                uint p2 = p1 + 32u;
+                uint p3 = p1 + 64u;
+                uint p4 = p1 + 96u;
+                for (uint r = 0u; r < Q6K_MMX_TM; ++r) {
+                    threadgroup const float* xr = xs + r * DQ_QK_K;
+                    acc[r] += xr[p1] * w1 + xr[p2] * w2 + xr[p3] * w3 + xr[p4] * w4;
+                }
+            }
+        }
+    }
+
+    if (col >= n_dim) return;
+    for (uint r = 0u; r < Q6K_MMX_TM; ++r) {
         uint rr = row0 + r;
         if (rr < m_dim) dst[(ulong)rr * n_dim + col] = acc[r];
     }
