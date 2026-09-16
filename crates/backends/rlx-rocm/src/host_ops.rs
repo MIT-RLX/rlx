@@ -44,6 +44,37 @@ pub fn run_fft1d(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn run_fft1d_q(
+    ctx: &RocmContext,
+    buffer: &HipBuffer<f32>,
+    arena_size_bytes: usize,
+    src_byte_off: usize,
+    dst_byte_off: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm_tag: u32,
+    scale_tag: u32,
+) {
+    let _ = arena_size_bytes;
+    let mut arena = RocmArena {
+        ctx,
+        buffer,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_fft1d_q_valued(
+        &mut arena,
+        src_byte_off,
+        dst_byte_off,
+        outer,
+        n_complex,
+        inverse,
+        norm_tag,
+        scale_tag,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_gated_delta_net(
     ctx: &RocmContext,
     buffer: &HipBuffer<f32>,
@@ -776,6 +807,7 @@ pub fn run_rope_backward(
     head_dim: u32,
     n_rot: u32,
     cos_len: u32,
+    cos_row_stride: u32,
 ) {
     let mut arena = RocmArena {
         ctx,
@@ -783,7 +815,18 @@ pub fn run_rope_backward(
         size_bytes: arena_size_bytes,
     };
     rlx_gpu_host::run_rope_backward(
-        &mut arena, dy, cos, sin, dx, batch, seq, hidden, head_dim, n_rot, cos_len,
+        &mut arena,
+        dy,
+        cos,
+        sin,
+        dx,
+        batch,
+        seq,
+        hidden,
+        head_dim,
+        n_rot,
+        cos_len,
+        cos_row_stride,
     );
 }
 

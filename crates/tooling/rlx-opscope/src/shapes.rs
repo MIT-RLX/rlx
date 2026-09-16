@@ -45,7 +45,7 @@ impl OpCost {
         }
     }
     /// Arithmetic intensity if the op were NOT fused (intermediates spill to DRAM).
-    /// The gap to [`intensity`] is what fusion buys on the roofline.
+    /// The gap to `intensity` is what fusion buys on the roofline.
     pub fn intensity_unfused(&self) -> f64 {
         let denom = self.bytes + self.internal_bytes;
         if denom == 0 {

@@ -222,9 +222,45 @@ fn read_native_as_f32_encoded(raw: &[u8], off: usize, dtype: DType, n: usize) ->
     out
 }
 
+/// Input indices an op writes back **in place**, which the host fallback has to
+/// carry out of its private CPU arena by hand.
+///
+/// [`eval`] builds a throwaway graph on its own `rlx_cpu::arena::Arena` and
+/// reads back only the output slot. That is right for a pure op and silently
+/// wrong for one whose contract is to mutate an operand: the RNN family with
+/// `carry: true` writes the final `hn`/`cn` over `h0`/`c0` so the next `run()`
+/// continues the sequence, and those writes landed in the scratch arena and
+/// were dropped. Symptom: four single-step runs diverged from one four-step run
+/// from step 1 onward — state simply never advanced.
+///
+/// Vulkan is the only backend affected. CUDA, ROCm, Metal and wgpu run carry
+/// natively and never take this path.
+pub fn inplace_inputs(op: &Op) -> &'static [usize] {
+    // Indices follow `Op::num_inputs`: Lstm(x, w_ih, w_hh, bias, h0, c0),
+    // Gru(x, w_ih, w_hh, b_ih, b_hh, h0), Rnn(x, w_ih, w_hh, bias, h0).
+    match op {
+        Op::Lstm { carry: true, .. } => &[4, 5],
+        Op::Gru { carry: true, .. } => &[5],
+        Op::Rnn { carry: true, .. } => &[4],
+        _ => &[],
+    }
+}
+
+/// [`eval`]'s result plus any operands the op mutated in place.
+pub struct HostEval {
+    pub out: HostOut,
+    /// `(input index, new contents)` for each entry of [`inplace_inputs`].
+    pub inplace: Vec<(usize, HostOut)>,
+}
+
 /// Run a single op on the CPU reference and return its output as f32-encoded
 /// values (or raw bytes for U8/I8 packed outputs) for the Vulkan arena.
 pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut {
+    eval_full(op, out_shape, inputs).out
+}
+
+/// [`eval`], also returning operands the op wrote back in place.
+pub fn eval_full(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostEval {
     let mut g = Graph::new("vk_host_fallback");
     let ids: Vec<rlx_ir::NodeId> = inputs
         .iter()
@@ -264,20 +300,35 @@ pub fn eval(op: &Op, out_shape: &Shape, inputs: &[(Shape, HostBuf)]) -> HostOut 
     let schedule = rlx_cpu::thunk::compile_thunks(&g, &arena);
     rlx_cpu::thunk::execute_thunks(&schedule, arena.raw_buf_mut());
 
-    let n = out_shape.num_elements().unwrap_or(0);
-    match out_shape.dtype() {
-        // Packed-byte outputs (quant codes / block scales) are read back raw so
-        // the U8 bytes aren't reinterpreted as f32.
-        DType::U8 | DType::I8 => {
-            let nbytes = n * out_shape.dtype().size_bytes();
-            let off = arena.byte_offset(out);
-            let avail = arena.raw_buf().len().saturating_sub(off);
-            let nbytes = nbytes.min(avail);
-            HostOut::Bytes(arena.raw_buf()[off..off + nbytes].to_vec())
+    // Read a slot back in whatever encoding its dtype calls for.
+    let read_slot = |arena: &rlx_cpu::arena::Arena, id: rlx_ir::NodeId, sh: &Shape| -> HostOut {
+        let n = sh.num_elements().unwrap_or(0);
+        let off = arena.byte_offset(id);
+        match sh.dtype() {
+            // Packed-byte slots (quant codes / block scales) are read back raw
+            // so the U8 bytes aren't reinterpreted as f32.
+            DType::U8 | DType::I8 => {
+                let nbytes =
+                    (n * sh.dtype().size_bytes()).min(arena.raw_buf().len().saturating_sub(off));
+                HostOut::Bytes(arena.raw_buf()[off..off + nbytes].to_vec())
+            }
+            dt => HostOut::F32(read_native_as_f32_encoded(arena.raw_buf(), off, dt, n)),
         }
-        dt => {
-            let off = arena.byte_offset(out);
-            HostOut::F32(read_native_as_f32_encoded(arena.raw_buf(), off, dt, n))
-        }
+    };
+
+    // Anything the op mutated in place has to come back too — see
+    // `inplace_inputs`. Without this the RNN carry writeback died in this
+    // function's private arena.
+    let inplace: Vec<(usize, HostOut)> = inplace_inputs(op)
+        .iter()
+        .filter_map(|&i| {
+            let (sh, _) = inputs.get(i)?;
+            Some((i, read_slot(&arena, ids[i], sh)))
+        })
+        .collect();
+
+    HostEval {
+        out: read_slot(&arena, out, out_shape),
+        inplace,
     }
 }

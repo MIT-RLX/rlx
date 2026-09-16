@@ -68,7 +68,10 @@ fn run() -> Result<()> {
         eprint!("{}", usage(&argv0));
         bail!("missing command");
     }
-    let cmd = args.remove(1);
+    // Drop argv0 as well as the subcommand: every handler below indexes `args` from its
+    // own first operand, so leaving the program path in would shift all of them by one.
+    args.remove(0);
+    let cmd = args.remove(0);
     match cmd.as_str() {
         "inspect" => cmd_inspect(&args)?,
         "verify" => cmd_verify(&args)?,

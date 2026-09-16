@@ -37,7 +37,7 @@ cargo test -p rlx-autodiff
 ## Benchmarks
 
 Third-order cubic-sum sweep across backends and batch sizes:
-[`docs/benchmarks/higher-order-ad.md`](../docs/benchmarks/higher-order-ad.md).
+[`docs/benchmarks/higher-order-ad.md`](../../../docs/benchmarks/higher-order-ad.md).
 
 ```sh
 cargo run -p rlx-bench --release --example bench_nth_order --features metal,mlx,gpu

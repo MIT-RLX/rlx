@@ -168,7 +168,7 @@ impl<'a> LowerCtx<'a> {
         let shape = node.shape.clone();
         let in_shape = self.graph.shape(node.inputs[0]).clone();
         let w_shape = self.graph.shape(node.inputs[1]).clone();
-        if std::env::var("RLX_DBG_CONV").is_ok() {
+        if rlx_ir::env::var("RLX_DBG_CONV").is_some() {
             eprintln!(
                 "[mil-conv] transpose={transpose} groups={groups} in={:?} w={:?} out={:?}",
                 in_shape.dims(),

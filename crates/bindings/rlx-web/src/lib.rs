@@ -16,7 +16,7 @@
 //!   the browser main thread (`rlx-cpu` is single-threaded on wasm).
 //!
 //! - **WebGPU (`webgpu` feature):** async forward/backward via
-//!   `rlx_wgpu::WgpuExecutable::run_async` (see [`webgpu`]); GPU→CPU readback
+//!   `rlx_wgpu::WgpuExecutable::run_async` (see the `webgpu` module); GPU→CPU readback
 //!   cannot block the browser event loop, so those entry points are `async`.
 //!
 //! The forward and backward graphs are identical across backends — only the

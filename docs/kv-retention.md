@@ -359,3 +359,6 @@ Stage-3+) is the lever. Full-context stays the recall upper bound.
   `HeavyHitter` to keep *important* (not merely recent) context.
 - Block retrieval currently re-chunks the evicted middle each step (simple,
   correct; a stable-block index is a later optimization).
+## License
+
+MIT OR Apache-2.0.

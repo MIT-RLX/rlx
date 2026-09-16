@@ -54,8 +54,12 @@ pub trait DeviceArena {
 /// Used by every CPU-resident-arena backend. GPU backends can call this
 /// after staging into a host buffer, then upload.
 ///
-/// Currently supports F32 / F64 / F16 / BF16 / C64 / C128. Other dtypes
-/// fall through to F32.
+/// `max_elems` is a count of `dtype` ELEMENTS, so every arm must write
+/// `dtype.size_bytes()` per element. The F32 fall-through writes 4 B/elem,
+/// which is only sound for the 4-byte dtypes (F32/I32/U32) — a narrower slot
+/// takes it as a 2x (I16) or 4x (U8/I8/Bool) buffer overrun. The narrow arms
+/// below convert numerically, the exact inverse of
+/// `rlx_runtime::backend::widen_bytes_to_f32`.
 pub unsafe fn write_typed_from_f32(dst_ptr: *mut u8, dtype: DType, src: &[f32], max_elems: usize) {
     let n = src.len().min(max_elems);
     match dtype {
@@ -96,6 +100,33 @@ pub unsafe fn write_typed_from_f32(dst_ptr: *mut u8, dtype: DType, src: &[f32], 
                 *dst.add(i) = src[i] as f64;
             }
         },
+        // 1-byte slots. `as` casts on floats saturate (and map NaN to 0),
+        // so an out-of-range value clamps rather than being UB.
+        DType::U8 => unsafe {
+            for i in 0..n {
+                *dst_ptr.add(i) = src[i] as u8;
+            }
+        },
+        DType::Bool => unsafe {
+            for i in 0..n {
+                *dst_ptr.add(i) = u8::from(src[i] != 0.0);
+            }
+        },
+        DType::I8 => unsafe {
+            let dst = dst_ptr as *mut i8;
+            for i in 0..n {
+                *dst.add(i) = src[i] as i8;
+            }
+        },
+        // 2-byte slot.
+        DType::I16 => unsafe {
+            let dst = dst_ptr as *mut i16;
+            for i in 0..n {
+                *dst.add(i) = src[i] as i16;
+            }
+        },
+        // F32 / I32 / U32: 4 B/elem, so the width matches. Integers keep the
+        // long-standing f32-bit-aliased representation of the f32 arena here.
         _ => unsafe {
             let dst = dst_ptr as *mut f32;
             std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
@@ -153,6 +184,16 @@ pub unsafe fn read_typed_to_f32(src_ptr: *const u8, dtype: DType, n_elems: usize
             }
             out
         },
+        // NOTE: narrow (U8/I8/Bool/I16) slots deliberately keep the f32 read
+        // below. This is `read_output`'s path, and on the CPU backend — which
+        // plans with `ArenaWidthPolicy::Native` — an integer/bool ACTIVATION is
+        // written by its kernel as f32 ("widen at compute", see the
+        // `plan_memory_hybrid` doc), so the f32 read is what matches it. That
+        // read runs past a natively-sized slot: it is the "integer-overrun
+        // risk" `plan_memory_hybrid` names, and closing it means settling
+        // whether a native-width U8 slot carries codes or widened f32 — a
+        // policy change, not a local fix. The WRITE path above is different:
+        // it is host input, where a native slot has no room for f32 at all.
         _ => unsafe {
             let src = src_ptr as *const f32;
             std::slice::from_raw_parts(src, n_elems).to_vec()

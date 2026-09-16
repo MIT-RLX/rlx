@@ -4,7 +4,7 @@
 
 //! Ergonomic front door. [`Pipeline`] wraps the partition + run steps so the
 //! common paths are one call, while the underlying [`crate::partition`],
-//! [`crate::pipeline`] and [`crate::distributed`] pieces stay available for full
+//! [`crate::pipeline`] and `crate::distributed` pieces stay available for full
 //! control (custom cuts, custom transports, streaming param sources).
 //!
 //! ```ignore
@@ -86,7 +86,7 @@ impl Pipeline {
     }
 
     /// Drive a cluster where `worker_addrs[i]` serves stage `i`
-    /// (see [`crate::distributed::serve_stage`]). Returns the final logits.
+    /// (see `crate::distributed::serve_stage`). Returns the final logits.
     pub fn run_tcp(
         &self,
         worker_addrs: &[String],

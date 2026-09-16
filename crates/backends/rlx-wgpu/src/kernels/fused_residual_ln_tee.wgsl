@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// FusedResidualLN with a "tee" output: writes BOTH (h + residual + [bias])
+// FusedResidualLN / FusedResidualRmsNorm with a "tee" output (`is_rms`): writes BOTH (h + residual + [bias])
 // AND LN(h + residual + [bias]) to two separate arena slots. Used when
 // the sum has multiple consumers downstream (the LN AND a later residual
 // add) and the regular `fused_residual_ln` can't fire because of its
@@ -33,7 +33,7 @@ struct Params {
     ln_out_off: u32,
     eps_bits: u32,
     has_bias: u32,
-    _p0: u32,
+    is_rms: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -74,13 +74,24 @@ fn fused_residual_ln_tee(
         sum_sq = sum_sq + d * d;
     }
     let var_ = sum_sq * n_inv;
-    let inv_std = inverseSqrt(var_ + eps);
+    // RMS norm scales by 1/sqrt(mean(x^2)) and does NOT recentre. Reuse the
+    // same stable two-pass accumulation: mean(x^2) = mean((x-mean)^2) + mean^2,
+    // which avoids the f32 cancellation a one-pass sum(x^2) suffers under the
+    // large DC offset pre-norm transformer activations carry.
+    let rms_only = params.is_rms != 0u;
+    let inv_scale = select(
+        inverseSqrt(var_ + eps),
+        inverseSqrt(var_ + mean * mean + eps),
+        rms_only,
+    );
 
-    // Pass 2: read sum_base, write LN result to out_base. Two distinct
+    // Pass 2: read sum_base, write the norm result to out_base. Two distinct
     // slots — the sum stays available for the other consumer.
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         let g = arena[params.gamma_off + i];
         let b = arena[params.beta_off  + i];
-        arena[out_base + i] = (arena[sum_base + i] - mean) * inv_std * g + b;
+        let v = arena[sum_base + i];
+        let centred = select(v - mean, v, rms_only);
+        arena[out_base + i] = centred * inv_scale * g + b;
     }
 }

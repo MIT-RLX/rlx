@@ -1,6 +1,6 @@
 # RLX
 
-![status](https://img.shields.io/badge/status-0.2.14-blue)
+![status](https://img.shields.io/badge/status-0.2.16-blue)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 ![rust](https://img.shields.io/badge/rust-edition%202024-orange)
 [![repo](https://img.shields.io/badge/github-MIT--RLX%2Frlx-black)](https://github.com/MIT-RLX/rlx)
@@ -35,10 +35,13 @@ sibling repos.
 - [Building from source](#building-from-source)
 - [Documentation](#documentation)
 - [Kernel dispatch and transparency](#kernel-dispatch-and-transparency)
+- [Development workflow](#development-workflow)
 - [Training](#training)
 - [Status by area](#status-by-area)
+- [Authors](#authors)
 - [Citing RLX](#citing-rlx)
 - [Contributing](#contributing)
+- [License](#license)
 
 ## Why another one
 
@@ -90,6 +93,7 @@ rlx = { version = "0.2", features = ["cpu", "metal"] }
 | `cpu` *(default)*   | NEON / AVX + Accelerate / OpenBLAS   | every host                |
 | `metal`             | Metal Performance Shaders + MSL      | macOS (Apple Silicon)     |
 | `mlx`               | Apple MLX (vendored)                 | macOS (Apple Silicon)     |
+| `mlx-cuda`          | Apple MLX's CUDA backend             | Linux + NVIDIA            |
 | `coreml`            | CoreML / Neural Engine (`Device::Ane`)| macOS / iOS (Apple)      |
 | `gpu`               | wgpu (Vulkan / DX12 / WebGPU / Metal)| cross-platform            |
 | `vulkan`            | native Vulkan compute (`ash` + SPIR-V)| Linux / Windows (+ MoltenVK)|
@@ -97,6 +101,7 @@ rlx = { version = "0.2", features = ["cpu", "metal"] }
 | `cuda`              | cuBLAS / cuDNN / NVRTC               | Linux / Windows + NVIDIA  |
 | `rocm`              | hipBLAS / MIOpen                     | Linux + AMD               |
 | `tpu`               | libtpu PJRT plugin                   | Linux + GCP TPU           |
+| `egpu`              | external GPU on a USB4/TB PCIe tunnel| macOS (discovery + transport)|
 | `blas-accelerate`   | macOS Accelerate                     | macOS                     |
 | `blas-mkl`          | Intel MKL                            | Intel / AMD CPUs          |
 | `blas-openblas`     | OpenBLAS                             | cross-platform CPU        |
@@ -116,13 +121,17 @@ Off by default; enable per workload:
 | `tensor` *(default)* | NumPy-style lazy `Tensor` DSL (`rlx::tensor`)      |
 | `gguf`         | GGUF v1 / v2 / v3 parser + dequant                       |
 | `gguf-convert` | safetensors / ONNX → GGUF with per-tensor quant          |
-| `onnx`         | run `.onnx` models on RLX backends via ONNX Runtime EPs  |
+| `onnx`         | run `.onnx` models — native compile, optional ORT fallback|
 | `optim`        | training-step optimizers (Adam/Lion/Muon/…, `rlx::optim`)|
 | `distributed`  | in-graph collectives + `rlx::distributed` front door     |
 | `umap`         | UMAP dimensionality reduction (`rlx::umap`)              |
+| `geo`          | exact integer Delaunay + discrete Voronoi (`rlx::geo`)   |
 | `bench`        | uniform benchmark harness                                |
 | `sparse`       | sparse linear algebra (custom-op scaffold)               |
 | `linalg`       | dense linalg via LAPACK (custom-op scaffold)             |
+| `splat`        | 3D Gaussian splat opcodes + executor registry (`rlx::splat`) — renderer is the out-of-tree `rlx-splat` |
+| `peft`         | LoRA / IA3 / AdaLoRA / DoRA / OFT adapters (`rlx::peft`) |
+| `rng`          | bit-exact numpy / PyTorch random streams (`rlx::rng`)    |
 
 ### Specialty crates
 
@@ -135,6 +144,10 @@ exposed through the prelude:
   `rlx_runtime::export` / `pyrlx.export_fpga` under the `fpga` feature).
 - `rlx-qnn` — Qualcomm Hexagon / QNN codegen + FFI runtime (`Device::Hexagon`;
   enable `rlx-runtime`'s `qnn` feature, not on the umbrella prelude).
+- `rlx-cerebras` — Cerebras WSE: IR → CSL → fabric simulator. No `Device`
+  variant; the fabric is targeted through codegen, not a runtime backend.
+- `rlx-ffi` — C ABI over the distributed node, for iOS (staticlib →
+  xcframework) and embedded hosts (cdylib).
 
 ## Quickstart
 
@@ -426,7 +439,7 @@ and [`docs/gguf-backend-paths.md`](docs/gguf-backend-paths.md)).
 ## Workspace layout
 
 The umbrella `rlx` crate is a prelude that re-exports the framework; the
-first-party workspace is 61 crates under
+first-party workspace is 72 crates under
 `crates/{core,backends,io,numerics,tooling,bindings}/`, each with its own
 `README.md`.
 
@@ -468,8 +481,11 @@ backends/  — one crate per hardware target
   rlx-cortexm        Cortex-M INT8 kernels for ARMv7E-M microcontrollers (no_std)
   rlx-fpga           FPGA — per-graph datapath synthesis (IR → Verilog → bitstream)
   rlx-cerebras       Cerebras Wafer-Scale Engine — IR → CSL → fabric simulator
+  rlx-egpu           external GPU over USB4/Thunderbolt — IOKit PCI discovery + DriverKit
   rlx-gpu-host       backend-agnostic host-fallback kernels (D2H → CPU → H2D)
   rlx-gpu-kernels    shared CUDA/HIP C++ kernel sources (NVRTC / hipRTC)
+  rlx-gpu-dispatch   shape-keyed kernel-variant dispatch table shared by all GPU backends
+  rlx-cortexm-trainer  native fp32 trainer that emits rlx-cortexm's INT8 weights
 
 io/  — model + weight loading, conversion, packaging
   rlx-gguf           standalone GGUF v1/2/3 parser + dequant (every llama.cpp scheme)
@@ -493,17 +509,26 @@ numerics/  — downstream domain packages (register against the custom-op scaffo
   rlx-vq             fused vector-quantization kernel (nearest-codebook assignment)
   rlx-umap           parametric UMAP (fit / transform + k-NN)
   rlx-fdm            force density method — pin-jointed form-finding
+  rlx-fem            nonlinear scalar P1 FEM on triangles (Poisson family)
+  rlx-geo            exact integer Delaunay + discrete Voronoi custom ops
+  rlx-lbm            moment-encoded lattice Boltzmann (HOME-LBM) — D2Q9 / D3Q27
   rlx-bbo            black-box optimization + FMQ/QGBS search
   rlx-rl             flow-map generative policies (FMQ / QGBS)
+  rlx-peft           parameter-efficient adaptation — LoRA / IA3 / AdaLoRA / DoRA / OFT
+  rlx-rng            bit-exact numpy + PyTorch random streams (MT19937 / PCG64 / randperm)
 
 tooling/
   rlx-check          device-free static graph checker (shape / dispatch / fusion / NaN)
   rlx-bench          benchmark harness + `rlx-gpu` GPU telemetry/control CLI
   rlx-hwprofile      host hardware profiler — GPU/VRAM detection for device selection
+  rlx-corpus         named kernel corpus every compiler change must clear, by family
+  rlx-opscope        data-pattern recorder — inject stat taps, sweep, mine exploitable structure
+  rlx-megakernel     standalone study: how far MoE composes toward one device program
   rlxsl              scalar-expr manifest → per-language activation kernels (WGSL/CUDA/MSL/…)
 
 bindings/
   pyrlx              Python bindings (PyO3) — run RLX graphs + HF models on any backend
+  rlx-ffi            C ABI for the distributed node — iOS xcframework + embedded hosts
   rlx-web            WebAssembly entry point — run models in-browser (CPU; WebGPU bring-up)
 ```
 
@@ -654,16 +679,16 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
 
 | Area                         | State                                         |
 |------------------------------|-----------------------------------------------|
-| CPU forward + backward       | Mature; full **153/`OpKind`** claim (fused/control expand before thunks) |
-| Apple Metal forward          | Mature; full OpKind claim; native fused Gru/Rnn/Mamba2 + training bwd |
-| Apple MLX forward + backward | Mature; full OpKind claim; tier-1/2/3 backward parity |
-| NVIDIA CUDA                  | Full **153** claim; shared `.cu` training/QAT/RNN/I8 depth; DenseSolve via cuSOLVER; optional NCCL (`--features nccl`); less field mileage than Metal |
-| AMD ROCm                     | Sister-crate parity to CUDA (shared kernels + hipSOLVER DenseSolve/Eigh) |
-| TPU                          | Full **153** claim; HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd; host for DenseSolve/SPD/`FftButterflyStage`; MiniLM-L6 E2E via PJRT |
-| WGPU                         | Full OpKind claim; coop-matrix paths under test; on-device C64 + native Gru/Rnn/Mamba2 / FftButterfly / act bwd |
-| Apple CoreML / ANE (`Device::Ane`) | Full OpKind claim; transformer block on-device (IR → MIL); Complex*/FftButterfly MIL; backward + on-device gradient training behind the `training` feature |
-| Native Vulkan (`Device::Vulkan`) | Full **153** claim; broad SPIR-V set (norms/fused/RNN/vision-bwd/I8 quant/FFT butterfly) + host/unfuse for specialty ops; C64 arithmetic; parity on MoltenVK / lavapipe |
-| Intel oneAPI (`Device::OneApi`) | Full **153** claim; OpenCL-C SPIR-V kernel set mirrors Vulkan depth when `RLX_ONEAPI_BUILD_KERNELS=1`; else CPU reference; DenseSolve stays HostOpDesc→LAPACK |
+| CPU forward + backward       | Mature; the reference surface — **176/187** `OpKind`s claimed (fused/control expand before thunks) |
+| Apple Metal forward          | Mature; widest claim of any backend (**179/187**); native fused Gru/Rnn/Mamba2 + training bwd |
+| Apple MLX forward + backward | Mature; **168/187**; tier-1/2/3 backward parity |
+| NVIDIA CUDA                  | **173/187**; shared `.cu` training/QAT/RNN/I8 depth; DenseSolve via cuSOLVER; optional NCCL (`--features nccl`); less field mileage than Metal |
+| AMD ROCm                     | **171/187** — sister-crate parity to CUDA (shared kernels + hipSOLVER DenseSolve/Eigh) |
+| TPU                          | **163/187**; HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd; host for DenseSolve/SPD/`FftButterflyStage`; MiniLM-L6 E2E via PJRT |
+| WGPU                         | **170/187**; coop-matrix paths under test; on-device C64 + native Gru/Rnn/Mamba2 / FftButterfly / act bwd |
+| Apple CoreML / ANE (`Device::Ane`) | **164/187**; transformer block on-device (IR → MIL); Complex*/FftButterfly MIL; backward + on-device gradient training behind the `training` feature |
+| Native Vulkan (`Device::Vulkan`) | **170/187**; broad SPIR-V set (norms/fused/RNN/vision-bwd/I8 quant/FFT butterfly) + host/unfuse for specialty ops; C64 arithmetic; parity on MoltenVK / lavapipe |
+| Intel oneAPI (`Device::OneApi`) | **161/187**; OpenCL-C SPIR-V kernel set mirrors Vulkan depth when `RLX_ONEAPI_BUILD_KERNELS=1`; else CPU reference; DenseSolve stays HostOpDesc→LAPACK |
 | Qualcomm Hexagon (QNN)       | Codegen + FFI runtime (`Device::Hexagon`): on-device INT8/INT4 `QMatMul`, `DequantMatMul`, `FusedAttentionBlock`, persistent session + context-binary save/load; x86 HTP functional sim (`just qnn-htp-sim`) |
 | Cortex-M (INT8)              | Production: 96.6% MNIST on nRF52840 hardware  |
 | FPGA                         | First-class SystemVerilog / bitstream export (`rlx_runtime::export`, `pyrlx.export_fpga`); Int8/Int4/Fp4, soft-port RTL + ECP5 / iCE40 / Xilinx7 synth |
@@ -671,7 +696,7 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
 | Forward-mode AD (`jvp`/`hvp`)| Functional; thin public API                   |
 | `vmap`                       | MVP — leading-axis batching                   |
 | QAT (PTQ + STE + LSQ)        | Complete: EMA, Fixed, PerBatch, propagation; native FakeQuantize/LSQ on CUDA/ROCm/Vulkan/Metal/wgpu |
-| OpKind coverage matrix       | **153/153** on CPU / Metal / MLX / wgpu / ANE / CUDA / ROCm / Vulkan / oneAPI / TPU — [`docs/op-coverage.md`](docs/op-coverage.md) (`just gen-op-coverage`) |
+| OpKind coverage matrix       | **187** `OpKind`s; per-backend claims run **161–179**, generated from each backend's `SUPPORTED_OPS` — [`docs/op-coverage.md`](docs/op-coverage.md) (`just gen-op-coverage`, gated by `just check-op-coverage`) |
 | Qwen3 LM (safetensors + GGUF)| End-to-end on Metal: 100% top-1 parity vs HF; matches/beats Python MPS on most prefill shapes. Q4_K_M GGUF loads + runs |
 | Op::DequantMatMul GGUF schemes | All llama.cpp schemes (incl. Q4_1, Q5_0, Q5_1, IQ/TQ/MX). GPU dequant on Metal/CUDA/ROCm/WGPU (shared scheme ids 0–23); **Metal fused GEMV** for Q4_K, Q4_0/1, Q8_0, IQ4NL, IQ2/3/1 families (`m=1` prefill); WGPU grouped MoE GPU when scratch fits; ANE MIL constexpr for K/IQ/TQ/MX; TPU compile-time + runtime Param bake. **pyrlx:** `quantize`, `load_gguf`, `convert_to_gguf`. See [docs/gguf-backend-paths.md](docs/gguf-backend-paths.md). |
 | Sampler chain                  | `SamplerChain` in `rlx-runtime::samplers`: Temperature, DynamicTemperature, TopK, TopP, TopNSigma, TypicalP, Mirostat v1/v2, XTC, DRY, RepetitionPenalty. Wired into `SampleOpts::into_chain()`; classic top-k/top-p stay on the fast path via `is_classic()`. |

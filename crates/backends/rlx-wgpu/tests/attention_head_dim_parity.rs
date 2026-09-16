@@ -13,7 +13,7 @@ use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
 fn run_case(nh: usize, nkv: usize, hd: usize, seq: usize) -> Option<f32> {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return None;
     }

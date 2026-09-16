@@ -73,7 +73,7 @@ pub enum FlowStage {
     SwiGlu(SwiGluStage),
     /// Prefill self-attention (QKV + RoPE + GQA + causal mask).
     SelfAttnPrefill(SelfAttnPrefillStage),
-    /// Gated DeltaNet scan (inputs via [`FlowState::gdn`]).
+    /// Gated DeltaNet scan (inputs via `FlowState::gdn`).
     GdnScan(GdnScanStage),
     /// Store active flow into a named stream.
     StoreStream(StoreStreamStage),

@@ -58,7 +58,7 @@ fn main() {
 
     let aiecc = std::env::var("AIECC").expect("set AIECC");
     let peano = std::env::var("PEANO").expect("set PEANO");
-    let include = std::env::var("RLX_XDNA_AIE_INCLUDE").expect("set RLX_XDNA_AIE_INCLUDE");
+    let include = rlx_ir::env::var("RLX_XDNA_AIE_INCLUDE").expect("set RLX_XDNA_AIE_INCLUDE");
 
     // 1) Representative f32 activation + weight (attention-scale std ~ 1/sqrt(K)).
     let wstd = 1.0 / (k as f32).sqrt();

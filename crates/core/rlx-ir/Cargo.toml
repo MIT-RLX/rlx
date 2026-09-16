@@ -21,7 +21,16 @@ aes = "0.9.1"
 
 [features]
 serialize = ["dep:serde", "dep:serde_json", "dep:bincode"]
+# One constructible `Op` per `OpKind` (`sample_ops`), so gates keyed on the op
+# set can cover all of it instead of the handful a test author thought of.
+# Off by default: it is test scaffolding, not part of the IR surface.
+test-support = []
 
 [dev-dependencies]
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["serialize"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

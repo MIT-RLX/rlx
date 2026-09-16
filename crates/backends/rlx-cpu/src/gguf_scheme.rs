@@ -38,6 +38,7 @@ pub fn quant_scheme_for_ggml(dtype: GgmlType) -> Option<QuantScheme> {
         GgmlType::Q2_0 => Some(QuantScheme::GgufQ2_0),
         GgmlType::FV5 => Some(QuantScheme::GgufFV5),
         GgmlType::FV5B => Some(QuantScheme::GgufFV5B),
+        GgmlType::G8_0 => Some(QuantScheme::GgufG8_0),
         _ => None,
     }
 }

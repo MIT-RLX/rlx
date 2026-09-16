@@ -56,7 +56,7 @@ the CUDA backend added an hour+ to every clean `cargo build` on WSL rigs.
 
 6. Runtime device selection (after build): `RLX_MLX_DEVICE=cpu|gpu`.
 
-Full guide: [`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
+Full guide: [`docs/benchmarks/mlx-linux.md`](../../../docs/benchmarks/mlx-linux.md).
 
 ### macOS / Windows
 

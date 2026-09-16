@@ -23,14 +23,16 @@
 
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 const F: DType = DType::F32;
 
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cpu),
-        Err(_) => Device::Cpu,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cpu),
+        None => Device::Cpu,
     }
 }
 
@@ -41,7 +43,7 @@ fn run1(g: &Graph, dev: Device, x: &[f32]) -> Vec<f32> {
 #[test]
 fn activation_deriv_wrt_x_matches_finite_difference() {
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("activation_deriv_fd: {dev:?} unavailable — skipping");
         return;
     }

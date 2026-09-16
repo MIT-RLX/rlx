@@ -80,8 +80,23 @@ pub fn clear_for_tests() {
 mod tests {
     use super::*;
 
+    /// Serializes the tests below.
+    ///
+    /// `clear_for_tests` wipes the process-global registry, so a sibling's
+    /// clear can land between this test's `register` and its `execute` — which
+    /// is exactly how `re_register_replaces` came to unwrap a `None` that the
+    /// code under test never produced.
+    static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take [`REGISTRY_TEST_LOCK`], ignoring poisoning: it orders registry
+    /// access and guards no invariant a panicking test could leave broken.
+    fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn register_then_execute() {
+        let _lock = registry_lock();
         clear_for_tests();
         register("test.identity", |ins| ins[0].to_vec());
         let out = execute("test.identity", &[&[1.0, 2.0, 3.0]]).unwrap();
@@ -90,12 +105,14 @@ mod tests {
 
     #[test]
     fn unknown_op_returns_none() {
+        let _lock = registry_lock();
         clear_for_tests();
         assert!(execute("nope", &[]).is_none());
     }
 
     #[test]
     fn re_register_replaces() {
+        let _lock = registry_lock();
         clear_for_tests();
         register("test.f", |_| vec![1.0]);
         register("test.f", |_| vec![2.0]);

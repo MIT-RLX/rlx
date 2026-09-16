@@ -24,13 +24,13 @@ std = []
 # already validates against. The kernels themselves we re-derive (cortexm
 # uses an f32 requantize; FPGA fabric needs integer-only Q0.31).
 [dependencies]
-rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.14", default-features = false, features = ["std"] }
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.16", default-features = false, features = ["std"] }
 rlx-ir = { workspace = true }
 rlx-opt = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.14", default-features = false, features = ["std"] }
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.16", default-features = false, features = ["std"] }
 
 [lib]
 path = "src/lib.rs"
@@ -41,3 +41,8 @@ path = "src/bin/emit.rs"
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["std"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

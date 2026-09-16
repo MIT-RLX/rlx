@@ -21,9 +21,9 @@
 //! - **dequantized to f32** via [`MlxWeights::into_f32_map`] /
 //!   [`MlxWeights::into_shaped_f32`], or
 //! - kept as packed triples for [`rlx_ir::Op::DequantMatMul`] with
-//!   [`rlx_ir::QuantScheme::MlxAffine`] / [`MlxMxfp4`] / [`MlxMxfp8`].
-//!   mlx-lm `nvfp4` maps to [`MlxMxfp4`] (same pack layout; typical
-//!   `group_size=16` with FP8 E4M3 scales) — not GGUF/NVIDIA [`Nvfp4Block`].
+//!   [`rlx_ir::QuantScheme::MlxAffine`] / `MlxMxfp4` / `MlxMxfp8`.
+//!   mlx-lm `nvfp4` maps to `MlxMxfp4` (same pack layout; typical
+//!   `group_size=16` with FP8 E4M3 scales) — not GGUF/NVIDIA `Nvfp4Block`.
 
 mod arch;
 mod config;

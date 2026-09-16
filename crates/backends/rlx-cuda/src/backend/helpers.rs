@@ -51,6 +51,26 @@ pub(crate) fn use_wmma() -> bool {
     crate::runtime_config().wmma
 }
 
+/// This device's key in the shared GPU dispatch table, with the persisted
+/// tuning cache guaranteed loaded.
+///
+/// Both halves are process-once and both are prerequisites of *any* table
+/// lookup, so they share one entry point rather than leaving callers to
+/// remember the load. Cached because `device_cc` is two driver attribute reads
+/// and this sits on the per-node dispatch path; same single-device assumption
+/// the kernel `OnceLock`s already make.
+pub(crate) fn gpu_arch(ctx: &Arc<CudaContext>) -> &'static rlx_gpu_kernels::dispatch::GpuArch {
+    use std::sync::OnceLock;
+    static ARCH: OnceLock<rlx_gpu_kernels::dispatch::GpuArch> = OnceLock::new();
+    ARCH.get_or_init(|| {
+        crate::tuning::ensure_tuning_cache_loaded();
+        match device_cc(ctx) {
+            (0, 0) => rlx_gpu_kernels::dispatch::GpuArch::unknown(),
+            (maj, min) => rlx_gpu_kernels::dispatch::GpuArch::cuda(maj as u32, min as u32),
+        }
+    })
+}
+
 /// Device compute capability `(major, minor)` via the driver attribute query.
 /// Cheap (two attribute reads); only hit on cold kernel compile. Falls back to
 /// `(0, 0)` if the query errors, which disables every arch-gated path.
@@ -66,6 +86,61 @@ pub(crate) fn device_cc(ctx: &Arc<CudaContext>) -> (i32, i32) {
 pub(crate) fn fp8_tensor_cores(ctx: &Arc<CudaContext>) -> bool {
     let (maj, min) = device_cc(ctx);
     (maj == 8 && min >= 9) || maj >= 9
+}
+
+/// The schedule-verifier [`Target`] for the attached device.
+///
+/// A schedule is checked against what *this* GPU provides, not against a
+/// portable floor: `Feature::AsyncCopy` is real on sm_80+ and absent below, and
+/// the whole point of declaring a capability is that a device lacking it
+/// produces a named rejection instead of a silent fallback.
+///
+/// Compute capabilities rlx has no calibrated entry for fall back to
+/// `Target::PORTABLE`, which under-reports capability. That direction is the
+/// safe one — a schedule refused for a feature the device may actually have is
+/// recoverable; one admitted for a feature it lacks is not.
+///
+/// [`Target`]: rlx_ir::kernel_schedule::Target
+#[cfg_attr(not(feature = "schedule-codegen"), allow(dead_code))]
+pub(crate) fn schedule_target(ctx: &Arc<CudaContext>) -> rlx_ir::kernel_schedule::Target {
+    use rlx_ir::kernel_schedule::Target;
+    match device_cc(ctx) {
+        // sm_80 and up: cp.async, async barriers, swizzled shared addressing.
+        // CUDA_SM86 is the calibrated Ampere entry; its 48 KiB shared budget is
+        // the default per-block limit rather than the opt-in ceiling, so a
+        // schedule that clears it launches without `cudaFuncSetAttribute`.
+        (maj, min) if maj > 8 || (maj == 8 && min >= 0) => Target::CUDA_SM86,
+        (7, _) => Target::CUDA_SM70,
+        _ => Target::PORTABLE,
+    }
+}
+
+/// NVRTC target for this device, as a `compute_XX` string.
+///
+/// Needed because NVRTC with no `--gpu-architecture` targets an old default,
+/// and inline PTX for a newer instruction then passes NVRTC (it is opaque asm)
+/// and dies in the *driver's* PTX JIT with `CUDA_ERROR_INVALID_PTX`. `cp.async`
+/// hits this exactly: it compiles fine and fails to load.
+///
+/// So an emitted schedule that declares `Feature::AsyncCopy` must be compiled
+/// for the device it declared the capability against. Returning `None` for an
+/// unrecognized capability keeps the portable path byte-identical — and its
+/// disk-cache slot unchanged — for every kernel that does not need this.
+#[cfg_attr(not(feature = "schedule-codegen"), allow(dead_code))]
+pub(crate) fn device_nvrtc_arch(ctx: &Arc<CudaContext>) -> Option<&'static str> {
+    Some(match device_cc(ctx) {
+        (8, 0) => "compute_80",
+        (8, 6) => "compute_86",
+        (8, 7) => "compute_87",
+        (8, 9) => "compute_89",
+        (9, _) => "compute_90",
+        (10, _) => "compute_100",
+        (12, _) => "compute_120",
+        // Anything else: no pinned arch rather than a guessed one. The caller
+        // treats that as "this schedule cannot be built here" for schedules
+        // that need a capability, which is the safe direction.
+        _ => return None,
+    })
 }
 
 /// NVRTC target for TMA/wgmma kernels: `Some("compute_90a")` on Hopper when

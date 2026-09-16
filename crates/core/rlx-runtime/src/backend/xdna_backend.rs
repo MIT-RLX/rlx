@@ -146,7 +146,7 @@ fn enable_turbo_once() {
     use std::sync::OnceLock;
     static TURBO: OnceLock<bool> = OnceLock::new();
     TURBO.get_or_init(|| {
-        if std::env::var("RLX_XDNA_TURBO").is_err() {
+        if rlx_ir::env::var("RLX_XDNA_TURBO").is_none() {
             return false;
         }
         match rlx_xdna::direct::Npu::open("") {
@@ -402,8 +402,7 @@ fn build_chain(graph: &Graph) -> Result<XdnaChainExec, String> {
         lru: Vec::new(),
         // Concurrent NPU hardware contexts are limited (~5-6 on amdxdna); keep an
         // LRU pool of open sub-exec contexts and re-open evicted ones on demand.
-        cap: std::env::var("RLX_XDNA_CHAIN_CAP")
-            .ok()
+        cap: rlx_ir::env::var("RLX_XDNA_CHAIN_CAP")
             .and_then(|v| v.parse().ok())
             .unwrap_or(4),
     })
@@ -1918,7 +1917,7 @@ fn build_matmul_node_exec(
     // overrides it — required when aiecc doesn't sit at `<mlir_aie>/bin/aiecc` (e.g. a
     // pip `mlir_aie` package puts the real include under site-packages, not next to
     // the `bin/aiecc` shim). Falls back to `<aiecc>/../../include`.
-    let include = std::env::var("RLX_XDNA_AIE_INCLUDE").ok().map_or_else(
+    let include = rlx_ir::env::var("RLX_XDNA_AIE_INCLUDE").map_or_else(
         || {
             std::path::Path::new(&aiecc)
                 .parent()
@@ -2219,7 +2218,7 @@ fn build_gemm_exec(graph: &Graph) -> Result<XdnaGemmExec, String> {
         w_i8: Vec::new(),
         sw: Vec::new(),
         // Resident weight blocks for ANY shape (opt out with RLX_XDNA_NO_RESIDENT).
-        resident: std::env::var("RLX_XDNA_NO_RESIDENT").is_err(),
+        resident: rlx_ir::env::var("RLX_XDNA_NO_RESIDENT").is_none(),
         weight_up: false,
     })
 }

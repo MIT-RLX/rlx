@@ -60,6 +60,13 @@ pub trait DecomposePolicy {
 
     /// Keep `Op::FusedSwiGLU` intact for a native fused kernel (CUDA/ROCm).
     /// Default: decompose to Narrow + Silu + Mul.
+    /// True when the backend's `Op::Binary` kernel broadcasts its operands
+    /// itself via `(i/rep)%len`, so the pass should not materialise an
+    /// `Expand` prologue. See [`simple_broadcast`] for what it must handle.
+    fn binary_broadcast_native(&self) -> bool {
+        false
+    }
+
     fn swiglu_native(&self) -> bool {
         false
     }
@@ -108,7 +115,7 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
     // prologues get inserted during the rewrite.
     let needs_rewrite = graph.nodes().iter().any(|n| {
         policy.should_unfuse(&n.op)
-            || needs_broadcast_prologue(&graph, n)
+            || needs_broadcast_prologue(&graph, n, policy)
             || needs_attn_rank3_promotion(&graph, n, policy)
     });
     if !needs_rewrite {
@@ -299,8 +306,17 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
                 if node.shape.dtype().is_complex() {
                     out.add_node(node.op.clone(), new_inputs, node.shape.clone())
                 } else {
-                    let broadcasted = broadcast_inputs(&mut out, &new_inputs, &node.shape);
-                    out.add_node(node.op.clone(), broadcasted, node.shape.clone())
+                    let native = matches!(node.op, Op::Binary(_))
+                        && policy.binary_broadcast_native()
+                        && node.inputs.iter().all(|&id| {
+                            simple_broadcast(&node.shape, &graph.node(id).shape).is_some()
+                        });
+                    if native {
+                        out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+                    } else {
+                        let broadcasted = broadcast_inputs(&mut out, &new_inputs, &node.shape);
+                        out.add_node(node.op.clone(), broadcasted, node.shape.clone())
+                    }
                 }
             }
             // Pass through everything else.
@@ -426,10 +442,51 @@ pub fn collapse_reshapes(graph: Graph) -> Graph {
     out
 }
 
+/// A broadcast expressible as one contiguous run of `len` values, each repeated
+/// `rep` times over the flat output index: `idx = (i / rep) % len`.
+///
+/// Returns `None` when the operand's non-unit axes are not a single contiguous
+/// block of the target, which no single `(rep, len)` pair can describe — the
+/// caller then falls back to materialising an `Expand`.
+///
+/// Note this is *not* the plain `i % n` some kernels use. For a `[1,C,1]` bias
+/// against `[1,C,T]`, `i % C` walks the channel with time and silently
+/// corrupts every per-channel bias — the MLX region-modulus bug. The divisor
+/// is what makes it channel-wise.
+pub fn simple_broadcast(target: &Shape, src: &Shape) -> Option<(u32, u32)> {
+    let t: Vec<usize> = target.dims().iter().map(|d| d.unwrap_static()).collect();
+    let s0: Vec<usize> = src.dims().iter().map(|d| d.unwrap_static()).collect();
+    if s0.len() > t.len() || t.is_empty() {
+        return None;
+    }
+    let mut s = vec![1usize; t.len() - s0.len()];
+    s.extend(s0);
+    if s.iter().zip(&t).any(|(a, b)| *a != 1 && a != b) {
+        return None;
+    }
+    let Some(first) = s.iter().zip(&t).position(|(a, b)| a == b && *b != 1) else {
+        return Some((1, 1)); // every axis is 1 — a scalar
+    };
+    let last = (first..t.len())
+        .rfind(|&i| s[i] == t[i] && t[i] != 1)
+        .unwrap_or(first);
+    // The kept axes have to be contiguous, and nothing after them may be kept.
+    if (first..=last).any(|i| s[i] != t[i]) || ((last + 1)..t.len()).any(|i| s[i] != 1) {
+        return None;
+    }
+    let rep: usize = t[(last + 1)..].iter().product();
+    let len: usize = t[first..=last].iter().product();
+    Some((rep as u32, len as u32))
+}
+
 /// True if `node` is an element-wise op whose inputs don't all share
 /// the same element count — i.e. a strict-shape kernel will reject
 /// it and we need to insert a broadcast prologue.
-fn needs_broadcast_prologue(graph: &Graph, node: &rlx_ir::Node) -> bool {
+fn needs_broadcast_prologue(
+    graph: &Graph,
+    node: &rlx_ir::Node,
+    policy: &dyn DecomposePolicy,
+) -> bool {
     let is_elt = matches!(node.op, Op::Binary(_) | Op::Compare(_) | Op::Where);
     if !is_elt {
         return false;
@@ -443,9 +500,28 @@ fn needs_broadcast_prologue(graph: &Graph, node: &rlx_ir::Node) -> bool {
         return false;
     }
     let target_n = node.shape.num_elements().unwrap_or(0);
-    node.inputs
+    let mismatched = node
+        .inputs
         .iter()
-        .any(|&id| graph.node(id).shape.num_elements().unwrap_or(0) != target_n)
+        .any(|&id| graph.node(id).shape.num_elements().unwrap_or(0) != target_n);
+    if !mismatched {
+        return false;
+    }
+    // A backend whose Binary kernel reads its operands through `(i/rep)%len`
+    // does not need the operand materialised. Skipping the prologue is the
+    // difference between a scalar and a full copy of the output tensor: on a
+    // 192^3 SynthStrip, 52 such Expands accounted for 5.57 GiB of a 7.05 GiB
+    // arena and pushed wgpu past its 4 GiB binding limit into striping.
+    if matches!(node.op, Op::Binary(_)) && policy.binary_broadcast_native() {
+        let all_simple = node
+            .inputs
+            .iter()
+            .all(|&id| simple_broadcast(&node.shape, &graph.node(id).shape).is_some());
+        if all_simple {
+            return false;
+        }
+    }
+    true
 }
 
 /// True if the node is a rank-3 attention op that needs reshaping +

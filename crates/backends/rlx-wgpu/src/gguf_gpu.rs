@@ -39,6 +39,25 @@ pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
     matches!(scheme_id, 0 | 2 | 24)
 }
 
+/// Scheme ids the WGSL `dequant_gguf` kernel actually has a branch for.
+///
+/// The kernel is an `if (scheme_id == N) { … return; }` chain with **no
+/// default arm**: an id that reaches it without a matching branch writes
+/// nothing, so the weights read as zeros and the model degrades silently
+/// instead of failing. Any scheme outside this set is therefore routed to
+/// the host dequant path ([`crate::gguf_host`]) — slower, but correct.
+///
+/// Every registered scheme is branched today, so this currently never
+/// diverts — it is the seam that keeps the *next* unbranched scheme correct.
+/// Kept in sync with the shader by
+/// `tests/gguf_kernel_scheme_coverage.rs`, which parses the branches out of
+/// `DEQUANT_GGUF_WGSL` and requires the two to agree in both directions — so
+/// adding a scheme id without a branch (or a branch without listing it here)
+/// fails the tests rather than shipping a silent mis-decode.
+pub fn kernel_supports_scheme(scheme_id: u32) -> bool {
+    matches!(scheme_id, 0..=28)
+}
+
 /// Max f32 scratch for dequantized weights `[n, k]` across all GGUF ops.
 pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
@@ -250,6 +269,24 @@ pub fn run_dequant_matmul_gguf_gpu(
     // Q4_K/Q6_K/Q1_0: scratch-free windowed GEMV (batched rows → one submit).
     if gemv_supports_scheme(scheme_id) {
         run_dequant_matmul_gguf_gemv_rows(
+            arena,
+            device,
+            queue,
+            m,
+            k,
+            n,
+            scheme_id,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+        );
+        return;
+    }
+
+    // No WGSL branch for this scheme → host dequant. Without this the kernel
+    // would run, match nothing, and leave the scratch untouched (= zeros).
+    if !kernel_supports_scheme(scheme_id) {
+        crate::gguf_host::run_dequant_matmul_gguf(
             arena,
             device,
             queue,
@@ -632,8 +669,7 @@ fn encode_dequant_matmul_gguf_gemv_one(
 
     // `RLX_WGPU_MAX_BIND_MB` artificially caps the binding size to exercise the
     // split path on GPUs whose real limit is large (validation/testing).
-    let max_bind = std::env::var("RLX_WGPU_MAX_BIND_MB")
-        .ok()
+    let max_bind = rlx_ir::env::var("RLX_WGPU_MAX_BIND_MB")
         .and_then(|s| s.parse::<u64>().ok())
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(device.limits().max_storage_buffer_binding_size);

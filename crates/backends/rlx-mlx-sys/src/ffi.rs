@@ -132,6 +132,17 @@ unsafe extern "C" {
     #[allow(dead_code)]
     pub fn rlx_mlx_dtype_size(dtype: MlxDtype) -> usize;
 
+    /// In-place single-row copy between two row-contiguous, same-dtype arrays.
+    /// See `rlx_mlx_shim.h` — this is the MLX stand-in for the device-side row
+    /// write the other backends use for resident KV.
+    pub fn rlx_mlx_array_copy_row_inplace(
+        dst: *mut mlx_array_t,
+        dst_elem_off: usize,
+        src: *mut mlx_array_t,
+        src_elem_off: usize,
+        nelems: usize,
+    ) -> c_int;
+
     pub fn rlx_mlx_array_free(h: *mut mlx_array_t);
     pub fn rlx_mlx_array_clone(h: *mut mlx_array_t, out: *mut *mut mlx_array_t) -> c_int;
 

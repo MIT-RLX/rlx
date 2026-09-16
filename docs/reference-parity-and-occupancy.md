@@ -60,10 +60,10 @@ rlx-models CI once #1 (enforced CI) exists.
 
 ---
 
-## #8 — Kernel occupancy tuning (CUDA, profile on `msi`)
+## #8 — Kernel occupancy tuning (CUDA, profile on a CUDA rig)
 
 **Status today.** The `RLX_DUMP_KERNELS` hook + `tools/kernel-inspect/kinspect.py`
-(runs on the msi RTX 3080 Ti rig) already report SASS / regs / occupancy /
+(runs on an RTX 3080 Ti / sm_86 rig) already report SASS / regs / occupancy /
 opcode mix. Prior runs surfaced concrete candidates; tuning them is iterative
 profiling that needs the GPU in the loop, so this is a candidate list + method,
 not a landed change.
@@ -84,7 +84,7 @@ not a landed change.
    - Check bank conflicts in the smem layout (`kinspect` opcode/stall report).
    - Consider a flash-attention-style online-softmax tiling if not already used.
 
-### Method (per candidate, on `msi`)
+### Method (per candidate, on the CUDA rig)
 ```
 RLX_DUMP_KERNELS=1 <run the target graph>          # dump SASS + cubin
 python tools/kernel-inspect/kinspect.py run <dump> # regs / occupancy / stalls
@@ -105,3 +105,6 @@ Metal Mac). #5 and #8 are **evidence-gathering** against an external oracle
 runs are one command away on the right machine, without conflating "harness
 exists" with "parity proven / kernel tuned" — which would be exactly the kind of
 silent over-claim a validated pipeline must not make.
+## License
+
+MIT OR Apache-2.0.

@@ -61,6 +61,7 @@ pub const MAXPOOL3D_BWD_WGSL: &str = include_str!("maxpool3d_backward.wgsl");
 pub const CONV3D_BWD_INPUT_WGSL: &str = include_str!("conv3d_backward_input.wgsl");
 pub const CONV3D_BWD_WEIGHT_WGSL: &str = include_str!("conv3d_backward_weight.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
+pub const GROUP_NORM_WGSL: &str = include_str!("group_norm.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
 pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
 pub const CUMSUM_BWD_WGSL: &str = include_str!("cumsum_backward.wgsl");
@@ -97,6 +98,22 @@ pub const ATTENTION_WGSL: &str = include_str!("attention.wgsl");
 pub const ATTENTION_BWD_WGSL: &str = include_str!("attention_bwd.wgsl");
 pub const ROPE_WGSL: &str = include_str!("rope.wgsl");
 pub const EXPAND_WGSL: &str = include_str!("expand.wgsl");
+/// On-device ONNX ND indexing (GatherND / GatherElements / ScatterElements /
+/// ScatterND + the scatter prologue). Five entry points over one 3-binding
+/// layout: arena, `Params`, and the `meta` shape/stride buffer.
+pub const INDEXING_ND_WGSL: &str = include_str!("indexing_nd.wgsl");
+/// General (all-format) low-precision quantize / dequantize / decode-GEMM for
+/// `Op::ScaledMatMul` and friends. Four entry points over the standard
+/// arena + `Params` layout.
+pub const SCALED_LOWP_WGSL: &str = include_str!("scaled_lowp.wgsl");
+/// INT8 `Op::Quantize` / `Op::Dequantize` with an affine table.
+pub const QUANT_I8_WGSL: &str = include_str!("quant_i8.wgsl");
+/// Real INT8 `Op::QMatMul` (i32 accumulate + float requantize).
+pub const Q_MATMUL_WGSL: &str = include_str!("q_matmul.wgsl");
+/// Real INT8 `Op::QConv2d` (i32 accumulate + float requantize).
+pub const Q_CONV2D_WGSL: &str = include_str!("q_conv2d.wgsl");
+/// `Op::BatchNormInference` and its three backwards (channels-last).
+pub const BATCH_NORM_INFERENCE_WGSL: &str = include_str!("batch_norm_inference.wgsl");
 pub const ARGMAX_WGSL: &str = include_str!("argmax.wgsl");
 pub const POOL2D_WGSL: &str = include_str!("pool2d.wgsl");
 pub const CONV2D_WGSL: &str = include_str!("conv2d.wgsl");
@@ -106,6 +123,7 @@ pub const POOL1D_WGSL: &str = include_str!("pool1d.wgsl");
 pub const POOL3D_WGSL: &str = include_str!("pool3d.wgsl");
 pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
 pub const CONV3D_WGSL: &str = include_str!("conv3d.wgsl");
+pub const CONV3D_CTILE_WGSL: &str = include_str!("conv3d_ctile.wgsl");
 pub const CONV_TRANSPOSE3D_WGSL: &str = include_str!("conv_transpose3d.wgsl");
 pub const GROUP_NORM_BWD_WGSL: &str = include_str!("group_norm_backward.wgsl");
 pub const AXIAL_ROPE2D_WGSL: &str = include_str!("axial_rope2d.wgsl");
@@ -169,6 +187,12 @@ pub struct BinaryParams {
     pub b_off: u32,
     pub c_off: u32,
     pub op: u32,
+    /// Per-operand broadcast — output element `i` reads `(i / rep) % len`.
+    /// `len == 0` is dense. See `binary_main.wgsl`.
+    pub a_rep: u32,
+    pub a_len: u32,
+    pub b_rep: u32,
+    pub b_len: u32,
     pub _p0: u32,
     pub _p1: u32,
     pub _p2: u32,
@@ -487,6 +511,27 @@ pub struct FakeQuantizeParams {
     pub _pad: u32,
 }
 
+/// Layout for the native NCHW `GroupNorm` kernel. 48 bytes.
+///
+/// One workgroup per `(batch, group)`; `gamma`/`beta` are indexed per channel,
+/// so the kernel needs `c` and `hw` to recover the channel from a flat index.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GroupNormParams {
+    pub groups_total: u32,
+    pub group_elems: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub gamma_off: u32,
+    pub beta_off: u32,
+    pub eps_bits: u32,
+    pub num_groups: u32,
+    pub c: u32,
+    pub hw: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
 /// Layout for LayerNorm / RmsNorm.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -566,6 +611,11 @@ pub struct RopeBwdParams {
     pub sin_off: u32,
     pub dx_off: u32,
     pub cos_len: u32,
+    /// The cos/sin table's own last dimension — see the WGSL `tab_off` note.
+    pub cos_row_stride: u32,
+    /// GptJ pairing (adjacent lanes) rather than NeoX rotate-half; 0 or 1.
+    /// Must match the forward `Rope` this is the adjoint of.
+    pub interleaved: u32,
 }
 
 #[repr(C)]
@@ -983,7 +1033,7 @@ pub struct AttentionParams {
     pub _pad_o: u32,
 }
 
-/// Layout for [`attention_bwd.wgsl`] — forward strides + `dy_off` + `wrt`.
+/// Layout for `attention_bwd.wgsl` — forward strides + `dy_off` + `wrt`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct AttentionBwdParams {
@@ -1074,6 +1124,178 @@ pub struct ExpandParams {
     pub out_dim_0: u32,
     pub _p2: u32,
     pub _p3: u32,
+}
+
+/// Layout for the two `quant_i8.wgsl` entry points.
+///
+/// `affine` is `vec4`-strided on purpose: a scalar array in a WGSL *uniform*
+/// buffer has a 16-byte stride, so a tightly packed host-side table would be
+/// read from the wrong offsets. The Vulkan twin shipped exactly that bug.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct QuantI8Params {
+    pub n: u32,
+    pub chan_dim: u32,
+    pub inner: u32,
+    /// `x` f32-element offset (quantize) or code byte offset (dequantize).
+    pub a_off: u32,
+    /// Code byte offset (quantize) or `out` f32-element offset (dequantize).
+    pub out_off: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    /// `[scale_bits, zero_point]` per channel, two channels per `vec4`.
+    pub affine: [u32; 24],
+}
+
+/// Channels whose affine pair fits [`QuantI8Params`]. Wider tensors keep the
+/// CPU host route, matching `QUANTIZE_I8_MAX_CHAN` on Vulkan.
+pub const QUANT_I8_MAX_CHAN: usize = 12;
+
+/// Layout for `q_matmul.wgsl`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct QMatMulParams {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    /// Byte offsets for the packed i8 operands.
+    pub x_off: u32,
+    pub w_off: u32,
+    pub out_off: u32,
+    /// f32-element offset.
+    pub bias_off: u32,
+    pub x_zp: i32,
+    pub w_zp: i32,
+    pub out_zp: i32,
+    pub mult: f32,
+    pub _pad0: u32,
+}
+
+/// Layout for the four `batch_norm_inference.wgsl` entry points.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct BatchNormInferenceParams {
+    /// Total elements (forward / bwd_input) — `count * channels`.
+    pub n: u32,
+    /// Rows (bwd_gamma / bwd_beta).
+    pub count: u32,
+    pub channels: u32,
+    pub eps: f32,
+    pub src_off: u32,
+    pub gamma_off: u32,
+    pub beta_off: u32,
+    pub mean_off: u32,
+    pub var_off: u32,
+    pub dy_off: u32,
+    pub dst_off: u32,
+    pub _pad0: u32,
+}
+
+/// Layout for `q_conv2d.wgsl`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct QConv2dParams {
+    pub batch: u32,
+    pub c_in: u32,
+    pub c_out: u32,
+    pub h: u32,
+    pub w: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub sh: u32,
+    pub sw: u32,
+    pub ph: u32,
+    pub pw: u32,
+    pub dh: u32,
+    pub dw: u32,
+    pub groups: u32,
+    /// Byte offsets for the packed i8 operands.
+    pub x_off: u32,
+    pub w_off: u32,
+    pub out_off: u32,
+    /// f32-element offset.
+    pub bias_off: u32,
+    pub x_zp: i32,
+    pub w_zp: i32,
+    pub out_zp: i32,
+    pub mult: f32,
+}
+
+/// Layout for the four `scaled_lowp.wgsl` entry points.
+///
+/// One struct for all of them: they share a bind-group layout, and a single
+/// layout is what keeps the WGSL in step with `scaled_lowp_general.cu`'s
+/// argument lists. Fields a given entry point does not use are zero.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ScaledLowpParams {
+    /// lhs codes (byte off) | `x` (f32 elem off) | codes (byte off).
+    pub a_byte_off: u32,
+    /// rhs codes (byte off).
+    pub b_byte_off: u32,
+    pub a_scale_byte_off: u32,
+    pub b_scale_byte_off: u32,
+    /// f32 element offset, or a byte offset for `scaled_quantize`.
+    pub out_off: u32,
+    pub bias_off: u32,
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub rows: u32,
+    pub cols: u32,
+    /// `ScaledFormat::kernel_id()` of the lhs / quantized tensor.
+    pub a_fmt: u32,
+    /// `ScaledFormat::kernel_id()` of the rhs.
+    pub b_fmt: u32,
+    /// 0 per-tensor f32, 1 block E8M0, 2 NVFP4 E4M3.
+    pub scale_mode: u32,
+    pub block: u32,
+    pub has_bias: u32,
+}
+
+/// Layout for the five `indexing_nd.wgsl` entry points.
+///
+/// One struct for all of them rather than five: they share a bind-group layout
+/// and a dispatch shape, and a single layout is also what keeps the WGSL in
+/// step with `indexing_nd.cu`'s argument list. Fields not used by a given entry
+/// point are zero.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct IndexingNdParams {
+    /// Thread count.
+    pub n: u32,
+    pub data_off: u32,
+    pub idx_off: u32,
+    /// Scatter only.
+    pub upd_off: u32,
+    pub dst_off: u32,
+    /// Scatter bounds guard; carries `data_len` for GatherElements.
+    pub dst_len: u32,
+    /// GatherElements / ScatterElements.
+    pub rank: u32,
+    /// GatherElements / ScatterElements.
+    pub axis: u32,
+    /// GatherElements wrap/clamp bound.
+    pub axis_dim: i32,
+    /// GatherND / ScatterND tuple width.
+    pub k: u32,
+    /// GatherND / ScatterND contiguous run per tuple.
+    pub slice: u32,
+    /// GatherND.
+    pub tuples_per_batch: u32,
+    /// GatherND.
+    pub batch_stride: u32,
+    /// Always 0 on wgpu — the WGSL scatters are overwrite-only because core
+    /// WGSL has no f32 atomics. Present so this layout matches the shared
+    /// launch plan (and the CUDA argument list) rather than silently diverging.
+    pub reduction: u32,
+    /// `copy_sanitize` only.
+    pub src_len: u32,
+    /// `copy_sanitize` only: bit0 = do_copy, bit1 = do_sanitize.
+    pub flags: u32,
 }
 
 /// Layout for argmax (matches Reduce shape).
@@ -1327,7 +1549,11 @@ pub struct FusedResidualLnTeeParams {
     pub ln_out_off: u32,
     pub eps_bits: u32,
     pub has_bias: u32,
-    pub _p0: u32,
+    /// 1 = RMS norm (scale by 1/rms, no mean subtraction), 0 = layer norm.
+    /// Uses what used to be pad: the two norms share this kernel because they
+    /// share the (multi-consumer Add -> norm) shape, and only the final scaling
+    /// differs.
+    pub is_rms: u32,
 }
 
 /// Layout for matmul_qkv (split-write QKV matmul).
@@ -1548,7 +1774,10 @@ pub struct LstmParams {
     pub dir_off: u32,
     /// 1 → walk the sequence backwards (reverse direction of a bidir layer).
     pub reverse: u32,
-    pub _p: u32,
+    /// 1 → write the final `hn`/`cn` back into `h0_off`/`c0_off` in place.
+    /// Explicit rather than inferred from `h0_off != 0`, because arena offset 0
+    /// is a legal placement for the state tensor.
+    pub carry: u32,
 }
 
 /// Layout for SelectiveScan. 64 bytes.
@@ -1741,7 +1970,13 @@ pub struct Conv3dParams {
     pub in_off: u32,
     pub w_off: u32,
     pub out_off: u32,
-    pub _p0: u32,
+    /// Per-output-channel bias offset, valid when `has_bias != 0`. Folding it
+    /// into the conv's store removes both the full-size `Expand` of the bias
+    /// and the full-size `Add` that consumed it.
+    pub bias_off: u32,
+    pub has_bias: u32,
+    pub _p1: u32,
+    pub _p2: u32,
 }
 
 /// Lazy-init container for a compute pipeline + its bind-group layout.
@@ -2277,6 +2512,7 @@ static AXIAL_ROPE2D: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_FIXED: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_PERBATCH: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
+static GROUP_NORM: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
 static LAYER_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
@@ -2319,6 +2555,23 @@ static ATTENTION: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE: OnceLock<Kernel> = OnceLock::new();
 static EXPAND: OnceLock<Kernel> = OnceLock::new();
+static QUANTIZE_I8: OnceLock<Kernel> = OnceLock::new();
+static DEQUANTIZE_I8: OnceLock<Kernel> = OnceLock::new();
+static Q_MATMUL: OnceLock<Kernel> = OnceLock::new();
+static Q_CONV2D: OnceLock<Kernel> = OnceLock::new();
+static BN_INFER: OnceLock<Kernel> = OnceLock::new();
+static BN_INFER_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
+static BN_INFER_BWD_GAMMA: OnceLock<Kernel> = OnceLock::new();
+static BN_INFER_BWD_BETA: OnceLock<Kernel> = OnceLock::new();
+static SCALED_QUANT_SCALE: OnceLock<Kernel> = OnceLock::new();
+static SCALED_QUANTIZE: OnceLock<Kernel> = OnceLock::new();
+static SCALED_DEQUANTIZE: OnceLock<Kernel> = OnceLock::new();
+static SCALED_MATMUL_DECODE: OnceLock<Kernel> = OnceLock::new();
+static GATHER_ND: OnceLock<Kernel> = OnceLock::new();
+static GATHER_ELEMENTS: OnceLock<Kernel> = OnceLock::new();
+static SCATTER_ELEMENTS: OnceLock<Kernel> = OnceLock::new();
+static SCATTER_ND_REDUCE: OnceLock<Kernel> = OnceLock::new();
+static COPY_SANITIZE: OnceLock<Kernel> = OnceLock::new();
 static ARGMAX: OnceLock<Kernel> = OnceLock::new();
 static POOL2D: OnceLock<Kernel> = OnceLock::new();
 static CONV2D: OnceLock<Kernel> = OnceLock::new();
@@ -2328,6 +2581,7 @@ static POOL1D: OnceLock<Kernel> = OnceLock::new();
 static POOL3D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_CTILE: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
@@ -2896,6 +3150,10 @@ pub fn fake_quantize_perbatch_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn layernorm_kernel(device: &wgpu::Device) -> &'static Kernel {
     LAYERNORM.get_or_init(|| build_kernel(device, "rlx-wgpu layernorm", LAYERNORM_WGSL, "norm"))
 }
+pub fn group_norm_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GROUP_NORM
+        .get_or_init(|| build_kernel(device, "rlx-wgpu group_norm", GROUP_NORM_WGSL, "group_norm"))
+}
 pub fn rms_norm_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
     RMS_NORM_BWD.get_or_init(|| {
         build_kernel(
@@ -3265,7 +3523,7 @@ pub fn gather_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 /// Split-binding gather: table (ro) + uniform + idx (ro) + out (rw, separate
 /// buffer). For >4 GiB arenas where the embedding output lies outside the
-/// table's bind window. See [`build_kernel_ro_u_ro_rw`].
+/// table's bind window. See `build_kernel_ro_u_ro_rw`.
 pub fn gather_split_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER_SPLIT.get_or_init(|| {
         build_kernel_ro_u_ro_rw(device, "rlx-wgpu gather_split", GATHER_SPLIT_WGSL, "gather")
@@ -3301,6 +3559,150 @@ pub fn rope_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn expand_kernel(device: &wgpu::Device) -> &'static Kernel {
     EXPAND.get_or_init(|| build_kernel_3(device, "rlx-wgpu expand", EXPAND_WGSL, "expand"))
 }
+pub fn quantize_i8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    QUANTIZE_I8
+        .get_or_init(|| build_kernel(device, "rlx-wgpu quantize_i8", QUANT_I8_WGSL, "quantize_i8"))
+}
+pub fn dequantize_i8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANTIZE_I8.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu dequantize_i8",
+            QUANT_I8_WGSL,
+            "dequantize_i8",
+        )
+    })
+}
+pub fn q_matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
+    Q_MATMUL.get_or_init(|| build_kernel(device, "rlx-wgpu q_matmul", Q_MATMUL_WGSL, "q_matmul"))
+}
+pub fn q_conv2d_kernel(device: &wgpu::Device) -> &'static Kernel {
+    Q_CONV2D.get_or_init(|| build_kernel(device, "rlx-wgpu q_conv2d", Q_CONV2D_WGSL, "q_conv2d"))
+}
+pub fn batch_norm_inference_kernel(device: &wgpu::Device) -> &'static Kernel {
+    BN_INFER.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu batch_norm_inference",
+            BATCH_NORM_INFERENCE_WGSL,
+            "batch_norm_inference",
+        )
+    })
+}
+pub fn batch_norm_inference_bwd_input_kernel(device: &wgpu::Device) -> &'static Kernel {
+    BN_INFER_BWD_INPUT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu batch_norm_inference_bwd_input",
+            BATCH_NORM_INFERENCE_WGSL,
+            "batch_norm_inference_bwd_input",
+        )
+    })
+}
+pub fn batch_norm_inference_bwd_gamma_kernel(device: &wgpu::Device) -> &'static Kernel {
+    BN_INFER_BWD_GAMMA.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu batch_norm_inference_bwd_gamma",
+            BATCH_NORM_INFERENCE_WGSL,
+            "batch_norm_inference_bwd_gamma",
+        )
+    })
+}
+pub fn batch_norm_inference_bwd_beta_kernel(device: &wgpu::Device) -> &'static Kernel {
+    BN_INFER_BWD_BETA.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu batch_norm_inference_bwd_beta",
+            BATCH_NORM_INFERENCE_WGSL,
+            "batch_norm_inference_bwd_beta",
+        )
+    })
+}
+pub fn scaled_quant_scale_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SCALED_QUANT_SCALE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu scaled_quant_scale",
+            SCALED_LOWP_WGSL,
+            "scaled_quant_scale",
+        )
+    })
+}
+pub fn scaled_quantize_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SCALED_QUANTIZE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu scaled_quantize",
+            SCALED_LOWP_WGSL,
+            "scaled_quantize",
+        )
+    })
+}
+pub fn scaled_dequantize_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SCALED_DEQUANTIZE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu scaled_dequantize",
+            SCALED_LOWP_WGSL,
+            "scaled_dequantize",
+        )
+    })
+}
+pub fn scaled_matmul_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SCALED_MATMUL_DECODE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu scaled_matmul_decode",
+            SCALED_LOWP_WGSL,
+            "scaled_matmul_decode",
+        )
+    })
+}
+pub fn gather_nd_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATHER_ND
+        .get_or_init(|| build_kernel_3(device, "rlx-wgpu gather_nd", INDEXING_ND_WGSL, "gather_nd"))
+}
+pub fn gather_elements_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATHER_ELEMENTS.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu gather_elements",
+            INDEXING_ND_WGSL,
+            "gather_elements",
+        )
+    })
+}
+pub fn scatter_elements_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SCATTER_ELEMENTS.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu scatter_elements",
+            INDEXING_ND_WGSL,
+            "scatter_elements",
+        )
+    })
+}
+pub fn scatter_nd_reduce_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SCATTER_ND_REDUCE.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu scatter_nd_reduce",
+            INDEXING_ND_WGSL,
+            "scatter_nd_reduce",
+        )
+    })
+}
+pub fn copy_sanitize_kernel(device: &wgpu::Device) -> &'static Kernel {
+    COPY_SANITIZE.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu copy_sanitize",
+            INDEXING_ND_WGSL,
+            "copy_sanitize",
+        )
+    })
+}
 pub fn argmax_kernel(device: &wgpu::Device) -> &'static Kernel {
     ARGMAX.get_or_init(|| build_kernel(device, "rlx-wgpu argmax", ARGMAX_WGSL, "argmax"))
 }
@@ -3334,6 +3736,17 @@ pub fn conv1d_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn conv3d_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONV3D.get_or_init(|| build_kernel(device, "rlx-wgpu conv3d", CONV3D_WGSL, "conv3d"))
+}
+/// Four-output-channel register tiling; ungrouped convolution only.
+pub fn conv3d_ctile_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_CTILE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_ctile",
+            CONV3D_CTILE_WGSL,
+            "conv3d_ctile",
+        )
+    })
 }
 pub fn conv_transpose3d_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONV_TRANSPOSE3D.get_or_init(|| {

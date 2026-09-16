@@ -6,6 +6,22 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.16] — 2026-09-15
+
+Covers 0.2.15 as well — neither went out to PyPI.
+
+### Fixed
+
+- **A GGUF dtype name pyrlx printed could not be handed back to it.** The
+  dtype-name parser kept its own table, and it had drifted from the printing
+  counterpart: it rejected seven names `ggml_type_name` emits, so the obvious
+  round-trip failed on those tensors. It now delegates to `GgmlType::from_name`,
+  so there is one table instead of two.
+
+### Changed
+
+- Aligned with RLX workspace **0.2.16**.
+
 ## [0.2.14] — 2026-07-24
 
 - Aligned with RLX workspace **0.2.14**.

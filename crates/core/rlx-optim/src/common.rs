@@ -96,7 +96,7 @@ pub fn l2_norm(xs: &[f32]) -> f32 {
 
 /// Global L2-norm clip across many tensors. Returns the scale factor
 /// (`<= 1.0`) to multiply every gradient by; callers can pre-scale
-/// before passing to [`Optimizer::step`]. Identical to
+/// before passing to `Optimizer::step`. Identical to
 /// `rlx_umap::adam::global_grad_clip_scale` but generic over any
 /// iterator yielding slices.
 pub fn global_grad_clip_scale<'a, I>(grads: I, max_norm: f32) -> f32

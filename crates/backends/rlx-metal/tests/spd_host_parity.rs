@@ -82,7 +82,7 @@ fn spd_f32(n: usize, seed: f32) -> Vec<f32> {
 /// BiMap `Y = W · X · Wᵀ` — Metal host-fallback vs the CPU SPD reference.
 #[test]
 fn bimap_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping bimap_metal_matches_cpu");
         return;
     }
@@ -110,7 +110,7 @@ fn bimap_metal_matches_cpu() {
 /// ReEig (eigenvalue rectification, the SPD ReLU) — Metal vs the CPU reference.
 #[test]
 fn reeig_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping reeig_metal_matches_cpu");
         return;
     }
@@ -141,7 +141,7 @@ fn reeig_metal_matches_cpu() {
 /// LogEig (matrix log to the tangent space) — Metal vs the CPU reference.
 #[test]
 fn logeig_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping logeig_metal_matches_cpu");
         return;
     }
@@ -171,7 +171,7 @@ fn logeig_metal_matches_cpu() {
 /// Weighted Karcher barycentre — Metal host-fallback vs the CPU reference.
 #[test]
 fn karcher_mean_weighted_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping karcher_mean_weighted");
         return;
     }
@@ -207,7 +207,7 @@ fn karcher_mean_weighted_metal_matches_cpu() {
 /// AIRM log map at an arbitrary base — Metal vs the CPU reference.
 #[test]
 fn log_map_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping log_map");
         return;
     }
@@ -231,7 +231,7 @@ fn log_map_metal_matches_cpu() {
 /// AIRM exp map at an arbitrary base — Metal vs the CPU reference.
 #[test]
 fn exp_map_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping exp_map");
         return;
     }
@@ -256,7 +256,7 @@ fn exp_map_metal_matches_cpu() {
 /// AIRM parallel transport — Metal vs the CPU reference.
 #[test]
 fn parallel_transport_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping parallel_transport");
         return;
     }
@@ -287,7 +287,7 @@ fn parallel_transport_metal_matches_cpu() {
 /// Batched matrix logarithm — Metal vs the CPU reference.
 #[test]
 fn matrix_fn_batch_metal_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal spd] no Metal device — skipping matrix_fn_batch");
         return;
     }

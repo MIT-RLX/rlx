@@ -24,7 +24,9 @@
 use rlx_autodiff::directional_nth_grad;
 use rlx_ir::op::{BinaryOp, ReduceOp};
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn f32_bytes(xs: &[f32]) -> Vec<u8> {
     xs.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -45,7 +47,7 @@ fn assert_matches_cpu(
     tol: f32,
     label: &str,
 ) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip directional_nth_gpu_parity {label} on {device:?} (unavailable)");
         return;
     }
@@ -131,10 +133,12 @@ macro_rules! directional_parity_suite {
             use super::*;
             #[test]
             fn sum_squares_directional_second() {
+    let _gpu = common::serialize_gpu();
                 directional_second_sum_squares($device);
             }
             #[test]
             fn x_cubed_directional_third() {
+    let _gpu = common::serialize_gpu();
                 directional_third_x_cubed($device);
             }
         }

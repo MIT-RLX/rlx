@@ -90,6 +90,9 @@ pub mod hnsw;
 pub mod hot_expert_cache;
 #[cfg(feature = "hwprofile")]
 pub mod hwprofile_select;
+// Depends on `hwprofile_select::device_vram_bytes`, so it carries the same gate.
+#[cfg(feature = "hwprofile")]
+pub mod arena_budget;
 pub mod jacfwd;
 pub mod kernel_trace;
 pub mod kv_cache;
@@ -157,6 +160,8 @@ pub use rlx_driver::{
 };
 // Collective ops (plan #12).
 pub use aot_cache::{AotCache, AotCacheError};
+#[cfg(feature = "hwprofile")]
+pub use arena_budget::{arena_budget, device_arena_limit, fit_batch, plan_arena_bytes};
 pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
 pub use backends_manifest::BackendsManifest;
 pub use browser::{
@@ -313,6 +318,9 @@ pub use rlx_ir::{CacheBuster, Tick, time_ns};
 pub use rlx_ir::{
     inspect_graph, inspect_hir, inspect_hir_stats, inspect_lir, inspect_mir, inspect_mir_stats,
 };
+// `CompileOptions::fusion_opts` takes a `FusionOptions`, so a downstream
+// crate has to be able to name one.
+pub use rlx_opt::FusionOptions;
 pub use rlx_opt::{OpKind, PrecisionPolicy};
 pub use rlx_opt::{PipelineInspect, inspect_pipeline};
 

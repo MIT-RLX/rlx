@@ -1,0 +1,46 @@
+#version 450
+// x / scale(block) -> codes, for Op::ScaledQuantize. One invocation per output
+// WORD (four codes) — see `rlx_wr_word`.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint x_off;             // tagged f32-word offset of x
+    uint scale_off;         // tagged word offset of the scale tensor
+    uint out_off;           // tagged word offset of the code tensor
+    uint rows;
+    uint cols;
+    uint fmt;
+    uint scale_mode;
+    uint block;
+} pc;
+
+float read_scale(uint r, uint c, uint nblk) {
+    if (pc.scale_mode == 0u) { return arena_load_f(pc.scale_off); }
+    uint si = r * nblk + c / pc.block;
+    uint b = rlx_rd_byte(pc.scale_off, si);
+    return (pc.scale_mode == 1u) ? rlx_e8m0(b) : rlx_decode_lowp(0u, b);
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    uint total = pc.rows * pc.cols;
+    uint words = (total + 3u) / 4u;
+    if (t >= words) { return; }
+
+    uint nblk = (pc.scale_mode == 0u) ? 1u : ((pc.cols + pc.block - 1u) / pc.block);
+    uint existing = arena_load_u(pc.out_off + t);
+    uvec4 out_bytes = uvec4(0u);
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint i = t * 4u + lane;
+        if (i >= total) {
+            out_bytes[lane] = (existing >> (lane * 8u)) & 0xFFu;
+            continue;
+        }
+        uint r = i / pc.cols;
+        uint c = i % pc.cols;
+        float s = read_scale(r, c, nblk);
+        float v = (s != 0.0) ? rlx_div_rn(arena_load_f(pc.x_off + i), s) : 0.0;
+        out_bytes[lane] = rlx_encode_lowp(pc.fmt, v);
+    }
+    rlx_wr_word(pc.out_off, t, out_bytes);
+}

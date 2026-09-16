@@ -1052,7 +1052,7 @@ mod imp {
             // (power/control=on) to keep it RESUMED so the firmware runs the command
             // (the `ert state=NEW`/never-completes hang looks power-state related —
             // runtime_status is `suspended` at idle).
-            if std::env::var("RLX_XDNA_TURBO").is_ok() {
+            if rlx_ir::env::var("RLX_XDNA_TURBO").is_some() {
                 match npu.set_turbo() {
                     Ok(()) => eprintln!("[turbo] exec fd → TURBO (max DPM)"),
                     Err(e) => eprintln!("[turbo] set_turbo on exec fd failed: {e}"),
@@ -1093,9 +1093,8 @@ mod imp {
             // its handle as `umq_bo`. Decisive feasibility test for zero-syscall
             // dispatch — on KMQ-only Phoenix the driver rejects it or returns
             // doorbell=0; on a UMQ device it returns a live doorbell offset.
-            let ctx = if std::env::var("RLX_XDNA_UMQ").is_ok() {
-                let ring_bytes = std::env::var("RLX_XDNA_UMQ_RING")
-                    .ok()
+            let ctx = if rlx_ir::env::var("RLX_XDNA_UMQ").is_some() {
+                let ring_bytes = rlx_ir::env::var("RLX_XDNA_UMQ_RING")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0x2000usize);
                 let (ring_h, _, ring_xdna) =

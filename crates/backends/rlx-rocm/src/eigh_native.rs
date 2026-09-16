@@ -6,7 +6,7 @@
 //! the on-device forward path for `Op::Eigh` / `Op::EighBatch`, replacing the
 //! F64 CPU host-fallback (`Step::SpdHost`, which does D2H → LAPACK → H2D).
 //!
-//! Mirrors [`rlx_cuda::eigh_native`]: hipSOLVER's batched Jacobi runs the
+//! Mirrors `rlx_cuda::eigh_native`: hipSOLVER's batched Jacobi runs the
 //! cyclic sweeps for the whole batch in parallel (one block per matrix).
 //! Constraint: batched syevj supports **n ≤ 32**. Larger `n` (or missing
 //! `libhipsolver`) stays on `Step::SpdHost`.

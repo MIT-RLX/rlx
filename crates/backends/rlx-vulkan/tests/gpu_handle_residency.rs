@@ -28,7 +28,7 @@ fn s(dims: &[usize]) -> Shape {
 /// the accumulator would not advance and the asserts would fail.
 #[test]
 fn resident_handle_accumulates_across_runs() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("rlx-vulkan: no device — skipping residency test");
         return;
     }
@@ -85,7 +85,7 @@ fn resident_handle_accumulates_across_runs() {
 /// not the previously accumulated resident value.
 #[test]
 fn rebind_reseeds_resident_handle() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let n = 4usize;
@@ -121,7 +121,7 @@ fn rebind_reseeds_resident_handle() {
 /// resident `past` slot at the active position — leaving the prefix untouched.
 #[test]
 fn row_feed_appends_new_token_into_resident_slot() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let upper = 4usize; // bucket rows in the resident `past` slot

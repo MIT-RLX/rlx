@@ -8,7 +8,9 @@
 #![cfg(feature = "gpu")]
 
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 const F: DType = DType::F32;
 
@@ -29,7 +31,8 @@ fn swiglu_graph(rows: usize, n_half: usize, gate_first: bool) -> Graph {
 
 #[test]
 fn wgpu_fused_swiglu_matches_cpu() {
-    if !is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip wgpu_fused_swiglu (wgpu unavailable)");
         return;
     }

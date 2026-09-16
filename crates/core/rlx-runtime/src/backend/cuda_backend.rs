@@ -75,6 +75,7 @@ impl ExecutableGraph for CudaExecutableWrapper {
     fn capabilities(&self) -> crate::ExecutableCapabilities {
         crate::ExecutableCapabilities {
             clone: true,
+            moe: true,
             gpu_handles: true,
             kv_resident: true,
             typed_io: true,

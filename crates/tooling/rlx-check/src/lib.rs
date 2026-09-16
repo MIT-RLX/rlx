@@ -16,6 +16,12 @@
 //! assert!(!report.has_errors());
 //! ```
 
+/// Lexical scan of Rust source for operand claims inside `Op::…` match arms,
+/// used by the gate that compares declared arity against what backends index.
+/// Feature `op-gates`.
+#[cfg(feature = "op-gates")]
+pub mod op_scan;
+
 pub mod demo;
 pub mod scaffold;
 

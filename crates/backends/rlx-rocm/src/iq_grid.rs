@@ -5,7 +5,7 @@
 
 //! IQ-family grid LUTs staged into a ROCm device buffer.
 //!
-//! Byte-identical layout to [`rlx_cuda::iq_grid`] / `rlx_metal::kernels::
+//! Byte-identical layout to `rlx_cuda::iq_grid` / `rlx_metal::kernels::
 //! iq_grid_buffer` — the `dequant_gguf` kernel (shared CUDA/ROCm `.cu`) indexes
 //! it for the IQ1/IQ2/IQ3 schemes:
 //!
@@ -60,7 +60,7 @@ static CACHE: OnceLock<Arc<HipBuffer<u8>>> = OnceLock::new();
 /// Per-process IQ grid LUT device buffer. Built once from the constant tables
 /// and cached; non-IQ GGUF schemes ignore the pointer but the `dequant_gguf`
 /// kernel signature requires it, so callers bind it unconditionally (mirrors
-/// [`rlx_cuda::iq_grid::cuda_iq_grid_buffer`]).
+/// `rlx_cuda::iq_grid::cuda_iq_grid_buffer`).
 pub fn rocm_iq_grid_buffer(ctx: &Arc<RocmContext>) -> Arc<HipBuffer<u8>> {
     Arc::clone(CACHE.get_or_init(|| {
         let bytes = build_bytes();

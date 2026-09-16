@@ -126,3 +126,7 @@ required-features = ["xrt"]
 [[example]]
 name = "xdna_unary"
 required-features = ["xrt"]
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

@@ -168,7 +168,7 @@ round-trips.
 ## Where it sits
 
 `rlx-tensor` is re-exported through the prelude crate as
-[`rlx::tensor`](../rlx) (`use rlx::prelude::*;` brings `Tensor`, `graph`, the
+[`rlx::tensor`](../../rlx) (`use rlx::prelude::*;` brings `Tensor`, `graph`, the
 `s!` / `shape!` macros, and the slice helpers into scope). It is one layer above
 [`rlx-ir`](../rlx-ir) and shares its `Op` set, so any graph it builds compiles
 through the same fusion / memory-planning / backend pipeline as the rest of RLX.

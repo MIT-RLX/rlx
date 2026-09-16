@@ -1,5 +1,6 @@
 #version 450
 // INT8 Dequantize matching CUDA `dequantize_i8` / rlx-cpu exec_dequantize.
+// See `quantize_i8.comp` for why the affine table is `uvec4` and not `uint[]`.
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
@@ -8,15 +9,20 @@ layout(push_constant) uniform PC {
     uint inner;
     uint q_word;
     uint out_off;
-    uint affine[26];
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uvec4 affine[6];
 } pc;
+
+uint affine_at(uint i) { return pc.affine[i >> 2u][i & 3u]; }
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) { return; }
     uint c = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
-    float s = uintBitsToFloat(pc.affine[2u * c]);
-    int zp = int(pc.affine[2u * c + 1u]);
+    float s = uintBitsToFloat(affine_at(2u * c));
+    int zp = int(affine_at(2u * c + 1u));
     int qv = arena_load_i8(pc.q_word, i);
     arena_store_f(pc.out_off + i, float(qv - zp) * s);
 }

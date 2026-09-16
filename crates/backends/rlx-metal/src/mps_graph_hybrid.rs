@@ -152,6 +152,18 @@ pub fn build_hybrid_plan(
     }) {
         return None;
     }
+    // Relaxing the `Op::Lstm` case was TRIED and reverted (2026-08-20). The
+    // miscompile above is specifically about a subgraph handing several boundary
+    // values to one native op, and an LSTM only ever takes one computed input
+    // (`x`; its weights are `Param`s), so gating on "no segment emits >1 output"
+    // is a principled narrowing and it did engage: rlx-ocr2's recognizer moved its
+    // conv front onto MPSGraph and still matched the numeric fixture
+    // (cos 1.000000, though max_abs moved 1.1e-5 -> 2.8e-5 — MPSGraph does not
+    // compute this bit-identically). It was reverted because the speedup could not
+    // be demonstrated: interleaved best-of-N on a loaded machine gave 32.1/30.8/18.9 ms
+    // with it vs 39.9/25.0/23.9 ms without — one round slower, variance swamping the
+    // effect. Not worth spending a correctness margin on an unproven win; re-measure
+    // on a quiet machine before trying again.
     let mut steps: Vec<HybridStep> = Vec::new();
     let mut pending: Vec<NodeId> = Vec::new();
     let mut pending_idxs: Vec<usize> = Vec::new();

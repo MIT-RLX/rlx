@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // RLX — versatile ML compiler + runtime. MIT OR Apache-2.0.
 //! Shard-aware checkpoint download — the streamlined replacement for hand-rolled
 //! `curl`/`wget` loops. Each node fetches only the safetensors shards its

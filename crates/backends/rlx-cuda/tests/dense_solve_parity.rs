@@ -24,7 +24,7 @@ fn cpu_run(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 
 #[test]
 fn dense_solve_f32_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda dense_solve] no CUDA device — skipping");
         return;
     }
@@ -53,7 +53,7 @@ fn dense_solve_f32_matches_cpu() {
 
 #[test]
 fn batched_dense_solve_f32_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda dense_solve] no CUDA device — skipping batched");
         return;
     }

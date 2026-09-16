@@ -12,7 +12,7 @@
 //! decoded today: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1,
 //! and the full K-quant family Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K.
 //! The encoder side covers every dtype the decoder accepts — see
-//! [`quantize`] and [`writer::GgufWriter`]. Anything outside that set
+//! [`quantize`](fn@quantize::quantize) and [`writer::GgufWriter`]. Anything outside that set
 //! parses fine but errors on `dequant_f32` so callers know exactly
 //! which key is unreadable; extending is a one-arm match.
 //!
@@ -54,7 +54,7 @@
 //! scheme rules see the companion [`rlx-gguf-convert`] crate.
 //!
 //! Map GGUF dtypes to RLX `QuantScheme` for `Op::DequantMatMul`:
-//! [`rlx_cpu::quant_scheme_for_ggml`] (requires `rlx-cpu`).
+//! `rlx_cpu::quant_scheme_for_ggml` (requires `rlx-cpu`).
 //!
 //! [`rlx-gguf-convert`]: https://docs.rs/rlx-gguf-convert
 
@@ -66,8 +66,10 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 
 pub mod fv5_dequant;
+pub mod g8_dequant;
 pub mod i2s_dequant;
 pub mod i8s_dequant;
+pub mod invariants;
 mod iq1_encode;
 mod iq2_encode;
 mod iq3_encode;
@@ -94,7 +96,7 @@ pub const DEFAULT_ALIGNMENT: u64 = 32;
 // Subset of upstream `ggml_type`. Codes are stable; adding new ones
 // is append-only.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 // Variant names mirror upstream `ggml_type` spelling verbatim (e.g. `I2_S`,
 // `I8_S`) so they map 1:1 to the on-disk format; keep them as-is.
@@ -146,6 +148,106 @@ pub enum GgmlType {
     // FV5 = transformer linears, FV5B = int8 embed/lm_head. See fv5_dequant.
     FV5 = 43,
     FV5B = 44,
+    // Doses AI Pestle (mortar.cpp fork): exact ternary with one bf16
+    // scale per group of 8. `token_embd` / `output` only — Pestle's
+    // linears are factorized Q2_0 pairs. See g8_dequant.
+    G8_0 = 143,
+}
+
+/// Single source of truth for `GgmlType` ↔ canonical upstream name.
+///
+/// Expanding this macro defines [`GgmlType::name`], [`GgmlType::from_name`],
+/// their `Display` / `FromStr` impls, and the test helper `NAME_PAIRS` — so the
+/// print and parse directions cannot drift apart. They previously did: pyrlx
+/// hand-maintained a second copy of this mapping where the printer knew seven
+/// names the parser rejected, and a newly added variant reached neither.
+///
+/// `name`'s `match` is exhaustive, so a new `GgmlType` variant fails to compile
+/// until it is listed here — the same enforcement `define_gguf_gpu_dequant_ids!`
+/// gives the GPU scheme ids.
+macro_rules! define_ggml_type_names {
+    ($(($variant:ident, $name:literal)),+ $(,)?) => {
+        impl GgmlType {
+            /// Canonical upstream spelling (`Q4K` → `"Q4_K"`).
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+
+            /// Inverse of [`Self::name`]. Case-insensitive; `None` if unknown.
+            pub fn from_name(s: &str) -> Option<Self> {
+                let upper = s.to_ascii_uppercase();
+                match upper.as_str() {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            /// `(variant, name)` pairs for tests — keep in sync via the macro.
+            #[cfg(test)]
+            pub(crate) const NAME_PAIRS: &'static [(Self, &'static str)] =
+                &[$((Self::$variant, $name),)+];
+        }
+
+        impl std::fmt::Display for GgmlType {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.name())
+            }
+        }
+
+        impl std::str::FromStr for GgmlType {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::from_name(s).ok_or_else(|| {
+                    format!("unknown GGUF dtype {s:?} — expected e.g. Q4_K, IQ2_XXS, TQ2_0")
+                })
+            }
+        }
+    };
+}
+
+define_ggml_type_names! {
+    (F32, "F32"),
+    (F16, "F16"),
+    (Q4_0, "Q4_0"),
+    (Q4_1, "Q4_1"),
+    (Q5_0, "Q5_0"),
+    (Q5_1, "Q5_1"),
+    (Q8_0, "Q8_0"),
+    (Q8_1, "Q8_1"),
+    (Q2K, "Q2_K"),
+    (Q3K, "Q3_K"),
+    (Q4K, "Q4_K"),
+    (Q5K, "Q5_K"),
+    (Q6K, "Q6_K"),
+    (Q8K, "Q8_K"),
+    (IQ2XXS, "IQ2_XXS"),
+    (IQ2XS, "IQ2_XS"),
+    (IQ3XXS, "IQ3_XXS"),
+    (IQ1S, "IQ1_S"),
+    (IQ4NL, "IQ4_NL"),
+    (IQ3S, "IQ3_S"),
+    (IQ2S, "IQ2_S"),
+    (IQ4XS, "IQ4_XS"),
+    (I8, "I8"),
+    (I16, "I16"),
+    (I32, "I32"),
+    (I64, "I64"),
+    (F64, "F64"),
+    (IQ1M, "IQ1_M"),
+    (BF16, "BF16"),
+    (TQ1_0, "TQ1_0"),
+    (TQ2_0, "TQ2_0"),
+    (I2_S, "I2_S"),
+    (I8_S, "I8_S"),
+    (MXFP4, "MXFP4"),
+    (NVFP4, "NVFP4"),
+    (Q1_0, "Q1_0"),
+    (Q2_0, "Q2_0"),
+    (FV5, "FV5"),
+    (FV5B, "FV5B"),
+    (G8_0, "G8_0"),
 }
 
 impl GgmlType {
@@ -190,6 +292,7 @@ impl GgmlType {
             42 => Self::Q2_0,
             43 => Self::FV5,
             44 => Self::FV5B,
+            143 => Self::G8_0,
             other => bail!("unknown ggml type {other}"),
         })
     }
@@ -349,6 +452,21 @@ impl GgufFile {
                 );
             }
         }
+    }
+
+    /// Byte offset of the tensor-data segment within the file.
+    ///
+    /// A [`GgufTensor::offset`] is relative to this, so `data_offset() +
+    /// t.offset` is the absolute file position a reader can `pread` from —
+    /// which is what a pager that reads individual experts on demand needs,
+    /// rather than borrowing from a whole-file mapping.
+    pub fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+
+    /// File this was read from, when there is one.
+    pub fn src_path(&self) -> Option<&Path> {
+        self.src_path.as_deref()
     }
 
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -621,6 +739,7 @@ impl GgufFile {
             GgmlType::Q2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
             GgmlType::FV5 => fv5_dequant::dequant_fv5(bytes, n)?,
             GgmlType::FV5B => fv5_dequant::dequant_fv5b(bytes, n)?,
+            GgmlType::G8_0 => g8_dequant::dequant_g8_0(bytes, n)?,
             GgmlType::I8 => {
                 if bytes.len() != n {
                     bail!("I8 tensor {name}: expected {n} bytes, got {}", bytes.len());
@@ -790,6 +909,8 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         // Fermion five-value ternary (Neutrino): 256-elem blocks.
         GgmlType::FV5 => fv5_dequant::fv5_bytes(n),
         GgmlType::FV5B => fv5_dequant::fv5b_bytes(n),
+        // Pestle exact ternary (Doses AI): 32-elem blocks, 4 bf16 scales.
+        GgmlType::G8_0 => g8_dequant::g8_0_bytes(n),
         GgmlType::I8 => Some(n),
         GgmlType::I16 => Some(n * 2),
         GgmlType::I32 => Some(n * 4),

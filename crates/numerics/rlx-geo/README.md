@@ -546,3 +546,6 @@ cursor whose order depends on thread scheduling, and at four cocircular points
 either diagonal is a valid Delaunay edge. The triangle *count* is always invariant;
 the choice of diagonal at a degenerate quad is not. Use the serial path if you need
 byte-reproducible output.
+## License
+
+MIT OR Apache-2.0.

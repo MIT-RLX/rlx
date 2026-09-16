@@ -34,7 +34,7 @@
 //!
 //! Cocoa's naming rule decides which constructor applies: selectors beginning
 //! `new`/`alloc`/`copy` (and C `…Create…`) return +1 and map to
-//! [`from_retained`]; everything else is autoreleased and is either borrowed as
+//! `from_retained`; everything else is autoreleased and is either borrowed as
 //! a `&FooRef` tied to its owner or explicitly retained via `from_autoreleased`.
 //! Getting that backwards is a leak or a use-after-free, so each call site below
 //! names which rule it is following.
@@ -772,6 +772,25 @@ impl CommandBufferRef {
         unsafe {
             let _: () = msg_send![self.as_ptr(), waitUntilCompleted];
         }
+    }
+
+    /// `GPUStartTime` — when the GPU began executing this buffer, in seconds on
+    /// the same base as `CACurrentMediaTime`.
+    ///
+    /// Only meaningful after the buffer has completed; Metal returns 0 before
+    /// then. Paired with [`Self::gpu_end_time`] this is the device-side span,
+    /// which excludes host encode and `objc` bridging — a wall-clock timer
+    /// around commit+wait measures those too, and they are a large fraction of
+    /// a small dispatch. rlx's Apple benchmarks have historically used wall
+    /// clock, so a kernel change and a host-overhead change looked the same.
+    pub fn gpu_start_time(&self) -> f64 {
+        unsafe { msg_send![self.as_ptr(), GPUStartTime] }
+    }
+
+    /// `GPUEndTime` — when the GPU finished this buffer. See
+    /// [`Self::gpu_start_time`].
+    pub fn gpu_end_time(&self) -> f64 {
+        unsafe { msg_send![self.as_ptr(), GPUEndTime] }
     }
 
     /// The command buffer's `error`, rendered; `None` if it completed cleanly.

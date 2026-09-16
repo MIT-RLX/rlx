@@ -26,8 +26,11 @@ Rust ML project.
 | `TQ1_0` / `TQ2_0` | 256 | 1.69 / 2.06 | ✅ | ✅ | BitNet-style ternary {−1,0,+1} |
 | `MXFP4` | 32 | 4.25 | ✅ | ✅ | E8M0 scale + E2M1 nibbles (OCP MX) |
 | `NVFP4` | 16 | 4.5 | ✅ | ✅ | E4M3 scale + E2M1 nibbles |
+| `Q1_0` / `Q2_0` | 128 | 1.125 / 2.125 | ✅ | ✅ | PrismML Bonsai fork: f16 group scale + sign bits / 2-bit codes |
+| `FV5` / `FV5B` | 256 | 3.25 / 8.125 | ✅ | — | Fermion five-value ternary + its int8 embed companion |
+| `G8_0` | 32 | 4 | ✅ | ✅ | Doses AI Pestle: **four** bf16 scales, one per group of 8, + 2-bit `{−1,0,+1}` codes |
 
-Not yet decoded: `Q1_0`. Files that contain it raise a clean
+Types outside this table raise a clean
 `"dequant for {type} not implemented yet"` error instead of
 returning garbage.
 
@@ -60,7 +63,7 @@ decode reference implementations live in this crate.
 | 23 | Q5_1 |
 
 Per-backend dispatch (GPU vs host, fused GEMV, ANE MIL constexpr, TPU
-compile-time bake): [docs/gguf-backend-paths.md](../docs/gguf-backend-paths.md).
+compile-time bake): [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
 When adding a format: implement `dequant_*` here, assign the next scheme id,
 then update MSL/CUDA/WGSL kernels and each backend's `gguf_scheme_id`.

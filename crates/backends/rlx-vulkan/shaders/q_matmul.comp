@@ -17,13 +17,9 @@ layout(push_constant) uniform PC {
     uint mult_bits;
 } pc;
 
-void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    uint total = pc.m * pc.n;
-    if (idx >= total) { return; }
+int q_matmul_one(uint idx) {
     uint mi = idx / pc.n;
     uint ni = idx - mi * pc.n;
-
     int acc = int(trunc(arena_load_f(pc.bias_off + ni)));
     for (uint ki = 0u; ki < pc.k; ki++) {
         int xv = arena_load_i8(pc.x_word, mi * pc.k + ki) - pc.x_zp;
@@ -34,5 +30,26 @@ void main() {
     int r = int(q_round_half_away(float(acc) * mult)) + pc.out_zp;
     if (r < -128) { r = -128; }
     if (r > 127) { r = 127; }
-    arena_store_i8(pc.out_word, mi * pc.n + ni, r);
+    return r;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.m * pc.n;
+    if (idx >= total) { return; }
+    // One invocation owns each packed uint word — the same launch shape
+    // `quantize_i8.comp` uses, and for the same reason: `arena_store_i8` is a
+    // read-modify-write of the containing word (naga's GLSL front end has no
+    // `atomicCompSwap`), so four invocations writing four consecutive output
+    // elements would clobber each other. This kernel did NOT do that, and the
+    // result was that only every fourth output survived — a plausible i8 tensor
+    // with three quarters of it left at the zero point.
+    if ((idx & 3u) != 0u) { return; }
+    uint word = 0u;
+    for (uint lane = 0u; lane < 4u; lane++) {
+        uint j = idx + lane;
+        if (j >= total) { break; }
+        word |= (uint(q_matmul_one(j)) & 0xFFu) << (lane * 8u);
+    }
+    arena_store_u(pc.out_word + (idx >> 2u), word);
 }

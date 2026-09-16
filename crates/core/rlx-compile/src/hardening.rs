@@ -4,7 +4,7 @@
 
 //! Debug-build verification hooks at compiler stage boundaries.
 //!
-//! Use [`debug_assert_graph!`] at pipeline stage boundaries. The macro
+//! Use `debug_assert_graph` at pipeline stage boundaries. The macro
 //! is compiled out entirely in release builds.
 
 /// Stage-boundary IR check. **Debug builds only** — compiled out in release.

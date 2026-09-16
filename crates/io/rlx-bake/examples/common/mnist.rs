@@ -357,7 +357,7 @@ pub fn try_load_mnist(n: usize) -> Option<(Vec<f32>, Vec<usize>)> {
 }
 
 fn mnist_raw_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RLX_MNIST_DIR") {
+    if let Some(p) = rlx_ir::env::var("RLX_MNIST_DIR") {
         let p = PathBuf::from(p);
         if p.is_dir() {
             return Some(p);
@@ -369,16 +369,14 @@ fn mnist_raw_dir() -> Option<PathBuf> {
 }
 
 pub fn default_out_path() -> PathBuf {
-    std::env::var("RLX_BAKE_OUT")
+    rlx_ir::env::var("RLX_BAKE_OUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/out/mnist.rlx")
-        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/out/mnist.rlx"))
 }
 
 pub fn password_from_env() -> anyhow::Result<String> {
-    let pw = std::env::var("RLX_BAKE_PASSWORD")
-        .map_err(|_| anyhow::anyhow!("set RLX_BAKE_PASSWORD in the environment"))?;
+    let pw = rlx_ir::env::var("RLX_BAKE_PASSWORD")
+        .ok_or_else(|| anyhow::anyhow!("set RLX_BAKE_PASSWORD in the environment"))?;
     if pw.is_empty() {
         anyhow::bail!("RLX_BAKE_PASSWORD is empty");
     }

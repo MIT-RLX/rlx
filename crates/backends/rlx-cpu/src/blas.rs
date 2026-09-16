@@ -17,6 +17,28 @@
 //! and the extern is replaced by a portable scalar/SIMD gemm with the same
 //! calling convention, so every consumer here keeps working (slower, correct).
 
+/// Which CBLAS/LAPACK vendor is linked into this build, if any.
+///
+/// - `"accelerate"` — Apple Accelerate (macOS / iOS)
+/// - `"openblas"` — OpenBLAS
+/// - `"mkl"` — Intel oneMKL
+/// - `"cblas"` — generic CBLAS (rare)
+/// - `None` — portable scalar/SIMD fallback (`--no-default-features` or no system BLAS)
+#[must_use]
+pub fn linked_blas() -> Option<&'static str> {
+    if cfg!(rlx_cpu_blas_accelerate) {
+        Some("accelerate")
+    } else if cfg!(rlx_cpu_blas_openblas) {
+        Some("openblas")
+    } else if cfg!(rlx_cpu_blas_mkl) {
+        Some("mkl")
+    } else if cfg!(rlx_cpu_blas) {
+        Some("cblas")
+    } else {
+        None
+    }
+}
+
 #[cfg(rlx_cpu_blas)]
 unsafe extern "C" {
     #[link_name = "cblas_sgemm"]
@@ -3681,7 +3703,7 @@ mod bf16_bench {
     use super::*;
     use std::time::Instant;
     #[test]
-    #[ignore]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
     fn bench_head_bf16_vs_f32() {
         let (m, k, n) = (1usize, 7168usize, 163840usize); // real LM-head GEMV
         let a: Vec<f32> = (0..m * k)

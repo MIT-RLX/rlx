@@ -75,7 +75,7 @@ pub fn worker_args() -> Option<WorkerArgs> {
             _ => {}
         }
     }
-    let rank = rank.or_else(|| std::env::var("RLX_RANK").ok().and_then(|v| v.parse().ok()))?;
+    let rank = rank.or_else(|| rlx_ir::env::var("RLX_RANK").and_then(|v| v.parse().ok()))?;
     Some(WorkerArgs {
         rank,
         hostfile: hostfile.unwrap_or_default(),
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn worker_args_none_without_flag() {
         // The test harness runs with no `--rank` and no RLX_RANK.
-        assert!(std::env::var("RLX_RANK").is_err());
+        assert!(rlx_ir::env::var("RLX_RANK").is_none());
         assert!(worker_args().is_none());
     }
 

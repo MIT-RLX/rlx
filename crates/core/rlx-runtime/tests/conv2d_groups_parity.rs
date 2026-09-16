@@ -11,6 +11,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 #[derive(Clone, Copy)]
 struct Cfg {
     n: usize,
@@ -244,6 +246,7 @@ fn assert_close(what: &str, actual: &[f32], reference: &[f32]) {
 
 #[test]
 fn conv2d_groups_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         let out = run_on(&cfg, Device::Cpu);
         assert!(out.iter().all(|x| x.is_finite()), "cpu {name}: non-finite");
@@ -254,6 +257,7 @@ fn conv2d_groups_cpu_runs() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn conv2d_groups_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         assert_close(
             &format!("metal {name}"),
@@ -266,6 +270,7 @@ fn conv2d_groups_metal_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn conv2d_groups_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         assert_close(
             &format!("mlx {name}"),
@@ -278,6 +283,10 @@ fn conv2d_groups_mlx_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn conv2d_groups_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for (name, cfg) in cfgs() {
         assert_close(
             &format!("wgpu {name}"),

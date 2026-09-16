@@ -90,7 +90,7 @@ impl CompileCache {
         self.get_or_compile_with_options(key, build, &crate::CompileOptions::new())
     }
 
-    /// Like [`Self::get_or_compile`] with explicit [`CompileOptions`].
+    /// Like [`Self::get_or_compile`] with explicit `CompileOptions`.
     pub fn get_or_compile_with_options<F: FnOnce() -> Graph>(
         &mut self,
         key: u64,
@@ -266,8 +266,7 @@ const LARGE_BUCKET_BYTES: usize = 256 * 1024 * 1024;
 /// pushes a 3 GB×N ladder past a 16 GB card. Override with
 /// `RLX_KV_CACHE_MAX_RESIDENT` (min 1) to trade VRAM for cross-bucket reuse.
 fn max_resident_large_buckets() -> usize {
-    std::env::var("RLX_KV_CACHE_MAX_RESIDENT")
-        .ok()
+    rlx_ir::env::var("RLX_KV_CACHE_MAX_RESIDENT")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(1)
@@ -389,7 +388,7 @@ impl BucketedCompileCache {
     /// the current bucket is never a victim. Runs *before* the new arena is
     /// allocated so the transient peak is `cap` copies, not `cap + 1`.
     fn evict_for_incoming(&mut self, incoming_idx: usize, incoming_bytes: usize) {
-        if std::env::var("RLX_KV_CACHE_NO_EVICT").is_ok() {
+        if rlx_ir::env::var("RLX_KV_CACHE_NO_EVICT").is_some() {
             return;
         }
         // Discrete VRAM always caps large buckets. Unified memory keeps the full
@@ -398,11 +397,11 @@ impl BucketedCompileCache {
         // baked into every decode bucket) whose inline duplication would grow
         // across a long generation. Monotonic host-fed-KV decode never revisits a
         // climbed-past bucket, so capping is safe and ~free within a generation.
-        let unified_opt_in = std::env::var("RLX_KV_CACHE_MAX_RESIDENT").is_ok();
+        let unified_opt_in = rlx_ir::env::var("RLX_KV_CACHE_MAX_RESIDENT").is_some();
         if !device_has_discrete_vram(self.device) && !unified_opt_in {
             return;
         }
-        if std::env::var("RLX_KV_CACHE_DBG").is_ok() {
+        if rlx_ir::env::var("RLX_KV_CACHE_DBG").is_some() {
             let (n_large, resident): (usize, usize) = self
                 .buckets
                 .iter()
@@ -466,7 +465,7 @@ impl BucketedCompileCache {
         self.get_or_compile_with_options(key, build, &crate::CompileOptions::new())
     }
 
-    /// Like [`Self::get_or_compile`] with explicit [`CompileOptions`].
+    /// Like [`Self::get_or_compile`] with explicit `CompileOptions`.
     pub fn get_or_compile_with_options<F: FnOnce(u64) -> Graph>(
         &mut self,
         key: u64,
@@ -495,7 +494,7 @@ impl BucketedCompileCache {
         self.get_or_compile_hir_with_options(key, build, &crate::CompileOptions::new())
     }
 
-    /// Like [`Self::get_or_compile_hir`] with explicit [`CompileOptions`] (tier-1 profile, fusion target, …).
+    /// Like [`Self::get_or_compile_hir`] with explicit `CompileOptions` (tier-1 profile, fusion target, …).
     pub fn get_or_compile_hir_with_options<F: FnOnce(u64) -> HirModule>(
         &mut self,
         key: u64,
@@ -608,7 +607,7 @@ impl BucketedCompileCache {
     /// If the recorded donor was evicted, tries any other live compiled bucket
     /// as a share source (needed when `RLX_KV_CACHE_MAX_RESIDENT=1` climbs).
     pub fn try_share_params_from_donor(&mut self, dst_upper: u64) -> bool {
-        if std::env::var("RLX_METAL_NO_SHARE").is_ok() {
+        if rlx_ir::env::var("RLX_METAL_NO_SHARE").is_some() {
             return false;
         }
         let mut candidates: Vec<u64> = Vec::new();
@@ -942,7 +941,7 @@ impl BucketedCompileCache {
     /// weight params (via `set_param_typed`) on first compile — the packed
     /// decode path, where K-quant linears stay U8 in the arena rather than
     /// dequant-to-f32. `build` returns `(graph, f32_params, packed_params)`
-    /// where each `packed_params` entry is `(name, bytes)` bound as [`DType::U8`].
+    /// where each `packed_params` entry is `(name, bytes)` bound as [`DType::U8`](rlx_ir::DType::U8).
     /// Binding happens ONLY on the compile miss (same as the f32 params), so
     /// steady-state decode pays nothing.
     pub fn ensure_graph_with_packed<F>(
@@ -1223,7 +1222,7 @@ impl DynamicDimCompileCache {
         self.template.as_ref()
     }
 
-    /// Specialize via on-disk LIR cache ([`CompilationMode::Aot`]).
+    /// Specialize via on-disk LIR cache ([`CompilationMode::Aot`](rlx_ir::CompilationMode::Aot)).
     /// Disk-backed specialize ([`rlx_ir::CompilationMode::Aot`]).
     pub fn get_or_specialize_aot<F: FnOnce() -> HirModule>(
         &mut self,
@@ -1724,7 +1723,7 @@ mod tests {
     // BinaryFull / Attention.
 
     #[test]
-    #[ignore = "active-extent execution is a stub on CPU (thunk.rs::execute_thunks_active)"]
+    #[ignore = "active-extent execution is a stub on CPU (rlx-cpu/src/thunk/exec_dispatch.rs::execute_thunks_active returns false unconditionally)"]
     fn active_extent_skips_compute_on_cpu_activation() {
         // tiny_graph(15) is `Input([15]) → Relu → Output` and lowers to
         // a Copy + ActivationInPlace pair on CPU — both are in the safe
@@ -1775,7 +1774,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "active-extent execution is a stub on CPU (thunk.rs::execute_thunks_active)"]
+    #[ignore = "active-extent execution is a stub on CPU (rlx-cpu/src/thunk/exec_dispatch.rs::execute_thunks_active returns false unconditionally)"]
     fn active_extent_skips_compute_on_binary_full() {
         // Input([4]) + Input([4]) → Output. Lowers to a BinaryFull
         // thunk with no broadcast (lhs_len == rhs_len == len), which
@@ -1896,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "active-extent execution is a stub on CPU (thunk.rs::execute_thunks_active)"]
+    #[ignore = "active-extent execution is a stub on CPU (rlx-cpu/src/thunk/exec_dispatch.rs::execute_thunks_active returns false unconditionally)"]
     fn active_extent_skips_compute_on_attention() {
         // Standalone Attention with kernel-synthesized MaskKind::None.
         // Q/K/V shape: [batch=1, seq=4, num_heads*head_dim=8].

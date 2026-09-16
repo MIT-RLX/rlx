@@ -6,37 +6,60 @@ use rlx_rocm::backend::RocmExecutable;
 
 pub struct RocmBackend;
 
+/// Everything `compile` does to a graph before `rlx-rocm` plans and lowers it.
+///
+/// Extracted so the arena size can be **asked** rather than estimated. Each of
+/// these passes changes how much memory the plan needs — `unfuse` alone is
+/// where `Op::SelectiveScan` becomes a trajectory-saving `Op::Scan`, which for
+/// a Mamba backward is the single largest term — so a caller that plans the
+/// raw graph is sizing something the backend never sees. Predicting from the
+/// raw graph under-counted by 1.70x on a 12-layer Mamba training graph
+/// (6.12 GB predicted vs 10.39 GB actual), enough to choose a batch that then
+/// failed to compile.
+///
+/// `log_fusion` is the one behavioural difference: the planning path stays
+/// quiet so a size probe does not spam the fusion report.
+pub(crate) fn prepare_rocm_exec_graph(
+    graph: Graph,
+    options: &CompileOptions,
+    log_fusion: bool,
+) -> (Graph, cpu_low_precision::IoDtypeManifest) {
+    use rlx_opt::pass::Pass as _;
+    let graph = rlx_rocm::unfuse::unfuse(graph);
+    let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, rlx_rocm::SUPPORTED_OPS)
+        .unwrap_or_else(|errors| {
+            panic!("{}", rlx_opt::format_legalize_error("rocm", &errors));
+        });
+    let graph = apply_scan_device_preference(graph, options);
+    let graph = crate::precompile::precompile_cleanup(graph, options);
+    let graph = rlx_opt::LegalizeBroadcast.run(graph);
+    let compile_result = crate::stages::compile_graph_stages_for_backend(
+        rlx_driver::Device::Rocm,
+        graph,
+        options,
+        rlx_rocm::SUPPORTED_OPS,
+    );
+    if log_fusion {
+        crate::stages::maybe_log_fusion(&compile_result.fusion);
+    }
+    let graph = compile_result.lir.into_graph();
+    let graph = match options.policy.clone() {
+        Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
+        None => graph,
+    };
+    // Non-trailing `Op::Reduce` is lowered inside `rlx_rocm`'s own compile
+    // entry (mirroring rlx-cuda), so every caller gets it — not just this
+    // wrapper.
+    cpu_low_precision::prepare_f32_exec_graph(graph)
+}
+
 impl Backend for RocmBackend {
     fn supported_ops(&self) -> &'static [rlx_ir::OpKind] {
         rlx_rocm::SUPPORTED_OPS
     }
 
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
-        use rlx_opt::pass::Pass as _;
-        let graph = rlx_rocm::unfuse::unfuse(graph);
-        let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, rlx_rocm::SUPPORTED_OPS)
-            .unwrap_or_else(|errors| {
-                panic!("{}", rlx_opt::format_legalize_error("rocm", &errors));
-            });
-        let graph = apply_scan_device_preference(graph, options);
-        let graph = crate::precompile::precompile_cleanup(graph, options);
-        let graph = rlx_opt::LegalizeBroadcast.run(graph);
-        let compile_result = crate::stages::compile_graph_stages_for_backend(
-            rlx_driver::Device::Rocm,
-            graph,
-            options,
-            rlx_rocm::SUPPORTED_OPS,
-        );
-        crate::stages::maybe_log_fusion(&compile_result.fusion);
-        let graph = compile_result.lir.into_graph();
-        let graph = match options.policy.clone() {
-            Some(p) => rlx_opt::AutoMixedPrecision::new(p).run(graph),
-            None => graph,
-        };
-        // Non-trailing `Op::Reduce` is lowered inside `rlx_rocm`'s own compile
-        // entry (mirroring rlx-cuda), so every caller gets it — not just this
-        // wrapper.
-        let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
+        let (graph, io_manifest) = prepare_rocm_exec_graph(graph, options, true);
         Box::new(RocmExecutableWrapper {
             inner: RocmExecutable::compile_rng(graph, options.rng),
             io_manifest,
@@ -72,9 +95,11 @@ impl ExecutableGraph for RocmExecutableWrapper {
     fn capabilities(&self) -> crate::ExecutableCapabilities {
         crate::ExecutableCapabilities {
             clone: true,
+            moe: true,
             gpu_handles: true,
             typed_io: true,
             active_extent: true,
+            kv_resident: true,
             ..crate::ExecutableCapabilities::NONE
         }
     }

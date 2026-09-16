@@ -1,0 +1,107 @@
+# rlx-distributed — example cluster config.
+#
+# Machines can be listed, discovered, or both. Anything written by hand is kept
+# verbatim and keeps its position in the pipeline; discovered hosts are appended
+# and deduped by `addr`, so you can pin the machines you care about and let the
+# rest be found.
+#
+#   let mut cx = Cluster::from_path("cluster.toml")?;
+#   cx.autoplan(&tensor_index, &CostOptions::default().with_experts(8, 288), worker_bin)?;
+#   print!("{}", cx.plan_table());
+
+model          = "unsloth/GLM-5.3-Flash-GGUF"
+seq            = 8
+reserve_ram_gb = 6.0          # headroom left free on every node
+
+[placement]
+# auto          — capacity is the better of "experts resident in RAM/VRAM" and
+#                 "dense weights resident, expert banks on disk"; layers are
+#                 shared out by predicted per-layer time, counting compute AND
+#                 the disk time to stream in the experts a token touches.
+#                 Use this for a fine-grained MoE.
+# ram_balanced  — fill a similar fraction of each node's RAM budget (default).
+# throughput    — balance by raw GFLOP/s; for models that already fit.
+# manual        — honour each node's explicit `layers = "a:b"`.
+policy = "auto"
+
+# What to make small. Distinct from `policy`, which says how to split.
+[placement.objective]
+# latency    — fewest hops: pack nodes full, leave the rest idle. Chat endpoints.
+# throughput — even stage times so the pipeline never stalls (default). Batch.
+# memory     — spread thin, maximise free RAM per machine. Shared clusters.
+optimize = "throughput"
+
+# Context the KV cache must hold. Reserved BEFORE weights, so a plan that fits
+# here still fits once the cache fills — set it to your real max context.
+context = 32768
+
+# The cache width is normally INFERRED from the checkpoint's tensor shapes:
+# latent (MLA) layers cache only the compressed latent, ordinary attention
+# caches K and V, and linear-attention layers have a fixed state that does not
+# grow with context at all. Nothing to configure when that works.
+#
+# When it cannot be read, planning STOPS rather than reserving nothing — a plan
+# that ignores the cache fits on paper and dies when it fills. Three ways out:
+#
+# The cache dtype scales the reservation — an f16 cache is half an f32 one, and
+# over-reserving can refuse a plan that would have fit. Set it on CostOptions
+# (`kv_dtype`) when the runtime does not cache in f32.
+#
+#   kv_bytes_per_layer_token = 2048   # state it yourself, if you know it
+#   on_unknown_kv = "assume"          # pessimistic MHA-width bound (needs the
+#                                     # model width; errors without one rather
+#                                     # than estimating it, since a byte-count
+#                                     # estimate under-reserves for quantized
+#                                     # weights)
+#   kv_dtype = "f16"                  # cache element width for that bound
+#   on_unknown_kv = "ignore"          # only if there is genuinely no cache
+
+# Seconds a network hop adds; only `optimize = "latency"` uses it.
+hop_secs = 0.002
+
+# If the model does not fit as stored, try these in order and report which was
+# used, instead of failing with "too big".
+precision_ladder = ["f16", "mxfp4"]
+
+# ── Discovery: ask the machines instead of describing them ──────────────────
+# `ssh_hosts` is preferred — it probes hardware over SSH, so RAM, VRAM, free
+# disk, disk throughput and per-device GFLOP/s all come back real, and the
+# device string is chosen from what the host actually has.
+[discover]
+ssh_hosts = ["node-b", "node-c"]
+ckpt_dir  = "/data/models/GLM-5.3-Flash"   # the path ON those hosts
+port      = 9100
+# device  = "cuda"        # force instead of picking the best each host reports
+# precision = "bf16"
+#
+# Or find workers already listening (learns only that something answers, so
+# these nodes get defaults and want a follow-up probe):
+# subnet     = "10.0.0.0/24"
+# timeout_ms = 300
+
+# ── Hand-listed nodes: kept exactly as written, and placed first ────────────
+#
+# role = "active"   (default) carries a stage
+#      | "standby"  loaded with the SAME layers as `standby_for`, kept warm and
+#                   serving nothing — promoting it is a pointer swap, not a
+#                   cold load of a 90 GB stage
+#      | "draining" on its way out; `Cluster::retire(addr)` puts a node here and
+#                   promotes its standby (or re-plans if there is none)
+[[node]]
+addr       = "10.0.0.5:9100"
+ssh        = "workstation"
+ckpt_dir   = "/mnt/nvme/GLM-5.3-Flash"
+device     = "cuda"        # cpu | metal | cuda | rocm | vulkan | "cuda+cpu"
+precision  = "bf16"
+kv_cache   = "device"      # none | host | device
+max_ram_gb = 40            # cap, e.g. to leave room for other work
+# layers   = "0:12"        # only with policy = "manual"
+
+# A hot spare for the node above. Same weights, no traffic, instant promotion.
+[[node]]
+addr        = "10.0.0.9:9100"
+ssh         = "spare-1"
+ckpt_dir    = "/mnt/nvme/GLM-5.3-Flash"
+device      = "cuda"
+role        = "standby"
+standby_for = "10.0.0.5:9100"   # omit to back whichever stage is largest

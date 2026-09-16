@@ -14,7 +14,7 @@ use crate::context::FlowCtx;
 use crate::stage::FlowStage;
 use crate::value::FlowValue;
 
-/// Apply [`Op::AdaLayerNorm`] using named modulation inputs already bound in
+/// Apply [`Op::AdaLayerNorm`](rlx_ir::Op::AdaLayerNorm) using named modulation inputs already bound in
 /// [`FlowCtx`] state (`scale_input` / `shift_input`).
 #[derive(Debug, Clone)]
 pub struct AdaLayerNormStage {
@@ -60,7 +60,7 @@ impl BlockStage for AdaLayerNormStage {
     }
 }
 
-/// Apply [`Op::GatedResidual`]: `residual + gate · y` where `y` is the active
+/// Apply [`Op::GatedResidual`](rlx_ir::Op::GatedResidual): `residual + gate · y` where `y` is the active
 /// tensor and `residual` was saved via [`super::ResidualSaveStage`].
 #[derive(Debug, Clone)]
 pub struct GatedResidualStage {

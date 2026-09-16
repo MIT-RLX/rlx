@@ -77,3 +77,6 @@ RLX_DUMP_KERNELS=/tmp/kd RLX_CUDA_ATTENTION=wmma \
   cargo run --release -p rlx-cuda --example bench_attention
 python3 tools/kernel-inspect/kinspect.py analyze /tmp/kd
 ```
+## License
+
+MIT OR Apache-2.0.

@@ -7,7 +7,7 @@
 //! parser): little-endian, alignment padding before the data
 //! segment, tensor data appended in declaration order.
 //!
-//! Typical use is via [`super::quantize`] feeding raw byte payloads
+//! Typical use is via [`super::quantize`](fn@super::quantize::quantize) feeding raw byte payloads
 //! into [`GgufWriter::add_tensor_bytes`], but the writer doesn't
 //! quantize itself — keeping float→quant and bytes→file as separate
 //! steps lets callers mix schemes per tensor without re-encoding.
@@ -47,7 +47,7 @@ use crate::{DEFAULT_ALIGNMENT, GGUF_MAGIC, GgmlType, MetaValue, bytes_for_public
 
 /// In-memory description of a tensor to be written. Bytes must
 /// already be in the storage layout for `dtype` (call
-/// [`crate::quantize`] for floats, pass-through for already-quantized
+/// [`crate::quantize`](fn@crate::quantize::quantize) for floats, pass-through for already-quantized
 /// tensors).
 pub struct TensorPayload {
     pub name: String,

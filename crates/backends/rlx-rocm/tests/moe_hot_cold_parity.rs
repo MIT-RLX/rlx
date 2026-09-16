@@ -51,7 +51,7 @@ fn run_case(
     resident: &[bool],
     label: &str,
 ) {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let (g, w_data) = build(m, k, n, num_experts);

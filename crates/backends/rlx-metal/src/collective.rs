@@ -35,7 +35,7 @@ impl MetalKernel for CollectiveHostKernel {
 }
 
 /// Register the host-delegate collective kernels on the Metal backend. Called
-/// from [`crate::op_registry::ensure_builtins_registered`] so they are always
+/// from `op_registry::ensure_builtins_registered` so they are always
 /// available; the actual transport still requires the consumer to have called
 /// `rlx_collectives::register()` and registered a process group.
 pub fn register() {

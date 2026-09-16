@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Validates the triangulation the same way the C++ reference validator does:
 // manifold edges, no duplicate/degenerate triangles, every site referenced, and
 // the empty-circumcircle (locally Delaunay) property on every shared edge.

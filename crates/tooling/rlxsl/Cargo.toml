@@ -7,6 +7,11 @@ description = "Scalar-expression manifest + per-language emitters for RLX's warm
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords.workspace      = true
+categories.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+readme                  = "README.md"
 
 [dependencies]
 rlx-ir = { workspace = true }
@@ -21,3 +26,7 @@ libm = "0.2"
 # `glsl-in`. CUDA/MSL/OpenCL have no toolchain-free parser, so those emitters are
 # checked structurally (balanced delimiters + full case coverage).
 naga = { version = "29", features = ["wgsl-in", "glsl-in"] }
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

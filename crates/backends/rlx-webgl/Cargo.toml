@@ -27,7 +27,7 @@ rlx-fusion = { workspace = true }
 # build (and the CPU executor errors on a collective there). `default-features
 # = false` drops the platform BLAS link (collectives don't GEMM).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.16", default-features = false }
 
 # WebGL2 runtime — wasm only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -65,3 +65,7 @@ rlx-collectives = { path = "../../core/rlx-collectives" }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

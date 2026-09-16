@@ -12,6 +12,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn nchw(n: usize, c: usize, h: usize, w: usize) -> Shape {
     Shape::new(&[n, c, h, w], DType::F32)
 }
@@ -71,6 +73,7 @@ fn cfgs() -> Vec<(&'static str, usize, usize, usize, usize, usize)> {
 
 #[test]
 fn group_norm_backward_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     // Was rejected at legalization before being claimed; now must compile+run.
     for (name, n, c, h, w, gr) in cfgs() {
         let out = run_backward(Device::Cpu, n, c, h, w, gr);
@@ -81,6 +84,7 @@ fn group_norm_backward_cpu_runs() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn group_norm_backward_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, n, c, h, w, gr) in cfgs() {
         assert_close(
             &format!("gn-bwd mlx {name}"),

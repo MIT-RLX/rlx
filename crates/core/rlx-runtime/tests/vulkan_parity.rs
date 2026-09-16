@@ -15,7 +15,9 @@
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp, RopeStyle};
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn f(dims: &[usize]) -> Shape {
     Shape::new(dims, DType::F32)
@@ -35,6 +37,10 @@ fn data(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn run_on(device: Device, graph: Graph, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+    // Serialize device use across this binary's threads — `fma_decomposed`
+    // intermittently failed in a parallel run and was always clean alone or at
+    // `--test-threads=1`. See `common::GpuTestGuard`.
+    let _guard = common::GpuTestGuard::acquire(device);
     Session::new(device).compile(graph).run(inputs)
 }
 
@@ -47,7 +53,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 /// Compile + run `build()` on CPU and Vulkan; assert outputs agree within `tol`.
 fn parity(name: &str, build: impl Fn() -> Graph, inputs: &[(&str, &[f32])], tol: f32) {
-    if !is_available(Device::Vulkan) {
+    if common::skip_unless_available(Device::Vulkan, "vulkan") {
         eprintln!("[parity] {name}: SKIP (no Vulkan device)");
         return;
     }
@@ -1340,7 +1346,7 @@ fn scatter_add_axis0() {
         let mut g = Graph::new("sca");
         let upd = g.input("u", f(&[3, 2]));
         let idx = g.input("i", f(&[3]));
-        let o = g.add_node(Op::ScatterAdd, vec![upd, idx], f(&[4, 2]));
+        let o = g.add_node(Op::ScatterAdd { axis: 0 }, vec![upd, idx], f(&[4, 2]));
         g.set_outputs(vec![o]);
         g
     };
@@ -1519,7 +1525,7 @@ fn fft_host() {
 
 #[test]
 fn dequant_matmul_host() {
-    if !is_available(Device::Vulkan) {
+    if common::skip_unless_available(Device::Vulkan, "vulkan") {
         eprintln!("[parity] dequant_matmul: SKIP (no Vulkan device)");
         return;
     }

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # RLX — XDNA NPU direct-path exec-hang diagnostic.
 #
 # Runs the feature=direct `direct_gemm` example (which currently hangs at the

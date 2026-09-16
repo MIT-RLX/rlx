@@ -42,6 +42,41 @@ pub fn record(name: &'static str, dt: Duration) {
     e.total_ns += dt.as_nanos();
 }
 
+/// Total recorded GPU time across all thunks, in milliseconds.
+///
+/// Exposed so a caller can score a cost model against what actually happened.
+/// A model nobody scores drifts silently — this tree shipped one whose compute
+/// term was 1e9x wrong precisely because nothing ever compared it to a clock.
+pub fn total_ms() -> Option<f64> {
+    let guard = STATS.lock().unwrap();
+    let map = guard.as_ref()?;
+    if map.is_empty() {
+        return None;
+    }
+    Some(map.values().map(|s| s.total_ns).sum::<u128>() as f64 / 1e6)
+}
+
+/// Whether the backend prints the summary itself at the end of each profiled
+/// run. Default `true`, which is what makes `RLX_METAL_THUNK_PROFILE=1` useful
+/// without writing any code.
+///
+/// A caller that reports for itself must turn this off, or the table appears
+/// twice — once from inside `run()` and once from the caller — and the two
+/// copies cover different sample sets if the caller reset in between.
+static AUTO_PRINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Suppress (or restore) the backend's own end-of-run summary.
+pub fn set_auto_print(on: bool) {
+    AUTO_PRINT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Called by the backend after a profiled run. Respects [`set_auto_print`].
+pub fn print_summary_auto() {
+    if AUTO_PRINT.load(std::sync::atomic::Ordering::Relaxed) {
+        print_summary();
+    }
+}
+
 pub fn print_summary() {
     if !enabled() {
         return;
@@ -70,7 +105,7 @@ pub fn print_summary() {
     rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     eprintln!(
-        "[rlx-metal] thunk profile (GPU-sync wall time, {:.2} ms total):",
+        "[rlx-metal] thunk profile (per-thunk GPU device span, {:.2} ms total):",
         total_ns as f64 / 1e6
     );
     eprintln!("{:<32} {:>6} {:>10} {:>7}", "thunk", "count", "ms", "pct");

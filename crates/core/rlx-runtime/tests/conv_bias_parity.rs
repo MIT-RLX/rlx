@@ -9,6 +9,8 @@ use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 #[derive(Clone, Copy)]
 struct Cfg {
     c_in: usize,
@@ -98,6 +100,7 @@ fn check(name: &str, cfg: Cfg) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn conv_bias_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check(
         "pw-hires",
         Cfg {

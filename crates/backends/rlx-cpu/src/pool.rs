@@ -32,7 +32,7 @@ fn ensure_pool() {
     });
 }
 
-/// Total Rayon worker count (configured from [`RuntimeConfig::pool_workers`]).
+/// Total Rayon worker count (configured from `RuntimeConfig::pool_workers`).
 ///
 /// On wasm there is no thread pool — the browser is single-threaded — so
 /// this is always 1.

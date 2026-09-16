@@ -369,12 +369,22 @@ fn normalize_axis(axis: i32, rank: usize) -> usize {
 }
 
 /// ONNX ScatterElements into `out` (starts as a copy of `data` when not aliased).
+/// ONNX ScatterElements.
+///
+/// `idx_shape` is the shape of `indices` (== the shape of `updates`). It may be
+/// **smaller than `data` along any axis**, in which case a flat position in
+/// `indices` decomposes by the *indices'* strides. Pass an empty slice (or a
+/// shape whose element count disagrees with the index count) to fall back to the
+/// pre-`idx_shape` heuristics, which are only right when the two shapes agree
+/// off-axis.
+#[allow(clippy::too_many_arguments)]
 pub fn scatter_elements_f32(
     data: &[f32],
     updates: &[f32],
     indices: &[i64],
     out: &mut [f32],
     data_shape: &[usize],
+    idx_shape: &[usize],
     axis: i32,
     reduction: ScatterNdReduction,
 ) {
@@ -406,6 +416,34 @@ pub fn scatter_elements_f32(
     let inner: usize = data_shape[axis + 1..].iter().product::<usize>().max(1);
     let axis_dim = data_shape[axis].max(1);
     let n = indices.len().min(updates.len());
+
+    // Exact path: with the indices' own shape we can decompose a flat index
+    // properly — coordinate `axis` comes from `indices`, every other coordinate
+    // is carried across unchanged.
+    if idx_shape.len() == rank && idx_shape.iter().product::<usize>() == n {
+        let mut idx_strides = vec![1usize; rank];
+        let mut data_strides = vec![1usize; rank];
+        for d in (0..rank.saturating_sub(1)).rev() {
+            idx_strides[d] = idx_strides[d + 1] * idx_shape[d + 1];
+            data_strides[d] = data_strides[d + 1] * data_shape[d + 1];
+        }
+        for flat_i in 0..n {
+            let row = indices[flat_i].max(0) as usize;
+            let mut rem = flat_i;
+            let mut dst = 0usize;
+            for d in 0..rank {
+                let c = rem / idx_strides[d];
+                rem %= idx_strides[d];
+                let c = if d == axis { row } else { c };
+                dst += c.min(data_shape[d].saturating_sub(1)) * data_strides[d];
+            }
+            if dst < out.len() {
+                apply_f32(&mut out[dst], updates[flat_i], reduction);
+            }
+        }
+        return;
+    }
+
     // Dense case: indices/updates match data layout except along `axis`.
     let dense = n == outer * axis_dim * inner || n == outer * inner;
     for flat_i in 0..n {
@@ -518,7 +556,17 @@ impl CpuKernel for ScatterElementsKernel {
         let data = inputs[0].expect_f32("data")?;
         let updates = inputs[2].expect_f32("updates")?;
         let out = output.expect_f32_mut("out")?;
-        scatter_elements_f32(data, updates, indices, out, &data_shape, axis, reduction);
+        let idx_shape = dims_usize(&inputs[1]);
+        scatter_elements_f32(
+            data,
+            updates,
+            indices,
+            out,
+            &data_shape,
+            &idx_shape,
+            axis,
+            reduction,
+        );
         Ok(())
     }
 }
@@ -1221,6 +1269,7 @@ mod tests {
             &updates,
             &idx,
             &mut out,
+            &[2, 4],
             &[2, 4],
             1,
             ScatterNdReduction::None,

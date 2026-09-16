@@ -32,7 +32,10 @@ DOC = ROOT / "docs" / "rlx-env-vars.md"
 REGISTRY_INC = ROOT / "crates/core/rlx-ir/src/env_registry_data.inc.rs"
 SKIP_DIRS = {".git", "target", "vendor", "node_modules", ".cursor"}
 SKIP_PATH_PARTS = ("vendor/mlx", "rlx-mlx-sys/vendor")
-NAME_RE = re.compile(r"RLX_[A-Z][A-Z0-9_]*")
+# Left boundary matters: without it `KITTEN_RLX_DEBUG_TRIP` matches as
+# `RLX_DEBUG_TRIP`, and the registry gains an entry for a variable no code
+# ever reads. Four such phantoms existed before this was tightened.
+NAME_RE = re.compile(r"(?<![A-Z0-9_])RLX_[A-Z][A-Z0-9_]*")
 ENTRY_RE = re.compile(
     r'name:\s*"(RLX_[A-Z0-9_]+)"\s*,\s*group:\s*"([^"]*)"\s*,\s*summary:\s*"([^"]*)"\s*,'
     r"\s*kind:\s*(EnvKind::\w+(?:\s*\{[^}]*\})?|EnvKind::Enum\([^)]*\))\s*,"
@@ -43,7 +46,7 @@ ENTRY_RE = re.compile(
 ENV_CALL_RE = re.compile(
     r'(?:rlx_ir::env::|crate::env::|env::|std::env::|'
     r'rlx_ir::env_registry::|env_registry::)'
-    r'(?:flag|flag_or|var|parse_or|var_os)\s*\(\s*"(RLX_[A-Z][A-Z0-9_]*)"'
+    r'(?:flag|flag_or|var|parse_or|var_os)\s*\(\s*"(?<![A-Z0-9_])(RLX_[A-Z][A-Z0-9_]*)"'
 )
 ENV_LINE_MARKERS = (
     "env::flag",
@@ -288,6 +291,34 @@ def cargo_registry_markdown() -> str | None:
     return None
 
 
+# Auto-generated stand-ins that are not descriptions. See the ratchet in main().
+PLACEHOLDER_PREFIXES = ("See call sites for", "Read at ")
+
+# At ZERO: every registered variable has a hand-written one-line summary.
+# Started at 507. Do not raise it — a new variable needs a real summary, not a
+# stand-in, and `Read at <path>` / `See call sites for X` are stand-ins.
+MAX_PLACEHOLDER_SUMMARIES = 0
+
+
+def summary_placeholders(entries: dict[str, dict]) -> list[str]:
+    """Names whose summary is an auto-generated stand-in.
+
+    `entries` is keyed by name, so iterating it directly yields strings and
+    every lookup silently misses — the first version of this did exactly that
+    and reported 0 placeholders out of 507. The assertion below makes a
+    vacuous result impossible: if nothing was inspected, that is a bug in this
+    function, not a clean registry.
+    """
+    seen = 0
+    out = []
+    for name, e in entries.items():
+        seen += 1
+        if str(e.get("summary", "")).startswith(PLACEHOLDER_PREFIXES):
+            out.append(name)
+    assert seen == len(entries), "placeholder scan inspected nothing"
+    return sorted(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="exit 1 if doc/registry drift")
@@ -316,7 +347,24 @@ def main() -> int:
         if args.check:
             return 1
 
-    # Soft report: prefer rlx_ir::env / env_registry over std::env::var("RLX_…")
+    # Every `RLX_*` read must go through the `rlx_ir::env` shim, not `std::env`.
+    #
+    # This used to be a soft note, and 208 call sites accumulated under it. The
+    # shim is not cosmetic: it layers in-process overrides on top of the real
+    # environment, so a variable read via `std::env` cannot be set by a test, by
+    # `EnvOverride`, or by any harness that needs to A/B two settings inside one
+    # process. Those were exactly the knobs nothing could exercise.
+    #
+    # The listed exceptions are the two places the shim genuinely cannot reach.
+    SHIM_EXEMPT = {
+        # Build scripts run before (and independently of) the crate graph, so
+        # `rlx-ir` is not linkable there and there is no process to override.
+        "crates/backends/rlx-cpu/build.rs",
+        # `rlx-gguf` is a deliberately standalone GGUF parser with no rlx-ir
+        # dependency; adding one for a trace flag would invert the layering.
+        "crates/io/rlx-gguf/src/lib.rs",
+        "crates/io/rlx-gguf/tests/iq_tq_real_weights.rs",
+    }
     std_env_hits: list[str] = []
     for dirpath, dirnames, filenames in os.walk(ROOT / "crates"):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
@@ -333,15 +381,19 @@ def main() -> int:
                 continue
             for i, line in enumerate(text.splitlines(), 1):
                 if 'std::env::var("RLX_' in line or "std::env::var_os(\"RLX_" in line:
+                    if rel in SHIM_EXEMPT:
+                        continue
                     std_env_hits.append(f"{rel}:{i}")
     if std_env_hits:
         print(
-            f"note: {len(std_env_hits)} std::env::var(\"RLX_…\") call sites "
-            f"(prefer rlx_ir::env / *Config::from_env); showing up to 15:",
+            f"{len(std_env_hits)} RLX_* read(s) bypass the rlx_ir::env shim "
+            f"(use rlx_ir::env::var / var_os / flag / parse_or):",
             file=sys.stderr,
         )
         for h in std_env_hits[:15]:
             print(f"  {h}", file=sys.stderr)
+        if len(std_env_hits) > 15:
+            print(f"  … +{len(std_env_hits) - 15} more", file=sys.stderr)
 
     leftovers = leftover_mentions(registered)
     text = render_from_registry(entries, leftovers)
@@ -353,6 +405,35 @@ def main() -> int:
             return 1
         if missing and not args.allow_unregistered_reads:
             return 1
+        if std_env_hits:
+            return 1
+
+        # Placeholder-summary ratchet.
+        #
+        # `See call sites for X` / `Read at <path>` are auto-generated stand-ins,
+        # not descriptions. Every `Public` entry already has a real summary, so
+        # the curated catalogue is clean; the debt is in the `Bisect` /
+        # `Internal` inventory. Rather than block on paying all of it down, this
+        # freezes the count: a new variable cannot add another placeholder, and
+        # the number only moves down. Lower it when you curate a batch.
+        placeholders = summary_placeholders(entries)
+        if len(placeholders) > MAX_PLACEHOLDER_SUMMARIES:
+            print(
+                f"{len(placeholders)} placeholder summaries "
+                f"(ratchet allows {MAX_PLACEHOLDER_SUMMARIES}); write a real one-line "
+                f"summary for:",
+                file=sys.stderr,
+            )
+            for n in placeholders[:15]:
+                print(f"  {n}", file=sys.stderr)
+            return 1
+        if len(placeholders) < MAX_PLACEHOLDER_SUMMARIES:
+            print(
+                f"placeholder summaries down to {len(placeholders)} "
+                f"(ratchet is {MAX_PLACEHOLDER_SUMMARIES}) — lower "
+                f"MAX_PLACEHOLDER_SUMMARIES in {Path(__file__).name} to lock it in.",
+                file=sys.stderr,
+            )
         print(
             f"{DOC.relative_to(ROOT)} is up to date "
             f"({len(entries)} registered, {len(leftovers)} leftover mentions)"

@@ -190,7 +190,7 @@ impl std::error::Error for QnnError {}
 /// Returns `None` when neither is set. The HTP/NPU backend is selected by
 /// pointing `RLX_QNN_BACKEND_LIB` at `libQnnHtp.so`.
 pub fn default_backend_lib() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("RLX_QNN_BACKEND_LIB") {
+    if let Some(p) = rlx_ir::env::var_os("RLX_QNN_BACKEND_LIB") {
         return Some(PathBuf::from(p));
     }
     let sdk = std::env::var("QNN_SDK_ROOT").ok()?;

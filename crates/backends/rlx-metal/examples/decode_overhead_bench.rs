@@ -22,11 +22,24 @@
 //!   | sed -E 's/.*encode=([0-9.]+).*commit=([0-9.]+).*wait=([0-9.]+).*/\1 \2 \3/' \
 //!   | awk '{e+=$1;c+=$2;w+=$3;n++} END {printf "encode %.1fus commit %.1fus wait %.1fus (n=%d)\n", e/n,c/n,w/n,n}'
 //! ```
-#![cfg(target_os = "macos")]
+// An example is a crate root, and a crate root must always produce a `main`.
+// This file used `#![cfg(target_os = "macos")]`, which empties the whole crate on
+// Linux and yields `error[E0601]: main function not found` — enough on its own to
+// fail a workspace `cargo test` on a non-Apple host, because a workspace test run
+// builds examples too. Gate the ITEMS and provide a non-Apple `main` instead,
+// matching `detect.rs` / `metal_calibrate.rs`.
 
+#[cfg(target_os = "macos")]
 use rlx_ir::{DType, Graph, Op, Shape};
+#[cfg(target_os = "macos")]
 use rlx_runtime::{Device, Session};
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("Metal only available on macOS");
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
     let iters: usize = std::env::args()
         .nth(1)

@@ -322,6 +322,8 @@ pub enum ReduceOp {
 /// which ops a backend can lower; the `LegalizeForBackend` pass in
 /// `rlx-opt` checks the graph against this set and fails the compile
 /// when an unsupported op is present (instead of silent fallback).
+// See the note on `Op`. Same reasoning, same trade.
+#[non_exhaustive]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
@@ -379,6 +381,7 @@ pub enum OpKind {
     Reverse,
     Pad,
     Slice,
+    Roll,
     Clamp,
     Tile,
     Trilu,
@@ -460,6 +463,7 @@ pub enum OpKind {
     ScaledDequantize,
     SelectiveScan,
     GatedDeltaNet,
+    GatedDeltaNetBackward,
     Lstm,
     Gru,
     Rnn,
@@ -495,6 +499,8 @@ pub enum OpKind {
     CustomFn,
     /// 1D FFT primitive (forward or inverse) — see [`Op::Fft`].
     Fft,
+    /// Fixed-point 1D FFT — see [`Op::FftQ`].
+    FftQ,
     /// Ternary pruned radix-2 butterfly stage — see [`Op::FftButterflyStage`].
     FftButterflyStage,
     /// Whisper-style log-mel from block-layout FFT spectrum — see [`Op::LogMel`].
@@ -718,6 +724,17 @@ pub enum SynthBwdWrt {
 
 /// - Matmul/Conv are BLAS-dispatched and form fusion boundaries
 /// - Reductions are fusion roots (drive the loop iteration)
+// `non_exhaustive` so that adding an op is not a breaking change for every
+// downstream crate that matches on this enum. rlx adds ops continuously and
+// downstream model crates construct them heavily (~2100 references in
+// rlx-models) while matching on them rarely — the asymmetry is what makes this
+// worth the one-time cost of adding catch-all arms.
+//
+// It is deliberately landed BEFORE any schedule-IR work: with it in place an
+// op addition cannot be confused with an intentional API break, and the
+// downstream churn happens once, in isolation, rather than mixed into a larger
+// change where an accidental break would be invisible.
+#[non_exhaustive]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
@@ -900,7 +917,7 @@ pub enum Op {
     },
 
     /// Fused transform chain (resize, future crop/color). Decompose via
-    /// [`rlx_fusion::DecomposeFusionRegions`] when no native kernel exists.
+    /// `rlx_fusion::DecomposeFusionRegions` when no native kernel exists.
     TransformRegion {
         steps: Vec<TransformStep>,
         num_inputs: u32,
@@ -1138,6 +1155,25 @@ pub enum Op {
         len: usize,
         step: i64,
     },
+    /// Cyclic shift along one or more axes — `jnp.roll` / `torch.roll`.
+    ///
+    /// `out[.., i, ..] = x[.., (i - shift) mod n, ..]` for each `(shift, dim)`
+    /// pair, applied in order. Shifts may be negative or exceed the axis length;
+    /// both are reduced modulo `n`. Output shape always equals input shape —
+    /// nothing is dropped or introduced, which is what separates this from
+    /// [`Op::Slice`] and from a circular [`Op::Pad`].
+    ///
+    /// No backend has a native kernel: `rlx_fusion::LowerRoll` legalizes each
+    /// axis to `concat(narrow(tail), narrow(head))`, which every backend already
+    /// supports. A native kernel is worth adding only if a workload shows the
+    /// two-copy decomposition is hot — the copies are the whole cost, so a fused
+    /// version saves one pass, not an order of magnitude.
+    Roll {
+        /// Shift amount per entry of `dims`, same length as `dims`.
+        shifts: Vec<i64>,
+        /// Axes to roll. Repeats are allowed and compose.
+        dims: Vec<usize>,
+    },
     /// Concatenate along an axis.
     Concat {
         axis: usize,
@@ -1279,6 +1315,31 @@ pub enum Op {
     /// (vs the scalar `S *= exp(g)` of the per-head gate). Everything else is
     /// identical; Qwen3-Next / Qwen3.5 use the per-head gate (`false`).
     GatedDeltaNet {
+        state_size: usize,
+        carry_state: bool,
+        gate_per_channel: bool,
+    },
+
+    /// Fused backward of [`Op::GatedDeltaNet`], computing every input gradient
+    /// from one reverse scan.
+    ///
+    /// Without it the gradient walk has to unfuse the forward: the time loop is
+    /// unrolled into per-timestep primitives, which for a 24-token prompt at
+    /// `state_size = 128` is ~585 nodes and runs **~32× slower** than the fused
+    /// kernel. The reason is structural rather than dispatch overhead — in SSA
+    /// graph form every timestep materializes a fresh `[B·H, N, N]` state,
+    /// while the kernel updates one working set in place.
+    ///
+    /// Inputs are `[q, k, v, g, beta]`, `+ [state]` when `carry_state`, then
+    /// `dy` last — so the optional state keeps index 5, matching the forward.
+    ///
+    /// The gradients have different shapes and a node has one output, so they
+    /// come back **packed into a 1-D tensor**, in this order: `dq`, `dk`, `dv`
+    /// (each `B·S·H·N`), `dg` (`B·S·H·N` when `gate_per_channel`, else
+    /// `B·S·H`), `dbeta` (`B·S·H`), and `dstate` (`B·H·N·N`, only when
+    /// `carry_state`). [`Op::Narrow`] + [`Op::Reshape`] recover each one; the
+    /// VJP rule emits exactly that.
+    GatedDeltaNetBackward {
         state_size: usize,
         carry_state: bool,
         gate_per_channel: bool,
@@ -1776,16 +1837,43 @@ pub enum Op {
         has_bias: bool,
     },
 
-    /// Scatter-add into a destination tensor. The "unpermute" half of
-    /// MoE routing (also useful for embedding gradient updates).
+    /// Scatter-add along `axis`. The "unpermute" half of MoE routing, the
+    /// transpose of [`Op::Gather`], and the shape every immersed-boundary or
+    /// segment-reduction kernel wants (many grid cells accumulating into few
+    /// slots).
+    ///
     /// Inputs: `[updates, indices]`
-    ///   updates : [num_updates, trailing]   — values to add
-    ///   indices : \[num_updates\]             — f32-encoded destination row
-    /// Output    : [out_dim, trailing]       — output[indices\[i\]] += updates\[i\]
-    /// `out_dim` is taken from the node's declared output shape.
-    /// Initial output is zero; multiple updates to the same row
-    /// accumulate (sequentially on CPU; with atomic-add on Metal).
-    ScatterAdd,
+    ///   updates : same rank as the output, with `axis` of length `num_updates`
+    ///   indices : `[num_updates]` — destination position along `axis`
+    /// Output    : node's declared shape; `out[.., indices[i], ..] += updates[.., i, ..]`
+    ///
+    /// Initial output is zero; repeated indices accumulate (sequentially on
+    /// CPU, atomic-add on GPU).
+    ///
+    /// Indices must lie in `[0, out_dim)` — out of range is a caller error, not
+    /// a supported "drop these" mode. The CPU kernel `debug_assert`s it; other
+    /// backends are unchecked. This contract predates the `axis` parameter and
+    /// is unchanged by it.
+    ///
+    /// # Index dtype
+    ///
+    /// `indices` may be [`crate::DType::I64`] (matching [`Op::Gather`]) or
+    /// `F32`. The `F32` encoding is historical and exact only below `2^24`;
+    /// [`crate::verify`](fn@crate::verify) rejects it when the destination is larger, since past
+    /// that point distinct rows share a representation and updates land on the
+    /// wrong slot with no error.
+    ///
+    /// # Axis support
+    ///
+    /// Backends implement `axis == 0` only. `rlx_fusion::LowerScatterAddAxis`
+    /// rewrites any other axis to `transpose → scatter → transpose` and
+    /// normalizes `I64` indices to the `F32` the kernels read, so a backend
+    /// never sees a form it does not handle. Adding a native strided kernel is
+    /// a per-backend optimization, not a correctness requirement.
+    ScatterAdd {
+        /// Destination axis. `0` is the historical row-scatter behaviour.
+        axis: usize,
+    },
 
     /// ONNX ScatterND: copy `data`, then write `updates` at multi-index
     /// locations from `indices`.
@@ -1834,8 +1922,8 @@ pub enum Op {
 
     /// NCHW im2col for conv backward-weight style matmul.
     /// Input `[N, C, H, W]`. Output `[M, C·kH·kW]` with
-    /// `M = N · H_out · W_out`. When batch is [`dynamic::sym::BATCH`],
-    /// output rows use [`dynamic::sym::ROWS`] (bind `N · H_out · W_out`).
+    /// `M = N · H_out · W_out`. When batch is `dynamic::sym::BATCH`,
+    /// output rows use `dynamic::sym::ROWS` (bind `N · H_out · W_out`).
     Im2Col {
         kernel_size: Vec<usize>,
         stride: Vec<usize>,
@@ -1957,6 +2045,17 @@ pub enum Op {
     RopeBackward {
         head_dim: usize,
         n_rot: usize,
+        /// Rotation pairing convention — must MATCH the forward [`Op::Rope`]
+        /// this is the adjoint of.
+        ///
+        /// This field is load-bearing and used not to exist. `vjp_rope`
+        /// destructured the forward as `Op::Rope { head_dim, n_rot, .. }`, and
+        /// that `..` silently dropped `style`: every `RopeStyle::GptJ` rotation
+        /// — the GGUF convention — got a NeoX adjoint. The forward was correct,
+        /// so nothing downstream complained; the gradient was simply wrong, on
+        /// every backend at once, for full and partial rotation alike.
+        /// `rlx-runtime`'s `fd_backward_gate` pins both styles now.
+        style: RopeStyle,
     },
 
     /// GroupNorm (NCHW) backward w.r.t. input. Inputs `[x, gamma, beta, dy]`.
@@ -2110,8 +2209,8 @@ pub enum Op {
     /// companion to the sparse integer-label
     /// [`Op::SoftmaxCrossEntropyWithLogits`]. Per-row output:
     /// `loss[n] = logsumexp(logits[n]) - Σ_c targets[n,c]·logits[n,c]`
-    ///         = -Σ_c targets[n,c]·log_softmax(logits[n])[c]`.
-    /// Inputs: `[logits, targets]`, both `[N, C]`. Output: `[N]`.
+    ///         = -Σ_c targets`n,c`·log_softmax(logits`n`)`c``.
+    /// Inputs: `[logits, targets]`, both `[N, C]`. Output: ``N``.
     /// Caller does the `Reduce::Mean` if they want a scalar.
     /// Numerically stable (max-subtract before exp). Used for label
     /// smoothing and knowledge distillation where targets are full
@@ -2559,6 +2658,21 @@ pub enum Op {
         norm: crate::fft::FftNorm,
     },
 
+    /// Fixed-point FFT over `I32` data in the same 2N-block layout `Op::Fft`
+    /// uses for `F32` (`n` real parts then `n` imaginary parts per row).
+    ///
+    /// Separate from [`Op::Fft`] rather than a dtype of it because it needs a
+    /// parameter the floating-point transform does not: how to keep the
+    /// datapath in range. That choice costs precision, so it is explicit —
+    /// see [`crate::fft::FftQScale`].
+    ///
+    /// Radix-2 only; the length must be a power of two.
+    FftQ {
+        inverse: bool,
+        norm: crate::fft::FftNorm,
+        scale: crate::fft::FftQScale,
+    },
+
     /// Ternary pruned radix-2 butterfly stage on interleaved complex state.
     ///
     /// Inputs:
@@ -2791,7 +2905,7 @@ pub enum Op {
     /// Symmetric **eigendecomposition** of an `[n,n]` matrix. Output is packed
     /// `[λ (n) ∥ U (n²)]` — ascending eigenvalues then the row-major eigenvector
     /// matrix (column `j` = eigenvector `j`, so `A = U diag(λ) Uᵀ`). The builder
-    /// [`Graph::eigh`] narrows the two views out. Differentiable (see
+    /// `Graph::eigh` narrows the two views out. Differentiable (see
     /// [`Op::EighBackward`]). The seam a native batched eigensolver (cuSOLVER
     /// `syevjBatched` &c.) plugs into.
     Eigh,
@@ -3008,6 +3122,7 @@ impl Op {
             Op::Reverse { .. } => OpKind::Reverse,
             Op::Pad { .. } => OpKind::Pad,
             Op::Slice { .. } => OpKind::Slice,
+            Op::Roll { .. } => OpKind::Roll,
             Op::Clamp { .. } => OpKind::Clamp,
             Op::Tile { .. } => OpKind::Tile,
             Op::Trilu { .. } => OpKind::Trilu,
@@ -3065,7 +3180,7 @@ impl Op {
             Op::DequantGroupedMatMulMlx { .. } => OpKind::DequantGroupedMatMulMlx,
             Op::DequantMoEWeights { .. } => OpKind::DequantMoEWeights,
             Op::ScaledGroupedMatMul { .. } => OpKind::ScaledGroupedMatMul,
-            Op::ScatterAdd => OpKind::ScatterAdd,
+            Op::ScatterAdd { .. } => OpKind::ScatterAdd,
             Op::ScatterNd { .. } => OpKind::ScatterNd,
             Op::ScatterElements { .. } => OpKind::ScatterElements,
             Op::GatherNd { .. } => OpKind::GatherNd,
@@ -3087,6 +3202,7 @@ impl Op {
             Op::ScaledDequantize { .. } => OpKind::ScaledDequantize,
             Op::SelectiveScan { .. } => OpKind::SelectiveScan,
             Op::GatedDeltaNet { .. } => OpKind::GatedDeltaNet,
+            Op::GatedDeltaNetBackward { .. } => OpKind::GatedDeltaNetBackward,
             Op::Lstm { .. } => OpKind::Lstm,
             Op::Gru { .. } => OpKind::Gru,
             Op::Rnn { .. } => OpKind::Rnn,
@@ -3111,6 +3227,7 @@ impl Op {
             Op::Custom { .. } => OpKind::Custom,
             Op::CustomFn { .. } => OpKind::CustomFn,
             Op::Fft { .. } => OpKind::Fft,
+            Op::FftQ { .. } => OpKind::FftQ,
             Op::FftButterflyStage { .. } => OpKind::FftButterflyStage,
             Op::LogMel => OpKind::LogMel,
             Op::LogMelBackward => OpKind::LogMelBackward,
@@ -3149,10 +3266,68 @@ impl Op {
     // live in `crate::capability`, which classifies every `OpKind`
     // exhaustively instead of via open `matches!` lists.
 
-    /// Number of tensor inputs this op expects.
-    pub fn num_inputs(&self) -> usize {
+    /// Operand count this op accepts.
+    ///
+    /// The single source of truth for arity. Prefer this over
+    /// [`num_inputs`](Self::num_inputs), which collapses a range to its
+    /// minimum and so cannot distinguish "exactly 2" from "2 or 3".
+    pub fn arity(&self) -> Arity {
         match self {
-            Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => 0,
+            // Leaves. Also caught by the `is_leaf` check in `verify`, but
+            // stating it here keeps the arity table complete rather than
+            // relying on a second mechanism.
+            Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => Arity::Exact(0),
+
+            // An optional seed/state operand. This used to report `0` and be
+            // re-checked by a hand-written special case in `verify` — the kind
+            // of second source of truth that drifts.
+            Op::RngNormal { .. } | Op::RngUniform { .. } => Arity::Range { min: 0, max: 1 },
+
+            // Genuinely variadic. Reporting `0` here previously opted these out
+            // of arity checking altogether.
+            Op::Concat { .. } => Arity::AtLeast(1),
+            // Predicate, then the branch captures. This said `Exact(1)` with
+            // the note "captures handled separately" — but they are not
+            // separate: `sccp` builds `vec![pred, x]`, and both
+            // `rlx-unfuse::expand_if` and the MLX lowering read `inputs[1..]`
+            // as the captures. `verify` therefore rejected every `If` that
+            // captured anything.
+            Op::If { .. } => Arity::AtLeast(1),
+            // Loop-carried values; zero of them is degenerate but not something
+            // this change should start rejecting.
+            Op::While { .. } => Arity::AtLeast(0),
+
+            _ => Arity::Exact(self.exact_num_inputs()),
+        }
+    }
+
+    /// Minimum operands this op requires.
+    ///
+    /// Kept for callers that just need a count. For ops with an optional
+    /// operand this is the *lower* bound, so it cannot be used to reject an
+    /// operand list — use [`arity`](Self::arity) and [`Arity::accepts`].
+    pub fn num_inputs(&self) -> usize {
+        self.arity().min_operands()
+    }
+
+    /// The fixed-arity table. Ops with optional or variadic operands are
+    /// handled in [`arity`](Self::arity) and never reach here.
+    fn exact_num_inputs(&self) -> usize {
+        match self {
+            // Handled in `arity`. Left as explicit arms rather than deleted so
+            // the match stays exhaustive, and as `unreachable!` rather than a
+            // duplicated count so this cannot drift from `arity` — the exact
+            // failure this refactor removed.
+            Op::Input { .. }
+            | Op::Param { .. }
+            | Op::Constant { .. }
+            | Op::RngNormal { .. }
+            | Op::RngUniform { .. }
+            | Op::Concat { .. }
+            | Op::If { .. }
+            | Op::While { .. } => {
+                unreachable!("{self} has a non-exact arity; see Op::arity")
+            }
             Op::Activation(_)
             | Op::Cast { .. }
             | Op::StopGradient
@@ -3164,6 +3339,7 @@ impl Op {
             | Op::Reverse { .. }
             | Op::Pad { .. }
             | Op::Slice { .. }
+            | Op::Roll { .. }
             | Op::Clamp { .. }
             | Op::Tile { .. }
             | Op::Trilu { .. }
@@ -3181,7 +3357,6 @@ impl Op {
             | Op::Sample { .. }
             | Op::ResizeNearest2x
             | Op::Interpolate3d { .. } => 1,
-            Op::RngNormal { .. } | Op::RngUniform { .. } => 0, // 0 or 1 — see verify
             // EMA / Fixed scale modes carry a state tensor as a 2nd input;
             // PerBatch (default) doesn't need one.
             Op::FakeQuantize { scale_mode, .. } => match scale_mode {
@@ -3190,7 +3365,11 @@ impl Op {
             },
             Op::FakeQuantizeLSQ { .. } => 2, // x, scale (learned param)
             Op::FakeQuantizeLSQBackwardX { .. } | Op::FakeQuantizeLSQBackwardScale { .. } => 3, // x, scale, dy
-            Op::Binary(_) | Op::Compare(_) | Op::Gather { .. } | Op::MatMul | Op::ScatterAdd => 2,
+            Op::Binary(_)
+            | Op::Compare(_)
+            | Op::Gather { .. }
+            | Op::MatMul
+            | Op::ScatterAdd { .. } => 2,
             Op::GatherNd { .. } | Op::GatherElements { .. } => 2,
             Op::ScatterNd { .. } | Op::ScatterElements { .. } => 3, // data, indices, updates
             Op::GroupedMatMul => 3,                                 // input, weight, expert_idx
@@ -3229,6 +3408,9 @@ impl Op {
             Op::SelectiveScan { .. } => 5,    // x, delta, a, b, c
             Op::GatedDeltaNet { carry_state, .. } if *carry_state => 6, // + state in/out
             Op::GatedDeltaNet { .. } => 5,    // q, k, v, g, beta
+            // q, k, v, g, beta [, state], dy
+            Op::GatedDeltaNetBackward { carry_state, .. } if *carry_state => 7,
+            Op::GatedDeltaNetBackward { .. } => 6,
             Op::Lstm { carry, .. } => {
                 if *carry { 6 } else { 4 } // x, w_ih, w_hh, bias (+ h0, c0)
             }
@@ -3304,7 +3486,6 @@ impl Op {
             Op::SoftmaxCrossEntropy => 2,                    // logits, targets
             Op::SoftmaxCrossEntropyWithLogits => 2,          // logits, labels
             Op::SoftmaxCrossEntropyBackward => 3,            // logits, labels, d_loss
-            Op::Concat { .. } => 0,                          // variadic — checked at graph level
             Op::KvAppend { .. } => 2,                        // cache, row
             Op::DotGeneral { .. } => 2,
             Op::DenseSolve => 2,             // A, b
@@ -3318,8 +3499,6 @@ impl Op {
             Op::FusedAttentionBlock {
                 has_bias, has_rope, ..
             } => 4 + if *has_bias { 2 } else { 0 } + if *has_rope { 2 } else { 0 },
-            Op::If { .. } => 1,    // predicate (captures handled separately)
-            Op::While { .. } => 0, // variadic loop-carried; checked at graph level
             Op::Scan {
                 num_bcast, num_xs, ..
             } => 1 + *num_bcast as usize + *num_xs as usize,
@@ -3330,9 +3509,21 @@ impl Op {
             Op::GaussianSplatPrepare { .. } => 7,
             Op::GaussianSplatRasterize { .. } => 2,
             Op::FusedTransformerLayer { has_bias, .. } => {
-                // hidden + qkv_w + out_w + ln1_g + ln1_b + fc1_w + fc2_w + ln2_g + ln2_b + mask = 10
-                // bias variant adds: qkv_b + out_b + fc1_b + fc2_b = 4 more
-                10 + if *has_bias { 4 } else { 0 }
+                // Must match `rlx_unfuse::expand_ftl`, which is what actually
+                // reads these operands:
+                //   with bias (14): hidden, qkv_w, qkv_b, out_w, out_b, ln1_g,
+                //     ln1_b, fc1_w, fc1_b, fc2_w, fc2_b, ln2_g, ln2_b, mask
+                //   without bias (8): hidden, qkv_w, out_w, ln1_g, fc1_w,
+                //     fc2_w, ln2_g, mask
+                //
+                // `has_bias` governs the LayerNorm betas too, not just the
+                // projection biases — `expand_ftl` synthesizes zero betas in the
+                // no-bias case rather than reading them. This said 10 for the
+                // no-bias variant, counting `ln1_b`/`ln2_b` the lowering never
+                // takes, so a correctly-built no-bias node failed the IR
+                // verifier. Only in DEBUG, because `debug_assert_valid!` is
+                // where the check lives and no recipe runs a debug test build.
+                if *has_bias { 14 } else { 8 }
             }
             Op::ElementwiseRegion { num_inputs, .. } => *num_inputs as usize,
             Op::TransformRegion { num_inputs, .. } => *num_inputs as usize,
@@ -3341,7 +3532,7 @@ impl Op {
             } => *num_batch_inputs as usize,
             Op::Custom { num_inputs, .. } => *num_inputs as usize,
             Op::CustomFn { num_inputs, .. } => *num_inputs as usize,
-            Op::Fft { .. } => 1,
+            Op::Fft { .. } | Op::FftQ { .. } => 1,
             Op::FftButterflyStage { .. } => 5,
             Op::LogMel => 2,
             Op::LogMelBackward => 3,
@@ -3508,6 +3699,7 @@ impl std::fmt::Display for Op {
             } => {
                 write!(f, "slice({axis},{start},{len},step={step})")
             }
+            Op::Roll { shifts, dims } => write!(f, "roll({shifts:?},dims={dims:?})"),
             Op::Clamp { min, max } => write!(f, "clamp({min},{max})"),
             Op::Tile { reps } => write!(f, "tile({reps:?})"),
             Op::Trilu { upper, diagonal } => write!(f, "trilu(upper={upper},diag={diagonal})"),
@@ -3676,6 +3868,18 @@ impl std::fmt::Display for Op {
                     write!(f, "gated_delta_net(n={state_size}{gpc})")
                 }
             }
+            Op::GatedDeltaNetBackward {
+                state_size,
+                carry_state,
+                gate_per_channel,
+            } => {
+                let gpc = if *gate_per_channel { ",gpc" } else { "" };
+                if *carry_state {
+                    write!(f, "gated_delta_net_backward(n={state_size},carry{gpc})")
+                } else {
+                    write!(f, "gated_delta_net_backward(n={state_size}{gpc})")
+                }
+            }
             Op::Lstm {
                 hidden_size,
                 num_layers,
@@ -3712,7 +3916,7 @@ impl std::fmt::Display for Op {
                 head_dim,
                 state_size,
             } => write!(f, "mamba2(p={head_dim},n={state_size})"),
-            Op::ScatterAdd => write!(f, "scatter_add"),
+            Op::ScatterAdd { axis } => write!(f, "scatter_add(axis={axis})"),
             Op::ScatterNd { reduction } => write!(f, "scatter_nd({reduction:?})"),
             Op::ScatterElements { axis, reduction } => {
                 write!(f, "scatter_elements(axis={axis},{reduction:?})")
@@ -3958,8 +4162,15 @@ impl std::fmt::Display for Op {
             Op::RmsNormBackwardInput { eps, .. } => write!(f, "rms_norm_backward_input(eps={eps})"),
             Op::RmsNormBackwardGamma { eps, .. } => write!(f, "rms_norm_backward_gamma(eps={eps})"),
             Op::RmsNormBackwardBeta { eps, .. } => write!(f, "rms_norm_backward_beta(eps={eps})"),
-            Op::RopeBackward { head_dim, n_rot } => {
-                write!(f, "rope_backward(d={head_dim},n_rot={n_rot})")
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            } => {
+                write!(
+                    f,
+                    "rope_backward(d={head_dim},n_rot={n_rot},style={style:?})"
+                )
             }
             Op::GroupNormBackwardInput { num_groups, eps } => {
                 write!(f, "group_norm_backward_input(g={num_groups},eps={eps})")
@@ -4051,6 +4262,14 @@ impl std::fmt::Display for Op {
             Op::Fft { inverse, norm } => {
                 write!(f, "fft(inverse={inverse}, norm={norm:?})")
             }
+            Op::FftQ {
+                inverse,
+                norm,
+                scale,
+            } => write!(
+                f,
+                "fft_q(inverse={inverse}, norm={norm:?}, scale={scale:?})"
+            ),
             Op::FftButterflyStage { stage, n_fft } => {
                 write!(f, "fft_butterfly_stage(stage={stage}, n_fft={n_fft})")
             }
@@ -4150,5 +4369,245 @@ mod subgraph_accessor_tests {
         let subs = op.subgraphs();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].name, "body");
+    }
+}
+
+/// How many operands an [`Op`] accepts.
+///
+/// Replaces a bare `usize` where `0` had to stand in for three unrelated
+/// things — a genuine leaf, an optional operand, and "variadic, don't check".
+/// Because `verify` skipped anything reporting `0`, every variadic op opted
+/// out of arity checking entirely, and the optional-operand case needed a
+/// hand-written exception alongside the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arity {
+    /// Exactly `n` operands.
+    Exact(usize),
+    /// Between `min` and `max` operands, inclusive — an optional trailing
+    /// operand such as a seed.
+    Range { min: usize, max: usize },
+    /// `n` or more — genuinely variadic (`Concat`, `While`).
+    AtLeast(usize),
+}
+
+impl Arity {
+    /// Whether `n` operands satisfy this arity.
+    pub fn accepts(self, n: usize) -> bool {
+        match self {
+            Arity::Exact(k) => n == k,
+            Arity::Range { min, max } => n >= min && n <= max,
+            Arity::AtLeast(min) => n >= min,
+        }
+    }
+
+    /// The fewest operands this arity permits.
+    pub fn min_operands(self) -> usize {
+        match self {
+            Arity::Exact(k) | Arity::AtLeast(k) => k,
+            Arity::Range { min, .. } => min,
+        }
+    }
+
+    /// The most operands permitted, or `None` when unbounded.
+    pub fn max_operands(self) -> Option<usize> {
+        match self {
+            Arity::Exact(k) => Some(k),
+            Arity::Range { max, .. } => Some(max),
+            Arity::AtLeast(_) => None,
+        }
+    }
+
+    /// Whether any operand count is permitted (`AtLeast(0)`), i.e. this arity
+    /// constrains nothing.
+    pub fn is_unconstrained(self) -> bool {
+        matches!(self, Arity::AtLeast(0))
+    }
+}
+
+impl std::fmt::Display for Arity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Arity::Exact(k) => write!(f, "{k}"),
+            Arity::Range { min, max } => write!(f, "{min} to {max}"),
+            Arity::AtLeast(k) => write!(f, "at least {k}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod arity_tests {
+    use super::*;
+
+    #[test]
+    fn exact_accepts_only_its_count() {
+        let a = Arity::Exact(2);
+        assert!(!a.accepts(1));
+        assert!(a.accepts(2));
+        assert!(!a.accepts(3));
+        assert_eq!(a.min_operands(), 2);
+        assert_eq!(a.max_operands(), Some(2));
+        assert!(!a.is_unconstrained());
+    }
+
+    #[test]
+    fn range_accepts_both_ends_inclusive() {
+        let a = Arity::Range { min: 0, max: 1 };
+        assert!(a.accepts(0));
+        assert!(a.accepts(1));
+        assert!(!a.accepts(2));
+        assert_eq!(a.min_operands(), 0);
+        assert_eq!(a.max_operands(), Some(1));
+    }
+
+    #[test]
+    fn at_least_is_unbounded_above() {
+        let a = Arity::AtLeast(1);
+        assert!(!a.accepts(0));
+        assert!(a.accepts(1));
+        assert!(a.accepts(64));
+        assert_eq!(a.max_operands(), None);
+        // `AtLeast(1)` still constrains; only `AtLeast(0)` means "anything".
+        assert!(!a.is_unconstrained());
+        assert!(Arity::AtLeast(0).is_unconstrained());
+    }
+
+    /// The wording is spliced into `verify`'s "expects {} inputs, got {}", so
+    /// it has to read as a count.
+    #[test]
+    fn display_reads_as_a_count() {
+        assert_eq!(Arity::Exact(2).to_string(), "2");
+        assert_eq!(Arity::Range { min: 0, max: 1 }.to_string(), "0 to 1");
+        assert_eq!(Arity::AtLeast(1).to_string(), "at least 1");
+    }
+
+    /// `num_inputs` is the lower bound of `arity`, so the two can never
+    /// disagree the way a second hand-maintained table would.
+    #[test]
+    fn num_inputs_is_the_arity_minimum() {
+        let ops = [
+            Op::Concat { axis: 0 },
+            Op::Input { name: "x".into() },
+            Op::Constant { data: vec![] },
+            Op::RngNormal {
+                mean: 0.0,
+                scale: 1.0,
+                key: 0,
+                op_seed: None,
+            },
+            Op::MatMul,
+            Op::Activation(Activation::Relu),
+        ];
+        for op in ops {
+            assert_eq!(
+                op.num_inputs(),
+                op.arity().min_operands(),
+                "num_inputs disagreed with arity for {op}"
+            );
+        }
+    }
+
+    /// The seven ops lifted out of the fixed-arity table are the only ones
+    /// whose reported count could have moved. Pinning them states exactly what
+    /// this refactor changed — and what it did not.
+    ///
+    /// Before, all seven reported `num_inputs() == 0`, and `verify` skipped
+    /// anything reporting `0`.
+    #[test]
+    fn lifted_ops_keep_their_reported_count() {
+        let cases: [(Op, Arity, usize); 7] = [
+            (Op::Input { name: "x".into() }, Arity::Exact(0), 0),
+            (Op::Param { name: "w".into() }, Arity::Exact(0), 0),
+            (Op::Constant { data: vec![] }, Arity::Exact(0), 0),
+            (
+                Op::RngNormal {
+                    mean: 0.0,
+                    scale: 1.0,
+                    key: 0,
+                    op_seed: None,
+                },
+                Arity::Range { min: 0, max: 1 },
+                0,
+            ),
+            (
+                Op::RngUniform {
+                    low: 0.0,
+                    high: 1.0,
+                    key: 0,
+                    op_seed: None,
+                },
+                Arity::Range { min: 0, max: 1 },
+                0,
+            ),
+            // The one intentional change: 0 -> 1. A `Concat` of nothing is not
+            // a graph anyone meant to build, and reporting 0 exempted it from
+            // arity checking altogether.
+            (Op::Concat { axis: 0 }, Arity::AtLeast(1), 1),
+            (
+                Op::While {
+                    cond: Box::new(crate::Graph::new("c")),
+                    body: Box::new(crate::Graph::new("b")),
+                    max_iterations: Some(1),
+                },
+                Arity::AtLeast(0),
+                0,
+            ),
+        ];
+        for (op, want_arity, want_count) in cases {
+            assert_eq!(op.arity(), want_arity, "arity for {op}");
+            assert_eq!(op.num_inputs(), want_count, "num_inputs for {op}");
+        }
+    }
+
+    /// `exact_num_inputs` must never be reached for the lifted ops — its arms
+    /// for them are `unreachable!`, so a future edit that routes one back
+    /// through the table panics instead of silently reporting `Exact(0)`.
+    #[test]
+    fn lifted_ops_never_reach_the_exact_table() {
+        for op in [
+            Op::Input { name: "x".into() },
+            Op::Concat { axis: 0 },
+            Op::RngUniform {
+                low: 0.0,
+                high: 1.0,
+                key: 0,
+                op_seed: None,
+            },
+        ] {
+            // Would panic inside `exact_num_inputs` if `arity` stopped
+            // intercepting it.
+            let _ = op.arity();
+        }
+    }
+
+    /// A range that cannot be satisfied would silently reject every graph.
+    #[test]
+    fn arity_bounds_are_well_formed() {
+        let ops = [
+            Op::Concat { axis: 0 },
+            Op::Input { name: "x".into() },
+            Op::RngUniform {
+                low: 0.0,
+                high: 1.0,
+                key: 0,
+                op_seed: None,
+            },
+            Op::MatMul,
+            Op::Conv3d {
+                stride: [1, 1, 1],
+                padding: [0, 0, 0],
+                dilation: [1, 1, 1],
+                groups: 1,
+            },
+        ];
+        for op in ops {
+            let a = op.arity();
+            if let Some(max) = a.max_operands() {
+                assert!(
+                    a.min_operands() <= max,
+                    "{op} has an unsatisfiable arity {a:?}"
+                );
+            }
+            assert!(a.accepts(a.min_operands()), "{op} rejects its own minimum");
+        }
     }
 }

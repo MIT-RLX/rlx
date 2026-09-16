@@ -4,8 +4,8 @@
 
 //! Per-forward MoE expert residency mask (TIDE placement) for CPU dispatch.
 //!
-//! Set by [`rlx_runtime::CompiledGraph::set_moe_resident_experts`] before
-//! `run`. [`crate::thunk::GroupedMatMul`] reads the mask for accounting;
+//! Set by `rlx_runtime::CompiledGraph::set_moe_resident_experts` before
+//! `run`. `crate::thunk::GroupedMatMul` reads the mask for accounting;
 //! numerics still use the full expert stack in the arena (lossless on CPU).
 
 use std::cell::{Cell, RefCell};

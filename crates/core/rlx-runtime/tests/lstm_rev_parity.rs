@@ -6,7 +6,9 @@
 #![cfg(all(feature = "cpu", feature = "mlx"))]
 use rlx_ir::op::Op;
 use rlx_ir::{DType, Graph, GraphExt, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 fn mk(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
         .map(|i| (((i.wrapping_mul(2654435761).wrapping_add(seed)) % 997) as f32) / 498.0 - 1.0)
@@ -42,7 +44,8 @@ fn build(b: usize, s: usize, h: usize) -> Graph {
 }
 #[test]
 fn lstm_rev_mlx_matches_cpu() {
-    if !is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip: no MLX device");
         return;
     }

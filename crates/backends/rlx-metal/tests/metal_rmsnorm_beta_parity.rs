@@ -30,7 +30,7 @@ fn build_rmsnorm(b: usize, s: usize, h: usize, eps: f32) -> Graph {
 
 #[test]
 fn metal_rmsnorm_beta_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

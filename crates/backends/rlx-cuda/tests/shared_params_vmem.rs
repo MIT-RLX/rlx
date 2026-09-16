@@ -64,7 +64,7 @@ fn expected(x: &[f32], w: &[f32]) -> Vec<f32> {
 #[test]
 fn two_models_in_one_process_keep_their_own_params() {
     let _serial = serial();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     rlx_cuda::vmem::set_enabled_for_test(true);
@@ -95,7 +95,7 @@ fn two_models_in_one_process_keep_their_own_params() {
 #[test]
 fn same_param_name_different_size_gets_distinct_slots() {
     let _serial = serial();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     rlx_cuda::vmem::set_enabled_for_test(true);
@@ -133,7 +133,7 @@ fn same_param_name_different_size_gets_distinct_slots() {
 #[test]
 fn second_executable_sees_params_uploaded_by_the_first() {
     let _serial = serial();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     rlx_cuda::vmem::set_enabled_for_test(true);
@@ -180,7 +180,7 @@ fn second_executable_sees_params_uploaded_by_the_first() {
 #[test]
 fn concurrent_compiles_are_consistent() {
     let _serial = serial();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     rlx_cuda::vmem::set_enabled_for_test(true);
@@ -224,7 +224,7 @@ fn concurrent_compiles_are_consistent() {
 #[test]
 fn different_scopes_do_not_alias_same_name_and_size() {
     let _serial = serial();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     rlx_cuda::vmem::set_enabled_for_test(true);
@@ -256,7 +256,7 @@ fn different_scopes_do_not_alias_same_name_and_size() {
 #[test]
 fn scope_zero_disables_sharing() {
     let _serial = serial();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     rlx_cuda::vmem::set_enabled_for_test(true);

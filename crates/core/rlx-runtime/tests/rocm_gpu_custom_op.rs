@@ -17,6 +17,8 @@ use rlx_ir::{DType, Graph, OpExtension, Shape, register_op};
 use rlx_rocm::rocm_gpu_kernels::{RocmGpuKernel, register_rocm_gpu_kernel};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 /// IR-level shape inference for `test.times_three_rocm` (identity).
 struct TimesThreeIr;
 impl OpExtension for TimesThreeIr {
@@ -63,7 +65,8 @@ impl RocmGpuKernel for TimesThreeRocm {
 
 #[test]
 fn times_three_runs_on_rocm_via_raw_gpu_kernel() {
-    if !rlx_rocm::is_available() {
+    let _gpu = common::serialize_gpu();
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         eprintln!("skipping rocm_gpu_custom_op: no ROCm device");
         return;
     }

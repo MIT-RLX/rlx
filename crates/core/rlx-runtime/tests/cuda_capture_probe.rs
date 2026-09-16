@@ -12,21 +12,24 @@
 //! `RLX_CUDA_CAPTURE_DEBUG=1`. The capture-safety gate then prints, per run,
 //! what SEGMENTED capture would recover ("would replay X/N steps across K
 //! graph(s)"). No-ops without a real CUDA GPU (`is_available` guard); run on the
-//! msi rig with `--nocapture` to read the diagnostic.
+//! CUDA rig with `--nocapture` to read the diagnostic.
 //!
 //!   RLX_CUDA_EXEC_MODE=graph RLX_CUDA_CAPTURE_DEBUG=1 \
 //!     cargo test -p rlx-runtime --features cuda --test cuda_capture_probe -- --nocapture
 
 use rlx_ir::op::{Activation, MaskKind};
 use rlx_ir::{DType, Graph, Shape};
+#[allow(unused_imports)]
 use rlx_runtime::{Device, Session, is_available};
+
+mod common;
 
 const F: DType = DType::F32;
 
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     }
 }
 
@@ -107,8 +110,9 @@ fn attention_graph(heads: usize, seq: usize, head_dim: usize, layers: usize) -> 
 /// graph capture (softmax + reductions). Run with RLX_CUDA_WHOLE_GRAPH_CAPTURE=1.
 #[test]
 fn cuda_whole_graph_attention_capture_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip cuda_whole_graph_attention ({dev:?} unavailable)");
         return;
     }
@@ -147,8 +151,9 @@ fn cuda_whole_graph_attention_capture_matches_cpu() {
 
 #[test]
 fn cuda_segmentation_opportunity_probe() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip cuda_capture_probe ({dev:?} unavailable)");
         return;
     }
@@ -219,14 +224,14 @@ fn cuda_segmentation_opportunity_probe() {
 ///     --test cuda_capture_probe cuda_whole_graph_capture -- --nocapture
 #[test]
 fn cuda_whole_graph_capture_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip cuda_whole_graph_capture ({dev:?} unavailable)");
         return;
     }
     // host_every > layers → no Sort → whole schedule is capture-safe.
-    let layers: usize = std::env::var("RLX_WG_LAYERS")
-        .ok()
+    let layers: usize = rlx_ir::env::var("RLX_WG_LAYERS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(6);
     let (m, d, hidden) = (64, 256, 1024);

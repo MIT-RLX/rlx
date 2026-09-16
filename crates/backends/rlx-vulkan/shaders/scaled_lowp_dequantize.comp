@@ -1,0 +1,34 @@
+#version 450
+// codes -> f32 via decode(code) * scale(block), for Op::ScaledDequantize.
+// The exact inverse of scaled_lowp_quantize; one invocation per element.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint codes_off;         // tagged word offset of the code tensor
+    uint scale_off;
+    uint out_off;           // tagged f32-word offset
+    uint rows;
+    uint cols;
+    uint fmt;
+    uint scale_mode;
+    uint block;
+} pc;
+
+float read_scale(uint r, uint c, uint nblk) {
+    if (pc.scale_mode == 0u) { return arena_load_f(pc.scale_off); }
+    uint si = r * nblk + c / pc.block;
+    uint b = rlx_rd_byte(pc.scale_off, si);
+    return (pc.scale_mode == 1u) ? rlx_e8m0(b) : rlx_decode_lowp(0u, b);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = pc.rows * pc.cols;
+    if (i >= total) { return; }
+    uint r = i / pc.cols;
+    uint c = i % pc.cols;
+    uint nblk = (pc.scale_mode == 0u) ? 1u : ((pc.cols + pc.block - 1u) / pc.block);
+    float s = read_scale(r, c, nblk);
+    arena_store_f(pc.out_off + i,
+                  rlx_decode_lowp(pc.fmt, rlx_rd_byte(pc.codes_off, i)) * s);
+}

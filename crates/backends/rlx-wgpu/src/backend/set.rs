@@ -65,7 +65,24 @@ impl WgpuExecutable {
         self.active_extent = extent;
     }
 
+    /// Un-arm the static-weight-pack skip: a param write makes every pack that
+    /// consumes it stale.
+    ///
+    /// Without this, `run(); set_param(w, ..); run()` keeps the FIRST run's
+    /// fused pack and the consuming GEMM silently computes with the old
+    /// weights — no error, just a wrong answer. That is the shape of every
+    /// weight-swap workload: a training step, a LoRA merge, quantisation
+    /// re-binding, a sweep harness reusing one executable across weight sets.
+    ///
+    /// Clearing the flag wholesale (rather than tracking which packs consume
+    /// `name`) costs one run's worth of re-packing and cannot be wrong. Weight
+    /// writes are rare next to inference steps.
+    fn invalidate_static_weight_packs(&mut self) {
+        self.static_once_done = false;
+    }
+
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        self.invalidate_static_weight_packs();
         const STASH_MAX_BYTES: usize = 16 * 1024 * 1024;
         if data.len() * 4 <= STASH_MAX_BYTES {
             self.stashed_params.insert(name.to_string(), data.to_vec());
@@ -90,6 +107,7 @@ impl WgpuExecutable {
     /// weights (int8 / int4) where the kernel reads the byte stream
     /// via `bitcast<u32>` from the f32-typed arena.
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
+        self.invalidate_static_weight_packs();
         if self.unresolved.is_some() {
             self.pending_param_bytes
                 .insert(name.to_string(), data.to_vec());
@@ -113,6 +131,7 @@ impl WgpuExecutable {
     /// path) when the graph is still unresolved or the param is not packed.
     /// The `Arena::write_f32` mirror covers the deferred-replay case.
     pub fn set_param_bf16_packed(&mut self, name: &str, data: &[u8]) -> bool {
+        self.invalidate_static_weight_packs();
         if self.unresolved.is_some() {
             return false;
         }

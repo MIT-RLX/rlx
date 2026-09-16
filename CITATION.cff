@@ -20,8 +20,8 @@ url: "https://github.com/MIT-RLX/rlx"
 license:
   - MIT
   - Apache-2.0
-version: "0.2.14"
-date-released: "2026-07-24"
+version: "0.2.16"
+date-released: "2026-09-15"
 keywords:
   - machine learning
   - compiler

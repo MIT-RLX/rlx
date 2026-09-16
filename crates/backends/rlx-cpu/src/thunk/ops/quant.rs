@@ -1605,9 +1605,9 @@ unsafe fn exec_dequant_grouped_mat_mul_mlx_inner(
 
 /// Slice-based grouped MLX-affine matmul for backends that host-delegate by
 /// value (rlx-mlx / rlx-wgpu / rlx-cuda copy Arrays out as `Vec`s rather than
-/// sharing the CPU arena). `x`=[m,k], `w_bytes`=`num_experts` packed slabs,
-/// `scales`/`biases`=[num_experts, n, n_groups] f32, `idx`=[m] f32-encoded
-/// expert ids; writes `out`=[m,n]. `x @ dequant(W_e)^T` per row.
+/// sharing the CPU arena). `x`=`m,k`, `w_bytes`=`num_experts` packed slabs,
+/// `scales`/`biases`=[num_experts, n, n_groups] f32, `idx`=`m` f32-encoded
+/// expert ids; writes `out`=`m,n`. `x @ dequant(W_e)^T` per row.
 #[allow(clippy::too_many_arguments)]
 pub fn dequant_grouped_matmul_affine_bt(
     x: &[f32],
@@ -2495,7 +2495,13 @@ pub(crate) fn exec_quantize(t: &Thunk, base: *mut u8) {
                 };
                 let inv_scale = 1.0 / scales[c];
                 let zp = zero_points[c];
-                let v = (xs[i] * inv_scale).round() as i32 + zp;
+                // `saturating_add`, not `+`: a float far outside i32 saturates
+                // to `i32::MAX` on the `as` cast, and adding a positive zero
+                // point to that panics in debug (and wraps to a *negative*
+                // code in release, which then clamps to -128 — the opposite of
+                // the intended saturation). Reached by any input more than
+                // ~2^31 scales from zero, e.g. `1e30` at `scale = 0.05`.
+                let v = ((xs[i] * inv_scale).round() as i32).saturating_add(zp);
                 *q_ptr.add(i) = v.clamp(-128, 127) as i8;
             }
         }

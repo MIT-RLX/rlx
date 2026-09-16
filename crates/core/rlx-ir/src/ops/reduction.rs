@@ -10,6 +10,24 @@ use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {
     /// Reduce.
+    /// Reduce over `axes`.
+    ///
+    /// Non-adjacent axes are emitted as a chain of single-axis reductions,
+    /// highest index first, rather than one node.
+    ///
+    /// The backends only implement a reduction over a *contiguous* axis range
+    /// — the shape folds to `[outer, reduced, inner]` and the kernel walks
+    /// that. Handed `[1, 3]` the CPU backend emits `Thunk::Nop`, so the output
+    /// buffer keeps whatever it held and the reduction silently answers zeros.
+    /// That is not a hypothetical: a hand-written 3-D max pool built this way
+    /// looked correct because it had been written around the bug, and the
+    /// workaround cost 30.8 ms of a 34 ms CUDA forward pass.
+    ///
+    /// Chaining is exact for every `ReduceOp` this accepts. Sum/Max/Min/Prod
+    /// are associative and commutative; `Mean` works because each axis is
+    /// fully reduced, so the divisors multiply out to the same total count.
+    /// Going highest-first keeps the lower axis indices valid as the rank
+    /// drops.
     pub fn reduce(
         &mut self,
         input: NodeId,
@@ -18,7 +36,49 @@ impl Graph {
         keep_dim: bool,
         shape: Shape,
     ) -> NodeId {
-        self.push(Op::Reduce { op, axes, keep_dim }, vec![input], shape, None)
+        let mut sorted = axes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let adjacent = sorted.windows(2).all(|w| w[1] == w[0] + 1);
+        if adjacent || sorted.len() < 2 {
+            return self.push(Op::Reduce { op, axes, keep_dim }, vec![input], shape, None);
+        }
+        let mut cur = input;
+        let mut dims: Vec<usize> = self
+            .shape(input)
+            .dims()
+            .iter()
+            .map(|d| d.unwrap_static())
+            .collect();
+        for &axis in sorted.iter().rev() {
+            if keep_dim {
+                dims[axis] = 1;
+            } else {
+                dims.remove(axis);
+            }
+            let step = Shape::new(&dims, shape.dtype());
+            cur = self.push(
+                Op::Reduce {
+                    op,
+                    axes: vec![axis],
+                    keep_dim,
+                },
+                vec![cur],
+                step,
+                None,
+            );
+        }
+        debug_assert_eq!(
+            dims,
+            shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static())
+                .collect::<Vec<_>>(),
+            "reduce: split over non-adjacent axes {sorted:?} did not land on the \
+             declared output shape"
+        );
+        cur
     }
 
     /// Softmax.

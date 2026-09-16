@@ -52,7 +52,7 @@ only in its Linux Docker image.)
 
 ## Status
 
-Claims the full **153/`OpKind`** surface ([`docs/op-coverage.md`](../../docs/op-coverage.md)).
+Claims **161** of the **187** `OpKind`s ([`docs/op-coverage.md`](../../../docs/op-coverage.md), generated from `SUPPORTED_OPS`).
 Native OpenCL-C kernels (when embedded) cover norms/fused/SoftmaxCE/RNN/SSM/
 vision-bwd/QAT/I8/FFT butterfly — mirroring the Vulkan depth wave. Ops without
 an embedded kernel use the bit-exact `rlx-cpu` path.

@@ -34,6 +34,20 @@ pub struct Calibration {
     pub sgemm_tiled_flops: f64,
     /// Measured baseline command-buffer round-trip (ns).
     pub roundtrip_overhead_ns: f64,
+    /// Measured GFLOP/s for the causal attention thunk.
+    ///
+    /// Attention does not run at GEMM rate — softmax, masking and
+    /// materializing the S x S scores are work no FLOP count sees — so the cost
+    /// model needs its own number rather than a fudge factor applied to sgemm.
+    /// It was a hardcoded `ATTENTION_EFFICIENCY` constant until this field
+    /// existed, and the constant was wrong by 5x because it had been derived
+    /// from a measurement that accidentally included Q/K/V upload.
+    ///
+    /// `serde(default)` so an older cache file still loads; a missing value
+    /// falls back to the arch default rather than deserialising to zero and
+    /// producing an infinite predicted cost.
+    #[serde(default)]
+    pub attention_flops: f64,
 }
 
 fn cache_path(registry_id: u64) -> PathBuf {
@@ -122,6 +136,60 @@ impl Calibration {
         let padded = measure(6, 768, 768);
         let tiled = measure(64, 128, 17);
 
+        // Attention, measured the same way the sgemm variants are: run the real
+        // thunk and divide FLOPs by device time.
+        //
+        // B=1, H=16, S=512, D=64 — a mid prefill, big enough that the kernel
+        // dominates the dispatch and small enough to calibrate quickly. Causal,
+        // so the FLOP count is 2*B*H*S^2*D (QK^T and PV are S^2*D MACs each;
+        // the mask skips about half).
+        let attention = {
+            use rlx_ir::op::MaskKind;
+            use rlx_ir::{DType, Graph, Shape};
+            let (b, h, sq, d) = (1usize, 16usize, 512usize, 64usize);
+            let f = DType::F32;
+            let mut g = Graph::new("calib_attn");
+            let q = g.input("q", Shape::new(&[b, h, sq, d], f));
+            let k = g.input("k", Shape::new(&[b, h, sq, d], f));
+            let v = g.input("v", Shape::new(&[b, h, sq, d], f));
+            let y = g.add_node(
+                rlx_ir::Op::Attention {
+                    num_heads: h,
+                    head_dim: d,
+                    v_head_dim: None,
+                    mask_kind: MaskKind::Causal,
+                    score_scale: None,
+                    attn_logit_softcap: None,
+                },
+                vec![q, k, v],
+                Shape::new(&[b, h, sq, d], f),
+            );
+            g.set_outputs(vec![y]);
+
+            let n = b * h * sq * d;
+            let data: Vec<f32> = (0..n)
+                .map(|i| ((i * 13 + 7) % 257) as f32 / 257.0)
+                .collect();
+            let feeds: Vec<(&str, &[f32])> = vec![("q", &data), ("k", &data), ("v", &data)];
+
+            // Per-thunk profiling isolates the KERNEL from the Q/K/V upload.
+            // Timing the whole run instead is what produced the 5x-wrong
+            // constant this field replaces.
+            rlx_ir::env::set("RLX_METAL_THUNK_PROFILE", "1");
+            let mut exe = crate::backend::MetalExecutable::compile(g);
+            let _ = exe.run(&feeds);
+            crate::thunk_profile::reset();
+            const N: usize = 10;
+            for _ in 0..N {
+                let _ = exe.run(&feeds);
+            }
+            let ms = crate::thunk_profile::total_ms().unwrap_or(0.0) / N as f64;
+            rlx_ir::env::unset("RLX_METAL_THUNK_PROFILE");
+
+            let flops = 2.0 * (b * h) as f64 * (sq * sq) as f64 * d as f64;
+            if ms > 0.0 { flops / (ms / 1e3) } else { 0.0 }
+        };
+
         // Round-trip baseline: empty command buffer commit+wait
         let roundtrip_ns = {
             let n_iter = 10;
@@ -142,6 +210,7 @@ impl Calibration {
             sgemm_padded_flops: padded,
             sgemm_tiled_flops: tiled,
             roundtrip_overhead_ns: roundtrip_ns,
+            attention_flops: attention,
         }
     }
 

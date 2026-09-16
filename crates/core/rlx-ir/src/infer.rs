@@ -117,6 +117,17 @@ pub trait GraphExt {
         groups: usize,
     ) -> NodeId;
 
+    // ── Pooling (NCHW) ───────────────────────────────────────
+    /// 2-D pooling; channels pass through, only the spatial axes shrink.
+    fn pool2d(
+        &mut self,
+        input: NodeId,
+        kind: crate::op::ReduceOp,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> NodeId;
+
     // ── Reduction ───────────────────────────────────────────
     fn sum(&mut self, x: NodeId, axes: Vec<usize>, keep_dim: bool) -> NodeId;
     fn mean(&mut self, x: NodeId, axes: Vec<usize>, keep_dim: bool) -> NodeId;
@@ -132,6 +143,9 @@ pub trait GraphExt {
     /// Strided slice along `axis`: `len` reads at `start + j*step` (`step != 0`,
     /// may be negative for reverse).
     fn slice_(&mut self, x: NodeId, axis: usize, start: usize, len: usize, step: i64) -> NodeId;
+    /// Cyclic shift: `out[i] = x[(i - shifts[k]) mod n]` along each `dims[k]`.
+    /// Shape-preserving; shifts may be negative or exceed the axis length.
+    fn roll_(&mut self, x: NodeId, shifts: Vec<i64>, dims: Vec<usize>) -> NodeId;
     /// Elementwise `clamp(x, min, max)`.
     fn clamp_(&mut self, x: NodeId, min: f32, max: f32) -> NodeId;
     /// Tile `x` by `reps[i]` along axis `i` (rank-aligned).
@@ -401,6 +415,17 @@ impl GraphExt for Graph {
         )
     }
 
+    fn pool2d(
+        &mut self,
+        input: NodeId,
+        kind: crate::op::ReduceOp,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> NodeId {
+        Graph::pool2d(self, input, kind, kernel_size, stride, padding)
+    }
+
     fn conv_transpose2d(
         &mut self,
         input: NodeId,
@@ -484,6 +509,16 @@ impl GraphExt for Graph {
     fn pad_(&mut self, x: NodeId, pads: Vec<[usize; 2]>, mode: PadMode) -> NodeId {
         let s = shape::pad_shape(self.shape(x), &pads).expect("pad shape inference");
         self.add_node(Op::Pad { pads, mode }, vec![x], s)
+    }
+
+    fn roll_(&mut self, x: NodeId, shifts: Vec<i64>, dims: Vec<usize>) -> NodeId {
+        assert_eq!(
+            shifts.len(),
+            dims.len(),
+            "roll: shifts and dims must be the same length"
+        );
+        let s = shape::unary_shape(self.shape(x));
+        self.add_node(Op::Roll { shifts, dims }, vec![x], s)
     }
 
     fn slice_(&mut self, x: NodeId, axis: usize, start: usize, len: usize, step: i64) -> NodeId {

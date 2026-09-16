@@ -11,6 +11,8 @@
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn nchw(n: usize, c: usize, h: usize, w: usize) -> Shape {
     Shape::new(&[n, c, h, w], DType::F32)
 }
@@ -104,6 +106,10 @@ fn run_resize(device: Device, n: usize, c: usize, h: usize, w: usize) -> Vec<f32
 #[test]
 #[cfg(feature = "gpu")]
 fn group_norm_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for &(n, c, h, w, gr) in &[(1, 8, 4, 4, 2), (2, 32, 8, 8, 8), (1, 16, 16, 16, 4)] {
         assert_close(
             &format!("gn wgpu [{n},{c},{h},{w}] groups={gr}"),
@@ -116,6 +122,10 @@ fn group_norm_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn layer_norm2d_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for &(n, c, h, w) in &[(1, 8, 4, 4), (2, 32, 8, 8), (1, 64, 16, 16)] {
         assert_close(
             &format!("ln2d wgpu [{n},{c},{h},{w}]"),
@@ -128,6 +138,10 @@ fn layer_norm2d_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn resize_nearest2x_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for &(n, c, h, w) in &[(1, 3, 8, 8), (2, 16, 12, 10), (1, 8, 32, 32)] {
         assert_close(
             &format!("resize wgpu [{n},{c},{h},{w}]"),
@@ -141,6 +155,7 @@ fn resize_nearest2x_wgpu_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn group_norm_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for &(n, c, h, w, gr) in &[(1, 8, 4, 4, 2), (2, 32, 8, 8, 8), (1, 16, 16, 16, 4)] {
         assert_close(
             &format!("gn mlx [{n},{c},{h},{w}] groups={gr}"),
@@ -153,6 +168,7 @@ fn group_norm_mlx_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn resize_nearest2x_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     // Standalone resize is wrapped into a single-step TransformRegion; Metal
     // must unwrap it to the native resize thunk (was an unimplemented panic).
     for &(n, c, h, w) in &[(1, 4, 8, 8), (2, 16, 12, 10), (1, 8, 32, 32)] {
@@ -167,6 +183,7 @@ fn resize_nearest2x_metal_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn layer_norm2d_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for &(n, c, h, w) in &[(1, 8, 4, 4), (2, 32, 8, 8)] {
         assert_close(
             &format!("ln2d mlx [{n},{c},{h},{w}]"),

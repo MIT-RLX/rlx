@@ -140,6 +140,13 @@ fn is_lowp_layout_op(op: &Op) -> bool {
             | Op::Reshape { .. }
             | Op::Transpose { .. }
             | Op::Expand { .. }
+            // A single-row copy into the cache it aliases — it moves bits and
+            // computes nothing, so there is no arithmetic to promote. Promoting
+            // it split the op from its own buffer: the cache is a boundary
+            // tensor and keeps its declared F16/BF16, while every backend takes
+            // the row stride from the KvAppend NODE's dtype, so an F32 node over
+            // an F16 cache strides a layout it does not have.
+            | Op::KvAppend { .. }
     )
 }
 
@@ -191,4 +198,59 @@ pub fn promote_to_f32(graph: Graph) -> Graph {
     }
     out.set_outputs(graph.outputs.iter().map(|o| id_map[o]).collect());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::GraphExt;
+
+    /// **`KvAppend` must keep the dtype of the cache it writes into.**
+    ///
+    /// The op aliases its cache input's buffer, and every backend derives the
+    /// row stride from the KvAppend NODE's dtype. The cache is a boundary
+    /// tensor, so it keeps its declared F16/BF16 through this pass — promoting
+    /// the node to F32 while leaving the cache half-width therefore strides a
+    /// layout the buffer does not have, and the new token lands in the wrong
+    /// row with nothing to report it.
+    #[test]
+    fn a_low_precision_kv_append_is_not_promoted() {
+        for dt in [DType::F16, DType::BF16] {
+            let mut g = Graph::new("kv");
+            let cache = g.input("cache", Shape::new(&[1, 8, 4], dt));
+            let row = g.input("row", Shape::new(&[1, 1, 4], dt));
+            let out = g.add_node(
+                Op::KvAppend { axis: 1, pos: 3 },
+                vec![cache, row],
+                Shape::new(&[1, 4, 4], dt),
+            );
+            g.set_outputs(vec![out]);
+
+            let promoted = promote_to_f32(g);
+            let node = promoted.node(promoted.outputs[0]);
+            assert!(
+                matches!(node.op, Op::KvAppend { .. }),
+                "{dt:?}: the append itself vanished"
+            );
+            assert_eq!(
+                node.shape.dtype(),
+                dt,
+                "{dt:?}: KvAppend was promoted away from its cache's dtype"
+            );
+        }
+    }
+
+    /// The other half: a genuinely computed operand still promotes, so this
+    /// exemption cannot be read as "low precision executes natively".
+    #[test]
+    fn arithmetic_over_the_same_operands_still_promotes() {
+        let mut g = Graph::new("mul");
+        let a = g.input("a", Shape::new(&[4], DType::F16));
+        let b = g.input("b", Shape::new(&[4], DType::F16));
+        let out = g.mul(a, b);
+        g.set_outputs(vec![out]);
+
+        let promoted = promote_to_f32(g);
+        assert_eq!(promoted.node(promoted.outputs[0]).shape.dtype(), DType::F32);
+    }
 }

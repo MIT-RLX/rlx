@@ -11,6 +11,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const ROWS: usize = 4;
 const CH: usize = 3;
 const NB: u32 = 6;
@@ -75,6 +77,7 @@ fn run(device: Device, x: &[f32], coeff: &[f32]) -> Vec<f32> {
 
 #[test]
 fn cpu_native_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let (x, coeff) = (x_data(), coeff_data());
     let out = run(Device::Cpu, &x, &coeff);
     let want = reference(&x, &coeff);
@@ -85,6 +88,7 @@ fn cpu_native_matches_reference() {
 
 #[test]
 fn decompose_matches_native() {
+    let _gpu = common::serialize_gpu();
     use rlx_fusion::LowerSplineActivation;
     use rlx_fusion::pass::Pass;
 
@@ -113,7 +117,8 @@ fn decompose_matches_native() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn metal_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let (x, coeff) = (x_data(), coeff_data());

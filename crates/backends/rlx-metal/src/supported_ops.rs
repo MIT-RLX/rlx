@@ -114,6 +114,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         SplineActivationBackwardX,
         SplineActivationBackwardCoeff,
         GatedDeltaNet,
+        GatedDeltaNetBackward,
         SelectiveScan,
         Lstm,
         Gru,
@@ -157,6 +158,10 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // compute kernel will replace this when a workload makes
         // the sync the bottleneck.
         Fft,
+        // Op::FftQ (fixed-point) uses the same host fallback. There is no MSL
+        // kernel for it yet; the Q30 twiddle products need one written for
+        // them rather than reusing the f32 dispatch.
+        FftQ,
         // Op::Scan (arbitrary-body recurrence) via the same host
         // fallback: compile the body once, loop it on the CPU against
         // the unified-memory arena. Enables IIR (`biquad`/`sosfilt`).

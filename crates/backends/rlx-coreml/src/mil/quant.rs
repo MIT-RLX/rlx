@@ -36,16 +36,16 @@ pub enum Q1Mode {
 }
 
 fn q1_ondevice_mode() -> Q1Mode {
-    match std::env::var("RLX_COREML_Q1_MODE").as_deref() {
+    match rlx_ir::env::var("RLX_COREML_Q1_MODE").as_deref() {
         // Legacy multi-GiB F32 unfold (disk OOM on 27B). Opt in only when
         // deliberately comparing against the old bake path.
-        Ok("f32") | Ok("F32") => Q1Mode::F32,
+        Some("f32") | Some("F32") => Q1Mode::F32,
         // Default + aliases: 1-bit LUT palettization (no F32 unfold).
         // "int8"/"affine" used to select the deprecated ios16 int8 constexpr
         // path; on iOS18 they map here (smaller, and affine no longer takes
         // `quantized_data`).
-        Ok("lut") | Ok("int8") | Ok("affine") | Err(_) => Q1Mode::Lut,
-        Ok(other) => {
+        Some("lut") | Some("int8") | Some("affine") | None => Q1Mode::Lut,
+        Some(other) => {
             eprintln!(
                 "[rlx-coreml] unknown RLX_COREML_Q1_MODE={other:?}; using lut \
                  (set f32 for the legacy unfold)"

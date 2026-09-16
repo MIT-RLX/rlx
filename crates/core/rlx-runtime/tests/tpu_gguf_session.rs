@@ -12,8 +12,10 @@ use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 fn run_tpu_gguf_session_case(scheme: QuantScheme, ggml: rlx_gguf::GgmlType, k: usize, n: usize) {
-    if !rlx_runtime::is_available(Device::Tpu) {
+    if common::skip_unless_available(Device::Tpu, "tpu") {
         eprintln!("TPU unavailable, skipping");
         return;
     }
@@ -64,7 +66,7 @@ fn run_tpu_gguf_session_with_bindings(
     k: usize,
     n: usize,
 ) {
-    if !rlx_runtime::is_available(Device::Tpu) {
+    if common::skip_unless_available(Device::Tpu, "tpu") {
         eprintln!("TPU unavailable, skipping");
         return;
     }
@@ -124,7 +126,7 @@ fn tpu_gguf_q8_0_session_quant_bindings() {
 
 #[test]
 fn tpu_gguf_q4_0_session_reupload_set_param_typed() {
-    if !rlx_runtime::is_available(Device::Tpu) {
+    if common::skip_unless_available(Device::Tpu, "tpu") {
         eprintln!("TPU unavailable, skipping");
         return;
     }

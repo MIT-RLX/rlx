@@ -12,6 +12,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn ramp(n: usize, seed: usize, scale: f32) -> Vec<f32> {
     (0..n)
         .map(|i| (((i + seed) % 23) as f32 - 11.0) * scale)
@@ -31,6 +33,10 @@ fn close(what: &str, a: &[f32], b: &[f32]) {
 
 #[test]
 fn gru_native_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let (b, s, inp, h) = (2usize, 5, 6, 8);
     let inputs = [
         ("x", ramp(b * s * inp, 1, 0.1)),
@@ -70,6 +76,10 @@ fn gru_native_wgpu_matches_cpu() {
 
 #[test]
 fn rnn_native_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let (b, s, inp, h) = (2usize, 5, 6, 8);
     for relu in [false, true] {
         let inputs = [
@@ -114,6 +124,10 @@ fn rnn_native_wgpu_matches_cpu() {
 
 #[test]
 fn gru_bidir_wgpu_host_fallback_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     // Bidirectional → not the native single-layer/unidir path → GruHost.
     let (b, s, inp, h) = (2usize, 4, 5, 6);
     let inputs = [
@@ -159,6 +173,10 @@ fn gru_bidir_wgpu_host_fallback_matches_cpu() {
 
 #[test]
 fn mamba2_native_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let (b, s, h, p, n) = (2usize, 4, 3, 8, 16);
     let inputs = [
         ("x", ramp(b * s * h * p, 1, 0.06)),

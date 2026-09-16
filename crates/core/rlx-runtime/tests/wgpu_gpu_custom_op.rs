@@ -17,6 +17,8 @@ use rlx_ir::{DType, Graph, OpExtension, Shape, register_op};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::wgpu_gpu_custom::{WgpuGpuKernel, register_wgpu_gpu_kernel};
 
+mod common;
+
 /// IR-level shape inference for `test.times_three_wgpu` (identity).
 struct TimesThreeIr;
 impl OpExtension for TimesThreeIr {
@@ -63,6 +65,10 @@ impl WgpuGpuKernel for TimesThreeWgpu {
 
 #[test]
 fn times_three_runs_on_wgpu_via_raw_gpu_kernel() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     register_op(Arc::new(TimesThreeIr));
     register_wgpu_gpu_kernel(Arc::new(TimesThreeWgpu));
 

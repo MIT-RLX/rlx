@@ -50,6 +50,33 @@ pub fn unfuse_recurrent_ops(g: Graph) -> Graph {
     out
 }
 
+/// Expand **only** `Op::GatedDeltaNet` into its primitive chain, regardless
+/// of `RLX_GDN_UNFUSE_FOR_AD`.
+///
+/// [`unfuse_fused_for_autodiff`] keeps GDN fused by default because unrolling
+/// the time loop costs ~32× on a backend that *has* a GDN kernel. A backend
+/// with no GDN kernel at all has no such trade to make: leaving the node
+/// fused means it reaches the scheduler and panics. Vulkan is in that
+/// position, and routing its expansion through the flag-gated function made
+/// the expansion a silent no-op — every `qwen35` model (Qwen3.5/3.6/3.8,
+/// Ternary-Bonsai, Pestle-27B) failed to compile there as a result.
+pub fn unfuse_gated_delta_net_always(g: Graph) -> Graph {
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    let original_outputs = g.outputs.clone();
+    let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
+    for node in &nodes {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match &node.op {
+            Op::GatedDeltaNet { .. } => unfuse_gated_delta_net(node, new_inputs, &mut out),
+            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(original_outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
 /// Expand fused blocks so per-op VJP rules apply.
 pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
     // Walk the input graph, copy node-by-node into a new graph,
@@ -107,7 +134,19 @@ pub fn unfuse_fused_for_autodiff(g: Graph) -> Graph {
             Op::FusedSwiGLU { .. } => unfuse_fused_swi_g_l_u(node, new_inputs, &mut out),
             Op::LoraMatMul { .. } => unfuse_lora_mat_mul(node, new_inputs, &mut out),
             Op::PartitionedConv { .. } => unfuse_partitioned_conv(node, new_inputs, &mut out),
-            Op::GatedDeltaNet { .. } => unfuse_gated_delta_net(node, new_inputs, &mut out),
+            // GatedDeltaNet keeps its fused form for AD by default: it has a
+            // dedicated VJP emitting `Op::GatedDeltaNetBackward`, and unrolling
+            // the time loop instead runs ~32x slower (every timestep
+            // materializes a fresh `[B·H, N, N]` state in SSA form, where the
+            // kernel updates one working set in place).
+            //
+            // `RLX_GDN_UNFUSE_FOR_AD=1` restores the unrolled decomposition, for
+            // a backend that executes `Op::GatedDeltaNet` but not yet its
+            // backward. The two paths agree numerically — see
+            // `rlx-autodiff/tests/gated_delta_net_vjp_fd.rs`, which runs both.
+            Op::GatedDeltaNet { .. } if rlx_ir::env::flag("RLX_GDN_UNFUSE_FOR_AD") => {
+                unfuse_gated_delta_net(node, new_inputs, &mut out)
+            }
             Op::Lstm { .. } => unfuse_lstm(node, new_inputs, &mut out),
             Op::Gru { .. } => unfuse_gru(node, new_inputs, &mut out),
             Op::Rnn { .. } => unfuse_rnn(node, new_inputs, &mut out),

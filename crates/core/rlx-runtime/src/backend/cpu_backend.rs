@@ -122,7 +122,7 @@ impl Backend for CpuBackend {
     fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
         // `Instant` is unimplemented on wasm32 — never touch it there.
         #[cfg(not(target_arch = "wasm32"))]
-        let prof = std::env::var_os("RLX_PROFILE_COMPILE").is_some();
+        let prof = rlx_ir::env::var_os("RLX_PROFILE_COMPILE").is_some();
         #[cfg(not(target_arch = "wasm32"))]
         let tt = if prof {
             Some(std::time::Instant::now())
@@ -400,9 +400,40 @@ impl CpuExecutable {
         let flat_probe = rlx_ir::env::parse_or::<usize>("RLX_CPU_DUMP_FLAT", usize::MAX);
         eprintln!("[rlx-cpu-dump] per-node max |x| (topo order, limit={limit})");
         let buf = self.arena.raw_buf();
+        // `RLX_CPU_DUMP_NODE_DATA=<id>[,<id>...]` writes each node's raw f32
+        // buffer to `$RLX_CPU_DUMP_DIR/node_<id>.f32`. Unlike the summary loop
+        // below this does not skip Param/Reshape, so a matmul's weights can be
+        // pulled out and the op recomputed in f64 to decide which backend is
+        // right when two disagree.
+        if let Some(spec) = rlx_ir::env::var("RLX_CPU_DUMP_NODE_DATA") {
+            let dir = rlx_ir::env::var("RLX_CPU_DUMP_DIR").unwrap_or_else(|| "/tmp".into());
+            for want in spec.split(',').filter_map(|t| t.trim().parse::<u32>().ok()) {
+                let Some(node) = self.graph.nodes().iter().find(|n| n.id.0 == want) else {
+                    continue;
+                };
+                if !self.arena.has_buffer(node.id) {
+                    continue;
+                }
+                let off = self.arena.byte_offset(node.id);
+                let n = node.shape.num_elements().unwrap_or(0);
+                let data: &[f32] =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off) as *const f32, n) };
+                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let path = format!("{dir}/node_{want}.f32");
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => eprintln!(
+                        "[rlx-cpu-dump] wrote {path} ({n} f32) byte_range=[{off}, {})",
+                        off + n * 4
+                    ),
+                    Err(e) => eprintln!("[rlx-cpu-dump] {path}: {e}"),
+                }
+            }
+        }
         let mut shown = 0usize;
+        let (mut no_buf, mut skipped_op, mut not_f32) = (0usize, 0usize, 0usize);
         for (i, node) in self.graph.nodes().iter().enumerate() {
             if !self.arena.has_buffer(node.id) {
+                no_buf += 1;
                 continue;
             }
             if matches!(
@@ -413,6 +444,7 @@ impl CpuExecutable {
                     | rlx_ir::Op::Reshape { .. }
                     | rlx_ir::Op::Cast { .. }
             ) {
+                skipped_op += 1;
                 continue;
             }
             if self
@@ -422,6 +454,7 @@ impl CpuExecutable {
                 .unwrap_or(DType::F32)
                 != DType::F32
             {
+                not_f32 += 1;
                 continue;
             }
             let off = self.arena.byte_offset(node.id);
@@ -430,24 +463,68 @@ impl CpuExecutable {
                 unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off) as *const f32, n) };
             let max = data.iter().fold(0f32, |m, &v| m.max(v.abs()));
             let nz = data.iter().filter(|&&v| v != 0.0).count();
+            // f64 sum: max/tail are single-element summaries and two tensors can
+            // share both while differing elsewhere, which hides the real first
+            // divergence. A whole-tensor sum does not.
+            let sum: f64 = data.iter().map(|&v| v as f64).sum();
+            // Max over the LAST row (final index of the second-to-last axis).
+            // Cross-backend divergences often sit in the tail token only, where
+            // the whole-tensor max is dominated by other rows and matches.
+            let row = node
+                .shape
+                .dims()
+                .last()
+                .and_then(|d| match d {
+                    rlx_ir::Dim::Static(n) => Some(*n),
+                    rlx_ir::Dim::Dynamic(_) => None,
+                })
+                .unwrap_or(data.len())
+                .max(1);
+            let tail = data
+                .len()
+                .checked_sub(row)
+                .map(|o| data[o..].iter().fold(0f32, |m, &v| m.max(v.abs())))
+                .unwrap_or(max);
+            // Sum of |v| over the tail row. A LayerNorm row sums to ~0, so a
+            // plain sum cancels and hides real differences; this does not.
+            let tabs: f64 = data
+                .len()
+                .checked_sub(row)
+                .map(|o| data[o..].iter().map(|&v| v.abs() as f64).sum())
+                .unwrap_or(0.0);
             let flat_s = if flat_probe < data.len() {
                 format!(" flat[{flat_probe}]={:.6}", data[flat_probe])
             } else {
                 String::new()
             };
             eprintln!(
-                "  [{i:>3}] id={:?} name={:?} {:?} shape={:?} max={max:.6} nonzero={nz}/{}{flat_s}",
+                "  [{i:>3}] in={:?} id={:?} name={:?} {:?} shape={:?} max={max:.6} tail={tail:.6} sum={sum:.6} tabs={tabs:.6} nonzero={nz}/{}{flat_s}",
+                node.inputs.iter().map(|n| n.0).collect::<Vec<_>>(),
                 node.id,
                 node.name,
                 node.op,
                 node.shape.dims(),
                 data.len()
             );
+            // `RLX_CPU_ROW_TABS=<node_id>`: per-row sum of |v| for one node.
+            // Lets a GPU tail row be searched for among ALL the reference rows —
+            // if it matches a different row exactly, the kernel is indexing
+            // wrong rather than computing wrong.
+            if rlx_ir::env::parse_or::<u32>("RLX_CPU_ROW_TABS", u32::MAX) == node.id.0 {
+                for (r, chunk) in data.chunks(row).enumerate() {
+                    let t: f64 = chunk.iter().map(|&v| v.abs() as f64).sum();
+                    eprintln!("  rowtabs node={} row={r} tabs={t:.6}", node.id.0);
+                }
+            }
             shown += 1;
             if shown >= limit {
                 break;
             }
         }
+        eprintln!(
+            "[rlx-cpu-dump] nodes={} shown={shown} no_buffer={no_buf} skipped_op={skipped_op} not_f32={not_f32}",
+            self.graph.nodes().len()
+        );
     }
 
     /// Write a f32 input slice into the arena, casting to the node's dtype.
@@ -477,6 +554,9 @@ impl ExecutableGraph for CpuExecutable {
         crate::ExecutableCapabilities {
             clone: true,
             moe: true,
+            // `bind_handle` / `read_handle` are implemented below and return
+            // real data; the flag said otherwise.
+            persistent_handles: true,
             typed_io: true,
             active_extent: true,
             ..crate::ExecutableCapabilities::NONE
@@ -503,6 +583,41 @@ impl ExecutableGraph for CpuExecutable {
                 write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, data, max_elems);
             }
         }
+    }
+
+    fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        // Paged-MoE residency: rewrite ONE expert slot of a large bank instead
+        // of re-uploading the bank. Without this the caller has to assemble the
+        // whole gathered bank in a Vec and hand it over, copying every active
+        // byte twice — at GLM-5.3-Flash scale ~2 GB of redundant memcpy per
+        // token, and CPU is the backend the cluster planner assigns paged
+        // stages to most often.
+        let Some(&id) = self.param_ids.get(name) else {
+            return false;
+        };
+        if !self.arena.has_buffer(id) {
+            return false;
+        }
+        // The bytes go in verbatim, and the signature carries no dtype to check
+        // them against. A param that AMP rewrote to F16/BF16 would be silently
+        // corrupted by F32 bytes, so refuse anything but F32 storage and let
+        // the caller take the whole-buffer path, which does convert.
+        if self.node_dtypes.get(&id).copied().unwrap_or(DType::F32) != DType::F32 {
+            return false;
+        }
+        // Bound to the PARAM, not to the arena: params sit in a shared buffer,
+        // so an over-long write does not fault — it lands in whichever tensor
+        // is next and corrupts it silently.
+        let size = self.arena.byte_size(id);
+        let Some(end) = byte_offset.checked_add(data.len()) else {
+            return false;
+        };
+        if end > size {
+            return false;
+        }
+        let off = self.arena.byte_offset(id);
+        self.arena.raw_buf_mut()[off + byte_offset..off + end].copy_from_slice(data);
+        true
     }
 
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
@@ -917,8 +1032,7 @@ impl CpuExecutable {
                     const ADVICE: i32 = 7;
                     #[cfg(not(target_os = "macos"))]
                     const ADVICE: i32 = 4;
-                    let advice = std::env::var("RLX_MADV")
-                        .ok()
+                    let advice = rlx_ir::env::var("RLX_MADV")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(ADVICE);
                     unsafe { madvise(a as *mut core::ffi::c_void, b - a, advice) };

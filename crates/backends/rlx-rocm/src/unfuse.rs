@@ -6,9 +6,10 @@
 //!
 //! The shared decompose driver lives in `rlx-unfuse`; this module only
 //! supplies ROCm's [`DecomposePolicy`]. ROCm shares CUDA's `.cu` kernels but
-//! (unlike CUDA) does not keep any `FusedAttentionBlock` native and does not
-//! promote `AttentionBackward` — so the policy is the plain default: lower
-//! every composite to primitives, materialize rank-4 attention, no
+//! (unlike CUDA) does not keep any `FusedAttentionBlock` native, but it does
+//! promote `AttentionBackward` to rank-4, because its kernel accepts nothing
+//! else — otherwise the policy is the plain default: lower every composite to
+//! primitives, materialize rank-4 attention, no
 //! FusedMatMulBiasAct / FusedResidualLN folding.
 //!
 //! [`Op::PartitionedConv`] has no native kernel; expand it to the
@@ -28,20 +29,41 @@ impl DecomposePolicy for RocmPolicy {
     fn swiglu_native(&self) -> bool {
         true
     }
+
+    /// ROCm's `AttentionBackward` kernel indexes `[B, H, S, D]` and panics on
+    /// anything else ("unfuse should have promoted to rank-4"). ROCm also
+    /// *claims* `AttentionBackward` in `SUPPORTED_OPS`, so legalization leaves
+    /// it alone rather than decomposing it — which meant a rank-3 backward, the
+    /// shape a transformer block actually produces, reached the compiler and
+    /// aborted. The kernel's requirement and the policy have to agree.
+    fn promote_attention_backward(&self) -> bool {
+        true
+    }
 }
 
 pub fn unfuse(graph: Graph) -> Graph {
-    let graph = expand_partitioned_conv(graph);
+    let graph = expand_unsupported_fusions(graph);
     rlx_unfuse::unfuse(graph, &RocmPolicy)
 }
 
 /// Expand [`Op::PartitionedConv`] → batched-GEMM frequency-domain primitives
 /// (`Fft` / `MatMul` / …) via `unfuse_fused_for_autodiff`.
-fn expand_partitioned_conv(g: Graph) -> Graph {
+/// Also expands any [`Op::FusedConvBiasAct`] that is not the 2-D case.
+///
+/// `SUPPORTED_OPS` lists the op unconditionally, but `backend::compile` lowers
+/// every rank to `Step::Conv2d`, reading `dims[2]`/`dims[3]` as h/w. On an
+/// NCDHW node that reads D and H, silently drops W, and returns garbage with
+/// no error — the identical defect was measured on CUDA at 97% of full scale
+/// away from the CPU result. Ranks other than 4 go back to primitives, where
+/// `Op::Conv3d` has a real kernel.
+fn expand_unsupported_fusions(g: Graph) -> Graph {
+    let unsupported_fused = |n: &rlx_ir::Node| -> bool {
+        matches!(n.op, Op::FusedConvBiasAct { .. }) && n.shape.rank() != 4
+    };
     let needs = g
         .nodes()
         .iter()
-        .any(|n| matches!(n.op, Op::PartitionedConv { .. }));
+        .any(|n| matches!(n.op, Op::PartitionedConv { .. }) || unsupported_fused(n));
     if !needs {
         return g;
     }
@@ -51,6 +73,9 @@ fn expand_partitioned_conv(g: Graph) -> Graph {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
         let new_id = match &node.op {
             Op::PartitionedConv { .. } => {
+                inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
+            }
+            Op::FusedConvBiasAct { .. } if node.shape.rank() != 4 => {
                 inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
             }
             _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),

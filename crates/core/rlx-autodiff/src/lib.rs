@@ -19,12 +19,14 @@ pub mod higher_order;
 pub mod legalize_reduce;
 pub mod mlip;
 pub mod prepare_ad;
+pub mod split_vjp;
 pub mod vmap;
 
 pub use autodiff::{
-    GradWithLossOptions, grad, grad_with_loss, grad_with_loss_opts, quantized_weight_bits,
+    GradWithLossOptions, Wrt, grad, grad_with_loss, grad_with_loss_opts, grad_with_loss_wrt,
+    quantized_weight_bits,
 };
-pub use autodiff_fwd::{hvp, jvp};
+pub use autodiff_fwd::{hvp, jvp, jvp_with_tangent_names};
 pub use compose::{broadcast_scalar, cse};
 pub use decompose_backward::{
     decompose_backward_for_ad, decompose_backward_ops, decompose_backward_ops_except,
@@ -42,4 +44,5 @@ pub use prepare_ad::{
     jvp_module, nth_order_grad_module, prepare_graph_for_ad, prepare_mir_for_ad,
     prepare_module_for_ad,
 };
+pub use split_vjp::{SAVED_PARAM_PREFIX, SavedActivation, SplitVjp, SplitVjpError, split_vjp};
 pub use vmap::vmap;

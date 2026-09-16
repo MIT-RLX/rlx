@@ -5,12 +5,17 @@
 
 [package]
 name = "rlx-cortexm-firmware"
-version = "0.2.14"
+version = "0.2.16"
 edition = "2024"
 description = "MNIST-on-nRF52840 firmware demo for rlx-cortexm"
 license = "MIT OR Apache-2.0"
 authors = ["Eugene Hauptmann", "Nataliya Kosmyna"]
 readme = "README.md"
+repository = "https://github.com/MIT-RLX/rlx"
+# Not on crates.io: this is an nRF52840 firmware binary, not a library. It also
+# lives in its own workspace (thumbv7em-none-eabihf doesn't mix with the host
+# one), so nothing stops a stray `cargo publish` here without this.
+publish = false
 
 [dependencies]
 rlx-cortexm   = { path = "..", default-features = false }

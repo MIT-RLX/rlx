@@ -453,7 +453,7 @@ impl Converter {
     /// 2. Resolve a [`Scheme`] via the override stack (name → predicate
     ///    → default), falling back to F16 if the element count doesn't
     ///    divide the chosen scheme's block size.
-    /// 3. Encode with [`rlx_gguf::quantize`] and stream into the
+    /// 3. Encode with [`rlx_gguf::quantize`](fn@rlx_gguf::quantize::quantize) and stream into the
     ///    [`rlx_gguf::GgufWriter`].
     ///
     /// On success returns a [`ConvertReport`] describing the per-tensor

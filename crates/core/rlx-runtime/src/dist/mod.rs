@@ -7,12 +7,13 @@
 //! A worker is a *generic* executor: it compiles and runs a graph the
 //! coordinator ships at runtime, so no model is baked into the worker binary
 //! and there is **no per-node / per-model recompile**. Build one worker binary
-//! per architecture (`Node::from_env().connect()` + [`serve_stage`]), deploy it
+//! per architecture (`Node::from_env().connect()` +
+//! [`serve_stage`](crate::dist::serve_stage)), deploy it
 //! to every node, and drive any model from a coordinator.
 //!
 //! The coordinator — which owns the model's graph builders (e.g. a crate in
 //! `rlx-models`) — partitions the model into stages and ships each worker a
-//! [`StageSpec`]: the serialized subgraph, its I/O node names, where to fetch
+//! [`StageSpec`](crate::dist::StageSpec): the serialized subgraph, its I/O node names, where to fetch
 //! each weight, and a device directive. Weights are resolved **locally** by a
 //! caller-provided closure (GGUF / safetensors / HF — rlx core stays
 //! model-agnostic), so only specs (KB) and activations cross the wire — never
@@ -37,6 +38,7 @@ use std::collections::HashMap;
 
 mod diagnostics;
 mod inference;
+pub mod node;
 mod training;
 
 pub use diagnostics::*;

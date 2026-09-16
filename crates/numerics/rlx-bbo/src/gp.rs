@@ -6,7 +6,7 @@
 //!
 //! Self-contained: implements its own dense symmetric-PSD Cholesky for
 //! the (typically ≤200×200) kernel matrix that BO sees. For larger
-//! covariance matrices, swap in [`rlx-linalg::cholesky`].
+//! covariance matrices, swap in `rlx-linalg::cholesky`.
 
 #[derive(Clone, Debug)]
 pub enum Kernel {

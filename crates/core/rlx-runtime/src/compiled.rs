@@ -236,6 +236,17 @@ impl CompiledGraph {
         self.inner.read_handle(name)
     }
 
+    /// What this executable can actually do.
+    ///
+    /// The ground truth, as opposed to [`crate::advisory_capabilities`], which
+    /// answers the same question from a device enum *before* anything is
+    /// compiled — useful for planning, but hand-maintained and therefore able to
+    /// drift. `rlx-runtime/tests/capability_table_matches_backends.rs` pins the
+    /// two together.
+    pub fn capabilities(&self) -> crate::ExecutableCapabilities {
+        self.inner.capabilities()
+    }
+
     /// GPU-resident MLX input (no-op on non-MLX backends).
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         self.inner.bind_gpu_handle(name, data)

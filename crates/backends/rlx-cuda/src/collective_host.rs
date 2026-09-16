@@ -5,7 +5,7 @@
 //! Host-side `Op::Custom("collective.*")` for CUDA arenas.
 //!
 //! Thin adapter over [`rlx_gpu_host::run_collective_f32`]. With
-//! `--features nccl` and a registered [`crate::distributed`] communicator,
+//! `--features nccl` and a registered `crate::distributed` communicator,
 //! `collective.all_reduce` / `collective.all_to_all` prefer the on-device
 //! NCCL path (no host round-trip). `moe_dispatch` / `moe_combine` stay on the
 //! host variable-`all_to_all_v` path until a device-resident variant lands.

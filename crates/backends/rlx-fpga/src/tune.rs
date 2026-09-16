@@ -8,7 +8,7 @@
 //! knob in [`Tune`] maps to a concrete Verilog difference; nothing here
 //! is a hint that "the synthesizer might decide to". Trade-offs are
 //! deterministic, visible in the emitted SV, and reflected in
-//! [`crate::estimate`].
+//! [`crate::estimate`](mod@crate::estimate).
 //!
 //! Pick an [`OptTarget`] preset for a coherent starting point; tweak
 //! individual fields if the preset doesn't match the board you're

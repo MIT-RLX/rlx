@@ -30,6 +30,8 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_sparse::SparseTensor;
 
+mod common;
+
 fn bytes_to_f64s(bytes: &[u8]) -> Vec<f64> {
     bytes
         .chunks_exact(8)
@@ -72,6 +74,7 @@ fn build_tridiag_4() -> (Vec<f64>, Vec<i32>, Vec<i32>) {
 
 #[test]
 fn sparse_lu_solve_runs_on_mlx_via_lazy_array_dispatch() {
+    let _gpu = common::serialize_gpu();
     rlx_sparse::register();
 
     let (values, col_idx, row_ptr) = build_tridiag_4();
@@ -116,6 +119,7 @@ fn sparse_lu_solve_runs_on_mlx_via_lazy_array_dispatch() {
 
 #[test]
 fn sparse_mat_vec_runs_on_mlx_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     rlx_sparse::register();
 
     let (values, col_idx, row_ptr) = build_tridiag_4();

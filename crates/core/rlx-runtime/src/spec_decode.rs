@@ -174,6 +174,137 @@ fn sample_from(probs: &[f32], rng: &mut Philox4x32) -> u32 {
     (probs.len() - 1) as u32
 }
 
+/// A distribution supported on a small candidate set, `ids[j] ->
+/// probs[j]`. Everything outside `ids` has probability zero.
+///
+/// Block drafters (DFlash2's candidate selector, Medusa-style heads)
+/// only ever expose a top-k slate, and a target sampler with top-k /
+/// top-p applied is likewise sparse. Carrying `[n, vocab]` dense rows
+/// for those is ~150k floats per position of pure waste, so the
+/// sparse path exists alongside [`speculative_accept`] rather than
+/// forcing callers to densify.
+///
+/// Duplicate ids are summed on lookup, so a caller may push the same
+/// id twice without corrupting the mass.
+#[derive(Debug, Clone, Default)]
+pub struct SparseDist {
+    pub ids: Vec<u32>,
+    pub probs: Vec<f32>,
+}
+
+impl SparseDist {
+    /// Probability this distribution assigns to `id` (0.0 if absent).
+    pub fn prob_of(&self, id: u32) -> f32 {
+        self.ids
+            .iter()
+            .zip(&self.probs)
+            .filter(|&(&i, _)| i == id)
+            .map(|(_, &p)| p)
+            .sum()
+    }
+}
+
+/// Sparse speculative acceptance — maximal coupling against a target
+/// distribution that is itself only known on a candidate set.
+///
+/// Same accept/reject law as [`speculative_accept`]: keep `draft[i]`
+/// with probability `min(1, p_target / q_draft)`, otherwise stop and
+/// emit one token from the residual `norm(max(0, p - q))`. Restricting
+/// the residual to the target's candidate set is what keeps the
+/// distribution exact *for that sampler*: a token the target's top-k
+/// already excluded must not reappear through the residual.
+///
+/// **Contract differs from [`speculative_accept`] on purpose.**
+/// `target` carries `draft.len() + 1` rows — one per drafted position
+/// plus the bonus slot the target verified for free — and `corrected`
+/// is therefore always `Some`. A round always yields
+/// `accepted.len() + 1` real tokens, so a fully-rejected block still
+/// advances by one. The dense function leaves that bonus to the
+/// caller; here it would just force every caller to re-derive it.
+///
+/// # Panics
+/// If `dists.len() != draft.len()` or `target.len() != draft.len() + 1`.
+pub fn speculative_accept_sparse(
+    draft: &[u32],
+    dists: &[SparseDist],
+    target: &[SparseDist],
+    rng: &mut Philox4x32,
+) -> AcceptDecision {
+    assert_eq!(
+        draft.len(),
+        dists.len(),
+        "speculative_accept_sparse: one proposal distribution per drafted token"
+    );
+    assert_eq!(
+        target.len(),
+        draft.len() + 1,
+        "speculative_accept_sparse: target must cover every drafted position plus the bonus slot"
+    );
+
+    let mut accepted: Vec<u32> = Vec::with_capacity(draft.len());
+    for i in 0..draft.len() {
+        let token = draft[i];
+        let q = dists[i].prob_of(token);
+        let p = target[i].prob_of(token);
+
+        // `u * q <= p` is `u <= p/q` without dividing by a q that the
+        // drafter may have left at zero.
+        if q > 0.0 && rng.next_f32() * q <= p {
+            accepted.push(token);
+            continue;
+        }
+
+        let corrected = sample_residual_sparse(&dists[i], &target[i], rng);
+        return AcceptDecision {
+            accepted,
+            corrected: Some(corrected),
+        };
+    }
+
+    // Whole block accepted: the bonus slot is a plain target sample.
+    let bonus = &target[draft.len()];
+    let corrected = sample_sparse(bonus, rng);
+    AcceptDecision {
+        accepted,
+        corrected: Some(corrected),
+    }
+}
+
+/// Sample `norm(max(0, p_target - q_draft))` over the target's support.
+fn sample_residual_sparse(draft: &SparseDist, target: &SparseDist, rng: &mut Philox4x32) -> u32 {
+    let residual: Vec<f32> = target
+        .ids
+        .iter()
+        .zip(&target.probs)
+        .map(|(&id, &p)| (p - draft.prob_of(id)).max(0.0))
+        .collect();
+    let sum: f32 = residual.iter().sum();
+    if sum <= f32::MIN_POSITIVE {
+        // Target mass is fully covered by the draft (possible when the
+        // two slates coincide and rounding eats the difference): fall
+        // back to the target itself rather than emitting nothing.
+        return sample_sparse(target, rng);
+    }
+    let inv = 1.0 / sum;
+    let idx = sample_from(&residual.iter().map(|v| v * inv).collect::<Vec<_>>(), rng) as usize;
+    target.ids[idx]
+}
+
+fn sample_sparse(dist: &SparseDist, rng: &mut Philox4x32) -> u32 {
+    assert!(
+        !dist.ids.is_empty(),
+        "speculative_accept_sparse: empty target candidate set"
+    );
+    let sum: f32 = dist.probs.iter().sum();
+    let idx = if sum > f32::MIN_POSITIVE {
+        let inv = 1.0 / sum;
+        sample_from(&dist.probs.iter().map(|v| v * inv).collect::<Vec<_>>(), rng) as usize
+    } else {
+        0
+    };
+    dist.ids[idx]
+}
+
 /// Top-level orchestrator. Holds a draft + target speculator and
 /// the lookahead window `n`. `step()` runs one full round and
 /// returns the tokens to append to the running context.
@@ -287,6 +418,80 @@ mod tests {
             total_accepted < 80,
             "divergent distributions should accept rarely; got {total_accepted}/800"
         );
+    }
+
+    fn sparse(ids: &[u32], probs: &[f32]) -> SparseDist {
+        SparseDist {
+            ids: ids.to_vec(),
+            probs: probs.to_vec(),
+        }
+    }
+
+    /// Matching slates → every draft token survives, plus the bonus.
+    #[test]
+    fn sparse_identical_slates_accept_all_plus_bonus() {
+        let slate = sparse(&[7, 8, 9], &[0.8, 0.15, 0.05]);
+        let draft = vec![7u32, 7, 7];
+        let dists = vec![slate.clone(); 3];
+        let target = vec![slate.clone(); 4];
+
+        for seed in 0..100u64 {
+            let mut rng = Philox4x32::new(seed + 1);
+            let d = speculative_accept_sparse(&draft, &dists, &target, &mut rng);
+            assert_eq!(d.accepted, draft, "seed {seed}");
+            // Contract: always n+1 tokens, unlike the dense path.
+            assert_eq!(d.total_tokens(), 4);
+            assert!(target[3].ids.contains(&d.corrected.unwrap()));
+        }
+    }
+
+    /// A rejection may only emit tokens the TARGET still allows —
+    /// letting the residual reach outside the target's slate would
+    /// resurrect tokens its top-k already discarded.
+    #[test]
+    fn sparse_correction_stays_inside_target_support() {
+        // Draft is certain of 100; target never proposes it at all.
+        let draft = vec![100u32];
+        let dists = vec![sparse(&[100], &[1.0])];
+        let target = vec![sparse(&[1, 2], &[0.5, 0.5]), sparse(&[1, 2], &[0.5, 0.5])];
+
+        for seed in 0..200u64 {
+            let mut rng = Philox4x32::new(seed + 1);
+            let d = speculative_accept_sparse(&draft, &dists, &target, &mut rng);
+            // p_target(100) = 0 → the accept test can never pass.
+            assert!(d.accepted.is_empty(), "seed {seed}: 100 must be rejected");
+            let c = d.corrected.unwrap();
+            assert!(c == 1 || c == 2, "seed {seed}: leaked token {c}");
+        }
+    }
+
+    /// The property that makes speculation *free*: the first emitted
+    /// token is distributed exactly as the target would have sampled
+    /// it, however wrong the drafter is.
+    #[test]
+    fn sparse_first_token_matches_target_distribution() {
+        let target_row = sparse(&[10, 11, 12], &[0.6, 0.3, 0.1]);
+        // Drafter is badly miscalibrated and always proposes 12.
+        let draft = vec![12u32];
+        let dists = vec![sparse(&[10, 11, 12], &[0.05, 0.05, 0.9])];
+        let target = vec![target_row.clone(), target_row.clone()];
+
+        let trials = 40_000;
+        let mut counts = [0usize; 3];
+        for seed in 0..trials {
+            let mut rng = Philox4x32::new(seed as u64 + 1);
+            let d = speculative_accept_sparse(&draft, &dists, &target, &mut rng);
+            let first = *d.accepted.first().unwrap_or(&d.corrected.unwrap());
+            counts[(first - 10) as usize] += 1;
+        }
+        for (i, &want) in target_row.probs.iter().enumerate() {
+            let got = counts[i] as f32 / trials as f32;
+            assert!(
+                (got - want).abs() < 0.02,
+                "token {}: target p={want}, sampled {got} over {trials} trials",
+                10 + i
+            );
+        }
     }
 
     /// Mock speculators for end-to-end SpecDecoder basic test.

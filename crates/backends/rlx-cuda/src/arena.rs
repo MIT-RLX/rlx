@@ -477,6 +477,45 @@ pub fn plan_f32_uniform_excluding(
             birth.entry(ri).or_insert(0);
         }
     }
+    // Static weight packs live to graph end.
+    //
+    // A `Concat`/`Cast`/`Expand` over `Param`s — the fused QKV and gate+up
+    // weights the matmul-fusion passes build — is invariant across `run()`s, so
+    // the backend materialises it once and skips it after (see the marking in
+    // `backend/compile.rs`). That is only sound if nothing else is assigned its
+    // slot, which liveness reuse will happily do: a pack dies at its consuming
+    // GEMM, and the very next activation lands on top of it.
+    //
+    // `rlx-compile`'s planner pins these via `extend_static_weight_pack_liveness`,
+    // but THIS planner is CUDA's own and never went through it — so the packs
+    // were being reused, the exclusivity check correctly refused to skip them,
+    // and the optimisation was silently dead on anything past one layer.
+    // Measured on a 28-layer decode-shaped graph: 0 of 140 pack steps qualified
+    // before this, 140 after.
+    //
+    // Costs the packs' bytes in arena residency, which is inherent: skipping the
+    // recompute means keeping the result.
+    // Conditional on the same switch that controls the skip: pinning without
+    // skipping is the worst of both worlds — it pays the residency and buys
+    // nothing. `RLX_STATIC_WEIGHT_PACK=0` gives back the ~940 MB (measured on a
+    // 28-layer decode graph, roughly +67% arena) along with the recompute.
+    if rlx_opt::memory::static_weight_pack_skip_enabled() {
+        let mut memo: HashMap<NodeId, bool> = HashMap::new();
+        for node in nodes {
+            if matches!(
+                node.op,
+                Op::Param { .. } | Op::Constant { .. } | Op::Input { .. }
+            ) {
+                continue;
+            }
+            if !rlx_opt::memory::is_static_weight_tensor(graph, node.id, &mut memo) {
+                continue;
+            }
+            let r = root(node.id);
+            death.entry(r).and_modify(|d| *d = n).or_insert(n);
+        }
+    }
+
     // Elided broadcast (see `Step::BinaryBroadcast`): the CUDA backend folds an
     // `Op::Expand` that feeds only `Op::Binary` into a stride-aware read of the
     // Expand's *input* at the Binary. That input must therefore stay live as long

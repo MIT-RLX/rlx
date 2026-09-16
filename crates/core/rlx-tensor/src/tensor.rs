@@ -430,19 +430,38 @@ impl Tensor {
         crate::array::cat(&[&tail, &head], axis)
     }
 
+    /// A constant filled with `value`, built on *this* tensor's graph.
+    ///
+    /// [`Tensor::full`] starts a fresh graph and [`crate::array::cat`] adopts
+    /// into its *first* operand, so padding a traced value with a standalone
+    /// constant would migrate the whole downstream chain off the graph being
+    /// traced — and the next `GraphScope` call, which does not adopt, would
+    /// then index it with a stale id.
+    fn full_on(&self, dims: &[usize], value: f32) -> Tensor {
+        let n: usize = dims.iter().product();
+        let bytes: Vec<u8> = std::iter::repeat_n(value, n)
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let shape = Shape::new(dims, DType::F32);
+        let id = self
+            .handle
+            .with_graph(|g| g.add_node(Op::Constant { data: bytes }, vec![], shape));
+        Self::new(self.handle.clone(), id)
+    }
+
     /// Pad `axis` with `before`/`after` entries of `value` (constant pad).
     pub fn pad(&self, axis: usize, before: usize, after: usize, value: f32) -> Tensor {
         let mut parts: Vec<Tensor> = Vec::new();
         if before > 0 {
             let mut d = self.dims();
             d[axis] = before;
-            parts.push(Tensor::full(&d, value));
+            parts.push(self.full_on(&d, value));
         }
         parts.push(self.clone());
         if after > 0 {
             let mut d = self.dims();
             d[axis] = after;
-            parts.push(Tensor::full(&d, value));
+            parts.push(self.full_on(&d, value));
         }
         let refs: Vec<&Tensor> = parts.iter().collect();
         crate::array::cat(&refs, axis)
@@ -642,6 +661,52 @@ impl Tensor {
             return self.clone();
         }
         self.sum((0..r).collect::<Vec<usize>>(), false)
+    }
+
+    /// 2-D pooling over NCHW (`Op::Pool`). Channels pass through; only the two
+    /// spatial axes shrink, by the rule convolution uses with dilation 1.
+    ///
+    /// `kind` selects the reduction — [`ReduceOp::Max`] and [`ReduceOp::Mean`]
+    /// are the ones backends lower.
+    pub fn pool2d(
+        &self,
+        kind: ReduceOp,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Self {
+        let id = self
+            .handle
+            .with_graph(|g| g.pool2d(self.id, kind, kernel_size, stride, padding));
+        Self::new(self.handle.clone(), id)
+    }
+
+    /// Max pooling over NCHW — [`pool2d`](Self::pool2d) with [`ReduceOp::Max`].
+    ///
+    /// ```no_run
+    /// # use rlx_tensor::Tensor;
+    /// # fn f(x: &Tensor) -> Tensor {
+    /// // `[N, C, H, W]` -> halve H with a width-3 window
+    /// x.max_pool2d([3, 1], [2, 1], [0, 0])
+    /// # }
+    /// ```
+    pub fn max_pool2d(
+        &self,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Self {
+        self.pool2d(ReduceOp::Max, kernel_size, stride, padding)
+    }
+
+    /// Average pooling over NCHW — [`pool2d`](Self::pool2d) with [`ReduceOp::Mean`].
+    pub fn avg_pool2d(
+        &self,
+        kernel_size: [usize; 2],
+        stride: [usize; 2],
+        padding: [usize; 2],
+    ) -> Self {
+        self.pool2d(ReduceOp::Mean, kernel_size, stride, padding)
     }
 
     pub fn conv2d(

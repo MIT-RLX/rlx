@@ -10,6 +10,8 @@ use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn build_bshd_attn(b: usize, s: usize, nh: usize, dh: usize) -> Graph {
     let f = DType::F32;
     let mut g = Graph::new("bshd_attn");
@@ -73,6 +75,7 @@ fn deterministic_inputs(
 
 #[test]
 fn cpu_bshd_rank4_reference() {
+    let _gpu = common::serialize_gpu();
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let (q, k, v) = deterministic_inputs(b, s, nh, dh);
     let out = run(Device::Cpu, b, s, nh, dh, &q, &k, &v);
@@ -84,7 +87,8 @@ macro_rules! gpu_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !rlx_runtime::is_available($dev) {
+            let _gpu = common::serialize_gpu();
+            if common::skip_unless($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

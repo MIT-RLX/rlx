@@ -13,11 +13,47 @@ android/
   app/                  # Gradle application (Kotlin)
 ```
 
+## Distributed node demo
+
+Beyond the local-inference demo, the app can join an RLX mesh as a **worker
+rank** — tap *Distributed node…* on the main screen.
+
+Start the desktop coordinator:
+
+```sh
+cargo run -p rlx-ffi --example node_coordinator -- --world 2 --peers <host-ip>:29500
+```
+
+Then on the handset enter rank `1`, world `2`, and that `<host-ip>:29500` as
+the coordinator. A worker only needs the coordinator's address — it dials out,
+and nothing dials it back.
+
+**From an emulator, the host is `10.0.2.2`, not `127.0.0.1`** — the emulator's
+loopback is its own.
+
+Verify the desktop half alone first:
+
+```sh
+cargo run -p rlx-ffi --example node_coordinator -- --world 2 --self-test
+```
+
+Two Android-specific requirements, both already wired in this app:
+
+- `INTERNET` for peer sockets, and `CHANGE_WIFI_MULTICAST_STATE` +
+  `ACCESS_WIFI_STATE` for UDP discovery. Android drops multicast/broadcast at
+  the Wi-Fi chipset unless a `MulticastLock` is held, so discovery silently
+  finds no peers without it — `RlxNode.start(discovery = true)` takes the lock.
+- `NodeActivity.onStop` tears the node down. Android suspends a backgrounded
+  process, and **a suspended rank stalls every peer waiting on it** — the mesh
+  has no timeout that rescues you.
+
 ## Prerequisites
 
 - Rust stable + `aarch64-linux-android` target
 - Android NDK (r26+; r27 recommended) via Android Studio or the SDK Manager
 - Android Studio Ladybug (2024.2+) or Gradle 8.7+ for the APK build
+- A JDK 17 and the Android SDK. With the Homebrew command-line tools:
+  `ANDROID_HOME=$(brew --prefix)/share/android-commandlinetools JAVA_HOME=$(brew --prefix openjdk@17) ./gradlew assembleDebug`
 - Physical **arm64** device or emulator with API 26+ (Vulkan optional)
 
 Set one of:

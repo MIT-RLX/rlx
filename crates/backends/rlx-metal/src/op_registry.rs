@@ -182,7 +182,7 @@ impl MetalKernel for OnnxHostDelegate {
         output: (&mut [u8], &Shape),
         attrs: &[u8],
     ) -> Result<(), String> {
-        if std::env::var("RLX_DBG_CUSTOM").is_ok() {
+        if rlx_ir::env::var("RLX_DBG_CUSTOM").is_some() {
             eprintln!(
                 "[custom] {} in={:?} out={:?}",
                 self.name,
@@ -246,7 +246,7 @@ pub struct MetalGpuDispatch<'a> {
 /// Register under the same `name` used in `Op::Custom` / `OpExtension::name`; a
 /// registered GPU kernel takes **precedence** over a host-delegate `MetalKernel`
 /// of the same name. Compile a `ComputePipelineState` once (e.g. behind a
-/// `OnceLock`) via [`crate::metal_device`] +
+/// `OnceLock`) via [`crate::device::metal_device`] +
 /// [`crate::pipeline_cache::load_or_compile_library`], then bind + dispatch in
 /// `encode`.
 pub trait MetalGpuKernel: Send + Sync + std::fmt::Debug {

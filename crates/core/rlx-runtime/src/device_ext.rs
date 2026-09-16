@@ -28,6 +28,7 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::Ane,
     Device::Hexagon,
     Device::Xdna,
+    Device::Egpu,
     Device::Gpu,
     Device::Vulkan,
     Device::DirectX,
@@ -102,6 +103,7 @@ pub fn feature_compiled(device: Device) -> bool {
         Device::Cuda => cfg!(feature = "cuda"),
         Device::Rocm => cfg!(feature = "rocm"),
         Device::Xdna => cfg!(feature = "xdna"),
+        Device::Egpu => cfg!(feature = "egpu"),
         Device::OneApi => cfg!(feature = "oneapi"),
         Device::Tpu => cfg!(feature = "tpu"),
         Device::Hexagon => cfg!(feature = "qnn"),
@@ -129,6 +131,14 @@ pub fn is_available(device: Device) -> bool {
     #[cfg(feature = "xdna")]
     if device == Device::Xdna {
         return rlx_xdna::is_available();
+    }
+    // The eGPU is gated the same way: the PCIe tunnel enumerating a supported
+    // card is not enough — rlx_egpu::is_available() additionally requires the
+    // device-bring-up path, so a discovered-but-undriveable card never becomes
+    // a dispatch target. See `detected_unavailable_devices`.
+    #[cfg(feature = "egpu")]
+    if device == Device::Egpu {
+        return rlx_egpu::is_available();
     }
     #[cfg(feature = "gpu")]
     if device == Device::Gpu {
@@ -202,6 +212,8 @@ pub fn is_available(device: Device) -> bool {
         // Only reached when the `xdna` feature is OFF (the probe above owns the
         // feature-ON case): no backend compiled in → unavailable.
         Device::Xdna => false,
+        // Same as XDNA: only reached with the `egpu` feature OFF.
+        Device::Egpu => false,
         Device::OneApi => cfg!(feature = "oneapi"),
         Device::Tpu => cfg!(feature = "tpu"),
         Device::Hexagon => cfg!(feature = "qnn"),
@@ -254,6 +266,10 @@ pub fn detected_unavailable_devices() -> Vec<(Device, String)> {
     if rlx_xdna::hardware_present() && !is_available(Device::Xdna) {
         out.push((Device::Xdna, rlx_xdna::diagnostic()));
     }
+    #[cfg(feature = "egpu")]
+    if rlx_egpu::hardware_present() && !is_available(Device::Egpu) {
+        out.push((Device::Egpu, rlx_egpu::diagnostic()));
+    }
     out
 }
 
@@ -279,7 +295,7 @@ pub fn devices_for(graph: &Graph) -> Vec<Device> {
 
 /// Highest-priority backend that is compiled in and live on this host.
 ///
-/// Probes [`DEVICE_PRIORITY`] in order (TPU → CUDA → ROCm → MLX → Metal → …
+/// Probes `DEVICE_PRIORITY` in order (TPU → CUDA → ROCm → MLX → Metal → …
 /// → CPU). Use this when you want a sensible default `Session` target without
 /// building a graph first. For workload-specific selection, prefer
 /// [`crate::cost::fastest_device_for`].
@@ -287,7 +303,7 @@ pub fn fastest_device() -> Device {
     fastest_among(&available_devices())
 }
 
-/// Pick the highest-priority entry from `candidates` (see [`DEVICE_PRIORITY`]).
+/// Pick the highest-priority entry from `candidates` (see `DEVICE_PRIORITY`).
 pub fn fastest_among(candidates: &[Device]) -> Device {
     for &d in DEVICE_PRIORITY {
         if candidates.contains(&d) {
@@ -348,7 +364,7 @@ pub fn supports(device: Device, op: &Op) -> bool {
         Device::Mlx => mlx_supports(op),
         Device::Metal => metal_supports(op),
         Device::Ane => coreml_supports(op),
-        Device::Gpu | Device::Cuda | Device::Rocm => gpu_family_supports(op),
+        Device::Gpu | Device::Cuda | Device::Rocm => gpu_family_supports(device, op),
         #[cfg(feature = "vulkan")]
         Device::Vulkan => vulkan_supports(op),
         #[cfg(feature = "oneapi")]
@@ -457,7 +473,7 @@ fn oneapi_supports(op: &Op) -> bool {
 /// Is every op in `graph` lowerable by `device`?
 ///
 /// When a backend is registered, uses the same rewrite + legalization probe as
-/// [`legalize_graph_for_device`] (see [`KernelDispatchReport::compile_ready`]).
+/// [`legalize_graph_for_device`] (see [`KernelDispatchReport::compile_ready`](rlx_compile::KernelDispatchReport::compile_ready)).
 /// Otherwise falls back to per-op [`supports`] heuristics.
 pub fn supports_graph(device: Device, graph: &Graph) -> bool {
     supports_graph_with_options(device, graph, &CompileOptions::default())
@@ -484,9 +500,9 @@ pub fn supports_graph_with_options(
     graph.nodes().iter().all(|n| supports(device, &n.op))
 }
 
-/// Legalize `graph` for `device` using that backend's claimed [`OpKind`] set.
+/// Legalize `graph` for `device` using that backend's claimed `OpKind` set.
 ///
-/// Applies the same rewrite + legalization path as [`Backend::compile`] (e.g.
+/// Applies the same rewrite + legalization path as `Backend::compile` (e.g.
 /// CUDA/ROCm rewrites before the legality check). Returns an error when the
 /// backend feature is not enabled or the graph contains unsupported ops.
 ///
@@ -497,7 +513,7 @@ pub fn legalize_graph_for_device(graph: Graph, device: Device) -> Result<Graph, 
     Ok(graph)
 }
 
-/// Like [`legalize_graph_for_device`] but returns a [`KernelDispatchReport`] for tooling.
+/// Like [`legalize_graph_for_device`] but returns a [`KernelDispatchReport`](rlx_compile::KernelDispatchReport) for tooling.
 pub fn legalize_graph_for_device_with_report(
     graph: Graph,
     device: Device,
@@ -506,7 +522,7 @@ pub fn legalize_graph_for_device_with_report(
 }
 
 /// Like [`legalize_graph_for_device_with_report`] using [`CompileOptions::kernel_dispatch`]
-/// (and the same rewrite path as [`Backend::compile`]).
+/// (and the same rewrite path as `Backend::compile`).
 pub fn legalize_graph_for_device_with_options(
     graph: Graph,
     device: Device,
@@ -666,12 +682,29 @@ fn coreml_supports(op: &Op) -> bool {
 }
 
 #[allow(unused_variables)]
-fn gpu_family_supports(op: &Op) -> bool {
-    // CUDA / ROCm / wgpu share the same IR surface area as CPU for the
-    // ops V-JEPA2 and other vision models exercise. Narrow when a backend
-    // reports a concrete lowering gap.
-    let _ = op;
-    true
+fn gpu_family_supports(device: Device, op: &Op) -> bool {
+    // These used to answer `true` for everything, on the grounds that CUDA /
+    // ROCm / wgpu cover the same IR surface as CPU for vision workloads. That
+    // makes `supports` useless for deciding anything: `Op::GatedDeltaNetBackward`
+    // is claimed by neither CUDA nor ROCm, and a caller that trusted the `true`
+    // got `backend "cuda" doesn't claim support for 1 op kind(s)` at compile
+    // time instead of a chance to pick a fallback.
+    //
+    // The per-backend `SUPPORTED_OPS` lists are authoritative — they are what
+    // `legalize_or_rewrite_for_backend` and the compiler's own check consult —
+    // so answer from them. A backend whose feature is off keeps the permissive
+    // answer, since there is no list to consult and nothing will dispatch there.
+    let kind = op.kind();
+    let _ = kind;
+    match device {
+        #[cfg(feature = "cuda")]
+        Device::Cuda => rlx_cuda::SUPPORTED_OPS.contains(&kind),
+        #[cfg(feature = "rocm")]
+        Device::Rocm => rlx_rocm::SUPPORTED_OPS.contains(&kind),
+        #[cfg(feature = "gpu")]
+        Device::Gpu => rlx_wgpu::SUPPORTED_OPS.contains(&kind),
+        _ => true,
+    }
 }
 
 /// Block until `device`'s queue is idle. Metal drains the global queue;

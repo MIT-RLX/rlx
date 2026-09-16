@@ -9,6 +9,8 @@
 use rlx_ir::{DType, Graph, ScatterNdReduction, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn run_scatter_elements(device: Device) -> Vec<f32> {
     let mut g = Graph::new("sel");
     let data = g.input("data", Shape::new(&[2, 4], DType::F32));
@@ -63,6 +65,7 @@ fn run_gather_elements(device: Device) -> Vec<f32> {
 
 #[test]
 fn scatter_elements_none_cpu() {
+    let _gpu = common::serialize_gpu();
     let out = run_scatter_elements(Device::Cpu);
     // Row0: cols 0,2 overwritten by 10,30 (and again 30,40 → last write wins)
     // indices row0 = [0,2,0,2] updates [10,20,30,40] → col0=30, col2=40
@@ -79,12 +82,14 @@ fn scatter_elements_none_cpu() {
 
 #[test]
 fn gather_nd_cpu() {
+    let _gpu = common::serialize_gpu();
     let out = run_gather_nd(Device::Cpu);
     assert_eq!(out, vec![2.0, 3.0, 6.0, 7.0]);
 }
 
 #[test]
 fn gather_elements_cpu() {
+    let _gpu = common::serialize_gpu();
     let out = run_gather_elements(Device::Cpu);
     // data = [[1,2,3,4],[5,6,7,8]], axis=1
     // idx row0 [0,2,1,3] → [1,3,2,4]; row1 [1,0,3,2] → [6,5,8,7]
@@ -94,6 +99,7 @@ fn gather_elements_cpu() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn indexing_ops_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     assert_eq!(
         run_scatter_elements(Device::Cpu),
         run_scatter_elements(Device::Metal)

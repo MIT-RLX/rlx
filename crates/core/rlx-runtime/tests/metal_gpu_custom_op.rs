@@ -16,6 +16,8 @@ use rlx_ir::{DType, Graph, OpExtension, Shape, register_op};
 use rlx_metal::op_registry::{MetalGpuDispatch, MetalGpuKernel, register_metal_gpu_kernel};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 /// IR-level extension: shape inference for `test.times_three_gpu` (identity).
 struct TimesThreeIr;
 impl OpExtension for TimesThreeIr {
@@ -94,6 +96,7 @@ impl MetalGpuKernel for TimesThreeMetal {
 
 #[test]
 fn times_three_runs_on_metal_via_raw_gpu_kernel() {
+    let _gpu = common::serialize_gpu();
     register_op(Arc::new(TimesThreeIr));
     register_metal_gpu_kernel(Arc::new(TimesThreeMetal));
 

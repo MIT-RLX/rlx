@@ -588,7 +588,7 @@ fn derive_key(seed: &[u8], rank: u32) -> [u8; 32] {
 /// - `RANK`, `WORLD` — this rank / total ranks (required).
 /// - `RLX_IROH_SEED=<hex>` — a shared seed; per-rank keys are derived
 ///   deterministically so every rank knows every [`EndpointId`] from the seed
-///   alone. The zero-config path (see [`derive_key`] for the trust caveat).
+///   alone. The zero-config path (see `derive_key` for the trust caveat).
 /// - `RLX_IROH_PEERS=<id>,<id>,…` — OR: each rank's `EndpointId` (hex),
 ///   indexed by rank; then also set `RLX_IROH_SECRET=<64-hex>` to this rank's
 ///   secret (whose public id must equal `PEERS[RANK]`).

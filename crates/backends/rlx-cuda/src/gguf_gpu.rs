@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
-    dequant_gguf_kernel, dequant_matmul_gguf_kernel, dequant_matmul_gguf_q1_gemv_kernel,
+    dequant_gguf_kernel, dequant_matmul_gguf_g8_gemv_kernel, dequant_matmul_gguf_kernel,
+    dequant_matmul_gguf_q1_gemv_kernel, dequant_matmul_gguf_q2_gemv_kernel,
     dequant_matmul_gguf_q4k_gemv_kernel, dequant_matmul_gguf_q4k_gemv_warp_kernel,
     matmul_bt_kernel, matmul_bt_tma_kernel,
 };
@@ -86,8 +87,12 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     max
 }
 
-/// Fused on-device GEMV for decode (`m == 1`) on Q4_K / Q6_K / Q1_0 —
-/// matches rlx-vulkan `dequant_matmul` and rlx-cpu `gguf_matmul_bt`.
+/// Fused on-device GEMV for decode (`m == 1`) on Q4_K / Q6_K / Q1_0 / Q2_0 /
+/// G8_0 — matches rlx-vulkan `dequant_matmul` and rlx-cpu `gguf_matmul_bt`.
+///
+/// Membership here is load-bearing twice over: it selects the scratch-free
+/// kernel *and* tells [`dequant_gguf_scratch_bytes`] not to reserve an
+/// `[n, k]` f32 slab for the op.
 pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool {
     if m != 1 {
         return false;
@@ -97,12 +102,16 @@ pub fn gguf_fused_gemv_m1_supported(scheme_id: u32, m: usize, k: usize) -> bool 
         0 | 2 => k.is_multiple_of(256),
         // Q1_0 (Bonsai): 128-elem blocks
         24 => k.is_multiple_of(128),
+        // Q2_0 (Ternary-Bonsai / Pestle factors): 128-elem blocks
+        25 => k.is_multiple_of(128),
+        // G8_0 (Pestle token_embd / lm_head): 32-elem blocks
+        28 => k.is_multiple_of(32),
         _ => false,
     }
 }
 
 /// Launch fused GGUF GEMV (`m == 1`) — one thread per output column for
-/// Q4_K/Q6_K; cooperative block-per-row for Q1_0.
+/// Q4_K/Q6_K; cooperative block-per-row for Q1_0 / Q2_0 / G8_0.
 pub fn run_dequant_matmul_gguf_gemv_m1(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
@@ -145,6 +154,44 @@ pub fn run_dequant_matmul_gguf_gemv_m1(
             launcher
                 .launch(cfg)
                 .expect("rlx-cuda: dequant_matmul_gguf_q1_gemv launch failed");
+        }
+        return;
+    }
+
+    // Q2_0 / G8_0: same cooperative block-per-row shape as Q1_0. Being
+    // scratch-free is the point as much as the speed — the alternative path
+    // materializes the whole [n, k] weight as f32, and Pestle's 248320-row
+    // lm_head is a 5.1 GiB slab that does not fit beside the packed weights
+    // on a 16 GiB card.
+    if scheme_id == 25 || scheme_id == 28 {
+        let kernel = if scheme_id == 25 {
+            dequant_matmul_gguf_q2_gemv_kernel(ctx)
+        } else {
+            dequant_matmul_gguf_g8_gemv_kernel(ctx)
+        };
+        let block = 128u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_u = n as u64;
+        let k_u = k as u64;
+        let x_u = x_off as u64;
+        let w_u = w_byte_off as u64;
+        let out_u = out_off as u64;
+        let mut launcher = stream.launch_builder(&kernel.function);
+        launcher
+            .arg(&mut *buffer)
+            .arg(&n_u)
+            .arg(&k_u)
+            .arg(&x_u)
+            .arg(&w_u)
+            .arg(&out_u);
+        unsafe {
+            launcher
+                .launch(cfg)
+                .expect("rlx-cuda: fused Q2_0/G8_0 GEMV launch failed");
         }
         return;
     }

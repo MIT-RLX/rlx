@@ -57,6 +57,8 @@ pub(crate) fn launch_rope_bwd(
     sin_off: u32,
     dx_off: u32,
     cos_len: u32,
+    cos_row_stride: u32,
+    interleaved: bool,
 ) {
     let total = batch * seq * hidden;
     let kernel = rope_backward_kernel(ctx);
@@ -66,6 +68,7 @@ pub(crate) fn launch_rope_bwd(
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
+    let interleaved_u: u32 = interleaved as u32;
     let mut launcher = stream.launch_builder(&kernel.function);
     launcher
         .arg(buffer)
@@ -78,7 +81,9 @@ pub(crate) fn launch_rope_bwd(
         .arg(&cos_off)
         .arg(&sin_off)
         .arg(&dx_off)
-        .arg(&cos_len);
+        .arg(&cos_len)
+        .arg(&cos_row_stride)
+        .arg(&interleaved_u);
     unsafe {
         launcher
             .launch(cfg)

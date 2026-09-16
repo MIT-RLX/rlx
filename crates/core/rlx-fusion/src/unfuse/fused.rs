@@ -87,31 +87,43 @@ pub(super) fn unfuse_fused_conv_bias_act(
         let y_shape = node.shape.clone(); // [N, C_out, H_out, W_out]
         let dtype = y_shape.dtype();
 
-        let y0 = out.conv2d(
-            in_x,
-            in_w,
-            [kernel_size[0], kernel_size[1]],
-            [stride[0], stride[1]],
-            [padding[0], padding[1]],
-            [dilation[0], dilation[1]],
-            *groups,
-        );
+        // 2D and 3D both reach here. The op's fields are already rank-generic
+        // vectors; only this decomposition assumed four dimensions, which made
+        // an otherwise-portable fused conv3d panic in `conv2d` shape inference
+        // the moment any backend declined to claim it.
+        let spatial = kernel_size.len();
+        let y0 = if spatial == 3 {
+            out.conv3d(
+                in_x,
+                in_w,
+                [stride[0], stride[1], stride[2]],
+                [padding[0], padding[1], padding[2]],
+                [dilation[0], dilation[1], dilation[2]],
+                *groups,
+            )
+        } else {
+            out.conv2d(
+                in_x,
+                in_w,
+                [kernel_size[0], kernel_size[1]],
+                [stride[0], stride[1]],
+                [padding[0], padding[1]],
+                [dilation[0], dilation[1]],
+                *groups,
+            )
+        };
 
-        // bias [C_out] → [1, C_out, 1, 1].
+        // bias [C_out] → [1, C_out, 1, 1(, 1)].
         let c_out = match y_shape.dim(1) {
             Dim::Static(n) => n,
             _ => panic!("FusedConvBiasAct unfuse: dynamic channel dim"),
         };
-        let b4_shape = IrShape::from_dims(
-            &[
-                Dim::Static(1),
-                Dim::Static(c_out),
-                Dim::Static(1),
-                Dim::Static(1),
-            ],
-            dtype,
-        );
-        let b4 = out.reshape(in_b, vec![1, c_out as i64, 1, 1], b4_shape);
+        let mut b_dims = vec![Dim::Static(1), Dim::Static(c_out)];
+        b_dims.extend(std::iter::repeat_n(Dim::Static(1), spatial));
+        let b4_shape = IrShape::from_dims(&b_dims, dtype);
+        let mut b_i64 = vec![1i64, c_out as i64];
+        b_i64.extend(std::iter::repeat_n(1i64, spatial));
+        let b4 = out.reshape(in_b, b_i64, b4_shape);
 
         let be = out.add_node(
             Op::Expand {

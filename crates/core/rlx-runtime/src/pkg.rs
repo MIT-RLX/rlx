@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Load `.rlxp` packages into a [`Session`](crate::Session).
+//! Load `.rlxp` packages into a [`Session`].
 //!
 //! ```ignore
 //! let compiled = rlx_runtime::pkg::compile_rlxp(&session, "model.rlxp")?;

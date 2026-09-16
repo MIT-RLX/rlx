@@ -49,8 +49,8 @@
 #      before issuing the next publish. After the last crate of a
 #      tier the loop additionally sleeps `BETWEEN_DELAY` to let
 #      downstream crates' dep resolution catch up.
-#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer,
-#      rlx-opscope) are skipped automatically by cargo — this script lists
+#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer) are
+#      skipped automatically by cargo — this script lists
 #      the rest. Keep the `SKIPPED` array below in sync with them:
 #      `validate_tier_coverage` requires every workspace member to be either
 #      in a tier or in `SKIPPED`.
@@ -123,7 +123,8 @@ LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
 SKIPPED=(
     pyrlx
     rlx-cortexm-trainer
-    rlx-opscope
+    rlx-corpus
+    rlx-megakernel
 )
 
 # Tier definitions. Each array entry is a single tier; space-separated
@@ -165,7 +166,8 @@ SKIPPED=(
 # rlx-hwprofile / rlx-onnx-proto are dep-free leaves (tier 0). rlx-gpu-host
 # (rlx-cpu/rlx-ir/rlx-compile) is consumed by the GPU backends, so it sits in
 # the backend tier right after rlx-cpu and before rlx-cuda/rlx-rocm/rlx-wgpu.
-# rlx-check (rlx-runtime) follows runtime.
+# rlx-check (rlx-runtime) follows runtime. rlx-ffi (rlx-runtime) rides the
+# same tier; its rlx-autodiff dev-dep is path-only so publish never resolves it.
 # New-crate placements (all pinned to the workspace version):
 #   rlxsl (rlx-ir) is a BUILD-dependency of rlx-gpu-kernels (tier 0) and the
 #     GPU backends, so it rides tier 0 *before* rlx-gpu-kernels. Its dir has no
@@ -179,20 +181,31 @@ SKIPPED=(
 #   rlx-distributed (rlx-ir/rlx-runtime/rlx-driver) follows runtime → tier 8.
 #   rlx-geo (opt rlx-ir/rlx-cpu/rlx-wgpu) and rlx-bake (rlx-compile/rlx-pkg/opt
 #     rlx-onnx-import+rlx-runtime) both need the backend/onnx tiers → tier 9.
-#   rlx-opscope is publish=false (dev/profiling tool) → SKIPPED, not a tier.
+#   rlx-gpu-dispatch (no deps) must precede rlx-gpu-kernels, which now depends
+#     on it, and precedes every GPU backend — Metal and wgpu take the dispatch
+#     table without the CUDA/HIP sources. Same tier 0, listed first.
+#   rlx-rng has NO dependencies at all (not even rlx-ir) → tier 0. rlx-peft
+#     depends on rlx-ir + rlx-runtime (+ a rlx-cpu dev-dep) → tier 8. It briefly
+#     carried an rlx-linalg dependency that no source file ever imported, which
+#     would have pinned it a tier lower for nothing.
+#   rlx-opscope now publishes (tier 9, after rlx-runtime). It was publish=false,
+#     which forced seven rlx-models crates onto a cross-workspace
+#     `path = "../../../rlx/…"` dev-dependency — and since Cargo resolves
+#     dev-dependencies at lock time regardless of features, that made a sibling
+#     `rlx` checkout mandatory just to load that workspace.
 TIERS=(
-    "rlx-ir rlxsl rlx-gguf rlx-nemo rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub"
+    "rlx-ir rlxsl rlx-gguf rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng"
     "rlx-unfuse rlx-flow rlx-fusion rlx-driver rlx-mlx-io"
     "rlx-autodiff rlx-extend rlx-pkg"
     "rlx-compile"
     "rlx-opt"
-    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl rlx-xdna"
+    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl rlx-xdna rlx-egpu"
     "rlx-metal"
     "rlx-collectives rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web rlx-check rlx-distributed"
+    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web rlx-check rlx-ffi rlx-distributed rlx-opscope rlx-peft"
     "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance rlx-geo rlx-bake"
     "rlx-onnx"
-    "rlx-fdm rlx-bench"
+    "rlx-fdm rlx-lbm rlx-bench"
     "rlx-rl"
     "rlx"
 )

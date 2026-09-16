@@ -16,8 +16,10 @@
 //! with a cheaper equivalent (or removes it) based on what its data actually does
 //! — saving space, time, and bandwidth while holding precision.
 //!
-//!   opscope-actions              # synthetic diverse model demo
-//!   opscope-actions <dir>        # recommend actions for every *.tensor in <dir>
+//! ```text
+//! opscope-actions              # synthetic diverse model demo
+//! opscope-actions <dir>        # recommend actions for every *.tensor in <dir>
+//! ```
 
 use rlx_opscope::layers::{Decomp, LayerProfile, profile_layer};
 use rlx_opscope::probe::{block_identity_gap, load_tensor};

@@ -1,9 +1,9 @@
 # Contributing to RLX
 
 Thanks for your interest in RLX. This file is the short version; the deeper
-guide is [`docs/development.md`](docs/development.md), the agent-facing
-conventions live in [`AGENTS.md`](AGENTS.md), and every crate has its own
-`README.md` documenting its public surface, build commands, and gotchas.
+guide is [`docs/development.md`](docs/development.md), and every crate has
+its own `README.md` documenting its public surface, build commands, and
+gotchas.
 
 By participating you agree to abide by our
 [Code of Conduct](CODE_OF_CONDUCT.md).
@@ -30,8 +30,9 @@ just install-git-hooks   # cargo fmt --all (re-stages fixed files) + clippy
 Backends are feature-gated and auto-detected — you build only what your hardware
 supports. On Apple Silicon the primary path is `cpu` + `metal` (optional `mlx`);
 CUDA/ROCm/TPU/wgpu/Vulkan and the Cortex-M / FPGA products live behind their own
-features. See [`AGENTS.md`](AGENTS.md#backend-notes) and each backend crate's
-`README.md` for the specifics.
+features. See each backend crate's `README.md` for the specifics, and
+[`docs/backend-selection.md`](docs/backend-selection.md) for how the runtime
+picks between them.
 
 ## Ground rules
 
@@ -125,9 +126,9 @@ rounds and validation on hardware you don't have. If a PR goes quiet, a polite
 nudge after about a week is welcome.
 
 **Vocabulary.** A short list of words is avoided in RLX-authored text — code,
-comments, docs, and identifiers alike. See the *Forbidden vocabulary* section of
-[`AGENTS.md`](AGENTS.md#forbidden-vocabulary) for the list and preferred
-replacements; if a contribution trips it, a maintainer will suggest a reword —
+comments, docs, and identifiers alike. Broadly: prefer the measured claim over
+the promotional one, and name what something *does* rather than how impressive
+it is. If a contribution trips the list, a maintainer will suggest a reword —
 it won't block a merge on its own.
 
 ## Reporting bugs & security

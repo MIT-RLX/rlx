@@ -1,0 +1,64 @@
+#version 450
+// amax -> scale for Op::ScaledQuantScale, any format / scale layout.
+// Codec + arena helpers are injected (see `lowp_codec.inc`).
+//
+// Per-tensor writes one f32; block modes write one scale BYTE per block, and
+// each invocation owns a whole 4-byte word (naga's GLSL front end has no
+// atomicCompSwap, so a per-byte RMW would race — same reason quantize_i8.comp
+// uses a word-owner launch).
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint x_off;             // tagged f32-word offset of x
+    uint scale_off;         // tagged word offset of the scale tensor
+    uint rows;
+    uint cols;
+    uint fmt;
+    uint scale_mode;        // 0 per-tensor f32, 1 block E8M0, 2 NVFP4 E4M3
+    uint block;
+} pc;
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    float maxf = rlx_max_finite(pc.fmt);
+
+    if (pc.scale_mode == 0u) {
+        if (t != 0u) { return; }
+        float amax = 0.0;
+        uint n = pc.rows * pc.cols;
+        for (uint i = 0u; i < n; ++i) {
+            amax = max(amax, abs(arena_load_f(pc.x_off + i)));
+        }
+        arena_store_f(pc.scale_off, (amax > 0.0) ? rlx_div_rn(amax, maxf) : 1.0);
+        return;
+    }
+
+    uint nblk = (pc.cols + pc.block - 1u) / pc.block;
+    uint total = pc.rows * nblk;
+    uint words = (total + 3u) / 4u;
+    if (t >= words) { return; }
+
+    // Bytes past the end of the scale tensor may belong to whatever the planner
+    // placed next, so carry them through untouched.
+    uint existing = arena_load_u(pc.scale_off + t);
+    uvec4 out_bytes = uvec4(0u);
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint idx = t * 4u + lane;
+        if (idx >= total) {
+            out_bytes[lane] = (existing >> (lane * 8u)) & 0xFFu;
+            continue;
+        }
+        uint r = idx / nblk;
+        uint b = idx % nblk;
+        uint lo = b * pc.block;
+        uint hi = min(lo + pc.block, pc.cols);
+        float amax = 0.0;
+        for (uint c = lo; c < hi; ++c) {
+            amax = max(amax, abs(arena_load_f(pc.x_off + r * pc.cols + c)));
+        }
+        float s = (amax > 0.0) ? rlx_div_rn(amax, maxf) : 1.0;
+        out_bytes[lane] = (pc.scale_mode == 1u) ? rlx_f32_to_e8m0(s)
+                                                : rlx_encode_lowp(0u, s);
+    }
+    rlx_wr_word(pc.scale_off, t, out_bytes);
+}

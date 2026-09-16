@@ -32,7 +32,20 @@ impl RocmExecutable {
         self.active_extent = extent;
     }
 
+    /// Un-arm the static-weight-pack skip: a param write makes every pack that
+    /// consumes it stale.
+    ///
+    /// Without this, `run(); set_param(w, ..); run()` keeps the FIRST run's
+    /// fused QKV / gate+up pack and the consuming GEMM silently computes with
+    /// the old weights — no error, just a wrong answer. That is the shape of
+    /// every weight-swap workload: a training step, a LoRA merge, quantisation
+    /// re-binding, a sweep harness reusing one executable across weight sets.
+    fn invalidate_static_weight_packs(&mut self) {
+        self.static_once_done = false;
+    }
+
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        self.invalidate_static_weight_packs();
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
         {
@@ -46,6 +59,7 @@ impl RocmExecutable {
     }
 
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
+        self.invalidate_static_weight_packs();
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
         {
@@ -68,6 +82,7 @@ impl RocmExecutable {
     }
 
     pub fn set_param_half(&mut self, name: &str, dtype: HalfDtype, bits: &[u16]) {
+        self.invalidate_static_weight_packs();
         let id = match self.param_offsets.get(name) {
             Some(&id) if self.arena.has(id) => id,
             _ => return,

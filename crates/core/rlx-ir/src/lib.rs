@@ -13,7 +13,7 @@
 //!
 //! - **HIR** ([`hir`]) — block-oriented IR for model builders (`Linear`,
 //!   `SwiGLU`, `ResidualRmsNorm`, …).
-//! - **MIR** ([`mir`]) — fused tensor DAG; input to [`rlx_opt`].
+//! - **MIR** ([`mir`]) — fused tensor DAG; input to `rlx_opt`.
 //! - **LIR** ([`lir`]) — optimized MIR + arena buffer plan for backends.
 //!
 //! [`Graph`] is the primary DX surface. Use [`Graph::define`] for
@@ -38,11 +38,14 @@ pub mod env_catalog;
 pub mod env_registry;
 pub mod equivalence;
 pub mod fft;
+pub mod gdn;
 pub mod graph;
 pub mod hir;
 pub mod infer;
 pub mod infer_shape;
 pub mod inspect;
+pub mod kernel_schedule;
+pub mod lanes;
 pub mod layout;
 pub mod lir;
 pub mod logical_kernel;
@@ -62,6 +65,7 @@ pub mod pretty;
 pub mod provenance;
 pub mod quant;
 pub mod region_encode;
+pub mod repr_check;
 pub mod residual;
 pub mod rng;
 pub mod tensor_inspect;
@@ -71,6 +75,10 @@ pub mod component;
 pub mod hir_extension;
 pub mod reflect;
 pub mod rf;
+/// One constructible `Op` per `OpKind`, for gates that must cover the whole
+/// op set. Feature `test-support`.
+#[cfg(feature = "test-support")]
+pub mod sample_ops;
 #[cfg(feature = "serialize")]
 pub mod serialize;
 pub mod shape;
@@ -112,6 +120,7 @@ pub use equivalence::{
     IgnoreConfig, fingerprint, node_value_key, ops_deep_eq, structural_hash, structurally_eq,
 };
 pub use fft::{FftGpuPlan, FftMeta, FftNorm, fft_meta, fftn_axes_all, normalize_fftn_axes};
+pub use gdn::GdnBackwardLayout;
 pub use graph::{Graph, Node, NodeId};
 pub use hir::{
     FusionPolicy, HirGraphExt, HirModule, HirMut, HirNode, HirNodeId, HirOp,
@@ -170,7 +179,7 @@ pub use serialize::{
     LIR_BIN_VERSION, hir_from_json, hir_to_json, lir_from_bytes, lir_from_json, lir_to_bytes,
     lir_to_json,
 };
-pub use verify::{VerifyError, verify, verify_all, verify_shapes};
+pub use verify::{VerifyError, verify, verify_all, verify_shapes, verify_unique_leaf_names};
 
 /// Lower a HIR module to MIR, then extract the legacy [`Graph`] API surface.
 pub fn hir_to_graph(hir: HirModule) -> Result<Graph, hir::LowerError> {

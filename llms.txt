@@ -8,24 +8,25 @@
 > Metal / MLX / CoreML, NVIDIA CUDA, AMD ROCm, Google TPU, wgpu, native Vulkan,
 > Intel oneAPI, Qualcomm Hexagon / QNN, Cortex-M, FPGA). The user-facing API is
 > `rlx-runtime` (`Session` / `compile` / `execute`); the entry crate is `rlx`
-> (the prelude, default features `cpu` + `tensor`). Concrete model definitions
+> (the prelude; `default = []`, so the consumer picks a backend — e.g.
+> `--features cpu,tensor`). Concrete model definitions
 > live downstream in the sibling `rlx-models` repo.
 
 ## Start here
 
 - [README.md](README.md): overview, install, quickstart, status by area
-- [AGENTS.md](AGENTS.md): instructions for AI agents — conventions, forbidden vocabulary, op checklist
+- [CONTRIBUTING.md](CONTRIBUTING.md): ground rules, PR expectations, vocabulary conventions
 - [docs/README.md](docs/README.md): documentation index
 - [CHANGELOG.md](CHANGELOG.md): per-release feature history
 
 ## Workspace (crates/ grouped by role)
 
-- **core**: `rlx-ir`, `rlx-flow`, `rlx-tensor`, `rlx-fusion`, `rlx-unfuse`, `rlx-autodiff`, `rlx-compile`, `rlx-opt`, `rlx-driver`, `rlx-runtime`, `rlx-optim`, `rlx-collectives`, `rlx-extend`, `rlx-macros`
-- **backends**: `rlx-cpu`, `rlx-metal`, `rlx-mlx`, `rlx-coreml`, `rlx-cuda`, `rlx-rocm`, `rlx-tpu`, `rlx-wgpu`, `rlx-vulkan`, `rlx-oneapi`, `rlx-webgl`, `rlx-qnn`, `rlx-cerebras`, `rlx-cortexm`, `rlx-fpga`, `rlx-gpu-host`, `rlx-gpu-kernels`
-- **io**: `rlx-gguf`, `rlx-gguf-convert`, `rlx-bake`, `rlx-pkg`, `rlx-onnx` (+ `-import` / `-proto` / `-conformance`), `rlx-torch-import`, `rlx-text`, `rlx-nemo`
-- **numerics**: `rlx-linalg`, `rlx-sparse`, `rlx-umap`, `rlx-fdm`, `rlx-bbo`, `rlx-rl`, `rlx-vq`
-- **tooling**: `rlx-bench`, `rlx-check`, `rlx-hwprofile`
-- **bindings**: `pyrlx` (PyO3), `rlx-web` (wasm)
+- **core**: `rlx-ir`, `rlx-flow`, `rlx-tensor`, `rlx-fusion`, `rlx-unfuse`, `rlx-autodiff`, `rlx-compile`, `rlx-opt`, `rlx-driver`, `rlx-runtime`, `rlx-optim`, `rlx-collectives`, `rlx-distributed`, `rlx-extend`, `rlx-macros`
+- **backends**: `rlx-cpu`, `rlx-metal`, `rlx-mlx` (+ `-sys`), `rlx-coreml`, `rlx-cuda`, `rlx-rocm`, `rlx-xdna`, `rlx-tpu`, `rlx-wgpu`, `rlx-vulkan`, `rlx-oneapi`, `rlx-webgl`, `rlx-qnn`, `rlx-egpu`, `rlx-cerebras`, `rlx-cortexm` (+ `-trainer`), `rlx-fpga`, `rlx-gpu-host`, `rlx-gpu-kernels`, `rlx-gpu-dispatch`
+- **io**: `rlx-gguf`, `rlx-gguf-convert`, `rlx-bake`, `rlx-pkg`, `rlx-hub`, `rlx-onnx` (+ `-import` / `-proto` / `-conformance`), `rlx-torch-import`, `rlx-text`, `rlx-nemo`, `rlx-dduf`, `rlx-mlx-io`
+- **numerics**: `rlx-linalg`, `rlx-sparse`, `rlx-umap`, `rlx-geo`, `rlx-fdm`, `rlx-fem`, `rlx-lbm`, `rlx-bbo`, `rlx-rl`, `rlx-vq`, `rlx-peft`, `rlx-rng`
+- **tooling**: `rlx-bench`, `rlx-check`, `rlx-hwprofile`, `rlx-corpus`, `rlx-opscope`, `rlx-megakernel`, `rlxsl`
+- **bindings**: `pyrlx` (PyO3), `rlx-web` (wasm), `rlx-ffi` (C ABI — iOS / embedded nodes)
 - **umbrella**: `rlx` (prelude crate)
 
 Each crate has its own `README.md`. `rlx-mlx-sys/vendor/mlx` is a git submodule — avoid drive-by edits.
@@ -52,4 +53,4 @@ Each crate has its own `README.md`. `rlx-mlx-sys/vendor/mlx` is a git submodule 
 
 - Per-backend peak performance is the north star; core stays application-agnostic; keep diffs minimal.
 - Adding an op touches `rlx-ir` + every backend's `SUPPORTED_OPS` + fusion + an autodiff VJP/JVP + a parity test.
-- Do not introduce the forbidden vocabulary listed in [AGENTS.md](AGENTS.md).
+- Prefer the measured claim over the promotional one; name what code does, not how impressive it is.

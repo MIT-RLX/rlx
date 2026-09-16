@@ -125,3 +125,23 @@ pub struct GgufPackedLinear {
     pub out_dim: usize,
     pub bias: Vec<f32>,
 }
+
+/// A packed **MoE expert bank**: `num_experts` contiguous `[out_dim, in_dim]`
+/// quant slabs in one blob.
+///
+/// The grouped counterpart of [`GgufPackedLinear`], which cannot describe this
+/// because it has no expert count — a 3-D `[E, out, in]` tensor read through
+/// `take_packed` would report `out_dim = E`. Served by
+/// [`WeightSource::take_packed_bank`] and consumed by
+/// `Graph::dequant_grouped_matmul_packed`.
+///
+/// The layout is GGUF's native order for `ffn_*_exps.weight`, so a loader hands
+/// the bytes over untouched.
+#[derive(Debug, Clone)]
+pub struct GgufPackedBank {
+    pub w_q: Vec<u8>,
+    pub scheme: rlx_ir::quant::QuantScheme,
+    pub num_experts: usize,
+    pub in_dim: usize,
+    pub out_dim: usize,
+}

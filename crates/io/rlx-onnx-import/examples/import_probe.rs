@@ -18,8 +18,7 @@ fn main() -> anyhow::Result<()> {
 
     // Optional distinct second length (e.g. ChatterBox decoder `feature_dim` =
     // the reference-mel length, independent of `num_speech_tokens`).
-    let feature_dim: usize = std::env::var("RLX_PROBE_FEATURE_DIM")
-        .ok()
+    let feature_dim: usize = rlx_ir::env::var("RLX_PROBE_FEATURE_DIM")
         .and_then(|s| s.parse().ok())
         .unwrap_or(seq);
     let mut named = HashMap::new();
@@ -30,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     named.insert("num_speech_tokens".to_string(), seq);
     named.insert("feature_dim".to_string(), feature_dim);
 
-    let dynamic = std::env::var_os("RLX_PROBE_DYNAMIC").is_some();
+    let dynamic = rlx_ir::env::var_os("RLX_PROBE_DYNAMIC").is_some();
     let opts = ImportOptions {
         sequence_length: seq,
         named_lengths: named,

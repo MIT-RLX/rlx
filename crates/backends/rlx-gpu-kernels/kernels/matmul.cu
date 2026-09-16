@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // Tiled fp32 matmul with register blocking + optional float4 vector
-// loads. Block tile 64×64 of C, inner-K tile 16. 16×16=256 threads per
-// block; each thread computes a 4×4 micro-tile of C accumulated in
+// loads. Block tile BM×BN of C, inner-K tile BK; BLOCK_DIM_X×BLOCK_DIM_Y
+// threads per block, each computing a TM×TN micro-tile of C accumulated in
 // registers. Same call shapes as v1 (2D × 2D, [B,M,K]×[K,N],
 // [B,M,K]×[B,K,N]) and same epilogue (optional bias + activation).
 //
@@ -15,14 +15,41 @@
 //
 // Activation IDs match the unary kernel's table:
 //   0=relu 1=sigmoid 2=tanh 5=sqrt 7=neg 8=abs 9=gelu 10=silu 11=gelu_approx
+//
+// ── Tile shape is a COMPILE PARAMETER ───────────────────────────────────────
+// The defaults below reproduce the historical hardcoded 64×64×16 schedule
+// exactly. A caller that wants a different physical schedule for a given shape
+// prepends its own `#define BM …` block to this source before handing it to
+// NVRTC / hipRTC; the `#ifndef` guards then leave the defaults unused. The
+// host-side legality rules that keep a tile compilable live in one place —
+// `rlx_gpu_kernels::tiles::TileParams::validate` — and the JIT source hash
+// already gives each tile its own module + disk-cache slot.
+//
+// Nothing in the body may assume the default values: the two vectorized tile
+// loaders below iterate `{A,B}_VEC_PER_THREAD` float4 chunks rather than
+// assuming one chunk per thread (which held only because 64·16/4 == 256).
 
+#ifndef BM
 #define BM 64
+#endif
+#ifndef BN
 #define BN 64
+#endif
+#ifndef BK
 #define BK 16
+#endif
+#ifndef TM
 #define TM 4
+#endif
+#ifndef TN
 #define TN 4
+#endif
+#ifndef BLOCK_DIM_X
 #define BLOCK_DIM_X 16
+#endif
+#ifndef BLOCK_DIM_Y
 #define BLOCK_DIM_Y 16
+#endif
 #define THREADS (BLOCK_DIM_X * BLOCK_DIM_Y)
 
 __device__ __forceinline__ float apply_act(float v, unsigned int act_id) {
@@ -80,8 +107,9 @@ extern "C" __global__ void matmul(
     // Block-level alignment check for float4 vector loads. These are
     // shape-only conditions; the arena pointer itself is f32-aligned so
     // float4-aligned slots only need the row stride to be a multiple of
-    // 4. blockIdx.y * BM and blockIdx.x * BN are both multiples of 64,
-    // so the leading element of each tile is also float4-aligned.
+    // 4. `TileParams::validate` requires BK % 4 == 0 and BN % 4 == 0, so
+    // `t*BK` and `blockIdx.x*BN` are multiples of 4 and the leading element
+    // of each tile stays float4-aligned for any admitted tile.
     bool vec_a = ((k & 3u) == 0u);
     bool vec_b = ((n & 3u) == 0u);
     bool full_block_a = (blockIdx.y * BM + BM <= m);
@@ -95,26 +123,34 @@ extern "C" __global__ void matmul(
     }
 
     unsigned int n_tiles = (k + BK - 1) / BK;
-    const unsigned int A_PER_THREAD = (BM * BK) / THREADS;  // 4
-    const unsigned int B_PER_THREAD = (BK * BN) / THREADS;  // 4
+    const unsigned int A_PER_THREAD = (BM * BK) / THREADS;  // 4 at the default tile
+    const unsigned int B_PER_THREAD = (BK * BN) / THREADS;  // 4 at the default tile
+    // float4 chunks each thread owns on the vectorized path. Both are 1 at the
+    // default tile (64·16/4 == 256 == THREADS), where the `#pragma unroll` below
+    // erases the loop entirely — the parameterized form is free there.
+    const unsigned int A_VEC_PER_THREAD = (BM * BK / 4) / THREADS;
+    const unsigned int B_VEC_PER_THREAD = (BK * BN / 4) / THREADS;
 
     for (unsigned int t = 0; t < n_tiles; ++t) {
         bool full_k_tile = (t * BK + BK <= k);
 
         // ── Load A tile [BM][BK] ────────────────────────────────────
         if (vec_a && full_block_a && full_k_tile) {
-            // Each thread owns one float4 of the tile (BM*BK/4 = 256
-            // float4 chunks for 256 threads).
-            unsigned int idx4 = tid;  // 0..255
-            unsigned int r = idx4 / (BK / 4);              // 0..63
-            unsigned int c4 = idx4 % (BK / 4);              // 0..3
-            unsigned int gr = blockIdx.y * BM + r;
-            unsigned int gc = t * BK + c4 * 4;
-            float4 v = *reinterpret_cast<const float4*>(&arena[a_base + gr * k + gc]);
-            tile_a[r][c4 * 4 + 0] = v.x;
-            tile_a[r][c4 * 4 + 1] = v.y;
-            tile_a[r][c4 * 4 + 2] = v.z;
-            tile_a[r][c4 * 4 + 3] = v.w;
+            // Each thread owns A_VEC_PER_THREAD float4 chunks of the tile
+            // (BM*BK/4 chunks spread over THREADS threads).
+            #pragma unroll
+            for (unsigned int li = 0; li < A_VEC_PER_THREAD; ++li) {
+                unsigned int idx4 = tid + li * THREADS;
+                unsigned int r = idx4 / (BK / 4);
+                unsigned int c4 = idx4 % (BK / 4);
+                unsigned int gr = blockIdx.y * BM + r;
+                unsigned int gc = t * BK + c4 * 4;
+                float4 v = *reinterpret_cast<const float4*>(&arena[a_base + gr * k + gc]);
+                tile_a[r][c4 * 4 + 0] = v.x;
+                tile_a[r][c4 * 4 + 1] = v.y;
+                tile_a[r][c4 * 4 + 2] = v.z;
+                tile_a[r][c4 * 4 + 3] = v.w;
+            }
         } else {
             #pragma unroll
             for (unsigned int li = 0; li < A_PER_THREAD; ++li) {
@@ -129,16 +165,19 @@ extern "C" __global__ void matmul(
 
         // ── Load B tile [BK][BN] ────────────────────────────────────
         if (vec_b && full_block_b && full_k_tile) {
-            unsigned int idx4 = tid;  // 0..255
-            unsigned int r = idx4 / (BN / 4);   // 0..15
-            unsigned int c4 = idx4 % (BN / 4);   // 0..15
-            unsigned int gr = t * BK + r;
-            unsigned int gc = blockIdx.x * BN + c4 * 4;
-            float4 v = *reinterpret_cast<const float4*>(&arena[b_base + gr * n + gc]);
-            tile_b[r][c4 * 4 + 0] = v.x;
-            tile_b[r][c4 * 4 + 1] = v.y;
-            tile_b[r][c4 * 4 + 2] = v.z;
-            tile_b[r][c4 * 4 + 3] = v.w;
+            #pragma unroll
+            for (unsigned int li = 0; li < B_VEC_PER_THREAD; ++li) {
+                unsigned int idx4 = tid + li * THREADS;
+                unsigned int r = idx4 / (BN / 4);
+                unsigned int c4 = idx4 % (BN / 4);
+                unsigned int gr = t * BK + r;
+                unsigned int gc = blockIdx.x * BN + c4 * 4;
+                float4 v = *reinterpret_cast<const float4*>(&arena[b_base + gr * n + gc]);
+                tile_b[r][c4 * 4 + 0] = v.x;
+                tile_b[r][c4 * 4 + 1] = v.y;
+                tile_b[r][c4 * 4 + 2] = v.z;
+                tile_b[r][c4 * 4 + 3] = v.w;
+            }
         } else {
             #pragma unroll
             for (unsigned int li = 0; li < B_PER_THREAD; ++li) {

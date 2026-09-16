@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
 rlx-gpu-kernels = { workspace = true }
+# Dispatch table + decision journal (also re-exported via rlx-gpu-kernels).
+rlx-gpu-dispatch = { workspace = true }
 rlx-gpu-host = { workspace = true }
 rlx-ir = { workspace = true }
 rlx-unfuse = { workspace = true }
@@ -95,12 +97,19 @@ nvtx = ["cudarc/nvtx"]
 # / single-GPU CI stays light; enable on multi-GPU NVIDIA hosts.
 nccl = ["cudarc/nccl"]
 hip-cpu-validate = ["dep:cc"]
+# Build the tiled `matmul` entry point FROM a typed `KernelSchedule` instead of
+# templating `kernels/matmul.cu`, selected at runtime by
+# `RLX_CUDA_SCHEDULE_MATMUL`. Off by default: the hand-written text stays the
+# shipping path until the emitted kernel is measured at least as fast on the
+# target in question (`examples/schedule_matmul_ab.rs`).
+schedule-codegen = ["rlx-gpu-kernels/schedule-codegen"]
 
 [build-dependencies]
 cc = { version = "1", optional = true }
 
 [dev-dependencies]
 rlx-runtime = { path = "../../core/rlx-runtime", features = ["cuda", "cpu"] }
+rlx-autodiff = { workspace = true }
 
 [[example]]
 name = "nccl_all_reduce_toy"
@@ -108,3 +117,7 @@ required-features = ["nccl"]
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

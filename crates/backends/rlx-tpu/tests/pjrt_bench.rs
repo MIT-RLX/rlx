@@ -42,7 +42,7 @@ fn skip_unless_bench() -> bool {
         );
         return true;
     }
-    if !rlx_tpu::is_available() {
+    if rlx_ir::env::skip_unless_device("tpu", true, rlx_tpu::is_available()) {
         eprintln!("[pjrt_bench] PJRT plugin failed to initialize — skipping");
         return true;
     }

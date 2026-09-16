@@ -27,7 +27,7 @@
 //! Feeding f32 operands through bf16/f16 is lossy by construction — it is a
 //! *different, faster* mode, not a bit-exact substitute. Callers opt in
 //! explicitly (`RLX_CPU_BNNS_BF16=1` for the `sgemm_auto` hook) and the tests
-//! report the accuracy delta vs the f32 oracle ([[feedback_perf_is_north_star]]).
+//! report the accuracy delta against the f32 oracle.
 //!
 //! The classic BNNS direct API is `__API_DEPRECATED("Use BNNSGraph* APIs")` as
 //! of macOS 15 but remains present/functional; `BNNSMatMul` is the current
@@ -129,12 +129,12 @@ pub fn is_available() -> bool {
 /// Whether `sgemm_auto` should route through the BNNS bf16 low-precision path.
 /// Requires the build (`amx-bnns`) + explicit `RLX_CPU_BNNS_BF16=1`. Opt-in is
 /// deliberate: downcasting f32→bf16 is lossy, so it must never silently replace
-/// the exact f32 vendor path ([[feedback_perf_is_north_star]]).
+/// the exact f32 vendor path.
 pub fn dispatch_enabled() -> bool {
     is_available()
         && matches!(
-            std::env::var("RLX_CPU_BNNS_BF16").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
+            rlx_ir::env::var("RLX_CPU_BNNS_BF16").as_deref(),
+            Some("1") | Some("on") | Some("true")
         )
 }
 
@@ -144,8 +144,8 @@ pub fn dispatch_enabled() -> bool {
 pub fn dispatch_enabled_f16() -> bool {
     is_available()
         && matches!(
-            std::env::var("RLX_CPU_BNNS_F16").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
+            rlx_ir::env::var("RLX_CPU_BNNS_F16").as_deref(),
+            Some("1") | Some("on") | Some("true")
         )
 }
 

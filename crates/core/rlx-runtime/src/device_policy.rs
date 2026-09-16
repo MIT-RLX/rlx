@@ -12,7 +12,7 @@ use crate::device_ext::{DEVICE_PRIORITY, is_available, supports_graph};
 use crate::device_parse::{device_label, parse_device, parse_device_list};
 use crate::registry::backend_for;
 
-/// How [`GraphDevices::resolve_with_inputs`] picks a backend when no hint is set.
+/// How `GraphDevices::resolve_with_inputs` picks a backend when no hint is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DevicePickStrategy {
     /// Rank via calibrated cost models + platform priority (default).
@@ -180,6 +180,7 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
         Device::Cpu => C {
             clone: true,
             moe: true,
+            persistent_handles: true,
             typed_io: true,
             active_extent: true,
             ..C::NONE
@@ -195,11 +196,11 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
         },
         Device::Mlx => C {
             clone: true,
-            moe: true,
             persistent_handles: true,
             gpu_handles: true,
             kv_resident: true,
             typed_io: true,
+            async_pipeline: true,
             active_extent: true,
             ..C::NONE
         },
@@ -210,6 +211,7 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
         },
         Device::Cuda => C {
             clone: true,
+            moe: true,
             gpu_handles: true,
             kv_resident: true,
             typed_io: true,
@@ -221,11 +223,14 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
             moe: true,
             gpu_handles: true,
             kv_resident: true,
+            typed_io: true,
+            active_extent: true,
             ..C::NONE
         },
         Device::Gpu | Device::WebGpu => C {
             clone: true,
             gpu_handles: true,
+            kv_resident: true,
             typed_io: true,
             active_extent: true,
             ..C::NONE
@@ -235,6 +240,7 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
             gpu_handles: true,
             kv_resident: true,
             typed_io: true,
+            active_extent: true,
             ..C::NONE
         },
         Device::OneApi => C {
@@ -252,8 +258,9 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
             ..C::NONE
         },
         // NPUs with no host-resident buffer/handle model in rlx (Hexagon via
-        // QNN; XDNA has no executor yet).
-        Device::Hexagon | Device::Xdna => C::NONE,
+        // QNN; XDNA has no executor yet), and the eGPU, whose device bring-up
+        // is not implemented.
+        Device::Hexagon | Device::Xdna | Device::Egpu => C::NONE,
     }
 }
 

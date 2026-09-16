@@ -58,7 +58,7 @@ fn ref_loss(logits: &[f32], targets: &[f32]) -> Vec<f32> {
 
 #[test]
 fn wgpu_softmax_cross_entropy_matches_cpu_and_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("skip wgpu_softmax_cross_entropy: no adapter");
         return;
     }

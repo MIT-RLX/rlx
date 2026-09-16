@@ -21,7 +21,7 @@ fn build(m: usize, k: usize, n: usize, e_cnt: usize) -> Graph {
 }
 
 fn parity(m: usize, k: usize, n: usize, e_cnt: usize, idx: Vec<f32>) {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     use rlx_runtime::{Device, Session};

@@ -1,0 +1,52 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+#ifndef RlxPciDriver_h
+#define RlxPciDriver_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <DriverKit/IOMemoryDescriptor.iig>
+#include <DriverKit/IODMACommand.iig>
+#include <PCIDriverKit/IOPCIDevice.iig>
+
+/// Response handed back from a DMA allocation: the buffer, and the DMA command
+/// that pins it. Both are held until the user client goes away.
+struct RlxDmaAllocation {
+    IOBufferMemoryDescriptor *buffer;
+    IODMACommand *command;
+};
+
+/// Claims a display-class PCI device and hands it to userspace. Deliberately
+/// thin: it opens the device, enables bus mastering, and exposes config space,
+/// BARs, a reset, and DMA-able memory. It drives nothing.
+class RlxPciDriver: public IOService
+{
+public:
+    virtual bool init() override;
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+    virtual void free() override;
+    virtual kern_return_t NewUserClient(uint32_t type, IOUserClient **userClient) override;
+
+    /// Map a BAR into the caller's task.
+    kern_return_t MapBar(uint32_t bar, IOMemoryDescriptor **memory) LOCALONLY;
+
+    /// Pin `memory` for DMA and report its physical segments.
+    kern_return_t PrepareDma(IOMemoryDescriptor *memory, uint64_t size,
+                             IODMACommand **command,
+                             IOAddressSegment *segments, uint32_t *segmentCount) LOCALONLY;
+
+    /// Allocate DMA-capable memory and write its physical segment table into
+    /// the head of the buffer.
+    kern_return_t CreateDma(size_t size, RlxDmaAllocation *allocation) LOCALONLY;
+
+    kern_return_t ConfigRead(uint32_t offset, uint32_t size, uint32_t *value) LOCALONLY;
+    kern_return_t ConfigWrite(uint32_t offset, uint32_t size, uint32_t value) LOCALONLY;
+
+    /// Function-level reset, falling back to a hot reset.
+    kern_return_t ResetDevice() LOCALONLY;
+};
+
+#endif /* RlxPciDriver_h */

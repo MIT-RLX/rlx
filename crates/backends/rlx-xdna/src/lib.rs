@@ -6,7 +6,7 @@
 //!
 //! The XDNA NPU is the AI Engine (`aie2`) tile array on AMD Ryzen AI SoCs, driven
 //! on Linux by the in-kernel `amdxdna` driver via `/dev/accel*`. This crate makes
-//! it a first-class [`rlx_driver::Device`] that **runs graphs on the NPU** — the
+//! it a first-class `rlx_driver::Device` that **runs graphs on the NPU** — the
 //! forward-inference surface of a transformer and a CNN, plus gradient training —
 //! validated bit-exact (or cosine, for the quantized matmul) against the CPU
 //! backend on real hardware (a Ryzen Phoenix `npu1` APU, AIE version 1.1).
@@ -17,7 +17,7 @@
 //! which drives the pieces in this crate:
 //!
 //! - **INT8 GEMM** — the fast matmul path, ~638 GOP/s on Phoenix, via the vendor
-//!   `aie::mmul` microkernel overlay ([`npu_gemm`]). The AIE array is an INT8/BF16
+//!   `aie::mmul` microkernel overlay (`npu_gemm`). The AIE array is an INT8/BF16
 //!   MAC engine (no native f32 datapath), so f32 matmuls are per-row/col quantized.
 //! - **Transformer** — multi-head causal attention, RoPE (NeoX/GptJ), RMS/Layer/
 //!   GroupNorm, softmax, 26 activations, elementwise / reduce / scan / data-movement.
@@ -33,10 +33,10 @@
 //!   itself, no Python.
 //! - [`compile`] — **Python-free overlay compilation** (drives the native `aiecc`
 //!   binary → xclbin + instruction stream).
-//! - [`npu_gemm`] — the **XRT INT8 GEMM executor** (the fast-matmul path).
-//! - [`xrt`] — bindings to the AMD **XRT** userspace runtime + `amdxdna` shim; the
+//! - `npu_gemm` — the **XRT INT8 GEMM executor** (the fast-matmul path).
+//! - `xrt` — bindings to the AMD **XRT** userspace runtime + `amdxdna` shim; the
 //!   default execution path (`xrt` feature).
-//! - [`direct`] — **closest to the metal**: the `amdxdna` DRM-accel ioctl ABI driven
+//! - `direct` — **closest to the metal**: the `amdxdna` DRM-accel ioctl ABI driven
 //!   directly on `/dev/accel*`, no XRT / no C++ shim (`direct` feature, Linux-only).
 //!   Owns hwctx / BO / exec / syncobj + AXLF-PDI parsing + the TURBO power mode. The
 //!   submit + syncobj GEMM path is complete but **parked**: on Phoenix `npu1` (a
@@ -139,13 +139,39 @@ pub fn detect() -> XdnaStatus {
     }
 }
 
+/// The rlx XRT shim (`librlx_xdna_shim.so`), or `None` when `RLX_XDNA_SHIM` is
+/// unset or points at a missing file.
+///
+/// This is rlx's own `extern "C"` wrapper built from `csrc/xrt_gemm_shim.cpp`,
+/// **not** XRT's `libxrt_driver_xdna.so`. Pointing it at the latter loads fine
+/// and then fails at first use with `undefined symbol: rlx_xdna_io_open`. Build:
+///
+/// ```sh
+/// g++ -O2 -fPIC -shared -std=c++17 -I$XILINX_XRT/include \
+///     -o librlx_xdna_shim.so csrc/xrt_gemm_shim.cpp \
+///     -L$XILINX_XRT/lib -Wl,-rpath,$XILINX_XRT/lib -lxrt_coreutil
+/// ```
+pub fn shim_from_env() -> Option<String> {
+    let v = rlx_ir::env::var("RLX_XDNA_SHIM")?;
+    std::path::Path::new(&v).exists().then_some(v)
+}
+
 /// `true` only when rlx can actually **execute a graph** on the NPU: the XRT
-/// runtime is present ([`runtime_present`]) AND an INT8 GEMM overlay is
-/// configured ([`overlay_from_env`] — shim + xclbin + insts + shape). Gating on
-/// a configured overlay keeps this an explicit opt-in and honest: without one
-/// there's no kernel to run, so selection won't dispatch here (no masquerade).
+/// runtime is present ([`runtime_present`]), the rlx shim is resolvable
+/// ([`shim_from_env`]), AND there is a kernel path — a precompiled INT8 GEMM
+/// overlay ([`overlay_from_env`]) or the on-demand mlir-aie toolchain
+/// ([`op_compile_available`]).
+///
+/// The shim is checked here, not just inside [`overlay_from_env`], because
+/// **both** kernel paths dlopen it. Without that check `AIECC`+`PEANO` alone
+/// reported the device as available and then the backend panicked at first
+/// compile (`no shim path`) — the one failure mode this backend's "no CPU
+/// masquerade" contract is supposed to rule out. `Backend::compile` returns a
+/// graph, not a `Result`, so being honest here is the only way to fail cleanly.
 pub fn is_available() -> bool {
-    runtime_present() && (overlay_from_env().is_some() || op_compile_available())
+    runtime_present()
+        && shim_from_env().is_some()
+        && (overlay_from_env().is_some() || op_compile_available())
 }
 
 /// `true` when the native mlir-aie toolchain is configured (`AIECC` + `PEANO`
@@ -159,7 +185,69 @@ pub fn op_compile_available() -> bool {
             .map(|v| std::path::Path::new(&v).exists())
             .unwrap_or(false)
     };
-    ok("AIECC") && ok("PEANO")
+    if !(ok("AIECC") && ok("PEANO")) {
+        return false;
+    }
+    toolchain_compiles_our_dialect()
+}
+
+/// Whether the configured toolchain can actually compile what **this** version
+/// of rlx emits — not merely whether `aiecc` exists on disk.
+///
+/// The path-existence check above is not enough, and that gap was live: rlx
+/// emitted `aie.logical_tile`, no released mlir-aie knew that op, and XDNA
+/// still advertised itself as dispatchable while every kernel failed to
+/// compile. `is_available` feeds device SELECTION and there is no CPU fallback
+/// behind it, so a wrong answer here is a hang or a hard failure, not a slow
+/// path.
+///
+/// Compiles a minimal real design once per process (~0.4 s) and caches the
+/// verdict. `RLX_XDNA_SKIP_PROBE=1` trusts the paths instead, for a host where
+/// spawning the compiler during device selection is unwanted.
+fn toolchain_compiles_our_dialect() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        if rlx_ir::env::flag("RLX_XDNA_SKIP_PROBE") {
+            return true;
+        }
+        let (Ok(aiecc), Ok(peano)) = (std::env::var("AIECC"), std::env::var("PEANO")) else {
+            return false;
+        };
+        let dir = std::env::temp_dir().join("rlx_xdna_probe");
+        // Clear first. `compile_overlay` reports success by checking its outputs
+        // exist, so a leftover `probe.xclbin` from an earlier good run makes a
+        // BROKEN toolchain probe clean — verified: pointing AIECC at /bin/echo
+        // still reported XDNA dispatchable until this line existed.
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        let mlir = dir.join("probe.mlir");
+        // The same shapes the emitters use, so a dialect change that breaks
+        // them breaks the probe too.
+        if std::fs::write(&mlir, crate::aie::emit_passthrough(1024, 1024)).is_err() {
+            return false;
+        }
+        let xclbin = dir.join("probe.xclbin");
+        let insts = dir.join("probe_insts.bin");
+        let spec = crate::compile::OverlaySpec {
+            aiecc: &aiecc,
+            peano: &peano,
+            mlir: mlir.to_str().unwrap_or_default(),
+            tmpdir: dir.to_str().unwrap_or_default(),
+            out_xclbin: xclbin.to_str().unwrap_or_default(),
+            out_insts: insts.to_str().unwrap_or_default(),
+        };
+        let verdict = crate::compile::compile_overlay(&spec).is_ok();
+        if !verdict {
+            eprintln!(
+                "[rlx-xdna] toolchain probe FAILED — AIECC/PEANO are set but cannot compile \
+                 rlx's AIE-MLIR. Treating XDNA as unavailable rather than dispatching to it."
+            );
+        }
+        verdict
+    })
 }
 
 /// A configured INT8 GEMM overlay: the compiled MLIR-AIE artifacts + the C++
@@ -188,8 +276,7 @@ pub fn overlay_from_env() -> Option<Overlay> {
     let shim = path("RLX_XDNA_SHIM")?;
     let xclbin = path("RLX_XDNA_XCLBIN")?;
     let insts = path("RLX_XDNA_INSTS")?;
-    let mut mkn = std::env::var("RLX_XDNA_GEMM")
-        .ok()?
+    let mut mkn = rlx_ir::env::var("RLX_XDNA_GEMM")?
         .split(',')
         .filter_map(|s| s.trim().parse::<usize>().ok())
         .collect::<Vec<_>>()
@@ -239,10 +326,28 @@ pub fn diagnostic() -> String {
             xrt_lib,
         } => format!(
             "AMD XDNA NPU live at {node} ({product}, fw {fw}); XRT runtime present ({xrt_lib}). \
-             `Device::Xdna` runs graphs here once the mlir-aie toolchain is configured (set AIECC \
-             + PEANO for the compile-on-demand op path, or RLX_XDNA_GEMM for a precompiled INT8 \
-             overlay) — the AIE-ML tiles are an INT8/BF16 engine, so f32 matmuls run quantized. \
-             No CPU fallback."
+             Still needed to execute: {missing}. The AIE-ML tiles are an INT8/BF16 engine, so f32 \
+             matmuls run quantized. No CPU fallback.",
+            missing = {
+                let mut m: Vec<&str> = Vec::new();
+                if shim_from_env().is_none() {
+                    m.push(
+                        "RLX_XDNA_SHIM (rlx's own librlx_xdna_shim.so, built from \
+                         csrc/xrt_gemm_shim.cpp — NOT libxrt_driver_xdna.so)",
+                    );
+                }
+                if overlay_from_env().is_none() && !op_compile_available() {
+                    m.push(
+                        "a kernel path — AIECC + PEANO for compile-on-demand, or \
+                         RLX_XDNA_SHIM/XCLBIN/INSTS/GEMM for a precompiled INT8 overlay",
+                    );
+                }
+                if m.is_empty() {
+                    "nothing — `Device::Xdna` is ready".to_string()
+                } else {
+                    m.join("; ")
+                }
+            }
         ),
     }
 }
@@ -263,7 +368,7 @@ impl std::error::Error for XdnaError {}
 
 /// Legacy detection-seam probe used for **fleet inventory / diagnostics**, not the
 /// live execution path — the real graph runner is `rlx-runtime`'s `XdnaBackend`
-/// (which drives [`npu_gemm`] / [`aie`] / [`compile`] directly). Returns a
+/// (which drives `npu_gemm` / [`aie`] / [`compile`] directly). Returns a
 /// [`XdnaError`] whose message ([`diagnostic`]) pinpoints what's missing on this
 /// host (no NPU / no runtime / runtime-but-no-overlay), so inventory tooling can
 /// report an honest "detected, not runnable" instead of a CPU masquerade.
@@ -328,7 +433,7 @@ fn driver_is_amdxdna(devdir: &std::path::Path) -> bool {
 #[cfg(target_os = "linux")]
 fn xrt_shim_dir() -> Option<String> {
     let mut dirs: Vec<String> = Vec::new();
-    if let Ok(d) = std::env::var("RLX_XDNA_XRT_LIB") {
+    if let Some(d) = rlx_ir::env::var("RLX_XDNA_XRT_LIB") {
         dirs.push(d);
     }
     if let Ok(p) = std::env::var("LD_LIBRARY_PATH") {

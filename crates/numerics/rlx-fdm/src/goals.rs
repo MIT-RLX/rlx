@@ -55,7 +55,7 @@ pub fn edge_length_error(state: &EquilibriumState, edge: usize, target: f64) -> 
     d * d
 }
 
-/// `∂L/∂x_f` for [`mean_edge_length`](Self::mean_edge_length), packed free layout.
+/// `∂L/∂x_f` for `mean_edge_length`, packed free layout.
 pub fn grad_mean_edge_length_wrt_xyz_free(
     state: &EquilibriumState,
     structure: &Structure,
@@ -64,7 +64,7 @@ pub fn grad_mean_edge_length_wrt_xyz_free(
     grad_edge_lengths_wrt_xyz_free(state, structure, edges, 1.0 / edges.len() as f64)
 }
 
-/// `∂L/∂x_f` for [`edge_length_error`](Self::edge_length_error) w.r.t. one edge.
+/// `∂L/∂x_f` for `edge_length_error` w.r.t. one edge.
 pub fn grad_edge_length_error_wrt_xyz_free(
     state: &EquilibriumState,
     structure: &Structure,
@@ -168,7 +168,7 @@ pub fn grad_node_coord_wrt_xyz_free(
     g
 }
 
-/// `∂L/∂x_f` for [`min_free_z`](Self::min_free_z) (subgradient at minimizer).
+/// `∂L/∂x_f` for `min_free_z` (subgradient at minimizer).
 pub fn grad_min_free_z_wrt_xyz_free(state: &EquilibriumState, structure: &Structure) -> Vec<f64> {
     let nf = structure.num_free();
     let mut g = vec![0.0; packed_free_dim(nf)];
@@ -196,7 +196,7 @@ pub fn grad_min_free_z_wrt_xyz_free(state: &EquilibriumState, structure: &Struct
     g
 }
 
-/// `∂L/∂x_f` for [`edge_force`](Self::edge_force) w.r.t. positions (via `q·l`).
+/// `∂L/∂x_f` for `edge_force` w.r.t. positions (via `q·l`).
 pub fn grad_edge_force_wrt_xyz_free(
     state: &EquilibriumState,
     structure: &Structure,
@@ -232,7 +232,7 @@ pub fn mesh_total_area(mesh: &MeshStructure, xyz: &[f64]) -> f64 {
     total
 }
 
-/// `∂(mesh area)/∂x_f` for [`mesh_total_area`](Self::mesh_total_area).
+/// `∂(mesh area)/∂x_f` for `mesh_total_area`.
 pub fn grad_mesh_total_area_wrt_xyz_free(
     mesh: &MeshStructure,
     xyz: &[f64],

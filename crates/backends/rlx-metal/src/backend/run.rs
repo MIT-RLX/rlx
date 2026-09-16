@@ -111,6 +111,24 @@ impl MetalExecutable {
             last.wait_until_completed();
         }
 
+        // Device-side span of this run, for benchmarks that must not measure
+        // host encode. Earliest start to latest end across the run's buffers —
+        // inter-buffer gaps included on purpose, because a schedule that leaves
+        // the GPU idle mid-run really is slower and summing per-buffer spans
+        // would hide it. Timestamps are only valid after the wait above.
+        {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for (cb, _) in &pending {
+                let (s, e) = (cb.gpu_start_time(), cb.gpu_end_time());
+                if s > 0.0 && e > s {
+                    lo = lo.min(s);
+                    hi = hi.max(e);
+                }
+            }
+            crate::gpu_span::record(if hi > lo { (hi - lo) * 1e3 } else { 0.0 });
+        }
+
         // Read back. Apple unified memory → contents() points at the same
         // bytes the GPU wrote.
         pending
@@ -184,8 +202,32 @@ impl MetalExecutable {
             let max = data.iter().fold(0f32, |m, &v| m.max(v.abs()));
             let nz = data.iter().filter(|&&v| v != 0.0).count();
             let nan = data.iter().filter(|&&v| v.is_nan()).count();
+            // `tail` / `tabs` mirror `RLX_CPU_DUMP_NODES` and the wgpu snapshot:
+            // the whole-tensor max hides a divergence confined to one row, which
+            // is the usual shape of a tail-handling bug. `tabs` (sum of |x| over
+            // the last row) cannot cancel the way a plain sum does.
+            let row = node
+                .shape
+                .dims()
+                .last()
+                .and_then(|d| match d {
+                    rlx_ir::Dim::Static(n) => Some(*n),
+                    rlx_ir::Dim::Dynamic(_) => None,
+                })
+                .unwrap_or(data.len())
+                .max(1);
+            let (tail, tabs) = data
+                .len()
+                .checked_sub(row)
+                .map(|o| {
+                    (
+                        data[o..].iter().fold(0f32, |m, &v| m.max(v.abs())),
+                        data[o..].iter().map(|&v| v.abs() as f64).sum::<f64>(),
+                    )
+                })
+                .unwrap_or((max, 0.0));
             eprintln!(
-                "  [{i:>3}] {:?} max={max:.6} nz={nz}/{} nan={nan}",
+                "  [{i:>3}] {:?} max={max:.6} tail={tail:.6} tabs={tabs:.6} nz={nz}/{} nan={nan}",
                 node.op,
                 data.len()
             );
@@ -338,7 +380,7 @@ impl MetalExecutable {
                 crate::thunk_profile::record(name, std::time::Duration::from_secs_f64(secs));
             }
         }
-        crate::thunk_profile::print_summary();
+        crate::thunk_profile::print_summary_auto();
     }
 
     /// Execute the graph via MPSGraph (set up by lowering at compile time).

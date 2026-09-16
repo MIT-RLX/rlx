@@ -26,7 +26,9 @@ use rlx_autodiff::nth_order_grad;
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::{MaskKind, ReduceOp, SteKind};
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_guard {
@@ -81,7 +83,7 @@ fn assert_vec_matches_cpu(
     tol: f32,
     label: &str,
 ) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip higher_order_decompose_parity {label} on {device:?} (unavailable)");
         return;
     }
@@ -938,114 +940,142 @@ macro_rules! decompose_parity_suite {
             use super::*;
             #[test]
             fn rms_norm_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_rms_norm($device);
             }
             #[test]
             fn layer_norm_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_layer_norm($device);
             }
             #[test]
             fn conv2d_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_conv2d($device);
             }
             #[test]
             fn conv2d_w_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_conv2d_w($device);
             }
             #[test]
             fn dynamic_conv_w_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_dynamic_conv_w($device);
             }
             #[test]
             fn dynamic_conv_x_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_dynamic_conv_x($device);
             }
             #[test]
             fn conv2d_groups_w_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_conv2d_groups_w($device);
             }
             #[test]
             fn maxpool_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_maxpool($device);
             }
             #[test]
             fn conv3d_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_conv3d($device);
             }
             #[test]
             fn conv3d_w_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_conv3d_w($device);
             }
             #[test]
             fn maxpool3d_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_maxpool3d($device);
             }
             #[test]
             fn group_norm_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_group_norm($device);
             }
             #[test]
             fn group_norm_gamma_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_group_norm_gamma($device);
             }
             #[test]
             fn group_norm_beta_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_group_norm_beta($device);
             }
             #[test]
             fn rope_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_rope($device);
             }
             #[test]
             fn cumsum_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_cumsum($device);
             }
             #[test]
             fn gather_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_gather($device);
             }
             #[test]
             fn sce_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_sce($device);
             }
             #[test]
             fn fake_quant_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_fake_quant($device);
             }
             #[test]
             fn scan_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_scan($device);
             }
             #[test]
             fn scan_long_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_scan_long($device);
             }
             #[test]
             fn scan_checkpoint_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_scan_checkpoint($device);
             }
             #[test]
             fn attention_rank3_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_attention_rank3($device);
             }
             #[test]
             fn attention_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_attention_none_q($device);
             }
             #[test]
             fn attention_causal_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_attention_causal_q($device);
             }
             #[test]
             fn attention_sliding_window_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_attention_sliding_window_q($device);
             }
             #[test]
             fn attention_custom_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_attention_custom_q($device);
             }
             #[test]
             fn attention_bias_second_derivative() {
+    let _gpu = common::serialize_gpu();
                 second_order_attention_bias_q($device);
             }
         }

@@ -90,6 +90,24 @@ pub fn qwen3_decode_layer_fused_qk(
     }
 }
 
+/// Decode layer that also exports its residual-stream input.
+///
+/// The tap is what Eagle-style drafters (EAGLE3, DFlash, DSpark) read instead
+/// of running their own embedding; see [`Qwen3DecodeLayerStage::layer_with_tap`].
+pub fn qwen3_decode_layer_fused_tap(
+    layer_idx: usize,
+    spec: Qwen3DecodeLayerSpec,
+    kv_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+    tap_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+) -> FlowStage {
+    FlowStage::Named {
+        name: format!("layer{layer_idx}"),
+        inner: Arc::new(FlowStage::Qwen3DecodeLayer(
+            Qwen3DecodeLayerStage::layer_with_tap(layer_idx, spec, kv_out, tap_out),
+        )),
+    }
+}
+
 /// Decode layer with optional Q/K side taps (AIF decode-step probe).
 pub fn qwen3_decode_layer_side(
     layer_idx: usize,
@@ -102,5 +120,27 @@ pub fn qwen3_decode_layer_side(
         qwen3_decode_layer_fused_qk(layer_idx, spec, kv_out.inner(), qk_out.inner())
     } else {
         qwen3_decode_layer_fused(layer_idx, spec, kv_out.inner())
+    }
+}
+
+/// Decode layer with optional Q/K taps and an optional residual tap.
+///
+/// `tap` is taken only when `layer_idx` is in `tap_layers`, so the caller
+/// passes the same closure for every layer and the sink fills in ascending
+/// layer order — which is the order a drafter's `fc` expects its taps
+/// concatenated in.
+pub fn qwen3_decode_layer_side_tap(
+    layer_idx: usize,
+    spec: Qwen3DecodeLayerSpec,
+    kv_out: &SideOutputs,
+    qk_out: &SideOutputs,
+    tap_out: &SideOutputs,
+    export_qk: bool,
+    tap_layers: &[usize],
+) -> FlowStage {
+    if tap_layers.contains(&layer_idx) {
+        qwen3_decode_layer_fused_tap(layer_idx, spec, kv_out.inner(), tap_out.inner())
+    } else {
+        qwen3_decode_layer_side(layer_idx, spec, kv_out, qk_out, export_qk)
     }
 }

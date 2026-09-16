@@ -21,6 +21,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn x_data(n: usize) -> Vec<f32> {
     // Same generator as `pad_parity`, so indices map to recognisable values.
     (0..n).map(|i| (i % 7) as f32 * 0.5 - 1.0).collect()
@@ -89,6 +91,10 @@ fn device() -> Option<(Device, &'static str)> {
 /// the trailing axis of `[2,3,4]`.
 #[test]
 fn narrow_edge_slice_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let Some((dev, label)) = device() else {
         return;
     };
@@ -105,6 +111,10 @@ fn narrow_edge_slice_matches_cpu() {
 /// Broadcasting that edge across the pad width — the step unique to `Replicate`.
 #[test]
 fn expand_of_edge_slice_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let Some((dev, label)) = device() else {
         return;
     };
@@ -128,6 +138,10 @@ fn expand_of_edge_slice_matches_cpu() {
 /// the stacked case is.
 #[test]
 fn replicate_pad_axis_combinations_match_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     use rlx_ir::PadMode;
     let Some((dev, label)) = device() else {
         return;

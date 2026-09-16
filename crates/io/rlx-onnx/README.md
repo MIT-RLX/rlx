@@ -2,7 +2,7 @@
 
 Run ONNX (`.onnx`) models on RLX backends. Default path: import via
 [`rlx-onnx-import`](../rlx-onnx-import), compile with
-[`rlx-runtime`](../rlx-runtime) `Session`, execute on CPU / Metal / CUDA /
+[`rlx-runtime`](../../core/rlx-runtime) `Session`, execute on CPU / Metal / CUDA /
 ROCm / MLX / wgpu. Optional ONNX Runtime (`ort`) backend for parity and
 execution-provider fallback.
 
@@ -20,7 +20,7 @@ rlx-onnx = { version = "0.2", default-features = true, features = ["cpu"] }
 # rlx-onnx = { version = "0.2", features = ["ort-fallback", "ort-cuda"] }
 ```
 
-From the [`rlx`](../rlx) prelude:
+From the [`rlx`](../../rlx) prelude:
 
 ```toml
 rlx = { version = "0.2", features = ["cpu", "onnx"] }
@@ -39,7 +39,7 @@ let outputs = model.run(&inputs)?;
 ```
 
 - **`OnnxCompileLevel`** — maps ONNX graph-opt tiers 0–3 to
-  [`CompileOptions`](../rlx-runtime) (DCE / constant folding / full pipeline).
+  [`CompileOptions`](../../core/rlx-runtime) (DCE / constant folding / full pipeline).
 - **`OnnxExecBackend::Native`** (default) — RLX compile + execute.
 - **`OnnxExecBackend::Ort`** — requires `ort` or `ort-fallback` feature.
 

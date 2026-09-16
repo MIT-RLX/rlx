@@ -1,0 +1,26 @@
+[package]
+name = "rlx-megakernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standalone study: how far rlx can compose a MoE block toward a single device program"
+publish = false
+authors.workspace       = true
+keywords.workspace      = true
+categories.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+readme                  = "README.md"
+
+[dependencies]
+rlx-ir = { workspace = true }
+rlx-opt = { workspace = true }
+
+[dev-dependencies]
+rlx-corpus = { path = "../rlx-corpus" }
+rlx-runtime = { workspace = true, features = ["cpu"] }
+
+[lints]
+workspace = true

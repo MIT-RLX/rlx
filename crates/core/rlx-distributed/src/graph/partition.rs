@@ -5,7 +5,7 @@
 //! Partition a computation [`Graph`] into `N` contiguous **pipeline stages** for
 //! multi-node execution. Each stage is a self-contained subgraph that a
 //! different machine compiles and runs; activations cross stage boundaries as
-//! named tensors (see [`crate::transport`]).
+//! named tensors (see `crate::transport`).
 //!
 //! The point is **RAM pooling**: a model too large for any single node is split
 //! so each node materializes only *its* stage's parameters (`Op::Param` leaves

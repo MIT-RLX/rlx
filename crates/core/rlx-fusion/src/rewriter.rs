@@ -22,11 +22,11 @@
 //! check, others rebuild unconditionally.
 //!
 //! [`MatchRewrite`] asks for the interesting part only. A blanket impl turns
-//! any implementation into a [`Pass`](crate::pass::Pass), so a rewrite is
+//! any implementation into a [`Pass`], so a rewrite is
 //! usable everywhere a pass is, and gets accurate
-//! [`IRStatus`](crate::pass::IRStatus) reporting for free — the driver knows
+//! [`IRStatus`] reporting for free — the driver knows
 //! exactly whether a pattern fired, so it never pays for the fingerprint
-//! comparison the default [`Pass::run_with_status`](crate::pass::Pass::run_with_status)
+//! comparison the default [`Pass::run_with_status`]
 //! would.
 //!
 //! # Convergence

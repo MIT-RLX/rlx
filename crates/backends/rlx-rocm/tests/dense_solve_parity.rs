@@ -51,7 +51,7 @@ fn dense_solve_f32_matches_cpu() {
 
 #[test]
 fn batched_dense_solve_f32_matches_cpu() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         eprintln!("[rlx-rocm dense_solve] no ROCm — skipping batched");
         return;
     }

@@ -39,6 +39,8 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_opt::autodiff::grad_with_loss;
 use rlx_runtime::{Device, Session, is_available, supports_graph};
 
+mod common;
+
 const N: usize = 64;
 
 /// Backends compiled into this build that are actually present on the box.
@@ -64,6 +66,12 @@ fn available_backends() -> Vec<Device> {
 }
 
 fn run(device: Device, g: &Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
+    // Serialize device use across this binary's test threads. Without it the
+    // Vulkan cases intermittently returned garbage (worst_rel=1.0, ~1 run in 6)
+    // while `--test-threads=1` was always clean — the adapters in this tree are
+    // not safe to init/teardown concurrently, which is what `GpuTestGuard` is
+    // for. This file never took it.
+    let _guard = common::GpuTestGuard::acquire(device);
     Session::new(device)
         .compile(g.clone())
         .run(inputs)

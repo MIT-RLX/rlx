@@ -461,7 +461,7 @@ pub fn rocm_target_arch() -> Option<String> {
     if let Some(a) = proven_arch() {
         return Some(a);
     }
-    if let Ok(a) = std::env::var("RLX_ROCM_ARCH") {
+    if let Some(a) = rlx_ir::env::var("RLX_ROCM_ARCH") {
         let a = a.trim();
         if !a.is_empty() {
             return Some(a.to_string());

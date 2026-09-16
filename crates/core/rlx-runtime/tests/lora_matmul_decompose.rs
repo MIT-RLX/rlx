@@ -14,6 +14,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const M: usize = 3;
 const K: usize = 8;
 const N: usize = 6;
@@ -55,23 +57,30 @@ fn assert_close(what: &str, a: &[f32], b: &[f32]) {
 
 #[test]
 fn lora_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     assert_eq!(run(Device::Cpu).len(), M * N);
 }
 
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn lora_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     assert_close("metal", &run(Device::Metal), &run(Device::Cpu));
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn lora_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     assert_close("wgpu", &run(Device::Gpu), &run(Device::Cpu));
 }
 
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn lora_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     assert_close("mlx", &run(Device::Mlx), &run(Device::Cpu));
 }

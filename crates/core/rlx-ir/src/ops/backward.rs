@@ -125,6 +125,8 @@ impl Graph {
         )
     }
 
+    /// Adjoint of [`Op::Rope`]. `style` must match the forward's — see
+    /// [`Op::RopeBackward::style`].
     pub fn rope_backward(
         &mut self,
         dy: NodeId,
@@ -132,10 +134,15 @@ impl Graph {
         sin: NodeId,
         head_dim: usize,
         n_rot: usize,
+        style: crate::op::RopeStyle,
     ) -> NodeId {
         let out_shape = self.shape(dy).clone();
         self.push(
-            Op::RopeBackward { head_dim, n_rot },
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            },
             vec![dy, cos, sin],
             out_shape,
             None,
@@ -643,7 +650,7 @@ impl Graph {
         (dq, dk, dv)
     }
 
-    /// Wirtinger backward for [`complex_norm_sq`]: given upstream `g`
+    /// Wirtinger backward for `complex_norm_sq`: given upstream `g`
     /// (real, same shape as the forward output) and the original
     /// complex input `z`, returns `dz = g · z` as C64.
     pub fn complex_norm_sq_backward(&mut self, z: NodeId, g: NodeId) -> NodeId {

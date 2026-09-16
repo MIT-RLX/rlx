@@ -49,9 +49,11 @@
 //! | `rlx::onnx`     | `rlx-onnx`      | ONNX Runtime `.onnx` inference *(feature `onnx`)*                               |
 //! | `rlx::bench`    | `rlx-bench`     | benchmark harness *(feature `bench`)*                                           |
 //! | `rlx::sparse`   | `rlx-sparse`    | downstream: sparse linalg *(feature `sparse`)*                                  |
-//! | `rlx::splat`    | `rlx-splat`     | 3D Gaussian splatting *(feature `splat`)* — `register()`, decomposed IR ops      |
 //! | `rlx::linalg`   | `rlx-linalg`    | downstream: dense linalg via LAPACK *(feature `linalg`)*                        |
 //! | `rlx::geo`      | `rlx-geo`       | exact 2D Delaunay / Voronoi custom ops *(feature `geo`)*                        |
+//! | `rlx::splat`    | `rlx-ir`+`rlx-cpu` | 3D Gaussian splat opcodes, layouts + executor registry *(feature `splat`)*   |
+//! | `rlx::peft`     | `rlx-peft`      | LoRA / IA3 / AdaLoRA / DoRA / OFT adapters *(feature `peft`)*                   |
+//! | `rlx::rng`      | `rlx-rng`       | bit-exact numpy / PyTorch random streams *(feature `rng`)*                      |
 //! | `rlx::cortexm`  | `rlx-cortexm`   | INT8 ARMv7E-M kernels *(feature `cortexm`)* — no `Backend` impl, kernels only   |
 //! | `rlx::fpga`     | `rlx-fpga`      | IR → SystemVerilog export *(feature `fpga`)* — target-agnostic RTL; no `Backend` |
 //!
@@ -62,13 +64,13 @@
 //!
 //! | namespace            | what                                                                          |
 //! |----------------------|-------------------------------------------------------------------------------|
-//! | [`rlx::quant`]       | `QuantScheme`, `QuantMap` (IR quantization metadata)                          |
-//! | [`rlx::ops`]         | `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ReduceOp`, `InterpMode`, `FftNorm`, … |
-//! | [`rlx::autodiff`]    | `grad`, `grad_with_loss`, `jvp`, `hvp`, `vmap`, `nth_order_grad`, …           |
-//! | [`rlx::pkg`]         | `.rlxp` open / compile / bind — `Package`, `open_rlxp`, `compile_rlxp`, …    |
-//! | [`rlx::compile`]     | `CompileOptions`, `Precision`, `PrecisionPolicy`, fusion / pass helpers      |
+//! | `rlx::quant`       | `QuantScheme`, `QuantMap` (IR quantization metadata)                          |
+//! | `rlx::ops`         | `Activation`, `BinaryOp`, `CmpOp`, `MaskKind`, `ReduceOp`, `InterpMode`, `FftNorm`, … |
+//! | `rlx::autodiff`    | `grad`, `grad_with_loss`, `jvp`, `hvp`, `vmap`, `nth_order_grad`, …           |
+//! | `rlx::pkg`         | `.rlxp` open / compile / bind — `Package`, `open_rlxp`, `compile_rlxp`, …    |
+//! | `rlx::compile`     | `CompileOptions`, `Precision`, `PrecisionPolicy`, fusion / pass helpers      |
 //! | `rlx::distributed`   | transports + in-graph collectives + ship-graph train/infer *(feature `distributed`)* |
-//! | [`rlx::prelude`]     | star-import: graph + Session + CompileOptions + quant + autodiff + pkg       |
+//! | `rlx::prelude`     | star-import: graph + Session + CompileOptions + quant + autodiff + pkg       |
 //!
 //! ## Backend feature gates
 //!
@@ -109,7 +111,7 @@
 //! rlx = { git = "https://github.com/MIT-RLX/rlx", features = ["apple-silicon", "mlx"] }
 //! ```
 
-#![doc(html_root_url = "https://docs.rs/rlx/0.2.14")]
+#![doc(html_root_url = "https://docs.rs/rlx/0.2.16")]
 
 // ── Module re-exports ───────────────────────────────────────────
 
@@ -169,11 +171,6 @@ pub use rlx_sparse as sparse;
 /// See [`rlx-linalg`](https://crates.io/crates/rlx-linalg).
 pub use rlx_linalg as linalg;
 
-#[cfg(feature = "splat")]
-/// Downstream: 3D Gaussian splatting (CPU reference render custom op).
-/// See [`rlx-splat`](https://crates.io/crates/rlx-splat).
-pub use rlx_splat as splat;
-
 #[cfg(feature = "umap")]
 /// Downstream: UMAP / fast-umap custom ops (k-NN from pairwise distances).
 pub use rlx_umap as umap;
@@ -184,6 +181,22 @@ pub use rlx_umap as umap;
 /// compiling graphs that reference them.
 /// See [`rlx-geo`](https://crates.io/crates/rlx-geo).
 pub use rlx_geo as geo;
+
+#[cfg(feature = "peft")]
+/// Parameter-efficient adaptation: LoRA, IA3, AdaLoRA, DoRA and OFT, matching
+/// HuggingFace PEFT's definitions. Both the host arithmetic and the equivalent
+/// graph builders (`peft::graph`), so an adapter can be checked on the host and
+/// then run on whichever backend is enabled.
+/// See [`rlx-peft`](https://crates.io/crates/rlx-peft).
+pub use rlx_peft as peft;
+
+#[cfg(feature = "rng")]
+/// Bit-exact reproductions of the numpy and PyTorch random streams
+/// (`RandomState`/MT19937, `Generator`/PCG64, `torch.randperm`). For porting a
+/// seeded Python reference, where matching the distribution is not enough —
+/// a different-but-valid draw moves every number downstream.
+/// See [`rlx-rng`](https://crates.io/crates/rlx-rng).
+pub use rlx_rng as rng;
 
 #[cfg(feature = "optim")]
 /// Training-step optimizers (Adam, AdamW, NAdamW, RAdam, QHAdamW,
@@ -351,9 +364,9 @@ pub mod autodiff {
 /// let opts = CompileOptions::default().precision(Precision::F16);
 /// ```
 ///
-/// Note: [`Precision`](crate::Precision) here is the **runtime** session
+/// Note: [`Precision`] here is the **runtime** session
 /// precision. The pass-level rewrite enum lives at
-/// [`rlx::opt::Precision`](crate::opt::Precision) / [`PassPrecision`].
+/// [`rlx::opt::Precision`](crate::opt::Precision) / `PassPrecision`.
 pub mod compile {
     pub use crate::{
         CalibrationRecord, CompileOptions, CompilePipeline, CompileResult, FusionOptions,
@@ -362,7 +375,7 @@ pub mod compile {
         maybe_dump_pipeline, supported_for_target, supports_op,
     };
     /// Pass-level numeric precision (AutoMixedPrecision rewrite). Distinct
-    /// from the session [`Precision`](crate::Precision) on [`CompileOptions`].
+    /// from the session [`Precision`] on [`CompileOptions`].
     pub use rlx_opt::Precision as PassPrecision;
 }
 
@@ -418,6 +431,58 @@ pub mod distributed {
     };
     // Heterogeneous multi-backend placement (rlx-runtime::hetero).
     pub use crate::runtime::{DeviceMap, HeteroExecutable};
+    // Node driver — join a mesh from a non-desktop shell (iOS / Android / an
+    // embedded host driving an FPGA). `NodeConfig` is fully programmatic, so a
+    // platform with no shell environment can still configure a rank.
+    pub use crate::runtime::dist::node::{
+        FixedFunction, FixedFunctionDevice, LoopbackFixedFunction, NodeCaps, NodeConfig,
+        NodeControl, NodeReport, NodeRole, NodeStopHandle, PeerSource, TrainReport, collect_caps,
+        mean_reduce, platform_tag, send_caps, serve_fixed_function_n, serve_trainer,
+        serve_trainer_here, serve_worker, serve_worker_n,
+    };
+}
+
+/// 3D Gaussian splatting — the half that lives in this workspace.
+///
+/// The renderer is not here. `rlx-splat` is a separate repo that depends on
+/// rlx, so the dependency points inward and this module is what it builds
+/// against: rlx-ir owns the opcodes and the packed buffer layouts, rlx-cpu owns
+/// dispatch, and the renderer supplies the six executor bodies at startup.
+///
+/// A downstream renderer registers itself like this:
+///
+/// ```ignore
+/// rlx::splat::register_splat_executors(
+///     Box::new(|a: rlx::splat::ArenaRenderArgs| { /* … */ }),
+///     Box::new(|a: rlx::splat::ArenaRenderBwdArgs| { /* … */ }),
+///     Box::new(|a: rlx::splat::ArenaPrepareArgs| { /* … */ }),
+///     Box::new(|a: rlx::splat::ArenaRasterizeArgs| { /* … */ }),
+///     Box::new(|a: rlx::splat::HostRenderArgs| -> Vec<f32> { /* … */ }),
+///     Box::new(|a: rlx::splat::HostBackwardArgs| -> Vec<f32> { /* … */ }),
+/// );
+/// ```
+///
+/// The layout helpers are shared on purpose: a renderer that computes its own
+/// tile count or packed length instead of calling
+/// [`gaussian_splat_tile_count`](rlx_ir::ops::splat::gaussian_splat_tile_count) /
+/// [`gaussian_splat_prep_packed_len`](rlx_ir::ops::splat::gaussian_splat_prep_packed_len)
+/// can disagree with the buffers rlx allocated, which is a silent wrong-pixels
+/// bug rather than an error.
+#[cfg(feature = "splat")]
+pub mod splat {
+    // Opcode payloads + packed buffer layout (rlx-ir, backend-free).
+    pub use rlx_ir::ops::splat::{
+        GAUSSIAN_SPLAT_PREP_RASTER_PARAMS_FLOATS, GaussianSplatBackwardParams, GaussianSplatInputs,
+        GaussianSplatRenderParams, gaussian_splat_packed_grad_len, gaussian_splat_prep_packed_len,
+        gaussian_splat_tile_count, unpack_gaussian_splat_packed_grads,
+    };
+    // The executor registry the downstream renderer plugs into (rlx-cpu).
+    pub use rlx_cpu::splat::{
+        ArenaPrepareArgs, ArenaRasterizeArgs, ArenaRenderArgs, ArenaRenderBwdArgs,
+        HostBackwardArgs, HostBackwardExec, HostRenderArgs, HostRenderExec, PrepareExec,
+        RasterizeExec, RenderBwdExec, RenderExec, backward_host_slices, register_splat_executors,
+        render_host_slices,
+    };
 }
 
 // ── Prelude — single `use rlx::prelude::*;` for the 95% case ────
@@ -518,19 +583,14 @@ pub mod prelude {
         PortNames, SidebandSpec, export_graph, export_tinyconv_mnist, tinyconv_mnist_from_cortexm,
     };
 
-    // 3D Gaussian splatting (`rlx-splat` — call `register()` once per process)
-    #[cfg(feature = "splat")]
-    pub use crate::splat::{
-        gaussian_splat_render_common_ir, gaussian_splat_render_decomposed,
-        gaussian_splat_render_reference, register,
-    };
+    // 3D Gaussian splatting IR surface. The renderer itself lives in the
+    // out-of-tree `rlx-splat`; `splat` is a no-op feature here, so only the
+    // shape/layout types that stayed in rlx-ir are re-exported.
     #[cfg(feature = "splat")]
     pub use rlx_ir::ops::splat::{
         GaussianSplatInputs, GaussianSplatRenderParams, gaussian_splat_prep_packed_len,
         gaussian_splat_tile_count,
     };
-    #[cfg(feature = "splat")]
-    pub use rlx_splat::prep_layout::{prep_packed_len, tile_count};
 }
 
 /// Register optional custom backends and companion custom-op crates.
@@ -541,8 +601,8 @@ pub mod prelude {
 ///
 /// ```ignore
 /// rlx::register_backends! {
-///     splat => rlx::splat::register,
 ///     sparse => rlx::sparse::register,
+///     geo => rlx::geo::register,
 /// }
 /// ```
 #[macro_export]

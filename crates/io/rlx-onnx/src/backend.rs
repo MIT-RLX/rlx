@@ -80,7 +80,7 @@ fn cuda_ep() -> ExecutionProviderDispatch {
                 | AttentionBackend::EFFICIENT_ATTENTION
                 | AttentionBackend::CUDNN_FLASH_ATTENTION,
         );
-    if std::env::var_os("RLX_ORT_CUDA_GRAPH")
+    if rlx_ir::env::var_os("RLX_ORT_CUDA_GRAPH")
         .or_else(|| std::env::var_os("KITTENTTS_ORT_CUDA_GRAPH"))
         .is_some_and(|v| v == "1")
     {

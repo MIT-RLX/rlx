@@ -15,7 +15,7 @@ use rlx_ir::{DType, Graph, Op, ScaleLayout, ScaledFormat, Shape};
 use rlx_runtime::{Device, Session};
 
 fn run_case(fmt: ScaledFormat, layout: ScaleLayout, m: usize, k: usize, n: usize, cos_thresh: f32) {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

@@ -15,10 +15,16 @@ documentation.workspace = true
 
 [features]
 default = []
+# Generate a tiled matmul entry point FROM a typed `KernelSchedule` (see
+# `kernel_schedule_emit`). Off by default and UNMEASURED: compiling the result
+# needs Intel's `ocloc` and running it needs an Intel GPU, neither of which this
+# project has. The shipping `kernels/matmul.cl` is untiled, so this port also
+# has no A/B baseline for the rotation — see the module docs.
+schedule-codegen = []
 
 [dependencies]
 rlx-ir = { workspace = true }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14", default-features = false, features = ["compile", "training"] }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.16", default-features = false, features = ["compile", "training"] }
 rlx-unfuse = { workspace = true }
 rlx-compile = { workspace = true }
 # CPU reference kernels for the host-fallback path. On a host with no Intel
@@ -36,7 +42,7 @@ rlx-compile = { workspace = true }
 # OpenBLAS — rlx-cpu's build.rs leaves the BLAS link off there and falls back to
 # SIMD, so the driverless build still needs no BLAS; only the eigen SPD ops
 # (BiMap, pure GEMM, still works) are unavailable in that narrow case.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false, features = [
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.16", default-features = false, features = [
     "blas",
     "splat",
 ] }
@@ -61,3 +67,7 @@ rlxsl = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

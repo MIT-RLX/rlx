@@ -44,7 +44,7 @@ Requirements: `cuda-compiler-12-*`, `libcudnn9-dev-cuda-12`, `liblapacke-dev`.
 Tips: install `ccache`; use `cargo build` (debug) on Linux so CMake uses
 `Debug` for nvcc; pin arch with `RLX_MLX_CUDA_ARCH=89` (Ada/4090).
 
-See also [`rlx-mlx-sys/README.md`](../../rlx-mlx-sys/README.md).
+See also [`rlx-mlx-sys/README.md`](../../crates/backends/rlx-mlx-sys/README.md).
 
 ### Rig (WSL)
 

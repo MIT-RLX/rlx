@@ -147,6 +147,20 @@ pub(crate) fn reduce_op_id(op: ReduceOp) -> u32 {
     op.opcode()
 }
 
+/// Op code for the `pool{1,2,3}d` kernels, whose legend is `0=max, 1=mean,
+/// 2=sum, 3=min, 4=prod` — this differs from [`reduce_op_id`], which swaps Max
+/// and Sum.
+///
+/// The two encodings feed the *same* shared kernel source, so using the wrong
+/// one does not fail: it computes a different reduction and returns a plausible
+/// tensor. Measured here, a max-pool came back exactly equal to a mean-pool
+/// (correlation 1.000000000 against the wrong answer, 0.556 against the right
+/// one) on a 3-D convolution the same backend computes exactly. CUDA carries
+/// the same note, having hit this first.
+pub(crate) fn pool_op_id(op: ReduceOp) -> u32 {
+    op.pool_opcode()
+}
+
 pub(crate) fn activation_op_id(act: Activation) -> u32 {
     act.opcode_relu_first()
 }

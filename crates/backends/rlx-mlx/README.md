@@ -76,7 +76,7 @@ Via WSL rig:
 ```
 
 Full Linux/WSL guide and **`rlx-mlx` CPU vs `rlx-cpu` matmul benchmarks**:
-[`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
+[`docs/benchmarks/mlx-linux.md`](../../../docs/benchmarks/mlx-linux.md).
 
 ## Build / test
 
@@ -95,7 +95,7 @@ cargo build -p rlx-runtime --features mlx --release
 
 Mature on Apple Silicon (M1 / M2 / M3 / M4). **Linux/WSL:** CPU MLX
 compiles and passes parity tests; CUDA is opt-in. See
-[`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
+[`docs/benchmarks/mlx-linux.md`](../../../docs/benchmarks/mlx-linux.md).
 On Intel Macs MLX falls back to its CPU path; supported but rarely the
 right choice.
 

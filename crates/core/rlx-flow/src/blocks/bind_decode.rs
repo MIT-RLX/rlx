@@ -13,6 +13,11 @@ pub struct BindDecodeInputsStage {
     pub num_layers: usize,
     pub use_custom_mask: bool,
     pub need_past_kv: bool,
+    /// Rows of real history in `past_k_*`/`past_v_*` when those inputs are
+    /// declared with spare capacity. See [`crate::DecodeBindings::past_len`] —
+    /// this is the only place the distinction can enter the flow, because the
+    /// two cache shapes are indistinguishable once built.
+    pub kv_past_len: Option<usize>,
 }
 
 impl BindDecodeInputsStage {
@@ -46,6 +51,7 @@ impl BindDecodeInputsStage {
             mask,
             past_k,
             past_v,
+            past_len: self.kv_past_len,
         });
         Ok(())
     }

@@ -50,7 +50,7 @@ fn build_repeat_kv(
 
 #[test]
 fn metal_repeat_kv_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

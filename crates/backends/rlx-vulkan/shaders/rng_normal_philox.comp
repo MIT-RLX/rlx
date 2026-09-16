@@ -1,0 +1,83 @@
+#version 450
+// On-device Philox4x32-10 normal RNG. Bit-matched to `rlx_ir::Philox4x32`, the
+// shared `rng_philox.cu`, and `rlx-wgpu/kernels/rng_philox.wgsl`.
+//
+// Vulkan was the last backend still filling RNG tensors by reading the arena
+// back, running the CPU generator, and uploading the result — a full stall in
+// the middle of the graph, once per RNG node.
+//
+// Sample `i` reads Philox block `i/2`, taking lanes {0,1} for even `i` and
+// {2,3} for odd, then Box-Muller with the cosine branch (the sine half is
+// discarded, exactly as the CPU generator does — the two must agree per-element,
+// not merely in distribution).
+//
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint out_off;
+    float mean;
+    float scale;
+    uint seed_lo;
+    uint seed_hi;
+} pc;
+
+// (hi, lo) = a * b as an exact 64-bit product, via 16-bit partial products.
+//
+// naga's GLSL front end does not implement `umulExtended`, so this is the same
+// emulation the WGSL twin uses — which also keeps the two shaders provably
+// identical rather than "equivalent modulo a builtin".
+uvec2 umul_wide(uint a, uint b) {
+    uint a0 = a & 0xFFFFu, a1 = a >> 16u;
+    uint b0 = b & 0xFFFFu, b1 = b >> 16u;
+    uint p00 = a0 * b0;
+    uint p01 = a0 * b1;
+    uint p10 = a1 * b0;
+    uint p11 = a1 * b1;
+    uint mid = (p00 >> 16u) + (p01 & 0xFFFFu) + (p10 & 0xFFFFu);
+    uint lo = (p00 & 0xFFFFu) | ((mid & 0xFFFFu) << 16u);
+    uint hi = p11 + (p01 >> 16u) + (p10 >> 16u) + (mid >> 16u);
+    return uvec2(hi, lo);
+}
+
+// One Philox4x32-10 block for counter `blk`.
+void philox_10(uint blk, uint seed_lo, uint seed_hi, out uint r[4]) {
+    // Counter high words are zero: `blk < 2^31` for any u32 element count.
+    uint s0 = blk, s1 = 0u, s2 = 0u, s3 = 0u;
+    uint k0 = seed_lo, k1 = seed_hi;
+    for (int i = 0; i < 10; ++i) {
+        uvec2 p0 = umul_wide(s0, 0xD2561A75u);
+        uvec2 p1 = umul_wide(s2, 0xCD9E8D57u);
+        uint n0 = p1.x ^ s1 ^ k0;
+        uint n1 = p1.y;
+        uint n2 = p0.x ^ s3 ^ k1;
+        uint n3 = p0.y;
+        s0 = n0; s1 = n1; s2 = n2; s3 = n3;
+        k0 += 0x9E3779B9u;
+        k1 += 0xBB67AE85u;
+    }
+    r[0] = s0; r[1] = s1; r[2] = s2; r[3] = s3;
+}
+
+// Top 24 bits → [0, 1). Matches the CPU generator's `(bits >> 8) / 2^24`.
+float u32_to_unit(uint bits) {
+    return float(bits >> 8u) / 16777216.0;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+
+    uint r[4];
+    philox_10(i / 2u, pc.seed_lo, pc.seed_hi, r);
+    uint lane0 = ((i & 1u) != 0u) ? 2u : 0u;
+
+    float u1 = u32_to_unit(r[lane0]);
+    float u2 = u32_to_unit(r[lane0 + 1u]);
+    // log(0) would be -inf; the CPU generator floors at f32::MIN_POSITIVE.
+    if (u1 < 1.17549435e-38) { u1 = 1.17549435e-38; }
+
+    float rad = sqrt(-2.0 * log(u1));
+    float theta = 6.283185307179586 * u2;
+    arena_store(pc.out_off + i, pc.mean + pc.scale * (rad * cos(theta)));
+}

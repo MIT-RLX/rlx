@@ -12,6 +12,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn run_cumprod(device: Device, dims: &[usize], axis: i32, excl: bool, x: &[f32]) -> Vec<f32> {
     let mut g = Graph::new("cumprod");
     let inp = g.input("x", Shape::new(dims, DType::F32));
@@ -72,6 +74,7 @@ fn approx(a: &[f32], b: &[f32], tol: f32, label: &str) {
 
 #[test]
 fn cumprod_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let dims = [2usize, 4];
     let x: Vec<f32> = vec![1.5, 0.5, 2.0, -1.0, 0.9, 1.1, 0.8, 1.2];
     approx(
@@ -90,6 +93,7 @@ fn cumprod_matches_reference() {
 
 #[test]
 fn cummax_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let dims = [2usize, 4];
     let x: Vec<f32> = vec![1.0, 3.0, 2.0, 5.0, -1.0, -3.0, 0.0, -2.0];
     approx(
@@ -133,19 +137,25 @@ fn check_device(device: Device, label: &str) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn cumulative_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check_device(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn cumulative_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     check_device(Device::Gpu, "wgpu");
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn cumulative_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     check_device(Device::Cuda, "cuda");
@@ -154,7 +164,8 @@ fn cumulative_cuda_matches_cpu() {
 #[test]
 #[cfg(feature = "mlx")]
 fn cumulative_mlx_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         return;
     }
     check_device(Device::Mlx, "mlx");
@@ -163,7 +174,8 @@ fn cumulative_mlx_matches_cpu() {
 #[test]
 #[cfg(feature = "vulkan")]
 fn cumulative_vulkan_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Vulkan) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Vulkan, "vulkan") {
         return;
     }
     check_device(Device::Vulkan, "vulkan");
@@ -172,7 +184,8 @@ fn cumulative_vulkan_matches_cpu() {
 #[test]
 #[cfg(feature = "coreml")]
 fn cumulative_coreml_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Ane, "ane") {
         return;
     }
     check_device(Device::Ane, "coreml");

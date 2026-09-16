@@ -62,7 +62,7 @@ pub use backend::{
 ///
 /// Runtime selection for a compiled graph goes through
 /// [`default_compute_units`] (env + dtype), **not** this enum's `Default`
-/// impl — that only provides a serde/placeholder default of [`All`].
+/// impl — that only provides a serde/placeholder default of [`Self::All`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ComputeUnits {
     /// CPU + GPU + Neural Engine, planner's choice (`MLComputeUnitsAll`).

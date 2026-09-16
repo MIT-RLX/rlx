@@ -21,6 +21,8 @@
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn bytes_to_f64s(bytes: &[u8]) -> Vec<f64> {
     bytes
         .chunks_exact(8)
@@ -58,6 +60,7 @@ fn build_fft_round_trip_graph(n: usize, re: &[f64], im: &[f64]) -> Graph {
 
 #[test]
 fn fft_round_trip_runs_on_metal_via_host_fallback() {
+    let _gpu = common::serialize_gpu();
     // Round-trip identity ifft(fft(x)) = N·x must hold when the FFT
     // runs through Metal's host fallback. If the cmd_buf sync /
     // restart path regresses, this test catches it — either compile
@@ -112,6 +115,7 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_metal_native_kernel_f32_pow2_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     // f32 + power-of-two → native multi-kernel MSL path (any N≥2).
     for &n in &[2usize, 4, 8, 16, 64, 256, 1024, 2048, 4096] {
         let mut re: Vec<f32> = Vec::with_capacity(n);
@@ -156,6 +160,7 @@ fn fft_metal_native_kernel_f32_pow2_matches_cpu() {
 // twiddle recurrence and DRAM-round-trip staging at 8192/16384/65536.
 #[test]
 fn fft_metal_native_large_n_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for &n in &[8192usize, 16384, 32768, 65536] {
         let mut x = Vec::with_capacity(2 * n);
         for i in 0..n {
@@ -193,6 +198,7 @@ fn fft_metal_native_large_n_matches_cpu() {
 // this pins the behavior so a future regression is caught).
 #[test]
 fn fft_metal_large_batch_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let (n, batch) = (8usize, 100_000usize);
     let mut x = Vec::with_capacity(batch * 2 * n);
     for b in 0..batch {
@@ -232,6 +238,7 @@ fn fft_metal_large_batch_matches_cpu() {
 
 #[test]
 fn fft_metal_native_round_trip_f32_pow2() {
+    let _gpu = common::serialize_gpu();
     // ifft(fft(x)) = N·x on the native Metal kernel path.
     let n: usize = 32;
     let re: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).sin()).collect();
@@ -267,6 +274,7 @@ fn fft_metal_native_round_trip_f32_pow2() {
 
 #[test]
 fn fft_metal_matches_cpu_bitwise_for_non_pow2() {
+    let _gpu = common::serialize_gpu();
     // Same input through Metal and CPU should produce identical
     // results — both backends run the same Bluestein kernel, just
     // dispatched against different arenas. N=6 forces the Bluestein

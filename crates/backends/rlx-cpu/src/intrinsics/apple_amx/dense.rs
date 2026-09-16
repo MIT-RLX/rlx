@@ -7,8 +7,8 @@
 //! There is deliberately no new dense kernel here: on Apple Silicon
 //! `cblas_sgemm` (Accelerate) already dispatches to the AMX/SME coprocessor and
 //! is the fastest CPU matmul available — you cannot beat the vendor library at
-//! its own game, so [[feedback_perf_is_north_star]] says *use it*, don't
-//! reimplement it. This module exists to (a) name that path explicitly and
+//! its own game, and since per-backend peak performance is the north star, the right move is to
+//! *use* it rather than reimplement it. This module exists to (a) name that path explicitly and
 //! (b) *measure* it — against the portable SIMD fallback and against our
 //! hand-written [`super::sme`] kernel — so the "Accelerate == AMX" claim is
 //! backed by numbers on the actual chip rather than asserted.

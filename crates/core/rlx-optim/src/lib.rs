@@ -106,10 +106,10 @@ pub use common::{global_grad_clip_scale, l2_norm};
 /// # Per-tensor learning rate
 ///
 /// For optimizers that don't need per-tensor LR variation (most
-/// transformer pre-training), set [`lr_scale`](Self::lr_scale) to
+/// transformer pre-training), set `lr_scale` to
 /// return `1.0` (the default). For domain-specific use cases — e.g.
 /// 3D Gaussian splatting, where different attributes need wildly
-/// different step sizes — override [`lr_scale`](Self::lr_scale) to
+/// different step sizes — override `lr_scale` to
 /// multiply the base `lr` by a per-name factor. The provided method
 /// on the trait does NOT scale automatically; algorithms are free to
 /// consult it via [`Optimizer::lr_scale`] inside their `step`.
@@ -140,7 +140,7 @@ pub trait Optimizer {
     }
 
     /// Advance the global step counter. Most algorithms increment per
-    /// call to [`step`], so most implementations leave this a no-op.
+    /// call to `step`, so most implementations leave this a no-op.
     fn end_iteration(&mut self) {}
 
     /// Set the base learning rate (for LR schedules / warmup). Default is a

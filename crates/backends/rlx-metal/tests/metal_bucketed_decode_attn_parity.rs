@@ -85,7 +85,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn metal_bucketed_decode_custom_mask_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -139,7 +139,7 @@ fn metal_bucketed_decode_custom_mask_matches_cpu() {
 /// Empty past + new KV row (decode first step after empty context).
 #[test]
 fn metal_empty_past_kv_concat_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -177,7 +177,7 @@ fn metal_empty_past_kv_concat_matches_cpu() {
 
 #[test]
 fn metal_decode_rope_single_row_hd128_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -228,7 +228,7 @@ fn metal_decode_rope_single_row_hd128_matches_cpu() {
 
 #[test]
 fn metal_causal_decode_attn_hd128_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -266,7 +266,7 @@ fn metal_causal_decode_attn_hd128_matches_cpu() {
 
 #[test]
 fn metal_concat_then_bucketed_attn_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -347,7 +347,7 @@ fn metal_concat_then_bucketed_attn_matches_cpu() {
 /// Qwen3 `per_head_rms`: reshape → RMS → reshape (talker q/k norm path).
 #[test]
 fn metal_per_head_rms_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -395,7 +395,7 @@ fn metal_per_head_rms_matches_cpu() {
 /// Single last-axis narrow on bucketed K tensor.
 #[test]
 fn metal_gqa_narrow_last_axis_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -437,7 +437,7 @@ fn metal_gqa_narrow_last_axis_matches_cpu() {
 /// Concat two distinct narrow slices (no duplicate src segments).
 #[test]
 fn metal_gqa_concat_two_narrows_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -493,7 +493,7 @@ fn metal_gqa_concat_two_narrows_matches_cpu() {
 /// Concat same narrow slice twice (repeat_kv pattern).
 #[test]
 fn metal_gqa_concat_duplicate_narrow_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -577,7 +577,7 @@ fn build_repeat_kv_concat_graph(
 /// `repeat_kv` narrow+concat only (no SDPA).
 #[test]
 fn metal_gqa_repeat_kv_concat_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -627,7 +627,7 @@ fn metal_gqa_repeat_kv_concat_matches_cpu() {
 /// Bucketed K concat on axis 1 with GQA `kv_hs` (talker-shaped).
 #[test]
 fn metal_gqa_kv_concat_axis1_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -668,7 +668,7 @@ fn metal_gqa_kv_concat_axis1_matches_cpu() {
 /// Talker GQA: K/V are `n_kv * head_dim`, `repeat_kv` expands to `n_q * head_dim`.
 #[test]
 fn metal_gqa_repeat_kv_bucketed_attn_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

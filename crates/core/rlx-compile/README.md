@@ -25,7 +25,7 @@ Depends on [`rlx-ir`] and [`rlx-fusion`].
 `prepare_graph_for_backend_with_report` and friends produce a
 `KernelDispatchReport` (native vs common-IR vs rewritten vs unsupported).
 The runtime uses the same legalization path as compile; see the root
-[`README.md`](../README.md#kernel-dispatch-and-transparency) for env vars
+[`README.md`](../../../README.md#kernel-dispatch-and-transparency) for env vars
 (`RLX_DISPATCH_REPORT`, `RLX_KERNEL_DISPATCH`).
 
 ## Install

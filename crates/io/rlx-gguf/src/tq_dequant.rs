@@ -48,8 +48,8 @@ pub fn tq2_0_bytes(n: usize) -> Option<usize> {
 /// Dequantize one TQ1_0 block (54 bytes) into `out`.
 ///
 /// Layout (in order in the file):
-///   qs[48]                              # offsets 0..48
-///   qh[4]                               # offsets 48..52
+///   qs`48`                              # offsets 0..48
+///   qh`4`                               # offsets 48..52
 ///   d  (f16, 2 bytes)                   # offsets 52..54
 pub fn dequant_tq1_0_block(block: &[u8], out: &mut [f32; QK_K]) {
     let qs = &block[0..TQ1_0_QS_LEN];

@@ -7,7 +7,7 @@
 //! [`moe_dispatch`] packs tokens by destination rank and exchanges them with
 //! variable-size [`ProcessGroup::all_to_all_v`](rlx_driver::ProcessGroup::all_to_all_v)
 //! (Phase 1), writing into a static `[P, H+4]` buffer (`P = world × max_tokens`)
-//! for shape-stable [`Op::GroupedMatMul`](rlx_ir::Op::GroupedMatMul).
+//! for shape-stable [`Op::GroupedMatMul`].
 //! [`moe_combine`] returns outputs the same way and applies the gate.
 //!
 //! Inference-first: VJP is intentionally empty (non-differentiable).

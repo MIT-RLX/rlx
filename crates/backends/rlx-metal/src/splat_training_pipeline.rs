@@ -197,7 +197,7 @@ pub enum SplatBinMode {
 
 /// Resolve bin mode from `RLX_FUSED_GPU_CONIC_SCANLINE` (production default: CPU conic prep).
 pub fn splat_bin_mode_from_env() -> SplatBinMode {
-    if std::env::var_os("RLX_FUSED_GPU_CONIC_SCANLINE").is_some() {
+    if rlx_ir::env::var_os("RLX_FUSED_GPU_CONIC_SCANLINE").is_some() {
         SplatBinMode::GpuConicScanline
     } else {
         SplatBinMode::RlxConicPrepare

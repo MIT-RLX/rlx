@@ -112,7 +112,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// exp/mant/bias) would corrupt the decode and fail here.
 #[test]
 fn cuda_scaled_matmul_f4e3m0_grid_is_exact() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: CUDA unavailable");
         return;
     }
@@ -147,7 +147,7 @@ fn cuda_scaled_matmul_f4e3m0_grid_is_exact() {
 /// run end-to-end on-device and produce a sane result.
 #[test]
 fn cuda_scaled_matmul_f4e3m0_tracks_f32() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: CUDA unavailable");
         return;
     }
@@ -175,7 +175,7 @@ fn cuda_scaled_matmul_f4e3m0_tracks_f32() {
 /// the generic-descriptor addition.
 #[test]
 fn cuda_scaled_matmul_named_e4m3_unaffected() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: CUDA unavailable");
         return;
     }
@@ -205,7 +205,7 @@ fn cuda_scaled_matmul_named_e4m3_unaffected() {
 /// f32 matmul; exact-vs-CPU no longer holds since accumulation is tile-blocked.)
 #[test]
 fn cuda_scaled_matmul_f4e3m0_multitile() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: CUDA unavailable");
         return;
     }
@@ -230,9 +230,9 @@ fn cuda_scaled_matmul_f4e3m0_multitile() {
 /// Throughput of the tiled decode GEMM at a GEMM-heavy size. `#[ignore]`d — run
 /// explicitly: `... --test cuda_scaled_custom decode_bench -- --ignored --nocapture`.
 #[test]
-#[ignore]
+#[ignore = "throughput benchmark; run with --ignored --nocapture (needs a CUDA GPU)"]
 fn cuda_scaled_matmul_decode_bench() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     let fmt = ScaledFormat::custom(3, 0);
@@ -310,7 +310,7 @@ fn build_quant_dequant_graph(fmt: ScaledFormat, rows: usize, cols: usize) -> Gra
 /// branch, which is compile-validated here) still decodes the named ids exactly.
 #[test]
 fn cuda_scaled_quant_dequant_matches_cpu_oracle_sweep() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: CUDA unavailable");
         return;
     }

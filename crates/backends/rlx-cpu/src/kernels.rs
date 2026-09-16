@@ -562,7 +562,7 @@ pub fn residual_bias_layer_norm(
 }
 
 /// Fused residual + bias + RMSNorm on [n, h] buffers.
-/// Computes: output[row] = RmsNorm(a[row] + b[row] + bias, gamma, beta)
+/// Computes: output`row` = RmsNorm(a`row` + b`row` + bias, gamma, beta)
 pub fn residual_bias_rms_norm(
     a: &[f32],
     b: &[f32],
@@ -958,10 +958,11 @@ pub fn par_gelu_approx_inplace(data: &mut [f32]) {
         let s = std::slice::from_raw_parts_mut((data_ptr as *mut f32).add(start), end - start);
         gelu_approx_inplace(s);
     });
-    let done = rows * chunk;
-    if done < len {
-        gelu_approx_inplace(&mut data[done..]);
-    }
+    // No trailing pass for `len % chunk`: the final `par_for` chunk already
+    // extends its `end` to `len` (see `off + cnt >= rows` above), so a second
+    // pass over `data[rows * chunk..]` would apply the activation TWICE to the
+    // last `len % 512` elements. In place that is silently wrong — and only for
+    // the tail, so whole-tensor summaries still look right.
 }
 
 pub fn gelu_approx_out(src: &[f32], dst: &mut [f32]) {
@@ -999,10 +1000,11 @@ pub fn par_gelu_approx_out(src: &[f32], dst: &mut [f32]) {
         let d = std::slice::from_raw_parts_mut((dst_ptr as *mut f32).add(start), n);
         gelu_approx_out(s, d);
     });
-    let done = rows * chunk;
-    if done < len {
-        gelu_approx_out(&src[done..], &mut dst[done..]);
-    }
+    // No trailing pass for `len % chunk`: the final `par_for` chunk already
+    // extends its `end` to `len` (see `off + cnt >= rows` above), so a second
+    // pass over `data[rows * chunk..]` would apply the activation TWICE to the
+    // last `len % 512` elements. In place that is silently wrong — and only for
+    // the tail, so whole-tensor summaries still look right.
 }
 
 pub fn par_gelu_inplace(data: &mut [f32]) {
@@ -1029,10 +1031,11 @@ pub fn par_gelu_inplace(data: &mut [f32]) {
         let s = std::slice::from_raw_parts_mut((data_ptr as *mut f32).add(start), end - start);
         gelu_inplace(s);
     });
-    let done = rows * chunk;
-    if done < len {
-        gelu_inplace(&mut data[done..]);
-    }
+    // No trailing pass for `len % chunk`: the final `par_for` chunk already
+    // extends its `end` to `len` (see `off + cnt >= rows` above), so a second
+    // pass over `data[rows * chunk..]` would apply the activation TWICE to the
+    // last `len % 512` elements. In place that is silently wrong — and only for
+    // the tail, so whole-tensor summaries still look right.
 }
 
 /// Parallel SiLU in-place. Same threshold reasoning as `par_gelu_inplace`.
@@ -1060,10 +1063,11 @@ pub fn par_silu_inplace(data: &mut [f32]) {
         let s = std::slice::from_raw_parts_mut((data_ptr as *mut f32).add(start), end - start);
         silu_inplace(s);
     });
-    let done = rows * chunk;
-    if done < len {
-        silu_inplace(&mut data[done..]);
-    }
+    // No trailing pass for `len % chunk`: the final `par_for` chunk already
+    // extends its `end` to `len` (see `off + cnt >= rows` above), so a second
+    // pass over `data[rows * chunk..]` would apply the activation TWICE to the
+    // last `len % 512` elements. In place that is silently wrong — and only for
+    // the tail, so whole-tensor summaries still look right.
 }
 
 // ── Small-m NEON matmul ─────────────────────────────────────────────────
@@ -1555,5 +1559,61 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(max_diff < 1e-6, "par vs seq diff: {max_diff}");
+    }
+}
+
+#[cfg(test)]
+mod par_activation_tail_tests {
+    use super::*;
+
+    /// The parallel activation kernels split the buffer into 512-element chunks
+    /// and let the last worker absorb the remainder. A trailing "finish the
+    /// tail" pass on top of that applied the activation TWICE to the final
+    /// `len % 512` elements — wrong only in the tail, so tensor-wide summaries
+    /// (max, mean) still looked right.
+    ///
+    /// `rlx-tinymyo` hit this on an MLP up-projection of `[1, 1387, 768]`:
+    /// 1387·768 = 1_065_216 is over `ACTIVATION_PAR_MIN` and leaves 256
+    /// elements over, so the last 256 values of the final token were
+    /// `gelu(gelu(x))` — an 18% error confined to one row, while every
+    /// accelerator (which does not share this kernel) was correct.
+    fn assert_matches_serial(len: usize) {
+        let mk = || -> Vec<f32> { (0..len).map(|i| ((i % 97) as f32 / 12.0) - 4.0).collect() };
+        for (name, par, serial) in [
+            (
+                "gelu",
+                par_gelu_inplace as fn(&mut [f32]),
+                gelu_inplace as fn(&mut [f32]),
+            ),
+            ("gelu_approx", par_gelu_approx_inplace, gelu_approx_inplace),
+            ("silu", par_silu_inplace, silu_inplace),
+        ] {
+            let (mut a, mut b) = (mk(), mk());
+            par(&mut a);
+            serial(&mut b);
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-6,
+                    "{name} len={len} index {i}: parallel {x} != serial {y}"
+                );
+            }
+        }
+        let (src, mut d_par, mut d_ser) = (mk(), mk(), mk());
+        par_gelu_approx_out(&src, &mut d_par);
+        gelu_approx_out(&src, &mut d_ser);
+        assert_eq!(d_par, d_ser, "gelu_approx_out len={len}");
+    }
+
+    #[test]
+    fn a_tail_shorter_than_the_chunk_is_not_activated_twice() {
+        // 1387 * 768 — the shape that exposed it; 256 elements over a chunk.
+        assert_matches_serial(1_065_216);
+    }
+
+    #[test]
+    fn tail_lengths_around_the_parallel_threshold_all_match_serial() {
+        for extra in [0usize, 1, 255, 256, 511] {
+            assert_matches_serial(ACTIVATION_PAR_MIN + extra);
+        }
     }
 }

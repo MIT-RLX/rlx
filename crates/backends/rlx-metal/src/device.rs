@@ -65,7 +65,7 @@ impl MetalDevice {
                 std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
             }
         }
-        if std::env::var_os("RLX_METAL_DEBUG").is_some() && bytes > 1 << 30 {
+        if rlx_ir::env::var_os("RLX_METAL_DEBUG").is_some() && bytes > 1 << 30 {
             eprintln!(
                 "[rlx-metal] alloc_shared {:.2} GB (maxBufferLength {:.2} GB) → length {:.2} GB",
                 bytes as f64 / 1e9,

@@ -36,7 +36,7 @@ fn gather_ref(codebook: &[f32], idx: &[u8]) -> Vec<f32> {
 
 #[test]
 fn metal_cast_u8_constant_gather_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
     // u8 index Constant (as rlx-tiny bakes SynthMatMul indices).

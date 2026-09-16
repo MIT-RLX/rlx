@@ -56,6 +56,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Transpose,
         Narrow,
         Concat,
+        KvAppend,
         Expand,
         Gather,
         Reverse,
@@ -101,6 +102,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         QConv2d,
         SelectiveScan,
         GatedDeltaNet,
+        GatedDeltaNetBackward,
         Lstm,
         Gru,
         Rnn,
@@ -178,6 +180,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // power-of-2 sizes). Other backends panic at lowering;
         // pin FFT-containing graphs to Device::Cpu for now.
         Fft,
+        FftQ,
         FftButterflyStage,
         LogMel,
         LogMelBackward,

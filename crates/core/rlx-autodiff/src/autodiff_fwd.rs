@@ -22,7 +22,15 @@
 //!
 //! * every original `Input` / `Param` node, and
 //! * one extra `Input` per node in `tangent_for`, named
-//!   `"tangent_<original_name>"`, with the same shape and dtype.
+//!   `"tangent_<original_name>"`, with the same shape and dtype — or
+//!   `"tangent_<original_name>_2"`, `_3`, … if `forward` already declares that
+//!   name. [`jvp_with_tangent_names`] returns the names actually used.
+//!
+//! The collision is not hypothetical: [`hvp`] *is* a `jvp`, so its result
+//! already contains `tangent_<name>` and `jvp(hvp(f))` — forward-over-reverse
+//! for a third derivative — hits it every time. Nothing errors when it happens,
+//! because binding is by name and reaches a single node: the second declaration
+//! is never bound, reads zeros, and the derivative comes back zero.
 //!
 //! It produces:
 //!
@@ -64,6 +72,17 @@ use crate::autodiff::unbroadcast_inverse;
 /// * Hitting an op without a JVP rule is a panic, not a silent
 ///   miscompute.
 pub fn jvp(forward: &Graph, tangent_for: &[NodeId]) -> Graph {
+    jvp_with_tangent_names(forward, tangent_for).0
+}
+
+/// [`jvp`], also returning the tangent input name chosen for each entry of
+/// `tangent_for`.
+///
+/// `"tangent_<name>"` is only the *usual* name — see the module docs. A caller
+/// composing `jvp` over a graph that already has tangent inputs (`jvp(hvp(f))`)
+/// needs the real names to bind them, and guessing is exactly the failure this
+/// avoids.
+pub fn jvp_with_tangent_names(forward: &Graph, tangent_for: &[NodeId]) -> (Graph, Vec<String>) {
     let forward_owned = crate::prepare_ad::prepare_graph_for_ad(forward.clone());
     let forward = &forward_owned;
 
@@ -80,6 +99,22 @@ pub fn jvp(forward: &Graph, tangent_for: &[NodeId]) -> Graph {
 
     // Build tangents for the seeded inputs — a fresh Input named
     // "tangent_<original>" with the same shape.
+    //
+    // The mirror above copied `forward`'s own leaves, so that name may already
+    // be taken; `hvp` emits `tangent_<name>`, which makes `jvp(hvp(f))` collide
+    // every time. A duplicate leaf name is not an error anywhere — binding
+    // resolves by name to one node, so the second one silently reads zeros —
+    // hence the derivative would come back zero rather than wrong-looking.
+    let mut taken: std::collections::HashSet<String> = forward
+        .nodes()
+        .iter()
+        .filter_map(|n| match &n.op {
+            Op::Input { name } | Op::Param { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut tangent_names = Vec::with_capacity(tangent_for.len());
     let mut tangents: HashMap<NodeId, NodeId> = HashMap::new();
     for &id in tangent_for {
         let original = forward.node(id);
@@ -87,7 +122,9 @@ pub fn jvp(forward: &Graph, tangent_for: &[NodeId]) -> Graph {
             Op::Input { name } | Op::Param { name } => name.clone(),
             other => panic!("jvp: tangent_for[{id}] must be Input/Param, got {other:?}"),
         };
-        let tangent = bwd.input(format!("tangent_{name}"), original.shape.clone());
+        let tangent_name = unique_tangent_name(&name, &mut taken);
+        let tangent = bwd.input(tangent_name.clone(), original.shape.clone());
+        tangent_names.push(tangent_name);
         tangents.insert(id, tangent);
     }
 
@@ -127,7 +164,25 @@ pub fn jvp(forward: &Graph, tangent_for: &[NodeId]) -> Graph {
         outs.push(t);
     }
     bwd.set_outputs(outs);
-    bwd
+    debug_assert!(
+        rlx_ir::verify_unique_leaf_names(&bwd).is_empty(),
+        "jvp emitted a duplicate leaf name: {:?}",
+        rlx_ir::verify_unique_leaf_names(&bwd)
+    );
+    (bwd, tangent_names)
+}
+
+/// `tangent_<base>`, or the first free `tangent_<base>_<n>` when that is taken.
+/// Records the choice in `taken` so repeated `tangent_for` entries can't
+/// collide with each other either.
+fn unique_tangent_name(base: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let mut candidate = format!("tangent_{base}");
+    let mut n = 2;
+    while !taken.insert(candidate.clone()) {
+        candidate = format!("tangent_{base}_{n}");
+        n += 1;
+    }
+    candidate
 }
 
 /// Hessian-vector product via forward-over-reverse.
@@ -155,10 +210,20 @@ pub fn jvp(forward: &Graph, tangent_for: &[NodeId]) -> Graph {
 ///
 /// ## Third order
 ///
-/// `jvp(hvp(f))` does **not** yield the third derivative — the outer
-/// `jvp` graph is still not AD-ready for another pass. Use
-/// [`crate::higher_order::nth_order_grad`] or
-/// [`crate::higher_order::directional_nth_grad`] instead.
+/// `jvp(hvp(f))` yields the third derivative: with `v` bound to
+/// `"tangent_<name>"` and `w` to the outer pass's tangent, the JVP of the
+/// `H·v` output is `∂(H·v)/∂x · w`.
+///
+/// It used to return zero, which was read as the composition being unsupported
+/// ("the outer `jvp` graph is not AD-ready for another pass"). The real cause
+/// was narrower: the outer `jvp` re-declared `"tangent_<name>"`, which this
+/// graph already has, and a duplicate leaf name binds to one node and leaves
+/// the other reading zeros. The outer tangent is now `"tangent_<name>_2"` —
+/// ask [`jvp_with_tangent_names`] rather than assuming either spelling.
+///
+/// [`crate::higher_order::nth_order_grad`] and
+/// [`crate::higher_order::directional_nth_grad`] remain the direct route when
+/// the whole n-th derivative is wanted rather than one directional slice.
 pub fn hvp(forward: &Graph, wrt: &[NodeId]) -> Graph {
     let bwd = crate::decompose_backward::prepare_grad_graph_for_jvp(
         crate::autodiff::grad_with_loss(forward, wrt),
@@ -687,6 +752,21 @@ fn jvp_rule(
                     start: *start,
                     len: *len,
                     step: *step,
+                },
+                vec![t_x],
+                node.shape.clone(),
+            ))
+        }
+
+        // Roll is linear (a permutation): tangent of a shift is the shift of
+        // the tangent, with the same shifts — not the negated ones, which is
+        // the VJP.
+        Op::Roll { shifts, dims } => {
+            let t_x = t_inputs[0]?;
+            Some(bwd.add_node(
+                Op::Roll {
+                    shifts: shifts.clone(),
+                    dims: dims.clone(),
                 },
                 vec![t_x],
                 node.shape.clone(),

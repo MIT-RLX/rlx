@@ -30,6 +30,10 @@ mlx = ["dep:rlx-mlx", "cpu"]
 
 [dependencies]
 rlx-ir = { workspace = true }
+# The sparse kernels are memory-bound gathers over disjoint output rows, which
+# is the shape rayon is for. `rlx-cpu` already threads its BLAS and SPD
+# kernels the same way.
+rayon = "1.10"
 rlx-cpu = { workspace = true, optional = true }
 rlx-mlx = { workspace = true, optional = true }
 
@@ -41,3 +45,8 @@ rlx-metal = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["cpu"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

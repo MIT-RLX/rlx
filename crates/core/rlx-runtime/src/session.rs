@@ -83,7 +83,7 @@ impl Session {
     ///
     /// If the graph carries `Dim::Dynamic` dims it is compiled lazily: the first
     /// `run` infers the concrete shape and specializes, so the same graph runs at
-    /// multiple input shapes on every backend. See [`crate::deferred`].
+    /// multiple input shapes on every backend. See `crate::deferred`.
     ///
     /// On ANE with `RLX_COREML_NATIVE_FLEX=1`, dynamic graphs compile once with
     /// CoreML `ShapeRange` and infer shapes at predict time instead.
@@ -219,7 +219,7 @@ impl Session {
         ))]
         {
             self.device == Device::Ane
-                && std::env::var("RLX_COREML_NATIVE_FLEX").ok().as_deref() == Some("1")
+                && rlx_ir::env::var("RLX_COREML_NATIVE_FLEX").as_deref() == Some("1")
         }
         #[cfg(not(all(
             feature = "coreml",
@@ -255,6 +255,7 @@ fn feature_name(device: Device) -> &'static str {
         Device::Cuda => "cuda",
         Device::Rocm => "rocm",
         Device::Xdna => "xdna",
+        Device::Egpu => "egpu",
         Device::OneApi => "oneapi",
         Device::Tpu => "tpu",
         Device::Hexagon => "qnn",

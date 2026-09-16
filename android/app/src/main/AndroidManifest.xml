@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Mesh transport: TCP peer sockets. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- UDP peer discovery. Android filters multicast/broadcast to the Wi-Fi
+         chipset unless a MulticastLock is held; both are required for the
+         zero-config DISCOVER path (RlxNode.start acquires it when
+         discovery = true). Static peer lists need neither. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <application
         android:allowBackup="true"
         android:icon="@android:drawable/sym_def_app_icon"
@@ -15,6 +25,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".NodeActivity"
+            android:label="@string/open_node"
+            android:exported="false" />
     </application>
 
 </manifest>

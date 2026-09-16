@@ -22,7 +22,7 @@
 //! cargo run -p rlx-cortexm-trainer --release -- \
 //!     --epochs 2 --batch 128 \
 //!     --data ~/.cache/torchvision-mnist/MNIST/raw \
-//!     --out  rlx-cortexm/src/model_weights.rs
+//!     --out  crates/backends/rlx-cortexm/src/model_weights.rs
 //! ```
 //!
 //! Data layout: this trainer reads the standard MNIST IDX files
@@ -72,6 +72,18 @@ struct Args {
     qat: Option<bool>,
 }
 
+/// Default destination for the emitted weights: the sibling `rlx-cortexm`
+/// crate, resolved from this crate's manifest directory rather than the
+/// process CWD. A CWD-relative default silently created a shadow
+/// `trainer/rlx-cortexm/` tree whenever the trainer was run from anywhere
+/// but the workspace root.
+fn default_out_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("src")
+        .join("model_weights.rs")
+}
+
 impl Default for Args {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -81,7 +93,7 @@ impl Default for Args {
             learning_rate: 0.05,
             momentum: 0.9,
             data_dir: PathBuf::from(format!("{home}/.cache/torchvision-mnist/MNIST/raw")),
-            out_path: PathBuf::from("rlx-cortexm/src/model_weights.rs"),
+            out_path: default_out_path(),
             seed: 0,
             train_limit: 0,
             eval_limit: 0,
@@ -162,7 +174,9 @@ Usage: train-mnist [OPTIONS]
   --data PATH           Directory containing MNIST IDX files
                         (default: ~/.cache/torchvision-mnist/MNIST/raw)
   --out PATH            Output path for model_weights.rs
-                        (default: rlx-cortexm/src/model_weights.rs)
+                        (default: the sibling rlx-cortexm crate's
+                        src/model_weights.rs, resolved from this
+                        crate's manifest dir — not the CWD)
   --seed N              RNG seed for weight init + shuffling
                         (default: 0)
   --train-limit N       Use only the first N training images per epoch
@@ -235,7 +249,7 @@ fn run(args: &Args) -> Result<(), String> {
     // Optional: dump the trained fp32 weights (for the CoreML/ANE inference
     // bench, which can't train on-device). Raw little-endian f32, concatenated
     // in param order: conv1_w, conv1_b, conv2_w, conv2_b, fc_w, fc_b.
-    if let Ok(path) = std::env::var("RLX_F32_DUMP") {
+    if let Some(path) = rlx_ir::env::var("RLX_F32_DUMP") {
         dump_f32_weights(&trained, &path)?;
     }
     let calibrated = quant::calibrate_and_quantize(&trained, &dataset, args)?;

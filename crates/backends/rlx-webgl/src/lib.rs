@@ -16,7 +16,7 @@
 //! the pure-Rust [`plan`]ner, and a [CPU executor](exec_cpu) runs the very
 //! same [`Plan`]. The CPU path is unit-tested against RLX's own CPU autodiff,
 //! so the planner + numerics are verified natively. The WebGL fragment shaders
-//! ([`exec_gl`], wasm only) mirror those exact formulas, fetching inputs by the
+//! (`exec_gl`, wasm only) mirror those exact formulas, fetching inputs by the
 //! planner's precomputed indices — so the GL path inherits the verified math
 //! and only the GL plumbing needs in-browser validation.
 //!

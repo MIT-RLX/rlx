@@ -363,7 +363,17 @@ pub(crate) fn compile_reduce(
             && !sorted.is_empty()
             && *sorted.last().unwrap() < rank;
         if !contiguous {
-            Thunk::Nop
+            // `Thunk::Nop` was the old answer here, which leaves the output
+            // buffer untouched — the reduction silently returns zeros. Every
+            // backend shares this restriction, so `Graph::reduce` now splits
+            // non-adjacent axes into a chain of single-axis reductions before
+            // a node like this can be built; anything that still reaches here
+            // was assembled by hand and would otherwise corrupt in silence.
+            panic!(
+                "rlx-cpu Reduce: axes {sorted:?} are not a contiguous range \
+                 (rank {rank}). Build it with `Graph::reduce`, which splits \
+                 non-adjacent axes, or reduce one axis at a time, highest first."
+            )
         } else {
             let first = sorted[0];
             let last = *sorted.last().unwrap();
@@ -607,13 +617,81 @@ pub(crate) fn exec_reduce_sum_f64(t: &Thunk, base: *mut u8) {
 
 #[inline(always)]
 pub(crate) fn exec_softmax(t: &Thunk, base: *mut u8) {
-    let Thunk::Softmax { data, rows, cols } = t else {
+    let Thunk::Softmax {
+        data,
+        rows,
+        cols,
+        inner,
+    } = t
+    else {
         unreachable!()
     };
     {
-        let (rows, cols) = (*rows as usize, *cols as usize);
-        unsafe {
-            crate::kernels::neon_softmax(sl_mut(*data, base, rows * cols), rows, cols);
+        let (rows, cols, inner) = (*rows as usize, *cols as usize, *inner as usize);
+        let d = unsafe { sl_mut(*data, base, rows * cols) };
+        if inner == 1 {
+            crate::kernels::neon_softmax(d, rows, cols);
+        } else {
+            softmax_strided(d, rows / inner, cols, inner);
+        }
+    }
+}
+
+/// Softmax along an axis that is not the last one.
+///
+/// The buffer is `[outer, cols, inner]` and each `(o, i)` pair is normalised
+/// over `cols`. Reached whenever `axis != rank-1` — a channel softmax on
+/// `[N,C,D,H,W]`, for instance, which is how a segmentation network turns
+/// logits into per-class probabilities.
+///
+/// Walks `inner` in chunks so each pass over a chunk is contiguous in memory:
+/// the naive ordering strides by `inner` on every access, which for a 160³
+/// volume is a cache miss per element, three times over.
+///
+/// `data` is expected to hold `outer * cols * inner` elements; a shorter slice
+/// panics on the first out-of-range index rather than reading past the end.
+pub(crate) fn softmax_strided(data: &mut [f32], outer: usize, cols: usize, inner: usize) {
+    if cols == 0 || inner == 0 {
+        return;
+    }
+    const CHUNK: usize = 8192;
+    let mut max = vec![0f32; CHUNK.min(inner)];
+    let mut sum = vec![0f32; CHUNK.min(inner)];
+    for o in 0..outer {
+        let plane = o * cols * inner;
+        let mut i0 = 0;
+        while i0 < inner {
+            let len = CHUNK.min(inner - i0);
+            max[..len].fill(f32::NEG_INFINITY);
+            sum[..len].fill(0.0);
+            for c in 0..cols {
+                let row = &data[plane + c * inner + i0..plane + c * inner + i0 + len];
+                for (m, &v) in max[..len].iter_mut().zip(row) {
+                    if v > *m {
+                        *m = v;
+                    }
+                }
+            }
+            for c in 0..cols {
+                let at = plane + c * inner + i0;
+                let row = &mut data[at..at + len];
+                for ((x, &m), s) in row.iter_mut().zip(&max[..len]).zip(sum[..len].iter_mut()) {
+                    // Subtracting the max before exponentiating is what keeps a
+                    // large logit from overflowing to inf and taking the whole
+                    // normalisation to NaN.
+                    let e = (*x - m).exp();
+                    *x = e;
+                    *s += e;
+                }
+            }
+            for c in 0..cols {
+                let at = plane + c * inner + i0;
+                let row = &mut data[at..at + len];
+                for (x, &s) in row.iter_mut().zip(&sum[..len]) {
+                    *x /= s;
+                }
+            }
+            i0 += len;
         }
     }
 }
@@ -1125,5 +1203,106 @@ pub unsafe fn fill_rng_uniform_arena(
     unsafe {
         let out = std::slice::from_raw_parts_mut((arena.add(dst_off)) as *mut f32, len);
         rlx_ir::fill_uniform_like(out, low, high, opts, key, op_seed);
+    }
+}
+
+#[cfg(test)]
+mod softmax_axis_tests {
+    use super::*;
+
+    /// Softmax over `cols` for a contiguous row — the definition, used as the
+    /// reference the strided kernel has to reproduce.
+    fn reference(row: &[f32]) -> Vec<f32> {
+        let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = row.iter().map(|x| (x - m).exp()).collect();
+        let s: f32 = e.iter().sum();
+        e.iter().map(|x| x / s).collect()
+    }
+
+    #[test]
+    fn a_channel_softmax_normalises_across_channels_not_neighbours() {
+        // The bug this kernel exists for: `[N,C,D]` with axis 1 laid out as
+        // C-major. Treating it as contiguous rows normalises over neighbouring
+        // positions instead of over channels, which still sums to one per row
+        // and so looks entirely healthy.
+        let (outer, cols, inner) = (2usize, 4usize, 5usize);
+        let mut data: Vec<f32> = (0..outer * cols * inner)
+            .map(|i| ((i * 37) % 23) as f32 / 7.0 - 1.0)
+            .collect();
+        let original = data.clone();
+        softmax_strided(&mut data, outer, cols, inner);
+
+        for o in 0..outer {
+            for i in 0..inner {
+                let gathered: Vec<f32> = (0..cols)
+                    .map(|c| original[o * cols * inner + c * inner + i])
+                    .collect();
+                let want = reference(&gathered);
+                for c in 0..cols {
+                    let got = data[o * cols * inner + c * inner + i];
+                    assert!(
+                        (got - want[c]).abs() < 1e-6,
+                        "o={o} c={c} i={i}: {got} vs {}",
+                        want[c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_position_sums_to_one_along_the_axis() {
+        let (outer, cols, inner) = (3usize, 7usize, 11usize);
+        let mut data: Vec<f32> = (0..outer * cols * inner).map(|i| (i % 13) as f32).collect();
+        softmax_strided(&mut data, outer, cols, inner);
+        for o in 0..outer {
+            for i in 0..inner {
+                let sum: f32 = (0..cols)
+                    .map(|c| data[o * cols * inner + c * inner + i])
+                    .sum();
+                assert!((sum - 1.0).abs() < 1e-5, "o={o} i={i} sums to {sum}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_inner_of_one_agrees_with_a_plain_row_softmax() {
+        // inner == 1 is the contiguous case the fast kernels still handle, so
+        // the two must not disagree at the boundary.
+        let (rows, cols) = (5usize, 9usize);
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 17) % 19) as f32 - 9.0)
+            .collect();
+        let mut strided = data.clone();
+        softmax_strided(&mut strided, rows, cols, 1);
+        for r in 0..rows {
+            let want = reference(&data[r * cols..(r + 1) * cols]);
+            for c in 0..cols {
+                assert!((strided[r * cols + c] - want[c]).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_logit_does_not_overflow_to_nan() {
+        // Without subtracting the max, exp(200) is inf and the normalisation
+        // becomes inf/inf.
+        let mut data = vec![200.0f32, 0.0, -200.0, 199.0, 1.0, -5.0];
+        softmax_strided(&mut data, 1, 3, 2);
+        assert!(data.iter().all(|x| x.is_finite()), "{data:?}");
+        assert!((data[0] + data[2] + data[4] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_inner_larger_than_one_chunk_is_handled_in_pieces() {
+        // The chunking is 8192 wide; anything past that exercises a second
+        // pass, where a mis-set offset would corrupt only the tail.
+        let (outer, cols, inner) = (1usize, 3usize, 8192 + 37);
+        let mut data: Vec<f32> = (0..outer * cols * inner).map(|i| (i % 5) as f32).collect();
+        softmax_strided(&mut data, outer, cols, inner);
+        for i in [0usize, 8191, 8192, inner - 1] {
+            let sum: f32 = (0..cols).map(|c| data[c * inner + i]).sum();
+            assert!((sum - 1.0).abs() < 1e-5, "i={i} sums to {sum}");
+        }
     }
 }

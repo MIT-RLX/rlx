@@ -17,7 +17,7 @@ fn mxfp4x2_cuda_decode_matches_cpu_oracle() {
     // `CudaContext::new` does not merely return `Err` without a driver — cudarc
     // *panics* when it cannot dlopen libcuda (as on macOS). Gate on the
     // dlopen-safe probe first so this skips instead of failing the suite.
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: no CUDA device");
         return;
     }

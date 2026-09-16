@@ -12,9 +12,12 @@
 //! sweep.
 //!
 //! Usage:
-//!   opscope-layers                 # synthetic diverse-structure model demo
-//!   opscope-layers <dir>           # mine every *.tensor in <dir> (real weights)
-//!   opscope-layers <dir> 0.35      # ...at a 35%-of-dense byte budget
+//!
+//! ```text
+//! opscope-layers                 # synthetic diverse-structure model demo
+//! opscope-layers <dir>           # mine every *.tensor in <dir> (real weights)
+//! opscope-layers <dir> 0.35      # ...at a 35%-of-dense byte budget
+//! ```
 //!
 //! Feed it real weights with `probe::save_tensor` dumps — e.g. the qwen example
 //! `opscope_qwen.rs --dump-tensors <dir>` writes one file per weight.

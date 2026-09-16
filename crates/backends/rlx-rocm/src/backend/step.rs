@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use rlx_gpu_dispatch::indexing::{KernelKind as IndexingNdKind, Prologue as IndexingPrologue};
 use std::collections::HashMap;
 
 // ── Step enum ─────────────────────────────────────────────────────────
@@ -31,13 +32,13 @@ pub(crate) enum Step {
         m: u32,
         k: u32,
         n: u32,
-        lhs_byte_off: u32,
-        rhs_byte_off: u32,
-        lhs_scale_byte_off: u32,
-        rhs_scale_byte_off: u32,
-        out_byte_off: u32,
+        lhs_byte_off: u64,
+        rhs_byte_off: u64,
+        lhs_scale_byte_off: u64,
+        rhs_scale_byte_off: u64,
+        out_byte_off: u64,
         has_bias: u32,
-        bias_byte_off: u32,
+        bias_byte_off: u64,
         lhs_e5m2: u32,
         rhs_e5m2: u32,
     },
@@ -52,7 +53,7 @@ pub(crate) enum Step {
     ScaledQuantizeFp8 {
         x_off_f32: u32,
         scale_off_f32: u32,
-        out_byte_off: u32,
+        out_byte_off: u64,
         n: u32,
         e5m2: u32,
     },
@@ -62,10 +63,10 @@ pub(crate) enum Step {
         m: u32,
         k: u32,
         n: u32,
-        lhs_byte_off: u32,
-        rhs_byte_off: u32,
-        lhs_scale_byte_off: u32,
-        rhs_scale_byte_off: u32,
+        lhs_byte_off: u64,
+        rhs_byte_off: u64,
+        lhs_scale_byte_off: u64,
+        rhs_scale_byte_off: u64,
         out_off_f32: u32,
         lhs_fmt: u32,
         rhs_fmt: u32,
@@ -81,10 +82,10 @@ pub(crate) enum Step {
         k: u32,
         n: u32,
         num_experts: u32,
-        input_byte_off: u32,
-        weight_byte_off: u32,
-        input_scale_byte_off: u32,
-        weight_scale_byte_off: u32,
+        input_byte_off: u64,
+        weight_byte_off: u64,
+        input_scale_byte_off: u64,
+        weight_scale_byte_off: u64,
         idx_off_f32: u32,
         out_off_f32: u32,
         bias_off_f32: u32,
@@ -97,7 +98,7 @@ pub(crate) enum Step {
     /// General (all-format/all-layout) scale producer.
     ScaledQuantScaleGeneral {
         x_off_f32: u32,
-        scale_byte_off: u32,
+        scale_byte_off: u64,
         rows: u32,
         cols: u32,
         fmt: u32,
@@ -107,8 +108,8 @@ pub(crate) enum Step {
     /// General (all-format/all-layout) quantize producer.
     ScaledQuantizeGeneral {
         x_off_f32: u32,
-        scale_byte_off: u32,
-        out_byte_off: u32,
+        scale_byte_off: u64,
+        out_byte_off: u64,
         rows: u32,
         cols: u32,
         fmt: u32,
@@ -116,8 +117,8 @@ pub(crate) enum Step {
         block: u32,
     },
     ScaledDequantizeGeneral {
-        codes_byte_off: u32,
-        scale_byte_off: u32,
+        codes_byte_off: u64,
+        scale_byte_off: u64,
         out_off_f32: u32,
         rows: u32,
         cols: u32,
@@ -494,11 +495,11 @@ pub(crate) enum Step {
         k: u32,
         n: u32,
         scheme: rlx_ir::quant::QuantScheme,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        scale_byte_off: u32,
-        zp_byte_off: u32,
-        out_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        zp_byte_off: u64,
+        out_byte_off: u64,
     },
     /// MxFp4x2 two-level residual E2M1 DequantMatMul: decode `w_q`=[plane0|plane1]
     /// + `scale`=[s0|s1] into f32 scratch, then hipBLAS sgemm x·scratch.
@@ -507,10 +508,10 @@ pub(crate) enum Step {
         k: u32,
         n: u32,
         group: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        scale_byte_off: u32,
-        out_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        out_byte_off: u64,
     },
     DequantGroupedMatmulGguf {
         m: u32,
@@ -518,10 +519,10 @@ pub(crate) enum Step {
         n: u32,
         num_experts: u32,
         scheme_id: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        idx_byte_off: u32,
-        out_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
     },
     /// MLX-affine/MXFP4 grouped MoE matmul, host-delegated (no native grouped-MLX ROCm
     /// kernel yet). 5 operands: input, w_q (codes), scales, biases/zp, expert_idx.
@@ -531,12 +532,12 @@ pub(crate) enum Step {
         n: u32,
         num_experts: u32,
         scheme: rlx_ir::quant::QuantScheme,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        scale_byte_off: u32,
-        zp_byte_off: u32,
-        idx_byte_off: u32,
-        out_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        zp_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
         scale_bf16: bool,
     },
     /// Native on-device MXFP4 grouped (MoE) decode-GEMM — replaces the host-delegate
@@ -549,11 +550,11 @@ pub(crate) enum Step {
         n: u32,
         num_experts: u32,
         group_size: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
-        scale_byte_off: u32,
-        idx_byte_off: u32,
-        out_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
+        scale_byte_off: u64,
+        idx_byte_off: u64,
+        out_byte_off: u64,
     },
     Sample {
         outer: u32,
@@ -567,7 +568,7 @@ pub(crate) enum Step {
         seed_hi: u32,
     },
     RngNormal {
-        dst_byte_off: u32,
+        dst_byte_off: u64,
         len: u32,
         mean: f32,
         scale: f32,
@@ -575,7 +576,7 @@ pub(crate) enum Step {
         op_seed: Option<f32>,
     },
     RngUniform {
-        dst_byte_off: u32,
+        dst_byte_off: u64,
         len: u32,
         low: f32,
         high: f32,
@@ -596,8 +597,8 @@ pub(crate) enum Step {
     },
     /// Gated-DeltaNet — host scan between GPU segments.
     Fft {
-        src_byte_off: u32,
-        dst_byte_off: u32,
+        src_byte_off: u64,
+        dst_byte_off: u64,
         outer: u32,
         n_complex: u32,
         inverse: bool,
@@ -605,28 +606,42 @@ pub(crate) enum Step {
         dtype_tag: u32,
         use_gpu: bool,
     },
+    /// Fixed-point 1D FFT (`Op::FftQ`) — host fallback.
+    ///
+    /// This arena stores integer tensors as f32 *values*, so the adapter
+    /// converts f32→i32 on the way in and i32→f32 on the way out. See
+    /// [`rlx_gpu_host::run_fft1d_q_valued`] for the exactness bound.
+    FftQ {
+        src_byte_off: u64,
+        dst_byte_off: u64,
+        outer: u32,
+        n_complex: u32,
+        inverse: bool,
+        norm_tag: u32,
+        scale_tag: u32,
+    },
     LogMelHost {
-        spec_byte_off: u32,
-        filt_byte_off: u32,
-        dst_byte_off: u32,
+        spec_byte_off: u64,
+        filt_byte_off: u64,
+        dst_byte_off: u64,
         outer: u32,
         n_fft: u32,
         n_bins: u32,
         n_mels: u32,
     },
     LogMelBackwardHost {
-        spec_byte_off: u32,
-        filt_byte_off: u32,
-        dy_byte_off: u32,
-        dst_byte_off: u32,
+        spec_byte_off: u64,
+        filt_byte_off: u64,
+        dy_byte_off: u64,
+        dst_byte_off: u64,
         outer: u32,
         n_fft: u32,
         n_bins: u32,
         n_mels: u32,
     },
     WelchPeaksHost {
-        spec_byte_off: u32,
-        dst_byte_off: u32,
+        spec_byte_off: u64,
+        dst_byte_off: u64,
         welch_batch: u32,
         n_fft: u32,
         n_segments: u32,
@@ -655,8 +670,8 @@ pub(crate) enum Step {
         stage: u32,
     },
     Im2ColHost {
-        x_byte_off: u32,
-        col_byte_off: u32,
+        x_byte_off: u64,
+        col_byte_off: u64,
         n: u32,
         c_in: u32,
         h: u32,
@@ -675,16 +690,16 @@ pub(crate) enum Step {
     },
     /// Host-staged batch-general reverse/flip.
     ReverseHost {
-        src_byte_off: u32,
-        dst_byte_off: u32,
+        src_byte_off: u64,
+        dst_byte_off: u64,
         dims: Vec<u32>,
         rev_mask: Vec<bool>,
         elem_bytes: u32,
     },
     /// Host-staged ArgMax/ArgMin (f32-encoded indices).
     ArgReduceHost {
-        src_byte_off: u32,
-        dst_byte_off: u32,
+        src_byte_off: u64,
+        dst_byte_off: u64,
         outer: u32,
         reduced: u32,
         inner: u32,
@@ -705,13 +720,13 @@ pub(crate) enum Step {
         repeat_factor: u32,
     },
     GatedDeltaNet {
-        q_byte_off: u32,
-        k_byte_off: u32,
-        v_byte_off: u32,
-        g_byte_off: u32,
-        beta_byte_off: u32,
-        state_byte_off: u32,
-        dst_byte_off: u32,
+        q_byte_off: u64,
+        k_byte_off: u64,
+        v_byte_off: u64,
+        g_byte_off: u64,
+        beta_byte_off: u64,
+        state_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         heads: u32,
@@ -721,13 +736,13 @@ pub(crate) enum Step {
         gate_per_channel: bool,
     },
     Lstm {
-        x_byte_off: u32,
-        w_ih_byte_off: u32,
-        w_hh_byte_off: u32,
-        bias_byte_off: u32,
-        h0_byte_off: u32,
-        c0_byte_off: u32,
-        dst_byte_off: u32,
+        x_byte_off: u64,
+        w_ih_byte_off: u64,
+        w_hh_byte_off: u64,
+        bias_byte_off: u64,
+        h0_byte_off: u64,
+        c0_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         input_size: u32,
@@ -738,12 +753,12 @@ pub(crate) enum Step {
     },
     /// Native ROCm GRU (any layers / dirs / carry, hidden ≤ 1024).
     Gru {
-        x_byte_off: u32,
-        w_ih_byte_off: u32,
-        w_hh_byte_off: u32,
-        b_ih_byte_off: u32,
-        b_hh_byte_off: u32,
-        dst_byte_off: u32,
+        x_byte_off: u64,
+        w_ih_byte_off: u64,
+        w_hh_byte_off: u64,
+        b_ih_byte_off: u64,
+        b_hh_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         input_size: u32,
@@ -751,17 +766,17 @@ pub(crate) enum Step {
         num_layers: u32,
         bidirectional: bool,
         /// h0 (carry) byte offset; 0 = no carry (h0 = 0).
-        h0_byte_off: u32,
+        h0_byte_off: u64,
     },
     /// Host-staged GRU fallback (hidden > 1024).
     GruHost {
-        x_byte_off: u32,
-        w_ih_byte_off: u32,
-        w_hh_byte_off: u32,
-        b_ih_byte_off: u32,
-        b_hh_byte_off: u32,
-        h0_byte_off: u32,
-        dst_byte_off: u32,
+        x_byte_off: u64,
+        w_ih_byte_off: u64,
+        w_hh_byte_off: u64,
+        b_ih_byte_off: u64,
+        b_hh_byte_off: u64,
+        h0_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         input_size: u32,
@@ -772,11 +787,11 @@ pub(crate) enum Step {
     },
     /// Native ROCm Elman RNN (any layers / dirs / carry, hidden ≤ 1024).
     Rnn {
-        x_byte_off: u32,
-        w_ih_byte_off: u32,
-        w_hh_byte_off: u32,
-        bias_byte_off: u32,
-        dst_byte_off: u32,
+        x_byte_off: u64,
+        w_ih_byte_off: u64,
+        w_hh_byte_off: u64,
+        bias_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         input_size: u32,
@@ -784,17 +799,17 @@ pub(crate) enum Step {
         num_layers: u32,
         bidirectional: bool,
         /// h0 (carry) byte offset; 0 = no carry (h0 = 0).
-        h0_byte_off: u32,
+        h0_byte_off: u64,
         relu: bool,
     },
     /// Host-staged Elman RNN fallback (hidden > 1024).
     RnnHost {
-        x_byte_off: u32,
-        w_ih_byte_off: u32,
-        w_hh_byte_off: u32,
-        bias_byte_off: u32,
-        h0_byte_off: u32,
-        dst_byte_off: u32,
+        x_byte_off: u64,
+        w_ih_byte_off: u64,
+        w_hh_byte_off: u64,
+        bias_byte_off: u64,
+        h0_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         input_size: u32,
@@ -806,12 +821,12 @@ pub(crate) enum Step {
     },
     /// Native ROCm Mamba-2 SSD scan (`state_size ≤ 256`).
     Mamba2 {
-        x_byte_off: u32,
-        dt_byte_off: u32,
-        a_byte_off: u32,
-        b_byte_off: u32,
-        c_byte_off: u32,
-        dst_byte_off: u32,
+        x_byte_off: u64,
+        dt_byte_off: u64,
+        a_byte_off: u64,
+        b_byte_off: u64,
+        c_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         heads: u32,
@@ -820,12 +835,12 @@ pub(crate) enum Step {
     },
     /// Host-staged Mamba-2 fallback (`state_size > 256` or force-host).
     Mamba2Host {
-        x_byte_off: u32,
-        dt_byte_off: u32,
-        a_byte_off: u32,
-        b_byte_off: u32,
-        c_byte_off: u32,
-        dst_byte_off: u32,
+        x_byte_off: u64,
+        dt_byte_off: u64,
+        a_byte_off: u64,
+        b_byte_off: u64,
+        c_byte_off: u64,
+        dst_byte_off: u64,
         batch: u32,
         seq: u32,
         heads: u32,
@@ -842,8 +857,30 @@ pub(crate) enum Step {
     },
     /// Native CPU ScatterNd / ScatterElements / GatherNd / GatherElements
     /// via full-arena D2H (correct for `I64` indices; no mini-graph rebuild).
+    ///
+    /// The residual fallback for shapes [`Step::IndexingNd`] declines.
     CpuIndexing {
         thunk: rlx_cpu::thunk::IndexingThunk,
+    },
+    /// Native on-device ONNX ND indexing (`indexing_nd.cu`, shared with CUDA).
+    ///
+    /// Replaces the `Step::CpuIndexing` D2H → CPU → H2D round trip for the
+    /// shapes [`rlx_gpu_dispatch::indexing`] can plan. `meta_idx` indexes the
+    /// compile-time u32 buffers, so there is no per-launch allocation.
+    IndexingNd {
+        kind: IndexingNdKind,
+        /// Threads for the main kernel.
+        n: u32,
+        /// Arena f32 element offsets.
+        data_off: u32,
+        idx_off: u32,
+        /// Scatter only; unused (0) for the gathers.
+        upd_off: u32,
+        dst_off: u32,
+        dst_len: u32,
+        /// Scatter prologue; `None` for the gathers, which write every slot.
+        prologue: Option<IndexingPrologue>,
+        meta_idx: usize,
     },
     /// Core Riemannian / SPD-manifold op (`Op::BiMap`, `ReEig`, `LogEig`,
     /// `SpdBatchNorm`, `SpdKarcherMean`, and their backwards) via host fallback
@@ -1026,58 +1063,63 @@ pub(crate) enum Step {
         max_list_entries: u32,
     },
     RmsNormBackwardInput {
-        x_byte_off: u32,
-        gamma_byte_off: u32,
-        beta_byte_off: u32,
-        dy_byte_off: u32,
-        dx_byte_off: u32,
+        x_byte_off: u64,
+        gamma_byte_off: u64,
+        beta_byte_off: u64,
+        dy_byte_off: u64,
+        dx_byte_off: u64,
         rows: u32,
         h: u32,
         eps_bits: u32,
     },
     RmsNormBackwardGamma {
-        x_byte_off: u32,
-        gamma_byte_off: u32,
-        beta_byte_off: u32,
-        dy_byte_off: u32,
-        dgamma_byte_off: u32,
+        x_byte_off: u64,
+        gamma_byte_off: u64,
+        beta_byte_off: u64,
+        dy_byte_off: u64,
+        dgamma_byte_off: u64,
         rows: u32,
         h: u32,
         eps_bits: u32,
     },
     RmsNormBackwardBeta {
-        x_byte_off: u32,
-        gamma_byte_off: u32,
-        beta_byte_off: u32,
-        dy_byte_off: u32,
-        dbeta_byte_off: u32,
+        x_byte_off: u64,
+        gamma_byte_off: u64,
+        beta_byte_off: u64,
+        dy_byte_off: u64,
+        dbeta_byte_off: u64,
         rows: u32,
         h: u32,
         eps_bits: u32,
     },
     RopeBackward {
-        dy_byte_off: u32,
-        cos_byte_off: u32,
-        sin_byte_off: u32,
-        dx_byte_off: u32,
+        dy_byte_off: u64,
+        cos_byte_off: u64,
+        sin_byte_off: u64,
+        dx_byte_off: u64,
         batch: u32,
         seq: u32,
         hidden: u32,
         head_dim: u32,
         n_rot: u32,
         cos_len: u32,
+        /// The cos/sin table's own last dimension — see `rlx_rope_bwd`.
+        cos_row_stride: u32,
+        /// GptJ pairing (adjacent lanes) rather than NeoX rotate-half. Must
+        /// match the forward `Step::Rope` this is the adjoint of.
+        interleaved: bool,
     },
     CumsumBackward {
-        dy_byte_off: u32,
-        dx_byte_off: u32,
+        dy_byte_off: u64,
+        dx_byte_off: u64,
         rows: u32,
         cols: u32,
         exclusive: bool,
     },
     GatherBackward {
-        dy_byte_off: u32,
-        indices_byte_off: u32,
-        dst_byte_off: u32,
+        dy_byte_off: u64,
+        indices_byte_off: u64,
+        dst_byte_off: u64,
         outer: u32,
         axis_dim: u32,
         num_idx: u32,
@@ -1552,7 +1594,7 @@ pub(crate) enum Step {
     /// byte offset (I8 slot).
     QuantizeI8 {
         in_off: u32,
-        q_byte_off: u32,
+        q_byte_off: u64,
         n: u32,
         chan_dim: u32,
         inner: u32,
@@ -1560,7 +1602,7 @@ pub(crate) enum Step {
     },
     /// Native INT8 `Op::Dequantize`. Affine packing matches `QuantizeI8`.
     DequantizeI8 {
-        q_byte_off: u32,
+        q_byte_off: u64,
         out_off: u32,
         n: u32,
         chan_dim: u32,
@@ -1573,10 +1615,10 @@ pub(crate) enum Step {
         m: u32,
         k: u32,
         n: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
         bias_off: u32,
-        out_byte_off: u32,
+        out_byte_off: u64,
         x_zp: i32,
         w_zp: i32,
         out_zp: i32,
@@ -1601,10 +1643,10 @@ pub(crate) enum Step {
         dh: u32,
         dw: u32,
         groups: u32,
-        x_byte_off: u32,
-        w_byte_off: u32,
+        x_byte_off: u64,
+        w_byte_off: u64,
         bias_off: u32,
-        out_byte_off: u32,
+        out_byte_off: u64,
         x_zp: i32,
         w_zp: i32,
         out_zp: i32,
@@ -1673,8 +1715,8 @@ pub(crate) enum Step {
     /// leave the high word as stack garbage.
     ComplexCast {
         n: u32,
-        in_byte_off: u32,
-        out_byte_off: u32,
+        in_byte_off: u64,
+        out_byte_off: u64,
         mode: u32,
     },
     /// Element-wise C64 binary (`binary_c64.cu`, shared with rlx-cuda):
@@ -1684,9 +1726,9 @@ pub(crate) enum Step {
     /// launch to match the kernel's `unsigned long long` params).
     BinaryC64 {
         n: u32,
-        a_byte_off: u32,
-        b_byte_off: u32,
-        c_byte_off: u32,
+        a_byte_off: u64,
+        b_byte_off: u64,
+        c_byte_off: u64,
         op: u32,
         n_a: u32,
         n_b: u32,
@@ -1695,22 +1737,22 @@ pub(crate) enum Step {
     /// `n` is the complex-element count; output is real F32 (one lane per elem).
     ComplexNormSq {
         n: u32,
-        src_byte_off: u32,
-        dst_byte_off: u32,
+        src_byte_off: u64,
+        dst_byte_off: u64,
     },
     /// Wirtinger VJP of ComplexNormSq: `dz = g · z` (`complex_norm_sq_backward`).
     /// `z` is C64, `g` is real F32, `dz` is C64.
     ComplexNormSqBackward {
         n: u32,
-        z_byte_off: u32,
-        g_byte_off: u32,
-        dz_byte_off: u32,
+        z_byte_off: u64,
+        g_byte_off: u64,
+        dz_byte_off: u64,
     },
     /// Element-wise C64 conjugate: `(re, -im)` (`conjugate_c64`).
     ConjugateC64 {
         n: u32,
-        src_byte_off: u32,
-        dst_byte_off: u32,
+        src_byte_off: u64,
+        dst_byte_off: u64,
     },
     FusedBinaryUnary {
         n: u32,
@@ -1820,6 +1862,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::RngUniform { .. } => "rlx::RngUniform",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
+        Step::FftQ { .. } => "rlx::FftQ",
         Step::LogMelHost { .. } => "rlx::LogMelHost",
         Step::LogMelBackwardHost { .. } => "rlx::LogMelBackwardHost",
         Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
@@ -1840,6 +1883,12 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScanHost { .. } => "rlx::ScanHost",
         Step::HostOp { .. } => "rlx::HostOp",
         Step::CpuIndexing { .. } => "rlx::CpuIndexing",
+        Step::IndexingNd { kind, .. } => match kind {
+            IndexingNdKind::GatherNd { .. } => "rlx::GatherNd",
+            IndexingNdKind::GatherElements { .. } => "rlx::GatherElements",
+            IndexingNdKind::ScatterElements { .. } => "rlx::ScatterElements",
+            IndexingNdKind::ScatterNd { .. } => "rlx::ScatterNd",
+        },
         Step::SpdHost { .. } => "rlx::SpdHost",
         Step::EighNative { .. } => "rlx::EighNative",
         Step::DenseSolveNative { .. } => "rlx::DenseSolveNative",
@@ -1910,6 +1959,13 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
 
 // ── step_offsets (port from rlx-cuda) ─────────────────────────────────
 
+/// (read offsets, write offsets) for a Step, as leading f32-**element** offsets.
+///
+/// These are slot identity keys for the multi-stream scheduler, not addresses,
+/// so they stay `u32` even though `Step`'s byte offsets are now `u64` — same
+/// convention as rlx-cuda. Narrowing here can only make two distinct slots
+/// compare equal, which adds a spurious dependency and serialises; it can never
+/// make two equal slots differ and drop a real one.
 pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
     match step {
         Step::ScanHost { desc } => {
@@ -1933,6 +1989,25 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
                 .map(|&(o, _)| vec![(o / 4) as u32])
                 .unwrap_or_default();
             (reads, writes)
+        }
+        // Offsets here are already f32-element indices, not bytes. `data` is
+        // read even by the scatters, whose prologue seeds `dst` from it.
+        Step::IndexingNd {
+            kind,
+            data_off,
+            idx_off,
+            upd_off,
+            dst_off,
+            ..
+        } => {
+            let mut reads = vec![*data_off, *idx_off];
+            if matches!(
+                kind,
+                IndexingNdKind::ScatterElements { .. } | IndexingNdKind::ScatterNd { .. }
+            ) {
+                reads.push(*upd_off);
+            }
+            (reads, vec![*dst_off])
         }
         Step::SpdHost {
             out_off, inputs, ..
@@ -1981,15 +2056,15 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => {
             let mut r = vec![
-                *lhs_byte_off / 4,
-                *rhs_byte_off / 4,
-                *lhs_scale_byte_off / 4,
-                *rhs_scale_byte_off / 4,
+                (*lhs_byte_off / 4) as u32,
+                (*rhs_byte_off / 4) as u32,
+                (*lhs_scale_byte_off / 4) as u32,
+                (*rhs_scale_byte_off / 4) as u32,
             ];
             if *has_bias != 0 {
-                r.push(*bias_byte_off / 4);
+                r.push((*bias_byte_off / 4) as u32);
             }
-            (r, vec![*out_byte_off / 4])
+            (r, vec![(*out_byte_off / 4) as u32])
         }
         Step::ScaledQuantScale {
             x_off_f32,
@@ -2001,7 +2076,10 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             scale_off_f32,
             out_byte_off,
             ..
-        } => (vec![*x_off_f32, *scale_off_f32], vec![*out_byte_off / 4]),
+        } => (
+            vec![*x_off_f32, *scale_off_f32],
+            vec![(*out_byte_off / 4) as u32],
+        ),
         Step::ScaledMatMulDecode {
             lhs_byte_off,
             rhs_byte_off,
@@ -2013,10 +2091,10 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => {
             let mut r = vec![
-                *lhs_byte_off / 4,
-                *rhs_byte_off / 4,
-                *lhs_scale_byte_off / 4,
-                *rhs_scale_byte_off / 4,
+                (*lhs_byte_off / 4) as u32,
+                (*rhs_byte_off / 4) as u32,
+                (*lhs_scale_byte_off / 4) as u32,
+                (*rhs_scale_byte_off / 4) as u32,
             ];
             if *has_bias != 0 {
                 r.push(*bias_off_f32);
@@ -2035,10 +2113,10 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => {
             let mut r = vec![
-                *input_byte_off / 4,
-                *weight_byte_off / 4,
-                *input_scale_byte_off / 4,
-                *weight_scale_byte_off / 4,
+                (*input_byte_off / 4) as u32,
+                (*weight_byte_off / 4) as u32,
+                (*input_scale_byte_off / 4) as u32,
+                (*weight_scale_byte_off / 4) as u32,
                 *idx_off_f32,
             ];
             if *has_bias != 0 {
@@ -2050,15 +2128,15 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             x_off_f32,
             scale_byte_off,
             ..
-        } => (vec![*x_off_f32], vec![*scale_byte_off / 4]),
+        } => (vec![*x_off_f32], vec![(*scale_byte_off / 4) as u32]),
         Step::ScaledQuantizeGeneral {
             x_off_f32,
             scale_byte_off,
             out_byte_off,
             ..
         } => (
-            vec![*x_off_f32, *scale_byte_off / 4],
-            vec![*out_byte_off / 4],
+            vec![*x_off_f32, (*scale_byte_off / 4) as u32],
+            vec![(*out_byte_off / 4) as u32],
         ),
         Step::ScaledDequantizeGeneral {
             codes_byte_off,
@@ -2066,7 +2144,7 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_off_f32,
             ..
         } => (
-            vec![*codes_byte_off / 4, *scale_byte_off / 4],
+            vec![(*codes_byte_off / 4) as u32, (*scale_byte_off / 4) as u32],
             vec![*out_off_f32],
         ),
         Step::Binary {
@@ -2148,7 +2226,7 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (vec![*logits_off, *labels_off, *d_loss_off], vec![*out_off]),
         Step::RngNormal { dst_byte_off, .. } | Step::RngUniform { dst_byte_off, .. } => {
-            (vec![], vec![*dst_byte_off / 4])
+            (vec![], vec![(*dst_byte_off / 4) as u32])
         }
         Step::TopK {
             in_off, out_off, ..
@@ -2341,12 +2419,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                w_byte_off / 4,
-                scale_byte_off / 4,
-                zp_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_byte_off / 4) as u32,
+                (scale_byte_off / 4) as u32,
+                (zp_byte_off / 4) as u32,
             ],
-            vec![out_byte_off / 4],
+            vec![(out_byte_off / 4) as u32],
         ),
         Step::DequantMatmulMxFp4x2 {
             x_byte_off,
@@ -2355,8 +2433,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_byte_off,
             ..
         } => (
-            vec![x_byte_off / 4, w_byte_off / 4, scale_byte_off / 4],
-            vec![out_byte_off / 4],
+            vec![
+                (x_byte_off / 4) as u32,
+                (w_byte_off / 4) as u32,
+                (scale_byte_off / 4) as u32,
+            ],
+            vec![(out_byte_off / 4) as u32],
         ),
         Step::DequantGroupedMatmulGguf {
             x_byte_off,
@@ -2365,8 +2447,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_byte_off,
             ..
         } => (
-            vec![x_byte_off / 4, w_byte_off / 4, idx_byte_off / 4],
-            vec![out_byte_off / 4],
+            vec![
+                (x_byte_off / 4) as u32,
+                (w_byte_off / 4) as u32,
+                (idx_byte_off / 4) as u32,
+            ],
+            vec![(out_byte_off / 4) as u32],
         ),
         Step::DequantGroupedMatmulMlxHost {
             x_byte_off,
@@ -2378,13 +2464,13 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                w_byte_off / 4,
-                scale_byte_off / 4,
-                zp_byte_off / 4,
-                idx_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_byte_off / 4) as u32,
+                (scale_byte_off / 4) as u32,
+                (zp_byte_off / 4) as u32,
+                (idx_byte_off / 4) as u32,
             ],
-            vec![out_byte_off / 4],
+            vec![(out_byte_off / 4) as u32],
         ),
         Step::DequantGroupedMatmulMlxNative {
             x_byte_off,
@@ -2395,12 +2481,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                w_byte_off / 4,
-                scale_byte_off / 4,
-                idx_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_byte_off / 4) as u32,
+                (scale_byte_off / 4) as u32,
+                (idx_byte_off / 4) as u32,
             ],
-            vec![out_byte_off / 4],
+            vec![(out_byte_off / 4) as u32],
         ),
         Step::SelectiveScan {
             x_off,
@@ -2418,15 +2504,26 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             src_byte_off,
             dst_byte_off,
             ..
-        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        } => (
+            vec![(*src_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
+        ),
+        Step::FftQ {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![(*src_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
+        ),
         Step::LogMelHost {
             spec_byte_off,
             filt_byte_off,
             dst_byte_off,
             ..
         } => (
-            vec![*spec_byte_off / 4, *filt_byte_off / 4],
-            vec![*dst_byte_off / 4],
+            vec![(*spec_byte_off / 4) as u32, (*filt_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
         ),
         Step::LogMelBackwardHost {
             spec_byte_off,
@@ -2435,14 +2532,21 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dst_byte_off,
             ..
         } => (
-            vec![*spec_byte_off / 4, *filt_byte_off / 4, *dy_byte_off / 4],
-            vec![*dst_byte_off / 4],
+            vec![
+                (*spec_byte_off / 4) as u32,
+                (*filt_byte_off / 4) as u32,
+                (*dy_byte_off / 4) as u32,
+            ],
+            vec![(*dst_byte_off / 4) as u32],
         ),
         Step::WelchPeaksHost {
             spec_byte_off,
             dst_byte_off,
             ..
-        } => (vec![*spec_byte_off / 4], vec![*dst_byte_off / 4]),
+        } => (
+            vec![(*spec_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
+        ),
         Step::WelchPeaksGpu {
             spec_off, dst_off, ..
         } => (vec![*spec_off], vec![*dst_off]),
@@ -2462,7 +2566,10 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             x_byte_off,
             col_byte_off,
             ..
-        } => (vec![*x_byte_off / 4], vec![*col_byte_off / 4]),
+        } => (
+            vec![(*x_byte_off / 4) as u32],
+            vec![(*col_byte_off / 4) as u32],
+        ),
         Step::ReverseHost {
             src_byte_off,
             dst_byte_off,
@@ -2472,7 +2579,10 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             src_byte_off,
             dst_byte_off,
             ..
-        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        } => (
+            vec![(*src_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
+        ),
         Step::AxialRope2d {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
@@ -2488,18 +2598,18 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => {
             let mut reads = vec![
-                q_byte_off / 4,
-                k_byte_off / 4,
-                v_byte_off / 4,
-                g_byte_off / 4,
-                beta_byte_off / 4,
+                (q_byte_off / 4) as u32,
+                (k_byte_off / 4) as u32,
+                (v_byte_off / 4) as u32,
+                (g_byte_off / 4) as u32,
+                (beta_byte_off / 4) as u32,
             ];
             if *use_carry {
-                reads.push(state_byte_off / 4);
+                reads.push((state_byte_off / 4) as u32);
             }
-            let mut writes = vec![dst_byte_off / 4];
+            let mut writes = vec![(dst_byte_off / 4) as u32];
             if *use_carry {
-                writes.push(state_byte_off / 4);
+                writes.push((state_byte_off / 4) as u32);
             }
             (reads, writes)
         }
@@ -2515,18 +2625,18 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => {
             let mut reads = vec![
-                x_byte_off / 4,
-                w_ih_byte_off / 4,
-                w_hh_byte_off / 4,
-                bias_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_ih_byte_off / 4) as u32,
+                (w_hh_byte_off / 4) as u32,
+                (bias_byte_off / 4) as u32,
             ];
-            let mut writes = vec![dst_byte_off / 4];
+            let mut writes = vec![(dst_byte_off / 4) as u32];
             if *carry {
                 // h0/c0 are read and (decode) written back in place.
-                reads.push(h0_byte_off / 4);
-                reads.push(c0_byte_off / 4);
-                writes.push(h0_byte_off / 4);
-                writes.push(c0_byte_off / 4);
+                reads.push((h0_byte_off / 4) as u32);
+                reads.push((c0_byte_off / 4) as u32);
+                writes.push((h0_byte_off / 4) as u32);
+                writes.push((c0_byte_off / 4) as u32);
             }
             (reads, writes)
         }
@@ -2540,13 +2650,13 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                w_ih_byte_off / 4,
-                w_hh_byte_off / 4,
-                b_ih_byte_off / 4,
-                b_hh_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_ih_byte_off / 4) as u32,
+                (w_hh_byte_off / 4) as u32,
+                (b_ih_byte_off / 4) as u32,
+                (b_hh_byte_off / 4) as u32,
             ],
-            vec![dst_byte_off / 4],
+            vec![(dst_byte_off / 4) as u32],
         ),
         Step::GruHost {
             x_byte_off,
@@ -2560,16 +2670,16 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => {
             let mut reads = vec![
-                x_byte_off / 4,
-                w_ih_byte_off / 4,
-                w_hh_byte_off / 4,
-                b_ih_byte_off / 4,
-                b_hh_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_ih_byte_off / 4) as u32,
+                (w_hh_byte_off / 4) as u32,
+                (b_ih_byte_off / 4) as u32,
+                (b_hh_byte_off / 4) as u32,
             ];
-            let mut writes = vec![dst_byte_off / 4];
+            let mut writes = vec![(dst_byte_off / 4) as u32];
             if *carry {
-                reads.push(h0_byte_off / 4);
-                writes.push(h0_byte_off / 4);
+                reads.push((h0_byte_off / 4) as u32);
+                writes.push((h0_byte_off / 4) as u32);
             }
             (reads, writes)
         }
@@ -2582,12 +2692,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                w_ih_byte_off / 4,
-                w_hh_byte_off / 4,
-                bias_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_ih_byte_off / 4) as u32,
+                (w_hh_byte_off / 4) as u32,
+                (bias_byte_off / 4) as u32,
             ],
-            vec![dst_byte_off / 4],
+            vec![(dst_byte_off / 4) as u32],
         ),
         Step::RnnHost {
             x_byte_off,
@@ -2600,15 +2710,15 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => {
             let mut reads = vec![
-                x_byte_off / 4,
-                w_ih_byte_off / 4,
-                w_hh_byte_off / 4,
-                bias_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (w_ih_byte_off / 4) as u32,
+                (w_hh_byte_off / 4) as u32,
+                (bias_byte_off / 4) as u32,
             ];
-            let mut writes = vec![dst_byte_off / 4];
+            let mut writes = vec![(dst_byte_off / 4) as u32];
             if *carry {
-                reads.push(h0_byte_off / 4);
-                writes.push(h0_byte_off / 4);
+                reads.push((h0_byte_off / 4) as u32);
+                writes.push((h0_byte_off / 4) as u32);
             }
             (reads, writes)
         }
@@ -2631,13 +2741,13 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                dt_byte_off / 4,
-                a_byte_off / 4,
-                b_byte_off / 4,
-                c_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (dt_byte_off / 4) as u32,
+                (a_byte_off / 4) as u32,
+                (b_byte_off / 4) as u32,
+                (c_byte_off / 4) as u32,
             ],
-            vec![dst_byte_off / 4],
+            vec![(dst_byte_off / 4) as u32],
         ),
         Step::GaussianSplatRender {
             positions_off,
@@ -2735,12 +2845,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                gamma_byte_off / 4,
-                beta_byte_off / 4,
-                dy_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (gamma_byte_off / 4) as u32,
+                (beta_byte_off / 4) as u32,
+                (dy_byte_off / 4) as u32,
             ],
-            vec![dx_byte_off / 4],
+            vec![(dx_byte_off / 4) as u32],
         ),
         Step::RmsNormBackwardGamma {
             x_byte_off,
@@ -2751,12 +2861,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                gamma_byte_off / 4,
-                beta_byte_off / 4,
-                dy_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (gamma_byte_off / 4) as u32,
+                (beta_byte_off / 4) as u32,
+                (dy_byte_off / 4) as u32,
             ],
-            vec![dgamma_byte_off / 4],
+            vec![(dgamma_byte_off / 4) as u32],
         ),
         Step::RmsNormBackwardBeta {
             x_byte_off,
@@ -2767,12 +2877,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             ..
         } => (
             vec![
-                x_byte_off / 4,
-                gamma_byte_off / 4,
-                beta_byte_off / 4,
-                dy_byte_off / 4,
+                (x_byte_off / 4) as u32,
+                (gamma_byte_off / 4) as u32,
+                (beta_byte_off / 4) as u32,
+                (dy_byte_off / 4) as u32,
             ],
-            vec![dbeta_byte_off / 4],
+            vec![(dbeta_byte_off / 4) as u32],
         ),
         Step::RopeBackward {
             dy_byte_off,
@@ -2781,22 +2891,29 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             dx_byte_off,
             ..
         } => (
-            vec![dy_byte_off / 4, cos_byte_off / 4, sin_byte_off / 4],
-            vec![dx_byte_off / 4],
+            vec![
+                (dy_byte_off / 4) as u32,
+                (cos_byte_off / 4) as u32,
+                (sin_byte_off / 4) as u32,
+            ],
+            vec![(dx_byte_off / 4) as u32],
         ),
         Step::CumsumBackward {
             dy_byte_off,
             dx_byte_off,
             ..
-        } => (vec![dy_byte_off / 4], vec![dx_byte_off / 4]),
+        } => (
+            vec![(dy_byte_off / 4) as u32],
+            vec![(dx_byte_off / 4) as u32],
+        ),
         Step::GatherBackward {
             dy_byte_off,
             indices_byte_off,
             dst_byte_off,
             ..
         } => (
-            vec![dy_byte_off / 4, indices_byte_off / 4],
-            vec![dst_byte_off / 4],
+            vec![(dy_byte_off / 4) as u32, (indices_byte_off / 4) as u32],
+            vec![(dst_byte_off / 4) as u32],
         ),
         Step::MaxPool2dBackward {
             x_byte_off,
@@ -2984,12 +3101,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         } => (vec![*in_off, *scale_off], vec![*out_off, *scale_off]),
         Step::QuantizeI8 {
             in_off, q_byte_off, ..
-        } => (vec![*in_off], vec![*q_byte_off / 4]),
+        } => (vec![*in_off], vec![(*q_byte_off / 4) as u32]),
         Step::DequantizeI8 {
             q_byte_off,
             out_off,
             ..
-        } => (vec![*q_byte_off / 4], vec![*out_off]),
+        } => (vec![(*q_byte_off / 4) as u32], vec![*out_off]),
         Step::QMatMul {
             x_byte_off,
             w_byte_off,
@@ -2997,8 +3114,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_byte_off,
             ..
         } => (
-            vec![*x_byte_off / 4, *w_byte_off / 4, *bias_off],
-            vec![*out_byte_off / 4],
+            vec![
+                (*x_byte_off / 4) as u32,
+                (*w_byte_off / 4) as u32,
+                *bias_off,
+            ],
+            vec![(*out_byte_off / 4) as u32],
         ),
         Step::QConv2d {
             x_byte_off,
@@ -3007,8 +3128,12 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             out_byte_off,
             ..
         } => (
-            vec![*x_byte_off / 4, *w_byte_off / 4, *bias_off],
-            vec![*out_byte_off / 4],
+            vec![
+                (*x_byte_off / 4) as u32,
+                (*w_byte_off / 4) as u32,
+                *bias_off,
+            ],
+            vec![(*out_byte_off / 4) as u32],
         ),
         Step::FakeQuantizeLsqBwdX {
             x_off,
@@ -3040,35 +3165,44 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             in_byte_off,
             out_byte_off,
             ..
-        } => (vec![*in_byte_off / 4], vec![*out_byte_off / 4]),
+        } => (
+            vec![(*in_byte_off / 4) as u32],
+            vec![(*out_byte_off / 4) as u32],
+        ),
         Step::BinaryC64 {
             a_byte_off,
             b_byte_off,
             c_byte_off,
             ..
         } => (
-            vec![*a_byte_off / 4, *b_byte_off / 4],
-            vec![*c_byte_off / 4],
+            vec![(*a_byte_off / 4) as u32, (*b_byte_off / 4) as u32],
+            vec![(*c_byte_off / 4) as u32],
         ),
         Step::ComplexNormSq {
             src_byte_off,
             dst_byte_off,
             ..
-        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        } => (
+            vec![(*src_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
+        ),
         Step::ComplexNormSqBackward {
             z_byte_off,
             g_byte_off,
             dz_byte_off,
             ..
         } => (
-            vec![*z_byte_off / 4, *g_byte_off / 4],
-            vec![*dz_byte_off / 4],
+            vec![(*z_byte_off / 4) as u32, (*g_byte_off / 4) as u32],
+            vec![(*dz_byte_off / 4) as u32],
         ),
         Step::ConjugateC64 {
             src_byte_off,
             dst_byte_off,
             ..
-        } => (vec![*src_byte_off / 4], vec![*dst_byte_off / 4]),
+        } => (
+            vec![(*src_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
+        ),
         Step::FusedBinaryUnary {
             a_off,
             b_off,

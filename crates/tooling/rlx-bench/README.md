@@ -29,15 +29,15 @@ PrecisionPolicy Y?"
   - `bench_mlx_wgpu` — matmul: `Device::Cpu` vs `Device::Mlx` (set
     `RLX_MLX_DEVICE=cpu` on Linux for MLX CPU path).
   - `bench_mlx_devices` — MLX device legs (Metal / Linux CPU / Linux CUDA);
-    see [`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
+    see [`docs/benchmarks/mlx-linux.md`](../../../docs/benchmarks/mlx-linux.md).
   - `bench_fk_fusion` — FKL resize prologue + batch region vs primitives;
     `FK_BENCH_OPS=1` prints fused op counts; `RLX_FK_BATCH_SINGLE_KERNEL=1`
     (CUDA/ROCm/Metal/wgpu) uses one batch-region launch; TPU uses per-slice HLO.
-    See [`docs/fk-fusion.md`](../docs/fk-fusion.md).
+    See [`docs/fk-fusion.md`](../../../docs/fk-fusion.md).
 
-Cross-platform results: [`docs/benchmarks/higher-order-ad.md`](../docs/benchmarks/higher-order-ad.md).
+Cross-platform results: [`docs/benchmarks/higher-order-ad.md`](../../../docs/benchmarks/higher-order-ad.md).
 
-Linux MLX (compile, `RLX_MLX_DEVICE`, vs `rlx-cpu`): [`docs/benchmarks/mlx-linux.md`](../docs/benchmarks/mlx-linux.md).
+Linux MLX (compile, `RLX_MLX_DEVICE`, vs `rlx-cpu`): [`docs/benchmarks/mlx-linux.md`](../../../docs/benchmarks/mlx-linux.md).
 
 ## Install
 

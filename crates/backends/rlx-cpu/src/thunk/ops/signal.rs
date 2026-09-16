@@ -5,6 +5,40 @@
 use crate::thunk::*;
 
 #[allow(unused_variables)]
+pub(crate) fn compile_fft_q(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::FftQ {
+        inverse,
+        norm,
+        scale,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let meta = rlx_ir::fft::fft_meta(&node.shape);
+    let dtype = node.shape.dtype();
+    assert!(
+        matches!(dtype, rlx_ir::DType::I32),
+        "Op::FftQ is a fixed-point transform and requires I32, got {dtype:?}"
+    );
+    Thunk::Fft1dQ {
+        src: node_offset(arena, node.inputs[0]),
+        dst: node_offset(arena, node.id),
+        outer: meta.outer as u32,
+        n_complex: meta.n_complex as u32,
+        inverse: *inverse,
+        norm_tag: norm.tag(),
+        scale_tag: scale.tag(),
+    }
+}
+
+#[allow(unused_variables)]
 pub(crate) fn compile_fft(
     node: &rlx_ir::Node,
     graph: &Graph,
@@ -500,6 +534,191 @@ impl FftArenaPtr {
     #[inline]
     fn ptr(self) -> *mut u8 {
         self.0
+    }
+}
+
+/// `Op::FftQ` against an arena, by byte offset.
+///
+/// Free-standing and public so the GPU backends can reach it: Metal runs it
+/// directly on its unified-memory arena and wgpu runs it on a readback, the
+/// same host-fallback pattern they already use for the FFT variants they have
+/// no kernel for. WGSL has no 64-bit integers, which the Q30 twiddle products
+/// need, so a native wgpu kernel would have to emulate them.
+///
+/// # Safety
+///
+/// `base + src` and `base + dst` must each address `outer * 2 * n_complex`
+/// readable/writable `i32`s.
+/// Largest integer f32 represents exactly.
+const FFT_Q_F32_EXACT_INT: i64 = 1 << 24;
+
+/// `Op::FftQ` against a staged span from an arena that stores integer tensors
+/// as f32 *values* — CUDA, ROCm, wgpu.
+///
+/// Converts f32->i32, transforms, converts back. Lives here rather than in
+/// `rlx-gpu-host` because that crate owns staging, not compute — and because
+/// the conversions parallelize exactly like the transform does. On a 256x1024
+/// batch they are over a million elements each way, which is not a rounding
+/// error next to the FFT itself.
+///
+/// Exact while every value stays inside f32's exact-integer range; past that it
+/// errors rather than dropping low bits.
+#[allow(clippy::too_many_arguments)]
+pub fn fft1d_q32_f32_valued(
+    host: &mut [u8],
+    src_elem: usize,
+    dst_elem: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm: rlx_ir::fft::FftNorm,
+    scale: rlx_ir::fft::FftQScale,
+) -> Result<(), String> {
+    use rayon::prelude::*;
+    let elems = outer * 2 * n_complex;
+    // Same break-even shape as the transform: below this, dispatch costs more
+    // than the conversion saves.
+    let parallel = elems >= (1 << 15) && cpu_fft_parallel_enabled();
+
+    let src = &host[src_elem * 4..(src_elem + elems) * 4];
+    let mut work = vec![0i32; elems];
+    // Byte-wise rather than a cast: the staged buffer carries no alignment
+    // guarantee, and rlx-cpu deliberately has no bytemuck dependency.
+    let convert_in = |(slot, b): (&mut i32, &[u8])| -> Result<(), String> {
+        let v = f32::from_le_bytes(b.try_into().unwrap());
+        if !v.is_finite() || f64::from(v).abs() >= FFT_Q_F32_EXACT_INT as f64 {
+            return Err(format!(
+                "Op::FftQ input {v} is outside f32's exact-integer range; this backend \
+                 stores integer tensors as f32 values"
+            ));
+        }
+        *slot = v.round() as i32;
+        Ok(())
+    };
+    if parallel {
+        work.par_iter_mut()
+            .zip(src.par_chunks_exact(4))
+            .try_for_each(convert_in)?;
+    } else {
+        work.iter_mut()
+            .zip(src.chunks_exact(4))
+            .try_for_each(convert_in)?;
+    }
+
+    fft1d_q32_block_parallel(&mut work, outer, n_complex, inverse, norm, scale)?;
+
+    if let Some(&bad) = work
+        .iter()
+        .find(|&&v| i64::from(v).abs() >= FFT_Q_F32_EXACT_INT)
+    {
+        return Err(format!(
+            "Op::FftQ result {bad} exceeds f32's exact-integer range on a backend that \
+             stores integers as f32 values. Use FftQScale::PerStage, or keep \
+             |input| below 2^24/n."
+        ));
+    }
+    let dst = &mut host[dst_elem * 4..(dst_elem + elems) * 4];
+    if parallel {
+        dst.par_chunks_exact_mut(4)
+            .zip(work.par_iter())
+            .for_each(|(b, &v)| b.copy_from_slice(&(v as f32).to_le_bytes()));
+    } else {
+        for (b, &v) in dst.chunks_exact_mut(4).zip(work.iter()) {
+            b.copy_from_slice(&(v as f32).to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// `fft1d_q32_block` with the batch fanned out across rows.
+///
+/// Rows of a block transform are independent and share only the plan's
+/// read-only twiddles, so this is **bit-identical** to the serial loop — not an
+/// approximation traded for speed.
+///
+/// Gated exactly like the f32 path: rayon dispatch costs more than it saves on
+/// small batches. Without this the fixed-point kernel was the only FFT variant
+/// running single-threaded, which made it look ~4x slower than f32 at
+/// 256x1024 when the arithmetic itself is within a few percent.
+/// `RLX_FFT_CPU_PARALLEL=0` forces serial.
+pub fn fft1d_q32_block_parallel(
+    data: &mut [i32],
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm: rlx_ir::fft::FftNorm,
+    scale: rlx_ir::fft::FftQScale,
+) -> Result<(), String> {
+    let parallel = outer >= 8
+        && (outer as u64) * (n_complex as u64) >= (1 << 15)
+        && cpu_fft_parallel_enabled();
+    if !parallel {
+        return rlx_ir::fft::fft1d_q32_block(data, outer, n_complex, inverse, norm, scale);
+    }
+    if data.len() != outer * 2 * n_complex {
+        return Err(format!(
+            "fixed-point FFT expects {} elements ({outer} x 2 x {n_complex}), got {}",
+            outer * 2 * n_complex,
+            data.len()
+        ));
+    }
+    let plan = rlx_ir::fft::FftQ32Plan::new(n_complex, inverse, norm, scale)?;
+    use rayon::prelude::*;
+    data.par_chunks_exact_mut(plan.row_elems())
+        .for_each(|row| plan.run_row(row));
+    Ok(())
+}
+
+pub unsafe fn execute_fft1d_q32(
+    src: usize,
+    dst: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm_tag: u32,
+    scale_tag: u32,
+    base: *mut u8,
+) {
+    let elems = outer * 2 * n_complex;
+    let s = std::slice::from_raw_parts(base.add(src).cast::<i32>(), elems);
+    let d = std::slice::from_raw_parts_mut(base.add(dst).cast::<i32>(), elems);
+    d.copy_from_slice(s);
+    fft1d_q32_block_parallel(
+        d,
+        outer,
+        n_complex,
+        inverse,
+        rlx_ir::fft::FftNorm::from_tag(norm_tag),
+        rlx_ir::fft::FftQScale::from_tag(scale_tag),
+    )
+    .unwrap_or_else(|e| panic!("Op::FftQ: {e}"));
+}
+
+/// `Op::FftQ` on CPU.
+pub(crate) fn exec_fft1d_q(t: &Thunk, base: *mut u8) {
+    let Thunk::Fft1dQ {
+        src,
+        dst,
+        outer,
+        n_complex,
+        inverse,
+        norm_tag,
+        scale_tag,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        execute_fft1d_q32(
+            *src,
+            *dst,
+            *outer as usize,
+            *n_complex as usize,
+            *inverse,
+            *norm_tag,
+            *scale_tag,
+            base,
+        );
     }
 }
 

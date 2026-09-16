@@ -78,7 +78,7 @@ pub trait LmRunner: Send {
     }
 
     /// Prefill `prompt_ids`, seed the decode KV cache, and return the
-    /// last-position logits `[vocab]`. Together with [`decode_logits`] this
+    /// last-position logits `[vocab]`. Together with `decode_logits` this
     /// gives a **host-driven** decode loop: the caller owns sampling, logit
     /// bias, log-probs, and stop detection (used by the HTTP server). The
     /// default reports unsupported so existing runners keep compiling.

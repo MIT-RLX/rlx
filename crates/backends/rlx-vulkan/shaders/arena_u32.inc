@@ -45,8 +45,15 @@ int arena_load_i8(uint tagged_word_base, uint i) {
 }
 
 // Packed i8 store via non-atomic RMW. naga's GLSL front-end has no
-// `atomicCompSwap`; concurrent writers to the same uint word can race.
-// Quantize uses a word-owner launch (see quantize_i8.comp) to avoid that.
+// `atomicCompSwap`; concurrent writers to the same uint word DO race — this is
+// only safe from a launch where one invocation owns the whole word.
+//
+// No shader calls it any more, and that is the point: `q_matmul.comp` and
+// `q_conv2d.comp` both used it with one invocation per output element, so three
+// of every four bytes were lost and the tensor came back three-quarters stale
+// at the output zero point. Both now assemble a word and `arena_store_u` it, as
+// `quantize_i8.comp` always did. Kept for the read side's symmetry — if you
+// reach for it, check your launch shape first.
 void arena_store_i8(uint tagged_word_base, uint i, int val) {
     uint word_tagged = tagged_word_base + (i >> 2u);
     uint shift = (i & 3u) * 8u;

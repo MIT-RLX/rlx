@@ -26,8 +26,8 @@
 //! multiple of the scheme's block size (32 for all three schemes).
 //!
 //! On read, callers materialize a window of rows to f32 via
-//! [`dequant_rows`]. On write, freshly produced f32 K/V is quantized
-//! one row at a time via [`quant_rows`] before being appended. The
+//! `dequant_rows`. On write, freshly produced f32 K/V is quantized
+//! one row at a time via `quant_rows` before being appended. The
 //! quantization wrappers route to the `rlx_gguf::quantize` /
 //! `dequant_*` kernels for parity with on-disk GGUF blocks.
 
@@ -479,7 +479,7 @@ pub mod mmap {
                 v_offset: capacity_rows * bytes_per_row,
                 path: Some(path.as_ref().to_path_buf()),
                 file: Some(file),
-                pread: std::env::var_os("RLX_KVSTORE_PREAD").is_some(),
+                pread: rlx_ir::env::var_os("RLX_KVSTORE_PREAD").is_some(),
             })
         }
 
@@ -522,7 +522,7 @@ pub mod mmap {
                 v_offset: capacity_rows * bytes_per_row,
                 path: Some(path.as_ref().to_path_buf()),
                 file: Some(file),
-                pread: std::env::var_os("RLX_KVSTORE_PREAD").is_some(),
+                pread: rlx_ir::env::var_os("RLX_KVSTORE_PREAD").is_some(),
             })
         }
 

@@ -38,7 +38,7 @@ no FFI, no submodules.
   sharded / split-weight arenas fall back to `gguf_host`. Grouped MoE GGUF
   uses the GPU path when scratch fits and the arena is unsharded. Scheme ids
   match Metal/CUDA. Details:
-  [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+  [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 - **FFT** — `fft_gpu.wgsl` multi-kernel pow-2 dispatch, all stages in one
   compute pass with a **per-stage uniform pool** (each stage binds its own
   slot; a *shared* uniform would alias across stages because `write_buffer`
@@ -51,7 +51,7 @@ no FFI, no submodules.
 ## Op coverage
 
 Broad inference surface (matmul, norms, attention, conv, vision, RNN/SSM,
-quantized matmul, etc.) — see [docs/op-coverage.md](../../docs/op-coverage.md).
+quantized matmul, etc.) — see [docs/op-coverage.md](../../../docs/op-coverage.md).
 GGUF `DequantMatMul` uses the GPU path when arena scratch fits; otherwise
 CPU dequant via `gguf_host`. MoE grouped GGUF remains host-only on WGPU.
 
@@ -167,7 +167,7 @@ tile matmul kernel remains correctness-first for unaligned shapes.
 - **Scalar-output latency:** End-to-end `run()` on tiny graphs is often
   readback-bound (~1.3 ms on MoltenVK; ~100–150 µs on DX12/Vulkan).
   Kernels may be sub-µs; use `RLX_BENCH_DISPATCH_ONLY=1` to time dispatch
-  without readback. See [`docs/benchmarks/higher-order-ad.md`](../docs/benchmarks/higher-order-ad.md).
+  without readback. See [`docs/benchmarks/higher-order-ad.md`](../../../docs/benchmarks/higher-order-ad.md).
 - **WSL:** Linux cargo on the rig uses `~/rlx-workspace-mirror/rlx` (ext4),
   not virtio `D:` directly. `rig.sh bench-nth-order` syncs new examples there.
 - Wgpu is async; we wrap with `pollster::block_on` for sync semantics.

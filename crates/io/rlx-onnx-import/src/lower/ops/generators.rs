@@ -698,6 +698,57 @@ pub(super) fn lower_resize(
         .get("mode")
         .and_then(|v| v.as_str())
         .unwrap_or("nearest");
+
+    // Nearest at an integer upscale, NCDHW.
+    //
+    // `ensure_nchw_4d` above is a rank-4 path, so a 3-D resize never reached
+    // the `mode == "nearest"` branch below and fell through to the zero-filled
+    // stub at the end of this function. SynthStrip has six of them in its
+    // decoder: the model imported, ran, reported success, and sat 91% of full
+    // scale away from onnxruntime on every backend and every compile level.
+    //
+    // Splitting each spatial axis into `(len, 1)` and broadcasting the
+    // singleton to the scale factor gives `[N,C,D,kd,H,kh,W,kw]`, whose
+    // row-major order is exactly that of `[N,C,D*kd,H*kh,W*kw]` — so both
+    // reshapes are free and the Expand is the only real work. That is ONNX's
+    // `asymmetric` + `floor` rule: for `out = k*in`, `src = floor(dst/k)`.
+    {
+        let s_in = m.shape(x0).clone();
+        if mode == "nearest"
+            && s_in.rank() == 5
+            && out_s_final.rank() == 5
+            && s_in.is_static()
+            && out_s_final.is_static()
+        {
+            let dim = |s: &Shape, i: usize| s.dim(i).unwrap_static();
+            let integral = dim(&s_in, 0) == dim(&out_s_final, 0)
+                && dim(&s_in, 1) == dim(&out_s_final, 1)
+                && (0..3).all(|i| {
+                    let (a, b) = (dim(&s_in, 2 + i), dim(&out_s_final, 2 + i));
+                    a > 0 && b >= a && b % a == 0
+                });
+            if integral {
+                let l: Vec<usize> = (0..3).map(|i| dim(&s_in, 2 + i)).collect();
+                let sc: Vec<usize> = (0..3).map(|i| dim(&out_s_final, 2 + i) / l[i]).collect();
+                let (n, c) = (dim(&s_in, 0), dim(&s_in, 1));
+                let split = [n, c, l[0], 1, l[1], 1, l[2], 1];
+                let target = [n, c, l[0], sc[0], l[1], sc[1], l[2], sc[2]];
+                let as_i64 = |v: &[usize]| v.iter().map(|&x| x as i64).collect::<Vec<i64>>();
+                let out_dims: Vec<usize> = (0..5).map(|i| dim(&out_s_final, i)).collect();
+                let r = m.reshape_(x0, as_i64(&split));
+                let e = m.add_node(
+                    Op::Expand {
+                        target_shape: as_i64(&target),
+                    },
+                    vec![r],
+                    Shape::new(&target, s_in.dtype()),
+                );
+                let id = m.reshape_(e, as_i64(&out_dims));
+                ctx.env.insert(node.outputs[0].clone(), id);
+                return Ok(true);
+            }
+        }
+    }
     // General 1-D LINEAR resize (`[N,C,1,W]→[N,C,1,W']`, e.g. the ISTFTNet NSF
     // m_source `l_sin_gen` phase up/downsample): two baked-index gathers +
     // per-position blend weights. `src=(o+½)·W/W'−½` for half_pixel (else `o·W/W'`),
@@ -821,6 +872,39 @@ pub(super) fn lower_resize(
             ctx.env.insert(node.outputs[0].clone(), id);
             return Ok(true);
         }
+        // General *integral* rank-4 nearest (`[N,C,H,W]→[N,C,H·kh,W·kw]`), the rank-4 case
+        // of the NCDHW identity above: `[N,C,H,1,W,1]` broadcast to `[N,C,H,kh,W,kw]` has
+        // exactly the row-major order of `[N,C,H·kh,W·kw]`, which is ONNX asymmetric+floor.
+        //
+        // The two branches above only cover 2×2 and *width*-only resizes, so a **height**
+        // upsample fell through to the zero stub at the end of this function. KittenTTS's
+        // `f0_upsamp` is one — `[1,1,1,F]→[1,1,300,F]` — and its NSF f0 source was
+        // therefore imported as zeros on every backend.
+        if h_in > 0
+            && w_in > 0
+            && h_out.is_multiple_of(h_in)
+            && w_out.is_multiple_of(w_in)
+            && (h_out != h_in || w_out != w_in)
+        {
+            let n = in_s.dim(0).unwrap_static();
+            let c = in_s.dim(1).unwrap_static();
+            let (kh, kw) = (h_out / h_in, w_out / w_in);
+            let as_i64 = |v: &[usize]| v.iter().map(|&x| x as i64).collect::<Vec<i64>>();
+            let split = [n, c, h_in, 1, w_in, 1];
+            let target = [n, c, h_in, kh, w_in, kw];
+            let r = m.reshape_(x, as_i64(&split));
+            let e = m.add_node(
+                Op::Expand {
+                    target_shape: as_i64(&target),
+                },
+                vec![r],
+                Shape::new(&target, in_s.dtype()),
+            );
+            let up = m.reshape_(e, as_i64(&[n, c, h_out, w_out]));
+            let id = nchw_to_ncl_if_needed(m, up, &out_s_final);
+            ctx.env.insert(node.outputs[0].clone(), id);
+            return Ok(true);
+        }
     }
     let new_shape: Vec<i64> = out_s_final
         .dims()
@@ -831,6 +915,26 @@ pub(super) fn lower_resize(
         let reshaped = m.reshape_(x0, new_shape);
         nchw_to_ncl_if_needed(m, reshaped, &out_s_final)
     } else {
+        // A Resize this function cannot lower. Substituting a zero-filled
+        // parameter and returning Ok makes the model *run* and quietly return
+        // wrong numbers — there is no signal anywhere that a chunk of the
+        // graph was replaced by zeros. SynthStrip's 3-D upsamples took this
+        // path for as long as it has existed.
+        //
+        // `RLX_ONNX_ALLOW_RESIZE_STUB=1` restores the old behaviour for anyone
+        // who was relying on a model importing rather than being correct.
+        if !rlx_ir::env::flag("RLX_ONNX_ALLOW_RESIZE_STUB") {
+            bail!(
+                "Resize at {} ({}D {:?} -> {}D {:?}, mode {mode:?}) has no lowering. \
+                 Importing it as zeros would run and silently corrupt the output; \
+                 set RLX_ONNX_ALLOW_RESIZE_STUB=1 to do that anyway.",
+                node.name,
+                m.shape(x0).rank(),
+                m.shape(x0).dims(),
+                out_s_final.rank(),
+                out_s_final.dims(),
+            );
+        }
         let key = format!("__resize__/{}", node.outputs[0]);
         let n = out_s_final
             .num_elements()

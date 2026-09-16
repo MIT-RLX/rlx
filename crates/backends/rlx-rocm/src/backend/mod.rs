@@ -87,6 +87,15 @@ pub struct RocmExecutable {
     pub(crate) graph: Graph,
     pub(crate) arena: Arena,
     pub(crate) schedule: Vec<Step>,
+    /// Schedule indices that materialise a static weight pack (`Concat` over
+    /// `Param`s — the fused QKV / gate+up weights). Invariant across runs, so
+    /// they are launched once and skipped after. See `compile.rs` for the two
+    /// conditions that make skipping sound.
+    pub(crate) static_once_steps: std::collections::HashSet<usize>,
+    /// Whether those steps have run at least once, i.e. the skip is armed.
+    /// Cleared by any `set_param*`, or a re-bound weight would never reach the
+    /// pack and the GEMM would silently use stale weights.
+    pub(crate) static_once_done: bool,
     pub(crate) input_offsets: HashMap<String, NodeId>,
     pub(crate) param_offsets: HashMap<String, NodeId>,
     pub(crate) meta_buffers: Vec<HipBuffer<u32>>,

@@ -40,8 +40,8 @@ type CloseFn = unsafe extern "C" fn(*mut c_void);
 
 fn resolve_shim(shim_path: &str) -> Result<String, XdnaError> {
     if shim_path.is_empty() {
-        std::env::var("RLX_XDNA_SHIM")
-            .map_err(|_| XdnaError("no shim path (set RLX_XDNA_SHIM or pass shim_path)".into()))
+        rlx_ir::env::var("RLX_XDNA_SHIM")
+            .ok_or_else(|| XdnaError("no shim path (set RLX_XDNA_SHIM or pass shim_path)".into()))
     } else {
         Ok(shim_path.to_string())
     }

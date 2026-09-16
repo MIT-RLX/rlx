@@ -53,7 +53,7 @@ fn make_ct3d_case() -> (Graph, Vec<f32>, Vec<f32>) {
 #[test]
 fn conv_transpose3d_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda ct3d] no CUDA device — skipping");
         return;
     }
@@ -74,7 +74,7 @@ fn conv_transpose3d_matches_cpu() {
 #[test]
 fn conv_transpose3d_cudnn_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda ct3d.cudnn] no CUDA device — skipping");
         return;
     }
@@ -107,7 +107,7 @@ fn conv_transpose3d_cudnn_matches_cpu() {
 #[test]
 fn conv_transpose3d_kernel_matches_cpu_when_no_cudnn() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda ct3d.kernel] no CUDA device — skipping");
         return;
     }
@@ -135,7 +135,7 @@ fn conv_transpose3d_kernel_matches_cpu_when_no_cudnn() {
 
 #[test]
 fn pool3d_max_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda pool3d] no CUDA device — skipping max");
         return;
     }
@@ -165,7 +165,7 @@ fn pool3d_max_matches_cpu() {
 
 #[test]
 fn pool3d_avg_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda pool3d] no CUDA device — skipping avg");
         return;
     }
@@ -195,7 +195,7 @@ fn pool3d_avg_matches_cpu() {
 
 #[test]
 fn pool3d_max_strided_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda pool3d] no CUDA device — skipping strided");
         return;
     }

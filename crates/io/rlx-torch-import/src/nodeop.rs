@@ -9,7 +9,7 @@
 //! `hir_build` match arm building the live `Op`, and an `emit` match arm
 //! printing the *same* `Op` as source text). That is pure duplication: the
 //! build arm and the emit arm are the same construction, once as a value and
-//! once as a string. [`define_node_ops!`] collapses it to **one line per op** —
+//! once as a string. `define_node_ops` collapses it to **one line per op** —
 //! the macro generates the `NodeOp` enum plus its [`NodeOp::build`] (value) and
 //! [`NodeOp::emit`] (source) methods, so `hir_build`/`emit` each need a single
 //! generic arm and adding a direct op is a one-line table entry.

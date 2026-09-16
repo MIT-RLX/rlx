@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 [dependencies]
 rlx-ir = { workspace = true }
+# Shape-keyed kernel-variant dispatch table, shared with CUDA/ROCm/wgpu.
+rlx-gpu-dispatch = { workspace = true }
 rayon = "1"
 # Single-source scalar-activation math: `scalar_activation_kernels!` builds the
 # per-activation MSL from this manifest at runtime (the A&S erf polynomial lives
@@ -33,7 +35,7 @@ rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gguf = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 # rlx-splat moved out of tree; restore with the native-splat feature below.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.14", optional = true, default-features = false, features = ["reference", "metal"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.16", optional = true, default-features = false, features = ["reference", "metal"] }
 
 [features]
 default = []
@@ -44,6 +46,11 @@ native-splat = []
 # threadgroup memory (one DRAM load + store) instead of the multi-launch path
 # that round-trips DRAM per outer stage. Runtime gate `RLX_FFT_FAST=0` disables.
 native-gpu-fft = []
+# Generate the tiled sgemm entry point FROM a typed `KernelSchedule` (see
+# `kernel_schedule_emit`) instead of the hand-written MSL in `kernels.rs`. Off by
+# default: the shipping text stays the shipping path until the emitted kernel is
+# measured at least as fast (`examples/schedule_sgemm_ab.rs`).
+schedule-codegen = []
 
 [target.'cfg(all(target_vendor = "apple", not(target_os = "watchos")))'.dependencies]
 # No `metal` (metal-rs) crate: `src/mtl.rs` binds the compute subset we use
@@ -67,6 +74,7 @@ half = "2"
 rlx-runtime = { path = "../../core/rlx-runtime", features = ["metal"] }
 rlx-gguf = { workspace = true }
 rlx-cpu = { workspace = true }
+rlx-autodiff = { workspace = true }
 rlx-mlx-io = { workspace = true }
 rlx-optim = { workspace = true }
 tempfile = "3"

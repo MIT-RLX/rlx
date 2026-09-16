@@ -95,6 +95,150 @@ pub fn is_pure_view(graph: &Graph, node: &rlx_ir::Node) -> bool {
     !matches!(node.op, Op::KvAppend { .. }) && pure_view_offset(graph, node).is_some()
 }
 
+/// True iff this node is a bank transpose that a backend folding
+/// `Transpose -> GroupedMatMul` will never execute.
+///
+/// `Op::GroupedMatMul` wants its expert bank as `[E, K, N]` while GGUF stores
+/// banks as `[E, N, K]`, so a dense MoE layer emits `Transpose(bank, [0,2,1])`
+/// ahead of the GEMM. A backend that can run the GEMM with B transposed skips
+/// that node — but the plan is built first, so without this the arena still
+/// reserves the transposed bank: a full second copy of the weights, per bank,
+/// that is never written and never read. On GLM-5.3-Flash that is ~1.88 GB per
+/// bank and ~5.6 GB per layer of dead arena, on nodes sized to hold one copy.
+///
+/// The condition is that EVERY reader folds. One transposed bank feeds all
+/// `top_k` grouped matmuls of a layer, so requiring a single use rejects the
+/// common case; but a reader that still needs the tensor materialized must keep
+/// it, or it reads an unallocated buffer.
+///
+/// Shared with the backend deliberately: the planner and the compiler have to
+/// agree exactly about which nodes vanish, and the only way to guarantee that
+/// is one predicate. Gated by [`MemoryPlanOptions::elide_bank_transposes`], so
+/// a backend that does not fold keeps its buffers.
+pub fn is_elidable_bank_transpose(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    is_elidable_bank_transpose_gated(graph, node, false)
+}
+
+/// [`is_elidable_bank_transpose`], optionally requiring every reader to be a
+/// SMALL-`m` grouped matmul.
+///
+/// Backends differ in where they can consume a transposed bank. A CPU
+/// `sgemm_bt` handles any `m`; Metal's transposed kernel is a decode-path GEMV
+/// (`m <= 4`) and its prefill kernel has no variant, so a transpose feeding a
+/// prefill-size matmul there must stay materialized. `require_small_m` lets a
+/// planner ask the question its backend will actually answer — the two have to
+/// elide exactly the same set, or one drops a buffer the other writes.
+pub fn is_elidable_bank_transpose_gated(
+    graph: &Graph,
+    node: &rlx_ir::Node,
+    require_small_m: bool,
+) -> bool {
+    if !matches!(&node.op, Op::Transpose { perm } if perm.as_slice() == [0, 2, 1])
+        || node.shape.rank() != 3
+        || node.shape.dtype() != rlx_ir::DType::F32
+    {
+        return false;
+    }
+    let mut readers = 0usize;
+    for n in graph.nodes() {
+        for (slot, &i) in n.inputs.iter().enumerate() {
+            if i != node.id {
+                continue;
+            }
+            readers += 1;
+            let folds = slot == 1
+                && matches!(n.op, Op::GroupedMatMul)
+                && n.shape.dtype() == rlx_ir::DType::F32;
+            if !folds {
+                return false;
+            }
+        }
+    }
+    if require_small_m {
+        // Every reader must also be small enough for the decode-path kernel.
+        for n in graph.nodes() {
+            if !n.inputs.contains(&node.id) {
+                continue;
+            }
+            let small = rlx_ir::shape::grouped_matmul_dims(
+                &graph.node(n.inputs[0]).shape,
+                &graph.node(n.inputs[1]).shape,
+                Some(&n.shape),
+            )
+            .map(|gd| gd.m <= SMALL_M_GROUPED)
+            .unwrap_or(false);
+            if !small {
+                return false;
+            }
+        }
+    }
+    // A transpose nothing reads is dead anyway; leave it to DCE rather than
+    // claiming it here.
+    readers > 0
+}
+
+/// The `m` below which a grouped matmul takes a decode-path GEMV. Mirrors
+/// `rlx-metal`'s `encode_grouped_matmul` threshold; shared so the planner and
+/// that encoder cannot disagree about which nodes vanish.
+pub const SMALL_M_GROUPED: usize = 4;
+
+/// True iff this node is a 2-D operand transpose that a backend folding
+/// `Transpose -> MatMul` into GEMM trans-flags will never execute.
+///
+/// Matmul backward emits `Transpose(operand) -> MatMul` for `dA = g·Bᵀ` and
+/// `dB = Aᵀ·g`, so a training graph carries one of these per weight. Folding it
+/// into a `cblas` trans flag skips the copy, but the plan is built first, so the
+/// arena still reserves a transposed copy of every weight it folds — never
+/// written, never read.
+///
+/// Sole use, matching the fold: a transpose read by anything other than the one
+/// matmul must stay materialized.
+pub fn is_elidable_matmul_transpose(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    if !matches!(&node.op, Op::Transpose { perm } if perm.as_slice() == [1, 0])
+        || node.shape.rank() != 2
+    {
+        return false;
+    }
+    let mut reader: Option<&rlx_ir::Node> = None;
+    for n in graph.nodes() {
+        for &i in &n.inputs {
+            if i != node.id {
+                continue;
+            }
+            if reader.is_some() {
+                return false; // more than one use
+            }
+            reader = Some(n);
+        }
+    }
+    let Some(mm) = reader else {
+        return false;
+    };
+    // The fold only fires for a 2-D F32 matmul, so only then is the buffer dead.
+    matches!(mm.op, Op::MatMul)
+        && mm.shape.dtype() == rlx_ir::DType::F32
+        && mm.inputs.len() >= 2
+        && graph.node(mm.inputs[0]).shape.rank() == 2
+        && graph.node(mm.inputs[1]).shape.rank() == 2
+}
+
+/// Either kind of transpose the CPU backend folds away — what the planner asks.
+pub fn is_elidable_folded_transpose(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    is_elidable_folded_transpose_gated(graph, node, false)
+}
+
+/// [`is_elidable_folded_transpose`] with the small-`m` gate of
+/// [`is_elidable_bank_transpose_gated`].
+pub fn is_elidable_folded_transpose_gated(
+    graph: &Graph,
+    node: &rlx_ir::Node,
+    require_small_m: bool,
+) -> bool {
+    is_elidable_bank_transpose_gated(graph, node, require_small_m)
+        // The 2-D matmul fold has no shape gate on any backend that does it.
+        || (!require_small_m && is_elidable_matmul_transpose(graph, node))
+}
+
 /// A buffer slot in the memory arena.
 #[derive(Debug, Clone)]
 pub struct BufferSlot {
@@ -112,6 +256,12 @@ pub struct MemoryPlan {
     /// Buffer assignment: NodeId → offset within arena.
     pub assignments: HashMap<NodeId, BufferSlot>,
     /// Node execution order (topological).
+    ///
+    /// "Schedule" here is the graph-level sense: the order ops run in. Not to
+    /// be confused with [`rlx_ir::kernel_schedule::KernelSchedule`], which is
+    /// the intra-kernel sense — roles, barriers and staging *inside* one op.
+    /// This field orders the ops; that type describes how one of them drives
+    /// the machine.
     pub schedule: Vec<NodeId>,
 }
 
@@ -182,6 +332,177 @@ fn resolve_view_root(graph: &Graph, mut id: NodeId) -> (NodeId, usize) {
                 id = parent;
             }
             None => return (id, total_offset),
+        }
+    }
+}
+
+/// The nodes a 3-D convolution's epilogue fold absorbs, and the tensors it
+/// reads through.
+///
+/// A backend can fold a convolution's consumers into its store (a LeakyReLU
+/// epilogue) and its producers into its gather (a channel-wise `Concat`, a
+/// nearest-neighbour upsample). That is arithmetically free, and it is a lie to
+/// the memory planner unless the planner is told: folding a consumer moves the
+/// convolution's **write earlier**, folding a producer extends a tensor's
+/// **read later**, and slot reuse was computed for neither.
+///
+/// Measured cost of not telling it: rlx-metal's three conv3d folds were exact
+/// at 64^3 and 128^3 and 17-19% of full scale wrong at 192^3, where the arena
+/// is under enough pressure to recycle a slot. Correct arithmetic, recycled
+/// memory, no error.
+///
+/// Shared with the backend deliberately, for the reason
+/// [`is_elidable_bank_transpose`] gives: the planner and the compiler have to
+/// agree about which nodes vanish. They need not agree *exactly* here, because
+/// the directions differ — the planner is conservative (it extends liveness
+/// for every candidate) and the backend is precise (it folds only when its own
+/// checks also pass). Extending the life of a tensor that ends up materialised
+/// wastes a little arena; folding one the planner did not extend corrupts.
+#[derive(Debug, Default, Clone)]
+pub struct Conv3dEpilogueFolds {
+    /// `absorbed[n] = conv` — `n`'s buffer is written by `conv`, earlier in the
+    /// schedule than `n`'s own step, so `n` must be live from `conv` onward.
+    pub absorbed: HashMap<NodeId, NodeId>,
+    /// `read_through[t] = conv` — `conv` gathers from `t` directly, after the
+    /// node that nominally consumed `t` has run, so `t` must live to `conv`.
+    pub read_through: HashMap<NodeId, NodeId>,
+}
+
+/// Recognise the graph-level shape of the folds. Backend-specific conditions
+/// (arena residency, kernel selection) are *not* checked here — see the note on
+/// [`Conv3dEpilogueFolds`] about which way the two sides may disagree.
+pub fn conv3d_epilogue_folds(graph: &Graph) -> Conv3dEpilogueFolds {
+    use rlx_ir::op::BinaryOp;
+    let mut out = Conv3dEpilogueFolds::default();
+    let mut uses: HashMap<NodeId, u32> = HashMap::new();
+    for n in graph.nodes() {
+        for &i in &n.inputs {
+            *uses.entry(i).or_insert(0) += 1;
+        }
+    }
+    let is_conv3d = |id: NodeId| {
+        let n = graph.node(id);
+        match &n.op {
+            Op::Conv3d { .. } => true,
+            Op::FusedConvBiasAct {
+                activation: None,
+                has_residual: false,
+                ..
+            } => n.shape.rank() == 5 && n.inputs.len() == 3,
+            _ => false,
+        }
+    };
+    let scalar_const = |id: NodeId| -> bool {
+        matches!(&graph.node(id).op, Op::Constant { data } if data.len() == 4)
+    };
+
+    for node in graph.nodes() {
+        // LeakyReLU `max(conv, alpha*conv)` absorbed into the conv's store.
+        if matches!(node.op, Op::Binary(BinaryOp::Max)) && node.inputs.len() == 2 {
+            for (ci, mi) in [(0usize, 1usize), (1, 0)] {
+                let (c, m) = (node.inputs[ci], node.inputs[mi]);
+                if !is_conv3d(c) {
+                    continue;
+                }
+                let mn = graph.node(m);
+                if !matches!(mn.op, Op::Binary(BinaryOp::Mul)) || mn.inputs.len() != 2 {
+                    continue;
+                }
+                let k = if mn.inputs[0] == c {
+                    mn.inputs[1]
+                } else if mn.inputs[1] == c {
+                    mn.inputs[0]
+                } else {
+                    continue;
+                };
+                if !scalar_const(k) || uses.get(&c) != Some(&2) || uses.get(&m) != Some(&1) {
+                    continue;
+                }
+                if graph.outputs.contains(&c) || graph.outputs.contains(&m) {
+                    continue;
+                }
+                out.absorbed.insert(node.id, c);
+                out.absorbed.insert(m, c);
+                break;
+            }
+        }
+        // A channel-wise `Concat`, and a nearest upsample feeding it, read in
+        // place by the convolution's gather.
+        if is_conv3d(node.id) {
+            let cat_id = node.inputs[0];
+            let cat = graph.node(cat_id);
+            if let Op::Concat { axis: 1 } = &cat.op
+                && cat.inputs.len() == 2
+                && uses.get(&cat_id) == Some(&1)
+                && !graph.outputs.contains(&cat_id)
+            {
+                for &src in &cat.inputs {
+                    out.read_through.insert(src, node.id);
+                }
+                // reshape -> Expand -> reshape is how `Graph::interpolate3d`
+                // lowers a nearest integer upscale; the conv can index the
+                // pre-expand tensor directly, so that must live to the conv too.
+                let a = cat.inputs[0];
+                if let Op::Reshape { .. } = &graph.node(a).op {
+                    let e = graph.node(a).inputs[0];
+                    if let Op::Expand { .. } = &graph.node(e).op {
+                        let r = graph.node(e).inputs[0];
+                        if let Op::Reshape { .. } = &graph.node(r).op {
+                            out.read_through.insert(graph.node(r).inputs[0], node.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Apply [`conv3d_epilogue_folds`] to the live ranges.
+fn extend_conv3d_epilogue_fold_liveness(
+    graph: &Graph,
+    ranges: &mut HashMap<NodeId, (usize, usize)>,
+) {
+    let folds = conv3d_epilogue_folds(graph);
+    if rlx_ir::env::flag("RLX_FOLD_LIVENESS_DEBUG") {
+        eprintln!(
+            "[fold-liveness] absorbed={} read_through={}",
+            folds.absorbed.len(),
+            folds.read_through.len()
+        );
+    }
+    if folds.absorbed.is_empty() && folds.read_through.is_empty() {
+        return;
+    }
+    let step_of: HashMap<NodeId, usize> = graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
+    // An absorbed node's buffer is written by its convolution, so it is live
+    // from the convolution's step rather than its own.
+    for (&absorbed, &conv) in &folds.absorbed {
+        let Some(&cs) = step_of.get(&conv) else {
+            continue;
+        };
+        if let Some(r) = ranges.get_mut(&absorbed) {
+            r.0 = r.0.min(cs);
+        }
+    }
+    // A read-through tensor must survive to the convolution that gathers it.
+    for (&tensor, &conv) in &folds.read_through {
+        let Some(&cs) = step_of.get(&conv) else {
+            continue;
+        };
+        let (root, _) = resolve_view_root(graph, tensor);
+        if let Some(r) = ranges.get_mut(&root) {
+            r.1 = r.1.max(cs);
+        }
+        if root != tensor
+            && let Some(r) = ranges.get_mut(&tensor)
+        {
+            r.1 = r.1.max(cs);
         }
     }
 }
@@ -326,12 +647,64 @@ fn extend_static_weight_pack_liveness(graph: &Graph, ranges: &mut HashMap<NodeId
         ) {
             continue;
         }
-        ranges.entry(node.id).and_modify(|r| r.1 = last_step);
+        // Birth 0 as well as death `last_step`, i.e. live for the WHOLE graph.
+        //
+        // Extending only the death is not enough, and the reason is a
+        // single-run vs across-runs mismatch. Liveness here describes ONE
+        // execution, so the planner may hand a pack the slot of an activation
+        // that died before the pack was born — legal within a run. But a
+        // backend that skips re-materialising the pack runs everything else
+        // again on the next `run()`, and that earlier activation is reborn into
+        // the same bytes and clobbers it.
+        //
+        // Seen on wgpu/Vulkan: layer 1's fused-weight pack was given layer 0's
+        // MatMul slot, so only 1 pack per graph was exclusively owned no matter
+        // how deep the model — 2 steps marked at 1, 2 and 8 layers. The
+        // backends' slot-exclusivity checks correctly refused to skip, which is
+        // why this surfaced as a dead optimisation rather than wrong output.
+        //
+        // Making the range span the whole graph forces a private slot, which is
+        // what "materialise once and never touch again" actually requires.
+        ranges
+            .entry(node.id)
+            .and_modify(|r| *r = (0usize, last_step));
     }
 }
 
+/// Whether backends may skip re-materialising static weight packs after run 1.
+///
+/// Default ON. `RLX_STATIC_WEIGHT_PACK=0` opts out, uniformly across Metal,
+/// wgpu, CUDA and ROCm — one switch for one behaviour, rather than a different
+/// (or missing) knob per backend. Its purpose is bisecting: if a model produces
+/// wrong output and a stale fused weight is a suspect, this turns the skip off
+/// everywhere without a rebuild.
+///
+/// `RLX_QWEN3_BAKE_WEIGHTS` is honoured as a legacy alias on Metal, where it
+/// was the original (model-specific) name for the same lever. The behaviour is
+/// not qwen3-specific — it applies to any graph the weight-concat fusions
+/// touch.
+pub fn static_weight_pack_skip_enabled() -> bool {
+    rlx_ir::env::flag_or("RLX_STATIC_WEIGHT_PACK", true)
+}
+
 /// True when `id`'s value is fixed after param/constant upload (no Inputs).
-fn is_static_weight_tensor(graph: &Graph, id: NodeId, memo: &mut HashMap<NodeId, bool>) -> bool {
+///
+/// Public because backends need the SAME predicate the planner used. This is
+/// what decides which packs `extend_static_weight_pack_liveness` pins to
+/// graph end, and a backend that skips re-running a pack on later `run()`s is
+/// relying on exactly that pin. A backend-local reimplementation can drift from
+/// this one, and when it does the skip is armed for a pack the planner never
+/// pinned — whose slot is then reused by an activation, so run 2+ reads
+/// clobbered weights. `rlx-wgpu` carried a byte-identical private copy; sharing
+/// this one removes the drift by construction rather than by vigilance.
+///
+/// A pin is still not a guarantee (see the `slot_is_exclusive` check in the
+/// wgpu and Metal lowerings), so treat this as necessary, not sufficient.
+pub fn is_static_weight_tensor(
+    graph: &Graph,
+    id: NodeId,
+    memo: &mut HashMap<NodeId, bool>,
+) -> bool {
     if let Some(&v) = memo.get(&id) {
         return v;
     }
@@ -618,6 +991,21 @@ pub struct MemoryPlanOptions {
     /// reuse: without it, packed prefills pin nearly every activation to the graph
     /// end (qwen3.5 8K packed prefill: 61.9 GB pinned vs ~4 GB reused).
     pub dequant_host_fallback: bool,
+    /// When true, do not reserve arena for transposes the backend will fold into
+    /// GEMM trans-flags — see [`is_elidable_folded_transpose`].
+    ///
+    /// Off by default, because a backend that does NOT fold would then execute
+    /// a transpose into a buffer that was never allocated. Only a planner
+    /// dedicated to a folding backend turns it on.
+    pub elide_bank_transposes: bool,
+    /// When true, account for the conv3d epilogue folds a backend may apply —
+    /// see [`conv3d_epilogue_folds`]. Off by default: a backend that does not
+    /// fold gets the tighter, ordinary liveness.
+    pub fold_conv3d_epilogue: bool,
+    /// Restrict [`Self::elide_bank_transposes`] to transposes whose readers are
+    /// all small-`m` grouped matmuls — for a backend (Metal) whose transposed
+    /// kernel exists only on the decode path.
+    pub elide_requires_small_m: bool,
 }
 
 impl MemoryPlanOptions {
@@ -626,11 +1014,13 @@ impl MemoryPlanOptions {
             allocate_params: true,
             allocate_inputs: true,
             allocate_constants: true,
-            arena_no_reuse: std::env::var("RLX_ARENA_NO_REUSE")
-                .ok()
+            arena_no_reuse: rlx_ir::env::var("RLX_ARENA_NO_REUSE")
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             pin_output_ancestors: true,
             dequant_host_fallback: true,
+            elide_bank_transposes: false,
+            fold_conv3d_epilogue: false,
+            elide_requires_small_m: false,
         }
     }
 
@@ -640,11 +1030,13 @@ impl MemoryPlanOptions {
             allocate_params: false,
             allocate_inputs: true,
             allocate_constants: true,
-            arena_no_reuse: std::env::var("RLX_ARENA_NO_REUSE")
-                .ok()
+            arena_no_reuse: rlx_ir::env::var("RLX_ARENA_NO_REUSE")
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             pin_output_ancestors: true,
             dequant_host_fallback: true,
+            elide_bank_transposes: false,
+            fold_conv3d_epilogue: false,
+            elide_requires_small_m: false,
         }
     }
 }
@@ -758,7 +1150,8 @@ pub fn plan_memory_aligned(graph: &Graph, alignment: usize) -> MemoryPlan {
 /// reuse slots that a mid-schedule CPU indexing thunk still needs to read,
 /// which drifts long ODE chains (F5 DiT on a sharded >4 GiB arena).
 pub fn plan_memory_f32_uniform(graph: &Graph, alignment: usize) -> MemoryPlan {
-    let pin = graph_has_host_indexing(graph);
+    let pin = graph_has_host_indexing(graph)
+        || rlx_ir::env::var("RLX_PIN_OUTPUT_ANCESTORS").as_deref() == Some("1");
     let opts = MemoryPlanOptions {
         // Default off: deep feed-forward vocoders (HiFi-GAN) need reuse to
         // stay under wgpu's 4 GiB single-buffer / binding limits.
@@ -803,6 +1196,10 @@ pub fn plan_memory_native_in_order(graph: &Graph, alignment: usize) -> MemoryPla
     let opts = MemoryPlanOptions {
         pin_output_ancestors: graph_has_host_indexing(graph),
         dequant_host_fallback: false,
+        // The CPU backend folds `Transpose -> GroupedMatMul`, and this planner
+        // is its own — no other backend calls it.
+        elide_bank_transposes: true,
+        fold_conv3d_epilogue: false,
         ..MemoryPlanOptions::default()
     };
     plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Native)
@@ -837,14 +1234,45 @@ pub fn plan_memory_f32_uniform_no_params(graph: &Graph, alignment: usize) -> Mem
     plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::F32Uniform)
 }
 
+/// True when the graph indexes with a **data-dependent** index tensor.
+///
+/// Such ops are hosted on several backends, and a hosted step's arena write is
+/// deferred to the next flush — so the planner's "an operand dies at its last
+/// consumer" rule stops describing when the buffer is actually free. Pinning
+/// output ancestors is the conservative answer.
+///
+/// Plain `Op::Gather` belongs here and was missing. It is the *most common* of
+/// these ops (every embedding table, every codebook lookup), and its index
+/// tensor is as data-dependent as `GatherElements`'. A graph whose only host
+/// indexing was a plain `Gather` planned as if it had none: rlx-peakflow's
+/// encoder came back with activations that were not its own on wgpu, while
+/// every op matched in isolation and `plan_check` called the plan clean —
+/// `RLX_PIN_OUTPUT_ANCESTORS=1` was the difference, which is exactly the flag
+/// this predicate sets.
 fn graph_has_host_indexing(graph: &Graph) -> bool {
     graph.nodes().iter().any(|n| {
         matches!(
             &n.op,
-            Op::ScatterNd { .. }
+            Op::Gather { .. }
+                | Op::ScatterNd { .. }
                 | Op::ScatterElements { .. }
                 | Op::GatherNd { .. }
                 | Op::GatherElements { .. }
+                // Not indexing, but the same hazard, and the same remedy.
+                // `LayerNormBackwardGamma` does not lower to one dispatch: wgpu
+                // emits a multi-workgroup *partial* that writes per-chunk sums
+                // into the arena's shared tail scratch zone, then a second pass
+                // that reduces them into the real dgamma slot. That intermediate
+                // is not a graph node, so liveness never accounts for it, and
+                // under slot reuse the backward comes back wrong — not subtly:
+                // on `rlx-sensorfm` the CPU gradients for the first slots are
+                // ~1e-7 while wgpu returned 0.07-2.9, ~1e6x too large. AdamW
+                // normalises magnitude, so those became full-size steps in
+                // arbitrary directions and the model simply did not learn (loss
+                // ratio 0.99 over 300 steps against 0.42 on CPU) while the
+                // forward loss stayed bit-identical, which is what made it look
+                // like a training-recipe problem rather than a backend one.
+                | Op::LayerNormBackwardGamma { .. }
         )
     })
 }
@@ -919,6 +1347,22 @@ fn node_slot_bytes(node: &rlx_ir::Node, policy: ArenaWidthPolicy) -> usize {
     }
 }
 
+thread_local! {
+    /// Per-thread switch for the planner's self-check (see `RLX_PLAN_VERIFY`).
+    /// A thread-local rather than an env var so a test can enable it without
+    /// racing every other test in the process.
+    static VERIFY_PLAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the planner's candidate-scan self-check enabled on this thread.
+#[cfg(test)]
+fn with_plan_verify<R>(f: impl FnOnce() -> R) -> R {
+    VERIFY_PLAN.with(|v| v.set(true));
+    let r = f();
+    VERIFY_PLAN.with(|v| v.set(false));
+    r
+}
+
 fn plan_memory_aligned_inner(
     graph: &Graph,
     alignment: usize,
@@ -932,6 +1376,9 @@ fn plan_memory_aligned_inner(
     extend_bert_hidden_liveness(graph, &mut ranges);
     extend_onnx_duration_epilogue_liveness(graph, &mut ranges);
     extend_static_weight_pack_liveness(graph, &mut ranges);
+    if opts.fold_conv3d_epilogue {
+        extend_conv3d_epilogue_fold_liveness(graph, &mut ranges);
+    }
     let mut opts = opts;
     if graph_exports_onnx_duration(graph) {
         opts.arena_no_reuse = true;
@@ -949,6 +1396,12 @@ fn plan_memory_aligned_inner(
         // Skip view nodes — they alias their parent's buffer (handled
         // in the post-pass below). Plan #46.
         if pure_view_offset(graph, node).is_some() {
+            continue;
+        }
+        // Folded into its consumers' GEMMs, so never written or read.
+        if opts.elide_bank_transposes
+            && is_elidable_folded_transpose_gated(graph, node, opts.elide_requires_small_m)
+        {
             continue;
         }
         let raw_size = node_slot_bytes(node, width);
@@ -985,35 +1438,88 @@ fn plan_memory_aligned_inner(
         let node = graph.node(buf.id);
         let tail_guard = boundary_tail_guard(&node.op, align);
         let placement_size = buf.size + tail_guard;
+        // Lowest offset at which this buffer fits without overlapping a buffer
+        // that is live at the same time.
+        //
+        // **Why this is a sweep and not a candidate scan.** This used to build
+        // a candidate offset per placed buffer, then test each candidate
+        // against every placed buffer — O(i^2) work for buffer i, so O(N^3)
+        // overall. A 12-layer Mamba training graph has N = 2378 buffers, and
+        // planning it took 28 s, roughly 60% of total compile time; the graph
+        // itself compiles in well under a second.
+        //
+        // Only buffers whose live range OVERLAPS this one can constrain it, so
+        // collect those, sort by offset, and walk left to right taking the
+        // first gap that fits. That is O(K log K) for the K time-overlapping
+        // buffers instead of O(i^2) for all of them.
+        //
+        // **This picks the same offset as the scan did.** The scan took the
+        // minimum conflict-free candidate, and its candidates were 0 and the
+        // end of every placed buffer. Any valid offset lies in some gap between
+        // time-overlapping buffers, and that gap's start is either 0 or the end
+        // of a time-overlapping buffer — which the scan also had in its
+        // candidate set, and which is <= the offset itself. So both take the
+        // true minimum first fit; the scan just spent O(N^3) reaching it.
+        let mut occupied: Vec<(usize, usize)> = placed
+            .iter()
+            .filter(|&&(_, _, p_birth, p_death)| buf.birth <= p_death && buf.death >= p_birth)
+            .map(|&(p_off, p_size, _, _)| (p_off, p_off + p_size))
+            .collect();
+        occupied.sort_unstable();
+
+        let mut cursor = 0usize;
         let mut best_offset: Option<usize> = None;
-
-        // Collect candidate start offsets: 0 plus the end of every placed
-        // buffer that could border a free gap.
-        let mut candidates = vec![0usize];
-        for &(p_off, p_size, _, _) in &placed {
-            candidates.push(p_off + p_size);
+        for (start, end) in occupied {
+            let aligned = (cursor + align - 1) & !(align - 1);
+            if aligned + placement_size <= start {
+                best_offset = Some(aligned);
+                break;
+            }
+            cursor = cursor.max(end);
         }
-        candidates.sort_unstable();
-        candidates.dedup();
+        if best_offset.is_none() {
+            // Past every time-overlapping buffer: the tail of that set is free.
+            best_offset = Some((cursor + align - 1) & !(align - 1));
+        }
 
-        for &candidate_offset in &candidates {
-            let aligned = (candidate_offset + align - 1) & !(align - 1);
-            let end = aligned + placement_size;
-
-            let conflict = placed.iter().any(|&(p_off, p_size, p_birth, p_death)| {
-                let p_end = p_off + p_size;
-                let mem_overlap = aligned < p_end && end > p_off;
-                let time_overlap = buf.birth <= p_death && buf.death >= p_birth;
-                mem_overlap && time_overlap
-            });
-
-            if !conflict {
-                match best_offset {
-                    None => best_offset = Some(aligned),
-                    Some(best) if aligned < best => best_offset = Some(aligned),
-                    _ => {}
+        // RLX_PLAN_VERIFY=1 re-derives the offset with the original O(N^3)
+        // candidate scan and asserts the sweep agrees. Off by default (it
+        // restores the cubic cost); on in `plan_sweep_matches_candidate_scan`
+        // and available for bisecting a suspected planning regression on a real
+        // graph. This is what backs the equivalence claim above — the argument
+        // is only an argument until something checks it.
+        if VERIFY_PLAN.with(|v| v.get()) || rlx_ir::env::flag("RLX_PLAN_VERIFY") {
+            let mut candidates = vec![0usize];
+            for &(p_off, p_size, _, _) in &placed {
+                candidates.push(p_off + p_size);
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            let mut want: Option<usize> = None;
+            for &cand in &candidates {
+                let a = (cand + align - 1) & !(align - 1);
+                let end = a + placement_size;
+                let conflict = placed.iter().any(|&(p_off, p_size, p_birth, p_death)| {
+                    a < p_off + p_size
+                        && end > p_off
+                        && buf.birth <= p_death
+                        && buf.death >= p_birth
+                });
+                if !conflict && want.is_none_or(|w| a < w) {
+                    want = Some(a);
                 }
             }
+            let want = want.unwrap_or_else(|| (arena_size + align - 1) & !(align - 1));
+            assert_eq!(
+                best_offset,
+                Some(want),
+                "plan sweep disagrees with the candidate scan for buffer {:?} \
+                 (size {}, live {}..{})",
+                buf.id,
+                buf.size,
+                buf.birth,
+                buf.death
+            );
         }
 
         let aligned = if opts.arena_no_reuse {
@@ -1443,5 +1949,59 @@ mod tests {
         let d = dual.input("dur", Shape::new(&[8], DType::I64));
         dual.set_outputs(vec![w2, d]);
         assert!(graph_exports_onnx_duration(&dual));
+    }
+
+    /// The sweep must place every buffer exactly where the original
+    /// candidate-scan planner did.
+    ///
+    /// The scan was replaced because it was O(N^3) — 28 s on a 2378-node Mamba
+    /// training graph, about 60% of that graph's total compile time. Equivalence
+    /// was argued from the structure of the two searches; this runs both and
+    /// compares, on a graph deep enough (200+ layers of differently-shaped
+    /// buffers) that live ranges genuinely overlap and gaps genuinely open up.
+    #[test]
+    fn plan_sweep_matches_candidate_scan() {
+        use rlx_ir::infer::GraphExt;
+        let mut g = Graph::new("deep");
+        let mut x = g.input("x", Shape::new(&[32, 64], DType::F32));
+        // Varying widths so buffers differ in size and first-fit has to choose
+        // between gaps rather than always appending at the tail.
+        for i in 0..200 {
+            let w = 32 + (i % 7) * 16;
+            let p = g.param(format!("w{i}"), Shape::new(&[64, w], DType::F32));
+            let m = g.mm(x, p);
+            let r = g.relu(m);
+            let p2 = g.param(format!("v{i}"), Shape::new(&[w, 64], DType::F32));
+            x = g.mm(r, p2);
+        }
+        g.set_outputs(vec![x]);
+
+        let plan =
+            with_plan_verify(|| plan_memory_with_options(&g, 128, MemoryPlanOptions::inference()));
+        assert!(
+            plan.assignments.len() > 400,
+            "expected a large plan, got {}",
+            plan.assignments.len()
+        );
+
+        // Independently: no two buffers that are live at the same time may
+        // overlap in the arena. The self-check above proves the sweep agrees
+        // with the old planner; this proves the answer they agree on is sound.
+        let ranges = compute_live_ranges_opts(&g, true);
+        let placed: Vec<_> = plan
+            .assignments
+            .iter()
+            .filter_map(|(id, slot)| ranges.get(id).map(|&(b, d)| (slot.offset, slot.size, b, d)))
+            .collect();
+        for (i, &(o1, s1, b1, d1)) in placed.iter().enumerate() {
+            for &(o2, s2, b2, d2) in &placed[i + 1..] {
+                let mem = o1 < o2 + s2 && o2 < o1 + s1;
+                let time = b1 <= d2 && b2 <= d1;
+                assert!(
+                    !(mem && time),
+                    "overlap: [{o1},{s1}) {b1}..{d1} vs [{o2},{s2}) {b2}..{d2}"
+                );
+            }
+        }
     }
 }

@@ -23,12 +23,16 @@ pub mod lower_dot_general;
 pub mod lower_fake_quantize;
 pub mod lower_fma;
 pub mod lower_histogram;
+pub mod lower_kv_append;
 pub mod lower_logical_kernels;
 pub mod lower_loss_ops;
 pub mod lower_pad;
 pub mod lower_reduce_axes;
+pub mod lower_roll;
 pub mod lower_scaled_grouped_matmul;
+pub mod lower_scatter_add;
 pub mod lower_slice;
+pub mod lower_softmax;
 pub mod lower_spectral;
 pub mod lower_spline_activation;
 pub mod lower_spline_backward;
@@ -77,8 +81,11 @@ pub use lower_logical_kernels::lower_logical_kernels;
 pub use lower_loss_ops::LowerSoftmaxCrossEntropy;
 pub use lower_pad::{LowerPad, lower_pad};
 pub use lower_reduce_axes::LowerNonLastAxisReduce;
+pub use lower_roll::{LowerRoll, lower_roll};
 pub use lower_scaled_grouped_matmul::LowerScaledGroupedMatMul;
+pub use lower_scatter_add::{LowerScatterAddAxis, lower_scatter_add};
 pub use lower_slice::{LowerSlice, lower_slice};
+pub use lower_softmax::{LowerSoftmaxAxis, lower_softmax};
 pub use lower_spectral::LowerSpectral;
 pub use lower_spline_activation::LowerSplineActivation;
 pub use lower_spline_backward::LowerSplineActivationBackward;
@@ -91,5 +98,6 @@ pub use pass::{
     Pass, register_ir_pass, registered_ir_passes, run_passes, run_registered_ir_passes,
 };
 pub use unfuse::{
-    unfuse_attention_block, unfuse_dit_modulation, unfuse_fused_for_autodiff, unfuse_recurrent_ops,
+    unfuse_attention_block, unfuse_dit_modulation, unfuse_fused_for_autodiff,
+    unfuse_gated_delta_net_always, unfuse_recurrent_ops,
 };

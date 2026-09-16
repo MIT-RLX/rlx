@@ -71,7 +71,11 @@ pub fn compose_gather_backward(
     let rank = table_shape.rank();
     let ax = axis_pos(axis, rank);
     if ax == 0 {
-        return g.add_node(Op::ScatterAdd, vec![dy, indices], table_shape.clone());
+        return g.add_node(
+            Op::ScatterAdd { axis: 0 },
+            vec![dy, indices],
+            table_shape.clone(),
+        );
     }
 
     let _dy_shape = g.node(dy).shape.clone();
@@ -106,7 +110,7 @@ pub fn compose_gather_backward(
     let base = g.mul(outer_node, axis_b);
     let flat_idx = g.add(base, idx_rep);
     let scattered = g.add_node(
-        Op::ScatterAdd,
+        Op::ScatterAdd { axis: 0 },
         vec![updates, flat_idx],
         Shape::new(&[outer * axis_dim, trailing], dt),
     );

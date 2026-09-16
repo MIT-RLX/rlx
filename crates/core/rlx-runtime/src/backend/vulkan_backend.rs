@@ -138,6 +138,14 @@ impl ExecutableGraph for VulkanExecutableWrapper {
     ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
         let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
         for (name, data, dt) in inputs {
+            // U8/I8 stay packed bytes, same as the constant-upload path: their
+            // arena slot is 1 B/elem, so widening to f32 and writing that would
+            // store f32 lane bytes where quant codes are expected.
+            if matches!(*dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                && self.inner.write_input_bytes(name, data)
+            {
+                continue;
+            }
             let v = if *dt == rlx_ir::DType::F32 {
                 let n = data.len() / 4;
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) }.to_vec()

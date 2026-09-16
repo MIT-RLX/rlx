@@ -62,12 +62,12 @@ fn share_weights_enabled() -> bool {
     // Default on (OOM mitigation). Set RLX_WGPU_SHARE_WEIGHTS=0 to force
     // fresh allocations per compile. Prefer env registry flag when set to
     // truthy; treat explicit "0"/"false"/"off" as disable.
-    match std::env::var("RLX_WGPU_SHARE_WEIGHTS") {
-        Ok(v) => {
+    match rlx_ir::env::var("RLX_WGPU_SHARE_WEIGHTS") {
+        Some(v) => {
             let t = v.trim();
             !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
         }
-        Err(_) => true,
+        None => true,
     }
 }
 
@@ -105,12 +105,39 @@ pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 
 /// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
 pub fn shard_stage_reserve() -> usize {
-    if let Ok(raw) = std::env::var("RLX_WGPU_SHARD_STAGE_MIB") {
+    if let Some(raw) = rlx_ir::env::var("RLX_WGPU_SHARD_STAGE_MIB") {
         if let Ok(mib) = raw.parse::<usize>() {
             return (mib.max(1) * 1024 * 1024).min(SHARD_STAGE_RESERVE);
         }
     }
     SHARD_STAGE_RESERVE
+}
+
+/// Device shard capacity, honouring `RLX_WGPU_SHARD_CAP_MIB`.
+///
+/// The real cap is the adapter's `max_buffer_size` (4 GiB on discrete Vulkan,
+/// smaller on Apple). Testing the striping path therefore meant building a plan
+/// larger than that — `sharded_arena.rs` asked for `shard_cap * 2`, which on a
+/// 4 GiB-limit adapter snapped to three 4 GiB buffers and died with
+/// `wgpu error: Out of Memory`. The test passed on Apple only because its
+/// smaller `max_buffer_size` happened to fit in unified memory.
+///
+/// A path that can only be exercised by allocating 12 GiB is a path that does
+/// not get exercised — and this one carries a standing warning that sharded
+/// arenas have produced *silently wrong results*. Allowing the cap to be lowered
+/// makes striping testable on any device at kilobyte scale.
+///
+/// Clamped to the device limit: this can only make shards SMALLER, so it can
+/// never be used to exceed what the adapter actually supports.
+pub fn effective_shard_cap(device: &wgpu::Device) -> usize {
+    let device_cap = ((device.limits().max_buffer_size as usize) / 256) * 256;
+    if let Some(raw) = rlx_ir::env::var("RLX_WGPU_SHARD_CAP_MIB")
+        && let Ok(mib) = raw.parse::<usize>()
+    {
+        let forced = (mib.max(1) * 1024 * 1024 / 256) * 256;
+        return forced.min(device_cap).max(256);
+    }
+    device_cap
 }
 
 /// Re-place unique buffer slots so no slot crosses a shard boundary.
@@ -132,8 +159,33 @@ fn snap_plan_to_shards_ex(plan: &mut MemoryPlan, shard_cap: usize, stage_reserve
     }
     let tail_extra = plan.arena_size.saturating_sub(max_end);
 
+    // Place slots in the order they are first *used*, not in the order the
+    // planner happened to lay them out.
+    //
+    // This is what keeps an op's operands in one stripe. A kernel binds a
+    // single stripe, so when a convolution's input and output land either side
+    // of a boundary the input reads as zero — silently, with a result that
+    // looks real. Ordering by original offset made that likely: a 3.5 MiB graph
+    // input assigned a high offset was pushed into stripe 1 while the 864 MiB
+    // tensor consuming it sat in stripe 0, purely because of where the planner
+    // had put them.
+    //
+    // First-use order groups tensors that are alive together, which is exactly
+    // the set an op touches at once. It is a heuristic, not a guarantee — a
+    // single op whose operands exceed one stripe cannot be satisfied by any
+    // ordering — so the compile-time check in `lower.rs` still runs and still
+    // refuses rather than computing something plausible.
+    let mut first_use: HashMap<usize, usize> = HashMap::new();
+    for (step, id) in plan.schedule.iter().enumerate() {
+        if let Some(a) = plan.assignments.get(id) {
+            first_use.entry(a.offset).or_insert(step);
+        }
+    }
+    let unscheduled = plan.schedule.len();
     let mut ordered: Vec<(usize, usize)> = slot_size.into_iter().collect();
-    ordered.sort_by_key(|(off, _)| *off);
+    // Ties and anything absent from the schedule fall back to offset order, so
+    // the placement stays deterministic.
+    ordered.sort_by_key(|(off, _)| (*first_use.get(off).unwrap_or(&unscheduled), *off));
 
     let mut remap: HashMap<usize, usize> = HashMap::with_capacity(ordered.len());
     let mut cursor = 0usize;
@@ -465,11 +517,62 @@ impl Arena {
     /// `max_storage_buffer_binding_size` (`RLX_WGPU_LARGE_BUFFERS`), snap into
     /// virtual bind-sized stripes (`shard_size > 0`, `extra_shards` empty) so
     /// staging uses per-stripe reserves instead of clobbering live params.
+    /// Refuse to build a striped activation arena.
+    ///
+    /// This used to be a warning, and the warning said — correctly — that a
+    /// striped arena produces wrong results silently. Continuing anyway means
+    /// the caller gets numbers, not an error, and only finds out if they
+    /// happen to check against another backend.
+    ///
+    /// Measured again on SynthStrip: exact at 64^3 and 128^3, and at 192^3 —
+    /// the size `StripNet` pads a real head to — every one of 7,077,888 output
+    /// voxels was wrong, 97.8% of full scale, while the run reported success.
+    /// The straddle guard hosts the 108 ops whose operands cross a stripe and
+    /// the host staging stitches per-shard reads correctly, so the mitigation
+    /// is real but plainly incomplete.
+    ///
+    /// `RLX_WGPU_ALLOW_SHARD=1` restores the old warn-and-continue for anyone
+    /// whose graph happens to survive it.
+    fn refuse_or_warn_about_sharding(logical: usize, shards: usize, cap: usize) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if !rlx_ir::env::flag("RLX_WGPU_ALLOW_SHARD") {
+            panic!(
+                "rlx-wgpu: the activation arena needs {:.2} GiB and would be striped across \
+                 {shards} buffers of {:.2} GiB.\n\
+                 \x20 Striped arenas produce WRONG RESULTS on this backend, silently — on \
+                 SynthStrip at 192^3 every output voxel was wrong (97.8% of scale) while the \
+                 run reported success.\n\
+                 \x20 Keep the largest intermediate small enough to avoid striping, use \
+                 another backend, or set RLX_WGPU_ALLOW_SHARD=1 to get the old \
+                 warn-and-continue behaviour.",
+                logical as f64 / (1u64 << 30) as f64,
+                cap as f64 / (1u64 << 30) as f64,
+            );
+        }
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if WARNED.swap(true, Ordering::Relaxed) || rlx_ir::env::flag("RLX_WGPU_QUIET_SHARD") {
+            return;
+        }
+        eprintln!(
+            "rlx-wgpu warning: the activation arena needs {:.2} GiB and is being striped \
+             across {shards} buffers of {:.2} GiB.\n\
+             \x20 Sharded arenas have produced WRONG RESULTS on this backend, silently: a \
+             3-D convolution stack whose output tensor was 864 MiB came back at correlation \
+             0.17 against a reference runtime, while the same graph at 666 MiB — which fits \
+             without striping — was exact. Reserve size made no difference.\n\
+             \x20 Check any result from this graph against `cpu`, or keep the largest \
+             intermediate small enough to avoid striping. Silence this with \
+             RLX_WGPU_QUIET_SHARD=1.",
+            logical as f64 / (1u64 << 30) as f64,
+            cap as f64 / (1u64 << 30) as f64,
+        );
+    }
+
     pub fn from_plan(device: &wgpu::Device, plan: &MemoryPlan) -> Self {
         let max_buf = device.limits().max_buffer_size as usize;
         let max_binding = device.limits().max_storage_buffer_binding_size as usize;
         // 256-byte alignment for storage-buffer bind offsets.
-        let shard_cap = (max_buf / 256) * 256;
+        let shard_cap = effective_shard_cap(device);
         let bind_shard_cap = (max_binding.min(max_buf) / 256) * 256;
         assert!(shard_cap >= 256, "rlx-wgpu: max_buffer_size too small");
         assert!(
@@ -479,7 +582,12 @@ impl Arena {
 
         let mut plan = plan.clone();
         let size_hint = plan.arena_size.max(1);
-        if size_hint > max_buf {
+        // The question throughout the sizing logic below is "does this fit in ONE
+        // shard?", so it is asked against `shard_cap` rather than the raw device
+        // limit. The two are identical unless `RLX_WGPU_SHARD_CAP_MIB` lowers the
+        // cap — which is what makes the striping path testable without allocating
+        // multiple gigabytes. `max_buf` is kept for the binding-limit maths.
+        if size_hint > shard_cap {
             // Prefer shrinking the per-stripe stage reserve so a compact plan
             // that only slightly exceeds max_buf (act + modest scratch) still
             // lands in one allocation. Full 768 MiB reserves turn ~2 GiB into
@@ -492,7 +600,7 @@ impl Arena {
             loop {
                 let mut trial = compact.clone();
                 snap_plan_to_shards_ex(&mut trial, shard_cap, reserve);
-                if trial.arena_size <= max_buf {
+                if trial.arena_size <= shard_cap {
                     if reserve < default_reserve
                         && (rlx_ir::env::flag("RLX_WGPU_DEBUG")
                             || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
@@ -536,8 +644,8 @@ impl Arena {
             loop {
                 let mut trial = compact.clone();
                 snap_plan_to_shards_ex(&mut trial, bind_shard_cap, reserve);
-                if trial.arena_size <= max_buf || reserve <= 1024 * 1024 {
-                    if trial.arena_size <= max_buf {
+                if trial.arena_size <= shard_cap || reserve <= 1024 * 1024 {
+                    if trial.arena_size <= shard_cap {
                         if reserve < default_reserve
                             && (rlx_ir::env::flag("RLX_WGPU_DEBUG")
                                 || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
@@ -555,7 +663,7 @@ impl Arena {
                         || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG")
                     {
                         eprintln!(
-                            "[rlx-wgpu] bind-stripe snap still {:.3} GiB (> max_buf) at \
+                            "[rlx-wgpu] bind-stripe snap still {:.3} GiB (> shard_cap) at \
                              {:.0} MiB reserve; keeping compact {:.3} GiB layout",
                             trial.arena_size as f64 / (1u64 << 30) as f64,
                             reserve as f64 / (1024.0 * 1024.0),
@@ -575,12 +683,12 @@ impl Arena {
         // already over the cap; re-pack onto physical shard boundaries.
         // Guard: never prefer an inflated multi-shard layout when the compact
         // plan fit in one buffer (handled above).
-        if size > max_buf {
+        if size > shard_cap {
             snap_plan_to_shards(&mut plan, shard_cap);
             size = plan.arena_size.max(1);
         }
 
-        let (buffer, extra_shards, shard_size) = if size <= max_buf {
+        let (buffer, extra_shards, shard_size) = if size <= shard_cap {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu arena"),
                 size: size as u64,
@@ -622,6 +730,10 @@ impl Arena {
                 }
             }
             let n_shards = size.div_ceil(shard_cap);
+            // Loud by default. Striping is where this backend has been measured
+            // to return wrong numbers without saying so, and a diagnostic behind
+            // a flag nobody sets is no diagnostic at all.
+            Self::refuse_or_warn_about_sharding(size, n_shards, shard_cap);
             if rlx_ir::env::flag("RLX_WGPU_DEBUG") || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG") {
                 eprintln!(
                     "[rlx-wgpu] sharded arena: logical={:.3} GiB → {n_shards} × {:.3} GiB shards",
@@ -738,8 +850,13 @@ impl Arena {
         // disables matmul param-anchor and panics on large F32 lm_heads.
         let max_bind = device.limits().max_storage_buffer_binding_size as usize;
         let bind_cap = (max_bind / 256) * 256;
+        // NOTE two distinct quantities. `max_buf` is the adapter's TRUE limit and
+        // drives the "is this the NVIDIA ~2 GiB storage-bind path" heuristics
+        // below; `weight_shard_cap` is the (possibly test-lowered) shard size.
+        // Conflating them would let `RLX_WGPU_SHARD_CAP_MIB` flip a hardware
+        // heuristic, which is not what that knob is for.
         let max_buf = device.limits().max_buffer_size as usize;
-        let weight_shard_cap = (max_buf / 256).saturating_mul(256).max(256);
+        let weight_shard_cap = effective_shard_cap(device);
         let scratch_aligned = scratch_bytes.div_ceil(16) * 16;
         let mut param_bytes_est = 0usize;
         for node in graph.nodes() {
@@ -809,8 +926,26 @@ impl Arena {
         let fill_weight_shard = max_buf <= (2usize << 30);
         let mut named_weight_slots: Vec<(String, usize, usize)> = Vec::new();
         for (id, ne, nbytes, dt, is_param, name) in park_candidates {
+            let packed_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8);
+            // A generic op reaches a weight-buffer param only by staging a copy
+            // into the act bind window, and that copy has to fit the scratch
+            // reserve. Parking a param bigger than the reserve is therefore a
+            // dead end: `arena_off_in_window_or_stage` can only panic on it.
+            // Keep such a param in the act arena instead, as long as the act
+            // arena still fits one bind window — that is strictly better than
+            // both alternatives (a panic, or a reserve grown to hundreds of MiB
+            // that every graph then pays for). Packed U8/I8 quant is exempt:
+            // fused GEMV binds the weight buffer directly and never stages.
+            //
+            // Qwen3-0.6B F32 is the case that needs this — its 622 MiB tied
+            // lm_head and embedding are far past any sane reserve, while the
+            // activations are ~1.2 GiB, so both fit the act arena comfortably.
+            let unstageable = !packed_quant && nbytes > scratch_aligned;
+            let act_after = tail.div_ceil(a) * a + nbytes + scratch_aligned;
+            let keep_in_act = unstageable && act_after <= bind_cap;
             let to_weight = is_param
-                && (matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                && !keep_in_act
+                && (packed_quant
                     || nbytes > LARGE_F32_PARAM
                     || park_all_params
                     || fill_weight_shard);
@@ -1013,6 +1148,69 @@ impl Arena {
         self.shard_size > 0
     }
 
+    /// Bytes per stripe, for diagnostics.
+    pub fn shard_size_bytes(&self) -> usize {
+        self.shard_size.max(1)
+    }
+
+    /// The whole logical arena size, for diagnostics.
+    pub fn logical_size(&self) -> usize {
+        self.size
+    }
+
+    /// Which stripe a logical activation offset falls in.
+    ///
+    /// `None` when the arena is not striped, in which case everything is in
+    /// the same place and there is nothing to compare.
+    pub fn shard_of(&self, off: usize) -> Option<usize> {
+        (self.is_sharded() && !is_weight_off(off)).then(|| off / self.shard_size)
+    }
+
+    /// Check that every operand of an op, and its output, live in one stripe.
+    ///
+    /// # Why this has to be checked, and checked here
+    ///
+    /// A kernel binds **one** stripe. Slot placement guarantees that no single
+    /// tensor straddles a boundary, which is not the same as guaranteeing that
+    /// an op's *operands* share a stripe — nothing in the planner knows which
+    /// tensors are used together. When they do not, the operand outside the
+    /// bound stripe reads as **zero**: no error, no warning, and a result that
+    /// is entirely plausible. A convolution in that state returns its bias for
+    /// every voxel, which looks like a real feature map.
+    ///
+    /// Only the matmul path checked for this, so every other operator failed
+    /// silently. This is the check for all of them, run once at compile time —
+    /// before any wrong number exists — rather than per dispatch.
+    ///
+    /// Returns the offending offsets if the op cannot be encoded.
+    ///
+    /// Wired from `lower.rs::op_straddles_shards`, which runs it per op
+    /// (operands + output) at compile time. When it fires, that op is routed to
+    /// the host path — which reads whole tensors and is stripe-agnostic — rather
+    /// than refused, so `RLX_WGPU_SHARD_GPU` stays a throughput preference and
+    /// never means "return zeros". Regression: `shard_straddle_guard`, which
+    /// reproduces the all-zeros result (786432/786432 outputs 0.0 instead of
+    /// 18.0) with the check removed.
+    pub fn straddles_shards(&self, ids: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
+        if !self.is_sharded() {
+            return None;
+        }
+        let mut seen: Option<usize> = None;
+        for &(off, _len) in ids {
+            let Some(shard) = self.shard_of(off) else {
+                continue;
+            };
+            match seen {
+                None => seen = Some(shard),
+                Some(first) if first != shard => {
+                    return Some(ids.to_vec());
+                }
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
     /// Logical byte offset of the staging reserve for the shard that contains
     /// `logical_off` (end of that stripe minus [`shard_stage_reserve`]).
     pub fn shard_stage_off(&self, logical_off: usize) -> usize {
@@ -1029,6 +1227,67 @@ impl Arena {
     }
 
     /// Physical buffer + local offset for a logical activation byte address.
+    /// Device-to-device copy inside the arena: `bytes` from `src_off` to
+    /// `dst_off`, both logical activation offsets.
+    ///
+    /// Needed by the resident-KV row feed, which folds the new token's row into
+    /// a device-resident handle without a host round trip. `rlx-metal` does this
+    /// with a plain memcpy because its arena is unified memory; here it has to
+    /// be a real GPU copy.
+    ///
+    /// **WebGPU forbids `copy_buffer_to_buffer` where source and destination are
+    /// the same buffer** ("Source and destination cannot be the same buffer"),
+    /// and the arena is one buffer — so the copy bounces through a caller-owned
+    /// `staging` buffer. Two copies instead of one, on a KV row of a few KiB,
+    /// once per layer per token.
+    ///
+    /// The arena may also be SHARDED, so a range can straddle a shard boundary
+    /// and is split at it. `copy_buffer_to_buffer` requires 4-byte-aligned
+    /// offsets and sizes, which arena slots satisfy (the arena is f32-uniform)
+    /// — asserted rather than assumed, because a silent misalignment here
+    /// corrupts a cache instead of failing.
+    pub fn copy_within_device(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        staging: &wgpu::Buffer,
+        src_off: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        assert!(
+            src_off.is_multiple_of(4) && dst_off.is_multiple_of(4) && bytes.is_multiple_of(4),
+            "rlx-wgpu: copy_within_device needs 4-byte alignment \
+             (src={src_off} dst={dst_off} bytes={bytes})"
+        );
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rlx-wgpu kv row feed"),
+        });
+        // Walk the range in pieces that lie within one shard on BOTH sides.
+        let mut done = 0usize;
+        while done < bytes {
+            let (src_buf, src_local) = self.resolve_act(src_off + done);
+            let (dst_buf, dst_local) = self.resolve_act(dst_off + done);
+            let remaining = bytes - done;
+            let chunk = if self.is_sharded() && self.shard_size > 0 {
+                let src_room = self.shard_size - (src_local % self.shard_size.max(1));
+                let dst_room = self.shard_size - (dst_local % self.shard_size.max(1));
+                remaining.min(src_room).min(dst_room)
+            } else {
+                remaining
+            };
+            // arena -> staging -> arena. A direct arena->arena copy is a
+            // validation error even when the ranges do not overlap.
+            enc.copy_buffer_to_buffer(src_buf, src_local as u64, staging, 0, chunk as u64);
+            enc.copy_buffer_to_buffer(staging, 0, dst_buf, dst_local as u64, chunk as u64);
+            done += chunk;
+        }
+        queue.submit(std::iter::once(enc.finish()));
+    }
+
     pub fn resolve_act(&self, global_off: usize) -> (&wgpu::Buffer, usize) {
         assert!(
             !is_weight_off(global_off),

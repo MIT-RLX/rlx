@@ -18,6 +18,8 @@ use rlx_ir::{DType, Graph, Op, Shape, SynthKind};
 use rlx_optim::{Muon, Optimizer};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const B: usize = 8;
 const K: usize = 8;
 const N: usize = 6;
@@ -48,6 +50,7 @@ fn synth_ref(x: &[f32], idx: &[u8], cb: &[f32]) -> Vec<f32> {
 
 #[test]
 fn synth_codebook_layer_trains_with_muon() {
+    let _gpu = common::serialize_gpu();
     let x: Vec<f32> = (0..B * K).map(|i| (i as f32 * 0.17).sin()).collect();
     let idx: Vec<u8> = (0..N * kb()).map(|i| ((i * 3 + 1) % NE) as u8).collect();
     let cb_true: Vec<f32> = (0..NE * D).map(|i| (i as f32 * 0.5).cos() * 0.9).collect();
@@ -146,7 +149,8 @@ fn synth_codebook_layer_trains_with_muon() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn synth_codebook_layer_trains_resident_on_metal() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let x: Vec<f32> = (0..B * K).map(|i| (i as f32 * 0.17).sin()).collect();

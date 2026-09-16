@@ -33,6 +33,7 @@ pub mod config;
 pub mod supported_ops;
 #[cfg(test)]
 mod tma_validate;
+pub mod tuning;
 pub mod vmem;
 pub use config::{
     AttentionVariant, CudaRuntimeConfig, install_runtime_config, reload_runtime_config,
@@ -49,7 +50,7 @@ pub mod distributed;
 pub mod fft_dispatch;
 pub mod nvml;
 pub mod fft_host {
-    pub use super::host_ops::run_fft1d;
+    pub use super::host_ops::{run_fft1d, run_fft1d_q};
 }
 pub mod dense_solve_native;
 pub mod eigh_native;
@@ -107,7 +108,6 @@ pub mod rng_gpu;
 pub mod rng_host;
 pub mod sam_ops_host;
 pub mod scan_host;
-pub mod scatter_nd_gpu;
 pub mod spd;
 pub mod spd_host;
 pub mod splat_host {

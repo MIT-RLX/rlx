@@ -16,6 +16,8 @@ use rlx_fusion::pass::Pass;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn hist_graph(dims: &[usize], bins: usize, min: f32, max: f32) -> Graph {
     let mut g = Graph::new("histogram");
     let inp = g.input("x", Shape::new(dims, DType::F32));
@@ -88,6 +90,7 @@ fn spread(n: usize, min: f32, max: f32) -> Vec<f32> {
 
 #[test]
 fn histogram_matches_reference() {
+    let _gpu = common::serialize_gpu();
     // 4 bins over [0,4], width 1. Hand-checkable:
     //   0.5→b0 | 1.5,1.9→b1 | 2.0→b2 | 3.99,4.0→b3 | -1.0,5.0 dropped.
     let x = vec![0.5, 1.5, 1.9, 2.0, 3.99, 4.0, -1.0, 5.0];
@@ -100,6 +103,7 @@ fn histogram_matches_reference() {
 
 #[test]
 fn histogram_native_matches_reference_multidim() {
+    let _gpu = common::serialize_gpu();
     // ND input is flattened before bucketize; shape of counts is [bins].
     let x = spread(120, -2.0, 3.0);
     let got = run_native(Device::Cpu, &[3, 5, 8], 16, -2.0, 3.0, &x);
@@ -109,6 +113,7 @@ fn histogram_native_matches_reference_multidim() {
 
 #[test]
 fn histogram_decompose_matches_native() {
+    let _gpu = common::serialize_gpu();
     for (bins, min, max) in [(4usize, 0.0f32, 4.0f32), (16, -2.0, 3.0), (7, -1.0, 1.0)] {
         let x = spread(500, min, max);
         let native = run_native(Device::Cpu, &[500], bins, min, max, &x);
@@ -143,19 +148,25 @@ fn check_device(device: Device, label: &str) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn histogram_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check_device(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn histogram_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     check_device(Device::Gpu, "wgpu");
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn histogram_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     check_device(Device::Cuda, "cuda");
@@ -164,7 +175,8 @@ fn histogram_cuda_matches_cpu() {
 #[test]
 #[cfg(feature = "mlx")]
 fn histogram_mlx_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         return;
     }
     check_device(Device::Mlx, "mlx");
@@ -173,7 +185,8 @@ fn histogram_mlx_matches_cpu() {
 #[test]
 #[cfg(feature = "vulkan")]
 fn histogram_vulkan_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Vulkan) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Vulkan, "vulkan") {
         return;
     }
     check_device(Device::Vulkan, "vulkan");

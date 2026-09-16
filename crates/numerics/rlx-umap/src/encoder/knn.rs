@@ -103,7 +103,7 @@ pub fn knn_indices_for_device(
     // neighbours; fit uses reference pairwise + CPU k-NN for strict parity.
     #[cfg(feature = "cuda")]
     if device == Device::Cuda
-        && !std::env::var("RLX_UMAP_CUDA_FUSED_KNN")
+        && !rlx_ir::env::var("RLX_UMAP_CUDA_FUSED_KNN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     {

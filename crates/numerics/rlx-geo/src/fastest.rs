@@ -20,7 +20,7 @@
 //! * **GPU is not auto-selected for host-resident points.** The flip loop is
 //!   latency-bound (per-round sync) and loses to CPU D&C on wall-clock once you
 //!   count the host→device→host transfer. It wins only when the points already
-//!   live in GPU memory — call [`triangulate_on_gpu`] explicitly for that.
+//!   live in GPU memory — call `triangulate_on_gpu` explicitly for that.
 
 use crate::triangulate::{GeoError, parallel_min, triangulate, triangulate_par};
 

@@ -103,7 +103,7 @@ pub use moe_ep::{
 /// graph and run it across a process group, which otherwise live in two
 /// crates: the in-graph op builders + group registry (this crate), the device
 /// mesh / placement planner (`mesh` / `planner`), and the transport types from
-/// [`rlx-driver`] (`ProcessGroup`, the transports, `Node` discovery,
+/// `rlx-driver` (`ProcessGroup`, the transports, `Node` discovery,
 /// `ReduceKind` / `ReduceMode`).
 ///
 /// ```ignore

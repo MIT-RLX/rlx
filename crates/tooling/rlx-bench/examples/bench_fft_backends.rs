@@ -99,8 +99,8 @@ fn main() {
     println!("  native-gpu-fft = {}", cfg!(feature = "native-gpu-fft"));
     println!(
         "  RLX_FFT_FAST={} RLX_FFT_RADIX={}\n",
-        std::env::var("RLX_FFT_FAST").unwrap_or_else(|_| "(default on)".into()),
-        std::env::var("RLX_FFT_RADIX").unwrap_or_else(|_| "(default 8)".into()),
+        rlx_ir::env::var("RLX_FFT_FAST").unwrap_or_else(|| "(default on)".into()),
+        rlx_ir::env::var("RLX_FFT_RADIX").unwrap_or_else(|| "(default 8)".into()),
     );
     println!(
         "  {:6} {:18} {:24} {:>5} {:>5}  {:>11} {:>10} {:>7}",

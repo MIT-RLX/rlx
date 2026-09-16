@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Reads a binary point file (shared with the C++ driver), triangulates it a few
 // times reusing one Triangulator, and prints: rust,<points>,<triangles>,<median_ms>
 //

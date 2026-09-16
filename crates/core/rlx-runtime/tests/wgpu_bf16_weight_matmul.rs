@@ -23,6 +23,8 @@ use half::bf16;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 fn build_matmul_graph(m: usize, k: usize, n: usize) -> Graph {
     let mut g = Graph::new("bf16_weight_matmul");
     let x = g.input("x", Shape::new(&[m, k], DType::F32));
@@ -117,6 +119,7 @@ fn run_case(m: usize, k: usize, n: usize, tol: f32) {
 
 #[test]
 fn wgpu_bf16_weight_matmul_unaligned() {
+    let _gpu = common::serialize_gpu();
     // Shapes unaligned to the coop-matrix tiling — the packed tiled kernel
     // bounds-checks, so no alignment requirement.
     run_case(8, 16, 12, 1e-3);
@@ -124,6 +127,7 @@ fn wgpu_bf16_weight_matmul_unaligned() {
 
 #[test]
 fn wgpu_bf16_weight_matmul_aligned_shapes() {
+    let _gpu = common::serialize_gpu();
     // Coop-eligible shapes (m%32, k%8, n%32). The packed path is bf16-exact
     // (never routes through the lossy f16 shadow), so a tight tol holds.
     run_case(32, 64, 64, 1e-3);
@@ -131,6 +135,7 @@ fn wgpu_bf16_weight_matmul_aligned_shapes() {
 
 #[test]
 fn wgpu_bf16_weight_matmul_m1_decode() {
+    let _gpu = common::serialize_gpu();
     // Decode-shaped GEMV: m=1 × unaligned N. Exercises the small/skinny
     // dispatch grid path for the packed weight.
     run_case(1, 128, 200, 1e-3);

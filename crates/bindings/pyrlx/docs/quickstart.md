@@ -87,7 +87,7 @@ router = rlx.DeviceRouter(g)  # warm-all on init
 device, outs = router.run(inputs)
 ```
 
-See [`docs/backend-selection.md`](../../docs/backend-selection.md).
+See [`docs/backend-selection.md`](../../../../docs/backend-selection.md).
 
 The compiled output of every backend is the same up to numerical
 precision — that's the parity test (`examples/cross_backend_parity.py`).

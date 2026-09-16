@@ -26,6 +26,8 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_sparse::SparseTensor;
 
+mod common;
+
 fn bytes_to_f64s(bytes: &[u8]) -> Vec<f64> {
     bytes
         .chunks_exact(8)
@@ -71,6 +73,7 @@ fn build_tridiag_4() -> (Vec<f64>, Vec<i32>, Vec<i32>) {
 
 #[test]
 fn sparse_lu_solve_runs_on_metal_via_owned_encoder_path() {
+    let _gpu = common::serialize_gpu();
     // The owned-encoder + cmd_buf-rebind path is what makes this
     // test possible. If that refactor regresses, this test would
     // either fail to compile (borrow error in encode_commit) or
@@ -122,6 +125,7 @@ fn sparse_lu_solve_runs_on_metal_via_owned_encoder_path() {
 
 #[test]
 fn sparse_mat_vec_runs_on_metal_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     // Cross-backend parity: build the same graph for CPU and Metal,
     // run both, demand element-wise agreement to f64 precision. This
     // is the strictest possible check that Metal dispatch is correct.

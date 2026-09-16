@@ -1,0 +1,58 @@
+#version 450
+// ONNX GatherElements / take-along-axis. See `gather_nd.comp` for the shared
+// conventions (f32-encoded indices, uvec4 push meta, the rank cap).
+//
+// The flat output position decomposes by the INDICES' strides — ONNX lets the
+// index tensor be smaller than `data` off-axis, and using the data's strides
+// instead is right for row 0 and wrong for every row after it.
+//
+// meta = [ ishape, dstride, ostride, dshape ], each `rank` long → rank <= 4.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;                 // prod(indices_shape), clamped to out_len
+    uint data_off;
+    uint idx_off;
+    uint dst_off;
+    uint data_len;
+    uint rank;
+    uint axis;
+    int axis_dim;
+    uvec4 meta[4];
+} pc;
+
+uint meta_at(uint i) { return pc.meta[i >> 2u][i & 3u]; }
+
+uint rlx_idx(float raw, int dim) {
+    int idx = int(round(raw));
+    if (idx < 0) { idx += dim; }
+    if (idx < 0) { idx = 0; }
+    if (dim > 0 && idx >= dim) { idx = dim - 1; }
+    return uint(idx);
+}
+
+void main() {
+    uint lin = gl_GlobalInvocationID.x;
+    if (lin >= pc.n) { return; }
+
+    uint r = pc.rank;
+    uint off = 0u;
+    for (uint d = 0u; d < r; ++d) {
+        uint dstride = meta_at(r + d);
+        if (d == pc.axis) {
+            off += rlx_idx(arena_load(pc.idx_off + lin), pc.axis_dim) * dstride;
+        } else {
+            uint dim = meta_at(d);
+            if (dim == 0u) { dim = 1u; }
+            uint coord = (lin / meta_at(2u * r + d)) % dim;
+            uint dshape = meta_at(3u * r + d);
+            uint last = (dshape > 0u) ? (dshape - 1u) : 0u;
+            off += min(coord, last) * dstride;
+        }
+    }
+    // `data.get(off)` on the CPU side leaves the output slot untouched when the
+    // read is out of range rather than faulting.
+    if (off < pc.data_len) {
+        arena_store(pc.dst_off + lin, arena_load(pc.data_off + off));
+    }
+}

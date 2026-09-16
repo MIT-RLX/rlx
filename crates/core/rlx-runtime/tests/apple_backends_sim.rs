@@ -26,6 +26,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session, fastest_device, is_available};
 
+mod common;
+
 const M: usize = 4;
 const K: usize = 6;
 const N: usize = 5;
@@ -78,6 +80,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn cpu_smoke() {
+    let _gpu = common::serialize_gpu();
     let out = run(Device::Cpu);
     assert_eq!(out.len(), M * N);
     assert!(out.iter().all(|v| v.is_finite()), "non-finite CPU output");
@@ -100,11 +103,12 @@ fn try_run(dev: Device) -> Option<Vec<f32>> {
 /// CPU reference. Opportunistic by design — see [`try_run`].
 #[test]
 fn apple_backends_match_cpu() {
+    let _gpu = common::serialize_gpu();
     let reference = run(Device::Cpu);
     let mut ran = Vec::new();
     let mut skipped = Vec::new();
     for dev in [Device::Metal, Device::Ane, Device::Mlx, Device::Gpu] {
-        if !is_available(dev) {
+        if common::skip_unless(dev) {
             skipped.push((dev.name(), "unavailable"));
             continue;
         }
@@ -128,6 +132,7 @@ fn apple_backends_match_cpu() {
 /// device for Metal/MLX, so the choice is always something that can run.
 #[test]
 fn runtime_selection_works() {
+    let _gpu = common::serialize_gpu();
     assert_eq!(rlx_runtime::parse_device("cpu").unwrap(), Device::Cpu);
     assert_eq!(rlx_runtime::parse_device("metal").unwrap(), Device::Metal);
     assert_eq!(rlx_runtime::parse_device("ane").unwrap(), Device::Ane);

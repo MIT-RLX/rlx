@@ -106,7 +106,7 @@ impl MetalExecutable {
     ///
     /// Writes `data` into the arena slot once and marks the handle **resident**
     /// so subsequent `run` / `run_read_outputs` calls skip host→arena copies.
-    /// [`feed_kv_row`] then appends new tokens with an in-arena memcpy only.
+    /// [`Self::feed_kv_row`] then appends new tokens with an in-arena memcpy only.
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         let Some(&id) = self.input_ids.get(name) else {
             return false;
@@ -132,7 +132,7 @@ impl MetalExecutable {
     }
 
     /// ZERO-COPY optimizer step for GPU-resident training. For each trainable
-    /// weight — a resident arena `Input` bound via [`bind_gpu_handle`] — whose
+    /// weight — a resident arena `Input` bound via [`Self::bind_gpu_handle`] — whose
     /// gradient sits at output slot `1 + i` (backward outputs are
     /// `[loss, grad0, grad1, …]`), this forms the param `&mut [f32]` and grad
     /// `&[f32]` as ALIASES into the unified-memory arena and calls `step` in

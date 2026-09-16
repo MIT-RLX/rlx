@@ -82,7 +82,7 @@ extern "C" __global__ void dequant_gguf(
     if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
-        && scheme_id != 24u) {
+        && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u) {
         float* dst = arena + dst_f32_off + gid * 256u;
 
         if (scheme_id == 3u) {
@@ -611,6 +611,39 @@ extern "C" __global__ void dequant_gguf(
         for (unsigned int j = 0u; j < 128u; ++j) {
             unsigned int bit = (qs[j >> 3u] >> (j & 7u)) & 1u;
             dst[j] = bit ? d : neg_d;
+        }
+        return;
+    }
+
+    if (scheme_id == 25u) {
+        // Q2_0 (PrismML Bonsai / Doses AI Pestle factors): f16 d | 32 two-bit
+        // bytes (34 bytes / 128 elements). LSB-first; code q -> (q-1)*d.
+        unsigned int off = gid * 34u;
+        float d = dq_read_f16(w_base, off);
+        const unsigned char* qs = w_base + off + 2u;
+        float* dst = arena + dst_f32_off + gid * 128u;
+        for (unsigned int j = 0u; j < 128u; ++j) {
+            unsigned int q = (qs[j >> 2u] >> ((j & 3u) * 2u)) & 3u;
+            dst[j] = (float)((int)q - 1) * d;
+        }
+        return;
+    }
+
+    if (scheme_id == 28u) {
+        // G8_0 (Doses AI Pestle): 4 bf16 scales — one per group of 8 —
+        // | 8 two-bit bytes (16 bytes / 32 elements). Value = (q-1)*d[j/8].
+        unsigned int off = gid * 16u;
+        const unsigned char* qs = w_base + off + 8u;
+        float* dst = arena + dst_f32_off + gid * 32u;
+        for (unsigned int g = 0u; g < 4u; ++g) {
+            unsigned int bits = ((unsigned int)w_base[off + g * 2u]
+                | ((unsigned int)w_base[off + g * 2u + 1u] << 8u)) << 16u;
+            float d = __int_as_float((int)bits);
+            for (unsigned int t = 0u; t < 8u; ++t) {
+                unsigned int j = g * 8u + t;
+                unsigned int q = (qs[j >> 2u] >> ((j & 3u) * 2u)) & 3u;
+                dst[j] = (float)((int)q - 1) * d;
+            }
         }
         return;
     }

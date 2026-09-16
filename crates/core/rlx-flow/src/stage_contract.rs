@@ -52,7 +52,7 @@ pub trait LayerStage: Send + Sync {
     ) -> Result<(FlowValue, StageArtifacts)>;
 }
 
-/// Type-erased [`LayerStage`] handle embedded in [`FlowStage::Dynamic`].
+/// Type-erased [`LayerStage`] handle embedded in `FlowStage::Dynamic`.
 ///
 /// Wraps `Arc<dyn LayerStage>` so [`FlowStage`](crate::FlowStage) can stay
 /// `Debug + Clone` (the wrapper prints the stage's `name()` and clones the
@@ -77,7 +77,7 @@ impl std::fmt::Debug for DynStage {
     }
 }
 
-/// Bridge existing [`BlockStage`] impls to [`LayerStage`] with hidden-only artifacts.
+/// Bridge existing `BlockStage` impls to [`LayerStage`] with hidden-only artifacts.
 pub struct BlockAsLayer<S>(pub S);
 
 impl<S: BlockStage + Send + Sync> LayerStage for BlockAsLayer<S> {

@@ -11,7 +11,8 @@ use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
 fn qnn_available() -> bool {
-    std::env::var_os("RLX_QNN_BACKEND_LIB").is_some() || std::env::var_os("QNN_SDK_ROOT").is_some()
+    rlx_ir::env::var_os("RLX_QNN_BACKEND_LIB").is_some()
+        || std::env::var_os("QNN_SDK_ROOT").is_some()
 }
 
 fn pack_i4(vals: &[i8]) -> Vec<u8> {

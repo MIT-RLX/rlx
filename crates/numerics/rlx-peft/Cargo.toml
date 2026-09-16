@@ -1,0 +1,42 @@
+[package]
+name = "rlx-peft"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Parameter-efficient adaptation on rlx graphs: LoRA, IA3, AdaLoRA, DoRA and OFT, matching HuggingFace PEFT"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["peft", "lora", "dora", "oft", "fine-tuning"]
+categories = ["science", "mathematics"]
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_peft"
+path = "src/lib.rs"
+
+[dependencies]
+rlx-ir = { workspace = true }
+rlx-runtime = { workspace = true }
+
+[dev-dependencies]
+rlx-cpu = { workspace = true }
+
+[features]
+default = ["cpu"]
+cpu = ["rlx-runtime/cpu"]
+metal = ["rlx-runtime/metal"]
+mlx = ["rlx-runtime/mlx"]
+gpu = ["rlx-runtime/gpu"]
+coreml = ["rlx-runtime/coreml"]
+cuda = ["rlx-runtime/cuda"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features       = ["cpu"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

@@ -52,7 +52,7 @@ fn build_full_swiglu(rows: usize, h: usize, inter: usize) -> Graph {
 
 #[test]
 fn metal_full_swiglu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

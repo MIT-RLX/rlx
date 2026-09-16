@@ -25,7 +25,7 @@ pub mod dequant_cache;
 pub mod dispatch;
 pub mod executor;
 pub mod expand;
-pub use expand::{expand_cpu_nop_fused, prepare_graph_for_thunks};
+pub use expand::{NO_THUNK_ARM, expand_cpu_nop_fused, prepare_graph_for_thunks};
 pub mod gdn;
 pub mod gguf_matmul;
 pub mod gguf_scheme;

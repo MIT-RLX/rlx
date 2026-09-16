@@ -280,7 +280,7 @@ static MLX_PROFILE: std::sync::Mutex<Option<std::collections::BTreeMap<&'static 
     std::sync::Mutex::new(None);
 
 fn mlx_profile_enabled() -> bool {
-    std::env::var_os("RLX_MLX_PROFILE").is_some()
+    rlx_ir::env::var_os("RLX_MLX_PROFILE").is_some()
 }
 
 fn mlx_profile_kind(op: &Op) -> &'static str {
@@ -413,6 +413,7 @@ pub fn lower_and_run_typed(
 /// the rest of the trace, so most ops just produce smaller outputs
 /// naturally — no per-op kernel scaling needed. Falls back to the full
 /// extent when the hint is `None` or the graph contains an unsafe op.
+#[allow(clippy::too_many_arguments)]
 pub fn lower_and_run_typed_with_extent(
     graph: &Graph,
     params: &HashMap<String, Vec<f32>>,
@@ -423,6 +424,42 @@ pub fn lower_and_run_typed_with_extent(
     active_extent: Option<(usize, usize)>,
     gpu_inputs: Option<&HashMap<String, Array>>,
     rng: rlx_ir::RngOptions,
+) -> Result<Vec<Array>, MlxError> {
+    let mut sink = Vec::new();
+    let outs = lower_and_run_typed_with_extent_writeback(
+        graph,
+        params,
+        params_typed,
+        inputs,
+        inputs_typed,
+        mode,
+        active_extent,
+        gpu_inputs,
+        rng,
+        &mut sink,
+    )?;
+    debug_assert!(
+        sink.is_empty(),
+        "recurrent state write-backs dropped: use the `_writeback` variant"
+    );
+    Ok(outs)
+}
+
+/// [`lower_and_run_typed_with_extent`], reporting any recurrent state the run
+/// produced (see `env::StateWriteback`). Callers that own the param buffers
+/// must apply these, or `Op::Lstm { carry }` silently stops advancing.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_and_run_typed_with_extent_writeback(
+    graph: &Graph,
+    params: &HashMap<String, Vec<f32>>,
+    params_typed: &HashMap<String, (Vec<u8>, DType)>,
+    inputs: &HashMap<String, Vec<f32>>,
+    inputs_typed: &HashMap<String, (Vec<u8>, DType)>,
+    mode: MlxMode,
+    active_extent: Option<(usize, usize)>,
+    gpu_inputs: Option<&HashMap<String, Array>>,
+    rng: rlx_ir::RngOptions,
+    writeback: &mut Vec<env::StateWriteback>,
 ) -> Result<Vec<Array>, MlxError> {
     // Resolve dynamic dims if any. The graph as-given may have
     // Dim::Dynamic entries in Input shapes (and propagated through
@@ -496,7 +533,8 @@ pub fn lower_and_run_typed_with_extent(
     // construction is pure (no eval), so we trigger it here against
     // outputs after lowering. For interleaved per-op eval we'd need
     // a separate walker variant — currently no caller asks for that.
-    let outs = lower_with_env(graph, env, params, params_typed, rng, true)?;
+    let outs =
+        env::lower_with_env_writeback(graph, env, params, params_typed, rng, true, writeback)?;
 
     let refs: Vec<&Array> = outs.iter().collect();
     match mode {
@@ -656,7 +694,7 @@ pub fn is_safe_for_active_extent(graph: &Graph, upper: usize) -> bool {
             // Conservatively unsafe — these have batch-touching
             // semantics (or sub-graph leaves) that the slice trick
             // doesn't handle.
-            Op::ScatterAdd
+            Op::ScatterAdd { .. }
             | Op::ScatterNd { .. }
             | Op::ScatterElements { .. }
             | Op::GatherNd { .. }

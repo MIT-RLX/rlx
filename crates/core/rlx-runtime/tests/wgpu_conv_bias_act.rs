@@ -14,7 +14,9 @@
 
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 const F: DType = DType::F32;
 
@@ -74,7 +76,8 @@ fn feeds(cfg: &Cfg) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn wgpu_fused_conv_bias_act_matches_cpu() {
-    if !is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip wgpu_fused_conv_bias_act (wgpu unavailable)");
         return;
     }

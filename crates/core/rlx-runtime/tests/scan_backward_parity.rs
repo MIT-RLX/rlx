@@ -7,7 +7,9 @@
 
 use rlx_ir::op::{BinaryOp, ReduceOp};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
-use rlx_runtime::{CompileOptions, Device, Session, is_available};
+use rlx_runtime::{CompileOptions, Device, Session};
+
+mod common;
 
 const F: DType = DType::F32;
 
@@ -64,7 +66,7 @@ fn run_dinit(dev: Device, bwd: &Graph, init: &[f32], d_seed: &[f32]) -> Vec<f32>
 }
 
 fn parity_vs_cpu(dev: Device) {
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("[scan_backward_parity] {dev:?} unavailable — skip");
         return;
     }
@@ -95,47 +97,55 @@ fn parity_vs_cpu(dev: Device) {
 
 #[test]
 fn scan_backward_cpu_matches_closed_form() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::Cpu);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn scan_backward_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::Metal);
 }
 
 #[cfg(feature = "gpu")]
 #[test]
 fn scan_backward_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::Gpu);
 }
 
 #[cfg(feature = "mlx")]
 #[test]
 fn scan_backward_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::Mlx);
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn scan_backward_cuda_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::Cuda);
 }
 
 #[cfg(feature = "vulkan")]
 #[test]
 fn scan_backward_vulkan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::Vulkan);
 }
 
 #[cfg(feature = "oneapi")]
 #[test]
 fn scan_backward_oneapi_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::OneApi);
 }
 
 #[cfg(feature = "rocm")]
 #[test]
 fn scan_backward_rocm_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(Device::Rocm);
 }

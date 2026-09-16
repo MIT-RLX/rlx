@@ -4,7 +4,7 @@
 
 //! **MIR** — mid-level IR.
 //!
-//! The fused, backend-neutral tensor DAG that [`rlx_opt`] runs fusion,
+//! The fused, backend-neutral tensor DAG that `rlx_opt` runs fusion,
 //! precision, and legalization passes on. Today MIR is structurally
 //! identical to [`Graph`]; the newtype marks pipeline stage and gives
 //! us room to attach MIR-only metadata later (alias sets, layout hints).

@@ -12,6 +12,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 #[derive(Clone, Copy)]
 struct Cfg {
     n: usize,
@@ -167,6 +169,7 @@ fn assert_close(what: &str, actual: &[f32], reference: &[f32]) {
 
 #[test]
 fn conv_transpose2d_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         let out = run_on(&cfg, Device::Cpu);
         let expect = cfg.n
@@ -187,6 +190,7 @@ fn conv_transpose2d_cpu_runs() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn conv_transpose2d_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         assert_close(
             &format!("metal {name}"),
@@ -199,6 +203,7 @@ fn conv_transpose2d_metal_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn conv_transpose2d_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         assert_close(
             &format!("mlx {name}"),
@@ -211,6 +216,10 @@ fn conv_transpose2d_mlx_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn conv_transpose2d_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for (name, cfg) in cfgs() {
         assert_close(
             &format!("wgpu {name}"),

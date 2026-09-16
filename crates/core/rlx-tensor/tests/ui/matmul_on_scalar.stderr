@@ -1,5 +1,5 @@
 error: matmul `@` requires tensor operands, not a scalar
- --> tests/ui/matmul_on_scalar.rs:6:19
+ --> tests/ui/matmul_on_scalar.rs:9:19
   |
-6 |         let y = x @ 2.0;   // matmul needs a tensor, not a scalar
+9 |         let y = x @ 2.0;   // matmul needs a tensor, not a scalar
   |                   ^

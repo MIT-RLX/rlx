@@ -17,6 +17,8 @@ use rlx_ir::op::{BinaryOp, MaskKind};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 /// Build the smallest interesting attention graph:
 ///   inputs:  qkv [B, S, 3*H], mask [B, S]
 ///   narrow:  q, k, v each [B, S, H]
@@ -96,6 +98,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn cpu_vs_metal_attention_no_mask_unpadded() {
+    let _gpu = common::serialize_gpu();
     // Tiny: B=1, S=4, NH=1, DH=4. Mask all 1s (no padding).
     let (b, s, nh, dh) = (1, 4, 1, 4);
     let h = nh * dh;
@@ -128,6 +131,7 @@ fn cpu_vs_metal_attention_no_mask_unpadded() {
 
 #[test]
 fn cpu_vs_metal_attention_multi_head_unpadded() {
+    let _gpu = common::serialize_gpu();
     // Multi-head: B=1, S=4, NH=2, DH=4 (matches the layout the
     // BERT model emits). Mask all 1s.
     let (b, s, nh, dh) = (1, 4, 2, 4);
@@ -155,6 +159,7 @@ fn cpu_vs_metal_attention_multi_head_unpadded() {
 
 #[test]
 fn cpu_vs_metal_full_block_unpadded() {
+    let _gpu = common::serialize_gpu();
     // Larger graph: a full transformer block (matmul + bias + attention
     // + residual+LN + FFN). Tests whether the MPSGraph parity gap
     // observed in the BERT bench is from accumulation across multiple
@@ -307,6 +312,7 @@ fn bisect(
 
 #[test]
 fn bisect_matmul_only() {
+    let _gpu = common::serialize_gpu();
     let (b, s, h) = (1, 4, 8);
     let f = DType::F32;
     let x: Vec<f32> = (0..b * s * h)
@@ -329,6 +335,7 @@ fn bisect_matmul_only() {
 
 #[test]
 fn bisect_matmul_plus_bias() {
+    let _gpu = common::serialize_gpu();
     let (b, s, h) = (1, 4, 8);
     let f = DType::F32;
     let x: Vec<f32> = (0..b * s * h)
@@ -354,6 +361,7 @@ fn bisect_matmul_plus_bias() {
 
 #[test]
 fn bisect_matmul_bias_narrow() {
+    let _gpu = common::serialize_gpu();
     let (b, s, h) = (1, 4, 8);
     let f = DType::F32;
     let x: Vec<f32> = (0..b * s * h)
@@ -388,6 +396,7 @@ fn bisect_matmul_bias_narrow() {
 
 #[test]
 fn bisect_three_narrows_to_attention() {
+    let _gpu = common::serialize_gpu();
     // Q, K, V all from the same parent narrow on the SAME tensor.
     // This is what the BERT block does. Tests whether multiple narrows
     // sharing a parent cause MPSGraph to alias data incorrectly.
@@ -451,6 +460,7 @@ fn bisect_three_narrows_to_attention() {
 
 #[test]
 fn bisect_mm_bias_then_three_narrows_no_attention() {
+    let _gpu = common::serialize_gpu();
     // Same as bisect_full_qkv_to_attention but stops after the 3 narrows
     // — output is the concat of narrowed Q/K/V to capture all values.
     // Tests whether the matmul→bias→narrow combination diverges WITHOUT
@@ -515,6 +525,7 @@ fn bisect_mm_bias_then_three_narrows_no_attention() {
 
 #[test]
 fn bisect_mm_bias_narrow_reshape() {
+    let _gpu = common::serialize_gpu();
     // Test whether reshape AFTER narrow on a matmul output diverges.
     // This isolates the narrow→reshape chain that mg.attention does
     // internally.
@@ -562,6 +573,7 @@ fn bisect_mm_bias_narrow_reshape() {
 
 #[test]
 fn bisect_full_qkv_to_attention() {
+    let _gpu = common::serialize_gpu();
     // Full chain: matmul + bias + 3 narrows + attention.
     // Larger-magnitude inputs so any divergence is well above f32 noise
     // and the relative-error figure is meaningful.
@@ -633,6 +645,7 @@ fn bisect_full_qkv_to_attention() {
 
 #[test]
 fn bisect_mm_bias_three_narrows_three_reshapes() {
+    let _gpu = common::serialize_gpu();
     // 3 narrows of computed tensor + 3 reshapes (mimicking what
     // attention does to Q/K/V before its matmul). If THIS fails, the
     // bug is reshape-of-slice-of-computed when there are multiple
@@ -718,6 +731,7 @@ fn bisect_mm_bias_three_narrows_three_reshapes() {
 
 #[test]
 fn bisect_mm_bias_one_narrow_no_attention() {
+    let _gpu = common::serialize_gpu();
     // The simplest failing-pattern variant: just mm+bias+narrow,
     // NO downstream attention. Output is the [B, S, H] narrow.
     // If this passes, the bug needs the slice→reshape combination
@@ -758,6 +772,7 @@ fn bisect_mm_bias_one_narrow_no_attention() {
 
 #[test]
 fn bisect_mm_bias_then_full_attention_noslice() {
+    let _gpu = common::serialize_gpu();
     // Mimic the failing pattern but feed Q/K/V as separate inputs
     // (not narrows). This isolates the question: does mm+bias on the
     // upstream side break attention, or is it specifically the
@@ -799,6 +814,7 @@ fn bisect_mm_bias_then_full_attention_noslice() {
 
 #[test]
 fn cpu_vs_metal_attention_with_padding() {
+    let _gpu = common::serialize_gpu();
     // B=1, S=4, NH=2, DH=4. Last 2 positions padded.
     let (b, s, nh, dh) = (1, 4, 2, 4);
     let h = nh * dh;

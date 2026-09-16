@@ -16,10 +16,62 @@
 use crate::Device;
 use rlx_ir::{Graph, Node, Op};
 
+/// Where a cost model's numbers actually came from.
+///
+/// The distinction is load-bearing and rlx used to erase it. `RocmCostModel`
+/// falls back to `sgemm_gflops: 10_000.0` when ROCm is absent; `MetalHwModel`
+/// falls back to `AppleGpuFamily::Unknown => (300e9, 180e9, 60e9)`. Both then
+/// feed [`fastest_device_for`], which ranks devices against each other — so on an
+/// unrecognized GPU rlx would confidently place a graph using invented
+/// throughput, and say nothing.
+///
+/// CAKE B.5 states the rule this implements: *"Timing-model coverage is
+/// separately evidence-gated: B200 is the measured baseline, H100 is calibrated
+/// independently, and other targets report a coverage limitation instead of
+/// inheriting estimates."* Reporting a coverage limitation is strictly more
+/// useful than a confident guess, because a caller can act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CostCalibration {
+    /// Measured on *this* machine (a calibration cache exists, or the model
+    /// probed the device). Comparisons across such models are meaningful.
+    Measured,
+    /// Compile-time constants chosen for this specific detected architecture.
+    /// Reasonable, but not measured here — treat cross-device comparisons as
+    /// indicative rather than authoritative.
+    ArchDefault,
+    /// The architecture was not recognized, so the numbers are a generic guess.
+    /// **Not** a basis for ranking one device against another.
+    Uncalibrated,
+}
+
+impl CostCalibration {
+    /// True when this model's numbers may be compared against another device's.
+    pub fn is_rankable(&self) -> bool {
+        matches!(self, Self::Measured | Self::ArchDefault)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::ArchDefault => "arch-default",
+            Self::Uncalibrated => "uncalibrated",
+        }
+    }
+}
+
 /// Hardware-aware cost characteristics for a backend on the current machine.
 pub trait BackendCostModel: Send + Sync {
     /// Identify which device this model is for.
     fn device(&self) -> Device;
+
+    /// Provenance of this model's numbers — see [`CostCalibration`].
+    ///
+    /// Defaults to [`CostCalibration::ArchDefault`]: a model that has not been
+    /// audited claims neither measurement nor ignorance. Every in-tree impl
+    /// overrides this with the truth.
+    fn calibration(&self) -> CostCalibration {
+        CostCalibration::ArchDefault
+    }
 
     /// Effective f32 sgemm throughput in GFLOP/s for the most-used kernel
     /// path at the given dimensions. Backends should return their best
@@ -107,7 +159,56 @@ fn node_cost(node: &Node, graph: &Graph, model: &dyn BackendCostModel) -> f64 {
 }
 
 /// Pick the device with the lowest predicted cost for this graph.
+///
+/// **Uncalibrated models are excluded from the ranking, not silently trusted.**
+/// A model whose numbers are a generic guess ([`CostCalibration::Uncalibrated`])
+/// cannot be meaningfully compared against a measured one — and the guesses are
+/// optimistic, so including them systematically hands the graph to whichever
+/// device rlx knows *least* about. That is the failure mode CAKE B.5 names:
+/// inheriting estimates rather than reporting a coverage limitation.
+///
+/// If *every* model is uncalibrated there is nothing to compare, so the lowest
+/// cost is as good a tiebreak as any and we take it — but say so under
+/// `RLX_VERBOSE`, because a caller seeing an unexpected placement deserves to
+/// know the ranking had no evidence behind it.
 pub fn pick_best_device(graph: &Graph, models: &[&dyn BackendCostModel]) -> Device {
+    let rankable: Vec<&&dyn BackendCostModel> = models
+        .iter()
+        .filter(|m| m.calibration().is_rankable())
+        .collect();
+
+    let (pool, blind): (&[&dyn BackendCostModel], bool) = if rankable.is_empty() {
+        (models, true)
+    } else if rankable.len() == models.len() {
+        (models, false)
+    } else {
+        // Some were dropped — report which, then rank the rest.
+        if rlx_ir::env::flag("RLX_VERBOSE") {
+            for m in models {
+                if !m.calibration().is_rankable() {
+                    eprintln!(
+                        "rlx: excluding {:?} from device ranking — cost model is {}",
+                        m.device(),
+                        m.calibration().as_str()
+                    );
+                }
+            }
+        }
+        // Re-borrow as a slice of trait objects.
+        let kept: Vec<&dyn BackendCostModel> = rankable.iter().map(|m| **m).collect();
+        return pick_lowest(graph, &kept);
+    };
+
+    if blind && rlx_ir::env::flag("RLX_VERBOSE") {
+        eprintln!(
+            "rlx: every candidate cost model is uncalibrated — device ranking has \
+             no measured basis on this host"
+        );
+    }
+    pick_lowest(graph, pool)
+}
+
+fn pick_lowest(graph: &Graph, models: &[&dyn BackendCostModel]) -> Device {
     let mut best = (Device::Cpu, f64::INFINITY);
     for &m in models {
         let cost = estimate_graph_cost(graph, m);
@@ -134,7 +235,7 @@ pub fn fastest_device_for_with_policy(
     // GPU backend — so a `--features gpu` run can be a CPU run in disguise,
     // masking real GPU failures. Honored at the top of the single chokepoint
     // so EVERY `fastest_device_for*` caller respects it.
-    if let Ok(s) = std::env::var("RLX_FORCE_DEVICE") {
+    if let Some(s) = rlx_ir::env::var("RLX_FORCE_DEVICE") {
         if let Ok(dev) = crate::parse_device(&s) {
             return dev;
         }
@@ -225,6 +326,11 @@ impl BackendCostModel for CpuCostModel {
     fn device(&self) -> Device {
         Device::Cpu
     }
+    fn calibration(&self) -> CostCalibration {
+        // `rlx_cpu::cost::HwModel` is built from detected CPU features and
+        // per-arch compile-time constants — real for the arch, not measured here.
+        CostCalibration::ArchDefault
+    }
     fn sgemm_gflops(&self, m: usize, k: usize, n: usize) -> f64 {
         // Take the better of NEON / BLAS at this shape.
         let flops = 2.0 * m as f64 * k as f64 * n as f64;
@@ -294,6 +400,18 @@ impl BackendCostModel for MetalCostModel {
     fn device(&self) -> Device {
         Device::Metal
     }
+    fn calibration(&self) -> CostCalibration {
+        // `load_or_measure` really does measure when no cache exists, so the
+        // sgemm figure is measured — but `memory_bw` is a hard-coded 200 GB/s
+        // floor (the calibrator does not probe bandwidth yet) and the Apple GPU
+        // family may be `Unknown`. Claiming Measured would overstate both, so
+        // report the weaker of the two: arch-default.
+        if rlx_metal::cost::hw_model().gpu_family == rlx_metal::cost::AppleGpuFamily::Unknown {
+            CostCalibration::Uncalibrated
+        } else {
+            CostCalibration::ArchDefault
+        }
+    }
     fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
         self.sgemm_gflops_avg
     }
@@ -361,6 +479,11 @@ impl BackendCostModel for MlxCostModel {
     fn device(&self) -> Device {
         Device::Mlx
     }
+    fn calibration(&self) -> CostCalibration {
+        // A crossover heuristic with hand-picked constants — no measurement and
+        // no per-arch table behind it.
+        CostCalibration::Uncalibrated
+    }
     fn sgemm_gflops(&self, m: usize, k: usize, n: usize) -> f64 {
         // Crossover heuristic: small shapes pay the per-op overhead;
         // large shapes hit the optimized path. The cutoff is rough —
@@ -394,6 +517,9 @@ pub struct CudaCostModel {
     sgemm_gflops: f64,
     roundtrip_ns: f64,
     memory_bw: f64,
+    /// Whether the numbers above came from a real calibration on this
+    /// machine or from the hardcoded no-device fallback below.
+    calibration: CostCalibration,
 }
 
 #[cfg(feature = "cuda")]
@@ -405,12 +531,17 @@ impl CudaCostModel {
                 sgemm_gflops: cal.sgemm_gflops,
                 roundtrip_ns: cal.roundtrip_overhead_ns,
                 memory_bw: cal.memory_bw_gbps,
+                calibration: CostCalibration::Measured,
             };
         }
+        // No CUDA device: these are invented numbers for a device that is not
+        // here. Marked Uncalibrated so `pick_best_device` refuses to rank on them
+        // rather than "discovering" that an absent GPU is fastest.
         Self {
             sgemm_gflops: 12_000.0,
             roundtrip_ns: 35_000.0,
             memory_bw: 900.0,
+            calibration: CostCalibration::Uncalibrated,
         }
     }
 }
@@ -426,6 +557,9 @@ impl Default for CudaCostModel {
 impl BackendCostModel for CudaCostModel {
     fn device(&self) -> Device {
         Device::Cuda
+    }
+    fn calibration(&self) -> CostCalibration {
+        self.calibration
     }
     fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
         self.sgemm_gflops
@@ -450,6 +584,9 @@ pub struct RocmCostModel {
     sgemm_gflops: f64,
     roundtrip_ns: f64,
     memory_bw: f64,
+    /// Whether the numbers above came from a real calibration on this
+    /// machine or from the hardcoded no-device fallback below.
+    calibration: CostCalibration,
 }
 
 #[cfg(feature = "rocm")]
@@ -461,12 +598,17 @@ impl RocmCostModel {
                 sgemm_gflops: cal.sgemm_gflops,
                 roundtrip_ns: cal.roundtrip_overhead_ns,
                 memory_bw: cal.memory_bw_gbps,
+                calibration: CostCalibration::Measured,
             };
         }
+        // No ROCm device — see the CUDA note. The old comment on this struct read
+        // "same class as CUDA until calibrated", which is exactly the inherited
+        // estimate CAKE B.5 warns against; now it is labelled instead.
         Self {
             sgemm_gflops: 10_000.0,
             roundtrip_ns: 40_000.0,
             memory_bw: 800.0,
+            calibration: CostCalibration::Uncalibrated,
         }
     }
 }
@@ -482,6 +624,9 @@ impl Default for RocmCostModel {
 impl BackendCostModel for RocmCostModel {
     fn device(&self) -> Device {
         Device::Rocm
+    }
+    fn calibration(&self) -> CostCalibration {
+        self.calibration
     }
     fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
         self.sgemm_gflops
@@ -506,6 +651,9 @@ pub struct WgpuCostModel {
     sgemm_gflops: f64,
     roundtrip_ns: f64,
     memory_bw: f64,
+    /// Whether the numbers above came from a real calibration on this machine
+    /// or from the hardcoded no-adapter fallback below.
+    calibration: CostCalibration,
 }
 
 #[cfg(feature = "gpu")]
@@ -517,12 +665,15 @@ impl WgpuCostModel {
                 sgemm_gflops: cal.sgemm_gflops,
                 roundtrip_ns: cal.roundtrip_overhead_ns,
                 memory_bw: cal.memory_bw_gbps,
+                calibration: CostCalibration::Measured,
             };
         }
+        // No wgpu adapter — invented numbers for a device that is not here.
         Self {
             sgemm_gflops: 2_500.0,
             roundtrip_ns: 80_000.0,
             memory_bw: 120.0,
+            calibration: CostCalibration::Uncalibrated,
         }
     }
 }
@@ -538,6 +689,9 @@ impl Default for WgpuCostModel {
 impl BackendCostModel for WgpuCostModel {
     fn device(&self) -> Device {
         Device::Gpu
+    }
+    fn calibration(&self) -> CostCalibration {
+        self.calibration
     }
     fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
         self.sgemm_gflops
@@ -560,6 +714,161 @@ impl BackendCostModel for WgpuCostModel {
 mod tests {
     use super::*;
     use rlx_ir::{DType, Graph, Shape};
+
+    /// A cost model with dictated numbers and provenance, for testing the
+    /// ranking policy without needing real hardware.
+    struct FakeModel {
+        device: Device,
+        gflops: f64,
+        calibration: CostCalibration,
+    }
+
+    impl BackendCostModel for FakeModel {
+        fn device(&self) -> Device {
+            self.device
+        }
+        fn calibration(&self) -> CostCalibration {
+            self.calibration
+        }
+        fn sgemm_gflops(&self, _m: usize, _k: usize, _n: usize) -> f64 {
+            self.gflops
+        }
+        fn dispatch_overhead_ns(&self) -> f64 {
+            100.0
+        }
+        fn roundtrip_overhead_ns(&self) -> f64 {
+            1_000.0
+        }
+        fn memory_bw(&self) -> f64 {
+            100.0
+        }
+        fn num_threads(&self) -> usize {
+            1
+        }
+    }
+
+    fn big_matmul() -> Graph {
+        let mut g = Graph::new("mm");
+        let x = g.input("x", Shape::new(&[512, 512], DType::F32));
+        let w = g.param("w", Shape::new(&[512, 512], DType::F32));
+        let y = g.matmul(x, w, Shape::new(&[512, 512], DType::F32));
+        g.set_outputs(vec![y]);
+        g
+    }
+
+    /// The core guarantee: an uncalibrated model cannot win the ranking, however
+    /// good its invented numbers look. Before this, `RocmCostModel`'s no-device
+    /// fallback claimed 10 TFLOP/s and would beat a measured CPU every time.
+    #[test]
+    fn uncalibrated_model_cannot_win_the_ranking() {
+        let g = big_matmul();
+        let measured_slow = FakeModel {
+            device: Device::Cpu,
+            gflops: 100.0,
+            calibration: CostCalibration::Measured,
+        };
+        let guessed_fast = FakeModel {
+            device: Device::Rocm,
+            gflops: 10_000.0,
+            calibration: CostCalibration::Uncalibrated,
+        };
+        let models: Vec<&dyn BackendCostModel> = vec![&measured_slow, &guessed_fast];
+        assert_eq!(
+            pick_best_device(&g, &models),
+            Device::Cpu,
+            "a guessed 100x-faster device must not be picked over a measured one"
+        );
+    }
+
+    /// …but a *measured* faster device must still win, or the guard would have
+    /// disabled device selection instead of correcting it.
+    #[test]
+    fn measured_faster_device_still_wins() {
+        let g = big_matmul();
+        let cpu = FakeModel {
+            device: Device::Cpu,
+            gflops: 100.0,
+            calibration: CostCalibration::Measured,
+        };
+        let gpu = FakeModel {
+            device: Device::Cuda,
+            gflops: 10_000.0,
+            calibration: CostCalibration::Measured,
+        };
+        let models: Vec<&dyn BackendCostModel> = vec![&cpu, &gpu];
+        assert_eq!(pick_best_device(&g, &models), Device::Cuda);
+    }
+
+    /// ArchDefault is rankable — per-arch constants are evidence, just weaker
+    /// than a measurement. Excluding them would strand every backend whose
+    /// calibrator has not run.
+    #[test]
+    fn arch_default_is_rankable() {
+        assert!(CostCalibration::Measured.is_rankable());
+        assert!(CostCalibration::ArchDefault.is_rankable());
+        assert!(!CostCalibration::Uncalibrated.is_rankable());
+
+        let g = big_matmul();
+        let cpu = FakeModel {
+            device: Device::Cpu,
+            gflops: 100.0,
+            calibration: CostCalibration::ArchDefault,
+        };
+        let gpu = FakeModel {
+            device: Device::Metal,
+            gflops: 5_000.0,
+            calibration: CostCalibration::ArchDefault,
+        };
+        let models: Vec<&dyn BackendCostModel> = vec![&cpu, &gpu];
+        assert_eq!(pick_best_device(&g, &models), Device::Metal);
+    }
+
+    /// When nothing is calibrated there is no evidence either way, so ranking
+    /// still has to return something — it must not panic or drop to a fixed
+    /// device.
+    #[test]
+    fn all_uncalibrated_still_returns_a_device() {
+        let g = big_matmul();
+        let a = FakeModel {
+            device: Device::Cpu,
+            gflops: 100.0,
+            calibration: CostCalibration::Uncalibrated,
+        };
+        let b = FakeModel {
+            device: Device::Gpu,
+            gflops: 9_000.0,
+            calibration: CostCalibration::Uncalibrated,
+        };
+        let models: Vec<&dyn BackendCostModel> = vec![&a, &b];
+        assert_eq!(pick_best_device(&g, &models), Device::Gpu);
+    }
+
+    /// Every cost model compiled into this build must state its provenance —
+    /// the trait default exists for out-of-tree impls, not as a way for an
+    /// in-tree one to stay silent.
+    #[test]
+    fn in_tree_models_declare_their_provenance() {
+        #[allow(unused_mut)]
+        let mut checked = 0usize;
+        #[cfg(feature = "cpu")]
+        {
+            let m = CpuCostModel::new();
+            assert_eq!(m.calibration(), CostCalibration::ArchDefault);
+            checked += 1;
+        }
+        #[cfg(feature = "gpu")]
+        {
+            let m = WgpuCostModel::new();
+            // Either is honest; what matters is that it is not a silent guess
+            // dressed as a measurement when no adapter exists.
+            assert!(
+                m.calibration() == CostCalibration::Measured
+                    || m.calibration() == CostCalibration::Uncalibrated
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no cost model was compiled in to check");
+    }
 
     #[test]
     fn fastest_device_for_falls_back_to_cpu_for_simple_graph() {

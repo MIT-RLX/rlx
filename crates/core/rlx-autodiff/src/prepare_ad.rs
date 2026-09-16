@@ -7,7 +7,7 @@
 //!
 //! The HIR → MIR → LIR pipeline lowers fusion-friendly blocks to MIR
 //! (`FusionPolicy::Direct`) or primitive chains (`FusionPolicy::Fusable` /
-//! [`FusionPolicy::for_autodiff`]). Autodiff always runs on **MIR**
+//! [`FusionPolicy::for_autodiff`](rlx_ir::FusionPolicy::for_autodiff)). Autodiff always runs on **MIR**
 //! ([`Graph`]); this module rewrites fused / control-flow / scan shapes
 //! into primitives the VJP table covers.
 //!
@@ -71,8 +71,8 @@ impl std::error::Error for AutodiffError {
 /// 2. [`legalize_multi_axis_reduce`](crate::legalize_reduce::legalize_multi_axis_reduce)
 /// 3. [`rlx_fusion::unfuse_fused_for_autodiff`] — tier-2 fused ops → primitives
 /// 4. [`LowerDotGeneral`](rlx_fusion::LowerDotGeneral)
-/// 5. [`control_flow::inline_if`]
-/// 6. [`control_flow::unroll_while`]
+/// 5. [`control_flow::inline_if`](rlx_fusion::control_flow::inline_if)
+/// 6. [`control_flow::unroll_while`](rlx_fusion::control_flow::unroll_while)
 /// 7. [`inline_custom_fn_for_autodiff`]
 /// 8. [`convert_scans_for_ad`]
 ///

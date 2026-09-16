@@ -49,7 +49,7 @@ fn make_conv3d_case() -> (Graph, Vec<f32>, Vec<f32>) {
 #[test]
 fn conv3d_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda conv3d] no CUDA device — skipping");
         return;
     }
@@ -70,7 +70,7 @@ fn conv3d_matches_cpu() {
 #[test]
 fn conv3d_cudnn_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda conv3d.cudnn] no CUDA device — skipping");
         return;
     }
@@ -109,7 +109,7 @@ fn conv3d_cudnn_matches_cpu() {
 #[test]
 fn conv3d_kernel_matches_cpu_when_no_cudnn() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda conv3d.kernel] no CUDA device — skipping");
         return;
     }
@@ -141,7 +141,7 @@ fn conv3d_kernel_matches_cpu_when_no_cudnn() {
 #[test]
 fn conv3d_identity_1x1x1_matches_input() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda conv3d] no CUDA device — skipping identity");
         return;
     }

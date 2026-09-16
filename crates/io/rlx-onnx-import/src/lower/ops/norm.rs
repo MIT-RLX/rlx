@@ -144,7 +144,7 @@ pub(super) fn lower_instance_norm(
     // so the zero padding dilutes the statistics → the F0/N AdaIN blocks over-normalize
     // and the vocoder collapses to near-silence. Route rank-3 `[N,C,T]` InstanceNorms to
     // a host-delegate kernel that reduces over the *active* mel frames only.
-    if rank == 3 && ch_axis == 1 && std::env::var("RLX_KITTEN_INORM_ACTIVE").is_ok() {
+    if rank == 3 && ch_axis == 1 && rlx_ir::env::var("RLX_KITTEN_INORM_ACTIVE").is_some() {
         // Byte 4 flags a VOCODER-generator AdaIN. The generator runs at several upsampled rates
         // (ups.0/ups.1/resblocks/noise_res), and for short utterances some of those axis lengths
         // fall BELOW the prosody cap — so a size threshold in the kernel misclassifies them and
@@ -291,7 +291,13 @@ pub(super) fn lower_batch_norm(
         .get("epsilon")
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-5) as f32;
-    let s = output_shape(ctx, node, m, x);
+    // `BatchNormalization` is elementwise: its output shape IS its input shape.
+    // Take it from the concrete HIR input rather than the recorded meta — the
+    // meta can carry a length that `propagate_shapes` guessed from a symbolic
+    // dim, and trusting it produces a node whose declaration contradicts its own
+    // operands (ChatterBox's speech_encoder: declared `[1, 128, 128]` over
+    // operands `[1, 128, 259]`, which lowering rejects outright).
+    let s = m.shape(x).clone();
     // ONNX `BatchNormalization` puts channels on axis 1 (`[N, C, …]`); the
     // per-channel γ/β/mean/var have length C. The backend `Op::BatchNormInference`
     // kernel takes channels from the LAST axis (channels-last). When the input is

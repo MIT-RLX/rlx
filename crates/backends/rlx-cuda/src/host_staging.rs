@@ -73,22 +73,57 @@ impl Drop for CacheablePinnedSlice {
     }
 }
 
+/// Emit a warning once per distinct message — these sit on the run hot path, so
+/// a repeating fallback must not turn into a per-step log flood.
+fn warn_once(msg: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut g) = seen.lock()
+        && g.insert(msg.to_string())
+    {
+        eprintln!("{msg}");
+    }
+}
+
 /// Host-side f32 buffer used for input upload / output download.
 pub enum F32HostSlot {
     Pageable(Vec<f32>),
     /// Write-combined pinned — for H2D input staging (host writes only).
-    Pinned(PinnedHostSlice<f32>),
+    ///
+    /// `ctx` is retained so the slot can drain in-flight DMA before falling back
+    /// (see [`F32HostSlot::copy_from_host`]).
+    Pinned(PinnedHostSlice<f32>, Arc<CudaContext>),
     /// Cacheable pinned — for D2H output staging (host reads the result back).
     PinnedCacheable(CacheablePinnedSlice),
+    /// A pinned slot that failed and was demoted to pageable staging.
+    ///
+    /// The original pinned allocation is **retained, not freed**: dropping it
+    /// could free host memory that an in-flight DMA is still reading. It is
+    /// simply never written again.
+    Demoted {
+        _retired: PinnedHostSlice<f32>,
+        host: Vec<f32>,
+    },
 }
 
 impl F32HostSlot {
     pub fn new(ctx: &Arc<CudaContext>, len: usize, pinned: bool) -> Self {
         if pinned {
-            Self::Pinned(
-                unsafe { ctx.alloc_pinned::<f32>(len) }
-                    .unwrap_or_else(|e| panic!("rlx-cuda: pinned host alloc failed: {e}")),
-            )
+            match unsafe { ctx.alloc_pinned::<f32>(len) } {
+                Ok(p) => Self::Pinned(p, ctx.clone()),
+                // Pinned staging is a bandwidth optimization, never a
+                // correctness requirement — a host-alloc failure (typically
+                // pinned-memory exhaustion, which is a global resource) must not
+                // take the process down.
+                Err(e) => {
+                    warn_once(&format!(
+                        "rlx-cuda: pinned host alloc failed ({e}); using pageable input staging"
+                    ));
+                    Self::Pageable(vec![0.0f32; len])
+                }
+            }
         } else {
             Self::Pageable(vec![0.0f32; len])
         }
@@ -111,7 +146,8 @@ impl F32HostSlot {
     pub fn len(&self) -> usize {
         match self {
             Self::Pageable(v) => v.len(),
-            Self::Pinned(p) => p.len(),
+            Self::Demoted { host, .. } => host.len(),
+            Self::Pinned(p, _) => p.len(),
             Self::PinnedCacheable(p) => p.len,
         }
     }
@@ -120,22 +156,68 @@ impl F32HostSlot {
         self.len() == 0
     }
 
+    /// Stage `data` for upload.
+    ///
+    /// `PinnedHostSlice::as_mut_slice` first synchronizes the slice's event —
+    /// the guard against overwriting a buffer whose DMA is still in flight — so
+    /// it is fallible. It used to be `expect`ed, which turned a driver-level
+    /// hiccup in a *bandwidth optimization* into a process abort; that is how the
+    /// `CUDA_ERROR_INVALID_VALUE` crash under repeated `set_param` surfaced.
+    ///
+    /// On failure this now:
+    /// 1. drains the context (any in-flight DMA out of this buffer completes),
+    /// 2. retries once — a transient stream/event state resolves here,
+    /// 3. otherwise demotes the slot to pageable staging for good.
+    ///
+    /// The drain in step 1 is what makes demotion safe: the retired pinned
+    /// allocation is kept alive regardless, but by then nothing is reading it.
+    /// Pageable staging is always correct, just slower, so the worst case is a
+    /// bandwidth regression on one input with a warning — never a wrong answer
+    /// and never a crash.
     pub fn copy_from_host(&mut self, data: &[f32]) {
         match self {
             Self::Pageable(v) => {
                 debug_assert!(data.len() <= v.len());
                 v[..data.len()].copy_from_slice(data);
             }
-            Self::Pinned(p) => {
-                debug_assert!(data.len() <= p.len());
-                let dst = p
-                    .as_mut_slice()
-                    .expect("rlx-cuda: pinned input staging unavailable");
-                dst[..data.len()].copy_from_slice(data);
+            Self::Demoted { host, .. } => {
+                debug_assert!(data.len() <= host.len());
+                host[..data.len()].copy_from_slice(data);
             }
             Self::PinnedCacheable(p) => {
                 debug_assert!(data.len() <= p.len);
                 p.as_mut_slice()[..data.len()].copy_from_slice(data);
+            }
+            Self::Pinned(p, ctx) => {
+                debug_assert!(data.len() <= p.len());
+                if let Ok(dst) = p.as_mut_slice() {
+                    dst[..data.len()].copy_from_slice(data);
+                    return;
+                }
+                // Drain, then retry once.
+                let drained = ctx.bind_to_thread().and_then(|_| ctx.synchronize());
+                if drained.is_ok()
+                    && let Ok(dst) = p.as_mut_slice()
+                {
+                    dst[..data.len()].copy_from_slice(data);
+                    return;
+                }
+                warn_once(
+                    "rlx-cuda: pinned input staging unavailable after a context drain; \
+                     falling back to pageable staging for this input (slower H2D, same results)",
+                );
+                let len = p.len();
+                let mut host = vec![0.0f32; len];
+                host[..data.len()].copy_from_slice(data);
+                // Replace in place, retaining the pinned allocation.
+                let old = std::mem::replace(self, Self::Pageable(Vec::new()));
+                *self = match old {
+                    Self::Pinned(retired, _) => Self::Demoted {
+                        _retired: retired,
+                        host,
+                    },
+                    other => other,
+                };
             }
         }
     }
@@ -149,7 +231,8 @@ impl F32HostSlot {
         debug_assert!(len <= self.len());
         match self {
             Self::Pageable(v) => stream.memcpy_htod(&v[..len], dst),
-            Self::Pinned(p) => stream.memcpy_htod(p, dst),
+            Self::Demoted { host, .. } => stream.memcpy_htod(&host[..len], dst),
+            Self::Pinned(p, _) => stream.memcpy_htod(p, dst),
             Self::PinnedCacheable(p) => stream.memcpy_htod(&p.as_slice()[..len], dst),
         }
     }
@@ -161,16 +244,31 @@ impl F32HostSlot {
     ) -> Result<(), DriverError> {
         match self {
             Self::Pageable(v) => stream.memcpy_dtoh(src, v.as_mut_slice()),
-            Self::Pinned(p) => stream.memcpy_dtoh(src, p),
+            Self::Demoted { host, .. } => stream.memcpy_dtoh(src, host.as_mut_slice()),
+            Self::Pinned(p, _) => stream.memcpy_dtoh(src, p),
             Self::PinnedCacheable(p) => stream.memcpy_dtoh(src, p.as_mut_slice()),
         }
     }
 
+    /// Read the staged bytes back — the **output** path (`copy_into`, `to_vec`).
+    ///
+    /// [`Self::Pinned`] is the write-combined *input* staging variant, produced
+    /// only by [`Self::new`]; output slots come from [`Self::new_output`], which
+    /// yields [`Self::PinnedCacheable`] or [`Self::Pageable`]. So the `Pinned`
+    /// arm is unreachable by construction, and reaching it means an input slot
+    /// was wired to an output — a wiring bug, not a runtime condition. Unlike
+    /// the write path (where the driver can legitimately refuse and we degrade),
+    /// there is nothing to degrade *to* here, so it stays a hard error with a
+    /// message that names the actual cause.
     pub fn as_slice(&self) -> &[f32] {
         match self {
             Self::Pageable(v) => v.as_slice(),
-            Self::Pinned(p) => p.as_slice().expect("rlx-cuda: pinned output read failed"),
+            Self::Demoted { host, .. } => host.as_slice(),
             Self::PinnedCacheable(p) => p.as_slice(),
+            Self::Pinned(p, _) => p.as_slice().expect(
+                "rlx-cuda: read-back from a write-combined INPUT staging slot — \
+                 output slots must be built with F32HostSlot::new_output",
+            ),
         }
     }
 

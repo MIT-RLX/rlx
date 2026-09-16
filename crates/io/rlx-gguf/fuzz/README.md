@@ -68,3 +68,6 @@ target here:
 
 If a dedicated safetensors index/header fuzz target is wanted, it belongs
 in an `rlx-hub/fuzz/` workspace targeting `SafetensorsIndex::parse`, not here.
+## License
+
+MIT OR Apache-2.0.

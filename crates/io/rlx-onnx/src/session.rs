@@ -36,7 +36,7 @@ pub struct OnnxModel {
     pub compile_level: OnnxCompileLevel,
     pub inputs: Vec<IoDesc>,
     pub outputs: Vec<IoDesc>,
-    /// ORT execution provider name when using [`OnnxExecBackend::Ort`].
+    /// ORT execution provider name when using `OnnxExecBackend::Ort`.
     pub ort_ep: Option<String>,
     /// Extent used for unknown/dynamic ONNX dimensions (see [`Self::zero_inputs_sized`]).
     pub dynamic_dim: i64,

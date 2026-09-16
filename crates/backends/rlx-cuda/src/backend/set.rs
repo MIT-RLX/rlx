@@ -54,7 +54,71 @@ impl CudaExecutable {
         self.schedule.iter().all(|s| s.safe_for_active_extent())
     }
 
+    /// Record that a host→device write just landed on `stream`, so the next
+    /// `run` can order its dispatch after it.
+    ///
+    /// `run` moves the whole dispatch onto `segment_stream` when graph capture
+    /// is engaged, while `set_param` uploads on the default stream. Those are
+    /// different streams, so without an explicit dependency the driver may land
+    /// a param write while a replay is reading the same arena bytes — a torn
+    /// weight, with no error reported. (cudarc's automatic cross-stream event
+    /// tracking would normally cover this, but the captured dispatch has to
+    /// disable it: the auto-inserted waits target uncaptured null-stream work
+    /// and abort the capture with `STREAM_CAPTURE_ISOLATION`.)
+    ///
+    /// An event is the right primitive here rather than "upload on the run's
+    /// stream": which stream the *next* run uses is not knowable at upload time
+    /// — `segment_stream` is created lazily and bypassed when an active extent
+    /// is set — so guessing it silently mis-orders exactly the cases that do not
+    /// take the common path.
+    fn note_host_write(&mut self, stream: &Arc<cudarc::driver::CudaStream>) {
+        match stream.record_event(None) {
+            Ok(ev) => self.pending_host_write = Some(ev),
+            // Losing the event only costs the ordering guarantee, and the common
+            // path (same stream) is ordered anyway — never worth aborting on.
+            Err(e) => {
+                if rlx_ir::env::flag("RLX_CUDA_INPUT_DIAG") {
+                    eprintln!("[cuda-param] host-write event record failed: {e}");
+                }
+            }
+        }
+
+        // Drop any whole-graph capture: a replay does not observe a param
+        // written after the capture was taken. Measured on an RTX 3080 Ti with
+        // `RLX_CUDA_WHOLE_GRAPH_CAPTURE=1`, writing `w = k·I` each step and
+        // reading back, 6 of 8 steps returned step `k-1`'s value — silently, with
+        // no error. (Only that config; plain `ExecMode::Graph` and the default
+        // stream path were both exact.) The stale read was previously hidden
+        // behind the `pinned input staging unavailable` abort, which fired first.
+        //
+        // Re-capturing costs one capture per write. That is real for a training
+        // loop, but a wrong weight is not a tradeoff — a native fix would make
+        // the param upload part of the captured graph (or use a graph-update
+        // path), and until then correctness wins. `set_param` before the first
+        // `run` — the inference case — has no capture to drop and is unaffected.
+        if self.captured_graph.is_some() {
+            self.captured_graph = None;
+            self.captured_readback_plan = None;
+        }
+    }
+
+    /// Un-arm the static-weight-pack skip: a param write makes every pack that
+    /// consumes it stale.
+    ///
+    /// Without this, `run(); set_param(w, ..); run()` keeps the FIRST run's
+    /// fused QKV / gate+up pack and the consuming GEMM silently computes with
+    /// the old weights — no error, just a wrong answer. That is the shape of
+    /// every weight-swap workload: a training step, a LoRA merge, quantisation
+    /// re-binding, a sweep harness reusing one executable across weight sets.
+    ///
+    /// Clearing wholesale (rather than tracking which packs consume `name`)
+    /// costs one run's worth of re-packing and cannot be wrong.
+    fn invalidate_static_weight_packs(&mut self) {
+        self.static_once_done = false;
+    }
+
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        self.invalidate_static_weight_packs();
         let diag = rlx_ir::env::flag("RLX_CUDA_INPUT_DIAG");
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
@@ -74,6 +138,7 @@ impl CudaExecutable {
             stream
                 .memcpy_htod(data, &mut slot)
                 .expect("rlx-cuda: param upload failed");
+            self.note_host_write(&stream);
             if diag {
                 eprintln!("[cuda-param] {name:?} -> uploaded ({} f32)", data.len());
             }
@@ -90,6 +155,7 @@ impl CudaExecutable {
 
     /// Upload packed U8/I8 GGUF weights into the param slot (byte offset).
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
+        self.invalidate_static_weight_packs();
         if let Some(&id) = self.param_offsets.get(name)
             && self.arena.has(id)
         {
@@ -99,6 +165,7 @@ impl CudaExecutable {
             let byte_off = self.arena.offset(id);
             let stream = self.ctx.default_stream();
             crate::gguf_host::upload_param_bytes(&stream, self.arena.f32_buf_mut(), byte_off, data);
+            self.note_host_write(&stream);
         }
     }
 
@@ -114,6 +181,7 @@ impl CudaExecutable {
     /// half-arena entry takes precedence in the matmul dispatch. Use
     /// only one of the two for any given param.
     pub fn set_param_half(&mut self, name: &str, dtype: crate::arena::HalfDtype, bits: &[u16]) {
+        self.invalidate_static_weight_packs();
         let id = match self.param_offsets.get(name) {
             Some(&id) if self.arena.has(id) => id,
             _ => return,
@@ -129,5 +197,6 @@ impl CudaExecutable {
                 .memcpy_htod(bits, &mut slot)
                 .expect("rlx-cuda: half-param upload failed");
         }
+        self.note_host_write(&stream);
     }
 }

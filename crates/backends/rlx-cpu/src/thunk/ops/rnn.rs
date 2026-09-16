@@ -2552,3 +2552,251 @@ pub unsafe fn execute_gated_delta_net_f16(
         }
     }
 }
+
+/// Arena driver for [`Thunk::GatedDeltaNetBackward`].
+///
+/// The scan itself lives in `crate::gdn::gdn_backward_head` and works on
+/// contiguous `[seq, n]` rows, so this gathers each head out of the
+/// `[b, s, h, n]` layout, runs the reverse scan, and scatters the gradients
+/// into the packed output. Heads are independent, so the gather/scan/scatter is
+/// the natural parallel unit — and it keeps the `O(seq · n²)` state history to
+/// one buffer per worker rather than one per `(batch, head)` pair.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_gated_delta_net_backward_f32(
+    q: usize,
+    k: usize,
+    v: usize,
+    g: usize,
+    beta: usize,
+    state: usize,
+    dy: usize,
+    dst: usize,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    state_size: usize,
+    gate_per_channel: bool,
+    carry_state: bool,
+    base: *mut u8,
+) {
+    #[derive(Copy, Clone)]
+    struct ArenaPtr(usize);
+    unsafe impl Send for ArenaPtr {}
+    unsafe impl Sync for ArenaPtr {}
+    impl ArenaPtr {
+        #[inline]
+        fn get(self) -> *mut u8 {
+            self.0 as *mut u8
+        }
+    }
+
+    unsafe {
+        let arena = ArenaPtr(base as usize);
+        let (b, s, h, n) = (batch, seq, heads, state_size);
+        let layout = rlx_ir::GdnBackwardLayout::new(b, s, h, n, gate_per_channel, carry_state);
+
+        let qkv_len = b * s * h * n;
+        let bsh_len = b * s * h;
+        let qs = sl(q, arena.get(), qkv_len);
+        let ks = sl(k, arena.get(), qkv_len);
+        let vs = sl(v, arena.get(), qkv_len);
+        let gs = sl(
+            g,
+            arena.get(),
+            if gate_per_channel { qkv_len } else { bsh_len },
+        );
+        let betas = sl(beta, arena.get(), bsh_len);
+        let dys = sl(dy, arena.get(), qkv_len);
+        let states = carry_state.then(|| sl(state, arena.get(), b * h * n * n));
+
+        // The packed bundle is written in full, so it needs no pre-zeroing
+        // beyond the per-head accumulators below.
+        let out = sl_mut(dst, arena.get(), layout.total_elems());
+        let out_ptr = ArenaPtr(out.as_mut_ptr() as usize);
+
+        let hs_n = h * n;
+        for bi in 0..b {
+            crate::pool::par_range(h, |hi| {
+                let mut scratch = crate::gdn::GdnBackwardScratch::new(s, n);
+                // Gather this head's rows.
+                let mut qh = vec![0.0f32; s * n];
+                let mut kh = vec![0.0f32; s * n];
+                let mut vh = vec![0.0f32; s * n];
+                let mut dyh = vec![0.0f32; s * n];
+                let mut gh = vec![0.0f32; if gate_per_channel { s * n } else { s }];
+                let mut betah = vec![0.0f32; s];
+                for ti in 0..s {
+                    let src = bi * s * hs_n + ti * hs_n + hi * n;
+                    let dstv = ti * n;
+                    qh[dstv..dstv + n].copy_from_slice(&qs[src..src + n]);
+                    kh[dstv..dstv + n].copy_from_slice(&ks[src..src + n]);
+                    vh[dstv..dstv + n].copy_from_slice(&vs[src..src + n]);
+                    dyh[dstv..dstv + n].copy_from_slice(&dys[src..src + n]);
+                    let gb = bi * s * h + ti * h + hi;
+                    betah[ti] = betas[gb];
+                    if gate_per_channel {
+                        gh[dstv..dstv + n].copy_from_slice(&gs[src..src + n]);
+                    } else {
+                        gh[ti] = gs[gb];
+                    }
+                }
+
+                let init = states.as_ref().map(|st| {
+                    let off = (bi * h + hi) * n * n;
+                    &st[off..off + n * n]
+                });
+
+                let mut dq = vec![0.0f32; s * n];
+                let mut dk = vec![0.0f32; s * n];
+                let mut dv = vec![0.0f32; s * n];
+                let mut dg = vec![0.0f32; gh.len()];
+                let mut dbeta = vec![0.0f32; s];
+                let mut dstate = carry_state.then(|| vec![0.0f32; n * n]);
+
+                {
+                    let io = crate::gdn::GdnHeadIo {
+                        q: &qh,
+                        k: &kh,
+                        v: &vh,
+                        g: &gh,
+                        beta: &betah,
+                        dy: &dyh,
+                        init_state: init,
+                    };
+                    let mut grads = crate::gdn::GdnHeadGrads {
+                        dq: &mut dq,
+                        dk: &mut dk,
+                        dv: &mut dv,
+                        dg: &mut dg,
+                        dbeta: &mut dbeta,
+                        dstate: dstate.as_deref_mut(),
+                    };
+                    crate::gdn::gdn_backward_head(
+                        &io,
+                        &mut grads,
+                        s,
+                        n,
+                        gate_per_channel,
+                        &mut scratch,
+                    );
+                }
+
+                // Scatter back. Heads write disjoint slots, so the raw pointer
+                // is sound across the parallel range.
+                let packed =
+                    std::slice::from_raw_parts_mut(out_ptr.get() as *mut f32, layout.total_elems());
+                for ti in 0..s {
+                    let dstv = bi * s * hs_n + ti * hs_n + hi * n;
+                    let srcv = ti * n;
+                    packed[layout.dq_offset() + dstv..layout.dq_offset() + dstv + n]
+                        .copy_from_slice(&dq[srcv..srcv + n]);
+                    packed[layout.dk_offset() + dstv..layout.dk_offset() + dstv + n]
+                        .copy_from_slice(&dk[srcv..srcv + n]);
+                    packed[layout.dv_offset() + dstv..layout.dv_offset() + dstv + n]
+                        .copy_from_slice(&dv[srcv..srcv + n]);
+                    let gb = bi * s * h + ti * h + hi;
+                    packed[layout.dbeta_offset() + gb] = dbeta[ti];
+                    if gate_per_channel {
+                        packed[layout.dg_offset() + dstv..layout.dg_offset() + dstv + n]
+                            .copy_from_slice(&dg[srcv..srcv + n]);
+                    } else {
+                        packed[layout.dg_offset() + gb] = dg[ti];
+                    }
+                }
+                if let Some(ds) = dstate {
+                    let off = layout.dstate_offset() + (bi * h + hi) * n * n;
+                    packed[off..off + n * n].copy_from_slice(&ds);
+                }
+            });
+        }
+    }
+}
+
+#[inline(always)]
+pub(crate) fn exec_gated_delta_net_backward(t: &Thunk, base: *mut u8) {
+    let Thunk::GatedDeltaNetBackward {
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        dy,
+        dst,
+        batch,
+        seq,
+        heads,
+        state_size,
+        gate_per_channel,
+        carry_state,
+    } = t
+    else {
+        unreachable!()
+    };
+    unsafe {
+        execute_gated_delta_net_backward_f32(
+            *q,
+            *k,
+            *v,
+            *g,
+            *beta,
+            *state,
+            *dy,
+            *dst,
+            *batch as usize,
+            *seq as usize,
+            *heads as usize,
+            *state_size as usize,
+            *gate_per_channel,
+            *carry_state,
+            base,
+        );
+    }
+}
+
+#[allow(unused_variables)]
+pub(crate) fn compile_gated_delta_net_backward(
+    node: &rlx_ir::Node,
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    matmul_fold: &std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)>,
+    rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    rng: rlx_ir::RngOptions,
+) -> Thunk {
+    let Op::GatedDeltaNetBackward {
+        state_size,
+        carry_state,
+        gate_per_channel,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+    let q_shape = &graph.node(node.inputs[0]).shape;
+    let (batch, seq, heads) = (
+        q_shape.dim(0).unwrap_static(),
+        q_shape.dim(1).unwrap_static(),
+        q_shape.dim(2).unwrap_static(),
+    );
+    // `dy` is last, after the optional carried state.
+    let dy_idx = if *carry_state { 6 } else { 5 };
+    Thunk::GatedDeltaNetBackward {
+        q: node_offset(arena, node.inputs[0]),
+        k: node_offset(arena, node.inputs[1]),
+        v: node_offset(arena, node.inputs[2]),
+        g: node_offset(arena, node.inputs[3]),
+        beta: node_offset(arena, node.inputs[4]),
+        state: if *carry_state {
+            node_offset(arena, node.inputs[5])
+        } else {
+            0
+        },
+        dy: node_offset(arena, node.inputs[dy_idx]),
+        dst: node_offset(arena, node.id),
+        batch: batch as u32,
+        seq: seq as u32,
+        heads: heads as u32,
+        state_size: *state_size as u32,
+        gate_per_channel: *gate_per_channel,
+        carry_state: *carry_state,
+    }
+}

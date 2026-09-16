@@ -242,6 +242,14 @@ impl MetalExecutable {
             &fused,
             128,
             memory::MemoryPlanOptions {
+                // `thunk::compile` folds a conv3d's LeakyReLU epilogue into its
+                // store and its Concat/upsample producers into its gather. Both
+                // move memory traffic outside the schedule the planner assumed,
+                // so the planner has to account for them — see
+                // `rlx_opt::memory::conv3d_epilogue_folds`, which both sides
+                // consult. Without this the folds are exact at 64^3 and 128^3
+                // and 17-19% of full scale wrong at 192^3.
+                fold_conv3d_epilogue: true,
                 // CPU-fallback thunks (conv/maxpool backward) read arena buffers
                 // AFTER the whole command buffer completes — including later GPU
                 // ops that reused those slots. Slot reuse is unsafe in that mix;
@@ -252,6 +260,15 @@ impl MetalExecutable {
                 // reuse-enabled footprint vs the pinned default.
                 pin_output_ancestors: !rlx_ir::env::flag("RLX_METAL_UNPIN_ALL"),
                 dequant_host_fallback,
+                // The bank transpose feeding a decode-path grouped matmul is
+                // folded into the `_bt` kernel and never executed, so reserving
+                // it costs a full second copy of every expert bank — on a
+                // resident 288-expert MoE that is gigabytes per layer, never
+                // written and never read. Gated to small `m` because that is
+                // where the transposed kernel exists; the same gated predicate
+                // decides which thunks become Nop, so the two cannot disagree.
+                elide_bank_transposes: true,
+                elide_requires_small_m: true,
                 ..Default::default()
             },
         );
@@ -302,6 +319,14 @@ impl MetalExecutable {
                 &fused,
                 128,
                 memory::MemoryPlanOptions {
+                    // Same fold accounting as the primary plan above — every
+                    // plan this backend might use has to agree, or the folds
+                    // touch slots one of them never reserved.
+                    // Load-bearing: this is the plan the arena is built from.
+                    // With the fold accounting missing *here* — and present in
+                    // the other two — SynthStrip was 18% of full scale wrong at
+                    // 192^3 and `RLX_METAL_FOLD_AUDIT=1` reported 83 conflicts.
+                    fold_conv3d_epilogue: true,
                     pin_output_ancestors: false,
                     arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
                     dequant_host_fallback,
@@ -316,7 +341,21 @@ impl MetalExecutable {
                     unpinned.arena_size <= max_buffer
                         || unpinned.arena_size + (plan.arena_size / 20) < plan.arena_size
                 } else {
+                    // Under maxBufferLength but over the MPS cliff. Crossing the
+                    // cliff is the best outcome — it restores MPSGraph fusion —
+                    // but it is not the only win. A 12-layer Mamba TRAINING
+                    // graph plans a 22 GiB arena that unpins to 4.8 GiB: fusion
+                    // stays off either way, yet keeping the pinned plan costs
+                    // 17 GiB of resident memory for nothing. Take a substantial
+                    // saving even when it lands above the cliff.
+                    //
+                    // Substantial, not marginal: the F5 DiT case that motivated
+                    // the `has_host_indexing` guard above "saved almost
+                    // nothing", so a 25% floor stays well clear of it while
+                    // still catching a 4.6x reduction. Graphs with host
+                    // indexing never reach here regardless.
                     unpinned.arena_size < MPS_BIND_CLIFF
+                        || unpinned.arena_size + (plan.arena_size / 4) < plan.arena_size
                 };
             if accept {
                 if verbose {
@@ -370,6 +409,7 @@ impl MetalExecutable {
                 &fused,
                 128,
                 memory::MemoryPlanOptions {
+                    fold_conv3d_epilogue: true,
                     allocate_params: false,
                     pin_output_ancestors: pin_act,
                     arena_no_reuse: rlx_ir::env::flag("RLX_ARENA_NO_REUSE"),
@@ -677,7 +717,7 @@ impl MetalExecutable {
                 plan.assignments.len()
             );
         }
-        if std::env::var_os("RLX_METAL_DEBUG").is_some() {
+        if rlx_ir::env::var_os("RLX_METAL_DEBUG").is_some() {
             let mut sizes: Vec<(usize, usize)> = plan
                 .assignments
                 .values()
@@ -1026,10 +1066,13 @@ fn widen_integer_activations_to_f32(mut graph: Graph) -> Graph {
     // / make the host kernel reject the buffer, so any Custom node and any
     // tensor consumed by a Custom node keep their true byte width — only the
     // native f32 GPU kernels need the widened form.
+    // `Op::FftQ` is in the same position: a host kernel whose whole point is
+    // that it operates on true i32. Widening it to f32 would hand the fixed-
+    // point transform a float bit pattern.
     let custom_operands: std::collections::HashSet<rlx_ir::NodeId> = graph
         .nodes()
         .iter()
-        .filter(|n| matches!(n.op, Op::Custom { .. }))
+        .filter(|n| matches!(n.op, Op::Custom { .. } | Op::FftQ { .. }))
         .flat_map(|n| std::iter::once(n.id).chain(n.inputs.iter().copied()))
         .collect();
     for node in graph.nodes_mut() {

@@ -272,7 +272,7 @@ fn rewrite_conv_integer(
     // The output-scale epilogue is pruned for float-act convs (act_scale is already baked in) —
     // see `rewrite_f32_quant_conv_bypass_output_scales`. Falls back to `act_q` for any conv whose
     // activation has no DynamicQuantizeLinear producer (e.g. a static/graph-input activation).
-    let float_act = std::env::var("RLX_CONVINT_FLOAT_ACT").is_ok();
+    let float_act = rlx_ir::env::var("RLX_CONVINT_FLOAT_ACT").is_some();
     struct ConvPlan {
         idx: usize,
         w_name: String,
@@ -974,7 +974,7 @@ mod rewrite_tests {
                 .join("../../../../rlx-models")
                 .join(rel),
         ];
-        if let Some(dir) = std::env::var_os("RLX_MODELS_DIR") {
+        if let Some(dir) = rlx_ir::env::var_os("RLX_MODELS_DIR") {
             candidates.push(std::path::PathBuf::from(dir).join(rel));
         }
         let Some(onnx) = candidates.into_iter().find(|p| p.is_file()) else {

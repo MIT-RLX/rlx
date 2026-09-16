@@ -30,6 +30,12 @@ pub struct StageSpec {
     /// Device directive: `auto` (fastest available) or a device name
     /// (`cuda`, `metal`, `cpu`, …). Honored against local availability.
     pub device: String,
+    /// Identifies which synthesized datapath this stage corresponds to, for
+    /// pre-synthesized fixed-function ranks (FPGA bitstreams). `None` for
+    /// ordinary stages, which any worker can compile. See
+    /// [`node::FixedFunction`](crate::dist::node::FixedFunction).
+    #[serde(default)]
+    pub stage_id: Option<String>,
 }
 
 impl StageSpec {
@@ -46,7 +52,15 @@ impl StageSpec {
             output: output.into(),
             weights: Vec::new(),
             device: device.into(),
+            stage_id: None,
         }
+    }
+
+    /// Tag this stage with the synthesized datapath it targets, so a
+    /// fixed-function rank can accept (or refuse) it at placement time.
+    pub fn stage_id(mut self, id: impl Into<String>) -> Self {
+        self.stage_id = Some(id.into());
+        self
     }
     /// Add an f32 weight (dequantized on load).
     pub fn weight(mut self, name: impl Into<String>, uri: impl Into<String>) -> Self {

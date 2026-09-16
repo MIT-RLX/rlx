@@ -1,4 +1,7 @@
 // RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// RLX — versatile ML compiler + runtime.
 //! CPU-vs-Metal parity for the native grouped MLX-MXFP4 MoE GEMV kernel
 //! (`grouped_dequant_matmul_mlx_gemv`). The same packed codes + BF16 scales — the
 //! DeepSeek-V4 per-expert format (`scale_bf16`) — pushed through both backends must

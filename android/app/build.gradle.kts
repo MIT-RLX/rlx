@@ -11,8 +11,12 @@ android {
         applicationId = "com.mit.rlx.demo"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.2.0"
+        // Tracks the workspace version in the root Cargo.toml — the demo bundles
+        // librlx_jni.so built from it, so a build.gradle version that drifts
+        // makes an installed APK impossible to trace back to a native build.
+        // versionCode is derived: major*10000 + minor*100 + patch.
+        versionCode = 216
+        versionName = "0.2.16"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += listOf("arm64-v8a")

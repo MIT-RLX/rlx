@@ -50,7 +50,7 @@ fn run_both(g: Graph, q: &[f32], k: &[f32], v: &[f32]) -> (Vec<f32>, Vec<f32>) {
 
 #[test]
 fn metal_sliding_window_attention_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

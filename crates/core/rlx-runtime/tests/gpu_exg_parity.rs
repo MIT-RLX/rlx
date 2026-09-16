@@ -22,6 +22,8 @@ use rlx_ir::ops::vq::VqMetric;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
     for x in xs {
@@ -55,7 +57,7 @@ fn run_on(dev: Device, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) -> Vec<Vec<f32
 
 /// Build on CPU and on `dev`, assert element-wise agreement.
 fn parity(name: &str, dev: Device, tol: f32, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) {
-    if !rlx_runtime::is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip {name}: {dev:?} unavailable");
         return;
     }
@@ -184,42 +186,52 @@ mod metal {
     use super::*;
     #[test]
     fn vector_quantize() {
+        let _gpu = common::serialize_gpu();
         check_vector_quantize(Device::Metal);
     }
     #[test]
     fn interpolate1d() {
+        let _gpu = common::serialize_gpu();
         check_interpolate1d(Device::Metal);
     }
     #[test]
     fn conv_transpose1d() {
+        let _gpu = common::serialize_gpu();
         check_conv_transpose1d(Device::Metal);
     }
     #[test]
     fn spectrogram() {
+        let _gpu = common::serialize_gpu();
         check_spectrogram(Device::Metal);
     }
     #[test]
     fn band_power() {
+        let _gpu = common::serialize_gpu();
         check_band_power(Device::Metal);
     }
     #[test]
     fn envelope() {
+        let _gpu = common::serialize_gpu();
         check_envelope(Device::Metal);
     }
     #[test]
     fn fir_filtfilt() {
+        let _gpu = common::serialize_gpu();
         check_fir_filtfilt(Device::Metal);
     }
     #[test]
     fn resample_poly() {
+        let _gpu = common::serialize_gpu();
         check_resample_poly(Device::Metal);
     }
     #[test]
     fn biquad() {
+        let _gpu = common::serialize_gpu();
         check_biquad(Device::Metal); // Op::Scan host-fallback
     }
     #[test]
     fn all() {
+        let _gpu = common::serialize_gpu();
         run_all(Device::Metal);
     }
 }
@@ -232,38 +244,47 @@ mod mlx {
     use super::*;
     #[test]
     fn vector_quantize() {
+        let _gpu = common::serialize_gpu();
         check_vector_quantize(Device::Mlx);
     }
     #[test]
     fn interpolate1d() {
+        let _gpu = common::serialize_gpu();
         check_interpolate1d(Device::Mlx);
     }
     #[test]
     fn conv_transpose1d() {
+        let _gpu = common::serialize_gpu();
         check_conv_transpose1d(Device::Mlx);
     }
     #[test]
     fn spectrogram() {
+        let _gpu = common::serialize_gpu();
         check_spectrogram(Device::Mlx);
     }
     #[test]
     fn band_power() {
+        let _gpu = common::serialize_gpu();
         check_band_power(Device::Mlx);
     }
     #[test]
     fn envelope() {
+        let _gpu = common::serialize_gpu();
         check_envelope(Device::Mlx);
     }
     #[test]
     fn fir_filtfilt() {
+        let _gpu = common::serialize_gpu();
         check_fir_filtfilt(Device::Mlx);
     }
     #[test]
     fn resample_poly() {
+        let _gpu = common::serialize_gpu();
         check_resample_poly(Device::Mlx);
     }
     #[test]
     fn biquad() {
+        let _gpu = common::serialize_gpu();
         check_biquad(Device::Mlx); // MLX lowers Op::Scan natively
     }
 }
@@ -273,38 +294,47 @@ mod wgpu {
     use super::*;
     #[test]
     fn vector_quantize() {
+        let _gpu = common::serialize_gpu();
         check_vector_quantize(Device::Gpu);
     }
     #[test]
     fn interpolate1d() {
+        let _gpu = common::serialize_gpu();
         check_interpolate1d(Device::Gpu);
     }
     #[test]
     fn conv_transpose1d() {
+        let _gpu = common::serialize_gpu();
         check_conv_transpose1d(Device::Gpu);
     }
     #[test]
     fn spectrogram() {
+        let _gpu = common::serialize_gpu();
         check_spectrogram(Device::Gpu);
     }
     #[test]
     fn band_power() {
+        let _gpu = common::serialize_gpu();
         check_band_power(Device::Gpu);
     }
     #[test]
     fn envelope() {
+        let _gpu = common::serialize_gpu();
         check_envelope(Device::Gpu);
     }
     #[test]
     fn fir_filtfilt() {
+        let _gpu = common::serialize_gpu();
         check_fir_filtfilt(Device::Gpu);
     }
     #[test]
     fn resample_poly() {
+        let _gpu = common::serialize_gpu();
         check_resample_poly(Device::Gpu);
     }
     #[test]
     fn biquad() {
+        let _gpu = common::serialize_gpu();
         check_biquad(Device::Gpu); // Op::Scan readback host-fallback
     }
 }
@@ -314,38 +344,47 @@ mod cuda {
     use super::*;
     #[test]
     fn vector_quantize() {
+        let _gpu = common::serialize_gpu();
         check_vector_quantize(Device::Cuda);
     }
     #[test]
     fn interpolate1d() {
+        let _gpu = common::serialize_gpu();
         check_interpolate1d(Device::Cuda);
     }
     #[test]
     fn conv_transpose1d() {
+        let _gpu = common::serialize_gpu();
         check_conv_transpose1d(Device::Cuda);
     }
     #[test]
     fn spectrogram() {
+        let _gpu = common::serialize_gpu();
         check_spectrogram(Device::Cuda);
     }
     #[test]
     fn band_power() {
+        let _gpu = common::serialize_gpu();
         check_band_power(Device::Cuda);
     }
     #[test]
     fn envelope() {
+        let _gpu = common::serialize_gpu();
         check_envelope(Device::Cuda);
     }
     #[test]
     fn fir_filtfilt() {
+        let _gpu = common::serialize_gpu();
         check_fir_filtfilt(Device::Cuda);
     }
     #[test]
     fn resample_poly() {
+        let _gpu = common::serialize_gpu();
         check_resample_poly(Device::Cuda);
     }
     #[test]
     fn biquad() {
+        let _gpu = common::serialize_gpu();
         check_biquad(Device::Cuda); // Op::Scan D2H→CPU→H2D host fallback
     }
 }

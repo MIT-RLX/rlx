@@ -16,15 +16,35 @@ pub fn scalar_f32() -> Shape {
     Shape::new(&[1], DType::F32)
 }
 
-/// Insert a literal `f32` constant node.
+/// Insert a literal `f32` constant node, `val` repeated over `shape`.
+///
+/// [`Op::Constant`] carries the **whole tensor** (`num_elements * 4` bytes).
+/// Backends copy `min(data, buffer)` floats and leave the remainder at zero, so
+/// a bare 4-byte literal paired with a wider shape fills element 0 and silently
+/// zeroes the rest — wrong numbers, not an error. This fills the shape.
+///
+/// For a value that should *broadcast* rather than be materialized, pass
+/// [`scalar_f32`] and let the consuming binary op broadcast it — that keeps the
+/// constant 4 bytes instead of `num_elements * 4`.
+///
+/// # Panics
+///
+/// If `shape` has a dynamic dimension: the element count is unknown at build
+/// time, so the tensor cannot be filled. Use [`scalar_f32`] + broadcast there.
 pub fn const_f32(g: &mut Graph, val: f32, shape: Shape) -> NodeId {
-    g.add_node(
-        Op::Constant {
-            data: val.to_le_bytes().to_vec(),
-        },
-        vec![],
-        shape,
-    )
+    let n = shape.num_elements().unwrap_or_else(|| {
+        panic!(
+            "rf::const_f32: shape {shape:?} has a dynamic dimension, so the \
+             constant cannot be filled — use rf::scalar_f32() and let the \
+             consuming op broadcast it"
+        )
+    });
+    let le = val.to_le_bytes();
+    let mut data = Vec::with_capacity(n * 4);
+    for _ in 0..n {
+        data.extend_from_slice(&le);
+    }
+    g.add_node(Op::Constant { data }, vec![], shape)
 }
 
 /// `|z|²` for complex `z = re + j·im`.
@@ -131,5 +151,44 @@ mod tests {
         g.set_outputs(vec![re, im]);
         assert_eq!(g.outputs.len(), 2);
         assert!(g.len() > 4);
+    }
+
+    /// `Op::Constant` carries the whole tensor. A 4-byte literal paired with a
+    /// wider shape used to fill element 0 and leave the rest at zero — silently
+    /// wrong numbers, since backends copy `min(data, buffer)` floats.
+    #[test]
+    fn const_f32_fills_the_whole_shape() {
+        let mut g = Graph::new("fill");
+        let id = const_f32(&mut g, 3.0, Shape::new(&[2, 4], DType::F32));
+        let Op::Constant { data } = &g.node(id).op else {
+            panic!("expected a Constant");
+        };
+        assert_eq!(data.len(), 2 * 4 * 4, "must carry num_elements * 4 bytes");
+        let vals: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![3.0; 8], "every element must be the literal");
+    }
+
+    /// The scalar case is unchanged — still 4 bytes, so a broadcast constant
+    /// does not grow into a materialized tensor.
+    #[test]
+    fn const_f32_scalar_stays_four_bytes() {
+        let mut g = Graph::new("scalar");
+        let id = const_f32(&mut g, 1.5, scalar_f32());
+        let Op::Constant { data } = &g.node(id).op else {
+            panic!("expected a Constant");
+        };
+        assert_eq!(data.len(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "dynamic dimension")]
+    fn const_f32_rejects_dynamic_shape() {
+        let mut g = Graph::new("dyn");
+        let shape = Shape::new(&[1], DType::F32)
+            .with_dim(0, crate::shape::Dim::Dynamic(crate::dynamic::sym::BATCH));
+        let _ = const_f32(&mut g, 1.0, shape);
     }
 }

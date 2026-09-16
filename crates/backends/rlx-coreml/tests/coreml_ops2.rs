@@ -159,7 +159,7 @@ fn scatter_add() {
     let idx = g.input("idx", Shape::new(&[3], DType::F32));
     let y = node(
         &mut g,
-        Op::ScatterAdd,
+        Op::ScatterAdd { axis: 0 },
         vec![upd, idx],
         Shape::new(&[3, 2], DType::F32),
     );

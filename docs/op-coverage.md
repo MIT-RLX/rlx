@@ -50,20 +50,20 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 
 ### Coverage at a glance
 
-| Backend | Ops claimed | of 184 |
+| Backend | Ops claimed | of 187 |
 |---------|------------:|-------:|
-| CPU  | **173** | reference (full OpKind surface; fused/control expand before thunks) |
-| MLX  | **167** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
-| MTL  | **177** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
-| WGPU  | **168** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
-| CUDA  | **171** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
-| ROCm  | **169** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
+| CPU  | **176** | reference (full OpKind surface; fused/control expand before thunks) |
+| MLX  | **168** | broadest GPU surface (control flow + scan + conv-bwd + QAT + GroupNorm fwd+bwd + Im2Col + ArgMax/Min) |
+| MTL  | **179** | Apple GPU inference + core training-bwd (Mamba `SelectiveScan`, `Sample`, `Reverse`, `ArgMax/Min`, **native fused `Gru`/`Rnn`/`Mamba2`**) |
+| WGPU  | **170** | cross-platform inference + partial training-bwd (vision trio + `Reverse` + `ArgMax/Min` + **native WGSL `Gru`/`Rnn`/`Mamba2`**) |
+| CUDA  | **173** | full OpKind surface (+ native `Mamba2`/`Gru`/`Rnn`/`FftButterflyStage`/`QMatMul`/`QConv2d`; DenseSolve via cuSOLVER) |
+| ROCm  | **171** | mirrors CUDA (shared `.cu` + hipSOLVER DenseSolve) |
 | TPU  | **163** | full OpKind surface (HLO compose for norms/QAT/conv-bwd/MaxPool/Attention bwd/AxialRope/Im2Col/ConvTranspose/PerTensor-FP8 Scaled* + host for SPD / splat / FftButterfly / DenseSolve) |
-| ANE  | **165** | static inference compiler + hybrid host segments (linalg batch host-staged; `CumProd`/`CumMax` still lag) |
+| ANE  | **164** | static inference compiler + hybrid host segments (linalg batch host-staged; `CumProd`/`CumMax` still lag) |
 
-*(Total **184** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
+*(Total **187** `OpKind`s. `Mamba2` still unfuses on ANE; `Gru`/`Rnn`/`Lstm` are native host.)*
 
-**Also at ~169 (EXTRA backends, not in the 8-column matrix):** **Vulkan** and **OneAPI** — claim parity with CUDA; native SPIR-V/OpenCL for norms/fused/RNN/vision-bwd/FFT/I8 quant + host/unfuse for specialty ops.
+**EXTRA backends, not in the 8-column matrix:** **Vulkan** (**170**) and **OneAPI** (**161**) — native SPIR-V/OpenCL for norms/fused/RNN/vision-bwd/FFT/I8 quant + host/unfuse for specialty ops.
 
 > **This revision** added a linear-algebra + sort batch — `Cholesky`,
 > `TriangularSolve`, `Det`, `LogDet`, `Sort`, `ArgSort`, `Svd` (U/S/Vt), `Qr`
@@ -236,7 +236,7 @@ fallback. Blank = not lowered (graph fails legalization on that device).
 
 | Op | Description | CPU | MTL | MLX | WGPU | ANE | CUDA | ROCm | TPU |
 |----|-------------|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| `SelectiveScan` | Mamba selective scan (S6) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `SelectiveScan` | Mamba selective scan (S6) | ✅ | ✅ | ✅ | ✅ |  | ✅ | ✅ | ✅ |
 | `GatedDeltaNet` | Qwen3.5 gated delta-net linear attention | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Lstm` | LSTM recurrence | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `Gru` | GRU recurrence (native CPU/Metal/WGPU/ANE host; MLX via decomposition) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |

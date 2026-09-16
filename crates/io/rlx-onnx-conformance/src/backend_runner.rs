@@ -41,7 +41,7 @@ pub fn unsupported_ops_in_model(model_path: &Path) -> Result<Vec<String>> {
     Ok(v)
 }
 
-/// Coverage dashboard: registry size grouped by [`OpCategory`].
+/// Coverage dashboard: registry size grouped by [`OpCategory`](rlx_onnx_import::OpCategory).
 pub fn coverage_dashboard() -> String {
     format_registry_dashboard()
 }

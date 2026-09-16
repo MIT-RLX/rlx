@@ -6,6 +6,8 @@
 use rlx_ir::{DType, Graph, Op, RngOptions, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 fn rng_normal_graph(seed_key: u64) -> Graph {
     let mut g = Graph::new("rng_normal");
     let template = g.input("template", Shape::new(&[2, 3], DType::F32));
@@ -25,6 +27,7 @@ fn rng_normal_graph(seed_key: u64) -> Graph {
 
 #[test]
 fn rng_normal_philox_is_deterministic() {
+    let _gpu = common::serialize_gpu();
     let g = rng_normal_graph(1);
     let opts = CompileOptions::new().rng(RngOptions::philox(99));
     let mut exe = Session::new(Device::Cpu).compile_with(g.clone(), &opts);
@@ -37,6 +40,7 @@ fn rng_normal_philox_is_deterministic() {
 
 #[test]
 fn rng_zero_backend_matches_template_shape() {
+    let _gpu = common::serialize_gpu();
     let g = rng_normal_graph(2);
     let opts = CompileOptions::new().rng(RngOptions::zero());
     let mut exe = Session::new(Device::Cpu).compile_with(g, &opts);
@@ -47,6 +51,7 @@ fn rng_zero_backend_matches_template_shape() {
 
 #[test]
 fn set_rng_changes_output_without_recompile() {
+    let _gpu = common::serialize_gpu();
     let g = rng_normal_graph(3);
     let opts = CompileOptions::new().rng(RngOptions::philox(1));
     let mut exe = Session::new(Device::Cpu).compile_with(g, &opts);
@@ -63,6 +68,7 @@ fn set_rng_changes_output_without_recompile() {
 
 #[test]
 fn rng_backend_switch_via_compile_options() {
+    let _gpu = common::serialize_gpu();
     let g = rng_normal_graph(4);
     let template = vec![0f32; 6];
     let mut ort = Session::new(Device::Cpu)
@@ -77,7 +83,8 @@ fn rng_backend_switch_via_compile_options() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn rng_normal_philox_is_deterministic_metal() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let g = rng_normal_graph(5);
@@ -98,7 +105,8 @@ fn rng_normal_philox_is_deterministic_metal() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn rng_uniform_cpu_metal_bit_parity() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::philox(123));
@@ -117,7 +125,8 @@ fn rng_uniform_cpu_metal_bit_parity() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn rng_normal_cpu_metal_close_parity() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::philox(77));
@@ -138,7 +147,8 @@ fn rng_normal_cpu_metal_close_parity() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn set_rng_switches_native_backend_metal() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let g = rng_normal_graph(14);
@@ -159,7 +169,8 @@ fn set_rng_switches_native_backend_metal() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn rng_normal_ort_host_parity_metal() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::ort(7));
@@ -174,7 +185,8 @@ fn rng_normal_ort_host_parity_metal() {
 #[cfg(feature = "gpu")]
 #[test]
 fn rng_normal_philox_is_deterministic_wgpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         return;
     }
     let g = rng_normal_graph(7);
@@ -195,7 +207,8 @@ fn rng_normal_philox_is_deterministic_wgpu() {
 #[cfg(feature = "gpu")]
 #[test]
 fn rng_uniform_cpu_wgpu_bit_parity() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::philox(123));
@@ -214,7 +227,8 @@ fn rng_uniform_cpu_wgpu_bit_parity() {
 #[cfg(feature = "gpu")]
 #[test]
 fn rng_normal_cpu_wgpu_close_parity() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::philox(77));
@@ -235,7 +249,8 @@ fn rng_normal_cpu_wgpu_close_parity() {
 #[cfg(feature = "gpu")]
 #[test]
 fn set_rng_switches_native_backend_wgpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         return;
     }
     let g = rng_normal_graph(14);
@@ -261,7 +276,8 @@ fn set_rng_switches_native_backend_wgpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn rng_normal_philox_is_deterministic_cuda() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     let g = rng_normal_graph(11);
@@ -283,7 +299,8 @@ fn rng_normal_philox_is_deterministic_cuda() {
 #[cfg(feature = "cuda")]
 #[test]
 fn rng_graph_capture_invalidates_on_set_rng_cuda() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     let g = rng_normal_graph(12);
@@ -344,7 +361,8 @@ fn rng_uniform_graph(seed_key: u64, low: f32, high: f32) -> Graph {
 #[cfg(feature = "rocm")]
 #[test]
 fn rng_uniform_cpu_rocm_bit_parity() {
-    if !rlx_runtime::is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::philox(123));
@@ -364,7 +382,8 @@ fn rng_uniform_cpu_rocm_bit_parity() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rng_uniform_general_range_close_parity_rocm() {
-    if !rlx_runtime::is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::philox(123));
@@ -386,7 +405,8 @@ fn rng_uniform_general_range_close_parity_rocm() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rng_normal_cpu_rocm_close_parity() {
-    if !rlx_runtime::is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         return;
     }
     let opts = CompileOptions::new().rng(RngOptions::philox(77));
@@ -411,7 +431,8 @@ fn rng_normal_cpu_rocm_close_parity() {
 #[cfg(feature = "rocm")]
 #[test]
 fn set_rng_switches_native_backend_rocm() {
-    if !rlx_runtime::is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         return;
     }
     let g = rng_normal_graph(13);

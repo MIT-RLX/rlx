@@ -89,7 +89,7 @@ pub struct MlaAttnPrefillSpec {
     pub score_scale: Option<f32>,
     /// RoPE pairing flavor. DeepSeek HF checkpoints are [`RopeStyle::NeoX`].
     pub rope_style: RopeStyle,
-    /// Optional named RoPE table (see [`super::self_attn::resolve_rope_handles`]).
+    /// Optional named RoPE table (see `super::self_attn::resolve_rope_handles`).
     pub rope_table: Option<String>,
 }
 

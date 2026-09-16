@@ -13,5 +13,7 @@ pub use rlx_gpu_kernels::rocm::MATMUL_MFMA_CU;
 /// Includes the on-device complex-simulation kernels `complex_cast` +
 /// `binary_c64` + Wirtinger trio (`complex_norm_sq` /
 /// `complex_norm_sq_backward` / `conjugate_c64`) (shared CUDA-C, compiled
-/// via hipRTC) and real-INT8 `q_matmul` / `q_conv2d`.
-pub const KERNEL_COUNT: usize = 74;
+/// via hipRTC) and real-INT8 `q_matmul` / `q_conv2d`, plus the on-device ONNX
+/// ND indexing set (`gather_nd_f32` / `gather_elements_f32` /
+/// `scatter_elements_f32` / `scatter_nd_reduce_f32` / `copy_sanitize_f32`).
+pub const KERNEL_COUNT: usize = 79;

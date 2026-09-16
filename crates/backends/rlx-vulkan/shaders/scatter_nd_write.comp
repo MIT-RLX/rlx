@@ -1,0 +1,44 @@
+#version 450
+// ONNX ScatterND. See `gather_nd.comp` for the shared conventions and
+// `scatter_elements_nd.comp` for why this is overwrite-only on Vulkan.
+//
+// meta = [ data_strides[k], data_dims[k] ] → k <= 8.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;                 // num_updates * slice
+    uint idx_off;
+    uint upd_off;
+    uint dst_off;
+    uint dst_len;
+    uint k;
+    uint slice;
+    uint _pad;
+    uvec4 meta[4];
+} pc;
+
+uint meta_at(uint i) { return pc.meta[i >> 2u][i & 3u]; }
+
+uint rlx_idx(float raw, int dim) {
+    int idx = int(round(raw));
+    if (idx < 0) { idx += dim; }
+    if (idx < 0) { idx = 0; }
+    if (dim > 0 && idx >= dim) { idx = dim - 1; }
+    return uint(idx);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+
+    uint u = i / pc.slice;
+    uint j = i - u * pc.slice;
+
+    uint off = 0u;
+    for (uint m = 0u; m < pc.k; ++m) {
+        int dim = int(meta_at(pc.k + m));
+        off += rlx_idx(arena_load(pc.idx_off + u * pc.k + m), dim) * meta_at(m);
+    }
+    if (off + j >= pc.dst_len) { return; }
+    arena_store(pc.dst_off + off + j, arena_load(pc.upd_off + u * pc.slice + j));
+}

@@ -192,7 +192,7 @@ impl MlxKernel for OnnxHostDelegate {
             attrs,
         )
         .map_err(MlxError)?;
-        if std::env::var("RLX_DBG_CUSTOM").is_ok() {
+        if rlx_ir::env::var("RLX_DBG_CUSTOM").is_some() {
             let peak = out_buf
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs())

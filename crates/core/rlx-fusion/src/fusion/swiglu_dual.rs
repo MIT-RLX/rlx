@@ -60,7 +60,17 @@ impl FuseSwiGLUDualMatmul {
         if up_mm.inputs[0] != gate_mm.inputs[0] {
             return None;
         }
-        if uses.use_count(silu_id) != 1 {
+        // All three of these are absorbed into the fused node below, so all
+        // three must be safe to delete: exactly one consumer and not exported.
+        // Checking only the silu left the two matmuls to be dropped even when
+        // something else still needed them — invisible in an ordinary model
+        // graph, but a graph that publishes an interior activation as an output
+        // (`split_vjp`'s save half, an instrumentation tap) loses the value and
+        // `Rewriter::finish` panics mapping the outputs.
+        if !uses.has_single_use(silu_id)
+            || !uses.has_single_use(gate_mm.id)
+            || !uses.has_single_use(up_mm.id)
+        {
             return None;
         }
         Some((mul_node.id, gate_mm.id, up_mm.id, up_mm.inputs[0], silu_id))

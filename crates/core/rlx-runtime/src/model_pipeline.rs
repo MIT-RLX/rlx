@@ -4,7 +4,7 @@
 
 //! Three-step model compile pipeline (template → specialize → backend).
 //!
-//! Host code loads symbolic HIR once, specializes per [`ModelVariant`] /
+//! Host code loads symbolic HIR once, specializes per [`ModelVariant`](rlx_ir::ModelVariant) /
 //! [`DimBinding`], then lowers to a device executable. Pair with
 //! [`BindingManifest`] for parameter-block style binding.
 
@@ -190,7 +190,7 @@ impl ModelCompilePipeline {
         self.build_template(build_hir, options)
     }
 
-    /// Disk-backed specialize ([`CompilationMode::Aot`]); caches by `key`.
+    /// Disk-backed specialize ([`CompilationMode::Aot`](rlx_ir::CompilationMode::Aot)); caches by `key`.
     pub fn get_or_specialize_aot<F: FnOnce() -> HirModule>(
         &mut self,
         aot: &crate::AotCache,

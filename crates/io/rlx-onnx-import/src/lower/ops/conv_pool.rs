@@ -182,6 +182,18 @@ pub(super) fn lower_conv(
             return Ok(true);
         }
     }
+    // A genuine 3-D convolution: `[N,C,D,H,W]` against a `[Cout,Cin/g,kD,kH,kW]`
+    // weight. Everything past this point assumes one or two spatial axes — the
+    // `kernel` below is a `[usize; 2]` — so a 3×3×3 weight reaches `conv2d` as
+    // `[3,3]` carrying rank-5 tensors. Shape inference accepts that, the
+    // conv-bias-activation fuser then matches it (its `cudnn_friendly_conv`
+    // guard only inspects the kernel, which looks 2-D), and the failure finally
+    // surfaces in the CPU expansion, far from the cause. Handle it here and
+    // return rather than teaching the 1-D/2-D path a third axis it would have
+    // to carry through every branch below.
+    if !transpose && m.shape(x0).rank() == 5 && m.shape(w).rank() == 5 {
+        return lower_conv3d(m, ctx, node, x0, w, groups);
+    }
     if transpose && groups > 1 {
         let s = m.shape(x0).clone();
         if s.rank() == 4 && s.dim(2).unwrap_static() == 1 {
@@ -390,11 +402,51 @@ pub(super) fn lower_conv(
             );
             out_shape.dim(2).unwrap_static() != lo
         };
+    // Same STALE-meta problem for a genuine 2-D conv. `meta_len_stale` above is
+    // rank-3 only, so a rank-4 conv whose meta carries a length that
+    // `propagate_shapes` guessed from a symbolic dim was trusted verbatim:
+    // ChatterBox's speech_encoder fed a correct 742-frame mel `[1, 1, 80, 742]`
+    // into a stride-1 3x3 conv and kept the meta's `[1, 32, 80, 128]`, collapsing
+    // time for the entire ResNet below it and leaving declared and operand shapes
+    // irreconcilable at lowering. Recompute from the concrete HIR input instead —
+    // the "genuine 2D forward conv" branch below already knows how, it was just
+    // never reached.
+    let meta_len_stale_2d = !meta_empty
+        && !transpose
+        && rank0 == 4
+        && out_shape.rank() == 4
+        && m.shape(w).rank() == 4
+        && in_s0.dim(2).unwrap_static() > 1
+        && in_s0.dim(3).unwrap_static() > 1
+        && out_shape.dim(1).unwrap_static() == expected_cout
+        && {
+            let conv_out = |sz: usize, k: usize, st: usize, p: usize, d: usize| {
+                let st = st.max(1);
+                let eff = d * k.saturating_sub(1);
+                (sz + 2 * p).saturating_sub(eff).saturating_sub(1) / st + 1
+            };
+            let h = conv_out(
+                in_s0.dim(2).unwrap_static(),
+                kernel[0],
+                stride[0],
+                pad[0],
+                dilation[0],
+            );
+            let wd = conv_out(
+                in_s0.dim(3).unwrap_static(),
+                kernel[1],
+                stride[1],
+                pad[1],
+                dilation[1],
+            );
+            out_shape.dim(2).unwrap_static() != h || out_shape.dim(3).unwrap_static() != wd
+        };
     if meta_empty
         || out_shape.rank() < 2
         || meta_layout_transposed
         || meta_len_stale
         || meta_len_stale_transpose
+        || meta_len_stale_2d
         || canonicalized_rank4_1d
     {
         let w_s = m.shape(w).clone();
@@ -719,6 +771,358 @@ pub(super) fn lower_conv(
     Ok(true)
 }
 
+/// Emit ONNX `MaxPool`'s optional second output: the index of each maximum.
+///
+/// The op declares two outputs and the pooled values are only the first. When
+/// the second is left unbound, every consumer of it fails to resolve — which is
+/// how a network that upsamples by max-unpooling (FastSurfer's VINN, and any
+/// SegNet-style decoder) stops importing, with an error naming the *consumer*
+/// rather than the pool.
+///
+/// # Convention
+///
+/// ONNX indices are flat over the **whole** `[N,C,H,W]` tensor, not per
+/// channel plane — `[0, N·C·H·W)`. PyTorch's are per-plane, so a graph that
+/// mixes the two is out by `(n·C + c)·H·W` on every channel but the first.
+/// This emits the ONNX convention, which is what the rest of an ONNX graph
+/// expects.
+///
+/// # How
+///
+/// For a non-overlapping pool the window can be exposed by reshaping, so the
+/// index is an `ArgMax` over the window plus arithmetic. Both the arithmetic
+/// terms are constants: a window only takes `kh·kw` distinct offsets, so a
+/// `Gather` from a small table covers it, and everything else — the plane
+/// offset and the window's origin — is fixed by the shapes. That leaves one
+/// data-dependent op where a direct implementation would need a new kernel on
+/// every backend.
+///
+/// Overlapping or padded pools cannot be reshaped this way and are refused
+/// rather than approximated.
+fn emit_pool_indices(
+    m: &mut HirMut<'_>,
+    x: HirNodeId,
+    kernel: [usize; 2],
+    stride: [usize; 2],
+    pad: &[usize],
+    name: &str,
+) -> Result<HirNodeId> {
+    let in_s = m.shape(x).clone();
+    if in_s.rank() != 4 {
+        bail!("{name}: pooling indices are only implemented for rank-4 NCHW");
+    }
+    let dims: Vec<usize> = (0..4).map(|i| in_s.dim(i).unwrap_static()).collect();
+    let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+    let (kh, kw) = (kernel[0], kernel[1]);
+
+    if pad.iter().any(|&p| p != 0) {
+        bail!("{name}: pooling indices with padding are not supported");
+    }
+    if stride != kernel {
+        bail!(
+            "{name}: pooling indices need non-overlapping windows (kernel {kernel:?}, \
+             stride {stride:?})"
+        );
+    }
+    if kh == 0 || kw == 0 || h % kh != 0 || w % kw != 0 {
+        bail!("{name}: {h}x{w} does not tile exactly by {kh}x{kw}");
+    }
+    let (oh, ow) = (h / kh, w / kw);
+
+    // [N,C,H,W] -> [N,C,OH,kh,OW,kw] -> [N,C,OH,OW,kh,kw] -> [N,C,OH,OW,kh*kw]
+    let r1 = m.reshape_(
+        x,
+        vec![
+            n as i64, c as i64, oh as i64, kh as i64, ow as i64, kw as i64,
+        ],
+    );
+    let t = m.transpose_(r1, vec![0, 1, 2, 4, 3, 5]);
+    let flat = m.reshape_(
+        t,
+        vec![n as i64, c as i64, oh as i64, ow as i64, (kh * kw) as i64],
+    );
+
+    let picked = m.add_node(
+        Op::ArgMax {
+            axis: 4,
+            keep_dim: false,
+        },
+        vec![flat],
+        Shape::new(&[n, c, oh, ow], DType::I64),
+    );
+
+    // Offset within the window, indexed by the argmax: row-major (a, b) sits
+    // `a·W + b` from the window's first element.
+    let table: Vec<i64> = (0..kh)
+        .flat_map(|a| (0..kw).map(move |b| (a * w + b) as i64))
+        .collect();
+    let table_bytes: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let table_id = m.add_node(
+        Op::Constant { data: table_bytes },
+        vec![],
+        Shape::new(&[kh * kw], DType::I64),
+    );
+    let offsets = m.add_node(
+        Op::Gather { axis: 0 },
+        vec![table_id, picked],
+        Shape::new(&[n, c, oh, ow], DType::I64),
+    );
+
+    // Where each window starts, flattened over the whole tensor.
+    let mut base = Vec::with_capacity(n * c * oh * ow);
+    for ni in 0..n {
+        for ci in 0..c {
+            let plane = ((ni * c + ci) * h * w) as i64;
+            for y in 0..oh {
+                for xw in 0..ow {
+                    base.push(plane + ((y * kh) * w + xw * kw) as i64);
+                }
+            }
+        }
+    }
+    let base_bytes: Vec<u8> = base.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let base_id = m.add_node(
+        Op::Constant { data: base_bytes },
+        vec![],
+        Shape::new(&[n, c, oh, ow], DType::I64),
+    );
+
+    Ok(binary_infer_add(m, offsets, base_id, name))
+}
+
+/// Lower a rank-5 `MaxPool` / `AveragePool` to a 3-spatial-axis [`Op::Pool`].
+///
+/// `Op::Pool` already carries `Vec` extents and the CPU backend already has a
+/// 3-D kernel, so all this has to do is read the attributes at their real
+/// length and compute the output shape, instead of going through the
+/// two-element `onnx_pads`.
+/// ONNX pooling output extent. `ceil_mode=1` rounds the division UP instead of
+/// down (`ceil((in + pads - kernel) / stride) + 1`), which the importer ignored
+/// entirely — `ceil_mode` appeared nowhere in it. ChatterBox's speaker encoder
+/// pools 259 frames with kernel/stride 100 and `ceil_mode=1`: the truth is 3
+/// windows, floor gives 2, and the CAM layer then expands the pooled segments
+/// back by 100 to a 200-frame tensor instead of 259 — silently wrong shapes and
+/// a speaker embedding that no longer identifies the speaker.
+fn pool_out_len(size: usize, pad: usize, kernel: usize, stride: usize, ceil_mode: bool) -> usize {
+    let stride = stride.max(1);
+    let num = (size + pad).saturating_sub(kernel);
+    let steps = if ceil_mode {
+        num.div_ceil(stride)
+    } else {
+        num / stride
+    };
+    steps + 1
+}
+
+/// `ceil_mode` attribute of a pooling node (ONNX default 0).
+fn pool_ceil_mode(node: &BundleNode) -> bool {
+    node.attrs
+        .get("ceil_mode")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0
+}
+
+fn lower_pool3d(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+    x: HirNodeId,
+    kind: ReduceOp,
+) -> Result<bool> {
+    let spatial = |name: &str, default: usize| -> [usize; 3] {
+        let v: Vec<usize> = node
+            .attrs
+            .get(name)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d.as_u64().map(|x| x as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        [0, 1, 2].map(|i| v.get(i).copied().unwrap_or(default))
+    };
+    let kernel = spatial("kernel_shape", 1);
+    let stride = spatial("strides", 1);
+
+    // ONNX orders `pads` as all the begins then all the ends. `Op::Pool` takes
+    // one number per axis, so an asymmetric pad has nowhere to go.
+    let pads: Vec<usize> = node
+        .attrs
+        .get("pads")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.as_u64().map(|x| x as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pad = if pads.is_empty() {
+        [0, 0, 0]
+    } else if pads.len() == 6 {
+        for i in 0..3 {
+            if pads[i] != pads[i + 3] {
+                bail!(
+                    "{}: asymmetric 3-D pool padding {pads:?} is not supported",
+                    node.name
+                );
+            }
+        }
+        [pads[0], pads[1], pads[2]]
+    } else {
+        bail!(
+            "{}: expected 6 pad values for a 3-D pool, got {pads:?}",
+            node.name
+        );
+    };
+
+    let in_s = m.shape(x).clone();
+    let dims: Vec<usize> = (0..5).map(|i| in_s.dim(i).unwrap_static()).collect();
+    let mut out = dims.clone();
+    let ceil_mode = pool_ceil_mode(node);
+    for a in 0..3 {
+        out[2 + a] = pool_out_len(dims[2 + a], 2 * pad[a], kernel[a], stride[a], ceil_mode);
+    }
+    let id = m.add_node(
+        Op::Pool {
+            kind,
+            kernel_size: kernel.to_vec(),
+            stride: stride.to_vec(),
+            padding: pad.to_vec(),
+        },
+        vec![x],
+        Shape::new(&out, in_s.dtype()),
+    );
+    ctx.env.insert(node.outputs[0].clone(), id);
+    Ok(true)
+}
+
+/// Lower a rank-5 forward `Conv` to [`Op::Conv3d`].
+///
+/// Deliberately separate from [`lower_conv`]: that function's shape logic is a
+/// long sequence of 1-D-versus-2-D disambiguations (BLC vs NCL, `[N,C,L,1]`
+/// canonicalisation, vocoder-specific layout fixes) and none of it applies to
+/// volumetric data, where `[N,C,D,H,W]` is unambiguous. Kernel extents come
+/// from the weight rather than `kernel_shape` for the same reason the 2-D path
+/// prefers them: the weight is concrete, the attribute is optional.
+fn lower_conv3d(
+    m: &mut HirMut<'_>,
+    ctx: &mut LowerCtx<'_>,
+    node: &BundleNode,
+    x: HirNodeId,
+    w: HirNodeId,
+    groups: usize,
+) -> Result<bool> {
+    let w_s = m.shape(w).clone();
+    let kernel = [
+        w_s.dim(2).unwrap_static(),
+        w_s.dim(3).unwrap_static(),
+        w_s.dim(4).unwrap_static(),
+    ];
+    let spatial = |name: &str, default: usize| -> [usize; 3] {
+        let v: Vec<usize> = node
+            .attrs
+            .get(name)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d.as_u64().map(|x| x as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        [0, 1, 2].map(|i| v.get(i).copied().unwrap_or(default))
+    };
+    let stride = spatial("strides", 1);
+    let dilation = spatial("dilations", 1);
+
+    // `Op::Conv3d` takes one padding per axis, so an asymmetric ONNX `pads` has
+    // no faithful representation. Say so instead of dropping the end pad, which
+    // would shift every downstream voxel by half a kernel.
+    let pads: Vec<usize> = node
+        .attrs
+        .get("pads")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.as_u64().map(|x| x as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    let auto_pad = node
+        .attrs
+        .get("auto_pad")
+        .and_then(|v| v.as_str())
+        .unwrap_or("NOTSET");
+    let pad = match auto_pad {
+        "VALID" => [0, 0, 0],
+        "SAME_UPPER" | "SAME_LOWER" => {
+            // Symmetric only when every kernel extent is odd and unstrided;
+            // otherwise ONNX puts the extra row on one side and we cannot.
+            let same = [0, 1, 2].map(|i| dilation[i] * (kernel[i] - 1) / 2);
+            for i in 0..3 {
+                if kernel[i].is_multiple_of(2) || stride[i] != 1 {
+                    bail!(
+                        "{}: {auto_pad} with kernel {kernel:?} stride {stride:?} needs \
+                         asymmetric padding, which Conv3d cannot express",
+                        node.name
+                    );
+                }
+            }
+            same
+        }
+        _ if pads.is_empty() => [0, 0, 0],
+        _ if pads.len() == 6 => {
+            for i in 0..3 {
+                if pads[i] != pads[i + 3] {
+                    bail!(
+                        "{}: asymmetric 3-D padding {pads:?} is not supported; \
+                         precede the Conv with an explicit Pad",
+                        node.name
+                    );
+                }
+            }
+            [pads[0], pads[1], pads[2]]
+        }
+        _ => bail!(
+            "{}: expected 6 pad values for a 3-D Conv, got {pads:?}",
+            node.name
+        ),
+    };
+
+    let in_s = m.shape(x).clone();
+    let out_shape =
+        rlx_ir::shape::conv3d_output_shape(&in_s, &w_s, kernel, stride, pad, dilation, groups)
+            .map_err(|e| anyhow!("{}: {e}", node.name))?;
+    let mut id = m.add_node(
+        Op::Conv3d {
+            stride,
+            padding: pad,
+            dilation,
+            groups,
+        },
+        vec![x, w],
+        out_shape,
+    );
+
+    // The conv bias is per-output-channel `[C]`. Reshaping it to `[1,C,1,1,1]`
+    // rather than leaving it rank-1 matters: a bare `[C]` broadcasts against the
+    // trailing axis (W), which for an isotropic volume has the same extent as C
+    // in exactly the cases where the mistake is invisible.
+    if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
+        let bias = ctx.tensor(&node.inputs[2])?;
+        let bias_in = if m.shape(bias).rank() == 1 {
+            let bc = m.shape(bias).dim(0).unwrap_static();
+            m.reshape_(bias, vec![1, bc as i64, 1, 1, 1])
+        } else {
+            bias
+        };
+        id = binary_infer_add(m, id, bias_in, &node.name);
+    }
+    ctx.env.insert(node.outputs[0].clone(), id);
+    Ok(true)
+}
+
 pub(super) fn lower_pool(
     m: &mut HirMut<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -731,6 +1135,15 @@ pub(super) fn lower_pool(
         "AveragePool" | "GlobalAveragePool" => ReduceOp::Mean,
         _ => ReduceOp::Max,
     };
+    // A 3-D pool over `[N,C,D,H,W]`. `onnx_pads` reports two spatial extents,
+    // so without this a 2×2×2 MaxPool arrives as 2×2 — and because the CPU
+    // backend pairs a 2-element kernel with a rank-5 input by emitting
+    // `Thunk::Nop`, the pool silently does nothing at all. The tensor keeps its
+    // full depth, every downstream shape is wrong, and a U-Net's skip
+    // connections stop lining up, with no error anywhere.
+    if m.shape(x).rank() == 5 && op != "GlobalAveragePool" {
+        return lower_pool3d(m, ctx, node, x, kind);
+    }
     let (kernel_size, stride, padding) = if op == "GlobalAveragePool" {
         let s = m.shape(x);
         if s.rank() >= 2 {
@@ -761,7 +1174,7 @@ pub(super) fn lower_pool(
         let kh = kernel_size.first().copied().unwrap_or(1).max(1);
         let sh = stride.first().copied().unwrap_or(1).max(1);
         let ph: usize = padding.iter().take(2).sum();
-        let ol = ((l + ph).saturating_sub(kh) / sh + 1).max(1);
+        let ol = pool_out_len(l, ph, kh, sh, pool_ceil_mode(node)).max(1);
         if ol == 1 && ph == 0 {
             // Single window starting at 0, covering the first `min(kh, l)` frames
             // (exact ONNX AveragePool/MaxPool window when there is one output and
@@ -808,13 +1221,145 @@ pub(super) fn lower_pool(
     let id = m.add_node(
         Op::Pool {
             kind,
-            kernel_size,
-            stride,
-            padding,
+            kernel_size: kernel_size.clone(),
+            stride: stride.clone(),
+            padding: padding.clone(),
         },
         vec![x],
         s,
     );
     ctx.env.insert(node.outputs[0].clone(), id);
+
+    // `MaxPool` may declare a second output, the index of each maximum. Left
+    // unbound it is not a missing optimisation — every consumer fails to
+    // resolve, and the error names the consumer rather than this.
+    if node.outputs.len() > 1 && !node.outputs[1].is_empty() {
+        let two = |v: &[usize], d: usize| {
+            [
+                v.first().copied().unwrap_or(d),
+                v.get(1).copied().unwrap_or(d),
+            ]
+        };
+        let indices = emit_pool_indices(
+            m,
+            x,
+            two(&kernel_size, 1),
+            two(&stride, 1),
+            &padding,
+            &node.name,
+        )?;
+        ctx.env.insert(node.outputs[1].clone(), indices);
+    }
     Ok(true)
+}
+
+#[cfg(test)]
+mod pool_indices_tests {
+    /// The index arithmetic `emit_pool_indices` builds, in plain Rust.
+    ///
+    /// The emitted graph computes `base + table[argmax]`; this is the same
+    /// expression evaluated directly, so the tests below check the *arithmetic*
+    /// — which is the part that is silently wrong when it is wrong. A wrong
+    /// index does not fail; it unpools each maximum to a different place, and
+    /// the decoder still produces a smooth, plausible image.
+    fn expected_index(
+        n: usize,
+        c: usize,
+        h: usize,
+        w: usize,
+        kh: usize,
+        kw: usize,
+        ni: usize,
+        ci: usize,
+        oy: usize,
+        ox: usize,
+        argmax: usize,
+    ) -> i64 {
+        let _ = n;
+        let plane = ((ni * c + ci) * h * w) as i64;
+        let origin = ((oy * kh) * w + ox * kw) as i64;
+        let (a, b) = (argmax / kw, argmax % kw);
+        let offset = (a * w + b) as i64;
+        plane + origin + offset
+    }
+
+    #[test]
+    fn indices_are_flat_over_the_whole_tensor_not_per_plane() {
+        // ONNX counts over all of `[N,C,H,W]`; PyTorch counts per plane. Mixing
+        // them is out by `(n·C + c)·H·W`, so channel 0 looks fine and every
+        // other channel unpools into the wrong plane.
+        let (n, c, h, w, kh, kw) = (2, 3, 4, 4, 2, 2);
+        let first = expected_index(n, c, h, w, kh, kw, 0, 0, 0, 0, 0);
+        let second_channel = expected_index(n, c, h, w, kh, kw, 0, 1, 0, 0, 0);
+        assert_eq!(first, 0);
+        assert_eq!(second_channel, (h * w) as i64);
+        let second_batch = expected_index(n, c, h, w, kh, kw, 1, 0, 0, 0, 0);
+        assert_eq!(second_batch, (c * h * w) as i64);
+    }
+
+    #[test]
+    fn each_position_in_a_window_maps_to_its_own_voxel() {
+        // The four corners of a 2x2 window, at a window that is not the origin.
+        let (h, w, kh, kw) = (4, 4, 2, 2);
+        let at = |am| expected_index(1, 1, h, w, kh, kw, 0, 0, 1, 1, am);
+        // Window (1,1) starts at row 2, column 2 -> flat 2*4 + 2 = 10.
+        assert_eq!(at(0), 10); // (0,0)
+        assert_eq!(at(1), 11); // (0,1)
+        assert_eq!(at(2), 10 + w as i64); // (1,0)
+        assert_eq!(at(3), 11 + w as i64); // (1,1)
+    }
+
+    #[test]
+    fn every_index_is_distinct_and_in_range() {
+        // A non-overlapping pool partitions the tensor, so across all windows
+        // and all argmax choices the indices must cover distinct voxels within
+        // bounds. A collision would mean two maxima unpool to one place.
+        let (n, c, h, w, kh, kw) = (2, 2, 6, 4, 2, 2);
+        let mut seen = std::collections::HashSet::new();
+        for ni in 0..n {
+            for ci in 0..c {
+                for oy in 0..h / kh {
+                    for ox in 0..w / kw {
+                        for am in 0..kh * kw {
+                            let i = expected_index(n, c, h, w, kh, kw, ni, ci, oy, ox, am);
+                            assert!(i >= 0 && (i as usize) < n * c * h * w, "{i} out of range");
+                            // Distinct only within a window's own choice set;
+                            // across windows the sets are disjoint.
+                            if am == 0 {
+                                assert!(seen.insert(i), "window origin {i} repeated");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(seen.len(), n * c * (h / kh) * (w / kw));
+    }
+
+    #[test]
+    fn a_one_by_one_pool_is_the_identity_index_map() {
+        // This is the case torch's max-unpool decomposition uses to obtain the
+        // flat index of every element, so it has to come out as exactly
+        // `arange(N·C·H·W)`.
+        let (n, c, h, w) = (2, 2, 3, 3);
+        let mut got = Vec::new();
+        for ni in 0..n {
+            for ci in 0..c {
+                for y in 0..h {
+                    for x in 0..w {
+                        got.push(expected_index(n, c, h, w, 1, 1, ni, ci, y, x, 0));
+                    }
+                }
+            }
+        }
+        let want: Vec<i64> = (0..(n * c * h * w) as i64).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_non_square_window_offsets_by_the_row_stride() {
+        // 1x2 and 2x1 windows exercise the `a·W + b` term separately.
+        assert_eq!(expected_index(1, 1, 2, 4, 1, 2, 0, 0, 0, 1, 1), 3);
+        assert_eq!(expected_index(1, 1, 4, 2, 2, 1, 0, 0, 1, 0, 1), 2 * 2 + 2);
+    }
 }

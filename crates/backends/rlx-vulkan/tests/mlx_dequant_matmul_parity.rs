@@ -28,7 +28,7 @@ fn assert_close(cpu: &[f32], gpu: &[f32], label: &str) {
 }
 
 fn run_affine(m: usize, k: usize, n: usize, bits: u8, group_size: u32) {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let gs = group_size as usize;
@@ -86,7 +86,7 @@ fn run_affine(m: usize, k: usize, n: usize, bits: u8, group_size: u32) {
 }
 
 fn run_mxfp(m: usize, k: usize, n: usize, group_size: u32, mxfp8: bool) {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let gs = group_size as usize;

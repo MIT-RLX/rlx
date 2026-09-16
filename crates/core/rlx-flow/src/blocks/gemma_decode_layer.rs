@@ -27,7 +27,7 @@ pub struct GemmaDecodeLayerSpec {
     /// — used by Gemma 4 full-attention layers for partial RoPE.
     pub n_rot: usize,
     /// Optional named decode RoPE row (see
-    /// [`crate::blocks::NamedRopeTablesStage`]). `None` ⇒ uses the
+    /// `crate::blocks::NamedRopeTablesStage`). `None` ⇒ uses the
     /// default `decode.cos`/`decode.sin` bound by `BindDecodeInputs`.
     pub rope_table: Option<String>,
     /// Reuse the K projection as V (Gemma 4 `attention_k_eq_v`).
@@ -47,9 +47,9 @@ pub struct GemmaDecodeLayerStage {
     pub layer_idx: usize,
     pub kv_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
     /// Optional EAGLE3-style tap for the pre-attention-norm layer
-    /// input. When set, [`emit`] pushes `input.id` here before doing
+    /// input. When set, `emit` pushes `input.id` here before doing
     /// any other work. Constructor leaves it `None`; opt in via
-    /// [`with_aux_input_tap`]. Push order across layers follows the
+    /// `with_aux_input_tap`. Push order across layers follows the
     /// stage construction order — the caller drains in the same
     /// order they pushed.
     pub aux_in_out: Option<Arc<Mutex<Vec<rlx_ir::HirNodeId>>>>,

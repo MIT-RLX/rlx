@@ -243,8 +243,8 @@ impl Graph {
 
     /// Fusion-first model definition at HIR level.
     ///
-    /// Returns a [`GraphModule`] at HIR stage; call [`GraphModule::lower`]
-    /// or pass to [`rlx_opt::CompilePipeline::compile_module`].
+    /// Returns a `GraphModule` at HIR stage; call `GraphModule::lower`
+    /// or pass to `rlx_opt::CompilePipeline::compile_module`.
     pub fn define(
         name: impl Into<String>,
         build: impl FnOnce(&mut crate::hir::HirModule) -> crate::hir::HirNodeId,
@@ -252,12 +252,12 @@ impl Graph {
         crate::GraphModule::define(name, build)
     }
 
-    /// Start an empty HIR-stage [`GraphModule`].
+    /// Start an empty HIR-stage `GraphModule`.
     pub fn hir(name: impl Into<String>) -> crate::GraphModule {
         crate::GraphModule::hir(name)
     }
 
-    /// Wrap this MIR graph in a [`GraphModule`] for pipeline operations.
+    /// Wrap this MIR graph in a `GraphModule` for pipeline operations.
     pub fn module(self) -> crate::GraphModule {
         crate::GraphModule::from_graph(self)
     }
@@ -267,7 +267,7 @@ impl Graph {
         hir.lower_to_mir().map(|m| m.into_graph())
     }
 
-    /// View as [`MirModule`].
+    /// View as `MirModule`.
     pub fn to_mir(self) -> crate::MirModule {
         crate::MirModule::from_graph(self)
     }
@@ -277,12 +277,12 @@ impl Graph {
         lir.into_graph()
     }
 
-    /// Annotated text dump ([`inspect_graph`]).
+    /// Annotated text dump (`inspect_graph`).
     pub fn inspect(&self) -> String {
         crate::inspect_graph(self)
     }
 
-    /// True if any node shape uses a [`Dim::Dynamic`] symbol.
+    /// True if any node shape uses a `Dim::Dynamic` symbol.
     pub fn has_dynamic_dims(&self) -> bool {
         crate::dynamic::has_dynamic_dims(self)
     }
@@ -297,7 +297,7 @@ impl Graph {
         crate::dynamic::bind_graph(self, bindings)
     }
 
-    /// Stage-aware dump when wrapped in [`GraphModule`].
+    /// Stage-aware dump when wrapped in `GraphModule`.
     pub fn inspect_module(module: &crate::GraphModule) -> String {
         module.inspect()
     }

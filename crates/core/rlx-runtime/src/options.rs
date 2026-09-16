@@ -36,10 +36,10 @@ pub struct CompileOptions {
     pub policy: Option<PrecisionPolicy>,
     /// Opt-in native low-precision GEMM. When set, every 2-D `Op::MatMul` is
     /// rewritten to a `ScaledMatMul` whose operands are dynamically quantized to
-    /// this element format + scale layout — any [`ScaledFormat`], including a
+    /// this element format + scale layout — any [`ScaledFormat`](rlx_ir::ScaledFormat), including a
     /// parameterized `Custom` (e.g. `f4e3m0`). Off by default; changes numerics.
     pub scaled_quant: Option<ScaledQuantConfig>,
-    /// RNG policy for in-graph [`Op::RngNormal`] / [`Op::RngUniform`] nodes.
+    /// RNG policy for in-graph [`Op::RngNormal`](rlx_ir::Op::RngNormal) / [`Op::RngUniform`](rlx_ir::Op::RngUniform) nodes.
     pub rng: rlx_ir::RngOptions,
     /// Run dead-code elimination as part of compile. Default: true.
     pub dce: bool,
@@ -57,7 +57,7 @@ pub struct CompileOptions {
     /// Panic at compile time if fusion diagnostics report missed patterns.
     pub assert_fusion_clean: bool,
     /// Backend op claim set for backend-aware fusion + post-fusion
-    /// legalization. Set by [`Backend::compile`] implementations.
+    /// legalization. Set by `Backend::compile` implementations.
     pub supported_ops: Option<&'static [OpKind]>,
     /// When set, specialize symbolic dims before backend lowering.
     pub dim_binding: Option<rlx_ir::DimBinding>,
@@ -131,7 +131,7 @@ impl CompileOptions {
         }
     }
 
-    /// [`baseline`] plus Public/compile-layer `RLX_*` overlays from the registry.
+    /// `baseline` plus Public/compile-layer `RLX_*` overlays from the registry.
     pub fn from_env() -> Self {
         let mut opts = Self::baseline();
         opts.apply_env();
@@ -179,7 +179,7 @@ impl CompileOptions {
         self
     }
     /// Enable native low-precision GEMM for every 2-D matmul in the graph, in
-    /// the given element format + scale layout. Accepts any [`ScaledFormat`] via
+    /// the given element format + scale layout. Accepts any [`ScaledFormat`](rlx_ir::ScaledFormat) via
     /// [`ScaledQuantConfig`] — e.g. `ScaledQuantConfig::fp8_e4m3()`, or a
     /// parameterized `ScaledFormat::custom(3, 0)` (`f4e3m0`).
     pub fn scaled_quant(mut self, cfg: ScaledQuantConfig) -> Self {

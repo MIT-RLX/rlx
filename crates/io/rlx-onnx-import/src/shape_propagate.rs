@@ -361,6 +361,51 @@ fn conv_output_dims(
     } else {
         ws[0]
     };
+
+    // A genuine 2-D conv — rank-4 input AND a 2-D kernel — gets both spatial
+    // axes computed, per-axis. Everything below this point keeps only
+    // `xs.last()` and returns rank 3, which for NCHW silently collapses H to 1:
+    // a WeSpeaker 3x3 stride-1 pad-1 conv on `[1, 1, 80, 148]` came out as
+    // `[1, 32, 1, 148]`, and the whole ResNet then ran on a one-bin
+    // "spectrogram". Restricted to rank-4-input + rank-4-weight so the rank-3
+    // (Conv1d / BLC / NCL) heuristics below are untouched.
+    if xs.len() == 4 && ws.len() == 4 {
+        let attr_at = |name: &str, idx: usize| -> Option<usize> {
+            node.attrs
+                .get(name)
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(idx))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+        };
+        let mut out = vec![serde_json::json!(n), serde_json::json!(co)];
+        for axis in 0..2 {
+            let i = xs[2 + axis];
+            let k = ws[2 + axis];
+            let st = attr_at("strides", axis).unwrap_or(1).max(1);
+            // ONNX orders `pads` as [x1_begin, x2_begin, x1_end, x2_end].
+            let pb = attr_at("pads", axis).unwrap_or(0);
+            let pe = attr_at("pads", axis + 2).unwrap_or(pb);
+            let dil = attr_at("dilations", axis).unwrap_or(1).max(1);
+            // Same three cases as the rank-3 path below, applied per axis —
+            // including its deliberate stride-1 pass-through, which exists
+            // because the `explicit Pad → VALID conv` pattern leaves the pad
+            // out of the attrs and the real formula would wrongly shrink.
+            let o = if transpose {
+                rlx_ir::shape::conv_transpose2d_spatial_output(i, k, st, pb, dil, 0)
+            } else if st > 1 {
+                (i + pb + pe)
+                    .saturating_sub(dil * k.saturating_sub(1))
+                    .saturating_sub(1)
+                    / st
+                    + 1
+            } else {
+                i
+            };
+            out.push(serde_json::json!(o.max(1)));
+        }
+        return Some(out);
+    }
     let lo = if transpose {
         rlx_ir::shape::conv_transpose2d_spatial_output(
             li,

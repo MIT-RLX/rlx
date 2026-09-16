@@ -136,7 +136,8 @@ pub use rlx_fusion::{
     LowerScan, LowerSpectral, MarkElementwiseRegions, MissReason, MissedFusion, Pass,
     UnfuseElementwiseRegions, inline_if, inline_subgraph_into, maybe_unroll_scans,
     maybe_unroll_scans_budget, register_ir_pass, registered_ir_passes, run_passes,
-    run_registered_ir_passes, unfuse_fused_for_autodiff, unroll_scan, unroll_while,
+    run_registered_ir_passes, unfuse_fused_for_autodiff, unfuse_gated_delta_net_always,
+    unroll_scan, unroll_while,
 };
 
 #[cfg(feature = "training")]
@@ -168,10 +169,13 @@ pub use rlx_compile::{
     PrecisionPolicy, SharedWeightLayout, SpecializeParams, WeightSlot, analyze_dispatch,
     format_dispatch_report, format_legalize_error, fusion_limits_for_target, fusion_passes,
     fusion_passes_for_supported, inline_into, insert_q_dq, inspect_compiled, inspect_fusion,
-    inspect_pipeline, is_pure_view, legalize_for_backend, legalize_or_rewrite_for_backend,
-    legalize_or_rewrite_for_backend_with_config, legalize_or_rewrite_for_backend_with_dispatch,
-    lower_custom_ops, maybe_dump_pipeline, maybe_log_dispatch_report, plan_memory_backward,
-    plan_memory_f32_uniform, plan_memory_with_options, prepare_graph_for_backend_with_report,
-    promote_params_to_inputs, rewrite_for_backend, rewrite_for_backend_with_config,
-    rewrite_for_backend_with_dispatch, specialize_params, supported_for_target, supports_op,
+    inspect_pipeline, is_elidable_bank_transpose, is_elidable_bank_transpose_gated,
+    is_elidable_folded_transpose, is_elidable_folded_transpose_gated, is_elidable_matmul_transpose,
+    is_pure_view, legalize_custom_attention_mask, legalize_for_backend,
+    legalize_or_rewrite_for_backend, legalize_or_rewrite_for_backend_with_config,
+    legalize_or_rewrite_for_backend_with_dispatch, lower_custom_ops, maybe_dump_pipeline,
+    maybe_log_dispatch_report, plan_memory_backward, plan_memory_f32_uniform,
+    plan_memory_with_options, prepare_graph_for_backend_with_report, promote_params_to_inputs,
+    rewrite_for_backend, rewrite_for_backend_with_config, rewrite_for_backend_with_dispatch,
+    specialize_params, supported_for_target, supports_op,
 };

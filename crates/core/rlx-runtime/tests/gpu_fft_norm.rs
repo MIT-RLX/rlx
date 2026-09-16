@@ -18,6 +18,8 @@ use rlx_ir::FftNorm;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn const_f32(g: &mut Graph, xs: &[f32]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
     for &x in xs {
@@ -46,7 +48,7 @@ fn complex_block(n: usize) -> Vec<f32> {
 }
 
 fn assert_fft_norm_matches_cpu(device: Device, n: usize, norm: FftNorm, inverse: bool) {
-    if !rlx_runtime::is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip: {device:?} unavailable");
         return;
     }
@@ -73,7 +75,7 @@ fn assert_fft_norm_matches_cpu(device: Device, n: usize, norm: FftNorm, inverse:
 }
 
 fn assert_fft_matches_cpu(device: Device, n: usize) {
-    if !rlx_runtime::is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip: {device:?} unavailable");
         return;
     }
@@ -108,6 +110,7 @@ macro_rules! gpu_fft_norm_tests {
 
             #[test]
             fn forward_and_ortho_norm_pow2() {
+                let _gpu = common::serialize_gpu();
                 for &n in &[16usize, 64, 256] {
                     for norm in [FftNorm::Forward, FftNorm::Ortho] {
                         assert_fft_norm_matches_cpu($device, n, norm, false);
@@ -118,6 +121,7 @@ macro_rules! gpu_fft_norm_tests {
 
             #[test]
             fn non_pow2_host_fallback() {
+                let _gpu = common::serialize_gpu();
                 for &n in &[15usize, 12, 20] {
                     assert_fft_matches_cpu($device, n);
                 }
@@ -127,7 +131,7 @@ macro_rules! gpu_fft_norm_tests {
 }
 
 fn assert_fft_real_and_psd(device: Device) {
-    if !rlx_runtime::is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip: {device:?} unavailable");
         return;
     }
@@ -169,23 +173,27 @@ gpu_fft_norm_tests!(
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_fft_real_and_psd() {
+    let _gpu = common::serialize_gpu();
     assert_fft_real_and_psd(Device::Cuda);
 }
 
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_fft_real_and_psd() {
+    let _gpu = common::serialize_gpu();
     assert_fft_real_and_psd(Device::Rocm);
 }
 
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_fft_real_and_psd() {
+    let _gpu = common::serialize_gpu();
     assert_fft_real_and_psd(Device::Gpu);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_fft_real_and_psd() {
+    let _gpu = common::serialize_gpu();
     assert_fft_real_and_psd(Device::Metal);
 }

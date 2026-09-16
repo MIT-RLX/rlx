@@ -9,9 +9,12 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 #[test]
 fn metal_layernorm_encoder_rows() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let rows = 191usize;
@@ -51,7 +54,8 @@ fn metal_layernorm_encoder_rows() {
 
 #[test]
 fn metal_layernorm_small() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let rows = 4usize;

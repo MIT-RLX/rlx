@@ -24,11 +24,13 @@ use rlx_ir::op::{Op, ReduceOp};
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available};
 
+mod common;
+
 const F: DType = DType::F32;
 
 /// Default to whichever GPU backend this binary was built with.
 fn target() -> Device {
-    if let Ok(s) = std::env::var("RLX_PARITY_DEVICE") {
+    if let Some(s) = rlx_ir::env::var("RLX_PARITY_DEVICE") {
         if let Ok(d) = rlx_runtime::parse_device(&s) {
             return d;
         }
@@ -65,7 +67,7 @@ fn reduce_graph(dims: &[usize], axes: Vec<usize>, out: &[usize]) -> Graph {
 
 fn check(name: &str, dims: &[usize], axes: Vec<usize>, out: &[usize]) {
     let dev = target();
-    if dev == Device::Cpu || !is_available(dev) {
+    if dev == Device::Cpu || common::skip_unless(dev) {
         eprintln!("{name}: no GPU backend available — skipping");
         return;
     }
@@ -94,22 +96,26 @@ fn check(name: &str, dims: &[usize], axes: Vec<usize>, out: &[usize]) {
 
 #[test]
 fn reduce_axis0_rank2() {
+    let _gpu = common::serialize_gpu();
     // The shape reverse-mode AD emits for a bias gradient.
     check("axis0_rank2", &[4, 3], vec![0], &[3]);
 }
 
 #[test]
 fn reduce_mid_axis_rank3() {
+    let _gpu = common::serialize_gpu();
     check("mid_axis_rank3", &[2, 4, 3], vec![1], &[2, 3]);
 }
 
 #[test]
 fn reduce_leading_axis_block_rank3() {
+    let _gpu = common::serialize_gpu();
     check("leading_block_rank3", &[2, 4, 3], vec![0, 1], &[3]);
 }
 
 #[test]
 fn reduce_trailing_control() {
+    let _gpu = common::serialize_gpu();
     // Negative control: the shape the kernels natively implement.
     check("trailing_control", &[4, 3], vec![1], &[4]);
 }

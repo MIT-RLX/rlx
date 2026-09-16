@@ -22,26 +22,27 @@ use crate::kernels::{
     concat_kernel, conjugate_c64_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
     conv_transpose3d_kernel, conv1d_kernel, conv2d_backward_input_kernel,
     conv2d_backward_weight_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cum_scan_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_gemm_kernel,
-    dequant_matmul_mlx_gemv_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
-    dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel, expand_kernel,
-    fake_quantize_backward_kernel, fake_quantize_ema_kernel, fake_quantize_fixed_kernel,
-    fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
+    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    dequant_matmul_mlx_gemm_kernel, dequant_matmul_mlx_gemv_kernel, dequant_matmul_mlx_kernel,
+    dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel,
+    expand_kernel, fake_quantize_backward_kernel, fake_quantize_ema_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
     fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, fused_attn_kernel,
     fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
     fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_kernel,
-    group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
-    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
-    kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
+    gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_elements_kernel,
+    gather_kernel, gather_nd_kernel, group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel,
+    group_norm_bwd_input_kernel, group_norm_kernel, grouped_matmul_kernel, im2col_kernel,
+    interpolate3d_kernel, kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
     layer_norm_bwd_input_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
-    matmul_kernel, matmul_tma_kernel, matmul_wmma_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel, pool2d_kernel,
-    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
-    relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
+    matmul_kernel, matmul_kernel_tiled, matmul_tma_kernel, matmul_wmma_kernel,
+    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel,
+    pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
+    reduce_kernel, relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
     rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scatter_add_acc_kernel, scatter_add_zero_kernel, selective_scan_kernel, slice_kernel,
+    scatter_add_acc_kernel, scatter_add_zero_kernel, scatter_elements_kernel,
+    scatter_nd_reduce_kernel, selective_scan_kernel, slice_kernel,
     softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     unary_kernel, where_kernel,
@@ -50,6 +51,7 @@ use cudarc::cublas::{CudaBlas, sys as cublas_sys};
 use cudarc::cublaslt::{result as cublaslt_result, sys as cublaslt_sys};
 use cudarc::cudnn::{result as cudnn_result, sys as cudnn_sys};
 use cudarc::driver::{CudaContext, DevicePtrMut, LaunchConfig, PushKernelArg};
+use rlx_gpu_dispatch::indexing::KernelKind as IndexingNdKind;
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::{Graph, NodeId, Op};
 use rlx_opt::rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
@@ -60,12 +62,24 @@ use std::sync::{Arc, Mutex, Once};
 use super::*;
 
 impl CudaExecutable {
-    /// Fast path: positional inputs, D2H into [`Self::host_arena`], no per-output `Vec`.
+    /// Fast path: positional inputs, D2H into `Self::host_arena`, no per-output `Vec`.
     pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
         self.upload_slot_inputs(inputs);
         let _ = self.run_inner(&[]);
         self.pack_host_arena();
         &self.output_slots
+    }
+
+    /// `(steps marked static-once, skip armed)` — diagnostics for the
+    /// weight-pack skip.
+    ///
+    /// The two halves are independent: lowering can mark steps (`.0 > 0`) while
+    /// no executed path ever arms the flag (`.1 == false`), in which case the
+    /// optimisation is dead and the packs are rebuilt every run. `rlx-wgpu` was
+    /// in exactly that state — its re-bind guards passed only because nothing
+    /// was ever skipped — so this is asserted rather than assumed.
+    pub fn static_once_report(&self) -> (usize, bool) {
+        (self.static_once_steps.len(), self.static_once_done)
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
@@ -228,6 +242,18 @@ impl CudaExecutable {
             default_stream.clone()
         };
 
+        // Order this dispatch after any host→device param write that landed on
+        // a different stream. Without it, a `set_param` on the default stream
+        // races a dispatch on `segment_stream` — the arena bytes a replay reads
+        // could be half-updated, with nothing reporting an error. Cheap: one
+        // event wait, and only when a write actually happened since the last run.
+        if let Some(ev) = self.pending_host_write.take()
+            && let Err(e) = stream.wait(&ev)
+            && rlx_ir::env::flag("RLX_CUDA_INPUT_DIAG")
+        {
+            eprintln!("[cuda-param] host-write wait failed: {e}");
+        }
+
         self.stage_gpu_handle_inputs(&stream, inputs);
 
         // Copy inputs to device. Always done outside any graph capture
@@ -337,7 +363,7 @@ impl CudaExecutable {
         // Actually engaging capture requires the extra flag
         // `RLX_CUDA_SEGMENTED_CAPTURE_ENGAGE` (kept as an opt-in while it's
         // validated on real models). The foundation is now WORKING end-to-end
-        // (msi RTX 3080 Ti, cuBLAS + cuBLAS-free, capture+replay bit-exact):
+        // (RTX 3080 Ti / sm_86, cuBLAS + cuBLAS-free, capture+replay bit-exact):
         //   • dedicated non-null capture stream (the default stream is the
         //     uncapturable legacy null stream),
         //   • the run's I/O routed onto it,
@@ -587,6 +613,23 @@ impl CudaExecutable {
             }
             // Replay: steps inside an already-launched Gpu segment are skipped.
             if step_i < skip_until {
+                continue;
+            }
+            // A static weight pack (fused QKV / gate+up `Concat` over `Param`s)
+            // is invariant across runs — materialise it once, then skip.
+            //
+            // NOT while segmented capture is live. Capture records this run's
+            // launches and replay re-issues them wholesale, so a pack captured
+            // on run 1 replays forever regardless of this flag; worse, skipping
+            // during capture would record a graph that never builds the pack,
+            // and the first replay would read an unwritten slot. Capture and
+            // this skip are alternative ways to remove the same host cost, so
+            // deferring to capture is both safe and no loss.
+            if self.static_once_done
+                && !segmented_active
+                && rlx_opt::memory::static_weight_pack_skip_enabled()
+                && self.static_once_steps.contains(&step_i)
+            {
                 continue;
             }
             let step = &self.schedule[step_i];
@@ -1079,6 +1122,9 @@ impl CudaExecutable {
                     }
 
                     if matmul_parity_mode() {
+                        // Parity mode pins the DEFAULT tile on purpose: it is
+                        // the fixed reference schedule other paths are compared
+                        // against, so it must not follow the tuning table.
                         let kernel = matmul_kernel(&self.ctx);
                         let cfg = LaunchConfig {
                             grid_dim: ((*n).div_ceil(64), (*m).div_ceil(64), *batch),
@@ -1181,7 +1227,12 @@ impl CudaExecutable {
                     // the two cublasLt natively fuses; other acts (silu,
                     // sigmoid, etc.) fall through to the sgemm + epilogue
                     // kernel path.
-                    let try_cublaslt = self.blas_lt.is_some()
+                    // `RLX_CUDA_NO_CUBLAS` skips both vendor tiers so dense GEMM
+                    // lands on rlx's own tiled kernel — the A/B lever, and the
+                    // only way a tuning sweep can reach the tile it is tuning.
+                    let no_cublas = crate::runtime_config().no_cublas;
+                    let try_cublaslt = !no_cublas
+                        && self.blas_lt.is_some()
                         && self.blas_lt_workspace.is_some()
                         && cublaslt_act_supported(*act_id);
                     let used_cublaslt = if try_cublaslt {
@@ -1227,7 +1278,8 @@ impl CudaExecutable {
 
                     // Tier 2: cuBLAS sgemm via raw pointers (bypasses
                     // the borrow checker's same-buffer aliasing).
-                    let used_cublas = if let Some(blas) = self.blas.as_ref() {
+                    let used_cublas = if let Some(blas) = self.blas.as_ref().filter(|_| !no_cublas)
+                    {
                         let blas = blas.lock().unwrap();
                         let (arena_ptr_u64, _record) =
                             self.arena.f32_buf_mut().device_ptr_mut(&stream);
@@ -1370,11 +1422,42 @@ impl CudaExecutable {
                             }
                         }
                     } else {
-                        // Custom scalar kernel fallback: 64×64 block tile, 4×4 register tile.
-                        let kernel = matmul_kernel(&self.ctx);
+                        // Custom scalar kernel fallback. The tile is a data
+                        // lookup keyed by (arch, op, shape bucket) rather than
+                        // the historical single hardcoded 64×64×16 — untuned,
+                        // the table returns exactly that tile, so this is the
+                        // same schedule until a measurement says otherwise.
+                        let mut tile = match rlx_gpu_kernels::dispatch::resolve_matmul(
+                            crate::backend::gpu_arch(&self.ctx),
+                            *m as usize,
+                            *k as usize,
+                            *n as usize,
+                        ) {
+                            rlx_gpu_kernels::dispatch::Choice::MatmulTiled(t) => t,
+                            // The table is typed by op family, so a non-matmul
+                            // choice cannot arrive here; MatmulWmma is reachable
+                            // only via `use_wmma()` above, which already ran.
+                            _ => rlx_gpu_kernels::tiles::TileParams::DEFAULT_MATMUL,
+                        };
+                        // A tile the driver won't launch (register pressure)
+                        // degrades to the default rather than aborting: the
+                        // dispatch table is a performance hint, never a
+                        // correctness dependency.
+                        let tiled = matmul_kernel_tiled(&self.ctx, tile);
+                        if tiled.is_none() {
+                            log_fallback(
+                                "matmul.tile",
+                                format!("{} not launchable — using default tile", tile.label()),
+                            );
+                            tile = rlx_gpu_kernels::tiles::TileParams::DEFAULT_MATMUL;
+                        }
+                        let kernel = match tiled {
+                            Some(k) => k,
+                            None => matmul_kernel(&self.ctx),
+                        };
                         let cfg = LaunchConfig {
-                            grid_dim: ((*n).div_ceil(64), (*m).div_ceil(64), *batch),
-                            block_dim: (16, 16, 1),
+                            grid_dim: ((*n).div_ceil(tile.bn), (*m).div_ceil(tile.bm), *batch),
+                            block_dim: (tile.bdx, tile.bdy, 1),
                             shared_mem_bytes: 0,
                         };
                         let mut launcher = stream.launch_builder(&kernel.function);
@@ -2539,11 +2622,33 @@ impl CudaExecutable {
                         // (head_dim<=64) when the workload amortizes it. The
                         // d128 WMMA kernel is slower than scalar today, so auto
                         // never picks it — auto is always >= scalar.
+                        //
+                        // "Is this shape big enough for WMMA" is a TUNING
+                        // question, so it comes from the shape-keyed dispatch
+                        // table rather than one constant applied to every shape
+                        // on every arch. Untuned, the table's default is the
+                        // historical `work >= 12288`, exactly. Eligibility above
+                        // stays here — that is capability, not tuning.
                         AttentionVariant::Auto => {
-                            let work = *batch as u64 * *heads as u64 * seq_q_eff as u64;
-                            wmma_eligible
-                                && *head_dim <= 64
-                                && work >= crate::runtime_config().attention_wmma_min_work
+                            let cfg_min = crate::runtime_config().attention_wmma_min_work;
+                            let table_says_wmma =
+                                if cfg_min == rlx_gpu_kernels::dispatch::ATTENTION_WMMA_MIN_WORK {
+                                    matches!(
+                                        rlx_gpu_kernels::dispatch::resolve_attention(
+                                            crate::backend::gpu_arch(&self.ctx),
+                                            *batch as usize,
+                                            *heads as usize,
+                                            seq_q_eff as usize,
+                                        ),
+                                        rlx_gpu_kernels::dispatch::Choice::AttentionWmma
+                                    )
+                                } else {
+                                    // An explicit `RLX_CUDA_ATTENTION_WMMA_MIN_WORK`
+                                    // is an operator pinning the boundary for an A/B;
+                                    // it outranks the table.
+                                    *batch as u64 * *heads as u64 * seq_q_eff as u64 >= cfg_min
+                                };
+                            wmma_eligible && *head_dim <= 64 && table_says_wmma
                         }
                         AttentionVariant::Scalar | AttentionVariant::Row => false,
                     };
@@ -2562,8 +2667,25 @@ impl CudaExecutable {
                     // `attention_warp` is a drop-in with the identical
                     // parameter list that gives each row a 32-lane group.
                     // A/B escape hatch: RLX_CUDA_LEGACY_ATTENTION_ROW=1.
-                    let use_warp =
-                        use_row_final && !rlx_ir::env::flag("RLX_CUDA_LEGACY_ATTENTION_ROW");
+                    //
+                    // Which of the two runs is a per-shape TUNING question, so a
+                    // measured override in the dispatch table decides it; warp
+                    // is the default because it is the measured winner at decode.
+                    // Without this the table could name `AttentionRow` and be
+                    // silently ignored — a dead variant in a table is worse than
+                    // no table.
+                    let use_warp = use_row_final
+                        && !rlx_ir::env::flag("RLX_CUDA_LEGACY_ATTENTION_ROW")
+                        && !matches!(
+                            rlx_gpu_kernels::dispatch::resolve_attention(
+                                crate::backend::gpu_arch(&self.ctx),
+                                *batch as usize,
+                                *heads as usize,
+                                seq_q_eff as usize,
+                            ),
+                            rlx_gpu_kernels::dispatch::Choice::AttentionRow
+                                | rlx_gpu_kernels::dispatch::Choice::AttentionScalar
+                        );
                     let mut launcher = stream.launch_builder(match wmma_kind {
                         1 => &attention_wmma_kernel(&self.ctx).function,
                         2 => &attention_wmma_d128_kernel(&self.ctx).function,
@@ -3807,6 +3929,29 @@ impl CudaExecutable {
                         );
                     }
                 }
+                Step::FftQ {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_complex,
+                    inverse,
+                    norm_tag,
+                    scale_tag,
+                } => {
+                    let (buf, arena_size) = self.arena.f32_buf_and_size();
+                    crate::fft_host::run_fft1d_q(
+                        &stream,
+                        buf,
+                        arena_size,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_complex as usize,
+                        *inverse,
+                        *norm_tag,
+                        *scale_tag,
+                    );
+                }
                 Step::WelchPeaksGpu {
                     spec_off,
                     dst_off,
@@ -4509,9 +4654,172 @@ impl CudaExecutable {
                     crate::scan_host::run_host_op(&stream, buf, arena_size, desc);
                 }
                 Step::CpuIndexing { thunk } => {
+                    // Anything still here is a shape `plan_indexing` declined at
+                    // compile time (packed i64 indices, a CAS reduction, one of
+                    // the CPU-only ScatterElements branches). No on-device retry:
+                    // the decision was made once, on the schedule.
                     let (buf, arena_size) = self.arena.f32_buf_and_size();
-                    if !crate::scatter_nd_gpu::try_run(&self.ctx, &stream, buf, thunk) {
-                        crate::scan_host::run_indexing(&stream, buf, arena_size, thunk);
+                    crate::scan_host::run_indexing(&stream, buf, arena_size, thunk);
+                }
+                Step::IndexingNd {
+                    kind,
+                    n,
+                    data_off,
+                    idx_off,
+                    upd_off,
+                    dst_off,
+                    dst_len,
+                    prologue,
+                    meta_idx,
+                } => {
+                    // Deliberately NOT `scale(*n)`. The `meta` strides are baked
+                    // from the full shape, so shrinking only the thread count
+                    // would decompose flat positions against the wrong extents.
+                    // Running the full count instead writes a few slots past the
+                    // active prefix — slots the arena already owns and nothing
+                    // downstream reads — which costs work but cannot be wrong.
+                    if *n == 0 {
+                        continue;
+                    }
+                    let launch_1d = |threads: u32| -> LaunchConfig {
+                        let (grid, block) = dispatch_grid_1d(threads, 256);
+                        LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        }
+                    };
+
+                    // Scatter prologue: seed `dst` from `data` (and, for
+                    // ScatterElements, zero non-finite slots) before any update
+                    // lands. Gathers write every output slot, so they skip it.
+                    if let Some(p) = prologue
+                        && *dst_len > 0
+                    {
+                        let kernel = copy_sanitize_kernel(&self.ctx);
+                        let cfg = launch_1d(*dst_len);
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        launcher
+                            .arg(self.arena.f32_buf_mut())
+                            .arg(dst_len)
+                            .arg(data_off)
+                            .arg(dst_off)
+                            .arg(&p.src_len)
+                            .arg(&p.do_copy)
+                            .arg(&p.do_sanitize);
+                        unsafe {
+                            launcher
+                                .launch(cfg)
+                                .expect("rlx-cuda: indexing prologue launch failed");
+                        }
+                    }
+
+                    let meta = &self.meta_buffers[*meta_idx];
+                    match kind {
+                        IndexingNdKind::GatherNd {
+                            k,
+                            slice,
+                            tuples_per_batch,
+                            batch_stride,
+                        } => {
+                            let kernel = gather_nd_kernel(&self.ctx);
+                            let cfg = launch_1d(*n);
+                            let mut launcher = stream.launch_builder(&kernel.function);
+                            launcher
+                                .arg(self.arena.f32_buf_mut())
+                                .arg(n)
+                                .arg(data_off)
+                                .arg(idx_off)
+                                .arg(dst_off)
+                                .arg(k)
+                                .arg(slice)
+                                .arg(tuples_per_batch)
+                                .arg(batch_stride)
+                                .arg(meta);
+                            unsafe {
+                                launcher
+                                    .launch(cfg)
+                                    .expect("rlx-cuda: gather_nd launch failed");
+                            }
+                        }
+                        IndexingNdKind::GatherElements {
+                            rank,
+                            axis,
+                            axis_dim,
+                            data_len,
+                        } => {
+                            let kernel = gather_elements_kernel(&self.ctx);
+                            let cfg = launch_1d(*n);
+                            let mut launcher = stream.launch_builder(&kernel.function);
+                            launcher
+                                .arg(self.arena.f32_buf_mut())
+                                .arg(n)
+                                .arg(data_off)
+                                .arg(idx_off)
+                                .arg(dst_off)
+                                .arg(data_len)
+                                .arg(rank)
+                                .arg(axis)
+                                .arg(axis_dim)
+                                .arg(meta);
+                            unsafe {
+                                launcher
+                                    .launch(cfg)
+                                    .expect("rlx-cuda: gather_elements launch failed");
+                            }
+                        }
+                        IndexingNdKind::ScatterElements {
+                            rank,
+                            axis,
+                            reduction,
+                        } => {
+                            let red = reduction.code();
+                            let kernel = scatter_elements_kernel(&self.ctx);
+                            let cfg = launch_1d(*n);
+                            let mut launcher = stream.launch_builder(&kernel.function);
+                            launcher
+                                .arg(self.arena.f32_buf_mut())
+                                .arg(n)
+                                .arg(upd_off)
+                                .arg(idx_off)
+                                .arg(dst_off)
+                                .arg(dst_len)
+                                .arg(rank)
+                                .arg(axis)
+                                .arg(&red)
+                                .arg(meta);
+                            unsafe {
+                                launcher
+                                    .launch(cfg)
+                                    .expect("rlx-cuda: scatter_elements launch failed");
+                            }
+                        }
+                        IndexingNdKind::ScatterNd {
+                            k,
+                            slice,
+                            reduction,
+                        } => {
+                            let red = reduction.code();
+                            let kernel = scatter_nd_reduce_kernel(&self.ctx);
+                            let cfg = launch_1d(*n);
+                            let mut launcher = stream.launch_builder(&kernel.function);
+                            launcher
+                                .arg(self.arena.f32_buf_mut())
+                                .arg(n)
+                                .arg(idx_off)
+                                .arg(upd_off)
+                                .arg(dst_off)
+                                .arg(dst_len)
+                                .arg(k)
+                                .arg(slice)
+                                .arg(&red)
+                                .arg(meta);
+                            unsafe {
+                                launcher
+                                    .launch(cfg)
+                                    .expect("rlx-cuda: scatter_nd_reduce launch failed");
+                            }
+                        }
                     }
                 }
                 Step::SpdHost {
@@ -6324,6 +6632,8 @@ impl CudaExecutable {
                     head_dim,
                     n_rot,
                     cos_len,
+                    cos_row_stride,
+                    interleaved,
                 } => {
                     launch_rope_bwd(
                         &self.ctx,
@@ -6339,6 +6649,8 @@ impl CudaExecutable {
                         (*sin_byte_off / 4) as u32,
                         (*dx_byte_off / 4) as u32,
                         *cos_len,
+                        *cos_row_stride,
+                        *interleaved,
                     );
                 }
                 Step::CumsumBackward {
@@ -7762,6 +8074,17 @@ impl CudaExecutable {
                 e.0 += dt;
                 e.1 += 1;
             }
+        }
+        // Every static weight pack has now been launched for real, so later runs
+        // may skip re-launching them.
+        //
+        // Only on a non-capture run. `cudaStreamBeginCapture` RECORDS without
+        // EXECUTING, so a capture run leaves the packs unwritten — arming here
+        // would make the next run skip a pack that was never materialised and
+        // read an unwritten slot. In capture mode the replayed graph already
+        // contains the pack, so there is nothing to gain by arming anyway.
+        if !segmented_active && !self.static_once_done && !self.static_once_steps.is_empty() {
+            self.static_once_done = true;
         }
         // A capture open at the last step (a Gpu segment ending at `len`) has no
         // next iteration to close it — close it here.

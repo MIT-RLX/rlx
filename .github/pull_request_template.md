@@ -21,7 +21,7 @@ Closes #
 ## Backends & hardware touched
 
 <!-- Which backends does this affect, and what hardware did you actually run on?
-     e.g. Metal on M4 Pro, CUDA on RTX 3080 Ti (msi), CPU only.
+     e.g. Metal on M4 Pro, CUDA on RTX 3080 Ti, CPU only.
      Delete this whole section for changes that touch no backend (docs / tooling / CI). -->
 
 | Backend | Built | Ran tests | Hardware |

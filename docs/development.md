@@ -1,7 +1,8 @@
 # Development guide
 
-Day-to-day workflow for the RLX workspace. See also [`AGENTS.md`](../AGENTS.md) and
-[`llms.txt`](../llms.txt).
+Day-to-day workflow for the RLX workspace. See also [`llms.txt`](../llms.txt)
+for the workspace map, and [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the
+review and ground rules.
 
 ## Prerequisites
 

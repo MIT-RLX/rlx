@@ -38,7 +38,7 @@ fn wgpu_run(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 
 #[test]
 fn group_norm_backward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let (n, c, h, w, groups) = (1usize, 8usize, 4usize, 4usize, 2usize);
@@ -85,7 +85,7 @@ fn group_norm_backward_matches_cpu() {
 
 #[test]
 fn axial_rope2d_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let end_x = 2usize;
@@ -109,7 +109,7 @@ fn axial_rope2d_matches_cpu() {
 
 #[test]
 fn maxpool2d_backward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let n = 1usize;
@@ -137,7 +137,7 @@ fn maxpool2d_backward_matches_cpu() {
 
 #[test]
 fn softmax_ce_with_logits_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let n = 3usize;
@@ -159,7 +159,7 @@ fn softmax_ce_with_logits_matches_cpu() {
 
 #[test]
 fn softmax_ce_backward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let n = 2usize;
@@ -186,7 +186,7 @@ fn softmax_ce_backward_matches_cpu() {
 
 #[test]
 fn relu_backward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("relu_bwd");
@@ -206,7 +206,7 @@ fn relu_backward_matches_cpu() {
 
 #[test]
 fn activation_backward_silu_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::Activation;
@@ -227,7 +227,7 @@ fn activation_backward_silu_matches_cpu() {
 
 #[test]
 fn dense_solve_f32_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let n = 2usize;
@@ -249,7 +249,7 @@ fn dense_solve_f32_matches_cpu() {
 
 #[test]
 fn complex_norm_sq_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("cnorm");
@@ -269,7 +269,7 @@ fn complex_norm_sq_matches_cpu() {
 
 #[test]
 fn complex_norm_sq_backward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("cnorm_bwd");
@@ -289,7 +289,7 @@ fn complex_norm_sq_backward_matches_cpu() {
 
 #[test]
 fn conjugate_c64_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("conj");
@@ -308,7 +308,7 @@ fn conjugate_c64_matches_cpu() {
 
 #[test]
 fn softmax_non_last_axis_host_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("sm_mid");
@@ -326,7 +326,7 @@ fn softmax_non_last_axis_host_matches_cpu() {
 
 #[test]
 fn batch_norm_inference_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let n = 1usize;
@@ -366,7 +366,7 @@ fn batch_norm_inference_matches_cpu() {
 
 #[test]
 fn conv3d_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("conv3d_parity");
@@ -386,7 +386,7 @@ fn conv3d_matches_cpu() {
 
 #[test]
 fn conv_transpose3d_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("ct3d_parity");
@@ -406,7 +406,7 @@ fn conv_transpose3d_matches_cpu() {
 
 #[test]
 fn pool3d_avg_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("pool3d_avg");
@@ -433,7 +433,7 @@ fn pool3d_avg_matches_cpu() {
 
 #[test]
 fn fake_quantize_perbatch_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::{ScaleMode, SteKind};
@@ -461,7 +461,7 @@ fn fake_quantize_perbatch_matches_cpu() {
 
 #[test]
 fn fake_quantize_fixed_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::{ScaleMode, SteKind};
@@ -495,7 +495,7 @@ fn fake_quantize_fixed_matches_cpu() {
 
 #[test]
 fn fake_quantize_perbatch_channel_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::{ScaleMode, SteKind};
@@ -523,7 +523,7 @@ fn fake_quantize_perbatch_channel_matches_cpu() {
 
 #[test]
 fn scaled_matmul_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::{ScaleLayout, ScaledFormat};
@@ -544,7 +544,7 @@ fn scaled_matmul_matches_cpu() {
 
 #[test]
 fn fft_butterfly_stage_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let n_fft = 4u32;

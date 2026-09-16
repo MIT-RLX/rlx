@@ -30,7 +30,7 @@ pub fn find_param_nodes(g: &Graph, names: &[&str]) -> Result<Vec<NodeId>, GraphO
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphOptConfig {
     pub steps: u32,
-    /// Base Adam learning rate (see [`relative_lr`]).
+    /// Base Adam learning rate (see `relative_lr`).
     pub lr: f32,
     /// When true, each optimized coordinate is scaled by `max(|x|, lr_floor)`
     /// before the Adam update — useful when params span orders of magnitude

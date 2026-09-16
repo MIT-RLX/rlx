@@ -15,6 +15,8 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_sparse::SparseTensor;
 
+mod common;
+
 fn bytes_to_f64s(bytes: &[u8]) -> Vec<f64> {
     bytes
         .chunks_exact(8)
@@ -83,6 +85,7 @@ fn transpose_csr(
 
 #[test]
 fn lu_general_runs_on_metal_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     rlx_sparse::register();
     let (values, col_idx, row_ptr) = build_nonsym_4();
     let n = 4;
@@ -120,6 +123,7 @@ fn lu_general_runs_on_metal_and_matches_cpu() {
 
 #[test]
 fn gmres_runs_on_metal_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     rlx_sparse::register();
     let (values, col_idx, row_ptr) = build_nonsym_4();
     let n = 4;
@@ -159,6 +163,7 @@ fn gmres_runs_on_metal_and_matches_cpu() {
 
 #[test]
 fn values_grad_runs_on_metal_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     // Direct unit test for the values_grad op (rather than through
     // autodiff) — sidesteps Metal's F64-host-input gap which would
     // be required if we differentiated w.r.t. an Input. Both CPU

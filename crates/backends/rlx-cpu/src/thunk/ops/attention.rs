@@ -477,6 +477,9 @@ pub(crate) fn compile_rope(
             )
         };
         let cos_len = get_len(graph, node.inputs[1]);
+        // The table's own row width (see `Thunk::Rope::cos_row_stride`).
+        let cos_row_stride =
+            rlx_ir::shape::rope_table_stride(&graph.node(node.inputs[1]).shape, *n_rot) as u32;
         Thunk::Rope {
             src: node_offset(arena, node.inputs[0]),
             cos: node_offset(arena, node.inputs[1]),
@@ -488,6 +491,7 @@ pub(crate) fn compile_rope(
             head_dim: *head_dim as u32,
             n_rot: *n_rot as u32,
             cos_len: cos_len as u32,
+            cos_row_stride,
             // Default: source rows are tightly packed (rewritten
             // by the Narrow→Rope fusion pass below if Rope ends
             // up reading from a wider parent like QKV).
@@ -535,7 +539,12 @@ pub(crate) fn compile_rope_backward(
     rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
     rng: rlx_ir::RngOptions,
 ) -> Thunk {
-    let Op::RopeBackward { head_dim, n_rot } = &node.op else {
+    let Op::RopeBackward {
+        head_dim,
+        n_rot,
+        style,
+    } = &node.op
+    else {
         unreachable!()
     };
     {
@@ -555,6 +564,9 @@ pub(crate) fn compile_rope_backward(
         };
         let cos_shape = &graph.node(node.inputs[1]).shape;
         let cos_len = cos_shape.num_elements().unwrap();
+        // Mirrors `compile_rope`. Deriving it separately here would reintroduce
+        // the forward/backward split.
+        let cos_row_stride = rlx_ir::shape::rope_table_stride(cos_shape, *n_rot) as u32;
         Thunk::RopeBackward {
             dy: node_offset(arena, node.inputs[0]),
             cos: node_offset(arena, node.inputs[1]),
@@ -566,6 +578,8 @@ pub(crate) fn compile_rope_backward(
             head_dim: *head_dim as u32,
             n_rot: *n_rot as u32,
             cos_len: cos_len as u32,
+            cos_row_stride,
+            interleaved: matches!(style, rlx_ir::op::RopeStyle::GptJ),
         }
     }
 }
@@ -763,6 +777,7 @@ pub(crate) fn exec_rope(t: &Thunk, base: *mut u8) {
         head_dim,
         n_rot,
         cos_len,
+        cos_row_stride,
         src_row_stride,
         interleaved,
     } = t
@@ -782,13 +797,15 @@ pub(crate) fn exec_rope(t: &Thunk, base: *mut u8) {
         let nh = hs / dh;
         let cl = *cos_len as usize;
         let src_rs = *src_row_stride as usize;
-        // Number of rows in the RoPE table. The table stores exactly the
-        // rotation angles — `n_rot/2` (rot_half) per token, NOT head_dim/2.
-        // For PARTIAL rope (n_rot < head_dim, e.g. DeepSeek-V4 MLA: rope only
-        // the first 64 of 512 dims) using head_dim/2 as the row stride reads
-        // out of bounds for token positions ≥1 → arena-dependent garbage.
-        // (Full rope has n_rot == head_dim, so rot_half == head_dim/2: no change.)
-        let cos_rows = cl / rot_half.max(1);
+        // Row stride comes from the table's own last dimension. It used to be
+        // assumed equal to `rot_half`, which is right for a tightly packed
+        // table (DeepSeek-V4 MLA) and wrong for one allocated at `head_dim/2`
+        // and only partly used (Qwen3.5) — there it read the wrong row for
+        // every position past the first. The shared CUDA/ROCm kernel assumed
+        // the opposite, `head_dim/2`, so the two agreed only when
+        // `n_rot == head_dim` and silently disagreed under partial rotation.
+        let tab_stride = (*cos_row_stride as usize).max(1);
+        let cos_rows = cl / tab_stride;
         let per_token = cos_rows == b * s && cos_rows != s;
         unsafe {
             let x = sl(*src, base, b * s * src_rs);
@@ -806,7 +823,7 @@ pub(crate) fn exec_rope(t: &Thunk, base: *mut u8) {
                 for idx in off..off + cnt {
                     let bi = idx / s;
                     let si = idx % s;
-                    let tab_off = if per_token { idx } else { si } * rot_half;
+                    let tab_off = if per_token { idx } else { si } * tab_stride;
 
                     for hi in 0..nh {
                         let src_base = bi * s * src_rs + si * src_rs + hi * dh;
@@ -898,6 +915,8 @@ pub(crate) fn exec_rope_backward(t: &Thunk, base: *mut u8) {
         head_dim,
         n_rot,
         cos_len,
+        cos_row_stride,
+        interleaved,
     } = t
     else {
         unreachable!()
@@ -912,12 +931,22 @@ pub(crate) fn exec_rope_backward(t: &Thunk, base: *mut u8) {
             *cos_len as usize,
         );
         let nh = hs / dh;
-        // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
-        // token, NOT head_dim/2 (same convention as the forward kernel and
-        // Metal's `rope_bwd`). Striding by head_dim/2 under PARTIAL rope
-        // (n_rot < head_dim) overshoots into a later token's angles for every
-        // position ≥1. Full rope has n_rot == head_dim, so this is unchanged.
+        // `rot_half` is how many angles are *used* per position; `tab_stride` is
+        // how far apart positions sit in the table. They differ whenever the
+        // table is allocated at `head_dim/2` and only partly used under partial
+        // rotation (Qwen3.5), and coincide when it is packed tight (DeepSeek-V4
+        // MLA). Deriving the stride from `n_rot` — as this kernel used to —
+        // reads a later position's angles for every row past the first, so the
+        // adjoint stops being the transpose of the forward. Both come from the
+        // same place as `exec_rope` now.
         let rot_half = nr / 2;
+        let tab_stride = (*cos_row_stride as usize).max(1);
+        let cos_rows = cl / tab_stride;
+        // A per-token table has one row per (batch, position) rather than one
+        // per position shared across the batch — the forward distinguishes the
+        // two the same way, and disagreeing here would be the same class of bug
+        // one level up.
+        let per_token = cos_rows == b * s && cos_rows != s;
         unsafe {
             let dys = sl(*dy, base, b * s * hs);
             let cos_tab = sl(*cos, base, cl);
@@ -925,18 +954,21 @@ pub(crate) fn exec_rope_backward(t: &Thunk, base: *mut u8) {
             let out = sl_mut(*dx, base, b * s * hs);
             for bi in 0..b {
                 for si in 0..s {
-                    let tab_off = si.saturating_mul(rot_half) % cl.max(1);
-                    let cp = &cos_tab[tab_off..tab_off + rot_half.min(cl)];
-                    let sp = &sin_tab[tab_off..tab_off + rot_half.min(cl)];
+                    let row = if per_token { bi * s + si } else { si };
+                    let tab_off = row.saturating_mul(tab_stride) % cl.max(1);
+                    let take = rot_half.min(cl.saturating_sub(tab_off));
+                    let cp = &cos_tab[tab_off..tab_off + take];
+                    let sp = &sin_tab[tab_off..tab_off + take];
                     for hi in 0..nh {
                         let base_idx = bi * s * hs + si * hs + hi * dh;
-                        crate::training_bwd::rope_backward_row(
+                        crate::training_bwd::rope_backward_row_styled(
                             &dys[base_idx..base_idx + dh],
                             cp,
                             sp,
                             &mut out[base_idx..base_idx + dh],
                             dh,
                             nr,
+                            *interleaved,
                         );
                     }
                 }
@@ -945,6 +977,17 @@ pub(crate) fn exec_rope_backward(t: &Thunk, base: *mut u8) {
     }
 }
 
+/// Host-fallback `Op::RopeBackward` for GPU backends without a native kernel.
+///
+/// `cos_row_stride` is the cos/sin table's own last dimension — see
+/// [`crate::thunk::Thunk::Rope`]'s field of the same name. It is a parameter
+/// rather than something derived here because `head_dim/2` and `n_rot/2` are
+/// both wrong for half the models in use, and this routine cannot see the
+/// shape. Passing the wrong one reads a later position's angles for every row
+/// past the first, which the cross-backend parity tests cannot catch — CUDA,
+/// ROCm and wgpu all reach this same function, so they would agree with each
+/// other while all three disagreed with the forward.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn execute_rope_backward_f32(
     dy: usize,
     cos: usize,
@@ -956,6 +999,7 @@ pub unsafe fn execute_rope_backward_f32(
     head_dim: u32,
     n_rot: u32,
     cos_len: u32,
+    cos_row_stride: u32,
     base: *mut u8,
 ) {
     let (b, s, hs, dh, nr, cl) = (
@@ -967,16 +1011,21 @@ pub unsafe fn execute_rope_backward_f32(
         cos_len as usize,
     );
     let nh = hs / dh;
-    let tab_half = dh / 2;
+    let rot_half = nr / 2;
+    let tab_stride = (cos_row_stride as usize).max(1);
+    let cos_rows = cl / tab_stride;
+    let per_token = cos_rows == b * s && cos_rows != s;
     let dys = sl(dy, base, b * s * hs);
     let cos_tab = sl(cos, base, cl);
     let sin_tab = sl(sin, base, cl);
     let out = sl_mut(dx, base, b * s * hs);
     for bi in 0..b {
         for si in 0..s {
-            let tab_off = si.saturating_mul(tab_half) % cl.max(1);
-            let cp = &cos_tab[tab_off..tab_off + tab_half.min(cl)];
-            let sp = &sin_tab[tab_off..tab_off + tab_half.min(cl)];
+            let row = if per_token { bi * s + si } else { si };
+            let tab_off = row.saturating_mul(tab_stride) % cl.max(1);
+            let take = rot_half.min(cl.saturating_sub(tab_off));
+            let cp = &cos_tab[tab_off..tab_off + take];
+            let sp = &sin_tab[tab_off..tab_off + take];
             for hi in 0..nh {
                 let base_idx = bi * s * hs + si * hs + hi * dh;
                 crate::training_bwd::rope_backward_row(

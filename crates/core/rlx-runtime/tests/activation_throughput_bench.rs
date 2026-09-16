@@ -27,6 +27,8 @@ use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available, supports_graph};
 use std::time::Instant;
 
+mod common;
+
 #[allow(clippy::vec_init_then_push)]
 fn available_backends() -> Vec<Device> {
     let mut v: Vec<Device> = Vec::new();
@@ -57,6 +59,7 @@ fn act_graph(act: Activation, n: usize) -> Graph {
 #[test]
 #[ignore = "perf benchmark — run with --ignored --nocapture (see file header)"]
 fn activation_kernel_throughput() {
+    let _gpu = common::serialize_gpu();
     const N: usize = 1 << 23; // 8.4M f32 = 32 MB per buffer
     const ITERS: usize = 30;
     let bytes_per_iter = (N * 4 * 2) as f64; // one load + one store, f32

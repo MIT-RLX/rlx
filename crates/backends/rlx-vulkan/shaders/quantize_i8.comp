@@ -1,7 +1,20 @@
 #version 450
 // INT8 Quantize matching CUDA `quantize_i8` / rlx-cpu exec_quantize.
-// Affine table in push constants: affine[2*c]=scale bits, affine[2*c+1]=zp.
-// Max 13 channels (push-constant budget); larger chan_dim stays host.
+//
+// Per-channel affine table in push constants: channel `c` is
+// `affine[c >> 1][(c & 1) * 2]` = scale bits and `[... + 1]` = zero point.
+//
+// **The table is `uvec4`, not `uint[]`, and that is load-bearing.** naga's GLSL
+// front end lays a bare `uint x[N]` push-constant array out with std140's
+// 16-byte stride and 16-byte start alignment, while the Rust side packs it
+// tightly (std430). Every element then reads from the wrong offset: with one
+// channel, `scale` and `zero_point` both landed in the zero padding, so `x/s`
+// was `x/0` and this kernel wrote zeros for every input — silently, since a
+// zeroed i8 tensor is a perfectly plausible one. `uvec4` is 16-byte aligned
+// under every layout rule, so the two sides cannot disagree.
+//
+// Max 12 channels: 32 bytes of scalars + 6 uvec4 = the 128-byte budget exactly.
+// Larger `chan_dim` stays host.
 //
 // Packed i8 store is word-serial (one writer per uint) so naga can build
 // without `atomicCompSwap` (unsupported in the GLSL front-end). Threads with
@@ -14,15 +27,30 @@ layout(push_constant) uniform PC {
     uint inner;
     uint in_off;
     uint q_word;
-    uint affine[26];
+    // Explicit scalars, not `uint _pad[3]` — a bare array is the very thing
+    // this block exists to avoid. Pads the head to the uvec4 boundary.
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uvec4 affine[6];
 } pc;
+
+uint affine_at(uint i) { return pc.affine[i >> 2u][i & 3u]; }
 
 int quantize_one(uint i) {
     uint c = (pc.chan_dim <= 1u) ? 0u : ((i / pc.inner) % pc.chan_dim);
-    float s = uintBitsToFloat(pc.affine[2u * c]);
-    int zp = int(pc.affine[2u * c + 1u]);
-    float scaled = arena_load_f(pc.in_off + i) / s;
-    int v = int(q_round_half_away(scaled)) + zp;
+    float s = uintBitsToFloat(affine_at(2u * c));
+    int zp = int(affine_at(2u * c + 1u));
+    // `x * (1/s)`, not `x / s`: the CPU kernel computes `inv_scale` once and
+    // multiplies, and a divide differs by an ULP — enough to move a value
+    // across a rounding boundary and pick a different code.
+    float scaled = arena_load_f(pc.in_off + i) * (1.0 / s);
+    // Clamp in float before the int conversion: an input far outside the i8
+    // range would otherwise convert to something near INT_MAX and wrap when `zp`
+    // is added. +-1e9 is far outside the i8 range either way. (rlx-cpu hits the
+    // same hazard and uses `saturating_add`.)
+    float r = clamp(q_round_half_away(scaled), -1.0e9, 1.0e9);
+    int v = int(r) + zp;
     if (v < -128) { v = -128; }
     if (v > 127) { v = 127; }
     return v;

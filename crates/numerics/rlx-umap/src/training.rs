@@ -13,7 +13,7 @@
 //! | Global k-NN | Precomputed once on the training device (fused pairwise + `umap.knn`) |
 //!
 //! Use [`fit`] or [`Umap::fit`](crate::umap::Umap::fit) for the full pipeline including
-//! embedding extraction and [`FittedUmap`](crate::fitted::FittedUmap).
+//! embedding extraction and [`crate::fitted::FittedUmap`].
 
 use crossbeam_channel::Receiver;
 use rlx_driver::Device;

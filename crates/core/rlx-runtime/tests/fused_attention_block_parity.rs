@@ -25,7 +25,9 @@
 #![allow(dead_code)]
 
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, GraphDevices, is_available};
+use rlx_runtime::{Device, GraphDevices};
+
+mod common;
 
 /// Build an `Op::FusedAttentionBlock` graph.
 ///
@@ -198,7 +200,7 @@ fn rope_case(device: Device, tol: f32, label: &str) {
 /// Run the full suite (identity + bias + rope) on `device`, comparing against
 /// the closed form / native CPU. No-op when the device is unavailable.
 fn fab_suite(device: Device, tol: f32, label: &str) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip fused_attention_block_parity/{label} ({device:?} unavailable)");
         return;
     }

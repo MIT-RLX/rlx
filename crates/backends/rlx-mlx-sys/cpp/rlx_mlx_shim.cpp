@@ -423,6 +423,98 @@ int rlx_mlx_array_to_bytes(
     });
 }
 
+// Byte pointer to an array's evaluated buffer, or throw if the array is not
+// row-contiguous. Shared by the in-place row copy below; deliberately does NOT
+// call mc::contiguous() on the destination, because that would hand back a
+// pointer into a temporary and the write would land nowhere.
+static char* rlx_mlx_row_bytes(mc::array& a, const char* what) {
+    if (!a.flags().row_contiguous) {
+        throw std::runtime_error(std::string(what) + ": array is not row-contiguous");
+    }
+    a.eval();
+    // Drop the graph now that the data exists, so nothing can recompute this
+    // array and silently discard rows written into its buffer. MLX's caching
+    // appears to prevent that on its own (a write survives repeated reads on a
+    // still-attached `astype` node), but relying on that is relying on an
+    // implementation detail to protect an in-place write; detaching removes the
+    // question.
+    //
+    // Costs nothing: 11.3us/row with, 11.8us/row without (4096x1024 F32, warm).
+    // It is kept for the invariant, not for speed — an earlier note here
+    // credited it with closing a ~7x F16 gap, which was wrong twice over. There
+    // is no per-row dtype penalty at all: warm steady state is ~13us/row for an
+    // F32 leaf, an F16 leaf AND a cast-built F16 handle alike. The apparent gap
+    // was a ONE-TIME materialization (19.6ms to cast 4.2M f32 elements to f16 on
+    // the first write) divided across a 50-iteration loop that included it.
+    a.detach();
+    switch (a.dtype().val()) {
+        case mc::Dtype::Val::float32:  return reinterpret_cast<char*>(a.data<float>());
+        case mc::Dtype::Val::float16:  return reinterpret_cast<char*>(a.data<uint16_t>());
+        case mc::Dtype::Val::bfloat16: return reinterpret_cast<char*>(a.data<uint16_t>());
+        case mc::Dtype::Val::float64:  return reinterpret_cast<char*>(a.data<double>());
+        case mc::Dtype::Val::int8:     return reinterpret_cast<char*>(a.data<int8_t>());
+        case mc::Dtype::Val::int16:    return reinterpret_cast<char*>(a.data<int16_t>());
+        case mc::Dtype::Val::int32:    return reinterpret_cast<char*>(a.data<int32_t>());
+        case mc::Dtype::Val::int64:    return reinterpret_cast<char*>(a.data<int64_t>());
+        case mc::Dtype::Val::uint8:    return reinterpret_cast<char*>(a.data<uint8_t>());
+        case mc::Dtype::Val::uint32:   return reinterpret_cast<char*>(a.data<uint32_t>());
+        case mc::Dtype::Val::bool_:    return reinterpret_cast<char*>(a.data<bool>());
+        default:
+            throw std::runtime_error(std::string(what) + ": unsupported dtype");
+    }
+}
+
+// Copy `nelems` elements from `src` (at element offset `src_elem_off`) into
+// `dst`'s buffer (at element offset `dst_elem_off`), IN PLACE.
+//
+// This is the MLX form of the single-row KV write every other backend does
+// device-side (rlx-cuda / rlx-rocm D2D, rlx-metal / rlx-vulkan in-arena
+// memcpy). MLX's array API is value-semantic and has no in-place row write:
+// `mc::slice_update` returns a new array and its `eval_gpu` copies the WHOLE
+// input first (`copy_gpu(in, out, ...)` in backend/metal/indexing.cpp) with no
+// donation path, so expressing this as a slice_update would make the resident
+// cache O(capacity) per layer per token.
+//
+// Apple's unified memory is what makes the direct write legal: `data<T>()`
+// hands back a CPU-visible pointer to the very buffer the GPU reads, and the
+// `eval()` inside `rlx_mlx_row_bytes` is the barrier that makes any pending
+// GPU writes to it visible first.
+//
+// The caller owns the aliasing question: mutating this buffer is visible
+// through every mc::array sharing it, which is exactly the point for a
+// persistent KV handle and would be a bug for anything else.
+int rlx_mlx_array_copy_row_inplace(
+    rlx_mlx_array_t* dst, size_t dst_elem_off,
+    rlx_mlx_array_t* src, size_t src_elem_off,
+    size_t nelems)
+{
+    return guarded([&] {
+        if (nelems == 0) return;
+        mc::array& d = unwrap(dst);
+        mc::array& s = unwrap(src);
+        // Offsets arrive as ELEMENT counts and are scaled here, so the array's
+        // own itemsize is the only source of truth for the row stride. The
+        // Rust side does not carry a dtype for these handles, and a caller
+        // that assumed 4 bytes/element would stride an F16 cache by double.
+        if (d.dtype() != s.dtype()) {
+            throw std::runtime_error("copy_row_inplace: dtype mismatch");
+        }
+        const size_t esz = d.itemsize();
+        const size_t nbytes = nelems * esz;
+        const size_t dst_off = dst_elem_off * esz;
+        const size_t src_off = src_elem_off * esz;
+        if (dst_off + nbytes > d.nbytes()) {
+            throw std::runtime_error("copy_row_inplace: dst range out of bounds");
+        }
+        if (src_off + nbytes > s.nbytes()) {
+            throw std::runtime_error("copy_row_inplace: src range out of bounds");
+        }
+        char* dp = rlx_mlx_row_bytes(d, "copy_row_inplace dst");
+        char* sp = rlx_mlx_row_bytes(s, "copy_row_inplace src");
+        std::memcpy(dp + dst_off, sp + src_off, nbytes);
+    });
+}
+
 int rlx_mlx_array_shape(
     rlx_mlx_array_t* h,
     int* out_shape, size_t cap, size_t* out_ndim)

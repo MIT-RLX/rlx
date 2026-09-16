@@ -17,7 +17,7 @@ use crate::profile::CompileProfile;
 use crate::value::FlowValue;
 use crate::weight::WeightSource;
 
-/// Handles for a [`Op::GatedDeltaNet`] / carry scan.
+/// Handles for a [`Op::GatedDeltaNet`](rlx_ir::Op::GatedDeltaNet) / carry scan.
 #[derive(Debug, Clone, Copy)]
 pub struct GdnInputSlots {
     pub q: HirNodeId,
@@ -73,6 +73,20 @@ pub struct DecodeBindings {
     pub mask: Option<HirNodeId>,
     pub past_k: Vec<HirNodeId>,
     pub past_v: Vec<HirNodeId>,
+    /// How many rows of `past_k`/`past_v` hold real history.
+    ///
+    /// `None` — the default — means the tensor's axis-1 extent IS the history:
+    /// the cache is exactly as long as the tokens it holds, and a new step has
+    /// to `concat` a row onto it.
+    ///
+    /// `Some(n)` means the caller declared the caches with SPARE CAPACITY —
+    /// `[batch, cap, kv_dim]` holding `n` real rows, `cap > n` — so a step can
+    /// write row `n` in place (`Op::KvAppend`) instead of copying the whole
+    /// cache. There is no way to infer this: a capacity-shaped cache and a
+    /// history-shaped one are the same tensor, and guessing wrong writes the
+    /// new token over the last real row and returns a prefix one row short,
+    /// which is wrong logits with nothing to catch it. So the caller states it.
+    pub past_len: Option<usize>,
 }
 
 /// Internal builder context. Blocks emit through this — tier-2 via [`crate::escape::Emit`].
@@ -317,9 +331,9 @@ impl FlowCtx<'_> {
     }
 
     /// Resolve a projection weight for a hand-rolled [`HirMut`] block (see
-    /// [`LinearWeight`]). Mirrors [`Self::linear`]'s packed dispatch: if the
+    /// `LinearWeight`). Mirrors [`Self::linear`]'s packed dispatch: if the
     /// [`WeightSource`] hands out a quant blob for `key`, register the U8 param
-    /// and return [`LinearWeight::Packed`] (emit becomes a fused
+    /// and return `LinearWeight::Packed` (emit becomes a fused
     /// `DequantMatMul`); otherwise load a dense F32/F16 param (`dtype`,
     /// `transpose`). F32-only sources (default `take_packed` → `None`) always
     /// take the dense branch, so non-packed builds are byte-for-byte unchanged.
@@ -357,7 +371,7 @@ impl FlowCtx<'_> {
     /// hidden) into ONE `DequantMatMul` — one GEMV dispatch instead of N, cutting
     /// per-token kernel launches on the decode path. The GGUF blobs are
     /// `[out_i, in_dim]` row-major, so the fused weight is just their bytes
-    /// concatenated (`out = Σ out_i`). Returns the combined [`LinearWeight`] plus
+    /// concatenated (`out = Σ out_i`). Returns the combined `LinearWeight` plus
     /// each part's `out_dim` (to `narrow_`-split the result). Returns `None` when
     /// the weights are not packed — `take_packed` on an F32 source yields `None`
     /// WITHOUT consuming, so the caller safely falls back to per-key `resolve_linear`.

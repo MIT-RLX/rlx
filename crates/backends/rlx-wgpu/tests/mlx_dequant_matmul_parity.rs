@@ -23,7 +23,7 @@ fn assert_close(cpu: &[f32], gpu: &[f32], label: &str) {
 }
 
 fn run_affine(m: usize, k: usize, n: usize, bits: u8, group_size: u32) {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;
     }
@@ -82,7 +82,7 @@ fn run_affine(m: usize, k: usize, n: usize, bits: u8, group_size: u32) {
 }
 
 fn run_mxfp(m: usize, k: usize, n: usize, group_size: u32, mxfp8: bool) {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         return;
     }
     let gs = group_size as usize;

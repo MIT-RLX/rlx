@@ -45,7 +45,29 @@ impl Drop for RocmContext {
     }
 }
 
-static CTX: OnceLock<Option<Arc<RocmContext>>> = OnceLock::new();
+/// Cached ROCm context.
+///
+/// A `Mutex<Option<..>>` rather than a `OnceLock<Option<..>>`, and the
+/// difference is load-bearing. `OnceLock` caches the FIRST result forever,
+/// including a failure — so a single unlucky probe permanently marks ROCm
+/// unavailable for the whole process.
+///
+/// That is not hypothetical. AMD GPUs runtime-suspend when idle
+/// (`rocm-smi`: "AMD GPU device(s) is/are in a low-power state"), and a probe
+/// against a suspended device fails. On the MI100 rig this made an entire
+/// 57-test ROCm suite report "no rocm device — skipping" while `rocminfo`
+/// listed four healthy HSA agents seconds later. The hardware was fine; the
+/// first probe lost a race with the power state and the answer was frozen.
+///
+/// Success is cached; failure is not.
+static CTX: Mutex<Option<Arc<RocmContext>>> = Mutex::new(None);
+
+/// Set once when `libamdhip64` cannot be loaded at all.
+///
+/// That failure genuinely cannot change within a process, so it IS worth
+/// caching — otherwise every `is_available()` on a machine with no ROCm pays
+/// for a failed `dlopen`.
+static RUNTIME_MISSING: OnceLock<bool> = OnceLock::new();
 static BLAS: OnceLock<Option<Arc<Mutex<HipblasContext>>>> = OnceLock::new();
 static BLAS_LT: OnceLock<Option<Arc<HipblasLtContext>>> = OnceLock::new();
 static DNN: OnceLock<Option<Arc<MiopenContext>>> = OnceLock::new();
@@ -54,36 +76,91 @@ static DNN: OnceLock<Option<Arc<MiopenContext>>> = OnceLock::new();
 /// a default stream. Returns `None` cleanly on hosts without HIP
 /// (libloading fails to find `libamdhip64`) or when device 0 isn't
 /// present.
+///
+/// **Retries after a failure.** See `CTX`: a device that is merely
+/// runtime-suspended will answer on a later call, and the first call is often
+/// what wakes it.
 pub fn rocm_context() -> Option<Arc<RocmContext>> {
-    CTX.get_or_init(|| {
-        let runtime = HipRuntime::load()?;
-        unsafe {
-            (runtime.hip_init)(0).ok().ok()?;
-            let mut count: i32 = 0;
-            (runtime.hip_get_device_count)(&mut count).ok().ok()?;
-            if count <= 0 {
-                return None;
-            }
+    if *RUNTIME_MISSING.get_or_init(|| false) {
+        return None;
+    }
+    let mut guard = CTX.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ctx) = guard.as_ref() {
+        return Some(ctx.clone());
+    }
+    let built = build_context();
+    if built.is_some() {
+        *guard = built.clone();
+    }
+    built
+}
 
-            let mut device: i32 = 0;
-            (runtime.hip_device_get)(&mut device, 0).ok().ok()?;
-
-            let mut ctx: HipCtx = ptr::null_mut();
-            (runtime.hip_ctx_create)(&mut ctx, 0u32 as c_uint, device)
-                .ok()
-                .ok()?;
-
-            let mut stream: HipStream = ptr::null_mut();
-            (runtime.hip_stream_create)(&mut stream).ok().ok()?;
-
-            Some(Arc::new(RocmContext {
-                runtime,
-                ctx,
-                default_stream: stream,
-            }))
+/// One attempt at bringing up HIP. Separated from the caching so the retry
+/// policy is visible in one place.
+fn build_context() -> Option<Arc<RocmContext>> {
+    let Some(runtime) = HipRuntime::load() else {
+        // Only this failure is permanent.
+        let _ = RUNTIME_MISSING.set(true);
+        return None;
+    };
+    unsafe {
+        if (runtime.hip_init)(0).ok().is_err() {
+            warn_transient("hipInit failed");
+            return None;
         }
-    })
-    .clone()
+        let mut count: i32 = 0;
+        if (runtime.hip_get_device_count)(&mut count).ok().is_err() {
+            warn_transient("hipGetDeviceCount failed");
+            return None;
+        }
+        if count <= 0 {
+            // Reported, not silent: zero devices on a machine that has them is
+            // the suspended-device symptom, and a silent skip is how it went
+            // unnoticed for a full test suite.
+            warn_transient("hipGetDeviceCount returned 0 devices");
+            return None;
+        }
+
+        let mut device: i32 = 0;
+        if (runtime.hip_device_get)(&mut device, 0).ok().is_err() {
+            warn_transient("hipDeviceGet(0) failed");
+            return None;
+        }
+
+        let mut ctx: HipCtx = ptr::null_mut();
+        if (runtime.hip_ctx_create)(&mut ctx, 0u32 as c_uint, device)
+            .ok()
+            .is_err()
+        {
+            warn_transient("hipCtxCreate failed");
+            return None;
+        }
+
+        let mut stream: HipStream = ptr::null_mut();
+        if (runtime.hip_stream_create)(&mut stream).ok().is_err() {
+            warn_transient("hipStreamCreate failed");
+            let _ = (runtime.hip_ctx_destroy)(ctx);
+            return None;
+        }
+
+        Some(Arc::new(RocmContext {
+            runtime,
+            ctx,
+            default_stream: stream,
+        }))
+    }
+}
+
+/// A recoverable bring-up failure. Printed under `RLX_VERBOSE` so a suite that
+/// skips every ROCm test can be told apart from one that had no ROCm to begin
+/// with.
+fn warn_transient(what: &str) {
+    if rlx_ir::env::flag("RLX_VERBOSE") {
+        eprintln!(
+            "rlx-rocm: {what} — treating ROCm as unavailable for now and RETRYING on the \
+             next call (an idle AMD GPU can be runtime-suspended)"
+        );
+    }
 }
 
 /// hipBLAS handle bound to the default stream. Wrapped in a Mutex

@@ -85,7 +85,7 @@ runner = rlx.GraphDevices(g, policy=rlx.DevicePolicy.only(["cpu", "metal"]))
 router = rlx.DeviceRouter(g, policy=rlx.DevicePolicy.from_env())
 ```
 
-Full reference: [`docs/backend-selection.md`](../../docs/backend-selection.md).
+Full reference: [`docs/backend-selection.md`](../../../../docs/backend-selection.md).
 
 Tests: `pytest tests/test_graph_devices.py`.
 
@@ -109,7 +109,7 @@ rlx.convert_to_gguf("in.safetensors", "out.gguf", "Q4_K", architecture="llama")
 ```
 
 Tests: `tests/test_gguf_quantize.py`, `test_gguf_file.py`, `test_gguf_convert.py`.
-Runtime dequant on Metal / CUDA / WGPU: [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+Runtime dequant on Metal / CUDA / WGPU: [docs/gguf-backend-paths.md](../../../../docs/gguf-backend-paths.md).
 
 ## License
 

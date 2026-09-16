@@ -892,7 +892,7 @@ fn main() {
                 let upd = g.input("upd", Shape::new(&[num_updates, trailing], f));
                 let idx = g.input("idx", Shape::new(&[num_updates], f));
                 let y = g.add_node(
-                    Op::ScatterAdd,
+                    Op::ScatterAdd { axis: 0 },
                     vec![upd, idx],
                     Shape::new(&[out_dim, trailing], f),
                 );

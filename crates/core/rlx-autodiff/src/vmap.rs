@@ -452,12 +452,16 @@ fn vmap_op(
         // a flat updates list, so as long as updates and indices are
         // batched on axis 0 and the output's leading dim is B, the
         // executor handles per-batch slicing via the scatter indices.
-        Op::ScatterAdd => {
+        Op::ScatterAdd { .. } => {
             let updates = lift_to_batched(out, new_inputs[0], batched, batch_size);
             let indices = lift_to_batched(out, new_inputs[1], batched, batch_size);
             batched.insert(updates);
             batched.insert(indices);
-            out.add_node(Op::ScatterAdd, vec![updates, indices], batched_shape())
+            out.add_node(
+                Op::ScatterAdd { axis: 0 },
+                vec![updates, indices],
+                batched_shape(),
+            )
         }
 
         Op::ScatterNd { reduction } => {

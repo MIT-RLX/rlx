@@ -75,7 +75,7 @@ let mut router = DeviceRouter::from_env(g)?;
 let (device, out) = router.run(&inputs, None)?;
 ```
 
-See [`docs/backend-selection.md`](../docs/backend-selection.md).
+See [`docs/backend-selection.md`](../../docs/backend-selection.md).
 
 ## Prelude + namespaces
 

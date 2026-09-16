@@ -1,0 +1,31 @@
+# RLX — versatile ML compiler + runtime.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "rlx-fem"
+version.workspace       = true
+edition.workspace       = true
+rust-version.workspace  = true
+description = "Nonlinear scalar P1 finite elements on triangles — field-dependent coefficient, flux source, tied/periodic degrees of freedom, damped Newton."
+authors.workspace       = true
+license.workspace       = true
+keywords = ["fem", "finite-element", "poisson", "newton", "rlx"]
+categories.workspace    = true
+readme                  = "README.md"
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+
+[features]
+# The solver core has no rlx dependencies and builds under
+# `--no-default-features`, the same layering `rlx-geo` uses for its geometry
+# core. There is nothing here that needs a graph runtime to be useful.
+default = []
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

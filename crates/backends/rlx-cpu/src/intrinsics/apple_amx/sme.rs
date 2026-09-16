@@ -36,7 +36,7 @@
 //! IS the vendor-tuned AMX/SME path — see [`super::dense`]); it exists as the
 //! substrate for the int8/bf16 SME kernels (where there is no vendor matmul)
 //! and for the regimes where a lean kernel avoids vendor per-call overhead. It
-//! stays opt-in ([[feedback_perf_is_north_star]]).
+//! stays opt-in: it must not displace the vendor path by default.
 //!
 //! # Portability
 //!
@@ -136,12 +136,12 @@ pub fn is_available() -> bool {
 
 /// Whether `sgemm_auto` should route through the SME kernel. Requires SME2
 /// ([`is_available`]) **and** `RLX_CPU_SME=1`. Opt-in is deliberate: this does
-/// not beat Accelerate for dense f32 ([[feedback_perf_is_north_star]]).
+/// not beat Accelerate for dense f32, and the fastest path per backend wins.
 pub fn dispatch_enabled() -> bool {
     is_available()
         && matches!(
-            std::env::var("RLX_CPU_SME").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
+            rlx_ir::env::var("RLX_CPU_SME").as_deref(),
+            Some("1") | Some("on") | Some("true")
         )
 }
 
@@ -149,12 +149,12 @@ pub fn dispatch_enabled() -> bool {
 /// Requires int8 SME ([`is_available_i8`]) + `RLX_CPU_SME_W8A8=1`. Opt-in is
 /// mandatory: it quantizes activations to int8 (a lossier W8A8 mode than the
 /// f32-activation oracle), so it must never be silently substituted
-/// ([[feedback_perf_is_north_star]]).
+/// for the exact one.
 pub fn w8a8_dispatch_enabled() -> bool {
     is_available_i8()
         && matches!(
-            std::env::var("RLX_CPU_SME_W8A8").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
+            rlx_ir::env::var("RLX_CPU_SME_W8A8").as_deref(),
+            Some("1") | Some("on") | Some("true")
         )
 }
 
@@ -162,8 +162,8 @@ pub fn w8a8_dispatch_enabled() -> bool {
 /// per call (tile packing + one `smstart`/`smstop` streaming-mode transition per
 /// 32×32 block), so below a size threshold the scalar/NEON path wins even on
 /// M4+. This gates the *already opt-in* fast paths so enabling them can never
-/// regress tiny matmuls — a fast path that isn't fast for this shape falls back
-/// ([[feedback_perf_is_north_star]]). Thresholds from `sme_lowprec_throughput_report`.
+/// regress tiny matmuls — a fast path that isn't fast for this shape falls
+/// back to the path that is. Thresholds from `sme_lowprec_throughput_report`.
 pub fn worth_sme(m: usize, k: usize, n: usize) -> bool {
     // Need enough K to amortize the mode switch, an output big enough that
     // packing overhead is a small fraction of the work, AND enough rows (`m`)
@@ -878,12 +878,12 @@ pub fn is_available_bf16() -> bool {
 
 /// Whether `sgemm_auto` should route through the native SME bf16 kernel.
 /// Requires bf16 SME ([`is_available_bf16`]) + `RLX_CPU_SME_BF16=1`. Opt-in:
-/// f32→bf16 downcast is lossy ([[feedback_perf_is_north_star]]).
+/// the f32→bf16 downcast is lossy, so it never substitutes silently.
 pub fn bf16_dispatch_enabled() -> bool {
     is_available_bf16()
         && matches!(
-            std::env::var("RLX_CPU_SME_BF16").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
+            rlx_ir::env::var("RLX_CPU_SME_BF16").as_deref(),
+            Some("1") | Some("on") | Some("true")
         )
 }
 

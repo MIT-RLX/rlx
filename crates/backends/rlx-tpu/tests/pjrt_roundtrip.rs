@@ -21,7 +21,7 @@ fn skip_without_plugin() -> bool {
         eprintln!("[pjrt_roundtrip] LIBTPU_PATH not set — skipping");
         return true;
     }
-    if !rlx_tpu::is_available() {
+    if rlx_ir::env::skip_unless_device("tpu", true, rlx_tpu::is_available()) {
         eprintln!(
             "[pjrt_roundtrip] LIBTPU_PATH set but plugin failed to \
                    initialize — skipping"

@@ -56,7 +56,7 @@ impl TransportBackend {
         }
     }
 
-    /// Canonical lowercase name — the inverse of [`parse`](Self::parse),
+    /// Canonical lowercase name — the inverse of `parse`,
     /// suitable for writing back into a `hosts.json`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -182,7 +182,7 @@ impl DistConfig {
         let hostfile = Hostfile::from_path(hostfile_path)?;
         let rank = match rank {
             Some(r) => r,
-            None => std::env::var("RLX_RANK")
+            None => rlx_ir::env::var("RLX_RANK")
                 .context("rank not given and RLX_RANK unset")?
                 .parse()
                 .context("RLX_RANK is not a u32")?,

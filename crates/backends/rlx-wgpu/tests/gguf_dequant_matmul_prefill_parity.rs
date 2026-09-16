@@ -14,7 +14,7 @@ fn run_case(
     k: usize,
     n: usize,
 ) -> Option<f32> {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return None;
     }
@@ -220,7 +220,7 @@ fn pack_fv5_block(codes: &[i8], s_lo: f32, s_hi: f32) -> Vec<u8> {
 // FV5 has no float quantizer (packs are made offline), so we pack directly.
 #[test]
 fn wgpu_fv5_dequant_matmul_prefill_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;
     }

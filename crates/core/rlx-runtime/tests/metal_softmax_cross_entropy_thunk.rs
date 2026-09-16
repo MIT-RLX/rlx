@@ -13,6 +13,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const N: usize = 6;
 const C: usize = 7;
 
@@ -60,6 +62,7 @@ fn ref_loss(logits: &[f32], targets: &[f32]) -> Vec<f32> {
 
 #[test]
 fn metal_sce_msl_thunk_kernel_matches_reference() {
+    let _gpu = common::serialize_gpu();
     // Force the thunk path so the native MSL kernel runs (not MPSGraph).
     rlx_ir::env::set("RLX_DISABLE_MPSGRAPH", "1");
 

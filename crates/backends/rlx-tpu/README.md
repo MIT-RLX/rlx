@@ -3,13 +3,13 @@
 Google TPU backend for RLX. Drives `libtpu.so` (the same library JAX
 and PyTorch-XLA dlopen) directly from Rust — no Python.
 
-## Status: full **153/`OpKind`** claim parity with CUDA/ROCm; off-TPU numerical + parse validation in Docker
+## Status: **163/187** `OpKind`s claimed; off-TPU numerical + parse validation in Docker
 
 Compiles on any host. `is_available()` returns true iff a libtpu /
 libpjrt-compatible plugin is on the loader path **and**
 `Plugin_Initialize` + `Client_Create` succeed. `TpuExecutable::compile`
 emits HLO and calls `PJRT_Client_Compile`; `run` executes through
-`PJRT_LoadedExecutable_Execute`. See [`docs/op-coverage.md`](../../docs/op-coverage.md).
+`PJRT_LoadedExecutable_Execute`. See [`docs/op-coverage.md`](../../../docs/op-coverage.md).
 
 ## How it works
 
@@ -136,7 +136,7 @@ Tier-3 ops (all lowered, full parity with rlx-cuda / rlx-rocm):
   - **GGUF** (`scheme.is_gguf()`): host-dequant at HLO emit via
     `rlx_gguf`, embed f32 constant, `dot_general`. Requires `Op::Constant`
     weights; runtime `Param` reload is not supported. See
-    [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+    [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 - `QMatMul` / `QConv2d` — int8 inputs promoted to s32, `subtract`
   zero-points, `dot`/`convolution`, `add` bias, `multiply` by mult,
   `round-nearest-even`, `add` out_zp, clamp to [-128, 127], `convert`

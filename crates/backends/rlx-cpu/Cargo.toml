@@ -83,6 +83,10 @@ gemm = { version = "0.19", optional = true }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 serde = { version = "1", features = ["derive"] }
+# Oracle test only: `tests/gpu_indexing_plan_parity.rs` replays the GPU indexing
+# kernels' addressing (planned in rlx-gpu-dispatch) against the CPU kernels here.
+# rlx-gpu-dispatch is dependency-free, so this adds nothing to the build graph.
+rlx-gpu-dispatch = { workspace = true }
 
 # ── Snippet micro-benches (plan #52) ──────────────────────────
 # Pattern: one .rs per kernel, cargo bench runs the lot.
@@ -113,3 +117,8 @@ harness = false
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["splat"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

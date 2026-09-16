@@ -137,6 +137,13 @@ pub enum QuantScheme {
     /// Neutrino's untied int8 `token_embd` / `output` (lm_head).
     /// See `rlx_gguf::fv5_dequant`.
     GgufFV5B,
+    /// Doses AI Pestle exact ternary (`mortar.cpp` fork, ggml type 143):
+    /// four bf16 scales — one per group of 8 — + 32×2-bit codes
+    /// → `w = (q−1)·d[j/8]`, three values `{0, ±d}`. 32 / 16 bytes
+    /// (4 bpw). Pestle's untied `token_embd` / `output` (lm_head); its
+    /// linears are factorized [`Self::GgufQ2_0`] pairs instead.
+    /// See `rlx_gguf::g8_dequant`.
+    GgufG8_0,
 }
 
 /// Single source of truth for GGUF → GPU `dequant_gguf` scheme ids.
@@ -224,6 +231,7 @@ impl QuantScheme {
             Self::GgufQ2_0 => 21, // 34 bytes / 128 elems × 8 = 2.125 bpe
             Self::GgufFV5 => 32,  // 104 bytes / 256 elems × 8 = 3.25 bpe
             Self::GgufFV5B => 81, // 260 bytes / 256 elems × 8 = 8.125 bpe
+            Self::GgufG8_0 => 40, // 16 bytes / 32 elems × 8 = 4.0 bpe
         }
     }
 
@@ -263,6 +271,7 @@ impl QuantScheme {
         (GgufQ2_0, 25),
         (GgufFV5, 26),
         (GgufFV5B, 27),
+        (GgufG8_0, 28),
     }
 
     /// True if this scheme requires a per-block scale tensor on the side.
@@ -374,6 +383,7 @@ impl QuantScheme {
             Self::GgufNVFP4 => 16,
             Self::GgufQ1_0 => 128,
             Self::GgufQ2_0 => 128,
+            Self::GgufG8_0 => 32,
             _ => 0,
         }
     }
@@ -409,6 +419,7 @@ impl QuantScheme {
             Self::GgufQ2_0 => 34,  // Metal fused Q2_0 block (128 elems)
             Self::GgufFV5 => 104,  // f32 s_lo + f32 s_hi + 3×32B planes (256 elems)
             Self::GgufFV5B => 260, // f32 s + 256 int8 (256 elems)
+            Self::GgufG8_0 => 16,  // 4 bf16 scales + 32×2-bit codes (32 elems)
             _ => 0,
         }
     }
@@ -448,6 +459,7 @@ impl QuantScheme {
                 | Self::GgufQ2_0
                 | Self::GgufFV5
                 | Self::GgufFV5B
+                | Self::GgufG8_0
         )
     }
 }
@@ -495,6 +507,7 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufQ2_0 => write!(f, "gguf_q2_0"),
             Self::GgufFV5 => write!(f, "gguf_fv5"),
             Self::GgufFV5B => write!(f, "gguf_fv5b"),
+            Self::GgufG8_0 => write!(f, "gguf_g8_0"),
         }
     }
 }
@@ -982,7 +995,7 @@ mod tests {
     #[test]
     fn gpu_dequant_scheme_id_is_stable() {
         use QuantScheme::*;
-        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 28);
+        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 29);
         for &(scheme, id) in QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS {
             assert_eq!(scheme.gpu_dequant_scheme_id(), Some(id), "{scheme:?}");
             assert_eq!(

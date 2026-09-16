@@ -3,7 +3,7 @@
 Apple **CoreML / Neural Engine (ANE)** backend for RLX.
 
 GGUF on-device dequant, hybrid host segments, and env toggles:
-[docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md) (ANE section).
+[docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) (ANE section).
 
 It lowers an RLX IR graph to a CoreML **ML Program** (the MIL dialect),
 serialises it into a `.mlpackage`, and runs it through `CoreML.framework`.

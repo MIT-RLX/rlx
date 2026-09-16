@@ -87,6 +87,7 @@ pub fn run_rope_backward(
     head_dim: u32,
     n_rot: u32,
     cos_len: u32,
+    cos_row_stride: u32,
 ) {
     let mut arena = CudaArena {
         stream,
@@ -94,7 +95,18 @@ pub fn run_rope_backward(
         size_bytes: arena_size_bytes,
     };
     rlx_gpu_host::run_rope_backward(
-        &mut arena, dy, cos, sin, dx, batch, seq, hidden, head_dim, n_rot, cos_len,
+        &mut arena,
+        dy,
+        cos,
+        sin,
+        dx,
+        batch,
+        seq,
+        hidden,
+        head_dim,
+        n_rot,
+        cos_len,
+        cos_row_stride,
     );
 }
 

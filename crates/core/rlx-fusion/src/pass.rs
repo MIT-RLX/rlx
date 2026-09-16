@@ -284,7 +284,7 @@ pub fn run_registered_ir_passes(mut graph: Graph) -> Graph {
 
 /// Run a sequence of passes, printing the graph after each if `verbose`.
 ///
-/// When `RLX_FUSION_REPORT=1`, prints a [`fusion_report::FusionReport`]
+/// When `RLX_FUSION_REPORT=1`, prints a `fusion_report::FusionReport`
 /// comparing the input graph to the fused result.
 ///
 /// In debug builds, the verifier (lifted from MAX) runs
@@ -631,7 +631,7 @@ mod registry_tests {
 /// Every built-in pass, keyed by its [`Pass::name`].
 ///
 /// Exists so a test fixture can name the passes it wants by string rather than
-/// by Rust type — the missing piece between [`rlx_ir::text`] (which can parse
+/// by Rust type — the missing piece between `rlx_ir::text` (which can parse
 /// and print IR) and pass tests that live as files instead of as code.
 ///
 /// Only passes that are constructible with no configuration appear here;

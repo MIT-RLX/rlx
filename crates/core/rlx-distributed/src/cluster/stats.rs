@@ -51,7 +51,7 @@ impl ClusterRun {
         seq as f64 / (self.total_forward_ms as f64 / 1000.0)
     }
 
-    /// Aggregate a per-node metric with a reduce op — the SAME [`ReduceKind`]
+    /// Aggregate a per-node metric with a reduce op — the SAME [`ReduceKind`](rlx_driver::ReduceKind)
     /// semantics the collective all-reduce uses for tensor-parallel partial sums.
     /// (Here over locally-gathered stats; [`crate::cluster::all_reduce`] runs the
     /// real cross-node collective.)

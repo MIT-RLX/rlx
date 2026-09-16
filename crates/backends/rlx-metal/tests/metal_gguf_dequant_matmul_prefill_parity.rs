@@ -30,7 +30,7 @@ fn run_case(
     k: usize,
     n: usize,
 ) -> Option<f32> {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return None;
     }
@@ -86,7 +86,7 @@ fn run_case(
 /// bit-exact; this checks the metal segmentation/boundary-I/O across many.
 #[test]
 fn gguf_dequant_matmul_chain_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -156,16 +156,14 @@ fn gguf_dequant_matmul_chain_matches_cpu() {
 /// `RLX_HYBRID_M` overrides m (default 96); set 4 to see it pass.
 #[test]
 fn hybrid_rmsnorm_dequant_large_m_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
-    let m: usize = std::env::var("RLX_HYBRID_M")
-        .ok()
+    let m: usize = rlx_ir::env::var("RLX_HYBRID_M")
         .and_then(|s| s.parse().ok())
         .unwrap_or(96);
-    let k: usize = std::env::var("RLX_HYBRID_K")
-        .ok()
+    let k: usize = rlx_ir::env::var("RLX_HYBRID_K")
         .and_then(|s| s.parse().ok())
         .unwrap_or(256); // square so we can chain
     let n_layers = 4usize;
@@ -253,7 +251,7 @@ fn hybrid_rmsnorm_dequant_large_m_matches_cpu() {
 /// correctness rather than reproducing the race itself.)
 #[test]
 fn gguf_dequant_matmul_multi_large_n_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -436,7 +434,7 @@ fn gguf_dequant_matmul_prefill_matches_cpu() {
 
 #[test]
 fn q1_0_decode_amp_f16_gemv_only_matches_f32() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -499,7 +497,7 @@ fn q1_0_decode_amp_f16_gemv_only_matches_f32() {
 /// simdgroup Q1 kernels (weight-BW path: packed W + half activation traffic).
 #[test]
 fn q1_0_decode_amp_f16_residual_matches_f32() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -580,7 +578,7 @@ fn q1_0_decode_amp_f16_residual_matches_f32() {
 
 #[test]
 fn q2_0_decode_gemv_matches_reference() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -627,4 +625,73 @@ fn q2_0_decode_gemv_matches_reference() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(max_abs < 2e-3, "Q2_0 decode Metal max_abs={max_abs}");
+}
+
+/// G8_0 (Doses AI Pestle `token_embd` / lm_head): four bf16 scales per
+/// 32-element block, one per group of 8. Exercises the finer scale
+/// granularity — a block-wide scale would fail this by construction,
+/// since group 3 is 64× group 0.
+#[test]
+fn g8_0_decode_gemv_matches_reference() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    use rlx_gguf::g8_dequant::{G8_0_BLOCK_BYTES, QKG8_0};
+    let k = 128usize;
+    let n = 16usize;
+    let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.017).sin()).collect();
+    let nblocks = k / QKG8_0;
+    let mut packed = Vec::with_capacity(n * nblocks * G8_0_BLOCK_BYTES);
+    let mut reference = vec![0.0f32; n];
+    for row in 0..n {
+        for block in 0..nblocks {
+            let mut d_ref = [0.0f32; 4];
+            for (g, slot) in d_ref.iter_mut().enumerate() {
+                // Spread scales widely across the four groups.
+                let d = half::bf16::from_f32(0.125 * 4f32.powi(g as i32) + row as f32 * 0.01);
+                packed.extend_from_slice(&d.to_bits().to_le_bytes());
+                *slot = d.to_f32();
+            }
+            for byte in 0..(QKG8_0 / 4) {
+                let mut bits = 0u8;
+                for lane in 0..4usize {
+                    let code = ((row + block + byte + lane) % 3) as u8;
+                    bits |= code << (lane * 2);
+                    let j = byte * 4 + lane;
+                    reference[row] += x[block * QKG8_0 + j] * (code as f32 - 1.0) * d_ref[j / 8];
+                }
+                packed.push(bits);
+            }
+        }
+    }
+    // The packed bytes must decode identically on the host.
+    let host = rlx_gguf::g8_dequant::dequant_g8_0(&packed, n * k).unwrap();
+    for (row, want) in reference.iter().enumerate() {
+        let got: f32 = (0..k).map(|j| x[j] * host[row * k + j]).sum();
+        assert!(
+            (got - want).abs() < 1e-4,
+            "host G8_0 row {row}: {got} vs {want}"
+        );
+    }
+    let mut g = Graph::new("g8_0_decode_gemv");
+    let x_in = g.input("x", Shape::new(&[1, k], DType::F32));
+    let w = g.param("w", Shape::new(&[packed.len()], DType::U8));
+    let y = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufG8_0,
+        },
+        vec![x_in, w],
+        Shape::new(&[1, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let mut c = Session::new(Device::Metal).compile(g);
+    c.set_param_typed("w", &packed, DType::U8);
+    let metal = c.run(&[("x", x.as_slice())]).remove(0);
+    let max_abs = reference
+        .iter()
+        .zip(&metal)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_abs < 2e-3, "G8_0 decode Metal max_abs={max_abs}");
 }

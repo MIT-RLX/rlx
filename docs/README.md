@@ -7,7 +7,8 @@
 | [backend-selection.md](backend-selection.md) | Multi-backend runtime: `DevicePolicy`, `GraphDevices`, `DeviceRouter`, env vars, Python API, calibration |
 | [distributed.md](distributed.md) | **Distributed computing**: the layers (Transport→ProcessGroup→Node), collectives, node discovery (static/mDNS/rendezvous), the `dist_job` + `dist_node` examples, and the `rlx_runtime::dist` ship-graph worker |
 | [iroh-transport.md](iroh-transport.md) | **NAT-traversing distributed** (`IrohTransport`, feature `iroh`): QUIC + n0 relays + pkarr/DNS discovery — reach peers by `EndpointId` (no `ip:port`/port-forwarding), the per-edge FIFO wire protocol, `connect_discovered` / `process_group_from_env`, the `TOPOLOGY=iroh` launcher topology + `RLX_DEVICE` / `RLX_DETERMINISTIC_REDUCE`, and hybrid GPU+CPU run recipes |
-| [op-coverage.md](op-coverage.md) | **Single source of truth** for every IR op: descriptions, per-backend coverage matrix (CPU/Metal/MLX/WGPU/ANE/CUDA/ROCm/TPU — all **153/`OpKind`**; Vulkan/oneAPI also at 153 as EXTRA backends), and op variations (Activation/Binary/Quant schemes/…) |
+| [ir-design-principles.md](ir-design-principles.md) | **What an `Op` or IR change is checked against** — the principles adapted from CAKE Appendix B.1, each naming the *mechanical gate* that enforces it (or marked explicitly as a review convention with no gate) |
+| [op-coverage.md](op-coverage.md) | **Single source of truth** for every IR op: descriptions, per-backend coverage matrix (CPU/Metal/MLX/WGPU/ANE/CUDA/ROCm/TPU, plus Vulkan/oneAPI as EXTRA backends — **161–179 of 187 `OpKind`s**, generated from each backend's `SUPPORTED_OPS`), and op variations (Activation/Binary/Quant schemes/…) |
 | [gguf-backend-paths.md](gguf-backend-paths.md) | **GGUF / `DequantMatMul` execution paths** — shared scheme ids, per-backend GPU/host/ANE/TPU lowering, Metal fused IQ GEMV, pyrlx convert/load, env toggles, P0–P5 + backlog code map |
 | [mlx-weights.md](mlx-weights.md) | **MLX weight layouts** — mlx-community dirs, `.npz`/`.npy`, affine/mxfp dequant, `import-mlx`, `QuantScheme::Mlx*` |
 | [dduf.md](dduf.md) | **DDUF (`.dduf`)** — HF ZIP of nested safetensors; `import-dduf`, qualified tensor names |
@@ -18,14 +19,20 @@
 | [rlx-bake.md](rlx-bake.md) | **`rlx-bake` walkthrough** — what bake is (vs model+weights), pipeline, format / encrypt, `.rlxp` export, full MNIST train→bake→encrypt→run steps and how to read the stats |
 | [rlxp.md](rlxp.md) | **`.rlxp` package format** — flat mmap (default) + hybrid hot/warm/cold, optional ZIP/dir, optional executable MIR graph, sidecars, dist placement, GGUF/ONNX import |
 | [rlx-env-vars.md](rlx-env-vars.md) | **Exhaustive `RLX_*` inventory** — every env / option identifier in the tree, grouped by backend/area, with curated-catalog and code-read marks (`just gen-rlx-env-vars`) |
+| [egpu.md](egpu.md) | **External GPU over USB4/Thunderbolt** (`Device::Egpu`) — what macOS withholds (a class-0x03 driver, not the bus), building `rlx-egpu`, the signed-firmware manifest + `pull_gpu_firmware.sh`, ahead-of-time kernel packs (compile on a ROCm/CUDA host, read with no toolchain), and **how to build the DriverKit extension**: entitlement, IOKit personality, user-client contract, helper wire protocol, signing/notarizing, and pointing rlx at it with `DextConfig` |
 | [development.md](development.md) | Dev workflow: `just` recipes, pyrlx, tests, dispatch probes, `Op::Scan` unroll / host contract |
 | [fpga-export.md](fpga-export.md) | **FPGA / SystemVerilog export**: `ExportTarget`, `FpgaExportConfig`, target-agnostic RTL, `HwTarget` matrix |
+| [kv-retention.md](kv-retention.md) | **Selective KV retention + retrieval** — extending effective context past a fixed resident budget without per-step cost growing with total context: `Full`/`Sinks`/`HeavyHitter`/`Retrieval`/`Auto` policies, `RLX_QWEN3_RETENTION`, and the small-LM retrieval-quality findings |
+| [metal-qwen3-decode-perf.md](metal-qwen3-decode-perf.md) | **Metal batch-1 decode, measured** — how qwen3-0.6B went 24 → 82 tok/s token-identically on an M4 Pro, and which "obvious" optimizations measured neutral or negative |
+| [reference-parity-and-occupancy.md](reference-parity-and-occupancy.md) | **Rig-gated workstreams** — parity against a *reference* implementation (llama.cpp / NeMo) rather than cross-backend only, and kernel-occupancy profiling; both need hardware a dev box doesn't have, so this is the turnkey harness plan |
+| [dual-encoder-retrieval-plan.md](dual-encoder-retrieval-plan.md) | *(design plan, not implemented)* Dual-encoder retrieval for the KV context store — why Q·K / K·K / lexical scoring all hit a ceiling, and the proposed seam |
+| [apple-feedback-mpsgraph-crash.md](apple-feedback-mpsgraph-crash.md) | Feedback Assistant draft for the `MPSGraphExecutable` null dereference inside MetalPerformanceShadersGraph, with reproduction and `.ips` triage notes |
 | [benchmarks/higher-order-ad.md](benchmarks/higher-order-ad.md) | Higher-order autodiff benchmarks |
 | [benchmarks/mlx-linux.md](benchmarks/mlx-linux.md) | MLX on Linux/WSL: compile, CPU vs CUDA, vs `rlx-cpu` matmul benches |
 | [benchmarks/coreml-training.md](benchmarks/coreml-training.md) | CoreML on-device training: RLX vs native `MLUpdateTask`, compute-unit sweep, overhead- vs compute-bound regimes (why `cpu`≥`ane`, and why the result flips with model size) |
 | [benchmarks/frameworks-and-backends.md](benchmarks/frameworks-and-backends.md) | MNIST-training comparison **matrix**: every framework × backend, verified/rig/candidate status, `torch.compile`/Keras/MPSGraph/ORT runners, and the CUDA runbook |
 
-Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.14**).
+Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.16**).
 
 Related repo docs:
 

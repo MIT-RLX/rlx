@@ -348,14 +348,29 @@ impl<'a> LowerCtx<'a> {
             Op::GatherBackward { axis } => {
                 self.lower_gather_backward(n.inputs[0], n.inputs[1], *axis, out_shape)
             }
-            Op::RopeBackward { head_dim, n_rot } => self.lower_rope_backward(
-                n.inputs[0],
-                n.inputs[1],
-                n.inputs[2],
-                *head_dim,
-                *n_rot,
-                out_shape,
-            ),
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            } => {
+                // `lower_rope_backward` emits NeoX rotate-half only — as does
+                // `lower_rope` on the forward side, which ignores `style`
+                // entirely. Accepting GptJ here would produce a wrong gradient
+                // silently; refuse until both sides learn the interleaved
+                // pairing.
+                assert!(
+                    matches!(style, rlx_ir::op::RopeStyle::NeoX),
+                    "rlx-tpu RopeBackward: only RopeStyle::NeoX is implemented, got {style:?}"
+                );
+                self.lower_rope_backward(
+                    n.inputs[0],
+                    n.inputs[1],
+                    n.inputs[2],
+                    *head_dim,
+                    *n_rot,
+                    out_shape,
+                )
+            }
 
             Op::Conv2dBackwardInput {
                 kernel_size,
@@ -542,7 +557,18 @@ impl<'a> LowerCtx<'a> {
                 padding,
             } => self.lower_pool(n.inputs[0], *kind, kernel_size, stride, padding, out_shape),
 
-            Op::ScatterAdd => self.lower_scatter_add(n.inputs[0], n.inputs[1], out_shape),
+            Op::ScatterAdd { axis } => {
+                // `lower_scatter_add` emits an axis-0 scatter;
+                // `rlx_fusion::LowerScatterAddAxis` normalizes every other axis
+                // before lowering. Reaching here with axis != 0 would scatter
+                // along the wrong dimension in silence.
+                assert_eq!(
+                    *axis, 0,
+                    "rlx-tpu: ScatterAdd axis {axis} reached the backend; \
+                     LowerScatterAddAxis must run first"
+                );
+                self.lower_scatter_add(n.inputs[0], n.inputs[1], out_shape)
+            }
 
             Op::ScatterNd { reduction } => {
                 self.lower_scatter_nd(n.inputs[0], n.inputs[1], n.inputs[2], *reduction, out_shape)
@@ -3386,6 +3412,7 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::GgufNVFP4
             | QuantScheme::GgufFV5
             | QuantScheme::GgufFV5B
+            | QuantScheme::GgufG8_0
             | QuantScheme::MxFp4x2Block { .. } => panic!(
                 "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
             ),

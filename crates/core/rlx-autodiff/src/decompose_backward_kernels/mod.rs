@@ -13,6 +13,7 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
 mod attention;
 mod conv_pool;
+mod gdn;
 mod indexing;
 mod loss;
 mod norm;
@@ -22,6 +23,7 @@ mod scan;
 
 pub use attention::*;
 pub use conv_pool::*;
+pub use gdn::*;
 pub use indexing::*;
 pub use loss::*;
 pub use norm::*;

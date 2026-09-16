@@ -307,6 +307,8 @@ pub(crate) fn dequant_gguf_weight(
             .map_err(|e| MlxError(format!("GGUF FV5 dequant: {e}"))),
         Q::GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(w_bytes, elems)
             .map_err(|e| MlxError(format!("GGUF FV5B dequant: {e}"))),
+        Q::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(w_bytes, elems)
+            .map_err(|e| MlxError(format!("GGUF G8_0 dequant: {e}"))),
         other => Err(MlxError(format!(
             "MLX DequantMatMul: unsupported GGUF scheme {other:?}"
         ))),
@@ -403,6 +405,264 @@ pub(crate) fn lower_gated_delta_net(
     let refs: Vec<&Array> = ys.iter().collect();
     let out = ops::concat(&refs, 1)?;
     Ok((out, state_in.map(|_| state)))
+}
+
+/// Lower `Op::GatedDeltaNetBackward` — every input gradient from one reverse
+/// scan, mirroring [`lower_gated_delta_net`].
+///
+/// Like the forward, the time loop is unrolled but each step is a *batched*
+/// MLX op over all `(batch, head)` pairs at once, so MLX's own kernels supply
+/// the parallelism and the intermediates stay lazy rather than being
+/// materialized per timestep the way the generic unfused decomposition does.
+///
+/// Forward, with `S` as `[bh, n, n]` (row = key channel, column = value) and
+/// `A = exp(g)`:
+///
+/// ```text
+///   P = A ⊙ S_{t-1};  m = k·P;  u = (v − m)·β;  S_t = P + kᵀ⊗u;  y = c·q·S_t
+/// ```
+///
+/// Backward, carrying `dS` from later timesteps:
+///
+/// ```text
+///   dq  = c·dy·Sᵀ_t         dS += c·qᵀ ⊗ dy
+///   dk += dS·uᵀ             du  = k·dS
+///   dv += β·du              dβ += ⟨v − m, du⟩      dm = −β·du
+///   dk += P·dmᵀ             dS += kᵀ ⊗ dm          (dS is now dP)
+///   dg  = A ⊙ ⟨S_{t-1}, dP⟩ dS_{t-1} = A ⊙ dP
+/// ```
+///
+/// `dk` and `dS` each take two contributions, and `du` must be read out of `dS`
+/// before the second pair lands — the order above is load-bearing.
+///
+/// The state entering every timestep is kept (`states[t]`), so `P` is recomputed
+/// rather than reconstructed by dividing out `exp(g) < 1`, which would amplify
+/// rounding without bound.
+///
+/// Returns the gradients in input order: `dq`, `dk`, `dv`, `dg`, `dbeta`, and
+/// `dstate` when the forward carried one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_gated_delta_net_backward(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g_in: &Array,
+    beta: &Array,
+    dy: &Array,
+    state_size: usize,
+    gate_per_channel: bool,
+    state_in: Option<&Array>,
+    q_shape: Vec<i32>,
+) -> Result<GdnBackwardGrads, MlxError> {
+    if q_shape.len() != 4 {
+        return Err(MlxError(format!(
+            "GatedDeltaNetBackward: q must be rank-4 [B, S, H, N], got rank {}",
+            q_shape.len()
+        )));
+    }
+    let batch = q_shape[0];
+    let seq = q_shape[1];
+    let heads = q_shape[2];
+    let n = q_shape[3];
+    if n as usize != state_size {
+        return Err(MlxError(format!(
+            "GatedDeltaNetBackward: state_size={state_size} != q last dim {n}"
+        )));
+    }
+    let bh = batch * heads;
+    let scale = 1.0f32 / (n as f32).sqrt();
+    let scale_arr = Array::from_f32_slice(&[scale], &[1], DType::F32)?;
+    let neg_one = Array::from_f32_slice(&[-1.0], &[1], DType::F32)?;
+
+    // Per-timestep slice of a `[B, S, H, N]` input, as `[bh, 1, n]`.
+    let row_at = |a: &Array, t: i32| -> Result<Array, MlxError> {
+        let sl = ops::slice(a, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
+        ops::reshape(&sl, &[bh, 1, n])
+    };
+    // exp(g) at timestep t, shaped to broadcast against `[bh, n, n]`:
+    // `[bh, n, 1]` per-channel (decays key row i), `[bh, 1, 1]` per-head.
+    let exp_g_at = |t: i32| -> Result<Array, MlxError> {
+        if gate_per_channel {
+            let gt = ops::slice(g_in, &[0, t, 0, 0], &[batch, t + 1, heads, n])?;
+            let gt = ops::reshape(&gt, &[bh, n, 1])?;
+            ops::unary(&gt, MlxUnary::Exp)
+        } else {
+            let gt = ops::slice(g_in, &[0, t, 0], &[batch, t + 1, heads])?;
+            let gt = ops::reshape(&gt, &[bh, 1, 1])?;
+            ops::unary(&gt, MlxUnary::Exp)
+        }
+    };
+    let beta_at = |t: i32| -> Result<Array, MlxError> {
+        let bt = ops::slice(beta, &[0, t, 0], &[batch, t + 1, heads])?;
+        ops::reshape(&bt, &[bh, 1, 1])
+    };
+
+    // ── forward, recording the state entering each timestep ──
+    let mut states: Vec<Array> = Vec::with_capacity(seq as usize + 1);
+    states.push(match state_in {
+        Some(s0) => ops::reshape(s0, &[bh, n, n])?,
+        None => {
+            let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+            ops::broadcast_to(&zero, &[bh, n, n])?
+        }
+    });
+    for t in 0..seq {
+        let prev = &states[t as usize];
+        let kt = row_at(k, t)?;
+        let vt = row_at(v, t)?;
+        let p = ops::mul(prev, &exp_g_at(t)?)?;
+        let m = ops::matmul(&kt, &p)?; // [bh,1,n]
+        let u = ops::mul(&ops::sub(&vt, &m)?, &beta_at(t)?)?;
+        let outer = ops::mul(&ops::reshape(&kt, &[bh, n, 1])?, &u)?;
+        states.push(ops::add(&p, &outer)?);
+    }
+
+    // ── reverse ──
+    let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+    let mut ds = ops::broadcast_to(&zero, &[bh, n, n])?;
+    // Filled walking time backwards, then reversed — `Array` is a handle type
+    // and not `Clone`, so there is nothing sensible to pre-fill with.
+    let cap = seq as usize;
+    let mut dq_steps: Vec<Array> = Vec::with_capacity(cap);
+    let mut dk_steps: Vec<Array> = Vec::with_capacity(cap);
+    let mut dv_steps: Vec<Array> = Vec::with_capacity(cap);
+    let mut dg_steps: Vec<Array> = Vec::with_capacity(cap);
+    let mut dbeta_steps: Vec<Array> = Vec::with_capacity(cap);
+
+    for t in (0..seq).rev() {
+        let ti = t as usize;
+        let s_prev = &states[ti];
+        let s_cur = &states[ti + 1];
+        let qt = row_at(q, t)?;
+        let kt = row_at(k, t)?;
+        let vt = row_at(v, t)?;
+        let dyt = row_at(dy, t)?;
+        let a = exp_g_at(t)?;
+        let bt = beta_at(t)?;
+        let p = ops::mul(s_prev, &a)?;
+
+        // dq = c·dy·Sᵀ ; dS += c·qᵀ ⊗ dy
+        let s_cur_t = ops::transpose(s_cur, &[0, 2, 1])?;
+        let dq = ops::mul(&ops::matmul(&dyt, &s_cur_t)?, &scale_arr)?;
+        dq_steps.push(ops::reshape(&dq, &[batch, 1, heads, n])?);
+        let q_col = ops::mul(&ops::reshape(&qt, &[bh, n, 1])?, &scale_arr)?;
+        ds = ops::add(&ds, &ops::mul(&q_col, &dyt)?)?;
+
+        // (v − m), kept unscaled so dβ needs no division by β.
+        let m = ops::matmul(&kt, &p)?;
+        let vmm = ops::sub(&vt, &m)?; // [bh,1,n]
+
+        // dk = β·(dS·(v − m)ᵀ)
+        let dk_a = ops::matmul(&ds, &ops::transpose(&vmm, &[0, 2, 1])?)?; // [bh,n,1]
+        let dk_a = ops::mul(&dk_a, &bt)?;
+
+        // du = k·dS ; dv = β·du ; dβ = ⟨v − m, du⟩ ; dm = −β·du
+        let du = ops::matmul(&kt, &ds)?; // [bh,1,n]
+        dv_steps.push(ops::reshape(&ops::mul(&du, &bt)?, &[batch, 1, heads, n])?);
+        let dbeta = ops::reduce(&ops::mul(&vmm, &du)?, MlxReduce::Sum, &[2], true)?; // [bh,1,1]
+        dbeta_steps.push(ops::reshape(&dbeta, &[batch, 1, heads])?);
+        let dm = ops::mul(&ops::mul(&du, &bt)?, &neg_one)?; // [bh,1,n]
+
+        // dk += P·dmᵀ ; dS += kᵀ ⊗ dm
+        let dk_b = ops::matmul(&p, &ops::transpose(&dm, &[0, 2, 1])?)?; // [bh,n,1]
+        let dk = ops::add(&dk_a, &dk_b)?;
+        dk_steps.push(ops::reshape(&dk, &[batch, 1, heads, n])?);
+        ds = ops::add(&ds, &ops::mul(&ops::reshape(&kt, &[bh, n, 1])?, &dm)?)?;
+
+        // dg = A ⊙ ⟨S_{t-1}, dP⟩ ; dS_{t-1} = A ⊙ dP
+        let prod = ops::mul(s_prev, &ds)?;
+        let dg = if gate_per_channel {
+            // one per key row: sum over the value axis → [bh,n,1]
+            let per_row = ops::reduce(&prod, MlxReduce::Sum, &[2], true)?;
+            let scaled = ops::mul(&per_row, &a)?;
+            ops::reshape(&scaled, &[batch, 1, heads, n])?
+        } else {
+            // one scalar per head: sum over both state axes → [bh,1,1]
+            let total = ops::reduce(&prod, MlxReduce::Sum, &[1, 2], true)?;
+            let scaled = ops::mul(&total, &a)?;
+            ops::reshape(&scaled, &[batch, 1, heads])?
+        };
+        dg_steps.push(dg);
+        ds = ops::mul(&ds, &a)?;
+    }
+
+    // Steps were pushed newest-first; concat wants time order.
+    dq_steps.reverse();
+    dk_steps.reverse();
+    dv_steps.reverse();
+    dg_steps.reverse();
+    dbeta_steps.reverse();
+    let cat = |steps: &[Array]| -> Result<Array, MlxError> {
+        let refs: Vec<&Array> = steps.iter().collect();
+        ops::concat(&refs, 1)
+    };
+    Ok(GdnBackwardGrads {
+        dq: cat(&dq_steps)?,
+        dk: cat(&dk_steps)?,
+        dv: cat(&dv_steps)?,
+        dg: cat(&dg_steps)?,
+        dbeta: cat(&dbeta_steps)?,
+        dstate: match state_in {
+            Some(_) => Some(ops::reshape(&ds, &[batch, heads, n, n])?),
+            None => None,
+        },
+    })
+}
+
+/// Gradients returned by [`lower_gated_delta_net_backward`], in input order.
+pub(crate) struct GdnBackwardGrads {
+    pub dq: Array,
+    pub dk: Array,
+    pub dv: Array,
+    pub dg: Array,
+    pub dbeta: Array,
+    pub dstate: Option<Array>,
+}
+
+/// Reshape `x` to the rank the GRAPH declares for node `id`, when MLX's array
+/// carries a different rank for the same elements.
+///
+/// CPU and Metal read a buffer at whatever rank the graph asks for. MLX enforces
+/// rank, so a tensor that reached an op through a batched matmul — MLX holding
+/// `[B, S, K]` where the graph says `[B·S, K]` — cannot broadcast against a
+/// sibling that *is* `[B·S, K]`. `Op::Reshape`, `Op::Narrow` and `Op::Transpose`
+/// each reconcile this way already; this is that rule, factored out, so the next
+/// op needing it does not become a fourth copy.
+///
+/// Returns `None` when nothing needs doing — the ranks already agree, or the
+/// element counts differ and a genuine shape error must still surface as one.
+/// (`Array` is not `Clone`, hence `Option` rather than handing back the input.)
+///
+/// **Reproducing case.** EEGMamba's `dt` path — `reshape [B,S,D] -> [B·S,D]`,
+/// matmul, `Narrow`, `+bias`, then `relu` (its softplus is
+/// `relu(x) + log(1 + exp(-|x|))`). Without this, MLX raises
+/// `[broadcast_shapes] Shapes (4,8,8) and (32,8) cannot be broadcast` inside
+/// `ReluBackward` and takes down the whole moabb decoder sweep. The guarding
+/// test is `moabb`'s `eegmamba_is_wired_and_trains` under
+/// `RLX_FORCE_DEVICE=mlx`, verified to fail when this function is stubbed to
+/// return `None`.
+///
+/// A minimal in-crate repro was attempted and NOT found: `reshape -> matmul ->
+/// relu` does not diverge (MLX materialises the reshape), and adding the model'"'"'s
+/// `Tile` makes a small graph fail earlier on `unsupported op Tile` instead.
+/// Left documented rather than faked — a test that passes with the fix removed
+/// would be worse than no test.
+pub(crate) fn reconcile_declared_rank(
+    graph: &Graph,
+    id: NodeId,
+    x: &Array,
+) -> Result<Option<Array>, MlxError> {
+    let declared = node_input_shape(graph, id);
+    let rt = x.shape()?;
+    if declared.len() == rt.len() {
+        return Ok(None);
+    }
+    let n_declared: i64 = declared.iter().map(|&d| d as i64).product();
+    let n_rt: i64 = rt.iter().map(|&d| d as i64).product();
+    if n_declared != n_rt {
+        return Ok(None);
+    }
+    crate::ops::reshape(x, &declared).map(Some)
 }
 
 pub(crate) fn node_input_shape(graph: &Graph, id: NodeId) -> Vec<i32> {
@@ -987,6 +1247,7 @@ pub(crate) fn force_indexing_indices_i64(thunk: rlx_cpu::thunk::Thunk) -> rlx_cp
             updates,
             dst,
             data_shape,
+            indices_shape,
             data_len,
             updates_len,
             indices_len,
@@ -999,6 +1260,7 @@ pub(crate) fn force_indexing_indices_i64(thunk: rlx_cpu::thunk::Thunk) -> rlx_cp
             updates,
             dst,
             data_shape,
+            indices_shape,
             data_len,
             updates_len,
             indices_len,
@@ -1660,7 +1922,7 @@ pub(crate) fn unsupported<T>(what: String) -> Result<T, MlxError> {
 /// (matmuls accumulate in f32) — faster/less bandwidth for wide hidden sizes —
 /// while inputs/outputs stay f32.
 pub(crate) fn rnn_compute_dtype() -> DType {
-    if std::env::var_os("RLX_MLX_RNN_F16").is_some() {
+    if rlx_ir::env::var_os("RLX_MLX_RNN_F16").is_some() {
         DType::F16
     } else {
         DType::F32

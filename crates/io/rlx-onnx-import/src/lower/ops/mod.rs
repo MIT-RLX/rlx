@@ -1020,7 +1020,7 @@ fn binary_infer(
     match rlx_ir::shape::binary_shape(&sa, &sb) {
         Ok(sh) => m.add_node(Op::Binary(op), vec![a_in, b_in], sh),
         Err(e) => {
-            if std::env::var("RLX_DBG_BINF").is_ok() {
+            if rlx_ir::env::var("RLX_DBG_BINF").is_some() {
                 eprintln!(
                     "[binf] {site}: unaligned {:?} vs {:?}: {e}",
                     sa.dims(),
@@ -1058,7 +1058,7 @@ fn resolve_dim_ir(v: &serde_json::Value, opts: &ImportOptions) -> Result<Dim> {
         // graph-split boundary dim (e.g. Kokoro decoder `unk__368`=total_frames,
         // `unk__357`=batch) is honored before any heuristic (or the `unk__` bail).
         serde_json::Value::String(s) if opts.named_lengths.contains_key(s.as_str()) => {
-            if std::env::var_os("RLX_DIM_DBG").is_some() {
+            if rlx_ir::env::var_os("RLX_DIM_DBG").is_some() {
                 eprintln!("[dim] '{s}' -> named {}", opts.named_lengths[s.as_str()]);
             }
             Ok(Dim::Static(opts.named_lengths[s.as_str()]))
@@ -1603,7 +1603,7 @@ pub fn build_hir_from_parts(
                     !inp.is_empty() && !init_names.contains(*inp) && !ctx.env.contains_key(*inp)
                 })
                 .collect();
-            if std::env::var("RLX_IMP_DBG").is_ok() {
+            if rlx_ir::env::var("RLX_IMP_DBG").is_some() {
                 // A tensor is "missing" but is it produced by ANY pending node?
                 // If not, its producer was lowered yet inserted nothing (the true
                 // root); if yes, walk toward that pending producer. Dump the whole
@@ -1654,7 +1654,7 @@ pub fn build_hir_from_parts(
     // `RLX_ONNX_TAP=name1,name2` to the ONNX tensor names of interest. Tapped
     // tensors are emitted after the real outputs, in the order listed; names that
     // were not lowered (folded/stubbed) are skipped with a warning.
-    if let Ok(tap) = std::env::var("RLX_ONNX_TAP") {
+    if let Some(tap) = rlx_ir::env::var("RLX_ONNX_TAP") {
         for name in tap.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if let Some(&id) = ctx.env.get(name) {
                 eprintln!("[onnx-tap] + output {name} shape={:?}", m.shape(id).dims());
@@ -1940,7 +1940,7 @@ fn lower_node(
             }
         }
     }
-    if std::env::var("RLX_DBG_SHAPES").is_ok() {
+    if rlx_ir::env::var("RLX_DBG_SHAPES").is_some() {
         for out in &node.outputs {
             if let Some(&id) = ctx.env.get(out) {
                 eprintln!("[shape] {} = {:?} ({})", out, m.shape(id).dims(), node.op);

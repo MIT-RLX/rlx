@@ -85,7 +85,7 @@ fn run(device: Device, g: Graph, seed: u64, n: usize) -> Vec<f32> {
 
 #[test]
 fn metal_philox_rng_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

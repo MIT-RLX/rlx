@@ -19,7 +19,7 @@ Native fast paths are **not** removed. Common lowering is additive.
 
 Environment: `RLX_KERNEL_DISPATCH=common|native`.
 
-Runtime: [`CompileOptions::kernel_dispatch`](../rlx/rlx-runtime/src/options.rs) ([`KernelDispatchConfig`](src/logical_kernel.rs)).
+Runtime: [`CompileOptions::kernel_dispatch`](../rlx-runtime/src/options.rs) ([`KernelDispatchConfig`](src/logical_kernel.rs)).
 
 Per-op overrides (without global `ForceCommon`):
 
@@ -38,7 +38,7 @@ See [`registered_logical_kernels()`](src/logical_kernel.rs). Splat common bodies
 
 1. Add or reuse an [`OpKind`](src/op.rs) + [`Op`](src/op.rs) variant.
 2. Implement `lower_*` in `rlx-fusion` (or call an existing fusion pass).
-3. Register in [`lower_logical_kernels.rs`](../rlx/rlx-fusion/src/lower_logical_kernels.rs).
+3. Register in [`lower_logical_kernels.rs`](../rlx-fusion/src/lower_logical_kernels.rs).
 4. List the kind in backend `supported_ops` only when a native thunk exists.
 
 ## Splat example
@@ -115,7 +115,7 @@ assert!(report.compile_ready);
 [`first_unsupported_op`](../rlx-runtime/src/device_ext.rs) use the same
 rewrite + legalization probe when a backend is registered.
 
-See also the overview in the [workspace README](../README.md#kernel-dispatch-and-transparency).
+See also the overview in the [workspace README](../../../README.md#kernel-dispatch-and-transparency).
 ## License
 
 MIT OR Apache-2.0.

@@ -11,6 +11,72 @@ use crate::thunk::*;
 /// by storing 0 before a compile.
 pub static FUSED_NOMIC_LAYER_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Storage width of one lane of a fused region operand.
+///
+/// A region computes in `f32` scratch, but its operands are not always stored
+/// as `f32`: `plan_memory_native*` packs an F16/BF16 tensor at 2 bytes and an
+/// F64 one at 8, while `plan_memory_f32_uniform` widens everything to 4. The
+/// declared dtype alone therefore cannot say how to address a lane — a 4-byte
+/// slot holding an `F16`-typed node contains a widened `f32`. Resolved at
+/// compile time from `Arena::byte_size`, which knows what the plan actually
+/// did.
+///
+/// Only widths that are unambiguous are distinguished. Every 4-byte lane stays
+/// `F32`, including integer-typed ones: under the f32-uniform plan those slots
+/// really do hold floats, and the region has always written them that way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneKind {
+    F32,
+    F16,
+    Bf16,
+    F64,
+}
+
+impl LaneKind {
+    /// Pick the lane from the width the memory plan actually assigned.
+    pub fn resolve(dtype: rlx_ir::DType, elem_bytes: usize) -> Self {
+        match (dtype, elem_bytes) {
+            (rlx_ir::DType::F16, 2) => LaneKind::F16,
+            (rlx_ir::DType::BF16, 2) => LaneKind::Bf16,
+            (rlx_ir::DType::F64, 8) => LaneKind::F64,
+            _ => LaneKind::F32,
+        }
+    }
+
+    /// Read one lane and widen it to the region's `f32` working precision.
+    ///
+    /// # Safety
+    /// `base + off` must point at a slot of at least `(idx + 1)` lanes.
+    #[inline(always)]
+    pub unsafe fn load(self, base: *const u8, off: usize, idx: usize) -> f32 {
+        unsafe {
+            let p = base.add(off);
+            match self {
+                LaneKind::F32 => *(p as *const f32).add(idx),
+                LaneKind::F16 => half::f16::from_bits(*(p as *const u16).add(idx)).to_f32(),
+                LaneKind::Bf16 => half::bf16::from_bits(*(p as *const u16).add(idx)).to_f32(),
+                LaneKind::F64 => *(p as *const f64).add(idx) as f32,
+            }
+        }
+    }
+
+    /// Narrow the region's `f32` result back into one lane.
+    ///
+    /// # Safety
+    /// `base + off` must point at a writable slot of at least `(idx + 1)` lanes.
+    #[inline(always)]
+    pub unsafe fn store(self, base: *mut u8, off: usize, idx: usize, v: f32) {
+        unsafe {
+            let p = base.add(off);
+            match self {
+                LaneKind::F32 => *(p as *mut f32).add(idx) = v,
+                LaneKind::F16 => *(p as *mut u16).add(idx) = half::f16::from_f32(v).to_bits(),
+                LaneKind::Bf16 => *(p as *mut u16).add(idx) = half::bf16::from_f32(v).to_bits(),
+                LaneKind::F64 => *(p as *mut f64).add(idx) = v as f64,
+            }
+        }
+    }
+}
 
 /// A pre-compiled kernel call with all args resolved to arena offsets.
 ///
@@ -37,6 +103,10 @@ pub enum Thunk {
         chain: Vec<rlx_ir::op::ChainStep>,
         scalar_input_mask: u32,
         input_modulus: [u32; 16],
+        /// Storage lane of each input, parallel to `input_offs`.
+        in_lanes: Vec<LaneKind>,
+        /// Storage lane of `dst`.
+        out_lane: LaneKind,
     },
     /// C = A @ B (BLAS sgemm)
     Sgemm {
@@ -223,6 +293,12 @@ pub enum Thunk {
         m: u32,
         k: u32,
         n: u32,
+        /// `true` when operand `a`/`b` has batch dim 1 and is BROADCAST across
+        /// every output batch (per-matrix stride 0 — reuse matrix 0). Mirrors
+        /// [`Thunk::BatchedSgemm`]; without it the loop over-reads a batch-1
+        /// operand for `bi > 0`.
+        a_bcast: bool,
+        b_bcast: bool,
     },
     /// Batched f32 matmul — same loop-per-batch shape as
     /// `BatchedDgemmF64` but calling `sgemm`. Needed for attention
@@ -273,7 +349,7 @@ pub enum Thunk {
         kind: Activation,
     },
     /// Element-wise complex squared-magnitude: `|z|² = re² + im²`.
-    /// Reads the C64 input at `src` as `2·len` f32 ([re,im] pairs),
+    /// Reads the C64 input at `src` as `2·len` f32 (`re,im` pairs),
     /// writes `len` f32 to `dst`.
     ComplexNormSqF32 {
         src: usize,
@@ -281,7 +357,7 @@ pub enum Thunk {
         /// Logical element count (number of complex values).
         len: u32,
     },
-    /// Wirtinger backward for [`ComplexNormSqF32`]: `dz = g · z` as
+    /// Wirtinger backward for `ComplexNormSqF32`: `dz = g · z` as
     /// C64. Reads `z` at `2·len` f32 + `g` at `len` f32; writes
     /// `2·len` f32 to `dz`.
     ComplexNormSqBackwardF32 {
@@ -291,7 +367,7 @@ pub enum Thunk {
         len: u32,
     },
     /// Element-wise C64 conjugate: writes `[re_i, -im_i]` per element.
-    /// Layout matches the rest of C64 here ([re,im] interleaved f32).
+    /// Layout matches the rest of C64 here (`re,im` interleaved f32).
     ConjugateC64 {
         src: usize,
         dst: usize,
@@ -1089,6 +1165,13 @@ pub enum Thunk {
         data: usize,
         rows: u32,
         cols: u32,
+        /// Distance between successive elements along the softmax axis.
+        ///
+        /// `1` for the usual last-axis softmax, where a row is contiguous.
+        /// Anything else means the axis is *not* last — `[N,C,D,H,W]` with
+        /// `axis=1` gives `inner = D·H·W` — and the contiguous kernels would
+        /// silently normalise over the wrong elements.
+        inner: u32,
     },
     /// Inclusive (or exclusive) cumulative sum along the last axis
     /// (callers pre-flatten higher-dim cumsums via reshape views).
@@ -1133,6 +1216,26 @@ pub enum Thunk {
     /// Gated DeltaNet linear-attention scan (Qwen3.5/3.6 trunk).
     /// Inputs: q, k, v `[b, s, h, n]`; g, beta `[b, s, h]`. Output:
     /// `[b, s, h, n]`. See `Op::GatedDeltaNet` for math.
+    /// Fused backward of [`Thunk::GatedDeltaNet`]. `dst` is the packed
+    /// gradient bundle described by `rlx_ir::GdnBackwardLayout`.
+    GatedDeltaNetBackward {
+        q: usize,
+        k: usize,
+        v: usize,
+        g: usize,
+        beta: usize,
+        /// Initial `[b, h, n, n]` state; meaningful only when `carry_state`.
+        state: usize,
+        dy: usize,
+        dst: usize,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        state_size: u32,
+        gate_per_channel: bool,
+        carry_state: bool,
+    },
+
     GatedDeltaNet {
         q: usize,
         k: usize,
@@ -1372,7 +1475,7 @@ pub enum Thunk {
     },
 
     /// Native low-precision scaled GEMM (FP8/FP6/FP4) — CPU reference oracle.
-    /// TN layout: lhs [m,k], rhs [n,k] codes, out [m,n] f32.
+    /// TN layout: lhs `m,k`, rhs `n,k` codes, out `m,n` f32.
     ScaledMatMul {
         lhs: usize,
         rhs: usize,
@@ -1594,6 +1697,16 @@ pub enum Thunk {
         head_dim: u32,
         n_rot: u32,
         cos_len: u32,
+        /// Elements per position in the cos/sin tables — the table's own last
+        /// dimension, NOT something derived from `head_dim` or `n_rot`.
+        ///
+        /// The two are not the same under partial rotation and the layout is a
+        /// per-model choice: Qwen3.5 allocates `[max_pos, head_dim/2]` and uses
+        /// the leading `n_rot/2` columns of each row, while DeepSeek-V4 MLA
+        /// packs `[.., n_rot/2]` with no slack. Assuming either one reads the
+        /// wrong row for every position past the first on the other, so take it
+        /// from the shape instead of guessing.
+        cos_row_stride: u32,
         src_row_stride: u32,
         /// `true` = GPT-J / llama.cpp-NORM interleaved pairs `(2i, 2i+1)`;
         /// `false` = HF / NeoX rotate-half pairs `(i, i+n_rot/2)`.
@@ -1713,6 +1826,28 @@ pub enum Thunk {
         total: u32,
         gate_first: bool,
     },
+    /// In-place KV-cache append: write one row into `dst` at sequence index
+    /// `pos`. `dst` is the cache buffer (the op's output aliases it), so this
+    /// touches `outer * inner` elements regardless of how long the context is,
+    /// where the `concat(past, row)` it replaces re-copies the whole cache
+    /// every step.
+    ///
+    /// Layout mirrors the GPU backends' thunk of the same name: byte-slice
+    /// `o` of the row lands at `o * seq_cap * inner_bytes + pos * inner_bytes`.
+    /// `outer == 1` (the usual `[1, seq, heads*dim]` cache with `axis = 1`)
+    /// makes it a single contiguous `memcpy`.
+    ///
+    /// Sized in BYTES, not elements, and copied as raw bytes: an append moves
+    /// data without touching its values, so it needs no dtype-specific variant
+    /// the way `Concat`/`ConcatF64` do — and a `memcpy` beats an element loop.
+    KvAppend {
+        src: usize,
+        dst: usize,
+        outer: u32,
+        seq_cap: u32,
+        pos: u32,
+        inner_bytes: u32,
+    },
     /// Concat along an axis: output[outer, axis, inner] = inputs concatenated.
     /// Each entry of `inputs` is (src_offset, axis_len_for_that_input) in u32
     /// elements. `outer`, `inner`, and `total_axis_len` are pre-computed
@@ -1817,6 +1952,15 @@ pub enum Thunk {
         k_dim: u32,
         n: u32,
         num_experts: u32,
+        /// `weight` holds `[E, N, K]` rather than `[E, K, N]`, so each expert's
+        /// GEMM runs with B transposed instead of materializing the swap.
+        ///
+        /// Set when the compiler folds a last-two-axis `Transpose` feeding this
+        /// node. See `compile_dispatch`'s fold pass for why it matters: GGUF
+        /// stores expert banks as `[E, out, in]` and this op wants
+        /// `[E, in, out]`, so a dense MoE layer transposes every bank on every
+        /// forward — measured as ~99% of a paged GLM-5.3-Flash layer.
+        w_transposed: bool,
     },
     /// GGUF K-quant packed expert stack + grouped matmul (MoE FFN).
     DequantGroupedMatMulGguf {
@@ -1892,6 +2036,11 @@ pub enum Thunk {
         updates: usize,
         dst: usize,
         data_shape: Vec<u32>,
+        /// Shape of `indices`. ONNX lets it be *smaller* than `data` along any
+        /// axis, and then the flat position of an index decomposes by the
+        /// indices' strides, not the data's — without this the kernel has to
+        /// guess and gets every row but the first wrong.
+        indices_shape: Vec<u32>,
         data_len: u32,
         updates_len: u32,
         indices_len: u32,
@@ -2330,6 +2479,23 @@ pub enum Thunk {
         head_dim: u32,
         n_rot: u32,
         cos_len: u32,
+        /// Elements per position in the cos/sin tables — same meaning, and the
+        /// same reason, as [`Thunk::Rope::cos_row_stride`].
+        ///
+        /// The backward must read the table with the *identical* stride to the
+        /// forward or the adjoint is not the transpose of the forward: it picks
+        /// up a different position's angles for every row past the first. The
+        /// forward gained this field while the backward kept deriving the
+        /// stride as `n_rot/2`, which the finite-difference check caught (the
+        /// cross-backend parity tests could not — every backend that shared the
+        /// wrong assumption agreed with itself).
+        cos_row_stride: u32,
+        /// GptJ pairing: rotate adjacent lanes `(2i, 2i+1)` rather than NeoX's
+        /// `(i, i + n_rot/2)`. Mirrors [`Thunk::Rope::interleaved`] — and for
+        /// the same reason as `cos_row_stride` above: the forward carried the
+        /// distinction, the backward did not, so the adjoint stopped being the
+        /// transpose of the forward for every GptJ (GGUF) rotation.
+        interleaved: bool,
     },
     CumsumBackward {
         dy: usize,
@@ -2717,6 +2883,16 @@ pub enum Thunk {
         norm_tag: u32,
         dtype: rlx_ir::DType,
     },
+    /// Fixed-point 1D FFT — see `rlx_ir::Op::FftQ`.
+    Fft1dQ {
+        src: usize,
+        dst: usize,
+        outer: u32,
+        n_complex: u32,
+        inverse: bool,
+        norm_tag: u32,
+        scale_tag: u32,
+    },
     FftButterflyStage {
         state_src: usize,
         state_dst: usize,
@@ -2982,6 +3158,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
             }
             v
         }
+        Thunk::Fft1dQ { src, .. } => vec![*src],
         Thunk::Rope { src, cos, sin, .. } => vec![*src, *cos, *sin],
         Thunk::FusedAttnBlock {
             hidden,

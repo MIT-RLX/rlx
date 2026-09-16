@@ -9,7 +9,9 @@
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::{Activation, BinaryOp, ReduceOp};
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{CompileOptions, Device, Session, is_available};
+use rlx_runtime::{CompileOptions, Device, Session};
+
+mod common;
 
 fn assert_close(a: &[f32], b: &[f32], tol: f32, label: &str) {
     assert_eq!(a.len(), b.len(), "{label} len");
@@ -22,7 +24,7 @@ fn assert_close(a: &[f32], b: &[f32], tol: f32, label: &str) {
 }
 
 fn run_pair(g: Graph, inputs: &[(&str, &[f32])], tol: f32, label: &str) {
-    if !is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip rocm_op_parity {label} (unavailable)");
         return;
     }
@@ -41,6 +43,7 @@ fn run_pair(g: Graph, inputs: &[(&str, &[f32])], tol: f32, label: &str) {
 
 #[test]
 fn rocm_binary_add_parity() {
+    let _gpu = common::serialize_gpu();
     let mut g = Graph::new("add");
     let x = g.input("x", Shape::new(&[4], DType::F32));
     let y = g.input("y", Shape::new(&[4], DType::F32));
@@ -59,6 +62,7 @@ fn rocm_binary_add_parity() {
 
 #[test]
 fn rocm_relu_parity() {
+    let _gpu = common::serialize_gpu();
     let mut g = Graph::new("relu");
     let x = g.input("x", Shape::new(&[5], DType::F32));
     let y = g.activation(Activation::Relu, x, Shape::new(&[5], DType::F32));
@@ -68,6 +72,7 @@ fn rocm_relu_parity() {
 
 #[test]
 fn rocm_residual_rmsnorm_parity() {
+    let _gpu = common::serialize_gpu();
     // `add(x, residual) → rms_norm` fuses into `Op::FusedResidualRmsNorm`
     // (the FuseResidualRmsNorm pass fires because rocm lists it as supported).
     // Exercises rlx-rocm's native fused kernel against the CPU oracle — the
@@ -100,6 +105,7 @@ fn rocm_residual_rmsnorm_parity() {
 
 #[test]
 fn rocm_softmax_parity() {
+    let _gpu = common::serialize_gpu();
     let mut g = Graph::new("softmax");
     let x = g.input("x", Shape::new(&[2, 4], DType::F32));
     let y = g.softmax(x, -1, Shape::new(&[2, 4], DType::F32));
@@ -110,6 +116,7 @@ fn rocm_softmax_parity() {
 
 #[test]
 fn rocm_reduce_sum_parity() {
+    let _gpu = common::serialize_gpu();
     let mut g = Graph::new("sum");
     let x = g.input("x", Shape::new(&[2, 3], DType::F32));
     let y = g.reduce(
@@ -130,6 +137,7 @@ fn rocm_reduce_sum_parity() {
 
 #[test]
 fn rocm_group_norm_parity() {
+    let _gpu = common::serialize_gpu();
     let n = 1usize;
     let c = 8usize;
     let h = 4usize;
@@ -148,7 +156,7 @@ fn rocm_group_norm_parity() {
     let y = g.group_norm(x_in, g_p, b_p, num_groups, 1e-5);
     g.set_outputs(vec![y]);
 
-    if !is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip rocm_op_parity group_norm (unavailable)");
         return;
     }
@@ -168,6 +176,7 @@ fn rocm_group_norm_parity() {
 
 #[test]
 fn rocm_resize_nearest_2x_parity() {
+    let _gpu = common::serialize_gpu();
     let n = 1usize;
     let c = 3usize;
     let h = 5usize;

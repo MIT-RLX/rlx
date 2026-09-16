@@ -33,7 +33,7 @@ impl FusionPolicy {
     ///
     /// Same as [`Self::Fusable`]. Fusion passes may still fuse later
     /// during [`CompilePipeline`](../../rlx-opt/src/compiler.rs) for
-    /// inference; run [`rlx_opt::prepare_graph_for_ad`] before AD when
+    /// inference; run `rlx_opt::prepare_graph_for_ad` before AD when
     /// the graph already contains fused ops from `Direct` lowering.
     pub const fn for_autodiff() -> Self {
         Self::Fusable

@@ -13,6 +13,8 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_sparse::SparseTensor;
 
+mod common;
+
 fn bytes_to_f64s(bytes: &[u8]) -> Vec<f64> {
     bytes
         .chunks_exact(8)
@@ -81,6 +83,7 @@ fn transpose_csr(
 
 #[test]
 fn lu_general_runs_on_mlx_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     rlx_sparse::register();
     let (values, col_idx, row_ptr) = build_nonsym_4();
     let n = 4;
@@ -118,6 +121,7 @@ fn lu_general_runs_on_mlx_and_matches_cpu() {
 
 #[test]
 fn gmres_runs_on_mlx_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     rlx_sparse::register();
     let (values, col_idx, row_ptr) = build_nonsym_4();
     let n = 4;
@@ -155,6 +159,7 @@ fn gmres_runs_on_mlx_and_matches_cpu() {
 
 #[test]
 fn values_grad_runs_on_mlx_and_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     rlx_sparse::register();
 
     let col_idx = vec![0, 1, 0, 1, 2, 1, 2, 3, 2, 3];

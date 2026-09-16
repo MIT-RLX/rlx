@@ -6,7 +6,7 @@
 //!
 //! RLX's diagnostics are ~2600 ad-hoc `eprintln!`/`println!` sites: unstructured
 //! and impossible to feed into an audit trail. This module is the typed, opt-in
-//! alternative — a thin facade over the [`tracing`] crate that emits STRUCTURED
+//! alternative — a thin facade over the `tracing` crate that emits STRUCTURED
 //! events with a stable name plus a metadata detail. It is the foundation for
 //! the audit-logging a HIPAA/FDA validated pipeline needs (per-inference
 //! records: model + weight hash, engine version, device, shapes, timing).
@@ -23,7 +23,7 @@
 //! Without the `tracing` feature every entry point compiles to a no-op (the
 //! optimizer removes the call), exactly like [`crate::kernel_trace`]. Turn on
 //! `--features tracing` to get structured logs; a downstream product installs
-//! its own [`tracing`] subscriber to route events to an append-only audit sink.
+//! its own `tracing` subscriber to route events to an append-only audit sink.
 //!
 //! ```ignore
 //! rlx_runtime::obs::event("inference", format_args!(

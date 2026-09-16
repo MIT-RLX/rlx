@@ -29,3 +29,7 @@ rlx-opt = { path = "../rlx-opt", features = ["compile"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

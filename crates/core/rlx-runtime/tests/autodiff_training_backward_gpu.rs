@@ -10,6 +10,8 @@ use rlx_cpu::arena::Arena;
 use rlx_cpu::thunk::{compile_thunks, execute_thunks};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
+mod common;
+
 fn write_slot(arena: &mut Arena, id: NodeId, data: &[f32]) {
     let off = arena.byte_offset(id);
     unsafe {
@@ -102,6 +104,7 @@ fn rms_norm_inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn cpu_rms_norm_backward_input_finite() {
+    let _gpu = common::serialize_gpu();
     let (x, gamma, beta, dy) = rms_norm_inputs();
     let got = cpu_run(
         build_rms_norm_bwd_input_graph(),
@@ -115,6 +118,7 @@ fn cpu_rms_norm_backward_input_finite() {
 /// backward (input + gamma + beta) is ground-truthed, not just the input term.
 #[test]
 fn cpu_rms_norm_backward_gamma_beta_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let (rows, h) = (3usize, 4usize);
     let f = DType::F32;
     let x: Vec<f32> = (0..rows * h).map(|i| 0.1 * (i as f32 - 3.0)).collect();
@@ -163,6 +167,7 @@ fn cpu_rms_norm_backward_gamma_beta_matches_finite_difference() {
 /// catch a bug shared by both (exactly how the `1/r` error stayed hidden).
 #[test]
 fn decompose_rms_norm_backward_input_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let (x, gamma, beta, dy) = rms_norm_inputs();
     let decomposed =
         rlx_opt::rlx_autodiff::decompose_backward_ops_except(build_rms_norm_bwd_input_graph(), &[]);
@@ -203,6 +208,7 @@ fn forward_rms_norm(x: &[f32], gamma: &[f32], beta: &[f32]) -> Vec<f32> {
 /// identically. Finite differences are the independent oracle.
 #[test]
 fn cpu_rms_norm_backward_input_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let (x, gamma, beta, dy) = rms_norm_inputs();
     let analytic = cpu_run(
         build_rms_norm_bwd_input_graph(),
@@ -240,6 +246,7 @@ fn cpu_rms_norm_backward_input_matches_finite_difference() {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_rms_norm_backward_input_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if !rlx_wgpu::is_available() {
         eprintln!("skip wgpu_rms_norm_backward_input_matches_cpu: no adapter");
         return;
@@ -261,8 +268,10 @@ fn wgpu_rms_norm_backward_input_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_rms_norm_backward_input_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }
@@ -283,8 +292,10 @@ fn cuda_rms_norm_backward_input_matches_cpu() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_rms_norm_backward_input_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip rocm_rms_norm_backward_input_matches_cpu (unavailable)");
         return;
     }
@@ -305,6 +316,7 @@ fn rocm_rms_norm_backward_input_matches_cpu() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_rms_norm_backward_input_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     use rlx_runtime::{CompileOptions, Device, Session};
     let (x, gamma, beta, dy) = rms_norm_inputs();
     let bwd = build_rms_norm_bwd_input_graph();
@@ -338,7 +350,7 @@ fn build_rope_bwd_graph() -> Graph {
     let dy = g.input("dy", Shape::new(&[b, s, hd], f));
     let cos = g.input("cos", Shape::new(&[s, tab], f));
     let sin = g.input("sin", Shape::new(&[s, tab], f));
-    let dx = g.rope_backward(dy, cos, sin, hd, 6);
+    let dx = g.rope_backward(dy, cos, sin, hd, 6, rlx_ir::op::RopeStyle::NeoX);
     g.set_outputs(vec![dx]);
     g
 }
@@ -360,9 +372,40 @@ fn rope_inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     (dy, cos, sin)
 }
 
+/// A **packed** cos/sin table (`[s, n_rot/2]`, no slack columns) — the
+/// DeepSeek-V4 MLA layout.
+///
+/// The padded fixture above uses `tab = head_dim/2`, which for `n_rot = 6`,
+/// `head_dim = 8` happens to equal 4 — the same number a `head_dim/2` hardcode
+/// would compute. So it pins the `n_rot/2` mistake and is blind to the
+/// `head_dim/2` one. This fixture is blind to the opposite. Both are needed;
+/// each backward kernel has, at different times, had each of the two.
+fn rope_inputs_packed() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (b, s, hd, n_rot) = (1usize, 3usize, 8usize, 4usize);
+    let tab = n_rot / 2;
+    let dy: Vec<f32> = (0..b * s * hd).map(|i| 0.05 + 0.11 * i as f32).collect();
+    let cos: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.41).cos()).collect();
+    let sin: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.41).sin()).collect();
+    (dy, cos, sin)
+}
+
+fn build_rope_bwd_graph_packed() -> Graph {
+    let f = DType::F32;
+    let (b, s, hd, n_rot) = (1usize, 3usize, 8usize, 4usize);
+    let tab = n_rot / 2;
+    let mut g = Graph::new("rope_bwd_packed");
+    let dy = g.input("dy", Shape::new(&[b, s, hd], f));
+    let cos = g.input("cos", Shape::new(&[s, tab], f));
+    let sin = g.input("sin", Shape::new(&[s, tab], f));
+    let dx = g.rope_backward(dy, cos, sin, hd, n_rot, rlx_ir::op::RopeStyle::NeoX);
+    g.set_outputs(vec![dx]);
+    g
+}
+
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_rope_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if !rlx_wgpu::is_available() {
         eprintln!("skip wgpu_rope_backward_matches_cpu: no adapter");
         return;
@@ -381,8 +424,10 @@ fn wgpu_rope_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_rope_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }
@@ -400,8 +445,10 @@ fn cuda_rope_backward_matches_cpu() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_rope_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip rocm_rope_backward_matches_cpu (unavailable)");
         return;
     }
@@ -419,11 +466,89 @@ fn rocm_rope_backward_matches_cpu() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_rope_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     use rlx_runtime::{CompileOptions, Device, Session};
     let (dy, cos, sin) = rope_inputs();
     let bwd = build_rope_bwd_graph();
     let want = cpu_run(bwd.clone(), &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
     let session = Session::new(Device::Metal);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled
+        .run(&[("dy", &dy), ("cos", &cos), ("sin", &sin)])
+        .remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_rope_backward_packed_table_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    use rlx_runtime::{CompileOptions, Session};
+    if !rlx_wgpu::is_available() {
+        eprintln!("skip: no adapter");
+        return;
+    }
+    let (dy, cos, sin) = rope_inputs_packed();
+    let bwd = build_rope_bwd_graph_packed();
+    let want = cpu_run(bwd.clone(), &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
+    let session = Session::new(rlx_runtime::Device::Gpu);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled
+        .run(&[("dy", &dy), ("cos", &cos), ("sin", &sin)])
+        .remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_rope_backward_packed_table_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    use rlx_runtime::{CompileOptions, Session};
+    if common::skip_unless(rlx_runtime::Device::Cuda) {
+        eprintln!("skip: no CUDA device");
+        return;
+    }
+    let (dy, cos, sin) = rope_inputs_packed();
+    let bwd = build_rope_bwd_graph_packed();
+    let want = cpu_run(bwd.clone(), &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
+    let session = Session::new(rlx_runtime::Device::Cuda);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled
+        .run(&[("dy", &dy), ("cos", &cos), ("sin", &sin)])
+        .remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_rope_backward_packed_table_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    use rlx_runtime::{CompileOptions, Session};
+    if common::skip_unless(rlx_runtime::Device::Rocm) {
+        eprintln!("skip: no ROCm device");
+        return;
+    }
+    let (dy, cos, sin) = rope_inputs_packed();
+    let bwd = build_rope_bwd_graph_packed();
+    let want = cpu_run(bwd.clone(), &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
+    let session = Session::new(rlx_runtime::Device::Rocm);
+    let mut compiled = session.compile_with(bwd, &CompileOptions::default());
+    let got = compiled
+        .run(&[("dy", &dy), ("cos", &cos), ("sin", &sin)])
+        .remove(0);
+    assert_close(&want, &got, 1e-4);
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn metal_rope_backward_packed_table_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    use rlx_runtime::{CompileOptions, Session};
+
+    let (dy, cos, sin) = rope_inputs_packed();
+    let bwd = build_rope_bwd_graph_packed();
+    let want = cpu_run(bwd.clone(), &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
+    let session = Session::new(rlx_runtime::Device::Metal);
     let mut compiled = session.compile_with(bwd, &CompileOptions::default());
     let got = compiled
         .run(&[("dy", &dy), ("cos", &cos), ("sin", &sin)])
@@ -463,6 +588,7 @@ fn cumsum_inputs() -> Vec<f32> {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_cumsum_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if !rlx_wgpu::is_available() {
         eprintln!("skip wgpu_cumsum_backward_matches_cpu: no adapter");
         return;
@@ -479,8 +605,10 @@ fn wgpu_cumsum_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_cumsum_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }
@@ -496,8 +624,10 @@ fn cuda_cumsum_backward_matches_cpu() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_cumsum_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip rocm_cumsum_backward_matches_cpu (unavailable)");
         return;
     }
@@ -513,6 +643,7 @@ fn rocm_cumsum_backward_matches_cpu() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_cumsum_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     use rlx_runtime::{CompileOptions, Device, Session};
     let dy = cumsum_inputs();
     let bwd = build_cumsum_bwd_graph();
@@ -556,6 +687,7 @@ fn gather_inputs() -> (Vec<f32>, Vec<f32>) {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_gather_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if !rlx_wgpu::is_available() {
         eprintln!("skip wgpu_gather_backward_matches_cpu: no adapter");
         return;
@@ -572,8 +704,10 @@ fn wgpu_gather_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_gather_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }
@@ -591,8 +725,10 @@ fn cuda_gather_backward_matches_cpu() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_gather_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip rocm_gather_backward_matches_cpu (unavailable)");
         return;
     }
@@ -610,6 +746,7 @@ fn rocm_gather_backward_matches_cpu() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_gather_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     use rlx_runtime::{CompileOptions, Device, Session};
     let (dy, indices) = gather_inputs();
     let bwd = build_gather_bwd_graph();
@@ -670,6 +807,7 @@ fn assert_dx_matches_fd_tol(
 
 #[test]
 fn cpu_layer_norm_backward_input_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let (rows, h) = (3usize, 4usize);
     let f = DType::F32;
     let x: Vec<f32> = (0..rows * h).map(|i| 0.1 * (i as f32 - 5.0)).collect();
@@ -700,6 +838,7 @@ fn cpu_layer_norm_backward_input_matches_finite_difference() {
 
 #[test]
 fn cpu_group_norm_backward_input_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     // N=1: the input kernel processes each batch independently, so N=1 fully pins the
     // per-group formula. (Larger N just inflates FD truncation on these magnitudes; the
     // cross-batch reduction is exercised by the gamma/beta test and the ANE N=2 parity.)
@@ -740,6 +879,7 @@ fn cpu_group_norm_backward_input_matches_finite_difference() {
 
 #[test]
 fn cpu_softmax_cross_entropy_backward_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     // The fused training-loss gradient (MNIST path). `dlogits = (softmax(logits) −
     // onehot(label))·d_loss`; FD the per-row `−log softmax` forward, weighted by
     // d_loss, since `assert_dx_matches_fd` computes `Σ forward·dy` as the scalar.
@@ -778,6 +918,7 @@ fn cpu_softmax_cross_entropy_backward_matches_finite_difference() {
 
 #[test]
 fn cpu_attention_backward_qkv_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     // Scaled-dot-product attention dQ/dK/dV (the last transformer backward op not
     // yet ground-truthed). Causal mask, default 1/√d scale shared by fwd+bwd.
     // Looser tol than the norms: softmax curvature inflates central-diff truncation.
@@ -836,6 +977,7 @@ fn cpu_attention_backward_qkv_matches_finite_difference() {
 
 #[test]
 fn cpu_rope_backward_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     use rlx_ir::op::RopeStyle;
     let (b, s, hd, n_rot) = (1usize, 2usize, 8usize, 6usize);
     let tab = hd / 2;
@@ -851,7 +993,7 @@ fn cpu_rope_backward_matches_finite_difference() {
     let dyi = g.input("dy", xshape());
     let cosi = g.input("cos", cshape());
     let sini = g.input("sin", cshape());
-    let dx = g.rope_backward(dyi, cosi, sini, hd, n_rot);
+    let dx = g.rope_backward(dyi, cosi, sini, hd, n_rot, rlx_ir::op::RopeStyle::NeoX);
     g.set_outputs(vec![dx]);
     let analytic = cpu_run(g, &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
 
@@ -875,8 +1017,109 @@ fn cpu_rope_backward_matches_finite_difference() {
     });
 }
 
+/// The same check with a **tightly packed** table (`[s, n_rot/2]`).
+///
+/// `cpu_rope_backward_matches_finite_difference` uses the Qwen3.5 layout, where
+/// the table is allocated at `head_dim/2` and only the leading `n_rot/2` columns
+/// of each row are used. DeepSeek-V4 MLA packs it with no slack instead, so the
+/// row stride is `n_rot/2`.
+///
+/// Both are valid and the kernel has to read the stride off the shape. Pinning
+/// only one lets the other regress: the backward previously hardcoded `n_rot/2`
+/// (right here, wrong there) and before that `head_dim/2` (the reverse), and
+/// each time the single existing test agreed with whichever assumption was
+/// current.
+#[test]
+fn cpu_rope_backward_fd_with_packed_table() {
+    let _gpu = common::serialize_gpu();
+    use rlx_ir::op::RopeStyle;
+    let (b, s, hd, n_rot) = (1usize, 3usize, 8usize, 4usize);
+    let tab = n_rot / 2; // packed: no slack columns
+    let f = DType::F32;
+    let xshape = || Shape::new(&[b, s, hd], f);
+    let cshape = || Shape::new(&[s, tab], f);
+    let x: Vec<f32> = (0..b * s * hd).map(|i| ((i as f32) * 0.17).cos()).collect();
+    let dy: Vec<f32> = (0..b * s * hd).map(|i| 0.05 + 0.11 * i as f32).collect();
+    let cos: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.41).cos()).collect();
+    let sin: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.41).sin()).collect();
+
+    let mut g = Graph::new("rope_bwd_packed");
+    let dyi = g.input("dy", xshape());
+    let cosi = g.input("cos", cshape());
+    let sini = g.input("sin", cshape());
+    let dx = g.rope_backward(dyi, cosi, sini, hd, n_rot, rlx_ir::op::RopeStyle::NeoX);
+    g.set_outputs(vec![dx]);
+    let analytic = cpu_run(g, &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
+
+    let (cos_c, sin_c) = (cos.clone(), sin.clone());
+    assert_dx_matches_fd(&analytic, &x, &dy, |xv| {
+        let mut g = Graph::new("rope_fwd_packed");
+        let xi = g.input("x", xshape());
+        let cosi = g.input("cos", cshape());
+        let sini = g.input("sin", cshape());
+        let y = g.add_node(
+            Op::Rope {
+                head_dim: hd,
+                n_rot,
+                style: RopeStyle::NeoX,
+            },
+            vec![xi, cosi, sini],
+            xshape(),
+        );
+        g.set_outputs(vec![y]);
+        cpu_run(g, &[("x", xv), ("cos", &cos_c), ("sin", &sin_c)])
+    });
+}
+
+/// Full rotation (`n_rot == head_dim`), where the two stride conventions
+/// coincide — the configuration under which the bug stayed invisible for both
+/// of its lifetimes.
+#[test]
+fn cpu_rope_backward_fd_full_rotation() {
+    let _gpu = common::serialize_gpu();
+    use rlx_ir::op::RopeStyle;
+    let (b, s, hd) = (2usize, 3usize, 6usize);
+    let n_rot = hd;
+    let tab = hd / 2;
+    let f = DType::F32;
+    let xshape = || Shape::new(&[b, s, hd], f);
+    let cshape = || Shape::new(&[s, tab], f);
+    let x: Vec<f32> = (0..b * s * hd).map(|i| ((i as f32) * 0.29).sin()).collect();
+    let dy: Vec<f32> = (0..b * s * hd).map(|i| 0.03 + 0.09 * i as f32).collect();
+    let cos: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.23).cos()).collect();
+    let sin: Vec<f32> = (0..s * tab).map(|i| (i as f32 * 0.23).sin()).collect();
+
+    let mut g = Graph::new("rope_bwd_full");
+    let dyi = g.input("dy", xshape());
+    let cosi = g.input("cos", cshape());
+    let sini = g.input("sin", cshape());
+    let dx = g.rope_backward(dyi, cosi, sini, hd, n_rot, rlx_ir::op::RopeStyle::NeoX);
+    g.set_outputs(vec![dx]);
+    let analytic = cpu_run(g, &[("dy", &dy), ("cos", &cos), ("sin", &sin)]);
+
+    let (cos_c, sin_c) = (cos.clone(), sin.clone());
+    assert_dx_matches_fd(&analytic, &x, &dy, |xv| {
+        let mut g = Graph::new("rope_fwd_full");
+        let xi = g.input("x", xshape());
+        let cosi = g.input("cos", cshape());
+        let sini = g.input("sin", cshape());
+        let y = g.add_node(
+            Op::Rope {
+                head_dim: hd,
+                n_rot,
+                style: RopeStyle::NeoX,
+            },
+            vec![xi, cosi, sini],
+            xshape(),
+        );
+        g.set_outputs(vec![y]);
+        cpu_run(g, &[("x", xv), ("cos", &cos_c), ("sin", &sin_c)])
+    });
+}
+
 #[test]
 fn cpu_cumsum_backward_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let (rows, cols) = (3usize, 4usize);
     let f = DType::F32;
     let shape = || Shape::new(&[rows, cols], f);
@@ -900,6 +1143,7 @@ fn cpu_cumsum_backward_matches_finite_difference() {
 
 #[test]
 fn cpu_gather_backward_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let f = DType::F32;
     let table = vec![0.5f32, -1.0, 2.0, 0.25];
     let indices = vec![0.0f32, 2.0];
@@ -925,6 +1169,7 @@ fn cpu_gather_backward_matches_finite_difference() {
 
 #[test]
 fn cpu_layer_norm_backward_gamma_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let (rows, h) = (3usize, 4usize);
     let f = DType::F32;
     let x: Vec<f32> = (0..rows * h).map(|i| 0.1 * (i as f32 - 5.0)).collect();
@@ -954,6 +1199,7 @@ fn cpu_layer_norm_backward_gamma_matches_finite_difference() {
 
 #[test]
 fn cpu_group_norm_backward_gamma_beta_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let dims = [2usize, 4, 2, 2]; // N>1 exercises the batch reduction
     let ng = 2usize;
     let c = dims[1];
@@ -998,6 +1244,7 @@ fn cpu_group_norm_backward_gamma_beta_matches_finite_difference() {
 
 #[test]
 fn cpu_activation_backward_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     use rlx_ir::op::Activation;
     let n = 6usize;
     let f = DType::F32;
@@ -1040,6 +1287,7 @@ fn cpu_activation_backward_matches_finite_difference() {
 
 #[test]
 fn cpu_relu_backward_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     use rlx_ir::op::Activation;
     let n = 6usize;
     let f = DType::F32;
@@ -1064,6 +1312,7 @@ fn cpu_relu_backward_matches_finite_difference() {
 
 #[test]
 fn cpu_maxpool2d_backward_matches_finite_difference() {
+    let _gpu = common::serialize_gpu();
     let f = DType::F32;
     let xs = Shape::new(&[1, 1, 4, 4], f);
     let ys = Shape::new(&[1, 1, 2, 2], f);

@@ -1,5 +1,6 @@
 [package]
 name = "rlx-runtime"
+build = "build.rs"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -88,7 +89,11 @@ mlx-cuda = ["mlx", "rlx-mlx/cuda"]
 
 # Apple CoreML / Neural Engine (ANE) — lowers the IR to a MIL ML Program
 # and runs it through CoreML.framework.
-coreml = ["cpu", "dep:rlx-coreml"]
+# `ane` is the marker `feature_compiled(Device::Ane)` gates on. Enabling
+# `coreml` without it made that report `false` while the backend was compiled in
+# and `is_available` said `true` — and `skip_unless_device` uses the pair to pick
+# skip-vs-fail, so ANE tests silently skipped on builds that could run them.
+coreml = ["cpu", "ane", "dep:rlx-coreml"]
 
 # All Apple RLX backends: Metal (incl. MPS), MLX, portable wgpu-on-Metal, CoreML/ANE.
 apple = ["cpu", "metal", "mlx", "gpu", "coreml"]
@@ -159,12 +164,23 @@ qnn = ["cpu", "dep:rlx-qnn"]
 # AIE kernel path lands.
 xdna = ["cpu", "dep:rlx-xdna", "rlx-xdna/xrt", "rlx-xdna/direct"]
 
+# ── External GPU ────────────────────────────────────────────
+# Discrete GPU on a USB4/Thunderbolt PCIe tunnel (`Device::Egpu`) — the path for
+# hosts with no in-tree class-0x03 driver (Apple Silicon). Pure Rust, no SDK at
+# build time. `is_available` requires device bring-up, which is unimplemented,
+# so this registers the seam and reports what is missing without dispatching.
+egpu = ["cpu", "dep:rlx-egpu", "rlx-egpu/dext"]
+
 # FPGA / SystemVerilog export (`rlx_runtime::export`). Offline artifact emit —
 # does not register a runtime Device / Backend.
 fpga = ["dep:rlx-fpga"]
 
 [dependencies]
 rlx-ir = { workspace = true, features = ["serialize"] }
+# Tile parameter space + analytical cost model, for the device-free schedule
+# axis of `check`. Not a GPU dependency: the crate is dependency-free, holds no
+# kernel sources, and touches neither the filesystem nor a driver.
+rlx-gpu-dispatch = { workspace = true }
 # Structured observability / audit spine (`obs.rs`), off by default. Optional so
 # the base build stays lean (empty-prelude ethos) and pays zero overhead.
 tracing = { version = "0.1", optional = true }
@@ -186,6 +202,7 @@ rlx-oneapi = { workspace = true, optional = true }
 rlx-tpu = { workspace = true, optional = true }
 rlx-qnn = { workspace = true, optional = true, features = ["runtime"] }
 rlx-xdna = { workspace = true, optional = true }
+rlx-egpu = { workspace = true, optional = true }
 rlx-fpga = { workspace = true, optional = true }
 rlx-macros = { workspace = true }
 # rlx-compile: used unconditionally by src/check.rs, so it belongs in
@@ -203,8 +220,8 @@ rlx-gguf = { workspace = true }
 rlx-pkg = { workspace = true }
 rlx-mlx-io = { workspace = true }
 rlx-dduf = { workspace = true }
-# rlx-gpu = { path = "../rlx-gpu", version = "0.2.14", optional = true }
-# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.14", optional = true }
+# rlx-gpu = { path = "../rlx-gpu", version = "0.2.16", optional = true }
+# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.16", optional = true }
 
 # rlx-metal is Apple-only (Metal is an Apple API). Make it a dependency solely on
 # Apple targets — excluding watchOS, which has no Metal compute — so the `metal`
@@ -238,7 +255,7 @@ rlx-flow = { workspace = true }
 rayon = "1"
 rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.14", default-features = false, features = ["test-support", "io"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.16", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # `metal`/`mlx` are enabled ONLY on macOS (see the target-specific
 # dev-dependencies below) — those backends exist solely on Apple, and on a
@@ -303,5 +320,3 @@ required-features = ["cpu"]
 features     = ["cpu", "gpu"]
 rustdoc-args = ["--cfg", "docsrs"]
 all-features = false
-
-build = "build.rs"

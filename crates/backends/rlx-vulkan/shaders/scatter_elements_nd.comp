@@ -1,0 +1,57 @@
+#version 450
+// ONNX ScatterElements. See `gather_nd.comp` for the shared conventions.
+//
+// Implements only the CPU kernel's *exact* branch — indices rank == data rank
+// and prod(indices_shape) == n — which decomposes a flat update position by the
+// indices' own strides. The host declines the rank-1 and "dense" branches,
+// which infer a layout rather than being told one.
+//
+// Overwrite only: `Reduction::Add` would need an f32 atomic, and Vulkan's
+// `VK_EXT_shader_atomic_float` is optional, so an accumulating scatter keeps the
+// host route (CUDA and ROCm use `atomicAdd`). `dst` must already hold the
+// sanitised copy of `data` — see `copy_sanitize.comp`.
+//
+// meta = [ istride, dstride, dshape ], each `rank` long → rank <= 5.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;                 // min(indices_len, updates_len)
+    uint upd_off;
+    uint idx_off;
+    uint dst_off;
+    uint dst_len;
+    uint rank;
+    uint axis;
+    uint _pad;
+    uvec4 meta[4];
+} pc;
+
+uint meta_at(uint i) { return pc.meta[i >> 2u][i & 3u]; }
+
+void main() {
+    uint f = gl_GlobalInvocationID.x;
+    if (f >= pc.n) { return; }
+
+    uint r = pc.rank;
+    // CPU: `indices[flat_i].max(0)` — a bare floor at 0, NOT the wrap-and-clamp
+    // the gathers apply. Kept different on purpose.
+    int row = int(round(arena_load(pc.idx_off + f)));
+    if (row < 0) { row = 0; }
+
+    uint rem = f;
+    uint dst = 0u;
+    for (uint d = 0u; d < r; ++d) {
+        uint istride = meta_at(d);
+        uint c = 0u;
+        if (istride != 0u) {
+            c = rem / istride;
+            rem = rem % istride;
+        }
+        if (d == pc.axis) { c = uint(row); }
+        uint dshape = meta_at(2u * r + d);
+        uint last = (dshape > 0u) ? (dshape - 1u) : 0u;
+        dst += min(c, last) * meta_at(r + d);
+    }
+    if (dst >= pc.dst_len) { return; }
+    arena_store(pc.dst_off + dst, arena_load(pc.upd_off + f));
+}

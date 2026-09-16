@@ -815,6 +815,9 @@ kernel void sdpa_h(
             if (ki > qi) s = -1e9f;
         } else if (mask_kind == 2u) {
             if (float(M[bi * seq_stride + ki]) < 0.5f) s = -1e9f;
+        } else if (mask_kind == 3u) {
+            // Additive per-head bias [B, H, S, S] — see `sdpa`. Lq == Lk here.
+            s += float(M[((bi * heads + hi) * seq + qi) * seq + ki]);
         } else if (mask_kind == 4u) {
             // Lq == Lk here (sdpa_h is prefill-only), so abs_q == qi.
             uint lo = qi > window ? qi - window : 0u;
@@ -879,14 +882,11 @@ kernel void rope_h(
     constant uint& n_rot          [[buffer(10)]],
     constant uint& cos_per_token  [[buffer(11)]],
     constant uint& interleaved    [[buffer(12)]],
+    constant uint& cos_row_stride [[buffer(13)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint rot_half = n_rot / 2;
-    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
-    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
-    // row stride overruns into the next token's angles from position 1 onward,
-    // which is why this indexes by `rot_half`. Full rope has n_rot == head_dim,
-    // so rot_half == head_dim/2 and nothing changes there.
+    uint tab_stride = max(cos_row_stride, 1u);
     if (gid.x >= head_dim) return;
 
     uint bs = gid.z;
@@ -914,8 +914,8 @@ kernel void rope_h(
             uint b = 2u * d + 1u;
             float x1 = float(x[src_base + a]);
             float x2 = float(x[src_base + b]);
-            float c = float(cos[cos_row * rot_half + d]);
-            float s = float(sin[cos_row * rot_half + d]);
+            float c = float(cos[cos_row * tab_stride + d]);
+            float s = float(sin[cos_row * tab_stride + d]);
             out[dst_base + a] = half(x1 * c - x2 * s);
             out[dst_base + b] = half(x2 * c + x1 * s);
         } else if (d >= n_rot) {
@@ -924,8 +924,8 @@ kernel void rope_h(
     } else if (d < rot_half) {
         float x1 = float(x[src_base + d]);
         float x2 = float(x[src_base + rot_half + d]);
-        float c = float(cos[cos_row * rot_half + d]);
-        float s = float(sin[cos_row * rot_half + d]);
+        float c = float(cos[cos_row * tab_stride + d]);
+        float s = float(sin[cos_row * tab_stride + d]);
         out[dst_base + d] = half(x1 * c - x2 * s);
         out[dst_base + rot_half + d] = half(x2 * c + x1 * s);
     } else if (d >= n_rot) {
@@ -2579,6 +2579,446 @@ kernel void conv_transpose2d(
 
 // 3D NCDHW convolution. Weight: [C_out, C_in/groups, kD, kH, kW].
 // One thread per output element; grid (w_out, h_out, n*c_out*d_out).
+
+// The implicit-GEMM conv3d, with the index arithmetic taken out of the loop.
+//
+// `conv3d_gemm` below gets the arithmetic onto the tensor units, but pays six
+// integer divisions per gathered element to turn a (position, tap) pair into
+// an input offset — and kw/kh/kd are runtime uniforms, so the compiler cannot
+// strength-reduce any of them. On a GPU with no integer divide that is not a
+// rounding error.
+//
+// MLX's answer is a precomputed `inp_jump_c`, and this is the same trick: make
+// the K-tile exactly one input channel wide, so a step through K is a step of
+// one channel and nothing else. Then
+//
+//   * the tap (kz, ky, kx) a slot reads is fixed for the whole loop,
+//   * so is the output position, so is the bounds test,
+//   * and the gather collapses to `src[base + ci * D*H*W]` — one add.
+//
+// The same holds for the filter: `wt[co * K + tap + ci * ktap]`.
+//
+// The cost is padding: 3^3 is 27 taps in a 32-wide tile, so 5/32 of the MMA
+// work multiplies zeros. Trading 16% of the tensor units for all of the
+// integer unit is a good trade.
+//
+// Slot indexing is chosen so that within a simdgroup the lane walks
+// consecutive output positions (contiguous input) for A and consecutive taps
+// (contiguous filter) for B, so both gathers coalesce. Threadgroup rows are
+// padded by one float to keep 32 lanes off the same bank.
+//
+// Requires groups == 1 and kd*kh*kw <= 32; `encode_conv3d` checks both.
+// Templated on the channel-tile width. A tile loads BM*K values of A and
+// serves BN output channels with them, so total A traffic is
+// `M * K * ceil(C_out / BN)` — doubling BN from 32 to 64 halves the reads for
+// every 64-channel layer, and SynthStrip has eight of them. Threadgroup
+// arrays come in as pointers because MSL only allows them at kernel scope.
+template <uint BM_T, uint BN_T, uint PAD_T>
+void conv3d_gemm_c_impl(
+    device const float* src,
+    device const float* wt,
+    device float* dst,
+    constant uint4& a, constant uint4& b, constant uint4& c,
+    constant uint4& d, constant uint4& e, constant uint4& f,
+    device const float* bias,   // per-output-channel; f.z says whether it is real
+    constant float& leaky_alpha, // epilogue slope; f.w selects the epilogue
+    device const float* src2,   // second half of a channel-concatenated input
+    constant uint& c_split,     // channels taken from `src`; == c_in when unfused
+    constant uint4& up,         // [sc_d, sc_h, sc_w, _]; all 1 when `src` is not upsampled
+    threadgroup float* As,
+    threadgroup float* Bs,
+    uint2 tgid, uint sgid, uint slid
+) {
+    constexpr uint BM = BM_T, BK = 32u, NT = 128u;
+    // One float of row padding keeps 32 lanes writing consecutive rows off the
+    // same bank. It also costs 256 bytes of threadgroup memory, which is the
+    // difference between 8448 and 8192 — potentially a whole extra resident
+    // threadgroup. PAD_T = 0 trades the conflict-freedom for that.
+    constexpr uint LDA = BK + PAD_T, LDB = BN_T + PAD_T, LDC = BN_T + PAD_T;
+    constexpr uint SLOTS = (BM * BK) / NT;      // A elements per thread
+    constexpr uint BSLOTS = (BK * BN_T) / NT;   // B elements per thread
+    constexpr uint CSLOTS = (BM * BN_T) / NT;   // output elements per thread
+    constexpr uint NACC = BN_T / 8u;            // 8-wide column blocks
+    constexpr uint RB = BM / 32u;               // 8-row blocks per simdgroup
+    // Slot p = tix + j*NT. Because BM divides NT, `p % BM` does not depend on
+    // j, so every thread owns one row for the whole kernel and the output
+    // position decodes exactly once — the property the whole design rests on.
+    constexpr uint KK_STRIDE = NT / BM;
+
+    uint nb = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
+    uint win = b.x; uint c_out = b.y; uint d_out = b.z; uint h_out = b.w;
+    uint w_out = c.x; uint kd = c.y; uint kh = c.z; uint kw = c.w;
+    uint sd = d.x; uint sh = d.y; uint sw = d.z;
+    uint pd = e.x; uint ph = e.y; uint pw = e.z; uint dd = e.w;
+    uint dh = f.x; uint dw = f.y;
+
+    uint ktap = kd * kh * kw;
+    uint K = c_in * ktap;
+    uint dhw = din * hin * win;
+    uint M = nb * d_out * h_out * w_out;
+    uint m0 = tgid.x * BM;
+    uint n0 = tgid.y * BN_T;
+
+    uint tix = sgid * 32u + slid;   // 0..127
+    uint row = tix % BM;
+    uint kk_base = tix / BM;
+    uint m = m0 + row;
+    bool m_ok = m < M;
+    uint wo = 0, ho = 0, d_o = 0, nn = 0;
+    if (m_ok) {
+        uint t = m;
+        wo = t % w_out; t /= w_out;
+        ho = t % h_out; t /= h_out;
+        d_o = t % d_out; nn = t / d_out;
+    }
+    // Two spatial offsets per slot, because the two concatenated sources need
+    // not share a resolution. `src` may be a nearest-neighbour upscale of a
+    // smaller tensor — the decoder's `upsample(x)` — in which case the voxel
+    // this position reads is at `in/scale` in that tensor's own grid. Folding
+    // that division in here means the upsampled volume is never built.
+    uint scd = max(up.x, 1u), sch = max(up.y, 1u), scw = max(up.z, 1u);
+    uint din_a = din / scd, hin_a = hin / sch, win_a = win / scw;
+    uint dhw_a = din_a * hin_a * win_a;
+    // Only the values that cannot be recomputed cheaply are kept per slot.
+    // The tap index, and every B-slot quantity below, are affine in the slot
+    // number — holding them in registers costs occupancy, which is what
+    // decides this kernel.
+    uint a_base[SLOTS]; uint a_base_a[SLOTS]; bool a_ok[SLOTS];
+    for (uint j = 0; j < SLOTS; ++j) {
+        uint tap = kk_base + KK_STRIDE * j;
+        a_ok[j] = false;
+        a_base[j] = 0u;
+        a_base_a[j] = 0u;
+        if (!m_ok || tap >= ktap) continue;
+        uint kx = tap % kw; uint r = tap / kw;
+        uint ky = r % kh;   uint kz = r / kh;
+        int in_d = (int)(d_o * sd + kz * dd) - (int)pd;
+        int in_h = (int)(ho * sh + ky * dh) - (int)ph;
+        int in_w = (int)(wo * sw + kx * dw) - (int)pw;
+        if (in_d < 0 || in_h < 0 || in_w < 0
+            || in_d >= (int)din || in_h >= (int)hin || in_w >= (int)win) continue;
+        a_ok[j] = true;
+        // Spatial offset only. The channel and batch terms are added in the
+        // loop, because with a concatenated input they differ per source.
+        a_base[j] = ((uint)in_d * hin + (uint)in_h) * win + (uint)in_w;
+        a_base_a[j] = (((uint)in_d / scd) * hin_a + ((uint)in_h / sch)) * win_a
+                    + ((uint)in_w / scw);
+    }
+    // B is staged through threadgroup memory rather than read from device
+    // memory in the MMA. `simdgroup_load` has a transpose flag and the filter
+    // is already a [co][tap] matrix with row stride K, so the tile *can* be
+    // loaded straight from `wt` with no staging at all — and that was measured
+    // at 40 ms against 22 ms for the whole network. A transposed device load
+    // walks eight columns that are K floats apart, so it touches eight distant
+    // cache lines per 8x8 block; staging reads the same values contiguously
+    // (stride 1 in tap) and pays one threadgroup round-trip for it.
+    //
+    // Removing the B staging is still worth 1.13x-1.26x on the large shapes
+    // (measured by hoisting it out of the loop). Getting it needs the weights
+    // pre-transposed to [ci][tap][co] so the direct load is contiguous in the
+    // output channel — a one-time layout change at parameter upload, not
+    // something the kernel can do for itself.
+    // B slots: column = sgid + 4j, tap = slid — recomputed where used.
+    bool b_tap_ok = slid < ktap;
+
+    simdgroup_float8x8 acc[RB * NACC];
+    for (uint j = 0; j < RB * NACC; ++j)
+        acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint nblk = (ktap + 7u) / 8u;
+
+    // Software pipeline. The device loads for channel ci+1 depend on nothing
+    // in the threadgroup, so they are issued before the MMAs for channel ci
+    // and their latency is paid while the tensor units are busy.
+    float a_reg[SLOTS], b_reg[BSLOTS];
+    // A channel-concatenated input is read in place rather than materialised:
+    // channels below `c_split` come from `src`, the rest from `src2`. The
+    // branch is on the loop counter, so it is uniform across the threadgroup —
+    // no divergence, and it costs one compare per input channel against a
+    // whole extra pass to build the concatenated tensor. When there is no
+    // concat the host sets `c_split = c_in` and `src2 = src`, and this reduces
+    // to the plain form.
+    uint base_a = nn * c_split * dhw_a;
+    uint base_b = nn * (c_in - c_split) * dhw;
+    for (uint j = 0; j < SLOTS; ++j) a_reg[j] = a_ok[j] ? src[base_a + a_base_a[j]] : 0.0f;
+    for (uint j = 0; j < BSLOTS; ++j) {
+        uint co = n0 + sgid + 4u * j;
+        b_reg[j] = (b_tap_ok && co < c_out) ? wt[co * K + slid] : 0.0f;
+    }
+
+    for (uint ci = 0; ci < c_in; ++ci) {
+        for (uint j = 0; j < SLOTS; ++j)
+            As[row * LDA + (kk_base + KK_STRIDE * j)] = a_reg[j];
+        for (uint j = 0; j < BSLOTS; ++j)
+            Bs[slid * LDB + (sgid + 4u * j)] = b_reg[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (ci + 1u < c_in) {
+            uint nci = ci + 1u;
+            uint woff = nci * ktap;
+            if (nci < c_split) {
+                uint soff = base_a + nci * dhw_a;
+                for (uint j = 0; j < SLOTS; ++j)
+                    a_reg[j] = a_ok[j] ? src[a_base_a[j] + soff] : 0.0f;
+            } else {
+                uint soff = base_b + (nci - c_split) * dhw;
+                for (uint j = 0; j < SLOTS; ++j)
+                    a_reg[j] = a_ok[j] ? src2[a_base[j] + soff] : 0.0f;
+            }
+            for (uint j = 0; j < BSLOTS; ++j) {
+                uint co = n0 + sgid + 4u * j;
+                b_reg[j] = (b_tap_ok && co < c_out) ? wt[co * K + slid + woff] : 0.0f;
+            }
+        }
+
+        // Each B tile is loaded once and multiplied against every row-block
+        // this simdgroup owns, so widening BM raises MMA work per staged
+        // element without touching the B staging at all. The staging — gather,
+        // threadgroup write, two barriers — is what bounds this kernel:
+        // measured, its runtime is flat from 1 tap to 32.
+        for (uint kb = 0; kb < nblk; ++kb) {
+            simdgroup_float8x8 bv;
+            for (uint j = 0; j < NACC; ++j) {
+                simdgroup_load(bv, Bs + kb * 8u * LDB + j * 8u, LDB);
+                for (uint r = 0; r < RB; ++r) {
+                    simdgroup_float8x8 av;
+                    simdgroup_load(av, As + (sgid * RB + r) * 8u * LDA + kb * 8u, LDA);
+                    simdgroup_multiply_accumulate(acc[r * NACC + j], av, bv,
+                                                  acc[r * NACC + j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Bs is dead once the last MMA has run, and it is the larger of the two
+    // staging buffers, so the output tile lands there rather than claiming a
+    // third allocation.
+    // As is dead once the last MMA has run and is the buffer sized BM x 33,
+    // which is exactly what the BM x BN output tile needs.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* Cs = As;
+    for (uint r = 0; r < RB; ++r)
+        for (uint j = 0; j < NACC; ++j)
+            simdgroup_store(acc[r * NACC + j],
+                            Cs + ((sgid * RB + r) * 8u) * LDC + j * 8u, LDC);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scatter back into [N, C_out, D, H, W]; the lane walks output positions,
+    // so the stores coalesce too.
+    for (uint j = 0; j < CSLOTS; ++j) {
+        uint col = kk_base + KK_STRIDE * j;
+        uint co = n0 + col;
+        if (!m_ok || co >= c_out) continue;
+        // The bias epilogue is free here: the accumulator is already in
+        // registers, so folding it in costs one add per output element and
+        // saves a whole separate pass over the tensor.
+        float v = Cs[row * LDC + col];
+        if (f.z) v += bias[co];
+        // LeakyReLU in the store. `max(v, alpha*v)` is exactly LeakyReLU for
+        // any alpha < 1, and here it is two instructions on a value already in
+        // a register — against two more full passes over the tensor if the
+        // activation is left as its own Mul and Max nodes.
+        if (f.w == 1u) v = max(v, leaky_alpha * v);
+        dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = v;
+    }
+}
+
+// Only 32x32 is instantiated, and both dimensions have been tried wider.
+//
+//   BN=64 — halves A traffic for 64-channel layers: 0.90x (slower).
+//   BM=64 — doubles MMA work per staged B element: 0.90x / 0.95x / 1.06x /
+//           0.87x per-op, and 0.78x on the whole network.
+//
+// Both are interleaved, same-process measurements. The pattern is occupancy:
+// this kernel already uses 8.4 KiB of threadgroup memory, three threadgroups
+// resident per core on an M4 Pro's 32 KiB, and either widening pushes that to
+// two. The template keeps both knobs visible so the results are not
+// re-discovered by hand.
+//
+// Written out rather than macro-generated: the MSL audit test scans this
+// source for `kernel void <name>(`, and a macro body declares one literally
+// named `NAME`.
+kernel void conv3d_gemm_c(
+    device const float* src [[buffer(0)]],
+    device const float* wt  [[buffer(1)]],
+    device float* dst       [[buffer(2)]],
+    constant uint4& a       [[buffer(3)]],
+    constant uint4& b       [[buffer(4)]],
+    constant uint4& c       [[buffer(5)]],
+    constant uint4& d       [[buffer(6)]],
+    constant uint4& e       [[buffer(7)]],
+    constant uint4& f       [[buffer(8)]],
+    device const float* bias [[buffer(9)]],
+    constant float& leaky_alpha [[buffer(10)]],
+    device const float* src2 [[buffer(11)]],
+    constant uint& c_split [[buffer(12)]],
+    constant uint4& up [[buffer(13)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  slid [[thread_index_in_simdgroup]]
+) {
+    threadgroup float As[32u * 33u];
+    threadgroup float Bs[32u * 33u];
+    conv3d_gemm_c_impl<32u, 32u, 1u>(src, wt, dst, a, b, c, d, e, f, bias, leaky_alpha,
+                                     src2, c_split, up, As, Bs, tgid, sgid, slid);
+}
+
+
+// A conv3d that never builds its im2col matrix.
+//
+// After MLX's `implicit_gemm_conv_3d`. A convolution is a matrix multiply
+// wearing a disguise: with
+//
+//     M = N * D_out * H_out * W_out   one row per output position
+//     N = C_out                       one column per output channel
+//     K = C_in * kd * kh * kw         one entry per tap
+//
+// the output is A x B, where A[m, k] is the input voxel that tap k reads for
+// output position m, and B[k, n] is the filter. im2col materialises A, which
+// for a 3^3 kernel is 27x the input — that is why `Conv::Im2col` upstream has
+// to be size-gated, and why it loses on the big early layers. Here A is never
+// built: each tile gathers its own 32x16 patch straight from the input, so the
+// multiply gets GEMM's arithmetic intensity with none of GEMM's memory.
+//
+// That intensity is the whole point. The naive `conv3d` below reads every
+// input voxel once per output channel and does one scalar FMA per two loads.
+// This reads each voxel once per 32-channel tile and runs the arithmetic on
+// the tensor units as 8x8 simdgroup matrices: 16 MACs per float loaded, a
+// factor of ~32.
+//
+// Restricted to groups == 1 and kernels whose K fits the addressing below;
+// `encode_conv3d` sends everything else to the naive kernel.
+//
+// Tile: 32 positions x 32 channels, 16 taps per pass, 128 threads
+// (4 simdgroups, one per 8 rows, each holding 4 column accumulators).
+kernel void conv3d_gemm(
+    device const float* src    [[buffer(0)]],
+    device const float* wt     [[buffer(1)]],
+    device float* dst          [[buffer(2)]],
+    constant uint4& a          [[buffer(3)]],  // [N, C_in, D, H]
+    constant uint4& b          [[buffer(4)]],  // [W, C_out, D_out, H_out]
+    constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
+    constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
+    constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
+    device const float* bias   [[buffer(9)]],  // per-channel; f.z = present
+    constant float& leaky_alpha [[buffer(10)]], // epilogue slope; f.w selects
+    device const float* src2   [[buffer(11)]], // second half of a concat input
+    constant uint& c_split     [[buffer(12)]], // channels from `src`; == c_in if none
+    constant uint4& up         [[buffer(13)]], // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  slid [[thread_index_in_simdgroup]]
+) {
+    constexpr uint BM = 32u, BN = 32u, BK = 16u, NT = 128u;
+
+    uint nb = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
+    uint win = b.x; uint c_out = b.y; uint d_out = b.z; uint h_out = b.w;
+    uint w_out = c.x; uint kd = c.y; uint kh = c.z; uint kw = c.w;
+    uint sd = d.x; uint sh = d.y; uint sw = d.z;
+    uint pd = e.x; uint ph = e.y; uint pw = e.z; uint dd = e.w;
+    uint dh = f.x; uint dw = f.y;
+
+    uint K = c_in * kd * kh * kw;
+    uint M = nb * d_out * h_out * w_out;
+    uint m0 = tgid.x * BM;
+    uint n0 = tgid.y * BN;
+    uint tix = sgid * 32u + slid;  // 0..127
+
+    threadgroup float As[BM * BK];
+    threadgroup float Bs[BK * BN];
+    threadgroup float Cs[BM * BN];
+
+    simdgroup_float8x8 acc[4];
+    for (uint j = 0; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        // A, gathered. Indexed so that consecutive threads walk consecutive
+        // output positions, which for a stride-1 conv is contiguous in the
+        // input — the gather reads coalesce even though it is a gather.
+        for (uint p = tix; p < BM * BK; p += NT) {
+            uint kk = p / BM;
+            uint row = p - kk * BM;
+            uint m = m0 + row;
+            uint k = k0 + kk;
+            float v = 0.0f;
+            if (m < M && k < K) {
+                uint wo = m % w_out; uint t = m / w_out;
+                uint ho = t % h_out; t /= h_out;
+                uint d_o = t % d_out; uint nn = t / d_out;
+                uint kx = k % kw; uint r = k / kw;
+                uint ky = r % kh; r /= kh;
+                uint kz = r % kd; uint ci = r / kd;
+                int in_d = (int)(d_o * sd + kz * dd) - (int)pd;
+                int in_h = (int)(ho * sh + ky * dh) - (int)ph;
+                int in_w = (int)(wo * sw + kx * dw) - (int)pw;
+                if (in_d >= 0 && in_h >= 0 && in_w >= 0
+                    && in_d < (int)din && in_h < (int)hin && in_w < (int)win) {
+                    // Concatenated (and possibly upsampled) input read in
+                    // place — see conv3d_gemm_c.
+                    uint dhw = din * hin * win;
+                    uint sp = ((uint)in_d * hin + (uint)in_h) * win + (uint)in_w;
+                    uint scd = max(up.x, 1u), sch = max(up.y, 1u), scw = max(up.z, 1u);
+                    uint da = din / scd, ha = hin / sch, wa = win / scw;
+                    uint spa = (((uint)in_d / scd) * ha + ((uint)in_h / sch)) * wa
+                             + ((uint)in_w / scw);
+                    v = (ci < c_split)
+                        ? src[(nn * c_split + ci) * (da * ha * wa) + spa]
+                        : src2[(nn * (c_in - c_split) + (ci - c_split)) * dhw + sp];
+                }
+            }
+            As[row * BK + kk] = v;
+        }
+        // B, straight out of the filter. Consecutive threads walk consecutive
+        // taps, which is how the filter is laid out.
+        for (uint p = tix; p < BK * BN; p += NT) {
+            uint col = p / BK;
+            uint kk = p - col * BK;
+            uint k = k0 + kk;
+            uint co = n0 + col;
+            Bs[kk * BN + col] = (co < c_out && k < K) ? wt[co * K + k] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kb = 0; kb < BK / 8u; ++kb) {
+            simdgroup_float8x8 av, bv;
+            simdgroup_load(av, As + sgid * 8u * BK + kb * 8u, BK);
+            for (uint j = 0; j < 4u; ++j) {
+                simdgroup_load(bv, Bs + kb * 8u * BN + j * 8u, BN);
+                simdgroup_multiply_accumulate(acc[j], av, bv, acc[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint j = 0; j < 4u; ++j)
+        simdgroup_store(acc[j], Cs + (sgid * 8u) * BN + j * 8u, BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scatter back into [N, C_out, D, H, W]. Consecutive threads take
+    // consecutive positions again, so the stores coalesce too.
+    for (uint p = tix; p < BM * BN; p += NT) {
+        uint col = p / BM;
+        uint row = p - col * BM;
+        uint m = m0 + row;
+        uint co = n0 + col;
+        if (m >= M || co >= c_out) continue;
+        uint wo = m % w_out; uint t = m / w_out;
+        uint ho = t % h_out; t /= h_out;
+        uint d_o = t % d_out; uint nn = t / d_out;
+        float v = Cs[row * BN + col];
+        if (f.z) v += bias[co];
+        if (f.w == 1u) v = max(v, leaky_alpha * v);
+        dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = v;
+    }
+}
+
+// The scalar conv3d: one thread, one output element, a walk over every tap.
+//
+// Correct for every shape, and the reference the GEMM kernels above are
+// tested against. It still runs for the cases they decline — grouped
+// convolution, and tiles too small to be worth filling.
 kernel void conv3d(
     device const float* src    [[buffer(0)]],
     device const float* wt     [[buffer(1)]],
@@ -2588,7 +3028,12 @@ kernel void conv3d(
     constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
     constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
     constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
-    constant uint4& f          [[buffer(8)]],  // [dh, dw, 0, 0]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
+    device const float* bias   [[buffer(9)]],  // per-channel; f.z = present
+    constant float& leaky_alpha [[buffer(10)]], // epilogue slope; f.w selects
+    device const float* src2   [[buffer(11)]], // second half of a concat input
+    constant uint& c_split     [[buffer(12)]], // channels from `src`; == c_in if none
+    constant uint4& up         [[buffer(13)]], // [sc_d, sc_h, sc_w, _]; 1 = not upsampled
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint n = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
@@ -2625,14 +3070,25 @@ kernel void conv3d(
                         || in_d >= (int)din || in_h >= (int)hin || in_w >= (int)win) {
                         continue;
                     }
-                    uint in_idx = (((nn * c_in + ci) * din + (uint)in_d) * hin + (uint)in_h) * win
-                                  + (uint)in_w;
+                    // Concatenated (and possibly upsampled) input read in
+                    // place — see conv3d_gemm_c.
+                    uint dhw = din * hin * win;
+                    uint sp = ((uint)in_d * hin + (uint)in_h) * win + (uint)in_w;
+                    uint scd = max(up.x, 1u), sch = max(up.y, 1u), scw = max(up.z, 1u);
+                    uint da = din / scd, ha = hin / sch, wa = win / scw;
+                    uint spa = (((uint)in_d / scd) * ha + ((uint)in_h / sch)) * wa
+                             + ((uint)in_w / scw);
+                    float sv = (ci < c_split)
+                        ? src[(nn * c_split + ci) * (da * ha * wa) + spa]
+                        : src2[(nn * (c_in - c_split) + (ci - c_split)) * dhw + sp];
                     uint w_idx = (((co * c_in_per_g + ci_off) * kd + kz) * kh + ky) * kw + kx;
-                    acc += src[in_idx] * wt[w_idx];
+                    acc += sv * wt[w_idx];
                 }
             }
         }
     }
+    if (f.z) acc += bias[co];
+    if (f.w == 1u) acc = max(acc, leaky_alpha * acc);
     dst[(((nn * c_out + co) * d_out + d_o) * h_out + ho) * w_out + wo] = acc;
 }
 
@@ -2647,7 +3103,7 @@ kernel void conv_transpose3d(
     constant uint4& c          [[buffer(5)]],  // [W_out, kd, kh, kw]
     constant uint4& d          [[buffer(6)]],  // [sd, sh, sw, groups]
     constant uint4& e          [[buffer(7)]],  // [pd, ph, pw, dd]
-    constant uint4& f          [[buffer(8)]],  // [dh, dw, 0, 0]
+    constant uint4& f          [[buffer(8)]],  // [dh, dw, has_bias, act]
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint n = a.x; uint c_in = a.y; uint din = a.z; uint hin = a.w;
@@ -2829,6 +3285,68 @@ kernel void pool2d(
     }
     if (kind == 0 || kind == 1) acc /= (float)(kh * kw);  // Mean
     dst[((n * c_total) + c) * h_out * w_out + ho * w_out + wo] = acc;
+}
+
+// 3-D pooling (NCDHW). One thread per output element.
+//
+// The 2-D kernel above cannot serve here and silently did nothing when handed
+// a rank-5 tensor: the compile step fell through to a no-op and left the output
+// buffer untouched, so a network with a 3-D pool returned zeros — or, once the
+// following layers added their biases, an input-independent constant, which is
+// worse because it looks like an answer.
+//
+// n, c and the output depth are packed into gid.z so the dispatch stays three
+// dimensional.
+kernel void pool3d(
+    device const float* src   [[buffer(0)]],
+    device float* dst         [[buffer(1)]],
+    constant uint4& ncdh      [[buffer(2)]],   // [N, C, D, H]
+    constant uint4& w_dhw_out [[buffer(3)]],   // [W, D_out, H_out, W_out]
+    constant uint4& kdhw_sd   [[buffer(4)]],   // [kd, kh, kw, sd]
+    constant uint4& shw_pd    [[buffer(5)]],   // [sh, sw, pd, ph]
+    constant uint2& pw_kind   [[buffer(6)]],   // [pw, kind]
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint n_total = ncdh.x;
+    uint c_total = ncdh.y;
+    uint d = ncdh.z;
+    uint h = ncdh.w;
+    uint w = w_dhw_out.x;
+    uint d_out = w_dhw_out.y;
+    uint h_out = w_dhw_out.z;
+    uint w_out = w_dhw_out.w;
+    uint kd = kdhw_sd.x; uint kh = kdhw_sd.y; uint kw = kdhw_sd.z;
+    uint sd = kdhw_sd.w; uint sh = shw_pd.x;  uint sw = shw_pd.y;
+    uint pd = shw_pd.z;  uint ph = shw_pd.w;  uint pw = pw_kind.x;
+    uint kind = pw_kind.y;
+
+    uint wo = gid.x;
+    uint ho = gid.y;
+    uint ncd = gid.z;
+    if (wo >= w_out || ho >= h_out || ncd >= n_total * c_total * d_out) return;
+    uint dobj = ncd % d_out;
+    uint nc = ncd / d_out;
+
+    float acc = (kind == 2) ? -INFINITY : 0.0f;
+    uint in_chan = nc * d * h * w;
+    for (uint ki = 0; ki < kd; ++ki) {
+        int di = (int)(dobj * sd + ki) - (int)pd;
+        if (di < 0 || di >= (int)d) continue;
+        for (uint kj = 0; kj < kh; ++kj) {
+            int hi = (int)(ho * sh + kj) - (int)ph;
+            if (hi < 0 || hi >= (int)h) continue;
+            for (uint kk = 0; kk < kw; ++kk) {
+                int wi = (int)(wo * sw + kk) - (int)pw;
+                if (wi < 0 || wi >= (int)w) continue;
+                float v = src[in_chan + ((uint)di * h + (uint)hi) * w + (uint)wi];
+                if (kind == 2) acc = max(acc, v); else acc += v;
+            }
+        }
+    }
+    // Mean divides by the whole window, padding included, matching pool2d and
+    // the CPU reference.
+    if (kind == 0 || kind == 1) acc /= (float)(kd * kh * kw);
+    dst[(nc * d_out + dobj) * h_out * w_out + ho * w_out + wo] = acc;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -3608,6 +4126,62 @@ kernel void grouped_gemv_splitk(
     }
 }
 
+// `grouped_gemv_splitk` over a bank still in GGUF's `[E, N, K]` order, so the
+// caller can skip materializing `Transpose(bank, [0,2,1])`.
+//
+// Why this is worth a second kernel rather than a transpose: at decode each of a
+// layer's `top_k` grouped matmuls reads ONE expert slab, so the eight of them
+// move ~67 MB, while transposing the whole `top_k`-slot bank first moves 201 MB.
+// The copy costs three times what the maths it feeds does. (Measured on an M4
+// Pro: 5.5 ms per bank transposed, ~16 ms per layer, and a RESIDENT 288-expert
+// bank is 36x that again.)
+//
+// Coalescing survives the layout change because the split moves with it. In
+// `grouped_gemv_splitk` the 32 lanes of a simdgroup span `col`, and consecutive
+// `col` are adjacent in `[E, K, N]`. Here they span `k` instead, and consecutive
+// `k` are adjacent in `[E, N, K]` — `weight[e*N*K + col*K + kk .. +31]` is the
+// same fully-coalesced 128-byte line. Reusing the original thread mapping on this
+// layout would have strided by K between lanes and thrown the bandwidth away.
+//
+// Same split-K reassociation as its sibling, so ~1 ulp from the sequential
+// kernel and deterministic run to run.
+kernel void grouped_gemv_splitk_bt(
+    device const float* input      [[buffer(0)]],
+    device const float* weight     [[buffer(1)]],
+    device const float* expert_idx [[buffer(2)]],
+    device float* dst              [[buffer(3)]],
+    constant uint& k_dim           [[buffer(4)]],
+    constant uint& n               [[buffer(5)]],
+    constant uint& num_experts     [[buffer(6)]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    constexpr uint KSPLIT = 32u;
+    // [col within tile][k-lane] — mirrors the sibling so the reduction is
+    // identical; only the weight indexing differs.
+    threadgroup float partial[32][KSPLIT];
+    uint col = tgid.x * 32u + tid.y;
+    uint row = tgid.y;
+    uint ks  = tid.x;
+    uint e = (uint)(expert_idx[row]);
+    float acc = 0.0f;
+    bool live = (col < n) && (e < num_experts);
+    if (live) {
+        uint w_base = e * n * k_dim + col * k_dim;
+        uint in_base = row * k_dim;
+        for (uint kk = ks; kk < k_dim; kk += KSPLIT) {
+            acc += input[in_base + kk] * weight[w_base + kk];
+        }
+    }
+    partial[tid.y][ks] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0u && live) {
+        float s = 0.0f;
+        for (uint j = 0u; j < KSPLIT; ++j) s += partial[tid.y][j];
+        dst[row * n + col] = s;
+    }
+}
+
 kernel void grouped_matmul(
     device const float* input      [[buffer(0)]],
     device const float* weight     [[buffer(1)]],
@@ -4177,6 +4751,13 @@ kernel void softmax_lastax(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float row_max = partial[0];
+    // `partial` is reused for the sum below and every thread has just read
+    // `partial[0]`. Without this barrier a thread reaching the reuse first
+    // overwrites `partial[0]` while another SIMD group is still reading
+    // `row_max` from it — a threadgroup spans several SIMD groups, which
+    // diverge freely, so the race is real and intermittent. The cross-entropy
+    // softmax kernels below already carry this barrier.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Pass 2: exp(x - max) and sum.
     float local_sum = 0.0f;
@@ -4231,6 +4812,13 @@ kernel void softmax_lastax_causal(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float row_max = partial[0];
+    // `partial` is reused for the sum below and every thread has just read
+    // `partial[0]`. Without this barrier a thread reaching the reuse first
+    // overwrites `partial[0]` while another SIMD group is still reading
+    // `row_max` from it — a threadgroup spans several SIMD groups, which
+    // diverge freely, so the race is real and intermittent. The cross-entropy
+    // softmax kernels below already carry this barrier.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint i = tid; i < active; i += tsize) {
@@ -5049,6 +5637,11 @@ kernel void ada_layer_norm_backward(
             local_sy += sy;
             local_sxh += sy * n;
         }
+        // Barrier before `partial*` is reused for the next reduction: every
+        // thread has just read slot 0, and a threadgroup spans several SIMD
+        // groups that diverge freely, so without this one group can overwrite
+        // slot 0 while another is still reading it. Intermittent by nature.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         partial_sum[tid] = local_sy;
         partial_sumsq[tid] = local_sxh;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5152,6 +5745,11 @@ kernel void ada_layer_norm_backward_h(
             local_sy += sy;
             local_sxh += sy * n;
         }
+        // Barrier before `partial*` is reused for the next reduction: every
+        // thread has just read slot 0, and a threadgroup spans several SIMD
+        // groups that diverge freely, so without this one group can overwrite
+        // slot 0 while another is still reading it. Intermittent by nature.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         partial_sum[tid] = local_sy;
         partial_sumsq[tid] = local_sxh;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5385,6 +5983,12 @@ kernel void sdpa(
             if (ki > q_offset + qi) s = -1e9;
         } else if (mask_kind == 2u) {
             if (M[bi * k_stride + ki] < 0.5) s = -1e9;
+        } else if (mask_kind == 3u) {
+            // Additive per-head bias [B, H, Sq, Sk]. Every long/flash kernel
+            // handled this; the short-sequence family silently dropped it, so a
+            // model with a learned position bias and seq <= 64 (W2v-BERT's
+            // `relative_key`, DETR-style boxRPB) quietly got plain attention.
+            s += M[((bi * heads + hi) * seq_q + qi) * seq_k + ki];
         } else if (mask_kind == 4u) {
             uint abs_q = q_offset + qi;
             uint lo = abs_q > window ? abs_q - window : 0u;
@@ -5507,6 +6111,12 @@ kernel void sdpa_simd(
             if (ki > q_offset + qi) s = -1e9;
         } else if (mask_kind == 2u) {
             if (M[bi * k_stride + ki] < 0.5) s = -1e9;
+        } else if (mask_kind == 3u) {
+            // Additive per-head bias [B, H, Sq, Sk]. Every long/flash kernel
+            // handled this; the short-sequence family silently dropped it, so a
+            // model with a learned position bias and seq <= 64 (W2v-BERT's
+            // `relative_key`, DETR-style boxRPB) quietly got plain attention.
+            s += M[((bi * heads + hi) * seq_q + qi) * seq_k + ki];
         } else if (mask_kind == 4u) {
             uint abs_q = q_offset + qi;
             uint lo = abs_q > window ? abs_q - window : 0u;
@@ -5629,6 +6239,9 @@ kernel void sdpa_simd_h16(
             if (ki > q_offset + qi) s = -65504.0f;
         } else if (mask_kind == 2u) {
             if (M[bi * k_stride + ki] < 0.5) s = -65504.0f;
+        } else if (mask_kind == 3u) {
+            // Additive per-head bias [B, H, Sq, Sk] — see `sdpa`.
+            s += M[((bi * heads + hi) * seq_q + qi) * seq_k + ki];
         } else if (mask_kind == 4u) {
             uint abs_q = q_offset + qi;
             uint lo = abs_q > window ? abs_q - window : 0u;
@@ -6515,17 +7128,17 @@ kernel void rope(
     constant uint& n_rot          [[buffer(10)]],
     constant uint& cos_per_token  [[buffer(11)]],
     constant uint& interleaved    [[buffer(12)]],
+    constant uint& cos_row_stride [[buffer(13)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     // gid.x = dim index within head (0..head_dim)
     // gid.y = head index
     // gid.z = batch * seq + seq pos (linearized)
     uint rot_half = n_rot / 2;
-    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
-    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
-    // row stride overruns into the next token's angles from position 1 onward,
-    // which is why this indexes by `rot_half`. Full rope has n_rot == head_dim,
-    // so rot_half == head_dim/2 and nothing changes there.
+    // Row stride comes from the table's own last dim (see CPU
+    // `rope_table_stride`). Hardcoding `rot_half` broke partial rotary when
+    // tables are allocated at `head_dim/2` (Moonshine / Qwen3.5).
+    uint tab_stride = max(cos_row_stride, 1u);
     if (gid.x >= head_dim) return;
 
     uint bs = gid.z;
@@ -6557,8 +7170,8 @@ kernel void rope(
             uint b = 2u * d + 1u;
             float x1 = x[src_base + a];
             float x2 = x[src_base + b];
-            float c = cos[cos_row * rot_half + d];
-            float s = sin[cos_row * rot_half + d];
+            float c = cos[cos_row * tab_stride + d];
+            float s = sin[cos_row * tab_stride + d];
             out[dst_base + a] = x1 * c - x2 * s;
             out[dst_base + b] = x2 * c + x1 * s;
         } else if (d >= n_rot) {
@@ -6567,8 +7180,8 @@ kernel void rope(
     } else if (d < rot_half) {
         float x1 = x[src_base + d];
         float x2 = x[src_base + rot_half + d];
-        float c = cos[cos_row * rot_half + d];
-        float s = sin[cos_row * rot_half + d];
+        float c = cos[cos_row * tab_stride + d];
+        float s = sin[cos_row * tab_stride + d];
         out[dst_base + d] = x1 * c - x2 * s;
         out[dst_base + rot_half + d] = x2 * c + x1 * s;
     } else if (d >= n_rot) {
@@ -7945,6 +8558,54 @@ kernel void rms_norm(
     }
 }
 
+// ggml `L2_NORM` over the last dim: out = x / max(sqrt(sum(x^2)), eps).
+//
+// Replaces the 6-thunk HIR expansion (mul → reduce → copy → sqrt →
+// max → div) that Gated-DeltaNet runs twice per linear layer to normalise q
+// and k. Same dispatch shape as `rms_norm`: one threadgroup per row, power-of-2
+// threadgroup reduction.
+//
+// `eps` is read from the arena rather than passed by value: it originates as a
+// `Constant` node, so its value is not known when thunks are compiled — only
+// its arena offset is.
+//
+// NOTE — the arithmetic must mirror the expansion exactly: sum, then `sqrt`,
+// then clamp with `max`, then *divide*. `rsqrt(max(sum, eps*eps))` followed by
+// a multiply is algebraically equal but rounds differently and diverges in the
+// clamped branch, which would break bit-exactness with ggml.
+kernel void l2_norm_lastdim(
+    device const char* arena [[buffer(0)]],
+    constant ulong& in_off [[buffer(1)]],
+    constant ulong& eps_off [[buffer(2)]],
+    constant ulong& out_off [[buffer(3)]],
+    constant uint& h [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tsize [[threads_per_threadgroup]]
+) {
+    device const float* input = (device const float*)(arena + in_off);
+    device float* output = (device float*)(arena + out_off);
+    const float eps = *((device const float*)(arena + eps_off));
+    threadgroup float partial[256];
+    float local_sumsq = 0.0f;
+    for (uint i = tid; i < h; i += tsize) {
+        float v = input[row * h + i];
+        local_sumsq += v * v;
+    }
+    partial[tid] = local_sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float denom = max(sqrt(partial[0]), eps);
+    for (uint i = tid; i < h; i += tsize) {
+        output[row * h + i] = input[row * h + i] / denom;
+    }
+}
+
 // GDN gated norm: out = rms_norm(x) * silu(z). Same dispatch as rms_norm.
 kernel void rms_norm_mul_silu(
     device const char* arena [[buffer(0)]],
@@ -8051,6 +8712,13 @@ kernel void softmax_lastax_h(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float row_max = partial[0];
+    // `partial` is reused for the sum below and every thread has just read
+    // `partial[0]`. Without this barrier a thread reaching the reuse first
+    // overwrites `partial[0]` while another SIMD group is still reading
+    // `row_max` from it — a threadgroup spans several SIMD groups, which
+    // diverge freely, so the race is real and intermittent. The cross-entropy
+    // softmax kernels below already carry this barrier.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint i = tid; i < cols; i += tsize) {
@@ -8595,6 +9263,244 @@ kernel void gated_delta_net_sg(
     }
 }
 
+// ── Gated DeltaNet backward (f32) ────────────────────────────────────
+// One thread per (batch, head), matching the forward's dispatch. Each
+// thread replays its own scan forward into `hist` — the state entering
+// every timestep — then walks it backwards accumulating gradients.
+//
+// The history is what costs memory: (seq + 1) n×n floats per (batch,
+// head). Reconstructing states backwards instead, by dividing out
+// exp(g), would avoid it, but the decay is < 1 so undoing it amplifies
+// rounding by the product of its reciprocals — unbounded over a long
+// prompt. `P = A ⊙ S[t-1]` and `m = kᵀP` are recomputed on the fly
+// instead of stored, which costs two extra n² passes and keeps register
+// pressure to two [n] rows.
+//
+// Forward, with S row-major [key, value] and A = exp(g):
+//   P = A ⊙ S_{t-1};  m = kᵀP;  u = (v − m)·β;  S_t = P + k ⊗ u
+//   y = c·qᵀS_t,  c = 1/√n
+// Backward, dS carried from later timesteps:
+//   dq  = c·S_t·dy          dS += c·q ⊗ dy
+//   dk += dS·u              du  = kᵀdS
+//   dv += β·du              dβ += ⟨v − m, du⟩       dm = −β·du
+//   dk += P·dm              dS += k ⊗ dm           (dS is now dP)
+//   dg  = A ⊙ ⟨S_{t-1}, dP⟩ dS_{t-1} = A ⊙ dP
+// `dk` and `dS` each take two contributions and `du` must be read out of
+// dS before the second pair lands — the order above is load-bearing.
+//
+// Gradients are written into one packed buffer; the host passes each
+// slice's offset so `rlx_ir::GdnBackwardLayout` stays the single source
+// of truth for the packing.
+kernel void gated_delta_net_backward(
+    device float* arena          [[buffer(0)]],
+    constant ulong& q_off        [[buffer(1)]],
+    constant ulong& k_off        [[buffer(2)]],
+    constant ulong& v_off        [[buffer(3)]],
+    constant ulong& g_off        [[buffer(4)]],
+    constant ulong& beta_off     [[buffer(5)]],
+    constant ulong& state_off    [[buffer(6)]],
+    constant ulong& dy_off       [[buffer(7)]],
+    constant ulong& hist_off     [[buffer(8)]],
+    constant uint4& dims         [[buffer(9)]],  // batch, seq, heads, n
+    constant uint& use_carry     [[buffer(10)]],
+    constant uint& gate_per_channel [[buffer(11)]],
+    constant ulong& dq_off       [[buffer(12)]],
+    constant ulong& dk_off       [[buffer(13)]],
+    constant ulong& dv_off       [[buffer(14)]],
+    constant ulong& dg_off       [[buffer(15)]],
+    constant ulong& dbeta_off    [[buffer(16)]],
+    constant ulong& dstate_off   [[buffer(17)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tid   [[thread_position_in_threadgroup]]
+) {
+    const uint b = dims.x, s = dims.y, h = dims.z, n = dims.w;
+    if (n > GDN_MAX_N || n == 0u || tg_id >= b * h) return;
+
+    const uint bi = tg_id / h;
+    const uint hi = tg_id % h;
+    const float scale = rsqrt(float(n));
+    const uint hs_n = h * n;
+    const ulong nn = (ulong)n * (ulong)n;
+
+    // One threadgroup per (batch, head); `tid` indexes a row or a column
+    // depending on the phase, so every reduction stays thread-local — a row
+    // phase walks `ds[tid*n + j]` contiguously, a column phase walks
+    // `ds[i*n + tid]` so neighbouring threads touch neighbouring addresses.
+    //
+    // This kernel is **memory-bound**, not compute-bound: the state history is
+    // `(seq+1)·n²` floats per (batch, head) — 822 MB at the shapes a lens fit
+    // uses — and it measured at ~93% of the machine's memory bandwidth. So the
+    // phases below are fused as far as the barriers allow, to touch each n²
+    // tile as few times as possible rather than to minimize arithmetic. Each
+    // reverse timestep now reads `s_cur` once, `s_prev` once, and `ds` twice
+    // read-modify-write; splitting them into one loop per term instead cost
+    // ~12 tile passes against these 7.
+    threadgroup float ta[GDN_MAX_N];    // the per-row gate A(i) for this timestep
+    threadgroup float tvm[GDN_MAX_N];   // (v − m), carried from the forward
+    threadgroup float tdm[GDN_MAX_N];   // dm
+    threadgroup float tred[GDN_MAX_N];  // cross-thread reduction staging
+
+    device float* hist = arena + hist_off
+        + (ulong)tg_id * ((ulong)(s + 2u) * nn + (ulong)s * (ulong)n);
+    device float* ds = hist + (ulong)(s + 1u) * nn;
+    // `v − m` per timestep, recorded by the forward. It is `seq·n` floats
+    // against the history's `seq·n²`, and keeping it removes a whole n²-tile
+    // read of `s_prev` from every reverse step.
+    device float* vmm_hist = hist + (ulong)(s + 2u) * nn;
+
+    #define GDN_A(row_i, qkv, gb) (gate_per_channel != 0u \
+        ? exp(arena[g_off + (qkv) + (row_i)]) : exp(arena[g_off + (gb)]))
+
+    // ── forward, recording the state entering each timestep ──
+    if (tid < n) {
+        device const float* init = arena + state_off + (ulong)(bi * h + hi) * nn;
+        for (uint j = 0u; j < n; ++j) {
+            hist[tid * n + j] = (use_carry != 0u) ? init[tid * n + j] : 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    for (uint ti = 0u; ti < s; ++ti) {
+        const uint qkv_step = bi * s * hs_n + ti * hs_n + hi * n;
+        const uint gb_step = bi * s * h + ti * h + hi;
+        device const float* k_ptr = arena + k_off + qkv_step;
+        device const float* v_ptr = arena + v_off + qkv_step;
+        const float beta_t = arena[beta_off + gb_step];
+        device const float* prev = hist + (ulong)ti * nn;
+        device float* cur = hist + (ulong)(ti + 1u) * nn;
+
+        // The gate, once per timestep rather than once per n² element — the
+        // reductions below want `A(i)` inside their inner loop, and `exp` is far
+        // too expensive to pay n² times for n distinct values.
+        if (tid < n) { ta[tid] = GDN_A(tid, qkv_step, gb_step); }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        // m = kᵀ(A ⊙ S_{t-1}), taken straight off S_{t-1}; keep (v − m) for the
+        // reverse.   (column phase)
+        //
+        // Materializing `P = A ⊙ S_{t-1}` first would be the literal reading of
+        // the recurrence, but it costs an extra write *and* read of an n² tile
+        // to store a value used twice — and this kernel is bandwidth-bound, so
+        // that is the whole cost. Folding `A` into both consumers takes the
+        // forward scan from 5 n²-tile passes per timestep to 3.
+        if (tid < n) {
+            float acc = 0.0f;
+            for (uint i = 0u; i < n; ++i) { acc += k_ptr[i] * ta[i] * prev[i * n + tid]; }
+            const float vmm = v_ptr[tid] - acc;
+            vmm_hist[ti * n + tid] = vmm;
+            tvm[tid] = vmm * beta_t;   // u
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        // S_t = A ⊙ S_{t-1} + k ⊗ u   (row phase)
+        if (tid < n) {
+            const float a = ta[tid];
+            const float ki = k_ptr[tid];
+            for (uint j = 0u; j < n; ++j) {
+                cur[tid * n + j] = a * prev[tid * n + j] + ki * tvm[j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+
+    // ── reverse ──
+    if (tid < n) {
+        for (uint j = 0u; j < n; ++j) { ds[tid * n + j] = 0.0f; }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    for (uint back = 0u; back < s; ++back) {
+        const uint ti = s - 1u - back;
+        const uint qkv_step = bi * s * hs_n + ti * hs_n + hi * n;
+        const uint gb_step = bi * s * h + ti * h + hi;
+        device const float* q_ptr = arena + q_off + qkv_step;
+        device const float* k_ptr = arena + k_off + qkv_step;
+        device const float* dy_ptr = arena + dy_off + qkv_step;
+        const float beta_t = arena[beta_off + gb_step];
+        device const float* s_prev = hist + (ulong)ti * nn;
+        device const float* s_cur = hist + (ulong)(ti + 1u) * nn;
+        device float* dq = arena + dq_off + qkv_step;
+        device float* dk = arena + dk_off + qkv_step;
+        device float* dv = arena + dv_off + qkv_step;
+
+        if (tid < n) { tvm[tid] = vmm_hist[ti * n + tid]; }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        // dq = c·S_t·dy ; dS += c·q ⊗ dy ; dk = β·(dS·(v − m))
+        // Fused: `dS` is updated and immediately consumed by `dk`, so the tile
+        // is read once and written once instead of three separate sweeps.
+        if (tid < n) {
+            const float qi = scale * q_ptr[tid];
+            float dq_acc = 0.0f;
+            float dk_acc = 0.0f;
+            for (uint j = 0u; j < n; ++j) {
+                dq_acc += s_cur[tid * n + j] * dy_ptr[j];
+                const float d = ds[tid * n + j] + qi * dy_ptr[j];
+                ds[tid * n + j] = d;
+                dk_acc += d * tvm[j];
+            }
+            dq[tid] = scale * dq_acc;
+            dk[tid] = beta_t * dk_acc;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        // du = kᵀdS ; dv = β·du ; dβ += ⟨v − m, du⟩ ; dm = −β·du   (column phase)
+        if (tid < n) {
+            float du = 0.0f;
+            for (uint i = 0u; i < n; ++i) { du += k_ptr[i] * ds[i * n + tid]; }
+            dv[tid] = beta_t * du;
+            tred[tid] = tvm[tid] * du;
+            tdm[tid] = -beta_t * du;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        if (tid == 0u) {
+            float acc = 0.0f;
+            for (uint j = 0u; j < n; ++j) { acc += tred[j]; }
+            arena[dbeta_off + gb_step] = acc;
+        }
+        // `tred` is reused for dg below, so the dβ sum must finish reading it.
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        // dk += P·dm ; dS += k ⊗ dm ; dg = A·⟨S_{t-1}, dP⟩ ; dS_{t-1} = A ⊙ dP
+        // All four need `s_prev` or `ds` at the same (i, j), so they collapse
+        // into one sweep: one `s_prev` read, one `ds` read-modify-write.
+        if (tid < n) {
+            const float a = GDN_A(tid, qkv_step, gb_step);
+            const float ki = k_ptr[tid];
+            float dk_acc = 0.0f;
+            float dg_acc = 0.0f;
+            for (uint j = 0u; j < n; ++j) {
+                const float sp = s_prev[tid * n + j];
+                dk_acc += sp * tdm[j];
+                const float d = ds[tid * n + j] + ki * tdm[j];
+                dg_acc += sp * d;
+                ds[tid * n + j] = d * a;
+            }
+            dk[tid] += a * dk_acc;
+            if (gate_per_channel != 0u) {
+                arena[dg_off + qkv_step + tid] = dg_acc * a;
+            } else {
+                tred[tid] = dg_acc * a;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        if (gate_per_channel == 0u && tid == 0u) {
+            float acc = 0.0f;
+            for (uint i = 0u; i < n; ++i) { acc += tred[i]; }
+            arena[dg_off + gb_step] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+
+    if (use_carry != 0u && tid < n) {
+        device float* dstate = arena + dstate_off + (ulong)(bi * h + hi) * nn;
+        for (uint j = 0u; j < n; ++j) { dstate[tid * n + j] = ds[tid * n + j]; }
+    }
+    #undef GDN_A
+}
+
 // ── Selective scan (Mamba SSM, f32) ─────────────────────────────────
 // One thread per (batch, channel); each thread owns a private state
 // vector of size n (n ≤ SSM_MAX_N) and scans sequentially over seq.
@@ -8643,68 +9549,156 @@ kernel void selective_scan(
     }
 }
 
-// LSTM (gate order i, f, g, o; single merged bias). Dispatched once per (layer,
-// direction) by `encode_lstm`, which loops layers×dirs and ping-pongs
-// intermediate layer outputs through an in-arena scratch region (x_off/dst_off
-// are absolute arena word offsets). One threadgroup per batch item; thread `k`
-// owns hidden unit `k`, keeps `c[k]` in a register, shares `h_prev` in
-// threadgroup memory. `h0_off`/`c0_off` (0 → 0) seed hidden/cell state; `more` =
-// (h0_off, out_width, dir_off, reverse). Single-layer/unidir/no-carry reduces to
-// the plain kernel. Matches `execute_lstm_f32` on CPU. hidden ≤ LSTM_MAX_H.
-#define LSTM_MAX_H 1024u
-kernel void lstm(
+// Input projection for `lstm`: xproj[b,t,r] = bias[r] + dot(W_ih[r,:], x[b,t,:])
+// for every (batch, timestep, gate row) at once.
+//
+// `W_ih · x_t` does not depend on the recurrent state, so evaluating it inside the
+// timestep loop wastes the machine: that loop runs in ONE threadgroup per batch
+// item (the recurrence is inherently sequential), so at batch=1 a single core
+// grinds through `seq × 4H × in_sz` MACs while the rest of the GPU idles.
+// Hoisting it here makes it a fully parallel pass over `batch·seq·4H` threads and
+// leaves the recurrence with only the `W_hh · h_prev` term — for a 192→128 LSTM
+// that is 2.5× less sequential work per step.
+//
+// Accumulation order is preserved exactly (bias, then `j` ascending, then the
+// hidden term `j` ascending back in `lstm`), so results stay bit-identical to the
+// old fused form and to `execute_lstm_f32`.
+kernel void lstm_input_proj(
     device float* arena      [[buffer(0)]],
     constant uint& x_off     [[buffer(1)]],
     constant uint& wih_off   [[buffer(2)]],
-    constant uint& whh_off   [[buffer(3)]],
-    constant uint& bias_off  [[buffer(4)]],
-    constant uint& dst_off   [[buffer(5)]],
-    constant uint4& dims     [[buffer(6)]], // batch, seq, in_l, hidden
-    constant uint4& more     [[buffer(7)]], // h0_off, out_width, dir_off, reverse
-    constant uint& c0_off    [[buffer(8)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]
+    constant uint& bias_off  [[buffer(3)]],
+    constant uint& dst_off   [[buffer(4)]],
+    constant uint4& dims     [[buffer(5)]], // batch, seq, in_l, four_h
+    uint gid [[thread_position_in_grid]]
 ) {
-    uint b = dims.x, s = dims.y, in_sz = dims.z, h = dims.w;
-    if (h > LSTM_MAX_H || gid >= b || tid >= h) return;
+    uint b = dims.x, s = dims.y, in_sz = dims.z, four_h = dims.w;
+    if (gid >= b * s * four_h) return;
+    uint r = gid % four_h;   // gate row within [4H]
+    uint bt = gid / four_h;  // flattened (batch, timestep)
+    float acc = arena[bias_off + r];
+    uint wih_row = wih_off + r * in_sz;
+    uint x_base = x_off + bt * in_sz;
+    for (uint j = 0u; j < in_sz; ++j) {
+        acc += arena[wih_row + j] * arena[x_base + j];
+    }
+    arena[dst_off + bt * four_h + r] = acc;
+}
+
+// LSTM (gate order i, f, g, o; single merged bias). Dispatched once per (layer,
+// direction) by `encode_lstm`, which loops layers×dirs and ping-pongs
+// intermediate layer outputs through an in-arena scratch region (x_off/dst_off
+// are absolute arena word offsets). The `bias + W_ih·x` term is precomputed per
+// (batch, timestep, gate row) by `lstm_input_proj` and read from `xproj_off`, so
+// this kernel only walks the recurrent term. `h0_off`/`c0_off` (0 → 0) seed
+// hidden/cell state; `more` = (h0_off, out_width, dir_off, reverse). Matches
+// `execute_lstm_f32` on CPU. hidden ≤ LSTM_MAX_H.
+//
+// One threadgroup per batch item, and **one thread per gate row** (`4·hidden`
+// threads, capped at the pipeline limit). The dominant cost is the `W_hh·h_prev`
+// dot product, which has `4·hidden` independent rows; giving each its own thread
+// makes that phase 4× wider than the older one-thread-per-*unit* layout, where a
+// single thread walked all four gate rows in sequence. Threads past `hidden` own
+// no unit and sit out the gate phase, but still take every barrier.
+//
+// Two threadgroup arrays: `h_sh` holds `h_prev` (static, `LSTM_MAX_H`), and `z_sh`
+// holds the `4·hidden` gate pre-activations (dynamic, sized by the encoder — a
+// static `4·LSTM_MAX_H` would burn 16 KiB and cut occupancy for every shape).
+#define LSTM_MAX_H 1024u
+kernel void lstm(
+    device float* arena          [[buffer(0)]],
+    constant uint& xproj_off     [[buffer(1)]],
+    constant uint& whh_off       [[buffer(2)]],
+    constant uint& dst_off       [[buffer(3)]],
+    constant uint4& dims         [[buffer(4)]], // batch, seq, carry, hidden
+    constant uint4& more         [[buffer(5)]], // h0_off, out_width, dir_off, reverse
+    constant uint& c0_off        [[buffer(6)]],
+    threadgroup float* z_sh      [[threadgroup(0)]], // 4·hidden floats
+    uint gid      [[threadgroup_position_in_grid]],
+    uint tid      [[thread_index_in_threadgroup]],
+    uint tg_size  [[threads_per_threadgroup]]
+) {
+    uint b = dims.x, s = dims.y, h = dims.w;
+    // No `tid >= h` early-out: every thread must reach every barrier below.
+    if (h > LSTM_MAX_H || gid >= b) return;
     uint bi = gid;
-    uint k = tid;
+    uint k = tid; // owns hidden unit `k` only while `k < h`
+    uint four_h = 4u * h;
     uint h0_off = more.x, out_width = more.y, dir_off = more.z, reverse = more.w;
 
     threadgroup float h_sh[LSTM_MAX_H];
-    h_sh[k] = (h0_off != 0u) ? arena[h0_off + bi * h + k] : 0.0f;
-    float c_k = (c0_off != 0u) ? arena[c0_off + bi * h + k] : 0.0f;
+    float c_k = 0.0f;
+    if (k < h) {
+        h_sh[k] = (h0_off != 0u) ? arena[h0_off + bi * h + k] : 0.0f;
+        c_k = (c0_off != 0u) ? arena[c0_off + bi * h + k] : 0.0f;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint step = 0; step < s; ++step) {
         uint t = (reverse != 0u) ? (s - 1u - step) : step;
-        uint x_base = x_off + (bi * s + t) * in_sz;
-        // Gate pre-activations for hidden unit k: rows i=k, f=h+k, g=2h+k, o=3h+k.
-        float z[4];
-        for (uint gate = 0u; gate < 4u; ++gate) {
-            uint r = gate * h + k;
-            float acc = arena[bias_off + r];
-            uint wih_row = wih_off + r * in_sz;
-            for (uint j = 0u; j < in_sz; ++j) {
-                acc += arena[wih_row + j] * arena[x_base + j];
-            }
+        uint proj_base = xproj_off + (bi * s + t) * four_h;
+
+        // Phase 1 — gate pre-activations, one row per thread (strided when the
+        // threadgroup is narrower than `4·hidden`).
+        for (uint r = tid; r < four_h; r += tg_size) {
+            float acc = arena[proj_base + r];
             uint whh_row = whh_off + r * h;
             for (uint j = 0u; j < h; ++j) {
                 acc += arena[whh_row + j] * h_sh[j];
             }
-            z[gate] = acc;
+            z_sh[r] = acc;
         }
-        float i_g = 1.0f / (1.0f + exp(-z[0]));
-        float f_g = 1.0f / (1.0f + exp(-z[1]));
-        float g_g = tanh(clamp(z[2], -15.0f, 15.0f));
-        float o_g = 1.0f / (1.0f + exp(-z[3]));
-        c_k = f_g * c_k + i_g * g_g;
-        float h_k = o_g * tanh(c_k);
-        // Finish reading h_prev across all threads before overwriting it.
+        // Publish z_sh, and finish every h_prev read before phase 2 overwrites it.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        h_sh[k] = h_k;
+
+        // Phase 2 — one thread per hidden unit: gates, cell update, output.
+        // Rows for unit k are i=k, f=h+k, g=2h+k, o=3h+k.
+        if (k < h) {
+            float zi = z_sh[k];
+            float zf = z_sh[h + k];
+            float zg = z_sh[2u * h + k];
+            float zo = z_sh[3u * h + k];
+            // PRECISE transcendentals, deliberately.
+            //
+            // Metal's default `exp`/`tanh` are the fast variants, and they are
+            // not accurate enough for this recurrence: with them the output is
+            // correct for hidden <= 32 and then diverges by O(1) at wider
+            // hidden — individual units collapsing to exactly 0.0 for a couple
+            // of steps before the (contractive) state recovers. CPU, CUDA and
+            // wgpu-on-NVIDIA-Vulkan all match an independent f64 reference;
+            // only the Apple GPU path did not.
+            //
+            // It is specifically the transcendentals: the same wrong answer
+            // survives changing the thread layout (4·hidden vs hidden), moving
+            // the gate values between threadgroup memory and registers, making
+            // `z_sh` static instead of dynamic, computing the input projection
+            // inline instead of reading the table, carrying the cell state in
+            // threadgroup memory, and turning off fast-math via
+            // `MTLCompileOptions`. Swapping in `precise::` fixes it at every
+            // width. See `rlx-runtime/tests/lstm_three_way.rs`.
+            float i_g = 1.0f / (1.0f + metal::precise::exp(-zi));
+            float f_g = 1.0f / (1.0f + metal::precise::exp(-zf));
+            float g_g = metal::precise::tanh(clamp(zg, -15.0f, 15.0f));
+            float o_g = 1.0f / (1.0f + metal::precise::exp(-zo));
+            c_k = f_g * c_k + i_g * g_g;
+            float h_k = o_g * metal::precise::tanh(c_k);
+            h_sh[k] = h_k;
+            arena[dst_off + (bi * s + t) * out_width + dir_off + k] = h_k;
+        }
+        // Publish h_sh, and finish every z_sh read before the next step rewrites it.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        arena[dst_off + (bi * s + t) * out_width + dir_off + k] = h_k;
+    }
+
+    // Carry: thread the final state back into h0/c0 IN PLACE. `Op::Lstm`'s
+    // contract for `carry` is that `hn`/`cn` overwrite `h0`/`c0` so the next
+    // decode step continues the sequence — without this the state is only ever
+    // *seeded*, every step restarts from the same h0/c0, and the wrongness is
+    // silent (plausible-looking outputs, wrong sequence). `dims.z` carries the
+    // flag rather than testing `h0_off != 0`, because arena offset 0 is a legal
+    // placement for the state tensor.
+    if (dims.z != 0u && k < h) {
+        arena[h0_off + bi * h + k] = h_sh[k];
+        arena[c0_off + bi * h + k] = c_k;
     }
 }
 
@@ -8763,6 +9757,13 @@ kernel void gru(
             xi[g] = ax;
             hi[g] = ah;
         }
+        // NOT `precise::` here, unlike `kernel void lstm`. GRU drifts with size
+        // (3.0e-7 at hidden 32 up to 3.6e-6 at hidden 256 / seq 1024) but that
+        // drift is ordinary f32 accumulation in the O(hidden^2) matvec, not fast
+        // `exp` error: switching these three to `precise::` moved the numbers by
+        // less than noise (2.03e-6 -> 1.43e-6 at one size, 2.68e-6 -> 2.80e-6 at
+        // another) and never crossed a cliff out to hidden 256 / seq 1024. The
+        // LSTM is different because its error feeds a saturating gate.
         float rg = 1.0f / (1.0f + exp(-(xi[0] + hi[0])));
         float zg = 1.0f / (1.0f + exp(-(xi[1] + hi[1])));
         float ng = tanh(clamp(xi[2] + rg * hi[2], -15.0f, 15.0f));
@@ -8890,13 +9891,25 @@ kernel void rms_norm_bwd(
         float dyv = dy[row * inner + i];
         local_dot += dyv * gv * xv;
     }
+    // Both reductions halve with `(n + 1) / 2` rather than `tsize / 2`. A
+    // threadgroup is `min(256, inner)` threads, so a row narrower than 256 and
+    // not a power of two — 1536/2 heads, say — would otherwise drop the odd
+    // element at every level and silently under-sum.
     partial[tid] = local_dot;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+    for (uint n = tsize; n > 1u; ) {
+        uint half_n = (n + 1u) / 2u;
+        if (tid + half_n < n) partial[tid] += partial[tid + half_n];
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        n = half_n;
     }
     float dot = partial[0] / float(inner);
+    // `partial` is reused for the sum of squares below, and every thread has
+    // just read `partial[0]`. Without this barrier a thread that reaches the
+    // reuse first overwrites `partial[0]` while another SIMD group is still
+    // reading `dot` from it — 256 threads span 8 SIMD groups, which diverge
+    // freely, so that race is real and intermittent.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float local_ss = 0.0f;
     for (uint i = tid; i < inner; i += tsize) {
         float xv = x[row * inner + i];
@@ -8904,9 +9917,11 @@ kernel void rms_norm_bwd(
     }
     partial[tid] = local_ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tsize / 2; stride > 0; stride /= 2) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+    for (uint n = tsize; n > 1u; ) {
+        uint half_n = (n + 1u) / 2u;
+        if (tid + half_n < n) partial[tid] += partial[tid + half_n];
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        n = half_n;
     }
     float inv_r = rsqrt(partial[0] / float(inner) + eps);
     // Cross term is inv_r³ (= inv_r2·inv_r below), NOT inv_r⁴: outer ·inv_r already supplies
@@ -9027,6 +10042,11 @@ kernel void layer_norm_bwd(
         float d = x[row * inner + i] - mean;
         local_var += d * d;
     }
+    // Barrier before `partial*` is reused for the next reduction: every
+    // thread has just read slot 0, and a threadgroup spans several SIMD
+    // groups that diverge freely, so without this one group can overwrite
+    // slot 0 while another is still reading it. Intermittent by nature.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     partial_a[tid] = local_var;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tsize / 2; stride > 0; stride /= 2) {
@@ -9043,6 +10063,11 @@ kernel void layer_norm_bwd(
         local_sy += sy;
         local_sxh += sy * xh;
     }
+    // Barrier before `partial*` is reused for the next reduction: every
+    // thread has just read slot 0, and a threadgroup spans several SIMD
+    // groups that diverge freely, so without this one group can overwrite
+    // slot 0 while another is still reading it. Intermittent by nature.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     partial_a[tid] = local_sy;
     partial_b[tid] = local_sxh;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9218,6 +10243,11 @@ kernel void group_norm_bwd_input(
         float d = x[b_base + (c0 + c_off) * spatial + s] - mean;
         local_var += d * d;
     }
+    // Barrier before `partial*` is reused for the next reduction: every
+    // thread has just read slot 0, and a threadgroup spans several SIMD
+    // groups that diverge freely, so without this one group can overwrite
+    // slot 0 while another is still reading it. Intermittent by nature.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     partial_a[tid] = local_var;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tsize / 2; stride > 0; stride /= 2) {
@@ -9237,6 +10267,11 @@ kernel void group_norm_bwd_input(
         local_sy += sy;
         local_sxh += sy * xh;
     }
+    // Barrier before `partial*` is reused for the next reduction: every
+    // thread has just read slot 0, and a threadgroup spans several SIMD
+    // groups that diverge freely, so without this one group can overwrite
+    // slot 0 while another is still reading it. Intermittent by nature.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     partial_a[tid] = local_sy;
     partial_b[tid] = local_sxh;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9349,6 +10384,8 @@ kernel void rope_bwd(
     constant uint& head_dim [[buffer(7)]],
     constant uint& n_rot [[buffer(8)]],
     constant uint& cos_len [[buffer(9)]],
+    constant uint& cos_row_stride [[buffer(10)]],
+    constant uint& interleaved [[buffer(11)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint d = gid.x;
@@ -9361,23 +10398,42 @@ kernel void rope_bwd(
     uint bi = bs / seq;
     uint si = bs % seq;
     uint rot_half = n_rot / 2u;
-    // The cos/sin table stores exactly the rotation angles — `n_rot/2` per
-    // token, NOT head_dim/2. For PARTIAL rope (n_rot < head_dim) a head_dim/2
-    // row stride overruns into the next token's angles from position 1 onward,
-    // which is why this indexes by `rot_half`. Full rope has n_rot == head_dim,
-    // so rot_half == head_dim/2 and nothing changes there.
-    uint tab_off = (si * rot_half) % max(cos_len, 1u);
+    // The table's ACTUAL row width, passed in from its last dimension. Neither
+    // head_dim/2 nor n_rot/2 is right in general — the layout is a per-model
+    // choice (Qwen3.5 pads to head_dim/2 and uses the leading n_rot/2 columns;
+    // DeepSeek-V4 MLA packs n_rot/2 exactly). Hardcoding `rot_half` here agreed
+    // with every other backward kernel and disagreed with the forward.
+    uint tab_off = (si * cos_row_stride) % max(cos_len, 1u);
     uint dy_base = bi * seq * hidden + si * hidden + hi * head_dim;
     uint dx_base = dy_base;
-    if (d < rot_half) {
-        float y1 = dy[dy_base + d];
-        float y2 = dy[dy_base + rot_half + d];
-        float c = cos[tab_off + d];
-        float s = sin[tab_off + d];
-        dx[dx_base + d] = y1 * c + y2 * s;
-        dx[dx_base + rot_half + d] = -y1 * s + y2 * c;
-    } else if (d >= n_rot) {
-        dx[dx_base + d] = dy[dy_base + d];
+    // `interleaved` = GptJ pairing (adjacent lanes 2i / 2i+1), the GGUF
+    // convention; else NeoX rotate-half (lane i with lane i + rot_half). The
+    // forward carried this distinction and the backward did not, so every GptJ
+    // rotation used to get a NeoX adjoint.
+    if (interleaved != 0u) {
+        // One thread per PAIR: the even lane writes both halves of its pair.
+        if (d < n_rot && (d & 1u) == 0u) {
+            uint i = d >> 1u;
+            float y1 = dy[dy_base + 2u * i];
+            float y2 = dy[dy_base + 2u * i + 1u];
+            float c = cos[tab_off + i];
+            float s = sin[tab_off + i];
+            dx[dx_base + 2u * i] = y1 * c + y2 * s;
+            dx[dx_base + 2u * i + 1u] = -y1 * s + y2 * c;
+        } else if (d >= n_rot) {
+            dx[dx_base + d] = dy[dy_base + d];
+        }
+    } else {
+        if (d < rot_half) {
+            float y1 = dy[dy_base + d];
+            float y2 = dy[dy_base + rot_half + d];
+            float c = cos[tab_off + d];
+            float s = sin[tab_off + d];
+            dx[dx_base + d] = y1 * c + y2 * s;
+            dx[dx_base + rot_half + d] = -y1 * s + y2 * c;
+        } else if (d >= n_rot) {
+            dx[dx_base + d] = dy[dy_base + d];
+        }
     }
 }
 
@@ -12473,6 +13529,8 @@ pub struct Kernels {
     pub fused_ternary_activation4: ComputePipelineState,
     pub layer_norm: ComputePipelineState,
     pub rms_norm: ComputePipelineState,
+    /// ggml `L2_NORM` over the last dim, fused from the 6-thunk expansion.
+    pub l2_norm_lastdim: ComputePipelineState,
     pub rms_norm_mul_silu: ComputePipelineState,
     pub elem_add: ComputePipelineState,
     pub elem_add4: ComputePipelineState,
@@ -12593,6 +13651,7 @@ pub struct Kernels {
     pub topk_lastax: ComputePipelineState,
     pub grouped_matmul: ComputePipelineState,
     pub grouped_gemv_splitk: ComputePipelineState,
+    pub grouped_gemv_splitk_bt: ComputePipelineState,
     pub gemv_f32_splitk: ComputePipelineState,
     pub scatter_add_zero: ComputePipelineState,
     pub scatter_add_accumulate: ComputePipelineState,
@@ -12606,6 +13665,7 @@ pub struct Kernels {
     pub transpose_swap12_batched_trail_tiled_f32: ComputePipelineState,
     pub gather_axis: ComputePipelineState,
     pub pool2d: ComputePipelineState,
+    pub pool3d: ComputePipelineState,
     pub maxpool2d_backward: ComputePipelineState,
     pub conv2d_backward_input: ComputePipelineState,
     pub conv2d_backward_weight: ComputePipelineState,
@@ -12622,6 +13682,8 @@ pub struct Kernels {
     pub resize_nearest_2x: ComputePipelineState,
     pub conv_transpose2d: ComputePipelineState,
     pub conv3d: ComputePipelineState,
+    pub conv3d_gemm: ComputePipelineState,
+    pub conv3d_gemm_c: ComputePipelineState,
     pub conv_transpose3d: ComputePipelineState,
     pub relu_inplace: ComputePipelineState,
     pub sigmoid_inplace: ComputePipelineState,
@@ -12662,8 +13724,11 @@ pub struct Kernels {
     pub fft_outer_r2_f32: ComputePipelineState,
     pub gated_delta_net: ComputePipelineState,
     pub gated_delta_net_sg: ComputePipelineState,
+    pub gated_delta_net_backward: ComputePipelineState,
     pub selective_scan: ComputePipelineState,
     pub lstm: ComputePipelineState,
+    /// Parallel `bias + W_ih·x` prepass feeding [`Self::lstm`].
+    pub lstm_input_proj: ComputePipelineState,
     pub gru: ComputePipelineState,
     pub rnn: ComputePipelineState,
     pub mamba2: ComputePipelineState,
@@ -12691,6 +13756,9 @@ pub struct Kernels {
     pub q1_0_mm_f32: ComputePipelineState,
     pub q2_0_mv_f32: ComputePipelineState,
     pub q2_0_mv_f32_sg: ComputePipelineState,
+    /// Fused G8_0 decode GEMV (Pestle `token_embd` / lm_head) — see
+    /// `dequant_gguf.msl`. Keeps the 248320x5120 head off the f32 scratch path.
+    pub g8_0_mv_f32_sg: ComputePipelineState,
     pub q2_0_dual_mv_f32_sg: ComputePipelineState,
     pub q2_0_mm_f32: ComputePipelineState,
     pub iq4_nl_mv_f32: ComputePipelineState,
@@ -12726,6 +13794,8 @@ pub struct Kernels {
     /// single-thread-per-output `q4k_mv_f32`. Used when `n_dim % 8 == 0`.
     pub q4k_mv_f32_sg: ComputePipelineState,
     pub q5k_mv_f32: ComputePipelineState,
+    /// Simdgroup-cooperative Q5_K decode GEMV (32 threads per output row).
+    pub q5k_mv_f32_sg: ComputePipelineState,
     pub q2k_mv_f32: ComputePipelineState,
     /// Simdgroup-cooperative Q6_K GEMV (32 threads reduce one output row via
     /// `simd_sum`; `Q6K_NSG` rows per threadgroup) and Q8_0 GEMV (32 threads →
@@ -12994,6 +14064,7 @@ impl Kernels {
             fused_ternary_activation4: pipeline("fused_ternary_activation4"),
             layer_norm: pipeline("layer_norm"),
             rms_norm: pipeline("rms_norm"),
+            l2_norm_lastdim: pipeline("l2_norm_lastdim"),
             rms_norm_mul_silu: pipeline("rms_norm_mul_silu"),
             elem_add: pipeline("elem_add"),
             elem_add4: pipeline("elem_add4"),
@@ -13101,6 +14172,7 @@ impl Kernels {
             topk_lastax: pipeline("topk_lastax"),
             grouped_matmul: pipeline("grouped_matmul"),
             grouped_gemv_splitk: pipeline("grouped_gemv_splitk"),
+            grouped_gemv_splitk_bt: pipeline("grouped_gemv_splitk_bt"),
             gemv_f32_splitk: pipeline("gemv_f32_splitk"),
             scatter_add_zero: pipeline("scatter_add_zero"),
             scatter_add_accumulate: pipeline("scatter_add_accumulate"),
@@ -13116,6 +14188,7 @@ impl Kernels {
             ),
             gather_axis: pipeline("gather_axis"),
             pool2d: pipeline("pool2d"),
+            pool3d: pipeline("pool3d"),
             maxpool2d_backward: pipeline("maxpool2d_backward"),
             conv2d_backward_input: pipeline("conv2d_backward_input"),
             conv2d_backward_weight: pipeline("conv2d_backward_weight"),
@@ -13132,6 +14205,8 @@ impl Kernels {
             resize_nearest_2x: pipeline("resize_nearest_2x"),
             conv_transpose2d: pipeline("conv_transpose2d"),
             conv3d: pipeline("conv3d"),
+            conv3d_gemm: pipeline("conv3d_gemm"),
+            conv3d_gemm_c: pipeline("conv3d_gemm_c"),
             conv_transpose3d: pipeline("conv_transpose3d"),
             relu_inplace: pipeline("relu_inplace"),
             sigmoid_inplace: pipeline("sigmoid_inplace"),
@@ -13168,8 +14243,10 @@ impl Kernels {
             fft_outer_r2_f32: pipeline("fft_outer_r2_f32"),
             gated_delta_net: pipeline("gated_delta_net"),
             gated_delta_net_sg: pipeline("gated_delta_net_sg"),
+            gated_delta_net_backward: pipeline("gated_delta_net_backward"),
             selective_scan: pipeline("selective_scan"),
             lstm: pipeline("lstm"),
+            lstm_input_proj: pipeline("lstm_input_proj"),
             gru: pipeline("gru"),
             rnn: pipeline("rnn"),
             mamba2: pipeline("mamba2"),
@@ -13188,6 +14265,7 @@ impl Kernels {
             q1_0_mm_f32: pipeline("q1_0_mm_f32"),
             q2_0_mv_f32: pipeline("q2_0_mv_f32"),
             q2_0_mv_f32_sg: pipeline("q2_0_mv_f32_sg"),
+            g8_0_mv_f32_sg: pipeline("g8_0_mv_f32_sg"),
             q2_0_dual_mv_f32_sg: pipeline("q2_0_dual_mv_f32_sg"),
             q2_0_mm_f32: pipeline("q2_0_mm_f32"),
             q4_0_mv_f32: pipeline("q4_0_mv_f32"),
@@ -13220,6 +14298,7 @@ impl Kernels {
             iq1_m_mv_f32: pipeline("iq1_m_mv_f32"),
             q4k_mv_f32_sg: pipeline("q4k_mv_f32_sg"),
             q5k_mv_f32: pipeline("q5k_mv_f32"),
+            q5k_mv_f32_sg: pipeline("q5k_mv_f32_sg"),
             q2k_mv_f32: pipeline("q2k_mv_f32"),
             q4k_mm_f32: pipeline("q4k_mm_f32"),
             q4k_mm_f32_xs: pipeline("q4k_mm_f32_xs"),

@@ -18,6 +18,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn build_ssm_graph(b: usize, s: usize, h: usize, n: usize) -> Graph {
     let mut g = Graph::new("ssm");
     let bsh = Shape::new(&[b, s, h], DType::F32);
@@ -35,6 +37,7 @@ fn build_ssm_graph(b: usize, s: usize, h: usize, n: usize) -> Graph {
 
 #[test]
 fn cpu_selective_scan_native_matches_recurrence() {
+    let _gpu = common::serialize_gpu();
     let (b, s, h, n) = (1, 4, 2, 3);
 
     // Deterministic-but-non-trivial inputs. Δ in (0, 0.5) so exp(Δ A)
@@ -171,6 +174,7 @@ fn assert_close(what: &str, actual: &[f32], reference: &[f32]) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn selective_scan_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, b, s, h, n) in shapes() {
         assert_close(
             &format!("metal {name}"),
@@ -183,6 +187,10 @@ fn selective_scan_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn selective_scan_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for (name, b, s, h, n) in shapes() {
         assert_close(
             &format!("wgpu {name}"),

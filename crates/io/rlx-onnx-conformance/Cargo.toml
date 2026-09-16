@@ -8,6 +8,10 @@ authors.workspace = true
 description = "ONNX op-level conformance tests (ORT reference vs RLX import/execute)"
 repository.workspace = true
 readme = "README.md"
+keywords.workspace      = true
+categories.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
 
 [dependencies]
 anyhow = "1"
@@ -35,3 +39,7 @@ workspace = true
 [[bin]]
 name = "rlx-onnx-coverage"
 path = "src/bin/coverage_dashboard.rs"
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

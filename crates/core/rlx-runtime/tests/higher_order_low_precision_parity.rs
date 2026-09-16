@@ -20,7 +20,9 @@ use half::{bf16, f16};
 use rlx_autodiff::nth_order_grad;
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn build_x_cubed(dt: DType) -> Graph {
     let mut g = Graph::new("x3_lp");
@@ -62,7 +64,7 @@ fn assert_matches_cpu(
     tol: f32,
     label: &str,
 ) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip higher_order_low_precision_parity {label} on {device:?} (unavailable)");
         return;
     }
@@ -79,6 +81,7 @@ mod cpu_only {
 
     #[test]
     fn nth_order_f16_bf16_graphs_build() {
+        let _gpu = common::serialize_gpu();
         for dt in [DType::F16, DType::BF16] {
             let g = build_x_cubed(dt);
             let hg = nth_order_grad(&g, "x", 3);
@@ -89,6 +92,7 @@ mod cpu_only {
 
     #[test]
     fn native_f16_third_derivative() {
+        let _gpu = common::serialize_gpu();
         let forward = build_x_cubed(DType::F16);
         let got = eval_third(Device::Cpu, &forward, DType::F16, 1.5);
         assert!(
@@ -99,6 +103,7 @@ mod cpu_only {
 
     #[test]
     fn native_bf16_third_derivative() {
+        let _gpu = common::serialize_gpu();
         let forward = build_x_cubed(DType::BF16);
         let got = eval_third(Device::Cpu, &forward, DType::BF16, 1.5);
         assert!(
@@ -109,6 +114,7 @@ mod cpu_only {
 
     #[test]
     fn nth_order_f32_third_with_f16_input_widen() {
+        let _gpu = common::serialize_gpu();
         let forward = build_x_cubed(DType::F32);
         let got = eval_third(Device::Cpu, &forward, DType::F16, 1.5);
         assert!(
@@ -119,6 +125,7 @@ mod cpu_only {
 
     #[test]
     fn nth_order_f32_third_with_bf16_input_widen() {
+        let _gpu = common::serialize_gpu();
         let forward = build_x_cubed(DType::F32);
         let got = eval_third(Device::Cpu, &forward, DType::BF16, 1.5);
         assert!(
@@ -181,18 +188,22 @@ macro_rules! lp_gpu_suite {
             use super::*;
             #[test]
             fn native_f16_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 gpu_native_f16_third($device);
             }
             #[test]
             fn native_bf16_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 gpu_native_bf16_third($device);
             }
             #[test]
             fn f16_widen_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 gpu_f16_widen_third($device);
             }
             #[test]
             fn bf16_widen_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 gpu_bf16_widen_third($device);
             }
         }

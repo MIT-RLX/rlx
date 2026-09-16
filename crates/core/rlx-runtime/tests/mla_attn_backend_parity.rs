@@ -20,6 +20,8 @@ use rlx_flow::prelude::*;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const B: usize = 1;
 const S: usize = 4;
 const HID: usize = 16;
@@ -125,6 +127,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn mla_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     let out = run_mla(Device::Cpu);
     assert_eq!(out.len(), B * S * NH * VH, "MLA output shape");
 }
@@ -134,7 +137,8 @@ macro_rules! backend_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !rlx_runtime::is_available($dev) {
+            let _gpu = common::serialize_gpu();
+            if common::skip_unless($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

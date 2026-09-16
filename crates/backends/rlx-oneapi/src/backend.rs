@@ -9,11 +9,11 @@
 //! Two execution paths share one legalized graph (the rlx-vulkan primitive set,
 //! so the same rewrite/legalize decompositions apply):
 //!
-//! - [`run_host`](OneApiExecutable::run_host) — a value-map interpreter that
+//! - `run_host` — a value-map interpreter that
 //!   evaluates every node through the `rlx-cpu` reference. This is the path the
 //!   macOS dev box / CI take (no Level Zero device), and it makes the backend
 //!   fully correct without Intel hardware.
-//! - [`run_l0`](OneApiExecutable::run_l0) — the native path: a USM-shared f32
+//! - `run_l0` — the native path: a USM-shared f32
 //!   arena + per-op SPIR-V kernel dispatch (with a CPU host-fallback, against
 //!   the same arena, for ops with no native kernel yet). Selected only when a
 //!   live device *and* embedded kernels are both present — neither is true off
@@ -2152,7 +2152,20 @@ impl OneApiExecutable {
                 ]);
                 (total.max(1), 256)
             }
-            Op::RopeBackward { head_dim, n_rot } => {
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            } => {
+                // This kernel implements NeoX rotate-half only. It used to
+                // accept any style and silently emit the NeoX adjoint, so a
+                // GptJ (GGUF) rotation got a wrong gradient with no signal.
+                // Refusing is the honest behaviour until the kernel grows the
+                // interleaved branch its CUDA/ROCm/Metal/wgpu twins now have.
+                assert!(
+                    matches!(style, rlx_ir::op::RopeStyle::NeoX),
+                    "rlx-oneapi RopeBackward: only RopeStyle::NeoX is implemented, got {style:?}"
+                );
                 let dy = node.inputs[0];
                 let cos = node.inputs[1];
                 let sin = node.inputs[2];

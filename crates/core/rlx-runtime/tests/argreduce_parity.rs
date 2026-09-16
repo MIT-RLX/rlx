@@ -11,6 +11,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn run(
     device: Device,
     dims: &[usize],
@@ -53,6 +55,7 @@ fn cases() -> Vec<(&'static str, Vec<usize>, usize)> {
 
 #[test]
 fn argreduce_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     for (name, dims, axis) in cases() {
         let n: usize = dims.iter().product();
         let x: Vec<f32> = (0..n)
@@ -78,6 +81,7 @@ fn dataset(n: usize) -> Vec<f32> {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn argreduce_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, dims, axis) in cases() {
         let x = dataset(dims.iter().product());
         for is_max in [true, false] {
@@ -93,6 +97,7 @@ fn argreduce_mlx_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn argreduce_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, dims, axis) in cases() {
         let x = dataset(dims.iter().product());
         for is_max in [true, false] {
@@ -110,6 +115,10 @@ fn argreduce_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn argreduce_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for (name, dims, axis) in cases() {
         let x = dataset(dims.iter().product());
         for is_max in [true, false] {

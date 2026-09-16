@@ -40,7 +40,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn wgpu_bucketed_decode_custom_mask_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;
     }

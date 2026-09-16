@@ -8,11 +8,13 @@
 //! The unified `rnn` kernel now loops over (layer, direction) on-device,
 //! ping-ponging intermediate layer outputs through a scratch buffer and seeding
 //! the hidden state from `h0` (Tier-1). This pins every native geometry (both
-//! `relu` and `tanh`) against the CPU reference. Runs on the msi rig
-//! (`RLX_PARITY_DEVICE=cuda`, default) and the amd rig (`=rocm`).
+//! `relu` and `tanh`) against the CPU reference. Runs on the CUDA rig
+//! (`RLX_PARITY_DEVICE=cuda`, default) and the ROCm rig (`=rocm`).
 
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn mk(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -28,16 +30,17 @@ fn mk(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     }
 }
 
 #[test]
 fn rnn_multilayer_bidir_native_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip rnn_multilayer_bidir_native ({dev:?} unavailable)");
         return;
     }

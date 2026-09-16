@@ -73,34 +73,22 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
             }
         }
 
-        // Check input count matches op expectation (except variadic ops like Concat).
-        match &node.op {
-            Op::RngNormal { .. } | Op::RngUniform { .. } => {
-                if node.inputs.len() > 1 {
-                    errors.push(VerifyError {
-                        node: Some(node.id),
-                        message: format!(
-                            "{} accepts 0 or 1 inputs, got {}",
-                            node.op,
-                            node.inputs.len()
-                        ),
-                    });
-                }
-            }
-            _ => {
-                let expected = node.op.num_inputs();
-                if expected > 0 && node.inputs.len() != expected {
-                    errors.push(VerifyError {
-                        node: Some(node.id),
-                        message: format!(
-                            "{} expects {} inputs, got {}",
-                            node.op,
-                            expected,
-                            node.inputs.len()
-                        ),
-                    });
-                }
-            }
+        // Operand count, driven by the op's own `Arity`. Previously this read
+        // `num_inputs()` and skipped anything reporting `0` — which meant every
+        // variadic op (`Concat`, `While`) was exempt from arity checking, and
+        // the one op with an optional operand needed a hand-written exception
+        // right here, beside the table it was contradicting.
+        let arity = node.op.arity();
+        if !arity.is_unconstrained() && !arity.accepts(node.inputs.len()) {
+            errors.push(VerifyError {
+                node: Some(node.id),
+                message: format!(
+                    "{} expects {} inputs, got {}",
+                    node.op,
+                    arity,
+                    node.inputs.len()
+                ),
+            });
         }
 
         // Op-local invariants, reported at the node that violates them.
@@ -129,6 +117,62 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
         }
     }
 
+    errors
+}
+
+/// Report `Op::Param` / `Op::Input` leaves that share a name.
+///
+/// Binding is by name and reaches a single node — `set_param("w", …)` and
+/// `run(&[("x", …)])` each resolve one `NodeId` — so a second leaf sharing a
+/// name is never fed. It keeps whatever the arena held (zeros) and every value
+/// flowing through it silently vanishes: no shape error, no missing-input
+/// error, just a wrong answer. A genuinely shared weight is *one* node with
+/// several consumers, so duplicate names only arise from a graph-rewrite bug.
+///
+/// Deliberately **not** part of [`verify`], which is asserted on every fusion
+/// pass in debug builds: graphs in the wild can still trip this, and each needs
+/// its own look before it can be made fatal.
+///
+/// Every instance found so far has been a real bug:
+///
+/// * `Rewriter::copy_node` emitted hoisted nodes twice — the one this check was
+///   written for — which silently zeroed gradient terms in every backward graph
+///   that went through `FuseSharedInputMatMul`. **Fixed.**
+/// * `jvp` re-declared `tangent_<name>` over a graph that already had one, so
+///   `jvp(hvp(f))` returned zero rather than the third derivative. That was read
+///   as forward-over-reverse not composing; it was a name collision. **Fixed** —
+///   the outer tangent is now `tangent_<name>_2`.
+/// * Qwen3.5 prefill graphs declare `last_token_idx` twice: once at flow level
+///   as F32, once inside the `GatherLastToken` block as I32. **Open**, in
+///   `rlx-models` (`rlx-qwen35/tests/last_token_idx_gather.rs`, `#[ignore]`d
+///   with the full diagnosis). Currently harmless only because the unbound node
+///   feeds a redundant second gather along an axis the first already collapsed
+///   to extent 1, where index 0 is the only legal index — nothing guarantees
+///   which of two same-named nodes gets bound, and the other way round every
+///   `last_logits_only` prefill would return the *first* token's logits.
+pub fn verify_unique_leaf_names(graph: &Graph) -> Vec<VerifyError> {
+    let mut errors = Vec::new();
+    let mut seen: std::collections::HashMap<&str, NodeId> = std::collections::HashMap::new();
+    for node in graph.nodes() {
+        let (kind, name) = match &node.op {
+            Op::Param { name } => ("Param", name),
+            Op::Input { name } => ("Input", name),
+            _ => continue,
+        };
+        match seen.get(name.as_str()) {
+            Some(&first) => errors.push(VerifyError {
+                node: Some(node.id),
+                message: format!(
+                    "duplicate {kind} name {name:?}: also declared at {first}. \
+                     Binding is by name and reaches only one node, so this one \
+                     would silently read zeros"
+                ),
+            }),
+            None => {
+                seen.insert(name.as_str(), node.id);
+            }
+        }
+    }
     errors
 }
 
@@ -404,6 +448,46 @@ pub fn verify_op(graph: &Graph, node: &Node) -> Vec<VerifyError> {
                 ));
             }
         }
+        // The single-row KV write is the one op whose operands are checked
+        // nowhere downstream: by the time it reaches a kernel it is a byte
+        // offset and a length, so a `pos` past the cache or a row of the wrong
+        // width stores out of bounds into whatever the memory planner placed
+        // next in the arena — a corrupted neighbouring tensor, not a crash.
+        // `kv_append_shape` holds the rules; this reports them per node.
+        Op::KvAppend { axis, pos } if node.inputs.len() == 2 => {
+            let (cache, row) = (node.inputs[0], node.inputs[1]);
+            if (cache.0 as usize) < graph.len() && (row.0 as usize) < graph.len() {
+                if let Err(message) =
+                    crate::shape::kv_append_shape(graph.shape(cache), graph.shape(row), *axis, *pos)
+                {
+                    err(message);
+                }
+            }
+        }
+        // A broadcast that is not a broadcast. `Expand` may only stretch axes
+        // that start at 1; `[8,128] -> [8,256]` duplicates nothing, it just
+        // declares an output twice the size of the buffer behind it. Nothing
+        // downstream rejects that — the CPU backend reads off the end of the
+        // input with `index out of bounds: the len is 1024 but the index is
+        // 1024`, which names neither the op nor the graph that built it.
+        //
+        // The rule lives in `expand_shape` (via `broadcast`) and was already
+        // being *computed*; it was lost at the `.ok()` in `infer_shape`, which
+        // renders "these operands are illegal" indistinguishable from "this op
+        // has no inference rule" — and `verify_shapes` skips the latter. This
+        // arm asks the helper directly, so there is still one source of truth.
+        Op::Expand { target_shape } if node.inputs.len() == 1 => {
+            let x = node.inputs[0];
+            if (x.0 as usize) < graph.len()
+                && let Err(message) = crate::shape::expand_shape(graph.shape(x), target_shape)
+            {
+                err(format!(
+                    "Expand to {target_shape:?} is not a broadcast of {}: {message} \
+                     (only axes of extent 1 may be expanded)",
+                    graph.shape(x)
+                ));
+            }
+        }
         // Registered custom ops state their own invariants.
         Op::Custom { name, .. } => {
             if let Some(ext) = crate::lookup_op(name) {
@@ -491,7 +575,20 @@ fn shapes_compatible(declared: &crate::Shape, inferred: &crate::Shape) -> bool {
 pub fn verify_shapes(graph: &Graph) -> Vec<VerifyError> {
     let mut errors = Vec::new();
     for node in graph.nodes() {
-        let Some(expected) = infer_shape::infer_output_shape(graph, node) else {
+        let (inferred, rejected) = infer_shape::infer_output_shape_reporting(graph, node);
+        // A rule that ran and said no is a finding, not a coverage gap. These
+        // messages already existed and were already precise — `matmul_shape`
+        // says `K mismatch: 128 vs 256` — they were just discarded at the
+        // `.ok()` in `infer_shape`, which left `None` meaning both "no rule for
+        // this op" and "these operands are illegal". The loop skipped both.
+        if let Some(message) = rejected {
+            errors.push(VerifyError {
+                node: Some(node.id),
+                message: format!("{:?}: {message}", node.op.kind()),
+            });
+            continue;
+        }
+        let Some(expected) = inferred else {
             continue;
         };
         if !shapes_compatible(&node.shape, &expected) {
@@ -694,6 +791,157 @@ mod tests {
             errs.iter()
                 .any(|e| e.message.contains("graph leaf but has 1 operand")),
             "{errs:?}"
+        );
+    }
+
+    /// `Concat` is variadic. It used to report `num_inputs() == 0`, and the
+    /// old check skipped anything reporting `0`, so a `Concat` with no
+    /// operands verified clean and blew up later in a backend.
+    #[test]
+    fn a_variadic_op_with_no_operands_is_caught() {
+        let shape = Shape::new(&[4], DType::F32);
+        let mut g = Graph::new("empty_concat");
+        let bogus = g.add_node(Op::Concat { axis: 0 }, vec![], shape);
+        g.set_outputs(vec![bogus]);
+
+        let errs = verify(&g);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("expects at least 1 inputs, got 0")),
+            "{errs:?}"
+        );
+    }
+
+    /// A variadic op with operands stays legal — the new check must not turn
+    /// "unchecked" into "always rejected".
+    #[test]
+    fn a_variadic_op_with_operands_is_accepted() {
+        let shape = Shape::new(&[4], DType::F32);
+        let mut g = Graph::new("concat");
+        let a = g.input("a", shape.clone());
+        let b = g.input("b", shape.clone());
+        let c = g.add_node(
+            Op::Concat { axis: 0 },
+            vec![a, b],
+            Shape::new(&[8], DType::F32),
+        );
+        g.set_outputs(vec![c]);
+        assert!(
+            !verify(&g).iter().any(|e| e.message.contains("expects")),
+            "{:?}",
+            verify(&g)
+        );
+    }
+
+    /// The optional-operand case, previously a hand-written exception in this
+    /// file sitting beside the table it contradicted.
+    #[test]
+    fn an_optional_operand_accepts_both_counts() {
+        let shape = Shape::new(&[4], DType::F32);
+        for n_seed in [0usize, 1] {
+            let mut g = Graph::new("rng");
+            let mut ins = Vec::new();
+            if n_seed == 1 {
+                ins.push(g.input("seed", shape.clone()));
+            }
+            let r = g.add_node(
+                Op::RngNormal {
+                    mean: 0.0,
+                    scale: 1.0,
+                    key: 0,
+                    op_seed: None,
+                },
+                ins,
+                shape.clone(),
+            );
+            g.set_outputs(vec![r]);
+            let errs = verify(&g);
+            assert!(
+                !errs.iter().any(|e| e.message.contains("expects")),
+                "{n_seed} operand(s) should verify: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_optional_operand_still_rejects_too_many() {
+        let shape = Shape::new(&[4], DType::F32);
+        let mut g = Graph::new("rng2");
+        let a = g.input("a", shape.clone());
+        let b = g.input("b", shape.clone());
+        let r = g.add_node(
+            Op::RngNormal {
+                mean: 0.0,
+                scale: 1.0,
+                key: 0,
+                op_seed: None,
+            },
+            vec![a, b],
+            shape,
+        );
+        g.set_outputs(vec![r]);
+        let errs = verify(&g);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("expects 0 to 1 inputs, got 2")),
+            "{errs:?}"
+        );
+    }
+
+    /// `Op::If` is `[predicate, captures…]`. It was declared `Exact(1)` with
+    /// the note "captures handled separately" — but `sccp` builds
+    /// `vec![pred, x]`, and both `rlx-unfuse::expand_if` and the MLX lowering
+    /// read `inputs[1..]` as the captures, so `verify` rejected every `If` that
+    /// captured anything.
+    #[test]
+    fn an_if_may_carry_branch_captures() {
+        let shape = Shape::new(&[4], DType::F32);
+        let branch = || {
+            let mut b = Graph::new("br");
+            let c = b.input("c0", shape.clone());
+            b.set_outputs(vec![c]);
+            Box::new(b)
+        };
+        let mut g = Graph::new("if_capture");
+        let pred = g.input("pred", Shape::new(&[1], DType::F32));
+        let x = g.input("x", shape.clone());
+        let n = g.add_node(
+            Op::If {
+                then_branch: branch(),
+                else_branch: branch(),
+            },
+            vec![pred, x],
+            shape,
+        );
+        g.set_outputs(vec![n]);
+        let errs = verify(&g);
+        assert!(
+            !errs.iter().any(|e| e.message.contains("expects")),
+            "an If with one capture must verify: {errs:?}"
+        );
+    }
+
+    /// …but a predicate is still mandatory.
+    #[test]
+    fn an_if_still_requires_a_predicate() {
+        let shape = Shape::new(&[4], DType::F32);
+        let branch = || Box::new(Graph::new("br"));
+        let mut g = Graph::new("if_nopred");
+        let n = g.add_node(
+            Op::If {
+                then_branch: branch(),
+                else_branch: branch(),
+            },
+            vec![],
+            shape,
+        );
+        g.set_outputs(vec![n]);
+        assert!(
+            verify(&g)
+                .iter()
+                .any(|e| e.message.contains("expects at least 1 inputs, got 0")),
+            "{:?}",
+            verify(&g)
         );
     }
 
@@ -922,6 +1170,136 @@ mod tests {
                     .any(|e| e.message.contains("matches neither")),
                 "a genuine head/dim mismatch must be caught"
             );
+        }
+    }
+
+    /// **`KvAppend` is the one op nothing downstream can check.**
+    ///
+    /// By the time the row write reaches a kernel it is a byte offset and a
+    /// length, so a `pos` past the cache stores into whatever the memory
+    /// planner put next in the arena — a corrupted neighbouring tensor, not a
+    /// crash. The cache being sized to a CAPACITY (with spare rows for `pos` to
+    /// index into) rather than to its current contents is also the op's least
+    /// obvious requirement, and the one an emitter gets wrong.
+    mod kv_append {
+        use super::*;
+
+        /// `cache[1, cap, 4]` + `row[1, 1, 4]` written at `pos`.
+        fn g(cap: usize, pos: usize, row_dims: &[usize], row_dt: DType) -> Graph {
+            let mut g = Graph::new("kv");
+            let cache = g.input("cache", Shape::new(&[1, cap, 4], DType::F32));
+            let row = g.input("row", Shape::new(row_dims, row_dt));
+            let out = g.add_node(
+                Op::KvAppend { axis: 1, pos },
+                vec![cache, row],
+                Shape::new(&[1, pos + 1, 4], DType::F32),
+            );
+            g.set_outputs(vec![out]);
+            g
+        }
+
+        fn only_error(g: &Graph) -> String {
+            let errors = verify_all(g);
+            assert_eq!(
+                errors.len(),
+                1,
+                "expected exactly one error, got {errors:?}"
+            );
+            errors[0].message.clone()
+        }
+
+        #[test]
+        fn a_well_formed_append_verifies() {
+            assert!(verify_all(&g(8, 7, &[1, 1, 4], DType::F32)).is_empty());
+        }
+
+        /// The whole point: `pos` indexes the SPARE rows. `pos == cap` means the
+        /// caller sized the cache to the history rather than the capacity.
+        #[test]
+        fn a_pos_past_the_cache_is_caught() {
+            assert!(only_error(&g(8, 8, &[1, 1, 4], DType::F32)).contains("capacity"));
+        }
+
+        #[test]
+        fn a_row_wider_than_the_cache_is_caught() {
+            assert!(only_error(&g(8, 3, &[1, 1, 8], DType::F32)).contains("row dim 2"));
+        }
+
+        /// A multi-step "row" would copy one step's worth and drop the rest.
+        #[test]
+        fn a_multi_row_operand_is_caught() {
+            assert!(only_error(&g(8, 3, &[1, 2, 4], DType::F32)).contains("must be 1"));
+        }
+
+        /// The write is a raw copy, so an f16 row into an f32 cache reinterprets
+        /// bits rather than converting them.
+        #[test]
+        fn a_dtype_mismatch_is_caught() {
+            assert!(only_error(&g(8, 3, &[1, 1, 4], DType::F16)).contains("dtype"));
+        }
+
+        #[test]
+        fn a_squeezed_row_is_caught() {
+            assert!(only_error(&g(8, 3, &[1, 4], DType::F32)).contains("rank"));
+        }
+    }
+
+    /// `expand-from-non-unit-dim` in the evolution ledger.
+    ///
+    /// Found by the corpus: `[8,128] -> [8,256]` cleared structural verify,
+    /// shape verify and `repr_check`, then panicked in rlx-cpu's
+    /// `exec_dispatch` with `index out of bounds: the len is 1024 but the
+    /// index is 1024` — a message that names neither `Expand` nor the graph.
+    mod expand_is_a_broadcast_or_it_is_nothing {
+        use super::*;
+
+        fn g(from: &[usize], to: &[i64]) -> Graph {
+            let mut g = Graph::new("expand");
+            let x = g.input("x", Shape::new(from, DType::F32));
+            let dims: Vec<usize> = to.iter().map(|&d| d as usize).collect();
+            let y = g.add_node(
+                Op::Expand {
+                    target_shape: to.to_vec(),
+                },
+                vec![x],
+                Shape::new(&dims, DType::F32),
+            );
+            g.set_outputs(vec![y]);
+            g
+        }
+
+        #[test]
+        fn a_non_unit_source_axis_is_rejected() {
+            let errors = verify(&g(&[8, 128], &[8, 256]));
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            let message = errors[0].message.clone();
+            assert!(message.contains("not a broadcast"), "{message}");
+            // The numbers that make it wrong belong in the message — this is
+            // the error that replaces an out-of-bounds panic 3 crates away.
+            assert!(
+                message.contains("128") && message.contains("256"),
+                "{message}"
+            );
+        }
+
+        /// The legal form still passes, so the check above is about the
+        /// illegal case and not about `Expand` being rejected in general.
+        #[test]
+        fn a_unit_source_axis_is_accepted() {
+            assert!(verify_all(&g(&[1, 128], &[8, 128])).is_empty());
+        }
+
+        /// Rank-extending broadcast (`[128] -> [8,128]`) is legal too.
+        #[test]
+        fn a_missing_leading_axis_is_accepted() {
+            assert!(verify_all(&g(&[128], &[8, 128])).is_empty());
+        }
+
+        /// `verify_all` runs `verify` first and returns early, so the rule
+        /// has to be reachable through the entry point everything else calls.
+        #[test]
+        fn verify_all_reports_it() {
+            assert!(!verify_all(&g(&[8, 128], &[8, 256])).is_empty());
         }
     }
 

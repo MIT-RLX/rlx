@@ -22,10 +22,13 @@ use rlx_opt::{
     feature = "rocm",
     feature = "tpu",
 ))]
+#[allow(unused_imports)]
 use rlx_runtime::is_available;
 use rlx_runtime::stages::pipeline_for;
 use rlx_runtime::{CompileOptions, Device, Session};
 use std::sync::Mutex;
+
+mod common;
 
 static FK_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -181,6 +184,7 @@ fn run_on(device: Device, g: Graph, opts: &CompileOptions, inputs: &[(&str, &[f3
 
 #[test]
 fn fk_prologue_chain_fusion_ir() {
+    let _gpu = common::serialize_gpu();
     let g = fuse_prologue_chain(build_resize_chain_graph(), FusionTarget::Metal);
     assert!(
         !g.nodes()
@@ -209,7 +213,8 @@ fn fk_prologue_chain_fusion_ir() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_prologue_chain_matches_primitives_on_metal() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_prologue_chain_matches_primitives_on_metal (unavailable)");
         return;
     }
@@ -232,7 +237,8 @@ fn fk_prologue_chain_matches_primitives_on_metal() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_prologue_session_pipeline_keeps_region() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_prologue_session_pipeline_keeps_region (unavailable)");
         return;
     }
@@ -276,6 +282,7 @@ fn fk_prologue_session_pipeline_keeps_region() {
 #[cfg(feature = "gpu")]
 #[test]
 fn fk_prologue_chain_matches_primitives_on_wgpu() {
+    let _gpu = common::serialize_gpu();
     if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
         eprintln!("skip fk_prologue_chain_matches_primitives_on_wgpu (unavailable)");
         return;
@@ -302,7 +309,8 @@ fn fk_prologue_chain_matches_primitives_on_wgpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fk_prologue_chain_matches_primitives_on_cuda() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip fk_prologue_chain_matches_primitives_on_cuda (unavailable)");
         return;
     }
@@ -321,7 +329,8 @@ fn fk_prologue_chain_matches_primitives_on_cuda() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fk_prologue_session_pipeline_keeps_region_cuda() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip fk_prologue_session_pipeline_keeps_region_cuda (unavailable)");
         return;
     }
@@ -341,6 +350,7 @@ fn fk_prologue_session_pipeline_keeps_region_cuda() {
 
 #[test]
 fn fk_batch_region_fusion_ir() {
+    let _gpu = common::serialize_gpu();
     use rlx_fusion::fk_fusion::FuseBatchPreprocess;
     let g = build_batch_relu_graph();
     let out = run_passes(g, &[&FuseBatchPreprocess], false);
@@ -354,7 +364,8 @@ fn fk_batch_region_fusion_ir() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_region_matches_primitives_on_metal() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_batch_region_matches_primitives_on_metal (unavailable)");
         return;
     }
@@ -383,7 +394,8 @@ fn fk_batch_region_matches_primitives_on_metal() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_single_launch_matches_primitives_on_metal() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_batch_single_launch_matches_primitives_on_metal (unavailable)");
         return;
     }
@@ -414,6 +426,7 @@ fn fk_batch_single_launch_matches_primitives_on_metal() {
 #[cfg(feature = "gpu")]
 #[test]
 fn fk_batch_region_matches_primitives_on_wgpu() {
+    let _gpu = common::serialize_gpu();
     if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
         eprintln!("skip fk_batch_region_matches_primitives_on_wgpu (unavailable)");
         return;
@@ -444,6 +457,7 @@ fn fk_batch_region_matches_primitives_on_wgpu() {
 #[cfg(feature = "gpu")]
 #[test]
 fn fk_batch_single_launch_matches_primitives_on_wgpu() {
+    let _gpu = common::serialize_gpu();
     if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
         eprintln!("skip fk_batch_single_launch_matches_primitives_on_wgpu (unavailable)");
         return;
@@ -476,7 +490,8 @@ fn fk_batch_single_launch_matches_primitives_on_wgpu() {
 #[cfg(feature = "mlx")]
 #[test]
 fn fk_batch_region_matches_primitives_on_mlx() {
-    if !is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip fk_batch_region_matches_primitives_on_mlx (unavailable)");
         return;
     }
@@ -505,7 +520,8 @@ fn fk_batch_region_matches_primitives_on_mlx() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_batch_session_pipeline_keeps_native_region (unavailable)");
         return;
     }
@@ -547,7 +563,8 @@ fn fk_batch_session_pipeline_keeps_native_region() {
 #[cfg(feature = "mlx")]
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region_mlx() {
-    if !is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip fk_batch_session_pipeline_keeps_native_region_mlx (unavailable)");
         return;
     }
@@ -574,7 +591,8 @@ fn fk_batch_session_pipeline_keeps_native_region_mlx() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fk_batch_single_launch_matches_primitives_on_cuda() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip fk_batch_single_launch_matches_primitives_on_cuda (unavailable)");
         return;
     }
@@ -605,7 +623,8 @@ fn fk_batch_single_launch_matches_primitives_on_cuda() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fk_batch_region_matches_primitives_on_cuda() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip fk_batch_region_matches_primitives_on_cuda (unavailable)");
         return;
     }
@@ -634,7 +653,8 @@ fn fk_batch_region_matches_primitives_on_cuda() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region_cuda() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip fk_batch_session_pipeline_keeps_native_region_cuda (unavailable)");
         return;
     }
@@ -651,6 +671,7 @@ fn fk_batch_session_pipeline_keeps_native_region_cuda() {
 
 #[test]
 fn fk_batch_session_default_keeps_batch_region() {
+    let _gpu = common::serialize_gpu();
     let g = build_batch_relu_graph();
     let pipe = pipeline_for(Device::Metal, &CompileOptions::new());
     let passes = fusion_passes_for_supported(
@@ -672,7 +693,8 @@ fn fk_batch_session_default_keeps_batch_region() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_batch_session_default_matches_cpu_metal() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_batch_session_default_matches_cpu_metal (unavailable)");
         return;
     }
@@ -698,6 +720,7 @@ fn fk_batch_session_default_matches_cpu_metal() {
 
 #[test]
 fn fk_batch_session_default_keeps_batch_region_tpu() {
+    let _gpu = common::serialize_gpu();
     let g = build_batch_relu_graph();
     let pipe = pipeline_for(Device::Tpu, &CompileOptions::new());
     let passes = fusion_passes_for_supported(
@@ -718,6 +741,7 @@ fn fk_batch_session_default_keeps_batch_region_tpu() {
 
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region_tpu_ir() {
+    let _gpu = common::serialize_gpu();
     let g = build_batch_relu_graph();
     let opts = compile_opts_session_native_fk(FusionTarget::Tpu);
     let pipe = pipeline_for(Device::Tpu, &opts);
@@ -739,6 +763,7 @@ fn fk_batch_session_pipeline_keeps_native_region_tpu_ir() {
 
 #[test]
 fn fk_primitive_batch_session_keeps_native_region_tpu_ir() {
+    let _gpu = common::serialize_gpu();
     use rlx_fusion::fk_graphs::batch_narrow_relu_primitive_graph;
     let g = batch_narrow_relu_primitive_graph("tpu_prim", 2, 3, 4, 4);
     let opts = compile_opts_session_native_fk(FusionTarget::Tpu);
@@ -762,7 +787,8 @@ fn fk_primitive_batch_session_keeps_native_region_tpu_ir() {
 #[cfg(all(feature = "cpu", feature = "tpu"))]
 #[test]
 fn fk_batch_region_matches_primitives_on_tpu() {
-    if !is_available(Device::Tpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Tpu, "tpu") {
         eprintln!("skip fk_batch_region_matches_primitives_on_tpu (unavailable)");
         return;
     }
@@ -791,6 +817,7 @@ fn fk_batch_region_matches_primitives_on_tpu() {
 #[cfg(feature = "gpu")]
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region_wgpu() {
+    let _gpu = common::serialize_gpu();
     if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
         eprintln!("skip fk_batch_session_pipeline_keeps_native_region_wgpu (unavailable)");
         return;
@@ -832,7 +859,8 @@ fn build_resize_prologue_secondary_input_graph() -> Graph {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_prologue_resize_on_input_one_matches_cpu() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_prologue_resize_on_input_one_matches_cpu (unavailable)");
         return;
     }
@@ -864,6 +892,7 @@ fn fk_prologue_resize_on_input_one_matches_cpu() {
 #[cfg(feature = "gpu")]
 #[test]
 fn fk_prologue_resize_on_input_one_matches_cpu_wgpu() {
+    let _gpu = common::serialize_gpu();
     if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
         eprintln!("skip fk_prologue_resize_on_input_one_matches_cpu_wgpu (unavailable)");
         return;
@@ -905,7 +934,8 @@ fn fk_prologue_resize_on_input_one_matches_cpu_wgpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fk_prologue_resize_on_input_one_matches_cpu_cuda() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip fk_prologue_resize_on_input_one_matches_cpu_cuda (unavailable)");
         return;
     }
@@ -941,7 +971,8 @@ fn fk_prologue_resize_on_input_one_matches_cpu_cuda() {
 #[cfg(feature = "mlx")]
 #[test]
 fn fk_prologue_resize_on_input_one_matches_cpu_mlx() {
-    if !is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip fk_prologue_resize_on_input_one_matches_cpu_mlx (unavailable)");
         return;
     }
@@ -979,6 +1010,7 @@ fn fk_prologue_resize_on_input_one_matches_cpu_mlx() {
 
 #[test]
 fn fk_batch_fusion_four_slices_ir() {
+    let _gpu = common::serialize_gpu();
     use rlx_fusion::fk_fusion::FuseBatchPreprocess;
     let mut g = Graph::new("fk_batch4");
     let batch = g.input("batch", nchw(4, 3, 8, 8));
@@ -1023,6 +1055,7 @@ fn fk_batch_fusion_four_slices_ir() {
 
 #[test]
 fn fk_native_batch_fusion_ir() {
+    let _gpu = common::serialize_gpu();
     let g = fuse_native_batch(build_batch_relu_graph(), FusionTarget::Metal);
     assert!(
         g.nodes()
@@ -1034,6 +1067,7 @@ fn fk_native_batch_fusion_ir() {
 
 #[test]
 fn fused_prologue_region_unfused_before_autodiff() {
+    let _gpu = common::serialize_gpu();
     use rlx_autodiff::prepare_graph_for_ad;
     let fused = fuse_prologue_chain(build_resize_chain_graph(), FusionTarget::Cpu);
     assert!(
@@ -1065,6 +1099,7 @@ fn fused_prologue_region_unfused_before_autodiff() {
 
 #[test]
 fn fused_batch_region_decomposed_before_autodiff() {
+    let _gpu = common::serialize_gpu();
     use rlx_autodiff::prepare_graph_for_ad;
     use rlx_fusion::fk_fusion::FuseBatchPreprocess;
     let g = run_passes(build_batch_relu_graph(), &[&FuseBatchPreprocess], false);
@@ -1086,7 +1121,8 @@ fn fused_batch_region_decomposed_before_autodiff() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn fk_primitive_batch_session_matches_cpu_metal() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip fk_primitive_batch_session_matches_cpu_metal (unavailable)");
         return;
     }
@@ -1105,7 +1141,8 @@ fn fk_primitive_batch_session_matches_cpu_metal() {
 #[cfg(feature = "rocm")]
 #[test]
 fn fk_batch_single_launch_matches_primitives_on_rocm() {
-    if !is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip fk_batch_single_launch_matches_primitives_on_rocm (unavailable)");
         return;
     }
@@ -1135,6 +1172,7 @@ fn fk_batch_single_launch_matches_primitives_on_rocm() {
 
 #[test]
 fn fk_primitive_batch_fuses_via_mark_batch_slice() {
+    let _gpu = common::serialize_gpu();
     use rlx_fusion::fk_graphs::batch_narrow_relu_primitive_graph;
     let g = batch_narrow_relu_primitive_graph("fk_prim", 2, 3, 8, 8);
     let fused = fuse_native_batch(g, FusionTarget::Metal);
@@ -1149,7 +1187,8 @@ fn fk_primitive_batch_fuses_via_mark_batch_slice() {
 #[cfg(feature = "rocm")]
 #[test]
 fn fk_batch_region_matches_primitives_on_rocm() {
-    if !is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip fk_batch_region_matches_primitives_on_rocm (unavailable)");
         return;
     }
@@ -1178,7 +1217,8 @@ fn fk_batch_region_matches_primitives_on_rocm() {
 #[cfg(feature = "rocm")]
 #[test]
 fn fk_prologue_resize_relu_matches_cpu_rocm() {
-    if !is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip fk_prologue_resize_relu_matches_cpu_rocm (unavailable)");
         return;
     }

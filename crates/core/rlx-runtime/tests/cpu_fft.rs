@@ -16,6 +16,8 @@ use rlx_opt::autodiff::grad_with_loss;
 use rlx_opt::autodiff_fwd::jvp;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn f32s_to_bytes(xs: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(xs.len() * 4);
     for x in xs {
@@ -76,6 +78,7 @@ fn dft_reference(re: &[f64], im: &[f64], inverse: bool) -> (Vec<f64>, Vec<f64>) 
 
 #[test]
 fn fft_f32_radix4_pow4_matches_dft() {
+    let _gpu = common::serialize_gpu();
     // Pure powers of four take the CPU radix-4 path; validate against the O(N²)
     // DFT at 16/64/256 (f32 input, f64 reference).
     for &n in &[16usize, 64, 256] {
@@ -112,6 +115,7 @@ fn fft_f32_radix4_pow4_matches_dft() {
 
 #[test]
 fn fft_forward_matches_naive_dft() {
+    let _gpu = common::serialize_gpu();
     let n: usize = 8;
     // Block layout: first N real, then N imag.
     let re = [1.0_f64, 0.5, -2.0, 0.25, 0.0, 1.5, -0.75, 3.0];
@@ -150,6 +154,7 @@ fn fft_forward_matches_naive_dft() {
 
 #[test]
 fn fft_inverse_round_trip_recovers_n_times_input() {
+    let _gpu = common::serialize_gpu();
     // ifft(fft(x)) = N·x  (unnormalized convention).
     let n: usize = 16;
     let re: Vec<f64> = (0..n).map(|i| (i as f64) * 0.1 - 0.5).collect();
@@ -187,6 +192,7 @@ fn fft_inverse_round_trip_recovers_n_times_input() {
 
 #[test]
 fn fft_vjp_is_inverse_fft() {
+    let _gpu = common::serialize_gpu();
     // For y = fft(x), VJP gives dx = ifft(upstream). Build a graph
     // that computes loss = sum of squared real parts of fft(x), and
     // compare the autodiff gradient against a closed-form check
@@ -252,6 +258,7 @@ fn fft_vjp_is_inverse_fft() {
 
 #[test]
 fn fft_f32_round_trip_recovers_n_times_input() {
+    let _gpu = common::serialize_gpu();
     // f32 path parity check: same unnormalized convention, same
     // 2N-real-block layout, just lower precision. Tolerance loosened
     // to match radix-2 accumulation in single precision.
@@ -293,6 +300,7 @@ fn fft_f32_round_trip_recovers_n_times_input() {
 
 #[test]
 fn fft_bluestein_forward_matches_naive_dft_non_pow2() {
+    let _gpu = common::serialize_gpu();
     // Bluestein path: N=6 (not a power of two) must still match the
     // naive DFT to the same tolerance as the radix-2 path.
     let n: usize = 6;
@@ -329,6 +337,7 @@ fn fft_bluestein_forward_matches_naive_dft_non_pow2() {
 
 #[test]
 fn fft_bluestein_round_trip_non_pow2() {
+    let _gpu = common::serialize_gpu();
     // Round-trip identity ifft(fft(x)) = N·x must hold for non-pow2
     // sizes too. Cover several N values to exercise different
     // padding lengths M = next_pow2(2N-1).
@@ -369,6 +378,7 @@ fn fft_bluestein_round_trip_non_pow2() {
 
 #[test]
 fn fft_bluestein_vjp_is_inverse_fft_non_pow2() {
+    let _gpu = common::serialize_gpu();
     // VJP rule (VJP(fft)=ifft) must hold for non-pow2 N — the AD
     // doesn't know which kernel runs underneath. Mirrors
     // `fft_vjp_is_inverse_fft` but with N=6.
@@ -422,6 +432,7 @@ fn fft_bluestein_vjp_is_inverse_fft_non_pow2() {
 
 #[test]
 fn fft_bluestein_f32_round_trip_non_pow2() {
+    let _gpu = common::serialize_gpu();
     // f32 Bluestein path: looser tolerance than f64, same identity.
     let n: usize = 10;
     let re: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3 - 1.0).sin()).collect();
@@ -459,6 +470,7 @@ fn fft_bluestein_f32_round_trip_non_pow2() {
 
 #[test]
 fn fft_axis_non_last_matches_naive_dft() {
+    let _gpu = common::serialize_gpu();
     // fft_axis(x, axis=0) should equal a manual transpose+fft+transpose.
     // Set up a 2D real-block tensor where the FFT axis (axis 0) carries
     // the 2N split: shape [2N, B], with B independent rows.
@@ -518,6 +530,7 @@ fn fft_axis_non_last_matches_naive_dft() {
 
 #[test]
 fn fft_axis_last_is_alias_for_fft() {
+    let _gpu = common::serialize_gpu();
     // When axis == rank-1, fft_axis should be identical to fft (no
     // transposes inserted, same numerical result).
     let n: usize = 8;
@@ -546,6 +559,7 @@ fn fft_axis_last_is_alias_for_fft() {
 
 #[test]
 fn fft_jvp_matches_forward_of_tangent() {
+    let _gpu = common::serialize_gpu();
     // FFT is linear, so JVP(fft(x), dx) = fft(dx) with the same
     // direction. Build a graph y = fft(x), JVP-transform it with x
     // seeded as the tangent input, and check the emitted tangent
@@ -607,6 +621,7 @@ fn bytes_to_c64_pairs(bytes: &[u8]) -> Vec<(f32, f32)> {
 
 #[test]
 fn fft2_c64_round_trip() {
+    let _gpu = common::serialize_gpu();
     // 2×2 complex field stored as C64 [H, W].
     let h = 2usize;
     let w = 2usize;
@@ -661,6 +676,7 @@ fn fft2_c64_round_trip() {
 
 #[test]
 fn fftn_single_axis_matches_fft() {
+    let _gpu = common::serialize_gpu();
     let n = 8usize;
     let re = [1.0_f64, 0.5, -2.0, 0.25, 0.0, 1.5, -0.75, 3.0];
     let im = [0.5_f64, -1.0, 0.0, 2.0, -0.5, 0.25, 1.0, -1.5];
@@ -697,6 +713,7 @@ fn const_f32(g: &mut Graph, xs: &[f32]) -> NodeId {
 
 #[test]
 fn fft_real_pads_to_pow2_and_splits_spectrum() {
+    let _gpu = common::serialize_gpu();
     let signal = [1.0_f32, 2.0, 3.0]; // pads to N=4
     let mut g = Graph::new("fft_real");
     let x = const_f32(&mut g, &signal);
@@ -737,6 +754,7 @@ fn fft_real_pads_to_pow2_and_splits_spectrum() {
 
 #[test]
 fn ifft_spectrum_forward_norm_round_trip() {
+    let _gpu = common::serialize_gpu();
     let signal = [1.0_f32, 0.0, 0.0, 0.0];
     let mut g = Graph::new("ifft_real");
     let x = const_f32(&mut g, &signal);
@@ -754,6 +772,7 @@ fn ifft_spectrum_forward_norm_round_trip() {
 
 #[test]
 fn psd_matches_squared_magnitude_over_n() {
+    let _gpu = common::serialize_gpu();
     let re = [3.0_f32, 0.0, 4.0, 0.0];
     let im = [0.0_f32, 1.0, 0.0, 2.0];
     let mut g = Graph::new("psd");
@@ -774,6 +793,7 @@ fn psd_matches_squared_magnitude_over_n() {
 
 #[test]
 fn fft_batch_real_matches_sequential() {
+    let _gpu = common::serialize_gpu();
     let batch = [[1.0_f32, 0.0, 0.0, 0.0], [0.0_f32, 1.0, 0.0, 0.0]];
     let flat: Vec<f32> = batch.iter().flat_map(|s| s.iter().copied()).collect();
 
@@ -808,6 +828,7 @@ fn fft_batch_real_matches_sequential() {
 
 #[test]
 fn fft_forward_norm_round_trip_is_identity() {
+    let _gpu = common::serialize_gpu();
     let n: usize = 16;
     let re: Vec<f64> = (0..n).map(|i| (i as f64 * 0.3 - 1.0).sin()).collect();
     let im: Vec<f64> = (0..n).map(|i| (i as f64 * 0.7).cos() * 0.5).collect();
@@ -840,6 +861,7 @@ fn fft_forward_norm_round_trip_is_identity() {
 
 #[test]
 fn fft_ortho_norm_round_trip_is_identity() {
+    let _gpu = common::serialize_gpu();
     let n: usize = 16;
     let re: Vec<f64> = (0..n).map(|i| (i as f64 * 0.2).sin()).collect();
     let im: Vec<f64> = (0..n).map(|i| (i as f64 * 0.4).cos()).collect();
@@ -865,6 +887,7 @@ fn fft_ortho_norm_round_trip_is_identity() {
 
 #[test]
 fn fft_forward_norm_vjp_matches_scaled_inverse() {
+    let _gpu = common::serialize_gpu();
     let n: usize = 8;
     let re = [1.0_f64, 0.5, -2.0, 0.25, 0.0, 1.5, -0.75, 3.0];
     let im = [0.5_f64, -1.0, 0.0, 2.0, -0.5, 0.25, 1.0, -1.5];
@@ -919,6 +942,7 @@ fn fft_forward_norm_vjp_matches_scaled_inverse() {
 
 #[test]
 fn fft_ortho_norm_jvp_matches_forward_of_tangent() {
+    let _gpu = common::serialize_gpu();
     let n: usize = 8;
     let re = [1.0_f64, 0.5, -2.0, 0.25, 0.0, 1.5, -0.75, 3.0];
     let im = [0.5_f64, -1.0, 0.0, 2.0, -0.5, 0.25, 1.0, -1.5];
@@ -960,6 +984,7 @@ fn fft_ortho_norm_jvp_matches_forward_of_tangent() {
 
 #[test]
 fn rfft_irfft_forward_round_trip() {
+    let _gpu = common::serialize_gpu();
     let signal = [1.0_f32, 2.0, 3.0, 0.5];
     let mut g = Graph::new("rfft_round_trip");
     let x = const_f32(&mut g, &signal);
@@ -982,6 +1007,10 @@ fn rfft_irfft_forward_round_trip() {
 // must recover the signal on every backend, and all backends must agree.
 #[test]
 fn rfft_irfft_roundtrip_mirror_all_backends() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let signal: Vec<f32> = (0..8).map(|i| (i as f32 * 0.7).sin() + 0.3).collect();
     let build = || {
         let mut g = Graph::new("irfft_mirror");
@@ -1011,6 +1040,7 @@ fn rfft_irfft_roundtrip_mirror_all_backends() {
 
 #[test]
 fn stft_single_frame_matches_rfft() {
+    let _gpu = common::serialize_gpu();
     let frame = [0.0_f32, 1.0, 0.0, -1.0];
     let mut g1 = Graph::new("stft");
     let x = const_f32(&mut g1, &frame);
@@ -1036,6 +1066,7 @@ fn stft_single_frame_matches_rfft() {
 
 #[test]
 fn stft_multiframe_matches_per_frame_reference() {
+    let _gpu = common::serialize_gpu();
     // Batched stft (one rfft over [n_frames, frame_len]) must equal the old
     // per-frame semantics (narrow → rfft → block → stack) element-for-element.
     let frame_len = 8usize;
@@ -1076,12 +1107,14 @@ fn stft_multiframe_matches_per_frame_reference() {
 
 #[test]
 fn fft_prime_factors_small_composite() {
+    let _gpu = common::serialize_gpu();
     assert_eq!(rlx_ir::fft::prime_factors(12), vec![2, 2, 3]);
     assert_eq!(rlx_ir::fft::prime_factors(7), vec![7]);
 }
 
 #[test]
 fn rfft_half_spectrum_length() {
+    let _gpu = common::serialize_gpu();
     let signal = [1.0_f32, 2.0, 3.0, 0.5];
     let mut g = Graph::new("rfft_len");
     let x = const_f32(&mut g, &signal);
@@ -1098,6 +1131,7 @@ fn rfft_half_spectrum_length() {
 
 #[test]
 fn fftfreq_matches_numpy_convention() {
+    let _gpu = common::serialize_gpu();
     let n = 8usize;
     let freqs = rlx_ir::fft::fftfreq(n);
     assert_eq!(freqs.len(), n);

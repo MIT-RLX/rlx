@@ -4,7 +4,7 @@
 
 //! WideEP EPLB: expert-parallel load balancing across ranks.
 //!
-//! Unlike TIDE ([`rlx_runtime::ExpertPool`]), which chooses which experts are
+//! Unlike TIDE (`rlx_runtime::ExpertPool`), which chooses which experts are
 //! **device-resident** on one GPU, EPLB chooses which **rank owns** each
 //! expert. Hits are summed across the EP group, then experts are reassigned
 //! so predicted token load is balanced while keeping a fixed per-rank shard

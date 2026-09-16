@@ -318,7 +318,7 @@ fn dequant_grouped_matmul_q4_0_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_grouped_matmul_q4_0_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -328,7 +328,7 @@ fn dequant_grouped_matmul_q4_0_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "cuda")]
 fn dequant_grouped_matmul_q4_0_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("CUDA unavailable, skipping");
         return;
     }
@@ -467,7 +467,7 @@ fn dequant_grouped_matmul_iq2_xxs_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_grouped_matmul_iq2_xxs_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -491,7 +491,7 @@ fn dequant_grouped_matmul_iq3_xxs_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_grouped_matmul_iq3_xxs_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -505,7 +505,7 @@ fn dequant_grouped_matmul_iq3_xxs_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "cuda")]
 fn dequant_grouped_matmul_iq2_xxs_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("CUDA unavailable, skipping");
         return;
     }
@@ -519,7 +519,7 @@ fn dequant_grouped_matmul_iq2_xxs_cuda_matches_cpu() {
 #[test]
 #[cfg(feature = "cuda")]
 fn dequant_grouped_matmul_iq3_xxs_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("CUDA unavailable, skipping");
         return;
     }
@@ -538,7 +538,7 @@ fn dequant_grouped_matmul_iq3_xxs_cuda_matches_cpu() {
 #[test]
 #[cfg(feature = "rocm")]
 fn dequant_grouped_matmul_q4_0_rocm_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("ROCm unavailable, skipping");
         return;
     }
@@ -552,7 +552,7 @@ fn dequant_grouped_matmul_q4_0_rocm_matches_cpu() {
 #[test]
 #[cfg(feature = "rocm")]
 fn dequant_grouped_matmul_iq2_xxs_rocm_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("ROCm unavailable, skipping");
         return;
     }
@@ -566,7 +566,7 @@ fn dequant_grouped_matmul_iq2_xxs_rocm_matches_cpu() {
 #[test]
 #[cfg(feature = "rocm")]
 fn dequant_grouped_matmul_iq3_xxs_rocm_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("ROCm unavailable, skipping");
         return;
     }
@@ -644,7 +644,7 @@ fn dequant_grouped_matmul_iq1_s_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_grouped_matmul_iq2_s_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -654,7 +654,7 @@ fn dequant_grouped_matmul_iq2_s_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_grouped_matmul_iq3_s_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -664,7 +664,7 @@ fn dequant_grouped_matmul_iq3_s_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_grouped_matmul_tq2_0_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -678,7 +678,7 @@ fn dequant_grouped_matmul_tq2_0_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_grouped_matmul_iq1_s_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -688,7 +688,7 @@ fn dequant_grouped_matmul_iq1_s_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "cuda")]
 fn dequant_grouped_matmul_iq2_s_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("CUDA unavailable, skipping");
         return;
     }
@@ -702,7 +702,7 @@ fn dequant_grouped_matmul_iq2_s_cuda_matches_cpu() {
 #[test]
 #[cfg(feature = "cuda")]
 fn dequant_grouped_matmul_iq3_s_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("CUDA unavailable, skipping");
         return;
     }
@@ -716,7 +716,7 @@ fn dequant_grouped_matmul_iq3_s_cuda_matches_cpu() {
 #[test]
 #[cfg(feature = "cuda")]
 fn dequant_grouped_matmul_tq2_0_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("CUDA unavailable, skipping");
         return;
     }

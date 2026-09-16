@@ -88,7 +88,7 @@ pub fn pipeline_schedule(item: TokenStream) -> TokenStream {
 ///
 /// # Opt-in self-check
 /// `#[rlx_model(check)]` injects a call to
-/// [`rlx_runtime::check::model_self_check`] right after the graph is traced, so
+/// `rlx_runtime::check::model_self_check` right after the graph is traced, so
 /// building the model surfaces shape/dtype, backend-dispatch, missed-fusion and
 /// numeric findings on stderr. It runs on the CPU reference backend by default;
 /// tune with `RLX_CHECK` (`off` / `all` / `strict`). No extra dependency — the
@@ -160,7 +160,7 @@ pub fn rlx_model(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// Register a per-family LM runner so [`rlx_runtime::auto_runner_name`]
+/// Register a per-family LM runner so `rlx_runtime::auto_runner_name`
 /// can route a weights file to it.
 ///
 /// ```ignore

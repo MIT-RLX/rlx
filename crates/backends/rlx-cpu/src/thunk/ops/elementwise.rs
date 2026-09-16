@@ -400,7 +400,7 @@ impl CastScalar {
 }
 
 /// Generic element-wise scalar cast for any dtype pair (see
-/// [`Thunk::CastGeneric`]). Decodes each source element into a [`CastScalar`],
+/// [`Thunk::CastGeneric`]). Decodes each source element into a `CastScalar`,
 /// then re-encodes into the destination dtype with correct numeric semantics:
 ///   * float dest (F16/BF16/F32/F64): value-as-f64 rounded to the target
 ///     (round-to-nearest for F16/BF16).
@@ -728,9 +728,17 @@ pub(crate) fn compile_scatter_add(
     rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
     rng: rlx_ir::RngOptions,
 ) -> Thunk {
-    let Op::ScatterAdd = &node.op else {
+    let Op::ScatterAdd { axis } = &node.op else {
         unreachable!()
     };
+    // Kernels implement the axis-0 form only. `rlx_fusion::LowerScatterAddAxis`
+    // rewrites every other axis to transpose/scatter/transpose before a backend
+    // sees it, so reaching here with axis != 0 means that pass did not run —
+    // which would otherwise scatter along the wrong dimension in silence.
+    assert_eq!(
+        *axis, 0,
+        "rlx-cpu: ScatterAdd axis {axis} reached the backend; run LowerScatterAddAxis first"
+    );
     {
         // updates: [num_updates, ...trailing], indices: [num_updates],
         // output: [out_dim, ...trailing]
@@ -818,6 +826,7 @@ pub(crate) fn compile_scatter_elements(
         updates: node_offset(arena, node.inputs[2]),
         dst: node_offset(arena, node.id),
         data_shape: shape_u32s(data_shape),
+        indices_shape: shape_u32s(indices_shape),
         data_len: data_shape.num_elements().unwrap_or(0) as u32,
         updates_len: updates_shape.num_elements().unwrap_or(0) as u32,
         indices_len: indices_shape.num_elements().unwrap_or(0) as u32,
@@ -921,6 +930,17 @@ pub(crate) fn compile_compare(
             && !lhs_dims_s.is_empty()
             && !rhs_dims_s.is_empty()
         {
+            // `broadcast_strides` asserts rank-in <= rank-out with no idea which node it is
+            // compiling, which makes an inconsistent graph very hard to localize. Broadcasting
+            // can never *reduce* rank, so name the node here instead.
+            assert!(
+                lhs_dims_s.len() <= out_dims_s.len() && rhs_dims_s.len() <= out_dims_s.len(),
+                "Compare {:?} at {}: operand rank exceeds output rank \
+                 (lhs {lhs_dims_s:?}, rhs {rhs_dims_s:?}, out {out_dims_s:?}) — \
+                 broadcasting cannot reduce rank, so the graph's shape metadata is inconsistent",
+                cmp,
+                node.name.as_deref().unwrap_or("<unnamed>"),
+            );
             (
                 out_dims_s.iter().map(|&d| d as u32).collect::<Vec<u32>>(),
                 broadcast_strides(&lhs_dims_s, &out_dims_s),
@@ -1111,7 +1131,7 @@ pub(crate) fn compile_gather_backward(
             .map(|i| dy_shape.dim(i).unwrap_static())
             .product::<usize>()
             .max(1);
-        let num_idx = idx_shape.dim(axis_u).unwrap_static();
+        let num_idx = idx_shape.gather_index_count(axis_u);
         let trailing: usize = (axis_u + 1..dy_shape.rank())
             .map(|i| dy_shape.dim(i).unwrap_static())
             .product::<usize>()
@@ -1224,6 +1244,18 @@ pub(crate) fn compile_elementwise_region(
                 .iter()
                 .map(|&id| node_offset(arena, id))
                 .collect();
+            // Resolve each operand's storage lane from the width the memory
+            // plan gave it. Without this the region reads and writes 4-byte
+            // f32 lanes unconditionally, so a packed F16 tensor is misread
+            // (and a half result is silently kept at full f32 precision).
+            let lane_of = |id: NodeId| {
+                let n = graph.node(id).shape.num_elements().unwrap_or(0);
+                let bytes = arena.byte_size(id);
+                let elem = bytes.checked_div(n).unwrap_or(4);
+                crate::thunk::types::LaneKind::resolve(graph.node(id).shape.dtype(), elem)
+            };
+            let in_lanes: Vec<crate::thunk::types::LaneKind> =
+                node.inputs.iter().map(|&id| lane_of(id)).collect();
             Thunk::ElementwiseRegion {
                 dst: node_offset(arena, node.id),
                 len: node.shape.num_elements().unwrap_or(0) as u32,
@@ -1231,6 +1263,8 @@ pub(crate) fn compile_elementwise_region(
                 chain: chain.clone(),
                 scalar_input_mask: *scalar_input_mask,
                 input_modulus: *input_modulus,
+                in_lanes,
+                out_lane: lane_of(node.id),
             }
         }
     }
@@ -1413,6 +1447,8 @@ pub(crate) fn exec_elementwise_region(t: &Thunk, base: *mut u8) {
         chain,
         scalar_input_mask,
         input_modulus,
+        in_lanes,
+        out_lane,
     } = t
     else {
         unreachable!()
@@ -1424,17 +1460,21 @@ pub(crate) fn exec_elementwise_region(t: &Thunk, base: *mut u8) {
             let dst = *dst;
             let scalar_mask = *scalar_input_mask;
             // Each output element is independent → fan over the range.
+            let out_lane = *out_lane;
             let eval = |gid: usize| {
                 let v = region_eval_elem(
                     gid,
                     base_addr as *const u8,
                     input_offs,
+                    in_lanes,
                     chain,
                     scalar_mask,
                     input_modulus,
                 );
+                // Narrow back into the destination's real lane width: an
+                // f32 store into a packed F16 slot would write two lanes.
                 unsafe {
-                    *((base_addr as *mut u8).add(dst) as *mut f32).add(gid) = v;
+                    out_lane.store(base_addr as *mut u8, dst, gid, v);
                 }
             };
             if fast_conv_enabled() && crate::pool::should_parallelize(len) {
@@ -1848,6 +1888,54 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
 }
 
 #[inline(always)]
+/// In-place KV-cache append — one row write, independent of context length.
+///
+/// The output aliases `dst` (the planner gives it the cache's slot), so there
+/// is nothing to copy but the row itself. `outer == 1` is the common
+/// `[1, seq, heads*dim]` cache, which reduces to a single `copy_from_slice`.
+pub(crate) fn exec_kv_append(t: &Thunk, base: *mut u8) {
+    let Thunk::KvAppend {
+        src,
+        dst,
+        outer,
+        seq_cap,
+        pos,
+        inner_bytes,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (outer, seq_cap, pos, inner_bytes) = (
+        *outer as usize,
+        *seq_cap as usize,
+        *pos as usize,
+        *inner_bytes as usize,
+    );
+    if inner_bytes == 0 || outer == 0 || pos >= seq_cap {
+        // `pos >= seq_cap` would write past the cache. Refuse rather than
+        // corrupt a neighbouring tensor: the row is dropped and the model
+        // degrades visibly, instead of silently scribbling on the arena.
+        return;
+    }
+    unsafe {
+        let row = base.add(*src);
+        let cache = base.add(*dst);
+        if outer == 1 {
+            // The common `[1, seq, heads*dim]` cache: one contiguous memcpy.
+            std::ptr::copy_nonoverlapping(row, cache.add(pos * inner_bytes), inner_bytes);
+        } else {
+            let stride = seq_cap * inner_bytes;
+            for o in 0..outer {
+                std::ptr::copy_nonoverlapping(
+                    row.add(o * inner_bytes),
+                    cache.add(o * stride + pos * inner_bytes),
+                    inner_bytes,
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn exec_concat(t: &Thunk, base: *mut u8) {
     let Thunk::Concat {
         dst,
@@ -2030,6 +2118,7 @@ pub(crate) fn exec_scatter_elements(t: &Thunk, base: *mut u8) {
         updates,
         dst,
         data_shape,
+        indices_shape,
         data_len,
         updates_len,
         indices_len,
@@ -2041,6 +2130,7 @@ pub(crate) fn exec_scatter_elements(t: &Thunk, base: *mut u8) {
         unreachable!()
     };
     let data_shape: Vec<usize> = data_shape.iter().map(|&d| d as usize).collect();
+    let idx_shape: Vec<usize> = indices_shape.iter().map(|&d| d as usize).collect();
     unsafe {
         let data_s = sl(*data, base, *data_len as usize);
         let updates_s = sl(*updates, base, *updates_len as usize);
@@ -2052,6 +2142,7 @@ pub(crate) fn exec_scatter_elements(t: &Thunk, base: *mut u8) {
             &idx,
             out,
             &data_shape,
+            &idx_shape,
             *axis,
             *reduction,
         );
@@ -2684,6 +2775,33 @@ pub(crate) fn region_binary_scalar(op: rlx_ir::op::BinaryOp, l: f32, r: f32) -> 
     }
 }
 
+/// Value semantics of a fused `ChainStep::Cast` on the f32-uniform region
+/// arena.
+///
+/// A fused chain carries every intermediate as `f32`, so a cast inside one
+/// cannot change storage width — but it must still change the *value*, or
+/// `Cast(F16)` silently keeps f32 precision and `Cast(I32)` silently keeps
+/// the fraction. Rules mirror [`exec_cast_generic`]'s destination table so a
+/// cast means the same thing fused and unfused: floats round to the target
+/// (`F64` widens exactly from f32, so it is the identity here), int targets
+/// truncate toward zero and saturate, `Bool` is `!= 0`, and complex targets
+/// keep the real part (the chain has no imaginary lane).
+pub(crate) fn region_cast_scalar(to: rlx_ir::DType, v: f32) -> f32 {
+    use rlx_ir::DType as DT;
+    match to {
+        DT::F32 | DT::F64 | DT::C64 | DT::C128 => v,
+        DT::F16 => half::f16::from_f32(v).to_f32(),
+        DT::BF16 => half::bf16::from_f32(v).to_f32(),
+        DT::I8 => v as i8 as f32,
+        DT::I16 => v as i16 as f32,
+        DT::I32 => v as i32 as f32,
+        DT::I64 => v as i64 as f32,
+        DT::U8 => v as u8 as f32,
+        DT::U32 => v as u32 as f32,
+        DT::Bool => f32::from(u8::from(v != 0.0)),
+    }
+}
+
 #[inline]
 pub(crate) fn region_compare_scalar(op: rlx_ir::op::CmpOp, l: f32, r: f32) -> bool {
     use rlx_ir::op::CmpOp as C;
@@ -2706,6 +2824,7 @@ pub(crate) fn region_resolve_operand(
     gid: usize,
     base: *const u8,
     input_offs: &[usize],
+    in_lanes: &[crate::thunk::types::LaneKind],
     scalar_mask: u32,
     modulus: &[u32; 16],
     scratch: &[f32; 32],
@@ -2722,7 +2841,13 @@ pub(crate) fn region_resolve_operand(
             } else {
                 gid
             };
-            unsafe { *(base.add(input_offs[i]) as *const f32).add(row) }
+            // Lane-aware: a packed F16/BF16 operand is 2 bytes wide and an
+            // F64 one is 8, so a fixed f32 stride would read the wrong bytes.
+            let lane = in_lanes
+                .get(i)
+                .copied()
+                .unwrap_or(crate::thunk::types::LaneKind::F32);
+            unsafe { lane.load(base, input_offs[i], row) }
         }
     }
 }
@@ -2734,6 +2859,7 @@ pub(crate) fn region_eval_elem(
     gid: usize,
     base: *const u8,
     input_offs: &[usize],
+    in_lanes: &[crate::thunk::types::LaneKind],
     chain: &[rlx_ir::op::ChainStep],
     scalar_mask: u32,
     modulus: &[u32; 16],
@@ -2741,12 +2867,12 @@ pub(crate) fn region_eval_elem(
     use rlx_ir::op::ChainStep as S;
     let mut scratch = [0f32; 32];
     let r = |o: &rlx_ir::op::ChainOperand, sc: &[f32; 32]| {
-        region_resolve_operand(o, gid, base, input_offs, scalar_mask, modulus, sc)
+        region_resolve_operand(o, gid, base, input_offs, in_lanes, scalar_mask, modulus, sc)
     };
     for (k, step) in chain.iter().enumerate() {
         scratch[k] = match step {
             S::Activation(a, x) => region_activation_scalar(*a, r(x, &scratch)),
-            S::Cast(_, x) => r(x, &scratch), // f32→f32 identity (chains are same-dtype)
+            S::Cast(to, x) => region_cast_scalar(*to, r(x, &scratch)),
             S::Binary(op, l, rr) => region_binary_scalar(*op, r(l, &scratch), r(rr, &scratch)),
             S::Compare(op, l, rr) => {
                 if region_compare_scalar(*op, r(l, &scratch), r(rr, &scratch)) {

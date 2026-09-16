@@ -5,7 +5,7 @@
 //! Unified model component — one object drives specialization, compile cache, and binding.
 //!
 //! Mirrors Slang “shader components”: the same granularity selects **what to specialize**
-//! (dims, dispatch, compilation mode) and **how host code binds** (via [`BindingManifest`]
+//! (dims, dispatch, compilation mode) and **how host code binds** (via `BindingManifest`
 //! after specialize). Works across eager, lazy, and AOT pipelines while keeping HIR/MIR/LIR.
 
 use std::collections::hash_map::DefaultHasher;
@@ -33,7 +33,7 @@ pub struct ModelComponent {
     pub variant: ModelVariant,
     pub kernel_dispatch: KernelDispatchConfig,
     pub compilation_mode: CompilationMode,
-    /// Hash of tier-1 [`CompileProfile`] or arch preset (see `rlx-flow` presets).
+    /// Hash of tier-1 `CompileProfile` or arch preset (see `rlx-flow` presets).
     pub profile_key: u64,
     /// Optional quant scheme affecting lowers and weight layout.
     pub quant: Option<QuantScheme>,
@@ -102,7 +102,7 @@ impl ModelComponent {
         self.variant.dim_binding()
     }
 
-    /// Stable on-disk prefix for [`rlx_runtime::AotCache`] (`{base}__{binding_hash}` per variant).
+    /// Stable on-disk prefix for `rlx_runtime::AotCache` (`{base}__{binding_hash}` per variant).
     pub fn aot_disk_base(&self) -> String {
         format!("rlx_{:016x}", self.cache_key())
     }

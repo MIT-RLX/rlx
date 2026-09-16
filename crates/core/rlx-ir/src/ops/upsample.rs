@@ -83,7 +83,7 @@ impl Graph {
 
     /// Nearest-neighbor resample of an NCDHW volume to `size = [D, H, W]`.
     ///
-    /// Emits native [`Op::Interpolate3d`]. Source index mapping:
+    /// Emits native `Op::Interpolate3d`. Source index mapping:
     /// `src = min(floor(dst * in / out), in - 1)`.
     ///
     /// Prefer [`Graph::interpolate3d`] (in `ops/conv3d.rs`) for mode/align_corners

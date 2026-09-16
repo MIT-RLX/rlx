@@ -10,13 +10,15 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme = "README.md"
+keywords.workspace      = true
+categories.workspace    = true
 
 [dependencies]
 anyhow = "1"
 bytemuck = "1"
 serde_json = "1"
 rlx-ir = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false, features = ["cpu"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.16", default-features = false, features = ["cpu"] }
 rlx-onnx-import = { workspace = true }
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
@@ -53,11 +55,22 @@ metal = ["rlx-runtime/metal"]
 mlx = ["rlx-runtime/mlx"]
 rocm = ["rlx-runtime/rocm"]
 gpu = ["rlx-runtime/gpu"]
+# The rest of what rlx-runtime can drive. Forwarded here so a consumer of the
+# ONNX front end can reach them without depending on the runtime directly.
+vulkan = ["rlx-runtime/vulkan"]
+oneapi = ["rlx-runtime/oneapi"]
+coreml = ["rlx-runtime/coreml"]
+tpu = ["rlx-runtime/tpu"]
+# Needs the Qualcomm AI Engine Direct SDK: the build script fails without
+# `QNN_SDK_ROOT`, which is why this is not in `all-ep`.
+qnn = ["rlx-runtime/qnn"]
+xdna = ["rlx-runtime/xdna"]
+egpu = ["rlx-runtime/egpu"]
 ort-coreml = ["ort", "ort/coreml"]
 ort-cuda = ["ort", "ort/cuda"]
 ort-rocm = ["ort", "ort/rocm"]
 ort-directml = ["ort", "ort/directml"]
-all-ep = ["metal", "mlx", "cuda", "rocm", "gpu", "ort-fallback", "ort-coreml", "ort-cuda", "ort-rocm", "ort-directml"]
+all-ep = ["metal", "mlx", "cuda", "rocm", "gpu", "vulkan", "oneapi", "coreml", "tpu", "xdna", "egpu", "ort-fallback", "ort-coreml", "ort-cuda", "ort-rocm", "ort-directml"]
 
 [[bin]]
 name = "rlx-onnx-run"
@@ -66,3 +79,8 @@ required-features = ["native"]
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["native", "cpu"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

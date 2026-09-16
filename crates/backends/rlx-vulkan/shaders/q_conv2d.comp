@@ -29,11 +29,7 @@ layout(push_constant) uniform PC {
     uint mult_bits;
 } pc;
 
-void main() {
-    uint total = pc.n * pc.c_out * pc.h_out * pc.w_out;
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= total) { return; }
-
+int q_conv2d_one(uint i) {
     uint wo = i % pc.w_out;
     uint q1 = i / pc.w_out;
     uint ho = q1 % pc.h_out;
@@ -68,5 +64,25 @@ void main() {
     int r = int(q_round_half_away(float(acc) * mult)) + pc.out_zp;
     if (r < -128) { r = -128; }
     if (r > 127) { r = 127; }
-    arena_store_i8(pc.out_word, i, r);
+    return r;
+}
+
+void main() {
+    uint total = pc.n * pc.c_out * pc.h_out * pc.w_out;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= total) { return; }
+    // One invocation owns each packed uint word — same launch shape and same
+    // reason as `quantize_i8.comp` / `q_matmul.comp`: `arena_store_i8` is a
+    // read-modify-write of the containing word (naga's GLSL front end has no
+    // `atomicCompSwap`), so four invocations writing consecutive output
+    // elements would clobber each other and leave three quarters of the tensor
+    // at the output zero point.
+    if ((i & 3u) != 0u) { return; }
+    uint word = 0u;
+    for (uint lane = 0u; lane < 4u; lane++) {
+        uint j = i + lane;
+        if (j >= total) { break; }
+        word |= (uint(q_conv2d_one(j)) & 0xFFu) << (lane * 8u);
+    }
+    arena_store_u(pc.out_word + (i >> 2u), word);
 }

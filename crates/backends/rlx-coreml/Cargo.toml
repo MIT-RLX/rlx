@@ -33,7 +33,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # rlx-cpu is the cross-platform CPU backend: host-fallback execution for ops
 # CoreML can't run, plus the collective host-delegate kernels. Available on
 # every platform (not Apple-only), so `host_exec` / `collective` build anywhere.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.16", default-features = false }
 
 [build-dependencies]
 prost-build = "0.13"

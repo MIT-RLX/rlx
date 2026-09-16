@@ -8,6 +8,10 @@ license.workspace      = true
 readme                 = "README.md"
 repository.workspace   = true
 description = "In-graph collective ops (all-reduce) for tensor-parallel RLX execution"
+keywords.workspace      = true
+categories.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
 
 [dependencies]
 rlx-ir = { workspace = true }
@@ -16,7 +20,7 @@ rlx-ir = { workspace = true }
 # out of the build so it cross-compiles to aarch64 (Raspberry Pi / qemu),
 # where no OpenBLAS exists. (rlx-runtime already links platform BLAS for the
 # actual matmul path where it's wanted.)
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.14", default-features = false }
+rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.16", default-features = false }
 rlx-driver = { workspace = true }
 
 [features]
@@ -68,3 +72,8 @@ rlx-xdna = { path = "../../backends/rlx-xdna", features = ["xrt", "direct"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["mdns"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

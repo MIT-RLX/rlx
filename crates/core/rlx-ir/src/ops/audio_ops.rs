@@ -21,7 +21,7 @@ impl Graph {
         self.push(Op::LogMel, vec![spectrum, filters], out, None)
     }
 
-    /// VJP of [`log_mel`] w.r.t. `spectrum`.
+    /// VJP of `log_mel` w.r.t. `spectrum`.
     pub fn log_mel_backward(&mut self, spectrum: NodeId, filters: NodeId, dy: NodeId) -> NodeId {
         let spec_shape = self.shape(spectrum).clone();
         self.push(

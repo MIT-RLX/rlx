@@ -11,6 +11,11 @@ categories.workspace    = true
 repository.workspace    = true
 homepage.workspace      = true
 documentation.workspace = true
+readme                  = "README.md"
+
+[target.'cfg(unix)'.dependencies]
+# Only for the page-cache hints in the disk bench (F_NOCACHE / posix_fadvise).
+libc = "0.2"
 
 [dependencies]
 rlx-ir      = { workspace = true, features = ["serialize"] }
@@ -21,6 +26,32 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 anyhow      = "1"
 toml        = "0.8"
+# Optional: derive ModelCost straight from a GGUF's tensor index (headers only).
+rlx-gguf    = { workspace = true, optional = true }
+
+[features]
+default = []
+gguf = ["dep:rlx-gguf"]
+
+# Backend passthroughs. A cluster probe can only BENCH a device its own binary
+# can compile for, so without these the planner on a Mac ranks every node by its
+# CPU and reports the GPU as unusable — which is honest, but not useful. Enable
+# whichever backends the cluster actually runs on.
+metal = ["rlx-runtime/metal"]
+mlx = ["rlx-runtime/mlx"]
+coreml = ["rlx-runtime/coreml"]
+cuda = ["rlx-runtime/cuda"]
+rocm = ["rlx-runtime/rocm"]
+vulkan = ["rlx-runtime/vulkan"]
 
 [dev-dependencies]
+rlx-gguf = { workspace = true }
 # (tests build small graphs directly against rlx-ir + rlx-runtime CPU)
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features       = ["gguf"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

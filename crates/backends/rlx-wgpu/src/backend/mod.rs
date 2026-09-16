@@ -289,6 +289,18 @@ pub struct WgpuExecutable {
     /// Byte offset of ephemeral GatedDeltaNet state (`carry_state=false`).
     gdn_scratch_off: usize,
     schedule: Vec<Step>,
+    /// Which graph node produced each schedule step, parallel to `schedule`.
+    ///
+    /// A node with no entry here was never written by any step — it was elided,
+    /// folded into a consumer, or is a pure view. That is invisible in a
+    /// post-hoc arena read, where an unwritten slot and a slot a kernel wrongly
+    /// filled with zeros look identical; conflating the two produced three
+    /// separate wrong diagnoses of the `rlx-vieeg` divergence.
+    step_nodes: Vec<NodeId>,
+    /// Guard so the snapshot replay does not re-enter itself.
+    in_snapshot: bool,
+    /// Stop the schedule after this many steps (snapshot replay only).
+    snapshot_stop: Option<usize>,
     input_offsets: HashMap<String, NodeId>,
     param_offsets: HashMap<String, NodeId>,
     /// One uniform buffer + bind group per dispatch step. Pre-allocated
@@ -354,6 +366,13 @@ pub struct WgpuExecutable {
     gpu_handle_feeds: HashMap<String, usize>,
     /// Arena input slots authoritative — skip host KV mirror each decode step.
     gpu_handle_resident: HashSet<String>,
+    /// Resident-KV row feeds: handle name -> graph output index. See
+    /// `register_kv_row_feed`.
+    kv_row_feeds: HashMap<String, usize>,
+    /// Bounce buffer for `feed_kv_row` — WebGPU refuses same-buffer copies, so
+    /// the arena row goes arena -> here -> arena. Cached and grown on demand
+    /// rather than allocated per feed (28 layers x every token otherwise).
+    kv_feed_staging: Option<wgpu::Buffer>,
     pending_read_indices: Option<Vec<usize>>,
     /// Runtime-mutable RNG policy for [`Step::RngNormalHost`] / [`Step::RngUniformHost`].
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
@@ -499,6 +518,9 @@ impl WgpuExecutable {
             dequant_scratch_off: 0,
             gdn_scratch_off: 0,
             schedule: Vec::new(),
+            step_nodes: Vec::new(),
+            in_snapshot: false,
+            snapshot_stop: None,
             input_offsets: HashMap::new(),
             param_offsets: HashMap::new(),
             uniforms: Vec::new(),
@@ -523,6 +545,8 @@ impl WgpuExecutable {
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
             gpu_handle_resident: HashSet::new(),
+            kv_row_feeds: HashMap::new(),
+            kv_feed_staging: None,
             pending_read_indices: None,
             rng,
             static_once_steps: HashSet::new(),
@@ -603,7 +627,7 @@ impl WgpuExecutable {
                 if !self.arena.has(node.id) {
                     return false;
                 }
-                if let Ok(spec) = std::env::var("RLX_WGPU_DUMP_IDS") {
+                if let Some(spec) = rlx_ir::env::var("RLX_WGPU_DUMP_IDS") {
                     let want: std::collections::HashSet<u32> = spec
                         .split(',')
                         .filter_map(|s| s.trim().parse().ok())
@@ -632,13 +656,22 @@ impl WgpuExecutable {
             } else {
                 String::new()
             };
+            // A node no step writes has no value of its own — it was elided,
+            // folded into a consumer, or is a pure view. Saying `max=0` for it
+            // is how a post-hoc dump invents divergences that are not there.
+            let written = self.step_nodes.contains(&node.id);
             eprintln!(
-                "  [{i:>3}] {:?} id={:?} off={} max={max:.6} nonzero={}/{}{flat_s}",
+                "  [{i:>3}] {:?} id={:?} off={} max={max:.6} nonzero={}/{}{flat_s}{}",
                 node.op,
                 node.id,
                 self.arena.offset(node.id),
                 nz,
-                data.len()
+                data.len(),
+                if written {
+                    ""
+                } else {
+                    "  [no writer: elided/fused/view]"
+                }
             );
             if rlx_ir::env::flag("RLX_WGPU_DUMP_INPUTS") {
                 for (j, &inp) in node.inputs.iter().enumerate() {
@@ -949,6 +982,29 @@ fn require_equal_shapes(graph: &Graph, ids: &[NodeId], op_name: &str) {
 }
 
 /// Bind the entire arena in one storage buffer range when it fits the device limit.
+/// Can a kernel that addresses the arena with ABSOLUTE offsets be bound?
+///
+/// `bind_op_output_window` rebases the binding onto a window around the op's
+/// operands when the arena is sharded or larger than one storage binding, and an
+/// absolute offset is meaningless against a rebased window — it would read and
+/// write the wrong slots, silently. Kernels that carry absolute offsets (the
+/// `scaled_lowp` / `quant_i8` / `q_matmul` / `q_conv2d` family, matching the
+/// `ScaledGroupedMatMul` convention) must ask this first and keep the CPU host
+/// route when it says no.
+///
+/// **Not exercised by the test suite, and not for lack of trying.** The sharded
+/// branch is unreachable on wgpu — `buffer.rs` hard-panics on a striped arena
+/// before any of this runs, deliberately (striping produced silently wrong
+/// SynthStrip output). The other branch needs an arena larger than the device's
+/// real `max_storage_buffer_binding_size`, and `RLX_WGPU_MAX_BIND_MB` only caps
+/// the GGUF path, not this helper. So this is correct by construction — it asks
+/// exactly the question `bind_op_output_window` answers — rather than by
+/// measurement. Worth a synthetic cap on the limit if that regime ever matters.
+pub(crate) fn arena_binds_whole_at_zero(dev: &wgpu::Device, arena: &Arena) -> bool {
+    arena_whole_arena_bind(arena, dev.limits().max_storage_buffer_binding_size)
+        .is_some_and(|(base, _)| base == 0)
+}
+
 fn arena_whole_arena_bind(arena: &Arena, max_binding: u64) -> Option<(u64, u64)> {
     if arena.is_sharded() {
         return None;
@@ -980,6 +1036,33 @@ fn arena_clamp_bind_window(arena: &Arena, base: &mut u64, size: &mut u64) {
     };
     let cap = buf.saturating_sub(local_base).max(256);
     if *size > cap {
+        // On a SHARDED arena this truncation is the silent-wrong-answer path.
+        //
+        // A kernel binds one stripe. Clamping the window here means the op asked
+        // for more than the stripe holds, so whatever lay past the boundary is
+        // simply not bound — and reads of it come back as **zero**. No error, no
+        // warning, and a result that is entirely plausible: a convolution in that
+        // state returns its bias for every voxel, which looks like a real feature
+        // map. `Arena::straddles_shards` exists to catch this at compile time,
+        // before any wrong number exists; this is the last line of defence for
+        // whatever it does not cover.
+        //
+        // Unsharded arenas clamp benignly (the caller over-requested against the
+        // single buffer's tail), so the report is gated on `is_sharded`.
+        if arena.is_sharded() {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[rlx-wgpu] WARNING: bind window clamped on a sharded arena \
+                     (base={base} requested={size} available={cap}). Operands of \
+                     this op do not share a stripe; the part outside the bound \
+                     window reads as ZERO, silently. Host the op \
+                     (`RLX_WGPU_FORCE_HOST=1`) or raise the shard size. \
+                     Reported once per process."
+                );
+            }
+        }
         *size = cap;
     }
 }
@@ -1129,7 +1212,22 @@ fn arena_window_for_nodes(dev: &wgpu::Device, arena: &Arena, ids: &[NodeId]) -> 
 }
 
 fn arena_local_off_f32(arena: &Arena, id: NodeId, base: u64) -> u32 {
-    (((arena.offset(id) as u64).saturating_sub(base)) / 4) as u32
+    let off = arena.offset(id);
+    // A weight-buffer offset carries `WEIGHT_BUF_TAG` (bit 62) and indexes a
+    // *different buffer*. Rebasing it against an act-arena window is not just
+    // wrong, it is SILENTLY wrong: `(tagged - base) / 4` truncated to u32 comes
+    // out as a small, perfectly plausible index (bit 62 vanishes in the cast),
+    // so the kernel reads whatever activation happens to sit there — usually
+    // zeros, this early in a graph. That is how Qwen3-0.6B F32 on a >4 GiB
+    // arena produced an all-zero token embedding and emitted token id 0
+    // forever. Callers must stage weight params into the act window
+    // (`arena_off_in_window_or_stage`) or bind the weight buffer separately
+    // (`run_gather_split`, fused GGUF GEMV); there is no correct rebase here.
+    assert!(
+        !crate::buffer::is_weight_off(off),
+        "rlx-wgpu: arena_local_off_f32 on weight-buffer node {id:?} (off={off:#x}) - stage it into the act window or bind the weight buffer separately"
+    );
+    (((off as u64).saturating_sub(base)) / 4) as u32
 }
 
 /// Split-binding embedding gather for >4 GiB arenas (see `Step::GatherSplit`).
@@ -1413,7 +1511,17 @@ fn arena_off_in_bind_window(
     if let Some((b, s)) = arena_whole_arena_bind(arena, max_binding) {
         *base = b;
         *size = s;
-        return arena_local_off_f32(arena, id, b);
+        // …but only activations live in that window. A param parked in the
+        // separate weight buffer has to be staged in even when the whole act
+        // arena binds — which is precisely the case this used to miss, because
+        // "arena fits one binding" and "params are in another buffer" are
+        // independent conditions. `from_plan_split` parks every param once
+        // act + params + scratch exceed the bind cap, so a model whose
+        // activations alone stay small (Qwen3-0.6B F32) hit the shortcut for
+        // every weight it read.
+        if !crate::buffer::is_weight_off(arena.offset(id)) {
+            return arena_local_off_f32(arena, id, b);
+        }
     }
     if arena_tensor_in_window(arena, id, *base, *size) {
         arena_local_off_f32(arena, id, *base)
@@ -1918,6 +2026,13 @@ fn arena_span_bytes(arena: &Arena, ids: &[NodeId]) -> u64 {
     let mut lo: u64 = u64::MAX;
     let mut hi: u64 = 0;
     for &id in ids {
+        // Zero-byte tensors (a zero-length dimension, e.g. LuxTTS's `Expand [0,1,512]`) carry
+        // an explicit empty slot at offset 0 — see the plan fixup in `compile_static_inner`.
+        // They occupy nothing, so they must not anchor the window: including offset 0 here
+        // would stretch it back to the head of the arena.
+        if !arena.has(id) || arena.len_of(id) == 0 {
+            continue;
+        }
         let off = arena.offset(id);
         if crate::buffer::is_weight_off(off) {
             // Weight-buffer tensors don't enlarge the activation bind span;
@@ -2058,7 +2173,15 @@ fn bind_two_buf0_window(
 /// matrix surface that lowers efficiently without needing the full
 /// coop-matrix dance, or when bf16 hardware lands. Today no path
 /// dispatches them.)
-fn derive_matmul_compute(
+///
+/// Three layers, in increasing authority: this cascade (the compile-time
+/// default), then a **measured override** from the shared dispatch table, then
+/// the `RLX_WGPU_*` env pins. The override is accepted only for a path this
+/// same function judged *eligible* — see [`derive_matmul_compute`]. Almost
+/// every condition below is eligibility rather than preference (dtype tags,
+/// device features, alignment the kernel assumes, and two known-bad-kernel
+/// guards), which is exactly why the table may not reach into them.
+fn derive_matmul_compute_default(
     dev: &wgpu::Device,
     graph: &Graph,
     mirror_acts: &HashSet<NodeId>,
@@ -2067,9 +2190,11 @@ fn derive_matmul_compute(
     m: u32,
     k: u32,
     n: u32,
-) -> MatmulCompute {
+) -> (MatmulCompute, MatmulEligibility) {
     if rlx_ir::env::flag("RLX_WGPU_MATMUL_F32_ONLY") {
-        return MatmulCompute::F32;
+        // An explicit pin: F32 is the only admissible path, so it is also the
+        // only eligible one — the table must not be able to route around it.
+        return (MatmulCompute::F32, MatmulEligibility::only_f32());
     }
     use rlx_ir::DType;
     let a_dt = graph.node(a_id).shape.dtype();
@@ -2103,27 +2228,34 @@ fn derive_matmul_compute(
         .features()
         .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
     let backend = crate::device::wgpu_device().map(|d| d.backend);
+    let b_is_param = traces_to_param(graph, b_id);
+
+    // ── Eligibility, computed ONCE ──────────────────────────────────────────
+    //
+    // Nearly every condition here is a correctness gate rather than a
+    // preference — dtype tags, device features, the alignment each kernel
+    // assumes, and two known-bad-kernel guards. Computing them once and having
+    // both the cascade below and the dispatch-table override read the SAME
+    // values is the point: restating a predicate for the override check is how
+    // a tuning table starts admitting a kernel that produces garbage.
+
     // Coop16 has an f16 accumulator (Naga 29 can't compile the mixed
     // f32-acc / f16-operand form). Sums of 3072 BERT-FFN activations
     // overflow f16, so we only enter on F16/BF16 IR tags — AutoMixed
     // users have already opted into the precision tradeoff.
-    if any_low
+    let coop16_ok = any_low
         && !any_bf16
         && has_coop
         && dev.features().contains(wgpu::Features::SHADER_F16)
-        && traces_to_param(graph, b_id)
-        && coop16_aligned
-    {
-        return MatmulCompute::Coop16;
-    }
-    if !any_low && coop_f16_vk_eligible(dev, m, k, n) {
-        if traces_to_param(graph, b_id)
-            && !mirror_acts.contains(&a_id)
-            && !mirror_acts.contains(&b_id)
-        {
-            return MatmulCompute::CoopF16Vk;
-        }
-    }
+        && b_is_param
+        && coop16_aligned;
+
+    let coop_f16_vk_ok = !any_low
+        && coop_f16_vk_eligible(dev, m, k, n)
+        && b_is_param
+        && !mirror_acts.contains(&a_id)
+        && !mirror_acts.contains(&b_id);
+
     // CoopF32 (`simdgroup_float8x8` on Apple): the f32 hardware-GEMM
     // path. Used whenever cooperative-matrix is available, B is a
     // Param, and shapes align — gives ~5-10× speedup over the
@@ -2140,25 +2272,159 @@ fn derive_matmul_compute(
     // vs CPU; forcing the plain F32 kernel restores cos 1.0. GGUF text models
     // dodged this via the DequantMatMul path. Until the kernel is root-caused,
     // Metal CoopF32 is opt-in via RLX_WGPU_FORCE_COOP_F32.
-    let metal_coop =
-        !disabled && has_coop && coop_f32_metal_aligned && traces_to_param(graph, b_id) && forced;
+    let metal_coop = !disabled && has_coop && coop_f32_metal_aligned && b_is_param && forced;
     let _ = backend;
     let vulkan_coop = !disabled
         && has_coop
         && coop_f32_portable_aligned
-        && traces_to_param(graph, b_id)
+        && b_is_param
         && crate::device::coop_discrete_backend()
         && crate::device::coop_f32_8x8_supported();
-    if metal_coop
+    let coop_f32_ok = metal_coop
         || vulkan_coop
         || (forced
             && has_coop
-            && traces_to_param(graph, b_id)
-            && (coop_f32_metal_aligned || coop_f32_portable_aligned))
-    {
-        return MatmulCompute::CoopF32;
+            && b_is_param
+            && (coop_f32_metal_aligned || coop_f32_portable_aligned));
+
+    let eligible = MatmulEligibility {
+        coop16: coop16_ok,
+        coop_f16_vk: coop_f16_vk_ok,
+        coop_f32: coop_f32_ok,
+        // The plain tiled f32 kernel has no alignment or feature requirement —
+        // it is the path everything else falls back to, so it is always legal.
+        f32: true,
+    };
+
+    // ── The cascade: preference order among the eligible ────────────────────
+    let default = if coop16_ok {
+        MatmulCompute::Coop16
+    } else if coop_f16_vk_ok {
+        MatmulCompute::CoopF16Vk
+    } else if coop_f32_ok {
+        MatmulCompute::CoopF32
+    } else {
+        MatmulCompute::F32
+    };
+    (default, eligible)
+}
+
+/// Which dense-matmul compute paths are legal for one specific call.
+///
+/// `Bf16Packed` and `F16` are absent on purpose: neither is chosen by
+/// `derive_matmul_compute` — `Bf16Packed` is installed later by the caller when
+/// it sees a BF16 `Param` rhs, and no path dispatches `F16` today. A tuning
+/// table must not be able to conjure either one here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MatmulEligibility {
+    pub coop16: bool,
+    pub coop_f16_vk: bool,
+    pub coop_f32: bool,
+    pub f32: bool,
+}
+
+impl MatmulEligibility {
+    /// Under `RLX_WGPU_MATMUL_F32_ONLY` the pin is absolute.
+    fn only_f32() -> Self {
+        Self {
+            coop16: false,
+            coop_f16_vk: false,
+            coop_f32: false,
+            f32: true,
+        }
     }
-    MatmulCompute::F32
+
+    fn allows(&self, v: MatmulCompute) -> bool {
+        match v {
+            MatmulCompute::Coop16 => self.coop16,
+            MatmulCompute::CoopF16Vk => self.coop_f16_vk,
+            MatmulCompute::CoopF32 => self.coop_f32,
+            MatmulCompute::F32 => self.f32,
+            // Never selectable from the table — see the struct doc.
+            MatmulCompute::F16 | MatmulCompute::Bf16Packed => false,
+        }
+    }
+}
+
+/// Pick the dense-matmul compute path, letting a measured override from the
+/// shared dispatch table retune the choice **within** what is legal here.
+///
+/// The table proposes; eligibility disposes. An override naming a path this
+/// call cannot run — a stale cache, or one copied from another adapter — is
+/// discarded in favour of the cascade's answer rather than honoured.
+#[allow(clippy::too_many_arguments)]
+fn derive_matmul_compute(
+    dev: &wgpu::Device,
+    graph: &Graph,
+    mirror_acts: &HashSet<NodeId>,
+    a_id: NodeId,
+    b_id: NodeId,
+    m: u32,
+    k: u32,
+    n: u32,
+) -> MatmulCompute {
+    let (default, eligible) =
+        derive_matmul_compute_default(dev, graph, mirror_acts, a_id, b_id, m, k, n);
+    let Some(want) = rlx_gpu_dispatch::dispatch::resolve_matmul(
+        crate::tuning::gpu_arch(),
+        m as usize,
+        k as usize,
+        n as usize,
+    )
+    .as_wgpu_matmul()
+    .map(matmul_compute_from_dispatch) else {
+        return default;
+    };
+    if want == default {
+        return default;
+    }
+    if eligible.allows(want) {
+        want
+    } else {
+        if rlx_ir::env::flag("RLX_VERBOSE") {
+            eprintln!(
+                "rlx-wgpu: tuning cache picks {want:?} for m={m} k={k} n={n} \
+                 but it is not eligible there — using {default:?}"
+            );
+        }
+        default
+    }
+}
+
+/// Bridge to the shared table's backend-agnostic variant enum. A test pins the
+/// mapping in both directions so a new variant cannot silently become another.
+///
+/// Only the `from_` direction is on the hot path today (the table proposes, this
+/// crate consumes). `to_` exists so the mapping is stated as a bijection and can
+/// be checked as one — and it is what a tuner writing measured winners back into
+/// the table will call.
+#[allow(dead_code)]
+pub(crate) fn matmul_compute_to_dispatch(
+    v: MatmulCompute,
+) -> rlx_gpu_dispatch::dispatch::WgpuMatmul {
+    use rlx_gpu_dispatch::dispatch::WgpuMatmul as D;
+    match v {
+        MatmulCompute::F32 => D::F32,
+        MatmulCompute::F16 => D::F16,
+        MatmulCompute::Coop16 => D::Coop16,
+        MatmulCompute::CoopF32 => D::CoopF32,
+        MatmulCompute::CoopF16Vk => D::CoopF16Vk,
+        MatmulCompute::Bf16Packed => D::Bf16Packed,
+    }
+}
+
+pub(crate) fn matmul_compute_from_dispatch(
+    v: rlx_gpu_dispatch::dispatch::WgpuMatmul,
+) -> MatmulCompute {
+    use rlx_gpu_dispatch::dispatch::WgpuMatmul as D;
+    match v {
+        D::F32 => MatmulCompute::F32,
+        D::F16 => MatmulCompute::F16,
+        D::Coop16 => MatmulCompute::Coop16,
+        D::CoopF32 => MatmulCompute::CoopF32,
+        D::CoopF16Vk => MatmulCompute::CoopF16Vk,
+        D::Bf16Packed => MatmulCompute::Bf16Packed,
+    }
 }
 
 /// Detects the BERT-style fused-QKV-then-narrow-then-attention
@@ -2235,9 +2501,15 @@ fn detect_qkv_narrow_pattern(
 /// disappear. Different from the reverted "skip narrow + read attention
 /// strided" approach because reads from each Q/K/V buffer remain
 /// sequential — the prefetcher stays happy.
-/// Detects (`Op::Binary(Add) → Op::LayerNorm`) where the Add has more
-/// than one consumer in the graph — the case `FuseResidualLN` declines
-/// because its single-consumer guard would force materializing the sum.
+/// Detects (`Op::Binary(Add) → Op::LayerNorm | Op::RmsNorm`) where the Add has
+/// more than one consumer in the graph — the case `FuseResidualLN` /
+/// `FuseResidualRmsNorm` decline because their single-consumer guard would
+/// force materializing the sum.
+///
+/// That guard makes the fusion miss EVERY transformer layer, because the
+/// residual sum feeds both the norm and the next residual
+/// (`h += attn; n = norm(h); h += ffn(n)`). On an 8-block probe wgpu emitted 8
+/// standalone Binary + 8 standalone norms where this collapses them to 8.
 ///
 /// Returns:
 ///   - `ln_to_tee`: `ln_id → (h, delta, gamma, beta, sum_id)` so the
@@ -2255,21 +2527,37 @@ fn detect_residual_ln_tee_pattern(
     use rlx_ir::op::BinaryOp;
     // Consumer counts (output references count once each).
     let mut consumers: HashMap<NodeId, usize> = HashMap::new();
+    // …and the consuming nodes themselves, so we can check *when* they run.
+    let mut consumer_nodes: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     for node in graph.nodes() {
         for &input in &node.inputs {
             *consumers.entry(input).or_insert(0) += 1;
+            consumer_nodes.entry(input).or_default().push(node.id);
         }
     }
     for &out in &graph.outputs {
         *consumers.entry(out).or_insert(0) += 1;
     }
+    // Emission order: steps are pushed while walking `graph.nodes()`.
+    let order: HashMap<NodeId, usize> = graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
 
     let mut ln_to_tee = HashMap::new();
     let mut skip_adds = HashSet::new();
     for node in graph.nodes() {
-        let Op::LayerNorm { axis: _, eps: _ } = &node.op else {
+        // BOTH norms. They share this shape — the residual sum feeds the norm
+        // and the next residual — and share the wgpu lowering arm; only the
+        // final scaling differs, which the kernel selects on `is_rms`. RmsNorm
+        // is the one that matters for Llama-class models, and it was excluded
+        // here purely because the pattern was written for a LayerNorm vision
+        // transformer.
+        if !matches!(&node.op, Op::LayerNorm { .. } | Op::RmsNorm { .. }) {
             continue;
-        };
+        }
         if node.inputs.len() < 3 {
             continue;
         } // need [in, gamma, beta]
@@ -2294,6 +2582,23 @@ fn detect_residual_ln_tee_pattern(
             continue;
         }
         if graph.node(delta_id).shape.dims() != node.shape.dims() {
+            continue;
+        }
+        // The tee writes the sum as a side effect of the *norm's* step, and the
+        // Add's own step is suppressed. That is only sound if every other reader
+        // of the Add runs after the norm — otherwise it reads a slot nothing has
+        // written yet. `rlx-vieeg` is exactly that shape: the residual also
+        // feeds a mean-pool head five steps earlier, so on wgpu the head read
+        // zeros and every hierarchy level came out wrong, but only when the
+        // graph had two or more distinct outputs (with one, the head is dead
+        // code and the early reader disappears). Graph outputs are read after
+        // the whole schedule, so they do not constrain this.
+        let ln_pos = order.get(&node.id).copied().unwrap_or(usize::MAX);
+        let early_reader = consumer_nodes.get(&in_id).is_some_and(|cs| {
+            cs.iter()
+                .any(|c| *c != node.id && order.get(c).copied().unwrap_or(usize::MAX) < ln_pos)
+        });
+        if early_reader {
             continue;
         }
         let gamma_id = node.inputs[1];
@@ -2392,38 +2697,10 @@ fn traces_to_param(graph: &Graph, mut id: NodeId) -> bool {
     }
 }
 
-/// True when `id`'s value is fixed after param/constant upload (no Inputs).
-/// Used to mark weight-packing Concat/Expand as run-once for the NFE loop.
-fn is_static_weight_tensor(graph: &Graph, id: NodeId, memo: &mut HashMap<NodeId, bool>) -> bool {
-    if let Some(&v) = memo.get(&id) {
-        return v;
-    }
-    let node = graph.node(id);
-    let v = match &node.op {
-        Op::Param { .. } | Op::Constant { .. } => true,
-        Op::Input { .. } => false,
-        Op::Cast { .. }
-        | Op::Reshape { .. }
-        | Op::Transpose { .. }
-        | Op::Narrow { .. }
-        | Op::Expand { .. }
-        | Op::Activation(_)
-        | Op::Concat { .. } => {
-            !node.inputs.is_empty()
-                && node
-                    .inputs
-                    .iter()
-                    .all(|&inp| is_static_weight_tensor(graph, inp, memo))
-        }
-        Op::Binary(_) | Op::Where | Op::Fma => node
-            .inputs
-            .iter()
-            .all(|&inp| is_static_weight_tensor(graph, inp, memo)),
-        _ => false,
-    };
-    memo.insert(id, v);
-    v
-}
+/// Re-export of the planner's predicate. `lower.rs` calls it unqualified; the
+/// definition lives in `rlx_compile::memory` so it cannot drift from the one
+/// that decides which packs get pinned.
+pub(crate) use rlx_compile::memory::is_static_weight_tensor;
 
 fn tensor_is_graph_param(
     graph: &Graph,

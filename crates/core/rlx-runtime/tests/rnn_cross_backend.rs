@@ -12,6 +12,8 @@ use rlx_ir::op::Op;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn mk(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
         .map(|i| (((i.wrapping_mul(2654435761).wrapping_add(seed)) % 1000) as f32) / 500.0 - 1.0)
@@ -56,6 +58,7 @@ const CFG: (usize, usize, usize, usize, usize, bool) = (2, 5, 4, 4, 2, true);
 
 #[test]
 fn lstm_agrees_cpu_mlx_coreml() {
+    let _gpu = common::serialize_gpu();
     let (b, s, inp, h, l, bi) = CFG;
     let f = DType::F32;
     let ex = rlx_cpu::thunk::rnn_expected_lens(4, b, s, inp, h, l, bi);
@@ -89,6 +92,7 @@ fn lstm_agrees_cpu_mlx_coreml() {
 
 #[test]
 fn gru_agrees_cpu_mlx_coreml() {
+    let _gpu = common::serialize_gpu();
     let (b, s, inp, h, l, bi) = CFG;
     let f = DType::F32;
     let ex = rlx_cpu::thunk::rnn_expected_lens(3, b, s, inp, h, l, bi);
@@ -135,6 +139,7 @@ fn gru_agrees_cpu_mlx_coreml() {
 
 #[test]
 fn rnn_agrees_cpu_mlx_coreml() {
+    let _gpu = common::serialize_gpu();
     let (b, s, inp, h, l, bi) = CFG;
     let f = DType::F32;
     let ex = rlx_cpu::thunk::rnn_expected_lens(1, b, s, inp, h, l, bi);

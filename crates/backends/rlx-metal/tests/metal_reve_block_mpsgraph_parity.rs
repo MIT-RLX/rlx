@@ -142,7 +142,7 @@ fn run_block(
 
 #[test]
 fn metal_patch_embed_mpsgraph_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
     rlx_ir::env::unset("RLX_DISABLE_MPSGRAPH");
@@ -182,7 +182,7 @@ fn metal_patch_embed_mpsgraph_matches_cpu() {
 
 #[test]
 fn metal_reve_attn_subgraph_mpsgraph_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
     rlx_ir::env::unset("RLX_DISABLE_MPSGRAPH");
@@ -266,7 +266,7 @@ fn metal_reve_attn_subgraph_mpsgraph_matches_cpu() {
 
 #[test]
 fn metal_reve_ffn_subgraph_mpsgraph_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
     rlx_ir::env::unset("RLX_DISABLE_MPSGRAPH");
@@ -324,7 +324,7 @@ fn metal_reve_ffn_subgraph_mpsgraph_matches_cpu() {
 
 #[test]
 fn metal_geglu_core_mpsgraph_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
     rlx_ir::env::unset("RLX_DISABLE_MPSGRAPH");
@@ -355,7 +355,7 @@ fn metal_geglu_core_mpsgraph_matches_cpu() {
 
 #[test]
 fn metal_reve_block_mpsgraph_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

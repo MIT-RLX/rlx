@@ -7,9 +7,9 @@
 #![cfg(feature = "cpu")]
 
 use rlx_ir::{DType, Graph, GraphExt, Shape};
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use rlx_runtime::is_available;
 use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn f64_bytes(xs: &[f64]) -> Vec<u8> {
     xs.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -29,12 +29,14 @@ fn run_f32_scale(device: Device, factor: f32) -> Vec<f32> {
 
 #[test]
 fn cpu_mul_by_graphext_constant() {
+    let _gpu = common::serialize_gpu();
     let got = run_f32_scale(Device::Cpu, 2.0);
     assert_eq!(got, vec![2.0, 4.0, 6.0]);
 }
 
 #[test]
 fn cpu_add_and_div_by_constants() {
+    let _gpu = common::serialize_gpu();
     let mut g = Graph::new("add_div");
     let x = g.input("x", Shape::new(&[2], DType::F32));
     let one = g.constant(1.0, DType::F32);
@@ -50,6 +52,7 @@ fn cpu_add_and_div_by_constants() {
 
 #[test]
 fn cpu_f64_constant_broadcasts() {
+    let _gpu = common::serialize_gpu();
     let mut g = Graph::new("f64");
     let x = g.input("x", Shape::new(&[2], DType::F64));
     let half = g.constant(0.5, DType::F64);
@@ -71,7 +74,8 @@ fn cpu_f64_constant_broadcasts() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_mul_by_graphext_constant_matches_cpu() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let cpu = run_f32_scale(Device::Cpu, 3.0);

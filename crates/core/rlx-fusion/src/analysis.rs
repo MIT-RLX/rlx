@@ -269,6 +269,8 @@ pub struct UseCounts {
     counts: Vec<usize>,
     /// Nodes reachable from the graph outputs (i.e. not dead).
     live: Vec<bool>,
+    /// Nodes that are themselves graph outputs.
+    is_output: Vec<bool>,
 }
 
 impl Analysis for UseCounts {
@@ -316,10 +318,18 @@ impl Analysis for UseCounts {
             }
         }
 
+        let mut is_output = vec![false; n];
+        for out in &graph.outputs {
+            if (out.0 as usize) < n {
+                is_output[out.0 as usize] = true;
+            }
+        }
+
         Self {
             users,
             counts,
             live,
+            is_output,
         }
     }
 }
@@ -338,10 +348,27 @@ impl UseCounts {
         self.counts.get(id.0 as usize).copied().unwrap_or(0)
     }
 
-    /// True when `id` has exactly one consumer — the precondition almost every
-    /// fusion pattern checks before absorbing a producer into its consumer.
+    /// True when `id` is a graph output.
+    pub fn is_graph_output(&self, id: NodeId) -> bool {
+        self.is_output.get(id.0 as usize).copied().unwrap_or(false)
+    }
+
+    /// True when `id` has exactly one consumer **and its value does not escape
+    /// as a graph output** — the precondition almost every fusion pattern
+    /// checks before absorbing a producer into its consumer.
+    ///
+    /// The output clause is load-bearing. Absorbing a producer deletes it, which
+    /// is only sound when nothing else needs its value; an exported value is
+    /// still needed even with a single consuming node. Without this, such a node
+    /// is skipped during the rewrite with no replacement recorded, and
+    /// `Rewriter::finish` panics mapping the outputs.
+    ///
+    /// Ordinary model graphs rarely export an interior value, which is why this
+    /// went unnoticed. A graph that publishes activations as outputs —
+    /// `rlx_autodiff::split_vjp`'s save half, or an instrumentation tap — hits
+    /// it immediately.
     pub fn has_single_use(&self, id: NodeId) -> bool {
-        self.use_count(id) == 1
+        self.use_count(id) == 1 && !self.is_graph_output(id)
     }
 
     /// Is `id` reachable from the graph outputs?

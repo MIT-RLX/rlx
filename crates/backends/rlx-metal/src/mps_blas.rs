@@ -36,6 +36,11 @@ use std::sync::{Mutex, OnceLock, RwLock};
 /// holds a *read* lock (concurrent encodes still overlap), while
 /// `invalidate_caches` takes the *write* lock so it can only run once no
 /// encode is in flight.
+///
+/// **This is a lifetime guarantee, not an exclusivity one** — it says a cached
+/// object will not be *freed* mid-encode, not that only one thread is using it.
+/// Sharing a stateful MPS kernel between concurrent encodes is a separate
+/// hazard, handled by keying the cache on the thread; see [`KernelKey`].
 static CACHE_GUARD: RwLock<()> = RwLock::new(());
 
 // Link the MetalPerformanceShaders framework. metal-rs gates its own
@@ -64,14 +69,38 @@ pub fn mps_supports_matmul() -> bool {
     *AVAIL.get_or_init(|| objc::runtime::Class::get("MPSMatrixMultiplication").is_some())
 }
 
-/// Cache of `(m,k,n)` → retained MPSMatrixMultiplication kernel.
+/// `(m, k, n, transposeA, transposeB, thread)` → retained
+/// MPSMatrixMultiplication kernel.
 ///
+/// **The thread is part of the key, and has to be.** [`CACHE_GUARD`] keeps a
+/// cached pointer *alive* across an encode — it stops `invalidate_caches`
+/// freeing one mid-use — but that is a lifetime guarantee, not an exclusivity
+/// one. An `MPSMatrixMultiplication` is stateful and mutates itself while
+/// encoding (`setIndexingArithmaticTypeMask:sourceArrays:…`), so two threads
+/// encoding the same shape would share one instance and race inside MPS:
+/// `EXC_BAD_ACCESS` in `MPSNDArrayMultiaryBase`, an Apple frame, with nothing
+/// in rlx's own stack looking wrong. Deterministic with ≥2 threads on one
+/// shape; `tests/mps_matmul_concurrency.rs` reproduces it in seconds and
+/// SIGSEGVs if this key loses its `ThreadId`.
+///
+/// Per-thread instances keep the property the [`CACHE_GUARD`] `RwLock` was
+/// chosen for — concurrent encodes still overlap — where a mutex around the
+/// encode would have serialized them.
+///
+/// The map is global rather than `thread_local!` so `invalidate_caches` can
+/// still release *every* live kernel under the write lock; a thread-local
+/// cache would strand other threads' objects. `ThreadId`s are never reused, so
+/// entries for finished threads linger until the next invalidate — which runs
+/// on every compile and on `MetalExecutable::drop`, so the bound is
+/// (live shapes × threads that encoded since the last compile).
+type KernelKey = (usize, usize, usize, bool, bool, std::thread::ThreadId);
+
 /// **Bridge-cost mitigation #1.** Building the kernel involves ~6 objc
 /// messages (alloc, init, set transposes, set α/β). For typical inference
 /// the same shapes recur every layer, so caching reduces per-call objc
 /// overhead.
 struct KernelCache {
-    map: Mutex<HashMap<(usize, usize, usize, bool, bool), usize>>,
+    map: Mutex<HashMap<KernelKey, usize>>,
 }
 unsafe impl Send for KernelCache {}
 unsafe impl Sync for KernelCache {}
@@ -204,8 +233,16 @@ unsafe fn get_or_build_kernel(
     transpose_b: bool,
 ) -> *mut Object {
     let cache = kernel_cache();
+    let key: KernelKey = (
+        m,
+        k,
+        n,
+        transpose_a,
+        transpose_b,
+        std::thread::current().id(),
+    );
     let mut map = cache.map.lock().expect("kernel cache poisoned");
-    if let Some(&p) = map.get(&(m, k, n, transpose_a, transpose_b)) {
+    if let Some(&p) = map.get(&key) {
         return p as *mut Object;
     }
     use crate::device::metal_device;
@@ -223,7 +260,7 @@ unsafe fn get_or_build_kernel(
         alpha: 1.0_f64
         beta: 0.0_f64
     ];
-    map.insert((m, k, n, transpose_a, transpose_b), kernel as usize);
+    map.insert(key, kernel as usize);
     kernel
 }
 

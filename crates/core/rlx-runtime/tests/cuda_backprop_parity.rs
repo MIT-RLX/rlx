@@ -13,16 +13,19 @@
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::{Activation, BinaryOp, ReduceOp};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
+#[allow(unused_imports)]
 use rlx_runtime::{Device, Session, is_available};
+
+mod common;
 
 const F: DType = DType::F32;
 
 /// Device under test — `RLX_PARITY_DEVICE` (cuda|metal|gpu|mlx|ane|rocm|vulkan…),
 /// default CUDA. Lets the SAME gradient-parity suite run against every backend.
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     }
 }
 
@@ -128,7 +131,8 @@ fn reduce(g: &mut Graph, op: ReduceOp, x: NodeId, axes: Vec<usize>, out: Shape) 
 /// bias-broadcast-VJP (reduce), softmax-CE-VJP.
 #[test]
 fn backward_primitives_isolation() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("backprop_parity: {:?} unavailable — skipping", target());
         return;
     }
@@ -274,7 +278,8 @@ fn backward_primitives_isolation() {
 /// full net fails, so add the bias add and multi-param grad one at a time.
 #[test]
 fn conv_bias_trigger() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("backprop_parity: {:?} unavailable — skipping", target());
         return;
     }
@@ -362,7 +367,8 @@ fn conv_bias_trigger() {
 /// decomposition rides — softmax, transpose[1,0], concat(axis 0), where/compare.
 #[test]
 fn softmax_ce_decomp_primitives() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("backprop_parity: {:?} unavailable — skipping", target());
         return;
     }
@@ -458,7 +464,8 @@ fn softmax_ce_decomp_primitives() {
 /// VJPs: matmul-transpose, reduce-broadcast, relu-mask).
 #[test]
 fn mlp_softmax_ce_grads_match_cpu() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("backprop_parity: {:?} unavailable — skipping", target());
         return;
     }
@@ -514,7 +521,8 @@ fn mlp_softmax_ce_grads_match_cpu() {
 /// maxpool2d backward paths (cuDNN / host-fallback) in addition to the MLP mix.
 #[test]
 fn conv_net_grads_match_cpu() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("backprop_parity: {:?} unavailable — skipping", target());
         return;
     }
@@ -594,7 +602,8 @@ fn conv_net_grads_match_cpu() {
 /// exercising `Conv2dBackwardInput`. Confirms a multi-conv CNN trains correctly.
 #[test]
 fn two_conv_grads_match_cpu() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("backprop_parity: {:?} unavailable — skipping", target());
         return;
     }
@@ -676,7 +685,8 @@ fn two_conv_grads_match_cpu() {
 // VJP produces the SAME gradients on CUDA as on CPU (stride-2 upsampling case).
 #[test]
 fn conv_transpose2d_backward_parity() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("backprop_parity: {:?} unavailable — skipping", target());
         return;
     }
@@ -712,7 +722,8 @@ fn conv_transpose2d_backward_parity() {
 /// and a masked conv (type-A causal). Square-loss so gradients are non-trivial.
 #[test]
 fn codec_ops_isolation() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("codec_ops: {:?} unavailable — skipping", target());
         return;
     }
@@ -913,7 +924,8 @@ fn codec_ops_isolation() {
 /// `yq² · exp(−2·(5·tanh(z/5)))`. Inputs ×4 to probe magnitude sensitivity.
 #[test]
 fn codec_ops_isolation2() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("codec_ops2: {:?} unavailable — skipping", target());
         return;
     }
@@ -1045,7 +1057,8 @@ fn codec_ops_isolation2() {
 /// Skips when libcudnn is unloadable so we don't silently lock the im2col path.
 #[test]
 fn cudnn_stable_conv_bwd_finite_matches_cpu() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("cudnn_stable_bwd: {:?} unavailable — skipping", target());
         return;
     }
@@ -1122,7 +1135,8 @@ fn cudnn_stable_conv_bwd_finite_matches_cpu() {
 /// yields ≈0. These exercise the exact failing shapes vs known-good controls.
 #[test]
 fn codec_conv_shapes_dw() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("codec_conv_shapes: {:?} unavailable — skipping", target());
         return;
     }
@@ -1169,7 +1183,8 @@ fn codec_conv_shapes_dw() {
 /// CPU vs CUDA — the codec zeroes these on CUDA while dx stays correct.
 #[test]
 fn codec_context_dw() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("codec_context_dw: skip");
         return;
     }
@@ -1255,7 +1270,8 @@ fn codec_context_dw() {
 /// here (large-spatial up2 backward). Check CUDA gradients stay finite.
 #[test]
 fn codec_up2_chain_finite() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("up2_chain: skip");
         return;
     }
@@ -1314,7 +1330,8 @@ fn codec_up2_chain_finite() {
 /// at the exact codec shape [16,256,64,64] — is CUDA's d_bias correct?
 #[test]
 fn codec_bias_reduce_large() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("bias_reduce: skip");
         return;
     }
@@ -1373,7 +1390,8 @@ fn codec_bias_reduce_large() {
 /// smaller under a mean loss. Compare ALL grads CPU vs CUDA (esp. biases).
 #[test]
 fn codec_residual_synth_meanloss() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("resid_synth: skip");
         return;
     }
@@ -1446,7 +1464,8 @@ fn codec_residual_synth_meanloss() {
 /// all-axis mean backward apply 1/N at 1M elements? grad(mean(x²)) = 2x/N.
 #[test]
 fn mean_backward_large_1m() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("mean_1m: skip");
         return;
     }

@@ -68,7 +68,7 @@ is a pure retrieval contract, swappable and independently trainable.
    }
    ```
    Keep the concrete encoder out of core (mirrors
-   [[feedback_rlx_framework_agnostic]]): core only sees the trait.
+   core stays framework-agnostic): core only sees the trait.
 
 2. **`KvContextStore`:** allow the HNSW key space to be a *separate* embed dim
    (not `kv_dim`). Add:
@@ -80,7 +80,7 @@ is a pure retrieval contract, swappable and independently trainable.
    of the blended signals.
 
 3. **`rlx-qwen3` generator (can depend on `rlx-embed`), behind a
-   `dual-encoder` feature** ([[feedback_optimizations_behind_features]],
+   `dual-encoder` feature** (optimizations stay opt-in,
    default OFF):
    - `KvStoreConfig::encoder(Arc<dyn BlockEmbedder>)` + blend weights.
    - Offload path: decode each evicted block's token span → text →
@@ -125,7 +125,7 @@ is a pure retrieval contract, swappable and independently trainable.
 3. rlx-qwen3 `dual-encoder` feature: `RlxEmbed` adapter + offload/retrieve wiring.
 4. `memory_probe`: `kvstore:…:enc[:W_E:W_Q:W_L]` spec field + **paraphrased**
    needles; bench recall vs Q·K and lexical. Record telemetry as usual.
-5. If it wins: document in [[kv_retention_seam]] and `docs/kv-retention.md`.
+5. If it wins: document it in [`kv-retention.md`](kv-retention.md).
 
 ## Relationship to shipped work
 
@@ -134,3 +134,6 @@ is a pure retrieval contract, swappable and independently trainable.
 - Orthogonal to the disk-tiering / HNSW / decay / provenance already shipped:
   those are the *index*; the dual encoder changes only the *key/query vectors*
   fed into it.
+## License
+
+MIT OR Apache-2.0.

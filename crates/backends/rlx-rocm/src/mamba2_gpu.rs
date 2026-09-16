@@ -4,7 +4,7 @@
 
 //! Native GPU Mamba-2 SSD scan for ROCm arenas (`Step::Mamba2`).
 //!
-//! Same coverage and semantics as [`rlx_cuda::mamba2_gpu`] / Metal `mamba2` /
+//! Same coverage and semantics as `rlx_cuda::mamba2_gpu` / Metal `mamba2` /
 //! wgpu `mamba2.wgsl` (`state_size ≤ 256`; host path otherwise).
 
 use crate::device::RocmContext;

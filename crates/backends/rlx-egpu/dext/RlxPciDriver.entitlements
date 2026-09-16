@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.driverkit</key>
+	<true/>
+	<!--
+	  The restricted entitlement. Apple grants this per development team; there
+	  is no self-serve path, and a build signed without it will not load.
+
+	  IOPCIPrimaryMatch is "device-id&mask" pairs. The value below matches AMD
+	  (0x1002) and NVIDIA (0x10de) vendors with any device id — narrow it to the
+	  exact parts you intend to drive before submitting the request. A narrower
+	  ask is easier to justify, and a review that has to reason about
+	  "every PCI device" is a review that takes longer.
+	-->
+	<key>com.apple.developer.driverkit.transport.pci</key>
+	<array>
+		<dict>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x00001002&amp;0x0000ffff</string>
+		</dict>
+		<dict>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+		</dict>
+	</array>
+</dict>
+</plist>

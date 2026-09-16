@@ -4,7 +4,7 @@
 
 //! MPSGraph / hybrid dispatch timing (`RLX_METAL_MPS_PROFILE=1`).
 //!
-//! Complements [`thunk_profile`] (per-thunk isolation). Records wall time
+//! Complements [`crate::thunk_profile`] (per-thunk isolation). Records wall time
 //! for full-graph MPSGraph runs, hybrid sub-graph steps, and thunk batches.
 
 use std::collections::HashMap;

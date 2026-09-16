@@ -360,6 +360,56 @@ impl<'a> LowerCtx<'a> {
                 bd[0] = Dim::Static(b);
                 let blast = scores_shape.rank() - 1;
                 bd[blast] = Dim::Static(s_k);
+                // The mask does not always ARRIVE as `[B, S_k]`: `rlx-unfuse`
+                // normalises a Custom mask to the score shape `[B, H, S_q, S_k]`
+                // before rebuilding `Op::Attention`. Both CPU paths still read
+                // only the leading `B · S_k` floats of the buffer
+                // (`mask_data[bi * k_s + ki]`), so the *value* semantics are
+                // "first B·S_k elements, row-major" whatever the declared rank —
+                // and matching CPU is the contract here.
+                //
+                // Reshaping a larger buffer straight to `[B, 1, .., 1, S_k]`
+                // silently drops H·S_q elements. `rlx_ir` does not verify
+                // element counts on a fully-concrete reshape target (ONNX
+                // importers depend on that) and the CPU backend just
+                // reinterprets the buffer, so nothing upstream rejected it —
+                // MPSGraph did, by `abort()`ing the process with `original
+                // module failed verification`. Take the leading slice first.
+                let want: usize = bd
+                    .iter()
+                    .map(|d| match d {
+                        Dim::Static(n) => *n,
+                        Dim::Dynamic(_) => 0,
+                    })
+                    .product();
+                let have = mask_shape.num_elements().unwrap_or(0);
+                let src = if have > want {
+                    let flat = Shape::new(&[have], DType::F32);
+                    let flat_name = format!("{out_name}_mk_f");
+                    self.emit(
+                        "reshape",
+                        &flat_name,
+                        &flat,
+                        vec![
+                            ("x", bind_name(&bias_flat)),
+                            ("shape", bind_value(vec_i32(&[have as i32]))),
+                        ],
+                    )?;
+                    let head = format!("{out_name}_mk_h");
+                    self.emit(
+                        "slice_by_size",
+                        &head,
+                        &Shape::new(&[want], DType::F32),
+                        vec![
+                            ("x", bind_name(&flat_name)),
+                            ("begin", bind_value(vec_i32(&[0]))),
+                            ("size", bind_value(vec_i32(&[want as i32]))),
+                        ],
+                    )?;
+                    head
+                } else {
+                    bias_flat
+                };
                 let bshape = Shape::from_dims(&bd, DType::F32);
                 let bias = format!("{out_name}_mk_b");
                 self.emit(
@@ -367,7 +417,7 @@ impl<'a> LowerCtx<'a> {
                     &bias,
                     &bshape,
                     vec![
-                        ("x", bind_name(&bias_flat)),
+                        ("x", bind_name(&src)),
                         ("shape", bind_value(vec_i32(&dims_i32(&bd)))),
                     ],
                 )?;

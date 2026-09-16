@@ -154,7 +154,7 @@ mod imp {
         let raw = std::env::var("MNIST_RAW")
             .unwrap_or_else(|_| format!("{home}/.cache/torchvision-mnist/MNIST/raw"));
         let wpath =
-            std::env::var("RLX_F32_DUMP").unwrap_or_else(|_| "/tmp/tinyconv_f32.bin".into());
+            rlx_ir::env::var("RLX_F32_DUMP").unwrap_or_else(|| "/tmp/tinyconv_f32.bin".into());
         let batch: usize = std::env::var("ANE_BATCH")
             .ok()
             .and_then(|v| v.parse().ok())

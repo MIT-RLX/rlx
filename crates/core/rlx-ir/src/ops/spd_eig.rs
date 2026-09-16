@@ -50,8 +50,7 @@ pub const SPD_JACOBI_SWEEPS: u32 = 6;
 
 /// Effective sweep count, honoring the `RLX_SPD_JACOBI_SWEEPS` env override.
 pub fn spd_jacobi_sweeps() -> u32 {
-    std::env::var("RLX_SPD_JACOBI_SWEEPS")
-        .ok()
+    crate::env::var("RLX_SPD_JACOBI_SWEEPS")
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(SPD_JACOBI_SWEEPS)
@@ -278,7 +277,7 @@ fn eigensolve(g: &mut Graph, a: NodeId, n: usize, sweeps: u32, dt: DType) -> (No
     // fully on-device) stays available for GPU-only workloads via
     // `RLX_SPD_UNROLL=1`, but it is NOT the default because its ~n²·sweeps node
     // count blows up CoreML's MIL compile (~125k nodes).
-    if std::env::var("RLX_SPD_UNROLL").as_deref() == Ok("1") {
+    if crate::env::flag("RLX_SPD_UNROLL") {
         let mut idk = vec![0f64; k * k];
         for i in 0..k {
             idk[i * k + i] = 1.0;
@@ -352,13 +351,17 @@ fn eigensolve(g: &mut Graph, a: NodeId, n: usize, sweeps: u32, dt: DType) -> (No
 /// after `max(λ, eps)`. Selects which SPD matrix function a spectral layer
 /// computes: `Re` = ReEig (`max`), `Log` = LogEig (`log∘max`), `Sqrt` = matrix
 /// square root (`√∘max`, `G^{1/2}`), `InvSqrt` = inverse square root
-/// (`1/√∘max`, `M^{-1/2}`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// (`1/√∘max`, `M^{-1/2}`), `Pow(p)` = the power deformation `λ^p` of the
+/// generalized Bures-Wasserstein metric (`p = 1` is the identity).
+///
+/// `Pow` carries an `f64`, so this enum is `PartialEq` but not `Eq`.
+#[derive(Clone, Copy, PartialEq)]
 pub enum SpectralFn {
     Re,
     Log,
     Sqrt,
     InvSqrt,
+    Pow(f64),
 }
 
 /// Diagonal `diag(f(λ_i))` matrix `[n,n]` for the selected [`SpectralFn`].
@@ -392,6 +395,14 @@ fn spectral_fmat(
             SpectralFn::Re => mx,
             SpectralFn::Log => g.activation(Activation::Log, mx, Shape::new(&[1, 1], dt)),
             SpectralFn::Sqrt => g.sqrt(mx),
+            // λ^p as exp(p·log λ): the floored λ is strictly positive, and no
+            // backend carries a general elementwise power.
+            SpectralFn::Pow(p) => {
+                let l = g.activation(Activation::Log, mx, Shape::new(&[1, 1], dt));
+                let pc = cscalar(g, p, dt);
+                let pl = g.mul(l, pc);
+                g.activation(Activation::Exp, pl, Shape::new(&[1, 1], dt))
+            }
             SpectralFn::InvSqrt => {
                 let s = g.sqrt(mx);
                 g.div(one, s)
@@ -658,6 +669,12 @@ pub fn spectral_matfn_batched(
         SpectralFn::Re => mx,
         SpectralFn::Log => g.activation(Activation::Log, mx, Shape::new(&[batch, n, 1], dt)),
         SpectralFn::Sqrt => g.sqrt(mx),
+        SpectralFn::Pow(p) => {
+            let l = g.activation(Activation::Log, mx, Shape::new(&[batch, n, 1], dt));
+            let pc = cscalar(g, p, dt);
+            let pl = g.mul(l, pc);
+            g.activation(Activation::Exp, pl, Shape::new(&[batch, n, 1], dt))
+        }
         SpectralFn::InvSqrt => {
             let s = g.sqrt(mx);
             g.div(one, s)
@@ -681,6 +698,45 @@ impl Graph {
         eps: f64,
     ) -> NodeId {
         spectral_matfn_batched(self, x, batch, n, sweeps, eps, SpectralFn::Re)
+    }
+
+    /// Batched graph-primitive **PowerEig** over `x: [B,n,n]` — `V·diag(λ^p)·Vᵀ`,
+    /// the power deformation the generalized Bures-Wasserstein metric is built
+    /// on. `p = 1` is the identity.
+    pub fn spd_poweig_batched(
+        &mut self,
+        x: NodeId,
+        batch: usize,
+        n: usize,
+        sweeps: u32,
+        eps: f64,
+        power: f64,
+    ) -> NodeId {
+        spectral_matfn_batched(self, x, batch, n, sweeps, eps, SpectralFn::Pow(power))
+    }
+
+    /// Batched graph-primitive **matrix square root** over `x: [B,n,n]`.
+    pub fn spd_sqrt_batched(
+        &mut self,
+        x: NodeId,
+        batch: usize,
+        n: usize,
+        sweeps: u32,
+        eps: f64,
+    ) -> NodeId {
+        spectral_matfn_batched(self, x, batch, n, sweeps, eps, SpectralFn::Sqrt)
+    }
+
+    /// Batched graph-primitive **inverse square root** over `x: [B,n,n]`.
+    pub fn spd_invsqrt_batched(
+        &mut self,
+        x: NodeId,
+        batch: usize,
+        n: usize,
+        sweeps: u32,
+        eps: f64,
+    ) -> NodeId {
+        spectral_matfn_batched(self, x, batch, n, sweeps, eps, SpectralFn::InvSqrt)
     }
 
     /// Batched graph-primitive **LogEig** over `x: [B,n,n]`.

@@ -53,7 +53,7 @@ pub fn mil_body_is_trivial(graph: &Graph) -> bool {
 /// Classify `graph` for hybrid execution.
 pub fn plan_execution(graph: &Graph) -> Result<ExecutionPlan> {
     let segments = build_segments(graph)?;
-    if std::env::var("RLX_COREML_SEG_REPORT").as_deref() == Ok("1") {
+    if rlx_ir::env::var("RLX_COREML_SEG_REPORT").as_deref() == Some("1") {
         let nh = segments
             .iter()
             .filter(|s| matches!(s, Segment::Host(_)))
@@ -136,6 +136,25 @@ fn build_mil_subgraph(
     graph: &Graph,
     mil_nodes: &[NodeId],
 ) -> Result<(Graph, Vec<(String, Shape)>, HashMap<u32, u32>)> {
+    // MPSGraph requires every tensor's shape to be fully static and does not
+    // report otherwise: it aborts the process from inside MPSRuntime
+    // (`failed assertion 'shape for TensorData is not static'`, SIGABRT), which
+    // no caller can catch and which takes any surrounding sweep down with it.
+    // Refuse here instead, naming the node, so the caller gets an error and can
+    // fall back to another backend.
+    if let Some(id) = mil_nodes
+        .iter()
+        .copied()
+        .find(|&id| !graph.node(id).shape.is_static())
+    {
+        let node = graph.node(id);
+        return Err(CoremlError::Unsupported(format!(
+            "dynamic shape {:?} on {:?} ({id:?}) — MPSGraph needs static shapes and \
+             aborts the process rather than erroring; run this graph on another backend",
+            node.shape.dims(),
+            node.op.kind(),
+        )));
+    }
     let mil_set: HashSet<NodeId> = mil_nodes.iter().copied().collect();
     let mut g = Graph::new(format!("{}_coreml", graph.name));
     let mut map: HashMap<NodeId, NodeId> = HashMap::new();

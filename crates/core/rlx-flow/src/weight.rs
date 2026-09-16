@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 
-use crate::GgufPackedLinear;
+use crate::{GgufPackedBank, GgufPackedLinear};
 
 /// Abstract weight source for block emission. Keeps `rlx-flow` independent of
 /// safetensors / GGUF file formats.
@@ -34,6 +34,23 @@ pub trait WeightSource {
     /// each time. The flow dedups the underlying graph param, so the U8 bytes
     /// are registered only once.
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Optional packed (quantized) **expert bank** for the MoE weight `key`.
+    ///
+    /// The grouped sibling of [`Self::take_packed`]. When this returns `Some`,
+    /// a builder can emit `Op::DequantGroupedMatMul` over the quant blob
+    /// instead of a `GroupedMatMul` over an F32 bank — which for a fine-grained
+    /// MoE is most of the model: at 288 experts a single layer's three banks are
+    /// gigabytes packed and tens of gigabytes as F32.
+    ///
+    /// Separate from `take_packed` because a bank is 3-D and
+    /// [`GgufPackedLinear`] has nowhere to put the expert count; reading one
+    /// through `take_packed` would silently report `out_dim = num_experts`.
+    /// Default: `None`, so F32-only and linear-only sources are unaffected.
+    fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         let _ = key;
         Ok(None)
     }

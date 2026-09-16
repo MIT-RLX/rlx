@@ -168,7 +168,19 @@ fn launch_sites_pass_the_declared_number_of_arguments() {
                     .trim_start_matches("mut ")
                     .trim()
                     .to_string();
-                if !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                if var.is_empty() || !var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    // A destructuring binding (`let (kernel, tile) = …`) is not
+                    // a plain identifier, so the resolver below cannot handle
+                    // it — but it still REBINDS the names inside it. Falling
+                    // through silently left the previous `kernel` arity in
+                    // scope, and the lint then compared a matmul launch against
+                    // whatever kernel was bound last (a 7-parameter epilogue).
+                    // Same stale-binding hazard the plain-identifier path
+                    // already guards; invalidate every name the pattern names.
+                    for name in var.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                        bound.remove(name);
+                    }
+                } else {
                     // Collect every `*_kernel(` candidate in this binding,
                     // which may span lines until the terminating `;`.
                     let mut cands: Vec<String> = Vec::new();

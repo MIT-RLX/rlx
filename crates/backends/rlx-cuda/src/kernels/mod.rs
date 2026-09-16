@@ -211,6 +211,185 @@ macro_rules! kernel_cache_arch {
     };
 }
 
+/// The `matmul` CUDA source for `tile`, from whichever physical schedule
+/// [`crate::config::MatmulScheduleSource`] selects.
+///
+/// Without the `schedule-codegen` feature this is exactly
+/// `matmul_cuda_src_tiled` and the knob is inert — the shipping kernel text is
+/// unreachable from a runtime flag, which is the point of a compile-time gate.
+/// The source, plus the NVRTC arch it must be compiled for.
+///
+/// The arch is *derived from the schedule's declared capabilities*, not chosen:
+/// a schedule that needs `cp.async` needs the PTX target that admits it, and a
+/// schedule that needs nothing keeps `None` so its cache slot is unchanged.
+#[cfg(not(feature = "schedule-codegen"))]
+fn matmul_src_for(
+    _ctx: &Arc<CudaContext>,
+    tile: rlx_gpu_kernels::tiles::TileParams,
+) -> Option<(String, Option<&'static str>)> {
+    rlx_gpu_kernels::matmul_cuda_src_tiled(tile)
+        .ok()
+        .map(|s| (s, None))
+}
+
+#[cfg(feature = "schedule-codegen")]
+fn matmul_src_for(
+    ctx: &Arc<CudaContext>,
+    tile: rlx_gpu_kernels::tiles::TileParams,
+) -> Option<(String, Option<&'static str>)> {
+    use crate::config::MatmulScheduleSource as S;
+    use rlx_gpu_kernels::MatmulSchedule;
+
+    let which = match crate::runtime_config().schedule_matmul {
+        S::Default => {
+            return rlx_gpu_kernels::matmul_cuda_src_tiled(tile)
+                .ok()
+                .map(|s| (s, None));
+        }
+        S::Serial => MatmulSchedule::EmittedSerial,
+        S::Pipelined(stages) => MatmulSchedule::EmittedPipelined { stages },
+    };
+    let target = crate::backend::schedule_target(ctx);
+    match rlx_gpu_kernels::matmul_cuda_src_scheduled(tile, which, target) {
+        Ok((src, facts)) => {
+            // NVRTC with no pinned arch targets an old default; inline `cp.async`
+            // is opaque to it and then dies in the driver's PTX JIT. A schedule
+            // that declared the capability gets compiled for a target that has
+            // it, or is refused — never emitted into a load failure.
+            let arch = if facts.as_ref().is_some_and(|f| f.async_copy) {
+                match crate::backend::device_nvrtc_arch(ctx) {
+                    Some(a) => Some(a),
+                    None => {
+                        eprintln!(
+                            "rlx-cuda: schedule {which:?} needs cp.async but this device's \
+                             compute capability has no NVRTC target mapping — refusing"
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            if rlx_ir::env::flag("RLX_VERBOSE") {
+                eprintln!(
+                    "rlx-cuda: matmul tile {} from schedule {which:?} on {} \
+                     (nvrtc {}) — {facts:?}",
+                    tile.label(),
+                    target.name,
+                    arch.unwrap_or("portable"),
+                );
+            }
+            Some((src, arch))
+        }
+        // A refused schedule is REPORTED, never quietly swapped for the default:
+        // an A/B whose treatment arm silently ran the baseline would report
+        // 1.00x and read as "no difference" rather than "did not run".
+        Err(e) => {
+            eprintln!(
+                "rlx-cuda: schedule {which:?} cannot be emitted for tile {} on {}: {e}",
+                tile.label(),
+                target.name
+            );
+            None
+        }
+    }
+}
+
+/// `matmul` compiled for an explicit tile schedule, cached per tile.
+///
+/// The plain [`matmul_kernel`] `OnceLock` stays the fast path for the default
+/// tile; this is the variant-keyed twin the shape dispatch table needs. Each
+/// distinct tile is a distinct NVRTC module — the disk cache already keys on the
+/// source hash, and `matmul_cuda_src_tiled` emits distinct source per tile, so
+/// the two layers agree without extra bookkeeping.
+///
+/// Returns `None` for a tile this device cannot actually launch, and that is the
+/// interesting part. `TileParams::validate` checks the *shape algebra* the kernel
+/// body depends on, but a tile can pass every one of those rules and still be
+/// unrunnable: register pressure is a property of the compiled code, not of the
+/// tile arithmetic. A 128×128 tile at 32×32 threads is legal by the algebra,
+/// fits shared memory comfortably, and dies at launch with
+/// `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` because 1024 threads × its register
+/// count overruns the per-block register file.
+///
+/// So the gate is two-layer, and the second layer asks the driver rather than
+/// guessing: after compiling, `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK` reports
+/// the largest block *this* function can be launched with on *this* device,
+/// register pressure included. Comparing the tile's block against it converts a
+/// runtime crash into a checked rejection before a single launch.
+///
+/// Compiled modules are leaked deliberately: they must outlive every launch, and
+/// the tile set is bounded by `MATMUL_TILE_CANDIDATES` (a handful), not by
+/// workload. Rejections are cached too, so a bad tile costs one compile.
+pub fn matmul_kernel_tiled(
+    ctx: &Arc<CudaContext>,
+    tile: rlx_gpu_kernels::tiles::TileParams,
+) -> Option<&'static CudaKernel> {
+    use cudarc::driver::sys::CUfunction_attribute_enum;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    // The cache key carries the SCHEDULE as well as the tile. Keying on the
+    // tile alone made an in-process A/B measure its first arm twice: the second
+    // arm asks for the same tile, gets the already-compiled kernel back, and
+    // reports a speedup of exactly 1.00x that reads as "no difference" rather
+    // than "never ran". Without `schedule-codegen` there is one schedule and
+    // the key collapses to the tile, as before.
+    type Key = (
+        rlx_gpu_kernels::tiles::TileParams,
+        crate::config::MatmulScheduleSource,
+    );
+    type Cache = HashMap<Key, Option<&'static CudaKernel>>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key: Key = (tile, current_matmul_schedule());
+    if let Some(k) = cache.lock().expect("tiled matmul cache poisoned").get(&key) {
+        return *k;
+    }
+
+    let entry = (|| {
+        let (src, arch) = matmul_src_for(ctx, tile)?;
+        let compiled: &'static CudaKernel =
+            Box::leak(Box::new(compile_with_arch(ctx, &src, "matmul", arch)));
+        // Hardware conformance, from the driver rather than a model of it.
+        let max_block = compiled
+            .function
+            .get_attribute(CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
+            .ok()?;
+        if tile.threads() as i32 > max_block {
+            if rlx_ir::env::flag("RLX_VERBOSE") {
+                eprintln!(
+                    "rlx-cuda: tile {} needs {} threads/block but this device admits {max_block} \
+                     for the compiled kernel (register pressure) — rejected",
+                    tile.label(),
+                    tile.threads()
+                );
+            }
+            return None;
+        }
+        Some(compiled)
+    })();
+
+    cache
+        .lock()
+        .expect("tiled matmul cache poisoned")
+        .insert(key, entry);
+    entry
+}
+
+/// The schedule the tiled `matmul` is currently built from.
+///
+/// Without the `schedule-codegen` feature there is exactly one, so the cache
+/// key it feeds is constant and the map behaves as it did before.
+#[cfg(feature = "schedule-codegen")]
+fn current_matmul_schedule() -> crate::config::MatmulScheduleSource {
+    crate::runtime_config().schedule_matmul
+}
+
+#[cfg(not(feature = "schedule-codegen"))]
+fn current_matmul_schedule() -> crate::config::MatmulScheduleSource {
+    crate::config::MatmulScheduleSource::Default
+}
+
 kernel_cache!(BINARY, binary_kernel, BINARY_CU, "binary");
 // On-device complex simulation (f32-lane): standalone complex cast + C64
 // binary. Shared with rlx-wgpu's `complex_cast.wgsl` / `binary_c64.wgsl`.
@@ -640,6 +819,31 @@ kernel_cache!(
     SCATTER_ND_CU,
     "scatter_nd_f32"
 );
+kernel_cache!(GATHER_ND, gather_nd_kernel, INDEXING_ND_CU, "gather_nd_f32");
+kernel_cache!(
+    GATHER_ELEMENTS,
+    gather_elements_kernel,
+    INDEXING_ND_CU,
+    "gather_elements_f32"
+);
+kernel_cache!(
+    SCATTER_ELEMENTS,
+    scatter_elements_kernel,
+    INDEXING_ND_CU,
+    "scatter_elements_f32"
+);
+kernel_cache!(
+    SCATTER_ND_REDUCE,
+    scatter_nd_reduce_kernel,
+    INDEXING_ND_CU,
+    "scatter_nd_reduce_f32"
+);
+kernel_cache!(
+    COPY_SANITIZE,
+    copy_sanitize_kernel,
+    INDEXING_ND_CU,
+    "copy_sanitize_f32"
+);
 kernel_cache!(
     DEQUANT_MATMUL,
     dequant_matmul_kernel,
@@ -705,6 +909,18 @@ kernel_cache!(
     dequant_matmul_gguf_q1_gemv_kernel,
     DEQUANT_MATMUL_GGUF_CU,
     "dequant_matmul_gguf_q1_gemv"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_Q2_GEMV,
+    dequant_matmul_gguf_q2_gemv_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_q2_gemv"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_G8_GEMV,
+    dequant_matmul_gguf_g8_gemv_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_g8_gemv"
 );
 kernel_cache!(
     DEQUANT_MATMUL_GGUF_Q4K_GEMV,

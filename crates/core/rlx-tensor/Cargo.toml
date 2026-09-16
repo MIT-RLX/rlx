@@ -16,7 +16,7 @@ documentation.workspace = true
 [dependencies]
 rlx-ir = { workspace = true }
 rlx-macros = { workspace = true, optional = true }
-rlx-runtime = { path = "../rlx-runtime", version = "0.2.14", default-features = false, optional = true }
+rlx-runtime = { path = "../rlx-runtime", version = "0.2.16", default-features = false, optional = true }
 rlx-autodiff = { workspace = true, optional = true }
 rlx-optim = { workspace = true, optional = true }
 ndarray = { version = "0.16", optional = true }

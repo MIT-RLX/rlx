@@ -5,7 +5,9 @@
 #![cfg(all(feature = "cpu", feature = "mlx"))]
 use rlx_ir::op::Op;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn mk(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
@@ -15,7 +17,8 @@ fn mk(n: usize, seed: usize) -> Vec<f32> {
 
 #[test]
 fn mlx_depthwise_convtranspose_stride2() {
-    if !is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip: no MLX device");
         return;
     }

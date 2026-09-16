@@ -10,25 +10,74 @@ use crate::shape;
 use crate::shape::Dim;
 use crate::{DType, Graph, Node, Shape};
 
+/// Records a shape rule that **ran and said no**, so it can be told apart from
+/// a rule that does not exist.
+///
+/// `Option<Shape>` cannot express that difference, and collapsing the two is
+/// what made `expand-from-non-unit-dim` invisible: `expand_shape` returned
+/// `Err("cannot broadcast 128 with 256")`, the `.ok()` below turned it into
+/// `None`, and [`crate::verify::verify_shapes`] reads `None` as "no rule for
+/// this op — skip the node". A precise diagnosis was computed and discarded at
+/// every one of these call sites.
+///
+/// Only the first rejection per node is kept: later ones are derived from the
+/// same bad operands and would just be noise.
+trait SinkErr {
+    fn sink(self, out: &mut Option<String>) -> Option<Shape>;
+}
+
+impl SinkErr for Result<Shape, String> {
+    fn sink(self, out: &mut Option<String>) -> Option<Shape> {
+        match self {
+            Ok(shape) => Some(shape),
+            Err(message) => {
+                out.get_or_insert(message);
+                None
+            }
+        }
+    }
+}
+
 /// Infer the output shape of `node` from its op and input shapes.
 ///
 /// Returns `None` when inference is not implemented for the op (the
-/// verifier skips those nodes rather than failing open).
+/// verifier skips those nodes rather than failing open), **and also** when a
+/// rule rejected the operands. Use [`infer_output_shape_reporting`] to tell
+/// those apart — the verifier does.
 pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
+    infer_output_shape_reporting(graph, node).0
+}
+
+/// [`infer_output_shape`] plus the reason it gave up, when it had one.
+///
+/// `(Some(shape), _)` — inferred. `(None, Some(why))` — a rule ran and
+/// rejected these operands; that is a verifier finding, not a coverage gap.
+/// `(None, None)` — no rule for this op.
+pub fn infer_output_shape_reporting(graph: &Graph, node: &Node) -> (Option<Shape>, Option<String>) {
+    let mut rejected = None;
+    let shape = infer_output_shape_inner(graph, node, &mut rejected);
+    (shape, rejected)
+}
+
+fn infer_output_shape_inner(
+    graph: &Graph,
+    node: &Node,
+    rejected: &mut Option<String>,
+) -> Option<Shape> {
     let in_shape = |i: usize| graph.shape(node.inputs[i]);
     match &node.op {
         Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => None,
 
-        Op::MatMul => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
-        // MoE grouped GEMM: input [M,K], expert bank [E,K,N] → [M,N]. Inference
-        // yields None when the operands disagree (the verifier then skips this
-        // node, as it does for any un-inferable op) — the backends reject that
-        // case themselves, with the same message, before a kernel sees it.
-        Op::GroupedMatMul => shape::grouped_matmul_shape(in_shape(0), in_shape(1)).ok(),
-        Op::LogMel => crate::audio::log_mel_output_shape(in_shape(0), in_shape(1)).ok(),
+        Op::MatMul => shape::matmul_shape(in_shape(0), in_shape(1)).sink(rejected),
+        // MoE grouped GEMM: input [M,K], expert bank [E,K,N] → [M,N]. When the
+        // operands disagree the rejection now reaches the verifier, which
+        // reports it device-free — the backends still reject it themselves,
+        // with the same message, but no longer have to be the first to notice.
+        Op::GroupedMatMul => shape::grouped_matmul_shape(in_shape(0), in_shape(1)).sink(rejected),
+        Op::LogMel => crate::audio::log_mel_output_shape(in_shape(0), in_shape(1)).sink(rejected),
         Op::LogMelBackward => Some(shape::unary_shape(in_shape(0))),
         Op::WelchPeaks { k, n_segments } => {
-            crate::audio::welch_peaks_output_shape(in_shape(0), *k, *n_segments).ok()
+            crate::audio::welch_peaks_output_shape(in_shape(0), *k, *n_segments).sink(rejected)
         }
 
         // ── Riemannian / SPD-manifold layers ────────────────────
@@ -98,17 +147,17 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             let n = (((1 + 4 * len) as f64).sqrt().round() as usize - 1) / 2;
             Some(Shape::new(&[b, n, n], in_shape(0).dtype()))
         }
-        Op::Binary(_) => shape::binary_shape(in_shape(0), in_shape(1)).ok(),
-        Op::Compare(_) => shape::compare_shape(in_shape(0), in_shape(1)).ok(),
+        Op::Binary(_) => shape::binary_shape(in_shape(0), in_shape(1)).sink(rejected),
+        Op::Compare(_) => shape::compare_shape(in_shape(0), in_shape(1)).sink(rejected),
         Op::Where => {
-            let branches = shape::binary_shape(in_shape(1), in_shape(2)).ok()?;
+            let branches = shape::binary_shape(in_shape(1), in_shape(2)).sink(rejected)?;
             shape::binary_shape(in_shape(0), &branches)
-                .ok()
+                .sink(rejected)
                 .map(|s| s.with_dtype(branches.dtype()))
         }
         Op::Fma => {
-            let ab = shape::binary_shape(in_shape(0), in_shape(1)).ok()?;
-            shape::binary_shape(&ab, in_shape(2)).ok()
+            let ab = shape::binary_shape(in_shape(0), in_shape(1)).sink(rejected)?;
+            shape::binary_shape(&ab, in_shape(2)).sink(rejected)
         }
 
         Op::Activation(_) | Op::ReluBackward | Op::Conjugate => {
@@ -127,31 +176,35 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             }
         }
 
-        Op::Reduce { axes, keep_dim, .. } => shape::reduce_shape(in_shape(0), axes, *keep_dim).ok(),
+        Op::Reduce { axes, keep_dim, .. } => {
+            shape::reduce_shape(in_shape(0), axes, *keep_dim).sink(rejected)
+        }
         Op::Histogram { bins, .. } => Some(Shape::new(&[*bins], DType::F32)),
         Op::ArgMax { axis, keep_dim } | Op::ArgMin { axis, keep_dim } => {
-            shape::reduce_shape(in_shape(0), &[*axis], *keep_dim).ok()
+            shape::reduce_shape(in_shape(0), &[*axis], *keep_dim).sink(rejected)
         }
         Op::Softmax { .. } => Some(shape::softmax_shape(in_shape(0))),
         Op::Cumsum { .. } | Op::CumProd { .. } | Op::CumMax { .. } => {
             Some(shape::unary_shape(in_shape(0)))
         }
 
-        Op::Reshape { new_shape } => shape::reshape_shape(in_shape(0), new_shape).ok(),
-        Op::Transpose { perm } => shape::transpose_shape(in_shape(0), perm).ok(),
-        Op::Narrow { axis, len, .. } => shape::narrow_shape(in_shape(0), *axis, *len).ok(),
+        Op::Reshape { new_shape } => shape::reshape_shape(in_shape(0), new_shape).sink(rejected),
+        Op::Transpose { perm } => shape::transpose_shape(in_shape(0), perm).sink(rejected),
+        Op::Narrow { axis, len, .. } => {
+            shape::narrow_shape(in_shape(0), *axis, *len).sink(rejected)
+        }
         Op::Concat { axis } => {
             let inputs: Vec<&Shape> = node.inputs.iter().map(|&id| graph.shape(id)).collect();
-            shape::concat_shape(&inputs, *axis).ok()
+            shape::concat_shape(&inputs, *axis).sink(rejected)
         }
         // In-place append: output is the [0..pos+1] prefix of `cache` (input 0)
-        // along `axis`; it aliases cache's buffer.
-        Op::KvAppend { axis, pos } => Some(
-            in_shape(0)
-                .clone()
-                .with_dim(*axis, crate::shape::Dim::Static(*pos + 1)),
-        ),
-        Op::Gather { axis } => shape::gather_shape(in_shape(0), in_shape(1), *axis).ok(),
+        // along `axis`; it aliases cache's buffer. `None` on a malformed operand
+        // pair so the declared-vs-inferred check stays quiet and `verify_op`
+        // reports the actual rule that was broken instead.
+        Op::KvAppend { axis, pos } => {
+            shape::kv_append_shape(in_shape(0), in_shape(1), *axis, *pos).sink(rejected)
+        }
+        Op::Gather { axis } => shape::gather_shape(in_shape(0), in_shape(1), *axis).sink(rejected),
         // ScatterND / ScatterElements output matches `data` (input 0).
         Op::ScatterNd { .. } | Op::ScatterElements { .. } => Some(shape::unary_shape(in_shape(0))),
         // GatherElements output matches `indices` (input 1).
@@ -160,11 +213,15 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         Op::GatherNd { .. } => Some(node.shape.clone()),
         // Reverse flips element order along axes; shape is unchanged.
         Op::Reverse { .. } => Some(shape::unary_shape(in_shape(0))),
-        Op::Pad { pads, .. } => shape::pad_shape(in_shape(0), pads).ok(),
-        Op::Slice { axis, len, .. } => shape::slice_shape(in_shape(0), *axis, *len).ok(),
+        Op::Pad { pads, .. } => shape::pad_shape(in_shape(0), pads).sink(rejected),
+        Op::Slice { axis, len, .. } => shape::slice_shape(in_shape(0), *axis, *len).sink(rejected),
+        // Roll is a permutation of elements — shape is preserved exactly.
+        Op::Roll { .. } => Some(shape::unary_shape(in_shape(0))),
         Op::Clamp { .. } | Op::Trilu { .. } => Some(shape::unary_shape(in_shape(0))),
-        Op::Tile { reps } => shape::tile_shape(in_shape(0), reps).ok(),
-        Op::Expand { target_shape } => shape::expand_shape(in_shape(0), target_shape).ok(),
+        Op::Tile { reps } => shape::tile_shape(in_shape(0), reps).sink(rejected),
+        Op::Expand { target_shape } => {
+            shape::expand_shape(in_shape(0), target_shape).sink(rejected)
+        }
 
         Op::LayerNorm { .. } | Op::LayerNorm2d { .. } | Op::GroupNorm { .. } => {
             Some(shape::unary_shape(in_shape(0)))
@@ -240,11 +297,13 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             let st = [stride[0], stride.get(1).copied().unwrap_or(1)];
             let pad = [padding[0], padding.get(1).copied().unwrap_or(0)];
             let dil = [dilation[0], dilation.get(1).copied().unwrap_or(1)];
-            shape::im2col_output_shape(in_shape(0), ks, st, pad, dil).ok()
+            shape::im2col_output_shape(in_shape(0), ks, st, pad, dil).sink(rejected)
         }
 
-        Op::FusedMatMulBiasAct { .. } => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
-        Op::FusedMatMulResidual => shape::matmul_shape(in_shape(0), in_shape(1)).ok(),
+        Op::FusedMatMulBiasAct { .. } => {
+            shape::matmul_shape(in_shape(0), in_shape(1)).sink(rejected)
+        }
+        Op::FusedMatMulResidual => shape::matmul_shape(in_shape(0), in_shape(1)).sink(rejected),
         // Like `Op::Conv`, the output shape is set explicitly by the fusion pass
         // (from the pre-fusion conv/activation output); nothing to infer here.
         Op::FusedConvBiasAct { .. } => None,
@@ -259,8 +318,8 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             let x = in_shape(0);
             let scale = in_shape(1);
             let shift = in_shape(2);
-            let b_scale = shape::broadcast(scale, x).ok()?;
-            let b_shift = shape::broadcast(shift, x).ok()?;
+            let b_scale = shape::broadcast(scale, x).sink(rejected)?;
+            let b_shift = shape::broadcast(shift, x).sink(rejected)?;
             if b_scale.dims() != x.dims() || b_shift.dims() != x.dims() {
                 return None;
             }
@@ -274,7 +333,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             if y.dims() != x.dims() {
                 return None;
             }
-            let b_gate = shape::broadcast(gate, x).ok()?;
+            let b_gate = shape::broadcast(gate, x).sink(rejected)?;
             if b_gate.dims() != x.dims() {
                 return None;
             }
@@ -289,8 +348,8 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             if dy.dims() != x.dims() || scale.dims() != shift.dims() {
                 return None;
             }
-            let b_scale = shape::broadcast(scale, x).ok()?;
-            let b_shift = shape::broadcast(shift, x).ok()?;
+            let b_scale = shape::broadcast(scale, x).sink(rejected)?;
+            let b_shift = shape::broadcast(shift, x).sink(rejected)?;
             if b_scale.dims() != x.dims() || b_shift.dims() != x.dims() {
                 return None;
             }
@@ -306,7 +365,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             if y.dims() != x.dims() || dy.dims() != x.dims() {
                 return None;
             }
-            let b_gate = shape::broadcast(gate, x).ok()?;
+            let b_gate = shape::broadcast(gate, x).sink(rejected)?;
             if b_gate.dims() != x.dims() {
                 return None;
             }
@@ -315,8 +374,35 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             Some(Shape::new(&[nx + nx + ng], x.dtype()))
         }
 
+        // A *packed* weight is a 1-D byte blob whose shape says nothing about
+        // `[k, n]` — the block layout does, and that lives in the scheme. So
+        // there is genuinely no rule here, and this returns `None` **without**
+        // recording a rejection: `matmul_shape` would answer "requires rank >=
+        // 2, got 2 and 1", which is a true statement about the wrong operand.
+        //
+        // Before rejections were reported this distinction did not matter,
+        // because both outcomes were discarded. It matters now: reporting it
+        // would fail every quantized corpus case for having done the correct
+        // thing.
+        //
+        // A weight that *is* declared rank-2 goes through a real rule — but
+        // which one depends on the scheme. GGUF's is `[n, k]` (its native
+        // `[out_dim, in_dim]` order), so the plain `[k, n]` matmul rule reads
+        // those axes backwards and rejects a correct graph.
+        Op::DequantMatMul { scheme } if scheme.is_gguf() => {
+            if in_shape(1).rank() < 2 {
+                return None;
+            }
+            shape::dequant_matmul_shape(in_shape(0), in_shape(1)).sink(rejected)
+        }
+
+        // `w [k, n]` for the Int8 / NVFP4 `DequantMatMul` schemes, `LoraMatMul`
+        // and `QMatMul` alike — see each op's input contract.
         Op::DequantMatMul { .. } | Op::LoraMatMul { .. } | Op::QMatMul { .. } => {
-            shape::matmul_shape(in_shape(0), in_shape(1)).ok()
+            if in_shape(1).rank() < 2 {
+                return None;
+            }
+            shape::matmul_shape(in_shape(0), in_shape(1)).sink(rejected)
         }
 
         // x [m, k] · Wᵀ → [m, n]; `n` is the row count of the `indices`
@@ -474,6 +560,35 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
             in_shape(0).dtype(),
         )),
 
+        // Packed 1-D gradient bundle; see `Op::GatedDeltaNetBackward`.
+        Op::GatedDeltaNetBackward {
+            state_size,
+            carry_state,
+            gate_per_channel,
+        } => {
+            let q = in_shape(0);
+            let dims: Vec<usize> = (0..q.rank())
+                .map(|i| match q.dim(i) {
+                    crate::Dim::Static(v) => v,
+                    _ => 0,
+                })
+                .collect();
+            // [B, S, H, N]; a dynamic axis leaves the packed length unknowable.
+            if dims.len() != 4 || dims.contains(&0) {
+                None
+            } else {
+                let layout = crate::gdn::GdnBackwardLayout::new(
+                    dims[0],
+                    dims[1],
+                    dims[2],
+                    *state_size,
+                    *gate_per_channel,
+                    *carry_state,
+                );
+                Some(shape::Shape::new(&[layout.total_elems()], q.dtype()))
+            }
+        }
+
         Op::DotGeneral { .. }
         | Op::If { .. }
         | Op::While { .. }
@@ -624,7 +739,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                 w.dim(4).unwrap_static(),
             ];
             shape::conv3d_output_shape(in_shape(0), w, ks, *stride, *padding, *dilation, *groups)
-                .ok()
+                .sink(rejected)
         }
         Op::ConvTranspose3d {
             stride,
@@ -652,7 +767,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
                 *output_padding,
                 *groups,
             )
-            .ok()
+            .sink(rejected)
         }
 
         Op::Custom { .. }
@@ -661,6 +776,7 @@ pub fn infer_output_shape(graph: &Graph, node: &Node) -> Option<Shape> {
         | Op::ConvTranspose2d { .. }
         | Op::Pool { .. }
         | Op::Fft { .. }
+        | Op::FftQ { .. }
         | Op::FftButterflyStage { .. } => None,
         _ => None,
     }

@@ -31,7 +31,7 @@ fn unavailable_is_graceful() {
 
 #[test]
 fn elementwise_add_and_relu() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return; // covered by `unavailable_is_graceful`
     }
     eprintln!(
@@ -56,7 +56,7 @@ fn elementwise_add_and_relu() {
 
 #[test]
 fn matmul_2x3_3x2() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let mut g = Graph::new("matmul");
@@ -87,13 +87,13 @@ fn matmul_2x3_3x2() {
 ///  -- --ignored --nocapture`. Per-call overhead (input upload + fence) is
 /// included and identical for both kernels, so the A/B ratio is fair.
 #[test]
-#[ignore]
+#[ignore = "scalar-vs-tiled matmul benchmark; run with --ignored --nocapture (needs a Vulkan device)"]
 fn bench_matmul() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[bench] no Vulkan device — skip");
         return;
     }
-    let label = std::env::var("RLX_VULKAN_MATMUL").unwrap_or_else(|_| "auto".into());
+    let label = rlx_ir::env::var("RLX_VULKAN_MATMUL").unwrap_or_else(|| "auto".into());
     eprintln!(
         "[bench] device={:?} kernel={label}",
         rlx_vulkan::device_name()
@@ -133,10 +133,10 @@ fn bench_matmul() {
 /// normal suite and doubles as the coop correctness check when forced.
 #[test]
 fn matmul_matches_cpu_reference() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
-    let kernel = std::env::var("RLX_VULKAN_MATMUL").unwrap_or_else(|_| "auto".into());
+    let kernel = rlx_ir::env::var("RLX_VULKAN_MATMUL").unwrap_or_else(|| "auto".into());
     // Shape matrix: 16-aligned (coop-eligible), K-unaligned (coop zero-pads its
     // last K-tile), and non-square + M/N-unaligned (coop routes back to the
     // fully general tiled kernel). Exercises every kernel's edge handling.
@@ -187,7 +187,7 @@ fn matmul_matches_cpu_reference() {
 /// this is what the Linux/lavapipe Docker container runs.
 #[test]
 fn transpose_reduce_narrow_softmax() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
 
@@ -259,7 +259,7 @@ fn run1(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 /// so the Linux/lavapipe Docker run validates more than the hot path.
 #[test]
 fn more_ops_exact() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
 
@@ -375,7 +375,7 @@ fn more_ops_exact() {
 /// reference. Runs on lavapipe in the Docker container.
 #[test]
 fn cum_scan_matches_reference() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let x = vec![1.5f32, 0.5, 2.0, 0.8, -1.0, 3.0, 2.0, 0.5];

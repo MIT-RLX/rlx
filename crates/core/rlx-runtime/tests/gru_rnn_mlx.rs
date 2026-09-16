@@ -7,7 +7,9 @@
 #![cfg(all(feature = "cpu", feature = "mlx"))]
 use rlx_ir::op::Op;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn mk(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
@@ -38,7 +40,7 @@ fn maxd(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn run_gru(b: usize, s: usize, inp: usize, h: usize, layers: usize, bidir: bool) {
-    if !is_available(Device::Mlx) {
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip: no MLX device");
         return;
     }
@@ -95,7 +97,7 @@ fn run_gru(b: usize, s: usize, inp: usize, h: usize, layers: usize, bidir: bool)
 }
 
 fn run_rnn(b: usize, s: usize, inp: usize, h: usize, layers: usize, bidir: bool, relu: bool) {
-    if !is_available(Device::Mlx) {
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip: no MLX device");
         return;
     }
@@ -145,20 +147,24 @@ fn run_rnn(b: usize, s: usize, inp: usize, h: usize, layers: usize, bidir: bool,
 
 #[test]
 fn gru_single() {
+    let _gpu = common::serialize_gpu();
     run_gru(2, 5, 4, 4, 1, false);
 }
 
 #[test]
 fn gru_multi_layer_bidirectional() {
+    let _gpu = common::serialize_gpu();
     run_gru(2, 6, 5, 4, 2, true);
 }
 
 #[test]
 fn rnn_tanh_bidirectional() {
+    let _gpu = common::serialize_gpu();
     run_rnn(2, 5, 4, 4, 1, true, false);
 }
 
 #[test]
 fn rnn_relu_multi_layer() {
+    let _gpu = common::serialize_gpu();
     run_rnn(1, 6, 5, 4, 3, false, true);
 }

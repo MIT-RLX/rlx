@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // RLX — MPS vs our-kernel head-to-head at qwen3 shapes (RE / ceiling probe).
 //
 // Answers: at each decode (m=1) and prefill (m>1) projection shape, how does

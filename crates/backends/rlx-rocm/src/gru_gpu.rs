@@ -5,7 +5,7 @@
 //! Native GPU GRU for ROCm arenas (`Step::Gru`).
 //!
 //! Multi-layer / bidirectional / carry, `hidden ≤ 1024` — mirror of
-//! [`rlx_cuda::gru_gpu`]: a per-(layer, direction) kernel launch with the
+//! `rlx_cuda::gru_gpu`: a per-(layer, direction) kernel launch with the
 //! recurrence inside; intermediate layer outputs ping-pong in a scratch buffer.
 //! Bit-for-bit mirror of `execute_gru_f32` (same packed weight layout).
 

@@ -1,0 +1,79 @@
+#version 450
+// Decode-and-accumulate GEMM for Op::ScaledMatMul. TN: both operands are K-last
+// (out = lhs * rhs^T), which is also what the block scales run along.
+//
+// This is the decode reference on shader cores, not a tensor-core path — the
+// point is that a block-scaled / FP4 / FP6 graph runs on-device at all instead
+// of taking a readback → CPU → upload per matmul.
+//
+// 16x16 output tiles staged through shared memory, matching the CUDA twin.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const uint TILE = 16u;
+
+layout(push_constant) uniform PC {
+    uint lhs_off;           // tagged word offset, U8 codes [m,k]
+    uint rhs_off;           // tagged word offset, U8 codes [n,k]
+    uint lhs_scale_off;
+    uint rhs_scale_off;
+    uint out_off;           // tagged f32-word offset [m,n]
+    uint bias_off;          // tagged f32-word offset [n]
+    uint m;
+    uint k;
+    uint n;
+    uint lhs_fmt;
+    uint rhs_fmt;
+    uint scale_mode;
+    uint block;
+    uint has_bias;
+} pc;
+
+shared float a_tile[TILE][TILE];
+shared float b_tile[TILE][TILE];
+
+float scale_at(uint scale_off, uint row, uint p, uint nblk) {
+    if (pc.scale_mode == 0u) { return arena_load_f(scale_off); }
+    uint si = row * nblk + p / pc.block;
+    uint b = rlx_rd_byte(scale_off, si);
+    return (pc.scale_mode == 1u) ? rlx_e8m0(b) : rlx_decode_lowp(0u, b);
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint i = gl_WorkGroupID.y * TILE + ty;  // output row (m)
+    uint j = gl_WorkGroupID.x * TILE + tx;  // output col (n)
+
+    uint nblk = (pc.scale_mode == 0u) ? 1u : ((pc.k + pc.block - 1u) / pc.block);
+    float acc = 0.0;
+    uint ntiles = (pc.k + TILE - 1u) / TILE;
+
+    for (uint t = 0u; t < ntiles; ++t) {
+        uint pa = t * TILE + tx;
+        if (i < pc.m && pa < pc.k) {
+            float ls = scale_at(pc.lhs_scale_off, i, pa, nblk);
+            a_tile[ty][tx] =
+                rlx_decode_lowp(pc.lhs_fmt, rlx_rd_byte(pc.lhs_off, i * pc.k + pa)) * ls;
+        } else {
+            a_tile[ty][tx] = 0.0;
+        }
+        uint pb = t * TILE + ty;
+        if (j < pc.n && pb < pc.k) {
+            float rs = scale_at(pc.rhs_scale_off, j, pb, nblk);
+            b_tile[ty][tx] =
+                rlx_decode_lowp(pc.rhs_fmt, rlx_rd_byte(pc.rhs_off, j * pc.k + pb)) * rs;
+        } else {
+            b_tile[ty][tx] = 0.0;
+        }
+        barrier();
+        for (uint p = 0u; p < TILE; ++p) {
+            acc += a_tile[ty][p] * b_tile[p][tx];
+        }
+        barrier();
+    }
+
+    if (i < pc.m && j < pc.n) {
+        if (pc.has_bias != 0u) { acc += arena_load_f(pc.bias_off + j); }
+        arena_store_f(pc.out_off + i * pc.n + j, acc);
+    }
+}

@@ -27,7 +27,7 @@
 //! |---|---|---|
 //! | [`triangulate_par`] — Dwyer, all cores | **~4 ms** ★ | best cache behavior + near-linear thread scaling |
 //! | [`delaunay32::Triangulator`] `with_threads(0)` — Guibas-Stolfi D&C, parallel | ~18 ms | GS merge is Θ(√n)-serial at the top → scales worse than Dwyer |
-//! | [`triangulate`] — Dwyer, serial | ~30 ms | |
+//! | [`fn@triangulate`] — Dwyer, serial | ~30 ms | |
 //! | `Triangulator::new()` — GS D&C, serial | ~76 ms | textbook recursive D&C, one arena |
 //!
 //! **On the GPU** the flip pipeline (`flip_gpu`, feature `gpu`) loses end-to-end (~5–8×

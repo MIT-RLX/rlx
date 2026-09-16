@@ -10,7 +10,9 @@
 
 use rlx_ir::op::ReduceOp;
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 /// `1e8 + 100000·1 − 1e8`, true sum = 100000. Each `+1` is below `1e8`'s f32
 /// ulp (=8), so plain f32 accumulation returns ~0.
@@ -43,7 +45,8 @@ fn sum_on_metal(x: &[f32]) -> f32 {
 
 #[test]
 fn metal_reduce_sum_double_single_precision_mode() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip: Metal unavailable");
         return;
     }

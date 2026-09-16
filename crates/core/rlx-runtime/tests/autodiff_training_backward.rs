@@ -363,10 +363,27 @@ fn gated_delta_net_unfused_before_autodiff() {
         Shape::from_dims(&[], f),
     );
     g.set_outputs(vec![loss]);
+    // GatedDeltaNet now keeps its fused form through autodiff preparation: it
+    // has a dedicated VJP emitting `Op::GatedDeltaNetBackward`, and unrolling
+    // the time loop instead runs ~32x slower. The unrolled decomposition is
+    // still reachable for backends without the backward kernel.
+    let kept = prepare_graph_for_ad(g.clone());
+    assert!(
+        kept.nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::GatedDeltaNet { .. })),
+        "GatedDeltaNet should survive autodiff preparation and use its own VJP"
+    );
+
+    rlx_ir::env::set("RLX_GDN_UNFUSE_FOR_AD", "1");
     let prep = prepare_graph_for_ad(g);
+    rlx_ir::env::unset("RLX_GDN_UNFUSE_FOR_AD");
     let has_gdn = prep
         .nodes()
         .iter()
         .any(|n| matches!(n.op, Op::GatedDeltaNet { .. }));
-    assert!(!has_gdn, "GatedDeltaNet must be unfused before autodiff");
+    assert!(
+        !has_gdn,
+        "RLX_GDN_UNFUSE_FOR_AD=1 must restore the unrolled decomposition"
+    );
 }

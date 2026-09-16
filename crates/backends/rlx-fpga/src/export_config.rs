@@ -141,7 +141,7 @@ pub enum OutputKind {
     /// Single-byte class index from Argmax (default TinyConv path).
     #[default]
     Argmax,
-    /// Last Dense logits only — no Argmax layer; `pred` is logits[0] for TB
+    /// Last Dense logits only — no Argmax layer; `pred` is logits`0` for TB
     /// compatibility, and `logits_len` is noted in EXPORT.md.
     Logits,
 }

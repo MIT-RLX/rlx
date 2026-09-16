@@ -13,6 +13,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn sigmoid(z: f32) -> f32 {
     1.0 / (1.0 + (-z).exp())
 }
@@ -229,6 +231,7 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
 
 #[test]
 fn gru_cpu_native_matches_reference() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         let (x, wih, whh, bih, bhh) = inputs(&cfg);
         let expected = reference_gru(&cfg, &x, &wih, &whh, &bih, &bhh);
@@ -240,6 +243,7 @@ fn gru_cpu_native_matches_reference() {
 
 #[test]
 fn gru_unfuse_decomposition_matches_reference() {
+    let _gpu = common::serialize_gpu();
     // The decomposed graph is the path MLX / CoreML / CUDA-host / ROCm / wgpu /
     // TPU and autodiff take. It must reproduce the native kernel / reference.
     for (name, cfg) in cfgs() {
@@ -271,6 +275,7 @@ fn gru_unfuse_decomposition_matches_reference() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn gru_metal_matches_cpu_and_reference() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         let (x, wih, whh, bih, bhh) = inputs(&cfg);
         let expected = reference_gru(&cfg, &x, &wih, &whh, &bih, &bhh);
@@ -284,6 +289,7 @@ fn gru_metal_matches_cpu_and_reference() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn gru_mlx_matches_reference() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         let (x, wih, whh, bih, bhh) = inputs(&cfg);
         let expected = reference_gru(&cfg, &x, &wih, &whh, &bih, &bhh);
@@ -297,6 +303,7 @@ fn gru_mlx_matches_reference() {
 #[test]
 #[ignore = "benchmark, not a correctness test; run with --ignored --nocapture for timings"]
 fn gru_bench() {
+    let _gpu = common::serialize_gpu();
     use std::time::Instant;
     let cfg = Cfg {
         b: 1,
@@ -338,6 +345,10 @@ fn gru_bench() {
 #[test]
 #[cfg(feature = "gpu")]
 fn gru_wgpu_matches_reference() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for (name, cfg) in cfgs() {
         let (x, wih, whh, bih, bhh) = inputs(&cfg);
         let expected = reference_gru(&cfg, &x, &wih, &whh, &bih, &bhh);

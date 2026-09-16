@@ -22,7 +22,7 @@ pub struct Arena {
 impl Arena {
     /// Allocate arena from a memory plan.
     pub fn from_plan(plan: MemoryPlan) -> Self {
-        if std::env::var_os("RLX_ARENA_CHECK").is_some() {
+        if rlx_ir::env::var_os("RLX_ARENA_CHECK").is_some() {
             let mut worst = 0usize;
             for (id, s) in &plan.assignments {
                 let end = s.offset + s.size;

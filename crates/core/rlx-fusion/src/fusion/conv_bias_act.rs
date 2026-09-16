@@ -81,7 +81,7 @@ fn trace_rank1_bias(graph: &Graph, mut id: NodeId, c_out: usize) -> Option<NodeI
 ///
 /// Deliberately narrow — it fires ONLY for the case rig benchmarks show wins:
 /// a cuDNN-friendly conv (2-D, un-grouped, kernel > 1×1; see
-/// [`cudnn_friendly_conv`]) with a Relu or no-op epilogue (see
+/// `cudnn_friendly_conv`) with a Relu or no-op epilogue (see
 /// [`fusible_conv_activation`]). There it collapses conv + bias-add + relu into
 /// one cuDNN call (1.5–2.1× the unfused path at batch 1). Other shapes (1×1,
 /// depthwise, grouped) and activations (sigmoid/tanh/silu/gelu) are left for the

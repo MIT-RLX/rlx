@@ -5,7 +5,7 @@
 //! Native GPU Elman RNN for ROCm arenas (`Step::Rnn`).
 //!
 //! Multi-layer / bidirectional / carry, `hidden ≤ 1024` — mirror of
-//! [`rlx_cuda::rnn_gpu`]: a per-(layer, direction) kernel launch with the
+//! `rlx_cuda::rnn_gpu`: a per-(layer, direction) kernel launch with the
 //! recurrence inside; intermediate layer outputs ping-pong in a scratch buffer.
 //! `relu` selects ReLU vs tanh; single merged bias. Bit-for-bit mirror of
 //! `execute_rnn_f32` (same packed weight layout).

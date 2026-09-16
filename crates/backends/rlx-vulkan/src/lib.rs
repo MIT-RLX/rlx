@@ -25,6 +25,14 @@ pub mod device;
 pub mod host;
 pub mod host_stage;
 pub mod kernels;
+
+/// Generate the tiled matmul entry point *from* a typed schedule rather than
+/// from `shaders/*.comp`, compiling to SPIR-V at run time.
+///
+/// Feature-gated: it is a second implementation of a shipping shader, and it is
+/// the only place this crate compiles a shader outside `build.rs`.
+#[cfg(feature = "schedule-codegen")]
+pub mod kernel_schedule_emit;
 pub mod shaders;
 pub mod spd;
 pub mod unfuse;

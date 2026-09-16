@@ -17,6 +17,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const N: usize = 6;
 const EPS: f64 = 1e-4;
 
@@ -245,6 +247,7 @@ fn run(dev: Device, g: Graph) -> Vec<f32> {
 /// then run. Proves the pass output matches the host-f64 reference.
 #[test]
 fn logeig_lowering_cpu() {
+    let _gpu = common::serialize_gpu();
     let a = spd_matrix();
     let g = LowerSpectral.run(build_graph(&a, true));
     assert!(
@@ -263,6 +266,7 @@ fn logeig_lowering_cpu() {
 
 #[test]
 fn reeig_lowering_cpu() {
+    let _gpu = common::serialize_gpu();
     let a = spd_matrix();
     let g = LowerSpectral.run(build_graph(&a, false));
     let out = run(Device::Cpu, g);
@@ -278,6 +282,7 @@ fn reeig_lowering_cpu() {
 /// This is the tsmnet-on-GPU failure mode (near-diagonal transported matrices).
 #[test]
 fn logeig_lowering_diagonal_no_nan() {
+    let _gpu = common::serialize_gpu();
     let n = N;
     let mut a = vec![0f64; n * n];
     for i in 0..n {
@@ -300,6 +305,7 @@ fn logeig_lowering_diagonal_no_nan() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn logeig_lowering_metal() {
+    let _gpu = common::serialize_gpu();
     let a = spd_matrix();
     let out = run(Device::Metal, build_graph(&a, true));
     let refy = spectral_ref(&a, true);
@@ -312,6 +318,7 @@ fn logeig_lowering_metal() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn reeig_lowering_metal() {
+    let _gpu = common::serialize_gpu();
     let a = spd_matrix();
     let out = run(Device::Metal, build_graph(&a, false));
     let refy = spectral_ref(&a, false);
@@ -325,6 +332,10 @@ fn reeig_lowering_metal() {
 #[cfg(feature = "gpu")]
 #[test]
 fn logeig_lowering_wgpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let a = spd_matrix();
     let out = run(Device::Gpu, build_graph(&a, true));
     let refy = spectral_ref(&a, true);
@@ -336,6 +347,10 @@ fn logeig_lowering_wgpu() {
 #[cfg(feature = "gpu")]
 #[test]
 fn reeig_lowering_wgpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let a = spd_matrix();
     let out = run(Device::Gpu, build_graph(&a, false));
     let refy = spectral_ref(&a, false);
@@ -349,6 +364,7 @@ fn reeig_lowering_wgpu() {
 #[cfg(feature = "mlx")]
 #[test]
 fn logeig_lowering_mlx() {
+    let _gpu = common::serialize_gpu();
     let a = spd_matrix();
     let out = run(Device::Mlx, build_graph(&a, true));
     let refy = spectral_ref(&a, true);
@@ -402,6 +418,7 @@ fn check_batched(out: &[f32], mats: &[Vec<f64>; 3], log: bool, tag: &str) {
 
 #[test]
 fn logeig_batched_cpu() {
+    let _gpu = common::serialize_gpu();
     let mats = batched_mats();
     let out = run(Device::Cpu, build_batched_graph(&mats, true));
     check_batched(&out, &mats, true, "batched logeig CPU");
@@ -409,6 +426,7 @@ fn logeig_batched_cpu() {
 
 #[test]
 fn reeig_batched_cpu() {
+    let _gpu = common::serialize_gpu();
     let mats = batched_mats();
     let out = run(Device::Cpu, build_batched_graph(&mats, false));
     check_batched(&out, &mats, false, "batched reeig CPU");
@@ -417,6 +435,7 @@ fn reeig_batched_cpu() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn logeig_batched_metal() {
+    let _gpu = common::serialize_gpu();
     let mats = batched_mats();
     let out = run(Device::Metal, build_batched_graph(&mats, true));
     check_batched(&out, &mats, true, "batched logeig Metal");
@@ -427,7 +446,7 @@ fn logeig_batched_metal() {
 /// for b>0). Exercises the backend's NATIVE batched matmul directly (not via a
 /// scan). `bcast_lhs` picks which operand is broadcast.
 fn bmm_broadcast_check(dev: Device, bcast_lhs: bool, tag: &str) {
-    if !rlx_runtime::is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip {tag}: {dev:?} unavailable");
         return;
     }
@@ -478,6 +497,7 @@ fn bmm_broadcast_check(dev: Device, bcast_lhs: bool, tag: &str) {
 
 #[test]
 fn batched_matmul_broadcast_cpu() {
+    let _gpu = common::serialize_gpu();
     bmm_broadcast_check(Device::Cpu, true, "bmm bcast-lhs CPU");
     bmm_broadcast_check(Device::Cpu, false, "bmm bcast-rhs CPU");
 }
@@ -485,6 +505,7 @@ fn batched_matmul_broadcast_cpu() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn batched_matmul_broadcast_metal() {
+    let _gpu = common::serialize_gpu();
     bmm_broadcast_check(Device::Metal, true, "bmm bcast-lhs Metal");
     bmm_broadcast_check(Device::Metal, false, "bmm bcast-rhs Metal");
 }
@@ -492,6 +513,7 @@ fn batched_matmul_broadcast_metal() {
 #[cfg(feature = "gpu")]
 #[test]
 fn batched_matmul_broadcast_wgpu() {
+    let _gpu = common::serialize_gpu();
     bmm_broadcast_check(Device::Gpu, true, "bmm bcast-lhs wgpu");
     bmm_broadcast_check(Device::Gpu, false, "bmm bcast-rhs wgpu");
 }
@@ -499,6 +521,7 @@ fn batched_matmul_broadcast_wgpu() {
 #[cfg(feature = "mlx")]
 #[test]
 fn batched_matmul_broadcast_mlx() {
+    let _gpu = common::serialize_gpu();
     bmm_broadcast_check(Device::Mlx, true, "bmm bcast-lhs MLX");
     bmm_broadcast_check(Device::Mlx, false, "bmm bcast-rhs MLX");
 }
@@ -506,6 +529,7 @@ fn batched_matmul_broadcast_mlx() {
 #[cfg(feature = "cuda")]
 #[test]
 fn batched_matmul_broadcast_cuda() {
+    let _gpu = common::serialize_gpu();
     bmm_broadcast_check(Device::Cuda, true, "bmm bcast-lhs CUDA");
     bmm_broadcast_check(Device::Cuda, false, "bmm bcast-rhs CUDA");
 }
@@ -547,6 +571,7 @@ fn bimap_ref(w: &[f64], x: &[f64]) -> Vec<f64> {
 
 #[test]
 fn bimap_lowering_cpu() {
+    let _gpu = common::serialize_gpu();
     let (w, x) = (bimap_w(), spd_matrix());
     let g = LowerSpectral.run(build_bimap_graph(&w, &x));
     assert!(!g.nodes().iter().any(|n| matches!(n.op, Op::BiMap)));
@@ -560,6 +585,7 @@ fn bimap_lowering_cpu() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn bimap_lowering_metal() {
+    let _gpu = common::serialize_gpu();
     let (w, x) = (bimap_w(), spd_matrix());
     let out = run(Device::Metal, build_bimap_graph(&w, &x));
     let refy = bimap_ref(&w, &x);
@@ -630,6 +656,7 @@ fn spdbn_inputs() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 
 #[test]
 fn spdbn_lowering_cpu() {
+    let _gpu = common::serialize_gpu();
     let (x, mean, gg) = spdbn_inputs();
     let g = LowerSpectral.run(build_spdbn_graph(&x, &mean, &gg));
     assert!(
@@ -647,6 +674,7 @@ fn spdbn_lowering_cpu() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn spdbn_lowering_metal() {
+    let _gpu = common::serialize_gpu();
     let (x, mean, gg) = spdbn_inputs();
     let out = run(Device::Metal, build_spdbn_graph(&x, &mean, &gg));
     let refy = spdbn_ref(&x, &mean, &gg);

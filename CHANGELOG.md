@@ -23,6 +23,1705 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+## [0.2.16] — 2026-09-15
+
+### Added
+
+- **`rlx-peft` — parameter-efficient adaptation as graph operations.** LoRA,
+  IA3, AdaLoRA, DoRA and OFT reproducing HuggingFace PEFT's definitions, which
+  is what published results are measured under. Both halves are there: host
+  arithmetic (`lora_delta`, `ia3_apply`, `adalora_delta`, `dora_weight`,
+  `oft_weight`, plus `cayley_orthogonal` for OFT's block rotation) and the same
+  updates as `rlx_ir::Graph` builders (`lora_delta_graph`, `ia3_graph`,
+  `adalora_delta_graph`, `dora_graph`), so they run on any compiled-in backend.
+  Two initialisation conventions are reproduced rather than chosen — `B` starts
+  at zero and IA3's `l` starts at one — because a nonzero `B` perturbs a
+  pretrained network before training begins, which is the usual source of "PEFT
+  hurt my model". `ParamBudget` / `lora_param_count` / `lora_is_economical`
+  supply the denominator every PEFT claim needs.
+- **Both new crates are reachable from the umbrella** as `rlx::peft` and
+  `rlx::rng`, behind the `peft` / `rng` features. `rlx-peft` is pulled with
+  `default-features = false` so enabling `peft` does not quietly select a
+  backend — its own `cpu` default would have forwarded `rlx-runtime/cpu` to a
+  consumer who never asked for one; `rlx/cpu` supplies the same cpu-enabled
+  runtime when you do ask.
+- **`rlx-rng` — numpy and PyTorch random streams, bit-exact.** Porting a Python
+  reference usually stops at the arithmetic and then fails on anything seeded: a
+  random projection, a subsample, a shuffled split need the *same stream*, not
+  merely the same distribution. `numpy::RandomState` (MT19937 + legacy polar
+  Gaussian), `numpy::SeedSequence` + `numpy::Generator` (PCG64 + Lemire
+  `integers`), `torch::RandomState` / `torch::randperm`, and the keyed
+  `deterministic_hash` / `hashing_projection` pair. Each needed a detail that is
+  invisible until you diff the streams — numpy's legacy Gaussian *caches* `f·x1`,
+  PCG64's `set_seed` reads word 0 as the **high** half, `Generator.integers`
+  dispatches to a 32-bit Lemire path that consumes the stream at a different
+  rate than the 64-bit one, and torch's `randperm` walks Fisher–Yates *forward*.
+  Every one of those produces a perfectly reasonable random sequence when wrong.
+  No dependencies, not even on `rlx-ir`.
+
+- **Non-desktop nodes: iOS, Android and pre-synthesized accelerators can join a
+  mesh, for training as well as inference.** The transport layer was already
+  portable — `rlx-driver` has no platform gating and no default C deps — but the
+  node driver lived in an *example*, and an example cannot be linked into an
+  Android `.so` or an iOS framework. `rlx_runtime::dist::node` is that driver as
+  a library: `NodeConfig` is fully programmatic (a phone has no meaningful
+  `RANK`/`PEERS` to read), `NodeControl` bounds the serving loop, and
+  `serve_worker` / `serve_trainer` cover both halves of what a rank is for. New
+  `rlx-ffi` crate exposes it over a C ABI; `ios/` adds an xcframework build,
+  Swift wrapper and demo app, and the Android JNI bridge gains node entry points
+  plus the `MulticastLock` that UDP discovery silently needs. Validated on an
+  iOS simulator and an Android emulator, including heterogeneous data-parallel
+  training (Android on wgpu, host on CPU). `just check-nodes` cross-compiles the
+  stack so this cannot regress unnoticed.
+- **FPGA joins as a pre-synthesized fixed-function rank.** An FPGA cannot host a
+  runtime — synthesis takes minutes — so `rlx-fpga` is a code generator with no
+  `Backend` impl. A board instead advertises the one datapath its bitstream
+  implements and the coordinator only ever assigns it that stage. Two guards,
+  because a wrong feed clocked into fabric produces numbers rather than an
+  error: `NodeCaps::accepts` refuses a mismatched *or untagged* `StageSpec` at
+  placement, and the serving loop checks every activation's length before
+  touching the board. `NodeCaps::can_train` refuses a training job outright — a
+  bitstream has no backward pass, and a rank that never reduces would stall
+  every rank that does. `LoopbackFixedFunction` makes the whole path testable
+  with no hardware.
+- `Op::arity` (`Arity::{Exact, Range, AtLeast}`) replaces a bare `usize` where
+  `0` had to mean a leaf, an optional operand, *and* "variadic, don't check" —
+  which exempted every variadic op from arity checking entirely. `rlx-ir`'s
+  `test-support` feature adds `sample_ops`: one constructible `Op` per `OpKind`
+  behind a compiler-enforced exhaustive match, so gates keyed on the op set can
+  cover all of it. `just check-ops` runs them, including a static check of the
+  declared arity against what backends actually index.
+
+- **The quantized corpus family is validated against an independent authority
+  for the first time** — 18 → 19 cases, on cpu, metal, mlx, wgpu, vulkan and
+  (on the CUDA rig) cuda. Two things were in the way, and neither was the one the
+  skip claimed:
+
+  * **A byte channel.** `oracle::validate_with_packed` feeds `U8` params as raw
+    bytes, mirroring `set_param_typed`. A quantized weight is not expressible as
+    `&[f32]`, and `set_param` would write four bytes per element into a slot
+    sized for one — a silent arena overflow, not a type error.
+  * **A decoder that is not `rlx-gguf`.** `oracle::gguf_q8_0_decode` reads
+    `block_q8_0` from the format description (f16 scale + 32 int8), with its own
+    `f16_to_f64`. rlx-cpu's dequant calls into `rlx-gguf`, so scoring against
+    `rlx-gguf` would have been a self-comparison wearing an oracle's clothes.
+
+  Q8_0 first because *any* byte string is a valid block, so a fixture needs no
+  encoder. The K-quants pack scales into shared nibble planes where arbitrary
+  bytes are not necessarily meaningful; they remain unvalidated and say so.
+  Passing also independently confirms the `[n, k]` weight orientation — the one
+  rlx-rocm got backwards behind an `n = 1` test.
+
+- **`rlx-corpus`'s device arm is precision-aware.** CUDA's default GEMM is TF32
+  on sm_80+ (10 mantissa bits, not 23), so an f32-derived bound fails it by
+  construction: measured 2.52e-3 and 4.50e-3 against 2.0e-4 / 4.0e-4 bounds on
+  an RTX 3080 Ti, with `RLX_CUDA_NO_TF32=1` restoring 19/19 at the full bound.
+  The gate now widens the bound 16x for TF32 GEMM graphs only, **prints that it
+  did**, and leaves every other case at f32 strictness. 16x is empirical and
+  labelled as such — the raw epsilon ratio is ~8000x, which would accept
+  anything.
+
+- **`Op::FftQ` — fixed-point FFT/IFFT, with an explicit scaling policy.** `I32`
+  data in the same 2N-block layout `Op::Fft` uses for `F32`, radix-2, Q30
+  twiddles, `i64` products. `Graph::fft_q` builds it; rlx-cpu executes it; the
+  kernel is `rlx_ir::fft::fft1d_q32_block`, shared rather than backend-local.
+
+  It is a separate op rather than a dtype of `Op::Fft` because it needs a
+  parameter the floating-point transform does not — how to keep the datapath in
+  range — and that choice costs precision, so it is in the type:
+
+  | [`FftQScale`] | bits lost | headroom needed | overflow |
+  |---|---|---|---|
+  | `None` | 0 | `log2(n)` | wraps |
+  | `Saturating` | 0 | `log2(n)` | clips |
+  | `EveryOther` | `log2(n)/2` | `log2(n)/2` | — |
+  | `PerStage` | `log2(n)` | 0 | cannot |
+
+  `bits_lost` and `headroom_needed` are methods, so a caller can check the
+  trade against its own signal rather than infer it. The textbook
+  halve-every-stage default costs ten bits on a 1024-point transform, which is
+  often more than the caller has to spend: full-scale i16 audio needs none of
+  it and lands within 3e-5 of a direct DFT.
+
+  Accuracy is **absolute** — every butterfly rounds to an integer — so relative
+  accuracy is whatever the input's magnitude makes of it. That is documented on
+  the kernel, and the tests use full-scale inputs because that is the intended
+  case.
+
+  `fft_meta` now accepts `I32`, which it previously rejected; the 2N-block
+  layout it measures is dtype-agnostic.
+
+  **Metal** carries the op through the same host fallback it already uses for
+  the f64/C64 `Op::Fft` variants — flush, run the shared kernel against the
+  unified-memory arena, restart the command buffer — and is **bit-identical to
+  CPU** across all four scaling policies, forward and inverse
+  (`metal_fft_q_parity`). Metal's integer-widening pass now exempts `Op::FftQ`
+  operands, alongside the host `Op::Custom` kernels that already needed true
+  integer widths.
+
+
+  **CUDA and ROCm carry it** through the same host fallback, and are
+  bit-identical to CPU (`cuda_fft_q_ingraph`, `rocm_fft_q_ingraph`, verified on
+  an RTX 3080 Ti and a gfx1103). These arenas are f32-*valued* — an integer
+  tensor is stored as the float with the same value — so the adapter
+  ([`rlx_gpu_host::run_fft1d_q_valued`]) **converts** at the boundary rather
+  than reinterpreting. Reading those slots as raw i32 instead is what made a
+  first attempt return `2147483647` / `-2147483648`; being byte-addressable for
+  staging is not the same as having typed i32 storage.
+
+  The conversion is exact while every value stays inside f32's exact-integer
+  range (2^24). Past that it **panics** rather than rounding, on both input and
+  result: a fixed-point transform that quietly drops low bits is worse than one
+  that stops. The bound is easy to respect — with `FftQScale::PerStage` the
+  result never exceeds the input, and unscaled a length-`n` transform of
+  `|x| < 2^24 / n` is always safe. A 1024-point frame of i16 audio needs
+  `PerStage` or `EveryOther`.
+
+  **wgpu carries it too**, through the same converting adapter
+  (`wgpu_fft_q_ingraph`). It additionally needed registering in
+  `step_runs_on_host` — without that the runtime never flushed pending GPU work
+  before the host step, so the transform read an unsynced arena and returned all
+  zeros. Silent zeros, not garbage: a step that is invisible to the host-sync
+  classifier fails quietly, which is worth knowing when adding any host fallback
+  to this backend.
+
+  **The fixed-point batch now parallelizes**, which it previously did not — it
+  was the only FFT variant still running single-threaded, and that alone (not
+  its arithmetic) was what made it look ~4x slower than f32 at 256x1024. Forcing
+  the f32 path serial with `RLX_FFT_CPU_PARALLEL=0` closed the gap to 0.95x,
+  which is how the cause was identified.
+
+  Rows of a block transform touch disjoint slices and share only read-only
+  twiddles, so the fan-out is **bit-identical** to the serial loop, not an
+  accuracy trade — `fft_q_parallel_is_exact` pins that across 288 combinations
+  of shape, scaling policy, direction and normalisation, plus the error paths.
+  The seam is [`rlx_ir::fft::FftQ32Plan`]: `rlx-ir` takes no rayon dependency,
+  so it exposes the shared twiddles and a `run_row`, and
+  [`rlx_cpu::thunk::fft1d_q32_block_parallel`] does the fan-out behind the same
+  measured gate the f32 path uses (`outer >= 8 && outer*n >= 2^15`). Splitting a
+  block into per-row `fft1d_q32_block` calls would have rebuilt the twiddle
+  tables once per row.
+
+  The f32<->i32 conversion in the host fallback moved to
+  [`rlx_cpu::thunk::fft1d_q32_f32_valued`] and parallelizes with it — at
+  256x1024 that is over a million elements each way, not a rounding error next
+  to the transform. It sits in `rlx-cpu` because `rlx-gpu-host` owns staging,
+  not compute.
+
+  Every backend shares the one kernel, so all of them gained (best-of-three,
+  net of the `Cast` nodes, microseconds):
+
+  | 256x1024 | before | after | |
+  |---|---|---|---|
+  | CPU (M-series) | 1963 | **458** | 4.3x |
+  | Metal | 3285 | **1754** | 1.9x |
+  | wgpu (Apple) | 3809 | **2750** | 1.4x |
+  | CPU (Ryzen) | 3815 | **573** | 6.7x |
+  | ROCm gfx1103 | 6012 | **1624** | 3.7x |
+  | CUDA RTX 3080 Ti | 6172 | **924** | 6.7x |
+
+  On CPU the fixed-point transform is now *faster* than the f32 one at batch
+  (0.55-0.81x); single-frame is unchanged at ~1.05-1.27x, correctly below the
+  parallel threshold. Reproduce with `rlx-cpu --example fft_q_kernel` (kernels
+  alone) and `rlx --example fft_q_speed` (graph + devices).
+
+  Two measurement notes, since both nearly produced wrong conclusions: medians
+  on a loaded rig yielded a *negative* net cost, so the benchmarks report
+  min-of-N; and the CUDA rig shows a sporadic ~2.2 ms per-session floor that
+  makes its small-size rows unreadable, so only its large-batch rows are quoted.
+
+  So the op is CPU, Metal, CUDA, ROCm and wgpu. Metal reaches exactness differently —
+  its compile keeps host-kernel operands at their true integer width
+  (`custom_operands`, which `Op::FftQ` now joins), so it carries raw i32 and has
+  no 2^24 bound at all.
+
+
+- **`rlx_ir::audio::MelBands` — banded mel filterbank, and `Op::LogMel` now uses
+  it.** A mel filter is a triangle, so a dense `[n_mels, n_bins]` bank is mostly
+  zeros: Whisper's 80x201 carries about 1,120 useful weights of 16,080, and the
+  dense product multiplied through all of them. Banding the rows and hoisting
+  the per-frame `Vec` allocations makes `log_mel_block_f32` **10.4x faster**
+  (14.05 ms -> 1.35 ms for 30 s of audio at 80 mels).
+
+  It is an arithmetic identity, not an approximation: only exact `+0.0` weights
+  at the two *ends* of a row are dropped, so the surviving terms are summed in
+  the same order. A leading run of zeros leaves the accumulator at `+0.0`
+  whatever the sign of the input, and a trailing run adds `±0.0` to a value that
+  is already final. Interior zeros are kept, so the saving does not depend on
+  the bank being triangular or its weights non-negative —
+  `banded_mel_is_bit_identical_to_dense` covers negative weights, interior
+  zeros and an all-zero row.
+
+  `MelBands` is public so model crates can share the one implementation rather
+  than each carrying its own dense loop.
+
+
+- **`Op::Pool` reaches the `Tensor` and `Graph` APIs.** `Graph::pool2d` /
+  `max_pool2d` / `avg_pool2d`, `GraphExt::pool2d` and `Tensor::pool2d` /
+  `max_pool2d` / `avg_pool2d`, with `shape::pool2d_output_shape`. The op and its
+  VJP already existed; there was simply no builder, so any graph with a pooling
+  layer had to hand-assemble the node and its output shape. Forward and backward
+  are covered by `rlx-tensor/tests/pool.rs`, including that max-pool routes
+  gradient only to each window's argmax and accumulates across overlapping
+  windows.
+
+- **`Func::train_step_all_at_on_qat_with`** — the quantization-aware step, with
+  the parameter's name and shape passed to the quantizer. Block formats need
+  this: a per-block scale is only usable if its blocks run along the axis a dot
+  product contracts over, and a flat `&mut [f32]` does not say which axis that
+  is. `train_step_all_at_on_qat` is now a thin wrapper over it.
+
+- **`rlx-fpga`: sequential-engine export target (`rlx_fpga::seq`).** Lowers an
+  rlx-ir graph to a single microcoded datapath — one MAC, one activation LUT,
+  one descriptor ROM — instead of a module per layer. Where the existing
+  `Model::from_graph` path covers feed-forward INT8 classifiers, this covers any
+  graph whose stages reduce to "bias, then a dot product over an address
+  pattern, then requantise and activate", **including recurrent ones**: LSTM
+  state is a tensor in the activation RAM and the engine updates it in place via
+  `SeqConfig::with_carry`.
+
+  The lowering does three things worth calling out:
+
+  - **`Reshape` and `Transpose` never move data.** They are pushed back into the
+    producing stage's destination strides, so the flatten in front of an LSTM
+    costs zero cycles.
+  - **`Concat` drives placement.** Its operands are made adjacent, which is what
+    lets a concatenated tap run (`x‖h` for a gate projection) be one dot
+    product. When two concats want the same operands in opposite orders, the
+    contraction rows of the consuming matmul are permuted rather than copying
+    activations.
+  - **Padding is free.** A `Concat` of zero-valued params becomes a reserved
+    range in a zero-initialised RAM, so the address generator needs no bounds
+    check.
+
+  Addresses come from running accumulators, so the address path is adders only.
+  Emitted output is `tv_core.sv` and `tv_lut.sv` (fixed) plus generated defs,
+  descriptor ROM and `.mem` images, so re-exporting a retrained network touches
+  no hand-written Verilog.
+
+  Validated end to end on TEN-VAD: 250 frames, **0 mismatches** against the Rust
+  fixed-point reference under Icarus Verilog; `yosys synth_ecp5` gives 4,067
+  LUT4, 891 FF, 74 × 18 kbit BRAM and 13 DSP.
+
+  `rlx_fpga::seq::quantise_pow2` is public so callers can generate matching
+  integer weights for a software reference — a power-of-two scale must round
+  *up* in fractional bits or the largest magnitudes clip, which costs three
+  orders of magnitude of accuracy.
+
+- **`rlx-runtime/tests/lstm_carry_writeback.rs`** — pins `Op::Lstm { carry }`'s
+  in-place `hn`/`cn` write-back on every backend. Stepping a `seq = 1` graph `N`
+  times must reproduce one `seq = N` run; a backend that only *seeds* the state
+  diverges from step 1. The existing `gru_carry_native` test could not catch
+  this class of bug — it compares a single run's output, and the write-back is
+  only observable across two runs.
+
+- **`rlx_ir::env::skip_unless_device`** — one implementation of the
+  "skip, or fail under `RLX_REQUIRE_DEVICE`" decision, taking `compiled` and
+  `available` as plain booleans so it carries no `Device` type and no backend
+  dependency. It lives in `rlx-ir` because the backend crates need the same
+  discipline and cannot depend on `rlx-runtime` — it depends on them.
+  `rlx-runtime/tests/common/mod.rs` now delegates to it rather than keeping a
+  second copy; `mask_strides_for_shape` and `is_static_weight_tensor` both
+  drifted that way already.
+
+- **`tests/device_present.rs`, in `rlx-runtime` and in each of rlx-metal /
+  wgpu / vulkan / mlx / cuda / rocm** — a floor under the whole problem: under
+  `RLX_REQUIRE_DEVICE=1` the **binary** fails if a backend it was built with
+  cannot be instantiated, no matter how its individual tests skip. Verified to
+  bite: `RLX_REQUIRE_DEVICE=1 cargo test -p rlx-rocm --test device_present`
+  fails on a host with no AMD GPU and skips cleanly without the flag.
+
+- **`tests/require_device_coverage.rs`** — counts the test files that still gate
+  on availability without the shared helper and **pins the number so it can only
+  go down**. A new test written with a raw `if !is_available(..) { return }` now
+  fails this gate rather than quietly reporting `ok` on a rig with no device.
+
+  186 → 45, migrating ~640 call sites across 141 files in rlx-metal, wgpu,
+  vulkan, mlx, cuda, rocm, coreml, tpu and rlx-runtime's own tests. Every
+  rewrite was compile-checked; metal, wgpu, vulkan, mlx and rlx-runtime were
+  also run.
+
+  Two things the gate caught about itself, which is the argument for having it:
+
+  * it **scanned a hardcoded list of backend directories** and missed seven,
+    including rlx-tpu's three unmigrated files. Directories are now discovered
+    under `crates/backends/*/tests`, so a new backend is covered the day it
+    appears. Fixing that pushed the count 47 → 50; the ratchet refused the
+    raise, and the files were migrated instead.
+  * it treated `assert!(is_available())` — a positive assertion, the opposite of
+    a skip — as unmigrated, putting two rlx-oneapi files on a backlog with no
+    work in it. It now requires a *negated* call.
+
+  The count reached **0**, so the pin is no longer a backlog — it is an absolute
+  rule, and a raw `if !is_available(..) { return }` anywhere in the test tree
+  now fails outright. Getting the last 45 there needed three things a pattern
+  could not do on its own:
+
+  * `common::skip_unless(dev)`, which derives the label from `{dev:?}`. Having
+    no literal to name was the *only* thing keeping `if !is_available(dev)` —
+    the single most common shape in the tree — on the raw form.
+  * two compound conditions rewritten by hand, where the short-circuit ordering
+    carries meaning: in `nontrailing_reduce_parity.rs`, `dev == Device::Cpu`
+    means no GPU backend was compiled at all, so it must be tested *before* the
+    assert — an absent backend is not a broken one.
+  * three uses that are not skips excluded from the gate entirely:
+    `egpu_seam.rs` and `rlx-tpu/basic.rs` assert a device is *absent*, and
+    `graph_devices_parity.rs` searches *for* an unavailable device to exercise
+    the fallback path on every host. Migrating any of them would have deleted
+    what the test checks. `gates_on_availability` now requires a negated call
+    **in an `if` condition**, so assertions and closure predicates do not count.
+
+- **`just lint-features`** — clippy over the feature combinations
+  `--all-targets` cannot reach, host-appropriate and probing CUDA/ROCm before
+  linting them. `just lint` depends on it. It found three real defects on its
+  first run, all invisible to the default-feature gate (see *Fixed*).
+
+- **Oracle arms for `Transpose`, `Expand`, `Narrow` and `Concat`** in
+  `rlx_corpus::oracle`. The evaluator covered nine op kinds, so the entire
+  `structural` family scored **0/3 on every device** — the ceiling was the
+  oracle, not the backends, and an unvalidated case is indistinguishable from an
+  absent one in a coverage number. Independently validated cases went 15 → 18 of
+  23 on every device at once. Reindexing is also where this tree's real defects
+  live (a broadcast axis given a non-zero stride, a window walking off an
+  extent), so the arms state the stride rules explicitly.
+
+- **`rlx-corpus` device arm teeth test** (`a_wrong_device_result_is_caught`).
+  The gate passing proves nothing on its own — a harness that compiled every
+  case, discarded the output and tallied `validated` would look identical. This
+  runs a real case on every device, perturbs one element of what the device
+  returned, and requires the same `tolerance_for` + `validate` pair to reject
+  it. Confirms 5 devices here.
+
+- **`rlx-corpus` gained a device arm** (`tests/device_gate.rs`, `just
+  check-corpus-device`, wired into `just test-gpu`). The crate's gate stack is
+  device-free by design — structure, representation, memory plan — but every
+  defect in this release was numerical and per-backend: the batch-broadcast
+  attention mask, the `KvAppend` row stride, wide-hidden LSTM on Apple GPUs, the
+  cross-stripe read of zeros. None is visible to a static gate.
+
+  Two things distinguish it from the GPU parity tests already in tree, which is
+  the reason to add it rather than point at them. It scores against
+  `rlx_corpus::oracle`'s **independent f64 evaluator**, not against rlx's own
+  CPU path — a defect both share is invisible to backend-vs-backend parity, and
+  `rms_norm_backward` carried an extra `1/r` in all seven implementations at
+  once. And it rolls up **per family**, which is the question a compiler change
+  actually asks and which a suite organized by owning crate cannot answer.
+
+  Backends are opt-in per host (`--features apple` / `gpu` / `cuda` / …) rather
+  than default-on, because cargo unifies features across a workspace build and
+  an Apple-only backend enabled here would be enabled for every crate on Linux.
+  Verified on this host across cpu, metal, mlx, wgpu and vulkan × 9 families.
+
+- **`rlx_cpu::NO_THUNK_ARM`** — the OpKinds rlx-cpu claims but has no thunk arm
+  for, where the catch-all is `Thunk::Nop`. It is not documentation:
+  `expand_cpu_nop_fused` dispatches on it, so it cannot drift from what actually
+  gets expanded, and it is the input to the new gate below.
+
+- **`rlx_vulkan::backend::routes_to_cpu_host`** — Vulkan's host-fallback routing
+  decision, readable from outside the crate without a device.
+
+- **`Op::KvAppend` is now native on CPU and wgpu too.** It was native on Metal,
+  CUDA and ROCm only; everything else fell back to `lower_kv_append`, i.e. back
+  to the O(context) `concat` the op exists to replace.
+  - CPU: a raw `memcpy` sized in BYTES rather than an element loop, so it needs
+    no per-dtype variant (an append moves data without touching its values) and
+    reduces to a single contiguous copy for the usual `[1, seq, heads*dim]`
+    cache.
+  - wgpu and Vulkan: one `Step::BufferCopy` / `Step::ActCopy`, no new shader on
+    either. That is only sufficient because the shape guard below guarantees the
+    prefix is contiguous — otherwise both would need a strided kernel. Fixing
+    the semantics first is what made the extra backends nearly free.
+
+  Six of seven backends are now native (CPU, Metal, CUDA, ROCm, wgpu, Vulkan).
+  **MLX still falls back** deliberately: it is a functional array API where an
+  in-place aliased write does not express naturally, and Metal already covers
+  the same hardware natively.
+
+- **Device-resident KV row feed on wgpu** (`register_kv_row_feed` /
+  `feed_kv_row`, `ExecutableCapabilities::kv_resident`). It existed on Metal,
+  CUDA, ROCm and Vulkan only.
+
+  This is the half that actually removes the O(context) decode cost.
+  `Op::KvAppend` alone does not: the `concat` it replaces copies the cache
+  on-GPU, but the runtime still re-uploads the past KV as a graph input every
+  step, so the cost merely moves. Residency keeps the cache on the device and
+  folds each new row in without a host round trip.
+
+  Backed by a new shard-aware `Arena::copy_within_device`. **WebGPU forbids
+  `copy_buffer_to_buffer` where source and destination are the same buffer**,
+  and the arena is one buffer, so the copy bounces through a cached staging
+  buffer — two copies on a few-KiB row rather than one, and grown on demand
+  instead of allocated per feed.
+
+- **`RLX_STATIC_WEIGHT_PACK`** — one switch, honoured by Metal, wgpu, CUDA, ROCm
+  and Vulkan, for the step-invariant weight-pack skip described under
+  *Performance*. Default on; `=0` restores the recompute **and** the memory it
+  costs. Replaces the Metal-only `RLX_QWEN3_BAKE_WEIGHTS`, whose name never
+  matched its scope (it applies to any graph the weight-concat fusions touch).
+- **`RLX_REQUIRE_DEVICE`** — turns "no GPU present" in a backend test from a
+  silent skip into a failure. A skipped test still reports `ok`, which is
+  indistinguishable from a real pass in the summary line; on a rig whose card is
+  unavailable a whole suite can go green while executing nothing.
+- **`CompiledGraph::capabilities()`** — what the compiled executable itself
+  reports, as opposed to `advisory_capabilities(Device)`, which answers from a
+  device enum before anything is compiled. The table was the only public way to
+  ask, and being hand-maintained it had drifted from four of the seven backends
+  (see *Fixed*).
+- **`rlx_compile::memory::is_static_weight_tensor`** is now public. Backends need
+  the *same* predicate the planner used to decide pinning; `rlx-wgpu` carried a
+  byte-identical private copy, which is a silent-divergence hazard.
+
+- **Every crate now tells docs.rs which features to build.** 63 of the 72
+  workspace members had no `[package.metadata.docs.rs]`. Because this workspace
+  gates essentially all public surface behind features — the prelude is empty by
+  design — docs.rs was building most crates with no features and rendering
+  near-empty pages. Each crate now declares a host-buildable feature set (no
+  vendor SDK, no network fetch, no device) plus `rustdoc-args = ["--cfg",
+  "docsrs"]`; all 63 sets were verified to build.
+- **`just check-doc-links`** — a Markdown link gate, wired into `just ci`. Every
+  relative link in a tracked `*.md` must resolve, and every same-file `#anchor`
+  must match a real heading under GitHub's slug rules. Relative links rot
+  silently: nothing renders an error, GitHub 404s only on a click, and
+  `cargo doc` never reads a README (see *Fixed*).
+- **`rlx-hub`, `rlx-lbm`, `rlx-corpus`, `rlx-megakernel`, `rlxsl` and
+  `rlx-onnx-proto` gained READMEs**, so the "every crate carries its own
+  `README.md`" claim in the workspace README is now true of all 72.
+- **`lint-features` now covers `rlx-cpu`'s AMX/SME/BNNS combination.** Those
+  features are opt-in and default-OFF, so nothing else in the gate compiled
+  them — which is how a non-compiling `amx-bnns` shipped (see *Fixed*).
+
+### Deprecated
+
+- **`RLX_QWEN3_BAKE_WEIGHTS`** — use `RLX_STATIC_WEIGHT_PACK`. Still honoured on
+  Metal.
+
+### Removed
+
+- **Committed build artifacts and stray blobs are no longer tracked** (37 files,
+  4.8 MiB):
+  `tinystories.rlxts` at the repo root, the Verilator output under
+  `rlx-fpga/hw/tinyconv_mnist/obj_dir/` (`.o`/`.a`/`.d` plus a `sim_bench`
+  binary), the orphaned half-downloaded MNIST copy in `data/` (its
+  `train-images-idx3-ubyte` was committed as a 0-byte file), and the stale
+  `rlx-cortexm/trainer/rlx-cortexm/` shadow tree. `.gitignore` now covers each,
+  and the trainer no longer recreates the shadow tree (see *Fixed*).
+- **`docs/pr-split-wip.md`** — an ephemeral working note planning a PR split
+  whose three parts (`Interpolate3d`, `QuantScheme::Mlx*`, `rlx-dduf`) all
+  landed before 0.2.14.
+
+### Fixed
+
+- **Metal picked the padded GEMM on shapes that did not need padding.** At
+  `m < 32` the sgemm cascade tested `k >= 256 && n >= 256 -> SimdPadded` *before*
+  `aligned_8 -> Simd`, so every fully 8-aligned large projection with a small
+  batch paid for padding it did not need. The `m >= 32` arm, for identical
+  eligibility, already preferred `Simd` — the small-`m` arm's own comment
+  claimed the two matched. The rule dated from when that arm's `else` was
+  `Naive`, so its job was escaping `Naive`, not beating `Simd`; once the arm
+  gained a general fallthrough it was both wrong and redundant
+  (`k >= 256 && n >= 256 && k % 8 == 0` implies the `k % 8 == 0 && n >= 8` rule
+  below it). Measured on M4 Pro with the arms alternated inside each timing
+  round: `Simd` wins all six affected shapes in both of two runs — 1.38-1.51x at
+  `m = 8`, 1.03-1.12x at `m = 16`, 1.22x at `m = 24`. Affects `m` in
+  `{8, 16, 24}` with 8-aligned `k, n >= 256`; non-8-aligned small-`m` still
+  routes to `SimdPadded` unchanged. Guard:
+  `cost::tests::the_cascade_never_picks_a_variant_its_own_cost_model_beats`.
+- **`rlx --features splat` did not compile, and the seam it should have exposed
+  was unreachable.** `rlx-splat` now lives in a separate repo that depends on
+  rlx, so the dependency points inward — but the umbrella still had three
+  `#[cfg(feature = "splat")]` blocks naming the `rlx_splat` crate, which made
+  the feature fail with `E0432`/`E0433`. `splat` is now a real feature over the
+  in-tree half: `rlx::splat` gathers rlx-ir's opcodes and packed-buffer layout
+  helpers together with rlx-cpu's executor registry, so a downstream renderer
+  has one import path. `rlx-cpu`'s six executor type aliases
+  (`RenderExec`, `HostBackwardExec`, …) are public for the same reason —
+  `register_splat_executors` was `pub` while none of its parameter types could
+  be named, so a renderer could call it but could not hold an executor in a
+  struct or return one from a builder.
+
+- **A zero-element tensor made the wgpu backend panic, then hang.** Two bugs, both
+  reached by any graph carrying a tensor with a zero-length dimension — LuxTTS's
+  flow decoder builds an `Expand [0,1,512]`, so the model was unrunnable on wgpu.
+
+  `rlx_compile::memory` only records a buffer when its slot size is non-zero, so
+  such a tensor gets no assignment at all and every `Arena::offset` lookup fired
+  `no offset for node NodeId(n) (not in arena or weight buffer)`.
+  `compile_static_inner` now gives each one an explicit empty slot — zero bytes to
+  read or write, so any offset is as correct as any other — and `arena_span_bytes`
+  skips zero-length ids so they never anchor a bind window.
+
+  With the node compiling, `WgpuExecutable::run_inner` then span forever. Roughly 79
+  match arms guard a degenerate dispatch with `if <scaled extent> == 0 { continue; }`,
+  but the only `step_i += 1` for a dispatched step is at the bottom of that loop, so
+  each one re-entered on the same step indefinitely. A skip must also consume the
+  step's bind group, or every later step binds the wrong one — the `static_once` skip
+  a few lines above already does exactly this, and the guards now follow it. New test
+  `tests/empty_tensor_arena_slot.rs`.
+
+
+- **Nearest `Resize` only lowered along the width axis, so a height upsample
+  imported as zeros.** `lower_resize`'s nearest path handled a 2×2 upsample and a
+  width-only resize gated on `h_in == h_out == 1`; anything else fell through to
+  the zero-filled `__resize__/…` stub. KittenTTS's vocoder `f0_upsamp` is
+  `[1,1,1,F] → [1,1,300,F]` — nearest ×300 on **height** — so its NSF f0 source
+  was zeros on every backend, and the model ran and returned wrong audio. Added
+  the rank-4 case of the identity the NCDHW path already uses: for integral
+  scales, `[N,C,H,1,W,1]` broadcast to `[N,C,H,kh,W,kw]` has exactly the
+  row-major order of `[N,C,H·kh,W·kw]`, which is ONNX's asymmetric + floor rule,
+  and both reshapes are free. Identity resizes still take the passthrough path.
+  New test `tests/resize_nearest_height.rs`.
+
+- **`compile_compare` asserted on rank without naming the node.** An operand
+  whose rank exceeds the output's tripped a bare `broadcast: input rank 4 >
+  output rank 3` inside `broadcast_strides`, with no indication of which node in
+  a 24 k-node graph was inconsistent. The assert now names the comparison and
+  prints all three shapes.
+
+- `Op::If` was declared as taking exactly one operand, with a note that captures
+  were "handled separately". They are not: `sccp` builds `If` with a capture, and
+  both `rlx-unfuse` and the MLX lowering read `inputs[1..]` as the captures — so
+  `verify` rejected every `If` that captured anything.
+- `rf::const_f32` emitted a 4-byte literal for any shape. `Op::Constant` carries
+  the whole tensor, and backends copy `min(data, buffer)` floats, so a scalar
+  paired with a wider shape filled element 0 and left the rest at zero — wrong
+  numbers, not an error. It now fills the shape, and rejects a dynamic one.
+- wgpu's rank-3 `Op::Conv` lowering computed `bias_off` / `has_bias` from the
+  operand list and then hard-coded both to `0`, so `conv3d.wgsl` skipped its bias
+  store. Unreachable today (`verify` rejects a 3-input `Conv`), but it would have
+  dropped the bias silently.
+
+- **KNOWN ISSUE — a workspace `cargo test` crashes a GPU test binary roughly one
+  run in five.** `rlx-vulkan`'s `static_weight_pack_rebind` died with **SIGTRAP
+  (signal 5)** and produced no output at all — no `test result` line, no panic —
+  during `just test`. It passes 3/3 in isolation, and four of five `just ci` runs
+  cleared the same stage.
+  
+  The cause is GPU contention **across test binaries**, which is why the
+  `GpuTestGuard` work does not fix it: that guard is a process-local `Mutex`, so
+  it serializes threads within one binary and cannot reach another process
+  opening the same device. The `Justfile`'s existing `-j 4` cap on Darwin exists
+  for this exact reason and is simply not tight enough.
+  
+  Two fixes, both with a real cost, left for a deliberate decision:
+  * a **cross-process file lock** in the guard — correct in general, but needs
+    `libc`/`fs2` in a core crate that has no such dependency today, plus
+    stale-lock handling for a crashed holder;
+  * **serializing the GPU backend crates** at the cargo level in `just test` —
+    no new dependencies, at the cost of wall time on the canonical gate.
+  
+  Recorded rather than papered over: cargo *does* report the crash (exit 101,
+  verified against a deliberately aborting test binary), so this fails loudly
+  rather than passing vacuously — it is a flake in the gate, not a hole in it.
+
+
+- **`just ci` had never been run end to end, and did not pass.** Its
+  constituents had each been run in isolation; the chain had not. Two failures
+  fell out on the first attempt, both invisible to any single recipe:
+
+  * `lstm_three_way::other_gpu_backends_are_checked_for_the_wide_hidden_lstm_defect`
+    **panicked unconditionally when CUDA was absent** — the intent ("this run
+    would have proved nothing") is exactly right and exactly what
+    `RLX_REQUIRE_DEVICE` expresses, but as a hard panic it failed on every host
+    without CUDA. A workspace `cargo test` feature-unifies `cuda` in, so `just
+    test` could never go green on a Mac. Now skips, and still fails loudly under
+    the flag, which `rig.sh` sets. A second copy of the same pattern in that file
+    was unreachable dead code after an earlier skip and has been removed.
+  * **rlx-mlx had two `i32 -> i32` casts** that `-D warnings` rejects. `just
+    lint` is default-features, so it never compiles rlx-mlx; only
+    `just lint-features` reaches it.
+
+  * **rlx-fpga's new `seq/lower.rs` had two clippy errors** — an unneeded
+    struct pattern on the unit variant `Op::MatMul`, and a
+    `Descriptor::default()` followed by thirteen field assignments. These are in
+    the *default*-feature lint, so `just lint` itself had been failing.
+
+  * **an `std::env::var("RLX_FORCE_DEVICE")` bypassing the `rlx_ir::env` shim**
+    in `rlx-autodiff`'s `indexing_grad.rs`. The shim is what lets a test or an
+    in-process A/B set a knob at all, which is why `check-rlx-env-vars` gates on
+    it.
+  * **`test-pyrlx` set up its venv `if [[ ! -d .venv ]]`** — guarding on the
+    directory existing rather than on the dependencies being present. A venv left
+    half-built by an interrupted run, or one predating a dependency being added
+    to that list, was never repaired, and the recipe then failed forever on that
+    machine with `No module named pytest`. Now each piece is installed on what is
+    actually missing, so the recipe is idempotent and self-repairing (155 passed,
+    17 skipped once it could run).
+
+  Between them, `lint-features` has surfaced four defects the default-feature
+  gate cannot see, and running the chain end to end surfaced four more that no
+  individual recipe could.
+
+
+- **Every GPU test now serializes device access; the guard is re-entrant and
+  gated.** `GpuTestGuard` existed but was taken by almost nothing: 94 of the
+  files in `rlx-runtime/tests` built a `Session` on a GPU device without it. Two
+  were actively flaking (`elementwise_backend_parity`, `vulkan_parity`); the
+  rest were latent.
+
+  Three changes made the sweep safe rather than a deadlock generator:
+
+  * the guard is **re-entrant** (thread-local depth count). A plain `Mutex`
+    deadlocks the moment a guarded helper is called from a guarded test, which
+    is exactly the shape these files have — a `run_on` chokepoint plus per-test
+    `Session::new` sites. Only the outermost guard drains Metal's queues; an
+    inner one releasing them mid-scope would defeat the point.
+  * `common::serialize_gpu()` takes the lock without naming a device, which is
+    the useful granularity for a test that loops over several.
+  * `require_device_coverage::gpu_tests_serialize_device_access` pins the
+    unguarded count at **0**, so a new GPU test that skips the guard fails
+    rather than joining a backlog nobody is watching.
+
+  517 insertions across 103 files. Suite: 229 binaries, 1337 passed, 0 failing,
+  307s wall — the guard is a thread-local check plus an uncontended mutex, and
+  only bites when two GPU tests actually overlap.
+
+
+- **`GpuTestGuard` did not list `Device::Vulkan`**, so the one mechanism this
+  tree has for serializing GPU use across a test binary's threads did not cover
+  Vulkan at all — and on macOS Vulkan *is* Metal via MoltenVK, the same device
+  the rest of the list exists to protect. `elementwise_backend_parity` returned
+  `worst_rel=1.0` on Vulkan about one run in six and was clean at
+  `--test-threads=1`; it also never took the guard. Both fixed. Measured 0/8
+  failing runs after, against 1/6 before.
+
+
+- **rlx-vulkan emitted a `Step` with no matching `StepDep` on the `KvAppend`
+  path.** `record_segments` indexes the two arrays in lockstep, and the builder
+  skipped *every* `Step::ActCopy` when attaching deps — correct only while the
+  activation binder was the sole producer of one, since `drain_copies` pushes
+  step and dep together. `Op::KvAppend` pushes an `ActCopy` directly, so it
+  emitted 1 step and 0 deps. The loop now fills exactly the tail that has no
+  dep, which states the invariant instead of approximating it.
+
+- **Vulkan RNN `carry` never threaded state.** `Op::Lstm`/`Gru`/`Rnn` with
+  `carry: true` take Vulkan's host fallback, and `host::eval` builds a throwaway
+  graph on its **own** `rlx_cpu` arena and reads back only the output slot. The
+  carry contract writes the final `hn`/`cn` over the `h0`/`c0` *inputs*, so
+  those writes landed in the scratch arena and were dropped: four single-step
+  runs diverged from one four-step run by 5.7e-2, from step 1 onward — state
+  simply never advanced.
+
+  `host::inplace_inputs` now names the operands an op rewrites in place and
+  `eval_full` returns them, which both `Segment::Host` call sites copy back into
+  the Vulkan arena. Vulkan measures 2.235e-8 against CPU now. Only Vulkan was
+  affected; CUDA, ROCm, Metal and wgpu run carry natively and never take this
+  path.
+
+- **`just test-debug-verifier`** — the gate that would have caught both of the
+  above, and `FusedTransformerLayer`'s arity, on the day they landed.
+  `rlx_ir::debug_assert_valid!` re-verifies the graph after every pass that
+  changed it, and it is a `debug_assert`: **every recipe in the `Justfile` is
+  `--release`, so the verifier was compiled out of the entire gate.** Now wired
+  into `just test`, scoped to the crates whose passes and schedulers carry the
+  asserts.
+
+
+- **`Op::FusedTransformerLayer` declared 10 inputs but its lowering reads 8.**
+  `num_inputs` counted `ln1_b`/`ln2_b` unconditionally; `rlx_unfuse::expand_ftl`
+  treats the LayerNorm betas as governed by `has_bias` like every other bias and
+  **synthesizes zero betas** in the no-bias case. So a correctly-built no-bias
+  node failed the IR verifier. Now `if has_bias { 14 } else { 8 }`, matching the
+  code that actually reads the operands.
+
+  It only ever failed in a **debug** build, because `debug_assert_valid!` is
+  where the verifier lives and **no recipe runs a debug test build** — `just
+  test` is `--release`. A whole class of IR-invariant violations is invisible to
+  the canonical gate for that reason.
+
+- **The quantized corpus cases sized every packed weight with a hardcoded
+  256-element block.** Block size is per-scheme: the K-quants pack 256, but
+  **Q8_0 packs 32**, so `q8_0_prefill`'s `w_packed` was allocated an eighth of
+  the bytes its weight needs. Harmless while nothing fed the param real data,
+  and a guaranteed out-of-bounds read the moment anything did — which is exactly
+  what validating the family does. Now uses `scheme.gguf_block_size()`.
+
+- **`OPKIND_TOTAL` had drifted** — `OpKind` grew to 187 variants (`Roll`,
+  `FftQ`, …) while the corpus coverage denominator still said 186, so coverage
+  was being reported against a stale total. Caught by `opkind_total_is_current`,
+  which re-derives the count from `op.rs` rather than trusting the constant.
+
+
+- **RoPE zeroed every position past the first when the cos/sin table was
+  rank-1.** The row stride was read off the table's last dimension, which is
+  right for a `[positions, width]` table and wrong for a flat
+  `positions * n_rot/2` run — there the last dimension *is* the whole table, so
+  position 1 indexed past the end, read as zeros, and silently blanked the rest
+  of the sequence. `rope_identity_when_cos1_sin0` was failing on CPU. Rank-1
+  rows are `n_rot/2` wide by construction.
+
+  The rule now lives once, in `rlx_ir::shape::rope_table_stride`, and rlx-cpu,
+  rlx-cuda, rlx-metal, rlx-rocm and rlx-wgpu all call it. Each had its own copy,
+  which is how the forward and backward paths — and the CPU and GPU paths —
+  drifted apart twice already; the surrounding comments were each warning about
+  a different half of the same split. The four GPU backward paths were reading
+  out of bounds on rank-1 tables for the same reason.
+
+  Pinned by `rope_reads_a_row_per_position_from_a_flat_table`, which gives the
+  two positions *different* angles — the pre-existing identity test passes even
+  if every position reads row 0, since all its rows are equal.
+
+- **`tests/ui/*.stderr` expectations regenerated.** A license header had been
+  added to each UI test source without updating the expected diagnostics, so
+  every line number was off by three and `--test ui` failed. Text is unchanged.
+
+
+- **`Tensor::pad` silently moved the graph.** It built its constant edges with
+  `Tensor::full`, which starts a fresh graph, and `cat` adopts into its *first*
+  operand — so padding a traced value migrated the whole downstream chain off
+  the graph being traced. The next `GraphScope` call, which does not adopt,
+  then indexed that graph with a stale id and panicked out of bounds. The pad
+  constants are now built on the padded tensor's own graph.
+
+- **`Op::Lstm { carry: true }` silently never advanced state on Metal and wgpu.**
+  Both kernels read `h0`/`c0` and then dropped the final state on the floor, so
+  every decode step restarted from the same seed — plausible-looking outputs,
+  wrong sequence, nothing failing. CPU, CUDA and ROCm already honoured the
+  contract (the CUDA kernel's explicit `carry` flag and trailing write-back loop
+  is the design the two GPU kernels now match). Found from `rlx-ten-vad`, whose
+  streaming VAD scored `max|Δ| 0.52` with 64 voice-decision flips off-CPU while
+  CPU was exact; both backends are now bit-identical to a single multi-step run.
+  The `carry` flag is passed explicitly rather than inferred from `h0_off != 0`,
+  since arena offset 0 is a legal placement for the state tensor.
+- **CoreML/ANE dropped the same write-back**, with the identical signature
+  (`max|Δ| 5.7e-2`, diverging from step 1). `Op::Lstm { carry: true }` is a host
+  op there; `execute_lstm_f32` wrote `hn`/`cn` into the local staging arena and
+  only `dst` was returned. The state now rides out through
+  `host_exec::StateWriteback` and is written straight into `params` — not via
+  `set_param`, which calls `invalidate_models()`: these params feed only the
+  host-side LSTM and never enter the MIL graph, so recompiling the CoreML model
+  per decode step would be pure cost. Found only because the new test's device
+  loop was extended to `Device::Ane`.
+- **`--features coreml` reported `feature_compiled(Device::Ane) == false`.** The
+  feature is named `coreml` but the gate checks `cfg!(feature = "ane")`, and
+  `coreml` did not imply it — so a build with the CoreML backend compiled in and
+  `is_available() == true` still claimed the feature was absent. `skip_unless_device`
+  picks skip-vs-fail from that pair, so ANE tests silently skipped on builds that
+  could run them. `coreml` now enables `ane`.
+- **`--features amx-sme` did not compile at all.** Three match arms in
+  `rlx-cpu/src/intrinsics/apple_amx/sme.rs` still tested `Ok("true")` against
+  `rlx_ir::env::var(..).as_deref()`, which returns `Option<&str>` — left behind
+  when that helper moved from `Result` to `Option`. Feature-gated code CI does
+  not lint. (For reference: with it fixed, the direct SME2 microkernel measures
+  *slower* than the default Accelerate path on small GEMMs — 365× vs 398× RT on
+  `rlx-ten-vad` — which is what `amx-dense`'s doc comment already claimed.)
+- **`Device::Xdna` reported available and then panicked.** `is_available()` was
+  `runtime_present() && (overlay || op_compile)`, but *both* kernel paths dlopen
+  the rlx shim, so `AIECC`+`PEANO` alone passed the gate and the backend panicked
+  at first compile with `no shim path`. `Backend::compile` returns a graph rather
+  than a `Result`, so the gate is the only place to fail cleanly; it now also
+  requires a resolvable `RLX_XDNA_SHIM`, and `diagnostic()` names exactly what is
+  missing. The README also documented `RLX_XDNA_SHIM=…/libxrt_driver_xdna.so`,
+  which dlopens fine and then fails with `undefined symbol: rlx_xdna_io_open` —
+  it must be rlx's own `librlx_xdna_shim.so` from `csrc/xrt_gemm_shim.cpp`, and
+  the build command is now in the README.
+- **MLX dropped the same write-back.** Its `carry` path host-evalled the shared
+  CPU kernel and returned only the output. MLX has no arena and holds `params`
+  by shared reference for the whole lowering walk, so the state now rides back
+  out through `lower_with_env_writeback` /
+  `lower_and_run_typed_with_extent_writeback` and the backend applies it to the
+  param buffers once the borrow ends. The old entry points remain, and
+  `debug_assert` that nothing was dropped. `carry = false` is unaffected.
+
+- **Three hand-rolled copies of the skip-or-fail decision, one of them broken.**
+  `activation_batch_parity.rs` defined its own `skip_unless_available` — same
+  name, same signature as the shared helper, **without** the
+  `RLX_REQUIRE_DEVICE` assert — so the file was exempt from the flag while
+  reading exactly like one that honoured it, and it fooled the new coverage
+  gate, which matched on the name. rlx-cuda and rlx-rocm's
+  `static_weight_pack_rebind.rs` each carried a third and fourth copy as
+  `device_missing()`. All now call `rlx_ir::env::skip_unless_device`, and a
+  local definition disqualifies a file from counting as migrated.
+
+- **`lstm_three_way.rs::reference_f64` was dead code under `cpu,cuda`.** The
+  file compiles under any of metal / gpu / cuda / rocm but consults the arbiter
+  from the metal arm alone. Gated to match its caller rather than blanket
+  `allow(dead_code)`, so adding a caller in another arm is a compile error
+  pointing at it.
+
+- **The capability guard skipped unavailable devices with a bare `continue`.**
+  A rig where CUDA is *compiled in and broken* — the case that most needs
+  reporting — looked identical to a Mac that has no CUDA at all, and CUDA's
+  entry stayed unverified either way. It now goes through
+  `skip_unless_available`, so `RLX_REQUIRE_DEVICE=1` separates the two.
+
+- **The `quantized` corpus skip cited a reason that had stopped being true.**
+  It said "set_param is an f32 API", but `CompiledGraph::set_param_typed` takes
+  raw bytes and predates the test. The actual blocker is an *authority*: those
+  cases need real Q4_K/Q6_K/Q8_0 fixtures and a block-decode reference in the
+  oracle before a score against them means anything. Reworded so it reads as
+  missing work rather than a permanent API limitation.
+
+- **A per-query mask under `MaskKind::Custom` was undefined and the backends
+  disagreed about it.** `Custom` is key padding — one bit per `(batch, key)`.
+  Handed a real query axis, MLX and wgpu broadcast it per query while CPU, Metal
+  and Vulkan read the same tensor as key padding. That is not a wrong number you
+  can catch by comparing backends: there was no contract saying which was right,
+  so `attention_mask_shapes.rs` documented the divergence as out of scope rather
+  than freeze whichever backend happened to be asked.
+
+  `rlx_ir::repr_check` rule R8 now rejects it, naming `MaskKind::Bias` as the op
+  that *does* define a per-query mask. Undefined-and-refused beats
+  undefined-and-divergent. Every broadcast spelling of a legal key-padding mask
+  — `[B, S_k]`, `[1, S_k]`, `[1, 1, S_k]`, `[B, 1, 1, S_k]` — stays accepted,
+  pinned by the same test that the parity suite enumerates.
+
+- **`RLX_REQUIRE_DEVICE` was set by nothing.** It shipped in nine Rust files
+  with the note that "rig runs should set it", and no Justfile recipe, script or
+  CI config did — so the mechanism built to stop a card-less rig reporting green
+  was off everywhere it mattered, which is the state the MI100 falling off the
+  PCIe bus exploited.
+
+  `rig.sh` now exports it on all three remote runtimes (`RIG_REQUIRE_DEVICE`,
+  default 1, overridable in `scripts/rig/local.env` while a rig is known
+  degraded), and the GPU recipes in the `Justfile` set it from a `require_device`
+  variable — asking for `just test-gpu` is asserting a GPU is present, and a host
+  without one wants `just require_device=0 test-gpu`.
+
+  `just test-rocm` deliberately does **not** set it: that recipe is in `just ci`,
+  which runs on developer machines where rlx-rocm compiles fine and no AMD GPU
+  exists — exactly the case the flag is designed to fail.
+
+  It was also read as `env::var(..).is_none()` at all six sites, so
+  `RLX_REQUIRE_DEVICE=0` *armed* it. The registry declares it `EnvKind::Bool`;
+  it now reads through `env::flag`, so `=0` means off.
+
+- **`rlx-runtime/tests/host_fallback_never_nops.rs`** — the claim-then-Nop
+  composition is now caught statically, with no device and no numerical
+  comparison.
+
+  `cpu_nop_fused_ops_parity.rs` catches this class by running the three ops on
+  every available device and requiring a non-zero answer. That works, but it
+  needs a device, and it needs someone to have written a case for the op — and
+  coverage-by-enumeration is what drifted in the first place. The new gate
+  derives it from the two static facts that compose into the bug: rlx-cpu
+  declares what it cannot thunk (`NO_THUNK_ARM`), and Vulkan declares what it
+  routes to the host (`routes_to_cpu_host`). Their intersection must be empty.
+
+  Verified to bite: re-adding `Op::PartitionedConv` to Vulkan's
+  `is_host_fallback` turns the gate red with the original diagnosis. It also
+  requires rlx-cpu to actually expand every kind it lists, so the list cannot
+  claim something the expander misses.
+
+  Coverage is reported rather than implied: metal, wgpu, cuda, rocm, oneapi, mlx
+  and coreml reach rlx-cpu through op-specific scheduler arms with no single
+  predicate to ask, so they are **not** checked, and a test says so out loud
+  instead of letting a green run read as full coverage.
+
+- **A batch-broadcast attention mask was wrong on every backend**, two
+  different ways, and read out of bounds on three.
+
+  `MaskKind::Custom` is a binary `[batch, key_len]` key-padding mask. `[1, S_k]`
+  — one padding row shared by the whole batch — is the same mask, as are its
+  rank-3/rank-4 spellings. None of them agreed.
+
+  * **CUDA, ROCm, wgpu** derive mask strides from the tensor's shape, but built
+    each one from a product of dims, so an axis of extent 1 got a non-zero
+    stride instead of 0. `rlx_ir::mask_strides_for_shape` now zeroes broadcast
+    axes. **wgpu carried a byte-identical private copy of that function**, which
+    is how it drifted; it now calls the shared one.
+  * **CPU, Metal, Vulkan** index the mask at a hard-coded `mask[b * S_k + k]`
+    with no strides at all, so `[1, S_k]` read *past the end of the tensor* for
+    every batch above 0, into whatever the arena placed next to it. New pass
+    `rlx_opt::legalize_custom_attention_mask` materializes the broadcast in the
+    IR ahead of them — the same trade `LegalizeBroadcast` already makes for
+    `Op::Binary`, and split out of it so Metal (whose binary kernels are
+    stride-aware and skip that pass) can run just this rewrite.
+
+  Out-of-bounds reads of a neighbouring tensor produce *plausible* numbers, so
+  `rlx-runtime/tests/attention_mask_shapes.rs` scores against a reference
+  computed in the test rather than against another backend, and separately
+  requires every spelling of one mask to agree with itself on each backend.
+
+  A per-query mask (`[S_q, S_k]`, `[B, H, S_q, S_k]`) is still undefined for
+  `Custom` — `MaskKind::Bias` is the per-head, per-query tensor. MLX and wgpu
+  broadcast one correctly; CPU, Metal and Vulkan read it as key padding. That
+  disagreement is documented in the test rather than pinned.
+
+- **Vulkan rejected `Op::Qr` and `Op::Svd` at legalize although its scheduler
+  already ran them.** Both were listed in the `Step::HostOp` arm next to
+  `Cholesky` / `TriangularSolve` / `Det` / `LogDet`; only the two
+  `SUPPORTED_OPS` entries were missing, so compilation failed before the
+  scheduler was ever reached. `qr_vulkan` and `svd_vulkan` now match CPU
+  bit-exactly, as the other four backends already did.
+
+- **39 parity tests asserted instead of skipping when a GPU was present but out
+  of memory.** They called `Session::new(Device::Gpu)` with no availability
+  check — the CUDA and ROCm cases beside them had one, wgpu was assumed always
+  present. On a box already running a training job, wgpu's `request_device`
+  fails with "Not enough memory left", `is_available` goes false, and the suite
+  turned 37 tests red at once across 25 files, indistinguishable at a glance
+  from a regression in the kernels.
+
+  They now share `tests/common/mod.rs::skip_unless_available`, which skips
+  loudly — **and asserts under `RLX_REQUIRE_DEVICE=1`**, so a rig where the
+  device *should* work cannot report `ok` for tests that never ran. Rig runs
+  should set it. The assert fires only for a backend that was actually compiled
+  in; one the build does not contain is not what the flag is about.
+
+- **Vulkan `Op::PartitionedConv` silently returned a buffer of zeros.**
+  Reproduced identically on MoltenVK, NVIDIA's driver and RADV, so not a driver
+  quirk — the op never ran at all.
+
+  Three correct-looking decisions composed into the bug. Vulkan *claims*
+  `PartitionedConv` in `SUPPORTED_OPS`, so it never enters the unsupported set
+  that makes `legalize_or_rewrite_for_backend` expand it. `rlx-unfuse` (shared
+  by CUDA / ROCm / wgpu / Vulkan / oneapi) has no arm for it — only
+  `rlx-fusion`'s unfuse does. So the node survived to the scheduler, which
+  routed it to the CPU host fallback, where it is a **Nop**: rlx-cpu expands
+  `PartitionedConv` before building thunks and therefore has no kernel for it
+  either. A claimed op, a fallback that accepts it, and a kernel that does
+  nothing — output stays zero and nothing reports an error.
+
+  `rlx_vulkan::unfuse::expand_partitioned_conv` now expands it in Vulkan's own
+  compile entry, mirroring the `expand_cpu_nop_fused` oneapi already carried.
+  It is also removed from `is_host_fallback`: if one ever reaches the scheduler
+  again, failing loudly beats zeroes.
+
+  `gpu_filters_parity` gained named `partitioned_conv_op` cases for wgpu (it had
+  only the anonymous `all()` batch) and oneapi (which had none, despite carrying
+  the same class of fix untested).
+
+  The class as a whole is now guarded by
+  `rlx-runtime/tests/cpu_nop_fused_ops_parity.rs`, which runs all three ops
+  rlx-cpu Nops — `FusedConvBiasAct`, `PartitionedConv`, `FusedTransformerLayer`
+  — on every available device and requires both agreement with CPU **and** a
+  non-zero result. The second check is the load-bearing one: a tolerance
+  comparison alone can pass against a reference that happens to be near zero.
+
+- **`advisory_capabilities` had drifted from four of the seven backends it
+  describes**, in both directions:
+
+  * ROCm implemented `register_kv_row_feed` / `feed_kv_row` and the table said
+    `kv_resident`, but its own `capabilities()` did not — so a caller gating on
+    the executable took the slow path on a backend that supported the fast one.
+  * ROCm and CUDA forward `set_moe_resident_experts` and never claimed `moe`.
+  * MLX claimed `moe` it does not implement, and hid the `async_pipeline` it
+    does.
+  * ROCm and Vulkan omitted `typed_io` / `active_extent` they honour.
+
+  Neither direction shows up as a test failure anywhere else — a capability the
+  table omits is a fast path planners never take, and one it invents is a fast
+  path callers take and lose. Both are missed optimisations, not wrong numbers.
+
+  `CompiledGraph::capabilities()` now exposes the executable's own answer (the
+  table was the only public way to ask), and
+  `rlx-runtime/tests/capability_table_matches_backends.rs` pins the two
+  together for every device the host can instantiate. Verified against cpu,
+  metal, mlx, wgpu, rocm, vulkan — and, on the CUDA rig (RTX 3080 Ti, driver
+  595.84), **cuda**, which closes the last of the seven: `kv_resident` is backed
+  by a real row feed and every probeable flag matches what its method returns.
+
+  A third case the table could not catch, because both copies were wrong the
+  same way: **CPU implements `bind_handle` / `read_handle` and reported
+  `persistent_handles: false`**. `probeable_flags_agree_with_what_the_methods_return`
+  now calls each probeable hook and requires the flag to match what it returned,
+  in both directions.
+
+  The `moe` flag is also documented more narrowly than it was: it means expert
+  residency, whose setters return `()` and therefore need a flag. The
+  instrumentation hooks return `Option`/`bool`, report for themselves, and are
+  CPU-only — they are no longer implied by it.
+
+- **wgpu GGUF dequant tests reported 24 failures when the GPU was merely busy.**
+  They called `.expect("no wgpu adapter")`, so a machine whose VRAM was full
+  produced two dozen simultaneous FAILUREs that read exactly like a numerical
+  regression in the dequant kernels. They now skip loudly, and
+  `RLX_REQUIRE_DEVICE=1` turns the skip back into a failure for rig runs where a
+  missing device means the run proved nothing.
+
+- **`Op::KvAppend` used the wrong row stride on Metal, CUDA and ROCm.** All three
+  derived the stride between outer slices from the OUTPUT shape, whose axis dim
+  is `pos + 1` (the op returns the `[..pos+1]` prefix), rather than the cache's
+  capacity. Their shared comment — *"Output shape == cache shape"* —
+  contradicted `infer_shape`. The stride is only read when `outer > 1`, i.e.
+  batch > 1, so batch-1 decode never exercised it.
+
+- **`Op::KvAppend`'s output cannot alias the cache for every shape.** The
+  aliasing contract needs the `[..pos+1]` prefix to be CONTIGUOUS from the start
+  of the buffer, which holds only when nothing precedes `axis`. For the natural
+  attention layout `[batch, heads, seq, dim]` with `axis = 2` the prefix is
+  `batch*heads` strided slices, so a row write into the aliased slot returns a
+  different tensor. `rewrite_for_backend` now lowers those shapes back to
+  narrow + concat on **every** backend, native support or not — a shape guard,
+  not a capability one, so it runs before the "backend supports everything"
+  early return. Batch-1 `[1, seq, heads*dim]` decode keeps the O(1) path.
+
+- **Metal: the dual-output residual fusion could alias its own operands.**
+  `fused_residual_rms_norm` writes the residual sum in its first pass and then
+  re-reads `x` and `res` in the second to recompute `x + res`; the overlap check
+  covered the norm output but not the sum's destination, so a plan that aliased
+  the add's output onto an operand would have had the second pass read what the
+  first overwrote. Guarded before enabling the path by default.
+
+- **Metal `set_param_bytes` silently wrote a quarter of any f32 param.**
+  `Arena::write_bytes` clamped a **byte** length against an **element** count, so
+  a wider-than-byte param was truncated to `num_elements` bytes and the copy then
+  succeeded with no error. It survived because that path is overwhelmingly used
+  for quantised U8 weights, where the two units coincide.
+- **A re-bound param did not reach a fused weight pack.** With the pack skip
+  armed, `run(); set_param(w, ..); run()` kept the first run's pack and the
+  consuming GEMM silently used the old weights — the shape of every weight-swap
+  workload (training step, LoRA merge, quantisation re-bind, sweep harness
+  reusing one executable). All param setters now invalidate, on every backend.
+- **wgpu: the static-weight skip never armed on three of five readback paths**,
+  so whether the optimisation engaged depended on which path a graph happened to
+  take; small-output graphs rebuilt their constant packs every run.
+- **wgpu: complex ops were routed to a lane-blind host fallback** on discrete
+  NVIDIA Vulkan, returning the lane-wise product `(ar·br, ai·bi)` instead of the
+  complex one. Complex add *is* lane-wise, so only mul/div failed. `complex_parity`
+  13/14 → **14/14** on that backend.
+- **wgpu: an op whose operands span two arena stripes read zeros.** A kernel binds
+  one stripe, and slot placement guarantees no single tensor straddles a boundary
+  — not that an op's *operands* share one. Measured: 786432 of 786432 outputs
+  returned 0.0 instead of 18.0 under `RLX_WGPU_SHARD_GPU=1`. Such ops now host.
+- **Wide-hidden LSTM was wrong on Apple GPUs** (`hidden > 32`), on both the Metal
+  MSL and wgpu WGSL kernels. Metal's default `exp`/`tanh` are the fast variants
+  and are not accurate enough for the recurrence: the error compounds through the
+  cell state until units collapse to exactly 0.0. Metal now uses
+  `metal::precise::`; WGSL has no such namespace, so `lstm.wgsl` uses a
+  range-reduced `exp` of its own. CPU, CUDA and wgpu-on-NVIDIA-Vulkan were always
+  correct. Native paths restored at full width on both.
+- **The weight-pack skip was silently dead on graphs deeper than one layer.**
+  Packs were given arena slots that an earlier activation also owns — legal
+  within a single run, but the skip means that activation is re-executed next run
+  and clobbers the pack. Liveness is now whole-graph for packs, and `rlx-cuda`
+  and `rlx-rocm` (which have their own planners) pin them too. A one-layer graph
+  cannot detect this, which is why it passed the original guards.
+
+- **`rlx-cpu`'s `amx-bnns` feature did not compile.** Two `matches!` arms in
+  `intrinsics/apple_amx/bnns.rs` still read `Ok("true")` after the env lookup
+  moved from `std::env::var` (`Result`) to `rlx_ir::env::var` (`Option`), so
+  `RLX_CPU_BNNS_BF16` / `RLX_CPU_BNNS_F16` failed to typecheck and the whole
+  feature was unbuildable. `just lint-features` now compiles that combination.
+- **`rlx-wgpu`'s `Step` enum lost its documentation and its `dead_code` allow.**
+  The per-shader kernel enums (`BatchNormKernel`, `QuantI8Kernel`,
+  `ScaledLowpKernel`, …) were inserted *between* `Step`'s doc comment plus
+  `#[allow(dead_code)]` and `Step` itself, so both attached to
+  `BatchNormKernel` — which then carried two stacked doc comments — while
+  `Step` warned on six fields it deliberately keeps (`mask_buf` extends a
+  buffer's lifetime; `meta_idx` is consulted during bind-group construction).
+- **`scripts/publish.sh` refused to run.** Its `validate_tier_coverage` requires
+  every workspace member to appear in a publish tier or in `SKIPPED`, and
+  `rlx-fem` was in neither, so the release driver aborted before its first
+  upload. It has no path dependencies, so it joins tier 0.
+- **`rlx-runtime` declared `build = "build.rs"` inside its docs.rs metadata
+  table.** A blank line does not close a TOML table, so the key landed in
+  `[package.metadata.docs.rs]` where cargo ignores it; the build script only ran
+  because cargo auto-detects `build.rs` at the package root. It is now declared
+  in `[package]`.
+- **The Cortex-M trainer wrote its weights to a CWD-relative path.**
+  `--out` defaulted to the literal `rlx-cortexm/src/model_weights.rs`, so
+  running the trainer from its own directory created a `trainer/rlx-cortexm/`
+  shadow tree — which is how a duplicate `model_weights.bin` and
+  `test_set.bin` came to be committed. The default now resolves against
+  `CARGO_MANIFEST_DIR`.
+- **59 relative Markdown links pointed at nothing**, nearly all of them left
+  over from regrouping the crates under
+  `crates/{core,backends,io,numerics,tooling,bindings}/`: a crate README moved
+  two levels deeper, and every `../docs/foo.md` in it went stale at once. All
+  496 links across the 133 tracked Markdown files now resolve, and
+  `just check-doc-links` keeps them that way.
+- **~230 broken rustdoc intra-doc links.** Where the target resolved to a
+  dependency it is now fully qualified (`rlx_ir::Op::TopK`); where it did not
+  resolve from that module, the link is gone and the text stays as inline code.
+  De-linking rather than guessing is deliberate — a link that silently points at
+  the wrong item reads as authoritative.
+
+- **The op-coverage claim was three releases stale, and overstated.** The README
+  and per-backend docs advertised "full **153/`OpKind`**" on ten backends.
+  `OpKind` has since grown to **187**, and no backend claims all of them —
+  actual claims run 161 (oneAPI) to 179 (Metal). `docs/op-coverage.md` is
+  regenerated from each backend's `SUPPORTED_OPS`, and the README, docs index
+  and the CUDA / TPU / Vulkan / oneAPI crate READMEs now quote the generated
+  numbers instead of a hand-copied total. `just check-op-coverage` already
+  guarded the matrix; nothing guarded the prose around it.
+- **Private note-taking slugs shipped in public doc comments.** Fifteen
+  `[[feedback_perf_is_north_star]]`-style wiki-links across `rlx-cpu`'s Apple
+  AMX/SME modules, an `rlx-vulkan` test and a design doc referenced a
+  machine-local notes system that no reader of this repository can resolve —
+  and rustdoc tried to resolve two of them as intra-doc links. Each is replaced
+  by the convention it stood for, spelled out.
+- **Two doc comments had drifted off the item they document**, leaving the
+  function undocumented and the comment attached to an unrelated one:
+  `compile_overlay` in `rlx-xdna` and `needs_broadcast_prologue` in
+  `rlx-unfuse`. Both reattached.
+- **`cargo clippy --all-targets -- -D warnings` is clean again** across the
+  workspace: eleven needless borrows and an `eprint!("{t}\n")` in `rlx-wgpu`, a
+  manual slice-size product in `rlx-metal`, a no-op `1 *` in an `rlx-mlx` test,
+  a manual checked division in `rlx-cpu`, and a `vec_init_then_push` in an
+  `rlx-runtime` test whose pushes are all `#[cfg]`-gated (the lint cannot model
+  that, so it is allowed with the reason stated).
+
+- **`just lint` failed outright on the `cpu,cuda` feature combination.**
+  `tests/wgpu_conv3d_bias_parity.rs` gated only its `#[test]` on `gpu`, leaving
+  four helper functions and their imports unconditional — dead code in any build
+  without `gpu`, and under `-D warnings` that is 15 hard errors rather than a
+  warning. The module is gated as a whole now. Nothing caught it because
+  `lint-features` reaches that combination only on a host where `rlx-cuda`
+  compiles.
+- **Rustdoc is warning-free across the workspace** (353 → 0 under each crate's
+  docs.rs feature set).
+
+- **The shape verifier read a GGUF `DequantMatMul` weight's axes backwards.**
+  `infer_shape` sent every rank-2 weight through `matmul_shape`, which assumes
+  `[k, n]` — but GGUF stores a linear as `[out_dim, in_dim]`, i.e. `[n, k]`
+  (the same order that lets `dequant_grouped_matmul_packed` take an expert bank
+  from a `ffn_*_exps.weight` blob with no transpose). Any graph declaring the
+  logical rank-2 weight instead of a packed byte blob was rejected with
+  `matmul K mismatch: 64 vs 3`. New `shape::dequant_matmul_shape` states the
+  `[n, k]` rule and `infer_shape` picks it for `scheme.is_gguf()`; the Int8 /
+  NVFP4 schemes, `LoraMatMul` and `QMatMul` keep `[k, n]` per their contracts.
+  The wrong rule was always there — it only became visible now that a rejected
+  inference is reported instead of silently discarded.
+
+- **A flaky `rlx-compile` test could fail on an assertion unrelated to what it
+  tests.** `RLX_NO_NATIVE_FK_REGIONS` is a process-global env var that
+  `apply_native_fk_defaults` reads for *every* target, and
+  `tpu_native_fk_region_pass_policy` sets it mid-test — but that writer held
+  `ENV_FK_TEST_LOCK` alone, so a mutex with exactly one user serialized nothing.
+  Any of the eight sibling tests that build a pass list could observe
+  `native_fk_regions = false` and fail. The eight now take the lock, which is
+  documented at its declaration as the contract for new tests here, and taking
+  it tolerates poisoning so one real failure cannot cascade into eight
+  `PoisonError` panics.
+
+- **A second flaky test of the same shape, in `rlx-ffi`.** The node C ABI keeps
+  one process-global last-error string — correct for a C consumer, but a test
+  that calls `rlx_node_start` and *then* reads `rlx_node_last_error` can read a
+  sibling's message. `rejects_bad_rank_world` failed asserting on `2/2` and got
+  `unknown mode [trian]`, the string `rejects_an_unknown_mode` had just written.
+  The seven tests that drive the ABI now share `FFI_TEST_LOCK`. Measured: 5
+  failures in 60 runs without it, 0 in 60 with.
+
+- **A third flaky test of the same shape, and the highest-rate one:
+  `rlx-metal`'s `mpsgraph_sync_compile`.** `the_env_override_still_selects_the_control_arm`
+  sets `RLX_MPSGRAPH_NO_SYNC_COMPILE=1` to check the A/B control arm, while
+  `sync_compile_mitigation_is_in_force` reads the same variable — and cargo runs
+  both on threads of one process, so the reader intermittently reported the
+  mitigation as *disabled* when it was not. The `// SAFETY: single-threaded
+  within this test` note was the tell: `set_var` is process-global, so what
+  matters is the sibling thread, not this test's own body. Both now take
+  `ENV_ARM_LOCK` and the safety comment states the real justification.
+  Measured: 22 failures in 60 runs without it, 0 in 60 with — it had passed
+  three consecutive full-suite runs by luck.
+
+- **A fourth flaky test, and the one that was *not* an env leak:
+  `rlx-runtime`'s `custom_ops` registry tests.** All three call
+  `clear_for_tests`, which wipes the process-global custom-op registry, so a
+  sibling's clear could land between `re_register_replaces`'s `register` and its
+  `execute` — making `execute` return `None` and the test unwrap a value the
+  code under test never failed to produce. The three now share
+  `REGISTRY_TEST_LOCK`. Measured: 4 failures in 300 runs without it, 0 in 300
+  with.
+
+  Found by measuring rather than by pattern-matching: a survey of the 22 test
+  files that mutate process-global state ran each 25 times and cleared 21 of
+  them, and the two obvious hypotheses for this one (`RLX_DEVICE` and
+  `RLX_TRACE_PERFETTO` leaking) were both disproved by forcing each variable
+  globally and seeing the suite still pass.
+
+### Performance
+
+- **wgpu: the residual→norm tee now covers RmsNorm, not just LayerNorm.**
+  `detect_residual_ln_tee_pattern` recovers the case both residual fusions
+  decline — a residual sum with two consumers, which is every transformer layer
+  — by emitting one step that writes the sum *and* the normalised result. It was
+  written for a LayerNorm vision transformer and matched only `Op::LayerNorm`,
+  so it missed every Llama-class model. Both norms already shared the same wgpu
+  lowering arm, so this is a mode flag (`is_rms`) on the existing kernel rather
+  than a second one. On a 6-block probe: **24 → 17 steps** (8 `binary` + 8 norm
+  → 1 + 1 + 7 tee). Numerics unchanged against the CPU reference for both norms.
+  Discrete Vulkan/DX12 route these ops to the host entirely, so the tee is
+  correctly inapplicable there.
+
+- **Metal: the residual + RMS-norm fusion now fires once per LAYER instead of
+  once per graph.** In a transformer the residual sum feeds both the norm and
+  the next residual (`h += attn; n = rms(h); h += ffn(n)`), so it has two
+  consumers and the fusion declined — on Carbon-500M it fired **1** time across
+  28 layers. The fused Metal kernel already had a dual output for exactly this
+  (it can emit the sum alongside the normalised result); it was gated off. On a
+  28-layer decode step **55 `binary` + 56 `rms_norm` dispatches collapse to 56
+  fused ones — 55 fewer kernel launches per token**, with byte traffic unchanged
+  (these are `[1, hidden]` tensors, so the win is launches, not bandwidth) and
+  output bit-identical to CPU.
+  `RLX_METAL_FUSE_RESIDUAL_DUAL=0` opts out.
+
+  Not quoted as a wall-clock figure: this Mac carried a load average of 50-122
+  throughout, where the same arm varied 5x run to run. The dispatch-count
+  reduction is exact and machine-independent; the time it buys is not measured.
+
+- **Fused QKV / gate-up weight packs are materialised once instead of per step.**
+  The matmul-fusion passes build them by concatenating weight tensors, and that
+  concat was re-run every decode step. On Carbon-500M (28 layers) it was **1879 MB
+  of 3941 MB of DRAM traffic per token (47.7%)**.
+  - CUDA (RTX 3080 Ti, 28-layer decode graph): **7.16 → 3.07 ms/iter (2.33×)**,
+    at **+864 MiB** arena residency (1480 → 2344 MiB) — inherent, since skipping
+    the recompute means keeping the result.
+  - ROCm (Radeon 780M, gfx1103, 12-layer decode graph): **24.39 → 12.32 ms/iter
+    (~1.98×)**.
+  - Metal (M4 Pro): **−15.2%** total GPU device time; 3941 → 2062 MB/token.
+  - Vulkan: mechanism validated; no timing (no meaningful Vulkan perf target).
+
+  `RLX_NO_WEIGHT_CONCAT_FUSION=1` is **not** a substitute: it recovers the same
+  bytes but costs 84 extra GEMM launches/token and measured −0.9%, i.e. nothing.
+
+## [0.2.15] — 2026-08-16
+
+### Added
+
+- **`rlx_ir::verify_unique_leaf_names`** — reports `Op::Param` / `Op::Input`
+  leaves that share a name. Such a leaf is never bound and silently reads zeros.
+  Deliberately *not* part of `verify` (which is debug-asserted after every
+  fusion pass): graphs in the wild can still trip it, and each needs its own look
+  first. Every instance it found was a real bug. Two are fixed below (the
+  `Rewriter::copy_node` duplication it was written for, and `jvp`'s
+  `tangent_<name>` collision); one is open in `rlx-models`, where Qwen3.5 prefill
+  graphs declare `last_token_idx` twice — once at flow level as F32, once inside
+  the `GatherLastToken` block as I32. That one is currently harmless only by
+  accident: the unbound node feeds a redundant second gather along an axis the
+  first already collapsed to extent 1, where index 0 is the only legal index.
+  Nothing guarantees which of two same-named nodes gets bound, and the other way
+  round every `last_logits_only` prefill would return the *first* token's logits.
+  Diagnosed in full in `rlx-qwen35/tests/last_token_idx_gather.rs` (`#[ignore]`d:
+  the fix changes the logits output rank, which the runner, speculative-decode
+  and serving paths all consume).
+
+- **External GPU over USB4 / Thunderbolt on Apple Silicon (`Device::Egpu`,
+  `rlx-egpu`).** PCIe tunnelling works on Apple Silicon — a device behind the
+  tunnel enumerates as a normal `IOPCIDevice` with `IOPCITunnelled = true`. What
+  macOS does not ship on arm64 is a driver for PCI base class 0x03, so a discrete
+  GPU enumerates and is then left unclaimed. The gap is a driver, not a bus.
+
+  What is complete: PCI discovery over the tunnel (IOKit on macOS, `/sys/bus/pci`
+  on Linux), config-space / BAR / DMA transport through a PCIDriverKit extension
+  (`dext/`, with its build, entitlement and signing procedure in `docs/egpu.md`),
+  ahead-of-time kernel packs that compile on a ROCm/CUDA host and are readable
+  with no toolchain, and SHA-256 verification of pinned vendor firmware.
+
+  What is **not**: device bring-up. The AMD RDNA3/4 sequence (PSP firmware load,
+  SMU, GFX/SDMA rings, GPUVM page tables) is written but **has never been
+  executed** — no card has been attached to run it — and NVIDIA GSP bring-up is
+  reserved, not written. So there is no execution path: `SUPPORTED_OPS` is empty
+  and `compile` surfaces a diagnostic rather than falling back to the CPU.
+  `is_available()` is gated on `am::VALIDATED_ON_HARDWARE`, *not* on
+  `cfg!(feature = "am")` — compiling an unexecuted driver must not make the
+  device dispatchable. `just test-egpu`, `just egpu-probe`, `just egpu-inspect`,
+  `just egpu-bake`, `just egpu-firmware`.
+
+- **`Op::Roll`** — cyclic shift along one or more axes (`jnp.roll` /
+  `torch.roll`). Shifts may be negative or exceed the axis length; both reduce
+  modulo `n`. Output shape always equals input shape, which is what separates it
+  from `Op::Slice` and from a circular `Op::Pad`. No backend has a native kernel:
+  `rlx_fusion::LowerRoll` legalizes each axis to
+  `concat(narrow(tail), narrow(head))`, so that pass is the only implementation
+  and therefore also the definition. The two narrows cost exactly one copy
+  regardless of shift, so a fused kernel would save one pass, not an order of
+  magnitude.
+
+- **`Op::ScatterAdd` gained an `axis`** — the "unpermute" half of MoE routing,
+  the transpose of `Op::Gather`, and the shape every immersed-boundary or
+  segment-reduction kernel wants. Backends implement `axis == 0` only and say so
+  by panicking; `rlx_fusion::LowerScatterAddAxis` normalizes every other axis
+  ahead of them in the compile pipeline.
+
+- **Lane masks (`rlx_ir::lanes`) — per-lane reset as *data*, not control flow.**
+  A batched workload running `n_lanes` independent problems (parallel RL
+  environments, a batch of decode sequences) finishes lanes at different times.
+  Resetting on the host throws away the captured graph every time, because the
+  graph is what encodes which buffers are read — on CUDA the capture is dropped
+  and re-taken, and the cost lands exactly on the episode boundary, which for
+  short episodes is most of them. Expressing it as
+  `state' = where(mask[lane] != 0, reset_value, state)` with `mask` a plain
+  `[n_lanes]` graph input means the *contents* change every step and the *graph*
+  never does, so a captured schedule stays valid across any sequence of resets.
+
+- **Pestle GGUF schemes `G8_0` and `Q2_0`.** `G8_0` (ggml type 143) is exact
+  ternary — every weight a 2-bit code `{0,1,2}` mapped to `(q−1)·d` — but unlike
+  `Q2_0` the scale is per *group of 8*, so a 32-element block carries four bf16
+  scales for 4 bits/weight. That finer granularity is what lets an embedding
+  table survive at ternary code width. `Doses-AI/Pestle-27B-Ternary-GGUF` uses
+  `G8_0` for the untied `token_embd` / `output` tables and `Q2_0` pairs for the
+  transformer linears.
+
+- **`rlx_gguf::invariants` — a quantization oracle that references no other
+  implementation.** Every other check on the quant path is *differential*:
+  fused-vs-unfused, backend-vs-backend, or against a `w_ref` from the same
+  decoder under test. A differential check cannot fail when the shared formula is
+  itself wrong — not hypothetical here, given the RmsNorm `1/r` bug (wrong in all
+  seven backends), the RoPE table stride (wrong and agreeing in three) and the
+  GELU constant (wrong in `rlxsl`, therefore in every generated backend). This is
+  the forward-path equivalent of finite differences: properties that follow from
+  what a quantizer *is* — projection closure, value idempotence, exact constant
+  and zero blocks, error bounded by the scheme's own step size.
+
+- **`rlx-lbm` — moment-encoded lattice Boltzmann (HOME-LBM).** Stores the first
+  three velocity moments per node and rebuilds the populations in-kernel rather
+  than storing 9 (D2Q9) or 27 (D3Q27) distribution values. In tree for two
+  reasons, neither of them fluid dynamics: it is the same DRAM-for-ALU trade as
+  `DequantMatMul` / `ScaledMatMul` / `SynthMatMul`, applied to a stencil; and a
+  27-point periodic stencil plus a large-grid-to-small-array reduction stresses
+  the fusion and region machinery where transformer graphs never reach. The `ir`
+  feature builds one step as an rlx `Graph` (streaming via `Op::Roll`) so it runs
+  on every backend through `Session`; `just test-lbm` runs that path.
+
+- **`rlx-opscope::bytes` — a static memory-traffic ledger read off the IR.** Most
+  of the perf work in this repo has converged on the same finding from different
+  directions: the bottleneck was bytes, not math. Each of those was found with a
+  profiler, after the fact. A graph already contains enough to predict them —
+  this computes per node the bytes that *must* move and the FLOPs that *must*
+  happen, and reports arithmetic intensity, with no device present. It is a lower
+  bound (one read per operand, one write per output — perfect reuse within an op,
+  none across ops) and diagnostic only: "measured ≫ this" means headroom,
+  "measured ≈ this" means the win has to come from somewhere else.
+
+- **Metal concurrent command encoders (`RLX_METAL_CONCURRENT`, opt-in).** Opens
+  compute encoders in `Concurrent` dispatch mode so independent decode dispatches
+  (q/k/v, gate/up) overlap on the GPU, inserting a `memoryBarrier` only before a
+  dispatch that data-depends on the current wave. Off by default; a classic
+  Serial encoder is the unchanged path. Ships with its own bisection harness
+  (`_SPLIT_ENC`, `_IDX_LO`/`_IDX_HI`, `_OPAQUE`, `_FENCE_ALL`,
+  `_BARRIER_FRESH`, `_STATS`) because a Concurrent encoder that opts out of
+  hazard tracking is not implicitly ordered after the previous one, so the first
+  dispatch of every encoder can go unsynchronised.
+
+- **`rlx_bbo::powell`** — Powell's conjugate-direction method, filling the gap
+  between `adam_opt_nd` (needs gradients) and `cmaes` (stochastic, needs a
+  population): deterministic, function-values only, superlinear on smooth
+  objectives. The direction update uses Brent's rule rather than replacing
+  unconditionally, which would collapse the direction set toward linear
+  dependence and degrade the search onto a subspace.
+
+- **`rlx_autodiff::grad_with_loss_wrt` — gradients w.r.t. an intermediate
+  activation.** `wrt` entries are now `Wrt` designators rather than bare
+  `NodeId`s: `Wrt::Leaf(name)` for a named `Op::Input`/`Op::Param`,
+  `Wrt::Output(i)` for an index into `forward.outputs`, `Wrt::Node(id)` for the
+  previous raw-id behavior. Only leaf *names* and output *positions* survive the
+  renumbering done by `prepare_graph_for_ad`, so `Wrt::Output` is what makes an
+  intermediate — a residual-stream activation, say — addressable: publish it as
+  an auxiliary forward output and refer to it by index. Combined with the
+  existing `d_output` input (which takes the shape of `outputs[0]`, scalar or
+  not), this gives a VJP at an arbitrary cut point: seed any cotangent, read
+  `∂outputs[0]/∂tap`. `grad_with_loss` / `grad_with_loss_opts` are unchanged and
+  now delegate to it.
+- **`GradWithLossOptions::emit_aux`** (default `true`, set via `with_aux`) —
+  suppresses mirroring `forward.outputs[1..]` into the backward graph's outputs.
+  For taps that exist only to designate `Wrt::Output` targets, the values are
+  dead weight; dropping them lets the compiler DCE the readback.
+- **Finite-difference VJP tests for the ops a decoder lens depends on** —
+  `attention_causal_vjp_fd` (causal and unmasked, including cross-position),
+  `rope_vjp_fd` (full and partial rotation), `rms_norm_rank_vjp_fd` (ranks 2/3/4;
+  Qwen3 normalizes *per attention head*, so rank 4 with `axis = -1` is a real
+  shape and not just a hypothetical), `gated_delta_net_vjp_fd` (gradient through
+  the recurrent state across positions, plus causality), and
+  `depthwise_conv1d_vjp_fd` (the length-in-H causal conv1d, checking every input
+  position receives gradient). All pass; they were written to *localize* a
+  gradient discrepancy and ended up exonerating each op individually.
+- **Output-position stability is now asserted.** `grad_with_loss_wrt` checks that
+  `prepare_graph_for_ad` preserved the output count, and
+  `tests/prepare_output_stability.rs` checks that each `outputs[i]` still holds
+  the same *value* across prepare. The invariant held before but was emergent —
+  a pass that reordered or dropped an output would have made `Wrt::Output(i)`
+  differentiate the wrong tensor with matching shapes and no error.
+
+### Fixed
+
+- **Metal MPS matmul crashed when two threads encoded the same shape.** The
+  `(m, k, n, transposeA, transposeB)` kernel cache handed the *same*
+  `MPSMatrixMultiplication` to every caller, and that object mutates itself
+  while encoding (`setIndexingArithmaticTypeMask:sourceArrays:…`). Two threads
+  encoding concurrently raced inside MPS and took `EXC_BAD_ACCESS` in
+  `MPSNDArrayMultiaryBase` — an Apple frame, with nothing in rlx's own stack
+  looking wrong, which is why the existing `CACHE_GUARD` comment reads as if the
+  case were covered. It was not: that `RwLock` keeps a cached pointer *alive*
+  across an encode (against `invalidate_caches` freeing it), which is a lifetime
+  guarantee, not an exclusivity one.
+
+  The cache is now keyed by thread as well as shape, so concurrent encodes still
+  overlap — the property the `RwLock` design was chosen for, where a mutex around
+  the encode would have serialized them — and the hit rate for the case that
+  motivated the cache (recurring shapes on one encode thread) is unchanged. The
+  map stays global rather than becoming `thread_local!` so `invalidate_caches`
+  can still release every live kernel; entries for finished threads linger until
+  the next invalidate, which runs on every compile and on
+  `MetalExecutable::drop`.
+
+  Found because `metal_q2_0_fused_decode_parity`'s three tests run in parallel:
+  5/5 SIGSEGV before, 0/5 after. It is deterministic with ≥2 threads on one
+  shape, and is *not* the intermittent MPSGraph compile crash — it reproduces
+  with `RLX_DISABLE_MPSGRAPH_EXECUTABLE=1`, and the faulting frame is
+  `MPSNDArrayMultiaryKernel`, not `MPSGraphExecutable`.
+
+  Regression test: `rlx-metal/tests/mps_matmul_concurrency.rs` — half the threads
+  hammer one shared shape (one cache key, maximal contention), half insert
+  distinct keys concurrently, and every result is checked against a CPU
+  reference rather than only checked for survival, since a corrupted kernel can
+  return a plausible wrong answer instead of a signal. It SIGSEGVs with the
+  `ThreadId` removed from the key, and passed 15/15 with it.
+
+- **webgl read the wrong row of the RoPE cos/sin tables under partial
+  rotation.** It derived the table row stride as `n_rot/2` while the rest of the
+  stack moved to taking it from the table's own last dimension. The two differ
+  exactly when `n_rot < head_dim`, and the layout is a per-model choice — Qwen3.5
+  allocates `[max_pos, head_dim/2]` and uses the leading `n_rot/2` columns of
+  each row, DeepSeek-V4 MLA packs `[.., n_rot/2]` tight — so *any* derived stride
+  is wrong for one of them. Every position past the first picked up another
+  token's angles. Caught by `rlx-webgl/tests/ops2_parity.rs::rope_full_and_partial`.
+
+- **`Op::GatedDeltaNetBackward` was unreachable on five of the eight backends
+  that run the forward.** CPU, Metal and MLX have the fused kernel; CUDA, ROCm,
+  wgpu, TPU and CoreML run `Op::GatedDeltaNet` but not its backward — and the
+  gradient walk emits the backward op by default. The only escape was setting
+  `RLX_GDN_UNFUSE_FOR_AD=1`, a global env flag answering a per-backend question,
+  and it has to be set *upstream of autodiff*, so a caller who reaches the error
+  has already built the wrong graph.
+
+  It now decomposes like every other fused backward op, through
+  `decompose_backward_ops_except` in `rewrite_for_backend` — automatically, and
+  only for a backend that does not claim the kind. The decomposition does not
+  re-derive the reverse scan by hand: it rebuilds the forward from the backward
+  node's own inputs, unrolls it and differentiates *that*, so it is the
+  `RLX_GDN_UNFUSE_FOR_AD` path reconstructed at the backend boundary rather than
+  chosen globally beforehand — and it agrees with the fused kernel by
+  construction, since the unrolled path is what that kernel is already pinned
+  against. Measured agreement **≤ 6e-8** across both gate modes and both state
+  modes (`rlx-autodiff/tests/gated_delta_net_backward_decompose.rs`), and
+  **2.2e-8** through the real `rewrite_for_backend` path
+  (`rlx-runtime/tests/gdn_backward_backend_fallback.rs`). A backend listing the
+  kind in `supported_ops` still keeps the fused kernel; the decomposition is
+  ~32× slower and is the fallback, not the default.
+
+  `gpu_family_supports` also stopped answering `true` for everything on the
+  CUDA/ROCm/wgpu family and now consults the per-backend `SUPPORTED_OPS`, so a
+  caller gets the chance to pick a fallback instead of a compile-time
+  unsupported-op error.
+
+- **`jvp` re-declared a tangent input the graph already had, so `jvp(hvp(f))`
+  returned zero instead of the third derivative.** `jvp` mirrors the forward
+  graph verbatim — including its leaves — then adds an `Op::Input` named
+  `tangent_<name>`. `hvp` *is* a `jvp`, so its result always already has that
+  name, and forward-over-reverse-over-reverse collided every time. Nothing
+  errored: binding is by name and reaches a single node, so the second
+  declaration was never bound, read zeros, and the derivative came back exactly
+  zero. This had been read as the composition being unsupported and was
+  documented as such ("the outer `jvp` graph is still not AD-ready for another
+  pass"); the cause was narrower than that.
+
+  The outer tangent is now `tangent_<name>_2` (first free suffix), and
+  `jvp_with_tangent_names` returns the names actually used rather than making
+  callers guess either spelling. `jvp(hvp(f))` now yields the correct third
+  derivative — verified against `∂(H·v)/∂x·w = 24xvw` on `Σxᵢ⁴`, which also
+  pins the Hessian-vector product at the same time
+  (`rlx-runtime/tests/jvp_over_hvp_third_order.rs`).
+
+- **`Q2_0` was registered on wgpu and CUDA with no kernel branch — weights read
+  as zeros.** `dequant_gguf.{msl,cu,wgsl}` are `if (scheme_id == N) { … return; }`
+  chains with no default branch, and schemes reach them through the shared
+  `define_gguf_gpu_dequant_ids!` table. An id in that table with no matching
+  branch does not raise: the kernel writes nothing. `tests/pestle_schemes_all_backends.rs`
+  now requires every backend to match the CPU reference for both schemes the
+  Pestle-27B model needs.
+
+- **Host steps that rewrite the whole arena left `HostTensorCache` stale.**
+  Host fallbacks come in two families: *cache-aware* steps (`HostOp`,
+  `Conv2dHost`, `ExpandHost`, `NarrowHost`, `TransposeHost`, `ConcatHost`,
+  `BufferCopy`) that read and write through the host mirror, and *whole-arena*
+  steps (everything routed via `rlx_gpu_host::with_whole_arena` — `GroupNormHost`,
+  `LayerNorm2dHost`, `ReverseHost`, `GruHost`, `RnnHost`, `MsDeformAttnHost`, …)
+  that read the device and rewrite the arena directly. The second kind got the
+  mirror flushed *before* it ran but nothing invalidated it *after*, so a
+  following cache-aware step could serve a pre-step copy of a region the
+  whole-arena step had just overwritten. `host_cache.clear()` is only reached
+  after real GPU work (`pass_dispatched`), and a run of consecutive host steps
+  never gets there. It needed a dead tensor whose arena slot the whole-arena
+  step reused, plus both families adjacent in one schedule — which in practice
+  meant discrete NVIDIA, where elementwise, conv and norms are all hosted.
+  Regression test: `tests/host_stage_cache_parity.rs` (uses
+  `RLX_WGPU_FORCE_HOST=1`, so it reproduces on any adapter).
+
+- **wgpu `Op::GroupNorm` disagreed with every other backend once the norm had a
+  consumer.** The op lowered to `Step::GroupNormHost`, which mirrors the *whole
+  arena* to the CPU and back. Read in isolation the result looked right — an
+  isolated `GroupNorm` matched CPU to 1e-7 at every group count and shape — but
+  a truncation sweep over a 225-layer MobileNet put the first divergence
+  immediately after a norm (34 of 96 hash bits, max|Δ| 0.15), i.e. the staged
+  writeback was not what the next kernel read. Now lowered to a native WGSL
+  kernel, so the default route no longer stages at all. The staging fault
+  itself is fixed separately (below), so `RLX_WGPU_HOST_NORM=1` and
+  virtually-sharded arenas are correct too.
+- **Fusion passes could delete a node that is a graph output.** `has_single_use`
+  — documented as "the precondition almost every fusion pattern checks before
+  absorbing a producer into its consumer" — counted only consuming *nodes*. A
+  value that is consumed once *and* exported as a graph output looked absorbable,
+  so the pass skipped it during the rewrite without recording a replacement and
+  `Rewriter::finish` panicked mapping the outputs (`no entry found for key`).
+
+  `has_single_use` now also requires that the node is not a graph output, and
+  `UseCounts::is_graph_output` exposes the test. `FuseSwiGLU` and
+  `FuseSwiGLUDualMatmul` were switched onto it; the latter also checked only one
+  of the three nodes it absorbs, so the two matmuls could be dropped even with
+  another consumer. Several passes (`ada_layer_norm`, `gated_residual`,
+  `rmsnorm_reshape`, `attention_block`, `residual_ln`, `residual_rmsnorm`)
+  already guarded this explicitly — the hazard was known, just applied
+  inconsistently.
+
+  Ordinary model graphs rarely export an interior value, which is why this went
+  unnoticed. Any graph that publishes activations as outputs hits it at once:
+  `split_vjp`'s save half, or an instrumentation tap.
+
+- **A fusion pass could silently zero gradient terms.** `Rewriter::copy_node`
+  re-copied nodes that `ensure_mapped` had already hoisted to a fusion site,
+  emitting a second node for one original and repointing `id_map` at it. For
+  `Op::Param` that is silent corruption rather than wasted work: binding is by
+  name and reaches a single node, so the duplicate kept the arena's zeros and
+  every value flowing through it vanished — no shape error, no missing-input
+  error, just a wrong answer.
+
+  A **forward** graph never showed it, because the fused-away consumer was the
+  weight's only reader and the duplicate was dead code. A **backward** graph
+  did: `grad_with_loss` mirrors the forward alongside the gradient ops, so a
+  weight is read twice — once by the mirrored matmul, once by `dX = dY · Wᵀ` —
+  and the duplicate was live. Any backward graph whose forward had several
+  matmuls sharing an input (a fused QKV or in-projection — i.e. most decoders)
+  lost the gradient terms through the hoisted weights.
+
+  Found in a Qwen3.5 gated-delta-net block, where it erased *all* cross-position
+  gradient while leaving the same-position gradient exactly right. `copy_node`
+  is now idempotent. `Rewriter` backs ten fusion passes, so the fix is not
+  specific to `FuseSharedInputMatMul`. Regression tests:
+  `rlx-fusion/tests/rewriter_no_duplicate_leaves.rs` (structural) and
+  `rlx-autodiff/tests/fused_shared_input_matmul_grad.rs` (gradients with fusion
+  on vs off); both fail without the fix.
+
+### Performance
+
+- **Metal simdgroup decode GEMVs for the remaining hot K-quants.** Decode is
+  weight-streaming — every token reads the whole model once, so a GEMV kernel's
+  achieved GB/s *is* the token rate. Q5_K was the last hot K-quant still on the
+  one-thread-per-row kernel, which is occupancy-starved: 90 GB/s at n=17408 and
+  19 GB/s at n=1024, against ~200 / ~120 for Q4_K and Q6_K. `q5k_mv_f32_sg` has
+  32 threads cooperate per output row via `simd_sum`; Q3_K and Q4_1 get the same
+  treatment. Both kernels dequantize identically and differ only in summation
+  order, so the parity test uses a relative tolerance rather than equality.
+  Per-kernel off-switches (`RLX_METAL_Q5K_SG_DISABLE`, `_Q3K_`, `_Q41_`) keep the
+  scalar path reachable for A/B.
+
+  All four Q2_0 GEMVs now share one 16-bit `q2_0_dot16` inner loop, which is why
+  `metal_q2_0_fused_decode_parity.rs` exists: `q2_0_dual_mv_f32_sg`,
+  `q2_0_swiglu_mv_f32_sg` and `q2_0_mv_residual_f32_sg` are reached only by
+  pattern-fusion of a decode MLP and had no test at all, so a mistake in the
+  shared loop would have shown up only in `q2_0_mv_f32_sg`. The reference is
+  computed on the host in exact f32.
+
+  `tests/gemv_bandwidth.rs` measures achieved GB/s per kernel directly at a 27B
+  FFN shape — a whole-model benchmark cannot, because at model scale the number
+  is confounded by paging and on a small model everything is launch-bound.
+
+- **Metal fused ggml `L2_NORM`.** Collapses the
+  `mul → sum(last) → sqrt → max(·, eps) → div` chain `rlx_qwen35`'s `l2_norm`
+  emits into a single `L2NormLastDim` dispatch. Gated-DeltaNet runs it twice per
+  linear layer, so it is 36×/token on a Qwen3.5 block. Off-switch
+  `RLX_METAL_FUSE_L2NORM=0`, which the parity test uses to run fused, unfused and
+  CPU against each other.
+
+- **CUDA warp-per-row Q4_K decode GEMV (`RLX_CUDA_Q4K_GEMV_WARP=1`, opt-in).**
+  One warp per output row with lanes splitting each super-block's 256 elements,
+  8 warps per block. Full occupancy at small `k`, unlike the block-per-row coop
+  kernel which idles all but `k/256` lanes.
+
+- **wgpu `Op::GroupNorm` — 88× on a 35-norm MobileNet (1096 ms → 12.4 ms per
+  forward).** The host fallback moved ~83 MB each way per norm; the new
+  `group_norm.wgsl` runs one workgroup per `(batch, group)` with a
+  shared-memory tree reduction and the same stable two-pass variance as
+  `layernorm.wgsl`. Covers `num_groups == C` (instance norm), `num_groups == 1`
+  and the general case.
+
+- **Metal `Op::GatedDeltaNetBackward` — 5.7× over CPU on a real block.** The op
+  had a CPU kernel only, so every other backend fell back to unrolling the time
+  loop. Metal now has its own.
+
+  The kernel is **threadgroup-cooperative**: one threadgroup per `(batch, head)`
+  with `state_size` threads inside it. A first version used one *thread* per
+  `(batch, head)` — the same shape as the forward's default kernel — and was
+  **3.7× slower than CPU**, because that is only `batch·heads` threads (256 at
+  the lens's batch) and leaves the GPU almost entirely idle. That is the lesson
+  the forward already learned with `gated_delta_net_sg`. Making it cooperative
+  was **19.6×** on its own (replay 31.2 s → 1.59 s over 64 passes).
+
+  Phases alternate between row-parallel and column-parallel over the state, so
+  every reduction stays thread-local — a row phase walks `ds[tid·n + j]`
+  contiguously, a column phase walks `ds[i·n + tid]` so neighbouring threads
+  touch neighbouring addresses. Only dβ and the per-head dg need a cross-thread
+  sum.
+
+  On a Qwen3.5-0.8B gated-delta-net block (1024×1024 Jacobian, 64 cotangents):
+  **8.5 s on CPU → 1.5 s on Metal**; an attention block goes 1.3 s → 0.3 s.
+  Verified against the CPU kernel — itself finite-difference-verified — for both
+  gate modes and with a carried state, agreeing to **6e-8**
+  (`rlx-metal/tests/gated_delta_net_backward_parity.rs`).
+
+  The state history costs `(seq + 2) · n²` floats per `(batch, head)` of
+  ephemeral scratch, sized by `gdn_ephemeral_state_bytes` alongside the
+  forward's. Reconstructing states backwards instead, by dividing out
+  `exp(g) < 1`, would remove that but amplifies rounding without bound.
+
+- **`rlx_autodiff::split_vjp` — run the forward once, replay the gradient per
+  cotangent.** `grad_with_loss` mirrors the whole forward into the backward
+  graph so gradient kernels can recompute activations. That is right for
+  training and wrong for anything sweeping many cotangents over one forward —
+  a Jacobian taken a block of output dimensions at a time, per-sample
+  gradients, influence functions — where the forward is recomputed once per
+  cotangent. PyTorch's `retain_graph` covers that case; a graph has no tape to
+  retain.
+
+  `split_vjp` cuts the backward graph in two. The cut is structural, needing no
+  cooperation from the gradient walk: a node belongs to the gradient half
+  exactly when it is reachable from `d_output`. Saved activations cross as
+  `Op::Param`, not `Op::Input` — parameters are bound once and persist, so `N`
+  replays cost one bind rather than `N` feeds of the same bytes. Forward leaves
+  the gradient half reads are copied rather than round-tripped through the host.
+
+  Measured on a Qwen3.5-0.8B attention block (1024×1024 Jacobian, 64 cotangents
+  over one forward): **2.7 s → 1.3 s**. Roughly neutral on a gated-delta-net
+  block, where the fused backward had already made the forward cheap relative to
+  the gradient work — 151 ms of forward against 8.3 s of replay.
+
+- **`Op::GatedDeltaNet` now has a dedicated backward — ~5.6× on a real
+  gated-delta-net block, and the op alone was ~32× off.** Autodiff previously
+  unfused the op, unrolling its time loop into per-timestep primitives so the
+  gradient walk could reach their existing VJPs. At Qwen3.5-0.8B shapes
+  (`B=16 S=24 H=16 N=128`) that is 585 nodes running **254.84 ms** against
+  **8.04 ms** for the fused kernel, same checksum. The cost is structural rather
+  than dispatch overhead: in SSA form every timestep materializes a fresh
+  `[B·H, N, N]` state — 16.8 MB here — while the kernel updates one working set
+  in place.
+
+  New `Op::GatedDeltaNetBackward` computes every input gradient from one reverse
+  scan, with a CPU kernel and a VJP rule that slices its packed output back into
+  per-input gradients (`rlx_ir::GdnBackwardLayout` owns the packing, shared by
+  the rule and the kernel so they cannot drift). `unfuse_fused_for_autodiff`
+  leaves the op fused by default; `RLX_GDN_UNFUSE_FOR_AD=1` restores the unrolled
+  decomposition for a backend that runs the forward but not yet the backward.
+
+  Measured on a Qwen3.5-0.8B gated-delta-net block: a 1024×1024 per-block
+  Jacobian went **47.0 s → 8.4 s**, closing the gap to an attention block from
+  19× to 3.1×, with the fitted Jacobian unchanged to the last reported digit.
+
+  Verified three ways: the kernel against finite differences for both gate modes
+  (worst 8.7e-6, `rlx-cpu` `gdn::backward_tests`); the fused path against the
+  unrolled one it replaces, which is itself finite-difference-verified (worst
+  **4.5e-8**, `rlx-autodiff/tests/gated_delta_net_fused_backward.rs`); and
+  end-to-end through `gated_delta_net_vjp_fd.rs`, including the cross-position
+  recurrence and causality.
+
+- **Smaller `GatedDeltaNet` unfusing.** The unrolled fallback held its state as
+  `[BH, N, N]` throughout instead of round-tripping to `[B, H, N, N]` six times
+  per timestep, and broadcasts `exp(g)` / `beta` / the readout scale rather than
+  expanding them to state size first — which also moves `exp` off a state-sized
+  tensor. Backward-graph tensor output drops 12.87 GB → 6.82 GB at the shapes
+  above (`Reshape` 4976 → 141 MB), numerics unchanged. Note this did **not**
+  change wall-clock on CPU, where those reshapes were free views; it is a
+  smaller graph, not a faster one.
+
 ## [0.2.14] — 2026-08-11
 
 ### Changed
@@ -2052,7 +3751,9 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.14...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.16...HEAD
+[0.2.16]: https://github.com/MIT-RLX/rlx/compare/v0.2.15...v0.2.16
+[0.2.15]: https://github.com/MIT-RLX/rlx/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/MIT-RLX/rlx/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/MIT-RLX/rlx/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/MIT-RLX/rlx/releases/tag/v0.2.12

@@ -94,7 +94,7 @@ fn preload_real_cudnn() {
     use std::path::PathBuf;
 
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = std::env::var("RLX_CUDNN_DIR") {
+    if let Some(d) = rlx_ir::env::var("RLX_CUDNN_DIR") {
         dirs.push(PathBuf::from(d));
     }
     for var in ["CONDA_PREFIX", "VIRTUAL_ENV"] {

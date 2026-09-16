@@ -60,26 +60,26 @@ Maps to runtime `CompileOptions` via [`ModelExecutionConfig`] + model-builder `f
 
 ## Execution variant (shader-component pattern)
 
-[`ModelComponent`](../../rlx-ir/src/component.rs) in `rlx-ir` bundles variant, kernel dispatch,
+[`ModelComponent`](../rlx-ir/src/component.rs) in `rlx-ir` bundles variant, kernel dispatch,
 compilation mode (eager/lazy/AOT), profile key, quant, and layer-composition fingerprint.
 [`ModelExecutionConfig`](src/execution.rs) pairs that component with an [`ExecutionPreset`].
 
-Three-step host compile ([`ModelCompilePipeline`](../../rlx-runtime/src/model_pipeline.rs)):
+Three-step host compile ([`ModelCompilePipeline`](../rlx-runtime/src/model_pipeline.rs)):
 
 1. `build_template()` — symbolic HIR → LIR template  
 2. `specialize_template(binding)` — concrete shapes + buffer plan  
 3. `compile_lir()` — backend executable  
 
 Use `get_or_compile_component` / `binding_manifest_for_component` for specialized layouts.
-[`BindingManifest::weight_blocks`](../../rlx-ir/src/binding_manifest.rs) groups params by prefix.
+[`BindingManifest::weight_blocks`](../rlx-ir/src/binding_manifest.rs) groups params by prefix.
 
-Reflection: [`ModelReflection`](../../rlx-runtime/src/reflect.rs) (`load_hir_template`, `layout_for_component`).
+Reflection: [`ModelReflection`](../rlx-runtime/src/reflect.rs) (`load_hir_template`, `layout_for_component`).
 
 Stage interfaces: [`AttentionStage`](src/stage_interfaces.rs), [`FfnStage`](src/stage_interfaces.rs), [`NormStage`](src/stage_interfaces.rs).
 
 Composite stacks: [`LayerComposition`](src/composite.rs) (`Homogeneous` / `Pair` — Slang light-array pattern).
 
-HIR extensions: [`FlowExtensionPlan`](src/extension.rs) + [`rlx_ir::hir_extension`](../../rlx-ir/src/hir_extension.rs).
+HIR extensions: [`FlowExtensionPlan`](src/extension.rs) + [`rlx_ir::hir_extension`](../rlx-ir/src/hir_extension.rs).
 
 Attention interfaces: [`AttentionStage`](src/stage_interfaces.rs) on
 [`SelfAttnPrefillStage`](src/blocks/self_attn.rs),
@@ -87,7 +87,7 @@ Attention interfaces: [`AttentionStage`](src/stage_interfaces.rs) on
 [`Qwen3DecodeLayerStage`](src/blocks/qwen3_decode_layer.rs) via [`attention_stage.rs`](src/blocks/attention_stage.rs).
 
 Qwen35 runner: `Qwen35CompileCache::with_aot` in the in-tree Qwen3.5 builder +
-[`CompilationMode::Aot`](../../rlx-ir/src/component.rs) persist specialized LIR to disk.
+[`CompilationMode::Aot`](../rlx-ir/src/component.rs) persist specialized LIR to disk.
 
 ## Multi-stream models (FLUX, …)
 

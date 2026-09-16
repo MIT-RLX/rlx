@@ -18,12 +18,16 @@ use rlx_fusion::lower_dot_general::LowerDotGeneral;
 use rlx_fusion::lower_fake_quantize::LowerFakeQuantize;
 use rlx_fusion::lower_fma::LowerFma;
 use rlx_fusion::lower_histogram::LowerHistogram;
+use rlx_fusion::lower_kv_append::LowerKvAppend;
 use rlx_fusion::lower_logical_kernels;
 use rlx_fusion::lower_loss_ops::LowerSoftmaxCrossEntropy;
 use rlx_fusion::lower_pad::LowerPad;
 use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
+use rlx_fusion::lower_roll::LowerRoll;
 use rlx_fusion::lower_scaled_grouped_matmul::LowerScaledGroupedMatMul;
+use rlx_fusion::lower_scatter_add::LowerScatterAddAxis;
 use rlx_fusion::lower_slice::LowerSlice;
+use rlx_fusion::lower_softmax::LowerSoftmaxAxis;
 use rlx_fusion::lower_spectral::LowerSpectral;
 use rlx_fusion::lower_spline_activation::LowerSplineActivation;
 use rlx_fusion::lower_spline_backward::LowerSplineActivationBackward;
@@ -96,6 +100,7 @@ fn needs_backward_decompose(bad: &HashSet<OpKind>) -> bool {
                 | ScanBackwardXs
                 | AdaLayerNormBackward
                 | GatedResidualBackward
+                | GatedDeltaNetBackward
         )
     })
 }
@@ -227,6 +232,31 @@ pub fn rewrite_for_backend_with_config(
     // early-out so decomposition reaches the standalone/codegen paths too.
     graph = lower_custom_ops(graph);
 
+    // Normalize `Op::ScatterAdd` to the axis-0, f32-index form every backend
+    // kernel actually implements. This must run before the `supported`
+    // early-outs: every backend *claims* `OpKind::ScatterAdd`, so the op never
+    // appears in `bad` and the legalization loop below would never see it —
+    // a graph with `axis: 2` would reach a kernel that scatters along axis 0
+    // and silently produce the wrong tensor. Self-gating: one scan, and the
+    // canonical case returns the graph untouched.
+    graph = LowerScatterAddAxis.run(graph);
+
+    // Same reasoning for Softmax: every backend claims it, so legalization
+    // never fires, and every backend's kernel reduces contiguous runs — which
+    // is the innermost axis and nothing else. Asked for any other axis the
+    // kernel groups the wrong elements and returns a plausible tensor with no
+    // error. Self-gating on the canonical form.
+    graph = LowerSoftmaxAxis.run(graph);
+
+    // Shape-driven, not capability-driven, so it runs BEFORE the early return
+    // that fires when a backend supports everything: a `KvAppend` whose output
+    // cannot alias the cache (anything before `axis` with extent > 1, i.e.
+    // batch > 1) must go back to narrow + concat even on a backend with the
+    // native row write, because the aliased prefix of a strided buffer is a
+    // different tensor. Batch-1 decode is untouched — which is exactly why this
+    // needs a shape guard rather than a capability one.
+    graph = LowerKvAppend::NON_ALIASABLE.run(graph);
+
     if supported.is_empty() {
         return graph;
     }
@@ -259,6 +289,23 @@ pub fn rewrite_for_backend_with_config(
         if bad.contains(&OpKind::Slice) {
             // Non-native backends lower strided slice to narrow/reverse/gather.
             apply(&mut graph, &mut changed, &LowerSlice);
+        }
+        if bad.contains(&OpKind::KvAppend) {
+            // CPU/Metal/CUDA/ROCm/wgpu/Vulkan claim `OpKind::KvAppend` and keep
+            // the O(1) single-row write; MLX (and any backend that does not
+            // claim it) gets narrow + concat here.
+            //
+            // Without this the op was unusable by any portable model: a graph
+            // containing it could not run on CPU at all, so model crates stayed
+            // on `Concat` everywhere — including the three backends that have
+            // the fast path. Carbon-500M decode on Metal spends 36.9% of its
+            // GPU time in exactly that concat, as much as every matmul combined.
+            apply(&mut graph, &mut changed, &LowerKvAppend::ALL);
+        }
+        if bad.contains(&OpKind::Roll) {
+            // No backend claims `OpKind::Roll`, so this always fires when a
+            // graph contains one: cyclic shift becomes narrow + concat.
+            apply(&mut graph, &mut changed, &LowerRoll);
         }
         if bad.contains(&OpKind::AxialRope2d) {
             // Non-native backends lower SAM2 axial 2-D RoPE to a constant-table

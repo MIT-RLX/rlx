@@ -1,6 +1,11 @@
 #version 450
-// RoPE backward (NeoX rotate-half pairing). One invocation per element of dx.
-// Cos/sin table rows indexed by seq position; dims [n_rot, head_dim) pass through.
+// RoPE backward. One invocation per element of dx. Cos/sin table rows indexed
+// by seq position; dims [n_rot, head_dim) pass through.
+//
+// `style` selects the pairing, exactly as in the forward `rope.comp`: 0 = NeoX
+// (lane i with lane i + n_rot/2), 1 = GptJ (adjacent lanes 2i / 2i+1, the GGUF
+// convention). This kernel was NeoX-only while the forward already honoured the
+// style, so every GptJ rotation received a NeoX adjoint.
 layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PC {
@@ -14,6 +19,7 @@ layout(push_constant) uniform PC {
     uint sin_off;
     uint dx_off;
     uint cos_len;
+    uint style;
 } pc;
 
 void main() {
@@ -35,7 +41,20 @@ void main() {
     uint dy_base = pc.dy_off + bi * pc.seq * pc.hidden + si * pc.hidden + hi * pc.head_dim;
     uint dx_base = pc.dx_off + bi * pc.seq * pc.hidden + si * pc.hidden + hi * pc.head_dim;
 
-    if (d < rot_half) {
+    if (pc.style != 0u) {
+        // GptJ: one invocation per PAIR — the even lane writes both halves.
+        if (d < pc.n_rot && (d & 1u) == 0u) {
+            uint j = d >> 1u;
+            float y1 = arena_load(dy_base + 2u * j);
+            float y2 = arena_load(dy_base + 2u * j + 1u);
+            float c = arena_load(pc.cos_off + tab_off + j);
+            float s = arena_load(pc.sin_off + tab_off + j);
+            arena_store(dx_base + 2u * j, y1 * c + y2 * s);
+            arena_store(dx_base + 2u * j + 1u, -y1 * s + y2 * c);
+        } else if (d >= pc.n_rot) {
+            arena_store(dx_base + d, arena_load(dy_base + d));
+        }
+    } else if (d < rot_half) {
         float y1 = arena_load(dy_base + d);
         float y2 = arena_load(dy_base + rot_half + d);
         float c = arena_load(pc.cos_off + tab_off + d);

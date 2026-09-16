@@ -25,7 +25,7 @@ impl Array {
     /// on the buffer, so leaking responsibility stays with the caller.
     ///
     /// Use case: training-loop params that live in a stable host-side
-    /// buffer (e.g. `ParamState::data`). Pairs with [`MlxExecutable`]'s
+    /// buffer (e.g. `ParamState::data`). Pairs with [`crate::MlxExecutable`]'s
     /// `params_view` storage which holds a `Vec<f32>` per param —
     /// `set_param` memcpys into the Vec without reallocating (the Vec
     /// is sized once at first use), then `run_compiled` constructs
@@ -162,6 +162,51 @@ impl Array {
 
     pub(crate) fn from_raw(ptr: *mut mlx_array_t) -> Self {
         Self { ptr }
+    }
+
+    /// Copy `nelems` elements from `src` at `src_elem_off` into **this array's
+    /// buffer** at `dst_elem_off`, in place.
+    ///
+    /// Offsets and length are ELEMENTS, not bytes: the shim scales them by the
+    /// array's own `itemsize()`, so an F16 or BF16 cache strides correctly
+    /// without Rust having to carry a dtype it does not currently track.
+    ///
+    /// This is the MLX stand-in for the device-side single-row KV write the
+    /// other backends do (rlx-cuda / rlx-rocm D2D, rlx-metal / rlx-vulkan
+    /// in-arena memcpy). MLX's array API is value-semantic and has no in-place
+    /// row write: `slice_update` returns a new array and its `eval_gpu` copies
+    /// the *whole* input first, with no donation path, so the obvious
+    /// functional spelling costs O(cache capacity) per layer per token.
+    ///
+    /// # Aliasing
+    ///
+    /// The write is visible through **every** handle sharing this buffer,
+    /// including ones obtained via [`Self::clone_handle`] (which shares, not
+    /// copies). That is the point for a persistent KV cache and a bug for
+    /// anything else — do not reach for this to "update" a value someone else
+    /// still holds as a value.
+    ///
+    /// Both arrays must be row-contiguous and share a dtype; the shim
+    /// evaluates both first, which is also the barrier that makes pending GPU
+    /// writes visible.
+    pub fn copy_row_inplace(
+        &mut self,
+        dst_elem_off: usize,
+        src: &Array,
+        src_elem_off: usize,
+        nelems: usize,
+    ) -> Result<(), MlxError> {
+        let _guard = crate::sync::runtime_guard();
+        let rc = unsafe {
+            ffi::rlx_mlx_array_copy_row_inplace(
+                self.ptr,
+                dst_elem_off,
+                src.ptr,
+                src_elem_off,
+                nelems,
+            )
+        };
+        check(rc)
     }
 
     /// Clone the array handle. Cheap — bumps the underlying

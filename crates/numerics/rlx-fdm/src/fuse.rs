@@ -158,7 +158,7 @@ impl FusedAutodiffFormFinding {
     }
 }
 
-/// Run [`crate::optimize::constrained_fdm_host`] with a fused MIR equilibrium runner.
+/// Run `optimize::constrained_fdm_host` with a fused MIR equilibrium runner.
 pub fn try_constrained_fdm_fused(
     network: &Network,
     goals: &[Goal],

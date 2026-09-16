@@ -779,9 +779,11 @@ fn encode_thunk_into_icb(
             src_row_stride,
             cos_per_token,
             interleaved,
+            cos_row_stride,
             ..
         } => {
-            // Layout: [batch, seq, hidden, head_dim, src_row_stride, seq_stride, n_rot, cos_per_token, interleaved]
+            // Layout: [batch, seq, hidden, head_dim, src_row_stride, seq_stride,
+            //          n_rot, cos_per_token, interleaved, cos_row_stride]
             write_u32s(&[
                 *batch,
                 *seq,
@@ -792,6 +794,7 @@ fn encode_thunk_into_icb(
                 *n_rot,
                 *cos_per_token as u32,
                 *interleaved as u32,
+                *cos_row_stride,
             ]);
             cmd.set_compute_pipeline_state(&k.rope);
             cmd.set_kernel_buffer(0, Some(&**arena), *src as u64);
@@ -807,6 +810,7 @@ fn encode_thunk_into_icb(
             cmd.set_kernel_buffer(10, Some(&**constants_buf), cb_arg(6));
             cmd.set_kernel_buffer(11, Some(&**constants_buf), cb_arg(7));
             cmd.set_kernel_buffer(12, Some(&**constants_buf), cb_arg(8));
+            cmd.set_kernel_buffer(13, Some(&**constants_buf), cb_arg(9));
             let nh = *hidden / *head_dim;
             let grid = MTLSize {
                 width: *head_dim as u64,

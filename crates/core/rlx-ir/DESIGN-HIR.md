@@ -23,8 +23,8 @@ Fusion is a **first-class citizen** at every stage:
 - **LIR** — optimized MIR + [`LirBufferPlan`]. [`CompileResult`] in
   `rlx_opt` bundles LIR + fusion diagnostics for backends.
 
-[`CompilePipeline`](../../rlx-compile/src/compiler.rs) wires the stages.
-[`rlx_runtime::stages`](../../rlx-runtime/src/stages.rs) connects
+[`CompilePipeline`](../rlx-compile/src/compiler.rs) wires the stages.
+[`rlx_runtime::stages`](../rlx-runtime/src/stages.rs) connects
 devices to fusion targets. Backends implement [`Backend::compile_hir`]
 and [`Backend::compile_lir`].
 

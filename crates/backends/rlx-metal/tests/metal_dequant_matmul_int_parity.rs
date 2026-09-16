@@ -19,7 +19,7 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 fn run_case(scheme: QuantScheme, m: usize, k: usize, n: usize, block: usize) {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

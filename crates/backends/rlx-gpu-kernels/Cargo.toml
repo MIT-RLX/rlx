@@ -13,6 +13,13 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 
+[dependencies]
+# Tile parameters + the dispatch table live in their own dependency-free
+# crate so Metal/wgpu can share them without linking these .cu sources.
+rlx-gpu-dispatch = { workspace = true }
+# For `schedule_port`: the typed schedule this crate's matmul.cu is described by.
+rlx-ir = { workspace = true }
+
 [build-dependencies]
 # Generates the shared unary/activation CUDA switch from the scalar-expression
 # manifest (single source across backends; native `erff` on this target).
@@ -22,6 +29,15 @@ rlxsl = { workspace = true }
 default = []
 # AMD-only rocWMMA matmul (`kernels/rocm/matmul_mfma.cu`).
 rocm = []
+# Generate the `matmul` CUDA entry FROM a `rlx_ir::kernel_schedule::KernelSchedule`
+# instead of templating `kernels/matmul.cu`. Off by default: the shipping path
+# stays the hand-written text until the emitted kernel has been measured to be
+# at least as fast on the target in question. See `kernel_schedule_emit`.
+schedule-codegen = []
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

@@ -15,7 +15,7 @@ pub const DEFAULT_HF_MLX_REPO: &str = "mlx-community/SmolLM2-135M-Instruct-4bit"
 
 /// Resolve cache dir: `$RLX_HF_CACHE` or `$HOME/.cache/rlx/hf`.
 pub fn hf_cache_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("RLX_HF_CACHE") {
+    if let Some(p) = rlx_ir::env::var("RLX_HF_CACHE") {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -23,7 +23,7 @@ pub fn hf_cache_dir() -> PathBuf {
 }
 
 fn hub_base(repo: &str) -> String {
-    let rev = std::env::var("RLX_HF_REVISION").unwrap_or_else(|_| "main".into());
+    let rev = rlx_ir::env::var("RLX_HF_REVISION").unwrap_or_else(|| "main".into());
     format!("https://huggingface.co/{repo}/resolve/{rev}")
 }
 
@@ -100,7 +100,7 @@ pub fn fetch_mlx_community(repo: &str, dest_dir: impl AsRef<Path>) -> Result<Pat
 
 /// Fetch [`DEFAULT_HF_MLX_REPO`] (or `$RLX_HF_MLX_REPO`) into the cache.
 pub fn fetch_default_mlx_community() -> Result<PathBuf> {
-    let repo = std::env::var("RLX_HF_MLX_REPO").unwrap_or_else(|_| DEFAULT_HF_MLX_REPO.into());
+    let repo = rlx_ir::env::var("RLX_HF_MLX_REPO").unwrap_or_else(|| DEFAULT_HF_MLX_REPO.into());
     let dest = hf_cache_dir().join(repo.replace('/', "--"));
     fetch_mlx_community(&repo, &dest)
 }

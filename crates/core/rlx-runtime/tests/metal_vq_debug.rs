@@ -9,6 +9,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
     for x in xs {
@@ -39,6 +41,7 @@ fn run(dev: Device, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) -> Vec<Vec<f32>> 
 
 #[test]
 fn argmin_isolated() {
+    let _gpu = common::serialize_gpu();
     let build: &dyn Fn(&mut Graph) -> Vec<NodeId> = &|g| {
         let d = const_f32(
             g,
@@ -57,6 +60,7 @@ fn argmin_isolated() {
 
 #[test]
 fn vq_dist_isolated() {
+    let _gpu = common::serialize_gpu();
     // Reproduce vector_quantize's L2 dist proxy and expose it + argmin.
     let build: &dyn Fn(&mut Graph) -> Vec<NodeId> = &|g| {
         let cb = const_f32(g, &[0.0, 0.0, 10.0, 0.0, 0.0, 10.0], &[3, 2]);
@@ -86,6 +90,7 @@ fn vq_dist_isolated() {
 /// computing `rhs OP lhs` for the non-commutative `Sub`/`Div`/`Pow`.
 #[test]
 fn noncommutative_lhs_broadcast_parity() {
+    let _gpu = common::serialize_gpu();
     let cases: &[(&str, &dyn Fn(&mut Graph) -> Vec<NodeId>)] = &[
         ("sub_row_lhs_broadcast", &|g| {
             let a = const_f32(g, &[10.0, 20.0, 30.0, 40.0], &[1, 4]); // lhs broadcasts rows

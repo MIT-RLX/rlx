@@ -11,6 +11,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn build_sample_graph(b: usize, v: usize, top_k: usize, top_p: f32, temp: f32, seed: u64) -> Graph {
     let mut g = Graph::new("sample");
     let logits = g.input("logits", Shape::new(&[b, v], DType::F32));
@@ -65,6 +67,7 @@ fn cases() -> Vec<(&'static str, usize, usize, usize, f32, f32, u64)> {
 
 #[test]
 fn sample_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     for (name, b, v, k, p, t, s) in cases() {
         let out = run_on(Device::Cpu, b, v, k, p, t, s);
         assert_eq!(out.len(), b, "{name}: expected {b} sampled indices");
@@ -80,6 +83,7 @@ fn sample_cpu_runs() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn sample_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, b, v, k, p, t, s) in cases() {
         let metal = run_on(Device::Metal, b, v, k, p, t, s);
         let cpu = run_on(Device::Cpu, b, v, k, p, t, s);

@@ -77,7 +77,7 @@ fn spd(n: usize, seed: f64) -> Vec<f64> {
 /// off-diagonal stays zero. Reference is exact (no eigendecomposition needed).
 #[test]
 fn reeig_forward_floors_diagonal() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping reeig_forward_floors_diagonal");
         return;
     }
@@ -109,7 +109,7 @@ fn reeig_forward_floors_diagonal() {
 /// BiMap `Y = W·X·Wᵀ` against a manual f32 matmul reference.
 #[test]
 fn bimap_forward_matches_manual() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping bimap_forward_matches_manual");
         return;
     }
@@ -155,7 +155,7 @@ fn bimap_forward_matches_manual() {
 /// Weighted Karcher barycentre of identical points is that point (any weights).
 #[test]
 fn karcher_mean_weighted_of_identicals() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping karcher_mean_weighted");
         return;
     }
@@ -186,7 +186,7 @@ fn karcher_mean_weighted_of_identicals() {
 /// log_map(I, X) on a diagonal spectrum reduces to diag(log λ).
 #[test]
 fn log_map_identity_base_diagonal() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping log_map");
         return;
     }
@@ -214,7 +214,7 @@ fn log_map_identity_base_diagonal() {
 /// exp_map(I, V) on a diagonal tangent reduces to diag(exp v).
 #[test]
 fn exp_map_identity_base_diagonal() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping exp_map");
         return;
     }
@@ -243,7 +243,7 @@ fn exp_map_identity_base_diagonal() {
 /// `Γ_{P→Q}(V)[k,k] = V[k,k]·Q[k,k]/P[k,k]`.
 #[test]
 fn parallel_transport_diagonal() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping parallel_transport");
         return;
     }
@@ -277,7 +277,7 @@ fn parallel_transport_diagonal() {
 /// Batched logm over a stack of diagonal matrices ⇒ per-slice diag(log λ).
 #[test]
 fn matrix_fn_batch_logm_diagonal() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping matrix_fn_batch");
         return;
     }
@@ -303,7 +303,7 @@ fn matrix_fn_batch_logm_diagonal() {
 /// host-delegation path (backward op is F64, host-delegated like the forward).
 #[test]
 fn log_map_grad_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping log_map_grad");
         return;
     }
@@ -350,7 +350,7 @@ fn log_map_grad_matches_cpu() {
 /// CUDA path, and checks the gradient equals identity vs the CPU backend.
 #[test]
 fn eigh_grad_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping eigh_grad");
         return;
     }
@@ -412,7 +412,7 @@ fn eigh_grad_matches_cpu() {
 /// assemble kernel (single + batched).
 #[test]
 fn eigh_native_forward_reconstructs() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda spd] no CUDA device — skipping eigh_native");
         return;
     }

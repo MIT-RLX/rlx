@@ -7,7 +7,7 @@
 //! - Tiny `matmul → bias → gelu` graph (`runInference` / `backendName`)
 //! - Embedded MNIST MLP 784→32→10 (`runMnist` / `mnistExpectedLabel`)
 
-use jni::objects::JClass;
+use jni::objects::{JClass, JString};
 use jni::sys::{jfloatArray, jint, jstring};
 use jni::JNIEnv;
 use rlx_ir::{op, DType, Graph, Shape};
@@ -326,5 +326,205 @@ mod tests {
     #[test]
     fn scalar_feature_enabled() {
         assert!(cfg!(feature = "scalar"));
+    }
+}
+
+// ── distributed node ───────────────────────────────────────────────────────
+//
+// Lets an Android handset join an RLX mesh as a worker rank. The node runs on
+// its own thread: JNI calls from the UI thread must not block, and a serving
+// loop parks in `recv` between activations.
+
+use rlx_runtime::dist::node::{
+    NodeConfig, NodeControl, NodeStopHandle, serve_trainer_here, serve_worker,
+};
+use std::sync::mpsc;
+
+struct NodeSlot {
+    stop: NodeStopHandle,
+    /// Set once the node thread finishes, so `nodeStatus` can report the
+    /// outcome rather than leaving the caller guessing.
+    done: mpsc::Receiver<String>,
+    last: Option<String>,
+}
+
+static NODE: Mutex<Option<NodeSlot>> = Mutex::new(None);
+
+fn node_start_inner(
+    rank: i32,
+    world: i32,
+    peers: String,
+    device: String,
+    mode: String,
+) -> Result<(), String> {
+    let training = match mode.as_str() {
+        "" | "infer" => false,
+        "train" => true,
+        other => return Err(format!("unknown mode [{other}]; expected infer or train")),
+    };
+    let mut slot = NODE.lock().map_err(|_| "node lock poisoned".to_string())?;
+    if slot.as_ref().is_some_and(|s| s.last.is_none()) {
+        return Err("a node is already running on this device".into());
+    }
+    if rank < 0 || world < 1 || rank >= world {
+        return Err(format!("bad rank/world: {rank}/{world}"));
+    }
+
+    let addrs: Vec<String> = peers
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // An empty peer list means "find the coordinator by UDP broadcast" — the
+    // path RlxNode.start(discovery = true) takes a MulticastLock for.
+    // Topology follows from what the caller supplied. A phone is a star
+    // worker: it dials the coordinator and nothing dials it back (most Wi-Fi
+    // will not route inbound to a handset), so a lone address — or discovery,
+    // where the coordinator announces itself — means star. A full per-rank
+    // list means the caller wants a mesh and believes every rank is reachable.
+    let base = NodeConfig::new(rank as u32, world as u32).device(device);
+    let cfg = if addrs.is_empty() {
+        base.star().discover(29600, 29500)
+    } else if addrs.len() == 1 && world > 1 {
+        base.star().peers(addrs)?
+    } else {
+        base.mesh().peers(addrs)?
+    };
+
+    let ctl = NodeControl::unbounded();
+    let stop = ctl.stop_handle();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("rlx-node".into())
+        .spawn(move || {
+            let msg = match cfg.connect() {
+                Err(e) => format!("connect failed: {e}"),
+                Ok(group) if training => match serve_trainer_here(&group, |_uri| Vec::new(), false)
+                {
+                    Ok(r) => format!(
+                        "ok: rank {} trained on {} ({}), {} sample(s), loss {:.4}->{:.4}",
+                        r.rank,
+                        r.metrics.device.name(),
+                        r.platform,
+                        r.metrics.samples,
+                        r.metrics.first_loss,
+                        r.metrics.last_loss
+                    ),
+                    Err(e) => format!("error: {e}"),
+                },
+                Ok(group) => match serve_worker(&group, |uri| {
+                    // No custom weight scheme on the handset: the built-in
+                    // gguf:// / safetensors:// / file:// resolvers already ran.
+                    let _ = uri;
+                    Vec::new()
+                }) {
+                    Ok(r) => format!(
+                        "ok: rank {} on {} ({}), {} activation(s)",
+                        r.rank,
+                        r.device.name(),
+                        r.platform,
+                        r.activations
+                    ),
+                    Err(e) => format!("error: {e}"),
+                },
+            };
+            let _ = tx.send(msg);
+        })
+        .map_err(|e| format!("spawn: {e}"))?;
+
+    *slot = Some(NodeSlot {
+        stop,
+        done: rx,
+        last: None,
+    });
+    Ok(())
+}
+
+fn node_status_inner() -> String {
+    let Ok(mut slot) = NODE.lock() else {
+        return "node lock poisoned".into();
+    };
+    match slot.as_mut() {
+        None => "idle".into(),
+        Some(s) => {
+            if s.last.is_none()
+                && let Ok(msg) = s.done.try_recv()
+            {
+                s.last = Some(msg);
+            }
+            match &s.last {
+                Some(m) => m.clone(),
+                None if s.stop.is_stopped() => "stopping".into(),
+                None => "running".into(),
+            }
+        }
+    }
+}
+
+/// Join a mesh as worker `rank` of `world`. `peers` is a comma-separated
+/// `host:port` list indexed by rank; `device` is `auto` or a backend name;
+/// `mode` is `infer` or `train`. Returns immediately — poll `nodeStatus`.
+///
+/// A training rank cannot drop out partway: the gradient reduce is a barrier,
+/// so stopping one stalls every other rank.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mit_rlx_RlxNative_nodeStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    rank: jint,
+    world: jint,
+    peers: JString,
+    device: JString,
+    mode: JString,
+) -> jstring {
+    let peers: String = match env.get_string(&peers) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            throw_runtime(&mut env, &format!("peers: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    let device: String = match env.get_string(&device) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            throw_runtime(&mut env, &format!("device: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    let mode: String = match env.get_string(&mode) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            throw_runtime(&mut env, &format!("mode: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    if let Err(e) = node_start_inner(rank, world, peers, device, mode) {
+        throw_runtime(&mut env, &e);
+        return std::ptr::null_mut();
+    }
+    env.new_string("started").expect("new_string").into_raw()
+}
+
+/// Current node state: `idle` | `running` | `stopping` | `ok: …` | `error: …`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mit_rlx_RlxNative_nodeStatus(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    env.new_string(node_status_inner())
+        .expect("new_string")
+        .into_raw()
+}
+
+/// Ask the node to leave the mesh after its current activation. Cooperative:
+/// a node parked in `recv` exits when its peer sends or the link drops.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mit_rlx_RlxNative_nodeStop(_env: JNIEnv, _class: JClass) {
+    if let Ok(slot) = NODE.lock()
+        && let Some(s) = slot.as_ref()
+    {
+        s.stop.stop();
     }
 }

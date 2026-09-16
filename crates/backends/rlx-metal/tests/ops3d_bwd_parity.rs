@@ -120,7 +120,7 @@ fn make_maxpool3d_bwd() -> (Graph, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn conv3d_backward_input_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal c3d_bwd_in] no Metal device — skipping");
         return;
     }
@@ -136,7 +136,7 @@ fn conv3d_backward_input_matches_cpu() {
 
 #[test]
 fn conv3d_backward_weight_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal c3d_bwd_w] no Metal device — skipping");
         return;
     }
@@ -152,7 +152,7 @@ fn conv3d_backward_weight_matches_cpu() {
 
 #[test]
 fn maxpool3d_backward_matches_cpu() {
-    if !rlx_metal::is_available() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("[rlx-metal mp3d_bwd] no Metal device — skipping");
         return;
     }

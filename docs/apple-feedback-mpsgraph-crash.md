@@ -112,3 +112,6 @@ Re-run either arm with `crates/backends/rlx-metal/scripts/mpsgraph-soak.sh`.
 `compileWithDevice:…compilationDescriptor:nil` should not crash. If the logging
 handle cannot be created, the logging path should tolerate a null handle rather
 than dereference it.
+## License
+
+MIT OR Apache-2.0.

@@ -19,6 +19,8 @@
 use rlx_ir::{DType, FirMode, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn const_f32(g: &mut Graph, xs: &[f32], dims: &[usize]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
     for x in xs {
@@ -58,7 +60,7 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Build on CPU and on `dev`, assert element-wise agreement.
 fn parity(name: &str, dev: Device, tol: f32, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) {
-    if !rlx_runtime::is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip {name}: {dev:?} unavailable");
         return;
     }
@@ -162,26 +164,32 @@ mod metal {
     use super::*;
     #[test]
     fn fir_direct() {
+        let _gpu = common::serialize_gpu();
         check_fir_direct(Device::Metal);
     }
     #[test]
     fn fir_fft() {
+        let _gpu = common::serialize_gpu();
         check_fir_fft(Device::Metal);
     }
     #[test]
     fn conv_reverb() {
+        let _gpu = common::serialize_gpu();
         check_conv_reverb(Device::Metal);
     }
     #[test]
     fn iir_as_fir() {
+        let _gpu = common::serialize_gpu();
         check_iir_as_fir(Device::Metal);
     }
     #[test]
     fn partitioned_conv_op() {
+        let _gpu = common::serialize_gpu();
         check_partitioned_conv_op(Device::Metal);
     }
     #[test]
     fn iirfilt() {
+        let _gpu = common::serialize_gpu();
         check_iirfilt(Device::Metal); // Op::Scan host-fallback
     }
 }
@@ -191,26 +199,32 @@ mod mlx {
     use super::*;
     #[test]
     fn fir_direct() {
+        let _gpu = common::serialize_gpu();
         check_fir_direct(Device::Mlx);
     }
     #[test]
     fn fir_fft() {
+        let _gpu = common::serialize_gpu();
         check_fir_fft(Device::Mlx);
     }
     #[test]
     fn conv_reverb() {
+        let _gpu = common::serialize_gpu();
         check_conv_reverb(Device::Mlx);
     }
     #[test]
     fn iir_as_fir() {
+        let _gpu = common::serialize_gpu();
         check_iir_as_fir(Device::Mlx);
     }
     #[test]
     fn partitioned_conv_op() {
+        let _gpu = common::serialize_gpu();
         check_partitioned_conv_op(Device::Mlx);
     }
     #[test]
     fn iirfilt() {
+        let _gpu = common::serialize_gpu();
         check_iirfilt(Device::Mlx); // MLX lowers Op::Scan natively
     }
 }
@@ -220,26 +234,40 @@ mod wgpu {
     use super::*;
     #[test]
     fn fir_direct() {
+        let _gpu = common::serialize_gpu();
         check_fir_direct(Device::Gpu);
     }
     #[test]
     fn fir_fft() {
+        let _gpu = common::serialize_gpu();
         check_fir_fft(Device::Gpu);
     }
     #[test]
     fn conv_reverb() {
+        let _gpu = common::serialize_gpu();
         check_conv_reverb(Device::Gpu);
     }
     #[test]
     fn iir_as_fir() {
+        let _gpu = common::serialize_gpu();
         check_iir_as_fir(Device::Gpu);
     }
     #[test]
     fn iirfilt() {
+        let _gpu = common::serialize_gpu();
         check_iirfilt(Device::Gpu); // Op::Scan readback host-fallback
+    }
+    // `all()` already covers this, but only as an anonymous element of a batch.
+    // Vulkan returned zeros here for every implementation until it was named,
+    // so it is worth a test whose failure says which op broke.
+    #[test]
+    fn partitioned_conv_op() {
+        let _gpu = common::serialize_gpu();
+        check_partitioned_conv_op(Device::Gpu);
     }
     #[test]
     fn all() {
+        let _gpu = common::serialize_gpu();
         run_all(Device::Gpu);
     }
 }
@@ -251,26 +279,32 @@ mod cuda {
     use super::*;
     #[test]
     fn fir_direct() {
+        let _gpu = common::serialize_gpu();
         check_fir_direct(Device::Cuda);
     }
     #[test]
     fn fir_fft() {
+        let _gpu = common::serialize_gpu();
         check_fir_fft(Device::Cuda);
     }
     #[test]
     fn conv_reverb() {
+        let _gpu = common::serialize_gpu();
         check_conv_reverb(Device::Cuda);
     }
     #[test]
     fn iir_as_fir() {
+        let _gpu = common::serialize_gpu();
         check_iir_as_fir(Device::Cuda);
     }
     #[test]
     fn partitioned_conv_op() {
+        let _gpu = common::serialize_gpu();
         check_partitioned_conv_op(Device::Cuda);
     }
     #[test]
     fn iirfilt() {
+        let _gpu = common::serialize_gpu();
         check_iirfilt(Device::Cuda);
     }
 }
@@ -280,26 +314,32 @@ mod rocm {
     use super::*;
     #[test]
     fn fir_direct() {
+        let _gpu = common::serialize_gpu();
         check_fir_direct(Device::Rocm);
     }
     #[test]
     fn fir_fft() {
+        let _gpu = common::serialize_gpu();
         check_fir_fft(Device::Rocm);
     }
     #[test]
     fn conv_reverb() {
+        let _gpu = common::serialize_gpu();
         check_conv_reverb(Device::Rocm);
     }
     #[test]
     fn iir_as_fir() {
+        let _gpu = common::serialize_gpu();
         check_iir_as_fir(Device::Rocm);
     }
     #[test]
     fn partitioned_conv_op() {
+        let _gpu = common::serialize_gpu();
         check_partitioned_conv_op(Device::Rocm);
     }
     #[test]
     fn iirfilt() {
+        let _gpu = common::serialize_gpu();
         check_iirfilt(Device::Rocm);
     }
 }
@@ -309,26 +349,32 @@ mod vulkan {
     use super::*;
     #[test]
     fn fir_direct() {
+        let _gpu = common::serialize_gpu();
         check_fir_direct(Device::Vulkan);
     }
     #[test]
     fn fir_fft() {
+        let _gpu = common::serialize_gpu();
         check_fir_fft(Device::Vulkan);
     }
     #[test]
     fn conv_reverb() {
+        let _gpu = common::serialize_gpu();
         check_conv_reverb(Device::Vulkan);
     }
     #[test]
     fn iir_as_fir() {
+        let _gpu = common::serialize_gpu();
         check_iir_as_fir(Device::Vulkan);
     }
     #[test]
     fn partitioned_conv_op() {
+        let _gpu = common::serialize_gpu();
         check_partitioned_conv_op(Device::Vulkan);
     }
     #[test]
     fn iirfilt() {
+        let _gpu = common::serialize_gpu();
         check_iirfilt(Device::Vulkan);
     }
 }
@@ -338,6 +384,15 @@ mod oneapi {
     use super::*;
     #[test]
     fn iirfilt() {
+        let _gpu = common::serialize_gpu();
         check_iirfilt(Device::OneApi);
+    }
+    /// OneAPI claims `PartitionedConv` and expands it in `expand_cpu_nop_fused`
+    /// — the same shape of fix Vulkan was missing. Untested until now, so
+    /// whether the expansion is reached was an assumption.
+    #[test]
+    fn partitioned_conv_op() {
+        let _gpu = common::serialize_gpu();
+        check_partitioned_conv_op(Device::OneApi);
     }
 }

@@ -12,6 +12,8 @@
 use rlx_ir::*;
 use rlx_runtime::{CompileOptions, Device, ScaledQuantConfig, Session};
 
+mod common;
+
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -30,6 +32,7 @@ fn build(m: usize, k: usize, n: usize) -> Graph {
 
 #[test]
 fn session_scaled_quant_policy_f4e3m0_tracks_f32() {
+    let _gpu = common::serialize_gpu();
     let (m, k, n) = (4usize, 64usize, 8usize);
     let x: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.13).sin() * 1.5).collect();
     let w: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.07).cos() * 1.2).collect();
@@ -69,18 +72,19 @@ fn session_scaled_quant_policy_f4e3m0_tracks_f32() {
 
 /// Per-tensor FP8 `ScaledMatMul` on CUDA. This is the NATIVE cuBLASLt FP8
 /// tensor-core path — which only exists on Ada (sm_89) / Hopper (sm_90)+. On
-/// Ampere (sm_86, e.g. the msi RTX 3080 Ti) the cuBLASLt FP8 GEMM returns
+/// Ampere (sm_86, e.g. an RTX 3080 Ti) the cuBLASLt FP8 GEMM returns
 /// NOT_SUPPORTED and USED TO PANIC; it now falls back to the software
 /// decode-and-accumulate path. Either way it must run + track f32. On an FP8-TC
-/// GPU this validates the tensor-core GEMM numerically. Runs on the msi rig
+/// GPU this validates the tensor-core GEMM numerically. Runs on the CUDA rig
 /// (`RLX_PARITY_DEVICE` selects the device); no-ops without CUDA.
 #[test]
 fn cuda_per_tensor_fp8_scaled_matmul_runs_and_tracks_f32() {
-    let dev = match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    let _gpu = common::serialize_gpu();
+    let dev = match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     };
-    if !rlx_runtime::is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip cuda_per_tensor_fp8 ({dev:?} unavailable)");
         return;
     }

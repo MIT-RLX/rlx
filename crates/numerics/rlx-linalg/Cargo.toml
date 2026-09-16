@@ -25,3 +25,8 @@ rlx-cpu = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["cpu"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

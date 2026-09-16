@@ -298,6 +298,63 @@ pub fn graph_has_mps_hostile_reduce(graph: &Graph) -> bool {
     })
 }
 
+/// Does `graph` contain the shape that crashes MPSGraph's SDPA canonicalizer?
+///
+/// Apple's `CommonRuntimeCanonicalizationPass` runs
+/// `CanonicalizeSDPA<false>::matchAndRewrite(mlir::mps::MatMulOp, …)`, which
+/// pattern-matches a **hand-rolled** softmax (`max → sub → exp → sum → div`, not
+/// an `Op::Softmax` node) feeding a matmul, and rewrites it to fused attention.
+/// On `rlx-latte` — hyperbolic attention, whose `v` is a `Concat` carrying the
+/// extra Lorentz coordinate — it dereferences null and takes the **process**
+/// down:
+///
+/// ```text
+/// EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS at 0x2c
+///   CanonicalizeSDPA<false>::matchAndRewrite(mlir::mps::MatMulOp, …)
+///   GreedyPatternRewriteDriver::processWorklist()
+/// ```
+///
+/// A crash inside the vendor compiler is not catchable, so the only defence is
+/// not handing it the graph. Bisecting LATTE's 358 nodes put the fault exactly on
+/// `MatMul(div_of_exp_over_sum, Concat)`; that is what this matches. Deliberately
+/// narrow: a plain `Op::Softmax` feeding a matmul is the ordinary transformer
+/// path and keeps its MPSGraph plan, and so does a matmul whose `v` is a normal
+/// tensor. `RLX_MPSGRAPH_TRACE=1` logs when it fires.
+///
+/// (Reconstructing the pattern in isolation does *not* crash — see
+/// `tests/sdpa_canonicalize_crash.rs` — so the trigger also depends on the rest
+/// of the module. The guard is therefore keyed on what the bisect proved, not on
+/// a standalone reproducer.)
+pub fn graph_has_mps_sdpa_crasher(graph: &Graph) -> bool {
+    let is_softmax_tail = |id: NodeId| -> bool {
+        // `div(exp(...), reduce_sum(..., keep_dim))` — the tail of a softmax
+        // written out by hand.
+        let d = graph.node(id);
+        if !matches!(d.op, Op::Binary(rlx_ir::op::BinaryOp::Div)) || d.inputs.len() != 2 {
+            return false;
+        }
+        let num = graph.node(d.inputs[0]);
+        let den = graph.node(d.inputs[1]);
+        let num_is_exp = matches!(num.op, Op::Activation(rlx_ir::op::Activation::Exp));
+        let den_is_sum = matches!(
+            den.op,
+            Op::Reduce {
+                op: rlx_ir::op::ReduceOp::Sum,
+                keep_dim: true,
+                ..
+            }
+        );
+        num_is_exp && den_is_sum
+    };
+    graph.nodes().iter().any(|n| {
+        if !matches!(n.op, Op::MatMul) || n.inputs.len() != 2 {
+            return false;
+        }
+        let rhs_is_concat = matches!(graph.node(n.inputs[1]).op, Op::Concat { .. });
+        rhs_is_concat && is_softmax_tail(n.inputs[0])
+    })
+}
+
 /// Same as [`try_lower`] but with an optional `params_as_constants`
 /// map. When provided, every `Op::Param { name }` whose name appears
 /// in the map is lowered as `constantWithData:shape:dataType:` —
@@ -322,6 +379,15 @@ pub fn try_lower_with_constants(
         .iter()
         .any(|n| matches!(n.op, Op::Fft { .. } | Op::LogMel | Op::LogMelBackward))
     {
+        return None;
+    }
+    if graph_has_mps_sdpa_crasher(graph) {
+        if rlx_ir::env::flag("RLX_MPSGRAPH_TRACE") {
+            eprintln!(
+                "[rlx-metal] mps: refusing plan (hand-rolled softmax into a \
+                 matmul over a concat — crashes Apple's CanonicalizeSDPA; using thunks)"
+            );
+        }
         return None;
     }
     if graph_has_mps_hostile_reduce(graph) {
@@ -839,14 +905,32 @@ pub fn try_lower_with_constants(
                 // multi-elem dst). MPSGraph's reshape is strict — same
                 // element count required — so dispatch broadcast for the
                 // expanding case and reshape otherwise.
-                let src_n: usize = shape_dims(graph, node.inputs[0])
+                //
+                // Count against the tensor MPSGraph *actually holds*, not the
+                // IR's declared input shape: they can disagree (see
+                // `MpsTensor::mps_elems`), and choosing the wrong branch makes
+                // MPSGraph abort the process during graph verification rather
+                // than return an error. When the real counts fit neither a
+                // reshape nor a broadcast, refuse the plan so the whole graph
+                // runs on thunks — slower, but correct and alive.
+                let ir_n: usize = shape_dims(graph, node.inputs[0])
                     .map(|s| s.iter().product())
                     .unwrap_or(0);
+                let src_n = x.mps_elems().unwrap_or(ir_n);
                 let dst_n: usize = dims.iter().product();
-                if dst_n != src_n {
+                if dst_n == src_n {
+                    mg.reshape(x, &dims)
+                } else if src_n != 0 && dst_n.is_multiple_of(src_n) {
                     mg.broadcast_to(x, &dims)
                 } else {
-                    mg.reshape(x, &dims)
+                    if trace {
+                        eprintln!(
+                            "[rlx-metal] mps: refusing plan (node {} reshape {src_n} -> {dst_n} \
+                             is neither a reshape nor a broadcast; ir says {ir_n})",
+                            node.id
+                        );
+                    }
+                    return None;
                 }
             }
             Op::Expand { .. } => {
@@ -1392,7 +1476,7 @@ fn lower_attention_4d(
     // rather than an error, so the old `match … { Some => use it }` silently
     // accepted the divergence. Opt back into MPS SDPA (faster where it's known
     // safe) via `RLX_METAL_MPS_SDPA=1`.
-    let use_mps = std::env::var("RLX_METAL_MPS_SDPA").as_deref() == Ok("1");
+    let use_mps = rlx_ir::env::var("RLX_METAL_MPS_SDPA").as_deref() == Some("1");
     let out4 = if use_mps {
         mg.scaled_dot_product_attention(&q4, &k4, &v4, &mask4, scale)
     } else {

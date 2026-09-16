@@ -233,7 +233,7 @@ pub fn attention_backward(
     // is bit-identical to the serial version.
     let out_ptr = out_data.as_mut_ptr() as usize;
     // A/B toggle for measuring the parallelization win (grain = total → serial).
-    let grain = if std::env::var_os("RLX_ATTN_BWD_SERIAL").is_some() {
+    let grain = if rlx_ir::env::var_os("RLX_ATTN_BWD_SERIAL").is_some() {
         (batch * num_heads).max(1)
     } else {
         1
@@ -530,7 +530,7 @@ pub fn attention_backward_all(
     let oq = out_q.as_mut_ptr() as usize;
     let ok = out_k.as_mut_ptr() as usize;
     let ov = out_v.as_mut_ptr() as usize;
-    let grain = if std::env::var_os("RLX_ATTN_BWD_SERIAL").is_some() {
+    let grain = if rlx_ir::env::var_os("RLX_ATTN_BWD_SERIAL").is_some() {
         (batch * num_heads).max(1)
     } else {
         1

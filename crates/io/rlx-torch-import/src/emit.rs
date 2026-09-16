@@ -723,7 +723,7 @@ cuda = ["rlx-runtime/cuda"]
 }
 
 /// Write a complete, buildable RLX crate for `lo` into `out_dir`, in the chosen
-/// [`EmitStyle`].
+/// `EmitStyle`.
 pub fn emit_crate(
     out_dir: &Path,
     lo: &Lowered,

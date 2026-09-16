@@ -554,7 +554,7 @@ fn rope_backward_matches_reference() {
     let dy = g.input("dy", Shape::new(&[b, s, hd], DType::F32));
     let cos = g.input("cos", Shape::new(&[s, tab], DType::F32));
     let sin = g.input("sin", Shape::new(&[s, tab], DType::F32));
-    let dx = g.rope_backward(dy, cos, sin, hd, n_rot);
+    let dx = g.rope_backward(dy, cos, sin, hd, n_rot, rlx_ir::op::RopeStyle::NeoX);
     g.set_outputs(vec![dx]);
 
     let dyv: Vec<f32> = (0..b * s * hd).map(|i| 0.1 * i as f32).collect();

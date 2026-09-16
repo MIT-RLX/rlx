@@ -11,9 +11,9 @@
 //!
 //! Runs real compute only when a Vulkan device is reachable (e.g. Linux +
 //! native driver, or macOS + MoltenVK via `VK_ICD_FILENAMES`). On a driverless
-//! host (macOS without MoltenVK, CI) it is a graceful no-op — the memory note
-//! [[vulkan_backend]] documents that Apple Silicon has no Vulkan loader by
-//! default, so this parity is validated on the wgpu backend (Metal) instead;
+//! host (macOS without MoltenVK, CI) it is a graceful no-op: Apple Silicon has
+//! no Vulkan loader by default, so this parity is validated on the wgpu
+//! backend (Metal) instead;
 //! see `rlx-wgpu/tests/spd_host_parity.rs`, which exercises the identical
 //! host-fallback wiring.
 //!
@@ -47,7 +47,7 @@ fn diagf(vals: &[f32]) -> Vec<f32> {
 /// off-diagonal stays zero. Reference is exact (no eigendecomposition needed).
 #[test]
 fn reeig_forward_floors_diagonal() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[rlx-vulkan spd] no Vulkan device — skipping reeig_forward_floors_diagonal");
         return;
     }
@@ -79,7 +79,7 @@ fn reeig_forward_floors_diagonal() {
 /// BiMap `Y = W·X·Wᵀ` against a manual f32 matmul reference.
 #[test]
 fn bimap_forward_matches_manual() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[rlx-vulkan spd] no Vulkan device — skipping bimap_forward_matches_manual");
         return;
     }
@@ -125,7 +125,7 @@ fn bimap_forward_matches_manual() {
 /// Weighted Karcher barycentre of identical points is that point (any weights).
 #[test]
 fn karcher_mean_weighted_of_identicals() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[rlx-vulkan spd] no Vulkan device — skipping karcher_mean_weighted");
         return;
     }
@@ -156,7 +156,7 @@ fn karcher_mean_weighted_of_identicals() {
 /// log_map(I, X) on a diagonal spectrum reduces to diag(log λ).
 #[test]
 fn log_map_identity_base_diagonal() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[rlx-vulkan spd] no Vulkan device — skipping log_map");
         return;
     }
@@ -184,7 +184,7 @@ fn log_map_identity_base_diagonal() {
 /// exp_map(I, V) on a diagonal tangent reduces to diag(exp v).
 #[test]
 fn exp_map_identity_base_diagonal() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[rlx-vulkan spd] no Vulkan device — skipping exp_map");
         return;
     }
@@ -213,7 +213,7 @@ fn exp_map_identity_base_diagonal() {
 /// `Γ_{P→Q}(V)[k,k] = V[k,k]·Q[k,k]/P[k,k]`.
 #[test]
 fn parallel_transport_diagonal() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[rlx-vulkan spd] no Vulkan device — skipping parallel_transport");
         return;
     }
@@ -247,7 +247,7 @@ fn parallel_transport_diagonal() {
 /// Batched logm over a stack of diagonal matrices ⇒ per-slice diag(log λ).
 #[test]
 fn matrix_fn_batch_logm_diagonal() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[rlx-vulkan spd] no Vulkan device — skipping matrix_fn_batch");
         return;
     }

@@ -11,6 +11,8 @@ use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, GraphDevices, is_available};
 
+mod common;
+
 fn matmul_graph() -> Graph {
     let mut g = Graph::new("gd_mm");
     let x = g.input("x", Shape::new(&[2, 4], DType::F32));
@@ -28,7 +30,7 @@ fn assert_close(a: &[f32], b: &[f32], tol: f32, label: &str) {
 }
 
 fn parity_on(device: Device, tol: f32, label: &str) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip graph_devices_parity {label} on {device:?} (unavailable)");
         return;
     }

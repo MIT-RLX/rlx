@@ -7,7 +7,7 @@
 //! Recognizes a single-output chain of FPGA-supported ops:
 //! [`Op::QConv2d`], [`Op::Activation`] (ReLU), [`Op::Pool`] (max),
 //! [`Op::QMatMul`], [`Op::TopK`] (k=1 / argmax), plus optional
-//! [`Op::Reshape`] / [`Op::Squeeze`] passthroughs.
+//! [`Op::Reshape`] / `Op::Squeeze` passthroughs.
 //!
 //! Weights / biases / per-channel requant tables come from:
 //! 1. [`Op::Constant`] inputs baked by [`crate::ir::to_graph`], or

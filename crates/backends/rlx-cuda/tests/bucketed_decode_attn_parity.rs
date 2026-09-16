@@ -42,7 +42,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn cuda_bucketed_decode_custom_mask_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: CUDA unavailable");
         return;
     }
@@ -87,7 +87,7 @@ fn cuda_bucketed_decode_custom_mask_matches_cpu() {
 
 #[test]
 fn cuda_causal_decode_attn_hd128_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("skip: CUDA unavailable");
         return;
     }

@@ -1,4 +1,7 @@
 // RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// RLX — versatile ML compiler + runtime.
 //! **Centralized resource budget for large-model inference** — the single source
 //! of truth for how much a model may hold resident, applied uniformly across ALL
 //! large models (DeepSeek-V4, Kimi-K3, Llama4, GLM-MoE, …). It unifies the two
@@ -38,11 +41,9 @@ impl ResourceBudget {
     /// Read from the environment. `RLX_MAX_RAM_BYTES` and `RLX_MAX_RESIDENT_EXPERTS`
     /// override; absent fields fall back to derivation at query time.
     pub fn from_env() -> Self {
-        let max_ram_bytes = std::env::var("RLX_MAX_RAM_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok());
-        let max_resident_experts = std::env::var("RLX_MAX_RESIDENT_EXPERTS")
-            .ok()
+        let max_ram_bytes =
+            rlx_ir::env::var("RLX_MAX_RAM_BYTES").and_then(|v| v.trim().parse::<usize>().ok());
+        let max_resident_experts = rlx_ir::env::var("RLX_MAX_RESIDENT_EXPERTS")
             .and_then(|v| v.trim().parse::<usize>().ok());
         Self {
             max_ram_bytes,

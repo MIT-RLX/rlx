@@ -112,7 +112,7 @@ fn make_maxpool3d_bwd() -> (Graph, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn conv3d_backward_input_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[rlx-wgpu c3d_bwd_in] no wgpu device — skipping");
         return;
     }
@@ -128,7 +128,7 @@ fn conv3d_backward_input_matches_cpu() {
 
 #[test]
 fn conv3d_backward_weight_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[rlx-wgpu c3d_bwd_w] no wgpu device — skipping");
         return;
     }
@@ -144,7 +144,7 @@ fn conv3d_backward_weight_matches_cpu() {
 
 #[test]
 fn maxpool3d_backward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[rlx-wgpu mp3d_bwd] no wgpu device — skipping");
         return;
     }

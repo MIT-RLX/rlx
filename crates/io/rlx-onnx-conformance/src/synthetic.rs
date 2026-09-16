@@ -14,7 +14,7 @@ pub fn random_normal_like_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_normal_like.onnx")
 }
 
-/// Embedded ONNX `RandomNormal` (mean=0.1, scale=2, seed=7, shape=[4]).
+/// Embedded ONNX `RandomNormal` (mean=0.1, scale=2, seed=7, shape=`4`).
 pub fn random_normal_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_normal.onnx")
 }
@@ -24,7 +24,7 @@ pub fn random_uniform_like_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_uniform_like.onnx")
 }
 
-/// Embedded ONNX `RandomUniform` (low=0, high=1, seed=7, shape=[4]).
+/// Embedded ONNX `RandomUniform` (low=0, high=1, seed=7, shape=`4`).
 pub fn random_uniform_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rng_uniform.onnx")
 }

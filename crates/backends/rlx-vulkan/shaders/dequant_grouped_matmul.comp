@@ -1,0 +1,174 @@
+#version 450
+// Fused GGUF K-quant / Q1_0 dequant + *grouped* (MoE) GEMM for
+// `Op::DequantGroupedMatMul`. The expert-indexed analogue of
+// `dequant_matmul.comp`, structured like `scaled_grouped_matmul_decode.comp`.
+//
+//   out[i, j] = sum_p x[i, p] * dequant(W[e(i)][j, p])
+//
+// with `e(i) = expert_idx[i]`. `x` is [M, K] f32, the weight stack is
+// [E, N, K] in packed GGUF block layout (each expert slab laid out exactly as
+// `dequant_matmul.comp` expects), `expert_idx` is [M] f32-encoded, and the
+// output is [M, N] f32.
+//
+// One invocation owns one output element and decodes expert `e(i)`'s row `j` on
+// the fly. **No f32 weight materialisation**: CUDA's grouped path dequantises a
+// whole `k*n` slab into a scratch arena region and then runs a dense GEMM, which
+// costs `k*n*4` bytes of scratch per call. Decoding in the loop needs none of
+// that, which matters precisely for the large MoE stacks this op exists for. It
+// also drops the host round trip CUDA needs to build a token-sort plan: the
+// expert index is read per row on-device instead.
+//
+// Scheme: 0 = Q4_K (144 B / 256 elems), 1 = Q6_K (210 B / 256),
+//         2 = Q1_0 (18 B / 128 elems). Anything else keeps the host route —
+//         these are the three `dequant_matmul.comp` implements, and the decode
+//         below is the same arithmetic.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint m;          // rows of x / tokens
+    uint n;          // output columns (rows of one expert slab)
+    uint k;          // contraction dim
+    uint x_word;     // f32-word offset of x [m, k]
+    uint w_word;     // f32-word offset of the packed weight stack [e, n, k]
+    uint idx_word;   // f32-word offset of expert_idx [m]
+    uint out_word;   // f32-word offset of out [m, n]
+    uint slab_bytes; // packed bytes per expert slab
+    uint num_experts;
+    uint scheme;     // 0 = Q4_K, 1 = Q6_K, 2 = Q1_0
+} pc;
+
+// Byte at `rel` relative to a word-aligned weight base.
+uint rd_byte_at(uint w_base, uint rel) {
+    uint w = arena_load_u(w_base + (rel >> 2u));
+    return (w >> ((rel & 3u) * 8u)) & 0xFFu;
+}
+
+float rd_f16_at(uint w_base, uint rel) {
+    uint w = arena_load_u(w_base + (rel >> 2u));
+    uint h = (w >> ((rel & 3u) * 8u)) & 0xFFFFu;
+    return unpackHalf2x16(h).x;
+}
+
+int sx8(uint b) {
+    return int(b) - 256 * int((b >> 7u) & 1u);
+}
+
+void scale_min_k4(uint w_base, uint j, uint sc_base, out uint sc, out uint mn) {
+    if (j < 4u) {
+        sc = rd_byte_at(w_base, sc_base + j) & 63u;
+        mn = rd_byte_at(w_base, sc_base + j + 4u) & 63u;
+    } else {
+        uint a = rd_byte_at(w_base, sc_base + j + 4u);
+        sc = (a & 0x0Fu) | ((rd_byte_at(w_base, sc_base + j - 4u) >> 6u) << 4u);
+        mn = (a >> 4u) | ((rd_byte_at(w_base, sc_base + j) >> 6u) << 4u);
+    }
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    uint total = pc.m * pc.n;
+    if (t >= total) { return; }
+    uint i = t / pc.n;   // token
+    uint j = t - i * pc.n; // output column
+
+    // Expert ids are f32-encoded on this arena (see the ND-indexing kernels);
+    // round rather than reinterpreting the bits.
+    int e = int(round(uintBitsToFloat(arena_load_u(pc.idx_word + i))));
+    if (e < 0) { e = 0; }
+    if (e >= int(pc.num_experts)) { e = int(pc.num_experts) - 1; }
+
+    // Slab bases are 4-byte aligned by construction (block sizes are), so the
+    // expert offset converts cleanly to a word base.
+    uint w_base = pc.w_word + (uint(e) * pc.slab_bytes) / 4u;
+    uint x_row = pc.x_word + i * pc.k;
+
+    float acc = 0.0;
+
+    if (pc.scheme == 2u) {
+        // ── Q1_0: 18 B / 128 elems (f16 d | 16 sign bytes, LSB-first) ──────
+        uint blocks_per_row = pc.k / 128u;
+        for (uint r = 0u; r < blocks_per_row; r++) {
+            uint base = (j * blocks_per_row + r) * 18u;
+            float d = rd_f16_at(w_base, base);
+            float neg_d = -d;
+            uint qs_base = base + 2u;
+            uint xb = x_row + r * 128u;
+            for (uint q = 0u; q < 128u; q++) {
+                uint bit = (rd_byte_at(w_base, qs_base + (q >> 3u)) >> (q & 7u)) & 1u;
+                float wv = (bit != 0u) ? d : neg_d;
+                acc += uintBitsToFloat(arena_load_u(xb + q)) * wv;
+            }
+        }
+        arena_store_u(pc.out_word + t, floatBitsToUint(acc));
+        return;
+    }
+
+    uint blocks_per_row = pc.k / 256u;
+    uint block_bytes = (pc.scheme == 0u) ? 144u : 210u;
+    float blk[256];
+
+    for (uint r = 0u; r < blocks_per_row; r++) {
+        uint base = (j * blocks_per_row + r) * block_bytes;
+
+        if (pc.scheme == 0u) {
+            float d = rd_f16_at(w_base, base);
+            float dmin = rd_f16_at(w_base, base + 2u);
+            uint sc_base = base + 4u;
+            uint qs_base = base + 16u;
+            uint out_i = 0u;
+            uint is = 0u;
+            for (uint jj = 0u; jj < 8u; jj += 2u) {
+                uint sc0; uint m0; uint sc1; uint m1;
+                scale_min_k4(w_base, jj, sc_base, sc0, m0);
+                scale_min_k4(w_base, jj + 1u, sc_base, sc1, m1);
+                float d0 = d * float(sc0);
+                float m0f = dmin * float(m0);
+                float d1 = d * float(sc1);
+                float m1f = dmin * float(m1);
+                for (uint l = 0u; l < 32u; l++) {
+                    uint q = rd_byte_at(w_base, qs_base + is + l);
+                    blk[out_i] = d0 * float(q & 0x0Fu) - m0f;
+                    out_i++;
+                }
+                for (uint l = 0u; l < 32u; l++) {
+                    uint q = rd_byte_at(w_base, qs_base + is + l);
+                    blk[out_i] = d1 * float(q >> 4u) - m1f;
+                    out_i++;
+                }
+                is += 32u;
+            }
+        } else {
+            uint ql_base = base;
+            uint qh_base = base + 128u;
+            uint sc_base = base + 192u;
+            float d = rd_f16_at(w_base, base + 208u);
+            for (uint h = 0u; h < 2u; h++) {
+                uint dst_base = h * 128u;
+                uint ql_off = h * 64u;
+                uint qh_off = h * 32u;
+                uint sc_off = h * 8u;
+                for (uint l = 0u; l < 32u; l++) {
+                    uint isb = l / 16u;
+                    uint qhb = rd_byte_at(w_base, qh_base + qh_off + l);
+                    uint lo0 = rd_byte_at(w_base, ql_base + ql_off + l);
+                    uint lo1 = rd_byte_at(w_base, ql_base + ql_off + l + 32u);
+                    int q1 = int((lo0 & 0x0Fu) | ((qhb & 3u) << 4u)) - 32;
+                    int q2 = int((lo1 & 0x0Fu) | (((qhb >> 2u) & 3u) << 4u)) - 32;
+                    int q3 = int((lo0 >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32;
+                    int q4 = int((lo1 >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32;
+                    blk[dst_base + l]       = d * float(sx8(rd_byte_at(w_base, sc_base + sc_off + isb)))       * float(q1);
+                    blk[dst_base + l + 32u] = d * float(sx8(rd_byte_at(w_base, sc_base + sc_off + isb + 2u))) * float(q2);
+                    blk[dst_base + l + 64u] = d * float(sx8(rd_byte_at(w_base, sc_base + sc_off + isb + 4u))) * float(q3);
+                    blk[dst_base + l + 96u] = d * float(sx8(rd_byte_at(w_base, sc_base + sc_off + isb + 6u))) * float(q4);
+                }
+            }
+        }
+
+        uint xb = x_row + r * 256u;
+        for (uint q = 0u; q < 256u; q++) {
+            acc += uintBitsToFloat(arena_load_u(xb + q)) * blk[q];
+        }
+    }
+
+    arena_store_u(pc.out_word + t, floatBitsToUint(acc));
+}

@@ -10,6 +10,8 @@ use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const N: usize = 64;
 
 fn inputs() -> (Vec<f32>, Vec<f32>) {
@@ -49,6 +51,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn atan2_cpu_matches_f32() {
+    let _gpu = common::serialize_gpu();
     let (a, b) = inputs();
     let out = run(Device::Cpu, &a, &b);
     for i in 0..N {
@@ -61,7 +64,8 @@ macro_rules! backend_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !rlx_runtime::is_available($dev) {
+            let _gpu = common::serialize_gpu();
+            if common::skip_unless($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

@@ -12,6 +12,8 @@ use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 fn cumsum_scan_graph(length: u32) -> Graph {
     let n = 3usize;
     let f = DType::F32;
@@ -43,6 +45,7 @@ fn cumsum_scan_graph(length: u32) -> Graph {
 
 #[test]
 fn short_scan_unroll_matches_native_scan_on_cpu() {
+    let _gpu = common::serialize_gpu();
     let length = 4u32;
     let g = cumsum_scan_graph(length);
     let init = [0.0f32; 3];
@@ -70,6 +73,7 @@ fn short_scan_unroll_matches_native_scan_on_cpu() {
 
 #[test]
 fn scan_unroll_max_length_zero_keeps_scan() {
+    let _gpu = common::serialize_gpu();
     let g = cumsum_scan_graph(4);
     let kept = rlx_opt::maybe_unroll_scans(g, 0);
     assert!(
@@ -80,6 +84,7 @@ fn scan_unroll_max_length_zero_keeps_scan() {
 
 #[test]
 fn packed_scan_host_matches_session() {
+    let _gpu = common::serialize_gpu();
     let length = 4u32;
     let n = 3usize;
     let g = cumsum_scan_graph(length);
@@ -138,7 +143,7 @@ fn packed_scan_host_matches_session() {
     feature = "rocm",
 ))]
 fn parity_vs_cpu(dev: Device, length: u32, opts: CompileOptions) {
-    if !rlx_runtime::is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip {dev:?}: unavailable");
         return;
     }
@@ -162,6 +167,7 @@ fn parity_vs_cpu(dev: Device, length: u32, opts: CompileOptions) {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_short_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(
         Device::Metal,
         4,
@@ -172,6 +178,7 @@ fn metal_short_scan_matches_cpu() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_long_host_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     // Force host Scan path (no IR unroll).
     parity_vs_cpu(
         Device::Metal,
@@ -183,6 +190,7 @@ fn metal_long_host_scan_matches_cpu() {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_short_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(
         Device::Gpu,
         4,
@@ -193,6 +201,7 @@ fn wgpu_short_scan_matches_cpu() {
 #[cfg(feature = "mlx")]
 #[test]
 fn mlx_short_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(
         Device::Mlx,
         4,
@@ -203,6 +212,7 @@ fn mlx_short_scan_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_short_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(
         Device::Cuda,
         4,
@@ -213,6 +223,7 @@ fn cuda_short_scan_matches_cpu() {
 #[cfg(feature = "vulkan")]
 #[test]
 fn vulkan_short_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(
         Device::Vulkan,
         4,
@@ -223,6 +234,7 @@ fn vulkan_short_scan_matches_cpu() {
 #[cfg(feature = "oneapi")]
 #[test]
 fn oneapi_short_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(
         Device::OneApi,
         4,
@@ -233,6 +245,7 @@ fn oneapi_short_scan_matches_cpu() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_short_scan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     parity_vs_cpu(
         Device::Rocm,
         4,

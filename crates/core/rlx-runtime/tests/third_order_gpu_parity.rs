@@ -25,7 +25,9 @@
 use rlx_autodiff::nth_order_grad;
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn f32_bytes(x: f32) -> Vec<u8> {
     x.to_le_bytes().to_vec()
@@ -45,7 +47,7 @@ fn assert_matches_cpu(
     tol: f32,
     label: &str,
 ) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         eprintln!("skip third_order_gpu_parity {label} on {device:?} (unavailable)");
         return;
     }
@@ -174,22 +176,27 @@ macro_rules! third_order_parity_suite {
             use super::*;
             #[test]
             fn x_cubed_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 third_order_x_cubed($device);
             }
             #[test]
             fn relu_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 third_order_relu($device);
             }
             #[test]
             fn tanh_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 third_order_tanh($device);
             }
             #[test]
             fn gelu_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 third_order_gelu($device);
             }
             #[test]
             fn silu_third_derivative() {
+    let _gpu = common::serialize_gpu();
                 third_order_silu($device);
             }
         }

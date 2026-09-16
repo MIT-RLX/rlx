@@ -93,7 +93,7 @@ pub enum HirOp {
     },
 
     /// Causal depthwise Conv1d on `[batch, seq, channels]` tensors.
-    /// Inputs: `[input, weight, left_pad]` — see [`conv::lower_depthwise_conv1d_causal`].
+    /// Inputs: `[input, weight, left_pad]` — see `conv::lower_depthwise_conv1d_causal`.
     DepthwiseConv1dCausal {
         kernel_size: usize,
     },
@@ -474,6 +474,33 @@ impl HirModule {
             inputs.push(zp.expect("DequantMatMul: zp required for non-GGUF schemes"));
         }
         self.push_block(HirOp::DequantMatMul { scheme }, inputs, out_shape, None)
+    }
+
+    /// GGUF / K-quant packed **expert bank** matmul — the grouped analogue of
+    /// [`Self::dequant_matmul`]. See [`Op::DequantGroupedMatMul`].
+    ///
+    /// `packed_bank` is one U8 blob of `num_experts` contiguous `[out, in]`
+    /// slabs — GGUF's native order for `ffn_*_exps.weight`, so no transpose is
+    /// needed (the F32 [`Op::GroupedMatMul`] path, which wants `[E, in, out]`,
+    /// does need one, and constant-folding then materializes a second copy of
+    /// the bank). The expert count is recovered from the blob size.
+    pub fn dequant_grouped_matmul_packed(
+        &mut self,
+        x: HirNodeId,
+        packed_bank: HirNodeId,
+        expert_idx: HirNodeId,
+        scheme: QuantScheme,
+        out_shape: Shape,
+    ) -> HirNodeId {
+        debug_assert!(
+            scheme.is_gguf(),
+            "dequant_grouped_matmul_packed requires a GGUF QuantScheme"
+        );
+        self.mir(
+            Op::DequantGroupedMatMul { scheme },
+            vec![x, packed_bank, expert_idx],
+            out_shape,
+        )
     }
 
     /// Gated DeltaNet without carry state (prefill / reset per batch).
@@ -905,7 +932,7 @@ impl HirModule {
             .lower_to_mir()
     }
 
-    /// Wrap an existing MIR [`Graph`] as a HIR module (`HirOp::Mir` per node).
+    /// Wrap an existing MIR `Graph` as a HIR module (`HirOp::Mir` per node).
     /// Enables `Session::compile_hir` for legacy graph builders during migration.
     pub fn wrap_mir_graph(graph: crate::Graph) -> Self {
         use std::collections::HashMap;

@@ -9,6 +9,8 @@ use rlx_ir::op::AdaNormKind;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn ada_graph(norm: AdaNormKind) -> (Graph, usize, usize, usize) {
     let (b, s, d) = (2usize, 5usize, 8usize);
     let mut g = Graph::new("ada");
@@ -45,6 +47,7 @@ fn fill(n: usize, seed: u32) -> Vec<f32> {
 
 #[test]
 fn cpu_session_ada_layer_norm_and_gated_residual() {
+    let _gpu = common::serialize_gpu();
     let (g, b, s, d) = ada_graph(AdaNormKind::LayerNorm);
     let x = fill(b * s * d, 0x1111);
     let scale = fill(b * d, 0x2222);
@@ -86,7 +89,8 @@ mod metal {
 
     #[test]
     fn metal_ada_layer_norm_matches_cpu() {
-        if !rlx_runtime::is_available(Device::Metal) {
+        let _gpu = common::serialize_gpu();
+        if common::skip_unless_available(Device::Metal, "metal") {
             return;
         }
         for &norm in &[AdaNormKind::LayerNorm, AdaNormKind::RmsNorm] {
@@ -111,7 +115,8 @@ mod metal {
 
     #[test]
     fn metal_gated_residual_matches_cpu() {
-        if !rlx_runtime::is_available(Device::Metal) {
+        let _gpu = common::serialize_gpu();
+        if common::skip_unless_available(Device::Metal, "metal") {
             return;
         }
         let (g, b, s, d) = gate_graph();
@@ -132,7 +137,8 @@ mod metal {
 
     #[test]
     fn metal_dit_modulation_grad_matches_cpu() {
-        if !rlx_runtime::is_available(Device::Metal) {
+        let _gpu = common::serialize_gpu();
+        if common::skip_unless_available(Device::Metal, "metal") {
             return;
         }
         use rlx_ir::Op;
@@ -206,7 +212,7 @@ mod metal {
 /// Shared packed-backward parity helper (CPU vs another device).
 #[cfg(any(feature = "cuda", feature = "gpu", feature = "rocm", feature = "mlx"))]
 fn packed_bwd_parity(device: Device, label: &str) {
-    if !rlx_runtime::is_available(device) {
+    if common::skip_unless(device) {
         return;
     }
     use rlx_ir::Op;
@@ -286,23 +292,27 @@ fn packed_bwd_parity(device: Device, label: &str) {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_dit_modulation_grad_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     packed_bwd_parity(Device::Cuda, "cuda");
 }
 
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_dit_modulation_grad_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     packed_bwd_parity(Device::Gpu, "wgpu");
 }
 
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_dit_modulation_grad_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     packed_bwd_parity(Device::Rocm, "rocm");
 }
 
 #[cfg(feature = "mlx")]
 #[test]
 fn mlx_dit_modulation_grad_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     packed_bwd_parity(Device::Mlx, "mlx");
 }

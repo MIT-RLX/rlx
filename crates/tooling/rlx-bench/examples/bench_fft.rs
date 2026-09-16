@@ -61,7 +61,7 @@ fn run_sweep(devs: &[(&'static str, Device)], batches: &[usize], ns: &[usize], t
                 inverse: false,
             };
             for &(label, dev) in devs {
-                let r = if std::env::var("RLX_BENCH_DISPATCH_ONLY").ok().as_deref() == Some("1") {
+                let r = if rlx_ir::env::var("RLX_BENCH_DISPATCH_ONLY").as_deref() == Some("1") {
                     run_benchmark_dispatch_only(&pattern, dev, 5, 30)
                 } else {
                     run_benchmark(&pattern, dev, 5, 30)

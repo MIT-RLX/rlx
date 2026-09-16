@@ -15,7 +15,7 @@ use rlx_runtime::{Device, Session};
 
 /// Rank-3 `[B, S, H·head_dim]` Q/K, `[B, S, H·v_head_dim]` V/out, causal.
 fn run_case(nh: usize, hd: usize, v_hd: usize, seq: usize) -> Option<f32> {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return None;
     }

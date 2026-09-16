@@ -13,7 +13,7 @@
 //! strides, and how the opcode tables in [`crate::opcodes`] drifted apart in
 //! the first place.
 //!
-//! [`print`] and [`parse`] are exact inverses, so a pass test can be a pair of
+//! [`print`](fn@print) and [`parse`] are exact inverses, so a pass test can be a pair of
 //! strings:
 //!
 //! ```
@@ -65,7 +65,7 @@
 //!
 //! # What round-trips
 //!
-//! Everything except [`Node::origin`], which is pass provenance rather than
+//! Everything except `Node::origin`, which is pass provenance rather than
 //! IR — it is re-stamped by whichever pass runs next, so serialising it would
 //! bake one pipeline's history into a test fixture. Concretely,
 //! `parse(print(g))` equals `g` under
@@ -340,7 +340,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Parse textual IR produced by [`print`].
+/// Parse textual IR produced by [`print`](fn@print).
 pub fn parse(text: &str) -> Result<Graph, ParseError> {
     let mut lines = text.lines().enumerate().peekable();
 

@@ -24,6 +24,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn build_gdn_graph(b: usize, s: usize, h: usize, n: usize) -> Graph {
     let mut g = Graph::new("gdn");
     let bshn = Shape::new(&[b, s, h, n], DType::F32);
@@ -40,6 +42,7 @@ fn build_gdn_graph(b: usize, s: usize, h: usize, n: usize) -> Graph {
 
 #[test]
 fn cpu_gated_delta_net_matches_reference_recurrence() {
+    let _gpu = common::serialize_gpu();
     let (b, s, h, n) = (1, 4, 2, 3);
 
     // Deterministic-but-non-trivial inputs. g is small-negative so
@@ -149,6 +152,7 @@ fn cpu_gated_delta_net_matches_reference_recurrence() {
 /// match.
 #[test]
 fn cpu_gated_delta_net_resets_state_between_batches() {
+    let _gpu = common::serialize_gpu();
     let (h, n, s) = (2, 3, 4);
 
     let nqkv_1 = s * h * n;
@@ -215,6 +219,7 @@ fn cpu_gated_delta_net_resets_state_between_batches() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_gated_delta_net_host_matches_cpu_n128() {
+    let _gpu = common::serialize_gpu();
     // Default Metal path uses CPU GDN unless RLX_METAL_GDN_NATIVE=1.
     let (b, s, h, n) = (1, 11, 32, 128);
     let nqkv = b * s * h * n;
@@ -255,6 +260,7 @@ fn metal_gated_delta_net_host_matches_cpu_n128() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_gated_delta_net_native_matches_cpu_n128() {
+    let _gpu = common::serialize_gpu();
     // Default native path (one thread per head). Bounded inputs — a linear
     // ramp over Fara-sized extents overflows f32 in the recurrence on every
     // backend.

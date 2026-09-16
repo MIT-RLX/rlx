@@ -59,7 +59,7 @@ pub struct ImportOptions {
     /// Upper bound multiplier for `Loop` / `ConcatFromSequence` static shapes (`seq * N`).
     pub max_frames_per_token: usize,
     /// When true, lower ONNX `Random*` to `Op::Custom` instead of native
-    /// [`Op::RngNormal`] / [`Op::RngUniform`]. Kept for callers that still
+    /// [`Op::RngNormal`](rlx_ir::Op::RngNormal) / [`Op::RngUniform`](rlx_ir::Op::RngUniform). Kept for callers that still
     /// route random ops through a backend custom-kernel registry.
     pub lower_random_as_custom: bool,
     /// Correct inferred output shapes for known-bad ONNX metadata (set by downstream model crates).

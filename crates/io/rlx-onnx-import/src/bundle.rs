@@ -111,9 +111,9 @@ pub fn topo_sort_nodes(nodes: Vec<BundleNode>) -> Vec<BundleNode> {
 ///
 /// Set `RLX_ONNX_BUNDLE` to point at an exported bundle directory.
 pub fn onnx_bundle_dir() -> std::path::PathBuf {
-    std::env::var("RLX_ONNX_BUNDLE")
+    rlx_ir::env::var("RLX_ONNX_BUNDLE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/rlx-onnx-bundle"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/rlx-onnx-bundle"))
 }
 
 pub fn load_bundle(dir: &Path) -> Result<RlxBundle> {

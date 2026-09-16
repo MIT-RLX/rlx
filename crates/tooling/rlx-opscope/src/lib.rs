@@ -19,7 +19,7 @@
 //! This module provides:
 //! - [`inject_matmul_stats`] — the stat-injection graph pass (matmul MVP).
 //! - [`StatConfig`] / [`StatSpec`] — what to record and how to label it.
-//! - [`Dist`] / [`gen`] — synthetic distribution generators.
+//! - [`Dist`] / `gen` — synthetic distribution generators.
 //! - [`Recorder`] — a dependency-free tidy-CSV sink.
 
 use rlx_ir::infer::GraphExt;
@@ -28,6 +28,7 @@ use rlx_ir::{DType, Graph, NodeId, Op, Philox4x32, Shape};
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+pub mod bytes;
 pub mod dataflow;
 pub mod demo;
 pub mod guard;
@@ -492,7 +493,7 @@ fn fakequant(g: &mut Graph, a: NodeId, per_channel: bool) -> NodeId {
 /// — so this quantizes precisely the linear-layer activations, as real W8A8 does.
 /// Outputs are preserved (same indices); compile with `skip_fusion` (the inserted
 /// nodes would otherwise trip SwiGLU fusion). `per_channel` picks the scale scope
-/// (see [`fakequant`]) — `false` = per-token (deployable W8A8), `true` = per-channel
+/// (see `fakequant`) — `false` = per-token (deployable W8A8), `true` = per-channel
 /// (the outlier-robust ceiling).
 pub fn inject_activation_fakequant(graph: &Graph, per_channel: bool) -> Graph {
     let mut g = Graph::new(&graph.name);

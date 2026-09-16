@@ -9,6 +9,8 @@
 use rlx_ir::{DType, Graph, ScatterNdReduction, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn scatter_nd_graph(reduction: ScatterNdReduction) -> Graph {
     let mut g = Graph::new("scatter_nd");
     let data = g.input("data", Shape::new(&[4, 4], DType::F32));
@@ -37,6 +39,7 @@ fn run(device: Device, reduction: ScatterNdReduction) -> Vec<f32> {
 
 #[test]
 fn scatter_nd_none_cpu() {
+    let _gpu = common::serialize_gpu();
     let out = run(Device::Cpu, ScatterNdReduction::None);
     assert_eq!(&out[0..4], &[0.0, 0.0, 0.0, 0.0]);
     assert_eq!(&out[4..8], &[1.0, 1.0, 1.0, 1.0]);
@@ -46,6 +49,7 @@ fn scatter_nd_none_cpu() {
 
 #[test]
 fn scatter_nd_add_cpu() {
+    let _gpu = common::serialize_gpu();
     let mut g = Graph::new("snd_add");
     let data = g.input("data", Shape::new(&[2], DType::F32));
     let indices = g.input("indices", Shape::new(&[2, 1], DType::F32));
@@ -67,6 +71,7 @@ fn scatter_nd_add_cpu() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn scatter_nd_none_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let cpu = run(Device::Cpu, ScatterNdReduction::None);
     let metal = run(Device::Metal, ScatterNdReduction::None);
     assert_eq!(cpu, metal);

@@ -132,6 +132,15 @@ fn register_builtin(r: &Registry) {
     map.insert(Device::Xdna, || {
         Box::new(crate::backend::xdna_backend::XdnaBackend) as Box<dyn Backend>
     });
+
+    // eGPU: same seam contract as XDNA above. `is_available(Egpu)` is false
+    // without a device bring-up path, so this never runs unless explicitly
+    // forced, in which case `EgpuBackend::compile` surfaces rlx_egpu's
+    // diagnostic naming what is missing.
+    #[cfg(feature = "egpu")]
+    map.insert(Device::Egpu, || {
+        Box::new(crate::backend::egpu_backend::EgpuBackend) as Box<dyn Backend>
+    });
 }
 
 /// Register a backend factory for `device`. External backend crates

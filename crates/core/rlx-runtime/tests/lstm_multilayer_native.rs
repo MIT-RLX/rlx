@@ -10,7 +10,9 @@
 //! reference. `RLX_PARITY_DEVICE` selects the device (default cuda).
 
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn mk(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -26,16 +28,17 @@ fn mk(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     }
 }
 
 #[test]
 fn lstm_multilayer_bidir_native_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip lstm_multilayer_bidir_native ({dev:?} unavailable)");
         return;
     }

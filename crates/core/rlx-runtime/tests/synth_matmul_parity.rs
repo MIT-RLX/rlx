@@ -15,6 +15,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 // The Metal synth tests toggle process-global `RLX_METAL_SYNTH_*` env vars to pick
 // the dispatch path; serialize them so a concurrent test never observes another's
 // flags. (Default Rust runs test fns in parallel.)
@@ -166,6 +168,7 @@ fn cases() -> Vec<Case> {
 
 #[test]
 fn cpu_native_matches_reference() {
+    let _gpu = common::serialize_gpu();
     for c in cases() {
         let (x, indices, codebook) = make_inputs(&c);
         let out = run_native(&c, &x, &indices, &codebook);
@@ -183,6 +186,7 @@ fn cpu_native_matches_reference() {
 
 #[test]
 fn decompose_matches_native() {
+    let _gpu = common::serialize_gpu();
     for c in cases() {
         let (x, indices, codebook) = make_inputs(&c);
         let native = run_native(&c, &x, &indices, &codebook);
@@ -204,8 +208,9 @@ fn decompose_matches_native() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let _g = METAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !rlx_runtime::is_available(Device::Metal) {
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     for c in cases() {
@@ -237,11 +242,12 @@ fn metal_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal", feature = "training"))]
 fn metal_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     use rlx_autodiff::grad_with_loss;
     use rlx_ir::op::{BinaryOp, ReduceOp};
 
     let _g = METAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !rlx_runtime::is_available(Device::Metal) {
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
 
@@ -335,8 +341,9 @@ fn metal_backward_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn metal_tiled_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let _g = METAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !rlx_runtime::is_available(Device::Metal) {
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // Edge cases: m,n,k not multiples of 32; d=1 and d=4.
@@ -400,8 +407,9 @@ fn metal_tiled_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn metal_tiled_f16_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let _g = METAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !rlx_runtime::is_available(Device::Metal) {
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let cases = [
@@ -458,8 +466,9 @@ fn metal_tiled_f16_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn metal_recon_f16_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let _g = METAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !rlx_runtime::is_available(Device::Metal) {
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // m>8 → the recon→MPS path (with the flag, its f16 variant).
@@ -511,7 +520,11 @@ fn metal_recon_f16_matches_cpu() {
 #[ignore = "wgpu f32-uniform arena can't decompose a u8-indexed op; needs a native kernel (like Metal)"]
 #[cfg(feature = "webgpu")]
 fn wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::WebGpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
+    if common::skip_unless_available(Device::WebGpu, "webgpu") {
         return;
     }
     for c in cases() {

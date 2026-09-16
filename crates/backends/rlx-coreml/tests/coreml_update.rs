@@ -72,7 +72,7 @@ fn mlupdatetask_falls_back_to_gradient_path() {
 
 #[test]
 fn ane_training_converges_linear_model() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -109,7 +109,7 @@ fn ane_training_converges_linear_model() {
 /// (Muon) + 2nd-order-ish (Sophia) steppers stay numerically stable on the ANE.
 #[test]
 fn ane_training_with_optimizer_suite() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -149,7 +149,7 @@ fn ane_training_with_optimizer_suite() {
 /// Also checks the pending-count bookkeeping.
 #[test]
 fn ane_gradient_accumulation_matches_single_step() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -190,7 +190,7 @@ fn ane_gradient_accumulation_matches_single_step() {
 /// matches the host `rlx-optim` SGD path step-for-step — same `v=μv+g; w−=lr·v`.
 #[test]
 fn ane_fused_on_device_sgd_matches_host() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -240,7 +240,7 @@ fn ane_fused_on_device_sgd_matches_host() {
 
 #[test]
 fn ane_gradient_step_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -277,7 +277,7 @@ fn ane_gradient_step_matches_cpu() {
 #[test]
 fn ane_maxpool_softmax_ce_training_decreases_loss() {
     use rlx_ir::Op;
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -378,7 +378,7 @@ fn ane_maxpool_softmax_ce_training_decreases_loss() {
 /// fast, lower-precision path. The realizable linear model still converges.
 #[test]
 fn ane_amp_f16_training_converges() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }

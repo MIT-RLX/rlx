@@ -1,0 +1,123 @@
+# Signed GPU firmware carried by linux-firmware.
+#
+# These blobs are the vendors' own, signed by keys fused into the silicon: the
+# AMD PSP and the NVIDIA GSP bootloader verify them on load and refuse anything
+# else. Nothing here is produced or re-signed by rlx — bring-up hands the card
+# its own firmware and the card boots itself.
+#
+# Provenance: hashes mirror tinygrad's `am`/`nv` drivers, which pin the same
+# linux-firmware commit. Verify before use; a mismatch means the upstream file
+# moved and the pin needs re-checking, not that the check should be relaxed.
+#
+# Format: vendor <TAB> family <TAB> path <TAB> name <TAB> sha256
+# Pull with: scripts/pull_gpu_firmware.sh [vendor|family ...]
+#
+# repo   https://gitlab.com/kernel-firmware/linux-firmware
+# commit 1e2c15348485939baf1b6d1f5a7a3b799d80703d
+#
+# AMD — RDNA3 (Navi 31/33), RDNA4 (Navi 44/48), CDNA3 (MI300X)
+amd	gc_11_0	amdgpu	gc_11_0_0_imu.bin	b4f8fc056b45709a6abf48e7885fb1b4ab8d3cc092cbfa2c554a78564a6403bc
+amd	gc_11_0	amdgpu	gc_11_0_0_me.bin	f8fba8a63dd4293b8fc1e4aab78b6fac630e575d1d62838c7996d9210f82aea1
+amd	gc_11_0	amdgpu	gc_11_0_0_mec.bin	801a09c9bf06188260db9b51ad8f978f15d84c72ca91b90643a2ef8af4074776
+amd	gc_11_0	amdgpu	gc_11_0_0_pfp.bin	e175cb0f580a38c961a6f7366142c08e413995f57f78f39795368b15442df8a3
+amd	gc_11_0	amdgpu	gc_11_0_0_rlc.bin	dabd49039772d02f5fd5e48dc21d35ad52a6b1283b470dabca86ca159c4c7c8e
+amd	gc_11_0	amdgpu	gc_11_0_1_imu.bin	ac71f4eec713fc35b4a1fe27531e3eb04edd81eeac2cef64df01ac50d8510805
+amd	gc_11_0	amdgpu	gc_11_0_1_me.bin	5030040b00955de94876341ec64ea43b96640413d7a03dc460a83c8386bf76e0
+amd	gc_11_0	amdgpu	gc_11_0_1_mec.bin	6afadcb7504bb11bcc9d4a205cdf73f7934a615e28f178fcf7285971df2ccd05
+amd	gc_11_0	amdgpu	gc_11_0_1_pfp.bin	f5bf21dfbd9e72a30b4caf4704282c27854710c1b7c4affbb2a19530466b12a8
+amd	gc_11_0	amdgpu	gc_11_0_1_rlc.bin	86145719a58e9428562930c6b5ee3b6ced4701d34a80d0b4d84d6026c93134f2
+amd	gc_11_0	amdgpu	gc_11_0_2_imu.bin	9befca62b0b0cfd252c3df4a9edca295526f4d43821cd99a6326454995a6ca2d
+amd	gc_11_0	amdgpu	gc_11_0_2_me.bin	0f21fd43f1dfbc6ccced9a2b3774de25c993c61a689aabab8b45333937b7945e
+amd	gc_11_0	amdgpu	gc_11_0_2_mec.bin	0da0edee28c73a6fa1191f77853d380ec2503cbf43e0aaae4617f32f1f8a48fa
+amd	gc_11_0	amdgpu	gc_11_0_2_pfp.bin	001c4dec1119e29314d725cc1280fc4f0cd9cabdf61ea5ee2260cfd4e62ec141
+amd	gc_11_0	amdgpu	gc_11_0_2_rlc.bin	b43eb2fd0600f50a1a5796bc9983d6b39b5c20960234920f5e89cb362193e0b8
+amd	gc_11_0	amdgpu	gc_11_0_3_imu.bin	beaf704d5acdf4623456b0d0cbcea8b8e428058340cd922a259a9045f5c457a3
+amd	gc_11_0	amdgpu	gc_11_0_3_me.bin	3acb5061dba342ade81d329d1932f19ec01f0c5bf44e6e3568008a951a351bac
+amd	gc_11_0	amdgpu	gc_11_0_3_mec.bin	323cfa6658b6b5169830f852e2ff0552acae8dfb9e44b42c63de7b2900d3fd9e
+amd	gc_11_0	amdgpu	gc_11_0_3_pfp.bin	0488034c85be97125e39e860308d33c3f76a01df8250092a32d4d55acb2526fd
+amd	gc_11_0	amdgpu	gc_11_0_3_rlc.bin	29b0b456f5b53076ddffa6f09de3bb697219e8e7b33504bf6c197e8b858426dc
+amd	gc_11_0	amdgpu	gc_11_0_4_imu.bin	ac71f4eec713fc35b4a1fe27531e3eb04edd81eeac2cef64df01ac50d8510805
+amd	gc_11_0	amdgpu	gc_11_0_4_me.bin	e4f1f6abcd213d54ad9e885d9f550083b0e2f67d983566015e8a53981e1cb155
+amd	gc_11_0	amdgpu	gc_11_0_4_mec.bin	5d89cf6b60354f3746c2cbd1ff0cb1a741556ca20d72745242cb69b553d0985c
+amd	gc_11_0	amdgpu	gc_11_0_4_pfp.bin	5ae8b7bb6316f87ae8b978354c088e3bd8c890959382d72886377cda25b1ffd1
+amd	gc_11_0	amdgpu	gc_11_0_4_rlc.bin	823573078b608108fbe4dd8176c396ec582632913db9c59a512d82b068f8eba0
+amd	gc_12_0	amdgpu	gc_12_0_0_imu.bin	aa15e5b3156bffc45e0c50bccbcd364fbd3f958531b695b7487a803d780b8328
+amd	gc_12_0	amdgpu	gc_12_0_0_me.bin	d7eba5197f2580f32b8256b1d9cb68e723e9e644293a34446a7913e3c093cba5
+amd	gc_12_0	amdgpu	gc_12_0_0_mec.bin	1931593440b8f9423580d9e2cdc5b34e7c682cdffe1ca4b74b0c2f6a0420236d
+amd	gc_12_0	amdgpu	gc_12_0_0_pfp.bin	16bfd64c10fe73b5e760055069a60e5841dba16c0ed4edb56c20d675e23901f6
+amd	gc_12_0	amdgpu	gc_12_0_0_rlc.bin	6436b582734a413456fff3d3c7195e71cc9e78a7ed31ee21c83ffd6fae1ad186
+amd	gc_12_0	amdgpu	gc_12_0_1_imu.bin	b3b301fb636efc77b63ce4d2ced0f90c851d03c19681852faa45598e6f5773fd
+amd	gc_12_0	amdgpu	gc_12_0_1_me.bin	365e7f193b39cbb10d3af44905fefaca0e9844721801755276baebac7b19c1ea
+amd	gc_12_0	amdgpu	gc_12_0_1_mec.bin	f57541688a5108730bf210663f1137ffc2121f3acfe614a6de09ec1982c69a2f
+amd	gc_12_0	amdgpu	gc_12_0_1_pfp.bin	49efb319305c5fffd90ac1eef7d7a0bdec72998ecb5cf4526996311788a53dc3
+amd	gc_12_0	amdgpu	gc_12_0_1_rlc.bin	6ba4459532246a5c415d3cb33c9b1248294e48f67b827e2accb292a8d1a5c0ec
+amd	gc_9_4	amdgpu	gc_9_4_3_mec.bin	3159176e72301fb88dc416721fb3d0ab82ece484cf93a43c3f37430c7e6673a1
+amd	gc_9_4	amdgpu	gc_9_4_3_rlc.bin	5345d388712d547b0ae16f199ad5ccadb65643584b3efa7817049ddeb3fdcd12
+amd	gc_9_4	amdgpu	gc_9_4_3_sjt_mec.bin	d19468dbb47849640bd0e6cdc8d7e25a3c8442c7ca2ca81357702e0d6baab50f
+amd	gc_9_4	amdgpu	gc_9_4_4_mec.bin	5004f73e43db2dd45e77d65942e33d4a69e7157618cfd23944c30f801c77a0f3
+amd	gc_9_4	amdgpu	gc_9_4_4_rlc.bin	e0c3585c72f8136670ca63e607fba32c1ae4948f493f13e33fc4d466bd6318a8
+amd	gc_9_4	amdgpu	gc_9_4_4_sjt_mec.bin	627a9e98102e70fe3bf0947eb764187f29f5e775d1130c7310e0ba5fc0502dbe
+amd	psp_13_0	amdgpu	psp_13_0_0_sos.bin	b5592f46885585b935e013f46c949db8ff2f15c0b346caf70e7fcd2776623d13
+amd	psp_13_0	amdgpu	psp_13_0_10_sos.bin	0bcaaad9cd8578d3841ae69155a6bd4fc3ceae8f4fb5a6ba4f576e7ace94d1d9
+amd	psp_13_0	amdgpu	psp_13_0_12_sos.bin	89da90bf4286b38678b1fd175c78462a426afa3d258d15872cd14072d7098b9b
+amd	psp_13_0	amdgpu	psp_13_0_14_sos.bin	a4f0d5f76d27b77409ec0b71d7cc6a848ddfd29f8c84f3003edf74ad3999fb7d
+amd	psp_13_0	amdgpu	psp_13_0_6_sos.bin	27657daa0f91ad8095d3610224a7de748b8b348a4cb211ecb5fccabe47369716
+amd	psp_13_0	amdgpu	psp_13_0_7_sos.bin	ef1af0ecea38abbac6f85cce71789f19848c498d0cb8ef13748dab2d65b23c31
+amd	psp_14_0	amdgpu	psp_14_0_2_sos.bin	7b538448b57d4f9dd06b2eea90d4f86a16e65e3027cdecee8db71c2c5f1fa243
+amd	psp_14_0	amdgpu	psp_14_0_3_sos.bin	23bea01a0c6f36d00759d0765d46cb4cb4aa87398b2fbccacbf547a890c0bf51
+amd	sdma_4_4	amdgpu	sdma_4_4_2.bin	456061b814268425843537da6f2191c8861d4e1a18d4c5d90c44ea6be18c78ff
+amd	sdma_4_4	amdgpu	sdma_4_4_4.bin	af47a2940e72b932d3e3a7e8f34f7a182624e5e433f7c56dff939ca5549cd33a
+amd	sdma_4_4	amdgpu	sdma_4_4_5.bin	6127baabea3de7b18db3868c983b02c0fbf2cd75997f7f11241a5b1be27e5134
+amd	sdma_6_0	amdgpu	sdma_6_0_0.bin	0f3da6b211f376356335b41be07149f650c10cfa4e23f7e25d53836006ed11f5
+amd	sdma_6_0	amdgpu	sdma_6_0_1.bin	ff565d3c215a30737560d4e3df6fc2c637738407e91d212fb200fdfb185b6744
+amd	sdma_6_0	amdgpu	sdma_6_0_2.bin	398380184bb69113ef4c8964a3b55f6184deb0c1ffd96c9683490a3eec3ba8f3
+amd	sdma_6_0	amdgpu	sdma_6_0_3.bin	0e8a83513087db865ba926f8b65cfb003fd41098f707e178d7a7ae2941fed0b1
+amd	sdma_6_1	amdgpu	sdma_6_1_0.bin	22e55d0ad5f0247a7f0fffc67cfd3161b39f24ad6062ff3c91ec7ff38bd7e1e1
+amd	sdma_6_1	amdgpu	sdma_6_1_1.bin	74533a581b8e3e2743b3c9c803d0666405e80898c4a630acefed82cb6b516ba2
+amd	sdma_6_1	amdgpu	sdma_6_1_2.bin	4fe04b0286ec739b0414e8aee17e62e85e691f0246d1d9b56bc18a1219072314
+amd	sdma_6_1	amdgpu	sdma_6_1_3.bin	35c9ed7e3a237c0d4a83b4975c63b62488f72aeafbb648342f384618e103f66b
+amd	sdma_7_0	amdgpu	sdma_7_0_0.bin	beaafb53993a106edd392392d5896245ae2a957c6d0f495d0002eec72ad8ad38
+amd	sdma_7_0	amdgpu	sdma_7_0_1.bin	73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59
+amd	smu_13_0	amdgpu	smu_13_0_0.bin	2ffac37fd8534965eeba19755db0e5ec80278213487dc4af0fbc8453befb64b1
+amd	smu_13_0	amdgpu	smu_13_0_0_kicker.bin	7f83656a2a89b7fce1c8a85e96d91cd8265a91fe883a7027f1a0ed18ced501de
+amd	smu_13_0	amdgpu	smu_13_0_10.bin	daedb9cbdf48942be7ffe00d31b7c16bb36e11ff5a9d7495f218e95c07717b71
+amd	smu_13_0	amdgpu	smu_13_0_14.bin	a4f36de75fdcecd8000246762e027b4be489b6787afea57675225b0b39d35625
+amd	smu_13_0	amdgpu	smu_13_0_6.bin	ad7232264e8c57c2094244fbdd5a55d7a4575ffe9b44d229884bc0b6a44fb0b1
+amd	smu_13_0	amdgpu	smu_13_0_7.bin	ccecc0fd0196b9613c920a51c2fd9436e739ff19dda5bdf74d97562387231732
+amd	smu_14_0	amdgpu	smu_14_0_2.bin	6951995d1d606f4dc60c895f19d34ed18aa40e62129f83d8510c45e8aa9ae2fc
+amd	smu_14_0	amdgpu	smu_14_0_3.bin	df230947ddb7bbfd6e77d1280001db886e69adf2b2a448b47fa668a48bc0009f
+amd	smu_14_0	amdgpu	smu_14_0_3_kicker.bin	8ddc1da5b4e1619796c2cc81f19f388a35bf7d78bfe476cee559625589cb4dc7
+
+# AMD — CDNA1 (MI100 / gfx908). ASIC-named rather than IP-versioned.
+# No userspace bring-up covers this part; the blobs are here because an
+# OCuLink-attached MI100 is the development target for `am` on Linux.
+amd	arcturus	amdgpu	arcturus_asd.bin	cd2f1d9c15608b626958ae30cf78b15b672a44b4fba8e909919c2ff749f87be1
+amd	arcturus	amdgpu	arcturus_gpu_info.bin	9a363362a39afc92e0072b012d0147276d552c88042429f3298801c412372b1a
+amd	arcturus	amdgpu	arcturus_mec.bin	c8d04701db13000ed4097e4044a020ee4467a769b0702b26135c5746e2c63254
+amd	arcturus	amdgpu	arcturus_mec2.bin	c8d04701db13000ed4097e4044a020ee4467a769b0702b26135c5746e2c63254
+amd	arcturus	amdgpu	arcturus_rlc.bin	82ec445ef3859a42ecbdcfb4d9ab2cbbeffd1ea1e5519f41a17f67a58038f970
+amd	arcturus	amdgpu	arcturus_sdma.bin	985902486050dc4b04bd74ca5fd7f60378ceb8079311f069046f593cf36f8d17
+amd	arcturus	amdgpu	arcturus_smc.bin	a7e794e585a20617d872e24d754e266f05c3e9615b38bb407a7f3a4dc581b27d
+amd	arcturus	amdgpu	arcturus_sos.bin	026c5d1641ccbcebd39b522591ab1f45bb3e879f3bb8cc6f1d15d17672bbc52f
+amd	arcturus	amdgpu	arcturus_ta.bin	f816775626a75eb42394b76f8842a0fbb5a63c38c41731c66e23acb6573765a0
+amd	arcturus	amdgpu	arcturus_vcn.bin	256d3af53397f00d28a27cd320c128239d9985b9ff861b8ebd0b4f543d57bcb8
+
+# NVIDIA — GSP boot chain (Ampere / Ada / Blackwell)
+#
+# There is ONE GSP image for every family and it lives under ga102:
+# nvidia/ad102/gsp/gsp-570.144.bin and nvidia/gb202/gsp/gsp-570.144.bin do not
+# exist upstream (verified: both 404 at this commit). The image is an ELF
+# carrying per-family microkernels (kernel_ga10x/gh100/gb10x/gb20x.elf) and
+# seven distinct .fwsignature_* sections, so one blob covers Ampere through
+# Blackwell and the chip picks its own signature.
+#
+# So the per-chip families here carry only the booter / bootloader / FMC, and
+# every NVIDIA part additionally needs `ga102` for the GSP image itself. The
+# asymmetry below is upstream's, not an omission — see ids::firmware_families.
+nvidia	ga102	nvidia/ga102/gsp	booter_load-570.144.bin	4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b
+nvidia	ga102	nvidia/ga102/gsp	bootloader-570.144.bin	82428f532240727e95bb3083fbaaba9b2cc7b937314323f2d546ce7245f27fad
+nvidia	ga102	nvidia/ga102/gsp	gsp-570.144.bin	a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f
+nvidia	ad102	nvidia/ad102/gsp	booter_load-570.144.bin	8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a
+nvidia	ad102	nvidia/ad102/gsp	bootloader-570.144.bin	65ab2e6b6e0fca95365c4deac79a34582abcfeb15b6ae234138f22e7183118a8
+nvidia	gb202	nvidia/gb202/gsp	bootloader-570.144.bin	d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071
+nvidia	gb202	nvidia/gb202/gsp	fmc-570.144.bin	cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece

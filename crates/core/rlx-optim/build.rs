@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Link Apple's Accelerate framework on macOS so Muon's Newton–Schulz
 // orthogonalization can call `cblas_sgemm` (AMX-backed BLAS) instead of the
 // portable hand-rolled matmul — the dominant cost of Muon on large models.

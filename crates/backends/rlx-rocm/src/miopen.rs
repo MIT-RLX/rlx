@@ -169,8 +169,66 @@ pub struct MiopenRuntime {
 unsafe impl Send for MiopenRuntime {}
 unsafe impl Sync for MiopenRuntime {}
 
+/// Does this MIOpen carry the precompiled kernels that make it worth using?
+///
+/// MIOpen ships its convolutions as prebuilt GCN assembly, and Debian and
+/// Ubuntu repackage it as `+dfsg` with those objects removed — they are binary
+/// blobs, so they fail the Free Software Guidelines. What is left loads, links
+/// and answers every call, but has no kernel database: it prints `Failed to
+/// load kernel source: ....s` for each one it wanted and falls back to a
+/// generic solver.
+///
+/// That is the dangerous case, because it does not fail.
+/// `miopenConvolutionForward` returns success, so a caller that treats an error
+/// as "use my own kernel instead" never does — and on an MI100 the result
+/// measured 3.6x *slower* than the same machine's CPU. So the check is up front
+/// and structural: no kernel database, no MIOpen.
+///
+/// `RLX_ROCM_MIOPEN_FORCE` uses MIOpen anyway, for measuring the difference.
+/// `RLX_ROCM_DISABLE_MIOPEN` — checked by the caller in `device.rs` — turns it
+/// off whether or not the kernels are present.
+pub fn miopen_has_kernels() -> bool {
+    if rlx_ir::env::var("RLX_ROCM_MIOPEN_FORCE").is_some() {
+        return true;
+    }
+
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = rlx_ir::env::var("MIOPEN_SYSTEM_DB_PATH") {
+        roots.push(std::path::PathBuf::from(dir));
+    }
+    if let Some(rocm) = rlx_ir::env::var("ROCM_PATH") {
+        roots.push(std::path::Path::new(&rocm).join("share/miopen/db"));
+    }
+    roots.push(std::path::PathBuf::from("/opt/rocm/share/miopen/db"));
+
+    roots.iter().any(|root| {
+        std::fs::read_dir(root).is_ok_and(|entries| {
+            // `.kdb` is the compiled kernel database. A `.db` beside it is only
+            // tuning data, and tuning for kernels that are absent helps nothing.
+            entries.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("kdb"))
+            })
+        })
+    })
+}
+
 impl MiopenRuntime {
     pub fn load() -> Option<Arc<Self>> {
+        if !miopen_has_kernels() {
+            // Once for the process, not once per convolution.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "rlx-rocm: MIOpen has no kernel database, so its convolutions would run on \
+                     a generic fallback slower than this backend's own kernels — using those \
+                     instead. Install AMD's MIOpen rather than a `+dfsg` repack to change that, \
+                     or set RLX_ROCM_MIOPEN_FORCE=1 to use it regardless."
+                );
+            });
+            return None;
+        }
         unsafe {
             let lib = Library::new("libMIOpen.so")
                 .or_else(|_| Library::new("libMIOpen.so.1"))

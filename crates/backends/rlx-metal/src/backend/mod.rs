@@ -992,7 +992,7 @@ impl MetalExecutable {
 
     /// Register a resident-KV *row* feed (vs the generic prefix feed): row
     /// `src_row` of output `output_index` is folded into handle `handle_name`'s
-    /// input slot at `dst_row` by [`feed_kv_row`]. For decode graphs that emit
+    /// input slot at `dst_row` by [`Self::feed_kv_row`]. For decode graphs that emit
     /// the new token at the last bucket-padded output row (llama32).
     pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
         self.kv_row_feeds

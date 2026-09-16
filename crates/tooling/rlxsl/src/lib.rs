@@ -855,7 +855,7 @@ fn cse(sx: &Sx) -> Sx {
 }
 
 /// The derivative `d(activation)/dx` as a scalar expression, auto-differentiated
-/// from [`activation_expr`], algebraically simplified, then run through [`cse`]
+/// from [`activation_expr`], algebraically simplified, then run through `cse`
 /// to re-share the subterms differentiation duplicated — the single source for
 /// the backward kernels. This is exactly the gradient of the forward we ship (so
 /// gelu's grad is the derivative of the A&S forward, matching it by
@@ -1223,7 +1223,7 @@ pub fn opencl_activation_module(scheme: OpcodeScheme) -> String {
 // ── Backward (auto-differentiated) modules ──────────────────────────────────
 
 /// Render `act`'s derivative to `(statements, expr)` — backward counterpart of
-/// [`emit_activation`]. `statements` holds the CSE temporaries [`cse`] hoisted
+/// [`emit_activation`]. `statements` holds the CSE temporaries `cse` hoisted
 /// (empty for grads with no repeated subterm); `expr` is the value referencing
 /// `x` and those temporaries.
 pub fn emit_activation_grad(act: Activation, lang: Lang) -> (Vec<String>, String) {

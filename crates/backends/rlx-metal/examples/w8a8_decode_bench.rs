@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Full qwen3-0.6B decode-STEP microbench: f32 attention vs W8A8 attention (int8
 // Q + int8 K → integer QK dot), MEASURED end-to-end decode tps + attention
 // precision. The real op mix per layer — 7 projections (f16 GEMV) + GQA flash

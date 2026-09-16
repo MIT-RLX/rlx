@@ -6,7 +6,7 @@
 //!
 //! - [`Umap::fit`] / [`fit_with_progress`](umap::Umap::fit_with_progress) — sparse cross-entropy training
 //! - [`FittedUmap::transform`] — inference with training z-score stats
-//! - [`FittedUmap::save`] / [`load`] — safetensors or GGUF (`.ruama` load only for legacy files)
+//! - [`FittedUmap::save`] / `load` — safetensors or GGUF (`.ruama` load only for legacy files)
 //!
 //! Call [`register`] once per process before Session execution.
 //!

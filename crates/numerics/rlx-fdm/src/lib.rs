@@ -16,7 +16,7 @@
 //! - [`sparse`] — CSR stiffness + PCG (`EquilibriumModelSparse`)
 //! - [`iterative`] — fixed-point nonlinear iteration (`solver_forward`)
 //! - [`loads`] — shape-dependent edge / nodal loads
-//! - [`reference`] — end-to-end `fdm()` / `fdm_with_options`
+//! - [`mod@reference`] — end-to-end `fdm()` / `fdm_with_options`
 //! - [`goals`] — scalar objectives for inverse form-finding
 //! - [`objective`] — weighted goals (`NetworkLoadpath`, `EdgeLength`)
 //! - [`constraints`] — soft penalties + `q` projection

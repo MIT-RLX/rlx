@@ -131,7 +131,7 @@ fn main() {
     let home = std::env::var("HOME").unwrap_or_default();
     let raw = std::env::var("MNIST_RAW")
         .unwrap_or_else(|_| format!("{home}/.cache/torchvision-mnist/MNIST/raw"));
-    let wpath = std::env::var("RLX_F32_DUMP").unwrap_or_else(|_| "/tmp/tinyconv_f32.bin".into());
+    let wpath = rlx_ir::env::var("RLX_F32_DUMP").unwrap_or_else(|| "/tmp/tinyconv_f32.bin".into());
     let devname = std::env::var("DEVICE").unwrap_or_else(|_| "cpu".into());
     let batch: usize = std::env::var("BATCH")
         .ok()

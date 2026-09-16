@@ -16,6 +16,8 @@ use rlx_ir::ops::spectral::WindowKind;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const SR: f32 = 128.0;
 const T: usize = 512;
 const C: usize = 4;
@@ -92,6 +94,7 @@ fn run(dev: Device) -> Vec<Vec<f32>> {
 
 #[test]
 fn cpu_pipeline_is_sane() {
+    let _gpu = common::serialize_gpu();
     let out = run(Device::Cpu);
     let (de, bp, spec) = (&out[0], &out[1], &out[2]);
     assert_eq!(de.len(), C * BANDS.len());
@@ -114,12 +117,20 @@ fn cpu_pipeline_is_sane() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
+        return;
+    }
     assert_parity(Device::Metal);
 }
 
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
+        return;
+    }
     assert_parity(Device::Gpu);
 }
 

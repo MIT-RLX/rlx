@@ -13,6 +13,49 @@
 // Single-layer/unidir/no-carry reduces to the plain kernel. Bit-for-bit mirror
 // of `execute_lstm_f32`. Barriers sit in uniform control flow.
 
+// PRECISE exp/tanh, deliberately hand-rolled.
+//
+// WGSL's `exp`/`tanh` lower to the backend's fast variants, and on Apple those
+// are not accurate enough for this recurrence: past hidden 32 the error
+// compounds through the cell state until units collapse to exactly 0.0 for a
+// couple of steps. `rlx-metal` hit the identical defect in MSL and fixed it with
+// `metal::precise::exp`/`tanh`; WGSL has no such namespace, so the accurate
+// version is written out here.
+//
+// The same WGSL is correct on discrete NVIDIA Vulkan, so this is not fixing a
+// portability wart — it is removing a dependency on how good a given backend's
+// fast `exp` happens to be. Cost is a few ALU ops against an O(hidden^2) matvec
+// per gate, i.e. nothing.
+//
+// Cody-Waite range reduction: exp(x) = 2^k · exp(r), k = round(x·log2e),
+// r = x − k·ln2 with ln2 split hi/lo so `k·ln2` stays exact in f32. |r| ≤ ln2/2
+// ≈ 0.3466, where the degree-6 Taylor below has relative error ≈ r^7/5040 ≈
+// 1.2e-7 — about one f32 ulp.
+const RLX_LOG2E: f32 = 1.4426950408889634;
+const RLX_LN2_HI: f32 = 0.693145751953125;      // exactly representable in f32
+const RLX_LN2_LO: f32 = 1.4286067653301868e-6;
+
+fn rlx_exp_precise(x: f32) -> f32 {
+    let k = round(x * RLX_LOG2E);
+    let r = (x - k * RLX_LN2_HI) - k * RLX_LN2_LO;
+    let p = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666667 + r * (0.041666668
+            + r * (0.008333334 + r * 0.0013888889)))));
+    return ldexp(p, i32(k));
+}
+
+fn rlx_sigmoid_precise(x: f32) -> f32 {
+    return 1.0 / (1.0 + rlx_exp_precise(-x));
+}
+
+// tanh via the numerically stable form: exponentiate only the negative
+// magnitude, so nothing overflows for large |x|.
+fn rlx_tanh_precise(x: f32) -> f32 {
+    let a = abs(x);
+    let e = rlx_exp_precise(-2.0 * a);
+    let t = (1.0 - e) / (1.0 + e);
+    return select(-t, t, x >= 0.0);
+}
+
 struct Params {
     batch: u32,
     seq: u32,
@@ -29,7 +72,8 @@ struct Params {
     out_width: u32,
     dir_off: u32,
     reverse: u32,
-    _p: u32,
+    // 1 -> write the final h/c back into h0_off/c0_off (decode threading).
+    carry: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -80,12 +124,12 @@ fn lstm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                 }
                 z[gate] = acc;
             }
-            let i_g = 1.0 / (1.0 + exp(-z[0]));
-            let f_g = 1.0 / (1.0 + exp(-z[1]));
-            let g_g = tanh(z[2]);
-            let o_g = 1.0 / (1.0 + exp(-z[3]));
+            let i_g = rlx_sigmoid_precise(z[0]);
+            let f_g = rlx_sigmoid_precise(z[1]);
+            let g_g = rlx_tanh_precise(z[2]);
+            let o_g = rlx_sigmoid_precise(z[3]);
             c_k = f_g * c_k + i_g * g_g;
-            h_k = o_g * tanh(c_k);
+            h_k = o_g * rlx_tanh_precise(c_k);
         }
         // Uniform barrier: all threads finished reading the old h_sh.
         workgroupBarrier();
@@ -94,5 +138,13 @@ fn lstm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             arena[params.out_off + (bi * params.seq_stride + t) * params.out_width + params.dir_off + k] = h_k;
         }
         workgroupBarrier();
+    }
+
+    // Carry: thread the final state back into h0/c0 IN PLACE, per `Op::Lstm`'s
+    // contract. Without it the state is only ever *seeded* — every call restarts
+    // from the same h0/c0, which is silently wrong rather than an error.
+    if (params.carry != 0u && lane_on) {
+        arena[params.h0_off + bi * h + k] = h_sh[k];
+        arena[params.c0_off + bi * h + k] = c_k;
     }
 }

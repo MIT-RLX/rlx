@@ -69,7 +69,7 @@ fix only removes the crash.
 
 ## Op coverage
 
-Claims the full **153/`OpKind`** surface ([`docs/op-coverage.md`](../../docs/op-coverage.md)).
+Claims **170** of the **187** `OpKind`s ([`docs/op-coverage.md`](../../../docs/op-coverage.md), generated from `SUPPORTED_OPS`).
 Native SPIR-V covers the transformer / vision / training hot path:
 
 - **Transformer**: matmul, attention (online softmax; causal / sliding-window /

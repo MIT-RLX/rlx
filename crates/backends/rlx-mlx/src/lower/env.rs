@@ -25,13 +25,48 @@ use super::host_eval::{host_eval_op_typed, is_mlx_typed_host_op};
 use super::subgraph::*;
 use super::*;
 
+/// A recurrent op's final state, destined for the param buffer it came from.
+///
+/// `Op::Lstm { carry }` overwrites `h0`/`c0` in place on the arena backends.
+/// MLX has no arena and holds `params` by shared reference for the whole walk,
+/// so the write-back rides back out here and the caller applies it.
+pub type StateWriteback = (String, Vec<f32>);
+
 pub fn lower_with_env(
+    graph: &Graph,
+    env: HashMap<NodeId, Array>,
+    params: &HashMap<String, Vec<f32>>,
+    params_typed: &HashMap<String, (Vec<u8>, DType)>,
+    rng: rlx_ir::RngOptions,
+    eval_barriers: bool,
+) -> Result<Vec<Array>, MlxError> {
+    let mut sink = Vec::new();
+    let outs = lower_with_env_writeback(
+        graph,
+        env,
+        params,
+        params_typed,
+        rng,
+        eval_barriers,
+        &mut sink,
+    )?;
+    debug_assert!(
+        sink.is_empty(),
+        "state write-backs dropped: use lower_with_env_writeback"
+    );
+    Ok(outs)
+}
+
+/// [`lower_with_env`], plus the recurrent state write-backs the run produced.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_with_env_writeback(
     graph: &Graph,
     mut env: HashMap<NodeId, Array>,
     params: &HashMap<String, Vec<f32>>,
     params_typed: &HashMap<String, (Vec<u8>, DType)>,
     rng: rlx_ir::RngOptions,
     eval_barriers: bool,
+    writeback: &mut Vec<StateWriteback>,
 ) -> Result<Vec<Array>, MlxError> {
     let cfg = crate::config::runtime_config();
     let debug_eval = cfg.debug_eval;
@@ -463,7 +498,24 @@ pub fn lower_with_env(
             Op::Transpose { perm } => {
                 let x = lookup(&env, node.inputs[0])?;
                 let p: Vec<i32> = perm.iter().map(|&d| d as i32).collect();
-                ops::transpose(x, &p)?
+                // The graph may address this tensor at a different rank than the
+                // array actually carries: a matmul backward treats a `[B, S, K]`
+                // activation as the `[B·S, K]` matrix it multiplies, and permutes
+                // *that*. CPU and Metal are rank-lenient and read the buffer
+                // either way; MLX enforces rank and rejects a 2-element `perm`
+                // on a 3-D array. Materialize the view the graph is describing —
+                // `Op::Reshape` and `Op::Narrow` above already reconcile the same
+                // way, this op just did not.
+                let declared = node_input_shape(graph, node.inputs[0]);
+                let rt = x.shape()?;
+                let same_elems = declared.iter().map(|&d| d as i64).product::<i64>()
+                    == rt.iter().map(|&d| d as i64).product::<i64>();
+                if declared.len() != rt.len() && same_elems && declared.len() == p.len() {
+                    let viewed = ops::reshape(x, &declared)?;
+                    ops::transpose(&viewed, &p)?
+                } else {
+                    ops::transpose(x, &p)?
+                }
             }
             Op::ResizeNearest2x => {
                 let x = lookup(&env, node.inputs[0])?;
@@ -642,7 +694,31 @@ pub fn lower_with_env(
             Op::RmsNorm { eps, .. } => {
                 let x = lookup(&env, node.inputs[0])?;
                 let g = mlx_norm_scale_1d(lookup(&env, node.inputs[1])?)?;
-                ops::rms_norm(x, &g, *eps)?
+                // `Op::RmsNorm` declares THREE inputs — x, gamma, beta — and
+                // MLX's `ops::rms_norm` takes only a scale, so the shift has to
+                // be added here. It used to be dropped on the floor: every
+                // model with a non-zero RMSNorm bias ran a different function on
+                // MLX than on CPU/Metal, silently. The same omission was fixed
+                // in wgpu/CUDA/ROCm; MLX was missed because its forward looked
+                // correct — `ops::rms_norm` is a native call, so nothing in the
+                // lowering hinted that an input was unused. The finite-difference
+                // gate caught it as an exactly-zero d(loss)/d(beta).
+                let y = ops::rms_norm(x, &g, *eps)?;
+                // Beta is OPTIONAL at this seam. `Op::RmsNorm` declares three
+                // inputs and every rlx-built graph supplies them, but hand-built
+                // graphs (rlx-mlx's own `basic.rs`) construct the two-input form,
+                // and indexing `inputs[2]` unconditionally panicked there with
+                // "index out of bounds: the len is 2 but the index is 2" — which
+                // then poisoned the MLX runtime lock and took the rest of the
+                // suite with it. Absent beta means no shift, which is the
+                // behaviour those graphs already expected.
+                match node.inputs.get(2) {
+                    Some(beta_id) => {
+                        let beta = mlx_norm_scale_1d(lookup(&env, *beta_id)?)?;
+                        ops::add(&y, &beta)?
+                    }
+                    None => y,
+                }
             }
             Op::Attention {
                 num_heads,
@@ -1232,7 +1308,20 @@ pub fn lower_with_env(
                         // Keying off the input singleton (old `in_shape[2]==1 ? 1 : 0`)
                         // read the wrong index for the first convention and silently
                         // dropped the length padding (11→9), crashing the next reshape.
-                        let li = if wsh[2] >= wsh[3] { 0 } else { 1 };
+                        // A 1x1 kernel is symmetric, so the weight says nothing
+                        // about which axis is the real one; fall back to the input's
+                        // non-singleton axis. Keying off the weight alone picked
+                        // index 0 for every pointwise conv and therefore read the
+                        // HEIGHT stride — always 1 — so a strided 1x1 (the standard
+                        // ResNet downsample shortcut) silently returned the first
+                        // `out_len` samples instead of every `stride`-th one.
+                        let li = if wsh[2] == wsh[3] {
+                            usize::from(in_shape[2] == 1)
+                        } else if wsh[2] > wsh[3] {
+                            0
+                        } else {
+                            1
+                        };
                         let _ = co;
                         let x_ncl = ops::reshape(x, &[n, ci, length])?;
                         let w_ncl = ops::reshape(w, &[co, cig, k])?;
@@ -1694,7 +1783,17 @@ pub fn lower_with_env(
                 // rlx encodes indices as f32 at the I/O boundary.
                 ops::cast(&idx, DType::F32)?
             }
-            Op::ScatterAdd => {
+            Op::ScatterAdd { axis } => {
+            // Every backend kernel implements the axis-0 form only;
+            // `rlx_fusion::LowerScatterAddAxis` rewrites any other axis to
+            // transpose/scatter/transpose before lowering. Reaching here with
+            // axis != 0 means that pass did not run, and scattering along axis
+            // 0 anyway would silently produce the wrong tensor.
+            assert_eq!(
+                *axis, 0,
+                "rlx-mlx: ScatterAdd axis {{axis}} reached the backend; \
+                 LowerScatterAddAxis must run first"
+            );
                 // Inputs: [updates, indices]. Output is a fresh
                 // tensor of node.shape; rlx semantics is "initial
                 // output is zero, accumulate updates by indices."
@@ -1731,7 +1830,21 @@ pub fn lower_with_env(
                 if upd_shape.len() > 1 {
                     ops::scatter_add_axis(&zero_target, &indices, updates, 0)?
                 } else {
-                    ops::scatter_add(&zero_target, &indices, updates, 0)?
+                    // Rank-1 scatter. MLX's low-level `scatter_add` requires
+                    // `updates.ndim == target.ndim + indices.ndim`, so for a 1-D
+                    // target with 1-D indices the updates must be 2-D `[n, 1]` —
+                    // handing it the bare 1-D updates fails with "Updates with 1
+                    // dimensions does not match the sum of the array (1) and
+                    // indices (1) dimensions".
+                    //
+                    // This is the shape `Op::Slice`'s VJP emits (axis-0 ScatterAdd
+                    // over a 1-D tensor), so every Slice gradient PANICKED on MLX.
+                    // Nothing caught it because no test took a Slice backward on
+                    // MLX — the rank>1 branch above is the only one the Gather VJP
+                    // exercises. Found by `fd_backward_gate`'s slice cases.
+                    let n = upd_shape.first().copied().unwrap_or(0);
+                    let updates_2d = ops::reshape(updates, &[n, 1])?;
+                    ops::scatter_add(&zero_target, &indices, &updates_2d, 0)?
                 }
             }
             Op::GroupedMatMul => {
@@ -1831,13 +1944,16 @@ pub fn lower_with_env(
                 // experiment: `RLX_MLX_GROUPED_ONDEVICE=1` (budget-guarded by
                 // `RLX_MLX_GROUPED_ONDEVICE_MAX_BYTES`). MLX's genuinely fast MoE
                 // would need its native int4-affine quant / a custom e2m1 kernel.
-                let budget: usize = std::env::var("RLX_MLX_GROUPED_ONDEVICE_MAX_BYTES")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(2_000_000_000);
+                // Read through `rlx_ir::env`, not `std::env`: the shim honours
+                // in-process overrides, so these are reachable from a test and
+                // from `EnvOverride`. `std::env` sees only the real process
+                // environment, which made these two the only MLX knobs a test
+                // could not set.
+                let budget: usize =
+                    rlx_ir::env::parse_or("RLX_MLX_GROUPED_ONDEVICE_MAX_BYTES", 2_000_000_000);
                 let gather_bytes = m.saturating_mul(n).saturating_mul(k).saturating_mul(4);
-                let ondevice =
-                    std::env::var("RLX_MLX_GROUPED_ONDEVICE").is_ok() && gather_bytes <= budget;
+                let ondevice = rlx_ir::env::var("RLX_MLX_GROUPED_ONDEVICE").is_some()
+                    && gather_bytes <= budget;
                 if ondevice {
                     let name = match &graph.node(node.inputs[1]).op {
                         rlx_ir::Op::Param { name } => name.clone(),
@@ -2569,7 +2685,20 @@ pub fn lower_with_env(
             }
             Op::FusedSwiGLU { cast_to, gate_first } => {
                 let src = lookup(&env, node.inputs[0])?;
-                let in_shape = node_input_shape(graph, node.inputs[0]);
+                // Slice bounds come from the array's *runtime* shape, not the
+                // graph's. MLX can legitimately hold a higher-rank array where
+                // the graph declares a flattened one — a `[B, S, F]` activation
+                // against a graph shape of `[B·S, F]`, say — and building rank-2
+                // bounds for a rank-3 array is a hard error rather than a
+                // silently wrong slice. The split is along the last axis, whose
+                // extent is the same either way, so the runtime shape is both
+                // safe and correct here.
+                let in_shape: Vec<i32> = src
+                    .shape()
+                    .map_err(|e| MlxError(format!("FusedSwiGLU: input shape: {e}")))?
+                    .iter()
+                    .map(|d| *d as i32)
+                    .collect();
                 let last = *in_shape
                     .last()
                     .ok_or_else(|| MlxError("FusedSwiGLU: input is rank-0".into()))?;
@@ -3023,10 +3152,16 @@ pub fn lower_with_env(
             // multi-layer) runs natively on-device by unrolling the time
             // loop into MLX ops — stays in the lazy graph and is
             // `mlx::compile`-able. Covers the Kokoro StyleTTS2 encoder
-            // BiLSTM (`H=256`, `bidirectional`, `!carry`). `carry = true`
-            // needs functional state write-back that MLX can't express in
-            // place, so it host-evals the shared CPU kernel (as Metal/CUDA
-            // do), which forces Lazy mode (see `first_host_eval_op`).
+            // BiLSTM (`H=256`, `bidirectional`, `!carry`).
+            //
+            // `carry = true` host-evals the shared CPU kernel (which forces
+            // Lazy mode, see `first_host_eval_op`) AND carries the resulting
+            // `hn`/`cn` back out via `writeback`. Returning only the output —
+            // which this did until the write-back was plumbed — silently drops
+            // the state, so every decode step restarts from the same `h0`/`c0`
+            // and the sequence is wrong with nothing failing. The arena
+            // backends overwrite `h0`/`c0` in place; MLX has no arena, so the
+            // caller applies the update to its param buffers instead.
             Op::Lstm {
                 hidden_size,
                 num_layers,
@@ -3034,20 +3169,7 @@ pub fn lower_with_env(
                 carry,
             } => {
                 if *carry {
-                    let mut vals = std::collections::HashMap::new();
-                    for &in_id in &node.inputs {
-                        vals.insert(in_id, ops::contiguous(lookup(&env, in_id)?)?.to_f32()?);
-                    }
-                    let out = rlx_cpu::thunk::run_host_op_node_f32(graph, node, |id| {
-                        vals.get(&id).cloned().unwrap_or_default()
-                    });
-                    let out_shape: Vec<usize> = node
-                        .shape
-                        .dims()
-                        .iter()
-                        .map(|d| d.unwrap_static())
-                        .collect();
-                    Array::from_f32_slice(&out, &out_shape, DType::F32)?
+                    lstm_carry_host(graph, &env, node, writeback)?
                 } else {
                     native_lstm(graph, &env, node, *hidden_size, *num_layers, *bidirectional)?
                 }
@@ -3182,6 +3304,50 @@ pub fn lower_with_env(
                 let refs: Vec<&Array> = ys.iter().collect();
                 ops::concat(&refs, 1)?
             }
+            Op::GatedDeltaNetBackward {
+                state_size,
+                carry_state,
+                gate_per_channel,
+            } => {
+                // `dy` sits after the optional carried state, matching the op.
+                let dy_idx = if *carry_state { 6 } else { 5 };
+                let grads = lower_gated_delta_net_backward(
+                    lookup(&env, node.inputs[0])?,
+                    lookup(&env, node.inputs[1])?,
+                    lookup(&env, node.inputs[2])?,
+                    lookup(&env, node.inputs[3])?,
+                    lookup(&env, node.inputs[4])?,
+                    lookup(&env, node.inputs[dy_idx])?,
+                    *state_size,
+                    *gate_per_channel,
+                    if *carry_state {
+                        Some(lookup(&env, node.inputs[5])?)
+                    } else {
+                        None
+                    },
+                    node_input_shape(graph, node.inputs[0]),
+                )?;
+                // One packed 1-D output, laid out by `rlx_ir::GdnBackwardLayout`
+                // — the VJP rule slices it back apart, so the order here must
+                // match `GdnBackwardLayout::slices`.
+                let flat = |a: &Array| -> Result<Array, MlxError> {
+                    let n: i32 = a.shape()?.iter().product::<usize>() as i32;
+                    ops::reshape(a, &[n])
+                };
+                let mut parts = vec![
+                    flat(&grads.dq)?,
+                    flat(&grads.dk)?,
+                    flat(&grads.dv)?,
+                    flat(&grads.dg)?,
+                    flat(&grads.dbeta)?,
+                ];
+                if let Some(dstate) = &grads.dstate {
+                    parts.push(flat(dstate)?);
+                }
+                let refs: Vec<&Array> = parts.iter().collect();
+                ops::concat(&refs, 0)?
+            }
+
             Op::GatedDeltaNet {
                 state_size,
                 carry_state,
@@ -3220,8 +3386,13 @@ pub fn lower_with_env(
             // gradient graph emitted by `rlx_opt::autodiff::grad_with_loss`.
             // Formulas mirror `rlx-cpu/src/thunk.rs` (the reference).
             Op::ReluBackward => {
-                let x = lookup(&env, node.inputs[0])?;
-                let dy = lookup(&env, node.inputs[1])?;
+                // `x` and `dy` must agree; see `reconcile_declared_rank` for why
+                // one of them can arrive at a different rank than the graph says.
+                let x0 = lookup(&env, node.inputs[0])?;
+                let d0 = lookup(&env, node.inputs[1])?;
+                let xr = reconcile_declared_rank(graph, node.inputs[0], x0)?;
+                let dr = reconcile_declared_rank(graph, node.inputs[1], d0)?;
+                let (x, dy) = (xr.as_ref().unwrap_or(x0), dr.as_ref().unwrap_or(d0));
                 let dtype = node.shape.dtype();
                 let zero = Array::from_f32_slice(&[0.0], &[1], dtype)?;
                 let mask = ops::gt(x, &zero)?;
@@ -3229,8 +3400,11 @@ pub fn lower_with_env(
             }
 
             Op::ActivationBackward { kind } => {
-                let x = lookup(&env, node.inputs[0])?;
-                let dy = lookup(&env, node.inputs[1])?;
+                let x0 = lookup(&env, node.inputs[0])?;
+                let d0 = lookup(&env, node.inputs[1])?;
+                let xr = reconcile_declared_rank(graph, node.inputs[0], x0)?;
+                let dr = reconcile_declared_rank(graph, node.inputs[1], d0)?;
+                let (x, dy) = (xr.as_ref().unwrap_or(x0), dr.as_ref().unwrap_or(d0));
                 let dtype = node.shape.dtype();
                 activation_backward_compose(x, dy, *kind, dtype)?
             }
@@ -4369,16 +4543,38 @@ pub fn lower_with_env(
                 let out_shape_usize: Vec<usize> = out_shape.iter().map(|d| *d as usize).collect();
                 let zero_target =
                     crate::array::Array::from_f32_slice(&zeros, &out_shape_usize, DType::F32)?;
-                let indices = if dy_shape.len() > 1 && idx_shape.len() == 1 {
-                    ops::reshape(&indices_in, &[idx_shape[0], 1])?
+                // `scatter_add_axis` requires the indices to have the SAME
+                // RANK as the array being scattered into. A flat rank-1 index
+                // (legal: gather's output rank is `data_rank - 1 + index_rank`)
+                // has to be lifted to `dy`'s shape, with its values varying
+                // along `axis` and repeated across every other axis.
+                //
+                // Reshaping to `[n, 1]` — what this did — only reaches rank 2,
+                // so a rank-3 `dy` still failed with "Indices of dimension 2
+                // does not match array of dimension 3".
+                let indices = if idx_shape.len() == 1 && dy_shape.len() > 1 {
+                    let mut lifted = vec![1_i32; dy_shape.len()];
+                    lifted[axis_pos as usize] = idx_shape[0];
+                    let reshaped = ops::reshape(&indices_in, &lifted)?;
+                    let target: Vec<i32> = dy_shape.to_vec();
+                    ops::broadcast_to(&reshaped, &target)?
                 } else {
                     indices_in
                 };
                 ops::scatter_add_axis(&zero_target, &indices, dy, axis_pos)?
             }
 
-            Op::RopeBackward { head_dim, n_rot } => {
-                // Backward = forward rotation with negated sin (NeoX).
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            } => {
+                // Backward = forward rotation with negated sin. A rotation's
+                // transpose is the rotation by -theta, which holds for either
+                // pairing — but the PAIRING must still match the forward. This
+                // arm was NeoX-only while the forward above honoured `style`,
+                // so every GptJ rotation got a NeoX adjoint.
+                let interleaved = matches!(style, RopeStyle::GptJ);
                 let dy = lookup(&env, node.inputs[0])?;
                 let cos = lookup(&env, node.inputs[1])?;
                 let sin = lookup(&env, node.inputs[2])?;
@@ -4401,6 +4597,33 @@ pub fn lower_with_env(
                     let seq_v = rot_shape[seq_axis];
                     let cos_seq = ops::slice(cos, &[0, 0], &[seq_v, pairs])?;
                     let sin_seq = ops::slice(&sin_neg, &[0, 0], &[seq_v, pairs])?;
+                    if interleaved {
+                        // GPT-J: reshape `[2*pairs]` -> `[pairs, 2]` so even/odd
+                        // lanes sit on a trailing axis, rotate, reshape back.
+                        // Mirrors the forward `rotate` above, with `sin` already
+                        // negated.
+                        let mut pair_shape = rot_shape.to_vec();
+                        pair_shape[rn - 1] = pairs;
+                        pair_shape.push(2);
+                        let x_pairs = ops::reshape(x_rot, &pair_shape)?;
+                        let mut even_stop = pair_shape.clone();
+                        even_stop[rn] = 1;
+                        let x_even = ops::slice(&x_pairs, &vec![0i32; rn + 1], &even_stop)?;
+                        let mut odd_start = vec![0i32; rn + 1];
+                        odd_start[rn] = 1;
+                        let x_odd = ops::slice(&x_pairs, &odd_start, &pair_shape)?;
+                        let mut bshape = vec![1i32; rn + 1];
+                        bshape[seq_axis] = seq_v;
+                        bshape[rn - 1] = pairs;
+                        let cos_b = ops::reshape(&cos_seq, &bshape)?;
+                        let sin_b = ops::reshape(&sin_seq, &bshape)?;
+                        let y_even =
+                            ops::sub(&ops::mul(&x_even, &cos_b)?, &ops::mul(&x_odd, &sin_b)?)?;
+                        let y_odd =
+                            ops::add(&ops::mul(&x_odd, &cos_b)?, &ops::mul(&x_even, &sin_b)?)?;
+                        let y_pairs = ops::concat(&[&y_even, &y_odd], rn as i32)?;
+                        return ops::reshape(&y_pairs, rot_shape);
+                    }
                     let mut bshape = vec![1i32; rn];
                     bshape[seq_axis] = seq_v;
                     bshape[rn - 1] = pairs;
@@ -4426,17 +4649,47 @@ pub fn lower_with_env(
                         "RopeBackward: last dim {last} < n_rot {n_rot}"
                     )));
                 }
-                let mut rot_stop = x_shape.clone();
-                rot_stop[n - 1] = nr.min(hd);
-                let rot = ops::slice(dy, &vec![0i32; n], &rot_stop)?;
-                let rotated = rotate(&rot, &rot_stop, n - 2, rot_half)?;
-                if last == nr.min(hd) {
-                    rotated
+                let rot_width = nr.min(hd);
+                // The last axis packs `heads · head_dim`, and RoPE rotates the
+                // first `n_rot` of EVERY head — not the first `n_rot` of the row.
+                // Slicing the flat axis rotates head 0 and passes every other
+                // head through untouched, which is silently wrong whenever
+                // `n_rot < head_dim` (partial RoPE) and there is more than one
+                // head packed here. Split the head axis out first.
+                if hd > 0 && last % hd == 0 && last != hd {
+                    let heads = last / hd;
+                    let mut head_shape = x_shape.clone();
+                    head_shape[n - 1] = heads;
+                    head_shape.push(hd);
+                    let dy_h = ops::reshape(dy, &head_shape)?;
+                    let mut rot_stop = head_shape.clone();
+                    rot_stop[n] = rot_width;
+                    let rot = ops::slice(&dy_h, &vec![0i32; n + 1], &rot_stop)?;
+                    // `seq_axis` stays at `n - 2`: splitting the last axis in two
+                    // leaves everything before it where it was.
+                    let rotated = rotate(&rot, &rot_stop, n - 2, rot_half)?;
+                    let joined = if hd == rot_width {
+                        rotated
+                    } else {
+                        let mut tail_start = vec![0i32; n + 1];
+                        tail_start[n] = rot_width;
+                        let tail = ops::slice(&dy_h, &tail_start, &head_shape)?;
+                        ops::concat(&[&rotated, &tail], n as i32)?
+                    };
+                    ops::reshape(&joined, &x_shape)?
                 } else {
-                    let mut tail_start = vec![0i32; n];
-                    tail_start[n - 1] = nr.min(hd);
-                    let tail = ops::slice(dy, &tail_start, &x_shape)?;
-                    ops::concat(&[&rotated, &tail], (n - 1) as i32)?
+                    let mut rot_stop = x_shape.clone();
+                    rot_stop[n - 1] = rot_width;
+                    let rot = ops::slice(dy, &vec![0i32; n], &rot_stop)?;
+                    let rotated = rotate(&rot, &rot_stop, n - 2, rot_half)?;
+                    if last == rot_width {
+                        rotated
+                    } else {
+                        let mut tail_start = vec![0i32; n];
+                        tail_start[n - 1] = rot_width;
+                        let tail = ops::slice(dy, &tail_start, &x_shape)?;
+                        ops::concat(&[&rotated, &tail], (n - 1) as i32)?
+                    }
                 }
             }
 
@@ -4733,19 +4986,114 @@ pub fn lower_with_env(
                         in_shape.len()
                     )));
                 }
+                let w_shape = node_input_shape(graph, node.inputs[1]);
                 let x = lookup(&env, node.inputs[0])?;
                 let w = lookup(&env, node.inputs[1])?;
                 let x_nd = ops::transpose(x, &[0, 2, 3, 4, 1])?;
                 let w_mlx = ops::transpose(w, &[0, 2, 3, 4, 1])?;
-                let y_nd = ops::conv3d(
-                    &x_nd,
-                    &w_mlx,
-                    (stride[0] as i32, stride[1] as i32, stride[2] as i32),
-                    (padding[0] as i32, padding[1] as i32, padding[2] as i32),
-                    (dilation[0] as i32, dilation[1] as i32, dilation[2] as i32),
-                    (*groups).max(1) as i32,
-                )?;
-                ops::transpose(&y_nd, &[0, 4, 1, 2, 3])?
+                let g = (*groups).max(1);
+
+                // MLX refuses `groups != 1` on a 3-D convolution ("[conv] Can
+                // only handle groups != 1 in 1D or 2D convolutions"), which
+                // takes out every depthwise EEG model whose conv is nominally
+                // 3-D but degenerate in one spatial axis — `rlx-eegsym` and
+                // `rlx-eeginceptionerp` both do, and each has TWO such convs
+                // with the degenerate axis in a *different* position
+                // (a [24,1,1,1,8] kernel, then a [6,2,2,1,8] one).
+                //
+                // If any spatial axis is a no-op (kernel extent 1, unit stride
+                // and dilation, no padding) the convolution IS 2-D: fold that
+                // axis into the batch and convolve over the other two. MLX's
+                // NDHWC layout puts D next to N, so a degenerate depth costs a
+                // reshape and nothing else; H or W costs one transpose.
+                // Anything genuinely 3-D and grouped still falls through to
+                // `conv3d` and MLX's own error, which is the honest outcome.
+                let degenerate: Option<usize> = (0..3).find(|&a| {
+                    w_shape.len() == 5
+                        && w_shape[2 + a] == 1
+                        && stride[a] == 1
+                        && padding[a] == 0
+                        && dilation[a] == 1
+                });
+                match (g > 1).then_some(degenerate).flatten() {
+                    Some(a) => {
+                        let others: Vec<usize> = (0..3).filter(|&i| i != a).collect();
+                        let xs: Vec<i32> =
+                            x_nd.shape()?.iter().map(|&v| v as i32).collect(); // [N,D,H,W,C]
+                        let ws: Vec<i32> =
+                            w_mlx.shape()?.iter().map(|&v| v as i32).collect(); // [O,kD,kH,kW,Cin/g]
+
+                        // Move the degenerate axis next to N, keep the other two
+                        // spatial axes in order, channel last.
+                        let xperm: Vec<i32> = std::iter::once(0)
+                            .chain(std::iter::once(a as i32 + 1))
+                            .chain(others.iter().map(|&i| i as i32 + 1))
+                            .chain(std::iter::once(4))
+                            .collect();
+                        let xt = if a == 0 {
+                            x_nd.clone_handle()?
+                        } else {
+                            ops::transpose(&x_nd, &xperm)?
+                        };
+                        let n = xs[0];
+                        let fold = xs[a + 1];
+                        let (s1, s2) = (xs[others[0] + 1], xs[others[1] + 1]);
+                        let x2 = ops::reshape(&xt, &[n * fold, s1, s2, xs[4]])?;
+
+                        // Same for the kernel. The permutation must name all
+                        // five axes; the degenerate one (extent 1) is dropped by
+                        // the reshape that follows, not by the transpose.
+                        let wperm: Vec<i32> = std::iter::once(0)
+                            .chain(std::iter::once(a as i32 + 1))
+                            .chain(others.iter().map(|&i| i as i32 + 1))
+                            .chain(std::iter::once(4))
+                            .collect();
+                        let wt = ops::transpose(&w_mlx, &wperm)?;
+                        let w2 = ops::reshape(
+                            &wt,
+                            &[ws[0], ws[others[0] + 1], ws[others[1] + 1], ws[4]],
+                        )?;
+
+                        let y2 = ops::conv2d(
+                            &x2,
+                            &w2,
+                            (stride[others[0]] as i32, stride[others[1]] as i32),
+                            (padding[others[0]] as i32, padding[others[1]] as i32),
+                            (dilation[others[0]] as i32, dilation[others[1]] as i32),
+                            g as i32,
+                        )?;
+
+                        // [N*fold, o1, o2, O] -> [N, fold, o1, o2, O], then undo
+                        // the axis move so the layout is NDHWC again.
+                        let ys: Vec<i32> = y2.shape()?.iter().map(|&v| v as i32).collect();
+                        let y5 = ops::reshape(&y2, &[n, fold, ys[1], ys[2], ys[3]])?;
+                        let y_nd = if a == 0 {
+                            y5
+                        } else {
+                            // Position of each target spatial axis in `y5`.
+                            let mut inv = vec![0i32; 5];
+                            inv[0] = 0;
+                            inv[4] = 4;
+                            inv[a + 1] = 1;
+                            for (j, &o) in others.iter().enumerate() {
+                                inv[o + 1] = 2 + j as i32;
+                            }
+                            ops::transpose(&y5, &inv)?
+                        };
+                        ops::transpose(&y_nd, &[0, 4, 1, 2, 3])?
+                    }
+                    None => {
+                        let y_nd = ops::conv3d(
+                            &x_nd,
+                            &w_mlx,
+                            (stride[0] as i32, stride[1] as i32, stride[2] as i32),
+                            (padding[0] as i32, padding[1] as i32, padding[2] as i32),
+                            (dilation[0] as i32, dilation[1] as i32, dilation[2] as i32),
+                            g as i32,
+                        )?;
+                        ops::transpose(&y_nd, &[0, 4, 1, 2, 3])?
+                    }
+                }
             }
 
             Op::FusedConvBiasAct { .. } | Op::PartitionedConv { .. } => {
@@ -5139,4 +5487,98 @@ pub fn lower_with_env(
         outs.push(arr);
     }
     Ok(outs)
+}
+
+/// Host-evaluate `Op::Lstm { carry: true }` and hand the final state back.
+///
+/// Lays the operands out in one flat f32 arena in the order
+/// `x | w_ih | w_hh | bias | h0 | c0 | dst` and calls the shared CPU kernel,
+/// which writes `hn`/`cn` over `h0`/`c0` in place. Those slots are then read
+/// back and queued against the param names they came from.
+fn lstm_carry_host(
+    graph: &Graph,
+    env: &HashMap<NodeId, Array>,
+    node: &rlx_ir::Node,
+    writeback: &mut Vec<StateWriteback>,
+) -> Result<Array, MlxError> {
+    let Op::Lstm {
+        hidden_size,
+        num_layers,
+        bidirectional,
+        ..
+    } = &node.op
+    else {
+        unreachable!("lstm_carry_host on a non-Lstm node")
+    };
+    // The state must live in params, or there is nowhere for it to persist.
+    let state_name = |slot: usize| -> Result<String, MlxError> {
+        match &graph.node(node.inputs[slot]).op {
+            Op::Param { name } => Ok(name.clone()),
+            other => Err(MlxError(format!(
+                "rlx-mlx: `Op::Lstm {{ carry: true }}` needs its h0/c0 to be Params so the \
+                 final state can persist across runs; input {slot} is {other:?}"
+            ))),
+        }
+    };
+    let (h_name, c_name) = (state_name(4)?, state_name(5)?);
+
+    let x_shape = &graph.node(node.inputs[0]).shape;
+    let batch = x_shape.dim(0).unwrap_static();
+    let seq = x_shape.dim(1).unwrap_static();
+    let input_size = x_shape.dim(2).unwrap_static();
+
+    // Flatten every operand, tracking where each landed.
+    let mut arena: Vec<f32> = Vec::new();
+    let mut offs = [0usize; 6];
+    for (slot, &in_id) in node.inputs.iter().enumerate().take(6) {
+        offs[slot] = arena.len();
+        arena.extend_from_slice(&ops::contiguous(lookup(env, in_id)?)?.to_f32()?);
+    }
+    let dst_off = arena.len();
+    let dst_len: usize = node.shape.num_elements().unwrap_or(0);
+    arena.resize(dst_off + dst_len, 0.0);
+
+    let bytes = |w: usize| w * std::mem::size_of::<f32>();
+    // SAFETY: every offset above is in-bounds of `arena` by construction, and
+    // the lengths come from the same shapes the kernel is told about.
+    unsafe {
+        rlx_cpu::thunk::execute_lstm_f32(
+            bytes(offs[0]),
+            bytes(offs[1]),
+            bytes(offs[2]),
+            bytes(offs[3]),
+            bytes(offs[4]),
+            bytes(offs[5]),
+            bytes(dst_off),
+            batch,
+            seq,
+            input_size,
+            *hidden_size,
+            *num_layers,
+            *bidirectional,
+            /*carry=*/ true,
+            arena.as_mut_ptr() as *mut u8,
+        );
+    }
+
+    let state_len = |slot: usize| {
+        graph
+            .node(node.inputs[slot])
+            .shape
+            .num_elements()
+            .unwrap_or(0)
+    };
+    let h_len = state_len(4);
+    let c_len = state_len(5);
+    writeback.push((h_name, arena[offs[4]..offs[4] + h_len].to_vec()));
+    writeback.push((c_name, arena[offs[5]..offs[5] + c_len].to_vec()));
+
+    let out_shape: Vec<usize> = node
+        .shape
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static())
+        .collect();
+    Array::from_f32_slice(&arena[dst_off..dst_off + dst_len], &out_shape, DType::F32)
+        .map_err(Into::into)
 }

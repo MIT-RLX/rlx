@@ -34,8 +34,8 @@ fn arena_off_large(off: usize) -> bool {
 #[inline]
 fn metal_host_fallback_enabled() -> bool {
     matches!(
-        std::env::var("RLX_METAL_HOST_SLICE").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
+        rlx_ir::env::var("RLX_METAL_HOST_SLICE").as_deref(),
+        Some("1") | Some("true") | Some("on")
     ) || rlx_ir::env::flag("RLX_METAL_HOST_FALLBACK")
 }
 
@@ -182,7 +182,7 @@ pub enum Thunk {
         /// as half in-kernel with f32 accumulate instead of misreading its bytes.
         a_f16: bool,
         /// Fold a materialized last-two-swap `Transpose` on the LHS into the GEMM:
-        /// `a` points at the *pre*-transpose source ([k,m]) and the GEMM reads it
+        /// `a` points at the *pre*-transpose source (\[k,m\]) and the GEMM reads it
         /// transposed (MPS `transposeLeft`). The autodiff `dW = Xᵀ·dY` emits this.
         ta: bool,
         /// Same for the RHS (`transposeRight`); the autodiff `dX = dY·Wᵀ` emits it.
@@ -348,6 +348,21 @@ pub enum Thunk {
     Conv3d {
         src: usize,
         weight: usize,
+        /// Per-output-channel bias, folded into the kernel's store epilogue.
+        /// `None` for a bare `Op::Conv`; `Some` when the graph carried an
+        /// `Op::FusedConvBiasAct`, which saves a separate full pass over the
+        /// output tensor.
+        bias: Option<usize>,
+        /// LeakyReLU slope applied in the store epilogue, when the graph's
+        /// `max(y, alpha*y)` pair was folded into this conv. `None` leaves the
+        /// activation as its own nodes.
+        leaky_alpha: Option<f32>,
+        /// Second source when the input is a channel-wise `Concat` read in
+        /// place: `(offset, channels taken from the first source)`.
+        concat_src: Option<(usize, u32)>,
+        /// Per-axis nearest-neighbour upscale applied to the first source,
+        /// folded into the gather so the upsampled volume is never built.
+        upsample: Option<[u32; 3]>,
         dst: usize,
         n: u32,
         c_in: u32,
@@ -423,6 +438,18 @@ pub enum Thunk {
         h: u32,
         eps: f32,
         dt: HalfFlag,
+    },
+    /// ggml `L2_NORM` over the last dim: `out = x / max(sqrt(sum(x²)), eps)`.
+    /// Peephole-fused from the 6-thunk expansion (mul → reduce → copy → sqrt →
+    /// max → div) emitted by `rlx_qwen35::builder::l2_norm`, which Gated-DeltaNet
+    /// runs twice per linear layer. `eps_src` is the arena offset of the eps
+    /// scalar (a `Constant`, so its value is unknown at thunk-compile time).
+    L2NormLastDim {
+        src: usize,
+        eps_src: usize,
+        dst: usize,
+        rows: u32,
+        h: u32,
     },
     BinaryFull {
         lhs: usize,
@@ -518,7 +545,7 @@ pub enum Thunk {
         lead_pack: [u32; 17],
         dt: HalfFlag,
     },
-    /// Packed `[dx ∥ dscale ∥ dshift]` — see [`Op::AdaLayerNormBackward`].
+    /// Packed `[dx ∥ dscale ∥ dshift]` — see [`rlx_ir::Op::AdaLayerNormBackward`].
     AdaLayerNormBackward {
         x: usize,
         scale: usize,
@@ -531,7 +558,7 @@ pub enum Thunk {
         mod_rows: u32,
         dt: HalfFlag,
     },
-    /// Packed `[dx ∥ dy ∥ dgate]` — see [`Op::GatedResidualBackward`].
+    /// Packed `[dx ∥ dy ∥ dgate]` — see [`rlx_ir::Op::GatedResidualBackward`].
     GatedResidualBackward {
         y: usize,
         gate: usize,
@@ -604,19 +631,25 @@ pub enum Thunk {
         len: u32,
         dt: HalfFlag,
     },
-    /// In-place KV append (`Op::KvAppend`). Write `row` (`src`, `outer*inner`
-    /// elems) into `dst` (the cache buffer, aliased to input 0) at sequence
-    /// index `pos`: for each of `outer` batches, copy `inner` elems to
-    /// `dst[(o*seq_cap + pos)*inner ..]`. `inner`/`pos`/`seq_cap` are NOT
+    /// In-place KV append (`Op::KvAppend`). Write `row` (`src`, `outer` rows of
+    /// `inner_bytes`) into `dst` (the cache buffer, aliased to input 0) at
+    /// sequence index `pos`: for each of `outer` batches, copy `inner_bytes` to
+    /// `dst[(o*seq_cap + pos)*inner_bytes ..]`. `pos`/`seq_cap` are NOT
     /// active-extent-scaled (fixed row write), unlike a plain Copy.
+    ///
+    /// Sized in BYTES rather than elements + a [`HalfFlag`], because the write
+    /// is a pure bit copy and `HalfFlag` only distinguishes 4-byte from 2-byte:
+    /// it maps BF16 to `F32`, so an element count would stride a BF16 cache by
+    /// twice the right amount. The copy kernels move 4-byte (or paired 2-byte)
+    /// lanes, so `inner_bytes` only has to be even — the dtype itself is
+    /// irrelevant to a byte-for-byte move.
     KvAppend {
         src: usize,
         dst: usize,
         outer: u32,
         seq_cap: u32,
         pos: u32,
-        inner: u32,
-        dt: HalfFlag,
+        inner_bytes: u32,
     },
     /// SDPA. `mask_kind` encodes how to apply masking inside the
     /// kernel:
@@ -686,7 +719,7 @@ pub enum Thunk {
         scale_bits: u32,
         has_rope: u32,
     },
-    /// [`Op::AttentionBackward`] — GPU MSL when scratch fits; CPU fallback otherwise.
+    /// [`rlx_ir::Op::AttentionBackward`] — GPU MSL when scratch fits; CPU fallback otherwise.
     /// on unified-memory arena (F32 only).
     AttentionBackward {
         q: usize,
@@ -751,6 +784,11 @@ pub enum Thunk {
         /// `false` = HF / NeoX rotate-half pairs `(i, i+n_rot/2)`. GGUF Llama
         /// weights need the interleaved flavor.
         interleaved: bool,
+        /// Cos/sin row stride in elements. Equals `n_rot/2` for tightly packed
+        /// tables; `head_dim/2` when only the leading `n_rot/2` columns are used
+        /// (Qwen3.5 / Moonshine partial rotary). Must match
+        /// [`rlx_ir::shape::rope_table_stride`].
+        cos_row_stride: u32,
     },
     /// Softmax
     Softmax {
@@ -880,6 +918,10 @@ pub enum Thunk {
         k_dim: u32,
         n: u32,
         num_experts: u32,
+        /// `weight` is `[E, N, K]` (GGUF order) rather than `[E, K, N]`, so a
+        /// preceding `Transpose` was folded away and the `_bt` kernel is used.
+        /// Only ever set where that kernel applies — see the compile-side fold.
+        w_transposed: bool,
     },
     /// GGUF packed expert stack + grouped matmul.
     DequantGroupedMatMulGguf {
@@ -956,6 +998,30 @@ pub enum Thunk {
         kw: u32,
         sh: u32,
         sw: u32,
+        ph: u32,
+        pw: u32,
+        kind: rlx_ir::op::ReduceOp,
+    },
+    /// 3D pooling (NCDHW). See CPU's Thunk::Pool3D, whose fields this mirrors
+    /// so the two can be compared field by field.
+    Pool3D {
+        src: usize,
+        dst: usize,
+        n: u32,
+        c: u32,
+        d: u32,
+        h: u32,
+        w: u32,
+        d_out: u32,
+        h_out: u32,
+        w_out: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        sd: u32,
+        sh: u32,
+        sw: u32,
+        pd: u32,
         ph: u32,
         pw: u32,
         kind: rlx_ir::op::ReduceOp,
@@ -1111,6 +1177,33 @@ pub enum Thunk {
     /// Stateful gated-DeltaNet scan. Native MSL kernel (`gated_delta_net`);
     /// host fallback when `RLX_METAL_GDN_HOST_FALLBACK=1`, f16 tensors,
     /// or n > 128.
+    /// Fused backward of [`Thunk::GatedDeltaNet`]. The `d*` fields are absolute
+    /// byte offsets into the packed gradient bundle, precomputed on the host
+    /// from `rlx_ir::GdnBackwardLayout` so the kernel never re-derives the
+    /// packing.
+    GatedDeltaNetBackward {
+        q: usize,
+        k: usize,
+        v: usize,
+        g: usize,
+        beta: usize,
+        state: usize,
+        dy: usize,
+        dst: usize,
+        dq: usize,
+        dk: usize,
+        dv: usize,
+        dg: usize,
+        dbeta: usize,
+        dstate: usize,
+        batch: u32,
+        seq: u32,
+        heads: u32,
+        state_size: u32,
+        gate_per_channel: bool,
+        carry_state: bool,
+    },
+
     GatedDeltaNet {
         q: usize,
         k: usize,
@@ -1611,6 +1704,11 @@ pub enum Thunk {
         head_dim: u32,
         n_rot: u32,
         cos_len: u32,
+        /// The cos/sin table's own last dimension — see the MSL `tab_off` note.
+        cos_row_stride: u32,
+        /// GptJ pairing (adjacent lanes) rather than NeoX rotate-half. Must
+        /// match the forward `Thunk::Rope::interleaved` this is the adjoint of.
+        interleaved: bool,
     },
     CumsumBackward {
         dy: usize,
@@ -1628,7 +1726,7 @@ pub enum Thunk {
         num_idx: u32,
         trailing: u32,
     },
-    /// [`Op::MaxPool2dBackward`] — host CPU on unified-memory arena (F32).
+    /// [`rlx_ir::Op::MaxPool2dBackward`] — host CPU on unified-memory arena (F32).
     MaxPool2dBackward {
         x: usize,
         dy: usize,
@@ -1646,7 +1744,7 @@ pub enum Thunk {
         ph: u32,
         pw: u32,
     },
-    /// [`Op::Conv2dBackwardInput`] — native MSL `conv2d` (same as decomposed `Op::Conv`).
+    /// [`rlx_ir::Op::Conv2dBackwardInput`] — native MSL `conv2d` (same as decomposed `Op::Conv`).
     Conv2dBackwardInput {
         dy: usize,
         w: usize,
@@ -1668,7 +1766,7 @@ pub enum Thunk {
         dw: u32,
         groups: u32,
     },
-    /// [`Op::Conv2dBackwardWeight`] — GPU implicit im2col+GEMM (N=1); im2col+sgemm or CPU fallback.
+    /// [`rlx_ir::Op::Conv2dBackwardWeight`] — GPU implicit im2col+GEMM (N=1); im2col+sgemm or CPU fallback.
     Conv2dBackwardWeight {
         x: usize,
         dy: usize,
@@ -1690,7 +1788,7 @@ pub enum Thunk {
         dw_dil: u32,
         groups: u32,
     },
-    /// [`Op::MaxPool3dBackward`] — native MSL gather (F32, NCDHW).
+    /// [`rlx_ir::Op::MaxPool3dBackward`] — native MSL gather (F32, NCDHW).
     MaxPool3dBackward {
         x: usize,
         dy: usize,
@@ -1713,7 +1811,7 @@ pub enum Thunk {
         ph: u32,
         pw: u32,
     },
-    /// [`Op::Conv3dBackwardInput`] — native MSL gather (F32, NCDHW).
+    /// [`rlx_ir::Op::Conv3dBackwardInput`] — native MSL gather (F32, NCDHW).
     Conv3dBackwardInput {
         dy: usize,
         w: usize,
@@ -1741,7 +1839,7 @@ pub enum Thunk {
         dw: u32,
         groups: u32,
     },
-    /// [`Op::Conv3dBackwardWeight`] — native MSL direct correlation (F32).
+    /// [`rlx_ir::Op::Conv3dBackwardWeight`] — native MSL direct correlation (F32).
     Conv3dBackwardWeight {
         x: usize,
         dy: usize,
@@ -1959,6 +2057,20 @@ pub enum Thunk {
         /// (the Concat([signal, zeros]) was dropped); read it with im=0.
         real_input: bool,
     },
+    /// Fixed-point 1D FFT (`Op::FftQ`), run on the host against the
+    /// unified-memory arena. WGSL-style 64-bit emulation is not needed here —
+    /// Metal has `long` — but the Q30 twiddle products want a native kernel
+    /// written for them, and until a workload makes the sync the bottleneck
+    /// this follows the same host-fallback pattern as f64/C64 `Op::Fft`.
+    Fft1dQ {
+        src: usize,
+        dst: usize,
+        outer: u32,
+        n_complex: u32,
+        inverse: bool,
+        norm_tag: u32,
+        scale_tag: u32,
+    },
     /// Fused nearest-codebook assignment (`Op::Custom("rlx.vq_assign")`) as an
     /// on-GPU MSL kernel — one threadgroup per row, cooperative argmin over the
     /// codebook, reading the arena buffers directly (no D2H/H2D copy).
@@ -2016,7 +2128,7 @@ pub enum Thunk {
         n_segments: u32,
         k: u32,
     },
-    /// Host fill for [`Op::RngNormal`] (unified-memory arena).
+    /// Host fill for [`rlx_ir::Op::RngNormal`] (unified-memory arena).
     RngNormal {
         dst: usize,
         len: u32,
@@ -2159,7 +2271,11 @@ fn thunk_bytes(t: &Thunk) -> (u64, u64) {
 pub fn dump_thunk_bytes(thunks: &[Thunk]) {
     use std::collections::BTreeMap;
     let mut agg: BTreeMap<&'static str, (u64, u64, u64)> = BTreeMap::new(); // (reads, writes, count)
-    let baking = rlx_ir::env::flag("RLX_QWEN3_BAKE_WEIGHTS");
+    // Must match the encode-side condition exactly, or the report claims a
+    // pack was baked when it was re-run (or vice versa) — a diagnostic that
+    // disagrees with the thing it measures is worse than none.
+    let baking = rlx_opt::memory::static_weight_pack_skip_enabled()
+        && rlx_ir::env::flag_or("RLX_QWEN3_BAKE_WEIGHTS", true);
     for t in thunks {
         if matches!(t, Thunk::Nop) {
             continue;
@@ -2240,6 +2356,24 @@ pub fn dump_thunk_bytes(thunks: &[Thunk]) {
         "",
         tot as f64 / 1e6
     );
+    // The baked row runs on the FIRST step only, so folding it into one TOTAL
+    // overstates every subsequent token by exactly its size — and on a Llama
+    // decode that is nearly half the figure. Report the steady-state number
+    // rather than leaving the reader to subtract a row from a percentage table.
+    let baked: u64 = rows
+        .iter()
+        .filter(|(name, _)| name.starts_with("concat_weight"))
+        .map(|(_, (r, w, _))| r + w)
+        .sum();
+    if baked > 0 {
+        eprintln!(
+            "  {:<22} {:>5} {:>39} {:>12.2}   <- per token after step 1",
+            "STEADY STATE",
+            "",
+            "",
+            (tot - baked) as f64 / 1e6
+        );
+    }
 }
 
 /// Static-string name for each Thunk variant — used by the Perfetto
@@ -2271,6 +2405,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Conv3d { .. } => "conv3d",
         Thunk::ConvTranspose3d { .. } => "conv_transpose3d",
         Thunk::RmsNorm { .. } => "rms_norm",
+        Thunk::L2NormLastDim { .. } => "l2_norm_lastdim",
         Thunk::ResizeNearest2x { .. } => "resize_nearest_2x",
         Thunk::BinaryFull { .. } => "binary",
         Thunk::BinaryBroadcast { .. } => "binary_broadcast",
@@ -2326,6 +2461,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::Transpose { .. } => "transpose",
         Thunk::GatherAxis { .. } => "gather_axis",
         Thunk::Pool2D { .. } => "pool2d",
+        Thunk::Pool3D { .. } => "pool3d",
         Thunk::Conv2D { .. } => "conv2d",
         Thunk::Where { .. } => "where",
         Thunk::Fma { .. } => "fma",
@@ -2349,6 +2485,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::AxialRope2dHost { .. } => "axial_rope2d_host",
         Thunk::Im2Col { .. } => "im2col",
         Thunk::Fft1d { .. } => "fft1d",
+        Thunk::Fft1dQ { .. } => "fft1d_q",
         Thunk::VqAssign { .. } => "vq_assign",
         Thunk::ScanHost { .. } => "scan_host",
         Thunk::HostOp { .. } => "host_op",
@@ -2359,6 +2496,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::RngNormal { .. } => "rng_normal",
         Thunk::RngUniform { .. } => "rng_uniform",
         Thunk::GatedDeltaNet { .. } => "gated_delta_net",
+        Thunk::GatedDeltaNetBackward { .. } => "gated_delta_net_backward",
         Thunk::SelectiveScan { .. } => "selective_scan",
         Thunk::Sample { .. } => "sample",
         Thunk::Reverse { .. } => "reverse",
@@ -2974,6 +3112,16 @@ pub fn fused_decode_mlp_blocks() -> usize {
     FUSED_DECODE_MLP_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Count of ggml-`L2_NORM` chains fused into [`Thunk::L2NormLastDim`]
+/// (process-wide). Monotonic; read the delta around a compile.
+pub static FUSED_L2_NORM_CHAINS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of `L2_NORM` chains fused across this process's lifetime.
+pub fn fused_l2_norm_chains() -> usize {
+    FUSED_L2_NORM_CHAINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Count of residual-add+RmsNorm blocks fused (process-wide).
 pub static FUSED_RESIDUAL_RMS_BLOCKS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -3173,6 +3321,9 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
         } => (vec![*x, *gate_w, *up_w], vec![*dst]),
         FusedMlpDownResidual { x, w, res, dst, .. } => (vec![*x, *w, *res], vec![*dst]),
         Reduce { src, dst, .. } => (vec![*src], vec![*dst]),
+        L2NormLastDim {
+            src, eps_src, dst, ..
+        } => (vec![*src, *eps_src], vec![*dst]),
         Transpose { src, dst, .. } => (vec![*src], vec![*dst]),
         _ => return None,
     };
@@ -3209,8 +3360,25 @@ pub(crate) fn concurrent_barrier_set(
     let mut wave_reads: HashSet<usize> = HashSet::new();
     let mut wave_writes: HashSet<usize> = HashSet::new();
     let mut prev_opaque = false;
+    // ── Debug bisection for the `RLX_METAL_CONCURRENT` correctness bug ──
+    // `RLX_METAL_CONCURRENT_FENCE_ALL=1` fences every thunk, degenerating
+    // Concurrent to serial ordering. If output is STILL wrong with it set,
+    // the hazard analysis here is exonerated and the defect is in the
+    // concurrent *encoder* path instead. `RLX_METAL_CONCURRENT_OPAQUE=a,b`
+    // force-fences the named thunk kinds (see `thunk_name`) so the culprit
+    // can be bisected without editing code. Both default off.
+    let fence_all = rlx_ir::env::flag("RLX_METAL_CONCURRENT_FENCE_ALL");
+    let force_opaque: Vec<String> = rlx_ir::env::var("RLX_METAL_CONCURRENT_OPAQUE")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
     for i in start..end.min(thunks.len()) {
-        match mlp_io(&thunks[i]) {
+        if fence_all {
+            barriers.insert(i);
+            continue;
+        }
+        let forced =
+            !force_opaque.is_empty() && force_opaque.iter().any(|n| n == thunk_name(&thunks[i]));
+        match if forced { None } else { mlp_io(&thunks[i]) } {
             None => {
                 // Opaque: potential reader/writer of anything. Fence before it,
                 // and force the following op to fence too (its wave is empty
@@ -4241,10 +4409,27 @@ fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collection
         // the skip stream still gets it, and drop the standalone add. Only for
         // the simple (no reshape-copy) f32 case; `src` must be the add's dst.
         let sum_live = !mlp_value_dead_in_range(thunks, add_i, src, &add_readers, thunks.len());
+        // The dual write must not alias the operands. `fused_residual_rms_norm`
+        // writes `sum` in its FIRST pass and then RE-READS `x` and `res` in the
+        // second to recompute `x+res`; if the sum lands on either operand, the
+        // second pass reads what the first overwrote. The existing overlap check
+        // above covers `dst` (the norm output) but not `src`, which is where the
+        // dual variant puts the sum — so it is checked here rather than assumed.
+        let dual_aliases_operand = mlp_f32_ranges_overlap(src, expect_len, x, expect_len)
+            || mlp_f32_ranges_overlap(src, expect_len, res, expect_len);
+        // Default ON. The transformer residual (`h+=attn; n=rms(h); h+=ffn(n)`)
+        // keeps the sum live, which is the common case, not the exception:
+        // without this the fusion fires once per GRAPH instead of once per
+        // layer. Measured on Carbon-500M (28 layers) decode: 55 `binary` + 56
+        // `rms_norm` dispatches collapse to 56 fused ones — 55 fewer launches
+        // per step on a launch-bound path — with byte traffic and output
+        // unchanged (bit-identical to CPU, and the rlx-metal suite is 314/314
+        // either way). `RLX_METAL_FUSE_RESIDUAL_DUAL=0` opts out.
         let dual_ok = sum_live
             && copy_i.is_none()
             && !output_offsets.contains(&src)
-            && rlx_ir::env::flag("RLX_METAL_FUSE_RESIDUAL_DUAL");
+            && !dual_aliases_operand
+            && rlx_ir::env::flag_or("RLX_METAL_FUSE_RESIDUAL_DUAL", true);
         if sum_live && !dual_ok {
             i += 1;
             continue;
@@ -4288,6 +4473,186 @@ fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collection
     }
     if verbose && fused > 0 {
         eprintln!("[rlx-metal] fuse_residual_rms_norm: {fused} blocks fused");
+    }
+}
+
+/// Fuse ggml `L2_NORM` — `out = x / max(sqrt(sum(x²)), eps)` — into one
+/// [`Thunk::L2NormLastDim`].
+///
+/// `rlx_qwen35::builder::l2_norm` lowers it as six thunks:
+/// `mul(x,x) → sum(last-dim) → [copy] → sqrt → max(·, eps) → div(x, ·)`.
+/// Gated-DeltaNet runs it twice per linear layer (q and k) — 36×/token on the
+/// 24-layer 0.8B, i.e. ~216 dispatches for ~4.5% of decode GPU time. Decode is
+/// dispatch-bound, so collapsing each chain to one kernel takes ~180 dispatches
+/// off the per-token floor.
+///
+/// Matched forward over a contiguous run (skipping `Nop`s) so the offsets chain
+/// is verified link by link; anything unexpected leaves the expansion intact.
+/// Every intermediate is checked against `output_offsets` before being dropped.
+/// Off-switch: `RLX_METAL_FUSE_L2NORM=0`.
+fn fuse_l2_norm(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet<usize>) {
+    if rlx_ir::env::var("RLX_METAL_FUSE_L2NORM").as_deref() == Some("0") {
+        return;
+    }
+    let verbose = rlx_ir::env::flag("RLX_METAL_FUSE_DECODE_LOG");
+    let n = thunks.len();
+    let mut fused = 0usize;
+    // Next non-`Nop` index at or after `k`.
+    let next = |thunks: &[Thunk], mut k: usize| -> Option<usize> {
+        while k < n {
+            if !matches!(thunks[k], Thunk::Nop) {
+                return Some(k);
+            }
+            k += 1;
+        }
+        None
+    };
+    let mut i = 0usize;
+    while i < n {
+        // 1. sq = x * x  (same offset on both sides)
+        let (x, sq, mul_len) = match &thunks[i] {
+            Thunk::BinaryFull {
+                lhs,
+                rhs,
+                dst,
+                len,
+                op: BinaryOp::Mul,
+                dt: HalfFlag::F32,
+            } if *lhs == *rhs => (*lhs, *dst, *len),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // 2. sumsq = sum(sq) over the last dim, keepdim ⇒ inner == 1.
+        let Some(i2) = next(thunks, i + 1) else { break };
+        let (sumsq, rows, h) = match &thunks[i2] {
+            Thunk::Reduce {
+                src,
+                dst,
+                outer,
+                reduced,
+                inner: 1,
+                op: rlx_ir::op::ReduceOp::Sum,
+                dt: HalfFlag::F32,
+            } if *src == sq && outer.saturating_mul(*reduced) == mul_len => {
+                (*dst, *outer, *reduced)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // 3. optional reshape copy of the reduced column.
+        let Some(i3) = next(thunks, i2 + 1) else {
+            break;
+        };
+        let (sum_view, after_copy, copy_idx) = match &thunks[i3] {
+            Thunk::Copy {
+                src,
+                dst,
+                len,
+                dt: HalfFlag::F32,
+            } if *src == sumsq && *len == rows => (*dst, i3 + 1, Some(i3)),
+            _ => (sumsq, i3, None),
+        };
+        // 4. rms = sqrt(sum_view), in place or out of place.
+        let Some(i4) = next(thunks, after_copy) else {
+            break;
+        };
+        let rms = match &thunks[i4] {
+            Thunk::ActivationInPlace {
+                data,
+                act: Activation::Sqrt,
+                dt: HalfFlag::F32,
+                ..
+            } if *data == sum_view => *data,
+            Thunk::ActivationOut {
+                src,
+                dst,
+                act: Activation::Sqrt,
+                dt: HalfFlag::F32,
+                ..
+            } if *src == sum_view => *dst,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // 5. denom = max(rms, eps) — either operand order.
+        let Some(i5) = next(thunks, i4 + 1) else {
+            break;
+        };
+        let (denom, eps_src) = match &thunks[i5] {
+            Thunk::BinaryBroadcast {
+                lhs,
+                rhs,
+                dst,
+                op: BinaryOp::Max,
+                dt: HalfFlag::F32,
+                ..
+            } if *lhs == rms => (*dst, *rhs),
+            Thunk::BinaryBroadcast {
+                lhs,
+                rhs,
+                dst,
+                op: BinaryOp::Max,
+                dt: HalfFlag::F32,
+                ..
+            } if *rhs == rms => (*dst, *lhs),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // 6. out = x / denom.
+        let Some(i6) = next(thunks, i5 + 1) else {
+            break;
+        };
+        let out = match &thunks[i6] {
+            Thunk::BinaryBroadcast {
+                lhs,
+                rhs,
+                dst,
+                len,
+                op: BinaryOp::Div,
+                dt: HalfFlag::F32,
+                ..
+            } if *lhs == x && *rhs == denom && *len == mul_len => *dst,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Never drop a value the graph hands back.
+        if [sq, sumsq, sum_view, rms, denom]
+            .iter()
+            .any(|o| output_offsets.contains(o))
+        {
+            i += 1;
+            continue;
+        }
+
+        thunks[i] = Thunk::Nop;
+        thunks[i2] = Thunk::Nop;
+        if let Some(c) = copy_idx {
+            thunks[c] = Thunk::Nop;
+        }
+        thunks[i4] = Thunk::Nop;
+        thunks[i5] = Thunk::Nop;
+        thunks[i6] = Thunk::L2NormLastDim {
+            src: x,
+            eps_src,
+            dst: out,
+            rows,
+            h,
+        };
+        fused += 1;
+        i = i6 + 1;
+    }
+    FUSED_L2_NORM_CHAINS.fetch_add(fused, std::sync::atomic::Ordering::Relaxed);
+    if verbose && fused > 0 {
+        eprintln!("[rlx-metal] fuse_l2_norm: {fused} chains fused");
     }
 }
 
@@ -4878,6 +5243,7 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         }
         Thunk::ResizeNearest2x { src, .. } => vec![*src],
         Thunk::RmsNorm { src, g, b, .. } => vec![*src, *g, *b],
+        Thunk::L2NormLastDim { src, eps_src, .. } => vec![*src, *eps_src],
         Thunk::FusedResidualLN {
             x, res, bias, g, b, ..
         } => vec![*x, *res, *bias, *g, *b],
@@ -4892,9 +5258,19 @@ fn metal_thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::GatedResidualBackward { y, gate, dy, .. } => vec![*y, *gate, *dy],
         Thunk::FusedRmsNormMulSilu { x, g, b, z, .. } => vec![*x, *g, *b, *z],
         Thunk::FusedDepthwiseConv1dBsc { src, weight, .. } => vec![*src, *weight],
-        Thunk::Conv3d { src, weight, .. } | Thunk::ConvTranspose3d { src, weight, .. } => {
-            vec![*src, *weight]
+        Thunk::Conv3d {
+            src,
+            weight,
+            bias,
+            concat_src,
+            ..
+        } => {
+            let mut v = vec![*src, *weight];
+            v.extend(bias.iter().copied());
+            v.extend(concat_src.iter().map(|&(o, _)| o));
+            v
         }
+        Thunk::ConvTranspose3d { src, weight, .. } => vec![*src, *weight],
         Thunk::ReluBackward { x, dy, .. } | Thunk::ActivationBackward { x, dy, .. } => {
             vec![*x, *dy]
         }

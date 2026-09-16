@@ -338,12 +338,19 @@ mod capabilities_tests {
         let caps = exec.capabilities();
         assert!(caps.clone);
         assert!(caps.moe);
+        assert!(caps.persistent_handles);
         assert!(caps.typed_io);
         assert!(caps.active_extent);
         assert!(!caps.gpu_handles);
         assert_eq!(
             caps.enabled_names(),
-            vec!["clone", "moe", "typed_io", "active_extent"]
+            vec![
+                "clone",
+                "moe",
+                "persistent_handles",
+                "typed_io",
+                "active_extent"
+            ]
         );
     }
 }
@@ -543,7 +550,7 @@ pub trait ExecutableGraph: Send {
 
     /// Register a targeted *row* feed for resident KV decode (graphs that emit
     /// the new token at the last bucket-padded output row). Returns false when
-    /// the backend has no GPU-resident handle support. See [`feed_kv_row`].
+    /// the backend has no GPU-resident handle support. See `feed_kv_row`.
     fn register_kv_row_feed(&mut self, _handle_name: &str, _output_index: usize) -> bool {
         false
     }
@@ -861,7 +868,7 @@ pub trait Backend: Send + Sync {
         Ok(self.compile_lir(result.lir, options))
     }
 
-    /// [`GraphModule`] compile — unified HIR/MIR/LIR entry.
+    /// [`GraphModule`](rlx_ir::GraphModule) compile — unified HIR/MIR/LIR entry.
     fn compile_module(
         &self,
         module: rlx_ir::GraphModule,
@@ -963,7 +970,7 @@ pub fn compile_hir(
     backend.compile_hir(hir, device, options)
 }
 
-/// Compile a [`GraphModule`] through the fusion-first pipeline.
+/// Compile a [`GraphModule`](rlx_ir::GraphModule) through the fusion-first pipeline.
 pub fn compile_module(
     backend: &dyn Backend,
     module: rlx_ir::GraphModule,
@@ -1052,3 +1059,9 @@ pub mod qnn_backend;
 /// diagnostic until the AIE kernel path lands (no CPU masquerade).
 #[cfg(feature = "xdna")]
 pub mod xdna_backend;
+
+/// External GPU over a PCIe tunnel (`Device::Egpu`) — wraps `rlx-egpu`.
+/// Discovery + transport seam only: `compile` surfaces rlx_egpu's diagnostic
+/// until device bring-up lands (no CPU masquerade).
+#[cfg(feature = "egpu")]
+pub mod egpu_backend;

@@ -76,3 +76,20 @@ fn rope_rotates_by_known_angle() {
     let out = x.rope(&cos, &sin, 2).to_vec();
     approx(&out, &[-1.0, 2.0]);
 }
+
+#[test]
+fn rope_reads_a_row_per_position_from_a_flat_table() {
+    // The identity test above passes even if every position reads row 0, since
+    // all its rows are equal. This one gives the two positions different
+    // angles: position 0 is the identity, position 1 rotates by 90 degrees.
+    //
+    // x: [b=1, seq=2, hidden=2] (head_dim=2, one rotation pair per position).
+    // The cos/sin tables are rank-1 of length seq*(dh/2)=2, which carries no
+    // row structure in its shape — the row width has to come from `n_rot/2`.
+    let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], [1, 2, 2]);
+    let cos = Tensor::from_vec(vec![1.0, 0.0], [2]);
+    let sin = Tensor::from_vec(vec![0.0, 1.0], [2]);
+    let out = x.rope(&cos, &sin, 2).to_vec();
+    // pos 0: unchanged. pos 1: [x1*c - x2*s, x2*c + x1*s] = [-4, 3].
+    approx(&out, &[1.0, 2.0, -4.0, 3.0]);
+}

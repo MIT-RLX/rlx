@@ -6,7 +6,9 @@
 
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 #[allow(unused)]
 fn graph(act: Activation) -> Graph {
@@ -43,7 +45,7 @@ fn run_backward(device: Device, act: Activation, x: &[f32], dy: &[f32]) -> Vec<f
 
 #[allow(unused)]
 fn check(device: Device, act: Activation, x: &[f32], tol: f32) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         return;
     }
     let expected = run(Device::Cpu, act, x);
@@ -58,7 +60,7 @@ fn check(device: Device, act: Activation, x: &[f32], tol: f32) {
 
 #[allow(unused)]
 fn check_backward(device: Device, act: Activation, x: &[f32], dy: &[f32], tol: f32) {
-    if !is_available(device) {
+    if common::skip_unless(device) {
         return;
     }
     let expected = run_backward(Device::Cpu, act, x, dy);
@@ -89,24 +91,28 @@ fn backward_dy() -> [f32; 8] {
 #[test]
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn reciprocal_matches_cpu_on_metal() {
+    let _gpu = common::serialize_gpu();
     check(Device::Metal, Activation::Recip, &recip_x(), 1e-5);
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn reciprocal_matches_cpu_on_wgpu() {
+    let _gpu = common::serialize_gpu();
     check(Device::Gpu, Activation::Recip, &recip_x(), 1e-5);
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn reciprocal_matches_cpu_on_cuda() {
+    let _gpu = common::serialize_gpu();
     check(Device::Cuda, Activation::Recip, &recip_x(), 1e-5);
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn exp_tanh_match_cpu_on_cuda() {
+    let _gpu = common::serialize_gpu();
     let x = exp_tanh_x();
     check(Device::Cuda, Activation::Exp, &x, 1e-5);
     check(Device::Cuda, Activation::Tanh, &x, 1e-5);
@@ -115,6 +121,7 @@ fn exp_tanh_match_cpu_on_cuda() {
 #[test]
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn activation_backward_matches_cpu_on_metal() {
+    let _gpu = common::serialize_gpu();
     let dy = backward_dy();
     check_backward(Device::Metal, Activation::Recip, &recip_x(), &dy, 1e-5);
     check_backward(Device::Metal, Activation::Exp, &exp_tanh_x(), &dy, 1e-5);
@@ -124,6 +131,7 @@ fn activation_backward_matches_cpu_on_metal() {
 #[test]
 #[cfg(feature = "gpu")]
 fn activation_backward_matches_cpu_on_wgpu() {
+    let _gpu = common::serialize_gpu();
     let dy = backward_dy();
     check_backward(Device::Gpu, Activation::Recip, &recip_x(), &dy, 1e-5);
     check_backward(Device::Gpu, Activation::Exp, &exp_tanh_x(), &dy, 1e-5);
@@ -133,6 +141,7 @@ fn activation_backward_matches_cpu_on_wgpu() {
 #[test]
 #[cfg(feature = "cuda")]
 fn activation_backward_matches_cpu_on_cuda() {
+    let _gpu = common::serialize_gpu();
     let dy = backward_dy();
     check_backward(Device::Cuda, Activation::Recip, &recip_x(), &dy, 1e-5);
     check_backward(Device::Cuda, Activation::Exp, &exp_tanh_x(), &dy, 1e-5);

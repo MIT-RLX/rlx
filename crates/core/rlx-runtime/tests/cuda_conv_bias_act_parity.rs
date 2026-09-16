@@ -16,7 +16,9 @@
 
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::*;
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 #[derive(Clone, Copy)]
 struct Cfg {
@@ -103,7 +105,8 @@ fn check(name: &str, cfg: Cfg) {
 
 #[test]
 fn cuda_conv_bias_act_matches_cpu() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }
@@ -228,7 +231,8 @@ fn run_affine(cfg: &Cfg, device: Device) -> Vec<f32> {
 
 #[test]
 fn cuda_conv_affine_matches_cpu() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }
@@ -335,7 +339,8 @@ fn run_affine_residual(cfg: &Cfg, device: Device) -> Vec<f32> {
 
 #[test]
 fn cuda_conv_affine_residual_matches_cpu() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }

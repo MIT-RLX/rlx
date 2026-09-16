@@ -61,7 +61,7 @@ impl Pass for LegalizeBroadcast {
 /// Free-function form for callers that don't go through the `Pass`
 /// trait machinery (most backends).
 pub fn run(graph: Graph) -> Graph {
-    run_with_remap(graph).0
+    legalize_custom_attention_mask(run_with_remap(graph).0)
 }
 
 /// Run the pass and additionally return a `NodeId` remap from old →
@@ -106,6 +106,100 @@ fn legalize_node(
     // Pass-through for everything else: copy node verbatim (with input
     // remapping).
     out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+}
+
+/// Materialize a batch-broadcast `MaskKind::Custom` attention mask.
+///
+/// The mask is documented as `[B, S_k]`, and the CPU, Metal and Vulkan kernels
+/// read it at a hard-coded `mask[b * S_k + k]` — they have no mask strides to
+/// zero. So a legitimate `[1, S_k]` mask (one key-padding row broadcast over the
+/// batch) makes every batch above 0 read PAST THE END of the tensor, into
+/// whatever the arena happened to place next to it.
+///
+/// Same trade as [`LegalizeBroadcast`] itself: materialize the broadcast in the
+/// IR rather than teach three kernels about strides. `[B, S_k]` is a handful of
+/// floats, so the copy is free next to the attention it feeds.
+///
+/// The stride-driven backends (CUDA, ROCm, wgpu) get this right on their own via
+/// [`rlx_ir::mask_strides_for_shape`]; expanding first is harmless there.
+///
+/// Split out from [`LegalizeBroadcast`] so Metal can run it alone — Metal's
+/// binary kernels are stride-aware and deliberately skip the rest of that pass.
+pub fn legalize_custom_attention_mask(graph: Graph) -> Graph {
+    let needs = graph.nodes().iter().any(|n| {
+        matches!(
+            n.op,
+            Op::Attention {
+                mask_kind: rlx_ir::op::MaskKind::Custom,
+                ..
+            }
+        )
+    });
+    if !needs {
+        return graph;
+    }
+    let mut out = Graph::new(&graph.name);
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in graph.nodes() {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|id| id_map[id]).collect();
+        let new_id = widen_custom_mask(node, &graph, &new_inputs, &mut out)
+            .unwrap_or_else(|| out.add_node(node.op.clone(), new_inputs, node.shape.clone()));
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(graph.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// `Some(new_id)` when `node` is an attention whose custom mask had to be
+/// widened; `None` to copy the node through unchanged.
+fn widen_custom_mask(
+    node: &Node,
+    fwd_graph: &Graph,
+    new_inputs: &[NodeId],
+    out: &mut Graph,
+) -> Option<NodeId> {
+    let Op::Attention {
+        num_heads,
+        head_dim,
+        mask_kind: rlx_ir::op::MaskKind::Custom,
+        ..
+    } = &node.op
+    else {
+        return None;
+    };
+    if node.inputs.len() < 4 {
+        return None;
+    }
+    let q_shape = &fwd_graph.node(node.inputs[0]).shape;
+    let k_shape = &fwd_graph.node(node.inputs[1]).shape;
+    let m_shape = &fwd_graph.node(node.inputs[3]).shape;
+    if q_shape.rank() < 3 || k_shape.rank() < 3 {
+        return None;
+    }
+    let m_elems = m_shape.num_elements()?;
+    let geom = rlx_ir::attention_geom(q_shape, k_shape, *num_heads, *head_dim);
+    // Exactly one key row present where the kernel will index `batch` of them.
+    // Anything else is either already correct or a shape this mask kind does not
+    // define (a per-query mask — that is what `MaskKind::Bias` is for).
+    if geom.batch <= 1 || m_elems != geom.seq_k {
+        return None;
+    }
+    let dt = m_shape.dtype();
+    let flat = out.reshape(
+        new_inputs[3],
+        vec![1, geom.seq_k as i64],
+        Shape::new(&[1, geom.seq_k], dt),
+    );
+    let wide = out.add_node(
+        Op::Expand {
+            target_shape: vec![geom.batch as i64, geom.seq_k as i64],
+        },
+        vec![flat],
+        Shape::new(&[geom.batch, geom.seq_k], dt),
+    );
+    let mut ins = new_inputs.to_vec();
+    ins[3] = wide;
+    Some(out.add_node(node.op.clone(), ins, node.shape.clone()))
 }
 
 fn maybe_expand(id: NodeId, src: &Shape, target: &Shape, out: &mut Graph) -> NodeId {

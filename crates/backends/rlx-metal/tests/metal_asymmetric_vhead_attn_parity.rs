@@ -51,7 +51,7 @@ fn max_abs(metal: &[f32], cpu: &[f32]) -> f32 {
 }
 
 fn run_case(label: &str, b: usize, h: usize, sq: usize, sk: usize, d: usize, vd: usize) {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

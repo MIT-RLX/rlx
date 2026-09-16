@@ -338,6 +338,39 @@ impl Graph {
         self.push(Op::DequantMatMul { scheme }, vec![x, packed_w], shape, None)
     }
 
+    /// GGUF / K-quant packed **expert bank** — `[x, packed_bank_bytes,
+    /// expert_idx]`, the grouped analogue of [`Self::dequant_matmul_packed`].
+    ///
+    /// `packed_bank` is one U8 tensor of `num_experts` contiguous slabs, each
+    /// the `[out_dim, in_dim]` blob of one expert — which is GGUF's native
+    /// order for `ffn_*_exps.weight` (GGML `ne = [in, out, experts]`), so no
+    /// transpose is needed. The op contracts along `in_dim` per expert, exactly
+    /// as [`Op::DequantMatMul`] does for a single linear, and the expert count
+    /// is recovered from the blob size.
+    ///
+    /// This is the packed counterpart of `Self::grouped_matmul`: an MoE layer
+    /// whose banks stay quantized never materializes them as F32, which for a
+    /// fine-grained MoE is the difference between a model fitting and not.
+    pub fn dequant_grouped_matmul_packed(
+        &mut self,
+        x: NodeId,
+        packed_bank: NodeId,
+        expert_idx: NodeId,
+        scheme: QuantScheme,
+        shape: Shape,
+    ) -> NodeId {
+        debug_assert!(
+            scheme.is_gguf(),
+            "dequant_grouped_matmul_packed requires a GGUF QuantScheme"
+        );
+        self.push(
+            Op::DequantGroupedMatMul { scheme },
+            vec![x, packed_bank, expert_idx],
+            shape,
+            None,
+        )
+    }
+
     /// NVFP4 (E2M1) block matmul — group size 16, FP8 block scales,
     /// optional f32 global scale (defaults to 1.0 when unset at runtime).
     pub fn dequant_matmul_nvfp4(

@@ -146,15 +146,88 @@ pub struct GradWithLossOptions {
     /// When true, parameters in `wrt` with no gradient path receive an
     /// explicit zero tensor instead of panicking (e.g. unused `logit_bias`).
     pub zero_missing_wrt: bool,
+    /// When true (the default), auxiliary forward outputs (`forward.outputs[1..]`)
+    /// are mirrored into the backward graph's outputs. Set false when the aux
+    /// outputs exist only to *designate* [`Wrt::Output`] targets and their
+    /// values aren't wanted — reading back a `[batch, seq, d_model]` activation
+    /// per tapped layer per run is pure bandwidth otherwise.
+    pub emit_aux: bool,
 }
 
 impl GradWithLossOptions {
     pub const STRICT: Self = Self {
         zero_missing_wrt: false,
+        emit_aux: true,
     };
     pub const TRAINING: Self = Self {
         zero_missing_wrt: true,
+        emit_aux: true,
     };
+
+    /// Set [`emit_aux`](Self::emit_aux).
+    pub const fn with_aux(mut self, emit_aux: bool) -> Self {
+        self.emit_aux = emit_aux;
+        self
+    }
+}
+
+/// How a `wrt` target is designated, so it survives the renumbering done by
+/// [`prepare_graph_for_ad`].
+///
+/// Prepare rewrites the graph (multi-axis reduce legalization, fused-op
+/// unfusing, `If`/`While` inlining), and every rewrite renumbers nodes. A
+/// [`NodeId`] captured against the caller's original graph is therefore only
+/// meaningful if it can be *re-found* in the prepared graph. Two things are
+/// stable across a rewrite:
+///
+/// * **leaf names** — `Op::Input`/`Op::Param` survive every pass ([`Wrt::Leaf`]);
+/// * **output positions** — passes remap `graph.outputs` in place ([`Wrt::Output`]).
+///
+/// Everything else is an *intermediate* with no stable handle. To take a
+/// gradient with respect to one — a residual-stream activation, say — publish
+/// it as an auxiliary forward output and refer to it by index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wrt {
+    /// A named `Op::Input` / `Op::Param` leaf, re-resolved by name.
+    Leaf(String),
+    /// Index into `forward.outputs`. The stable way to name an **intermediate**:
+    /// `outputs[0]` is the differentiated output itself, `outputs[1..]` are the
+    /// aux taps. Pair with [`GradWithLossOptions::with_aux`]`(false)` when only
+    /// the gradient is wanted.
+    Output(usize),
+    /// A raw [`NodeId`] against the caller's pre-prepare graph. Resolved by name
+    /// when it points at a leaf; otherwise used as-is, which is only correct if
+    /// no pass renumbered past it. Prefer [`Wrt::Leaf`] / [`Wrt::Output`].
+    Node(NodeId),
+}
+
+impl From<NodeId> for Wrt {
+    fn from(id: NodeId) -> Self {
+        Wrt::Node(id)
+    }
+}
+
+/// Resolve one [`Wrt`] against the prepared graph.
+fn resolve_wrt(wrt: &Wrt, orig: &Graph, prepared: &Graph) -> NodeId {
+    match wrt {
+        Wrt::Leaf(name) => prepared.node_id_by_name(name).unwrap_or_else(|| {
+            panic!("grad: wrt leaf {name:?} is not an Op::Input/Op::Param in the forward graph")
+        }),
+        Wrt::Output(idx) => {
+            assert!(
+                *idx < prepared.outputs.len(),
+                "grad: wrt output index {idx} out of range ({} outputs)",
+                prepared.outputs.len()
+            );
+            prepared.outputs[*idx]
+        }
+        Wrt::Node(id) => match &orig.node(*id).op {
+            Op::Param { name } | Op::Input { name } => {
+                prepared.node_id_by_name(name).unwrap_or(*id)
+            }
+            _ => *id,
+        },
+    }
 }
 
 /// Build a backward graph with scalar loss + gradients w.r.t. `wrt`.
@@ -168,6 +241,35 @@ pub fn grad_with_loss(forward: &Graph, wrt: &[NodeId]) -> Graph {
 
 /// Like [`grad_with_loss`] with configurable unused-parameter handling.
 pub fn grad_with_loss_opts(forward: &Graph, wrt: &[NodeId], opts: GradWithLossOptions) -> Graph {
+    let wrt: Vec<Wrt> = wrt.iter().copied().map(Wrt::Node).collect();
+    grad_with_loss_wrt(forward, &wrt, opts)
+}
+
+/// [`grad_with_loss_opts`] with rewrite-stable `wrt` designators.
+///
+/// The generalization of `grad_with_loss_opts`: `wrt` entries are [`Wrt`]
+/// rather than bare [`NodeId`]s, so a gradient can be taken with respect to an
+/// **intermediate** activation — published as an auxiliary forward output and
+/// named by [`Wrt::Output`] — and not just a named leaf.
+///
+/// This is what a VJP-at-a-cut-point needs: set `forward.outputs[0]` to the
+/// tensor you want to differentiate (it need not be a scalar — `d_output` takes
+/// its shape, so any cotangent can be seeded), publish the cut points as
+/// `outputs[1..]`, and ask for `Wrt::Output(1..)`.
+///
+/// ```no_run
+/// # use rlx_ir::{Graph, NodeId};
+/// # use rlx_autodiff::{GradWithLossOptions, Wrt, grad_with_loss_wrt};
+/// # fn build(_: &mut Graph) -> (NodeId, Vec<NodeId>) { unimplemented!() }
+/// # let mut fwd = Graph::new("decoder");
+/// let (h_final, taps) = build(&mut fwd);
+/// // outputs[0] = differentiated tensor, outputs[1..] = the cut points.
+/// fwd.set_outputs(std::iter::once(h_final).chain(taps.iter().copied()).collect());
+/// let wrt: Vec<Wrt> = (1..=taps.len()).map(Wrt::Output).collect();
+/// let bwd = grad_with_loss_wrt(&fwd, &wrt, GradWithLossOptions::STRICT.with_aux(false));
+/// // bwd outputs: [h_final, dh_final/dtap0, dh_final/dtap1, …]; seed "d_output".
+/// ```
+pub fn grad_with_loss_wrt(forward: &Graph, wrt: &[Wrt], opts: GradWithLossOptions) -> Graph {
     assert!(
         !forward.outputs.is_empty(),
         "grad_with_loss: forward must have at least one output (the loss)"
@@ -186,21 +288,30 @@ pub fn grad_with_loss_opts(forward: &Graph, wrt: &[NodeId], opts: GradWithLossOp
     // are all decomposed by `rlx_fusion::unfuse_fused_for_autodiff` (each is
     // a multi-stage sub-graph; mirrors what `rlx-tpu/src/unfuse.rs`
     // does for HLO emission).
-    // `wrt` NodeIds were captured against the caller's ORIGINAL graph. Prepare
-    // renumbers nodes whenever it expands an op (multi-axis Reduce legalization,
-    // fused-op unfusing), so a param/input built AFTER an expansion point gets a
-    // stale id here → wrong gradient (or, if the stale id lands on a node with
-    // no gradient, the "no gradient flowed" panic below). Keep a handle to the
-    // original graph and re-resolve every wrt leaf by its stable name.
+    // `wrt` was captured against the caller's ORIGINAL graph. Prepare renumbers
+    // nodes whenever it expands an op (multi-axis Reduce legalization, fused-op
+    // unfusing), so a param/input built AFTER an expansion point gets a stale id
+    // here → wrong gradient (or, if the stale id lands on a node with no
+    // gradient, the "no gradient flowed" panic below). Keep a handle to the
+    // original graph and re-resolve every wrt target against the prepared one:
+    // leaves by name, intermediates by output position. See [`Wrt`].
     let orig_forward = forward;
     let forward_owned = crate::prepare_ad::prepare_graph_for_ad(forward.clone());
     let forward = &forward_owned;
+    // `Wrt::Output` leans on passes remapping `outputs` in place rather than
+    // dropping or reordering them. A pass that broke that would otherwise
+    // silently differentiate the wrong tensor, so check it here.
+    assert_eq!(
+        orig_forward.outputs.len(),
+        forward.outputs.len(),
+        "prepare_graph_for_ad changed the output count ({} → {}); \
+         Wrt::Output indices are no longer meaningful",
+        orig_forward.outputs.len(),
+        forward.outputs.len()
+    );
     let wrt_prepared: Vec<NodeId> = wrt
         .iter()
-        .map(|&id| match &orig_forward.node(id).op {
-            Op::Param { name } | Op::Input { name } => forward.node_id_by_name(name).unwrap_or(id),
-            _ => id,
-        })
+        .map(|w| resolve_wrt(w, orig_forward, forward))
         .collect();
 
     let mut bwd = Graph::new(format!("{}_grad", forward.name));
@@ -220,7 +331,20 @@ pub fn grad_with_loss_opts(forward: &Graph, wrt: &[NodeId], opts: GradWithLossOp
     // input the caller provides (typically `[1.0]` for a scalar loss).
     let loss_fwd = forward.outputs[0];
     let loss_bwd = fwd_to_bwd[&loss_fwd];
-    let loss_shape = forward.node(loss_fwd).shape.clone();
+    // A cotangent is real-valued even when the primal output is not. A
+    // ScaledQuantize output is `U8` packed codes, and cloning its shape typed
+    // `d_output` U8 too — so the CPU arena sized that slot at 1 B/elem while
+    // the caller fed it f32 gradients (0.5, 0.75, ...), overrunning the slot
+    // and, once `write_typed_from_f32` stopped writing 4 B into a 1 B element,
+    // truncating every value to an integer. Gradients are F32.
+    let loss_shape = {
+        let s = forward.node(loss_fwd).shape.clone();
+        if s.dtype().is_float() || s.dtype().is_complex() {
+            s
+        } else {
+            s.with_dtype(rlx_ir::DType::F32)
+        }
+    };
     let d_output = bwd.input("d_output", loss_shape);
 
     let mut grads: HashMap<NodeId, NodeId> = HashMap::new();
@@ -247,13 +371,21 @@ pub fn grad_with_loss_opts(forward: &Graph, wrt: &[NodeId], opts: GradWithLossOp
         }
     }
 
-    let n_aux = forward.outputs.len().saturating_sub(1);
+    let n_aux = if opts.emit_aux {
+        forward.outputs.len().saturating_sub(1)
+    } else {
+        0
+    };
     let mut outputs = Vec::with_capacity(1 + n_aux + wrt.len());
     outputs.push(loss_bwd);
     // Auxiliary forward outputs (everything past `outputs[0]`): mirrored
-    // from the forward graph, no gradient propagation.
-    for &aux in &forward.outputs[1..] {
-        outputs.push(fwd_to_bwd[&aux]);
+    // from the forward graph, no gradient propagation. Suppressed under
+    // `emit_aux = false`, where they exist only to designate `Wrt::Output`
+    // targets — dropping them here makes them dead code the compiler removes.
+    if opts.emit_aux {
+        for &aux in &forward.outputs[1..] {
+            outputs.push(fwd_to_bwd[&aux]);
+        }
     }
     for &id in &wrt_prepared {
         let g = match grads.get(&fwd_to_bwd[&id]).copied() {
@@ -455,7 +587,7 @@ fn grouped_matmul_vjp(
     );
     let dw_per = bwd.matmul(x_3d, up_for_outer, Shape::from_dims(&[m, k, n_out], dtype));
     let dw = bwd.add_node(
-        Op::ScatterAdd,
+        Op::ScatterAdd { axis: 0 },
         vec![dw_per, expert_bwd],
         Shape::from_dims(&[e, k, n_out], dtype),
     );
@@ -547,7 +679,11 @@ fn vjp_synth_mat_mul(
         vec![idx_f32],
         Shape::new(&[p], DType::F32),
     );
-    let d_codebook = bwd.add_node(Op::ScatterAdd, vec![grad_blocks, idx_f32_flat], cb_shape);
+    let d_codebook = bwd.add_node(
+        Op::ScatterAdd { axis: 0 },
+        vec![grad_blocks, idx_f32_flat],
+        cb_shape,
+    );
 
     vec![(0, dx), (2, d_codebook)]
 }
@@ -599,7 +735,11 @@ fn vjp_synth_reconstruct(
         vec![idx_f32],
         Shape::new(&[p], DType::F32),
     );
-    let d_codebook = bwd.add_node(Op::ScatterAdd, vec![blocks, idx_f32_flat], cb_shape);
+    let d_codebook = bwd.add_node(
+        Op::ScatterAdd { axis: 0 },
+        vec![blocks, idx_f32_flat],
+        cb_shape,
+    );
     vec![(1, d_codebook)]
 }
 
@@ -920,6 +1060,7 @@ fn vjp(
         Op::Reverse { .. } => vjp_reverse(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Pad { .. } => vjp_pad(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Slice { .. } => vjp_slice(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Roll { .. } => vjp_roll(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Clamp { .. } => vjp_clamp(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Tile { .. } => vjp_tile(node, upstream, upstream_shape, fwd_map, bwd),
         Op::Trilu { .. } => vjp_trilu(node, upstream, upstream_shape, fwd_map, bwd),
@@ -988,6 +1129,9 @@ fn vjp(
             score_scale: _,
             attn_logit_softcap: _,
         } => vjp_attention(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::GatedDeltaNet { .. } => {
+            vjp_gated_delta_net(node, upstream, upstream_shape, fwd_map, bwd)
+        }
         Op::Reduce {
             op: ReduceOp::Prod,
             axes,
@@ -1125,7 +1269,7 @@ fn vjp(
         Op::SplineActivation { .. } => {
             vjp_spline_activation(node, upstream, upstream_shape, fwd_map, bwd)
         }
-        Op::ScatterAdd => vjp_scatter_add(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::ScatterAdd { .. } => vjp_scatter_add(node, upstream, upstream_shape, fwd_map, bwd),
         Op::ScatterNd { reduction } => vjp_scatter_nd(node, upstream, upstream_shape, fwd_map, bwd),
         Op::ScatterElements { .. } => {
             vjp_scatter_elements(node, upstream, upstream_shape, fwd_map, bwd)
@@ -3189,6 +3333,32 @@ fn vjp_pad(
     vec![(0, dy)]
 }
 
+/// VJP of `Op::Roll`. A cyclic shift is a permutation, so it is orthogonal:
+/// its transpose is its inverse, which is the roll by the negated shifts.
+///
+/// No scatter, no mask, no shape change — unlike `Op::Slice`, nothing is
+/// dropped, so every upstream element has exactly one destination.
+fn vjp_roll(
+    node: &Node,
+    upstream: NodeId,
+    upstream_shape: Shape,
+    _fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::Roll { shifts, dims } = &node.op else {
+        unreachable!("vjp_roll on {:?}", node.op)
+    };
+    let dx = bwd.add_node(
+        Op::Roll {
+            shifts: shifts.iter().map(|s| -s).collect(),
+            dims: dims.clone(),
+        },
+        vec![upstream],
+        upstream_shape,
+    );
+    vec![(0, dx)]
+}
+
 /// VJP of `Op::Slice`. Strided slice is a strided gather; its transpose is a
 /// scatter-add of the upstream grad back onto the source positions
 /// `start + j*step` (zeros elsewhere) — uniform across all `step` values.
@@ -3223,7 +3393,11 @@ fn vjp_slice(
     );
 
     let dx = if *axis == 0 {
-        bwd.add_node(Op::ScatterAdd, vec![upstream, idx_node], x_shape)
+        bwd.add_node(
+            Op::ScatterAdd { axis: 0 },
+            vec![upstream, idx_node],
+            x_shape,
+        )
     } else {
         // Move `axis` to front, scatter-add along axis 0, move back.
         let mut perm: Vec<usize> = (0..rank).collect();
@@ -3232,7 +3406,7 @@ fn vjp_slice(
         let dy_t = bwd.transpose_(upstream, perm.clone());
         let xt_shape =
             rlx_ir::shape::transpose_shape(&x_shape, &perm).expect("slice VJP transpose shape");
-        let scattered = bwd.add_node(Op::ScatterAdd, vec![dy_t, idx_node], xt_shape);
+        let scattered = bwd.add_node(Op::ScatterAdd { axis: 0 }, vec![dy_t, idx_node], xt_shape);
         let mut inv = vec![0usize; rank];
         for (i, &p) in perm.iter().enumerate() {
             inv[p] = i;
@@ -3419,7 +3593,7 @@ fn vjp_interpolate3d(
         Shape::new(&[m_out, trailing], dt),
     );
     let dx_m_nc = bwd.add_node(
-        Op::ScatterAdd,
+        Op::ScatterAdd { axis: 0 },
         vec![dy_m_nc, idx_node],
         Shape::new(&[m_in, trailing], dt),
     );
@@ -3761,7 +3935,11 @@ fn vjp_gather(
         let indices_bwd = fwd_map[&node.inputs[1]];
         let table_shape = bwd.node(table_bwd).shape.clone();
         if *axis == 0 {
-            let dtable = bwd.add_node(Op::ScatterAdd, vec![upstream, indices_bwd], table_shape);
+            let dtable = bwd.add_node(
+                Op::ScatterAdd { axis: 0 },
+                vec![upstream, indices_bwd],
+                table_shape,
+            );
             vec![(0, dtable)]
         } else {
             let dtable = bwd.gather_backward(
@@ -3893,8 +4071,15 @@ fn vjp_rope(
     fwd_map: &HashMap<NodeId, NodeId>,
     bwd: &mut Graph,
 ) -> Vec<(usize, NodeId)> {
+    // Destructure `style` EXPLICITLY. This was `{ head_dim, n_rot, .. }`, and
+    // the `..` dropped the pairing convention on the floor: every GptJ (GGUF)
+    // rotation received a NeoX adjoint, so the gradient was wrong on every
+    // backend while the forward stayed right. Naming the field means a future
+    // variant of `Op::Rope` breaks this build instead of the gradients.
     let Op::Rope {
-        head_dim, n_rot, ..
+        head_dim,
+        n_rot,
+        style,
     } = &node.op
     else {
         unreachable!()
@@ -3902,7 +4087,7 @@ fn vjp_rope(
     {
         let cos = fwd_map[&node.inputs[1]];
         let sin = fwd_map[&node.inputs[2]];
-        let dx = bwd.rope_backward(upstream, cos, sin, *head_dim, *n_rot);
+        let dx = bwd.rope_backward(upstream, cos, sin, *head_dim, *n_rot, *style);
         vec![(0, dx)]
     }
 }
@@ -3989,6 +4174,94 @@ fn vjp_attention(
             bwd.attention_backward_all(q, k, v, upstream, *num_heads, *head_dim, *mask_kind, mask);
         vec![(0, dq), (1, dk), (2, dv)]
     }
+}
+
+// ── GatedDeltaNet ───────────────────────────────────────
+//
+// Delegates to the fused `Op::GatedDeltaNetBackward` rather than letting the
+// forward be unfused into an unrolled time loop. Unfusing is correct but
+// ~32x slower: in SSA form each timestep materializes a fresh `[B·H, N, N]`
+// state, while the kernel updates one working set in place.
+//
+// The backward op returns every gradient packed into one 1-D tensor (a node
+// has a single output), so this slices them back out with Narrow + Reshape.
+// `rlx_ir::GdnBackwardLayout` owns the offsets and is shared with the kernel.
+fn vjp_gated_delta_net(
+    node: &Node,
+    upstream: NodeId,
+    _upstream_shape: Shape,
+    fwd_map: &HashMap<NodeId, NodeId>,
+    bwd: &mut Graph,
+) -> Vec<(usize, NodeId)> {
+    let Op::GatedDeltaNet {
+        state_size,
+        carry_state,
+        gate_per_channel,
+    } = &node.op
+    else {
+        unreachable!()
+    };
+
+    let q_bwd = fwd_map[&node.inputs[0]];
+    let q_shape = bwd.node(q_bwd).shape.clone();
+    let dtype = q_shape.dtype();
+    let dims: Vec<usize> = (0..q_shape.rank())
+        .map(|i| q_shape.dim(i).unwrap_static())
+        .collect();
+    assert_eq!(
+        dims.len(),
+        4,
+        "GatedDeltaNet backward: q must be [batch, seq, heads, state]"
+    );
+    let layout = rlx_ir::GdnBackwardLayout::new(
+        dims[0],
+        dims[1],
+        dims[2],
+        *state_size,
+        *gate_per_channel,
+        *carry_state,
+    );
+
+    // [q, k, v, g, beta] + [state] + [dy] — dy last, so the optional state
+    // keeps index 5 exactly as in the forward.
+    let n_fwd_inputs = if *carry_state { 6 } else { 5 };
+    let mut inputs: Vec<NodeId> = (0..n_fwd_inputs)
+        .map(|i| fwd_map[&node.inputs[i]])
+        .collect();
+    inputs.push(upstream);
+
+    let packed = bwd.add_node(
+        Op::GatedDeltaNetBackward {
+            state_size: *state_size,
+            carry_state: *carry_state,
+            gate_per_channel: *gate_per_channel,
+        },
+        inputs,
+        Shape::new(&[layout.total_elems()], dtype),
+    );
+
+    layout
+        .slices()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (offset, len))| {
+            let flat = bwd.add_node(
+                Op::Narrow {
+                    axis: 0,
+                    start: offset,
+                    len,
+                },
+                vec![packed],
+                Shape::new(&[len], dtype),
+            );
+            // Restore the input's own shape.
+            let target = bwd.node(fwd_map[&node.inputs[idx]]).shape.clone();
+            let target_dims: Vec<i64> = (0..target.rank())
+                .map(|i| target.dim(i).unwrap_static() as i64)
+                .collect();
+            (idx, bwd.reshape(flat, target_dims, target))
+        })
+        .collect()
 }
 
 // ── Reduce(Prod) ────────────────────────────────────────
@@ -4365,7 +4638,7 @@ fn vjp_scaled_grouped_mat_mul(
         let mut grads = vec![(0usize, dx), (1usize, dw)];
         if *has_bias {
             let d_bias = bwd.add_node(
-                Op::ScatterAdd,
+                Op::ScatterAdd { axis: 0 },
                 vec![upstream, expert_idx],
                 Shape::from_dims(&[e, n], f32),
             );
@@ -4528,15 +4801,18 @@ fn vjp_scatter_add(
     fwd_map: &HashMap<NodeId, NodeId>,
     bwd: &mut Graph,
 ) -> Vec<(usize, NodeId)> {
-    let Op::ScatterAdd = &node.op else {
+    let Op::ScatterAdd { axis } = &node.op else {
         unreachable!()
     };
     {
         let updates_bwd = fwd_map[&node.inputs[0]];
         let indices_bwd = fwd_map[&node.inputs[1]];
         let updates_shape = bwd.node(updates_bwd).shape.clone();
+        // Scatter-add and gather are transposes of each other, along the SAME
+        // axis — hardcoding 0 here would give a silently wrong gradient for any
+        // other axis while still producing a correctly-shaped tensor.
         let dupdates = bwd.add_node(
-            Op::Gather { axis: 0 },
+            Op::Gather { axis: *axis },
             vec![upstream, indices_bwd],
             updates_shape,
         );
@@ -6743,16 +7019,30 @@ mod tests {
         (g, q, vec![q, k, v, g_in, beta])
     }
 
+    /// GatedDeltaNet keeps its fused form for autodiff — it has a dedicated
+    /// VJP emitting `Op::GatedDeltaNetBackward`, and unrolling instead costs
+    /// ~32x. `RLX_GDN_UNFUSE_FOR_AD=1` restores the unrolled decomposition for
+    /// backends without the backward kernel; this pins that fallback's shape.
     #[test]
-    fn unfuse_decomposes_gated_delta_net() {
+    fn unfuse_decomposes_gated_delta_net_under_opt_in() {
         let (g, _q, _params) = build_gdn_graph();
+        let kept = rlx_fusion::unfuse_fused_for_autodiff(g.clone());
+        assert!(
+            kept.nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::GatedDeltaNet { .. })),
+            "Op::GatedDeltaNet should stay fused by default"
+        );
+
+        rlx_ir::env::set("RLX_GDN_UNFUSE_FOR_AD", "1");
         let unfused = rlx_fusion::unfuse_fused_for_autodiff(g);
+        rlx_ir::env::unset("RLX_GDN_UNFUSE_FOR_AD");
 
         let has_gdn = unfused
             .nodes()
             .iter()
             .any(|n| matches!(n.op, Op::GatedDeltaNet { .. }));
-        assert!(!has_gdn, "Op::GatedDeltaNet should be unfused");
+        assert!(!has_gdn, "Op::GatedDeltaNet should be unfused under opt-in");
 
         let count = |pred: fn(&Op) -> bool| -> usize {
             unfused.nodes().iter().filter(|n| pred(&n.op)).count()

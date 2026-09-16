@@ -21,6 +21,11 @@ splat = ["rlx-cpu/splat"]
 # workgroup memory (one DRAM load + store) instead of the multi-launch path that
 # round-trips DRAM per outer stage. Runtime gate `RLX_FFT_FAST=0` disables.
 native-gpu-fft = []
+# Generate the tiled `matmul` entry point FROM a typed `KernelSchedule` (see
+# `kernel_schedule_emit`) instead of the hand-written `kernels/matmul.wgsl`. Off
+# by default: the shipping shader stays the shipping path until the emitted one
+# is measured at least as fast (`examples/schedule_matmul_ab.rs`).
+schedule-codegen = []
 
 [build-dependencies]
 # Generates the standalone unary/activation WGSL switch from the shared
@@ -29,8 +34,10 @@ rlxsl = { workspace = true }
 
 [dependencies]
 rlx-ir = { workspace = true }
+# Shape-keyed kernel-variant dispatch table, shared with CUDA/ROCm/Metal.
+rlx-gpu-dispatch = { workspace = true }
 rlx-unfuse = { workspace = true }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.14", default-features = false, features = ["compile"] }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.16", default-features = false, features = ["compile"] }
 rlx-compile = { workspace = true }
 rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gpu-host = { workspace = true }
@@ -69,3 +76,8 @@ bytemuck = "1"
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["splat"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Validates the Dwyer (Morton alternating-cut) build against the x-cut reference:
 // same triangle count and a valid Delaunay mesh (empty-circumcircle, manifold, CCW).
 use rlx_geo::{triangulate, triangulate_dwyer};

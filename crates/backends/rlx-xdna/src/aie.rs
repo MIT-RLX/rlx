@@ -23,9 +23,9 @@ pub fn emit_passthrough(len: usize, fifo: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %logical_shim_noc = aie.logical_tile<ShimNOCTile>(?, ?)
-    %logical_mem = aie.logical_tile<MemTile>(?, ?)
-    %logical_shim_noc_0 = aie.logical_tile<ShimNOCTile>(?, ?)
+    %logical_shim_noc = aie.tile(0, 0)
+    %logical_mem = aie.tile(0, 1)
+    %logical_shim_noc_0 = aie.tile(0, 0)
     aie.objectfifo @in(%logical_shim_noc, {{%logical_mem}}, 2 : i32) : !aie.objectfifo<memref<{fifo}xi32>>
     aie.objectfifo @in_fwd(%logical_mem, {{%logical_shim_noc_0}}, 2 : i32) : !aie.objectfifo<memref<{fifo}xi32>>
     aie.objectfifo.link [@in] -> [@in_fwd]([] [0])
@@ -139,9 +139,9 @@ pub fn emit_eltwise_chain(n: usize, chunk: usize, ops: &[Eltwise]) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xi32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xi32>>
     %0 = aie.core(%core) {{
@@ -204,9 +204,9 @@ pub fn emit_relu_f32(n: usize, chunk: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xf32>>
     %0 = aie.core(%core) {{
@@ -265,7 +265,7 @@ const VEC_BF16: usize = 32;
 /// tile: `out = max(0.0, in)` over `vector<32xbf16>`. This is the *fast* float
 /// activation path on AIE2 — unlike f32 (whose vector ops `aievec` rejects),
 /// bf16 vector max lowers natively, so this vectorizes 32-wide. Host f32↔bf16
-/// cast happens at the I/O boundary (see [`crate::npu_gemm::NpuIoBf16`]).
+/// cast happens at the I/O boundary (see `crate::npu_gemm::NpuIoBf16`).
 /// Requires `n % chunk == 0`, `chunk % VEC_BF16 == 0`.
 pub fn emit_relu_bf16(n: usize, chunk: usize) -> String {
     assert!(
@@ -279,9 +279,9 @@ pub fn emit_relu_bf16(n: usize, chunk: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xbf16>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xbf16>>
     %0 = aie.core(%core) {{
@@ -365,8 +365,8 @@ pub fn emit_eltwise_multicol(n: usize, chunk: usize, cols: usize, ops: &[Eltwise
     let mut rt = String::new();
     let mut awaits = String::new();
     for c in 0..cols {
-        tiles += &format!("    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n");
-        tiles += &format!("    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n");
+        tiles += &format!("    %core{c} = aie.tile({c}, 2)\n");
+        tiles += &format!("    %shim{c} = aie.tile({c}, 0)\n");
         fifos += &format!(
             "    aie.objectfifo @in{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{chunk}xi32>>\n"
         );
@@ -451,10 +451,10 @@ pub fn emit_matmul(m: usize, k: usize, n: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_a = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_b = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_c = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_a = aie.tile(0, 0)
+    %shim_b = aie.tile(0, 0)
+    %shim_c = aie.tile(0, 0)
     aie.objectfifo @a0(%shim_a, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{m}x{k}xi8>>
     aie.objectfifo @b0(%shim_b, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{k}x{n}xi8>>
     aie.objectfifo @c0(%core, {{%shim_c}}, 2 : i32) : !aie.objectfifo<memref<{m}x{n}xi32>>
@@ -539,7 +539,7 @@ pub fn emit_matmul(m: usize, k: usize, n: usize) -> String {
 
 /// Pure-Rust vectorized int8 matmul via `vector.contract` → `aievec.matmul` on the
 /// AIE2 hardware MAC, **no C++**. Numerically correct (bit-exact vs a CPU i32
-/// reference on the amd rig) when driven by the [`tile_a`] / [`tile_b`] /
+/// reference on the ROCm rig) when driven by the [`tile_a`] / [`tile_b`] /
 /// [`untile_c`] / [`matmul_signed_fixup`] host helpers — validated to ~64³.
 ///
 /// SUPERSEDED for production by [`emit_matmul_microkernel`] (the vendor `aie::mmul`
@@ -597,10 +597,10 @@ pub fn emit_matmul_tiled(m: usize, k: usize, n: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %sa = aie.logical_tile<ShimNOCTile>(?, ?)
-    %sb = aie.logical_tile<ShimNOCTile>(?, ?)
-    %sc = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %sa = aie.tile(0, 0)
+    %sb = aie.tile(0, 0)
+    %sc = aie.tile(0, 0)
     aie.objectfifo @a0(%sa, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{na}xi8>>
     aie.objectfifo @b0(%sb, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{nb}xi8>>
     aie.objectfifo @c0(%core, {{%sc}}, 2 : i32) : !aie.objectfifo<memref<{nc}xi32>>
@@ -796,9 +796,7 @@ pub fn emit_matmul_multicol(m: usize, k: usize, n: usize, cols: usize) -> String
     let mut rt = String::new();
     let mut awaits = String::new();
     for c in 0..cols {
-        tiles += &format!(
-            "    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n"
-        );
+        tiles += &format!("    %core{c} = aie.tile({c}, 2)\n    %shim{c} = aie.tile({c}, 0)\n");
         // @a depth 1: A is read-only + delivered once per run, so it needs no
         // double-buffer — halving its (dominant, full-m·k) tile footprint.
         fifos += &format!(
@@ -963,9 +961,7 @@ pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> S
     let mut rt = String::new();
     let mut awaits = String::new();
     for c in 0..cols {
-        tiles += &format!(
-            "    %core{c} = aie.logical_tile<CoreTile>(?, ?)\n    %shim{c} = aie.logical_tile<ShimNOCTile>(?, ?)\n"
-        );
+        tiles += &format!("    %core{c} = aie.tile({c}, 2)\n    %shim{c} = aie.tile({c}, 0)\n");
         fifos += &format!(
             "    aie.objectfifo @a{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi8>>\n"
         );
@@ -1233,11 +1229,17 @@ impl BinaryOp {
         matches!(
             self,
             BinaryOp::Add
-                | BinaryOp::Sub
+                // `Sub` is NOT here: mlir-aie's AIE core codegen rejects a
+                // vectorized `arith.subi` — "failed to legalize operation
+                // 'arith.subi' that was explicitly marked illegal" — and aiecc
+                // dies in Object FIFO lowering. The scalar path below compiles
+                // and runs, so subtraction works at 1 lane instead of 16 rather
+                // than not at all. Re-add when upstream grows the lowering.
                 | BinaryOp::Max
-                | BinaryOp::Min
-                | BinaryOp::BitAnd
-                | BinaryOp::BitOr
+                | BinaryOp::Min // `BitAnd`/`BitOr` are out for the same reason as `Sub`:
+                                // vectorized `arith.andi`/`arith.ori` fail AIE core lowering.
+                                // Unlike `Sub` they are not rescued by the -O1 retry either,
+                                // so the vector form has to go.
         )
     }
     /// The `arith` opcode for this op at dtype `ty`.
@@ -1323,10 +1325,10 @@ pub fn emit_binary(op: BinaryOp, ty: Ty, n: usize, chunk: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %sa = aie.logical_tile<ShimNOCTile>(?, ?)
-    %sb = aie.logical_tile<ShimNOCTile>(?, ?)
-    %so = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %sa = aie.tile(0, 0)
+    %sb = aie.tile(0, 0)
+    %so = aie.tile(0, 0)
     aie.objectfifo @a0(%sa, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{chunk}x{t}>>
     aie.objectfifo @b0(%sb, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{chunk}x{t}>>
     aie.objectfifo @o0(%core, {{%so}}, 2 : i32) : !aie.objectfifo<memref<{chunk}x{t}>>
@@ -1830,7 +1832,7 @@ impl UnaryOp {
 
 /// Emit AIE-MLIR for a 1-D `n`-element **unary** float activation `out = op(in)`
 /// on one compute tile (`arg0`=in, `arg2`=out, `arg1` unused — the 1-in/1-out
-/// ABI of [`crate::npu_gemm::NpuIoF32`]/`NpuIoBf16`). f32 lowers scalar (no f32
+/// ABI of `crate::npu_gemm::NpuIoF32`/`NpuIoBf16`). f32 lowers scalar (no f32
 /// vector path); bf16 vectorizes 32-wide. Requires `n % chunk == 0`,
 /// `chunk % lanes == 0`.
 pub fn emit_unary(op: UnaryOp, ty: Ty, n: usize, chunk: usize) -> String {
@@ -1861,9 +1863,9 @@ pub fn emit_unary(op: UnaryOp, ty: Ty, n: usize, chunk: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{chunk}x{t}>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{chunk}x{t}>>
     %0 = aie.core(%core) {{
@@ -1941,9 +1943,9 @@ pub fn emit_softmax(rows: usize, cols: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{tr}x{cols}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{tr}x{cols}xf32>>
     %0 = aie.core(%core) {{
@@ -2016,9 +2018,9 @@ pub fn emit_rms_norm(rows: usize, cols: usize, eps: f32) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     %0 = aie.core(%core) {{
@@ -2084,9 +2086,9 @@ pub fn emit_layer_norm(rows: usize, cols: usize, eps: f32) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     %0 = aie.core(%core) {{
@@ -2153,7 +2155,7 @@ pub fn emit_layer_norm(rows: usize, cols: usize, eps: f32) -> String {
 /// Emit AIE-MLIR for an **affine RMSNorm** over `[rows, cols]`:
 /// `out[r,c] = x[r,c] · rsqrt(mean_c(x²)+eps) · gamma[c] + beta[c]`. `gamma` and
 /// `beta` (each `[cols]`) are packed into one `[2*cols]` second buffer (`gamma`
-/// then `beta`), so it runs through the generic 3-buffer [`crate::npu_gemm::NpuRun3`]
+/// then `beta`), so it runs through the generic 3-buffer `crate::npu_gemm::NpuRun3`
 /// (arg0=x, arg1=gamma‖beta, arg2=out). Classic RMSNorm passes `beta=0`.
 pub fn emit_rms_norm_affine(rows: usize, cols: usize, eps: f32) -> String {
     let n = rows * cols;
@@ -2164,10 +2166,10 @@ pub fn emit_rms_norm_affine(rows: usize, cols: usize, eps: f32) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_x = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_gb = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_x = aie.tile(0, 0)
+    %shim_gb = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @x0(%shim_x, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{tr}x{cols}xf32>>
     aie.objectfifo @gb0(%shim_gb, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{gb2}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{tr}x{cols}xf32>>
@@ -2240,7 +2242,7 @@ pub fn emit_rms_norm_affine(rows: usize, cols: usize, eps: f32) -> String {
 
 /// Emit AIE-MLIR for an **affine LayerNorm** over `[rows, cols]`:
 /// `out[r,c] = (x[r,c]−mean_r)·rsqrt(var_r+eps)·gamma[c] + beta[c]`. Same packed
-/// `gamma‖beta` [2*cols] second buffer + [`crate::npu_gemm::NpuRun3`] ABI as
+/// `gamma‖beta` `2*cols` second buffer + `crate::npu_gemm::NpuRun3` ABI as
 /// [`emit_rms_norm_affine`].
 pub fn emit_layer_norm_affine(rows: usize, cols: usize, eps: f32) -> String {
     let n = rows * cols;
@@ -2251,10 +2253,10 @@ pub fn emit_layer_norm_affine(rows: usize, cols: usize, eps: f32) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_x = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_gb = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_x = aie.tile(0, 0)
+    %shim_gb = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @x0(%shim_x, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{tr}x{cols}xf32>>
     aie.objectfifo @gb0(%shim_gb, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{gb2}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{tr}x{cols}xf32>>
@@ -2338,7 +2340,7 @@ pub fn emit_layer_norm_affine(rows: usize, cols: usize, eps: f32) -> String {
 /// contiguous `group_size = (C/G)·H·W` block, so it's a per-row (`rows = N·G`)
 /// mean/var normalize; the affine channel is `c = (r % G)·cg + j/hw`. Single-tile
 /// (whole tensor resident). `gamma‖beta` packed as `[2·C]` (arg1); x/out as arg0/2
-/// → [`crate::npu_gemm::NpuRun3`]. `cg = C/G`, `hw = H·W`, `C = G·cg`.
+/// → `crate::npu_gemm::NpuRun3`. `cg = C/G`, `hw = H·W`, `C = G·cg`.
 pub fn emit_group_norm(
     rows: usize,
     group_size: usize,
@@ -2355,10 +2357,10 @@ pub fn emit_group_norm(
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_x = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_gb = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_x = aie.tile(0, 0)
+    %shim_gb = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @x0(%shim_x, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{group_size}xf32>>
     aie.objectfifo @gb0(%shim_gb, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{gb2}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{group_size}xf32>>
@@ -2467,10 +2469,10 @@ pub fn emit_rope(rows: usize, head_dim: usize, n_rot: usize, nh: usize, neox: bo
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_x = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_cs = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_x = aie.tile(0, 0)
+    %shim_cs = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @x0(%shim_x, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{nx}xf32>>
     aie.objectfifo @cs0(%shim_cs, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{cs_len}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{nx}xf32>>
@@ -2559,13 +2561,15 @@ pub fn emit_rope(rows: usize, head_dim: usize, n_rot: usize, nh: usize, neox: bo
 /// does a numerically-stable softmax in place (pure-arith exp), then the
 /// weighted sum over V. Scalar f32 (correct, not fast). `K` and `V` are packed
 /// into one `[2·seq·d]` buffer (`K` then `V`) → rides the 3-buffer
-/// [`crate::npu_gemm::NpuRun3`] (arg0=Q, arg1=K‖V, arg2=out). Keep `seq·d` +
+/// `crate::npu_gemm::NpuRun3` (arg0=Q, arg1=K‖V, arg2=out). Keep `seq·d` +
 /// `seq·seq` scratch within tile memory.
 pub fn emit_attention(seq: usize, d: usize, num_heads: usize, scale: f32, causal: bool) -> String {
     let hd = num_heads * d; // hidden = heads · head_dim
     let shd = seq * hd; // Q/O element count
     let kv2 = 2 * shd; // packed K‖V
     let scale_decl = fbits("scale", scale);
+    let allrow = num_heads * seq;
+    let allsc = allrow * seq;
     let exp_p = approx_exp_f32("%xm", "%e");
     // Causal mask: for query row i, keys j>i are future → score = −∞ (softmax → 0).
     let sc_mask = if causal {
@@ -2576,14 +2580,16 @@ pub fn emit_attention(seq: usize, d: usize, num_heads: usize, scale: f32, causal
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_q = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_kv = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_q = aie.tile(0, 0)
+    %shim_kv = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @q0(%shim_q, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{seq}x{hd}xf32>>
     aie.objectfifo @kv0(%shim_kv, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{kv2}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{seq}x{hd}xf32>>
-    %scores = aie.buffer(%core) : memref<{seq}xf32>
+    %scores = aie.buffer(%core) {{ sym_name = "scores" }} : memref<{allsc}xf32>
+    %maxes = aie.buffer(%core) {{ sym_name = "maxes" }} : memref<{allrow}xf32>
+    %sums = aie.buffer(%core) {{ sym_name = "sums" }} : memref<{allrow}xf32>
     %0 = aie.core(%core) {{
       %z0 = arith.constant 0 : index
       %zmax = arith.constant 9223372036854775807 : index
@@ -2607,7 +2613,10 @@ pub fn emit_attention(seq: usize, d: usize, num_heads: usize, scale: f32, causal
         %O = aie.objectfifo.subview.access %o_sv[0] : !aie.objectfifosubview<memref<{seq}x{hd}xf32>> -> memref<{seq}x{hd}xf32>
         scf.for %h = %z0 to %HN step %one {{
           %ho = arith.muli %h, %dc : index
+          %hrow = arith.muli %h, %seqN : index
           scf.for %i = %z0 to %seqN step %one {{
+            %row = arith.addi %hrow, %i : index
+            %rowb = arith.muli %row, %seqN : index
             %maxv = scf.for %j = %z0 to %seqN step %one iter_args(%m = %ninf) -> (f32) {{
               %jhd = arith.muli %j, %hdc : index
               %jbase = arith.addi %jhd, %ho : index
@@ -2620,33 +2629,60 @@ pub fn emit_attention(seq: usize, d: usize, num_heads: usize, scale: f32, causal
                 %a2 = arith.addf %a, %p : f32
                 scf.yield %a2 : f32
               }}
-{sc_mask}              memref.store %sc, %scores[%j] : memref<{seq}xf32>
+{sc_mask}              %si = arith.addi %rowb, %j : index
+              memref.store %sc, %scores[%si] : memref<{allsc}xf32>
               %m2 = arith.maximumf %m, %sc : f32
               scf.yield %m2 : f32
             }}
-            %sum = scf.for %j = %z0 to %seqN step %one iter_args(%s = %zerof) -> (f32) {{
-              %sv = memref.load %scores[%j] : memref<{seq}xf32>
-              %xm = arith.subf %sv, %maxv : f32
-{exp_p}              memref.store %e, %scores[%j] : memref<{seq}xf32>
-              %s2 = arith.addf %s, %e : f32
+            memref.store %maxv, %maxes[%row] : memref<{allrow}xf32>
+          }}
+        }}
+        %allscN = arith.constant {allsc} : index
+        scf.for %idx = %z0 to %allscN step %one {{
+          %ri = arith.divui %idx, %seqN : index
+          %mv = memref.load %maxes[%ri] : memref<{allrow}xf32>
+          %sv = memref.load %scores[%idx] : memref<{allsc}xf32>
+          %xm = arith.subf %sv, %mv : f32
+{exp_p}          memref.store %e, %scores[%idx] : memref<{allsc}xf32>
+        }}
+        scf.for %hS = %z0 to %HN step %one {{
+          %hrowS = arith.muli %hS, %seqN : index
+          scf.for %iS = %z0 to %seqN step %one {{
+            %rowS = arith.addi %hrowS, %iS : index
+            %rowbS = arith.muli %rowS, %seqN : index
+            %sum = scf.for %jS = %z0 to %seqN step %one iter_args(%s = %zerof) -> (f32) {{
+              %siS = arith.addi %rowbS, %jS : index
+              %evS = memref.load %scores[%siS] : memref<{allsc}xf32>
+              %s2 = arith.addf %s, %evS : f32
               scf.yield %s2 : f32
             }}
-            %inv = arith.divf %onef, %sum : f32
-            scf.for %k = %z0 to %dN step %one {{
-              %ok = arith.addi %ho, %k : index
-              %acc = scf.for %j = %z0 to %seqN step %one iter_args(%a = %zerof) -> (f32) {{
-                %sv = memref.load %scores[%j] : memref<{seq}xf32>
-                %jhd = arith.muli %j, %hdc : index
-                %vbase = arith.addi %shdc, %jhd : index
-                %vh = arith.addi %vbase, %ho : index
-                %vidx = arith.addi %vh, %k : index
+            memref.store %sum, %sums[%rowS] : memref<{allrow}xf32>
+          }}
+        }}
+        scf.for %hB = %z0 to %HN step %one {{
+          %hoB = arith.muli %hB, %dc : index
+          %hrowB = arith.muli %hB, %seqN : index
+          scf.for %iB = %z0 to %seqN step %one {{
+            %rowB = arith.addi %hrowB, %iB : index
+            %rowbB = arith.muli %rowB, %seqN : index
+            %svB = memref.load %sums[%rowB] : memref<{allrow}xf32>
+            %inv = arith.divf %onef, %svB : f32
+            scf.for %kk = %z0 to %dN step %one {{
+              %ok = arith.addi %hoB, %kk : index
+              %acc = scf.for %jB = %z0 to %seqN step %one iter_args(%ac = %zerof) -> (f32) {{
+                %siB = arith.addi %rowbB, %jB : index
+                %ev = memref.load %scores[%siB] : memref<{allsc}xf32>
+                %jhdB = arith.muli %jB, %hdc : index
+                %vbase = arith.addi %shdc, %jhdB : index
+                %vh = arith.addi %vbase, %hoB : index
+                %vidx = arith.addi %vh, %kk : index
                 %vv = memref.load %KV[%vidx] : memref<{kv2}xf32>
-                %p = arith.mulf %sv, %vv : f32
-                %a2 = arith.addf %a, %p : f32
-                scf.yield %a2 : f32
+                %pp = arith.mulf %ev, %vv : f32
+                %ac2 = arith.addf %ac, %pp : f32
+                scf.yield %ac2 : f32
               }}
               %o = arith.mulf %acc, %inv : f32
-              memref.store %o, %O[%i, %ok] : memref<{seq}x{hd}xf32>
+              memref.store %o, %O[%iB, %ok] : memref<{seq}x{hd}xf32>
             }}
           }}
         }}
@@ -2739,9 +2775,9 @@ pub fn emit_reduce(op: ReduceOp, rows: usize, cols: usize) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     %0 = aie.core(%core) {{
@@ -2814,9 +2850,9 @@ pub fn emit_argmax(rows: usize, cols: usize, is_max: bool) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{rows}x{cols}xf32>>
     %0 = aie.core(%core) {{
@@ -2931,9 +2967,9 @@ fn emit_axis_copy(
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n_in}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{n_out}xf32>>
     %0 = aie.core(%core) {{
@@ -3028,9 +3064,9 @@ fn emit_pad_impl(
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n_in}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{n_out}xf32>>
     %0 = aie.core(%core) {{
@@ -3148,9 +3184,9 @@ fn dm_unary(n: usize, body: &str) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %shim_in = aie.logical_tile<ShimNOCTile>(?, ?)
-    %shim_out = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %shim_in = aie.tile(0, 0)
+    %shim_out = aie.tile(0, 0)
     aie.objectfifo @in0(%shim_in, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n}xf32>>
     aie.objectfifo @out0(%core, {{%shim_out}}, 2 : i32) : !aie.objectfifo<memref<{n}xf32>>
     %0 = aie.core(%core) {{
@@ -3196,10 +3232,10 @@ fn dm_binary2(n: usize, body: &str) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %sa = aie.logical_tile<ShimNOCTile>(?, ?)
-    %sb = aie.logical_tile<ShimNOCTile>(?, ?)
-    %so = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %sa = aie.tile(0, 0)
+    %sb = aie.tile(0, 0)
+    %so = aie.tile(0, 0)
     aie.objectfifo @a0(%sa, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n}xf32>>
     aie.objectfifo @b0(%sb, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n}xf32>>
     aie.objectfifo @o0(%core, {{%so}}, 2 : i32) : !aie.objectfifo<memref<{n}xf32>>
@@ -3264,10 +3300,10 @@ fn dm_ternary_packed(n: usize, body: &str) -> String {
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %sa = aie.logical_tile<ShimNOCTile>(?, ?)
-    %sp = aie.logical_tile<ShimNOCTile>(?, ?)
-    %so = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %sa = aie.tile(0, 0)
+    %sp = aie.tile(0, 0)
+    %so = aie.tile(0, 0)
     aie.objectfifo @a0(%sa, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n}xf32>>
     aie.objectfifo @p0(%sp, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n2}xf32>>
     aie.objectfifo @o0(%core, {{%so}}, 2 : i32) : !aie.objectfifo<memref<{n}xf32>>
@@ -3396,10 +3432,10 @@ pub fn emit_concat2(outer: usize, a_axis: usize, b_axis: usize, inner: usize) ->
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %sa = aie.logical_tile<ShimNOCTile>(?, ?)
-    %sb = aie.logical_tile<ShimNOCTile>(?, ?)
-    %so = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %sa = aie.tile(0, 0)
+    %sb = aie.tile(0, 0)
+    %so = aie.tile(0, 0)
     aie.objectfifo @a0(%sa, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{na}xf32>>
     aie.objectfifo @b0(%sb, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{nb}xf32>>
     aie.objectfifo @o0(%core, {{%so}}, 2 : i32) : !aie.objectfifo<memref<{nc}xf32>>
@@ -3492,10 +3528,10 @@ pub fn emit_gather(outer: usize, in_axis: usize, inner: usize, num_idx: usize) -
     format!(
         r#"module {{
   aie.device(npu1_1col) {{
-    %core = aie.logical_tile<CoreTile>(?, ?)
-    %sd = aie.logical_tile<ShimNOCTile>(?, ?)
-    %si = aie.logical_tile<ShimNOCTile>(?, ?)
-    %so = aie.logical_tile<ShimNOCTile>(?, ?)
+    %core = aie.tile(0, 2)
+    %sd = aie.tile(0, 0)
+    %si = aie.tile(0, 0)
+    %so = aie.tile(0, 0)
     aie.objectfifo @d0(%sd, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{n_data}xf32>>
     aie.objectfifo @i0(%si, {{%core}}, 2 : i32) : !aie.objectfifo<memref<{num_idx}xf32>>
     aie.objectfifo @o0(%core, {{%so}}, 2 : i32) : !aie.objectfifo<memref<{n_out}xf32>>

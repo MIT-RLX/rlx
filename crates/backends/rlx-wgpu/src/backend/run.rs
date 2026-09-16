@@ -26,34 +26,39 @@ use crate::kernels::{
     TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
     activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
     argmax_kernel, attention_bwd_kernel, attention_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
+    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
+    batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
     complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
     conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, cum_scan_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel,
+    conv3d_backward_weight_kernel, conv3d_ctile_kernel, conv3d_kernel, copy_kernel,
+    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
     fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
     fma_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
     fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
     gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
-    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
-    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
-    group_norm_backward_input_kernel, grouped_matmul_kernel, gru_kernel, im2col2d_kernel,
-    layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
-    layer_norm_backward_input_kernel, layernorm_kernel, lstm_kernel, mamba2_kernel,
-    matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
-    matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
-    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
-    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
+    gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
+    group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
+    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
+    lstm_kernel, mamba2_kernel, matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel,
+    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop16_kernel,
+    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
+    matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
+    matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
+    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel,
+    pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
     reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scaled_grouped_matmul_decode_kernel,
-    scatter_add_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
-    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
+    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
+    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
+    selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -65,6 +70,133 @@ use std::num::NonZeroU64;
 use super::*;
 
 impl WgpuExecutable {
+    /// Register a resident-KV row feed: `handle_name` (a device-resident input,
+    /// see `bind_gpu_handle`) receives row data from graph output `output_index`.
+    ///
+    /// Pairs with `Op::KvAppend`. Without residency the op does not actually
+    /// remove the O(context) cost — the concat it replaces copies the cache
+    /// on-GPU, but the runtime still re-uploads the past KV as a graph input
+    /// every step, so the cost merely moves. This is the half that keeps the
+    /// cache on the device between steps.
+    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
+        self.kv_row_feeds
+            .insert(handle_name.to_string(), output_index);
+    }
+
+    /// Fold each registered feed's new-token row (`src_row` of its output) into
+    /// the resident handle at `dst_row`, device-side.
+    ///
+    /// Mirrors `rlx-metal`'s semantics, including the aliased case: when the
+    /// output IS the input (in-place `KvAppend`, `out_id == in_id`), a copy with
+    /// `src_row != dst_row` is a legitimate intra-buffer relocate — the graph
+    /// writes the new token at a fixed row and this moves it to the growing
+    /// `past_seq` row. Only a genuine no-op (same node AND same row) is skipped.
+    pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
+        let Some(dev) = crate::device::wgpu_device() else {
+            return false;
+        };
+        let feeds: Vec<(String, usize)> = self
+            .kv_row_feeds
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        if feeds.is_empty() {
+            return false;
+        }
+        let bytes = row_elems * std::mem::size_of::<f32>();
+        for (name, out_idx) in feeds {
+            if out_idx >= self.graph.outputs.len() {
+                continue;
+            }
+            let out_id = self.graph.outputs[out_idx];
+            let Some(&in_id) = self.input_offsets.get(name.as_str()) else {
+                continue;
+            };
+            if !self.arena.has(in_id) || !self.arena.has(out_id) {
+                continue;
+            }
+            if in_id != out_id || src_row != dst_row {
+                let staging = self.kv_feed_staging.get_or_insert_with(|| {
+                    dev.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("rlx-wgpu kv feed staging"),
+                        size: bytes as u64,
+                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                });
+                // Grow if a later feed carries a wider row.
+                if staging.size() < bytes as u64 {
+                    *staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("rlx-wgpu kv feed staging"),
+                        size: bytes as u64,
+                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                }
+                self.arena.copy_within_device(
+                    &dev.device,
+                    &dev.queue,
+                    staging,
+                    self.arena.offset(out_id) + src_row * bytes,
+                    self.arena.offset(in_id) + dst_row * bytes,
+                    bytes,
+                );
+            }
+            self.gpu_handle_resident.insert(name.clone());
+            self.gpu_handles.insert(name.clone(), Vec::new());
+        }
+        true
+    }
+
+    /// How many schedule steps of each kind this executable will dispatch.
+    ///
+    /// wgpu has no equivalent of `rlx-metal`'s per-thunk profile, so there was
+    /// no way to see the shape of a lowered graph short of a debugger. Counts
+    /// are exact and machine-independent, which makes them usable on a
+    /// contended box where timings are not: "111 dispatches became 56" is a
+    /// fact about the schedule, not about the machine that ran it.
+    pub fn step_kind_counts(&self) -> std::collections::BTreeMap<&'static str, usize> {
+        let mut m = std::collections::BTreeMap::new();
+        for s in &self.schedule {
+            *m.entry(crate::backend::step::step_name(s)).or_insert(0) += 1;
+        }
+        m
+    }
+
+    /// `(steps marked static-once, skip armed)` — diagnostics for the
+    /// weight-pack skip.
+    ///
+    /// A `Concat`/`Expand`/`Cast` over `Param`s (the fused QKV and gate+up packs
+    /// the matmul-fusion passes build) is invariant across `run()`s, so lowering
+    /// marks its steps and later runs skip them. On a Llama decode those packs
+    /// are close to half of all DRAM traffic, so whether the skip actually arms
+    /// is worth being able to assert rather than infer.
+    ///
+    /// The two halves are independent: lowering can mark steps (`.0 > 0`) while
+    /// no executed path ever sets the flag (`.1 == false`), in which case the
+    /// optimisation is dead and the packs are rebuilt every run.
+    pub fn static_once_report(&self) -> (usize, bool) {
+        (self.static_once_steps.len(), self.static_once_done)
+    }
+
+    /// Arm the static-weight-pack skip: the schedule has run, so every pack has
+    /// been materialised and later runs may skip re-computing it.
+    ///
+    /// Called from EVERY readback return in `run_inner`, not just some. Two of
+    /// the five did this inline and three did not, so whether the optimisation
+    /// engaged depended on which readback path the graph happened to take —
+    /// a graph with small outputs returns via the "tiny" path and never armed,
+    /// silently rebuilding its constant weight packs on every run. Routing all
+    /// five through one helper is what keeps that from drifting apart again.
+    fn arm_static_once(&mut self) {
+        if !rlx_compile::memory::static_weight_pack_skip_enabled() {
+            return;
+        }
+        if !self.static_once_done && !self.static_once_steps.is_empty() {
+            self.static_once_done = true;
+        }
+    }
+
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.run_read_outputs(inputs, None)
     }
@@ -74,10 +206,136 @@ impl WgpuExecutable {
         inputs: &[(&str, &[f32])],
         read_indices: Option<&[usize]>,
     ) -> Vec<Vec<f32>> {
+        if rlx_ir::env::flag("RLX_WGPU_SNAPSHOT") && !self.in_snapshot {
+            self.snapshot_nodes(inputs);
+        }
         self.pending_read_indices = read_indices.map(|s| s.to_vec());
         let outs = self.run_inner(inputs);
         self.pending_read_indices = None;
         outs
+    }
+
+    /// Print each node's output **at the moment it is produced**.
+    ///
+    /// Every other way of inspecting a node is unsound. Adding it as a graph
+    /// output changes the compilation. Reading the arena after the run reports a
+    /// reused slot's final occupant, and cannot tell an elided node from one a
+    /// kernel wrongly zeroed. Both produced confident wrong answers on the
+    /// `rlx-vieeg` wgpu divergence.
+    ///
+    /// This replays the *same* compiled schedule truncated to its first `k`
+    /// steps, for every `k`, and reads the node that step `k-1` produced. Bind
+    /// groups, uniforms and the arena are untouched — the prefix indices line up
+    /// with the full run — so the value read is the one the graph really
+    /// computed at that point. Cost is O(n²) dispatches, which is fine for a
+    /// debug path on a few hundred nodes.
+    ///
+    /// `RLX_WGPU_SNAPSHOT=1`.
+    fn snapshot_nodes(&mut self, inputs: &[(&str, &[f32])]) {
+        let Some(dev) = crate::device::wgpu_device() else {
+            return;
+        };
+        let total = self.schedule.len();
+        eprintln!("[wgpu-snapshot] replaying {total} steps, reading each node as it is produced");
+        self.in_snapshot = true;
+        for k in 1..=total {
+            // `Step` is not `Clone`, so stop the loop by index rather than by
+            // rebuilding a truncated schedule — which also keeps the bind-group
+            // and uniform indices identical to the full run.
+            self.snapshot_stop = Some(k);
+            self.dispatch_only = true;
+            let _ = self.run_inner(inputs);
+            self.dispatch_only = false;
+            let Some(&node) = self.step_nodes.get(k - 1) else {
+                continue;
+            };
+            // A step whose node is also produced by a later step (fused tees
+            // write more than one slot) is reported at each point it is written.
+            if !self.arena.has(node) {
+                continue;
+            }
+            let data = self.arena.read_f32(&dev.device, &dev.queue, node);
+            let max = data.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            let nz = data.iter().filter(|&&v| v != 0.0).count();
+            // For a `[1, N, D]` activation, report the final row on its own.
+            // A fault confined to the last token — TinyMyo's shape — shows up as
+            // this ratio departing from the rest of the tensor, which needs no
+            // reference run and no cross-backend node-id alignment (node ids do
+            // not correspond across backends, since each fuses differently).
+            let dims: Vec<usize> = self
+                .graph
+                .node(node)
+                .shape
+                .dims()
+                .iter()
+                .map(|d| d.unwrap_static())
+                .collect();
+            // Max over the LAST row, by the same rule the CPU dump uses
+            // (`RLX_CPU_DUMP_NODES`), so the two are directly comparable. The
+            // rank-3-only block below stays for the tail/rest ratio.
+            let row = dims.last().copied().unwrap_or(data.len()).max(1);
+            let sum: f64 = data.iter().map(|&v| v as f64).sum();
+            let tail_row = data
+                .len()
+                .checked_sub(row)
+                .map(|o| data[o..].iter().fold(0.0f32, |m, &v| m.max(v.abs())))
+                .unwrap_or(max);
+            let tabs: f64 = data
+                .len()
+                .checked_sub(row)
+                .map(|o| data[o..].iter().map(|&v| v.abs() as f64).sum())
+                .unwrap_or(0.0);
+            // `RLX_WGPU_ROW_TABS=<step>`: per-row sum of |v| for one step's node,
+            // to diff against the CPU dump's `RLX_CPU_ROW_TABS` and see exactly
+            // which rows a kernel gets wrong.
+            if rlx_ir::env::parse_or::<usize>("RLX_WGPU_ROW_TABS", usize::MAX) == k - 1 {
+                for (r, chunk) in data.chunks(row).enumerate() {
+                    let t: f64 = chunk.iter().map(|&v| v.abs() as f64).sum();
+                    eprintln!("  rowtabs step={} row={r} tabs={t:.6}", k - 1);
+                }
+            }
+            let tail = if dims.len() == 3
+                && dims[0] == 1
+                && dims[1] > 1
+                && data.len() == dims[1] * dims[2]
+            {
+                let d = dims[2];
+                let last = &data[data.len() - d..];
+                let rest = &data[..data.len() - d];
+                let lm = last.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let rm = rest.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-12);
+                Some(format!("  tail_max={lm:.6} tail/rest={:.4}", lm / rm))
+            } else {
+                None
+            };
+            // `RLX_WGPU_SNAPSHOT_WATCH=<id>` also reports one chosen node after
+            // every step. A fused op can write a slot it does not own — the tee
+            // form of residual+LayerNorm does — so a node with no step of its own
+            // may still be filled, and the only way to see *when* is to watch it.
+            let watch = rlx_ir::env::var("RLX_WGPU_SNAPSHOT_WATCH")
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(rlx_ir::NodeId)
+                .filter(|w| self.arena.has(*w));
+            let watched = watch.map(|w| {
+                let d = self.arena.read_f32(&dev.device, &dev.queue, w);
+                let mx = d.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let n = d.iter().filter(|&&v| v != 0.0).count();
+                format!("   watch[{}] max={mx:.6} nz={n}/{}", w.0, d.len())
+            });
+            eprintln!(
+                "  step {:>3} node {:>4} {:<34} max={max:.6} tail={tail_row:.6} sum={sum:.6} tabs={tabs:.6} nonzero={nz}/{}{}",
+                k - 1,
+                node.0,
+                format!("{:?}", self.graph.node(node).op.kind()),
+                data.len(),
+                watched.unwrap_or_default()
+            );
+            if let Some(t) = tail {
+                eprintln!("{t}");
+            }
+        }
+        self.snapshot_stop = None;
+        self.in_snapshot = false;
     }
 
     /// Async sibling of [`Self::run`] for the browser, where GPU→CPU readback
@@ -316,7 +574,7 @@ impl WgpuExecutable {
                     }
                     continue;
                 }
-                if std::env::var("RLX_DBG_STEP").is_ok() {
+                if rlx_ir::env::var("RLX_DBG_STEP").is_some() {
                     let usz = self.uniforms.get(gpu_ui).map(|u| u.size()).unwrap_or(0);
                     eprintln!("[wgpu-uni gpu_ui={gpu_ui} ubuf={usz}B] {}", step_name(step));
                 }
@@ -325,6 +583,51 @@ impl WgpuExecutable {
                         // Params are static for this step (offset+len), so the
                         // pre-pass write at compile time is sufficient. No
                         // active-extent scaling — len is the full element count.
+                    }
+                    Step::IndexingNd { params, .. } => {
+                        // No active-extent scaling (see
+                        // `safe_for_active_extent`); write the params as planned.
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
+                    Step::ScaledLowp { params, .. } => {
+                        // Same: shapes are baked, nothing to rescale.
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
+                    Step::QuantI8 { params, .. } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
+                    Step::QMatMul { params, .. } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
+                    Step::QConv2d { params, .. } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
+                    Step::BatchNormInference { params, .. } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
                     }
                     Step::Matmul {
                         m,
@@ -433,6 +736,15 @@ impl WgpuExecutable {
                         p.outer = scale(p.outer);
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::GroupNorm { params } => {
+                        // NCHW geometry is fixed; there is no sequence extent to
+                        // scale, so the params go out verbatim.
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
                     }
                     Step::FusedSwiGLU { params } => {
                         let mut p = *params;
@@ -880,6 +1192,7 @@ impl WgpuExecutable {
                     | Step::CollectiveHost { .. }
                     | Step::CustomHost { .. }
                     | Step::FftHost { .. }
+                    | Step::FftQHost { .. }
                     | Step::ScanHost { .. }
                     | Step::HostOp { .. }
                     | Step::CpuIndexing { .. }
@@ -960,6 +1273,25 @@ impl WgpuExecutable {
                     gpu_ui += 1;
                 }
             }
+            if rlx_ir::env::flag("RLX_WGPU_DBG_COUNTERS") {
+                let host = self
+                    .schedule
+                    .iter()
+                    .filter(|s| step_runs_on_host(s))
+                    .count();
+                let tail = self
+                    .schedule
+                    .iter()
+                    .filter(|s| step_is_tail_host(s))
+                    .count();
+                eprintln!(
+                    "[wgpu-counters] steps={} host={host} tail_host={tail} uniforms={} \
+                     bind_groups={} final_gpu_ui={gpu_ui}",
+                    self.schedule.len(),
+                    self.uniforms.len(),
+                    self.bind_groups.len(),
+                );
+            }
             self.uniforms_active_extent = Some(active);
         }
 
@@ -982,12 +1314,18 @@ impl WgpuExecutable {
         // One dispatch per compute pass ⇒ WebGPU inserts a full memory barrier
         // between every op, eliminating intra-pass hazard races on aliased arena
         // slots (the source of nondeterministic deep-graph results on wgpu).
-        let one_op_per_pass = rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS");
+        // The snapshot needs exactly one step per submitted pass so it can stop
+        // after a chosen step and read what that step produced.
+        let one_op_per_pass =
+            rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS") || self.snapshot_stop.is_some();
         let mut step_i = 0;
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
         let mut host_cache = rlx_gpu_host::HostTensorCache::new();
         while step_i < self.schedule.len() {
+            if self.snapshot_stop.is_some_and(|stop| step_i >= stop) {
+                break;
+            }
             // Host→Host streaks: skip empty compute encodes/submits between
             // HostOps (was dominating Kitten discrete wall time alongside D2H).
             let starting_on_host = step_runs_on_host(&self.schedule[step_i])
@@ -1037,11 +1375,19 @@ impl WgpuExecutable {
                         {
                             break;
                         }
+                        // NOTE: the match arms below skip a dispatch whose scaled extent is
+                        // zero (`if m_s == 0 { … continue; }` and ~78 siblings). Such a skip
+                        // must still consume this step's bind group and advance the cursor —
+                        // the same idiom as the `static_once` skip above — because the only
+                        // `step_i += 1` for a dispatched step is at the very bottom of this
+                        // loop. A bare `continue` re-entered the loop on the same step and
+                        // spun forever; a bare `step_i += 1` would shift every later step onto
+                        // the wrong bind group.
                         let step = &self.schedule[step_i];
                         // PLAN L3: per-step Perfetto trace span; no-op when
                         // env var RLX_TRACE_PERFETTO unset.
                         let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
-                        if std::env::var("RLX_DBG_STEP").is_ok() {
+                        if rlx_ir::env::var("RLX_DBG_STEP").is_some() {
                             eprintln!("[wgpu-step] {}", step_name(step));
                         }
                         match step {
@@ -1079,6 +1425,10 @@ impl WgpuExecutable {
                                 // batch retain prior values via c_batch_stride.
                                 let m_s = scale(*m);
                                 if m_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let coop_f16_wide = mm_coop_f16_vk.is_some()
@@ -1217,6 +1567,10 @@ impl WgpuExecutable {
                             Step::Binary { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 pass.set_pipeline(&bk.pipeline);
@@ -1227,6 +1581,10 @@ impl WgpuExecutable {
                             Step::Compare { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 pass.set_pipeline(&ck.pipeline);
@@ -1237,6 +1595,10 @@ impl WgpuExecutable {
                             Step::Unary { params, f16_mirror } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 if *f16_mirror {
@@ -1255,6 +1617,10 @@ impl WgpuExecutable {
                             Step::Where { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 pass.set_pipeline(&wk.pipeline);
@@ -1265,6 +1631,10 @@ impl WgpuExecutable {
                             Step::Fma { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 pass.set_pipeline(&fk.pipeline);
@@ -1275,6 +1645,10 @@ impl WgpuExecutable {
                             Step::ReluBackward { params } | Step::ActivationBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 pass.set_pipeline(&abk.pipeline);
@@ -1285,6 +1659,10 @@ impl WgpuExecutable {
                             Step::Reduce { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let rk = reduce_kernel(&dev.device);
@@ -1306,6 +1684,10 @@ impl WgpuExecutable {
                             Step::Softmax { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let sk = softmax_kernel(&dev.device);
@@ -1319,6 +1701,10 @@ impl WgpuExecutable {
                             Step::SoftmaxCrossEntropy { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let sk = softmax_cross_entropy_kernel(&dev.device);
@@ -1330,6 +1716,10 @@ impl WgpuExecutable {
                             Step::SoftmaxCrossEntropyWithLogits { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let sk = softmax_cross_entropy_with_logits_kernel(&dev.device);
@@ -1341,6 +1731,10 @@ impl WgpuExecutable {
                             Step::SoftmaxCrossEntropyBackward { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let sk = softmax_cross_entropy_backward_kernel(&dev.device);
@@ -1352,6 +1746,10 @@ impl WgpuExecutable {
                             Step::LayerNorm { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let lk = layernorm_kernel(&dev.device);
@@ -1362,9 +1760,30 @@ impl WgpuExecutable {
                                 let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
+                            Step::GroupNorm { params } => {
+                                if params.groups_total == 0 || params.group_elems == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let gk = group_norm_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // One workgroup (64 threads) per (batch, group)
+                                // → tree reduction over the group's elements.
+                                let (gx, gy, gz) =
+                                    dispatch_dims(params.groups_total.saturating_mul(64), 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
                             Step::FusedSwiGLU { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let k = fused_swiglu_kernel(&dev.device);
@@ -1378,6 +1797,10 @@ impl WgpuExecutable {
                             Step::RmsNormBackwardInput { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let rk = rms_norm_backward_kernel(&dev.device);
@@ -1388,6 +1811,10 @@ impl WgpuExecutable {
                             Step::RmsNormBackwardGamma { params }
                             | Step::RmsNormBackwardBeta { params } => {
                                 if params.inner == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let rk = rms_norm_backward_param_kernel(&dev.device);
@@ -1398,6 +1825,10 @@ impl WgpuExecutable {
                             Step::LayerNormBackwardInput { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let lk = layer_norm_backward_input_kernel(&dev.device);
@@ -1410,6 +1841,10 @@ impl WgpuExecutable {
                                 num_workgroups,
                             } => {
                                 if params.inner == 0 || *num_workgroups == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let lk = layer_norm_backward_gamma_partial_kernel(&dev.device);
@@ -1419,6 +1854,10 @@ impl WgpuExecutable {
                             }
                             Step::LayerNormBackwardGammaReduce { params } => {
                                 if params.inner == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let lk = layer_norm_backward_gamma_reduce_kernel(&dev.device);
@@ -1429,6 +1868,10 @@ impl WgpuExecutable {
                             Step::CumsumBackward { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck = cumsum_backward_kernel(&dev.device);
@@ -1440,6 +1883,10 @@ impl WgpuExecutable {
                             Step::RopeBackward { params } => {
                                 let seq_s = scale(params.seq);
                                 if seq_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let rk = rope_backward_kernel(&dev.device);
@@ -1452,6 +1899,10 @@ impl WgpuExecutable {
                             Step::GatherBackward { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let total = outer_s * params.axis_dim * params.trailing;
@@ -1470,6 +1921,10 @@ impl WgpuExecutable {
                             Step::Cumsum { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck2 = cumsum_kernel(&dev.device);
@@ -1481,6 +1936,10 @@ impl WgpuExecutable {
                             Step::CumScan { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck2 = cum_scan_kernel(&dev.device);
@@ -1515,6 +1974,10 @@ impl WgpuExecutable {
                             Step::Copy { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck2 = copy_kernel(&dev.device);
@@ -1526,6 +1989,10 @@ impl WgpuExecutable {
                             Step::Cast { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let cast_k = cast_kernel(&dev.device);
@@ -1537,6 +2004,10 @@ impl WgpuExecutable {
                             Step::ComplexCast { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let k = complex_cast_kernel(&dev.device);
@@ -1548,6 +2019,10 @@ impl WgpuExecutable {
                             Step::BinaryC64 { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let k = binary_c64_kernel(&dev.device);
@@ -1559,6 +2034,10 @@ impl WgpuExecutable {
                             Step::ComplexNormSq { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let k = complex_norm_sq_kernel(&dev.device);
@@ -1570,6 +2049,10 @@ impl WgpuExecutable {
                             Step::ComplexNormSqBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let k = complex_norm_sq_backward_kernel(&dev.device);
@@ -1581,6 +2064,10 @@ impl WgpuExecutable {
                             Step::ConjugateC64 { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let k = conjugate_c64_kernel(&dev.device);
@@ -1593,6 +2080,10 @@ impl WgpuExecutable {
                                 let batch_s = scale(params.batch);
                                 let n = batch_s.saturating_mul(params.half);
                                 if n == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let k = fft_butterfly_stage_kernel(&dev.device);
@@ -1607,6 +2098,10 @@ impl WgpuExecutable {
                             Step::ElementwiseRegion { params } => {
                                 let len_s = scale(params.len);
                                 if len_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
@@ -1631,6 +2126,10 @@ impl WgpuExecutable {
                                 let slice_len_s = scale(params.slice_len);
                                 let num_batch_s = scale(params.num_batch);
                                 if slice_len_s == 0 || num_batch_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ek = batch_elementwise_region_kernel(&dev.device);
@@ -1652,6 +2151,10 @@ impl WgpuExecutable {
                                         params.out_total
                                     };
                                 if total_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let tk = transpose_kernel(&dev.device);
@@ -1663,6 +2166,10 @@ impl WgpuExecutable {
                             Step::Narrow { params } => {
                                 let total_s = scale(params.total);
                                 if total_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let nk = narrow_kernel(&dev.device);
@@ -1674,6 +2181,10 @@ impl WgpuExecutable {
                             Step::Concat { params } => {
                                 let total_s = scale(params.total);
                                 if total_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let cck = concat_kernel(&dev.device);
@@ -1685,6 +2196,10 @@ impl WgpuExecutable {
                             Step::Gather { params } => {
                                 let n_out_s = scale(params.n_out);
                                 if n_out_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let gk = gather_kernel(&dev.device);
@@ -1699,6 +2214,10 @@ impl WgpuExecutable {
                                 let total_s =
                                     scale(params.outer) * params.num_idx * params.trailing;
                                 if total_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let gk = gather_axis_kernel(&dev.device);
@@ -1713,6 +2232,10 @@ impl WgpuExecutable {
                                 // extent) inside the WGSL.
                                 let seq_q_s = scale(params.seq_q);
                                 if seq_q_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ak = attention_kernel(&dev.device);
@@ -1730,6 +2253,10 @@ impl WgpuExecutable {
                                 };
                                 let axis_s = scale(axis);
                                 if axis_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ak = attention_bwd_kernel(&dev.device);
@@ -1745,12 +2272,154 @@ impl WgpuExecutable {
                                 let s_active = scale(params.seq);
                                 let total_s = params.batch * s_active * params.last_dim;
                                 if total_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let rk = rope_kernel(&dev.device);
                                 pass.set_pipeline(&rk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::QuantI8 {
+                                kernel, threads, ..
+                            } => {
+                                if *threads == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let k = match kernel {
+                                    QuantI8Kernel::Quantize => quantize_i8_kernel(&dev.device),
+                                    QuantI8Kernel::Dequantize => dequantize_i8_kernel(&dev.device),
+                                };
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::BatchNormInference {
+                                kernel, threads, ..
+                            } => {
+                                if *threads == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let k = match kernel {
+                                    BatchNormKernel::Forward => {
+                                        batch_norm_inference_kernel(&dev.device)
+                                    }
+                                    BatchNormKernel::BwdInput => {
+                                        batch_norm_inference_bwd_input_kernel(&dev.device)
+                                    }
+                                    BatchNormKernel::BwdGamma => {
+                                        batch_norm_inference_bwd_gamma_kernel(&dev.device)
+                                    }
+                                    BatchNormKernel::BwdBeta => {
+                                        batch_norm_inference_bwd_beta_kernel(&dev.device)
+                                    }
+                                };
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::QConv2d { threads, .. } => {
+                                if *threads == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let k = q_conv2d_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::QMatMul { threads, .. } => {
+                                if *threads == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let k = q_matmul_kernel(&dev.device);
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ScaledLowp {
+                                params,
+                                kernel,
+                                threads,
+                            } => {
+                                if matches!(kernel, ScaledLowpKernel::MatmulDecode) {
+                                    if params.m == 0 || params.n == 0 {
+                                        gpu_bi += 1;
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = scaled_matmul_decode_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // 16x16 output tiles, matching the shader's
+                                    // workgroup_size(16, 16).
+                                    pass.dispatch_workgroups(
+                                        params.n.div_ceil(16),
+                                        params.m.div_ceil(16),
+                                        1,
+                                    );
+                                } else {
+                                    if *threads == 0 {
+                                        gpu_bi += 1;
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = match kernel {
+                                        ScaledLowpKernel::QuantScale => {
+                                            scaled_quant_scale_kernel(&dev.device)
+                                        }
+                                        ScaledLowpKernel::Quantize => {
+                                            scaled_quantize_kernel(&dev.device)
+                                        }
+                                        _ => scaled_dequantize_kernel(&dev.device),
+                                    };
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                            }
+                            Step::IndexingNd { params, kernel, .. } => {
+                                if params.n == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let k = match kernel {
+                                    IndexingNdKernel::GatherNd => gather_nd_kernel(&dev.device),
+                                    IndexingNdKernel::GatherElements => {
+                                        gather_elements_kernel(&dev.device)
+                                    }
+                                    IndexingNdKernel::ScatterElements => {
+                                        scatter_elements_kernel(&dev.device)
+                                    }
+                                    IndexingNdKernel::ScatterNd => {
+                                        scatter_nd_reduce_kernel(&dev.device)
+                                    }
+                                    IndexingNdKernel::CopySanitize => {
+                                        copy_sanitize_kernel(&dev.device)
+                                    }
+                                };
+                                pass.set_pipeline(&k.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(params.n, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::Expand { params, .. } => {
@@ -1763,6 +2432,10 @@ impl WgpuExecutable {
                                         params.out_total
                                     };
                                 if total_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ek = expand_kernel(&dev.device);
@@ -1774,6 +2447,10 @@ impl WgpuExecutable {
                             Step::Argmax { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let amk = argmax_kernel(&dev.device);
@@ -1785,6 +2462,10 @@ impl WgpuExecutable {
                             Step::Pool2d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = pool2d_kernel(&dev.device);
@@ -1797,6 +2478,10 @@ impl WgpuExecutable {
                             Step::MaxPool2dBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = maxpool2d_backward_kernel(&dev.device);
@@ -1810,6 +2495,10 @@ impl WgpuExecutable {
                             Step::MaxPool3dBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = maxpool3d_backward_kernel(&dev.device);
@@ -1822,6 +2511,10 @@ impl WgpuExecutable {
                             Step::Conv3dBackwardInput { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = conv3d_backward_input_kernel(&dev.device);
@@ -1834,6 +2527,10 @@ impl WgpuExecutable {
                             Step::Conv3dBackwardWeight { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = conv3d_backward_weight_kernel(&dev.device);
@@ -1848,6 +2545,10 @@ impl WgpuExecutable {
                             Step::GroupNormBackwardInput { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = group_norm_backward_input_kernel(&dev.device);
@@ -1870,6 +2571,10 @@ impl WgpuExecutable {
                             Step::AxialRope2d { params } => {
                                 let batch_s = scale(params.batch);
                                 if batch_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let total = batch_s * params.seq * params.hidden;
@@ -1882,6 +2587,10 @@ impl WgpuExecutable {
                             Step::FakeQuantizeFixed { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = fake_quantize_fixed_kernel(&dev.device);
@@ -1893,6 +2602,10 @@ impl WgpuExecutable {
                             Step::FakeQuantizePerBatch { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 || params.chan_dim == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = fake_quantize_perbatch_kernel(&dev.device);
@@ -1904,6 +2617,10 @@ impl WgpuExecutable {
                             Step::Conv2d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck2 = conv2d_kernel(&dev.device);
@@ -1920,6 +2637,10 @@ impl WgpuExecutable {
                             Step::Conv2dTiled { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck = conv1d_tiled_kernel(&dev.device);
@@ -1934,6 +2655,10 @@ impl WgpuExecutable {
                             Step::FusedConvBiasAct { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck = fused_conv_bias_act_kernel(&dev.device);
@@ -1960,6 +2685,10 @@ impl WgpuExecutable {
                             Step::Pool1d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = pool1d_kernel(&dev.device);
@@ -1972,6 +2701,10 @@ impl WgpuExecutable {
                             Step::Pool3d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let pk = pool3d_kernel(&dev.device);
@@ -1985,6 +2718,10 @@ impl WgpuExecutable {
                             Step::Conv1d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck = conv1d_kernel(&dev.device);
@@ -1997,19 +2734,41 @@ impl WgpuExecutable {
                             Step::Conv3d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
-                                let ck = conv3d_kernel(&dev.device);
+                                // Four output channels per thread when the
+                                // convolution is ungrouped; see
+                                // conv3d_ctile.wgsl. `RLX_WGPU_CONV3D_SCALAR=1`
+                                // forces the one-element-per-thread kernel so
+                                // the two can be timed against each other in
+                                // one process.
+                                let tiled = params.groups <= 1
+                                    && !rlx_ir::env::flag("RLX_WGPU_CONV3D_SCALAR");
+                                let spatial = params.d_out * params.h_out * params.w_out;
+                                let (ck, total) = if tiled {
+                                    (
+                                        conv3d_ctile_kernel(&dev.device),
+                                        n_s * params.c_out.div_ceil(4) * spatial,
+                                    )
+                                } else {
+                                    (conv3d_kernel(&dev.device), n_s * params.c_out * spatial)
+                                };
                                 pass.set_pipeline(&ck.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total =
-                                    n_s * params.c_out * params.d_out * params.h_out * params.w_out;
                                 let (gx, gy, gz) = dispatch_dims(total, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::ConvTranspose3d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ck = conv_transpose3d_kernel(&dev.device);
@@ -2039,6 +2798,10 @@ impl WgpuExecutable {
                             Step::TopK { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let tk = topk_kernel(&dev.device);
@@ -2050,6 +2813,10 @@ impl WgpuExecutable {
                             Step::WelchPeaksGpu { params } => {
                                 let batch_s = scale(params.welch_batch);
                                 if batch_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let wk = welch_peaks_gpu_kernel(&dev.device);
@@ -2061,6 +2828,10 @@ impl WgpuExecutable {
                             Step::UmapKnn { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let uk = umap_knn_kernel(&dev.device);
@@ -2087,6 +2858,10 @@ impl WgpuExecutable {
                             Step::GroupedMatmul { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let gk = grouped_matmul_kernel(&dev.device);
@@ -2097,6 +2872,10 @@ impl WgpuExecutable {
                             Step::ScaledGroupedMatmul { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let sk = scaled_grouped_matmul_decode_kernel(&dev.device);
@@ -2107,6 +2886,10 @@ impl WgpuExecutable {
                             Step::Sample { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let sk = sample_kernel(&dev.device);
@@ -2169,6 +2952,10 @@ impl WgpuExecutable {
                             Step::DequantMatmul { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let dk = dequant_matmul_kernel(&dev.device);
@@ -2179,6 +2966,10 @@ impl WgpuExecutable {
                             Step::DequantMatmulMlx { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let dk = dequant_matmul_mlx_kernel(&dev.device);
@@ -2192,6 +2983,10 @@ impl WgpuExecutable {
                             Step::FusedResidualLn { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let frk = fused_residual_ln_kernel(&dev.device);
@@ -2203,6 +2998,10 @@ impl WgpuExecutable {
                             Step::FusedResidualLnTee { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let frtk = fused_residual_ln_tee_kernel(&dev.device);
@@ -2214,6 +3013,10 @@ impl WgpuExecutable {
                             Step::FusedResidualRmsNorm { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let frk = fused_residual_rms_norm_kernel(&dev.device);
@@ -2225,6 +3028,10 @@ impl WgpuExecutable {
                             Step::AdaLayerNorm { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ak = ada_layer_norm_kernel(&dev.device);
@@ -2236,6 +3043,10 @@ impl WgpuExecutable {
                             Step::GatedResidual { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let total = outer_s.saturating_mul(params.inner);
@@ -2248,6 +3059,10 @@ impl WgpuExecutable {
                             Step::AdaLayerNormBackward { params } => {
                                 let mod_rows_s = scale(params.mod_rows);
                                 if mod_rows_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let ak = ada_layer_norm_backward_kernel(&dev.device);
@@ -2258,6 +3073,10 @@ impl WgpuExecutable {
                             Step::GatedResidualBackward { params } => {
                                 let mod_rows_s = scale(params.mod_rows);
                                 if mod_rows_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let gk = gated_residual_backward_kernel(&dev.device);
@@ -2268,6 +3087,10 @@ impl WgpuExecutable {
                             Step::MatmulQkv { params, kind } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
+                                    if !matches!(step, Step::FftGpu { .. }) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
                                     continue;
                                 }
                                 let qkv_coop_wide = matches!(kind, MatmulQkvKind::CoopF16Vk)
@@ -2355,6 +3178,7 @@ impl WgpuExecutable {
                             | Step::CollectiveHost { .. }
                             | Step::CustomHost { .. }
                             | Step::FftHost { .. }
+                            | Step::FftQHost { .. }
                             | Step::ScanHost { .. }
                             | Step::HostOp { .. }
                             | Step::CpuIndexing { .. }
@@ -2380,6 +3204,12 @@ impl WgpuExecutable {
                         }
                         if !matches!(step, Step::FftGpu { .. }) {
                             gpu_bi += 1;
+                        }
+                        if rlx_ir::env::flag("RLX_WGPU_DBG_COUNTERS") {
+                            eprintln!(
+                                "[wgpu-bi] step {step_i} {} -> gpu_bi now {gpu_bi}",
+                                step_name(step)
+                            );
                         }
                         step_i += 1;
                         pass_dispatched = true;
@@ -2425,10 +3255,12 @@ impl WgpuExecutable {
                         let sub = dev.queue.submit(std::iter::once(enc.finish()));
                         wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
-                        return self.pack_readback_outputs(
-                            &plan,
-                            vec![decode_tiny_mapped_f32(tiny.buffer(), layout.total_bytes)],
-                        );
+                        // Decode before arming: `tiny` borrows `self` immutably and the
+                        // borrow must end before `arm_static_once` takes it mutably.
+                        let decoded =
+                            vec![decode_tiny_mapped_f32(tiny.buffer(), layout.total_bytes)];
+                        self.arm_static_once();
+                        return self.pack_readback_outputs(&plan, decoded);
                     }
                     ReadbackStaging::prepare(
                         &dev.device,
@@ -2480,10 +3312,12 @@ impl WgpuExecutable {
                             let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
                             wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                             map_rx.recv().unwrap().unwrap();
-                            return self.pack_readback_outputs(
-                                &plan,
-                                vec![decode_tiny_mapped_f32(tiny.buffer(), layout.total_bytes)],
-                            );
+                            // Decode before arming: `tiny` borrows `self` immutably and the
+                            // borrow must end before `arm_static_once` takes it mutably.
+                            let decoded =
+                                vec![decode_tiny_mapped_f32(tiny.buffer(), layout.total_bytes)];
+                            self.arm_static_once();
+                            return self.pack_readback_outputs(&plan, decoded);
                         }
                         ReadbackStaging::prepare(
                             &dev.device,
@@ -2505,6 +3339,7 @@ impl WgpuExecutable {
                             map_rx.recv().unwrap().unwrap();
                             self.dump_node_stats_if_requested(dev);
                             let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
+                            self.arm_static_once();
                             return self.pack_readback_outputs(&plan, partial);
                         }
                     }
@@ -2525,9 +3360,7 @@ impl WgpuExecutable {
                 }
                 if gpu_schedule_done {
                     if skip_readback || defer_tail {
-                        if !self.static_once_done && !self.static_once_steps.is_empty() {
-                            self.static_once_done = true;
-                        }
+                        self.arm_static_once();
                         return self
                             .graph
                             .outputs
@@ -2550,9 +3383,7 @@ impl WgpuExecutable {
                         map_rx.recv().unwrap().unwrap();
                         self.dump_node_stats_if_requested(dev);
                         let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
-                        if !self.static_once_done && !self.static_once_steps.is_empty() {
-                            self.static_once_done = true;
-                        }
+                        self.arm_static_once();
                         return self.pack_readback_outputs(&plan, partial);
                     }
                     break;
@@ -2573,20 +3404,31 @@ impl WgpuExecutable {
             if !step_runs_on_host(&self.schedule[step_i]) {
                 continue;
             }
-            // Deferred HostOp/Conv/structure outputs live only in the mirror
-            // until a device-reading host step or GPU pass needs them.
-            if host_cache.has_deferred_writes()
-                && !matches!(
-                    &self.schedule[step_i],
-                    Step::HostOp { .. }
-                        | Step::Conv2dHost { .. }
-                        | Step::ExpandHost { .. }
-                        | Step::NarrowHost { .. }
-                        | Step::TransposeHost { .. }
-                        | Step::ConcatHost { .. }
-                        | Step::BufferCopy { .. }
-                )
-            {
+            // Does this host step go straight at the device, bypassing the
+            // mirror? The cache-aware steps below read and write through
+            // `host_cache` themselves; everything else (the `with_whole_arena`
+            // family — GroupNorm, LayerNorm2d, Reverse, Gru, …) reads the
+            // device and rewrites the arena underneath it.
+            //
+            // Such a step needs the mirror flushed BEFORE it runs (so it sees
+            // pending host results) *and* dropped AFTER (so the next cache-aware
+            // step does not serve a pre-step copy from the mirror). Only the
+            // first half used to happen: a `HostOp` following a hosted
+            // GroupNorm re-read its stale cached input, silently, and nothing
+            // cleared the mirror because `host_cache.clear()` is reached only
+            // after real GPU work (`pass_dispatched`) — a run of consecutive
+            // host steps never gets there.
+            let bypasses_host_cache = !matches!(
+                &self.schedule[step_i],
+                Step::HostOp { .. }
+                    | Step::Conv2dHost { .. }
+                    | Step::ExpandHost { .. }
+                    | Step::NarrowHost { .. }
+                    | Step::TransposeHost { .. }
+                    | Step::ConcatHost { .. }
+                    | Step::BufferCopy { .. }
+            );
+            if host_cache.has_deferred_writes() && bypasses_host_cache {
                 let mut a = crate::host_stage::WgpuArena {
                     arena: &self.arena,
                     device: &dev.device,
@@ -2671,7 +3513,17 @@ impl WgpuExecutable {
                             );
                             bytemuck::cast_slice(&bytes_host).to_vec()
                         };
-                        let defer = !rlx_ir::env::flag("RLX_WGPU_HOST_EAGER_H2D");
+                        // A weight-tagged source is a *staged* copy, and stages
+                        // are bump-allocated into a wrapping scratch reserve —
+                        // so many params share one `dst`. The deferred host
+                        // mirror is keyed by `dst`, so deferring these collapses
+                        // the whole sequence to whichever copy ran last and
+                        // every other weight reads stale bytes. Silently: the
+                        // graph stays finite and simply stops depending on its
+                        // input. Only `RLX_WGPU_HOST_EAGER_H2D` used to prevent
+                        // it, which made the flag a correctness switch rather
+                        // than the performance knob it is meant to be.
+                        let defer = !src_is_weight && !rlx_ir::env::flag("RLX_WGPU_HOST_EAGER_H2D");
                         if !defer {
                             self.arena.write_bytes_range(
                                 &dev.queue,
@@ -3515,6 +4367,28 @@ impl WgpuExecutable {
                         fft_dtype_from_tag(*dtype_tag),
                     );
                 }
+                Step::FftQHost {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_complex,
+                    inverse,
+                    norm_tag,
+                    scale_tag,
+                } => {
+                    crate::fft_host::run_fft1d_q(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_complex as usize,
+                        *inverse,
+                        *norm_tag,
+                        *scale_tag,
+                    );
+                }
                 Step::ScanHost { desc } => {
                     crate::scan_host::run_scan(&self.arena, &dev.device, &dev.queue, desc);
                 }
@@ -4117,6 +4991,11 @@ impl WgpuExecutable {
                     );
                 }
                 _ => break,
+            }
+            // The step just rewrote the arena directly, so every cached
+            // mirror entry is potentially stale (see `bypasses_host_cache`).
+            if bypasses_host_cache {
+                host_cache.clear();
             }
             step_i += 1;
             // Host paths stage with `queue.write_buffer` (no submit). Flush

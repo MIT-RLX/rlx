@@ -124,13 +124,18 @@ impl FuseSwiGLU {
 
             // Single-use checks: narrows feed only into silu+mul, silu feeds
             // only into mul. The cat itself can have arbitrary other users.
-            if uses.use_count(up_narrow.id) != 1 {
+            //
+            // `has_single_use` also rejects a node that escapes as a graph
+            // output — these three are absorbed into the fused node, so an
+            // exported one would lose its value and leave `Rewriter::finish`
+            // with nothing to map.
+            if !uses.has_single_use(up_narrow.id) {
                 continue;
             }
-            if uses.use_count(gate_narrow_id) != 1 {
+            if !uses.has_single_use(gate_narrow_id) {
                 continue;
             }
-            if uses.use_count(silu_id) != 1 {
+            if !uses.has_single_use(silu_id) {
                 continue;
             }
 

@@ -25,7 +25,7 @@ fn parity(m: usize, k: usize, n: usize, e_cnt: usize, idx: Vec<f32>) {
     // `Session::new(Device::Cuda)` panics both without CUDA hardware AND when
     // rlx-runtime was built without its `cuda` feature. The runtime's own probe
     // covers both; `rlx_cuda::is_available()` would only catch the former.
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_runtime::is_available(Device::Cuda)) {
         eprintln!("skip: CUDA unavailable (no device, or runtime built without `cuda`)");
         return;
     }

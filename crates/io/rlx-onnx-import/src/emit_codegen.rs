@@ -408,7 +408,7 @@ fn emit_resize(node: &BundleNode, out_ident: &str, meta0: &str) -> Vec<String> {
     )]
 }
 
-/// Emit one output of [`DynamicQuantizeLinear`] (quantized tensor, scale, zero-point).
+/// Emit one output of `DynamicQuantizeLinear` (quantized tensor, scale, zero-point).
 pub fn emit_dynamic_quant_output(
     node: &BundleNode,
     output_index: usize,
@@ -893,6 +893,12 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
             let s1 = attr_usize(node, "strides", 1, 1);
             let p0 = attr_usize(node, "pads", 0, 0);
             let p1 = attr_usize(node, "pads", 1, 0);
+            // Third spatial axis, for a volumetric Conv. ONNX orders `pads` as
+            // all the starts then all the ends, so the third start is index 2
+            // for a 3-D kernel — not index 4.
+            let k2 = attr_usize(node, "kernel_shape", 2, 1);
+            let s2 = attr_usize(node, "strides", 2, 1);
+            let p2 = attr_usize(node, "pads", 2, 0);
             let groups = attr_i64(node, "group", 1);
             let transpose = node.op == "ConvTranspose";
             let x = rust_str_lit(&node.inputs[0]);
@@ -917,10 +923,14 @@ pub fn emit_node_body(node: &BundleNode, out_ident: &str) -> Vec<String> {
                         let l_out = rlx_ir::shape::conv_transpose2d_spatial_output(l, {k0}, {s0}, {p0}, 1, 0); \
                         Shape::new(&[n, c_out, l_out], dt) \
                     }} else {{ Shape::new(&[1], dt) }} \
+                }} else if rank == 5 {{ \
+                    shape::conv3d_output_shape(in_s, w_s, [{k0}, {k1}, {k2}], [{s0}, {s1}, {s2}], [{p0}, {p1}, {p2}], [1, 1, 1], {groups} as usize).unwrap_or(meta_sh) \
                 }} else {{ \
                     shape::conv2d_output_shape(in_s, w_s, [{k0}, {k1}], [{s0}, {s1}], [{p0}, {p1}], [1, 1], {groups} as usize).unwrap_or(meta_sh) \
                 }}; \
-                if rank == 4 {{ \
+                if rank == 5 && !{transpose} {{ \
+                    m.conv3d(x, w, [{s0}, {s1}, {s2}], [{p0}, {p1}, {p2}], [1, 1, 1], {groups} as usize) \
+                }} else if rank == 4 {{ \
                     if {transpose} {{ \
                         m.conv_transpose2d(x, w, [{k0}, {k1}], [{s0}, {s1}], [{p0}, {p1}], [1, 1], [0, 0], {groups} as usize, out_sh) \
                     }} else {{ m.conv2d(x, w, [{k0}, {k1}], [{s0}, {s1}], [{p0}, {p1}], {groups} as usize, out_sh) }} \

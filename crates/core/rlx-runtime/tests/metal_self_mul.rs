@@ -5,10 +5,12 @@
 #![cfg(all(target_os = "macos", feature = "metal"))]
 use rlx_ir::op::{BinaryOp, Op};
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn run_self_mul(n0: usize, n1: usize, n2: usize, scale: f32) {
-    if !is_available(Device::Metal) {
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip: no Metal device");
         return;
     }
@@ -45,17 +47,20 @@ fn run_self_mul(n0: usize, n1: usize, n2: usize, scale: f32) {
 
 #[test]
 fn metal_self_mul_small() {
+    let _gpu = common::serialize_gpu();
     run_self_mul(1, 32, 64, 0.01);
 }
 
 #[test]
 fn metal_self_mul_adain_shape() {
+    let _gpu = common::serialize_gpu();
     // Kokoro generator AdaIN variance: 128 channels × ~6k frames
     run_self_mul(1, 128, 6241, 0.01);
 }
 
 #[test]
 fn metal_self_mul_large_values() {
+    let _gpu = common::serialize_gpu();
     // Observed Sub magnitudes near the silent Mul (~1e5)
     run_self_mul(1, 128, 512, 100.0);
 }

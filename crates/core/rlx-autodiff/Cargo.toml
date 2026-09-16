@@ -17,9 +17,20 @@ documentation.workspace = true
 rlx-ir = { workspace = true }
 rlx-fusion = { workspace = true }
 half = "2"
+thiserror = "2"
 
 [features]
 default = []
+# Accelerator passthroughs for the TEST binaries. The gather-backward rank-1 bug
+# was present verbatim in all five backends, so the regression test for it has
+# to be runnable somewhere other than CPU; without these the dev-dependency on
+# `rlx` is pinned to `cpu` and the test can only ever prove the CPU path.
+#   RLX_FORCE_DEVICE=metal cargo test -p rlx-autodiff --features metal --test indexing_grad
+metal = ["rlx/metal"]
+mlx = ["rlx/mlx"]
+gpu = ["rlx/gpu"]
+cuda = ["rlx/cuda"]
+rocm = ["rlx/rocm"]
 
 [dev-dependencies]
 # Path-only (no version): test-only cycle on the umbrella crate, which is
@@ -29,3 +40,7 @@ rlx = { path = "../../rlx", default-features = false, features = ["cpu"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

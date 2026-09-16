@@ -21,7 +21,7 @@
 //! (Sample, TopK, SelectiveScan) panic with a clear message.
 //!
 //! **GGUF `DequantMatMul`:** host-dequant at emit time → f32 constant →
-//! `dot_general` ([`lower_dequant_matmul_gguf`]). See
+//! `dot_general` (`lower_dequant_matmul_gguf`). See
 //! [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) (TPU section).
 
 use std::collections::HashMap;

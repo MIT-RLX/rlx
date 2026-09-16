@@ -66,17 +66,29 @@ impl DecomposePolicy for CudaPolicy {
 }
 
 pub fn unfuse(graph: Graph) -> Graph {
-    let graph = expand_partitioned_conv(graph);
+    let graph = expand_unsupported_fusions(graph);
     rlx_unfuse::unfuse(graph, &CudaPolicy)
 }
 
 /// Expand [`Op::PartitionedConv`] → batched-GEMM frequency-domain primitives
-/// (`Fft` / `MatMul` / …) via `unfuse_fused_for_autodiff`.
-fn expand_partitioned_conv(g: Graph) -> Graph {
+/// (`Fft` / `MatMul` / …) via `unfuse_fused_for_autodiff`, and expand any
+/// [`Op::FusedConvBiasAct`] that is not the 2-D case CUDA actually implements.
+///
+/// `SUPPORTED_OPS` lists `FusedConvBiasAct` unconditionally, so the shared
+/// pipeline leaves every rank fused — but `backend::compile` lowers all of
+/// them to `Step::Conv2d`, reading `dims[2]`/`dims[3]` as h/w. Handed an NCDHW
+/// node that reads D and H, silently drops W, and produces garbage: a native
+/// 3-D SynthStrip forward came out 97% of full scale away from the CPU result
+/// while the run reported success. Ranks other than 4 go back to primitives,
+/// where `Op::Conv3d` has a real kernel.
+fn expand_unsupported_fusions(g: Graph) -> Graph {
+    let unsupported_fused = |n: &rlx_ir::Node| -> bool {
+        matches!(n.op, Op::FusedConvBiasAct { .. }) && n.shape.rank() != 4
+    };
     let needs = g
         .nodes()
         .iter()
-        .any(|n| matches!(n.op, Op::PartitionedConv { .. }));
+        .any(|n| matches!(n.op, Op::PartitionedConv { .. }) || unsupported_fused(n));
     if !needs {
         return g;
     }
@@ -86,6 +98,9 @@ fn expand_partitioned_conv(g: Graph) -> Graph {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
         let new_id = match &node.op {
             Op::PartitionedConv { .. } => {
+                inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
+            }
+            Op::FusedConvBiasAct { .. } if node.shape.rank() != 4 => {
                 inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
             }
             _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),

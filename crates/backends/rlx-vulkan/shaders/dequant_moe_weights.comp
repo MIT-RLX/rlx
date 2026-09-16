@@ -1,0 +1,156 @@
+#version 450
+// `Op::DequantMoEWeights`: dequantise a packed GGUF MoE expert stack to dense
+// F32 in GroupedMatMul layout.
+//
+//   out[e, i, j] = dequant(slab_e)[j * k + i]     — a per-expert transpose
+//
+// Input is `[E]` slabs of `[N, K]` packed blocks (the same stacking
+// `dequant_grouped_matmul.comp` reads); output is `[E, K, N]` f32.
+//
+// **This materialises `E · K · N` floats, which is the whole point and the whole
+// cost.** `dequant_grouped_matmul.comp` exists precisely to avoid it by decoding
+// inside the accumulation loop, and is the better choice whenever the consumer
+// is a grouped GEMM. This op is for the graphs that genuinely want dense expert
+// weights; running it on-device beats the alternative of a readback plus a CPU
+// pass plus an upload of the same enormous tensor.
+//
+// One invocation per OUTPUT element, so each decodes a *single* element out of
+// its block rather than expanding a whole 256-element super-block and throwing
+// 255 of them away — the transpose means neighbouring output elements come from
+// different blocks, so whole-block decode would be pure waste here. That single-
+// element addressing is the part worth checking: it has to reproduce, index for
+// index, the layout the block-at-a-time decoders build.
+//
+// Scheme: 0 = Q4_K (144 B / 256 elems), 1 = Q6_K (210 B / 256), 2 = Q1_0
+// (18 B / 128). Other schemes keep the host route.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint k;
+    uint n;
+    uint num_experts;
+    uint w_word;      // f32-word offset of the packed stack
+    uint out_word;    // f32-word offset of the [E, K, N] output
+    uint slab_bytes;  // packed bytes per expert
+    uint scheme;
+} pc;
+
+uint rd_byte_at(uint w_base, uint rel) {
+    uint w = arena_load_u(w_base + (rel >> 2u));
+    return (w >> ((rel & 3u) * 8u)) & 0xFFu;
+}
+
+float rd_f16_at(uint w_base, uint rel) {
+    uint w = arena_load_u(w_base + (rel >> 2u));
+    uint h = (w >> ((rel & 3u) * 8u)) & 0xFFFFu;
+    return unpackHalf2x16(h).x;
+}
+
+int sx8(uint b) {
+    return int(b) - 256 * int((b >> 7u) & 1u);
+}
+
+// Q4_K sub-block scale/min for sub-block `j` (0..7). Same 6-bit packing the
+// block-at-a-time decoder uses.
+void scale_min_k4(uint w_base, uint j, uint sc_base, out uint sc, out uint mn) {
+    if (j < 4u) {
+        sc = rd_byte_at(w_base, sc_base + j) & 63u;
+        mn = rd_byte_at(w_base, sc_base + j + 4u) & 63u;
+    } else {
+        uint a = rd_byte_at(w_base, sc_base + j + 4u);
+        sc = (a & 0x0Fu) | ((rd_byte_at(w_base, sc_base + j - 4u) >> 6u) << 4u);
+        mn = (a >> 4u) | ((rd_byte_at(w_base, sc_base + j) >> 6u) << 4u);
+    }
+}
+
+// Element `e` (0..255) of the Q4_K super-block at `base`.
+//
+// The block decoder walks sub-blocks in pairs, emitting 32 low nibbles then 32
+// high nibbles per pair, so position `e` inverts to: pair `e/64`, half
+// `(e%64)/32` (low vs high nibble, and which of the pair's two scales), lane
+// `e%32`. Getting that inversion wrong still yields plausible weights.
+float q4k_elem(uint w_base, uint base, uint e) {
+    float d = rd_f16_at(w_base, base);
+    float dmin = rd_f16_at(w_base, base + 2u);
+    uint sc_base = base + 4u;
+    uint qs_base = base + 16u;
+
+    uint pair = e / 64u;          // 0..3  -> sub-blocks (2*pair, 2*pair+1)
+    uint half_i = (e % 64u) / 32u; // 0 = low nibble, 1 = high nibble
+    uint lane = e % 32u;
+
+    uint sc; uint mn;
+    scale_min_k4(w_base, 2u * pair + half_i, sc_base, sc, mn);
+    uint q = rd_byte_at(w_base, qs_base + pair * 32u + lane);
+    uint nib = (half_i == 0u) ? (q & 0x0Fu) : (q >> 4u);
+    return d * float(sc) * float(nib) - dmin * float(mn);
+}
+
+// Element `e` (0..255) of the Q6_K super-block at `base`.
+//
+// The block decoder emits two halves of 128, each as four quarters of 32 built
+// from a shared `qh` byte. Position `e` inverts to half `e/128`, quarter
+// `(e%128)/32`, lane `e%32`; the quarter selects which 2-bit field of `qh`, which
+// nibble of which `ql` byte, and which of the eight scales.
+float q6k_elem(uint w_base, uint base, uint e) {
+    uint ql_base = base;
+    uint qh_base = base + 128u;
+    uint sc_base = base + 192u;
+    float d = rd_f16_at(w_base, base + 208u);
+
+    uint h = e / 128u;
+    uint rem = e % 128u;
+    uint quarter = rem / 32u;
+    uint lane = rem % 32u;
+
+    uint ql_off = h * 64u;
+    uint qh_off = h * 32u;
+    uint sc_off = h * 8u;
+    uint isb = lane / 16u;
+
+    uint qhb = rd_byte_at(w_base, qh_base + qh_off + lane);
+    uint lo = rd_byte_at(w_base, ql_base + ql_off + lane + ((quarter == 1u || quarter == 3u) ? 32u : 0u));
+    uint hi_bits = (qhb >> (quarter * 2u)) & 3u;
+    uint nib = (quarter < 2u) ? (lo & 0x0Fu) : (lo >> 4u);
+    int q = int(nib | (hi_bits << 4u)) - 32;
+    int sc = sx8(rd_byte_at(w_base, sc_base + sc_off + isb + quarter * 2u));
+    return d * float(sc) * float(q);
+}
+
+// Element `e` (0..127) of the Q1_0 block at `base` (f16 d | 16 sign bytes).
+float q1_0_elem(uint w_base, uint base, uint e) {
+    float d = rd_f16_at(w_base, base);
+    uint bit = (rd_byte_at(w_base, base + 2u + (e >> 3u)) >> (e & 7u)) & 1u;
+    return (bit != 0u) ? d : -d;
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    uint per_expert = pc.k * pc.n;
+    uint total = pc.num_experts * per_expert;
+    if (t >= total) { return; }
+
+    uint e = t / per_expert;
+    uint rem = t - e * per_expert;
+    uint i = rem / pc.n;   // K index
+    uint j = rem - i * pc.n; // N index
+
+    // The transpose: output (i, j) reads source row j, column i.
+    // (`flat` is a reserved GLSL interpolation qualifier — hence `src_flat`.)
+    uint src_flat = j * pc.k + i;
+
+    uint w_base = pc.w_word + (e * pc.slab_bytes) / 4u;
+
+    float v = 0.0;
+    if (pc.scheme == 2u) {
+        uint b = src_flat / 128u;
+        v = q1_0_elem(w_base, b * 18u, src_flat % 128u);
+    } else if (pc.scheme == 0u) {
+        uint b = src_flat / 256u;
+        v = q4k_elem(w_base, b * 144u, src_flat % 256u);
+    } else {
+        uint b = src_flat / 256u;
+        v = q6k_elem(w_base, b * 210u, src_flat % 256u);
+    }
+    arena_store_u(pc.out_word + t, floatBitsToUint(v));
+}

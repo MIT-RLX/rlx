@@ -36,7 +36,7 @@ fn grad_parity(
     inputs: &[(&str, &[f32])],
     grad_out_index: usize,
 ) {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -148,7 +148,7 @@ fn grad_softmax() {
 /// gradient satisfies `dS == loss` at S=1 — and the ANE's `conv_transpose` hits it.
 #[test]
 fn grad_conv2d_input_native_matches_analytic() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -213,7 +213,7 @@ fn grad_relu_activation() {
 /// numerical gradient of `loss = sum(conv(x, W))`.
 #[test]
 fn grad_conv2d_weight_native_matches_fd() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }

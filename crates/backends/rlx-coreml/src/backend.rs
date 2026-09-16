@@ -208,7 +208,7 @@ pub fn default_lower_options(graph: &Graph) -> LowerOptions {
     // RLX_COREML_F16=1 stores activations (and the dequant output) in f16, ~half
     // the RAM + half the BNNS-compile working set. Needed for 27B-class models
     // where the f32 decode-graph IR overruns disk during coremlc/BNNS compile.
-    let float_dtype = if std::env::var("RLX_COREML_F16").ok().as_deref() == Some("1") {
+    let float_dtype = if rlx_ir::env::var("RLX_COREML_F16").as_deref() == Some("1") {
         DType::F16
     } else {
         DType::F32
@@ -216,8 +216,8 @@ pub fn default_lower_options(graph: &Graph) -> LowerOptions {
     LowerOptions {
         float_dtype,
         flexible_inputs: rlx_ir::dynamic::has_dynamic_dims(graph)
-            || std::env::var("RLX_COREML_FLEXIBLE_INPUTS").ok().as_deref() == Some("1"),
-        ondevice_dequant: std::env::var("RLX_COREML_HOST_DEQUANT").ok().as_deref() != Some("1"),
+            || rlx_ir::env::var("RLX_COREML_FLEXIBLE_INPUTS").as_deref() == Some("1"),
+        ondevice_dequant: rlx_ir::env::var("RLX_COREML_HOST_DEQUANT").as_deref() != Some("1"),
         q1_mode: None, // None → RLX_COREML_Q1_MODE env (default Lut)
     }
 }
@@ -273,11 +273,11 @@ fn is_backward_graph(graph: &Graph) -> bool {
 /// Precision↔speed is the user's choice: default fp32 (CPU+GPU, accurate /
 /// BNNS-safe) or an AFP f16 policy / `RLX_COREML_UNITS=ane` (ANE, fast).
 pub fn default_compute_units(graph: &Graph) -> ComputeUnits {
-    match std::env::var("RLX_COREML_UNITS").as_deref() {
-        Ok("cpu") => ComputeUnits::CpuOnly,
-        Ok("gpu") => ComputeUnits::CpuAndGpu,
-        Ok("all") => ComputeUnits::All,
-        Ok("ane") => ComputeUnits::CpuAndNeuralEngine,
+    match rlx_ir::env::var("RLX_COREML_UNITS").as_deref() {
+        Some("cpu") => ComputeUnits::CpuOnly,
+        Some("gpu") => ComputeUnits::CpuAndGpu,
+        Some("all") => ComputeUnits::All,
+        Some("ane") => ComputeUnits::CpuAndNeuralEngine,
         _ if graph_has_f16(graph) => ComputeUnits::CpuAndNeuralEngine,
         // Host-split graphs (Op::Scan-family: SPD eigensolvers, IIR/SSM
         // recurrences) alternate host and MIL segments; EACH MIL segment
@@ -370,6 +370,33 @@ impl CoremlExecutable {
         }
         lower_opts.flexible_inputs =
             lower_opts.flexible_inputs || rlx_ir::dynamic::has_dynamic_dims(&graph);
+        // A flexible-shape CoreML model is executed through MPSGraph, which
+        // requires every tensor's shape to be static and does not say so: it
+        // aborts the process from inside MPSRuntime (`failed assertion 'shape
+        // for TensorData is not static'`, SIGABRT), taking any surrounding sweep
+        // with it. `hybrid::build_mil_subgraph` already refuses this, but only
+        // for multi-segment plans — a graph that lowers to a single MIL segment
+        // took the `MilOnly` path and skipped the check entirely. Refuse here
+        // too, naming the first offending node, so the caller can pick another
+        // backend instead of losing the process.
+        if lower_opts.flexible_inputs
+            && compute_units != crate::ComputeUnits::CpuOnly
+            && let Some(n) = graph.nodes().iter().find(|n| {
+                n.shape
+                    .dims()
+                    .iter()
+                    .any(|d| matches!(d, rlx_ir::Dim::Dynamic(_)))
+            })
+        {
+            panic!(
+                "unsupported for CoreML: dynamic shape {:?} on {:?} (node {}) — MPSGraph \
+                 needs static shapes and aborts the process rather than erroring; run \
+                 this graph on another backend or set RLX_COREML_UNITS=cpu",
+                n.shape.dims(),
+                n.op.kind(),
+                n.id.0
+            );
+        }
 
         let plan = hybrid::plan_execution(&graph).unwrap_or_else(|e| {
             panic!("CoreML hybrid plan failed: {e}");
@@ -465,6 +492,7 @@ impl CoremlExecutable {
 
             let seq = PKG_COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
+            reap_stale_packages(pid);
             let dir = std::env::temp_dir().join(format!(
                 "rlx-coreml-{pid}-{seq}-{i}-{}.mlpackage",
                 sanitize(&self.graph.name)
@@ -489,7 +517,7 @@ impl CoremlExecutable {
                 Err(e) => {
                     // Dump I/O feature shapes so "Error in declaring input X"
                     // failures are actionable (shape / dtype / name collision).
-                    if std::env::var("RLX_COREML_DEBUG_IO").as_deref() == Ok("1") {
+                    if rlx_ir::env::var("RLX_COREML_DEBUG_IO").as_deref() == Some("1") {
                         eprintln!("[coreml] finalize slot {i} load failed ({e}); inputs:");
                         for io in &lowered.inputs {
                             eprintln!(
@@ -562,13 +590,23 @@ impl CoremlExecutable {
         // Host segments run op-by-op on the CPU, so we can localize a NaN to the
         // exact host op (culprit vs propagator) — MIL segments stay opaque.
         let scanner = rlx_ir::numeric_check::DebugScanner::from_env("coreml");
+        // `Op::Lstm { carry }` runs host-side here and overwrites `h0`/`c0` in
+        // place per its contract; the new state is collected and applied to
+        // `params` once the immutable borrow of `self` ends, below.
+        let mut state_writeback: Vec<crate::host_exec::StateWriteback> = Vec::new();
         let mut mil_idx = 0usize;
         for seg in segments {
             match seg {
                 Segment::Host(ids) => {
                     for &id in ids {
-                        let v =
-                            run_host_node(&self.graph, id, &env, &self.params, &self.typed_params)?;
+                        let v = run_host_node(
+                            &self.graph,
+                            id,
+                            &env,
+                            &self.params,
+                            &self.typed_params,
+                            &mut state_writeback,
+                        )?;
                         if scanner.enabled() {
                             let mut inbufs: Vec<(rlx_ir::NodeId, &[f32])> = Vec::new();
                             for &inp in &self.graph.node(id).inputs {
@@ -616,6 +654,14 @@ impl CoremlExecutable {
                     mil_idx += 1;
                 }
             }
+        }
+        // Apply the carried recurrent state. Written straight into `params`
+        // rather than via `set_param`, which calls `invalidate_models()` — these
+        // params feed only the host-side `Op::Lstm { carry }` and never enter
+        // the MIL graph, so no compiled model depends on them and recompiling
+        // per decode step would be pure cost.
+        for (name, data) in state_writeback {
+            self.params.insert(name, data);
         }
         self.graph
             .outputs
@@ -753,11 +799,62 @@ impl CoremlExecutable {
     }
 }
 
+/// Delete `rlx-coreml-<pid>-…` temp packages left by processes that are gone.
+///
+/// [`CoremlExecutable`]'s `Drop` removes its own, but CoreML failures here are
+/// *aborts* — MPSGraph calls `abort()`, BNNS segfaults — and no destructor runs
+/// on those paths. Every such crash therefore leaked a `.mlpackage` and its
+/// compiled `.mlmodelc` sibling, up to tens of MB each. A corpus sweep that
+/// exercises the aborting models repeatedly accumulated 212 GB of them and
+/// eventually failed unrelated models with `No space left on device`, which
+/// reads as eight numerical regressions rather than a full disk.
+///
+/// Runs once per process, before the first package is written.
+fn reap_stale_packages(self_pid: u32) {
+    use std::sync::Once;
+    static REAPED: Once = Once::new();
+    REAPED.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(rest) = name.strip_prefix("rlx-coreml-") else {
+                continue;
+            };
+            // `rlx-coreml-<pid>-<seq>-<slot>-<graph>.mlpackage|.mlmodelc`
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == self_pid || process_is_alive(pid) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    });
+}
+
+/// True if a process with this id still exists.
+///
+/// `kill -0` via the shell would be a process spawn per candidate; `ps` once is
+/// cheaper, and this runs a single time per process.
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true)
+}
+
 impl Drop for CoremlExecutable {
     fn drop(&mut self) {
         for slot in &mut self.mil_slots {
             slot.model = None;
             if let Some(dir) = slot.pkg_dir.take() {
+                // CoreML compiles the package into a sibling `.mlmodelc`; that
+                // one was never tracked, so it survived even a clean shutdown.
+                let _ = std::fs::remove_dir_all(dir.with_extension("mlmodelc"));
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
@@ -936,7 +1033,7 @@ mod tests {
 
     fn with_units_env(val: Option<&str>, f: impl FnOnce()) {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RLX_COREML_UNITS");
+        let prev = rlx_ir::env::var_os("RLX_COREML_UNITS");
         match val {
             Some(v) => unsafe { std::env::set_var("RLX_COREML_UNITS", v) },
             None => unsafe { std::env::remove_var("RLX_COREML_UNITS") },

@@ -70,7 +70,14 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         DequantGroupedMatMul,
         Quantize,
         Dequantize,
-        SelectiveScan,
+        // NOT SelectiveScan: `mil::ssm::lower_selective_scan` unrolls the whole
+        // sequence (`for t in 0..s`, ~12 MIL ops per step), and Apple's compiler
+        // is superlinear in program size — measured on `rlx-neuromamba` at 19
+        // channels, 8.8 s / 25.8 s / 81.5 s / 307 s for lengths 125 / 250 / 500 /
+        // 1000, while a non-scan model of any length compiles in 0.04 s. Leaving
+        // it unclaimed lets the compiler rewrite it into the compact `Op::Scan`
+        // form (~20 nodes regardless of length), which is numerically identical
+        // and is what every other backend already uses.
         GatedDeltaNet,
         ArgMax,
         ArgMin,

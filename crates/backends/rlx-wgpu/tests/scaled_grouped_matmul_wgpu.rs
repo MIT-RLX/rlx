@@ -20,7 +20,7 @@ fn build(m: usize, k: usize, n: usize, e_cnt: usize) -> Graph {
 }
 
 fn parity(m: usize, k: usize, n: usize, e_cnt: usize, idx: Vec<f32>) {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_runtime::{Device, Session};

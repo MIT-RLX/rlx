@@ -24,3 +24,7 @@ tokenizers   = { version = "0.22", default-features = false, features = ["onig"]
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

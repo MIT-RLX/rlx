@@ -17,6 +17,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 // ----------------------------- recompile per shape -----------------------------
 
 /// conv2d(3→8, k3s1p1) → relu → conv_transpose2d(8→4, k2s2) upsample.
@@ -92,6 +94,7 @@ fn assert_close(what: &str, actual: &[f32], reference: &[f32]) {
 /// One compiled graph per shape on CPU must just run and stay finite.
 #[test]
 fn multi_shape_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     for (name, n, h, w) in shapes() {
         let out = run_static(Device::Cpu, n, h, w);
         assert_eq!(
@@ -107,6 +110,7 @@ fn multi_shape_cpu_runs() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn multi_shape_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, n, h, w) in shapes() {
         assert_close(
             &format!("metal {name}"),
@@ -119,6 +123,7 @@ fn multi_shape_metal_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn multi_shape_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, n, h, w) in shapes() {
         assert_close(
             &format!("mlx {name}"),
@@ -131,6 +136,10 @@ fn multi_shape_mlx_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn multi_shape_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for (name, n, h, w) in shapes() {
         assert_close(
             &format!("wgpu {name}"),
@@ -190,23 +199,30 @@ fn dynamic_matches_static(device: Device, label: &str) {
 
 #[test]
 fn dynamic_batch_cpu() {
+    let _gpu = common::serialize_gpu();
     dynamic_matches_static(Device::Cpu, "cpu");
 }
 
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn dynamic_batch_metal() {
+    let _gpu = common::serialize_gpu();
     dynamic_matches_static(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn dynamic_batch_mlx() {
+    let _gpu = common::serialize_gpu();
     dynamic_matches_static(Device::Mlx, "mlx");
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn dynamic_batch_wgpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     dynamic_matches_static(Device::Gpu, "wgpu");
 }

@@ -129,13 +129,42 @@ pub fn compile_thunks_with_rng(
             *use_counts.entry(i).or_insert(0) += 1;
         }
     }
-    let is_t2 = |g: &Graph, id: NodeId| -> bool {
-        matches!(&g.node(id).op, Op::Transpose { perm } if perm.as_slice() == [1, 0])
-            && g.node(id).shape.rank() == 2
-    };
     let mut folded_transpose: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     let mut matmul_fold: std::collections::HashMap<NodeId, (NodeId, bool, NodeId, bool)> =
         std::collections::HashMap::new();
+
+    for n in graph.nodes() {
+        if !matches!(n.op, Op::GroupedMatMul) || n.shape.dtype() != rlx_ir::DType::F32 {
+            continue;
+        }
+        let w_id = n.inputs[1];
+        // `Transpose -> GroupedMatMul` folds into a B-transposed GEMM.
+        //
+        // `Op::GroupedMatMul` wants `[E, K, N]` while GGUF stores expert banks
+        // as `[E, N, K]`, so every dense MoE layer emits `Transpose(bank,
+        // [0,2,1])` ahead of it — a full copy of the bank, per forward. On a
+        // paged GLM-5.3-Flash layer that transpose measured ~99% of the layer:
+        // 446 ms against 370 us for the eight grouped matmuls it feeds.
+        //
+        // The predicate lives in the memory planner, and is shared rather than
+        // restated here on purpose: the planner skips reserving arena for these
+        // nodes, so if the two ever disagreed about which vanish, this compiler
+        // would emit a transpose into a buffer that was never allocated.
+        //
+        // It is not numerically free. `sgemm_bt` walks the bank along K where
+        // `sgemm` walks it along N, so the sums land in a different order.
+        // Measured against an f64 evaluation over a 512-term contraction: 1.2e-6
+        // relative error folded against 4.7e-7 unfolded, about 2.5x worse and
+        // both at the f32 noise floor for that length (~sqrt(K)*eps = 2.7e-6).
+        // Buying ~8x layer throughput for a fraction of an ulp is the right side
+        // of that trade for inference, but a caller doing error analysis should
+        // know the order changed.
+        if rlx_opt::memory::is_elidable_bank_transpose(graph, graph.node(w_id)) {
+            matmul_fold.insert(n.id, (n.inputs[0], false, graph.node(w_id).inputs[0], true));
+            folded_transpose.insert(w_id);
+        }
+    }
+
     for n in graph.nodes() {
         if !matches!(n.op, Op::MatMul) {
             continue;
@@ -147,8 +176,11 @@ pub fn compile_thunks_with_rng(
         {
             continue;
         }
-        let fold_a = is_t2(graph, a_id) && use_counts.get(&a_id) == Some(&1);
-        let fold_b = is_t2(graph, b_id) && use_counts.get(&b_id) == Some(&1);
+        // Shared with the memory planner, which skips reserving arena for these
+        // nodes — restating the condition here would risk emitting a transpose
+        // into a buffer that was never allocated.
+        let fold_a = rlx_opt::memory::is_elidable_matmul_transpose(graph, graph.node(a_id));
+        let fold_b = rlx_opt::memory::is_elidable_matmul_transpose(graph, graph.node(b_id));
         if !fold_a && !fold_b {
             continue;
         }
@@ -652,6 +684,15 @@ pub fn compile_thunks_with_rng(
                 };
                 let cols = node.shape.dim(ax).unwrap_static();
                 let total = node.shape.num_elements().unwrap();
+                // Elements between neighbours along the softmax axis. For the
+                // last axis this is 1 and the row is contiguous; for any other
+                // it is the product of the trailing dims, and treating the data
+                // as contiguous normalises over neighbouring *positions*
+                // instead of over the axis — a plausible-looking result that is
+                // entirely wrong.
+                let inner: usize = (ax + 1..rank)
+                    .map(|d| node.shape.dim(d).unwrap_static())
+                    .product();
                 let in_off = node_offset(arena, node.inputs[0]);
                 let out_off = node_offset(arena, node.id);
                 // Softmax kernel runs in-place on its data buffer. If the
@@ -670,6 +711,7 @@ pub fn compile_thunks_with_rng(
                     data: out_off,
                     rows: (total / cols) as u32,
                     cols: cols as u32,
+                    inner: inner as u32,
                 }
             }
 
@@ -678,6 +720,9 @@ pub fn compile_thunks_with_rng(
             }
             Op::GatedDeltaNet { .. } => {
                 compile_gated_delta_net(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
+            Op::GatedDeltaNetBackward { .. } => {
+                compile_gated_delta_net_backward(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
             Op::Lstm {
                 hidden_size,
@@ -825,7 +870,7 @@ pub fn compile_thunks_with_rng(
             Op::Transpose { perm } => {
                 compile_transpose(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
-            Op::ScatterAdd => {
+            Op::ScatterAdd { .. } => {
                 compile_scatter_add(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
             Op::ScatterNd { .. } => {
@@ -961,9 +1006,11 @@ pub fn compile_thunks_with_rng(
                 }
             }
 
-            Op::RopeBackward { head_dim, n_rot } => {
-                compile_rope_backward(node, graph, arena, &matmul_fold, &rng_shared, rng)
-            }
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            } => compile_rope_backward(node, graph, arena, &matmul_fold, &rng_shared, rng),
             Op::CumsumBackward { exclusive, .. } => {
                 compile_cumsum_backward(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
@@ -1256,6 +1303,34 @@ pub fn compile_thunks_with_rng(
             Op::Concat { axis } => {
                 compile_concat(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
+            Op::KvAppend { axis, pos } => {
+                // The stride between outer slices is the CACHE's capacity, not
+                // the output's axis dim: the output declares the `[..pos+1]`
+                // prefix while aliasing a buffer with `seq_cap` rows. Taking it
+                // from the output writes slice `o` at `o*(pos+1)*inner` instead
+                // of `o*seq_cap*inner` — invisible at batch 1 (where `outer`
+                // is 1 and the stride is unused) and wrong for every batch
+                // above it.
+                let cache_shape = &graph.node(node.inputs[0]).shape;
+                let out = &node.shape;
+                let rank = out.rank();
+                let outer: usize = (0..*axis)
+                    .map(|i| out.dim(i).unwrap_static())
+                    .product::<usize>()
+                    .max(1);
+                let inner: usize = (*axis + 1..rank)
+                    .map(|i| out.dim(i).unwrap_static())
+                    .product::<usize>()
+                    .max(1);
+                Thunk::KvAppend {
+                    src: arena.byte_offset(node.inputs[1]),
+                    dst: arena.byte_offset(node.id),
+                    outer: outer as u32,
+                    seq_cap: cache_shape.dim(*axis).unwrap_static() as u32,
+                    pos: *pos as u32,
+                    inner_bytes: (inner * out.dtype().size_bytes().max(1)) as u32,
+                }
+            }
             Op::GaussianSplatRender {
                 width,
                 height,
@@ -1313,6 +1388,7 @@ pub fn compile_thunks_with_rng(
             Op::Fft { inverse, norm } => {
                 compile_fft(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
+            Op::FftQ { .. } => compile_fft_q(node, graph, arena, &matmul_fold, &rng_shared, rng),
             Op::FftButterflyStage { stage, n_fft } => {
                 compile_fft_butterfly_stage(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
@@ -1674,10 +1750,20 @@ pub fn compile_thunks_with_rng(
                     })
                 }
 
-                Thunk::Softmax { data, rows, cols } => {
-                    let (rows, cols) = (rows as usize, cols as usize);
+                Thunk::Softmax {
+                    data,
+                    rows,
+                    cols,
+                    inner,
+                } => {
+                    let (rows, cols, inner) = (rows as usize, cols as usize, inner as usize);
                     Arc::new(move |base: *mut u8| unsafe {
-                        crate::naive::softmax(sl_mut(data, base, rows * cols), rows, cols);
+                        let d = sl_mut(data, base, rows * cols);
+                        if inner == 1 {
+                            crate::naive::softmax(d, rows, cols);
+                        } else {
+                            crate::thunk::ops::softmax_strided(d, rows / inner, cols, inner);
+                        }
                     })
                 }
 
@@ -2234,7 +2320,7 @@ pub fn compile_thunks_with_rng(
                     v_row_stride,
                     bhsd,
                 } => {
-                    if std::env::var("RLX_ATTN_DEBUG").is_ok() {
+                    if rlx_ir::env::var("RLX_ATTN_DEBUG").is_some() {
                         eprintln!("[attn-compile] batch={batch} seq={seq} kv_seq={kv_seq} heads={heads} bhsd={bhsd}");
                     }
                     // Q seq length (`q_s`) and K/V seq length (`k_s`) differ
@@ -2266,7 +2352,7 @@ pub fn compile_thunks_with_rng(
                     let vrs = v_row_stride as usize;
                     // honor Op::Attention::score_scale (e.g. Gemma 4 = 1.0)
                     Arc::new(move |base: *mut u8| unsafe {
-                        if std::env::var("RLX_ATTN_DEBUG").is_ok() {
+                        if rlx_ir::env::var("RLX_ATTN_DEBUG").is_some() {
                             eprintln!("[attn] b={b} q_s={q_s} k_s={k_s} nh={nh} dh={dh} bhsd={bhsd} mask_kind={:?}", mask_kind);
                         }
                         // Slice lengths use the source's row stride so the

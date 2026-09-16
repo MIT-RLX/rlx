@@ -102,7 +102,7 @@ pub struct StoredBlock {
 
 /// The decision for one decode step: how the caller should reshape its resident
 /// K/V before the next attention. Indices are into the caller's **current**
-/// resident set (same order the manager last saw via [`KvRetentionManager::sync_resident_len`]).
+/// resident set (same order the manager last saw via `KvRetentionManager::sync_resident_len`).
 #[derive(Clone, Debug, Default)]
 pub struct RetentionPlan {
     /// Resident indices to **retain**, in the new resident order (before any

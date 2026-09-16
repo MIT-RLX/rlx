@@ -80,7 +80,7 @@ impl AdjointSolveConfig {
     }
 }
 
-/// `λ = K⁻¹ v` for packed `v` (`nf × 3`), using dense or PCG to match forward [`nodes_free_positions_auto`].
+/// `λ = K⁻¹ v` for packed `v` (`nf × 3`), using dense or PCG to match forward `nodes_free_positions_auto`.
 pub fn solve_adjoint_columns(
     q: &[f64],
     structure: &Structure,

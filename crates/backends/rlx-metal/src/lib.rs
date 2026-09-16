@@ -58,6 +58,37 @@ pub mod mtl;
 #[cfg(rlx_metal_host)]
 pub mod icb;
 
+/// Gated on `rlx_metal_host` because it reads `crate::kernels::RLX_KERNELS_MSL`
+/// to scan the shipping MSL for `simdgroup_load` strides — and `kernels` is
+/// host-gated. Leaving this ungated compiled on macOS and broke the *Linux*
+/// build of this crate, which is the `linux_workspace_test_gate` trap: a
+/// workspace `cargo test` builds every crate, Apple-only ones included, so one
+/// ungated Apple module stops **every** test on the ROCm rig from running.
+#[cfg(rlx_metal_host)]
+pub mod kernel_schedule_port;
+
+/// The Apple kernel knobs, in one place — builder, config and CLI, one parser.
+///
+/// Five parameters, each targeting a limiter measured on Apple silicon, and a
+/// single `RLX_METAL_PARAMS` variable rather than one per knob.
+pub mod apple_params;
+
+/// Does more threadgroup memory pay for itself on this Apple GPU?
+///
+/// Apple hides memory latency with occupancy, not with software pipelining, so
+/// the CAKE-shaped question "how deep should the pipeline be" has an
+/// Apple-shaped answer that is usually "shallower". Calibrated from measured
+/// runs; refuses to predict on chips it has not seen.
+pub mod occupancy;
+
+/// Generate the tiled sgemm entry point *from* a typed schedule rather than
+/// from the hand-written MSL in [`kernels`].
+///
+/// Feature-gated because it is a second implementation of a shipping kernel:
+/// until it is measured at least as fast on Apple hardware, `kernels.rs` stays
+/// the default and this is opt-in.
+#[cfg(feature = "schedule-codegen")]
+pub mod kernel_schedule_emit;
 #[cfg(rlx_metal_host)]
 pub mod kernels;
 
@@ -102,6 +133,11 @@ pub mod backend;
 #[cfg(rlx_metal_host)]
 pub mod attention_bwd_gpu;
 
+/// Device-side span of the last run, from the command buffer's own
+/// `GPUStartTime`/`GPUEndTime` — the part a kernel change can actually move.
+#[cfg(rlx_metal_host)]
+pub mod gpu_span;
+
 #[cfg(rlx_metal_host)]
 pub mod thunk_profile;
 
@@ -141,6 +177,17 @@ pub mod collective;
 
 /// Legalization op claim — always available (no Metal device required).
 pub mod supported_ops;
+
+/// Dispatch-table persistence + the arch key.
+///
+/// Gated on `rlx_metal_host` like `cost` and `calibrate`, because it reads
+/// `cost::hw_model()` to name the GPU family. Leaving it ungated compiled fine on
+/// macOS and broke the *Linux* build of this crate — which then failed the whole
+/// workspace `cargo test` on the ROCm rig, so **zero** tests ran there. That is
+/// the `linux_workspace_test_gate` trap: a workspace test run builds every crate,
+/// Apple-only ones included, and a green macOS check says nothing about it.
+#[cfg(rlx_metal_host)]
+pub mod tuning;
 pub use supported_ops::SUPPORTED_OPS;
 
 /// PLAN: Schedule splitting for the Metal MPSGraph path. Splits the

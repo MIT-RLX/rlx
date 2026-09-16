@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // int8 KV-cache decode-attention microbench (ceiling probe before integration).
 //
 // Decode attention is weight-free but reads the whole K/V cache each step, so at

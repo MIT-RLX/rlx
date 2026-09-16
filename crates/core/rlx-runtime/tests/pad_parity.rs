@@ -13,6 +13,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, PadMode, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn run(
     device: Device,
     dims: &[usize],
@@ -128,6 +130,7 @@ fn reference(dims: &[usize], pads: &[[usize; 2]], mode: PadMode, x: &[f32]) -> V
 // ── 1-D: pin each mode to its NumPy vector on [1,2,3,4] pad (2,2). ──
 #[test]
 fn pad_1d_matches_numpy() {
+    let _gpu = common::serialize_gpu();
     let x = [1.0, 2.0, 3.0, 4.0];
     let cases: &[(PadMode, [f32; 8])] = &[
         (PadMode::Constant(0.0), [0., 0., 1., 2., 3., 4., 0., 0.]),
@@ -150,6 +153,7 @@ fn pad_1d_matches_numpy() {
 // ── Asymmetric constant pad with a non-zero fill. ──
 #[test]
 fn pad_1d_asymmetric_constant() {
+    let _gpu = common::serialize_gpu();
     let x = [5.0, 6.0, 7.0];
     let got = run(Device::Cpu, &[3], vec![[1, 2]], PadMode::Constant(-1.0), &x);
     assert_eq!(got, vec![-1.0, 5.0, 6.0, 7.0, -1.0, -1.0]);
@@ -158,6 +162,7 @@ fn pad_1d_asymmetric_constant() {
 // ── 2-D: all four modes vs the sequential reference (corners included). ──
 #[test]
 fn pad_2d_all_modes() {
+    let _gpu = common::serialize_gpu();
     let dims = [3usize, 4];
     let x: Vec<f32> = (1..=12).map(|i| i as f32).collect();
     for mode in [
@@ -189,7 +194,8 @@ fn all_modes() -> [PadMode; 4] {
 #[cfg(any(
     all(target_os = "macos", feature = "metal"),
     feature = "gpu",
-    feature = "cuda"
+    feature = "cuda",
+    feature = "vulkan"
 ))]
 fn cases() -> Vec<(Vec<usize>, Vec<[usize; 2]>)> {
     vec![
@@ -203,7 +209,8 @@ fn cases() -> Vec<(Vec<usize>, Vec<[usize; 2]>)> {
 #[cfg(any(
     all(target_os = "macos", feature = "metal"),
     feature = "gpu",
-    feature = "cuda"
+    feature = "cuda",
+    feature = "vulkan"
 ))]
 fn check_device_matches_cpu(device: Device, label: &str) {
     for (dims, pads) in cases() {
@@ -222,27 +229,52 @@ fn check_device_matches_cpu(device: Device, label: &str) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn pad_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check_device_matches_cpu(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn pad_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     check_device_matches_cpu(Device::Gpu, "wgpu");
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn pad_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     check_device_matches_cpu(Device::Cuda, "cuda");
 }
 
+/// Vulkan was the one backend this file did not cover, and `pad` is named in
+/// the `wgpu-vulkan-dsp-divergence` ledger entry as wrong on Vulkan only.
+///
+/// Those two facts together are the reason to add it: the entry's status was
+/// not "fixed", it was "never checked here" — every other device in this file
+/// had a case and Vulkan did not, so a green run said nothing about it either
+/// way. If the divergence is real this reproduces it; if it is stale, the
+/// entry can be retired against evidence rather than against silence.
+#[test]
+#[cfg(feature = "vulkan")]
+fn pad_vulkan_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Vulkan, "vulkan") {
+        return;
+    }
+    check_device_matches_cpu(Device::Vulkan, "vulkan");
+}
+
 // ── Padding only a subset of axes (zero pads must be no-ops). ──
 #[test]
 fn pad_2d_single_axis() {
+    let _gpu = common::serialize_gpu();
     let dims = [2usize, 3];
     let x: Vec<f32> = (1..=6).map(|i| i as f32).collect();
     let pads = vec![[0, 0], [1, 1]];

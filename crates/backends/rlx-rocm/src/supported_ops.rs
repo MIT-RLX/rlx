@@ -142,6 +142,10 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         GaussianSplatRasterize,
         Custom,
         Fft,
+        // Fixed-point `Op::FftQ`, host fallback. The arena stores integers as
+        // f32 values, so the adapter converts at the boundary; exact while every
+        // value stays inside f32's exact-integer range (see run_fft1d_q_valued).
+        FftQ,
         LogMel,
         LogMelBackward,
         WelchPeaks,
@@ -214,3 +218,54 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         CustomFn,
     ]
 };
+
+/// Does this op get handed to rlx-cpu instead of a HIP kernel?
+///
+/// Exposed so the routing can be checked from outside the crate **without a
+/// device**, by `rlx-runtime/tests/host_fallback_never_nops.rs`. The
+/// composition it guards is invisible to any single-crate test: [`SUPPORTED_OPS`]
+/// claims an op (so nothing upstream expands it), no kernel lowers it, this
+/// returns true, and rlx-cpu has no thunk arm for it either — the result is a
+/// `Thunk::Nop` over a zeroed slot, with no panic and no unsupported-op error.
+/// Vulkan's `PartitionedConv` shipped exactly that way.
+///
+/// rlx-rocm is structurally safer than that: anything reaching its compile
+/// match with no arm hits a `panic!("op … not yet lowered")` rather than a
+/// host route, so an unhandled claim is loud. This predicate covers the ops
+/// that are *deliberately* handed to rlx-cpu — the generic `Step::HostOp`
+/// catch-all, plus the three op-specific host steps (`Step::ScanHost`,
+/// `Step::HostOp` for the scan backwards, and `Step::CpuIndexing`).
+pub fn routes_to_cpu_host(op: &rlx_ir::Op) -> bool {
+    use rlx_ir::Op;
+    matches!(
+        op,
+        // Generic `Step::HostOp` catch-all in `backend/compile.rs`: F64 (and
+        // other dtypes) via CPU LAPACK, plus the opaque `CustomFn` body.
+        Op::DenseSolve
+            | Op::BatchedDenseSolve
+            | Op::Cholesky
+            | Op::TriangularSolve { .. }
+            | Op::Det
+            | Op::LogDet
+            | Op::Sort { .. }
+            | Op::Svd { .. }
+            | Op::Qr { .. }
+            | Op::ArgSort { .. }
+            | Op::CustomFn { .. }
+            // `Step::ScanHost` / `Step::HostOp`.
+            | Op::Scan { .. }
+            | Op::ScanBackward { .. }
+            | Op::ScanBackwardXs { .. }
+            // `Step::CpuIndexing`. These four now have on-device kernels
+            // (`Step::IndexingNd`, shared with CUDA), so this is the *residual*
+            // host route: the shapes `rlx_gpu_host::indexing_plan` declines —
+            // genuine packed I64 indices, non-f32 gathered elements, Mul/Max/Min
+            // reductions, and the two ScatterElements branches that infer a
+            // layout. The predicate stays coarse on purpose: it answers "can
+            // this op reach rlx-cpu", and it still can.
+            | Op::ScatterNd { .. }
+            | Op::ScatterElements { .. }
+            | Op::GatherNd { .. }
+            | Op::GatherElements { .. }
+    )
+}

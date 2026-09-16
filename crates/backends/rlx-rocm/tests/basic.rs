@@ -22,7 +22,7 @@ fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
 
 #[test]
 fn binary_add_matches_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let mut g = Graph::new("add");
@@ -40,7 +40,7 @@ fn binary_add_matches_reference() {
 
 #[test]
 fn relu_clamps_negatives_to_zero() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let mut g = Graph::new("relu");
@@ -54,7 +54,7 @@ fn relu_clamps_negatives_to_zero() {
 
 #[test]
 fn matmul_2x3x2_matches_cpu_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let mut g = Graph::new("mm");
@@ -83,7 +83,7 @@ fn matmul_2x3x2_matches_cpu_reference() {
 
 #[test]
 fn gated_delta_net_matches_cpu_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     use rlx_ir::Op;
@@ -193,7 +193,7 @@ fn gated_delta_net_matches_cpu_reference() {
 /// blind spot. `n = 2` makes the layout observable.
 #[test]
 fn dequant_matmul_gguf_q8k_multi_column_matches_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let k = QK_K;
@@ -253,7 +253,7 @@ fn dequant_matmul_gguf_q8k_multi_column_matches_reference() {
 
 #[test]
 fn dequant_matmul_gguf_q8k_matches_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let k = 256;
@@ -304,7 +304,7 @@ fn dequant_matmul_gguf_q8k_matches_reference() {
 
 #[test]
 fn layer_norm2d_matches_cpu_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let n = 1usize;
@@ -342,7 +342,7 @@ fn layer_norm2d_matches_cpu_reference() {
 
 #[test]
 fn conv_transpose2d_stride2_k2_matches_cpu_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let n = 1usize;
@@ -403,7 +403,7 @@ fn conv_transpose2d_stride2_k2_matches_cpu_reference() {
 
 #[test]
 fn group_norm_matches_cpu_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let n = 1usize;
@@ -442,7 +442,7 @@ fn group_norm_matches_cpu_reference() {
 
 #[test]
 fn resize_nearest_2x_matches_cpu_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let n = 1usize;
@@ -476,7 +476,7 @@ fn resize_nearest_2x_matches_cpu_reference() {
 
 #[test]
 fn attention_bshd_eeg_shape_matches_cpu() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     use rlx_ir::op::MaskKind;
@@ -525,7 +525,7 @@ fn attention_bshd_eeg_shape_matches_cpu() {
 
 #[test]
 fn packed_bshd_attn_matches_cpu_ref() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     use rlx_ir::op::{MaskKind, Op};
@@ -615,7 +615,7 @@ fn packed_bshd_attn_matches_cpu_ref() {
 
 #[test]
 fn run_slots_matches_run_single_output() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let mut g = Graph::new("slots");
@@ -657,12 +657,13 @@ fn kernel_sources_are_reachable() {
     assert!(!FFT_BUTTERFLY_STAGE_CU.is_empty());
     assert!(!Q_MATMUL_CU.is_empty());
     assert!(!Q_CONV2D_CU.is_empty());
-    assert_eq!(KERNEL_COUNT, 74);
+    assert!(!INDEXING_ND_CU.is_empty());
+    assert_eq!(KERNEL_COUNT, 79);
 }
 
 #[test]
 fn welch_peaks_gpu_matches_cpu_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     let batch = 8usize;
@@ -698,7 +699,7 @@ fn welch_peaks_gpu_matches_cpu_reference() {
 
 #[test]
 fn dequant_matmul_mxfp4x2_matches_reference() {
-    if !rlx_rocm::is_available() {
+    if rlx_ir::env::skip_unless_device("rocm", true, rlx_rocm::is_available()) {
         return;
     }
     use rlx_ir::ScaledFormat;

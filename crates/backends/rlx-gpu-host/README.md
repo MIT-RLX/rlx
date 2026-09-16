@@ -13,7 +13,7 @@ memcpy calls. This crate holds the wrapper **once**, generic over a
 [`DeviceArena`] staging trait. Each backend implements `DeviceArena` for its
 own stream/buffer handle (a ~15-line adapter in `host_stage.rs`) and either
 calls the shared `run_*` functions directly or uses
-[`forward_arena_op!`](crate::forward_arena_op) to generate the thin forwarder.
+`forward_arena_op!` to generate the thin forwarder.
 
 Thin CUDA/ROCm/wgpu adapters live in each crate's `*_host.rs` / `host_ops.rs`
 (module facades keep stable call sites). Shared staging also covers Scan/HostOp,

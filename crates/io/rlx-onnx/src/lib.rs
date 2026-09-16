@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Run ONNX (`.onnx`) models through **native RLX** (`Session::compile`) on the
-//! chosen [`Device`] and compile level.
+//! chosen `Device` and compile level.
 //!
 //! ONNX is imported to HIR (see `rlx-onnx-import`), compiled, and executed on CPU /
 //! Metal / CUDA / etc. Enable optional `ort-fallback` for ONNX Runtime parity.

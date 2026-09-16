@@ -108,7 +108,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// ScaledQuantize [U8 output] → ScaledMatMul) through the mapped arena.
 #[test]
 fn vulkan_scaled_f4e3m0_grid_is_exact() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("skip: no Vulkan device");
         return;
     }
@@ -139,7 +139,7 @@ fn vulkan_scaled_f4e3m0_grid_is_exact() {
 /// f4e3m0 on smooth data with block-MX scaling tracks the f32 matmul.
 #[test]
 fn vulkan_scaled_f4e3m0_tracks_f32() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let fmt = ScaledFormat::custom(3, 0);
@@ -159,7 +159,7 @@ fn vulkan_scaled_f4e3m0_tracks_f32() {
 /// Named E4M3 through the same host-fallback path is high-fidelity.
 #[test]
 fn vulkan_scaled_named_e4m3() {
-    if !rlx_vulkan::is_available() {
+    if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
     let (m, k, n) = (4usize, 64usize, 8usize);

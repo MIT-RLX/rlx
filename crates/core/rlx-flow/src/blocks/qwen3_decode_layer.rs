@@ -37,6 +37,16 @@ pub struct Qwen3DecodeLayerStage {
     pub layer_idx: usize,
     pub kv_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
     pub qk_out: Option<Arc<Mutex<Vec<rlx_ir::HirNodeId>>>>,
+    /// Residual-stream tap: when set, this layer's **input** hidden state (the
+    /// residual before `input_layernorm`) is pushed here.
+    ///
+    /// This is what Eagle-style drafters — EAGLE3, DFlash, DSpark — consume:
+    /// they read the target's residual stream at a few chosen depths and fuse
+    /// them instead of running their own embedding. Tapping the input rather
+    /// than the output is deliberate; layer `i`'s input is layer `i-1`'s
+    /// output, and the drafter checkpoints index by the layer whose input they
+    /// want (llama.cpp's `res->t_layer_inp[il] = inpL`).
+    pub tap_out: Option<Arc<Mutex<Vec<rlx_ir::HirNodeId>>>>,
 }
 
 impl Qwen3DecodeLayerStage {
@@ -51,6 +61,7 @@ impl Qwen3DecodeLayerStage {
             layer_idx,
             kv_out,
             qk_out: None,
+            tap_out: None,
         }
     }
 
@@ -66,6 +77,24 @@ impl Qwen3DecodeLayerStage {
             layer_idx,
             kv_out,
             qk_out: Some(qk_out),
+            tap_out: None,
+        }
+    }
+
+    /// Layer that also exports its residual-stream input to `tap_out`.
+    pub fn layer_with_tap(
+        layer_idx: usize,
+        spec: Qwen3DecodeLayerSpec,
+        kv_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+        tap_out: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
+    ) -> Self {
+        Self {
+            layer_prefix: format!("model.layers.{layer_idx}"),
+            spec,
+            layer_idx,
+            kv_out,
+            qk_out: None,
+            tap_out: Some(tap_out),
         }
     }
 }
@@ -162,6 +191,10 @@ impl BlockStage for Qwen3DecodeLayerStage {
 
         let mut gb = HirMut::new(ctx.hir());
         let skip = input.id;
+        // Residual tap, taken before anything in this layer touches it.
+        if let Some(ref sink) = self.tap_out {
+            sink.lock().expect("qwen3 decode tap out").push(input.id);
+        }
         let normed_in = gb.rms_norm(skip, in_ln_g, zero_beta_h, spec.eps);
         use crate::context::FusedProj;
         let (mut q, mut k, mut v) = match &qkv_fused {
@@ -217,15 +250,31 @@ impl BlockStage for Qwen3DecodeLayerStage {
             (k_rope, v)
         };
 
-        // In-place KV append (opt-in `RLX_QWEN3_INPLACE_KV`): write the new row
-        // into `past_k/v` at index `past_seq` instead of concat-copying the whole
-        // O(context) cache. Requires the flow to declare `past_k/v` one row
-        // larger (`[batch, past_seq+1, kv_dim]`) so the aliased output fits.
-        let (new_k, new_v) = if rlx_ir::env::flag("RLX_QWEN3_INPLACE_KV") {
-            let pos = gb.shape(past_k).dim(1).unwrap_static() - 1;
+        // In-place KV append: write the new row into `past_k/v` at index
+        // `past_len` instead of concat-copying the whole O(context) cache.
+        //
+        // Gated on the CACHE CONTRACT, not on an env flag. `RLX_QWEN3_INPLACE_KV`
+        // used to be the whole switch, with `pos` taken as `past_k.dim(1) - 1`
+        // — which is only the append position when the caller declared the cache
+        // with a spare row. Against an ordinary history-shaped cache that writes
+        // the new token OVER the last real row and returns a prefix one row
+        // short: wrong logits, no error, on every backend. The distinction is
+        // not visible in the shape, so it has to come from the caller
+        // (`bind_decode_inputs_with_capacity`); the env flag now only opts OUT.
+        let inplace_kv = decode
+            .past_len
+            .filter(|_| !rlx_ir::env::flag("RLX_QWEN3_NO_INPLACE_KV"));
+        let (new_k, new_v) = if let Some(past_len) = inplace_kv {
+            let cap = gb.shape(past_k).dim(1).unwrap_static();
+            anyhow::ensure!(
+                past_len < cap,
+                "qwen3 decode layer {}: in-place KV needs a cache with spare capacity, \
+                 got past_len={past_len} in a [.., {cap}, ..] cache",
+                self.layer_idx
+            );
             (
-                gb.kv_append(past_k, k_rope, 1, pos),
-                gb.kv_append(past_v, v, 1, pos),
+                gb.kv_append(past_k, k_rope, 1, past_len),
+                gb.kv_append(past_v, v, 1, past_len),
             )
         } else {
             (

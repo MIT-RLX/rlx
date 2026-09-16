@@ -48,3 +48,7 @@ accelerate = ["rlx-runtime/blas-accelerate"]
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

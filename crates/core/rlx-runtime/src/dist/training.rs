@@ -248,7 +248,7 @@ fn training_lanes(spec_device: &str, available: &[Device], graph: &Graph) -> Vec
 ///   the collective is a barrier, so a rank that syncs fewer times deadlocks the
 ///   rest. `run_train` guarantees this by keeping each rank's per-epoch sync
 ///   count driven only by cluster-uniform quantities (`shard_len / batch`), not
-///   by node-local hardware (see [`training_lanes`]).
+///   by node-local hardware (see `training_lanes`).
 ///
 /// `world` is the number of ranks in the cross-worker group. It gates the
 /// intra-node multi-lane (`device:"all"`) path, which is single-node-only:

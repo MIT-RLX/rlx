@@ -37,7 +37,7 @@
 //! # What this deliberately does not do
 //!
 //! * **No algebraic identities.** `mul(x, 1)`, `add(x, 0)` and friends belong
-//!   to [`algebraic_simplify`](crate::algebraic_simplify), which already owns
+//!   to [`algebraic_simplify`](fn@crate::algebraic_simplify), which already owns
 //!   them. Duplicating them here would mean two places to keep IEEE-correct.
 //! * **No iteration.** Textbook SCCP runs a worklist to a fixpoint because it
 //!   handles loops and φ-nodes. rlx's dataflow graph is an acyclic DAG in

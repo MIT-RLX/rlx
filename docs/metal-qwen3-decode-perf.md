@@ -9,7 +9,7 @@ negative** and why.
 > the **packed Q4** decode runner (emit `Op::DequantMatMul`, SIMD quant GEMV
 > kernels, resident KV, flash-decode) and the **batched / serving throughput**
 > stack (uniform + ragged, packed + resident-KV), see
-> [`rlx-models/docs/qwen3-packed-decode-throughput.md`](../../rlx-models/docs/qwen3-packed-decode-throughput.md).
+> [`rlx-models/docs/qwen3-packed-decode-throughput.md`](https://github.com/MIT-RLX/rlx-models/blob/main/docs/qwen3-packed-decode-throughput.md).
 
 Bench: `rlx-models` `qwen_quant_bench kvbench metal` (median per-step decode
 tps). All flags are opt-in / default-off unless noted.
@@ -21,7 +21,7 @@ tps). All flags are opt-in / default-off unless noted.
 | f32 baseline | 24 | — |
 | **F16-resident weights** | 33 | `RLX_QWEN3_F16_WEIGHTS` — store matmul weights f16 (native bf16 ⇒ ≈lossless) |
 | **K-split M=1 GEMV** | 55 | `gemv_f16w_splitk` (KSPLIT=32 + half2) — saturate more bandwidth on small-N gemv |
-| **Bake the weight concat** | 82 | `RLX_QWEN3_BAKE_WEIGHTS` — stop re-concatenating the fused QKV/gate-up weight every token |
+| **Bake the weight concat** | 82 | `RLX_STATIC_WEIGHT_PACK` (default on) — stop re-concatenating the fused QKV/gate-up weight every token |
 | **GQA-native attention** | **89** | `RLX_QWEN3_GQA_NATIVE` — drop `repeat_kv`'s Expand; attention reads un-expanded KV in place |
 
 Each is a **bytes-moved** reduction. Nothing that only reduced *dispatch count*
@@ -88,7 +88,7 @@ Two fixes were built and A/B-tested (both token-identical, same window):
 |---|---|---|---|
 | baseline (concat every step) | 55 | 17.4 ms | 2434 MB |
 | **B** — read weights in place (`RLX_NO_WEIGHT_CONCAT_FUSION`; disable the two weight-concat fusions, keep activation `FuseSwiGLU`) | 80 | 11.9 ms | 1260 MB |
-| **A** — bake once (`RLX_QWEN3_BAKE_WEIGHTS`; `Concat.weight_const` set at lowering when all inputs are Param/Constant → compute on first step, skip after) | **82** | **11.2 ms** | 1260 MB |
+| **A** — bake once (`RLX_STATIC_WEIGHT_PACK`, now **on by default** on every GPU backend; `Concat.weight_const` set at lowering via the planner's own `is_static_weight_tensor` **and** an arena-slot-exclusivity check → compute on first step, skip after) | **82** | **11.2 ms** | 1260 MB |
 
 **A wins**: it keeps the single fused matmul (one big N=4096 GEMV → better
 occupancy than B's separate smaller ones) *and* keeps the fusion's benefit on
@@ -159,7 +159,7 @@ metric, and buried the weight-vs-KV distinction).
 |---|---|---|
 | `RLX_QWEN3_F16_WEIGHTS` | off | f16-resident decode matmul weights + lm_head (lever 1) |
 | `RLX_METAL_GEMV_SPLITK` | **on** (within f16 path) | K-split M=1 gemv (lever 2); `=0` reverts to `sgemm_f16w_small_m` |
-| `RLX_QWEN3_BAKE_WEIGHTS` | off | compute weight-only concats once, skip after (lever 3, option A) |
+| `RLX_STATIC_WEIGHT_PACK` | **on** | compute weight-only concats once, skip after (lever 3, option A). `=0` opts out. `RLX_QWEN3_BAKE_WEIGHTS` is a deprecated Metal-only alias |
 | `RLX_NO_WEIGHT_CONCAT_FUSION` | off | disable the two weight-concat fusions; read weights in place (lever 3, option B) |
 | `RLX_QWEN3_GQA_NATIVE` | off | drop `repeat_kv`; attention reads un-expanded KV (lever 4) |
 | `RLX_METAL_DUMP_BYTES` | off | dump per-op DRAM traffic for one decode step |
@@ -177,3 +177,6 @@ miss — a 1.18 GB/token redundant weight copy — was invisible to dispatch-cou
 and per-op profiling and obvious the instant we recorded **bytes moved**. And the
 one lever we wrongly rejected (GQA-native) failed only a noisy timer, not the byte
 math — which is the whole lesson twice over: **measure bytes moved.**
+## License
+
+MIT OR Apache-2.0.

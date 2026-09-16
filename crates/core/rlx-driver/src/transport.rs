@@ -581,7 +581,7 @@ impl ProcessGroup {
     /// Bandwidth-optimal **ring** all-reduce (reduce-scatter then
     /// all-gather): every rank moves only `~2·(n-1)/n · len` floats in and
     /// out, independent of `n`, versus the old gather-to-root that funneled
-    /// `O(n)·len` through rank 0. Deadlock-free over [`NetTransport`]
+    /// `O(n)·len` through rank 0. Deadlock-free over `NetTransport`
     /// because each rank's background reader thread always drains its
     /// socket, so a `send` never blocks on a peer that is itself sending.
     pub fn all_reduce(&self, data: &mut [f32], op: ReduceKind) -> Result<(), CollectiveError> {
@@ -1020,7 +1020,7 @@ impl ProcessGroup {
 
     /// Reduce to `root`: every rank contributes `data`; afterward only `root`'s
     /// buffer holds the reduction (non-root buffers are left unchanged). The
-    /// transpose of [`broadcast`].
+    /// transpose of `broadcast`.
     pub fn reduce(
         &self,
         root: u32,

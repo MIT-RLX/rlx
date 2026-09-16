@@ -7,7 +7,9 @@
 
 use rlx_ir::op::BinaryOp;
 use rlx_ir::*;
-use rlx_runtime::{CompileOptions, Device, Session, is_available};
+use rlx_runtime::{CompileOptions, Device, Session};
+
+mod common;
 
 /// `y = x @ (w · scale)` — `w·scale` is param-invariant (hoistable into prepare).
 fn build() -> Graph {
@@ -38,7 +40,8 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn cuda_param_hoisting_matches_and_is_stable() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }

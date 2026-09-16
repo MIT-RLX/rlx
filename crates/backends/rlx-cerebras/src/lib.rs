@@ -36,7 +36,7 @@
 //!   DSD / `@fmacs` vectorized form and **multi-PE tiling** (where the
 //!   wafer-scale perf actually lives — the north star) are the next
 //!   milestones; single-PE is only a correctness stepping stone.
-//! * **Not yet wafer- or `cslc`-validated.** The Rust [`reference`] oracle and
+//! * **Not yet wafer- or `cslc`-validated.** The Rust [`reference`](mod@reference) oracle and
 //!   the artifact structure are unit-tested here; compiling the CSL with
 //!   `cslc` and running it on the simulator requires the SDK container on a
 //!   Linux host (e.g. ALCF), and is the validation step that closes the loop.

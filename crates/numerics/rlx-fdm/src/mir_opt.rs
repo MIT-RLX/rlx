@@ -64,7 +64,7 @@ impl Default for FdmGradMode {
 pub struct FdmMirOptimizer {
     pub grad_mode: FdmGradMode,
     pub fdm: FdmOptions,
-    /// Use [`graph_sparse::fdm_sparse_pcg_graph`] when `num_free ≥ sparse_graph_min_free`.
+    /// Use `graph_sparse::fdm_sparse_pcg_graph` when `num_free ≥ sparse_graph_min_free`.
     pub sparse_graph_min_free: usize,
 }
 

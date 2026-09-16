@@ -71,6 +71,84 @@ pub fn log_mel_output_shape(spectrum: &Shape, filters: &Shape) -> Result<Shape, 
         .with_dim(spectrum.rank() - 1, Dim::Static(meta.n_mels)))
 }
 
+/// A `[n_mels, n_bins]` filterbank with each row's zero prefix and suffix
+/// stripped.
+///
+/// Mel filters are triangles: a row of 201 bins carries perhaps 15 non-zero
+/// weights, so the dense product does an order of magnitude more arithmetic
+/// than the filterbank contains. Whisper's 80x201 bank is 16,080 multiplies
+/// per frame of which ~1,200 matter.
+///
+/// **This is bit-exact, not an approximation.** Only exact `+0.0` weights at
+/// the two ends of a row are dropped, so the surviving terms are summed in the
+/// same order: a leading run of zeros leaves the accumulator at `+0.0`
+/// whatever the sign of `power`, and a trailing run adds `±0.0` to a value
+/// that is already final. Interior zeros are kept, so the saving does not
+/// depend on the bank being triangular or its weights being non-negative.
+pub struct MelBands {
+    /// First bin row `m` touches.
+    offset: Vec<usize>,
+    /// Row `m` occupies `weight[span[m]..span[m + 1]]`.
+    span: Vec<usize>,
+    weight: Vec<f32>,
+}
+
+impl MelBands {
+    /// Retained coefficients — how much of the dense bank actually mattered.
+    pub fn nonzeros(&self) -> usize {
+        self.weight.len()
+    }
+}
+
+impl MelBands {
+    pub fn from_dense(filters: &[f32], n_mels: usize, n_bins: usize) -> Self {
+        let mut offset = Vec::with_capacity(n_mels);
+        let mut span = Vec::with_capacity(n_mels + 1);
+        let mut weight = Vec::with_capacity(n_mels * 32);
+        span.push(0);
+        for m in 0..n_mels {
+            let row = &filters[m * n_bins..(m + 1) * n_bins];
+            let lo = row.iter().position(|v| *v != 0.0).unwrap_or(n_bins);
+            let hi = row.iter().rposition(|v| *v != 0.0).map_or(lo, |i| i + 1);
+            offset.push(lo);
+            weight.extend_from_slice(&row[lo..hi]);
+            span.push(weight.len());
+        }
+        Self {
+            offset,
+            span,
+            weight,
+        }
+    }
+
+    /// `out[m] = Σ_k power[k] · filters[m][k]`, in bin order.
+    pub fn apply(&self, power: &[f32], out: &mut [f32]) {
+        for (m, slot) in out.iter_mut().enumerate() {
+            let w = &self.weight[self.span[m]..self.span[m + 1]];
+            let p = &power[self.offset[m]..self.offset[m] + w.len()];
+            let mut acc = 0f32;
+            for (&pk, &wk) in p.iter().zip(w) {
+                acc += wk * pk;
+            }
+            *slot = acc;
+        }
+    }
+}
+
+/// Whisper's dynamic-range compression, applied in place to a mel frame.
+fn compress_log_mel(mel: &mut [f32]) {
+    for v in mel.iter_mut() {
+        *v = v.max(1e-10).log10();
+    }
+    let max = mel.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let floor = max - 8.0;
+    for v in mel.iter_mut() {
+        *v = (*v).max(floor);
+        *v = (*v + 4.0) / 4.0;
+    }
+}
+
+#[cfg(test)]
 fn power_to_log_mel_frame(
     power: &[f32],
     filters: &[f32],
@@ -83,14 +161,9 @@ fn power_to_log_mel_frame(
         for k in 0..n_bins {
             acc += filters[m * n_bins + k] * power[k];
         }
-        mel[m] = acc.max(1e-10).log10();
+        mel[m] = acc;
     }
-    let max = mel.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let floor = max - 8.0;
-    for v in mel.iter_mut() {
-        *v = (*v).max(floor);
-        *v = (*v + 4.0) / 4.0;
-    }
+    compress_log_mel(&mut mel);
     mel
 }
 
@@ -166,17 +239,21 @@ pub fn log_mel_block_f32(
     debug_assert_eq!(spectrum.len(), outer * n_fft * 2);
     debug_assert_eq!(filters.len(), n_mels * n_bins);
     debug_assert_eq!(out.len(), outer * n_mels);
+    // Built once for the whole block, not per frame: the conversion costs
+    // about as much as one dense frame would.
+    let bands = MelBands::from_dense(filters, n_mels, n_bins);
+    let mut power = vec![0f32; n_bins];
     for b in 0..outer {
         let spec_base = b * n_fft * 2;
         let mel_base = b * n_mels;
-        let mut power = vec![0f32; n_bins];
         for k in 0..n_bins {
             let re = spectrum[spec_base + k];
             let im = spectrum[spec_base + n_fft + k];
             power[k] = re * re + im * im;
         }
-        let mel = power_to_log_mel_frame(&power, filters, n_mels, n_bins);
-        out[mel_base..mel_base + n_mels].copy_from_slice(&mel);
+        let mel = &mut out[mel_base..mel_base + n_mels];
+        bands.apply(&power, mel);
+        compress_log_mel(mel);
     }
 }
 
@@ -191,17 +268,19 @@ pub fn log_mel_interleaved_f32(
     out: &mut [f32],
 ) {
     debug_assert_eq!(spectrum.len(), outer * n_fft * 2);
+    let bands = MelBands::from_dense(filters, n_mels, n_bins);
+    let mut power = vec![0f32; n_bins];
     for b in 0..outer {
         let spec_base = b * n_fft * 2;
         let mel_base = b * n_mels;
-        let mut power = vec![0f32; n_bins];
         for k in 0..n_bins {
             let re = spectrum[spec_base + k * 2];
             let im = spectrum[spec_base + k * 2 + 1];
             power[k] = re * re + im * im;
         }
-        let mel = power_to_log_mel_frame(&power, filters, n_mels, n_bins);
-        out[mel_base..mel_base + n_mels].copy_from_slice(&mel);
+        let mel = &mut out[mel_base..mel_base + n_mels];
+        bands.apply(&power, mel);
+        compress_log_mel(mel);
     }
 }
 
@@ -382,6 +461,69 @@ pub fn welch_peaks_block_f32(
 
 #[cfg(test)]
 mod tests {
+
+    /// The banded filterbank must be bit-identical to the dense product, not
+    /// merely close — it is an arithmetic identity, so any difference is a bug.
+    /// Covers the cases the triangular mel bank does not exercise: negative
+    /// weights, interior zeros, and an all-zero row.
+    #[test]
+    fn banded_mel_is_bit_identical_to_dense() {
+        let (n_mels, n_bins) = (12usize, 61usize);
+        let mut filters = vec![0f32; n_mels * n_bins];
+        for m in 0..n_mels {
+            let lo = m * 3;
+            let hi = (lo + 11).min(n_bins);
+            for k in lo..hi {
+                // Sign alternates and every third weight is an interior zero.
+                let mag = ((k - lo) as f32 + 1.0) * 0.37;
+                filters[m * n_bins + k] = if (k - lo) % 3 == 2 {
+                    0.0
+                } else if m % 2 == 0 {
+                    mag
+                } else {
+                    -mag
+                };
+            }
+        }
+        // One row left entirely zero.
+        for k in 0..n_bins {
+            filters[5 * n_bins + k] = 0.0;
+        }
+
+        for sign in [1.0f32, -1.0] {
+            let power: Vec<f32> = (0..n_bins)
+                .map(|k| sign * ((k as f32 * 0.61).sin() * 1e3 + 1.5))
+                .collect();
+            let bands = MelBands::from_dense(&filters, n_mels, n_bins);
+            let mut banded = vec![0f32; n_mels];
+            bands.apply(&power, &mut banded);
+            compress_log_mel(&mut banded);
+
+            let dense = power_to_log_mel_frame(&power, &filters, n_mels, n_bins);
+            assert_eq!(banded, dense, "banded diverged from dense (sign {sign})");
+        }
+    }
+
+    /// The banding has to actually remove work, or it is only complexity.
+    #[test]
+    fn banded_mel_drops_most_of_a_triangular_bank() {
+        let (n_mels, n_bins) = (80usize, 201usize);
+        let mut filters = vec![0f32; n_mels * n_bins];
+        for m in 0..n_mels {
+            let lo = m * 2;
+            let hi = (lo + 5).min(n_bins);
+            for k in lo..hi {
+                filters[m * n_bins + k] = 1.0;
+            }
+        }
+        let bands = MelBands::from_dense(&filters, n_mels, n_bins);
+        let dense = n_mels * n_bins;
+        assert!(
+            bands.weight.len() * 8 < dense,
+            "kept {} of {dense} coefficients",
+            bands.weight.len()
+        );
+    }
     use super::*;
 
     #[test]

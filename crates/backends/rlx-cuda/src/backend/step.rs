@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use rlx_gpu_dispatch::indexing::{KernelKind as IndexingNdKind, Prologue as IndexingPrologue};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -670,6 +671,20 @@ pub(crate) enum Step {
         /// for stockham-eligible sizes.
         real_input: bool,
     },
+    /// Fixed-point 1D FFT (`Op::FftQ`) — host fallback.
+    ///
+    /// This arena stores integer tensors as f32 *values*, so the adapter
+    /// converts f32→i32 on the way in and i32→f32 on the way out. See
+    /// [`rlx_gpu_host::run_fft1d_q_valued`] for the exactness bound.
+    FftQ {
+        src_byte_off: u64,
+        dst_byte_off: u64,
+        outer: u32,
+        n_complex: u32,
+        inverse: bool,
+        norm_tag: u32,
+        scale_tag: u32,
+    },
     /// Log-mel from block-layout FFT spectrum — host fallback.
     LogMelHost {
         spec_byte_off: u64,
@@ -962,8 +977,38 @@ pub(crate) enum Step {
     },
     /// Native CPU ScatterNd / ScatterElements / GatherNd / GatherElements
     /// via full-arena D2H (correct for `I64` indices; no mini-graph rebuild).
+    ///
+    /// The fallback for shapes [`Step::IndexingNd`] declines — genuine packed
+    /// I64 indices, non-f32 gathered elements, `Mul`/`Max`/`Min` reductions, and
+    /// the two CPU-only ScatterElements branches.
     CpuIndexing {
         thunk: rlx_cpu::thunk::IndexingThunk,
+    },
+    /// Native on-device ONNX ND indexing (`indexing_nd.cu`).
+    ///
+    /// Replaces the `Step::CpuIndexing` round trip — D2H of data + indices +
+    /// updates, a CPU pass, H2D of the result — for the shapes
+    /// [`rlx_gpu_dispatch::indexing`] can plan. Unlike the host route this is
+    /// CUDA-Graph-capture-safe, so it drops out of `capture_safe`'s host list
+    /// and into the on-device catch-all.
+    ///
+    /// `meta_idx` indexes the compile-time u32 buffers; the plan carries no
+    /// per-launch allocation.
+    IndexingNd {
+        kind: IndexingNdKind,
+        /// Threads for the main kernel.
+        n: u32,
+        /// Arena f32 element offsets.
+        data_off: u32,
+        idx_off: u32,
+        /// Scatter only; unused (0) for the gathers.
+        upd_off: u32,
+        dst_off: u32,
+        dst_len: u32,
+        /// Scatter prologue: seed `dst` from `data`, optionally zeroing
+        /// non-finite slots. `None` for the gathers, which write every slot.
+        prologue: Option<IndexingPrologue>,
+        meta_idx: usize,
     },
     /// Core Riemannian / SPD-manifold op (`Op::BiMap`, `ReEig`, `LogEig`,
     /// `SpdBatchNorm`, `SpdKarcherMean`, and their backwards) via host fallback
@@ -1201,6 +1246,11 @@ pub(crate) enum Step {
         head_dim: u32,
         n_rot: u32,
         cos_len: u32,
+        /// The cos/sin table's own last dimension — see `rlx_rope_bwd`.
+        cos_row_stride: u32,
+        /// GptJ pairing (adjacent lanes) rather than NeoX rotate-half. Must
+        /// match the forward `Step::Rope` this is the adjoint of.
+        interleaved: bool,
     },
     CumsumBackward {
         dy_byte_off: u64,
@@ -2332,6 +2382,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::RngUniform { .. } => "rlx::RngUniform",
         Step::SelectiveScan { .. } => "rlx::SelectiveScan",
         Step::Fft { .. } => "rlx::Fft",
+        Step::FftQ { .. } => "rlx::FftQ",
         Step::LogMelHost { .. } => "rlx::LogMelHost",
         Step::LogMelBackwardHost { .. } => "rlx::LogMelBackwardHost",
         Step::WelchPeaksHost { .. } => "rlx::WelchPeaksHost",
@@ -2422,6 +2473,12 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::FusedBinaryUnary { .. } => "rlx::FusedBinaryUnary",
         Step::ElementwiseRegion { .. } => "rlx::ElementwiseRegion",
         Step::BatchElementwiseRegion { .. } => "rlx::BatchElementwiseRegion",
+        Step::IndexingNd { kind, .. } => match kind {
+            IndexingNdKind::GatherNd { .. } => "rlx::GatherNd",
+            IndexingNdKind::GatherElements { .. } => "rlx::GatherElements",
+            IndexingNdKind::ScatterElements { .. } => "rlx::ScatterElements",
+            IndexingNdKind::ScatterNd { .. } => "rlx::ScatterNd",
+        },
     }
 }
 
@@ -3041,6 +3098,14 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![*out_off],
         ),
         Step::Fft {
+            src_byte_off,
+            dst_byte_off,
+            ..
+        } => (
+            vec![(*src_byte_off / 4) as u32],
+            vec![(*dst_byte_off / 4) as u32],
+        ),
+        Step::FftQ {
             src_byte_off,
             dst_byte_off,
             ..
@@ -3787,6 +3852,26 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             vec![(prep_off / 4) as u32, (meta_off / 4) as u32],
             vec![(dst_off / 4) as u32],
         ),
+        // Offsets here are already f32-element indices, not bytes — unlike every
+        // arm above, which divides. `data` is read even by the scatters, whose
+        // prologue seeds `dst` from it.
+        Step::IndexingNd {
+            kind,
+            data_off,
+            idx_off,
+            upd_off,
+            dst_off,
+            ..
+        } => {
+            let mut reads = vec![*data_off, *idx_off];
+            if matches!(
+                kind,
+                IndexingNdKind::ScatterElements { .. } | IndexingNdKind::ScatterNd { .. }
+            ) {
+                reads.push(*upd_off);
+            }
+            (reads, vec![*dst_off])
+        }
     }
 }
 

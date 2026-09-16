@@ -7,7 +7,7 @@
 //! dispatches over a single f32 arena buffer, then execute it.
 //!
 //! Design (mirrors rlx-cuda / rlx-wgpu): every tensor is an f32 slot in one
-//! arena `VkBuffer`; each schedule [`Step`] is one compute pipeline + push
+//! arena `VkBuffer`; each schedule `Step` is one compute pipeline + push
 //! constants + a workgroup count. A single descriptor set binds the whole
 //! arena; per-op offsets/dims ride in push constants. Between dispatches we
 //! insert a global shader-memory barrier (every kernel reads/writes the shared
@@ -31,6 +31,7 @@ use crate::host_stage::VulkanArena;
 use crate::kernels::kernels;
 use ash::vk;
 use rlx_compile::memory::MemoryPlan;
+use rlx_gpu_dispatch::indexing::{KernelKind as IndexKind, Reduction as IndexReduction};
 use rlx_ir::op::{
     Activation, AttentionBwdWrt, BinaryOp, CmpOp, MaskKind, ReduceOp, RopeStyle, SteKind,
 };
@@ -140,6 +141,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Transpose,
         Narrow,
         Concat,
+        KvAppend,
         Expand,
         Gather,
         Cumsum,
@@ -216,6 +218,11 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // mapped f32 arena, same HostOpDesc contract as Det / LogDet.
         Sort,
         ArgSort,
+        // The scheduler has routed `Qr` / `Svd` to `Step::HostOp` alongside the
+        // other LAPACK ops all along; only these two claims were missing, so
+        // legalize rejected the graph before the scheduler ever saw it.
+        Qr,
+        Svd,
         // Native SPIR-V packed-INT8 matmul / conv (see quantize_i8 / q_matmul).
         QMatMul,
         QConv2d,
@@ -263,6 +270,22 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
 /// `DequantMatMul` is handled by its own scheduler arm: Q1_0 prefill uses
 /// tiled `dequant_gemm_q1_0`; Q4_K / Q6_K / Q1_0 decode (and Q4/Q6 prefill)
 /// use row-loop `dequant_matmul` GEMV. Other schemes fall back to CPU.
+///
+/// Anything routed here must be an op **rlx-cpu can actually run**. See
+/// [`routes_to_cpu_host`] for why that is not a given, and
+/// `rlx-runtime/tests/host_fallback_never_nops.rs` for the gate that enforces
+/// it rather than trusting the comment below.
+/// `uvec4 meta[4]` in the indexing shaders' push blocks.
+///
+/// Vulkan's descriptor set here is fixed at binding 0 = activations, binding 1 =
+/// weights, so unlike CUDA/wgpu there is no spare storage buffer for the shape
+/// and stride table — it rides in the push block instead. The guaranteed
+/// `maxPushConstantsSize` is 128 bytes and the largest scalar head below is 32,
+/// which leaves exactly these 16 words. In practice that caps GatherND/ScatterND
+/// at `k <= 8`, GatherElements at rank 4 and ScatterElements at rank 5; anything
+/// larger keeps the CPU route, which is correct, just slower.
+const INDEXING_META_WORDS: usize = 16;
+
 fn is_host_fallback(op: &Op) -> bool {
     // Any `Op::Custom` (in-graph collectives, onnx.* host kernels, …) — no
     // SPIR-V kernel; `host::eval` runs the registered rlx-cpu kernel against
@@ -274,24 +297,45 @@ fn is_host_fallback(op: &Op) -> bool {
     }
     matches!(
         op,
+        // ScaledMatMul / ScaledQuantScale / ScaledQuantize / ScaledDequantize
+        // used to be listed here. They now lower to `scaled_lowp_*.comp`
+        // unconditionally with no residual host path, so listing them would
+        // claim a route that no longer exists — and this predicate is read from
+        // outside the crate precisely to reason about what can reach rlx-cpu.
+        //
         // Lstm / Gru / Rnn / Mamba2 / ConvTranspose2d / FusedMatMulBiasAct /
         // ElementwiseRegion* / GatedDeltaNet: native or decomposed before
         // schedule (oversized RNN still uses dedicated Host schedule arms).
         Op::Fft { .. }
+            // `DequantGroupedMatMul` reaches here only for the schemes
+            // `dequant_grouped_matmul.comp` does not decode (anything other
+            // than Q4_K / Q6_K / Q1_0) or a non-static shape; those three go
+            // native in `build_schedule`. Listed because this predicate answers
+            // "can this op reach rlx-cpu", and for the rest it still can.
             | Op::DequantGroupedMatMul { .. }
             | Op::DequantGroupedMatMulMlx { .. }
+            // `DequantMoEWeights` likewise reaches here only for the schemes
+            // `dequant_moe_weights.comp` does not decode, or a non-`[E, K, N]`
+            // output shape.
             | Op::DequantMoEWeights { .. }
-            | Op::ScaledMatMul { .. }
-            | Op::ScaledQuantScale { .. }
-            | Op::ScaledQuantize { .. }
-            | Op::ScaledDequantize { .. }
+            // RngNormal / RngUniform reach here only for the `Ort` / `Bnns`
+            // parity streams; `Philox` and `Zero` take the native
+            // `rng_*_philox` / `rng_fill_zero` shaders in `build_schedule`.
+            // Listed anyway because this predicate answers "can this op reach
+            // rlx-cpu", and for those two backends it still can.
             | Op::RngNormal { .. }
             | Op::RngUniform { .. }
+            // `Sample` (multinomial from a probability row) stays on the host:
+            // unlike the RNG fills it needs a per-row prefix scan, so it is a
+            // different kernel rather than a port of the Philox one.
             | Op::Sample { .. } // ScanBackward* uses dedicated `Step::HostOp` / `HostOpDesc`.
             // Packed-INT8 Quantize/Dequantize/QMatMul/QConv2d: native SPIR-V.
             // DenseSolve / LogMel / WelchPeaks(ineligible) / CumsumBackward /
             // GatherBackward use dedicated schedule arms (HostOpDesc or SPIR-V).
-            | Op::PartitionedConv { .. }
+            // `PartitionedConv` is deliberately NOT here: rlx-cpu expands it
+            // before building thunks, so the host path Nops it into a buffer of
+            // zeros. `unfuse::expand_partitioned_conv` removes it at compile
+            // time; if one ever survives, failing loudly beats zeroes.
             | Op::CustomFn { .. }
             | Op::GaussianSplatRender { .. }
             | Op::GaussianSplatRenderBackward { .. }
@@ -308,10 +352,22 @@ fn is_host_fallback(op: &Op) -> bool {
     )
 }
 
+/// Does this op get handed to rlx-cpu instead of a SPIR-V kernel?
+///
+/// Exposed so the routing can be checked from outside the crate without a
+/// Vulkan device. The composition this exists to guard is not visible to any
+/// single-crate test: `SUPPORTED_OPS` claims an op (so nothing upstream expands
+/// it), no shader lowers it, `is_host_fallback` accepts it, and rlx-cpu has
+/// no thunk arm for it either — the result is a Nop over a zeroed slot, with no
+/// panic and no unsupported-op error. `PartitionedConv` shipped that way.
+pub fn routes_to_cpu_host(op: &Op) -> bool {
+    is_host_fallback(op)
+}
+
 /// `RLX_VULKAN_HOST_OPS=conv,matmul,reindex,binary,unary,reduce,gather,norm,attn,scatter,all`
 /// forces listed GPU op families through the CPU host fallback (diagnosis / parity).
 fn host_ops_forced(op: &Op) -> bool {
-    let Ok(raw) = std::env::var("RLX_VULKAN_HOST_OPS") else {
+    let Some(raw) = rlx_ir::env::var("RLX_VULKAN_HOST_OPS") else {
         return false;
     };
     let tags: Vec<String> = raw
@@ -360,7 +416,7 @@ fn host_ops_forced(op: &Op) -> bool {
             hit(&["complex", "binary", "elemwise"])
         }
         Op::Attention { .. } | Op::Rope { .. } => hit(&["attn", "attention", "rope"]),
-        Op::ScatterAdd | Op::TopK { .. } => hit(&["scatter", "topk"]),
+        Op::ScatterAdd { .. } | Op::TopK { .. } => hit(&["scatter", "topk"]),
         Op::Fft { .. } => hit(&["fft"]),
         Op::SelectiveScan { .. } => hit(&["scan", "selective_scan"]),
         _ => all,
@@ -410,6 +466,13 @@ enum Step {
     /// f32-uniform arena. Uses [`rlx_cpu::thunk::IndexingThunk::force_indices_f32`]
     /// — same fix as wgpu — so float-encoded indices are not re-read as i64
     /// (that zeroed Kitten alignment → quiet NSF mush on discrete NVIDIA).
+    ///
+    /// Now the *residual* route: `gather_nd` / `gather_elements` /
+    /// `scatter_elements_nd` / `scatter_nd_write` handle the shapes
+    /// `rlx_gpu_host::indexing_plan` plans and the push block can carry. This
+    /// keeps the rest — packed I64 indices, non-f32 gathered elements,
+    /// accumulating scatters, the CPU-only ScatterElements branches, and
+    /// anything past [`INDEXING_META_WORDS`].
     CpuIndexing {
         thunk: rlx_cpu::thunk::IndexingThunk,
     },
@@ -460,6 +523,13 @@ pub struct VulkanExecutable {
     graph: Graph,
     arena: Arena,
     schedule: Vec<Step>,
+    /// Step indices that materialise a static weight pack — replayed once, then
+    /// skipped. See `build_schedule` for the two conditions that make that sound.
+    static_once_steps: std::collections::HashSet<usize>,
+    /// Whether those steps have run, i.e. the skip is armed. Cleared by any
+    /// `set_param*`, or a re-bound weight never reaches the pack and the GEMM
+    /// silently computes with stale weights.
+    static_once_done: bool,
     /// Pre-recorded segments (GPU command buffers + interleaved host ops). Built
     /// once from `schedule`; reused every `run`. Empty when caching is disabled
     /// (`RLX_VULKAN_NOCACHE=1`), in which case the legacy per-run record path
@@ -717,7 +787,18 @@ fn matmul_kernel(m: usize, k: usize, n: usize) -> &'static str {
     let dev = vulkan_device();
     let portability = dev.map(|d| d.portability).unwrap_or(false);
     let coop = dev.map(|d| d.coop_matmul).unwrap_or(false);
-    match std::env::var("RLX_VULKAN_MATMUL").ok().as_deref() {
+    // A generated schedule replaces `matmul_tiled` and only where that kernel
+    // would have run: same K alignment rule, same non-portability gate. Letting
+    // it take shapes the shipping tiled kernel refuses would change two things
+    // at once and make the A/B unreadable.
+    #[cfg(feature = "schedule-codegen")]
+    if let Some(name) = crate::kernel_schedule_emit::scheduled_kernel_name()
+        && !portability
+        && k.is_multiple_of(16)
+    {
+        return name;
+    }
+    match rlx_ir::env::var("RLX_VULKAN_MATMUL").as_deref() {
         Some("scalar") => "matmul",
         Some("tiled") => "matmul_tiled",
         Some("coop") if coop && coop_eligible(m, k, n) => "matmul_coop",
@@ -775,12 +856,24 @@ fn fake_quantize_layout(axis: Option<usize>, dims: &[usize], n: usize) -> (usize
     }
 }
 
-/// Max per-channel affine pairs that fit in the Quantize/Dequantize push block
-/// (`affine[26]` → 13 channels) alongside the scalar header.
-const QUANTIZE_I8_MAX_CHAN: usize = 13;
+/// Channels whose affine (scale, zero-point) pair fits the quantize/dequantize
+/// push block.
+///
+/// 13 before: 5 scalar words + a tightly packed `uint affine[26]` = 124 of the
+/// 128 available bytes. That packing was the bug — naga lays a bare `uint[]`
+/// push array out with std140's 16-byte stride, so the shader read the table
+/// from the wrong offsets and every quantized tensor came out zero. The table is
+/// `uvec4` now, which both sides agree on, and the head is padded to its 16-byte
+/// boundary: 32 bytes of scalars + 6 uvec4 = 128 exactly, i.e. 12 channels.
+/// Anything wider takes the CPU packed path, as before.
+const QUANTIZE_I8_MAX_CHAN: usize = 12;
 
+/// The `uvec4 affine[6]` table, preceded by the three padding words that align
+/// it to a 16-byte boundary. Must stay in lockstep with the push blocks in
+/// `quantize_i8.comp` / `dequantize_i8.comp`.
 fn push_quantize_affine(scales: &[f32], zero_points: &[i32], chan_dim: usize) -> Push {
-    let mut p = Push::default();
+    // Pad the 5-word scalar head out to the uvec4 boundary.
+    let mut p = Push::default().u(0).u(0).u(0);
     for c in 0..QUANTIZE_I8_MAX_CHAN {
         if c < chan_dim {
             p = p.u(scales[c].to_bits()).u(zero_points[c] as u32);
@@ -830,6 +923,10 @@ impl VulkanExecutable {
         let graph = rlx_opt::unfuse::unfuse_dit_modulation(graph);
         // GatedDeltaNet → MatMul/Mul/Add time-unroll (no dedicated GDN kernel).
         let graph = crate::unfuse::expand_gated_delta_net(graph);
+        // PartitionedConv → rfft/matmul/irfft. Claimed for legalize, so nothing
+        // upstream expands it, and the CPU host fallback Nops it — see
+        // `expand_partitioned_conv`.
+        let graph = crate::unfuse::expand_partitioned_conv(graph);
         // TransformRegion / BatchElementwiseRegion → Resize + ElementwiseRegion;
         // then ElementwiseRegion → Binary / Activation / … primitives.
         let graph = rlx_opt::rlx_fusion::DecomposeFusionRegions.run(graph);
@@ -900,8 +997,8 @@ impl VulkanExecutable {
             .map(|&id| graph.node(id).shape.dtype())
             .collect();
 
-        let (schedule, deps) = build_schedule(&graph, &arena);
-        if std::env::var("RLX_VULKAN_CHECK_CAST").as_deref() == Ok("1") {
+        let (schedule, deps, static_once_steps) = build_schedule(&graph, &arena, rng);
+        if rlx_ir::env::var("RLX_VULKAN_CHECK_CAST").as_deref() == Some("1") {
             let mut bad = 0usize;
             let mut ok = 0usize;
             for node in graph.nodes() {
@@ -1004,7 +1101,7 @@ impl VulkanExecutable {
         // memcpy'd into the host-visible arena, never the command stream. So a
         // single recording is valid for every `run`, turning each step into one
         // `queue_submit` instead of allocate → record → fence → free.
-        let cached = std::env::var("RLX_VULKAN_NOCACHE").as_deref() != Ok("1");
+        let cached = rlx_ir::env::var("RLX_VULKAN_NOCACHE").as_deref() != Some("1");
         let (segments, fence) = if cached {
             let segs = record_segments(dev, kern, &act_desc_sets, &schedule, &deps);
             (segs, dev.create_reusable_fence())
@@ -1012,7 +1109,7 @@ impl VulkanExecutable {
             (Vec::new(), vk::Fence::null())
         };
 
-        if std::env::var_os("RLX_VULKAN_DEBUG").is_some() {
+        if rlx_ir::env::var_os("RLX_VULKAN_DEBUG").is_some() {
             let gpu = schedule
                 .iter()
                 .filter(|s| matches!(s, Step::Gpu { .. }))
@@ -1041,6 +1138,8 @@ impl VulkanExecutable {
             graph,
             arena,
             schedule,
+            static_once_steps,
+            static_once_done: false,
             segments,
             fence,
             cached,
@@ -1060,15 +1159,36 @@ impl VulkanExecutable {
         }
     }
 
+    /// Un-arm the static-weight-pack skip: a param write makes every pack that
+    /// consumes it stale.
+    ///
+    /// Without this, `run(); set_param(w, ..); run()` keeps the FIRST run's
+    /// fused pack and the consuming GEMM silently computes with the old
+    /// weights — no error, just a wrong answer.
+    fn invalidate_static_weight_packs(&mut self) {
+        self.static_once_done = false;
+    }
+
+    /// `(steps marked static-once, skip armed)` — diagnostics for the skip.
+    ///
+    /// Both halves matter independently: lowering can mark steps while no
+    /// executed path ever arms the flag, leaving the optimisation dead. That is
+    /// exactly the state `rlx-wgpu` was in, with green re-bind guards.
+    pub fn static_once_report(&self) -> (usize, bool) {
+        (self.static_once_steps.len(), self.static_once_done)
+    }
+
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        self.invalidate_static_weight_packs();
         if let Some(&id) = self.param_ids.get(name) {
             self.arena.write_f32(id, data);
         }
     }
 
     /// Raw-byte param upload (packed weights). The arena is f32-uniform, so
-    /// callers should normally use [`set_param`]; this exists for symmetry.
+    /// callers should normally use `set_param`; this exists for symmetry.
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
+        self.invalidate_static_weight_packs();
         if let Some(&id) = self.param_ids.get(name) {
             self.arena.write_bytes(id, data);
         }
@@ -1076,7 +1196,7 @@ impl VulkanExecutable {
 
     /// Whether `name` is a bf16 matmul weight stored PACKED (raw bf16 bytes,
     /// unpacked in the `matmul_bf16` shader). Such a param is fed via
-    /// [`set_param_bytes`] (raw) instead of host-widening to f32.
+    /// `set_param_bytes` (raw) instead of host-widening to f32.
     pub fn is_packed_bf16_param(&self, name: &str) -> bool {
         self.packed_bf16_params.contains(name)
     }
@@ -1118,7 +1238,7 @@ impl VulkanExecutable {
     /// row `src_row` of output `output_index` is folded into handle
     /// `handle_name`'s input slot at row `dst_row`. For decode graphs that emit
     /// the new K/V token at the last bucket-padded output row (llama32). Driven
-    /// explicitly via [`feed_kv_row`]; does NOT trigger the auto-propagation in
+    /// explicitly via `feed_kv_row`; does NOT trigger the auto-propagation in
     /// `run_read_outputs`.
     pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
         self.kv_row_feeds
@@ -1284,6 +1404,25 @@ impl VulkanExecutable {
         self.rng
     }
 
+    /// Write a packed-byte input (U8/I8 — quantized weight blobs, code
+    /// streams) straight into its arena slot.
+    ///
+    /// `run` only accepts `&[f32]`, so `run_typed` used to widen these to f32
+    /// and hand them to `write_f32`. U8/I8 slots are sized at 1 B/elem (see
+    /// `Arena::slot_bytes`), and `write_f32` clamps to `cap / 4` — so a 2160
+    /// byte blob became 540 f32 lanes written over the first 2160 bytes, and
+    /// every consumer decoded the lane bytes as quant codes. Constants already
+    /// took the byte path here; inputs did not.
+    pub fn write_input_bytes(&self, name: &str, data: &[u8]) -> bool {
+        match self.input_ids.get(name) {
+            Some(&id) => {
+                self.arena.write_bytes(id, data);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.run_read_outputs(inputs, None)
     }
@@ -1363,9 +1502,19 @@ impl VulkanExecutable {
                                 (sh, buf)
                             })
                             .collect();
-                        match crate::host::eval(op, out_shape, &in_specs) {
+                        let ev = crate::host::eval_full(op, out_shape, &in_specs);
+                        match ev.out {
                             crate::host::HostOut::F32(v) => self.arena.write_f32(*out, &v),
                             crate::host::HostOut::Bytes(b) => self.arena.write_bytes(*out, &b),
+                        }
+                        // Operands the op rewrote in place (RNN `carry` state)
+                        // live in `eval`'s private arena until copied back.
+                        for (i, buf) in ev.inplace {
+                            let id = in_ids[i];
+                            match buf {
+                                crate::host::HostOut::F32(v) => self.arena.write_f32(id, &v),
+                                crate::host::HostOut::Bytes(b) => self.arena.write_bytes(id, &b),
+                            }
                         }
                         self.arena.sync_gpu_after_host();
                     }
@@ -1435,7 +1584,22 @@ impl VulkanExecutable {
                 i += 1;
             }
             if i > start {
-                let gpu = self.schedule[start..i].to_vec();
+                // Static weight packs (the fused QKV / gate+up `Concat` over
+                // `Param`s) are invariant across runs. Unlike the other
+                // backends there is no per-step loop to `continue` — steps are
+                // batched into ONE command buffer here — so the skip filters
+                // them out of the batch instead. A batch that ends up empty is
+                // not submitted at all.
+                let skipping = self.static_once_done
+                    && rlx_opt::memory::static_weight_pack_skip_enabled()
+                    && !self.static_once_steps.is_empty();
+                let gpu: Vec<Step> = (start..i)
+                    .filter(|j| !(skipping && self.static_once_steps.contains(j)))
+                    .map(|j| self.schedule[j].clone())
+                    .collect();
+                if gpu.is_empty() {
+                    continue;
+                }
                 dev.submit_and_wait(|cmd| unsafe {
                     let barrier = vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1516,9 +1680,18 @@ impl VulkanExecutable {
                                 (sh, buf)
                             })
                             .collect();
-                        match crate::host::eval(&op, &out_shape, &in_specs) {
+                        let ev = crate::host::eval_full(&op, &out_shape, &in_specs);
+                        match ev.out {
                             crate::host::HostOut::F32(v) => self.arena.write_f32(out, &v),
                             crate::host::HostOut::Bytes(b) => self.arena.write_bytes(out, &b),
+                        }
+                        // Same in-place writeback as the segmented path above.
+                        for (i, buf) in ev.inplace {
+                            let id = in_ids[i];
+                            match buf {
+                                crate::host::HostOut::F32(v) => self.arena.write_f32(id, &v),
+                                crate::host::HostOut::Bytes(b) => self.arena.write_bytes(id, &b),
+                            }
                         }
                         self.arena.sync_gpu_after_host();
                     }
@@ -1595,7 +1768,19 @@ impl VulkanExecutable {
     /// all outputs are read back, also refresh host mirrors; for logits-only
     /// decode (`read_indices == Some([0])`) the K/V never leaves the arena, which
     /// is the whole point. Then read the requested outputs.
+    /// Arm the static-weight-pack skip: the schedule has run, so every pack has
+    /// been materialised and later runs may skip re-recording it.
+    ///
+    /// Called from `finish_run`, which every dispatch path funnels through, so
+    /// the skip cannot end up armed on one route and dead on another — the
+    /// defect that left `rlx-wgpu`'s equivalent silently doing nothing.
     fn finish_run(&mut self, read_indices: Option<&[usize]>) -> Vec<Vec<f32>> {
+        if rlx_opt::memory::static_weight_pack_skip_enabled()
+            && !self.static_once_done
+            && !self.static_once_steps.is_empty()
+        {
+            self.static_once_done = true;
+        }
         // Last GPU segment may have left the host mapping stale.
         self.arena.sync_host_after_gpu();
         if !self.gpu_handle_feeds.is_empty() {
@@ -1620,7 +1805,7 @@ impl VulkanExecutable {
         // first node whose output is non-finite while its inputs are finite is
         // the true source (Inf as well as NaN). The default output-only scan
         // passes empty inputs, mislabelling every non-finite output a "culprit".
-        if scanner.enabled() && std::env::var("RLX_VULKAN_SCAN_ALL").is_ok() {
+        if scanner.enabled() && rlx_ir::env::var("RLX_VULKAN_SCAN_ALL").is_some() {
             for node in self.graph.nodes() {
                 let id = node.id;
                 let n = node.shape.num_elements().unwrap_or(0);
@@ -1736,8 +1921,8 @@ fn record_segments(
     deps: &[StepDep],
 ) -> Vec<Segment> {
     let layout = kern.pipeline_layout;
-    let no_barrier = std::env::var("RLX_VULKAN_NOBARRIER").as_deref() == Ok("1");
-    let full_barrier = std::env::var("RLX_VULKAN_FULLBARRIER").as_deref() == Ok("1");
+    let no_barrier = rlx_ir::env::var("RLX_VULKAN_NOBARRIER").as_deref() == Some("1");
+    let full_barrier = rlx_ir::env::var("RLX_VULKAN_FULLBARRIER").as_deref() == Some("1");
     let mut segments = Vec::new();
     let n = schedule.len();
     let mut i = 0;
@@ -2118,13 +2303,44 @@ fn push_gpu_step(
 /// graph node contributes its node-level footprint to every `Step` it emits
 /// (most nodes emit one; `Concat` emits one per input — conservatively sharing
 /// the node footprint, which over-serializes only a concat's own sub-copies).
-fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
+/// Lower the graph to a step list.
+///
+/// The third return is the set of step indices that materialise a **static
+/// weight pack** — a `Concat` over `Param`s, i.e. the fused QKV / gate+up
+/// weights the matmul-fusion passes build. Their value is fixed once params are
+/// bound, so the runner replays them on the first `run()` and skips them after;
+/// on a Llama decode those packs are ~48% of all DRAM traffic (measured on
+/// Metal), and rebuilding a constant every token is pure waste.
+fn build_schedule(
+    graph: &Graph,
+    arena: &Arena,
+    rng: RngOptions,
+) -> (Vec<Step>, Vec<StepDep>, std::collections::HashSet<usize>) {
     let mut steps = Vec::new();
     let mut deps: Vec<StepDep> = Vec::new();
+    // Both conditions are required, same as Metal / wgpu / CUDA / ROCm:
+    //   1. the planner's OWN `is_static_weight_tensor`, so this can never arm a
+    //      skip for a pack `plan_memory` did not pin to graph end, and
+    //   2. arena-slot exclusivity — a pin is not a guarantee, and where it
+    //      failed the slot is liveness-reused, so a skipped pack would read
+    //      bytes some later node clobbered.
+    let mut static_weight_memo: std::collections::HashMap<rlx_ir::NodeId, bool> =
+        std::collections::HashMap::new();
+    let offset_owner_count: std::collections::HashMap<usize, usize> = {
+        let mut m = std::collections::HashMap::new();
+        for n in graph.nodes() {
+            if rlx_opt::memory::is_pure_view(graph, n) || !arena.has(n.id) {
+                continue;
+            }
+            *m.entry(arena.byte_offset(n.id)).or_insert(0usize) += 1;
+        }
+        m
+    };
+    let mut static_once_steps: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut binder = ActBinder::new();
     // BF16 matmul weights stored packed (2 bytes/elem) → `matmul_bf16` kernel.
     let bf16_weights = crate::buffer::bf16_packed_matmul_weights(graph);
-    if std::env::var("RLX_VULKAN_DUMP_OPS").as_deref() == Ok("1") {
+    if rlx_ir::env::var("RLX_VULKAN_DUMP_OPS").as_deref() == Some("1") {
         let mut hist: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let mut host_n = 0usize;
         for node in graph.nodes() {
@@ -2158,7 +2374,7 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 Op::Im2Col { .. } => "im2col",
                 Op::Attention { .. } => "attention",
                 Op::Rope { .. } => "rope",
-                Op::ScatterAdd => "scatter_add",
+                Op::ScatterAdd { .. } => "scatter_add",
                 other => {
                     if is_host_fallback(other) {
                         host_n += 1;
@@ -2328,7 +2544,7 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 // tile n. Mid-axis broadcasts that slip past LegalizeBroadcast
                 // silently corrupt TTS decoders (Kokoro cos≈0.09).
                 let trailing_ok = |m: usize| m == 0 || m == n || n.is_multiple_of(m);
-                if std::env::var("RLX_VULKAN_CHECK_BCAST").as_deref() == Ok("1")
+                if rlx_ir::env::var("RLX_VULKAN_CHECK_BCAST").as_deref() == Some("1")
                     && (!trailing_ok(an) || !trailing_ok(bn))
                 {
                     eprintln!(
@@ -3799,7 +4015,11 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 }
             }
 
-            Op::RopeBackward { head_dim, n_rot } => {
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            } => {
                 let dy = node.inputs[0];
                 let cos = node.inputs[1];
                 let sin = node.inputs[2];
@@ -3821,6 +4041,10 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                     .u(binder.off(arena, sin))
                     .u(binder.off(arena, out))
                     .u(cos_len as u32)
+                    .u(match style {
+                        RopeStyle::NeoX => 0u32,
+                        RopeStyle::GptJ => 1u32,
+                    })
                     .bytes();
                 push_gpu_step(
                     &mut binder,
@@ -4029,7 +4253,45 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 );
             }
 
+            // In-place KV append: the output aliases the cache (the planner
+            // gives it input 0's slot), so the op is one contiguous copy of the
+            // new row to `pos` along `axis`.
+            //
+            // `outer == 1` is guaranteed, not assumed: `rewrite_for_backend`
+            // lowers any `KvAppend` whose `[..pos+1]` prefix is non-contiguous
+            // — anything with a dim > 1 before `axis` — back to narrow + concat
+            // on every backend. That is what lets a single `ActCopy` stand in
+            // for a strided kernel.
+            Op::KvAppend { axis, pos } => {
+                let cache = graph.node(node.inputs[0]);
+                let inner_elems: usize = (*axis + 1..cache.shape.rank())
+                    .map(|i| cache.shape.dim(i).unwrap_static())
+                    .product::<usize>()
+                    .max(1);
+                // The arena is f32-UNIFORM (see `buffer.rs`): every real / int /
+                // bool tensor occupies one f32 lane per element whatever its
+                // dtype says — F16/BF16 are widened on upload — while U8/I8
+                // stay byte-packed and complex genuinely spans several lanes.
+                // `dtype().size_bytes()` is the stride for the last two only; on
+                // an F16 cache it would step 2 bytes through a buffer laid out 4
+                // bytes per element and cover half the row. rlx-wgpu had exactly
+                // this bug (its `kv_append_strides_a_narrow_cache_by_its_own_
+                // element_size` case caught it); this mirrors the fix.
+                let dt = cache.shape.dtype();
+                let elem_bytes = match dt {
+                    DType::U8 | DType::I8 => 1,
+                    _ if dt.is_complex() => dt.size_bytes(),
+                    _ => 4,
+                };
+                let inner_bytes = inner_elems * elem_bytes;
+                steps.push(Step::ActCopy {
+                    src_byte: arena.byte_offset(node.inputs[1]),
+                    dst_byte: arena.byte_offset(node.id) + pos * inner_bytes,
+                    bytes: inner_bytes,
+                });
+            }
             Op::Concat { axis } => {
+                let sched_before = steps.len();
                 // Complex packs `lanes` contiguous f32 per element; the `reindex`
                 // kernel copies one f32 per "element". Append an INNERMOST lane
                 // axis to the output AND each input's dims so `contig_strides`/
@@ -4088,6 +4350,14 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                         groups1d(n, 256),
                     );
                     axis_cursor += *id_dims.get(*axis).unwrap_or(&1);
+                }
+                if rlx_opt::memory::is_static_weight_tensor(graph, node.id, &mut static_weight_memo)
+                    && arena.has(node.id)
+                    && offset_owner_count.get(&arena.byte_offset(node.id)).copied() == Some(1)
+                {
+                    for i in sched_before..steps.len() {
+                        static_once_steps.insert(i);
+                    }
                 }
             }
 
@@ -4459,7 +4729,7 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 groups,
             } => {
                 // Opt-in CPU path for diagnosing SPIR-V conv2d (Kokoro ISTFTNet).
-                if std::env::var("RLX_VULKAN_HOST_CONV").as_deref() == Ok("1") {
+                if rlx_ir::env::var("RLX_VULKAN_HOST_CONV").as_deref() == Some("1") {
                     steps.push(Step::Host {
                         op: node.op.clone(),
                         out: node.id,
@@ -5175,7 +5445,16 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 );
             }
 
-            Op::ScatterAdd => {
+            Op::ScatterAdd { axis } => {
+                // The kernel implements the axis-0 form only;
+                // `rlx_fusion::LowerScatterAddAxis` normalizes every other axis
+                // before lowering. Reaching here with axis != 0 would scatter
+                // along the wrong dimension in silence.
+                assert_eq!(
+                    *axis, 0,
+                    "rlx-vulkan: ScatterAdd axis {axis} reached the backend; \
+                     LowerScatterAddAxis must run first"
+                );
                 // updates [U, ...trailing], indices [U] → out [out_dim, ...trailing]
                 let updates = node.inputs[0];
                 let indices = node.inputs[1];
@@ -5542,10 +5821,477 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 // f32-uniform arena: indices are float-encoded. Mirror wgpu —
                 // HostOpDesc would set indices_i64 from IR dtype and re-read
                 // float bits as i64 (Kitten alignment → NSF mush on NVIDIA).
-                steps.push(Step::CpuIndexing {
-                    thunk: rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.byte_offset(id))
-                        .force_indices_f32(),
+                let thunk = rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.byte_offset(id))
+                    .force_indices_f32();
+                // ...and *because* they are float-encoded, `gather_nd.comp` and
+                // friends can read them directly. Whatever the shared planner or
+                // the push-constant budget declines keeps the host route below.
+                let planned = if rlx_ir::env::flag("RLX_VULKAN_INDEXING_HOST") {
+                    None
+                } else {
+                    rlx_gpu_host::indexing_plan::plan_indexing(&thunk)
+                };
+                let planned = planned.filter(|l| {
+                    // Overwrite only: no guaranteed f32 atomics in core Vulkan.
+                    let overwrite = !matches!(
+                        l.kind,
+                        IndexKind::ScatterElements {
+                            reduction: IndexReduction::Add,
+                            ..
+                        } | IndexKind::ScatterNd {
+                            reduction: IndexReduction::Add,
+                            ..
+                        }
+                    );
+                    // Shapes and strides travel in the push block (no spare
+                    // descriptor binding), so the meta budget is a hard cap.
+                    overwrite && l.meta.len() <= INDEXING_META_WORDS
                 });
+
+                match planned {
+                    Some(l) => {
+                        let is_scatter =
+                            matches!(node.op, Op::ScatterNd { .. } | Op::ScatterElements { .. });
+                        let data_id = node.inputs[0];
+                        let idx_id = node.inputs[1];
+                        let upd_id = if is_scatter { node.inputs[2] } else { data_id };
+                        let data_off = binder.off(arena, data_id);
+                        let idx_off = binder.off(arena, idx_id);
+                        let upd_off = binder.off(arena, upd_id);
+                        let dst_off = binder.off(arena, out);
+
+                        // Prologue: seed `dst` from `data` before any update
+                        // lands (and, for ScatterElements, zero non-finite slots).
+                        if let Some(pro) = l.prologue
+                            && l.dst_len > 0
+                        {
+                            let push = Push::default()
+                                .u(l.dst_len)
+                                .u(data_off)
+                                .u(dst_off)
+                                .u(pro.src_len)
+                                .u(pro.do_copy)
+                                .u(pro.do_sanitize)
+                                .bytes();
+                            push_gpu_step(
+                                &mut binder,
+                                &mut steps,
+                                &mut deps,
+                                "indexing_copy_sanitize",
+                                push,
+                                groups1d(l.dst_len as usize, 256),
+                            );
+                        }
+
+                        let mut meta = l.meta.clone();
+                        meta.resize(INDEXING_META_WORDS, 0);
+                        let (kernel, head) = match l.kind {
+                            IndexKind::GatherNd {
+                                k,
+                                slice,
+                                tuples_per_batch,
+                                batch_stride,
+                            } => (
+                                "gather_nd",
+                                Push::default()
+                                    .u(l.n)
+                                    .u(data_off)
+                                    .u(idx_off)
+                                    .u(dst_off)
+                                    .u(k)
+                                    .u(slice)
+                                    .u(tuples_per_batch)
+                                    .u(batch_stride),
+                            ),
+                            IndexKind::GatherElements {
+                                rank,
+                                axis,
+                                axis_dim,
+                                data_len,
+                            } => (
+                                "gather_elements",
+                                Push::default()
+                                    .u(l.n)
+                                    .u(data_off)
+                                    .u(idx_off)
+                                    .u(dst_off)
+                                    .u(data_len)
+                                    .u(rank)
+                                    .u(axis)
+                                    .i(axis_dim),
+                            ),
+                            IndexKind::ScatterElements { rank, axis, .. } => (
+                                "scatter_elements_nd",
+                                Push::default()
+                                    .u(l.n)
+                                    .u(upd_off)
+                                    .u(idx_off)
+                                    .u(dst_off)
+                                    .u(l.dst_len)
+                                    .u(rank)
+                                    .u(axis)
+                                    .u(0),
+                            ),
+                            IndexKind::ScatterNd { k, slice, .. } => (
+                                "scatter_nd_write",
+                                Push::default()
+                                    .u(l.n)
+                                    .u(idx_off)
+                                    .u(upd_off)
+                                    .u(dst_off)
+                                    .u(l.dst_len)
+                                    .u(k)
+                                    .u(slice)
+                                    .u(0),
+                            ),
+                        };
+                        push_gpu_step(
+                            &mut binder,
+                            &mut steps,
+                            &mut deps,
+                            kernel,
+                            head.us(&meta).bytes(),
+                            groups1d(l.n as usize, 256),
+                        );
+                    }
+                    None => steps.push(Step::CpuIndexing { thunk }),
+                }
+            }
+
+            // On-device Philox — the one-shot dispatch that replaces a
+            // readback → CPU generator → upload stall per RNG node. Only the
+            // Philox and Zero streams have a shader; `Ort`/`Bnns` are parity
+            // streams and keep the host route below.
+            //
+            // Note what this also fixes: `host::eval` builds a fresh one-op CPU
+            // graph and never sees this executable's `RngOptions`, so before
+            // this arm `compile_rng(g, opts)` silently produced the *default*
+            // stream on Vulkan no matter what `opts.seed` said. The GPU path
+            // reads `rng` directly, so the seed now takes effect. Ort/Bnns still
+            // go through `host::eval` and still ignore it — narrower, not gone.
+            Op::RngNormal {
+                mean, scale, key, ..
+            }
+            | Op::RngUniform {
+                low: mean,
+                high: scale,
+                key,
+                ..
+            } if matches!(
+                rng.backend,
+                rlx_ir::RngBackend::Philox | rlx_ir::RngBackend::Zero
+            ) =>
+            {
+                let zero = matches!(rng.backend, rlx_ir::RngBackend::Zero);
+                let (seed_lo, seed_hi) = if zero {
+                    (0u32, 0u32)
+                } else {
+                    let seed = rlx_ir::combine_seed(rng.seed, *key);
+                    ((seed & 0xFFFF_FFFF) as u32, (seed >> 32) as u32)
+                };
+                let n = numel(&dims(graph, out));
+                let kernel = if zero {
+                    "rng_fill_zero"
+                } else if matches!(node.op, Op::RngNormal { .. }) {
+                    "rng_normal_philox"
+                } else {
+                    "rng_uniform_philox"
+                };
+                let push = Push::default()
+                    .u(n as u32)
+                    .u(binder.off(arena, out))
+                    .f(*mean)
+                    .f(*scale)
+                    .u(seed_lo)
+                    .u(seed_hi)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    kernel,
+                    push,
+                    groups1d(n, 256),
+                );
+            }
+
+            // ── Native general low-precision path (`scaled_lowp_*.comp`) ──
+            //
+            // These four used to take the CPU host route even though the harder
+            // grouped (MoE) variant already had a native decode kernel next
+            // door. That one is MXFP4-only, so this is a full codec port
+            // (`lowp_codec.inc`) rather than a rewire.
+            Op::ScaledQuantScale {
+                format,
+                scale_layout,
+            } => {
+                let x_id = node.inputs[0];
+                let xs = dims(graph, x_id);
+                let cols = *xs.last().unwrap_or(&1) as u32;
+                let rows = numel(&xs) as u32 / cols.max(1);
+                let (scale_mode, block) = scale_layout.mode_block();
+                // Per-tensor is a single-invocation reduction; block modes write
+                // one scale BYTE per block, four to an invocation.
+                let threads = if scale_mode == 0 {
+                    1
+                } else {
+                    (rows * cols.div_ceil(block.max(1))).div_ceil(4)
+                } as usize;
+                let push = Push::default()
+                    .u(binder.off(arena, x_id))
+                    .u(binder.off(arena, out))
+                    .u(rows)
+                    .u(cols)
+                    .u(format.kernel_id())
+                    .u(scale_mode)
+                    .u(block)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "scaled_lowp_quant_scale",
+                    push,
+                    groups1d(threads, 256),
+                );
+            }
+            Op::ScaledQuantize {
+                format,
+                scale_layout,
+            } => {
+                let x_id = node.inputs[0];
+                let scale_id = node.inputs[1];
+                let xs = dims(graph, x_id);
+                let cols = *xs.last().unwrap_or(&1) as u32;
+                let rows = numel(&xs) as u32 / cols.max(1);
+                let (scale_mode, block) = scale_layout.mode_block();
+                let push = Push::default()
+                    .u(binder.off(arena, x_id))
+                    .u(binder.off(arena, scale_id))
+                    .u(binder.off(arena, out))
+                    .u(rows)
+                    .u(cols)
+                    .u(format.kernel_id())
+                    .u(scale_mode)
+                    .u(block)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "scaled_lowp_quantize",
+                    push,
+                    // One invocation per output WORD (four codes).
+                    groups1d((rows * cols).div_ceil(4) as usize, 256),
+                );
+            }
+            Op::ScaledDequantize {
+                format,
+                scale_layout,
+            } => {
+                let codes_id = node.inputs[0];
+                let scale_id = node.inputs[1];
+                let cs = dims(graph, codes_id);
+                let cols = *cs.last().unwrap_or(&1) as u32;
+                let rows = numel(&cs) as u32 / cols.max(1);
+                let (scale_mode, block) = scale_layout.mode_block();
+                let push = Push::default()
+                    .u(binder.off(arena, codes_id))
+                    .u(binder.off(arena, scale_id))
+                    .u(binder.off(arena, out))
+                    .u(rows)
+                    .u(cols)
+                    .u(format.kernel_id())
+                    .u(scale_mode)
+                    .u(block)
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "scaled_lowp_dequantize",
+                    push,
+                    groups1d((rows * cols) as usize, 256),
+                );
+            }
+            Op::ScaledMatMul {
+                lhs_format,
+                rhs_format,
+                scale_layout,
+                has_bias,
+            } => {
+                // TN: lhs [m,k], rhs [n,k] (K-last on both), out [m,n].
+                let lhs_id = node.inputs[0];
+                let rhs_id = node.inputs[1];
+                let ls_id = node.inputs[2];
+                let rs_id = node.inputs[3];
+                let ld = dims(graph, lhs_id);
+                let rd = dims(graph, rhs_id);
+                let m = ld[ld.len() - 2] as u32;
+                let k = ld[ld.len() - 1] as u32;
+                let n = rd[rd.len() - 2] as u32;
+                let (scale_mode, block) = scale_layout.mode_block();
+                let bias_off = if *has_bias {
+                    binder.off(arena, node.inputs[4])
+                } else {
+                    0
+                };
+                let push = Push::default()
+                    .u(binder.off(arena, lhs_id))
+                    .u(binder.off(arena, rhs_id))
+                    .u(binder.off(arena, ls_id))
+                    .u(binder.off(arena, rs_id))
+                    .u(binder.off(arena, out))
+                    .u(bias_off)
+                    .u(m)
+                    .u(k)
+                    .u(n)
+                    .u(lhs_format.kernel_id())
+                    .u(rhs_format.kernel_id())
+                    .u(scale_mode)
+                    .u(block)
+                    .u(u32::from(*has_bias))
+                    .bytes();
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "scaled_lowp_matmul",
+                    push,
+                    // 16x16 output tiles, matching local_size in the shader.
+                    (n.div_ceil(16), m.div_ceil(16), 1),
+                );
+            }
+
+            // Dequantise a packed MoE expert stack to dense F32 `[E, K, N]`.
+            //
+            // Materialises `E*K*N` floats by definition — `dequant_grouped_matmul`
+            // avoids that entirely and is the better choice when the consumer is
+            // a grouped GEMM. This is for graphs that genuinely want dense expert
+            // weights, where on-device still beats readback + CPU + upload of the
+            // same tensor.
+            Op::DequantMoEWeights { scheme } => {
+                let w_id = node.inputs[0];
+                let od = dims(graph, out);
+                let gpu_scheme = match scheme {
+                    rlx_ir::QuantScheme::GgufQ4K => Some(0u32),
+                    rlx_ir::QuantScheme::GgufQ6K => Some(1u32),
+                    rlx_ir::QuantScheme::GgufQ1_0 => Some(2u32),
+                    _ => None,
+                };
+                // Output is declared `[E, K, N]`.
+                let experts = od.first().copied().unwrap_or(0);
+                let k = od.get(1).copied().unwrap_or(0);
+                let n = od.get(2).copied().unwrap_or(0);
+                let block_elems = scheme.gguf_block_size() as usize;
+                let block_bytes = scheme.gguf_block_bytes() as usize;
+                let slab_bytes = (k * n)
+                    .checked_div(block_elems)
+                    .map_or(0, |blocks| blocks * block_bytes);
+                let eligible = gpu_scheme.is_some()
+                    && od.len() == 3
+                    && experts > 0
+                    && k > 0
+                    && n > 0
+                    && block_elems > 0
+                    && (k * n) % block_elems == 0
+                    && slab_bytes % 4 == 0;
+                if !eligible {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                } else {
+                    let push = Push::default()
+                        .u(k as u32)
+                        .u(n as u32)
+                        .u(experts as u32)
+                        .u(binder.off(arena, w_id))
+                        .u(binder.off(arena, out))
+                        .u(slab_bytes as u32)
+                        .u(gpu_scheme.unwrap_or(0))
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "dequant_moe_weights",
+                        push,
+                        groups1d(experts * k * n, 64),
+                    );
+                }
+            }
+
+            // Fused GGUF dequant + grouped (MoE) GEMM, for the three schemes
+            // `dequant_grouped_matmul.comp` decodes. Decoding in the loop rather
+            // than staging a dequantised slab is what keeps this viable on large
+            // expert stacks — CUDA's grouped path needs `k*n*4` bytes of scratch
+            // plus a host round trip to sort tokens by expert; this needs
+            // neither.
+            Op::DequantGroupedMatMul { scheme } => {
+                let in_id = node.inputs[0];
+                let w_id = node.inputs[1];
+                let idx_id = node.inputs[2];
+                let in_dims = dims(graph, in_id);
+                let out_dims = dims(graph, out);
+                let gpu_scheme = match scheme {
+                    rlx_ir::QuantScheme::GgufQ4K => Some(0u32),
+                    rlx_ir::QuantScheme::GgufQ6K => Some(1u32),
+                    rlx_ir::QuantScheme::GgufQ1_0 => Some(2u32),
+                    _ => None,
+                };
+                let m = in_dims.first().copied().unwrap_or(0);
+                let k = in_dims.get(1).copied().unwrap_or(0);
+                let n = out_dims.last().copied().unwrap_or(0);
+                let block_elems = scheme.gguf_block_size() as usize;
+                let block_bytes = scheme.gguf_block_bytes() as usize;
+                let slab_bytes = (k * n)
+                    .checked_div(block_elems)
+                    .map_or(0, |blocks| blocks * block_bytes);
+                let total_bytes = graph.node(w_id).shape.num_elements().unwrap_or(0);
+                let num_experts = total_bytes.checked_div(slab_bytes).unwrap_or(0);
+                // The shader indexes whole blocks per row, so K must divide
+                // evenly; and a slab has to be word-aligned for the expert
+                // offset to convert to a word base.
+                let eligible = gpu_scheme.is_some()
+                    && m > 0
+                    && k > 0
+                    && n > 0
+                    && num_experts > 0
+                    && block_elems > 0
+                    && k % block_elems == 0
+                    && slab_bytes % 4 == 0;
+                if !eligible {
+                    steps.push(Step::Host {
+                        op: node.op.clone(),
+                        out: node.id,
+                        out_shape: node.shape.clone(),
+                        inputs: node.inputs.clone(),
+                    });
+                } else {
+                    let push = Push::default()
+                        .u(m as u32)
+                        .u(n as u32)
+                        .u(k as u32)
+                        .u(binder.off(arena, in_id))
+                        .u(binder.off(arena, w_id))
+                        .u(binder.off(arena, idx_id))
+                        .u(binder.off(arena, out))
+                        .u(slab_bytes as u32)
+                        .u(num_experts as u32)
+                        .u(gpu_scheme.unwrap_or(0))
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "dequant_grouped_matmul",
+                        push,
+                        groups1d(m * n, 64),
+                    );
+                }
             }
 
             op if is_host_fallback(op) => {
@@ -5588,10 +6334,19 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
                 .map(|&id| span(id))
                 .collect();
             let write = span(out);
-            for step in &steps[before..] {
-                if matches!(step, Step::ActCopy { .. }) {
-                    continue;
-                }
+            // `record_segments` indexes `steps` and `deps` in lockstep, so every
+            // Step needs a StepDep at the same index. Copies the binder queued
+            // already got theirs from `drain_copies` (which pushes both), and
+            // they sit at the front of this op's range — so fill exactly the
+            // tail that has none.
+            //
+            // This used to skip *every* `ActCopy`, which was right only while
+            // the binder was the only thing producing one. `Op::KvAppend` pushes
+            // an `ActCopy` directly — no binder, no dep — so it emitted 1 step
+            // and 0 deps and tripped `debug_assert_eq!` below. Only in debug,
+            // where it also meant every later step's barrier info was read off
+            // by one in release.
+            while deps.len() < steps.len() {
                 deps.push(StepDep {
                     reads: reads.clone(),
                     write,
@@ -5602,5 +6357,5 @@ fn build_schedule(graph: &Graph, arena: &Arena) -> (Vec<Step>, Vec<StepDep>) {
     }
     binder.drain_copies(&mut steps, &mut deps);
     debug_assert_eq!(steps.len(), deps.len(), "schedule/deps length mismatch");
-    (steps, deps)
+    (steps, deps, static_once_steps)
 }

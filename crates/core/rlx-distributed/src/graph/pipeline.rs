@@ -4,7 +4,7 @@
 
 //! Execute a partitioned model as a pipeline. [`run_pipeline_local`] runs every
 //! stage in one process (single machine) — the correctness reference for the
-//! multi-node path in [`crate::distributed`]. Each [`StageRunner`] compiles one
+//! multi-node path in `crate::distributed`. Each [`StageRunner`] compiles one
 //! [`Stage`] and loads only that stage's parameters, so peak RAM is one stage's
 //! weights, not the whole model.
 

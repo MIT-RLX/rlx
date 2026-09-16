@@ -217,8 +217,7 @@ pub const DEFAULT_SOFT_MEMORY_FRACTION: f64 = 0.80;
 /// Fraction of physical RAM treated as a soft working-set cap.
 /// Override with `RLX_SOFT_MEMORY_FRACTION` (e.g. `0.8`).
 pub fn soft_memory_fraction() -> f64 {
-    std::env::var("RLX_SOFT_MEMORY_FRACTION")
-        .ok()
+    rlx_ir::env::var("RLX_SOFT_MEMORY_FRACTION")
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&f| f > 0.0 && f <= 1.0)
         .unwrap_or(DEFAULT_SOFT_MEMORY_FRACTION)
@@ -227,7 +226,7 @@ pub fn soft_memory_fraction() -> f64 {
 /// Soft RSS budget: `physical_ram * soft_memory_fraction()`.
 /// Returns `None` when physical RAM is unknown (non-macOS without override).
 pub fn soft_memory_budget_bytes() -> Option<usize> {
-    if let Ok(v) = std::env::var("RLX_SOFT_MEMORY_BUDGET_BYTES") {
+    if let Some(v) = rlx_ir::env::var("RLX_SOFT_MEMORY_BUDGET_BYTES") {
         if let Ok(n) = v.parse::<usize>() {
             return Some(n);
         }
@@ -326,8 +325,7 @@ fn exceeds_budget(rss: usize, additional: usize, budget: usize) -> bool {
 /// Conservative peak for one LLaMA decode graph compile with F32 params (3B class).
 /// Computed in `u64` and clamped — the raw constants exceed 32-bit `usize` (wasm).
 pub fn llama_decode_bucket_compile_peak_bytes() -> usize {
-    std::env::var("RLX_DECODE_BUCKET_PEAK_BYTES")
-        .ok()
+    rlx_ir::env::var("RLX_DECODE_BUCKET_PEAK_BYTES")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(12 * 1024 * 1024 * 1024)
         .min(usize::MAX as u64) as usize
@@ -335,8 +333,7 @@ pub fn llama_decode_bucket_compile_peak_bytes() -> usize {
 
 /// Lazy per-step decode compile (GGUF on demand, no resident param cache).
 pub fn llama_decode_oneshot_compile_peak_bytes() -> usize {
-    std::env::var("RLX_DECODE_ONESHOT_PEAK_BYTES")
-        .ok()
+    rlx_ir::env::var("RLX_DECODE_ONESHOT_PEAK_BYTES")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(4 * 1024 * 1024 * 1024)
         .min(usize::MAX as u64) as usize
@@ -353,8 +350,7 @@ pub fn llama_decode_oneshot_compile_peak_bytes() -> usize {
 /// while a memory-constrained machine trims buckets to fit. Override with
 /// `RLX_DECODE_BUCKET_RESIDENT_BYTES` to match a different model size.
 pub fn llama_decode_bucket_resident_bytes() -> usize {
-    std::env::var("RLX_DECODE_BUCKET_RESIDENT_BYTES")
-        .ok()
+    rlx_ir::env::var("RLX_DECODE_BUCKET_RESIDENT_BYTES")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(2 * 1024 * 1024 * 1024)
         .min(usize::MAX as u64) as usize

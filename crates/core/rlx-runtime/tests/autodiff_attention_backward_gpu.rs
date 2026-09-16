@@ -11,6 +11,8 @@ use rlx_cpu::thunk::{compile_thunks, execute_thunks};
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
+mod common;
+
 const B: usize = 1;
 const H: usize = 2;
 const S: usize = 4;
@@ -119,6 +121,7 @@ fn assert_grads_close(name: &str, cpu: &[f32], gpu: &[f32], rtol: f32) {
 
 #[test]
 fn cpu_reference_bwd_grads_finite() {
+    let _gpu = common::serialize_gpu();
     let (q, k, v, dy) = synthetic_inputs();
     let (dq, dk, dv) = cpu_bwd_grads(build_bwd_kernel_graph(), &q, &k, &v, &dy);
     assert!(dq.iter().any(|x| x.is_finite() && x.abs() > 1e-8));
@@ -129,6 +132,7 @@ fn cpu_reference_bwd_grads_finite() {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_attention_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if !rlx_wgpu::is_available() {
         eprintln!("skip wgpu_attention_backward_matches_cpu: no adapter");
         return;
@@ -149,6 +153,7 @@ fn wgpu_attention_backward_matches_cpu() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_attention_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     use rlx_runtime::{CompileOptions, Device, Session};
     let (q, k, v, dy) = synthetic_inputs();
     let bwd = build_bwd_kernel_graph();
@@ -166,8 +171,10 @@ fn metal_attention_backward_matches_cpu() {
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_attention_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip cuda_attention_backward_matches_cpu (unavailable)");
         return;
     }
@@ -187,8 +194,10 @@ fn cuda_attention_backward_matches_cpu() {
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_attention_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    #[allow(unused_imports)]
     use rlx_runtime::{CompileOptions, Device, Session, is_available};
-    if !is_available(Device::Rocm) {
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         eprintln!("skip rocm_attention_backward_matches_cpu (unavailable)");
         return;
     }

@@ -1,0 +1,61 @@
+# XcodeGen spec for the RLX node demo app.
+#
+#   ios/build-xcframework.sh        # produces ../build/RlxNode.xcframework
+#   cd ios/Demo && xcodegen generate
+#   open RlxDemo.xcodeproj
+#
+# Or build headlessly — see ios/README.md.
+name: RlxDemo
+options:
+  bundleIdPrefix: com.mit.rlx
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+targets:
+  RlxDemo:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      # The shared Swift wrapper, compiled straight into the app so the demo
+      # needs no SwiftPM resolution step.
+      - path: ../Sources/RlxNode
+    dependencies:
+      # Static archive: linked, not embedded.
+      - framework: ../build/RlxNode.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mit.rlx.nodedemo
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/RlxDemo-Bridging-Header.h
+        # The C ABI header lives with the crate that defines it.
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../../crates/bindings/rlx-ffi/include
+        # A static archive carries no link directives, so the app must name
+        # what the Rust code needs: Accelerate for rlx-cpu's BLAS/LAPACK/vForce
+        # (cblas_*, dgesvd_, vvexpf, ...), plus libresolv/libc++ for Rust std.
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -framework
+          - Accelerate
+          - -lresolv
+          - -lc++
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: RLX Node
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # REQUIRED. Without this key iOS blocks LAN peer traffic — including
+        # plain TCP to a host:port — and the node silently reaches nothing.
+        NSLocalNetworkUsageDescription: >-
+          Joins a nearby RLX compute cluster to share model execution.
+        # Only needed for mDNS-based discovery (the `mdns` feature).
+        NSBonjourServices:
+          - _rlx-coord._udp

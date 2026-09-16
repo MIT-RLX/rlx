@@ -67,7 +67,7 @@ pub struct CompilePipeline {
     pub target: FusionTarget,
     pub opts: FusionOptions,
     pub arena_alignment: usize,
-    /// When true, [`compile_hir`] / [`compile_graph`] panic if fusion
+    /// When true, `compile_hir` / `compile_graph` panic if fusion
     /// diagnostics report missed block-level patterns.
     pub assert_fusion_clean: bool,
     /// Backend op claim set. When `Some` and non-empty, fusion passes
@@ -80,7 +80,7 @@ pub struct CompilePipeline {
     pub backend_label: Option<&'static str>,
     /// Native vs common IR lowering for logical kernels (see `rlx_ir::logical_kernel`).
     pub kernel_dispatch: KernelDispatchConfig,
-    /// Static NaN/Inf lint (`RLX_LINT_NUMERICS` / [`CompileOptions::lint_numerics`]).
+    /// Static NaN/Inf lint (`RLX_LINT_NUMERICS` / `CompileOptions::lint_numerics`).
     pub lint_numerics: bool,
     /// Fusion before/after report (`RLX_FUSION_REPORT`).
     pub fusion_report: bool,
@@ -124,8 +124,7 @@ fn fix_import_lstm_x_shape(x: &rlx_ir::Shape) -> rlx_ir::Shape {
     let d1 = x.dim(1).unwrap_static();
     let d2 = x.dim(2).unwrap_static();
     if d0 == 1 && d1 <= 1 && (d2 == 640 || d2 == 512) {
-        let seq = std::env::var("RLX_ONNX_SEQUENCE_LENGTH")
-            .ok()
+        let seq = rlx_ir::env::var("RLX_ONNX_SEQUENCE_LENGTH")
             .and_then(|s| s.parse().ok())
             .unwrap_or(128);
         return rlx_ir::Shape::new(&[seq, d1.max(1), d2], x.dtype());
@@ -163,7 +162,7 @@ fn fix_lstm_output_shapes(graph: &mut Graph) {
 /// Only runs when `RLX_ONNX_SEQUENCE_LENGTH` is set explicitly — decode graphs such as
 /// Qwen3 talker use legitimate `[1, 1, H]` hidden states and must not be expanded.
 fn fix_import_sequence_axis(graph: &mut Graph) {
-    let Ok(seq_str) = std::env::var("RLX_ONNX_SEQUENCE_LENGTH") else {
+    let Some(seq_str) = rlx_ir::env::var("RLX_ONNX_SEQUENCE_LENGTH") else {
         return;
     };
     let seq: usize = match seq_str.parse() {
@@ -229,7 +228,7 @@ impl CompilePipeline {
     /// HIR → MIR (block lowering only). **Panic-isolated** (see `compile_hir`):
     /// `lower_hir` is also called directly (bypassing `compile_hir`) from parallel
     /// model-build threads, and the `debug_assert_graph!` verifier `panic!`s on an
-    /// invalid graph — catch it here so it returns [`LowerError::Panicked`] rather
+    /// invalid graph — catch it here so it returns `LowerError::Panicked` rather
     /// than unwinding into a caller thread and aborting the process.
     pub fn lower_hir(hir: HirModule) -> Result<MirModule, rlx_ir::hir::LowerError> {
         let name = hir.name.clone();
@@ -803,7 +802,14 @@ mod tests {
 
         let mut g = Graph::new("dyn");
         let x = g.input("x", Shape::batch_seq_2d(sym::BATCH, sym::SEQ, DType::F32));
-        let w = g.param("w", Shape::new(&[4, 8], DType::F32));
+        // SEQ is this matmul's K, so the binding below has to agree with the
+        // weight's row count. It did not: binding SEQ=16 against a `[4, 8]`
+        // weight specialized to a `[2,16] × [4,8]` matmul, which the verifier
+        // now rejects as `K mismatch: 16 vs 4`. Nothing caught it before —
+        // `matmul_shape` said so all along and `infer_shape` dropped it at a
+        // `.ok()`, so the test asserted that a K-mismatched graph plans and
+        // sizes an arena, which it happily does.
+        let w = g.param("w", Shape::new(&[16, 8], DType::F32));
         let y = g.mm(x, w);
         g.set_outputs(vec![y]);
 

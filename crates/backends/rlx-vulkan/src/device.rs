@@ -147,7 +147,7 @@ impl VulkanDevice {
         // VUID messages print to stderr. Off by default (no runtime cost).
         let validation_layer = c"VK_LAYER_KHRONOS_validation";
         let mut inst_layers: Vec<*const c_char> = Vec::new();
-        if std::env::var("RLX_VULKAN_VALIDATION").ok().as_deref() == Some("1") {
+        if rlx_ir::env::var("RLX_VULKAN_VALIDATION").as_deref() == Some("1") {
             inst_layers.push(validation_layer.as_ptr());
         }
 
@@ -252,7 +252,7 @@ impl VulkanDevice {
             dev_ext.push(f16_ext.as_ptr());
             dev_ext.push(s16_ext.as_ptr());
         }
-        if std::env::var_os("RLX_VULKAN_DEBUG").is_some() {
+        if rlx_ir::env::var_os("RLX_VULKAN_DEBUG").is_some() {
             eprintln!(
                 "[rlx-vulkan] device={name:?} portability={is_portability} coop_matmul={coop_matmul}"
             );
@@ -332,7 +332,7 @@ impl VulkanDevice {
         })
     }
 
-    /// Like [`find_memory_type`], but chosen for an allocation of `size` bytes.
+    /// Like `find_memory_type`, but chosen for an allocation of `size` bytes.
     /// Among the matching types, prefer one whose backing heap can actually hold
     /// `size`, then a *non*-DEVICE_LOCAL heap (GTT / system RAM on an APU — large),
     /// then the largest heap. This keeps an oversubscribed arena out of a tiny
@@ -405,9 +405,9 @@ impl VulkanDevice {
 
     /// Allocate one reusable primary command buffer from the shared pool. The
     /// caller records it once and re-submits it many times via
-    /// [`submit_recorded_wait`] (the schedule is static across runs — inputs
+    /// `submit_recorded_wait` (the schedule is static across runs — inputs
     /// flow through the host-visible arena, not the command stream — so a single
-    /// recording is valid for every step). Free it with [`free_cmds`].
+    /// recording is valid for every step). Free it with `free_cmds`.
     pub fn alloc_primary_cmd(&self) -> vk::CommandBuffer {
         unsafe {
             self.device
@@ -429,7 +429,7 @@ impl VulkanDevice {
     }
 
     /// Create one unsignaled fence, reused across submits (reset after each
-    /// wait). Avoids the per-step create/destroy of [`submit_and_wait`].
+    /// wait). Avoids the per-step create/destroy of `submit_and_wait`.
     pub fn create_reusable_fence(&self) -> vk::Fence {
         unsafe {
             self.device
@@ -438,7 +438,7 @@ impl VulkanDevice {
         }
     }
 
-    /// Destroy a fence created by [`create_reusable_fence`].
+    /// Destroy a fence created by `create_reusable_fence`.
     pub fn destroy_fence(&self, fence: vk::Fence) {
         unsafe {
             self.device.destroy_fence(fence, None);

@@ -113,7 +113,7 @@ laid out so the dequant kernel can decode it without a side lookup.
 see `scheme.is_gguf()` and `Graph::dequant_matmul_packed`.
 
 **Backend paths** (GPU scheme ids, fused GEMV, ANE constexpr, TPU
-compile-time bake): [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+compile-time bake): [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
 The CPU backend dequants every scheme; GPU backends use native
 `dequant_gguf` kernels where listed in that doc. Metal additionally

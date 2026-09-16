@@ -78,6 +78,11 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         crate::ExecutableCapabilities {
             clone: true,
             gpu_handles: true,
+            // Device-resident KV row feed: `register_kv_row_feed` +
+            // `feed_kv_row`, backed by a shard-aware device-to-device arena
+            // copy. Without this the `Op::KvAppend` fast path does not remove
+            // the O(context) cost — the past KV is still re-uploaded each step.
+            kv_resident: true,
             typed_io: true,
             active_extent: true,
             ..crate::ExecutableCapabilities::NONE
@@ -99,6 +104,13 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     }
     fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         self.inner.bind_gpu_handle(name, data)
+    }
+    fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+        self.inner.register_kv_row_feed(handle_name, output_index);
+        true
+    }
+    fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
+        self.inner.feed_kv_row(src_row, dst_row, row_elems)
     }
     fn has_gpu_handle(&self, name: &str) -> bool {
         self.inner.has_gpu_handle(name)

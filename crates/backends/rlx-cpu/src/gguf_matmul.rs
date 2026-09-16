@@ -53,6 +53,13 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
         // so `out` maps 1:1. FV5 = transformer linears, FV5B = int8 embed/lm_head.
         QuantScheme::GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5_block(block, out),
         QuantScheme::GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b_block(block, out),
+        // 32-element exact-ternary block (Doses AI Pestle embed / lm_head).
+        QuantScheme::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0_block(
+            block,
+            (&mut out[..rlx_gguf::g8_dequant::QKG8_0])
+                .try_into()
+                .unwrap(),
+        ),
         // 32-element blocks: caller slices `out` to the correct length.
         QuantScheme::GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4_block(
             block,
@@ -589,6 +596,7 @@ pub fn dequant_moe_weights_to_grouped_f32(
             QuantScheme::GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(slab, k * n),
             QuantScheme::GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(slab, k * n),
             QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(slab, k * n),
+            QuantScheme::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(slab, k * n),
             other => panic!("dequant_moe_weights: unsupported scheme {other:?}"),
         }
         .expect("dequant_moe_weights: slab dequant failed");
@@ -1275,7 +1283,7 @@ fn aarch64_has_dotprod() -> bool {
     // `RLX_Q4K_NO_DOTPROD=1` forces the baseline path (A/B benchmarking, or a
     // hedge against a mis-detected feature on an exotic core).
     *OK.get_or_init(|| {
-        std::env::var_os("RLX_Q4K_NO_DOTPROD").is_none()
+        rlx_ir::env::var_os("RLX_Q4K_NO_DOTPROD").is_none()
             && std::arch::is_aarch64_feature_detected!("dotprod")
     })
 }

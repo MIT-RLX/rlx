@@ -11,7 +11,7 @@
 //! new op — that resamples D, H, W one axis at a time by moving that axis last
 //! (`transpose_`), applying a host-built `[L_in, L_out]` matrix via `mm`, and
 //! moving it back. So it lowers entirely to existing kernels and runs on every
-//! backend, matching the 1-D idea in [`super::upsample::Graph::interpolate1d`].
+//! backend, matching the 1-D idea in `super::upsample::Graph::interpolate1d`.
 
 use crate::infer::GraphExt as _;
 use crate::ops::upsample::InterpMode;
@@ -324,6 +324,52 @@ impl Graph {
             out_dhw.iter().all(|&l| l > 0),
             "interpolate3d: out_dhw must be positive"
         );
+        // Nearest at an integer upscale is voxel replication, which is a
+        // reshape, a broadcast, and a reshape — no arithmetic at all. The
+        // separable path below instead pays, per axis, a transpose, a matmul
+        // against a one-hot `[L_in, L_out]` matrix, and a transpose back:
+        // measured on Metal, six transposes and three GEMMs to replicate each
+        // volume, 3.9 ms of a 33 ms network.
+        //
+        // Splitting every axis into `(len, 1)` and broadcasting the singleton
+        // to `k` gives `[N, C, D, k, H, k, W, k]`, whose row-major order is
+        // `n, c, d, i, h, j, w, l` — exactly the order of the target
+        // `[N, C, kD, kH, kW]`. So both reshapes are free and the expand is
+        // the single unavoidable write of the output.
+        //
+        // The two index rules agree on exactly this case. With
+        // `align_corners = false` the separable path selects source
+        // `floor((j + 0.5) * in/out)`; for `out = k * in` that is `floor(j/k)`,
+        // which is what replication does. Downsampling, non-integer ratios,
+        // `align_corners`, and Linear all keep the general path, where the
+        // rules do *not* coincide.
+        if matches!(mode, InterpMode::Nearest) && !align_corners {
+            let factors: Option<Vec<usize>> = (0..3)
+                .map(|i| {
+                    let l_in = xs.dim(2 + i).unwrap_static();
+                    (out_dhw[i] >= l_in && out_dhw[i].is_multiple_of(l_in))
+                        .then_some(out_dhw[i] / l_in)
+                })
+                .collect();
+            if let Some(k) = factors {
+                let n = xs.dim(0).unwrap_static();
+                let c = xs.dim(1).unwrap_static();
+                let l: Vec<usize> = (0..3).map(|i| xs.dim(2 + i).unwrap_static()).collect();
+                let split = [n, c, l[0], 1, l[1], 1, l[2], 1];
+                let target = [n, c, l[0], k[0], l[1], k[1], l[2], k[2]];
+                let out = [n, c, out_dhw[0], out_dhw[1], out_dhw[2]];
+                let as_i64 = |v: &[usize]| v.iter().map(|&d| d as i64).collect::<Vec<i64>>();
+                let y = self.reshape_(x, as_i64(&split));
+                let y = self.add_node(
+                    crate::Op::Expand {
+                        target_shape: as_i64(&target),
+                    },
+                    vec![y],
+                    crate::Shape::new(&target, xs.dtype()),
+                );
+                return self.reshape_(y, as_i64(&out));
+            }
+        }
         // Resample D (axis 2), then H (axis 3), then W (axis 4). Each pass is a
         // 1-D separable resample of one axis — order does not matter.
         let mut y = x;

@@ -14,14 +14,14 @@ use crate::decompose_backward_kernels::{
     SCAN_DECOMPOSE_MAX_LENGTH, compose_ada_layer_norm_backward, compose_conv2d_backward_input,
     compose_conv2d_backward_weight, compose_conv2d_backward_weight_im2col,
     compose_conv3d_backward_input, compose_conv3d_backward_weight, compose_cumsum_backward,
-    compose_fake_quantize_backward, compose_gated_residual_backward, compose_gather_backward,
-    compose_group_norm_backward_beta, compose_group_norm_backward_gamma,
-    compose_group_norm_backward_input, compose_layer_norm_backward_gamma,
-    compose_layer_norm_backward_input, compose_max_pool2d_backward, compose_max_pool3d_backward,
-    compose_rms_norm_backward_beta, compose_rms_norm_backward_gamma,
-    compose_rms_norm_backward_input, compose_rope_backward, compose_scan_backward,
-    compose_scan_backward_xs, compose_softmax_cross_entropy_backward, conv_di_decompose_eligible,
-    conv_dw_im2col_eligible, emit_attention_backward,
+    compose_fake_quantize_backward, compose_gated_delta_net_backward,
+    compose_gated_residual_backward, compose_gather_backward, compose_group_norm_backward_beta,
+    compose_group_norm_backward_gamma, compose_group_norm_backward_input,
+    compose_layer_norm_backward_gamma, compose_layer_norm_backward_input,
+    compose_max_pool2d_backward, compose_max_pool3d_backward, compose_rms_norm_backward_beta,
+    compose_rms_norm_backward_gamma, compose_rms_norm_backward_input, compose_rope_backward,
+    compose_scan_backward, compose_scan_backward_xs, compose_softmax_cross_entropy_backward,
+    conv_di_decompose_eligible, conv_dw_im2col_eligible, emit_attention_backward,
 };
 
 /// Rewrite `*Backward` ops into primitive chains; copy everything else.
@@ -78,6 +78,7 @@ fn contains_training_backward_except(g: &Graph, preserved: &[OpKind]) -> bool {
                 | Op::ScanBackwardXs { .. }
                 | Op::AdaLayerNormBackward { .. }
                 | Op::GatedResidualBackward
+                | Op::GatedDeltaNetBackward { .. }
         )
     })
 }
@@ -249,11 +250,15 @@ fn decompose_backward_ops_once_except(g: Graph, preserved: &[OpKind]) -> Graph {
                 };
                 compose_group_norm_backward_beta(&mut out, dy, &node.shape)
             }
-            Op::RopeBackward { head_dim, n_rot } => {
+            Op::RopeBackward {
+                head_dim,
+                n_rot,
+                style,
+            } => {
                 let [dy, cos, sin] = new_inputs[..] else {
                     panic!("RopeBackward expects [dy, cos, sin]");
                 };
-                compose_rope_backward(&mut out, dy, cos, sin, *head_dim, *n_rot)
+                compose_rope_backward(&mut out, dy, cos, sin, *head_dim, *n_rot, *style)
             }
             Op::AttentionBackward {
                 num_heads,
@@ -393,6 +398,23 @@ fn decompose_backward_ops_once_except(g: Graph, preserved: &[OpKind]) -> Graph {
                 };
                 compose_fake_quantize_backward(&mut out, x, dy, &node.shape, *bits, *axis, *ste)
             }
+            // Rebuilds the forward from this node's own inputs, unrolls it and
+            // differentiates that — the `RLX_GDN_UNFUSE_FOR_AD` path,
+            // reconstructed at the backend boundary rather than chosen by a
+            // global flag before AD ran. Reached only when the target backend
+            // does not claim `GatedDeltaNetBackward` (CPU / Metal / MLX do).
+            Op::GatedDeltaNetBackward {
+                state_size,
+                carry_state,
+                gate_per_channel,
+            } => compose_gated_delta_net_backward(
+                &mut out,
+                &new_inputs,
+                *state_size,
+                *carry_state,
+                *gate_per_channel,
+                &node.shape,
+            ),
             Op::ScanBackward {
                 body_vjp,
                 length,
@@ -776,17 +798,33 @@ mod tests {
         assert_input_backward_decomposed(&decomposed);
     }
 
+    /// Both pairing conventions must decompose, and each must re-emit the
+    /// forward in **its own** style. The decomposition used to hardcode
+    /// `rope_n` (NeoX), so a GptJ adjoint decomposed into a NeoX rotation.
     #[test]
     fn decompose_rope_backward() {
-        let f = DType::F32;
-        let mut g = Graph::new("rope_decomp");
-        let dy = g.input("dy", Shape::new(&[1, 2, 4], f));
-        let cos = g.input("cos", Shape::new(&[2], f));
-        let sin = g.input("sin", Shape::new(&[2], f));
-        let dx = g.rope_backward(dy, cos, sin, 4, 4);
-        g.set_outputs(vec![dx]);
-        let decomposed = decompose_backward_ops(g);
-        assert_input_backward_decomposed(&decomposed);
+        for style in [rlx_ir::op::RopeStyle::NeoX, rlx_ir::op::RopeStyle::GptJ] {
+            let f = DType::F32;
+            let mut g = Graph::new("rope_decomp");
+            let dy = g.input("dy", Shape::new(&[1, 2, 4], f));
+            let cos = g.input("cos", Shape::new(&[2], f));
+            let sin = g.input("sin", Shape::new(&[2], f));
+            let dx = g.rope_backward(dy, cos, sin, 4, 4, style);
+            g.set_outputs(vec![dx]);
+            let decomposed = decompose_backward_ops(g);
+            assert_input_backward_decomposed(&decomposed);
+            // The re-emitted forward carries the same pairing it is the
+            // adjoint of — the whole point of threading `style` through.
+            let emitted: Vec<_> = decomposed
+                .nodes()
+                .iter()
+                .filter_map(|n| match &n.op {
+                    Op::Rope { style, .. } => Some(*style),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(emitted, vec![style], "decomposed to the wrong RoPE style");
+        }
     }
 
     #[test]

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Lower logical kernels to common IR when native backend ops are unavailable.
 //!
-//! Runs before [`rlx_compile::rewrite_for_backend`] so native `supported_ops` still win under
-//! [`KernelDispatchPolicy::PreferNative`].
+//! Runs before `rlx_compile::rewrite_for_backend` so native `supported_ops` still win under
+//! [`KernelDispatchPolicy::PreferNative`](rlx_ir::KernelDispatchPolicy::PreferNative).
 
 use crate::lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNearest2x};
 use crate::pass::Pass;

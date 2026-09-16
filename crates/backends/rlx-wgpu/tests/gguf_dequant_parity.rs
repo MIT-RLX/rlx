@@ -32,12 +32,34 @@ fn cpu_dequant_gguf(scheme_id: u32, packed: &[u8], elems: usize) -> Vec<f32> {
         GgufNVFP4 => rlx_gguf::mx_dequant::dequant_nvfp4(packed, elems).unwrap(),
         GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(packed, elems).unwrap(),
         GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(packed, elems).unwrap(),
+        GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(packed, elems).unwrap(),
+        GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(packed, elems).unwrap(),
         other => panic!("cpu_dequant_gguf: unsupported scheme_id {scheme_id} ({other})"),
     }
 }
 
+/// `None` when there is no usable adapter — a busy or full GPU, not a defect.
+///
+/// These tests used to `.expect("no wgpu adapter")`, which turns "somebody
+/// else's job filled the GPU" into 24 simultaneous FAILUREs that read exactly
+/// like a numerical regression. That cost real debugging time. Skip instead,
+/// loudly; `RLX_REQUIRE_DEVICE=1` makes it a failure again for rig runs where a
+/// missing device genuinely means the run proved nothing.
+fn adapter_or_skip() -> Option<&'static rlx_wgpu::device::WgpuDevice> {
+    if let Some(d) = rlx_wgpu::device::wgpu_device() {
+        return Some(d);
+    }
+    assert!(
+        !rlx_ir::env::flag("RLX_REQUIRE_DEVICE"),
+        "RLX_REQUIRE_DEVICE=1 but no wgpu adapter is present — this run would \
+         have reported a vacuous pass"
+    );
+    eprintln!("no wgpu adapter (busy or out of memory?) — skipping");
+    None
+}
+
 fn run_wgpu_dequant(scheme_id: u32, block_bytes: &[u8], num_blocks: u32) -> Vec<f32> {
-    let dev = rlx_wgpu::device::wgpu_device().expect("no wgpu adapter");
+    let dev = rlx_wgpu::device::wgpu_device().expect("adapter checked by `parity`");
     let total_out_elems = num_blocks as usize * scheme_block_elems(scheme_id);
     let weight_bytes = block_bytes.len();
     let dst_byte_off = weight_bytes.div_ceil(16) * 16;
@@ -136,6 +158,13 @@ fn run_wgpu_dequant(scheme_id: u32, block_bytes: &[u8], num_blocks: u32) -> Vec<
 }
 
 fn parity(scheme_id: u32, packed: &[u8], elems: usize, tol: f32, name: &str) {
+    // The skip has to be HERE, in the function every case funnels through — not
+    // in `run_wgpu_dequant`, which returns a value the caller then compares.
+    // Returning an empty Vec from the helper does not skip anything; it just
+    // fails the length assertion below with a misleading message.
+    if adapter_or_skip().is_none() {
+        return;
+    }
     let num_blocks = (elems / scheme_block_elems(scheme_id)) as u32;
     let gpu_out = run_wgpu_dequant(scheme_id, packed, num_blocks);
     let cpu_out = cpu_dequant_gguf(scheme_id, packed, elems);
@@ -432,4 +461,34 @@ fn tq2_0_wgsl_matches_cpu_reference() {
         packed.extend_from_slice(&block);
     }
     parity(9, &packed, 512, 1e-5, "TQ2_0");
+}
+
+/// G8_0 (Doses AI Pestle embed / lm_head): four bf16 scales per 32-element
+/// block, one per group of 8. The per-group granularity is the whole point
+/// of the format, so the fixture spreads the four scales 64× apart — a
+/// kernel that read one block-wide scale, or read the scales as f16, fails
+/// this rather than drifting.
+#[test]
+fn g8_0_wgsl_matches_cpu_reference() {
+    let w: Vec<f32> = (0..512)
+        .map(|i| {
+            let d = 0.125 * 4f32.powi(((i / 8) % 4) as i32);
+            [-1.0f32, 0.0, 1.0][i % 3] * d
+        })
+        .collect();
+    let packed = rlx_gguf::g8_dequant::quantize_g8_0(&w).expect("quantize G8_0");
+    parity(28, &packed, 512, 1e-5, "G8_0");
+}
+
+/// Q2_0 (PrismML Bonsai / Doses AI Pestle factor pairs): f16 group scale +
+/// 128 two-bit codes → `(q-1)*d`. Reaches the WGSL kernel via the scratch
+/// path (`gemv_supports_scheme` covers only Q4_K/Q6_K/Q1_0), so a missing
+/// branch here reads as zeros rather than raising.
+#[test]
+fn q2_0_wgsl_matches_cpu_reference() {
+    let w: Vec<f32> = (0..512)
+        .map(|i| [-0.35f32, 0.0, 0.35, 0.7][i % 4] * (1.0 + (i / 128) as f32))
+        .collect();
+    let packed = rlx_gguf::q2_dequant::quantize_q2_0(&w).expect("quantize Q2_0");
+    parity(25, &packed, 512, 1e-5, "Q2_0");
 }

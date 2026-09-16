@@ -29,7 +29,7 @@ anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 safetensors = { version = "0.7", optional = true }
-rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.14", optional = true, default-features = false }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.16", optional = true, default-features = false }
 rlx-nemo = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -47,3 +47,8 @@ required-features = ["safetensors"]
 name = "fidelity_check"
 path = "examples/fidelity_check.rs"
 required-features = ["safetensors"]
+
+[package.metadata.docs.rs]
+features       = ["safetensors", "onnx"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

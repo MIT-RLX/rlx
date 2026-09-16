@@ -50,13 +50,13 @@ throughput unlock — Phase H made matmul-interleaved schedules use it.
   [`backend::has_metal_dequant_kernel`].
 - **Fused decode GEMV** — single-pass matvec when `m == 1` (skips f32 scratch):
   Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M (`dequant_gguf.msl`).
-  See [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md) for shape
+  See [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) for shape
   constraints and disable env vars.
 - **FP8 / NVFP4 block matmul** — `dequant_matmul_fp8` / `dequant_matmul_nvfp4`
   MSL for non-GGUF `QuantScheme::Fp8*` / `Nvfp4Block` (CPU fallback when
   deferred host ops are pending).
 
-Full backend matrix: [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md).
+Full backend matrix: [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 Parity vs `rlx_gguf` on real Qwen3-0.6B weights:
 [`tests/iq_full_real_weights.rs`](tests/iq_full_real_weights.rs),
 [`tests/iq_mv_parity.rs`](tests/iq_mv_parity.rs),
@@ -106,7 +106,7 @@ Gating env vars worth knowing:
 - `RLX_METAL_IQ4NL_FUSED_DISABLE=1` and `RLX_METAL_IQ{2,3,1}*_FUSED_DISABLE=1` —
   disable fused IQ-family GEMV paths.
 
-See [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md) for the
+See [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) for the
 full GGUF env table.
 
 ## Status

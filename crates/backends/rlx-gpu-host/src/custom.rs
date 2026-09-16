@@ -132,7 +132,7 @@ pub fn run_custom_host_bytes<A: DeviceArena>(
     rlx_cpu::op_registry::run_custom_op_host(name, &in_pairs, (&mut out, out_shape), attrs)
         .unwrap_or_else(|e| panic!("rlx-gpu-host custom-op '{name}': {e}"));
 
-    if std::env::var("RLX_DBG_CUSTOM").is_ok() {
+    if rlx_ir::env::var("RLX_DBG_CUSTOM").is_some() {
         eprintln!(
             "[gpu-host-custom] {name} out_off={out_byte_off} out_dtype={:?} out_n={out_n} in={:?}",
             out_shape.dtype(),

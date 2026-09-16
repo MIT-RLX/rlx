@@ -172,7 +172,7 @@ fn op_kind(op: &Op) -> OpKind {
         | Op::Pool { .. }
         | Op::FusedAttentionBlock { .. }
         | Op::TopK { .. }
-        | Op::ScatterAdd
+        | Op::ScatterAdd { .. }
         | Op::ScatterNd { .. }
         | Op::ScatterElements { .. }
         | Op::GatherNd { .. }
@@ -413,7 +413,7 @@ impl Pass for AutoMixedPrecision {
                 | Op::GroupNorm { .. }
                 | Op::FusedAttentionBlock { .. }
                 | Op::TopK { .. }
-                | Op::ScatterAdd
+                | Op::ScatterAdd { .. }
                 | Op::ScatterNd { .. }
                 | Op::ScatterElements { .. }
                 | Op::GatherNd { .. }
@@ -549,6 +549,15 @@ impl Pass for AutoMixedPrecision {
                 node.shape.clone()
             } else if let Op::Cast { to } = &node.op {
                 node.shape.clone().with_dtype(*to)
+            } else if !matches!(node.shape.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+                // An op that *produces* a non-float produces it under every
+                // precision policy — integer indices, masks, and fixed-point
+                // transforms (`Op::FftQ`) are bit patterns, not AMP floats.
+                // This is the same rule the input loop above applies; it was
+                // only being enforced for boundaries, so an integer-valued
+                // compute op was relabeled F32 and its backend then rejected
+                // it on dtype.
+                node.shape.clone()
             } else {
                 node.shape.clone().with_dtype(target.dtype())
             };

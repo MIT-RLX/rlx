@@ -30,3 +30,8 @@ rayon = { version = "1.10", optional = true }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["runner", "parallel"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

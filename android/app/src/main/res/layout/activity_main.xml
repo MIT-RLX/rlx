@@ -46,4 +46,13 @@
         app:layout_constraintBaseline_toBaselineOf="@id/runButton"
         app:layout_constraintStart_toEndOf="@id/runButton" />
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/nodeButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="@string/open_node"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/runButton" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>

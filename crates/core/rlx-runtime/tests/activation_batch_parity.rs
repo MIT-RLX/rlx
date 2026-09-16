@@ -105,6 +105,7 @@ fn xs() -> Vec<f32> {
 
 #[test]
 fn activation_batch_cpu_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let x = xs();
     for a in ACTS {
         let want: Vec<f32> = x.iter().map(|&v| eval(v, a)).collect();
@@ -154,16 +155,33 @@ fn check_device(device: Device, label: &str) {
     }
 }
 
+// This file carried its own `skip_unless_available`, byte-similar to
+// `common::skip_unless_available` but WITHOUT the `RLX_REQUIRE_DEVICE` assert —
+// so it was exempt from the flag while reading exactly like a file that
+// honoured it. Use the shared one.
+mod common;
+// Every call site is behind a backend cfg, so a build with none of them (e.g.
+// `cpu,rocm`, where this file's ROCm case does not exist) leaves the import
+// unused. `common/mod.rs` carries `#![allow(dead_code)]` for the same reason:
+// one shared helper module, many binaries, each using a different subset.
+#[allow(unused_imports)]
+use common::skip_unless_available;
+
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn activation_batch_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if skip_unless_available(Device::Metal, "metal") {
+        return;
+    }
     check_device(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn activation_batch_mlx_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if skip_unless_available(Device::Mlx, "mlx") {
         return;
     }
     check_device(Device::Mlx, "mlx");
@@ -172,13 +190,18 @@ fn activation_batch_mlx_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn activation_batch_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if skip_unless_available(Device::Gpu, "wgpu") {
+        return;
+    }
     check_device(Device::Gpu, "wgpu");
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn activation_batch_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     check_device(Device::Cuda, "cuda");

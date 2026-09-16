@@ -19,6 +19,8 @@ use rlx_ir::fft::FftNorm;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -48,6 +50,7 @@ fn run(dev: Device, n: usize, sig_bytes: &[u8]) -> (Vec<f32>, Vec<f32>) {
 // tolerance (FFT magnitude scales with n).
 #[test]
 fn fft_real_multikernel_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for &n in &[8192usize, 16384, 32768] {
         let sig: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).sin()).collect();
         let sig_bytes: Vec<u8> = sig.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -77,6 +80,7 @@ fn fft_real_multikernel_matches_cpu() {
 
 #[test]
 fn fft_real_fusion_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for &n in &[2048usize, 4096] {
         let sig: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).sin()).collect();
         let sig_bytes: Vec<u8> = sig.iter().flat_map(|v| v.to_le_bytes()).collect();

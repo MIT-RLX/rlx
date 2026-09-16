@@ -250,7 +250,13 @@ pub fn fusion_passes_for_supported(
     //   FusedMatMulBiasAct(qkv) → narrow×3 → Attention → FusedMatMulBiasAct(out)
     // which is the pattern BERT-family encoders actually present after the
     // per-layer matmul+bias fusion has collapsed Q, K, V, and out projections.
-    if supports_op(supported, OpKind::FusedMatMulBiasAct) {
+    // `RLX_DISABLE_MATMUL_BIAS_FUSION=1` keeps `matmul → add(bias)` decomposed.
+    // Ablation knob: two ports (`rlx-vieeg` on wgpu, `rlx-tinymyo` on every
+    // accelerator) diverge from CPU at the op immediately *after* such a pair,
+    // and there was no way to take the fusion out of the picture to confirm it.
+    if supports_op(supported, OpKind::FusedMatMulBiasAct)
+        && rlx_ir::env::var("RLX_DISABLE_MATMUL_BIAS_FUSION").as_deref() != Some("1")
+    {
         passes.push(&FuseMatMulBiasAct);
     }
     // Conv + bias + activation → cuDNN's fused conv-bias-activation (CUDA only
@@ -282,7 +288,13 @@ pub fn fusion_passes_for_supported(
     // FuseResidualLN must run BEFORE FuseTransformerLayer: the layer-level
     // pass matches `FAB → FusedResidualLN → FMBA(GeLU) → FMBA → FusedResidualLN`
     // and needs the residual+LN ops already collapsed.
-    if supports_op(supported, OpKind::FusedResidualLN) {
+    // `RLX_DISABLE_RESIDUAL_LN_FUSION=1` keeps `residual + LayerNorm` apart.
+    // The fused form *tees*: it writes both the normed output and the residual
+    // sum, so it is the only op in these graphs that writes a slot it does not
+    // own — worth being able to take out of the picture.
+    if rlx_ir::env::var("RLX_DISABLE_RESIDUAL_LN_FUSION").as_deref() != Some("1")
+        && supports_op(supported, OpKind::FusedResidualLN)
+    {
         passes.push(&FuseResidualLN);
     }
     if supports_op(supported, OpKind::FusedResidualRmsNorm) {
@@ -293,7 +305,13 @@ pub fn fusion_passes_for_supported(
     if supports_op(supported, OpKind::AdaLayerNorm) {
         passes.push(&FuseAdaLayerNorm);
     }
-    if supports_op(supported, OpKind::GatedResidual) {
+    // `RLX_DISABLE_GATED_RESIDUAL_FUSION=1` keeps the gated residual decomposed.
+    // Ablation knob: it is one of the few fused ops with a distinct kernel per
+    // backend, so it is a candidate whenever CPU disagrees with every
+    // accelerator on an otherwise identical graph.
+    if supports_op(supported, OpKind::GatedResidual)
+        && rlx_ir::env::var("RLX_DISABLE_GATED_RESIDUAL_FUSION").as_deref() != Some("1")
+    {
         passes.push(&FuseGatedResidual);
     }
     passes.push(&FuseRmsNormReshape);
@@ -724,7 +742,25 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Serializes every test that builds a pass list.
+    ///
+    /// `RLX_NO_NATIVE_FK_REGIONS` is a *process-global* env var that
+    /// `apply_native_fk_defaults` reads for **every** target, and
+    /// `tpu_native_fk_region_pass_policy` sets it. Any test calling
+    /// `fusion_passes` or `apply_native_fk_defaults` concurrently with that
+    /// one sees `native_fk_regions = false` and fails on an assertion that
+    /// has nothing to do with what it is testing. Hold this lock in any new
+    /// test here that builds a pass list.
     static ENV_FK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take [`ENV_FK_TEST_LOCK`], ignoring poisoning.
+    ///
+    /// The mutex orders env-var access; it guards no invariant that a panicking
+    /// test could leave broken. Unwrapping instead would turn one real failure
+    /// into a cascade of `PoisonError` panics in every sibling test.
+    fn env_fk_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_FK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// The one-call `fuse` / `Fuse` API folds matmul+bias+act on CPU and keeps
     /// Input/Param leaves recoverable by name in the rewritten graph — the
@@ -764,6 +800,7 @@ mod tests {
 
     #[test]
     fn cpu_pipeline_includes_attention_block() {
+        let _lock = env_fk_lock();
         let passes = fusion_passes(FusionTarget::Cpu, FusionOptions::default());
         assert_eq!(
             passes.len(),
@@ -787,6 +824,7 @@ mod tests {
 
     #[test]
     fn metal_skip_fusion_only_lowers_dot() {
+        let _lock = env_fk_lock();
         let passes = fusion_passes(
             FusionTarget::Metal,
             FusionOptions {
@@ -849,6 +887,7 @@ mod tests {
 
     #[test]
     fn metal_unfuses_elementwise_regions_by_default() {
+        let _lock = env_fk_lock();
         let passes = fusion_passes(FusionTarget::Metal, FusionOptions::default());
         assert!(
             passes
@@ -859,6 +898,7 @@ mod tests {
 
     #[test]
     fn metal_default_unfuse_preserves_prologue_regions() {
+        let _lock = env_fk_lock();
         let mut g = rlx_ir::Graph::new("t");
         let shape_in = rlx_ir::Shape::new(&[1, 3, 8, 8], rlx_ir::DType::F32);
         let shape_out = rlx_ir::Shape::new(&[1, 3, 16, 16], rlx_ir::DType::F32);
@@ -886,6 +926,7 @@ mod tests {
 
     #[test]
     fn fk_passes_after_elementwise_includes_batch_fusion() {
+        let _lock = env_fk_lock();
         let opts = FusionOptions::default().apply_native_fk_defaults(FusionTarget::Tpu);
         let passes =
             fk_passes_after_elementwise_regions(supported_for_target(FusionTarget::Tpu), opts);
@@ -900,7 +941,7 @@ mod tests {
 
     #[test]
     fn tpu_native_fk_region_pass_policy() {
-        let _lock = ENV_FK_TEST_LOCK.lock().unwrap();
+        let _lock = env_fk_lock();
         let default_passes = fusion_passes(FusionTarget::Tpu, FusionOptions::default());
         assert!(
             !default_passes
@@ -922,6 +963,7 @@ mod tests {
 
     #[test]
     fn native_fk_regions_skips_decompose_on_tpu() {
+        let _lock = env_fk_lock();
         let passes = fusion_passes(
             FusionTarget::Tpu,
             FusionOptions {
@@ -941,6 +983,7 @@ mod tests {
 
     #[test]
     fn native_fk_regions_skips_decompose_on_metal() {
+        let _lock = env_fk_lock();
         let passes = fusion_passes(
             FusionTarget::Metal,
             FusionOptions {
@@ -960,6 +1003,7 @@ mod tests {
 
     #[test]
     fn metal_keeps_elementwise_regions_when_requested() {
+        let _lock = env_fk_lock();
         let passes = fusion_passes(
             FusionTarget::Metal,
             FusionOptions {

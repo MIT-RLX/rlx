@@ -23,7 +23,7 @@ fn cpu_run(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 
 #[test]
 fn interpolate3d_2x_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda interpolate3d] no CUDA device — skipping");
         return;
     }
@@ -43,7 +43,7 @@ fn interpolate3d_2x_matches_cpu() {
 
 #[test]
 fn interpolate3d_asymmetric_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda interpolate3d] no CUDA device — skipping asymmetric");
         return;
     }

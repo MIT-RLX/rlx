@@ -38,7 +38,9 @@ use rlx_ir::{Graph, Shape};
     feature = "vulkan",
     all(feature = "metal", target_os = "macos")
 ))]
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 const F: DType = DType::F32;
 const EPS: f32 = 1e-5;
@@ -180,7 +182,8 @@ fn dc_ramp(n: usize, seed: usize) -> Vec<f32> {
 #[test]
 #[cfg(feature = "cuda")]
 fn cuda_softmax_non_last_axis_matches_reference() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip cuda_softmax_non_last_axis (CUDA unavailable)");
         return;
     }
@@ -214,7 +217,8 @@ fn cuda_softmax_non_last_axis_matches_reference() {
 #[test]
 #[cfg(feature = "cuda")]
 fn cuda_group_norm_dc_offset_matches_cpu() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip cuda_group_norm_dc_offset (CUDA unavailable)");
         return;
     }
@@ -253,7 +257,8 @@ fn cuda_group_norm_dc_offset_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn wgpu_layer_norm_dc_offset_matches_two_pass_reference() {
-    if !is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip wgpu_layer_norm_dc_offset (wgpu unavailable)");
         return;
     }
@@ -300,6 +305,7 @@ fn wgpu_layer_norm_dc_offset_matches_two_pass_reference() {
 /// keeps the lock meaningful on CUDA-less / wgpu-less hosts.
 #[test]
 fn dc_offset_exposes_one_pass_layer_norm_cancellation() {
+    let _gpu = common::serialize_gpu();
     let (rows, inner) = (2usize, 32usize);
     let x = dc_ramp(rows * inner, 3);
     let gamma = vec![1.0f32; inner];
@@ -322,7 +328,8 @@ fn dc_offset_exposes_one_pass_layer_norm_cancellation() {
 #[test]
 #[cfg(feature = "gpu")]
 fn wgpu_layer_norm_striding_matches_two_pass_reference() {
-    if !is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip wgpu_layer_norm_striding (wgpu unavailable)");
         return;
     }
@@ -402,7 +409,8 @@ fn ref_rms_norm_two_pass(
 #[test]
 #[cfg(feature = "gpu")]
 fn wgpu_rms_norm_striding_matches_two_pass_reference() {
-    if !is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip wgpu_rms_norm_striding (wgpu unavailable)");
         return;
     }
@@ -447,7 +455,8 @@ fn wgpu_rms_norm_striding_matches_two_pass_reference() {
 #[test]
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn metal_rms_norm_matches_cpu_oracle() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         eprintln!("skip metal_rms_norm (Metal unavailable)");
         return;
     }
@@ -505,7 +514,8 @@ fn rms_norm_two_pass_beta_case() -> (Graph, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f3
 #[test]
 #[cfg(feature = "cuda")]
 fn cuda_rms_norm_matches_cpu_oracle() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     let (g, x, gamma, beta, two) = rms_norm_two_pass_beta_case();
@@ -522,7 +532,8 @@ fn cuda_rms_norm_matches_cpu_oracle() {
 #[test]
 #[cfg(feature = "rocm")]
 fn rocm_rms_norm_matches_cpu_oracle() {
-    if !is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         return;
     }
     let (g, x, gamma, beta, two) = rms_norm_two_pass_beta_case();
@@ -539,7 +550,8 @@ fn rocm_rms_norm_matches_cpu_oracle() {
 #[test]
 #[cfg(feature = "vulkan")]
 fn vulkan_rms_norm_matches_cpu_oracle() {
-    if !is_available(Device::Vulkan) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Vulkan, "vulkan") {
         return;
     }
     let (g, x, gamma, beta, two) = rms_norm_two_pass_beta_case();
@@ -578,7 +590,8 @@ fn layer_norm_dc_case() -> (Graph, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 #[test]
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn metal_layer_norm_dc_offset_matches_two_pass() {
-    if !is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let (g, x, gamma, beta, two) = layer_norm_dc_case();
@@ -590,12 +603,13 @@ fn metal_layer_norm_dc_offset_matches_two_pass() {
 #[test]
 #[cfg(feature = "cuda")]
 fn cuda_layer_norm_dc_offset_matches_two_pass() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     let (g, x, gamma, beta, two) = layer_norm_dc_case();
     let inputs: &[(&str, &[f32])] = &[("x", &x), ("gamma", &gamma), ("beta", &beta)];
-    // msi CPU is x86_64+AVX2 → also validates the AVX CPU two-pass LayerNorm.
+    // That rig's CPU is x86_64+AVX2 → also validates the AVX CPU two-pass LayerNorm.
     let cpu = run(Device::Cpu, g.clone(), inputs);
     assert_close("cpu(avx) LayerNorm DC vs two-pass", &cpu, &two, 1e-3);
     let got = run(Device::Cuda, g, inputs);
@@ -605,7 +619,8 @@ fn cuda_layer_norm_dc_offset_matches_two_pass() {
 #[test]
 #[cfg(feature = "rocm")]
 fn rocm_layer_norm_dc_offset_matches_two_pass() {
-    if !is_available(Device::Rocm) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Rocm, "rocm") {
         return;
     }
     let (g, x, gamma, beta, two) = layer_norm_dc_case();
@@ -622,7 +637,8 @@ fn rocm_layer_norm_dc_offset_matches_two_pass() {
 #[test]
 #[cfg(feature = "gpu")]
 fn wgpu_softmax_last_axis_striding_matches_reference() {
-    if !is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip wgpu_softmax_striding (wgpu unavailable)");
         return;
     }

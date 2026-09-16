@@ -77,6 +77,14 @@ pub fn var(key: &str) -> Option<String> {
 }
 
 /// Like [`var`] but returns an `OsString` (mirrors `std::env::var_os`).
+///
+/// **Not** a drop-in for `std::env::var_os` on non-UTF-8 values: this routes
+/// through [`var`], which uses `std::env::var(..).ok()` and therefore drops a
+/// value that is not valid UTF-8, where `std::env::var_os` would return it.
+/// That is deliberate — an override is stored as a `String`, so there is no
+/// representation for non-UTF-8 here — but it means a path-valued `RLX_*`
+/// variable containing invalid UTF-8 (possible on Linux, not on macOS) is
+/// treated as unset rather than used.
 pub fn var_os(key: &str) -> Option<OsString> {
     var(key).map(Into::into)
 }
@@ -102,6 +110,49 @@ pub fn flag_or(key: &str, default: bool) -> bool {
 /// True when neither a code override nor process env provides the key.
 pub fn is_unset(key: &str) -> bool {
     var(key).is_none()
+}
+
+/// Should a device-gated test skip, given whether the backend is built and
+/// whether it could be instantiated? Panics instead under `RLX_REQUIRE_DEVICE`.
+///
+/// A skipped test still prints `ok`, which is indistinguishable from a real
+/// pass in the summary line. On a rig whose card has fallen off the PCIe bus,
+/// a whole suite goes green having executed nothing — this repo has watched
+/// that happen. `RLX_REQUIRE_DEVICE=1` (set by `rig.sh` and the `Justfile` GPU
+/// recipes) turns the skip into a failure.
+///
+/// The `compiled` argument is what keeps that honest in both directions: a
+/// backend the build does not contain is *absent*, not *broken*, and failing
+/// for it would make every host fail for every backend it wasn't built with.
+/// Only a backend that IS built and still could not be instantiated is what the
+/// flag is about.
+///
+/// This lives in `rlx-ir` rather than in `rlx-runtime`'s test helpers because
+/// the backend crates need it too and cannot depend on `rlx-runtime` — it
+/// depends on them. Taking the two facts as plain booleans keeps it free of any
+/// backend or `Device` type:
+///
+/// ```no_run
+/// # fn is_available() -> bool { true }
+/// if rlx_ir::env::skip_unless_device("metal", cfg!(feature = "metal"), is_available()) {
+///     return;
+/// }
+/// ```
+#[must_use = "the caller must actually return when this is true, or the test runs without a device"]
+pub fn skip_unless_device(label: &str, compiled: bool, available: bool) -> bool {
+    if available {
+        return false;
+    }
+    assert!(
+        !flag("RLX_REQUIRE_DEVICE") || !compiled,
+        "RLX_REQUIRE_DEVICE=1, the `{label}` backend is compiled in, and it still \
+         could not be instantiated — this run would have reported `ok` without \
+         executing anything on it"
+    );
+    if compiled {
+        eprintln!("{label} unavailable on this host — skipping");
+    }
+    true
 }
 
 /// Parse an integer/bool/string knob, falling back to `default`.

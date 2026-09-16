@@ -6,14 +6,16 @@
 
 use rlx_ir::op::ReduceOp;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 const F: DType = DType::F32;
 
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     }
 }
 
@@ -85,7 +87,8 @@ fn sum_loss(g: &mut Graph, y: NodeId) -> NodeId {
 
 #[test]
 fn conv3d_grads_match_cpu() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!(
             "ops3d_backprop: {:?} unavailable — skipping conv3d",
             target()
@@ -109,7 +112,8 @@ fn conv3d_grads_match_cpu() {
 
 #[test]
 fn maxpool3d_grads_match_cpu() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!(
             "ops3d_backprop: {:?} unavailable — skipping maxpool3d",
             target()
@@ -148,7 +152,8 @@ fn maxpool3d_grads_match_cpu() {
 
 #[test]
 fn conv_transpose3d_grads_match_cpu() {
-    if !is_available(target()) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless(target()) {
         eprintln!("ops3d_backprop: {:?} unavailable — skipping ct3d", target());
         return;
     }

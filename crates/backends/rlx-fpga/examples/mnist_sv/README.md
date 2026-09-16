@@ -48,7 +48,7 @@ let arts = ExportSession::fpga("hw/out")
     .export_model(&tinyconv_mnist_from_cortexm())?;
 ```
 
-See [docs/fpga-export.md](../../../../docs/fpga-export.md).
+See [docs/fpga-export.md](../../../../../docs/fpga-export.md).
 ## License
 
 MIT OR Apache-2.0.

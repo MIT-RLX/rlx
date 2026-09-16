@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Native + FlashKDA-chunk Op::GatedDeltaNet(pc) on the selected device: a
 // correctness check vs a Rust reference, and a scaling profile. Toggle the chunk
 // kernel with the SHELL env RLX_CUDA_KDA_CHUNK=1 (read at kernel launch), e.g.:
@@ -13,8 +16,10 @@ use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 use std::time::Instant;
 
+mod common;
+
 fn dev() -> Device {
-    match std::env::var("RLX_TEST_DEVICE").ok().as_deref() {
+    match rlx_ir::env::var("RLX_TEST_DEVICE").as_deref() {
         Some("cuda") => Device::Cuda,
         Some("metal") => Device::Metal,
         _ => Device::Cpu,
@@ -167,7 +172,8 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// exercises the chunked kernel; without it, the native scan. n=128 (chunk req).
 #[test]
 fn gdn_correctness() {
-    let chunk = std::env::var("RLX_CUDA_KDA_CHUNK").is_ok();
+    let _gpu = common::serialize_gpu();
+    let chunk = rlx_ir::env::var("RLX_CUDA_KDA_CHUNK").is_some();
     println!("device={:?} kda_chunk_env={chunk}", dev());
     let n = 128usize;
     // (b, s, h) — include seq not a multiple of 16 (padding path).
@@ -223,8 +229,9 @@ fn time_min(b: usize, s: usize, h: usize, n: usize) -> f64 {
 #[test]
 #[ignore = "profiling; run with --release --ignored --nocapture"]
 fn gdn_native_scaling() {
+    let _gpu = common::serialize_gpu();
     let n = 128usize;
-    let tag = if std::env::var("RLX_CUDA_KDA_CHUNK").is_ok() {
+    let tag = if rlx_ir::env::var("RLX_CUDA_KDA_CHUNK").is_some() {
         "KDA-CHUNK"
     } else {
         "native"

@@ -10,6 +10,8 @@ use rlx_ir::quant::QuantScheme;
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const QK_K: usize = 256;
 
 /// Build one Q8_K block (276 bytes / 256 elements):
@@ -31,6 +33,7 @@ fn build_one_q8_k_block(scale: f32, qs: &[i8; QK_K]) -> Vec<u8> {
 
 #[test]
 fn dequant_matmul_q8k_matches_dequant_then_matmul() {
+    let _gpu = common::serialize_gpu();
     // Weight: [k, n] = [256, 4], packed as 4 Q8_K blocks (one per
     // output column n). Each block has scale=0.0625 and qs[i]=i-128
     // (covers the full i8 range).
@@ -113,11 +116,13 @@ fn dequant_matmul_q8k_matches_dequant_then_matmul() {
 /// Layout regression for n>1 — see `run_q8k_layout_case`.
 #[test]
 fn dequant_matmul_q8k_correct_layout_for_n_gt_1() {
+    let _gpu = common::serialize_gpu();
     run_q8k_layout_case(Device::Cpu);
 }
 
 #[test]
 fn dequant_matmul_q6k_runs_without_panicking() {
+    let _gpu = common::serialize_gpu();
     // Q6_K block: [128 ql + 64 qh + 16 i8 scales + 2 (f16 d)] = 210
     // bytes / 256 elements. Hand-built with d=1, every scale=1,
     // every 6-bit quant value = 32 (which decodes to 0 after the
@@ -164,6 +169,7 @@ fn dequant_matmul_q6k_runs_without_panicking() {
 
 #[test]
 fn dequant_matmul_q6k_signed_scale_matches_reference() {
+    let _gpu = common::serialize_gpu();
     // Regression: `dequant_q6_k_block` must cast scale bytes as i8 (same as
     // `dequant_q6_k`). Using `as f32` on 0xFF turns −1 into 255 and skews matmul.
     const BLK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
@@ -288,6 +294,7 @@ fn run_q8k_layout_case(device: Device) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn dequant_matmul_q8k_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     run_q8k_layout_case(Device::Metal);
 }
 
@@ -349,12 +356,14 @@ fn run_q4k_case(device: Device) {
 
 #[test]
 fn dequant_matmul_q4k_matches_reference() {
+    let _gpu = common::serialize_gpu();
     run_q4k_case(Device::Cpu);
 }
 
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn dequant_matmul_q4k_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     run_q4k_case(Device::Metal);
 }
 
@@ -365,7 +374,7 @@ fn dequant_matmul_q4k_metal_matches_cpu() {
 #[cfg(feature = "gpu")]
 fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
     use half::f16;
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("skip: wgpu unavailable");
         return;
     }
@@ -458,6 +467,7 @@ fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_matmul_q4k_gemv_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     run_gguf_gemv_case(QuantScheme::GgufQ4K, 256, 5);
     // Multi-block rows (k=768 → 3 blocks/row) exercise the per-block accumulate.
     run_gguf_gemv_case(QuantScheme::GgufQ4K, 768, 7);
@@ -466,6 +476,7 @@ fn dequant_matmul_q4k_gemv_wgpu_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_matmul_q6k_gemv_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     // Even row count → 210-byte Q6_K blocks pack to a 4-aligned param upload.
     run_gguf_gemv_case(QuantScheme::GgufQ6K, 256, 6);
     run_gguf_gemv_case(QuantScheme::GgufQ6K, 768, 6);

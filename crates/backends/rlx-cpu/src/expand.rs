@@ -15,9 +15,39 @@
 //! `Op::If` / `Op::While` are claimed too; `LowerControlFlow` (fusion pipeline
 //! + `CpuBackend::compile`) expands them before thunks.
 
-use rlx_ir::{Graph, NodeId, Op};
+use rlx_ir::{Graph, NodeId, Op, OpKind};
 use rlx_opt::pass::Pass as _;
 use std::collections::HashMap;
+
+/// OpKinds rlx-cpu **claims but has no thunk arm for**. The catch-all compile
+/// arm is `Thunk::Nop`, so one of these reaching `compile_thunks` produces a
+/// zeroed output rather than an error.
+///
+/// This list is not documentation — [`expand_cpu_nop_fused`] dispatches on it,
+/// so it cannot drift from what actually gets expanded. It is also the input to
+/// `rlx-runtime/tests/host_fallback_never_nops.rs`, which is the point: **every
+/// backend routing an op here to the CPU host fallback gets silent zeros**, and
+/// that composition is invisible to a per-backend test. Vulkan's
+/// `PartitionedConv` shipped exactly that way — claimed, never lowered, routed
+/// to a host path that Nops it, reproducing identically on three drivers
+/// because the op never ran at all.
+pub const NO_THUNK_ARM: &[OpKind] = &[
+    // Rewritten to primitives by `expand_cpu_nop_fused`, below.
+    OpKind::FusedConvBiasAct,
+    OpKind::PartitionedConv,
+    OpKind::FusedTransformerLayer,
+    // Rewritten by `DecomposeFusionRegions` in `prepare_graph_for_thunks`.
+    OpKind::TransformRegion,
+    OpKind::BatchElementwiseRegion,
+];
+
+/// The subset of [`NO_THUNK_ARM`] that [`expand_cpu_nop_fused`] itself inlines.
+/// The rest are handled by `DecomposeFusionRegions`.
+const INLINED_HERE: &[OpKind] = &[
+    OpKind::FusedConvBiasAct,
+    OpKind::PartitionedConv,
+    OpKind::FusedTransformerLayer,
+];
 
 /// Expand claimed fused/region forms that would otherwise become `Thunk::Nop`.
 ///
@@ -32,14 +62,10 @@ pub fn prepare_graph_for_thunks(graph: Graph) -> Graph {
 
 /// Expand fused ops whose CPU compile arm is `Thunk::Nop`.
 pub fn expand_cpu_nop_fused(g: Graph) -> Graph {
-    let needs = g.nodes().iter().any(|n| {
-        matches!(
-            n.op,
-            Op::FusedConvBiasAct { .. }
-                | Op::PartitionedConv { .. }
-                | Op::FusedTransformerLayer { .. }
-        )
-    });
+    let needs = g
+        .nodes()
+        .iter()
+        .any(|n| INLINED_HERE.contains(&n.op.kind()));
     if !needs {
         return g;
     }
@@ -48,13 +74,10 @@ pub fn expand_cpu_nop_fused(g: Graph) -> Graph {
     let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
     for node in &nodes {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-        let new_id = match &node.op {
-            Op::FusedConvBiasAct { .. }
-            | Op::PartitionedConv { .. }
-            | Op::FusedTransformerLayer { .. } => {
-                inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
-            }
-            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        let new_id = if INLINED_HERE.contains(&node.op.kind()) {
+            inline_unfused(&mut out, &node.op, &new_inputs, &node.shape)
+        } else {
+            out.add_node(node.op.clone(), new_inputs, node.shape.clone())
         };
         id_map.insert(node.id, new_id);
     }

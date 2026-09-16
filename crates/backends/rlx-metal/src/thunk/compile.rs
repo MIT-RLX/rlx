@@ -311,14 +311,480 @@ impl ThunkSchedule {
             (fold, folded)
         };
 
+        // Bank transposes folded into the `_bt` grouped-GEMV. Separate from the
+        // MatMul fold above because the gate differs: `Op::GroupedMatMul` folds
+        // only where `encode_grouped_matmul` takes the `m <= 4` split-K path, so
+        // the transpose is dead only when EVERY reader is such a matmul. A
+        // mixed graph (some readers at prefill sizes) keeps the copy, or those
+        // readers would index `[E, N, K]` as though it were `[E, K, N]`.
+        let folded_bank_transpose: std::collections::HashSet<NodeId> = graph
+            .nodes()
+            .iter()
+            .filter(|n| rlx_opt::memory::is_elidable_bank_transpose_gated(graph, n, true))
+            .map(|n| n.id)
+            .collect();
+
+        // ── Which weight packs may be baked (materialised once, then skipped) ──
+        //
+        // A `Concat`/`Expand`/`Cast` over `Param`s — the fused QKV and gate+up
+        // packs the matmul-fusion passes build — is invariant across `run()`s.
+        // On a Carbon-500M decode step those packs are 1879 MB of the 3941 MB
+        // total DRAM traffic (`RLX_METAL_DUMP_BYTES`), so re-materialising them
+        // per token roughly doubles the bytes moved.
+        //
+        // Two conditions, both necessary:
+        //
+        // 1. `is_static_weight_tensor` — the SAME predicate `plan_memory` used to
+        //    decide which packs to pin to graph end. Sharing it (rather than
+        //    re-deriving "all inputs are Param/Constant" here) means the encoder
+        //    can never arm the skip for a pack the planner did not pin, and picks
+        //    up transitive cases (`Concat(Cast(Param), Cast(Param))`) the shallow
+        //    check missed.
+        //
+        // 2. Slot exclusivity — a pin is not a guarantee. Where it failed, the
+        //    pack shares a liveness-reused slot and a later node clobbers it, so
+        //    run 2+ would read stale bytes. Counting materialising owners per
+        //    arena offset and requiring exactly one trusts the pin where it
+        //    worked and falls back to recompute where it did not. This is the
+        //    guard `rlx-wgpu` already carries; Metal did not have it.
+        //
+        // Reached through `rlx_opt::memory`, which re-exports `rlx_compile`'s —
+        // same function object, not a copy.
+        let mut static_weight_memo: std::collections::HashMap<rlx_ir::NodeId, bool> =
+            std::collections::HashMap::new();
+        let offset_owner_count: std::collections::HashMap<usize, usize> = {
+            let mut m = std::collections::HashMap::new();
+            for n in graph.nodes() {
+                if rlx_opt::memory::is_pure_view(graph, n) || !arena.has_buffer(n.id) {
+                    continue;
+                }
+                *m.entry(arena.byte_offset(n.id)).or_insert(0usize) += 1;
+            }
+            m
+        };
+
+        // ---------------------------------------------------------------
+        // NOTE: both folds below are OFF by default. They are correct
+        // arithmetically and wrong about memory.
+        //
+        // Folding a consumer into its producer moves the producer's *write*
+        // earlier in the schedule (the conv stores into the consumer's arena
+        // slot); folding a producer into its consumer extends the producer's
+        // *read* later (the conv gathers from a Concat's inputs after the
+        // planner believes they are dead). The memory planner computed slot
+        // reuse for the original schedule and is never told, so either fold
+        // can clobber or read a recycled slot.
+        //
+        // It does not show up at small sizes because nothing is being reused.
+        // On SynthStrip: exact at 64^3 and 128^3, and 17% of full scale wrong
+        // at 192^3 — which is the size `StripNet` actually pads to. With
+        // `RLX_ARENA_NO_REUSE=1` all sizes are exact, which is what pins the
+        // cause to liveness rather than arithmetic.
+        //
+        // Worth ~1.2x together. To turn them back on for real, the fold set
+        // has to be computed before memory planning so liveness can account
+        // for it — a graph-level rewrite, not a thunk-level peephole.
+        // `RLX_METAL_CONV3D_FOLDS=1` enables them for measurement.
+        // The planner was told about these folds via
+        // `MemoryPlanOptions::fold_conv3d_epilogue`, using the shared predicate
+        // below. Everything this file folds must be a SUBSET of what that
+        // predicate reported, or the fold touches a slot whose liveness was
+        // never extended — the defect that made these folds 17-19% of full
+        // scale wrong at 192^3 while staying exact at 64^3 and 128^3.
+        //
+        // The planner is deliberately the more generous of the two: it extends
+        // liveness for every candidate, and the backend declines any it cannot
+        // also satisfy. Disagreement in that direction wastes a little arena;
+        // the other direction corrupts.
+        let planned_folds = rlx_opt::memory::conv3d_epilogue_folds(graph);
+        let folds_enabled = !rlx_ir::env::flag("RLX_METAL_NO_CONV3D_FOLDS");
+
+        // A channel-wise `Concat` feeding a 3D conv, read in place.
+        //
+        // The decoder's `concat(upsampled, skip)` exists only so the
+        // convolution has one contiguous tensor to gather from. The gather
+        // already computes an address per input channel, so it can pick a
+        // source instead: channels below the split come from the first input,
+        // the rest from the second. That deletes a full write and read of the
+        // concatenated tensor — 1.65 ms of a 23 ms SynthStrip forward.
+        //
+        // Map: conv id → (second source id, channels in the first source);
+        // `folded_concat`: concat ids that become Nops.
+        // The first source may additionally be a nearest-neighbour upscale.
+        // `Graph::interpolate3d` lowers that to reshape -> Expand -> reshape:
+        // every axis is split into `(len, 1)` and the singleton broadcast to
+        // the scale factor. Recognising the trio lets the conv read the small
+        // tensor with a divided index, so the expanded volume is never built —
+        // it is the last materialised intermediate in the decoder.
+        //
+        // Returns (source id, [sc_d, sc_h, sc_w]) and the ids to drop.
+        let upsample_of = |id: NodeId| -> Option<(NodeId, [u32; 3], [NodeId; 2])> {
+            let out = graph.node(id);
+            let Op::Reshape { .. } = &out.op else {
+                return None;
+            };
+            let exp = graph.node(out.inputs[0]);
+            let Op::Expand { .. } = &exp.op else {
+                return None;
+            };
+            let inr = graph.node(exp.inputs[0]);
+            let Op::Reshape { .. } = &inr.op else {
+                return None;
+            };
+            let src = graph.node(inr.inputs[0]);
+            // [N,C,D,1,H,1,W,1] broadcast to [N,C,D,kd,H,kh,W,kw].
+            if inr.shape.rank() != 8 || exp.shape.rank() != 8 || src.shape.rank() != 5 {
+                return None;
+            }
+            let dim = |n: &rlx_ir::Node, i: usize| n.shape.dim(i).unwrap_static();
+            for (i, &ax) in [3usize, 5, 7].iter().enumerate() {
+                let _ = i;
+                if dim(inr, ax) != 1 {
+                    return None;
+                }
+            }
+            for (i, &ax) in [2usize, 4, 6].iter().enumerate() {
+                if dim(inr, ax) != dim(src, 2 + i) || dim(exp, ax) != dim(src, 2 + i) {
+                    return None;
+                }
+            }
+            if dim(inr, 0) != dim(src, 0) || dim(inr, 1) != dim(src, 1) {
+                return None;
+            }
+            let sc = [dim(exp, 3) as u32, dim(exp, 5) as u32, dim(exp, 7) as u32];
+            // Output must be the flattened product on each spatial axis.
+            for i in 0..3 {
+                if dim(out, 2 + i) != dim(src, 2 + i) * sc[i] as usize {
+                    return None;
+                }
+            }
+            (sc.iter().any(|&v| v > 1)).then_some((inr.inputs[0], sc, [out.inputs[0], id]))
+        };
+
+        let (concat_fold, folded_concat): (
+            std::collections::HashMap<NodeId, (NodeId, u32, Option<[u32; 3]>, NodeId)>,
+            std::collections::HashSet<NodeId>,
+        ) = {
+            let mut fold = std::collections::HashMap::new();
+            let mut folded = std::collections::HashSet::new();
+            let disabled = !folds_enabled || rlx_ir::env::flag("RLX_METAL_NO_CONV3D_CONCAT_FOLD");
+            let no_upsample = rlx_ir::env::flag("RLX_METAL_NO_CONV3D_UPSAMPLE_FOLD");
+            let mut uses: std::collections::HashMap<NodeId, u32> = std::collections::HashMap::new();
+            for node in graph.nodes() {
+                for &inp in &node.inputs {
+                    *uses.entry(inp).or_insert(0) += 1;
+                }
+            }
+            for node in graph.nodes() {
+                if disabled {
+                    break;
+                }
+                let conv_in = match &node.op {
+                    Op::Conv3d { groups, .. } if *groups <= 1 => node.inputs[0],
+                    Op::FusedConvBiasAct {
+                        groups,
+                        activation: None,
+                        has_residual: false,
+                        ..
+                    } if *groups <= 1 && node.shape.rank() == 5 && node.inputs.len() == 3 => {
+                        node.inputs[0]
+                    }
+                    _ => continue,
+                };
+                let cat = graph.node(conv_in);
+                let Op::Concat { axis } = &cat.op else {
+                    continue;
+                };
+                // Channels only, exactly two sources, and the concatenated
+                // tensor must be dead once the conv has read it.
+                if *axis != 1 || cat.inputs.len() != 2 || cat.shape.rank() != 5 {
+                    continue;
+                }
+                if uses.get(&conv_in) != Some(&1) || graph.outputs.contains(&conv_in) {
+                    continue;
+                }
+                let (a, b) = (graph.node(cat.inputs[0]), graph.node(cat.inputs[1]));
+                // Both halves must share the conv's spatial extent, or the
+                // in-place address arithmetic does not hold.
+                if a.shape.rank() != 5 || b.shape.rank() != 5 {
+                    continue;
+                }
+                if (2..5).any(|d| {
+                    a.shape.dim(d).unwrap_static() != cat.shape.dim(d).unwrap_static()
+                        || b.shape.dim(d).unwrap_static() != cat.shape.dim(d).unwrap_static()
+                }) {
+                    continue;
+                }
+                // If the first half is an upscale nobody else reads, take the
+                // pre-upscale tensor as the source and drop the whole trio.
+                let mut a_src = cat.inputs[0];
+                let mut scale = None;
+                if let Some((small, sc, chain)) = upsample_of(cat.inputs[0])
+                    && !no_upsample
+                    && chain
+                        .iter()
+                        .all(|id| uses.get(id) == Some(&1) && !graph.outputs.contains(id))
+                    && uses.get(&graph.node(chain[0]).inputs[0]) == Some(&1)
+                {
+                    a_src = small;
+                    scale = Some(sc);
+                }
+                let (ao, bo) = (off(a_src), off(cat.inputs[1]));
+                if ao == usize::MAX || bo == usize::MAX {
+                    continue;
+                }
+                fold.insert(
+                    node.id,
+                    (
+                        cat.inputs[1],
+                        a.shape.dim(1).unwrap_static() as u32,
+                        scale,
+                        a_src,
+                    ),
+                );
+                folded.insert(conv_in);
+                if scale.is_some() {
+                    // reshape, Expand, and the inner reshape all go away.
+                    folded.insert(cat.inputs[0]);
+                    folded.insert(graph.node(cat.inputs[0]).inputs[0]);
+                    folded.insert(graph.node(graph.node(cat.inputs[0]).inputs[0]).inputs[0]);
+                }
+            }
+            (fold, folded)
+        };
+
+        // LeakyReLU folded into the conv3d store epilogue.
+        //
+        // `max(y, alpha*y)` is exactly LeakyReLU for any alpha < 1. Written as
+        // graph nodes it is two more full passes over the convolution's output;
+        // folded into the store it is two instructions on a value already in a
+        // register. On SynthStrip the activation measures ~4 ms of a 26 ms
+        // forward, so this is the largest remaining elementwise cost.
+        //
+        // The ordinary region-fusion pass cannot do it: the conv output feeds
+        // both the Mul and the Max, and region fusion gates on `use_count == 1`.
+        // Expressing it as an `ElementwiseRegion` instead is possible (a chain
+        // step may name a region input) but measured a wash — rlx's region
+        // kernel walks a chain descriptor, so one interpreted pass costs about
+        // what two specialised passes do. Only removing the passes helps.
+        //
+        // Map: conv id → (alpha, node whose arena slot the conv writes instead);
+        // `folded_leaky`: the Mul and Max ids, which become Nops.
+        let (leaky_fold, folded_leaky): (
+            std::collections::HashMap<NodeId, (f32, NodeId)>,
+            std::collections::HashSet<NodeId>,
+        ) = {
+            let mut fold = std::collections::HashMap::new();
+            let mut folded = std::collections::HashSet::new();
+            let mut uses: std::collections::HashMap<NodeId, u32> = std::collections::HashMap::new();
+            // `RLX_METAL_NO_CONV3D_LEAKY_FOLD=1` leaves the activation as its
+            // own nodes, so the two forms can be timed against each other in
+            // one process and checked for identical output.
+            let disabled = !folds_enabled || rlx_ir::env::flag("RLX_METAL_NO_CONV3D_LEAKY_FOLD");
+            for node in graph.nodes() {
+                for &inp in &node.inputs {
+                    *uses.entry(inp).or_insert(0) += 1;
+                }
+            }
+            let is_out = |id: NodeId| graph.outputs.contains(&id);
+            // A rank-0/1 f32 `Op::Constant` holding one value.
+            let scalar_const = |id: NodeId| -> Option<f32> {
+                let n = graph.node(id);
+                let Op::Constant { data } = &n.op else {
+                    return None;
+                };
+                (data.len() == 4 && n.shape.dtype() == DType::F32)
+                    .then(|| f32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+            };
+            // Does this node lower to `Thunk::Conv3d`?
+            let is_conv3d = |id: NodeId| -> bool {
+                let n = graph.node(id);
+                match &n.op {
+                    Op::Conv3d { .. } => true,
+                    Op::FusedConvBiasAct {
+                        activation: None,
+                        has_residual: false,
+                        ..
+                    } => n.shape.rank() == 5 && n.inputs.len() == 3,
+                    _ => false,
+                }
+            };
+            for node in graph.nodes() {
+                if disabled {
+                    break;
+                }
+                if !matches!(node.op, Op::Binary(BinaryOp::Max)) || node.inputs.len() != 2 {
+                    continue;
+                }
+                // Either operand order: max(conv, mul) or max(mul, conv).
+                for (ci, mi) in [(0usize, 1usize), (1, 0)] {
+                    let (c_id, m_id) = (node.inputs[ci], node.inputs[mi]);
+                    if !is_conv3d(c_id) {
+                        continue;
+                    }
+                    let m = graph.node(m_id);
+                    if !matches!(m.op, Op::Binary(BinaryOp::Mul)) || m.inputs.len() != 2 {
+                        continue;
+                    }
+                    // The Mul must be `conv * scalar`, in either order.
+                    let Some(k_id) = (if m.inputs[0] == c_id {
+                        Some(m.inputs[1])
+                    } else if m.inputs[1] == c_id {
+                        Some(m.inputs[0])
+                    } else {
+                        None
+                    }) else {
+                        continue;
+                    };
+                    let Some(alpha) = scalar_const(k_id) else {
+                        continue;
+                    };
+                    // Outside [0, 1) this is not LeakyReLU and `max` is not the
+                    // identity on the positive half.
+                    if !(0.0..1.0).contains(&alpha) {
+                        continue;
+                    }
+                    // The conv output must feed nothing but this pair, and the
+                    // Mul nothing but this Max, or the intermediates are live.
+                    if uses.get(&c_id) != Some(&2) || uses.get(&m_id) != Some(&1) {
+                        continue;
+                    }
+                    if is_out(c_id) || is_out(m_id) {
+                        continue;
+                    }
+                    // The conv writes the Max's slot, so both must be real
+                    // arena buffers, not weight-tagged or absent.
+                    let (co, xo) = (off(c_id), off(node.id));
+                    if co == usize::MAX || xo == usize::MAX || is_weight_off(xo) {
+                        continue;
+                    }
+                    if planned_folds.absorbed.get(&node.id) != Some(&c_id)
+                        || planned_folds.absorbed.get(&m_id) != Some(&c_id)
+                    {
+                        continue; // planner did not account for this one
+                    }
+                    fold.insert(c_id, (alpha, node.id));
+                    folded.insert(m_id);
+                    folded.insert(node.id);
+                    break;
+                }
+            }
+            (fold, folded)
+        };
+
+        // `RLX_METAL_FOLD_AUDIT=1`: for every fold, report whether the byte
+        // range it touches outside the plan's expectation belongs to a node the
+        // planner believes is live at that moment. The plan is self-consistent
+        // by construction (`RLX_MEM_VERIFY` checks that); what is unchecked
+        // anywhere is whether the emitted schedule agrees with it.
+        // `RLX_METAL_FOLD_AUDIT=1`: check that the arena the planner produced
+        // actually honours the fold accounting.
+        //
+        // The plan is self-consistent by construction and `RLX_MEM_VERIFY`
+        // checks that much; what nothing checked is whether the plan was built
+        // with the same assumptions the schedule then acts on. It was not:
+        // rlx-metal plans in three places and only one of them had been told
+        // about these folds, so two tensors that are simultaneously live *under
+        // folding* were handed the same bytes. Exact at 64^3 and 128^3, 15.7%
+        // of full scale wrong at 192^3.
+        //
+        // The invariant, stated directly: if two nodes share arena bytes, their
+        // fold-adjusted live ranges must not overlap.
+        if rlx_ir::env::flag("RLX_METAL_FOLD_AUDIT") {
+            let folds = rlx_opt::memory::conv3d_epilogue_folds(graph);
+            let step: std::collections::HashMap<NodeId, usize> = graph
+                .nodes()
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.id, i))
+                .collect();
+            let mut live: std::collections::HashMap<NodeId, (usize, usize)> =
+                std::collections::HashMap::new();
+            for (i, n) in graph.nodes().iter().enumerate() {
+                live.entry(n.id).or_insert((i, i));
+                for &inp in &n.inputs {
+                    live.entry(inp)
+                        .and_modify(|r| r.1 = r.1.max(i))
+                        .or_insert((0, i));
+                }
+            }
+            for (&ab, &cv) in &folds.absorbed {
+                if let (Some(&cs), Some(r)) = (step.get(&cv), live.get_mut(&ab)) {
+                    r.0 = r.0.min(cs);
+                }
+            }
+            for (&t, &cv) in &folds.read_through {
+                if let (Some(&cs), Some(r)) = (step.get(&cv), live.get_mut(&t)) {
+                    r.1 = r.1.max(cs);
+                }
+            }
+            let span = |id: NodeId| -> Option<(usize, usize)> {
+                arena.has_buffer(id).then(|| {
+                    let o = arena.byte_offset(id);
+                    let n = graph.node(id);
+                    (
+                        o,
+                        o + n.shape.num_elements().unwrap_or(0) * n.shape.dtype().size_bytes(),
+                    )
+                })
+            };
+            let touched: Vec<NodeId> = folds
+                .absorbed
+                .keys()
+                .chain(folds.read_through.keys())
+                .copied()
+                .collect();
+            let mut bad = 0usize;
+            // A view shares its parent's bytes by design, so overlap there is
+            // not a conflict.
+            for &t in &touched {
+                if rlx_opt::is_pure_view(graph, graph.node(t)) {
+                    continue;
+                }
+                let (Some(ts), Some(&(tb, td))) = (span(t), live.get(&t)) else {
+                    continue;
+                };
+                for other in graph.nodes() {
+                    if other.id == t || rlx_opt::is_pure_view(graph, other) {
+                        continue;
+                    }
+                    let (Some(os), Some(&(ob, od))) = (span(other.id), live.get(&other.id)) else {
+                        continue;
+                    };
+                    if ts.0 < os.1 && os.0 < ts.1 && tb <= od && ob <= td {
+                        eprintln!(
+                            "[fold-audit] {:?} and {:?} share arena bytes but are both live \
+                             under folding ({tb}..{td} vs {ob}..{od})",
+                            t, other.id
+                        );
+                        bad += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[fold-audit] {bad} conflicts over {} folded tensors",
+                touched.len()
+            );
+        }
+
         for node in graph.nodes() {
             #[cfg(feature = "native-gpu-fft")]
             if fft_real_skip.contains(&node.id) {
                 thunks.push(Thunk::Nop);
                 continue;
             }
+            // Read in place by the consuming conv3d's gather.
+            if folded_concat.contains(&node.id) {
+                thunks.push(Thunk::Nop);
+                continue;
+            }
+            // Folded into the producing conv3d's store epilogue.
+            if folded_leaky.contains(&node.id) {
+                thunks.push(Thunk::Nop);
+                continue;
+            }
             // Folded into a downstream MatMul's transposed GEMM — drop the copy.
-            if folded_transpose.contains(&node.id) {
+            if folded_transpose.contains(&node.id) || folded_bank_transpose.contains(&node.id) {
                 thunks.push(Thunk::Nop);
                 continue;
             }
@@ -509,18 +975,42 @@ impl ThunkSchedule {
                             }
                             ok
                         };
-                    if batched {
+                    // A LOWER-rank LEFT operand broadcast over a batched right
+                    // operand — `[M,K] · [B,K,N]`. This is not the 2-D flatten
+                    // case: flattening the output to `[B·M, N]` derives
+                    // `k = A.numel()/(B·M)`, which is only correct when the
+                    // rank-2 operand is on the RIGHT. With the ranks the other
+                    // way round it silently computes `k = K/B` and produces
+                    // garbage of exactly the right shape.
+                    let lhs_bcast = !batched
+                        && shape.rank() >= 3
+                        && a_shape.rank() == 2
+                        && b_shape.rank() == shape.rank()
+                        && a_shape.dim(0).unwrap_static()
+                            == shape.dim(shape.rank() - 2).unwrap_static()
+                        && a_shape.dim(1).unwrap_static()
+                            == b_shape.dim(b_shape.rank() - 2).unwrap_static()
+                        && (0..shape.rank() - 2).all(|d| {
+                            b_shape.dim(d).unwrap_static() == shape.dim(d).unwrap_static()
+                        });
+                    if batched || lhs_bcast {
                         let r = shape.rank();
                         let mut batch_prod = 1usize;
                         let mut a_batch = 1usize;
                         let mut b_batch = 1usize;
                         for d in 0..r - 2 {
                             batch_prod *= shape.dim(d).unwrap_static();
-                            a_batch *= a_shape.dim(d).unwrap_static();
-                            b_batch *= b_shape.dim(d).unwrap_static();
+                            if a_shape.rank() == r {
+                                a_batch *= a_shape.dim(d).unwrap_static();
+                            }
+                            if b_shape.rank() == r {
+                                b_batch *= b_shape.dim(d).unwrap_static();
+                            }
                         }
                         let m_dim = shape.dim(r - 2).unwrap_static();
-                        let k_dim = a_shape.dim(r - 1).unwrap_static();
+                        // K is A's own last dim — A may be rank-2 while the
+                        // output is rank-3 (the broadcast-left case).
+                        let k_dim = a_shape.dim(a_shape.rank() - 1).unwrap_static();
                         let n_dim = shape.dim(r - 1).unwrap_static();
                         Thunk::BatchedSgemm {
                             a: off(node.inputs[0]),
@@ -867,9 +1357,83 @@ impl ThunkSchedule {
                     let w_shape = &graph.node(node.inputs[1]).shape;
                     let out_shape = &node.shape;
                     Thunk::Conv3d {
-                        src: off(node.inputs[0]),
+                        src: concat_fold
+                            .get(&node.id)
+                            .map_or_else(|| off(node.inputs[0]), |&(_, _, _, a_src)| off(a_src)),
                         weight: off(node.inputs[1]),
-                        dst: off(node.id),
+                        bias: node.inputs.get(2).map(|&b| off(b)),
+                        concat_src: concat_fold.get(&node.id).map(|&(s2, n, _, _)| (off(s2), n)),
+                        upsample: concat_fold.get(&node.id).and_then(|&(_, _, sc, _)| sc),
+                        leaky_alpha: leaky_fold.get(&node.id).map(|&(a, _)| a),
+                        dst: leaky_fold
+                            .get(&node.id)
+                            .map_or_else(|| off(node.id), |&(_, dst)| off(dst)),
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        d: in_shape.dim(2).unwrap_static() as u32,
+                        h: in_shape.dim(3).unwrap_static() as u32,
+                        w_in: in_shape.dim(4).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        d_out: out_shape.dim(2).unwrap_static() as u32,
+                        h_out: out_shape.dim(3).unwrap_static() as u32,
+                        w_out: out_shape.dim(4).unwrap_static() as u32,
+                        kd: w_shape.dim(2).unwrap_static() as u32,
+                        kh: w_shape.dim(3).unwrap_static() as u32,
+                        kw: w_shape.dim(4).unwrap_static() as u32,
+                        sd: stride[0] as u32,
+                        sh: stride[1] as u32,
+                        sw: stride[2] as u32,
+                        pd: padding[0] as u32,
+                        ph: padding[1] as u32,
+                        pw: padding[2] as u32,
+                        dd: dilation[0] as u32,
+                        dh: dilation[1] as u32,
+                        dw: dilation[2] as u32,
+                        groups: (*groups).max(1) as u32,
+                        dt: node.shape.dtype().into(),
+                    }
+                }
+
+                // A 3D conv carrying its bias. The epilogue is free — the
+                // accumulator is already in registers when the kernel stores —
+                // and it removes a separate full pass over the output tensor,
+                // which on SynthStrip is 27 of them.
+                //
+                // `lower_cpu_nop_fused_for_metal` expands this op for the 2D
+                // case, with a recorded measurement behind it: keeping it fused
+                // routed conv2d off the MPSGraph path onto the naive MSL kernel
+                // and cost 8.7 ms -> 57.8 ms on rlx-ocr2. Neither half of that
+                // applies here. There is no MPSGraph lowering for 3D
+                // convolution at all (`mps_graph_lower` bails on
+                // `stride.len() != 2`), and the MSL kernel this reaches is the
+                // implicit-GEMM one, not the scalar fallback.
+                //
+                // Only the no-activation, no-residual form is claimed; anything
+                // else still expands.
+                Op::FusedConvBiasAct {
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                    activation: None,
+                    has_residual: false,
+                    ..
+                } if node.shape.rank() == 5 && node.inputs.len() == 3 => {
+                    let in_shape = &graph.node(node.inputs[0]).shape;
+                    let w_shape = &graph.node(node.inputs[1]).shape;
+                    let out_shape = &node.shape;
+                    Thunk::Conv3d {
+                        src: concat_fold
+                            .get(&node.id)
+                            .map_or_else(|| off(node.inputs[0]), |&(_, _, _, a_src)| off(a_src)),
+                        weight: off(node.inputs[1]),
+                        bias: Some(off(node.inputs[2])),
+                        concat_src: concat_fold.get(&node.id).map(|&(s2, n, _, _)| (off(s2), n)),
+                        upsample: concat_fold.get(&node.id).and_then(|&(_, _, sc, _)| sc),
+                        leaky_alpha: leaky_fold.get(&node.id).map(|&(a, _)| a),
+                        dst: leaky_fold
+                            .get(&node.id)
+                            .map_or_else(|| off(node.id), |&(_, dst)| off(dst)),
                         n: in_shape.dim(0).unwrap_static() as u32,
                         c_in: in_shape.dim(1).unwrap_static() as u32,
                         d: in_shape.dim(2).unwrap_static() as u32,
@@ -1653,9 +2217,10 @@ impl ThunkSchedule {
                     // Per-token RoPE when the cos table has one row per
                     // (batch·seq) token (ragged decode), distinct from the
                     // shared per-seq-position table.
-                    let half = (head_dim / 2).max(1);
-                    let cos_rows =
-                        graph.node(node.inputs[1]).shape.num_elements().unwrap_or(0) / half;
+                    let cos_shape = &graph.node(node.inputs[1]).shape;
+                    let cos_row_stride = rlx_ir::shape::rope_table_stride(cos_shape, *n_rot).max(1);
+                    let cos_rows = graph.node(node.inputs[1]).shape.num_elements().unwrap_or(0)
+                        / cos_row_stride;
                     let cos_per_token = cos_rows == batch * seq && cos_rows != seq;
                     Thunk::Rope {
                         src: off(node.inputs[0]),
@@ -1671,6 +2236,7 @@ impl ThunkSchedule {
                         src_row_stride: hidden as u32,
                         cos_per_token,
                         interleaved: matches!(style, rlx_ir::op::RopeStyle::GptJ),
+                        cos_row_stride: cos_row_stride as u32,
                     }
                 }
 
@@ -1741,8 +2307,15 @@ impl ThunkSchedule {
                 Op::KvAppend { axis, pos } => {
                     // In-place append: write input[1] (the new row) into the
                     // output buffer (aliased to `cache`) at sequence index `pos`.
-                    // Output shape == cache shape, so `seq_cap` = output's axis
-                    // dim (the buffer's true seq stride).
+                    //
+                    // `seq_cap` comes from the CACHE (input 0), not the output:
+                    // the output declares the `[..pos+1]` prefix (see
+                    // `infer_shape`) while aliasing a buffer with `seq_cap`
+                    // rows. Using the output's axis dim strides outer slices by
+                    // `pos+1` instead of `seq_cap`, which batch-1 decode never
+                    // exercises (`outer == 1` ignores the stride) and every
+                    // larger batch gets wrong.
+                    let cache_shape = &graph.node(node.inputs[0]).shape;
                     let out_shape = &node.shape;
                     let rank = out_shape.rank();
                     let outer: usize = (0..*axis)
@@ -1753,15 +2326,24 @@ impl ThunkSchedule {
                         .map(|i| out_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    let seq_cap = out_shape.dim(*axis).unwrap_static();
+                    let seq_cap = cache_shape.dim(*axis).unwrap_static();
+                    // BYTES, from the real dtype — `HalfFlag` collapses BF16 to
+                    // F32, so an element count plus a flag strides a BF16 cache
+                    // by 4 bytes per element instead of 2.
+                    let inner_bytes = inner * out_shape.dtype().size_bytes().max(1);
+                    assert!(
+                        inner_bytes.is_multiple_of(2),
+                        "rlx-metal KvAppend: row is {inner_bytes} bytes; the copy kernels \
+                         move 4-byte or paired 2-byte lanes, so an odd byte count \
+                         (1-byte dtype with an odd inner extent) has no lane form"
+                    );
                     Thunk::KvAppend {
                         src: off(node.inputs[1]),
                         dst: off(node.id),
                         outer: outer as u32,
                         seq_cap: seq_cap as u32,
                         pos: *pos as u32,
-                        inner: inner as u32,
-                        dt: out_shape.dtype().into(),
+                        inner_bytes: inner_bytes as u32,
                     }
                 }
                 Op::Concat { axis } => {
@@ -1798,12 +2380,12 @@ impl ThunkSchedule {
                         .iter()
                         .map(|&in_id| graph.node(in_id).shape.dtype().into())
                         .collect();
-                    let weight_const = node.inputs.iter().all(|&in_id| {
-                        matches!(
-                            graph.node(in_id).op,
-                            rlx_ir::op::Op::Param { .. } | rlx_ir::op::Op::Constant { .. }
-                        )
-                    });
+                    let weight_const = rlx_opt::memory::is_static_weight_tensor(
+                        graph,
+                        node.id,
+                        &mut static_weight_memo,
+                    ) && arena.has_buffer(node.id)
+                        && offset_owner_count.get(&arena.byte_offset(node.id)).copied() == Some(1);
                     Thunk::Concat {
                         dst: off(node.id),
                         outer: outer as u32,
@@ -1932,6 +2514,32 @@ impl ThunkSchedule {
                             pw: padding.get(1).copied().unwrap_or(0) as u32,
                             kind: *kind,
                         }
+                    } else if kernel_size.len() == 3
+                        && in_shape.rank() == 5
+                        && out_shape.rank() == 5
+                    {
+                        Thunk::Pool3D {
+                            src: off(node.inputs[0]),
+                            dst: off(node.id),
+                            n: in_shape.dim(0).unwrap_static() as u32,
+                            c: in_shape.dim(1).unwrap_static() as u32,
+                            d: in_shape.dim(2).unwrap_static() as u32,
+                            h: in_shape.dim(3).unwrap_static() as u32,
+                            w: in_shape.dim(4).unwrap_static() as u32,
+                            d_out: out_shape.dim(2).unwrap_static() as u32,
+                            h_out: out_shape.dim(3).unwrap_static() as u32,
+                            w_out: out_shape.dim(4).unwrap_static() as u32,
+                            kd: kernel_size[0] as u32,
+                            kh: kernel_size[1] as u32,
+                            kw: kernel_size[2] as u32,
+                            sd: stride.first().copied().unwrap_or(1) as u32,
+                            sh: stride.get(1).copied().unwrap_or(1) as u32,
+                            sw: stride.get(2).copied().unwrap_or(1) as u32,
+                            pd: padding.first().copied().unwrap_or(0) as u32,
+                            ph: padding.get(1).copied().unwrap_or(0) as u32,
+                            pw: padding.get(2).copied().unwrap_or(0) as u32,
+                            kind: *kind,
+                        }
                     } else {
                         Thunk::Nop
                     }
@@ -1985,7 +2593,17 @@ impl ThunkSchedule {
                     }
                 }
 
-                Op::ScatterAdd => {
+                Op::ScatterAdd { axis } => {
+                    // Every backend kernel implements the axis-0 form only;
+                    // `rlx_fusion::LowerScatterAddAxis` rewrites any other axis to
+                    // transpose/scatter/transpose before lowering. Reaching here with
+                    // axis != 0 means that pass did not run, and scattering along axis
+                    // 0 anyway would silently produce the wrong tensor.
+                    assert_eq!(
+                        *axis, 0,
+                        "rlx-metal: ScatterAdd axis {{axis}} reached the backend; \
+                     LowerScatterAddAxis must run first"
+                    );
                     let upd_shape = &graph.node(node.inputs[0]).shape;
                     let out_shape = &node.shape;
                     let num_updates = upd_shape.dim(0).unwrap_static();
@@ -2015,15 +2633,36 @@ impl ThunkSchedule {
                     )
                     .unwrap_or_else(|e| panic!("rlx-metal: node {:?}: {e}", node.id));
                     let (m, k_dim, n, num_experts) = (gd.m, gd.k, gd.n, gd.num_experts);
+                    // Fold `Transpose(bank, [0,2,1])` into the `_bt` kernel,
+                    // which reads GGUF's `[E, N, K]` directly. Gated on `m <= 4`
+                    // because that is exactly when `encode_grouped_matmul` takes
+                    // the split-K GEMV; the prefill kernel has no transposed
+                    // variant, and folding for it would read the bank in the
+                    // wrong layout. `m` is static, so the gate is a compile-time
+                    // decision, not a guess.
+                    //
+                    // Worth it because the copy is bigger than the maths: at
+                    // decode a layer's `top_k` grouped matmuls read one expert
+                    // slab each (~67 MB together) while transposing the bank
+                    // first moves 201 MB — 5.5 ms per bank on an M4 Pro.
+                    // Exactly the set decided above, so a transpose is never
+                    // dropped while some reader still expects it materialized.
+                    let w_transposed = folded_bank_transpose.contains(&node.inputs[1]);
+                    let weight = if w_transposed {
+                        off(graph.node(node.inputs[1]).inputs[0])
+                    } else {
+                        off(node.inputs[1])
+                    };
                     Thunk::GroupedMatMul {
                         input: off(node.inputs[0]),
-                        weight: off(node.inputs[1]),
+                        weight,
                         expert_idx: off(node.inputs[2]),
                         dst: off(node.id),
                         m: m as u32,
                         k_dim: k_dim as u32,
                         n: n as u32,
                         num_experts: num_experts as u32,
+                        w_transposed,
                     }
                 }
 
@@ -2752,6 +3391,29 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::FftQ {
+                    inverse,
+                    norm,
+                    scale,
+                } => {
+                    let meta = rlx_ir::fft::fft_meta(&node.shape);
+                    let dtype = node.shape.dtype();
+                    assert!(
+                        matches!(dtype, rlx_ir::DType::I32),
+                        "rlx-metal Op::FftQ is a fixed-point transform and requires I32, \
+                         got {dtype:?}"
+                    );
+                    Thunk::Fft1dQ {
+                        src: off(node.inputs[0]),
+                        dst: off(node.id),
+                        outer: meta.outer as u32,
+                        n_complex: meta.n_complex as u32,
+                        inverse: *inverse,
+                        norm_tag: norm.tag(),
+                        scale_tag: scale.tag(),
+                    }
+                }
+
                 Op::Scan { .. } => {
                     // Host fallback: compile the body once, then loop it on the
                     // CPU against the unified-memory arena at run time.
@@ -2843,6 +3505,53 @@ impl ThunkSchedule {
                     key: *key,
                     op_seed: *op_seed,
                 },
+
+                Op::GatedDeltaNetBackward {
+                    state_size,
+                    carry_state,
+                    gate_per_channel,
+                } => {
+                    let q_shape = &graph.node(node.inputs[0]).shape;
+                    let (b, sq, hd) = (
+                        q_shape.dim(0).unwrap_static(),
+                        q_shape.dim(1).unwrap_static(),
+                        q_shape.dim(2).unwrap_static(),
+                    );
+                    let layout = rlx_ir::GdnBackwardLayout::new(
+                        b,
+                        sq,
+                        hd,
+                        *state_size,
+                        *gate_per_channel,
+                        *carry_state,
+                    );
+                    let dst = off(node.id);
+                    let at = |elems: usize| dst + elems * std::mem::size_of::<f32>();
+                    // `dy` sits after the optional carried state, matching the op.
+                    let dy_idx = if *carry_state { 6 } else { 5 };
+                    Thunk::GatedDeltaNetBackward {
+                        q: off(node.inputs[0]),
+                        k: off(node.inputs[1]),
+                        v: off(node.inputs[2]),
+                        g: off(node.inputs[3]),
+                        beta: off(node.inputs[4]),
+                        state: if *carry_state { off(node.inputs[5]) } else { 0 },
+                        dy: off(node.inputs[dy_idx]),
+                        dst,
+                        dq: at(layout.dq_offset()),
+                        dk: at(layout.dk_offset()),
+                        dv: at(layout.dv_offset()),
+                        dg: at(layout.dg_offset()),
+                        dbeta: at(layout.dbeta_offset()),
+                        dstate: at(layout.dstate_offset()),
+                        batch: b as u32,
+                        seq: sq as u32,
+                        heads: hd as u32,
+                        state_size: *state_size as u32,
+                        gate_per_channel: *gate_per_channel,
+                        carry_state: *carry_state,
+                    }
+                }
 
                 Op::GatedDeltaNet {
                     state_size,
@@ -3582,7 +4291,11 @@ impl ThunkSchedule {
                     }
                 }
 
-                Op::RopeBackward { head_dim, n_rot } => {
+                Op::RopeBackward {
+                    head_dim,
+                    n_rot,
+                    style,
+                } => {
                     if node.shape.dtype() != rlx_ir::DType::F32 {
                         panic!("rlx-metal RopeBackward: F32 only");
                     }
@@ -3600,7 +4313,12 @@ impl ThunkSchedule {
                             dy_shape.dim(1).unwrap_static(),
                         )
                     };
-                    let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap();
+                    let cos_shape = &graph.node(node.inputs[1]).shape;
+                    let cos_len = cos_shape.num_elements().unwrap();
+                    // Row width off the table — see the MSL `tab_off` note.
+                    // Shared with every other backend so the rule cannot drift
+                    // again; a rank-1 table's rows are `n_rot/2`, not its length.
+                    let cos_row_stride = rlx_ir::shape::rope_table_stride(cos_shape, *n_rot) as u32;
                     Thunk::RopeBackward {
                         dy: off(node.inputs[0]),
                         cos: off(node.inputs[1]),
@@ -3612,6 +4330,8 @@ impl ThunkSchedule {
                         head_dim: *head_dim as u32,
                         n_rot: *n_rot as u32,
                         cos_len: cos_len as u32,
+                        cos_row_stride,
+                        interleaved: matches!(style, rlx_ir::op::RopeStyle::GptJ),
                     }
                 }
 
@@ -3652,7 +4372,7 @@ impl ThunkSchedule {
                         .map(|i| dy_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    let num_idx = idx_shape.dim(axis_u).unwrap_static();
+                    let num_idx = idx_shape.gather_index_count(axis_u);
                     let trailing: usize = (axis_u + 1..dy_shape.rank())
                         .map(|i| dy_shape.dim(i).unwrap_static())
                         .product::<usize>()
@@ -4103,6 +4823,9 @@ impl ThunkSchedule {
         // RLX_METAL_FUSE_DECODE=0. Output offsets stay live (never fused away).
         fuse_decode_mlp(&mut thunks, &output_offsets);
         fuse_gdn_gated_norm(&mut thunks, &output_offsets);
+        // ggml L2_NORM: 6 thunks → 1, twice per Gated-DeltaNet layer.
+        // Off-switch: RLX_METAL_FUSE_L2NORM=0.
+        fuse_l2_norm(&mut thunks, &output_offsets);
         fuse_depthwise_conv1d_bsc(&mut thunks, &output_offsets);
         fuse_residual_rms_norm(&mut thunks, &output_offsets);
 

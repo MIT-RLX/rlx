@@ -9,6 +9,33 @@ use crate::thunk::*;
 /// Zero match dispatch — each closure is a direct kernel call.
 pub fn execute_compiled(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     let base = arena_buf.as_mut_ptr();
+    // `RLX_CPU_WATCH=<byte_offset>:<n_floats>` reports every thunk that changes
+    // the watched region. A node read by one thunk and written by a LATER one
+    // is a scheduling hazard the post-run arena dump cannot see: it shows the
+    // final value, so the reader looks like it was fed data it never got.
+    if let Some(spec) = rlx_ir::env::var("RLX_CPU_WATCH") {
+        let mut it = spec
+            .split(':')
+            .filter_map(|t| t.trim().parse::<usize>().ok());
+        if let (Some(off), Some(len)) = (it.next(), it.next()) {
+            let mut prev: Option<Vec<f32>> = None;
+            for (i, f) in schedule.compiled_fns.iter().enumerate() {
+                f(base);
+                let cur: Vec<f32> =
+                    unsafe { std::slice::from_raw_parts(base.add(off) as *const f32, len) }
+                        .to_vec();
+                if prev.as_deref() != Some(cur.as_slice()) {
+                    let tabs: f64 = cur.iter().map(|&v| v.abs() as f64).sum();
+                    eprintln!(
+                        "[rlx-cpu-watch] thunk {i} {:?} changed watch: tabs={tabs:.6}",
+                        schedule.thunks.get(i).map(std::mem::discriminant)
+                    );
+                    prev = Some(cur);
+                }
+            }
+            return;
+        }
+    }
     for f in &schedule.compiled_fns {
         f(base);
     }
@@ -342,14 +369,14 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     let mut fl_ffn = vec![0f32; fl_m * fl_int.max(2 * fl_int)]; // Nomic needs 2×int for fused fc11+fc12
     let mut fl_sc = vec![0f32; fl_ss.max(1)];
 
-    let trace_thunks = std::env::var_os("RLX_TRACE_THUNK").is_some();
+    let trace_thunks = rlx_ir::env::var_os("RLX_TRACE_THUNK").is_some();
     if trace_thunks {
         eprintln!(
             "[thunk] prealloc max_h={max_h} sdpa={} fl_m={fl_m} fl_h={fl_h} fl_int={fl_int}",
             max_units * max_seq * max_seq
         );
     }
-    let profile = std::env::var_os("RLX_PROFILE_THUNKS").is_some();
+    let profile = rlx_ir::env::var_os("RLX_PROFILE_THUNKS").is_some();
     // Time the previous thunk at the top of each iteration (avoids touching the
     // giant match's many arms). The last thunk's tail is folded into the next
     // step's first sample — negligible over a training run.
@@ -359,12 +386,53 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     // kernel that writes past its planned slot — the classic SIMD-tail overrun
     // that corrupts whichever buffer the planner reused next — is named
     // directly instead of inferred. O(arena) per thunk, so diagnostics only.
-    let write_trace = std::env::var_os("RLX_ARENA_WRITE_TRACE").is_some();
+    let write_trace = rlx_ir::env::var_os("RLX_ARENA_WRITE_TRACE").is_some();
     let mut wt_before: Vec<u8> = if write_trace {
         arena_buf.to_vec()
     } else {
         Vec::new()
     };
+    // `RLX_CPU_WATCH=<byte_offset>:<n_floats>` reports the watched region's
+    // contents whenever they change, naming the thunk about to run — so the
+    // writer is the thunk *before* the one printed. A node written after its
+    // reader is a scheduling hazard invisible to the post-run arena dump,
+    // which only ever shows the final value.
+    let watch = rlx_ir::env::var("RLX_CPU_WATCH").and_then(|spec| {
+        let mut it = spec
+            .split(':')
+            .filter_map(|t| t.trim().parse::<usize>().ok());
+        Some((it.next()?, it.next()?))
+    });
+    let mut watch_prev: Option<Vec<f32>> = None;
+    // `RLX_CPU_DUMP_THUNKS=<lo>:<hi>` prints the compiled thunks in that index
+    // range, with their arena offsets and dimensions — the arguments a kernel
+    // actually receives, as opposed to the ones the graph implies.
+    if let Some(spec) = rlx_ir::env::var("RLX_CPU_DUMP_THUNKS") {
+        let mut it = spec
+            .split(':')
+            .filter_map(|t| t.trim().parse::<usize>().ok());
+        if let (Some(lo), Some(hi)) = (it.next(), it.next()) {
+            for (i, t) in thunks.iter().enumerate().take(hi.min(len)).skip(lo) {
+                let detail = match t {
+                    Thunk::FusedMmBiasAct {
+                        a,
+                        w,
+                        bias,
+                        c,
+                        m,
+                        k,
+                        n,
+                        act,
+                    } => format!(" a={a} w={w} bias={bias} c={c} m={m} k={k} n={n} act={act:?}"),
+                    Thunk::Sgemm { a, b, c, m, k, n } => {
+                        format!(" a={a} b={b} c={c} m={m} k={k} n={n}")
+                    }
+                    _ => String::new(),
+                };
+                eprintln!("[rlx-cpu-thunk] {i} {}{detail}", thunk_kind_name(t));
+            }
+        }
+    }
     for i in 0..len {
         if profile {
             if let Some((pn, pt)) = prof_prev.take() {
@@ -372,6 +440,18 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             }
         }
         let thunk = unsafe { thunks.get_unchecked(i) };
+        if let Some((woff, wlen)) = watch {
+            let cur: Vec<f32> =
+                unsafe { std::slice::from_raw_parts(base.add(woff) as *const f32, wlen) }.to_vec();
+            if watch_prev.as_deref() != Some(cur.as_slice()) {
+                let tabs: f64 = cur.iter().map(|&v| v.abs() as f64).sum();
+                eprintln!(
+                    "[rlx-cpu-watch] before thunk {i} ({}) tabs={tabs:.6}",
+                    thunk_kind_name(thunk)
+                );
+                watch_prev = Some(cur);
+            }
+        }
         if trace_thunks && (i < 120 || i % 200 == 0 || i + 1 == len) {
             eprintln!("[thunk {i}/{len}] {}", thunk_kind_name(thunk));
         }
@@ -389,6 +469,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::GaussianSplatPrepare { .. } => exec_gaussian_splat_prepare(thunk, base),
             Thunk::GaussianSplatRasterize { .. } => exec_gaussian_splat_rasterize(thunk, base),
             Thunk::Fft1d { .. } => exec_fft1d(thunk, base),
+            Thunk::Fft1dQ { .. } => exec_fft1d_q(thunk, base),
             Thunk::FftButterflyStage { .. } => exec_fft_butterfly_stage(thunk, base),
             Thunk::LogMel { .. } => exec_log_mel(thunk, base),
             Thunk::LogMelBackward { .. } => exec_log_mel_backward(thunk, base),
@@ -1773,6 +1854,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             }
 
             Thunk::GatedDeltaNet { .. } => exec_gated_delta_net(thunk, base),
+            Thunk::GatedDeltaNetBackward { .. } => exec_gated_delta_net_backward(thunk, base),
             Thunk::Lstm { .. } => exec_lstm(thunk, base),
             Thunk::Gru { .. } => exec_gru(thunk, base),
             Thunk::Rnn { .. } => exec_rnn(thunk, base),
@@ -2815,6 +2897,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
 
             Thunk::FusedSwiGLU { .. } => exec_fused_swi_g_l_u(thunk, base),
             Thunk::Concat { .. } => exec_concat(thunk, base),
+            Thunk::KvAppend { .. } => exec_kv_append(thunk, base),
             Thunk::ConcatF64 { .. } => exec_concat_f64(thunk, base),
             Thunk::Compare {
                 lhs,
@@ -3165,11 +3248,13 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 k_dim,
                 n,
                 num_experts,
+                w_transposed,
             } => {
                 let m = *m as usize;
                 let k_dim = *k_dim as usize;
                 let n = *n as usize;
                 let num_experts = *num_experts as usize;
+                let w_transposed = *w_transposed;
                 unsafe {
                     let inp = sl(*input, base, m * k_dim);
                     let wt = sl(*weight, base, num_experts * k_dim * n);
@@ -3227,6 +3312,19 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 if let Some(ptr) =
                                     crate::moe_residency::host_expert_weight_ptr(gmm_ord, e)
                                 {
+                                    // Residency hands over `[K, N]` slabs by
+                                    // construction. A folded transpose means the
+                                    // bank is `[N, K]`, so the two do not compose
+                                    // — and silently using one as the other reads
+                                    // a correctly-sized block of the wrong values,
+                                    // which no shape check would catch. Refuse.
+                                    assert!(
+                                        !w_transposed,
+                                        "rlx-cpu: MoE host residency supplies [K, N] expert \
+                                         slabs, but this GroupedMatMul folded a bank transpose \
+                                         and reads [N, K]. The two are not composed; unbind \
+                                         residency or disable the fold."
+                                    );
                                     std::slice::from_raw_parts(ptr, expert_stride)
                                 } else {
                                     &wt[e * expert_stride..(e + 1) * expert_stride]
@@ -3240,7 +3338,14 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         // 1.5 MFLOP matvec, and decode issues 368 of these per token,
                         // so ~368 Rayon hand-offs cost more than the extra memory
                         // parallelism buys. Keep the serial call.
-                        crate::blas::sgemm(in_slice, w_slab, out_slice, count, k_dim, n);
+                        if w_transposed {
+                            // Bank is `[E, N, K]`: B-transposed GEMM, no copy.
+                            crate::blas::sgemm_bt(
+                                in_slice, w_slab, out_slice, count, k_dim, n, 1.0,
+                            );
+                        } else {
+                            crate::blas::sgemm(in_slice, w_slab, out_slice, count, k_dim, n);
+                        }
                     }
 
                     // Unpermute back to original token order.
@@ -3363,10 +3468,19 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let out_addr = out.as_mut_ptr() as usize;
                     let is_max = matches!(kind, ReduceOp::Max);
                     let is_mean = matches!(kind, ReduceOp::Mean);
-                    // No-padding windows (the conv-net case) are always fully
-                    // in-bounds, so the hot path drops the per-element bounds
-                    // branches and hoists the reduce-op choice out of the loop.
-                    let nopad = ph == 0 && pw == 0;
+                    // No-padding windows are *usually* fully in-bounds (the
+                    // conv-net case), so the hot path drops the per-element
+                    // bounds branches and hoists the reduce-op choice out of the
+                    // loop. "Usually" is not "always": under ONNX `ceil_mode=1`
+                    // the final window may start inside the input and overhang
+                    // its end (259 frames, kernel/stride 100 -> 3 windows, the
+                    // last spanning 200..300), and the fast path then indexes
+                    // past the buffer. Require every window to fit before taking
+                    // it; the general path below already treats the overhang as
+                    // padding, which is what ONNX specifies.
+                    let windows_fit = h_out.saturating_sub(1) * sh + kh <= h
+                        && w_out.saturating_sub(1) * sw + kw <= w;
+                    let nopad = ph == 0 && pw == 0 && windows_fit;
                     let pool_plane = |nc: usize| {
                         let ni = nc / c;
                         let ci = nc % c;
@@ -3375,6 +3489,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let op = out_addr as *mut f32;
                         for ho in 0..h_out {
                             for wo in 0..w_out {
+                                let mut valid = 0.0f32;
                                 let acc = if nopad {
                                     let row0 = in_chan + (ho * sh) * w + wo * sw;
                                     let mut a = if is_max { f32::NEG_INFINITY } else { 0.0 };
@@ -3410,12 +3525,23 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                                 a = a.max(v);
                                             } else {
                                                 a += v;
+                                                valid += 1.0;
                                             }
                                         }
                                     }
                                     a
                                 };
-                                let acc = if is_mean { acc / kernel_area } else { acc };
+                                // Average over the elements that actually exist,
+                                // not over the nominal window. ONNX's default is
+                                // `count_include_pad = 0`, and a `ceil_mode`
+                                // window that overhangs the input is not padding
+                                // at all — those positions simply are not there.
+                                // ChatterBox's speaker encoder pools 259 frames
+                                // with kernel/stride 100: the third window holds
+                                // 59 real frames, and dividing it by 100 scaled
+                                // it by 0.59 against the reference.
+                                let denom = if nopad { kernel_area } else { valid.max(1.0) };
+                                let acc = if is_mean { acc / denom } else { acc };
                                 *op.add(out_chan + ho * w_out + wo) = acc;
                             }
                         }
@@ -3827,6 +3953,82 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     );
                                 } else {
                                     tile(0, d0);
+                                }
+                            } else if rank >= 3
+                                && in_strides[rank - 2] == 1
+                                && in_strides[rank - 1] as usize == out_dims[rank - 2] as usize
+                                && {
+                                    // Leading axes untouched and contiguous, so
+                                    // each batch plane is one dense 2-D block.
+                                    let plane = (out_dims[rank - 2] as usize)
+                                        * (out_dims[rank - 1] as usize);
+                                    let mut expect = plane;
+                                    let mut ok = true;
+                                    for d in (0..rank - 2).rev() {
+                                        if in_strides[d] as usize != expect {
+                                            ok = false;
+                                            break;
+                                        }
+                                        expect *= out_dims[d] as usize;
+                                    }
+                                    ok
+                                }
+                            {
+                                // BATCHED 2-D transpose: the permutation swaps
+                                // only the last two axes.
+                                //
+                                // Neither branch above catches this. The
+                                // innermost stride is not 1 (it is the input's
+                                // inner extent), and the rank is not 2, so it
+                                // used to fall through to the general
+                                // per-element index walk — measured at
+                                // **103 MB/s** on an M4 Pro, against ~20 GB/s of
+                                // memory bandwidth. A `[8, 2048, 1024]` f32
+                                // bank took 653 ms.
+                                //
+                                // It is not a rare shape: `GroupedMatMul` wants
+                                // `[E, in, out]` while GGUF stores expert banks
+                                // as `[E, out, in]`, so every dense MoE layer
+                                // transposes all three of its banks, and
+                                // attention permutes `[B, H, S, D]` the same
+                                // way. Reuse the tiling the rank-2 branch uses,
+                                // once per plane.
+                                let d_i = out_dims[rank - 2] as usize;
+                                let d_o = out_dims[rank - 1] as usize;
+                                let plane = d_i * d_o;
+                                let batches = total / plane.max(1);
+                                let out_addr = out.as_mut_ptr() as usize;
+                                let in_addr = inp.as_ptr() as usize;
+                                let plane_tp = |b0: usize, b1: usize| {
+                                    const T: usize = 32;
+                                    for b in b0..b1 {
+                                        let ip = (in_addr as *const f32).add(b * plane);
+                                        let op = (out_addr as *mut f32).add(b * plane);
+                                        let mut i0 = 0;
+                                        while i0 < d_i {
+                                            let i1 = (i0 + T).min(d_i);
+                                            let mut o0 = 0;
+                                            while o0 < d_o {
+                                                let o1 = (o0 + T).min(d_o);
+                                                for i in i0..i1 {
+                                                    for o in o0..o1 {
+                                                        *op.add(i * d_o + o) = *ip.add(o * d_i + i);
+                                                    }
+                                                }
+                                                o0 = o1;
+                                            }
+                                            i0 = i1;
+                                        }
+                                    }
+                                };
+                                if crate::pool::should_parallelize(total) && batches >= 2 {
+                                    crate::pool::par_for(
+                                        batches,
+                                        crate::pool::outer_chunk(batches),
+                                        &|off, cnt| plane_tp(off, off + cnt),
+                                    );
+                                } else {
+                                    plane_tp(0, batches);
                                 }
                             } else if rank >= 3
                                 && *in_strides.last().unwrap_or(&0) == 1

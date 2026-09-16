@@ -20,6 +20,8 @@ use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available, supports_graph};
 
+mod common;
+
 const N: usize = 64;
 const TOL: f32 = 5e-3;
 
@@ -96,6 +98,7 @@ fn worst_rel(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn activation_backward_parity() {
+    let _gpu = common::serialize_gpu();
     let backends = available_backends();
     eprintln!("activation-backward parity over backends: {backends:?}");
     let dy: Vec<f32> = (0..N).map(|i| 0.3 + (i as f32 * 0.07).sin()).collect();

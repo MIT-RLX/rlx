@@ -47,6 +47,11 @@ fn read_w_i8(rel: u32) -> i32 {
     return select(i32(b), i32(b) - 256, b >= 128u);
 }
 
+fn dq_read_bf16(rel: u32) -> f32 {
+    // bf16 is the top 16 bits of an f32: shift into place and bitcast.
+    return bitcast<f32>((read_w(rel) | (read_w(rel + 1u) << 8u)) << 16u);
+}
+
 fn dq_read_f16(rel: u32) -> f32 {
     let bits = read_w(rel) | (read_w(rel + 1u) << 8u);
     let sign = (bits >> 15u) & 1u;
@@ -107,7 +112,8 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
     if (params.scheme_id != 6u && params.scheme_id != 10u && params.scheme_id != 11u
         && params.scheme_id != 19u && params.scheme_id != 20u
         && params.scheme_id != 21u && params.scheme_id != 22u && params.scheme_id != 23u
-        && params.scheme_id != 24u) {
+        && params.scheme_id != 24u && params.scheme_id != 25u
+        && params.scheme_id != 28u) {
         let dst_base = params.dst_f32_off + gid * 256u;
 
         if (params.scheme_id == 3u) {
@@ -719,6 +725,37 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         for (var j: u32 = 0u; j < 128u; j = j + 1u) {
             let bit = (read_w(qs_rel + (j >> 3u)) >> (j & 7u)) & 1u;
             arena[dst_base + j] = select(neg_d, d, bit != 0u);
+        }
+        return;
+    }
+
+    if (params.scheme_id == 25u) {
+        // Q2_0 (PrismML Bonsai / Doses AI Pestle factors): f16 d | 32 two-bit
+        // bytes (34 bytes / 128 elements). LSB-first; code q -> (q-1)*d.
+        let off = gid * 34u;
+        let d = dq_read_f16(off);
+        let qs_rel = off + 2u;
+        let dst_base = params.dst_f32_off + gid * 128u;
+        for (var j: u32 = 0u; j < 128u; j = j + 1u) {
+            let q = (read_w(qs_rel + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u;
+            arena[dst_base + j] = f32(i32(q) - 1) * d;
+        }
+        return;
+    }
+
+    if (params.scheme_id == 28u) {
+        // G8_0 (Doses AI Pestle): 4 bf16 scales — one per group of 8 —
+        // | 8 two-bit bytes (16 bytes / 32 elements). Value = (q-1)*d[j/8].
+        let off = gid * 16u;
+        let qs_rel = off + 8u;
+        let dst_base = params.dst_f32_off + gid * 32u;
+        for (var g: u32 = 0u; g < 4u; g = g + 1u) {
+            let d = dq_read_bf16(off + g * 2u);
+            for (var t: u32 = 0u; t < 8u; t = t + 1u) {
+                let j = g * 8u + t;
+                let q = (read_w(qs_rel + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u;
+                arena[dst_base + j] = f32(i32(q) - 1) * d;
+            }
         }
         return;
     }

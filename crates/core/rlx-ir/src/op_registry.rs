@@ -199,7 +199,7 @@ pub trait OpExtension: Send + Sync {
         None
     }
 
-    /// Op-local invariants, checked by [`crate::verify`].
+    /// Op-local invariants, checked by [`crate::verify`](fn@crate::verify).
     ///
     /// Default: nothing beyond the generic arity/shape checks every node
     /// gets. Override to state what a *well-formed* instance of this op looks

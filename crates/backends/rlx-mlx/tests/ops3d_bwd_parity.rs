@@ -104,7 +104,7 @@ fn make_maxpool3d_bwd() -> (Graph, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn conv3d_backward_input_matches_cpu() {
-    if !rlx_mlx::is_available() {
+    if rlx_ir::env::skip_unless_device("mlx", true, rlx_mlx::is_available()) {
         eprintln!("[rlx-mlx c3d_bwd_in] MLX unavailable — skipping");
         return;
     }
@@ -119,7 +119,7 @@ fn conv3d_backward_input_matches_cpu() {
 
 #[test]
 fn conv3d_backward_weight_matches_cpu() {
-    if !rlx_mlx::is_available() {
+    if rlx_ir::env::skip_unless_device("mlx", true, rlx_mlx::is_available()) {
         eprintln!("[rlx-mlx c3d_bwd_w] MLX unavailable — skipping");
         return;
     }
@@ -134,7 +134,7 @@ fn conv3d_backward_weight_matches_cpu() {
 
 #[test]
 fn maxpool3d_backward_matches_cpu() {
-    if !rlx_mlx::is_available() {
+    if rlx_ir::env::skip_unless_device("mlx", true, rlx_mlx::is_available()) {
         eprintln!("[rlx-mlx mp3d_bwd] MLX unavailable — skipping");
         return;
     }

@@ -874,7 +874,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                     }
                 };
 
-                if std::env::var("RLX_ROPE_DEBUG").is_ok() {
+                if rlx_ir::env::var("RLX_ROPE_DEBUG").is_some() {
                     eprintln!(
                         "[rope] shape={:?} num_chunks={num_chunks} cos_rows={cos_rows} s_dim={s_dim} heads_per_seq={heads_per_seq}",
                         x_shape.dims()
@@ -906,7 +906,7 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                         // Per-seq-position table shared across the batch.
                         (token % s_dim).min(cos_rows.saturating_sub(1))
                     };
-                    if std::env::var("RLX_ROPE_DEBUG").is_ok() && chunk < 4 {
+                    if rlx_ir::env::var("RLX_ROPE_DEBUG").is_some() && chunk < 4 {
                         eprintln!("[rope]   chunk={chunk} pos={pos}");
                     }
                     let cos_off = pos * tab_half;

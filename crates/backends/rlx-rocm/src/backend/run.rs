@@ -15,6 +15,7 @@ use crate::hipblas::{
 use crate::hipblaslt::HipblasLtContext;
 use crate::host_staging::F32HostSlot;
 use crate::miopen::MiopenContext;
+use rlx_gpu_dispatch::indexing::KernelKind as IndexingNdKind;
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::{Graph, NodeId, Op};
 use std::collections::HashMap;
@@ -24,12 +25,24 @@ use std::sync::Mutex;
 use super::*;
 
 impl RocmExecutable {
-    /// Fast path: positional inputs, D2H into [`Self::host_arena`], no per-output `Vec`.
+    /// Fast path: positional inputs, D2H into `Self::host_arena`, no per-output `Vec`.
     pub fn run_slots(&mut self, inputs: &[&[f32]]) -> &[(usize, usize)] {
         self.upload_slot_inputs(inputs);
         let _ = self.run_inner(&[]);
         self.pack_host_arena();
         &self.output_slots
+    }
+
+    /// `(steps marked static-once, skip armed)` — diagnostics for the
+    /// weight-pack skip.
+    ///
+    /// The two halves are independent: lowering can mark steps (`.0 > 0`) while
+    /// no executed path ever arms the flag (`.1 == false`), leaving the
+    /// optimisation dead and the packs rebuilt every run. `rlx-wgpu` sat in
+    /// exactly that state with green re-bind guards, so this is asserted rather
+    /// than assumed.
+    pub fn static_once_report(&self) -> (usize, bool) {
+        (self.static_once_steps.len(), self.static_once_done)
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
@@ -158,7 +171,22 @@ impl RocmExecutable {
         // Monotonic plain-GroupedMatmul ordinal within this forward → MoE layer
         // index (= ord/3) for the hot/cold residency table. Matches rlx-cuda + CPU.
         let mut moe_gmm_ord = 0usize;
-        for step in &self.schedule {
+        for (step_i, step) in self.schedule.iter().enumerate() {
+            // A static weight pack (fused QKV / gate+up `Concat` over `Param`s)
+            // is invariant across runs — materialise it once, then skip.
+            //
+            // NOT while capturing. `hipStreamBeginCapture` RECORDS WITHOUT
+            // EXECUTING, so a capture run leaves the packs unwritten; skipping
+            // during capture would additionally record a graph that never builds
+            // the pack. The replay path returns before this loop and its graph
+            // already contains the pack, so nothing is lost by deferring to it.
+            if self.static_once_done
+                && !do_capture
+                && rlx_opt::memory::static_weight_pack_skip_enabled()
+                && self.static_once_steps.contains(&step_i)
+            {
+                continue;
+            }
             if profile_steps {
                 unsafe {
                     let _ = (self.ctx.runtime.hip_stream_sync)(stream);
@@ -1639,13 +1667,13 @@ impl RocmExecutable {
                             *m,
                             *k,
                             *n,
-                            *lhs_byte_off as u64,
-                            *rhs_byte_off as u64,
-                            *lhs_scale_byte_off as u64,
-                            *rhs_scale_byte_off as u64,
-                            *out_byte_off as u64,
+                            *lhs_byte_off,
+                            *rhs_byte_off,
+                            *lhs_scale_byte_off,
+                            *rhs_scale_byte_off,
+                            *out_byte_off,
                             *has_bias != 0,
-                            *bias_byte_off as u64,
+                            *bias_byte_off,
                             *lhs_e5m2 != 0,
                             *rhs_e5m2 != 0,
                             stream,
@@ -2166,13 +2194,36 @@ impl RocmExecutable {
                         continue;
                     }
 
-                    // Tier 4: custom 64×64 + 4×4 register-tile kernel.
-                    let kernel = matmul_kernel(&self.ctx);
+                    // Tier 4: rlx's own register-tiled kernel. The tile is a
+                    // data lookup keyed by (arch, op, shape bucket) rather than
+                    // the historical hardcoded 64×64×16 — untuned, the table
+                    // returns exactly that tile, so this is the same schedule
+                    // until a measurement on this gfx target says otherwise. A
+                    // tile this device cannot launch degrades to the default:
+                    // the table is a performance hint, never a correctness
+                    // dependency.
+                    let mut tile = match rlx_gpu_kernels::dispatch::resolve_matmul(
+                        crate::kernels::gpu_arch(),
+                        *m as usize,
+                        *k as usize,
+                        *n as usize,
+                    ) {
+                        rlx_gpu_kernels::dispatch::Choice::MatmulTiled(t) => t,
+                        _ => rlx_gpu_kernels::tiles::TileParams::DEFAULT_MATMUL,
+                    };
+                    let tiled = crate::kernels::matmul_kernel_tiled(&self.ctx, tile);
+                    if tiled.is_none() {
+                        tile = rlx_gpu_kernels::tiles::TileParams::DEFAULT_MATMUL;
+                    }
+                    let kernel = match tiled {
+                        Some(k) => k,
+                        None => matmul_kernel(&self.ctx),
+                    };
                     crate::launch_kernel!(
                         kernel,
                         stream,
-                        ((*n).div_ceil(64), (*m).div_ceil(64), *batch),
-                        (16, 16, 1),
+                        ((*n).div_ceil(tile.bn), (*m).div_ceil(tile.bm), *batch),
+                        (tile.bdx, tile.bdy, 1),
                         [
                             &mut arena_ptr,
                             m,
@@ -2766,11 +2817,11 @@ impl RocmExecutable {
                     let block = if amort { (256, 1, 1) } else { (16, 16, 1) };
                     let mut arena_ptr = arena_base;
                     // Kernel offsets are u64 (shared with CUDA >4 GiB arenas); widen u32.
-                    let x64 = *x_byte_off as u64;
-                    let w64 = *w_byte_off as u64;
-                    let s64 = *scale_byte_off as u64;
-                    let idx64 = *idx_byte_off as u64;
-                    let out64 = *out_byte_off as u64;
+                    let x64 = *x_byte_off;
+                    let w64 = *w_byte_off;
+                    let s64 = *scale_byte_off;
+                    let idx64 = *idx_byte_off;
+                    let out64 = *out_byte_off;
                     crate::launch_kernel!(
                         kernel,
                         stream,
@@ -2843,8 +2894,9 @@ impl RocmExecutable {
                             &self.ctx,
                             stream,
                             arena_ptr,
-                            *src_byte_off / 4,
-                            *dst_byte_off / 4,
+                            // FFT dispatch takes f32-element offsets as u32.
+                            (*src_byte_off / 4) as u32,
+                            (*dst_byte_off / 4) as u32,
                             *outer,
                             *n_complex,
                             *inverse,
@@ -2864,6 +2916,28 @@ impl RocmExecutable {
                             rocm_fft_dtype_from_tag(*dtype_tag),
                         );
                     }
+                }
+                Step::FftQ {
+                    src_byte_off,
+                    dst_byte_off,
+                    outer,
+                    n_complex,
+                    inverse,
+                    norm_tag,
+                    scale_tag,
+                } => {
+                    crate::fft_host::run_fft1d_q(
+                        &self.ctx,
+                        &self.arena.buffer,
+                        self.arena.size,
+                        *src_byte_off as usize,
+                        *dst_byte_off as usize,
+                        *outer as usize,
+                        *n_complex as usize,
+                        *inverse,
+                        *norm_tag,
+                        *scale_tag,
+                    );
                 }
                 Step::WelchPeaksGpu {
                     spec_off,
@@ -3359,12 +3433,169 @@ impl RocmExecutable {
                     );
                 }
                 Step::CpuIndexing { thunk } => {
+                    // Anything still here is a shape `plan_indexing` declined at
+                    // compile time. No on-device retry: the decision was made
+                    // once, on the schedule.
                     crate::scan_host::run_indexing(
                         &self.ctx,
                         &self.arena.buffer,
                         self.arena.size,
                         thunk,
                     );
+                }
+                Step::IndexingNd {
+                    kind,
+                    n,
+                    data_off,
+                    idx_off,
+                    upd_off,
+                    dst_off,
+                    dst_len,
+                    prologue,
+                    meta_idx,
+                } => {
+                    // Deliberately NOT `scale(*n)`. The `meta` strides are baked
+                    // from the full shape, so shrinking only the thread count
+                    // would decompose flat positions against the wrong extents.
+                    // Running the full count writes a few slots past the active
+                    // prefix — slots the arena owns and nothing reads.
+                    if *n == 0 {
+                        continue;
+                    }
+                    let mut meta_ptr = self.meta_buffers[*meta_idx].ptr;
+
+                    // Scatter prologue: seed `dst` from `data` (and, for
+                    // ScatterElements, zero non-finite slots) before any update
+                    // lands. Gathers write every output slot, so they skip it.
+                    if let Some(p) = prologue
+                        && *dst_len > 0
+                    {
+                        let kernel = copy_sanitize_kernel(&self.ctx);
+                        let (grid, block) = dispatch_grid_1d(*dst_len, 256);
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (grid, 1, 1),
+                            (block, 1, 1),
+                            [
+                                &mut arena_ptr,
+                                dst_len,
+                                data_off,
+                                dst_off,
+                                &p.src_len,
+                                &p.do_copy,
+                                &p.do_sanitize
+                            ]
+                        );
+                    }
+
+                    let (grid, block) = dispatch_grid_1d(*n, 256);
+                    match kind {
+                        IndexingNdKind::GatherNd {
+                            k,
+                            slice,
+                            tuples_per_batch,
+                            batch_stride,
+                        } => {
+                            let kernel = gather_nd_kernel(&self.ctx);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    n,
+                                    data_off,
+                                    idx_off,
+                                    dst_off,
+                                    k,
+                                    slice,
+                                    tuples_per_batch,
+                                    batch_stride,
+                                    &mut meta_ptr
+                                ]
+                            );
+                        }
+                        IndexingNdKind::GatherElements {
+                            rank,
+                            axis,
+                            axis_dim,
+                            data_len,
+                        } => {
+                            let kernel = gather_elements_kernel(&self.ctx);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    n,
+                                    data_off,
+                                    idx_off,
+                                    dst_off,
+                                    data_len,
+                                    rank,
+                                    axis,
+                                    axis_dim,
+                                    &mut meta_ptr
+                                ]
+                            );
+                        }
+                        IndexingNdKind::ScatterElements {
+                            rank,
+                            axis,
+                            reduction,
+                        } => {
+                            let red = reduction.code();
+                            let kernel = scatter_elements_kernel(&self.ctx);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    n,
+                                    upd_off,
+                                    idx_off,
+                                    dst_off,
+                                    dst_len,
+                                    rank,
+                                    axis,
+                                    &red,
+                                    &mut meta_ptr
+                                ]
+                            );
+                        }
+                        IndexingNdKind::ScatterNd {
+                            k,
+                            slice,
+                            reduction,
+                        } => {
+                            let red = reduction.code();
+                            let kernel = scatter_nd_reduce_kernel(&self.ctx);
+                            crate::launch_kernel!(
+                                kernel,
+                                stream,
+                                (grid, 1, 1),
+                                (block, 1, 1),
+                                [
+                                    &mut arena_ptr,
+                                    n,
+                                    idx_off,
+                                    upd_off,
+                                    dst_off,
+                                    dst_len,
+                                    k,
+                                    slice,
+                                    &red,
+                                    &mut meta_ptr
+                                ]
+                            );
+                        }
+                    }
                 }
                 Step::SpdHost {
                     op,
@@ -3888,11 +4119,14 @@ impl RocmExecutable {
                     head_dim,
                     n_rot,
                     cos_len,
+                    cos_row_stride,
+                    interleaved,
                 } => {
                     let dy_off = *dy_byte_off / 4;
                     let cos_off = *cos_byte_off / 4;
                     let sin_off = *sin_byte_off / 4;
                     let dx_off = *dx_byte_off / 4;
+                    let interleaved_u: u32 = *interleaved as u32;
                     let kernel = rope_backward_kernel(&self.ctx);
                     let total = batch * seq * hidden;
                     let (grid, block) = dispatch_grid_1d(total, 256);
@@ -3912,7 +4146,9 @@ impl RocmExecutable {
                             &cos_off,
                             &sin_off,
                             &dx_off,
-                            cos_len
+                            cos_len,
+                            cos_row_stride,
+                            &interleaved_u
                         ]
                     );
                 }
@@ -5177,8 +5413,8 @@ impl RocmExecutable {
                     // f32-element offsets as u64 — the kernel declares its offset
                     // params `unsigned long long`, so passing a u32 here would
                     // leave the high word as stack garbage → illegal address.
-                    let in_off: u64 = (*in_byte_off / 4) as u64;
-                    let out_off: u64 = (*out_byte_off / 4) as u64;
+                    let in_off: u64 = *in_byte_off / 4;
+                    let out_off: u64 = *out_byte_off / 4;
                     crate::launch_kernel!(
                         kernel,
                         stream,
@@ -5203,9 +5439,9 @@ impl RocmExecutable {
                     let kernel = binary_c64_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(n_s, 256);
                     // f32-element offsets as u64 (kernel params are u64 — see above).
-                    let a_off: u64 = (*a_byte_off / 4) as u64;
-                    let b_off: u64 = (*b_byte_off / 4) as u64;
-                    let c_off: u64 = (*c_byte_off / 4) as u64;
+                    let a_off: u64 = *a_byte_off / 4;
+                    let b_off: u64 = *b_byte_off / 4;
+                    let c_off: u64 = *c_byte_off / 4;
                     crate::launch_kernel!(
                         kernel,
                         stream,
@@ -5225,8 +5461,8 @@ impl RocmExecutable {
                     }
                     let kernel = complex_norm_sq_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(n_s, 256);
-                    let src_off: u64 = (*src_byte_off / 4) as u64;
-                    let dst_off: u64 = (*dst_byte_off / 4) as u64;
+                    let src_off: u64 = *src_byte_off / 4;
+                    let dst_off: u64 = *dst_byte_off / 4;
                     crate::launch_kernel!(
                         kernel,
                         stream,
@@ -5247,9 +5483,9 @@ impl RocmExecutable {
                     }
                     let kernel = complex_norm_sq_backward_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(n_s, 256);
-                    let z_off: u64 = (*z_byte_off / 4) as u64;
-                    let g_off: u64 = (*g_byte_off / 4) as u64;
-                    let dz_off: u64 = (*dz_byte_off / 4) as u64;
+                    let z_off: u64 = *z_byte_off / 4;
+                    let g_off: u64 = *g_byte_off / 4;
+                    let dz_off: u64 = *dz_byte_off / 4;
                     crate::launch_kernel!(
                         kernel,
                         stream,
@@ -5269,8 +5505,8 @@ impl RocmExecutable {
                     }
                     let kernel = conjugate_c64_kernel(&self.ctx);
                     let (grid, block) = dispatch_grid_1d(n_s, 256);
-                    let src_off: u64 = (*src_byte_off / 4) as u64;
-                    let dst_off: u64 = (*dst_byte_off / 4) as u64;
+                    let src_off: u64 = *src_byte_off / 4;
+                    let dst_off: u64 = *dst_byte_off / 4;
                     crate::launch_kernel!(
                         kernel,
                         stream,
@@ -5763,6 +5999,16 @@ impl RocmExecutable {
                     producer_of.insert(*w, idx);
                 }
             }
+        }
+
+        // Every static weight pack has now been launched for real, so later runs
+        // may skip re-launching them.
+        //
+        // Only on a non-capture run: `hipStreamBeginCapture` records without
+        // executing, so arming after a capture run would make the next run skip
+        // a pack that was never materialised and read an unwritten slot.
+        if !do_capture && !self.static_once_done && !self.static_once_steps.is_empty() {
+            self.static_once_done = true;
         }
 
         // Multi-stream: sync every pool stream + clean up events so

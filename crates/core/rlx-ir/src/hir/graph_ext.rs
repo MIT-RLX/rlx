@@ -132,7 +132,7 @@ impl<'a> HirMut<'a> {
     }
 
     /// Bilinear 2-D resize of NCHW `x` to `[N, C, out_h, out_w]` — see
-    /// [`Self::resize_separable`].
+    /// `Self::resize_separable`.
     pub fn resize_bilinear2d(
         &mut self,
         x: HirNodeId,
@@ -144,7 +144,7 @@ impl<'a> HirMut<'a> {
     }
 
     /// Bicubic 2-D resize of NCHW `x` to `[N, C, out_h, out_w]` — see
-    /// [`Self::resize_separable`] (PyTorch cubic-convolution kernel, `a = -0.75`).
+    /// `Self::resize_separable` (PyTorch cubic-convolution kernel, `a = -0.75`).
     pub fn resize_bicubic2d(
         &mut self,
         x: HirNodeId,
@@ -559,14 +559,14 @@ impl<'a> HirMut<'a> {
 
     /// ReEig (eigenvalue rectification) SPDNet nonlinearity:
     /// `Y = U · max(ε, Σ) · Uᵀ`. `x` is `[n, n]` symmetric SPD; output `Y` is
-    /// the same shape (the SPD analogue of ReLU). See [`Self::spectral_layer`].
+    /// the same shape (the SPD analogue of ReLU). See `Self::spectral_layer`.
     pub fn reeig(&mut self, x: HirNodeId, eps: f32) -> HirNodeId {
         self.spectral_layer(Op::ReEig { eps }, x)
     }
 
     /// LogEig SPDNet layer: `Y = logm(X) = U · log(Σ) · Uᵀ`. Maps the SPD
     /// manifold to the tangent space at the identity. `x` is `[n, n]`; output
-    /// `Y` is the same shape. See [`Self::spectral_layer`].
+    /// `Y` is the same shape. See `Self::spectral_layer`.
     pub fn logeig(&mut self, x: HirNodeId, eps: f32) -> HirNodeId {
         self.spectral_layer(Op::LogEig { eps }, x)
     }
@@ -1353,10 +1353,12 @@ impl HirGraphExt for HirMut<'_> {
         axis: usize,
         pos: usize,
     ) -> HirNodeId {
-        let s = self
-            .shape(cache)
-            .clone()
-            .with_dim(axis, shape::Dim::Static(pos + 1));
+        // Validated at construction, not just in `verify`: the operands that go
+        // wrong here (a `pos` past the cache, a row of the wrong width) become a
+        // raw out-of-bounds store in every backend's row write, which corrupts a
+        // neighbouring arena tensor instead of failing.
+        let s = shape::kv_append_shape(self.shape(cache), self.shape(row), axis, pos)
+            .expect("kv_append shape inference");
         self.0.mir(Op::KvAppend { axis, pos }, vec![cache, row], s)
     }
 

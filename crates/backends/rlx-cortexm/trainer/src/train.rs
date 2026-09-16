@@ -42,7 +42,7 @@ fn env_flag(key: &str) -> bool {
 /// scalar path (the unfused `rlx` bench bar).
 fn fast_conv_label() -> bool {
     !matches!(
-        std::env::var("RLX_FAST_CONV").ok().as_deref(),
+        rlx_ir::env::var("RLX_FAST_CONV").as_deref(),
         Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
@@ -247,7 +247,7 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
             None
         },
     };
-    let mlp = std::env::var("RLX_ARCH").as_deref() == Ok("mlp");
+    let mlp = rlx_ir::env::var("RLX_ARCH").as_deref() == Some("mlp");
     // The contiguous batch-shuffle MLP path converges better at a slightly
     // lower LR while preserving higher throughput. Keep user overrides
     // untouched; only auto-tune the historical default 0.05.
@@ -393,7 +393,7 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
     };
     let batches_per_epoch = total_train / args.batch;
 
-    let log_epoch_loss = std::env::var_os("RLX_LOG_EPOCH_LOSS").is_some();
+    let log_epoch_loss = rlx_ir::env::var_os("RLX_LOG_EPOCH_LOSS").is_some();
     let mut steps: Vec<f64> = Vec::new();
     let mut train_s = 0.0f64;
     let mut order: Vec<usize> = (0..total_train).collect();
@@ -403,7 +403,7 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
             for (i, v) in batch_order.iter_mut().enumerate() {
                 *v = i;
             }
-            if std::env::var_os("RLX_NO_SHUFFLE").is_none() {
+            if rlx_ir::env::var_os("RLX_NO_SHUFFLE").is_none() {
                 // MLP benchmark: shuffle at batch granularity so each batch is
                 // still contiguous in memory (one memcpy), while SGD sees
                 // stochastic batch order each epoch.
@@ -413,7 +413,7 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
             for (i, v) in order.iter_mut().enumerate() {
                 *v = i;
             }
-            if std::env::var_os("RLX_NO_SHUFFLE").is_none() {
+            if rlx_ir::env::var_os("RLX_NO_SHUFFLE").is_none() {
                 shuffle(&mut order, &mut rng);
             }
         }
@@ -492,7 +492,7 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
         "rlx-graphfused"
     };
     emit_bench_row(label, &steps, train_s, args.epochs, args.batch, acc);
-    if std::env::var_os("RLX_PROFILE_THUNKS").is_some() {
+    if rlx_ir::env::var_os("RLX_PROFILE_THUNKS").is_some() {
         rlx_cpu::thunk::dump_thunk_profile();
     }
     if mlp {
@@ -736,7 +736,7 @@ fn emit_bench_row(label: &str, steps: &[f64], train_s: f64, epochs: usize, batch
         "{label},cpu,{acc:.4},{train_s:.1},{epoch_s:.1},{p50:.1},{first:.0},{imgs_per_s:.0}"
     );
     println!("RLX_BENCH,{row}");
-    if let Ok(path) = std::env::var("RLX_BENCH_CSV") {
+    if let Some(path) = rlx_ir::env::var("RLX_BENCH_CSV") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)

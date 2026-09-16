@@ -41,15 +41,15 @@ fuse = ["ir", "rlx-sparse", "dep:rlx-autodiff"]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 rlx-ir = { workspace = true, optional = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false, features = ["cpu"], optional = true }
-rlx-sparse = { path = "../rlx-sparse", version = "0.2.14", default-features = false, features = ["cpu"], optional = true }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.16", default-features = false, features = ["cpu"], optional = true }
+rlx-sparse = { path = "../rlx-sparse", version = "0.2.16", default-features = false, features = ["cpu"], optional = true }
 rlx-cpu = { workspace = true, optional = true }
 rlx-autodiff = { workspace = true, optional = true }
 
 [dev-dependencies]
 rlx-ir = { workspace = true }
 rlx-autodiff = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.14", default-features = false, features = ["cpu"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.16", default-features = false, features = ["cpu"] }
 bytemuck = "1"
 
 [[test]]
@@ -150,3 +150,8 @@ required-features = ["fuse"]
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["reference", "sparse", "nonlinear", "io", "ir", "fuse"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

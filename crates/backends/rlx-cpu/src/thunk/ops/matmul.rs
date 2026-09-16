@@ -78,10 +78,29 @@ pub(crate) fn compile_mat_mul(
                 n: n as u32,
             }
         } else {
-            // Batched GEMM only when both operands carry batch dimensions.
+            // Batched GEMM when both operands carry batch dimensions.
             // 3D×2D (activations × shared weight) must flatten to one Sgemm.
             let both_batched = a_shape.rank() >= 3 && b_shape.rank() >= 3;
-            let batched_3d = rank >= 3 && both_batched && a_shape.rank() + b_shape.rank() > 4;
+            // ...and when only `b` is batched. `matmul_shape` broadcasts a rank-2
+            // lhs across the rhs's batch, so the output IS batched — but the
+            // 2-D flatten below cannot express that. It would emit a single
+            // Sgemm against `b`'s first matrix and leave every later output
+            // batch holding whatever was already in the arena: a silent wrong
+            // answer, not a crash. `BatchedSgemm` handles it via `a_bcast`.
+            //
+            // This is the mirror of the case the `BatchedSgemm` doc comment
+            // already warns about; only the `a`-side was ever wired up.
+            let lhs_bcast_batched = a_shape.rank() < 3 && b_shape.rank() >= 3;
+            let batched_3d = rank >= 3
+                && (both_batched && a_shape.rank() + b_shape.rank() > 4 || lhs_bcast_batched);
+            // Per-operand batch counts: an operand whose batch product is 1
+            // (while the output batch is > 1) is BROADCAST across the batch.
+            let a_batch: usize = (0..a_shape.rank().saturating_sub(2))
+                .map(|d| a_shape.dim(d).unwrap_static())
+                .product();
+            let b_batch: usize = (0..b_shape.rank().saturating_sub(2))
+                .map(|d| b_shape.dim(d).unwrap_static())
+                .product();
             if batched_3d && shape.dtype() == rlx_ir::DType::F64 {
                 let mut batch_prod = 1usize;
                 for d in 0..rank - 2 {
@@ -96,6 +115,8 @@ pub(crate) fn compile_mat_mul(
                     m: m_dim as u32,
                     k: k_dim as u32,
                     n: n as u32,
+                    a_bcast: a_batch == 1 && batch_prod > 1,
+                    b_bcast: b_batch == 1 && batch_prod > 1,
                 }
             } else if batched_3d && shape.dtype() == rlx_ir::DType::F32 {
                 let mut batch_prod = 1usize;
@@ -103,14 +124,6 @@ pub(crate) fn compile_mat_mul(
                     batch_prod *= eff.dim(d).unwrap_static();
                 }
                 let m_dim = eff.dim(rank - 2).unwrap_static();
-                // Per-operand batch counts: an operand whose batch product is 1
-                // (while the output batch is >1) is BROADCAST across the batch.
-                let a_batch: usize = (0..a_shape.rank().saturating_sub(2))
-                    .map(|d| a_shape.dim(d).unwrap_static())
-                    .product();
-                let b_batch: usize = (0..b_shape.rank().saturating_sub(2))
-                    .map(|d| b_shape.dim(d).unwrap_static())
-                    .product();
                 Thunk::BatchedSgemm {
                     a: node_offset(arena, node.inputs[0]),
                     b: node_offset(arena, node.inputs[1]),
@@ -258,15 +271,24 @@ pub(crate) fn compile_grouped_mat_mul(
         let dims = rlx_ir::shape::grouped_matmul_dims(in_shape, w_shape, Some(&node.shape))
             .unwrap_or_else(|e| panic!("rlx-cpu: node {:?}: {e}", node.id));
         let (m, k_dim, n, num_experts) = (dims.m, dims.k, dims.n, dims.num_experts);
+        // A folded `Transpose(bank, [0, 2, 1])`: read the bank in its `[E, N, K]`
+        // form and let the GEMM transpose B, instead of copying the whole bank.
+        // `dims` still comes from the graph's declared (post-transpose) shapes,
+        // so only the buffer and the stride order change.
+        let (weight, w_transposed) = match matmul_fold.get(&node.id) {
+            Some(&(_, _, bsrc, true)) => (node_offset(arena, bsrc), true),
+            _ => (node_offset(arena, node.inputs[1]), false),
+        };
         Thunk::GroupedMatMul {
             input: node_offset(arena, node.inputs[0]),
-            weight: node_offset(arena, node.inputs[1]),
+            weight,
             expert_idx: node_offset(arena, node.inputs[2]),
             dst: node_offset(arena, node.id),
             m: m as u32,
             k_dim: k_dim as u32,
             n: n as u32,
             num_experts: num_experts as u32,
+            w_transposed,
         }
     }
 }

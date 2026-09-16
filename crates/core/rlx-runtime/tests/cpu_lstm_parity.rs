@@ -10,6 +10,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const B: usize = 2;
 const S: usize = 4;
 const IN: usize = 3;
@@ -93,6 +95,7 @@ fn inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn lstm_cpu_native_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let (x, w_ih, w_hh, bias) = inputs();
     let expected = reference_lstm(&x, &w_ih, &w_hh, &bias);
 
@@ -147,6 +150,7 @@ fn run_device_case(device: Device) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn lstm_metal_matches_reference() {
+    let _gpu = common::serialize_gpu();
     run_device_case(Device::Metal);
 }
 
@@ -155,6 +159,7 @@ fn lstm_metal_matches_reference() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn lstm_metal_large_hidden_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let (bb, ss, inn, hh) = (3usize, 6usize, 10usize, 100usize);
     let four_h = 4 * hh;
     let x: Vec<f32> = (0..bb * ss * inn)
@@ -214,11 +219,16 @@ fn lstm_metal_large_hidden_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn lstm_wgpu_matches_reference() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     run_device_case(Device::Gpu);
 }
 
 #[test]
 fn lstm_unfuse_decomposition_matches_native() {
+    let _gpu = common::serialize_gpu();
     // The decomposed graph is what MLX / CoreML / TPU (no native LSTM)
     // and the autodiff pass run. It must match the fused kernel exactly.
     let (x, w_ih, w_hh, bias) = inputs();

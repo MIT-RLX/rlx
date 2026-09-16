@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use rlx_cuda::cuda_gpu_kernels::{CudaGpuKernel, register_cuda_gpu_kernel};
 use rlx_ir::{DType, Graph, OpExtension, Shape, register_op};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 /// IR-level shape inference for `test.times_three_cuda` (identity).
 struct TimesThreeIr;
@@ -65,7 +67,8 @@ impl CudaGpuKernel for TimesThreeCuda {
 
 #[test]
 fn times_three_runs_on_cuda_via_raw_gpu_kernel() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }

@@ -73,8 +73,6 @@ pub(super) fn unfuse_gated_delta_net(
         let bh1n = IrShape::from_dims(&[Dim::Static(bh), Dim::Static(1), Dim::Static(n)], dtype);
         let bh11 = IrShape::from_dims(&[Dim::Static(bh), Dim::Static(1), Dim::Static(1)], dtype);
         let bh_n1 = IrShape::from_dims(&[Dim::Static(bh), Dim::Static(n), Dim::Static(1)], dtype);
-        let bhnn_i64 = vec![bh as i64, n as i64, n as i64];
-        let bh1n_i64 = vec![bh as i64, 1, n as i64];
 
         let bhn = IrShape::from_dims(
             &[Dim::Static(b_dim), Dim::Static(h_dim), Dim::Static(n)],
@@ -93,21 +91,26 @@ pub(super) fn unfuse_gated_delta_net(
             ],
             dtype,
         );
-        let bhnn4 = IrShape::from_dims(
-            &[
-                Dim::Static(b_dim),
-                Dim::Static(h_dim),
-                Dim::Static(n),
-                Dim::Static(n),
-            ],
-            dtype,
-        );
-
+        // The running state is held as `[BH, N, N]` for the whole loop.
+        //
+        // It used to be reshaped back to `[B, H, N, N]` after each update and
+        // to `[BH, N, N]` again before each use — six reshapes per timestep of
+        // a tensor that is `B·H·N²` floats. Those are the same contiguous
+        // buffer, but they are still nodes that materialize: on Qwen3.5-0.8B
+        // (`N = 128`, `H = 16`, batch 16) the state is 16.8 MB, so the
+        // round-tripping alone accounted for ~39% of the unrolled backward
+        // graph's tensor traffic — more than every matmul in the block
+        // combined. Only the carried-state input and, below, nothing else needs
+        // the 4-D view.
         let mut state = if *carry_state {
-            new_inputs[5]
+            out.reshape(
+                new_inputs[5],
+                vec![bh as i64, n as i64, n as i64],
+                bhnn.clone(),
+            )
         } else {
             let zero_bytes = vec![0u8; b_dim * h_dim * n * n * 4];
-            out.add_node(Op::Constant { data: zero_bytes }, vec![], bhnn4.clone())
+            out.add_node(Op::Constant { data: zero_bytes }, vec![], bhnn.clone())
         };
 
         let scale_val = (1.0f32 / (n as f32).sqrt()).to_le_bytes().to_vec();
@@ -121,13 +124,9 @@ pub(super) fn unfuse_gated_delta_net(
             vec![1, 1, 1],
             IrShape::from_dims(&[Dim::Static(1), Dim::Static(1), Dim::Static(1)], dtype),
         );
-        let scale_bh1n = out.add_node(
-            Op::Expand {
-                target_shape: bh1n_i64.clone(),
-            },
-            vec![scale_111],
-            bh1n.clone(),
-        );
+        // Broadcast the scalar in the readout multiply instead of expanding it
+        // to `[BH, 1, N]` up front.
+        let scale_bh1n = scale_111;
 
         let mut ys: Vec<NodeId> = Vec::with_capacity(s_dim);
 
@@ -183,14 +182,11 @@ pub(super) fn unfuse_gated_delta_net(
                     b1hn.clone(),
                 );
                 let gt_bhn1 = out.reshape(gt_b1hn, vec![bh as i64, n as i64, 1], bh_n1.clone());
-                let gt_bhnn = out.add_node(
-                    Op::Expand {
-                        target_shape: bhnn_i64.clone(),
-                    },
-                    vec![gt_bhn1],
-                    bhnn.clone(),
-                );
-                out.activation(Activation::Exp, gt_bhnn, bhnn.clone())
+                // `exp` on `[BH, N, 1]`, not on the expanded `[BH, N, N]`: the
+                // decay is constant along the last axis, so expanding first
+                // meant computing `N` identical exponentials per entry and
+                // materializing a state-sized tensor to hold them.
+                out.activation(Activation::Exp, gt_bhn1, bh_n1.clone())
             } else {
                 let gt_b1h = out.add_node(
                     Op::Narrow {
@@ -210,29 +206,23 @@ pub(super) fn unfuse_gated_delta_net(
                     ),
                 );
                 let gt_bh11 = out.reshape(gt_bhn, vec![bh as i64, 1, 1], bh11.clone());
-                let gt_bhnn = out.add_node(
-                    Op::Expand {
-                        target_shape: bhnn_i64.clone(),
-                    },
-                    vec![gt_bh11],
-                    bhnn.clone(),
-                );
-                out.activation(Activation::Exp, gt_bhnn, bhnn.clone())
+                // One exponential per (batch, head) — the per-head decay is a
+                // single scalar. Expanding to `[BH, N, N]` first computed `N²`
+                // copies of it and wrote a state-sized tensor per timestep.
+                out.activation(Activation::Exp, gt_bh11, bh11.clone())
             };
 
-            let state_bhnn = out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
-            let damped = out.binary(BinaryOp::Mul, exp_g, state_bhnn, bhnn.clone());
-            state = out.reshape(
-                damped,
-                vec![b_dim as i64, h_dim as i64, n as i64, n as i64],
-                bhnn4.clone(),
-            );
+            // `exp_g` broadcasts against the state rather than being expanded
+            // to its full `[BH, N, N]` first — `Op::Binary` already broadcasts
+            // (the outer product below relies on it), so materializing the
+            // decay factor at state size was one redundant `B·H·N²` tensor per
+            // timestep.
+            state = out.binary(BinaryOp::Mul, exp_g, state, bhnn.clone());
 
             let kt_bh1n = out.reshape(kt_b1hn, vec![bh as i64, 1, n as i64], bh1n.clone());
             let vt_bh1n = out.reshape(vt_b1hn, vec![bh as i64, 1, n as i64], bh1n.clone());
-            let state_bhnn = out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
 
-            let mut sk = out.matmul(kt_bh1n, state_bhnn, bh1n.clone());
+            let mut sk = out.matmul(kt_bh1n, state, bh1n.clone());
             sk = out.binary(BinaryOp::Sub, vt_bh1n, sk, bh1n.clone());
 
             let beta_bhn = out.reshape(
@@ -243,15 +233,10 @@ pub(super) fn unfuse_gated_delta_net(
                     dtype,
                 ),
             );
+            // Same broadcast argument as `exp_g`: `[BH, 1, 1]` against
+            // `[BH, 1, N]` needs no expansion.
             let beta_bh11 = out.reshape(beta_bhn, vec![bh as i64, 1, 1], bh11.clone());
-            let beta_bh1n = out.add_node(
-                Op::Expand {
-                    target_shape: bh1n_i64.clone(),
-                },
-                vec![beta_bh11],
-                bh1n.clone(),
-            );
-            sk = out.binary(BinaryOp::Mul, sk, beta_bh1n, bh1n.clone());
+            sk = out.binary(BinaryOp::Mul, sk, beta_bh11, bh1n.clone());
 
             let kt_bhn = out.reshape(
                 kt_b1hn,
@@ -259,19 +244,13 @@ pub(super) fn unfuse_gated_delta_net(
                 bhn.clone(),
             );
             let kt_bhn1 = out.reshape(kt_bhn, vec![bh as i64, n as i64, 1], bh_n1.clone());
-            let sk_bh1 = out.reshape(sk, vec![bh as i64, 1, n as i64], bh1n.clone());
-            let outer = out.binary(BinaryOp::Mul, kt_bhn1, sk_bh1, bhnn.clone());
-            let state_bhnn = out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
-            state = out.binary(BinaryOp::Add, state_bhnn, outer, bhnn.clone());
-            state = out.reshape(
-                state,
-                vec![b_dim as i64, h_dim as i64, n as i64, n as i64],
-                bhnn4.clone(),
-            );
+            // `sk` is already `[BH, 1, N]`; the outer product broadcasts it
+            // against `[BH, N, 1]` directly.
+            let outer = out.binary(BinaryOp::Mul, kt_bhn1, sk, bhnn.clone());
+            state = out.binary(BinaryOp::Add, state, outer, bhnn.clone());
 
             let qt_bh1n = out.reshape(qt_b1hn, vec![bh as i64, 1, n as i64], bh1n.clone());
-            let state_bhnn = out.reshape(state, vec![bh as i64, n as i64, n as i64], bhnn.clone());
-            let mut out_t = out.matmul(qt_bh1n, state_bhnn, bh1n.clone());
+            let mut out_t = out.matmul(qt_bh1n, state, bh1n.clone());
             out_t = out.binary(BinaryOp::Mul, out_t, scale_bh1n, bh1n.clone());
             let out_b1hn = out.reshape(
                 out_t,
@@ -1251,7 +1230,7 @@ pub(super) fn unfuse_selective_scan(
     // ~20·S-node unroll). Set `RLX_SELSCAN_LEGACY_UNROLL=1` to force the
     // legacy per-timestep unroll (kept for the parity gate that compares
     // the two backwards in one build).
-    let legacy = std::env::var("RLX_SELSCAN_LEGACY_UNROLL")
+    let legacy = rlx_ir::env::var("RLX_SELSCAN_LEGACY_UNROLL")
         .map(|v| v == "1")
         .unwrap_or(false);
     if legacy {

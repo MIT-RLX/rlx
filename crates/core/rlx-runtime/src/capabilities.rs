@@ -9,7 +9,7 @@
 //! pipeline, …). Most backends leave those as no-ops / `false`. Callers that
 //! need to branch on support should prefer:
 //!
-//! 1. [`ExecutableGraph::capabilities`] for a cheap advisory bitmask, then
+//! 1. `ExecutableGraph::capabilities` for a cheap advisory bitmask, then
 //! 2. the concrete method's return value (`false` / `None`) as the source of
 //!    truth — capabilities can lag a backend that forgot to override them.
 //!
@@ -31,7 +31,14 @@
 pub struct ExecutableCapabilities {
     /// [`crate::ExecutableGraph::clone_box`] is implemented (not the default panic).
     pub clone: bool,
-    /// MoE residency / TopK capture hooks are live.
+    /// `set_moe_resident_experts` (and the per-layer form) pin experts on the
+    /// device instead of streaming them per token.
+    ///
+    /// This is the half that needs a flag: those setters return `()`, so a
+    /// caller has no other way to learn the backend ignored them. The
+    /// instrumentation hooks (`enable_moe_topk_capture`,
+    /// `take_moe_residency_stats`) return `Option`/`bool` and report for
+    /// themselves — they are CPU-only and are NOT implied by this flag.
     pub moe: bool,
     /// Persistent named handles (`bind_handle` / `read_handle`).
     pub persistent_handles: bool,

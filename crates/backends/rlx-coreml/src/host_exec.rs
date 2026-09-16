@@ -56,7 +56,7 @@ pub fn is_host_op(op: &Op) -> bool {
             ..
         } => {
             *save_trajectory
-                || std::env::var("RLX_COREML_NATIVE_SCAN").as_deref() == Ok("0")
+                || rlx_ir::env::var("RLX_COREML_NATIVE_SCAN").as_deref() == Some("0")
                 || body.nodes().iter().any(|n| is_host_node(body, n.id))
         }
         // Most `Op::Custom` stay host (ONNX reference kernels). ScatterND has a
@@ -163,6 +163,12 @@ pub fn is_host_op(op: &Op) -> bool {
 }
 
 /// Graph-aware host decision (see [`is_host_op`]).
+/// Largest spatial kernel extent CoreML's 2-D convolution computes correctly.
+///
+/// Above this it returns wrong numbers rather than refusing, so the bound has to
+/// be enforced on our side. Determined by bisection against the CPU kernel.
+pub const COREML_MAX_CONV_KERNEL: usize = 64;
+
 pub fn is_host_node(graph: &Graph, id: NodeId) -> bool {
     let node = graph.node(id);
     match &node.op {
@@ -172,17 +178,77 @@ pub fn is_host_node(graph: &Graph, id: NodeId) -> bool {
             let w = &graph.node(node.inputs[1]).op;
             !matches!(w, Op::Param { .. } | Op::Constant { .. })
         }
+        // CoreML's 2-D `conv` silently returns wrong values once a spatial
+        // kernel exceeds 64 — it does not refuse, it just computes something
+        // else. Measured on a `[1,2,1,2500]` depthwise conv: kernel widths up to
+        // 64 are exact, 65 gives cos 0·437, 129 gives cos 0·221, and the error
+        // grows with the channel count. `rlx-msmddnet` uses a 1x65 multiscale
+        // branch and was wrong on the Neural Engine for exactly this reason
+        // while matching on every other backend. Host the op instead; it is a
+        // correctness bound, not a performance choice.
+        Op::Conv { kernel_size, .. }
+            if kernel_size.iter().any(|&k| {
+                k > rlx_ir::env::var("RLX_COREML_MAX_CONV_KERNEL")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(COREML_MAX_CONV_KERNEL)
+            }) =>
+        {
+            if rlx_ir::env::var("RLX_COREML_DBG_CONV").is_some() {
+                eprintln!("[coreml] hosting Conv node {} kernel {kernel_size:?}", id.0);
+            }
+            true
+        }
+        // CoreML miscomputes a reduction whose input is a *reshaped concat* —
+        // deterministically, and only above a size that depends on the shape in
+        // a way Apple does not document (with 48 channels and pool 4 it is exact
+        // at 341 groups, wrong at 342 and 343, exact again at 400, wrong at
+        // 1000). The same reduce is exact when fed a plain input or a reshape of
+        // one, so it is the concat's output being viewed rather than copied.
+        // `rlx-msmddnet` pools a three-branch concat exactly this way and was
+        // wrong on the Neural Engine while matching every other backend.
+        // Hosting the reduction sidesteps it; `RLX_COREML_HOST_RESHAPED_REDUCE=0`
+        // turns the guard off for bisection.
+        Op::Reduce { .. }
+            if rlx_ir::env::var("RLX_COREML_HOST_RESHAPED_REDUCE").as_deref() != Some("0")
+                && reduces_a_reshaped_concat(graph, node) =>
+        {
+            true
+        }
         other => is_host_op(other),
     }
 }
 
+/// True when this reduction's input is a `Reshape` of a `Concat`.
+fn reduces_a_reshaped_concat(graph: &Graph, node: &rlx_ir::Node) -> bool {
+    let Some(&src) = node.inputs.first() else {
+        return false;
+    };
+    let src_node = graph.node(src);
+    if !matches!(src_node.op, Op::Reshape { .. }) {
+        return false;
+    }
+    src_node
+        .inputs
+        .first()
+        .is_some_and(|&p| matches!(graph.node(p).op, Op::Concat { .. }))
+}
+
 /// Run one host op; `env` maps producer `NodeId` → f32 tensor (row-major).
+/// A recurrent op's final state, destined for the param it was loaded from.
+///
+/// `Op::Lstm { carry }` is contracted to overwrite `h0`/`c0` in place so the
+/// next decode step continues the sequence. This backend runs that form on the
+/// host (see [`is_host_op`]), so the new state comes back out through here and
+/// the caller writes it into its param map.
+pub type StateWriteback = (String, Vec<f32>);
+
 pub fn run_host_node(
     graph: &Graph,
     id: NodeId,
     env: &HashMap<u32, Vec<f32>>,
     _params: &HashMap<String, Vec<f32>>,
     typed_params: &crate::mil::TypedParams,
+    writeback: &mut Vec<StateWriteback>,
 ) -> Result<Vec<f32>> {
     let node = graph.node(id);
     let load = |nid: NodeId| -> Result<Vec<f32>> {
@@ -310,6 +376,7 @@ pub fn run_host_node(
             *num_layers,
             *bidirectional,
             *carry,
+            writeback,
         ),
         Op::Gru {
             hidden_size,
@@ -832,6 +899,7 @@ fn custom_int_dtype_overrides(
 }
 
 #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+#[allow(clippy::too_many_arguments)]
 fn run_lstm_f32(
     graph: &Graph,
     node: &rlx_ir::Node,
@@ -840,6 +908,7 @@ fn run_lstm_f32(
     num_layers: usize,
     bidirectional: bool,
     carry: bool,
+    writeback: &mut Vec<StateWriteback>,
 ) -> Result<Vec<f32>> {
     let load = |nid: NodeId| -> Result<Vec<f32>> {
         env.get(&nid.0)
@@ -914,6 +983,23 @@ fn run_lstm_f32(
             arena.as_mut_ptr(),
         );
     }
+    // `execute_lstm_f32` overwrote h0/c0 in the arena with the final hn/cn.
+    // Returning only `dst` — which this did until the write-back was plumbed —
+    // silently drops them, so every decode step restarts from the same state and
+    // the sequence is wrong with nothing failing.
+    if carry {
+        let read = |off: usize, len: usize| -> Vec<f32> {
+            arena[off..off + len * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        for (slot, off, len) in [(4usize, h0_off, h0.len()), (5usize, c0_off, c0.len())] {
+            if let Op::Param { name } = &graph.node(node.inputs[slot]).op {
+                writeback.push((name.clone(), read(off, len)));
+            }
+        }
+    }
     let dst_bytes = &arena[dst_off..dst_off + out_len * 4];
     Ok(dst_bytes
         .chunks_exact(4)
@@ -922,6 +1008,7 @@ fn run_lstm_f32(
 }
 
 #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+#[allow(clippy::too_many_arguments)]
 fn run_lstm_f32(
     _graph: &Graph,
     _node: &rlx_ir::Node,
@@ -930,6 +1017,7 @@ fn run_lstm_f32(
     _num_layers: usize,
     _bidirectional: bool,
     _carry: bool,
+    _writeback: &mut Vec<StateWriteback>,
 ) -> Result<Vec<f32>> {
     Err(CoremlError::Unsupported(
         "lstm host execution requires macOS/iOS".into(),

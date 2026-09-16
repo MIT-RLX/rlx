@@ -35,7 +35,7 @@
 use crate::op::{Op, OpKind};
 
 /// Number of [`OpKind`] variants.
-pub const N_KINDS: usize = 184;
+pub const N_KINDS: usize = 186;
 
 /// Static properties of an op, independent of its operands or attributes.
 ///
@@ -179,6 +179,7 @@ impl OpKind {
         OpKind::Reverse,
         OpKind::Pad,
         OpKind::Slice,
+        OpKind::Roll,
         OpKind::Clamp,
         OpKind::Tile,
         OpKind::Trilu,
@@ -282,6 +283,7 @@ impl OpKind {
         OpKind::Custom,
         OpKind::CustomFn,
         OpKind::Fft,
+        OpKind::FftQ,
         OpKind::FftButterflyStage,
         OpKind::LogMel,
         OpKind::LogMelBackward,
@@ -360,6 +362,7 @@ impl OpKind {
             PartitionedConv
             | SelectiveScan
             | GatedDeltaNet
+            | GatedDeltaNetBackward
             | Lstm
             | Gru
             | Rnn
@@ -408,6 +411,7 @@ impl OpKind {
             | Reverse
             | Pad
             | Slice
+            | Roll
             | Clamp
             | Tile
             | Trilu
@@ -464,6 +468,7 @@ impl OpKind {
             | ScaledDequantize
             | Custom
             | Fft
+            | FftQ
             | FftButterflyStage
             | LogMel
             | LogMelBackward

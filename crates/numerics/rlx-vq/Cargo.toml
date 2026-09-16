@@ -37,3 +37,8 @@ rlx-runtime = { workspace = true, features = ["cpu", "metal", "gpu", "mlx"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+features       = ["cpu"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

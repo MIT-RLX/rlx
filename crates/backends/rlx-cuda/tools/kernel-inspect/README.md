@@ -56,12 +56,14 @@ python3 …/kinspect.py analyze /tmp/kd
 python3 …/kinspect.py diff before/report.json after/report.json
 ```
 
-From the mac, drive it on the rigs via `rig.sh` (see the repo's rig setup):
+Both backends run the same entry point; point it at whichever host has the GPU:
 
 ```bash
-./rig.sh --msi exec 'python3 crates/backends/rlx-cuda/tools/kernel-inspect/kinspect.py run'  # CUDA on msi
-./rig.sh --amd exec 'python3 crates/backends/rlx-cuda/tools/kernel-inspect/kinspect.py run'  # ROCm on amd
+python3 crates/backends/rlx-cuda/tools/kernel-inspect/kinspect.py run   # CUDA or ROCm
 ```
+
+Driving it on a remote GPU host is a local-tooling concern and deliberately not
+described here — the command above is the whole interface.
 
 ## Output
 
@@ -85,3 +87,6 @@ Under `<dump>/report/` (default `target/kernel-inspect/dump-<target>/report/`):
   `llvm-objdump`+`llvm-readobj`), no GPU.
 - The `RLX_DUMP_KERNELS` hook is off unless the env var is set — zero cost to
   normal builds.
+## License
+
+MIT OR Apache-2.0.

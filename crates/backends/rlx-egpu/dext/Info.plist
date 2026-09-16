@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key>
+	<string>RlxPciDriver</string>
+	<key>CFBundlePackageType</key>
+	<string>DEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>OSBundleUsageDescription</key>
+	<string>Provides userspace access to an external GPU on a Thunderbolt/USB4 PCIe tunnel.</string>
+
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>RlxPciDriver</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOUserClass</key>
+			<string>RlxPciDriver</string>
+			<key>IOMatchCategory</key>
+			<string>RlxPciDriver</string>
+			<key>IOResourceMatch</key>
+			<string>IOKit</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+
+			<!-- Base class 0x03: display controller. The class macOS ships no
+			     arm64 driver for, which is why an eGPU arrives unclaimed. -->
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000</string>
+
+			<!-- Without this the personality never matches a device behind a
+			     Thunderbolt/USB4 tunnel, which is every eGPU. -->
+			<key>IOPCITunnelCompatible</key>
+			<true/>
+
+			<key>RlxPciDriverUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>RlxPciDriverUserClient</string>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>

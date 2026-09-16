@@ -76,7 +76,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn cast_f32_to_i32_truncates_toward_zero() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[cast_parity] no wgpu device — skipping f32→i32");
         return;
     }
@@ -89,7 +89,7 @@ fn cast_f32_to_i32_truncates_toward_zero() {
 
 #[test]
 fn cast_f32_to_u8_saturates() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[cast_parity] no wgpu device — skipping f32→u8");
         return;
     }
@@ -103,7 +103,7 @@ fn cast_f32_to_u8_saturates() {
 
 #[test]
 fn cast_f32_to_bool_is_nonzero() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[cast_parity] no wgpu device — skipping f32→bool");
         return;
     }
@@ -116,7 +116,7 @@ fn cast_f32_to_bool_is_nonzero() {
 
 #[test]
 fn cast_i32_to_f32_is_value_preserving() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[cast_parity] no wgpu device — skipping i32→f32");
         return;
     }
@@ -133,7 +133,7 @@ fn cast_i32_to_f32_is_value_preserving() {
 /// either way. `mul(x, 2.5)` then truncate to i32.
 #[test]
 fn cast_fused_after_mul_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[cast_parity] no wgpu device — skipping fused cast");
         return;
     }
@@ -187,7 +187,7 @@ fn cast_fused_after_mul_matches_cpu() {
 /// kernel does the real cast, not the old identity.
 #[test]
 fn region_fused_relu_then_cast_i32() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[cast_parity] no wgpu device — skipping region cast");
         return;
     }
@@ -226,7 +226,7 @@ fn region_fused_relu_then_cast_i32() {
 /// demotion — compiling one must panic (cleanly rejected, not silent garbage).
 #[test]
 fn cast_to_f64_is_rejected() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[cast_parity] no wgpu device — skipping f64 rejection");
         return;
     }

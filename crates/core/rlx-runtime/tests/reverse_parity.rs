@@ -11,6 +11,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn run(device: Device, dims: &[usize], axes: Vec<usize>, x: &[f32]) -> Vec<f32> {
     let mut g = Graph::new("reverse");
     let inp = g.input("x", Shape::new(dims, DType::F32));
@@ -49,6 +51,7 @@ fn reference(dims: &[usize], axes: &[usize], x: &[f32]) -> Vec<f32> {
 
 #[test]
 fn reverse_batch_general_seq_axis() {
+    let _gpu = common::serialize_gpu();
     // [batch=3, seq=4, feat=2] reversed on the seq axis: each batch row flips
     // independently. The old batch=1 gather would corrupt rows 1..3.
     let dims = [3usize, 4, 2];
@@ -66,6 +69,7 @@ fn reverse_batch_general_seq_axis() {
 
 #[test]
 fn reverse_multi_axis_and_identity() {
+    let _gpu = common::serialize_gpu();
     let dims = [2usize, 3, 4];
     let x: Vec<f32> = (0..2 * 3 * 4).map(|i| (i * 3 % 7) as f32).collect();
     // Flip last two axes.
@@ -85,6 +89,7 @@ fn reverse_multi_axis_and_identity() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn reverse_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dims = [3usize, 4, 5];
     let x: Vec<f32> = (0..3 * 4 * 5).map(|i| (i % 11) as f32 * 0.5).collect();
     for axes in [vec![1], vec![0, 2], vec![2]] {
@@ -99,6 +104,7 @@ fn reverse_mlx_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn reverse_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dims = [3usize, 4, 5];
     let x: Vec<f32> = (0..3 * 4 * 5).map(|i| (i % 11) as f32 * 0.5).collect();
     for axes in [vec![1], vec![0, 2], vec![2]] {
@@ -113,6 +119,10 @@ fn reverse_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn reverse_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let dims = [3usize, 4, 5];
     let x: Vec<f32> = (0..3 * 4 * 5).map(|i| (i % 11) as f32 * 0.5).collect();
     for axes in [vec![1], vec![0, 2], vec![2]] {

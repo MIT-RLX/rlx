@@ -1,5 +1,6 @@
 package com.mit.rlx
 
+import android.content.Intent
 import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
@@ -19,6 +20,17 @@ class MainActivity : AppCompatActivity() {
         val outputText = findViewById<TextView>(R.id.outputText)
         val runButton = findViewById<Button>(R.id.runButton)
         val mnistButton = findViewById<Button>(R.id.mnistButton)
+        val nodeButton = findViewById<Button>(R.id.nodeButton)
+
+        nodeButton.setOnClickListener {
+            startActivity(Intent(this, NodeActivity::class.java))
+        }
+
+        // Scripted entry: `am start` can only reach an exported activity, and
+        // NodeActivity is not one. Forward the node extras through here.
+        if (intent?.hasExtra(NodeActivity.EXTRA_AUTOJOIN) == true) {
+            startActivity(NodeActivity.intentFrom(this, intent))
+        }
 
         runButton.setOnClickListener {
             try {

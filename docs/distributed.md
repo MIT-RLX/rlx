@@ -288,11 +288,184 @@ The workspace is validated across a Mac (arm64/Metal), a Linux CUDA rig, and an 
   (hybrid Metal + CUDA training). See [iroh-transport.md](iroh-transport.md).
 - **Raspberry-Pi-class aarch64**: cross-compile + run under QEMU with
   `./rig.sh test-pi` (includes a quantized `DequantMatMul` stage across two
-  emulated nodes). See [rig notes in `rig.sh`](../rig.sh).
+  emulated nodes). See rig notes in `rig.sh`.
 
 A worked three-way run (Mac coordinator on Metal + a Linux worker on CPU + a
 QEMU/Docker worker on aarch64, all joined by dial-out star with rendezvous
 discovery) is exactly what `dist_node MODE=fft` and `dist_job` demonstrate.
+
+## Non-desktop nodes — phones, embedded hosts, FPGAs
+
+A node is not necessarily a workstation. The transport layer has **no platform
+gating and no default C dependencies**, so anything with a CPU, a TCP stack and
+`std` can be a rank. What used to block non-desktop nodes was packaging, not
+capability: the node driver lived only in `rlx-collectives/examples/dist_node.rs`,
+and an *example* cannot be linked into an Android `.so` or an iOS framework.
+
+`rlx_runtime::dist::node` is that driver as a library — fully programmatic, so a
+platform with no shell environment can still configure a rank:
+
+```rust
+use rlx_runtime::dist::node::{NodeConfig, NodeControl, serve_worker};
+
+let cfg = NodeConfig::new(1, 2)
+    .peers(["192.168.1.10:29500", "192.168.1.11:29501"])?
+    .device("auto");                 // or "cpu", "metal", "gpu", …
+let group = cfg.connect()?;
+let report = serve_worker(&group, |_uri| Vec::new())?;
+```
+
+`NodeControl` bounds the serving loop with a step budget and a stop flag another
+thread can raise — a mobile node must be able to leave the mesh when the app is
+backgrounded. The flag is observed **between** activations: a node parked in
+`recv` exits when its peer sends or the link drops.
+
+### Training on a non-desktop node
+
+A node can join a **data-parallel training run**, not just serve inference:
+
+```rust
+use rlx_runtime::dist::node::{NodeConfig, serve_trainer_here};
+
+let group = NodeConfig::new(1, 2).peers(["192.168.1.10:29500"])?.connect()?;
+let report = serve_trainer_here(&group, rlx_runtime::dist::uri_resolver, false)?;
+println!("{} samples, loss {} -> {}",
+    report.metrics.samples, report.metrics.first_loss, report.metrics.last_loss);
+```
+
+The worker is model-agnostic — it receives a `TrainSpec` and trains a model it
+has no code for. The cross-rank gradient reduce rides on the group's own
+`all_reduce`, so the node driver needs no dependency on `rlx-collectives`.
+
+Three things that are easy to get wrong, and each fails quietly:
+
+- **Every rank must use the same reduce.** `mean_reduce` is public for that
+  reason: the coordinator trains alongside the workers, and a group where one
+  side sums while another averages scales the step differently per replica —
+  slow divergence, not an error.
+- **`push_data` is mandatory for a real node.** A handset has no shared
+  filesystem, so the spec's `file://` URIs — paths on the coordinator's disk —
+  resolve to nothing. The reduce counts then desync and the barrier deadlocks.
+  Only loopback can use `push_data: false`.
+- **A training rank cannot drop out partway.** The reduce is a barrier, so a
+  node that leaves stalls every other rank. `NodeControl`'s stop flag is
+  honoured between inference activations but **not** mid-training-run.
+
+Ask before shipping: `NodeCaps::can_train()` refuses a fixed-function rank,
+because a bitstream has no backward pass. Without that check the `TrainSpec`
+lands on a tag the board never reads and the coordinator waits forever.
+
+```sh
+just demo-coordinator "--world 2 --self-test --train"   # loopback, verifies agreement
+just demo-coordinator "--world 2 --train --peers 0.0.0.0:29500"  # wait for a phone
+```
+
+Verified on this machine: an **Android emulator trained on GPU (wgpu)** while
+the Mac ran CPU — heterogeneous data-parallel, loss 0.2875 → 0.0000; the iOS
+simulator likewise. The loopback self-test additionally checks that both ranks
+end bit-identical, which only holds if the all-reduce actually ran.
+
+### Shells
+
+| Target | Shell | Notes |
+|---|---|---|
+| iOS / macOS | `crates/bindings/rlx-ffi` (C ABI) + `ios/` | `ios/build-xcframework.sh` → `RlxNode.xcframework`; Swift wrapper in `ios/Sources/RlxNode`. **Needs `NSLocalNetworkUsageDescription`**, and the multicast entitlement for UDP discovery — see [ios/README.md](../ios/README.md) |
+| Android | `android/rlx-jni` + `RlxNode.kt` | `nodeStart` / `nodeStatus` / `nodeStop`; `RlxNode.start(discovery = true)` takes a `MulticastLock`, without which UDP discovery silently finds no peers |
+| Embedded Linux host | `crates/bindings/rlx-ffi` (staticlib) | Same C ABI; the host for an FPGA rank |
+
+`rlx-ffi` builds a `staticlib` only. A `cdylib` must resolve every symbol at
+link time and `zstd-sys` (pulled in by the GGUF reader) does not on iOS.
+
+### Demo apps
+
+Runnable demos for both mobile platforms, plus the desktop coordinator they
+pair with.
+
+```sh
+just demo-coordinator          # desktop side, loopback self-test (no phone)
+just demo-ios                  # xcframework → XcodeGen project → simulator build
+just demo-android              # cross-build the .so → APK
+```
+
+The coordinator ships a parameter-free stage (`gelu(x * 3 + 1)` over 64
+elements), streams activations around the ring, and checks each result against
+an f64 reference — so "it connected" and "it computed the right thing" are
+separate, visible outcomes. With two phones the activation is transformed
+twice, which makes it a pipeline rather than a round trip.
+
+To involve a handset, give it the coordinator's address:
+
+```sh
+cargo run -p rlx-ffi --example node_coordinator -- --world 2 --peers 0.0.0.0:29500
+```
+
+A worker only needs **one** address — the coordinator's. It dials out and
+nothing dials it back, because most Wi-Fi will not route inbound connections to
+a handset. That is why the mobile shells default to a star: a lone peer address
+(or discovery) selects `Topology::Star`, while a full per-rank list selects a
+mesh.
+
+Both apps are scriptable, so a run needs no UI driving:
+
+```sh
+# iOS — UserDefaults picks up `-key value` launch arguments
+xcrun simctl launch <sim> com.mit.rlx.nodedemo \
+    -rank 1 -world 2 -peers 127.0.0.1:29500 -autojoin YES
+
+# Android — MainActivity forwards the extras (NodeActivity stays unexported)
+adb shell am start -n com.mit.rlx.demo/com.mit.rlx.MainActivity \
+    --ei rank 1 --ei world 2 --es peers 10.0.2.2:29500 --ez autojoin true
+```
+
+The iOS simulator shares the host network stack, so `127.0.0.1` reaches a
+coordinator on the Mac. **An Android emulator does not** — its loopback is its
+own, and the host is `10.0.2.2`.
+
+Verified end-to-end on this machine: an iOS simulator joined as
+`rank 1 — ios [worker] devices: cpu` and an Android emulator as
+`rank 1 — android [worker] devices: cpu, gpu`, both matching the reference to
+6e-8.
+
+### FPGA — pre-synthesized fixed-function ranks
+
+An FPGA cannot host a runtime. `rlx-fpga` is a Verilog **code generator**; there
+is no `Device::Fpga` and it deliberately does not implement the `Backend` trait,
+because synthesis takes minutes and a shipped graph would need it in
+milliseconds.
+
+So an FPGA joins as a rank that advertises the *one* datapath its bitstream
+implements, and the coordinator only ever assigns it that stage:
+
+```rust
+use rlx_runtime::dist::node::{FixedFunction, serve_fixed_function_n, NodeControl};
+
+let ff = FixedFunction::new("relu4-int8-v1", 4, 4, DType::F32);
+serve_fixed_function_n(&group, &ff, &mut board, &NodeControl::unbounded())?;
+```
+
+Two guards, because a wrong feed clocked into fabric produces numbers rather
+than an error:
+
+- **At placement** — `NodeCaps::accepts(&spec)` refuses a `StageSpec` whose
+  `stage_id` does not match the bitstream, *and* refuses an untagged spec. The
+  coordinator calls `collect_caps` before shipping anything.
+- **At execution** — the serving loop checks every activation's length against
+  the descriptor before touching the board.
+
+The board itself is behind the `FixedFunctionDevice` trait (one method:
+`execute`), so the link is board-specific — PCIe, AXI on a Zynq PS, USB, UART —
+while the mesh side stays testable. `LoopbackFixedFunction` is the software
+stand-in used by `crates/core/rlx-runtime/tests/dist_node_fixed_function.rs`,
+which runs a real 3-rank mesh (coordinator → general worker → fixed-function
+rank) with no hardware attached.
+
+**Writing the `FixedFunctionDevice` for a specific board is still yours to do** —
+that part cannot be validated without the hardware.
+
+### Verifying
+
+`just check-nodes` cross-compiles the whole node stack for iOS and Android and
+runs the node tests. Android is skipped, loudly, if no NDK is installed.
 
 ## Where things live
 
@@ -305,6 +478,13 @@ discovery) is exactly what `dist_node MODE=fft` and `dist_job` demonstrate.
 | `crates/core/rlx-collectives/` | in-graph collectives (`all_reduce`, `moe_dispatch` / `moe_combine`, …) + examples |
 | `crates/core/rlx-collectives/examples/wide_ep_toy.rs` | WideEP Phase 0: 2-expert / 2-rank padded EP MoE parity |
 | `crates/core/rlx-runtime/src/dist/` | ship-graph `{inference, training, diagnostics}` submodules + shared weight resolvers (`mod.rs`) |
+| `crates/core/rlx-runtime/src/dist/node.rs` | platform-neutral node driver: `NodeConfig`, `NodeControl`, `serve_worker`, fixed-function (FPGA) ranks |
+| `crates/bindings/rlx-ffi/` | C ABI for the node — iOS `staticlib` + embedded C hosts |
+| `ios/` | `xcframework` build + Swift wrapper + entitlement notes |
+| `android/rlx-jni/` | JNI node entry points; `RlxNode.kt` owns the multicast lock + lifecycle |
+| `crates/bindings/rlx-ffi/examples/node_coordinator.rs` | desktop coordinator for the mobile demos (`--self-test` runs the workers on loopback) |
+| `ios/Demo/` | SwiftUI node demo (XcodeGen `project.yml`) |
+| `android/app/.../NodeActivity.kt` | Android node demo screen |
 | `crates/core/rlx-collectives/DISTRIBUTED_ROADMAP.md` | the deeper tiers (NCCL/RCCL, UCX/RDMA, NVSHMEM) |
 ## License
 

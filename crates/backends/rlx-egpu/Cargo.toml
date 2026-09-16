@@ -1,0 +1,79 @@
+[package]
+name = "rlx-egpu"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "External GPU (USB4/Thunderbolt) backend seam for RLX on Apple Silicon — IOKit PCI discovery + PCIDriverKit transport."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Discovery + transport only: no build script, no SDK. macOS grants no in-tree
+# path to a PCIe GPU, so the device-bring-up stage (`am` / `nv`) hangs off the
+# transport in `dext` once a userspace ring/firmware driver exists.
+
+[features]
+default = []
+# PCI transport through a signed driver extension holding
+# `com.apple.developer.driverkit.transport.pci`. Speaks the helper's UNIX-socket
+# protocol: config space, BAR mapping, DMA buffers with physical scatter-gather
+# addresses. rlx ships no extension of its own and names none in code — the
+# helper path, IOService name and socket are all overridable. macOS-only; needs
+# libc for `recvmsg`/`mmap`.
+dext = ["dep:libc"]
+# AMD RDNA3/RDNA4 device bring-up (PSP firmware load, SMU, GFX/SDMA rings,
+# GPUVM page tables) on top of `dext`. The register sequencing is written but
+# has never been executed — no card has been attached to run it — so this
+# compiles the module without making the device dispatchable. See README.
+am = ["dext", "firmware"]
+# RESERVED — NVIDIA GSP bring-up (booter / FMC / GSP images, then RPC to the
+# GSP microcontroller). Not written. Reserved so the `am`-shaped gate is not
+# mistaken for covering both vendors.
+nv = ["dext", "firmware"]
+# SHA-256 verification of the signed vendor firmware in the local cache. The
+# blobs are fetched by `scripts/pull_gpu_firmware.sh`; this feature is what lets
+# rlx refuse one whose hash does not match the pinned manifest.
+firmware = ["dep:sha2"]
+# CUDA C++ -> PTX through NVRTC, dlopen'd at run time. NVRTC compiles in-process
+# and reads no system headers, so it works where the `nvcc` frontend collides
+# with glibc's math declarations. No CUDA needed at build time.
+nvrtc = ["dep:libc"]
+
+[dependencies]
+# For the (currently empty) `SUPPORTED_OPS` claim the legalizer consults.
+rlx-ir = { workspace = true }
+# recvmsg/SCM_RIGHTS + mmap for the driver-extension transport (feature `dext`).
+libc = { version = "0.2", optional = true }
+# Verify the pinned vendor firmware blobs (feature `firmware`).
+sha2 = { version = "0.10", optional = true }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "egpu_probe"
+
+[[example]]
+name = "egpu_pci"
+required-features = ["dext"]
+
+# Reads a baked kernel pack with no toolchain, no driver and no device — the
+# half that runs on the machine holding the card.
+[[example]]
+name = "egpu_inspect"
+
+# Builds a pack. Needs hipcc / ptxas, so it runs on the build host.
+[[example]]
+name = "egpu_bake"
+
+[[example]]
+name = "egpu_firmware"
+required-features = ["firmware"]
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

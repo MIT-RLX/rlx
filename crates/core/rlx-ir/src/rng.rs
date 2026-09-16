@@ -6,7 +6,7 @@
 //!
 //! # Behavioral contract
 //!
-//! [`Op::RngNormal`] / [`Op::RngUniform`] take an optional shape-template input
+//! `Op::RngNormal` / `Op::RngUniform` take an optional shape-template input
 //! (ONNX `Random*Like`) or no inputs when the output shape is fixed at import
 //! time (ONNX `Random*` with a `shape` attribute). The output tensor shape is
 //! always the node's assigned shape; the template input is not copied into the
@@ -19,15 +19,15 @@
 //! | [`RngBackend::Bnns`] | Portable Apple BNNS AES-CTR-128 stream (`BNNSCreateRandomGeneratorWithSeed`) + BNNS uniform byte mapping; Box–Muller normals; see [`BnnsAesCtr128`]. |
 //! | [`RngBackend::Zero`] | Writes zeros — useful when comparing against a stochastic reference without re-seeding ORT. |
 //!
-//! Policy is set at compile time via [`CompileOptions::rng`] and can be overridden
-//! per session through [`rlx_runtime::CompiledGraph::set_rng`] without
+//! Policy is set at compile time via `CompileOptions::rng` and can be overridden
+//! per session through `rlx_runtime::CompiledGraph::set_rng` without
 //! recompiling. Each execute re-seeds from the current policy (ORT session state
 //! is not advanced across runs today).
 
 use aes::Aes128;
 use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 
-/// Which RNG implementation to use for [`Op::RngNormal`] / [`Op::RngUniform`].
+/// Which RNG implementation to use for `Op::RngNormal` / `Op::RngUniform`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub enum RngBackend {

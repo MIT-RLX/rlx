@@ -34,9 +34,13 @@ extern "C" __global__ void rope(
     unsigned int head_base = i - d_in_head;
 
     // Partial rotary (Gemma 4 global layers use n_rot < head_dim): only the
-    // first n_rot = 2*rot_half dims rotate; trailing dims pass through. The
-    // cos/sin row stride stays `half` (head_dim/2), matching the CPU reference.
-    // `rot_half == half` for full rotation, so this guard never fires there.
+    // first n_rot = 2*rot_half dims rotate; trailing dims pass through.
+    // `half` is the cos/sin table's ACTUAL row stride, passed in from the
+    // table's last dimension — it is not necessarily head_dim/2, because the
+    // layout is a per-model choice (Qwen3.5 pads to head_dim/2 and uses the
+    // leading n_rot/2 columns; DeepSeek-V4 MLA packs n_rot/2 exactly). This
+    // used to be hardcoded to head_dim/2 here and to n_rot/2 in the CPU
+    // reference, so the two silently disagreed whenever n_rot < head_dim.
     unsigned int n_rot = rot_half * 2u;
     if (d_in_head >= n_rot) {
         arena[out_off + i] = arena[in_off + i];

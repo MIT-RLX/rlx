@@ -13,7 +13,7 @@
 //! math.
 //!
 //! Pairs with [`crate::RopeTablesStage`] (which consumes the `(cos, sin)`
-//! tables this module emits) and with [`rlx_ir::op::Rope`] (the IR op).
+//! tables this module emits) and with `rlx_ir::op::Rope` (the IR op).
 
 use std::f64::consts::PI;
 

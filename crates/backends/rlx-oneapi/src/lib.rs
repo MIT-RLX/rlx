@@ -32,6 +32,12 @@ pub mod backend;
 pub mod device;
 pub mod host;
 pub mod kernels;
+
+/// Generate a tiled matmul entry point *from* a typed schedule.
+///
+/// Feature-gated and unmeasured — see the module docs for both caveats.
+#[cfg(feature = "schedule-codegen")]
+pub mod kernel_schedule_emit;
 pub mod level_zero;
 pub mod spd;
 pub(crate) mod unfuse;

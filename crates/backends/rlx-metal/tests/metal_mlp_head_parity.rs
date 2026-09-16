@@ -81,7 +81,7 @@ fn build(rows: usize, h: usize, inter: usize, vocab: usize, eps: f32) -> Graph {
 
 #[test]
 fn metal_mlp_head_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

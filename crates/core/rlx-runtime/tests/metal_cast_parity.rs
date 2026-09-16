@@ -27,6 +27,8 @@ use half::{bf16, f16};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 /// Decode a typed output buffer to `f64` real values (complex → real part),
 /// so CPU and Metal can be compared even when a backend reports a widened
 /// output dtype (Metal stores an I32 Cast in a widened f32 slot → reports F32,
@@ -124,7 +126,8 @@ fn run_cast_chain(name: &str, xs: &[f32], dtypes: &[DType]) -> (Vec<f64>, Vec<f6
 
 #[test]
 fn metal_cast_f32_to_i32_truncates() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let xs = [3.7f32, -3.7, 100.9, -100.9, 0.0];
@@ -137,7 +140,8 @@ fn metal_cast_f32_to_i32_truncates() {
 
 #[test]
 fn metal_cast_f32_to_c64() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let xs = [1.0f32, -2.5, 3.0];
@@ -177,7 +181,8 @@ fn metal_cast_f32_to_c64() {
 
 #[test]
 fn metal_cast_f32_to_f16_and_bf16() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // F16/BF16 no longer PANIC on Metal (BF16 was unsupported in the old
@@ -213,7 +218,8 @@ fn metal_cast_f32_to_f16_and_bf16() {
 
 #[test]
 fn metal_cast_f32_to_u8_saturates() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // F32 → U8 (saturate) → F32. U8 is not widened by Metal, so the F32→U8
@@ -228,7 +234,8 @@ fn metal_cast_f32_to_u8_saturates() {
 
 #[test]
 fn metal_cast_u8_to_i8_wraps() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // F32 → U8 (saturate) → I8 (int→int WRAP) → F32. The U8 and I8 interior
@@ -245,7 +252,8 @@ fn metal_cast_u8_to_i8_wraps() {
 
 #[test]
 fn metal_cast_f64_roundtrip() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // F32 → F64 → F32. F64 has no Metal device kernels, but the interior F64
@@ -260,7 +268,8 @@ fn metal_cast_f64_roundtrip() {
 
 #[test]
 fn metal_cast_c64_to_f32_roundtrip() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // F32 → C64 (CastHost) → F32 (CastHost). Round-trips the real part; the

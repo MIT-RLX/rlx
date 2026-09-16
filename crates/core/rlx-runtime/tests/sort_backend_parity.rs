@@ -9,6 +9,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const R: usize = 4;
 const C: usize = 8;
 
@@ -39,6 +41,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn sort_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     assert_eq!(run(Device::Cpu, &x()).len(), 2 * R * C);
 }
 
@@ -47,7 +50,8 @@ macro_rules! backend_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !rlx_runtime::is_available($dev) {
+            let _gpu = common::serialize_gpu();
+            if common::skip_unless($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

@@ -57,7 +57,7 @@ impl Pass for FuseAttentionBackwardAll {
         //     forward reads a packed strided QKV while the backward reads separate,
         //     unwritten buffers). Under investigation; until fixed the correct non-fused
         //     CPU path (parallelize + BLAS, ~75× over the original naive kernel) is default.
-        if std::env::var("RLX_CPU_ATTN_BWD_FUSE").as_deref() != Ok("1") {
+        if rlx_ir::env::var("RLX_CPU_ATTN_BWD_FUSE").as_deref() != Some("1") {
             return graph;
         }
         // Group the sibling AttentionBackward nodes by their shared (q,k,v,dy).

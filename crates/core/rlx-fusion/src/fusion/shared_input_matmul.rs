@@ -34,8 +34,8 @@ use rlx_ir::OpKind;
 /// This saves one full input read (the shared input is read once instead
 /// of twice). Critical for SwiGLU (fc11+fc12) and QKV fusion.
 ///
-/// Groups larger than [`MAX_SHARED_INPUT_MATMULS`] (or whose concatenated
-/// weights exceed [`MAX_SHARED_INPUT_WEIGHT_ELEMS`]) are left unfused.
+/// Groups larger than `MAX_SHARED_INPUT_MATMULS` (or whose concatenated
+/// weights exceed `MAX_SHARED_INPUT_WEIGHT_ELEMS`) are left unfused.
 /// F5 DiT otherwise packs ~23 AdaLN linears on the same time embed into one
 /// ~0.5 GiB Concat weight; sharded wgpu cannot bind/stage that B correctly
 /// (MatMul term collapses; AdaLN Gemm matches bias alone).

@@ -265,6 +265,139 @@ extern "C" __global__ void dequant_matmul_gguf_q1_gemv(
     }
 }
 
+// Cooperative Q2_0 GEMV (PrismML Ternary-Bonsai / Doses AI Pestle factors).
+// One block per output row; threads split the k/128 blocks. Fusing dequant
+// into the dot is what makes this worth having: the scratch path materializes
+// the whole [n, k] weight as f32 first, which for Pestle's 248320-row lm_head
+// is a 5.1 GiB slab that will not fit beside the packed weights on a 16 GiB
+// card. Block layout: f16 scale + 32 bytes of 2-bit codes, value = (q-1)*d.
+// Neumaier-compensated accumulation + tree reduce, matching the Q1_0 path.
+extern "C" __global__ void dequant_matmul_gguf_q2_gemv(
+    float* arena,
+    unsigned long long n,
+    unsigned long long k,
+    unsigned long long x_off,
+    unsigned long long w_byte_off,
+    unsigned long long out_off
+) {
+    unsigned long long j = blockIdx.x;
+    if (j >= n) return;
+
+    unsigned long long w_word = w_byte_off / 4ull;
+    unsigned long long blocks_per_row = k / 128ull;
+    float acc = 0.0f;
+    float comp = 0.0f;
+
+    for (unsigned long long r = threadIdx.x; r < blocks_per_row; r += blockDim.x) {
+        unsigned long long base = (j * blocks_per_row + r) * 34ull;
+        float d = rd_f16(arena, w_word, base);
+        unsigned long long xb = x_off + r * 128ull;
+        #pragma unroll 4
+        for (unsigned int byte = 0u; byte < 32u; byte++) {
+            unsigned int qs = rd_byte(arena, w_word, base + 2ull + (unsigned long long)byte);
+            #pragma unroll
+            for (unsigned int c = 0u; c < 4u; c++) {
+                float w = (float)((int)((qs >> (2u * c)) & 3u) - 1) * d;
+                float xv = arena[xb + (unsigned long long)(byte * 4u + c)];
+                float p = xv * w;
+                float e = __fmaf_rn(xv, w, -p);
+                neumaier_add(acc, comp, p);
+                comp += e;
+            }
+        }
+    }
+
+    __shared__ float smem_acc[256];
+    __shared__ float smem_comp[256];
+    unsigned int tid = threadIdx.x;
+    smem_acc[tid] = acc;
+    smem_comp[tid] = comp;
+    __syncthreads();
+    for (unsigned int s = blockDim.x >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float a = smem_acc[tid];
+            float c = smem_comp[tid];
+            float a2 = smem_acc[tid + s];
+            float c2 = smem_comp[tid + s];
+            float ssum = a + a2;
+            float err = (fabsf(a) >= fabsf(a2)) ? ((a - ssum) + a2) : ((a2 - ssum) + a);
+            smem_acc[tid] = ssum;
+            smem_comp[tid] = c + c2 + err;
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        arena[out_off + j] = smem_acc[0] + smem_comp[0];
+    }
+}
+
+// Cooperative G8_0 GEMV (Doses AI Pestle `token_embd` / lm_head). 32 elements
+// per block / 16 bytes: four **bf16** scales, one per group of 8, then 8 bytes
+// of 2-bit codes; value = (q-1)*bf16(d[j/8]). The per-group-of-8 scale is the
+// whole point of the format — a single block-wide scale reads as garbage.
+extern "C" __global__ void dequant_matmul_gguf_g8_gemv(
+    float* arena,
+    unsigned long long n,
+    unsigned long long k,
+    unsigned long long x_off,
+    unsigned long long w_byte_off,
+    unsigned long long out_off
+) {
+    unsigned long long j = blockIdx.x;
+    if (j >= n) return;
+
+    unsigned long long w_word = w_byte_off / 4ull;
+    unsigned long long blocks_per_row = k / 32ull;
+    float acc = 0.0f;
+    float comp = 0.0f;
+
+    for (unsigned long long r = threadIdx.x; r < blocks_per_row; r += blockDim.x) {
+        unsigned long long base = (j * blocks_per_row + r) * 16ull;
+        unsigned long long xb = x_off + r * 32ull;
+        #pragma unroll
+        for (unsigned int g = 0u; g < 4u; g++) {
+            // bf16 = the top 16 bits of an f32.
+            unsigned int lo = rd_byte(arena, w_word, base + (unsigned long long)(g * 2u));
+            unsigned int hi = rd_byte(arena, w_word, base + (unsigned long long)(g * 2u + 1u));
+            float d = __uint_as_float((lo | (hi << 8u)) << 16u);
+            #pragma unroll
+            for (unsigned int t = 0u; t < 8u; t++) {
+                unsigned int e = g * 8u + t;
+                unsigned int qs = rd_byte(arena, w_word, base + 8ull + (unsigned long long)(e >> 2u));
+                float w = (float)((int)((qs >> (2u * (e & 3u))) & 3u) - 1) * d;
+                float xv = arena[xb + (unsigned long long)e];
+                float p = xv * w;
+                float er = __fmaf_rn(xv, w, -p);
+                neumaier_add(acc, comp, p);
+                comp += er;
+            }
+        }
+    }
+
+    __shared__ float smem_acc[256];
+    __shared__ float smem_comp[256];
+    unsigned int tid = threadIdx.x;
+    smem_acc[tid] = acc;
+    smem_comp[tid] = comp;
+    __syncthreads();
+    for (unsigned int s = blockDim.x >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float a = smem_acc[tid];
+            float c = smem_comp[tid];
+            float a2 = smem_acc[tid + s];
+            float c2 = smem_comp[tid + s];
+            float ssum = a + a2;
+            float err = (fabsf(a) >= fabsf(a2)) ? ((a - ssum) + a2) : ((a2 - ssum) + a);
+            smem_acc[tid] = ssum;
+            smem_comp[tid] = c + c2 + err;
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        arena[out_off + j] = smem_acc[0] + smem_comp[0];
+    }
+}
+
 // Cooperative Q4_K GEMV: one block per output row, threads split the k/256
 // super-blocks (contiguous in the row-major weight → coalesced loads, unlike
 // the one-thread-per-row `dequant_matmul_gguf` whose 32 lanes each stride a

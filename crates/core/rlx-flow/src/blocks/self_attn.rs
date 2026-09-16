@@ -29,7 +29,7 @@ pub struct SelfAttnPrefillSpec {
     /// Optional named RoPE table to use instead of the default
     /// (`state.rope_cos` / `state.rope_sin`). When set, the emitter
     /// looks up `state.named["{name}_cos"]` / `…_sin`. Populate via
-    /// [`crate::blocks::NamedRopeTablesStage`].
+    /// `crate::blocks::NamedRopeTablesStage`.
     pub rope_table: Option<String>,
     /// Reuse the K projection as V (Gemma 4 `attention_k_eq_v`).
     /// When true, `v_key` is ignored and V is sourced from K
@@ -83,7 +83,7 @@ impl SelfAttnPrefillSpec {
     }
 
     /// Switch this layer to a named RoPE table (see
-    /// [`crate::blocks::NamedRopeTablesStage`]).
+    /// `crate::blocks::NamedRopeTablesStage`).
     pub fn with_rope_table(mut self, name: impl Into<String>) -> Self {
         self.rope_table = Some(name.into());
         self

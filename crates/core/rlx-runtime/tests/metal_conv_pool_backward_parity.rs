@@ -17,6 +17,8 @@ use rlx_cpu::thunk::{compile_thunks, execute_thunks};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 fn write_slot(arena: &mut Arena, id: NodeId, data: &[f32]) {
     let off = arena.byte_offset(id);
     unsafe {
@@ -192,6 +194,7 @@ const CONV_CFGS: &[ConvCfg] = &[
 
 #[test]
 fn metal_conv2d_backward_input_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let f = DType::F32;
     for c in CONV_CFGS {
         let ho = out_dim(c.h, c.k, c.s, c.p, c.d);
@@ -223,6 +226,7 @@ fn metal_conv2d_backward_input_matches_cpu() {
 
 #[test]
 fn metal_conv2d_backward_weight_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let f = DType::F32;
     for c in CONV_CFGS {
         let ho = out_dim(c.h, c.k, c.s, c.p, c.d);
@@ -301,6 +305,7 @@ const POOL_CFGS: &[PoolCfg] = &[
 // softmax+one-hot(compare/where) decomposition on Metal.
 #[test]
 fn metal_softmax_cross_entropy_with_logits_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let f = DType::F32;
     for &(n, c) in &[(4usize, 10usize), (7, 3), (128, 10), (3, 257)] {
         let mut g = Graph::new("sce_fwd");
@@ -318,6 +323,7 @@ fn metal_softmax_cross_entropy_with_logits_matches_cpu() {
 
 #[test]
 fn metal_softmax_cross_entropy_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let f = DType::F32;
     for &(n, c) in &[(4usize, 10usize), (7, 3), (128, 10), (3, 257)] {
         let mut g = Graph::new("sce_bwd");
@@ -340,6 +346,7 @@ fn metal_softmax_cross_entropy_backward_matches_cpu() {
 
 #[test]
 fn metal_maxpool2d_backward_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let f = DType::F32;
     for c in POOL_CFGS {
         let ho = out_dim(c.h, c.k, c.s, c.p, 1);

@@ -130,7 +130,7 @@ pub const SHARD_STAGE_RESERVE: usize = 576 * 1024 * 1024;
 
 /// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
 pub fn shard_stage_reserve() -> usize {
-    if let Ok(raw) = std::env::var("RLX_VULKAN_SHARD_STAGE_MIB") {
+    if let Some(raw) = rlx_ir::env::var("RLX_VULKAN_SHARD_STAGE_MIB") {
         if let Ok(mib) = raw.parse::<usize>() {
             return (mib.max(1) * 1024 * 1024).min(SHARD_STAGE_RESERVE);
         }
@@ -471,8 +471,8 @@ impl Arena {
             );
         }
 
-        let debug = std::env::var("RLX_VULKAN_ARENA_DEBUG").ok().as_deref() == Some("1")
-            || std::env::var("RLX_VULKAN_SHARD_LOG").ok().as_deref() == Some("1");
+        let debug = rlx_ir::env::var("RLX_VULKAN_ARENA_DEBUG").as_deref() == Some("1")
+            || rlx_ir::env::var("RLX_VULKAN_SHARD_LOG").as_deref() == Some("1");
         if debug {
             eprintln!(
                 "[rlx-vulkan split] params={} weight_buf={:.2} GiB (bind {:.2} GiB) act_arena={:.2} GiB device={}",
@@ -527,8 +527,8 @@ impl Arena {
                 }
             }
             let n_shards = size.div_ceil(shard_cap);
-            if std::env::var("RLX_VULKAN_ARENA_DEBUG").ok().as_deref() == Some("1")
-                || std::env::var("RLX_VULKAN_SHARD_LOG").ok().as_deref() == Some("1")
+            if rlx_ir::env::var("RLX_VULKAN_ARENA_DEBUG").as_deref() == Some("1")
+                || rlx_ir::env::var("RLX_VULKAN_SHARD_LOG").as_deref() == Some("1")
             {
                 eprintln!(
                     "[rlx-vulkan] sharded arena: logical={:.3} GiB → {n_shards} × {:.3} GiB shards device={}",
@@ -547,8 +547,7 @@ impl Arena {
             (primary, shards, shard_cap)
         };
 
-        if std::env::var("RLX_VULKAN_ARENA_DEBUG").ok().as_deref() == Some("1") && weight.is_none()
-        {
+        if rlx_ir::env::var("RLX_VULKAN_ARENA_DEBUG").as_deref() == Some("1") && weight.is_none() {
             eprintln!(
                 "[rlx-vulkan arena] {:.2} GiB ({} bytes) device={}",
                 size as f64 / (1u64 << 30) as f64,

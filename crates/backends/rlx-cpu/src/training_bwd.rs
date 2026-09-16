@@ -70,15 +70,52 @@ pub fn rope_backward_row(
     head_dim: usize,
     n_rot: usize,
 ) {
+    rope_backward_row_styled(dy, cos, sin, dx, head_dim, n_rot, false)
+}
+
+/// RoPE backward for one head row, honouring the pairing convention.
+///
+/// The adjoint of a rotation is the rotation by `-θ`, so each branch here is its
+/// forward twin with `sin` negated:
+///
+/// * NeoX (`interleaved = false`) pairs lane `i` with lane `i + n_rot/2`.
+/// * GptJ (`interleaved = true`) pairs adjacent lanes `2i` and `2i+1` — the
+///   llama.cpp / GGUF convention.
+///
+/// Only the NeoX branch used to exist, and `Op::RopeBackward` carried no style,
+/// so GptJ rotations silently got the NeoX adjoint: right shape, right
+/// magnitude, wrong lanes. Lanes past `n_rot` are pass-through in both
+/// conventions (partial rotary), which is why a wrong pairing still produced
+/// plausible-looking gradients.
+pub fn rope_backward_row_styled(
+    dy: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    dx: &mut [f32],
+    head_dim: usize,
+    n_rot: usize,
+    interleaved: bool,
+) {
     let rot_half = n_rot / 2;
     debug_assert!(dy.len() >= head_dim && dx.len() >= head_dim);
-    for i in 0..rot_half {
-        let y1 = dy[i];
-        let y2 = dy[rot_half + i];
-        let cv = cos[i];
-        let sv = sin[i];
-        dx[i] = y1 * cv + y2 * sv;
-        dx[rot_half + i] = -y1 * sv + y2 * cv;
+    if interleaved {
+        for i in 0..rot_half {
+            let y1 = dy[2 * i];
+            let y2 = dy[2 * i + 1];
+            let cv = cos[i];
+            let sv = sin[i];
+            dx[2 * i] = y1 * cv + y2 * sv;
+            dx[2 * i + 1] = -y1 * sv + y2 * cv;
+        }
+    } else {
+        for i in 0..rot_half {
+            let y1 = dy[i];
+            let y2 = dy[rot_half + i];
+            let cv = cos[i];
+            let sv = sin[i];
+            dx[i] = y1 * cv + y2 * sv;
+            dx[rot_half + i] = -y1 * sv + y2 * cv;
+        }
     }
     dx[n_rot..head_dim].copy_from_slice(&dy[n_rot..head_dim]);
 }

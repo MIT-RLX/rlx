@@ -15,7 +15,8 @@
 //! [`Func`](crate::Func)'s QAT helpers / the `rlx-tinystories` `--fake-quant`.
 //!
 //! The [`float_format!`] macro generates a marker type per format with a
-//! `const`-parameterized [`FloatFormat`] impl; [`parse_format`] resolves a
+//! `const`-parameterized [`FloatFormat`](crate::lowp::FloatFormat) impl;
+//! [`parse_format`](crate::lowp::parse_format) resolves a
 //! runtime spec string (`"nvf4"`, `"f8e4m3"`, `"bf8"`, or generic `"f8m3e4"`).
 
 /// Round `x` to the nearest value representable by a binary float format with a

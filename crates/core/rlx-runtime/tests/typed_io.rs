@@ -15,6 +15,8 @@ use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompileOptions, Device, Session};
 
+mod common;
+
 fn build_param_add_graph() -> Graph {
     // out = x + b, where b is a param. F32 throughout; the test
     // exercises the typed I/O surface by uploading b as F16/BF16
@@ -42,6 +44,7 @@ fn build_f32_relu_graph() -> Graph {
 #[cfg(feature = "cpu")]
 #[test]
 fn cpu_set_param_typed_f16_widens_to_f32_and_runs() {
+    let _gpu = common::serialize_gpu();
     let g = build_param_add_graph();
     let session = Session::new(Device::Cpu);
     let mut compiled = session.compile_with(g, &CompileOptions::default());
@@ -61,6 +64,7 @@ fn cpu_set_param_typed_f16_widens_to_f32_and_runs() {
 #[cfg(feature = "cpu")]
 #[test]
 fn cpu_set_param_typed_bf16_widens_to_f32() {
+    let _gpu = common::serialize_gpu();
     let g = build_param_add_graph();
     let session = Session::new(Device::Cpu);
     let mut compiled = session.compile_with(g, &CompileOptions::default());
@@ -80,6 +84,7 @@ fn cpu_set_param_typed_bf16_widens_to_f32() {
 #[cfg(feature = "cpu")]
 #[test]
 fn cpu_run_typed_with_f16_input_widens_and_runs() {
+    let _gpu = common::serialize_gpu();
     // F16 input bytes flow through `run_typed`'s widen path; output
     // dtype matches the graph's declared F32 output.
     let g = build_f32_relu_graph();
@@ -109,6 +114,7 @@ fn cpu_run_typed_with_f16_input_widens_and_runs() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_run_typed_with_f16_input_widens_and_runs() {
+    let _gpu = common::serialize_gpu();
     let g = build_f32_relu_graph();
     let session = Session::new(Device::Metal);
     let mut compiled = session.compile_with(g, &CompileOptions::default());
@@ -130,16 +136,18 @@ fn metal_run_typed_with_f16_input_widens_and_runs() {
 
 #[cfg(feature = "cpu")]
 #[test]
-#[ignore = "needs Thunk::CastDtype — Op::Cast currently lowers to Thunk::Copy (rlx-cpu/src/thunk.rs:671)"]
 fn cpu_run_typed_narrows_f16_output_via_cast_thunk() {
+    let _gpu = common::serialize_gpu();
     // PLAN AMP-narrowing: graph declares Relu output as F32 + an
-    // explicit Cast to F16. The CPU `Op::Cast` is documented to lower
-    // to `Thunk::CastDtype` (the cross-dtype cast thunk this test was
-    // designed to validate), but today the CPU backend lowers Cast as
-    // a plain `Thunk::Copy` — fine for same-dtype reshape-style casts,
-    // but produces garbage when the dtypes differ. The test stays here
-    // (marked `#[ignore]`) as the contract `Thunk::CastDtype` must
-    // satisfy when it lands.
+    // explicit Cast to F16, and `run_typed` must hand back 2-byte F16.
+    //
+    // This was `#[ignore]`d on the grounds that CPU lowered `Op::Cast` to a
+    // plain `Thunk::Copy` and so "produces garbage when the dtypes differ".
+    // That stopped being true: `compile_cast` now dispatches a per-pair cast
+    // thunk, and F32→F16 lands on `Thunk::CastF32ToF16`. The stale
+    // `rlx-cpu/src/thunk.rs:671` reference in the old ignore message was the
+    // tell — `thunk` is a directory now. An ignore that outlives its cause
+    // costs real coverage and, worse, documents a defect that is not there.
     let mut g = Graph::new("typed_io_narrow_f16");
     let x = g.input("x", Shape::new(&[6], DType::F32));
     let r = g.add_node(
@@ -176,6 +184,7 @@ fn cpu_run_typed_narrows_f16_output_via_cast_thunk() {
 #[cfg(feature = "cpu")]
 #[test]
 fn cpu_last_axis_broadcast_in_chain_matches_reference() {
+    let _gpu = common::serialize_gpu();
     // PLAN L2 quality: trailing-shape broadcast in chains. Build
     // `(x[B,S,H] + bias[H]) * scale[H]` where bias and scale broadcast
     // over the leading B*S axes. The encoder sets `input_modulus[i] = H`
@@ -213,6 +222,7 @@ fn cpu_last_axis_broadcast_in_chain_matches_reference() {
 #[cfg(feature = "cpu")]
 #[test]
 fn cpu_scalar_broadcast_in_chain_matches_reference() {
+    let _gpu = common::serialize_gpu();
     // PLAN L2 quality: scalar broadcast in chains. Build a graph that
     // compiles down to one ElementwiseRegion with `scalar_input_mask`
     // set for the bias/scale inputs. Verify the CPU thunk's
@@ -243,6 +253,7 @@ fn cpu_scalar_broadcast_in_chain_matches_reference() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_set_param_typed_f16_widens_to_f32() {
+    let _gpu = common::serialize_gpu();
     let g = build_param_add_graph();
     let session = Session::new(Device::Metal);
     let mut compiled = session.compile_with(g, &CompileOptions::default());

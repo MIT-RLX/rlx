@@ -58,7 +58,7 @@ impl CudaExecutable {
         Self::compile_with_rng(graph, compile_mode_from_env(), exec_mode_from_env(), rng)
     }
 
-    /// Compile with explicit RNG policy (used by [`rlx-runtime`]).
+    /// Compile with explicit RNG policy (used by `rlx-runtime`).
     pub fn compile_with_rng(
         graph: Graph,
         compile_mode: CompileMode,
@@ -354,6 +354,36 @@ impl CudaExecutable {
         }
 
         let mut schedule = Vec::new();
+
+        // ── Static weight packs: which Concat steps may be run once ──────────
+        //
+        // The matmul-fusion passes fuse Q/K/V and gate/up into one GEMM by
+        // emitting `Concat` over the weight `Param`s. That concat is invariant
+        // across `run()`s, yet CUDA lowers it to ONE STEP PER INPUT and replays
+        // all of them every step: 5 launches/layer, 140/token on a 28-layer
+        // Llama, moving ~1.9 GB of constants. Metal measures the same packs at
+        // 47.7% of a decode step's DRAM traffic.
+        //
+        // Both conditions are required, same as Metal and wgpu:
+        //   1. the planner's OWN `is_static_weight_tensor`, so the encoder can
+        //      never arm a skip for a pack `plan_memory` did not pin, and
+        //   2. arena-slot exclusivity, because a pin is not a guarantee — where
+        //      it failed the slot is liveness-reused and a later node clobbers
+        //      it, so a skipped pack would read stale bytes on run 2+.
+        let mut static_weight_memo: std::collections::HashMap<rlx_ir::NodeId, bool> =
+            std::collections::HashMap::new();
+        let offset_owner_count: std::collections::HashMap<usize, usize> = {
+            let mut m = std::collections::HashMap::new();
+            for n in graph.nodes() {
+                if rlx_opt::memory::is_pure_view(&graph, n) || !arena.has(n.id) {
+                    continue;
+                }
+                *m.entry(arena.offset(n.id)).or_insert(0usize) += 1;
+            }
+            m
+        };
+        let mut static_once_steps: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         let mut meta_buffers: Vec<cudarc::driver::CudaSlice<u32>> = Vec::new();
         let mut packed_bshd_attn: HashMap<NodeId, (NodeId, u32)> = HashMap::new();
         if !rlx_ir::env::flag("RLX_CUDA_NO_PACKED_BSHD_ATTN") {
@@ -1531,9 +1561,7 @@ impl CudaExecutable {
                     // In-place append: write input[1] (the new token's row) into
                     // the output buffer, which the shared memory planner aliases
                     // onto input 0 (the cache) — see `rlx-compile/src/memory.rs`.
-                    // Output shape == cache shape, so `seq_cap` is the output's
-                    // own axis dim (the buffer's true seq stride). Mirrors
-                    // rlx-metal's `Op::KvAppend` lowering.
+                    // Mirrors rlx-metal's `Op::KvAppend` lowering.
                     let out_shape = &node.shape;
                     let rank = out_shape.rank();
                     let outer: usize = (0..*axis)
@@ -1544,14 +1572,33 @@ impl CudaExecutable {
                         .map(|i| out_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    let seq_cap = out_shape.dim(*axis).unwrap_static();
+                    // Stride from the CACHE, not the output: the output is the
+                    // `[..pos+1]` prefix, so its axis dim is `pos+1`, not the
+                    // buffer's capacity. Only observable at `outer > 1`, which
+                    // `rewrite_for_backend` now lowers away — belt and braces.
+                    let seq_cap = graph.node(node.inputs[0]).shape.dim(*axis).unwrap_static();
+                    // The kernel and the `/4` offsets below both count f32
+                    // LANES, not elements. The arena widens most dtypes to one
+                    // lane each but sizes U8/I8 at one byte and complex at 2/4
+                    // lanes, so an element count is the lane count for neither.
+                    let lanes = match out_shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        rlx_ir::DType::U8 | rlx_ir::DType::I8 => panic!(
+                            "rlx-cuda KvAppend: {} cache is byte-packed in the arena while \
+                             the row-write kernel addresses f32 lanes — a quantized KV cache \
+                             needs a byte-addressed kernel, not this one",
+                            out_shape.dtype()
+                        ),
+                        _ => 1,
+                    };
                     schedule.push(Step::KvAppend {
                         src_off: (arena.offset(node.inputs[1]) / 4) as u32,
                         dst_off: (arena.offset(node.id) / 4) as u32,
                         outer: outer as u32,
                         seq_cap: seq_cap as u32,
                         pos: *pos as u32,
-                        inner: inner as u32,
+                        inner: (inner * lanes) as u32,
                     });
                 }
                 Op::Narrow { axis, start, len } => {
@@ -1709,6 +1756,7 @@ impl CudaExecutable {
                     });
                 }
                 Op::Concat { axis } => {
+                    let sched_before = schedule.len();
                     // Caller convention: one Step::Concat per input, copying
                     // each input's slice into the output at the right axis offset.
                     // Complex packs `lanes` contiguous f32 per element; the lane
@@ -1754,6 +1802,17 @@ impl CudaExecutable {
                             out_off: (arena.offset(node.id) / 4) as u32,
                         });
                         start += axis_in;
+                    }
+                    if rlx_opt::memory::is_static_weight_tensor(
+                        &graph,
+                        node.id,
+                        &mut static_weight_memo,
+                    ) && arena.has(node.id)
+                        && offset_owner_count.get(&arena.offset(node.id)).copied() == Some(1)
+                    {
+                        for i in sched_before..schedule.len() {
+                            static_once_steps.insert(i);
+                        }
                     }
                 }
                 Op::Attention {
@@ -2007,6 +2066,27 @@ impl CudaExecutable {
                     if q_shape.len() != 4 {
                         panic!("rlx-cuda AttentionBackward: unfuse should have promoted to rank-4");
                     }
+                    // `scores`/`dp` in attention_bwd.cu are fixed at
+                    // MAX_ATTN_SEQ; past that the kernel returns having written
+                    // nothing and the gradient comes back as exact zeros. A
+                    // silent zero gradient is far worse than a stop — training
+                    // proceeds and learns nothing from these tensors — so refuse
+                    // explicitly. head_dim is no longer bounded: its accumulator
+                    // is tiled at MAX_HEAD_DIM inside the kernel.
+                    const MAX_ATTN_SEQ: usize = 512;
+                    let seq_q_chk = q_shape[2].unwrap_static();
+                    let seq_k_chk = k_shape[2].unwrap_static();
+                    assert!(
+                        seq_q_chk <= MAX_ATTN_SEQ && seq_k_chk <= MAX_ATTN_SEQ,
+                        "{}: seq_q {} / seq_k {} exceed the backward kernel's \
+                         supported {}; it would silently produce zero gradients. \
+                         Decompose Op::AttentionBackward for this shape or extend \
+                         the kernel.",
+                        "rlx-cuda AttentionBackward",
+                        seq_q_chk,
+                        seq_k_chk,
+                        MAX_ATTN_SEQ
+                    );
                     let batch = q_shape[0].unwrap_static() as u32;
                     let heads = q_shape[1].unwrap_static() as u32;
                     let seq_q = q_shape[2].unwrap_static() as u32;
@@ -2072,7 +2152,23 @@ impl CudaExecutable {
                         n_total: total,
                         seq,
                         head_dim: *head_dim as u32,
-                        half: (*head_dim / 2) as u32,
+                        // Row stride of the cos/sin tables, taken from the
+                        // table's own last dimension rather than `head_dim / 2`.
+                        // The two differ under partial rotation and the layout
+                        // is a per-model choice: Qwen3.5 allocates
+                        // `[max_pos, head_dim/2]` and uses the leading
+                        // `n_rot/2` columns, DeepSeek-V4 MLA packs `n_rot/2`
+                        // with no slack. `head_dim/2` reads a wrong-but-valid
+                        // row on the packed layout; `n_rot/2` (what the CPU
+                        // reference assumed) does the same on the padded one.
+                        // Both only agreed when `n_rot == head_dim`.
+                        half: graph
+                            .node(cos_id)
+                            .shape
+                            .dims()
+                            .last()
+                            .map(|d| d.unwrap_static() as u32)
+                            .unwrap_or((*head_dim / 2) as u32),
                         // Partial rotary: rotate only n_rot dims (Gemma 4 global
                         // layers use n_rot < head_dim). Equals half for full rope.
                         rot_half: (*n_rot / 2) as u32,
@@ -2234,7 +2330,17 @@ impl CudaExecutable {
                         });
                     }
                 }
-                Op::ScatterAdd => {
+                Op::ScatterAdd { axis } => {
+                    // Every backend kernel implements the axis-0 form only;
+                    // `rlx_fusion::LowerScatterAddAxis` rewrites any other axis to
+                    // transpose/scatter/transpose before lowering. Reaching here with
+                    // axis != 0 means that pass did not run, and scattering along axis
+                    // 0 anyway would silently produce the wrong tensor.
+                    assert_eq!(
+                        *axis, 0,
+                        "rlx-cuda: ScatterAdd axis {{axis}} reached the backend; \
+                     LowerScatterAddAxis must run first"
+                    );
                     let upd_id = node.inputs[0];
                     let idx_id = node.inputs[1];
                     let upd_dims = graph.node(upd_id).shape.dims();
@@ -2392,6 +2498,29 @@ impl CudaExecutable {
                         dtype_tag: fft_dtype_tag(dtype),
                         use_gpu,
                         real_input,
+                    });
+                }
+                Op::FftQ {
+                    inverse,
+                    norm,
+                    scale,
+                } => {
+                    // Host fallback. This arena is f32-*valued* — integers live
+                    // in it as the float with the same value — so the adapter
+                    // converts rather than reinterpreting. Reading these slots
+                    // as raw i32 yields float bit patterns, which is the garbage
+                    // this path exists to avoid.
+                    let in_id = node.inputs[0];
+                    let in_shape = graph.node(in_id).shape.clone();
+                    let meta = rlx_ir::fft::fft_meta(&in_shape);
+                    schedule.push(Step::FftQ {
+                        src_byte_off: arena.offset(in_id) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
+                        outer: meta.outer as u32,
+                        n_complex: meta.n_complex as u32,
+                        inverse: *inverse,
+                        norm_tag: norm.tag(),
+                        scale_tag: scale.tag(),
                     });
                 }
                 Op::LogMel => {
@@ -2993,10 +3122,46 @@ impl CudaExecutable {
                     // f32-uniform arena: I64 indices live as f32 slots. Match
                     // wgpu — `indices_i64=1` reinterprets float bits as i64 and
                     // breaks F5 DiT RoPE ScatterNd (fox 0/6 on GPU DiT).
-                    schedule.push(Step::CpuIndexing {
-                        thunk: rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.offset(id))
-                            .force_indices_f32(),
-                    });
+                    let thunk = rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.offset(id))
+                        .force_indices_f32();
+                    // ...and *because* they live as f32 slots, the kernels in
+                    // `indexing_nd.cu` can read them directly. Everything the
+                    // planner declines keeps the host route below.
+                    let launch = if rlx_ir::env::flag("RLX_CUDA_INDEXING_HOST") {
+                        None
+                    } else {
+                        rlx_gpu_host::indexing_plan::plan_indexing(&thunk)
+                    };
+                    match launch {
+                        Some(l) => {
+                            let meta = ctx
+                                .default_stream()
+                                .clone_htod(&l.meta)
+                                .expect("rlx-cuda: indexing meta upload failed");
+                            let meta_idx = meta_buffers.len();
+                            meta_buffers.push(meta);
+                            schedule.push(Step::IndexingNd {
+                                kind: l.kind,
+                                n: l.n,
+                                data_off: l.data_off,
+                                idx_off: l.idx_off,
+                                upd_off: l.upd_off,
+                                dst_off: l.dst_off,
+                                dst_len: l.dst_len,
+                                prologue: l.prologue,
+                                meta_idx,
+                            });
+                        }
+                        None => {
+                            if rlx_ir::env::flag("RLX_CUDA_INDEXING_TRACE") {
+                                eprintln!(
+                                    "[indexing] host route for {:?} (planner declined)",
+                                    node.op.kind()
+                                );
+                            }
+                            schedule.push(Step::CpuIndexing { thunk });
+                        }
+                    }
                 }
                 Op::Custom { name, attrs, .. } => match name.as_str() {
                     "llada2.group_limited_gate" => {
@@ -4201,7 +4366,11 @@ impl CudaExecutable {
                         _ => unreachable!(),
                     }
                 }
-                Op::RopeBackward { head_dim, n_rot } => {
+                Op::RopeBackward {
+                    head_dim,
+                    n_rot,
+                    style,
+                } => {
                     let dy_shape = &graph.node(node.inputs[0]).shape;
                     let (batch, seq, hidden) = if dy_shape.rank() >= 3 {
                         (
@@ -4216,7 +4385,13 @@ impl CudaExecutable {
                             dy_shape.dim(1).unwrap_static() as u32,
                         )
                     };
-                    let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
+                    let cos_shape = &graph.node(node.inputs[1]).shape;
+                    let cos_len = cos_shape.num_elements().unwrap() as u32;
+                    // Read the row width off the table; deriving it from
+                    // head_dim or n_rot is wrong for half the layouts in use.
+                    // Shared with every other backend so the rule cannot drift
+                    // again; a rank-1 table's rows are `n_rot/2`, not its length.
+                    let cos_row_stride = rlx_ir::shape::rope_table_stride(cos_shape, *n_rot) as u32;
                     schedule.push(Step::RopeBackward {
                         dy_byte_off: arena.offset(node.inputs[0]) as u64,
                         cos_byte_off: arena.offset(node.inputs[1]) as u64,
@@ -4228,6 +4403,8 @@ impl CudaExecutable {
                         head_dim: *head_dim as u32,
                         n_rot: *n_rot as u32,
                         cos_len,
+                        cos_row_stride,
+                        interleaved: matches!(style, rlx_ir::op::RopeStyle::GptJ),
                     });
                 }
                 Op::CumsumBackward { exclusive, .. } => {
@@ -4260,7 +4437,7 @@ impl CudaExecutable {
                         .map(|i| dy_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    let num_idx = idx_shape.dim(axis_u).unwrap_static();
+                    let num_idx = idx_shape.gather_index_count(axis_u);
                     let trailing: usize = (axis_u + 1..dy_shape.rank())
                         .map(|i| dy_shape.dim(i).unwrap_static())
                         .product::<usize>()
@@ -4634,17 +4811,11 @@ impl CudaExecutable {
                 // F64 (and unsupported dtypes) use LAPACK on host; CustomFn
                 // runs the opaque body. `PartitionedConv` is expanded to
                 // Fft/MatMul in `crate::unfuse` before this match.
-                Op::DenseSolve
-                | Op::BatchedDenseSolve
-                | Op::Cholesky
-                | Op::TriangularSolve { .. }
-                | Op::Det
-                | Op::LogDet
-                | Op::Sort { .. }
-                | Op::Svd { .. }
-                | Op::Qr { .. }
-                | Op::ArgSort { .. }
-                | Op::CustomFn { .. } => {
+                // The op list lives in `crate::supported_ops::routes_to_cpu_host`
+                // so the claim and the route can be compared from outside this
+                // crate without a device — see that function, and
+                // `rlx-runtime/tests/host_fallback_never_nops.rs`.
+                other if crate::supported_ops::routes_to_cpu_host(other) => {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });
@@ -4777,6 +4948,8 @@ impl CudaExecutable {
             graph,
             arena,
             schedule,
+            static_once_steps,
+            static_once_done: false,
             input_offsets,
             param_offsets,
             meta_buffers,
@@ -4784,6 +4957,7 @@ impl CudaExecutable {
             captured_graph: None,
             segment_graphs: Vec::new(),
             segment_stream: None,
+            pending_host_write: None,
             capture_warmed: false,
             capture_disabled: false,
             streams,

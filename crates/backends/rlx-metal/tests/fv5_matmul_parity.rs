@@ -45,7 +45,7 @@ fn pack_fv5b_block(qs: &[i8], s: f32) -> Vec<u8> {
 }
 
 fn run(scheme: QuantScheme, packed: &[u8], m: usize, k: usize, n: usize) -> Option<f32> {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return None;
     }

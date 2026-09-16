@@ -11,7 +11,15 @@ categories.workspace   = true
 repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
+readme                  = "README.md"
 
 [dependencies]
 rlx-ir = { workspace = true }
 rlx-flow = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

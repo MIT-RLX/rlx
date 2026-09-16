@@ -229,8 +229,13 @@ pub mod matfn;
 
 // ── Algos: shared LAPACK-backed kernel bodies ────────────────────
 
+/// LAPACK-backed kernel bodies, shared by this crate's ops and usable directly.
+///
+/// Exposed because downstream crates were each growing their own Jacobi `eigh`
+/// and Gauss–Jordan solve — three copies at last count, all slower and less
+/// accurate than the `dsyevd`/`dgesv` calls already here.
 #[cfg(feature = "cpu")]
-mod algos {
+pub mod algos {
     /// Cholesky: in-place factorization. Returns the factor in the
     /// configured triangle, zeros the other.
     pub fn cholesky(a_in: &[f64], n: usize, lower: bool, out: &mut [f64]) -> Result<(), String> {
@@ -450,7 +455,7 @@ mod algos {
     /// Given A = V·Λ·Vᵀ:
     ///   C = Vᵀ·dA·V          (n×n, symmetric)
     ///   t_λ = diag(C)
-    ///   Ω[i,j] = C[i,j]/(λ\[j\]-λ\[i\]) for i≠j  (degeneracy mask)
+    ///   Ω\[i,j\] = C\[i,j\]/(λ\[j\]-λ\[i\]) for i≠j  (degeneracy mask)
     ///   t_V = V·Ω
     pub fn eigh_jvp(
         eigvals: &[f64],
@@ -829,12 +834,12 @@ mod algos {
     ///   - `dl_dv`: dL/dV row-major n×n (same orientation as `eigvecs`)
     ///
     /// Formula:
-    ///   F[i,j] = 1/(λ\[j\] - λ\[i\])  for i ≠ j (with degeneracy mask)
+    ///   F\[i,j\] = 1/(λ\[j\] - λ\[i\])  for i ≠ j (with degeneracy mask)
     ///   G      = Vᵀ · dL/dV
     ///   T      = diag(dL/dλ) + (F ⊙ (G - Gᵀ)) / 2
     ///   dL/dA  = sym(V · T · Vᵀ)
     ///
-    /// Degeneracy: |λ\[j\] - λ\[i\]| < eps → F[i,j] = 0 (drop the contribution).
+    /// Degeneracy: |λ\[j\] - λ\[i\]| < eps → F\[i,j\] = 0 (drop the contribution).
     /// The eps threshold is per-eigenvalue-pair and uses the spectrum's
     /// max-magnitude as a scale.
     pub fn eigh_backward(
@@ -925,8 +930,8 @@ mod algos {
     /// thin QR with full column rank:
     ///
     ///   M       = R · dL/dRᵀ - dL/dQᵀ · Q
-    ///   copytril(M)[i,j] = M[i,j] if i > j; M[i,j] if i < j (taken
-    ///                      from M[j,i]); M[i,i] for i = j... actually
+    ///   copytril(M)\[i,j\] = M\[i,j\] if i > j; M\[i,j\] if i < j (taken
+    ///                      from M\[j,i\]); M\[i,i\] for i = j... actually
     ///                      copytril(M) := M_lower + M_lowerᵀ (symmetric copy).
     ///   S       = dL/dQ + Q · copytril(M)
     ///   dL/dA   = S · R⁻ᵀ
@@ -1014,7 +1019,7 @@ mod algos {
     ///
     /// Townsend 2016 closed form. For thin SVD with m ≥ n:
     ///
-    ///   F[i,j] = 1/(s_j² - s_i²) for i ≠ j (degenerate → 0)
+    ///   F\[i,j\] = 1/(s_j² - s_i²) for i ≠ j (degenerate → 0)
     ///   Σ_U = Uᵀ · dL/dU         (k×k)
     ///   Σ_V = Vᵀ · dL/dV         (k×k)        (V = (V^T)^T)
     ///
@@ -1785,7 +1790,7 @@ mod algos {
     }
 
     /// `logdet(A)` for SPD A. Computed via Cholesky:
-    ///   L = chol(A);  log det(A) = 2 · Σ log L[i,i]
+    ///   L = chol(A);  log det(A) = 2 · Σ log L\[i,i\]
     pub fn logdet(a_in: &[f64], n: usize, out: &mut [f64]) -> Result<(), String> {
         if a_in.len() != n * n {
             return Err(format!("logdet: A must be n×n, got len {}", a_in.len()));

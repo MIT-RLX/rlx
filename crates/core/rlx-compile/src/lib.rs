@@ -24,6 +24,7 @@ pub mod memory;
 pub mod numeric_lint;
 pub mod param_hoist;
 pub mod param_specialize;
+pub mod plan_check;
 pub mod precision;
 pub mod promote_params;
 pub mod quant_insert;
@@ -61,9 +62,11 @@ pub use inspect::{
 };
 pub use io_output_gate::SelectPeaksOnlyOutputs;
 pub use legalize::{LegalizeResult, format_legalize_error, legalize_for_backend};
-pub use legalize_broadcast::LegalizeBroadcast;
+pub use legalize_broadcast::{LegalizeBroadcast, legalize_custom_attention_mask};
 pub use memory::{
-    ArenaWidthPolicy, MemoryPlanOptions, SharedWeightLayout, WeightSlot, is_pure_view,
+    ArenaWidthPolicy, MemoryPlanOptions, SMALL_M_GROUPED, SharedWeightLayout, WeightSlot,
+    is_elidable_bank_transpose, is_elidable_bank_transpose_gated, is_elidable_folded_transpose,
+    is_elidable_folded_transpose_gated, is_elidable_matmul_transpose, is_pure_view,
     plan_memory_backward, plan_memory_f32_uniform, plan_memory_hybrid, plan_memory_native,
     plan_memory_native_in_order, plan_memory_with_options,
 };

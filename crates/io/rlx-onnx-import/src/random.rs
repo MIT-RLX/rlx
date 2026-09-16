@@ -10,7 +10,7 @@ use crate::bundle::BundleNode;
 
 /// Stable per-node key mixed into [`rlx_ir::RngOptions::seed`] for Philox streams.
 ///
-/// Used by both [`crate::lower::ops`] and [`crate::emit_codegen`] so direct
+/// Used by both `crate::lower::ops` and [`crate::emit_codegen`] so direct
 /// import and emitted Rust sources agree on per-op RNG keys.
 pub fn node_name_tag(name: &str) -> u64 {
     name.bytes()

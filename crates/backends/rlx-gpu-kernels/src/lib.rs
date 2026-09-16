@@ -6,6 +6,31 @@
 //!
 //! Each constant is the full `.cu` source text, embedded at compile time.
 //! Backends JIT-compile via NVRTC / hipRTC on first use.
+//!
+//! Because the sources are shared, so are the decisions *about* them — but the
+//! decisions live one crate down, in `rlx-gpu-dispatch`, so Metal and wgpu can
+//! use the same routing policy without linking any of this CUDA/HIP text.
+//! [`tiles`] owns the tile-schedule parameter space and its legality rules;
+//! [`dispatch`] owns the shape-keyed table. Both are re-exported here because
+//! the CUDA-side source templating below is their main consumer.
+
+// The table and the tile parameter space moved to `rlx-gpu-dispatch` so Metal
+// and wgpu can share them without depending on these CUDA/HIP sources. Re-export
+// under the old paths — this crate is still where the CUDA-side templating
+// (`matmul_cuda_src_tiled`) lives, so `rlx_gpu_kernels::tiles` remains the
+// natural spelling at those call sites.
+pub use rlx_gpu_dispatch::{cost, dispatch, tiles};
+
+pub mod kernel_schedule_port;
+
+/// Generate the `matmul` entry point *from* a typed schedule rather than
+/// templating `kernels/matmul.cu`.
+///
+/// Feature-gated because it is a second implementation of a shipping kernel:
+/// until it is measured at least as fast on a given target, the hand-written
+/// text stays the default and this is opt-in.
+#[cfg(feature = "schedule-codegen")]
+pub mod kernel_schedule_emit;
 
 pub const BINARY_CU: &str = include_str!(concat!(env!("OUT_DIR"), "/binary.cu"));
 /// Standalone complex `Op::Cast` on the f32-uniform arena (real<->C64,
@@ -123,6 +148,13 @@ pub const GROUPED_MATMUL_CU: &str = include_str!("../kernels/grouped_matmul.cu")
 pub const SCATTER_ADD_CU: &str = include_str!("../kernels/scatter_add.cu");
 /// ONNX ScatterND (reduction=none) on the f32-uniform arena.
 pub const SCATTER_ND_CU: &str = include_str!("../kernels/scatter_nd.cu");
+/// ONNX GatherND / GatherElements / ScatterElements, plus a rank-general
+/// reduction-capable ScatterND, on the f32-uniform arena. These four used to
+/// take `Step::CpuIndexing` (a full D2H/H2D round trip) on every arena backend;
+/// shapes and strides ride in a `meta` u32 buffer planned by
+/// [`rlx_gpu_dispatch::indexing`], so there is no rank cap and no per-launch
+/// allocation.
+pub const INDEXING_ND_CU: &str = include_str!("../kernels/indexing_nd.cu");
 pub const DEQUANT_MATMUL_CU: &str = include_str!("../kernels/dequant_matmul.cu");
 pub const DEQUANT_GGUF_CU: &str = include_str!("../kernels/dequant_gguf.cu");
 pub const DEQUANT_MATMUL_GGUF_CU: &str = include_str!("../kernels/dequant_matmul_gguf.cu");
@@ -188,6 +220,168 @@ cuda_src_with_gelu!(
     include_str!("../kernels/fused_binary_unary.cu")
 );
 cuda_src_with_gelu!(matmul_cuda_src, include_str!("../kernels/matmul.cu"));
+
+/// `matmul.cu` compiled for an explicit tile schedule.
+///
+/// The tile is pinned by a `#define` prelude ahead of the kernel body, whose
+/// own `#ifndef` defaults then fall away. For [`tiles::TileParams::DEFAULT_MATMUL`]
+/// the prelude is empty and this returns exactly [`matmul_cuda_src`] — same
+/// bytes, so the same NVRTC/hipRTC module and the same disk-cache slot as before
+/// the tile became a parameter.
+///
+/// Returns `Err` for a tile that violates a kernel invariant, so an illegal
+/// schedule is refused on the host rather than silently reading out of bounds on
+/// the device. Callers cache the resulting `String` per tile — the backends' JIT
+/// caches already key on the source hash, so distinct tiles never collide.
+pub fn matmul_cuda_src_tiled(tile: tiles::TileParams) -> Result<String, tiles::TileError> {
+    tile.validate()?;
+    // The tile's typed schedule must verify before any source is emitted.
+    //
+    // This is where `rlx_ir::kernel_schedule` earns its place: `validate()` checks the
+    // algebra the kernel body's indexing relies on, and the schedule checks
+    // what that algebra cannot see — that the shared tiles fit a portable
+    // budget, that the two `__syncthreads()` order the staging correctly, and
+    // that no two accesses to a tile disagree about its layout. A tile that
+    // fails here would have compiled and produced wrong numbers.
+    kernel_schedule_port::verify_tile_schedule(tile).map_err(|errors| {
+        tiles::TileError::UnsoundSchedule(
+            errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    })?;
+    let defines = tile.defines();
+    if defines.is_empty() {
+        return Ok(matmul_cuda_src().to_string());
+    }
+    Ok(format!("{defines}{}", matmul_cuda_src()))
+}
+
+/// Which physical schedule the `matmul` entry should be built from.
+///
+/// This is the knob the A/B experiment turns. `Default` is the shipping
+/// hand-written text; the others are *generated* from a `KernelSchedule`, so
+/// the difference between them is a declaration, not a second kernel file.
+#[cfg(feature = "schedule-codegen")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MatmulSchedule {
+    /// `kernels/matmul.cu` templated by `#define`. The baseline.
+    #[default]
+    Default,
+    /// Emitted from the schedule that *describes* `matmul.cu`: one stage, two
+    /// block syncs per K iteration. Exists to separate "the emitter is correct
+    /// and costs nothing" from "the pipeline is faster" — without it a win
+    /// cannot be attributed to the schedule rather than to codegen luck.
+    EmittedSerial,
+    /// Emitted from [`kernel_schedule_emit::matmul_pipelined_schedule`]:
+    /// `stages`-deep rotation, `cp.async` staging, one block sync per K
+    /// iteration.
+    EmittedPipelined { stages: usize },
+}
+
+#[cfg(feature = "schedule-codegen")]
+impl MatmulSchedule {
+    /// Parse `default | serial | pipelined[:N]`.
+    ///
+    /// Shared by every backend that exposes this knob, so CUDA and ROCm cannot
+    /// drift into accepting different spellings of the same experiment. An
+    /// unrecognized value is an `Err` carrying the offending text rather than a
+    /// silent fall-through to `Default`: a typo that quietly runs the baseline
+    /// makes an A/B measure one path twice and report it as parity, which is
+    /// the `metal-variant-typo-silent` defect this tree already shipped once.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let v = value.trim();
+        if v.eq_ignore_ascii_case("default") || v == "0" {
+            return Ok(Self::Default);
+        }
+        if v.eq_ignore_ascii_case("serial") {
+            return Ok(Self::EmittedSerial);
+        }
+        if v.to_ascii_lowercase().starts_with("pipelined") {
+            let stages = v
+                .split([':', '='])
+                .nth(1)
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(2);
+            return Ok(Self::EmittedPipelined {
+                stages: stages.max(2),
+            });
+        }
+        Err(format!(
+            "{value:?} is not one of default|serial|pipelined[:N]"
+        ))
+    }
+
+    /// Short stable label for reports and cache keys.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Default => "default".into(),
+            Self::EmittedSerial => "serial".into(),
+            Self::EmittedPipelined { stages } => format!("pipe:{stages}"),
+        }
+    }
+}
+
+/// Build the `matmul` CUDA source for `tile` under `schedule`.
+///
+/// The emitted variants carry the same entry name and parameter list as
+/// `matmul.cu`, so every caller and launcher is unchanged and the experiment
+/// varies one thing.
+#[cfg(feature = "schedule-codegen")]
+pub fn matmul_cuda_src_scheduled(
+    tile: tiles::TileParams,
+    schedule: MatmulSchedule,
+    target: rlx_ir::kernel_schedule::Target,
+) -> Result<(String, Option<kernel_schedule_emit::EmitFacts>), String> {
+    matmul_src_scheduled(tile, schedule, target, kernel_schedule_emit::Lang::Cuda)
+}
+
+/// Build the `matmul` source for `tile` under `schedule`, in `lang`.
+///
+/// The `.cu` text is shared between NVRTC and hipRTC, so this is too — but only
+/// the portable subset is genuinely shared, and `lang` is what makes that a
+/// typed rejection instead of a hipRTC error on inline PTX. See
+/// [`kernel_schedule_emit::Lang`].
+///
+/// ROCm reaches this through the same tile parameter space and the same
+/// dispatch table as CUDA, which is the whole reason the kernel text lives in
+/// this crate rather than in either backend.
+#[cfg(feature = "schedule-codegen")]
+pub fn matmul_src_scheduled(
+    tile: tiles::TileParams,
+    schedule: MatmulSchedule,
+    target: rlx_ir::kernel_schedule::Target,
+    lang: kernel_schedule_emit::Lang,
+) -> Result<(String, Option<kernel_schedule_emit::EmitFacts>), String> {
+    let sched = match schedule {
+        MatmulSchedule::Default => {
+            return matmul_cuda_src_tiled(tile)
+                .map(|s| (s, None))
+                .map_err(|e| e.to_string());
+        }
+        MatmulSchedule::EmittedSerial => kernel_schedule_port::matmul_schedule(tile),
+        MatmulSchedule::EmittedPipelined { stages } => {
+            let mut s = kernel_schedule_emit::matmul_pipelined_schedule(tile, stages);
+            // HIP gets the rotation without the async-copy declaration. This is
+            // NOT the emitter quietly downgrading a capability — the schedule
+            // is a different one, it says so in its `requires`, and the
+            // resulting `EmitFacts.async_copy` is `false` so a report cannot
+            // claim an async pipeline that was never emitted.
+            if lang == kernel_schedule_emit::Lang::Hip {
+                s.requires.clear();
+            }
+            s
+        }
+    };
+    let (body, facts) =
+        kernel_schedule_emit::emit(&sched, tile, target, lang).map_err(|e| e.to_string())?;
+    // `gelu_erf` / `gelu_approx` come from the shared header, exactly as they do
+    // for the hand-written kernel.
+    Ok((format!("{GELU_CUH}\n{body}"), Some(facts)))
+}
+
 cuda_src_with_gelu!(
     matmul_epilogue_cuda_src,
     include_str!("../kernels/matmul_epilogue.cu")
@@ -310,6 +504,90 @@ pub fn declared_param_count(src: &str, entry: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tiled_src_tests {
+    use super::*;
+    use crate::tiles::{MATMUL_TILE_CANDIDATES, TileParams};
+
+    /// The default tile must produce the *same bytes* as before the tile became
+    /// a parameter — same JIT module, same disk-cache slot, same SASS.
+    #[test]
+    fn default_tile_source_is_unchanged() {
+        let s = matmul_cuda_src_tiled(TileParams::DEFAULT_MATMUL).expect("default is legal");
+        assert_eq!(s, matmul_cuda_src());
+    }
+
+    /// Every macro the kernel guards with `#ifndef` must be pinned by the
+    /// prelude, and the prelude must come first so the guards see it.
+    #[test]
+    fn non_default_tile_pins_every_guarded_macro_before_the_body() {
+        let t = MATMUL_TILE_CANDIDATES[0];
+        assert_ne!(t, TileParams::DEFAULT_MATMUL);
+        let s = matmul_cuda_src_tiled(t).expect("candidate is legal");
+        for (m, v) in [
+            ("BM", t.bm),
+            ("BN", t.bn),
+            ("BK", t.bk),
+            ("TM", t.tm),
+            ("TN", t.tn),
+            ("BLOCK_DIM_X", t.bdx),
+            ("BLOCK_DIM_Y", t.bdy),
+        ] {
+            let pin = format!("#define {m} {v}\n");
+            let at = s
+                .find(&pin)
+                .unwrap_or_else(|| panic!("no `{pin:?}` in source"));
+            let guard = s
+                .find(&format!("#ifndef {m}"))
+                .unwrap_or_else(|| panic!("kernel lost its `#ifndef {m}` guard"));
+            assert!(at < guard, "`{m}` pinned after its own #ifndef guard");
+        }
+    }
+
+    /// Distinct tiles must produce distinct source, or they would share a JIT
+    /// cache slot and the second one would silently run the first one's module.
+    #[test]
+    fn distinct_tiles_produce_distinct_source() {
+        let mut seen = std::collections::HashSet::new();
+        for t in MATMUL_TILE_CANDIDATES {
+            let s = matmul_cuda_src_tiled(*t).expect("candidate is legal");
+            assert!(seen.insert(s), "source collision for {t:?}");
+        }
+    }
+
+    /// An illegal tile is refused at source-generation time.
+    #[test]
+    fn illegal_tile_is_refused() {
+        let bad = TileParams {
+            bk: 15,
+            ..TileParams::DEFAULT_MATMUL
+        };
+        assert!(matmul_cuda_src_tiled(bad).is_err());
+    }
+
+    /// The kernel body must not have re-acquired a hardcoded tile assumption:
+    /// each guarded macro appears exactly once as an unconditional `#define`
+    /// (inside its own `#ifndef`).
+    #[test]
+    fn kernel_body_defines_each_tile_macro_exactly_once() {
+        let src = include_str!("../kernels/matmul.cu");
+        // Directive lines only — prose in the header comment mentions these
+        // macros too, and a substring scan would count it.
+        let directives = |kind: &str, m: &str| {
+            let want = format!("{kind} {m}");
+            src.lines()
+                .map(str::trim)
+                .filter(|l| *l == want || l.starts_with(&format!("{want} ")))
+                .count()
+        };
+        for m in ["BM", "BN", "BK", "TM", "TN", "BLOCK_DIM_X", "BLOCK_DIM_Y"] {
+            let n = directives("#define", m);
+            assert_eq!(n, 1, "`{m}` defined {n}× in matmul.cu");
+            assert_eq!(directives("#ifndef", m), 1, "`{m}` is not #ifndef-guarded");
+        }
+    }
 }
 
 #[cfg(test)]

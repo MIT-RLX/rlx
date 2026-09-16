@@ -10,6 +10,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const N: usize = 5;
 
 fn spd_and_b() -> (Vec<f32>, Vec<f32>) {
@@ -57,6 +59,7 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn linalg_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     let (a, b) = spd_and_b();
     let out = run(Device::Cpu, &a, &b);
     assert_eq!(out.len(), N + 2); // trisolve(N) + det + logdet
@@ -67,7 +70,8 @@ macro_rules! backend_parity {
         #[test]
         #[$feat]
         fn $name() {
-            if !rlx_runtime::is_available($dev) {
+            let _gpu = common::serialize_gpu();
+            if common::skip_unless($dev) {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }

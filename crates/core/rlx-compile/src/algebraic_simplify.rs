@@ -68,17 +68,38 @@ pub fn algebraic_simplify(graph: &Graph) -> Graph {
                 let b_const = constant_f32_values(&out, b);
                 let out_elems = node.shape.num_elements().unwrap_or(0);
                 let const_matches = |c: &[f32]| c.len() == out_elems || c.len() == 1;
+                // Folding `x + 0` away is only sound when `x` already HAS the
+                // node's shape. `add(param[1,G,d], zeros[B,G,d])` is the idiom
+                // for broadcasting a learned query across the batch — dropping
+                // the add leaves consumers with a [1,G,d] tensor where [B,G,d]
+                // was declared. CPU broadcasts on the fly and hides it; MLX
+                // rejects the reshape and the model dies on that backend only.
+                let keeps_shape = |id: NodeId| out.node(id).shape == node.shape;
                 match (op, a_const.as_deref(), b_const.as_deref()) {
-                    (BinaryOp::Add, Some(c), None) if const_matches(c) && is_all_zero(c) => Some(b),
-                    (BinaryOp::Add, None, Some(c)) if const_matches(c) && is_all_zero(c) => Some(a),
-                    (BinaryOp::Sub, None, Some(c)) if const_matches(c) && is_all_zero(c) => Some(a),
+                    (BinaryOp::Add, Some(c), None)
+                        if const_matches(c) && is_all_zero(c) && keeps_shape(b) =>
+                    {
+                        Some(b)
+                    }
+                    (BinaryOp::Add, None, Some(c))
+                        if const_matches(c) && is_all_zero(c) && keeps_shape(a) =>
+                    {
+                        Some(a)
+                    }
+                    (BinaryOp::Sub, None, Some(c))
+                        if const_matches(c) && is_all_zero(c) && keeps_shape(a) =>
+                    {
+                        Some(a)
+                    }
                     (BinaryOp::Mul, Some(c), None)
                         if const_matches(c) && (is_all_zero(c) || is_all_one(c)) =>
                     {
                         if is_all_zero(c) {
                             Some(zeros_like(&mut out, &node.shape))
-                        } else {
+                        } else if keeps_shape(b) {
                             Some(b)
+                        } else {
+                            None
                         }
                     }
                     (BinaryOp::Mul, None, Some(c))
@@ -86,8 +107,10 @@ pub fn algebraic_simplify(graph: &Graph) -> Graph {
                     {
                         if is_all_zero(c) {
                             Some(zeros_like(&mut out, &node.shape))
-                        } else {
+                        } else if keeps_shape(a) {
                             Some(a)
+                        } else {
+                            None
                         }
                     }
                     _ => None,

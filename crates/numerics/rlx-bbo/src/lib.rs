@@ -13,6 +13,7 @@ pub mod gp;
 mod gradcheck;
 mod gradient_descent;
 mod graph_opt;
+mod powell;
 mod q_guidance;
 pub mod sampling;
 mod surrogate;
@@ -32,6 +33,7 @@ pub use graph_opt::{
     GraphOptConfig, GraphOptError, GraphOptResult, GraphOptSpec, adam_opt_graph, find_param_node,
     find_param_nodes,
 };
+pub use powell::{PowellConfig, powell};
 pub use q_guidance::{
     DEFAULT_KAPPA, QSteerConfig, QgbsConfig, eta_eff_twin, finite_diff_grad, q_guided_beam_search,
     q_steered_search, q_steered_search_with_grad, search_by_method, trust_region_q_step,

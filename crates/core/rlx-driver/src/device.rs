@@ -32,6 +32,11 @@ pub enum Device {
     /// AMD XDNA / Ryzen AI NPU (AI Engine `aie2`) via the `amdxdna` driver.
     Xdna,
 
+    // ── External (USB4 / Thunderbolt) ───────────────────────
+    /// Discrete GPU on a PCIe tunnel, driven from userspace. The path for
+    /// hosts with no in-tree driver for PCI class 0x03 (Apple Silicon).
+    Egpu,
+
     // ── Intel ───────────────────────────────────────────────
     /// Intel GPU (Arc / Data Center Max) via oneAPI Level Zero.
     OneApi,
@@ -71,6 +76,7 @@ impl Device {
             Device::Cuda => "CUDA",
             Device::Rocm => "ROCm",
             Device::Xdna => "XDNA NPU",
+            Device::Egpu => "eGPU (PCIe tunnel)",
             Device::OneApi => "oneAPI (Level Zero)",
             Device::Tpu => "TPU",
             Device::Hexagon => "Hexagon NPU",
@@ -82,7 +88,7 @@ impl Device {
         }
     }
 
-    /// Canonical lowercase token that round-trips through [`FromStr`].
+    /// Canonical lowercase token that round-trips through `FromStr`.
     /// Use this when forwarding a device across a CLI / `--device`
     /// boundary; [`name`](Self::name) is human-facing and does not always
     /// round-trip (e.g. `"GPU (wgpu)"`).
@@ -95,6 +101,7 @@ impl Device {
             Device::Cuda => "cuda",
             Device::Rocm => "rocm",
             Device::Xdna => "xdna",
+            Device::Egpu => "egpu",
             Device::OneApi => "oneapi",
             Device::Tpu => "tpu",
             Device::Hexagon => "hexagon",
@@ -118,6 +125,7 @@ impl Device {
             Device::Cuda,
             Device::Rocm,
             Device::Xdna,
+            Device::Egpu,
             Device::OneApi,
             Device::Tpu,
             Device::Hexagon,
@@ -136,7 +144,7 @@ impl std::fmt::Display for Device {
     }
 }
 
-/// Error returned by [`Device::from_str`] when the input doesn't match
+/// Error returned by `Device::from_str` when the input doesn't match
 /// any known device alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceFromStrError(pub String);
@@ -145,7 +153,7 @@ impl std::fmt::Display for DeviceFromStrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, xdna, oneapi, gpu, vulkan, opengl, directx, webgpu, tpu)",
+            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, xdna, egpu, oneapi, gpu, vulkan, opengl, directx, webgpu, tpu)",
             self.0
         )
     }
@@ -166,6 +174,7 @@ impl std::str::FromStr for Device {
             "cuda" | "nvidia" => Device::Cuda,
             "rocm" | "hip" | "amd" => Device::Rocm,
             "xdna" | "aie" | "aie2" | "ryzenai" | "ryzen-ai" | "amdnpu" => Device::Xdna,
+            "egpu" | "tbgpu" | "thunderbolt" => Device::Egpu,
             "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Device::OneApi,
             "gpu" | "wgpu" => Device::Gpu,
             "vulkan" | "vk" => Device::Vulkan,

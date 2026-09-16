@@ -28,6 +28,7 @@ pub mod io;
 pub mod linalg;
 pub mod manifold;
 pub mod normalization;
+pub mod pool2d;
 pub mod reduction;
 pub mod shape_ops;
 pub mod spd_eig;

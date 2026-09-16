@@ -165,7 +165,7 @@ fn main() {
         let _ = npu.run(&[("x", xv.as_slice())]);
     }
     let per_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-    let resident = std::env::var("RLX_XDNA_NO_RESIDENT").is_err();
+    let resident = rlx_ir::env::var("RLX_XDNA_NO_RESIDENT").is_none();
 
     if npu_ok {
         println!(

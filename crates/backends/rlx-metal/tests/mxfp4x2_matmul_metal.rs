@@ -17,7 +17,7 @@ use rlx_runtime::{Device, Session};
 
 #[test]
 fn dequant_matmul_mxfp4x2_metal_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
     let (m, k, n) = (2usize, 32usize, 4usize);

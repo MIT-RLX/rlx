@@ -94,7 +94,7 @@ pub struct MlxExecutable {
 impl Drop for MlxExecutable {
     fn drop(&mut self) {
         static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if std::env::var_os("RLX_MLX_PROFILE").is_some()
+        if rlx_ir::env::var_os("RLX_MLX_PROFILE").is_some()
             && !REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             crate::lower::mlx_profile_report();
@@ -266,7 +266,7 @@ impl MlxExecutable {
             use std::collections::HashSet;
             use std::sync::{Mutex, OnceLock};
             static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-            let warn_all = std::env::var("RLX_MLX_WARN_LAZY")
+            let warn_all = rlx_ir::env::var("RLX_MLX_WARN_LAZY")
                 .map(|v| v.eq_ignore_ascii_case("all"))
                 .unwrap_or(false);
             let first = {
@@ -431,10 +431,14 @@ impl MlxExecutable {
             input_map.insert(name.to_string(), data.to_vec());
         }
 
+        // `Op::Lstm { carry }` overwrites `h0`/`c0` in place on the arena
+        // backends. MLX holds `params` by shared reference for the whole walk,
+        // so the new state comes back here and is applied after the borrow ends.
+        let mut state_writeback = Vec::new();
         let outs = if self.use_compiled() {
             self.run_compiled(&input_map)?
         } else {
-            lower::lower_and_run_typed_with_extent(
+            lower::lower_and_run_typed_with_extent_writeback(
                 &self.graph,
                 &self.params,
                 &self.params_typed,
@@ -448,8 +452,12 @@ impl MlxExecutable {
                 self.active_extent,
                 Some(&self.gpu_handles),
                 self.current_rng(),
+                &mut state_writeback,
             )?
         };
+        for (name, data) in state_writeback {
+            self.set_param(&name, &data);
+        }
 
         self.refresh_gpu_handles_from_outputs(&outs)?;
         self.last_outputs = outs.iter().filter_map(|a| a.clone_handle().ok()).collect();
@@ -830,7 +838,7 @@ impl MlxExecutable {
         self.gpu_handles.contains_key(name)
     }
 
-    /// After each [`run`] / [`run_feed_gpu`], copy `outputs[out_idx]` into `handle_name`.
+    /// After each [`Self::run`] / [`Self::run_feed_gpu`], copy `outputs[out_idx]` into `handle_name`.
     pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);
@@ -917,7 +925,7 @@ impl MlxExecutable {
         Ok(())
     }
 
-    /// Register a resident-KV row feed: [`feed_kv_row`] copies one output row into the handle.
+    /// Register a resident-KV row feed: [`Self::feed_kv_row`] copies one output row into the handle.
     pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
         self.kv_row_feeds
             .insert(handle_name.to_string(), output_index);
@@ -949,25 +957,46 @@ impl MlxExecutable {
                 .get(&name)
                 .ok_or_else(|| MlxError(format!("no gpu handle '{name}'")))?
                 .clone_handle()?;
-            let out_shape = out_arr.shape()?;
-            let handle_shape = handle.shape()?;
-            let out_data = out_arr.to_f32()?;
-            let mut handle_data = handle.to_f32()?;
+            // One row, written straight into the handle's buffer.
+            //
+            // This used to read the WHOLE output and the WHOLE cache back to
+            // the host as f32 (`to_f32`), memcpy one row between them, and
+            // rebuild the cache with `from_f32_slice(.., DType::F32)`. Three
+            // things were wrong with that, and the middle one is the reason
+            // "GPU-resident KV" was a misnomer on MLX:
+            //
+            //   1. it was O(cache capacity) per handle per token, twice over,
+            //      through the host — the exact O(context) traffic the
+            //      resident path exists to avoid, and worse than the `concat`
+            //      it replaced;
+            //   2. every other backend does this as a single-row device write
+            //      (rlx-cuda / rlx-rocm D2D, rlx-metal / rlx-vulkan in-arena
+            //      memcpy), so MLX was the one backend paying it;
+            //   3. the rebuild hard-coded `DType::F32`. Latent rather than
+            //      live — `bind_gpu_handle` only builds F32 handles today, so
+            //      nothing could observe it — but it made the dtype of a
+            //      resident cache a property of this function rather than of
+            //      the cache, which is a trap for the first non-F32 handle.
+            //
+            // Measured on an M4 Pro, 4096x1024 F32 cache (Qwen3-0.6B-shaped
+            // per-layer KV), both arms warmed before timing:
+            // 751us/feed -> 11.3us/feed, ~60x (57-67x across runs; the spread
+            // is all in the old arm, which moved ~33MB of host traffic per
+            // feed and is therefore sensitive to memory pressure).
+            //
+            // `copy_row_inplace` takes ELEMENT offsets and scales by the
+            // array's own itemsize, so (3) cannot recur by construction.
+            let out_elems = out_arr.num_elements()?;
+            let handle_elems = handle.num_elements()?;
             let src_start = src_row * row_elems;
             let dst_start = dst_row * row_elems;
-            let src_end = src_start + row_elems;
-            let dst_end = dst_start + row_elems;
-            if src_end > out_data.len() || dst_end > handle_data.len() {
+            if src_start + row_elems > out_elems || dst_start + row_elems > handle_elems {
                 return Err(MlxError(format!(
                     "feed_kv_row {name}: src_row={src_row} dst_row={dst_row} row_elems={row_elems} \
-                     out_len={} handle_len={}",
-                    out_data.len(),
-                    handle_data.len()
+                     out_len={out_elems} handle_len={handle_elems}"
                 )));
             }
-            handle_data[dst_start..dst_end].copy_from_slice(&out_data[src_start..src_end]);
-            handle = Array::from_f32_slice(&handle_data, &handle_shape, DType::F32)?;
-            let _ = out_shape;
+            handle.copy_row_inplace(dst_start, out_arr, src_start, row_elems)?;
             self.gpu_handles.insert(name, handle);
         }
         Ok(())

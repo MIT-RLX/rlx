@@ -71,6 +71,7 @@ mod op_bicgstab;
 mod op_cg;
 mod op_cholesky;
 mod op_gmres;
+mod op_ic0_pcg;
 mod op_ilu_pcg;
 mod op_lsqr;
 mod op_lu;
@@ -84,6 +85,7 @@ use op_bicgstab::*;
 use op_cg::*;
 use op_cholesky::*;
 use op_gmres::*;
+use op_ic0_pcg::*;
 use op_ilu_pcg::*;
 use op_lsqr::*;
 use op_lu::*;
@@ -156,6 +158,11 @@ pub const SPARSE_ILU_PCG_SOLVE: &str = "rlx_sparse.ilu_pcg_solve";
 /// of LU and numerically more stable.
 pub const SPARSE_CHOLESKY_SOLVE: &str = "rlx_sparse.cholesky_solve";
 
+/// Conjugate gradients preconditioned by incomplete Cholesky — the SPD
+/// counterpart of [`SPARSE_ILU_PCG_SOLVE`], which stores both triangles of a
+/// factorisation whose halves are transposes of each other.
+pub const SPARSE_IC0_PCG_SOLVE: &str = "rlx_sparse.ic0_pcg_solve";
+
 /// LSQR for sparse least-squares `min_x ||A·x - b||₂`. 4 inputs
 /// (values, col_idx, row_ptr, b) + attrs encoding (max_iter, tol,
 /// n_cols). Forward only in v1 — VJP returns empty (least-squares
@@ -180,7 +187,73 @@ pub const SPARSE_SPGEMM: &str = "rlx_sparse.spgemm";
 // Shape). Both backends end up calling the same arithmetic.
 
 #[cfg(feature = "cpu")]
+/// Below this much work — non-zeros times right-hand sides — a kernel runs on
+/// the calling thread.
+///
+/// Deliberately conservative. Three things argue for staying serial longer
+/// than a flop count alone would suggest:
+///
+/// * A small system lives in cache, and splitting it across cores trades a
+///   warm L2 for cold traffic plus synchronisation. Measured on a 3,600-row
+///   Laplacian, threading an 8-column block made it **five times slower**.
+/// * Callers frequently parallelise above this — one solve per core over many
+///   independent systems is the common shape — and a second level of
+///   splitting underneath buys nothing and costs scheduling.
+/// * When threading does pay, it pays by a lot: the same benchmark at 128
+///   columns runs 4× faster. There is no need to chase the margin.
+///
+/// So the rule is to thread only where the win is unambiguous. This constant
+/// is a floor, not a tuned optimum, and was chosen on a machine busy enough
+/// that a tuned optimum could not have been measured honestly.
+const PAR_MIN_WORK: usize = 1 << 21;
+
 mod algos {
+    use super::PAR_MIN_WORK;
+    use rayon::prelude::*;
+
+    /// `y = A·x` for a CSR matrix, threaded over output rows.
+    ///
+    /// Every iterative solver in this module needs exactly this and each one
+    /// used to spell it out again, so threading it meant threading it four
+    /// times. The rows are disjoint — each writes one element and only reads
+    /// `x` — which is what makes the split safe without any synchronisation.
+    pub(super) fn mat_vec_into(
+        values: &[f64],
+        col_idx: &[i32],
+        row_ptr: &[i32],
+        x: &[f64],
+        y: &mut [f64],
+    ) {
+        let row = |r: usize| -> f64 {
+            (row_ptr[r] as usize..row_ptr[r + 1] as usize)
+                .map(|k| values[k] * x[col_idx[k] as usize])
+                .sum()
+        };
+        if values.len() >= PAR_MIN_WORK {
+            let stride = rows_per_task(y.len());
+            y.par_chunks_mut(stride).enumerate().for_each(|(blk, out)| {
+                let base = blk * stride;
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = row(base + i);
+                }
+            });
+        } else {
+            y.iter_mut().enumerate().for_each(|(r, o)| *o = row(r));
+        }
+    }
+
+    /// How many output rows one parallel task should take.
+    ///
+    /// Granularity is the whole game here. A task per row means rayon's
+    /// bookkeeping — a few hundred nanoseconds — against a handful of
+    /// multiply-adds, and the "parallel" version loses to the serial one by
+    /// six times. Aiming at a few tasks per thread keeps the split amortised
+    /// while leaving the work-stealer something to balance with.
+    pub(super) fn rows_per_task(n_rows: usize) -> usize {
+        let want = rayon::current_num_threads().max(1) * 4;
+        n_rows.div_ceil(want).max(64)
+    }
+
     pub fn lu_solve(
         values: &[f64],
         col_idx: &[i32],
@@ -328,15 +401,7 @@ mod algos {
         }
         let m = max_iter.max(1) as usize;
 
-        let matvec = |x: &[f64], y: &mut [f64]| {
-            for r in 0..n {
-                let mut acc = 0f64;
-                for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
-                    acc += values[k] * x[col_idx[k] as usize];
-                }
-                y[r] = acc;
-            }
-        };
+        let matvec = |x: &[f64], y: &mut [f64]| mat_vec_into(values, col_idx, row_ptr, x, y);
 
         // x_0 = 0; r_0 = b; β = ||b||
         let beta_init = b.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -502,17 +567,25 @@ mod algos {
         max_iter: u32,
         tol: f64,
     ) -> Result<(), String> {
-        let n = b.len();
-        if out.len() != n {
-            return Err(format!("pcg_solve: out len {} != n {n}", out.len()));
+        if row_ptr.len() < 2 {
+            return Err(format!("pcg_solve: row_ptr len {}", row_ptr.len()));
         }
-        if row_ptr.len() != n + 1 {
+        let n = row_ptr.len() - 1;
+        if out.len() != b.len() {
             return Err(format!(
-                "pcg_solve: row_ptr len {} != n+1 ({})",
-                row_ptr.len(),
-                n + 1
+                "pcg_solve: out len {} != b len {}",
+                out.len(),
+                b.len()
             ));
         }
+        if n == 0 || !b.len().is_multiple_of(n) {
+            return Err(format!(
+                "pcg_solve: b len {} is not a whole number of {n}-long \
+                 right-hand sides",
+                b.len()
+            ));
+        }
+        let k = b.len() / n;
 
         // Extract diag(A) from CSR — one O(nnz) pass. Missing
         // diagonals (zero or absent entries) get a 1.0 fallback so
@@ -530,51 +603,140 @@ mod algos {
         }
         let inv_diag: Vec<f64> = diag.iter().map(|&d| 1.0 / d).collect();
 
-        let matvec = |x: &[f64], y: &mut [f64]| {
-            for r in 0..n {
-                let mut acc = 0f64;
-                for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
-                    acc += values[k] * x[col_idx[k] as usize];
+        // `A·P` for all `k` columns at once. The matrix is read once per
+        // iteration rather than once per right-hand side, which is the whole
+        // reason to batch: for `k` in the hundreds the sparse entries stop
+        // being the cost and the dense block becomes it.
+        //
+        // What batching costs, and it is not nothing: the block runs until
+        // its **slowest** column has converged, so every column pays the
+        // worst one's iteration count where separate solves each stop at
+        // their own. Batching therefore wins when `k` is large enough that
+        // re-reading the matrix dominates, and loses when `k` is small and
+        // the columns differ in difficulty. Measured on a 3,600-row
+        // Laplacian: slower at `k = 8`, roughly 3× faster at `k = 32` and
+        // above. There is no threshold that makes this choice for the caller,
+        // because it depends on how alike the right-hand sides are.
+        //
+        // Row-major throughout, so the `k` values a matrix entry touches are
+        // contiguous and the inner loop is a strided AXPY the compiler can
+        // vectorise.
+        //
+        // Threaded over output rows, which are disjoint — each writes its own
+        // slice and only reads `xs`. Below `PAR_MIN_WORK` the split costs more
+        // than the arithmetic, and a caller who is already running one solve
+        // per core wants this to stay out of the way.
+        let matmul = |xs: &[f64], ys: &mut [f64]| {
+            let work = values.len() * k;
+            let body = |r: usize, row: &mut [f64]| {
+                let (s, e) = (row_ptr[r] as usize, row_ptr[r + 1] as usize);
+                row.fill(0.0);
+                for t in s..e {
+                    let v = values[t];
+                    let c = col_idx[t] as usize * k;
+                    for (o, sv) in row.iter_mut().zip(&xs[c..c + k]) {
+                        *o += v * sv;
+                    }
                 }
-                y[r] = acc;
+            };
+            if work >= PAR_MIN_WORK {
+                // Chunked by *blocks of rows*, not by single rows: one task
+                // per row would be a few multiply-adds against rayon's own
+                // overhead, which is a reliable way to make a parallel loop
+                // slower than the serial one.
+                let stride = rows_per_task(n);
+                ys.par_chunks_mut(stride * k)
+                    .enumerate()
+                    .for_each(|(blk, out)| {
+                        let base = blk * stride;
+                        for (i, row) in out.chunks_mut(k).enumerate() {
+                            body(base + i, row);
+                        }
+                    });
+            } else {
+                ys.chunks_mut(k)
+                    .enumerate()
+                    .for_each(|(r, row)| body(r, row));
+            }
+        };
+        // Per-column dot product of two `n × k` blocks.
+        let dots = |a: &[f64], c: &[f64], into: &mut [f64]| {
+            into.fill(0.0);
+            for r in 0..n {
+                for j in 0..k {
+                    into[j] += a[r * k + j] * c[r * k + j];
+                }
             }
         };
 
-        // PCG with x0 = 0: r0 = b, z0 = M⁻¹·r0
-        let mut x = vec![0f64; n];
+        // PCG with X₀ = 0: R₀ = B, Z₀ = M⁻¹·R₀
+        let mut x = vec![0f64; n * k];
         let mut r = b.to_vec();
-        let mut z: Vec<f64> = r.iter().zip(&inv_diag).map(|(rv, mi)| rv * mi).collect();
+        let mut z = vec![0f64; n * k];
+        for i in 0..n {
+            for j in 0..k {
+                z[i * k + j] = r[i * k + j] * inv_diag[i];
+            }
+        }
         let mut p = z.clone();
-        let mut ap = vec![0f64; n];
-        let mut rho_old: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
+        let mut ap = vec![0f64; n * k];
+        let mut rho_old = vec![0f64; k];
+        dots(&r, &z, &mut rho_old);
+
+        let mut pap = vec![0f64; k];
+        let mut rho_new = vec![0f64; k];
+        let mut alpha = vec![0f64; k];
+        let mut beta = vec![0f64; k];
+        let mut rr = vec![0f64; k];
 
         for _ in 0..max_iter {
-            // Convergence on plain ‖r‖₂ (matches CG's contract).
-            let r_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if r_norm < tol {
+            // Convergence on plain ‖r‖₂ per column (matches CG's contract).
+            // Columns converge at different rates; the block runs until the
+            // slowest is done, and a column that has arrived is held still
+            // rather than pushed around by its own rounding.
+            dots(&r, &r, &mut rr);
+            if rr.iter().all(|v| v.sqrt() < tol) {
                 break;
             }
-            matvec(&p, &mut ap);
-            let pap: f64 = p.iter().zip(&ap).map(|(a, b)| a * b).sum();
-            if pap == 0.0 {
+
+            matmul(&p, &mut ap);
+            dots(&p, &ap, &mut pap);
+            if k == 1 && pap[0] == 0.0 {
                 return Err("pcg_solve: pᵀ·A·p = 0 (A is singular or not SPD)".into());
             }
-            let alpha = rho_old / pap;
-            for i in 0..n {
-                x[i] += alpha * p[i];
+            for j in 0..k {
+                // A zero curvature means this column has nothing left to do;
+                // stepping it would divide by zero and spread a NaN through
+                // the block.
+                alpha[j] = if pap[j] == 0.0 || rr[j].sqrt() < tol {
+                    0.0
+                } else {
+                    rho_old[j] / pap[j]
+                };
             }
             for i in 0..n {
-                r[i] -= alpha * ap[i];
+                for j in 0..k {
+                    let idx = i * k + j;
+                    x[idx] += alpha[j] * p[idx];
+                    r[idx] -= alpha[j] * ap[idx];
+                    z[idx] = r[idx] * inv_diag[i];
+                }
+            }
+            dots(&r, &z, &mut rho_new);
+            for j in 0..k {
+                beta[j] = if rho_old[j] == 0.0 {
+                    0.0
+                } else {
+                    rho_new[j] / rho_old[j]
+                };
             }
             for i in 0..n {
-                z[i] = r[i] * inv_diag[i];
+                for j in 0..k {
+                    let idx = i * k + j;
+                    p[idx] = z[idx] + beta[j] * p[idx];
+                }
             }
-            let rho_new: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
-            let beta = rho_new / rho_old;
-            for i in 0..n {
-                p[i] = z[i] + beta * p[i];
-            }
-            rho_old = rho_new;
+            rho_old.copy_from_slice(&rho_new);
         }
 
         out.copy_from_slice(&x);
@@ -585,6 +747,28 @@ mod algos {
     /// factors via LAPACK `dpotrf`, then forward+back triangular solve
     /// via `dtrsm`. The mirror of [`lu_solve`] for SPD matrices —
     /// faster (factor cost ½× LU) and numerically more stable.
+    ///
+    /// # Many right-hand sides share one factorisation
+    ///
+    /// `b` may hold **several** right-hand sides: an `n × nrhs` row-major
+    /// block, with `nrhs` taken from `b.len() / n`. One column is the
+    /// ordinary case and behaves exactly as before.
+    ///
+    /// This is the shape a direct method is *for*. Factoring costs `O(n³)`
+    /// and each solve after it costs `O(n²)`, so a problem that reuses one
+    /// matrix — a time series, a batch of loads, a reconstruction solving the
+    /// same system once per slice — should pay the factorisation once. Calling
+    /// this `nrhs` times instead re-factors `nrhs` times, which for `n` in the
+    /// thousands is the difference between minutes and hours.
+    ///
+    /// # Cost
+    ///
+    /// The dense buffer is `8n²` bytes and is allocated whatever the sparsity:
+    /// 800 MB at `n = 10,000`. That is a real limit rather than a detail, so
+    /// it is refused with a message that says so rather than by the allocator.
+    /// A true sparse factorisation with a fill-reducing ordering would lift
+    /// it; until then, an iterative solver ([`pcg`], [`lsqr_solve`]) is what
+    /// large systems want.
     pub fn cholesky_solve(
         values: &[f64],
         col_idx: &[i32],
@@ -592,38 +776,288 @@ mod algos {
         b: &[f64],
         out: &mut [f64],
     ) -> Result<(), String> {
-        let n = b.len();
-        if out.len() != n {
-            return Err(format!("cholesky_solve: out len {} != n {n}", out.len()));
+        if row_ptr.len() < 2 {
+            return Err(format!("cholesky_solve: row_ptr len {}", row_ptr.len()));
         }
-        if row_ptr.len() != n + 1 {
+        let n = row_ptr.len() - 1;
+        if out.len() != b.len() {
             return Err(format!(
-                "cholesky_solve: row_ptr len {} != n+1",
-                row_ptr.len()
+                "cholesky_solve: out len {} != b len {}",
+                out.len(),
+                b.len()
             ));
         }
+        if n == 0 || !b.len().is_multiple_of(n) {
+            return Err(format!(
+                "cholesky_solve: b len {} is not a whole number of {n}-long \
+                 right-hand sides",
+                b.len()
+            ));
+        }
+        let nrhs = b.len() / n;
+
+        // 8n² bytes, dense, however sparse the input was.
+        const MAX_DENSE_BYTES: usize = 8 << 30;
+        let bytes = n.saturating_mul(n).saturating_mul(8);
+        if bytes > MAX_DENSE_BYTES {
+            return Err(format!(
+                "cholesky_solve: this densifies to {n}×{n}, which is {} GiB — \
+                 use an iterative solver (pcg, lsqr) for a system this size",
+                bytes >> 30
+            ));
+        }
+
         let mut a_dense = vec![0f64; n * n];
         for r in 0..n {
             for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
                 a_dense[r * n + col_idx[k] as usize] = values[k];
             }
         }
-        // Factor: A = L·Lᵀ; L stored in lower triangle of a_dense.
+        // Factor: A = L·Lᵀ; L stored in lower triangle of a_dense. Once,
+        // whatever `nrhs` is — that is the point of a direct method.
         let info = rlx_cpu::blas::dpotrf(&mut a_dense, n, /*lower=*/ true);
         if info != 0 {
             return Err(format!("cholesky_solve: dpotrf info={info} (not SPD?)"));
         }
-        // Solve L·y = b (forward).
+        // Solve L·Y = B (forward), then Lᵀ·X = Y (back), all columns at once.
         let mut x = b.to_vec();
         rlx_cpu::blas::dtrsm_lower_or_upper(
-            &a_dense, &mut x, n, 1, /*lower=*/ true, /*trans=*/ false,
+            &a_dense, &mut x, n, nrhs, /*lower=*/ true, /*trans=*/ false,
         );
-        // Solve Lᵀ·x = y (back).
         rlx_cpu::blas::dtrsm_lower_or_upper(
-            &a_dense, &mut x, n, 1, /*lower=*/ true, /*trans=*/ true,
+            &a_dense, &mut x, n, nrhs, /*lower=*/ true, /*trans=*/ true,
         );
         out.copy_from_slice(&x);
         Ok(())
+    }
+
+    /// Conjugate gradients preconditioned by [`ic0_factor`].
+    ///
+    /// Same contract as [`pcg`] — SPD `A`, absolute `‖r‖₂` tolerance, `x₀ = 0`
+    /// — and the same answer, reached in fewer iterations. The preconditioner
+    /// is the whole difference: Jacobi divides by the diagonal, which knows
+    /// nothing about how the matrix couples its unknowns, where `IC(0)`
+    /// approximates the factorisation itself.
+    ///
+    /// Each iteration costs two triangular solves on top of the sparse
+    /// product, so this is worth it when it saves more iterations than that
+    /// overhead — which for anything with structure it usually does, and by a
+    /// lot. Measured on a super-resolution reconstruction's normal equations,
+    /// `9,900 × 9,900` with 292,356 non-zeros: Jacobi reaches the `f64` floor
+    /// in about 48 iterations, this in about 10.
+    pub fn ic0_pcg(
+        values: &[f64],
+        col_idx: &[i32],
+        row_ptr: &[i32],
+        b: &[f64],
+        out: &mut [f64],
+        max_iter: u32,
+        tol: f64,
+    ) -> Result<(), String> {
+        if row_ptr.len() < 2 {
+            return Err(format!("ic0_pcg: row_ptr len {}", row_ptr.len()));
+        }
+        let n = row_ptr.len() - 1;
+        if out.len() != b.len() {
+            return Err(format!(
+                "ic0_pcg: out len {} != b len {}",
+                out.len(),
+                b.len()
+            ));
+        }
+        if n == 0 || !b.len().is_multiple_of(n) {
+            return Err(format!(
+                "ic0_pcg: b len {} is not a whole number of {n}-long \
+                 right-hand sides",
+                b.len()
+            ));
+        }
+        let k = b.len() / n;
+
+        // Factorised **once**, whatever `k` is. This is the reason to hand
+        // several right-hand sides in rather than call this once each: the
+        // incomplete Cholesky depends only on the matrix, and a caller solving
+        // the same system repeatedly — a super-resolution reconstruction runs
+        // 1,430 solves against one matrix — otherwise pays for it every time.
+        let (l, lc, lr) = ic0_factor(values, col_idx, row_ptr, n)?;
+
+        let mut x = vec![0f64; n];
+        let mut r = vec![0f64; n];
+        let mut z = vec![0f64; n];
+        let mut p = vec![0f64; n];
+        let mut ap = vec![0f64; n];
+
+        for rhs in 0..k {
+            let bj = &b[rhs * n..(rhs + 1) * n];
+            x.fill(0.0);
+            r.copy_from_slice(bj);
+            ic0_apply(&l, &lc, &lr, n, &r, &mut z);
+            p.copy_from_slice(&z);
+            let mut rho_old: f64 = r.iter().zip(&z).map(|(a, c)| a * c).sum();
+
+            for _ in 0..max_iter {
+                if r.iter().map(|v| v * v).sum::<f64>().sqrt() < tol {
+                    break;
+                }
+                mat_vec_into(values, col_idx, row_ptr, &p, &mut ap);
+                let pap: f64 = p.iter().zip(&ap).map(|(a, c)| a * c).sum();
+                if pap == 0.0 {
+                    return Err("ic0_pcg: pᵀ·A·p = 0 (A is singular or not SPD)".into());
+                }
+                let alpha = rho_old / pap;
+                for i in 0..n {
+                    x[i] += alpha * p[i];
+                    r[i] -= alpha * ap[i];
+                }
+                ic0_apply(&l, &lc, &lr, n, &r, &mut z);
+                let rho_new: f64 = r.iter().zip(&z).map(|(a, c)| a * c).sum();
+                let beta = if rho_old == 0.0 {
+                    0.0
+                } else {
+                    rho_new / rho_old
+                };
+                for i in 0..n {
+                    p[i] = z[i] + beta * p[i];
+                }
+                rho_old = rho_new;
+            }
+            out[rhs * n..(rhs + 1) * n].copy_from_slice(&x);
+        }
+        Ok(())
+    }
+
+    /// Incomplete Cholesky, `IC(0)`: `A ≈ L·Lᵀ` with `L` confined to the
+    /// lower triangle of `A`'s own sparsity pattern.
+    ///
+    /// The SPD counterpart of [`ilu0_factor`], and the right one to reach for
+    /// when the matrix is symmetric positive definite — which is exactly when
+    /// conjugate gradients apply, so any caller of [`pcg`] is a candidate.
+    /// `ILU(0)` on such a matrix computes and stores both triangles of a
+    /// factorisation whose halves are transposes of each other: twice the
+    /// memory, and twice the work in every triangular solve.
+    ///
+    /// # Breakdown
+    ///
+    /// Dropping fill can make a pivot non-positive even though `A` is
+    /// definite — the factorisation exists, its incomplete version need not.
+    /// The standard remedy is Manteuffel's: retry on `A + α·diag(A)` with `α`
+    /// growing until it succeeds. The shifted factor is still a valid
+    /// preconditioner, because a preconditioner only has to be *close* to
+    /// `A⁻¹` and symmetric positive definite; it never has to be exact.
+    ///
+    /// Returns `L` in CSR, lower triangle including the diagonal.
+    pub fn ic0_factor(
+        values: &[f64],
+        col_idx: &[i32],
+        row_ptr: &[i32],
+        n: usize,
+    ) -> Result<(Vec<f64>, Vec<i32>, Vec<i32>), String> {
+        // The lower triangle of A's pattern, row by row, columns ascending.
+        let mut l_row_ptr = Vec::with_capacity(n + 1);
+        let mut l_col_idx: Vec<i32> = Vec::new();
+        let mut a_low: Vec<f64> = Vec::new();
+        let mut diag_a = vec![0f64; n];
+        l_row_ptr.push(0i32);
+        for i in 0..n {
+            let mut row: Vec<(i32, f64)> = (row_ptr[i] as usize..row_ptr[i + 1] as usize)
+                .filter(|&k| (col_idx[k] as usize) <= i)
+                .map(|k| (col_idx[k], values[k]))
+                .collect();
+            row.sort_by_key(|(c, _)| *c);
+            for (c, v) in &row {
+                if *c as usize == i {
+                    diag_a[i] = *v;
+                }
+                l_col_idx.push(*c);
+                a_low.push(*v);
+            }
+            l_row_ptr.push(l_col_idx.len() as i32);
+        }
+        if diag_a.iter().any(|d| *d <= 0.0) {
+            return Err("ic0: a non-positive diagonal, so A is not SPD".into());
+        }
+
+        // Up to a few shifted attempts; α doubles from a small fraction.
+        let mut alpha = 0f64;
+        for attempt in 0..12 {
+            let mut l = a_low.clone();
+            for (i, d) in diag_a.iter().enumerate() {
+                let k = l_row_ptr[i + 1] as usize - 1; // the diagonal is last
+                l[k] = d * (1.0 + alpha);
+            }
+            if ic0_sweep(&mut l, &l_col_idx, &l_row_ptr, n).is_ok() {
+                if attempt > 0 {
+                    // Worth nothing to the caller but everything to whoever
+                    // is reading a profile and wondering where the time went.
+                    debug_assert!(alpha > 0.0);
+                }
+                return Ok((l, l_col_idx, l_row_ptr));
+            }
+            alpha = if alpha == 0.0 { 1e-3 } else { alpha * 2.0 };
+        }
+        Err("ic0: no diagonal shift made the factorisation succeed".into())
+    }
+
+    /// One in-place `IC(0)` sweep over an already-extracted lower triangle.
+    fn ic0_sweep(l: &mut [f64], col_idx: &[i32], row_ptr: &[i32], n: usize) -> Result<(), String> {
+        for i in 0..n {
+            let (rs, re) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
+            for k in rs..re {
+                let j = col_idx[k] as usize;
+                // `Σ L[i,p]·L[j,p]` over columns the two rows share, which is
+                // a merge of two ascending index lists.
+                let (js, je) = (row_ptr[j] as usize, row_ptr[j + 1] as usize);
+                let mut sum = l[k];
+                let (mut p, mut q) = (rs, js);
+                while p < k && q < je && col_idx[q] < j as i32 {
+                    match col_idx[p].cmp(&col_idx[q]) {
+                        std::cmp::Ordering::Less => p += 1,
+                        std::cmp::Ordering::Greater => q += 1,
+                        std::cmp::Ordering::Equal => {
+                            sum -= l[p] * l[q];
+                            p += 1;
+                            q += 1;
+                        }
+                    }
+                }
+                if j == i {
+                    if sum <= 0.0 {
+                        return Err("ic0: non-positive pivot".into());
+                    }
+                    l[k] = sum.sqrt();
+                } else {
+                    let d = l[row_ptr[j + 1] as usize - 1];
+                    if d == 0.0 {
+                        return Err("ic0: zero pivot".into());
+                    }
+                    l[k] = sum / d;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply `M⁻¹ = (L·Lᵀ)⁻¹` to one vector: forward then back substitution.
+    fn ic0_apply(l: &[f64], col_idx: &[i32], row_ptr: &[i32], n: usize, r: &[f64], z: &mut [f64]) {
+        z.copy_from_slice(r);
+        // L·y = r
+        for i in 0..n {
+            let (rs, re) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
+            let mut acc = z[i];
+            for k in rs..re - 1 {
+                acc -= l[k] * z[col_idx[k] as usize];
+            }
+            z[i] = acc / l[re - 1];
+        }
+        // Lᵀ·x = y, which walks rows backwards and scatters.
+        for i in (0..n).rev() {
+            let (rs, re) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
+            z[i] /= l[re - 1];
+            let zi = z[i];
+            for k in rs..re - 1 {
+                z[col_idx[k] as usize] -= l[k] * zi;
+            }
+        }
     }
 
     /// BiCGSTAB for general non-symmetric A. `transpose_a` lets a single
@@ -747,7 +1181,8 @@ mod algos {
         max_iter: u32,
         tol: f64,
         n_cols: usize,
-    ) -> Result<(), String> {
+        damp: f64,
+    ) -> Result<usize, String> {
         let m = b.len();
         let n = n_cols;
         if out.len() != n {
@@ -761,17 +1196,16 @@ mod algos {
             ));
         }
 
-        // y = A·x  (gather over rows of A)
-        let av = |x: &[f64], y: &mut [f64]| {
-            for r in 0..m {
-                let mut acc = 0f64;
-                for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
-                    acc += values[k] * x[col_idx[k] as usize];
-                }
-                y[r] = acc;
-            }
-        };
-        // y = Aᵀ·u  (scatter over rows)
+        // y = A·x  (gather over rows of A), threaded.
+        let av = |x: &[f64], y: &mut [f64]| mat_vec_into(values, col_idx, row_ptr, x, y);
+        // y = Aᵀ·u  (scatter over rows).
+        //
+        // Deliberately *not* threaded: every entry does a read-modify-write
+        // into a location the index array picks, so two rows can collide on
+        // one output and the split would need atomics or per-thread buffers.
+        // Measured on a banded matrix the scatter costs only 1.06× the
+        // gather — the collisions are local and the cache absorbs them — so
+        // the cost of making it safe would exceed what it could win.
         let atv = |u: &[f64], y: &mut [f64]| {
             for v in y.iter_mut() {
                 *v = 0.0;
@@ -789,7 +1223,7 @@ mod algos {
             for v in out.iter_mut() {
                 *v = 0.0;
             }
-            return Ok(());
+            return Ok(0);
         }
         for v in u.iter_mut() {
             *v /= beta;
@@ -802,7 +1236,7 @@ mod algos {
             for v in out.iter_mut() {
                 *v = 0.0;
             }
-            return Ok(());
+            return Ok(0);
         }
         for x in v.iter_mut() {
             *x /= alpha;
@@ -812,11 +1246,21 @@ mod algos {
         let mut w = v.clone();
         let mut phi_bar = beta;
         let mut rho_bar = alpha;
+        // ‖b‖, and a running ‖A‖_F built from the bidiagonal entries — both
+        // needed to make the stopping tests relative. Paige & Saunders (1982)
+        // §6; `anorm² = Σ (αᵢ² + βᵢ²)`.
+        let bnorm = beta;
+        let mut anorm2 = alpha * alpha;
+        let mut iters = 0usize;
+        // With damping the residual has a second part — the `damp·x` block of
+        // the augmented system — which is accumulated rather than formed.
+        let mut res2 = 0f64;
 
         let mut tmp_u = vec![0f64; m];
         let mut tmp_v = vec![0f64; n];
 
         for _ in 0..max_iter {
+            iters += 1;
             // Bidiagonalization step.
             // u_new = A·v - alpha·u; β = ||u_new||
             av(&v, &mut tmp_u);
@@ -841,14 +1285,37 @@ mod algos {
                 }
             }
 
+            anorm2 += beta * beta + alpha * alpha + damp * damp;
+
+            // A first rotation folds the damping into the bidiagonal, which
+            // is what makes this solve the *augmented* least-squares problem
+            //
+            //     min ‖[ A ; damp·I ]·x − [ b ; 0 ]‖₂
+            //
+            // without anyone building `[ A ; damp·I ]`. That matrix has `n`
+            // extra rows and, for a caller who only wanted Tikhonov, exists
+            // solely to be multiplied by zero.
+            let (rho_bar1, psi) = if damp != 0.0 {
+                let r1 = (rho_bar * rho_bar + damp * damp).sqrt();
+                let c1 = rho_bar / r1;
+                let s1 = damp / r1;
+                let psi = s1 * phi_bar;
+                phi_bar *= c1;
+                (r1, psi)
+            } else {
+                (rho_bar, 0.0)
+            };
+
             // Givens rotation to eliminate β below ρ̄.
-            let rho = (rho_bar * rho_bar + beta * beta).sqrt();
-            let c = rho_bar / rho;
+            let rho = (rho_bar1 * rho_bar1 + beta * beta).sqrt();
+            let c = rho_bar1 / rho;
             let s = beta / rho;
             let theta = s * alpha;
             rho_bar = -c * alpha;
             let phi = c * phi_bar;
             phi_bar *= s;
+            let tau = s * phi;
+            res2 += psi * psi;
 
             // Update x and w.
             let phi_over_rho = phi / rho;
@@ -858,7 +1325,40 @@ mod algos {
                 w[i] = v[i] - theta_over_rho * w[i];
             }
 
-            if phi_bar.abs() < tol {
+            // ── Stopping ────────────────────────────────────────────
+            //
+            // Two tests, and the second is the one that matters.
+            //
+            // `‖A·x − b‖` reaches zero only when the system is *consistent*.
+            // A least-squares problem is overdetermined and inconsistent by
+            // construction — that is what makes it a least-squares problem —
+            // so its residual converges to a nonzero minimum and a test on
+            // `‖r‖` alone never fires. Every solve then runs to `max_iter`,
+            // returning the right answer having spent an arbitrary multiple
+            // of the time reaching it.
+            //
+            // The quantity that does go to zero is `‖Aᵀ·r‖`, the gradient of
+            // `½‖A·x − b‖²`, which is what "least squares" means. Paige &
+            // Saunders express both in terms of the bidiagonalisation
+            // already computed here:
+            //
+            //     ‖r‖    = phi_bar
+            //     ‖Aᵀr‖  = phi_bar · alpha · |c|
+            //
+            // so neither costs a product. Both are made relative, because an
+            // absolute threshold on a residual is a threshold on the units
+            // the data happens to be in.
+            let rnorm = (phi_bar * phi_bar + res2).sqrt();
+            let arnorm = alpha * tau.abs();
+            let anorm = anorm2.sqrt();
+            let xnorm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+            // Consistent system: the residual itself is going to zero.
+            if rnorm <= tol * bnorm + tol * anorm * xnorm {
+                break;
+            }
+            // Inconsistent system: the residual is orthogonal to the range.
+            if arnorm <= tol * anorm * rnorm {
                 break;
             }
             if alpha == 0.0 || beta == 0.0 {
@@ -866,7 +1366,7 @@ mod algos {
             }
         }
         out.copy_from_slice(&x);
-        Ok(())
+        Ok(iters)
     }
 
     /// In-place ILU(0): factor `values` over CSR sparsity pattern.
@@ -982,15 +1482,7 @@ mod algos {
         }
         let mut fact = vec![0f64; values.len()];
         ilu0_factor(values, col_idx, row_ptr, n, &mut fact)?;
-        let matvec = |x: &[f64], y: &mut [f64]| {
-            for r in 0..n {
-                let mut acc = 0f64;
-                for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
-                    acc += values[k] * x[col_idx[k] as usize];
-                }
-                y[r] = acc;
-            }
-        };
+        let matvec = |x: &[f64], y: &mut [f64]| mat_vec_into(values, col_idx, row_ptr, x, y);
         let mut x = vec![0f64; n];
         let mut r = b.to_vec();
         let mut z = vec![0f64; n];
@@ -1118,15 +1610,7 @@ mod algos {
                 n + 1
             ));
         }
-        let matvec = |x: &[f64], y: &mut [f64]| {
-            for r in 0..n {
-                let mut acc = 0f64;
-                for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
-                    acc += values[k] * x[col_idx[k] as usize];
-                }
-                y[r] = acc;
-            }
-        };
+        let matvec = |x: &[f64], y: &mut [f64]| mat_vec_into(values, col_idx, row_ptr, x, y);
         let mut x = vec![0f64; n];
         let mut r = b.to_vec();
         let mut p = r.clone();
@@ -1381,6 +1865,12 @@ impl SparseTensor {
     /// into a dense buffer and calls LAPACK `dpotrf` + triangular
     /// solves. Mirror of `solve` (LU-based) but ½× factor cost and
     /// numerically more stable; only valid when A is SPD.
+    /// `x = A⁻¹ · b` by dense Cholesky, for symmetric positive-definite A.
+    ///
+    /// `b` may be a single vector or an `n × nrhs` row-major block; the
+    /// factorisation is computed **once** and reused across the columns. See
+    /// `algos::cholesky_solve` for why that distinction is the whole reason
+    /// to choose a direct method, and for the dense memory it costs.
     pub fn cholesky_solve(&self, g: &mut Graph, b: NodeId) -> NodeId {
         assert_eq!(
             self.n_rows, self.n_cols,
@@ -1398,10 +1888,41 @@ impl SparseTensor {
     /// returns the minimum-norm solution when A is rank-deficient or
     /// under-determined. VJP not implemented in v1.
     pub fn lsqr_solve(&self, g: &mut Graph, b: NodeId, max_iter: u32, tol: f64) -> NodeId {
-        let mut attrs = Vec::with_capacity(16);
+        self.lsqr_solve_damped(g, b, max_iter, tol, 0.0)
+    }
+
+    /// `x = argmin ‖A·x − b‖₂² + damp²·‖x‖₂²` — Tikhonov-regularised least
+    /// squares, by LSQR.
+    ///
+    /// This is the same problem as
+    ///
+    /// ```text
+    ///     min ‖ [   A    ]·x − [ b ] ‖
+    ///         ‖ [ damp·I ]     [ 0 ] ‖₂
+    /// ```
+    ///
+    /// and the reason to ask for it here rather than build that matrix is
+    /// that the matrix is mostly a formality: `n` extra rows, one entry each,
+    /// multiplied by a right-hand side of zeros. Paige & Saunders fold the
+    /// damping into the bidiagonalisation with one extra Givens rotation per
+    /// iteration, so it costs two scalars and no storage.
+    ///
+    /// Ridge regression, Tikhonov-regularised inverse problems and damped
+    /// Gauss–Newton steps are all this call. `damp = 0` is plain
+    /// [`SparseTensor::lsqr_solve`].
+    pub fn lsqr_solve_damped(
+        &self,
+        g: &mut Graph,
+        b: NodeId,
+        max_iter: u32,
+        tol: f64,
+        damp: f64,
+    ) -> NodeId {
+        let mut attrs = Vec::with_capacity(24);
         attrs.extend_from_slice(&max_iter.to_le_bytes());
         attrs.extend_from_slice(&tol.to_le_bytes());
         attrs.extend_from_slice(&(self.n_cols as u32).to_le_bytes());
+        attrs.extend_from_slice(&damp.to_le_bytes());
         g.custom_op(
             SPARSE_LSQR_SOLVE,
             attrs,
@@ -1432,6 +1953,32 @@ impl SparseTensor {
     /// (same contract as CG/PCG). ILU is factored on each call —
     /// for static-pattern Newton loops the cost amortizes against the
     /// faster convergence vs. Jacobi-PCG.
+    /// `x = A⁻¹ · b` by conjugate gradients preconditioned with incomplete
+    /// Cholesky, for **symmetric positive-definite** A.
+    ///
+    /// The one to reach for when `A` is SPD, which is precisely when
+    /// conjugate gradients apply at all. Against [`SparseTensor::pcg_solve`]'s
+    /// Jacobi preconditioner it converges in a fraction of the iterations —
+    /// roughly a fifth on a normal-equations system measured at
+    /// `9,900 × 9,900` — at the cost of two triangular solves per iteration
+    /// and one factorisation up front.
+    ///
+    /// Against [`SparseTensor::ilu_pcg_solve`] it does the same job with half
+    /// the storage and half the triangular work, because `ILU(0)` on a
+    /// symmetric matrix computes both halves of a factorisation whose halves
+    /// are transposes of each other.
+    pub fn ic0_pcg_solve(&self, g: &mut Graph, b: NodeId, max_iter: u32, tol: f64) -> NodeId {
+        assert_eq!(
+            self.n_rows, self.n_cols,
+            "SparseTensor::ic0_pcg_solve requires a square matrix"
+        );
+        g.custom_op(
+            SPARSE_IC0_PCG_SOLVE,
+            encode_cg_attrs(max_iter, tol),
+            vec![self.values, self.col_idx, self.row_ptr, b],
+        )
+    }
+
     pub fn ilu_pcg_solve(&self, g: &mut Graph, b: NodeId, max_iter: u32, tol: f64) -> NodeId {
         assert_eq!(
             self.n_rows, self.n_cols,
@@ -1934,6 +2481,7 @@ pub fn register() {
     register_op(Arc::new(SparseTransposeValuesExt));
     register_op(Arc::new(SparsePcgExt));
     register_op(Arc::new(SparseBicgstabExt));
+    register_op(Arc::new(SparseIc0PcgExt));
     register_op(Arc::new(SparseIluPcgExt));
     register_op(Arc::new(SparseCholeskyExt));
     register_op(Arc::new(SparseLsqrExt));
@@ -1949,6 +2497,7 @@ pub fn register() {
         register_cpu_kernel(Arc::new(SparseTransposeValuesCpu));
         register_cpu_kernel(Arc::new(SparsePcgCpu));
         register_cpu_kernel(Arc::new(SparseBicgstabCpu));
+        register_cpu_kernel(Arc::new(SparseIc0PcgCpu));
         register_cpu_kernel(Arc::new(SparseIluPcgCpu));
         register_cpu_kernel(Arc::new(SparseCholeskyCpu));
         register_cpu_kernel(Arc::new(SparseLsqrCpu));
@@ -1974,5 +2523,779 @@ pub fn register() {
         register_mlx_kernel(Arc::new(mlx_kernels::SparseValuesGradMlx));
         register_mlx_kernel(Arc::new(mlx_kernels::SparseLuGeneralMlx));
         register_mlx_kernel(Arc::new(mlx_kernels::SparseGmresMlx));
+    }
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod algo_tests {
+    use super::algos;
+
+    /// A small SPD matrix in CSR: tridiagonal, diagonally dominant.
+    fn spd() -> (Vec<f64>, Vec<i32>, Vec<i32>, usize) {
+        let values = vec![4.0, 1.0, 1.0, 5.0, 1.0, 1.0, 6.0, 1.0, 1.0, 7.0];
+        let col_idx = vec![0, 1, 0, 1, 2, 1, 2, 3, 2, 3];
+        let row_ptr = vec![0, 2, 5, 8, 10];
+        (values, col_idx, row_ptr, 4)
+    }
+
+    fn mul(values: &[f64], col_idx: &[i32], row_ptr: &[i32], x: &[f64]) -> Vec<f64> {
+        (0..row_ptr.len() - 1)
+            .map(|r| {
+                (row_ptr[r] as usize..row_ptr[r + 1] as usize)
+                    .map(|k| values[k] * x[col_idx[k] as usize])
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// One factorisation, several right-hand sides — and the columns must be
+    /// indistinguishable from solving them one at a time.
+    ///
+    /// This is what a direct method is for: factoring costs `O(n³)` and each
+    /// solve after it costs `O(n²)`, so a caller with `k` right-hand sides
+    /// for one matrix should pay for one factorisation rather than `k`.
+    #[test]
+    fn cholesky_reuses_one_factorisation_across_a_block() {
+        let (v, ci, rp, n) = spd();
+        let cols: [[f64; 4]; 3] = [
+            [1.0, 2.0, 3.0, 4.0],
+            [0.0, 1.0, 0.0, -1.0],
+            [2.5, -1.5, 0.5, 1.0],
+        ];
+
+        // As an n × 3 row-major block.
+        let mut b = vec![0f64; n * 3];
+        for (j, c) in cols.iter().enumerate() {
+            for (i, val) in c.iter().enumerate() {
+                b[i * 3 + j] = *val;
+            }
+        }
+        let mut block = vec![0f64; n * 3];
+        algos::cholesky_solve(&v, &ci, &rp, &b, &mut block).unwrap();
+
+        for (j, c) in cols.iter().enumerate() {
+            let mut alone = vec![0f64; n];
+            algos::cholesky_solve(&v, &ci, &rp, c, &mut alone).unwrap();
+
+            let column: Vec<f64> = (0..n).map(|i| block[i * 3 + j]).collect();
+            for i in 0..n {
+                assert!(
+                    (column[i] - alone[i]).abs() < 1e-12,
+                    "column {j} differs from the lone solve: {column:?} vs {alone:?}"
+                );
+            }
+            // And it solves the system it was given.
+            for (r, got) in mul(&v, &ci, &rp, &column).iter().enumerate() {
+                assert!((got - c[r]).abs() < 1e-10, "row {r}: {got} vs {}", c[r]);
+            }
+        }
+    }
+
+    /// A single right-hand side is the one-column case, unchanged.
+    #[test]
+    fn cholesky_still_takes_a_bare_vector() {
+        let (v, ci, rp, n) = spd();
+        let b = [1.0, 2.0, 3.0, 4.0];
+        let mut x = vec![0f64; n];
+        algos::cholesky_solve(&v, &ci, &rp, &b, &mut x).unwrap();
+        for (r, got) in mul(&v, &ci, &rp, &x).iter().enumerate() {
+            assert!((got - b[r]).abs() < 1e-10, "row {r}: {got} vs {}", b[r]);
+        }
+    }
+
+    /// A right-hand side that is not a whole number of columns is a caller
+    /// error, and saying so beats solving something else.
+    #[test]
+    fn cholesky_refuses_a_ragged_block() {
+        let (v, ci, rp, _) = spd();
+        let b = [1.0, 2.0, 3.0, 4.0, 5.0]; // 5 is not a multiple of 4
+        let mut x = vec![0f64; 5];
+        let e = algos::cholesky_solve(&v, &ci, &rp, &b, &mut x).unwrap_err();
+        assert!(e.contains("right-hand sides"), "{e}");
+    }
+
+    /// Incomplete Cholesky must reproduce the answer Jacobi reaches, in
+    /// fewer iterations.
+    ///
+    /// Both are preconditioners on the same system, so the *answer* is not
+    /// negotiable — a preconditioner that changed it would be a bug, not a
+    /// faster method. What it may change is how long it takes, and that is
+    /// the point.
+    #[test]
+    fn ic0_reaches_the_same_answer_as_jacobi_in_fewer_iterations() {
+        // A 2-D Laplacian: SPD, and structured enough that a preconditioner
+        // which understands the coupling beats one that only sees diagonals.
+        let side = 24usize;
+        let n = side * side;
+        let (mut values, mut col_idx, mut row_ptr) = (Vec::new(), Vec::new(), vec![0i32]);
+        for i in 0..n {
+            let (r, c) = (i / side, i % side);
+            let mut push = |j: usize, v: f64| {
+                values.push(v);
+                col_idx.push(j as i32);
+            };
+            if r > 0 {
+                push(i - side, -1.0);
+            }
+            if c > 0 {
+                push(i - 1, -1.0);
+            }
+            push(i, 4.0);
+            if c + 1 < side {
+                push(i + 1, -1.0);
+            }
+            if r + 1 < side {
+                push(i + side, -1.0);
+            }
+            row_ptr.push(values.len() as i32);
+        }
+        let b: Vec<f64> = (0..n).map(|i| ((i % 17) as f64 / 17.0) - 0.5).collect();
+
+        let resid = |x: &[f64]| {
+            let mut ax = vec![0f64; n];
+            algos::mat_vec_into(&values, &col_idx, &row_ptr, x, &mut ax);
+            let num: f64 = ax.iter().zip(&b).map(|(a, c)| (a - c) * (a - c)).sum();
+            let den: f64 = b.iter().map(|v| v * v).sum();
+            (num / den).sqrt()
+        };
+
+        // Converged, both of them, to the same place.
+        let mut jac = vec![0f64; n];
+        algos::pcg_solve(&values, &col_idx, &row_ptr, &b, &mut jac, 5000, 1e-13).unwrap();
+        let mut ic0 = vec![0f64; n];
+        algos::ic0_pcg(&values, &col_idx, &row_ptr, &b, &mut ic0, 5000, 1e-13).unwrap();
+        assert!(resid(&jac) < 1e-10, "jacobi left {:.3e}", resid(&jac));
+        assert!(resid(&ic0) < 1e-10, "ic0 left {:.3e}", resid(&ic0));
+        let peak = jac.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for (a, c) in ic0.iter().zip(&jac) {
+            assert!(
+                (a - c).abs() < 1e-8 * peak.max(1e-30),
+                "the preconditioner changed the answer"
+            );
+        }
+
+        // And at a budget too small for Jacobi, IC(0) is already there.
+        let capped =
+            |f: fn(&[f64], &[i32], &[i32], &[f64], &mut [f64], u32, f64) -> Result<(), String>| {
+                let mut x = vec![0f64; n];
+                f(&values, &col_idx, &row_ptr, &b, &mut x, 12, 1e-30).unwrap();
+                resid(&x)
+            };
+        let (j12, i12) = (capped(algos::pcg_solve), capped(algos::ic0_pcg));
+        assert!(
+            i12 < j12 / 10.0,
+            "after 12 iterations ic0 is at {i12:.3e} and jacobi at {j12:.3e}, which is \
+             not the improvement a real preconditioner gives"
+        );
+    }
+
+    /// The shifted retry must actually rescue a matrix that breaks IC(0).
+    ///
+    /// Dropping fill can make a pivot non-positive even where `A` is
+    /// definite, and a preconditioner that gives up there is one the caller
+    /// has to write a fallback for.
+    #[test]
+    fn ic0_recovers_from_a_breakdown_by_shifting() {
+        // Weak diagonal relative to the off-diagonals: definite, but only
+        // just, which is where the incomplete factorisation struggles.
+        let n = 40usize;
+        let (mut values, mut col_idx, mut row_ptr) = (Vec::new(), Vec::new(), vec![0i32]);
+        for i in 0..n {
+            if i > 0 {
+                values.push(-1.0);
+                col_idx.push(i as i32 - 1);
+            }
+            values.push(2.0001);
+            col_idx.push(i as i32);
+            if i + 1 < n {
+                values.push(-1.0);
+                col_idx.push(i as i32 + 1);
+            }
+            row_ptr.push(values.len() as i32);
+        }
+        let b: Vec<f64> = (0..n).map(|i| (i % 5) as f64).collect();
+        let mut x = vec![0f64; n];
+        algos::ic0_pcg(&values, &col_idx, &row_ptr, &b, &mut x, 500, 1e-12).unwrap();
+
+        let mut ax = vec![0f64; n];
+        algos::mat_vec_into(&values, &col_idx, &row_ptr, &x, &mut ax);
+        for (r, got) in ax.iter().enumerate() {
+            assert!((got - b[r]).abs() < 1e-8, "row {r}: {got} vs {}", b[r]);
+        }
+    }
+
+    /// A block of right-hand sides must be indistinguishable from solving
+    /// them one at a time.
+    ///
+    /// Batching exists so the matrix is read once per iteration rather than
+    /// once per right-hand side. What it must not do is let the columns see
+    /// each other: a solver that mixed them would still converge and still
+    /// return plausible numbers, and only a comparison against the lone
+    /// solves would notice.
+    #[test]
+    fn pcg_solves_a_block_the_same_way_it_solves_the_columns() {
+        let (v, ci, rp, n) = spd();
+        let cols: [[f64; 4]; 3] = [
+            [1.0, 2.0, 3.0, 4.0],
+            [0.0, 1.0, 0.0, -1.0],
+            [2.5, -1.5, 0.5, 1.0],
+        ];
+        let mut b = vec![0f64; n * 3];
+        for (j, c) in cols.iter().enumerate() {
+            for (i, val) in c.iter().enumerate() {
+                b[i * 3 + j] = *val;
+            }
+        }
+
+        let mut block = vec![0f64; n * 3];
+        algos::pcg_solve(&v, &ci, &rp, &b, &mut block, 500, 1e-14).unwrap();
+
+        for (j, c) in cols.iter().enumerate() {
+            let mut alone = vec![0f64; n];
+            algos::pcg_solve(&v, &ci, &rp, c, &mut alone, 500, 1e-14).unwrap();
+            let column: Vec<f64> = (0..n).map(|i| block[i * 3 + j]).collect();
+            for i in 0..n {
+                assert!(
+                    (column[i] - alone[i]).abs() < 1e-10,
+                    "column {j}: {column:?} vs {alone:?}"
+                );
+            }
+            for (r, got) in mul(&v, &ci, &rp, &column).iter().enumerate() {
+                assert!((got - c[r]).abs() < 1e-10, "row {r} of column {j}");
+            }
+        }
+    }
+
+    /// A column that has already converged must not be pushed around by the
+    /// ones that have not.
+    ///
+    /// The zero right-hand side is the sharp case: its solution is exactly
+    /// zero, it converges at iteration nought, and it then sits in the block
+    /// while its neighbours iterate. Anything that leaks across columns shows
+    /// up here as a non-zero.
+    #[test]
+    fn pcg_holds_a_converged_column_still() {
+        let (v, ci, rp, n) = spd();
+        let mut b = vec![0f64; n * 2];
+        for i in 0..n {
+            b[i * 2] = (i + 1) as f64; // column 0 has work to do
+            b[i * 2 + 1] = 0.0; // column 1 is already solved
+        }
+        let mut x = vec![0f64; n * 2];
+        algos::pcg_solve(&v, &ci, &rp, &b, &mut x, 500, 1e-14).unwrap();
+
+        for i in 0..n {
+            assert_eq!(
+                x[i * 2 + 1],
+                0.0,
+                "the zero column moved: {:?}",
+                (0..n).map(|r| x[r * 2 + 1]).collect::<Vec<_>>()
+            );
+        }
+        let solved: Vec<f64> = (0..n).map(|i| x[i * 2]).collect();
+        for (r, got) in mul(&v, &ci, &rp, &solved).iter().enumerate() {
+            assert!((got - (r + 1) as f64).abs() < 1e-10, "row {r}");
+        }
+    }
+
+    /// Damped LSQR must agree with plain LSQR on the matrix it stands in for.
+    ///
+    /// `min ‖A·x − b‖² + damp²‖x‖²` is the same problem as
+    /// `min ‖[A; damp·I]·x − [b; 0]‖²`, and the only reason to have the
+    /// damped form is to avoid building the second matrix. So the check is
+    /// that they land on the same answer: this constructs the augmented
+    /// system explicitly and solves it undamped.
+    #[test]
+    fn damped_lsqr_matches_the_augmented_system_it_replaces() {
+        // 5×3, inconsistent.
+        let values = vec![1.0, 2.0, 3.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0];
+        let col_idx = vec![0, 1, 1, 2, 0, 2, 0, 1, 1, 2];
+        let row_ptr = vec![0, 2, 4, 6, 8, 10];
+        let b = [1.0, 2.0, 3.0, 0.5, 1.5];
+        let (m, n) = (5usize, 3usize);
+
+        for damp in [0.1f64, 1.0, 7.5] {
+            let mut damped = vec![0f64; n];
+            algos::lsqr_solve(
+                &values,
+                &col_idx,
+                &row_ptr,
+                &b,
+                &mut damped,
+                5000,
+                1e-14,
+                n,
+                damp,
+            )
+            .unwrap();
+
+            // The same thing spelled out: `n` extra rows of `damp` on the
+            // diagonal, and `n` extra zeros on the right-hand side.
+            let mut av = values.clone();
+            let mut ac = col_idx.clone();
+            let mut ar = row_ptr.clone();
+            for j in 0..n {
+                av.push(damp);
+                ac.push(j as i32);
+                ar.push(av.len() as i32);
+            }
+            let mut ab = b.to_vec();
+            ab.resize(m + n, 0.0);
+
+            let mut augmented = vec![0f64; n];
+            algos::lsqr_solve(&av, &ac, &ar, &ab, &mut augmented, 5000, 1e-14, n, 0.0).unwrap();
+
+            for i in 0..n {
+                assert!(
+                    (damped[i] - augmented[i]).abs() < 1e-9,
+                    "damp = {damp}: {damped:?} vs {augmented:?}"
+                );
+            }
+        }
+    }
+
+    /// Damping must actually regularise: more of it, smaller answer.
+    ///
+    /// Agreement with the augmented system would still hold if both were
+    /// wrong in the same way, so this checks the property damping is *for*.
+    #[test]
+    fn more_damping_gives_a_smaller_solution() {
+        let values = vec![1.0, 2.0, 3.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0];
+        let col_idx = vec![0, 1, 1, 2, 0, 2, 0, 1, 1, 2];
+        let row_ptr = vec![0, 2, 4, 6, 8, 10];
+        let b = [1.0, 2.0, 3.0, 0.5, 1.5];
+
+        let norm_at = |damp: f64| {
+            let mut x = vec![0f64; 3];
+            algos::lsqr_solve(
+                &values, &col_idx, &row_ptr, &b, &mut x, 5000, 1e-14, 3, damp,
+            )
+            .unwrap();
+            x.iter().map(|v| v * v).sum::<f64>().sqrt()
+        };
+
+        let norms: Vec<f64> = [0.0, 0.5, 2.0, 10.0].iter().map(|d| norm_at(*d)).collect();
+        for w in norms.windows(2) {
+            assert!(w[1] < w[0], "‖x‖ did not shrink with damping: {norms:?}");
+        }
+        // And in the limit it goes to zero rather than somewhere arbitrary.
+        assert!(norm_at(1e6) < 1e-6, "{}", norm_at(1e6));
+    }
+
+    /// Threading must not change the answer.
+    ///
+    /// The split is over output rows, which are disjoint, so this should hold
+    /// exactly rather than approximately — every row accumulates in the same
+    /// order whichever thread runs it. A reduction that had been split
+    /// differently would show up here as a last-bit difference.
+    #[test]
+    fn threading_the_matvec_changes_nothing() {
+        // Big enough to cross `PAR_MIN_WORK`, so the threaded branch is the
+        // one under test. The assertion below says so rather than trusting
+        // it: raising the threshold once left this problem on the serial
+        // path, where it proved nothing.
+        let side = 700usize;
+        let n = side * side;
+        let (mut values, mut col_idx, mut row_ptr) = (Vec::new(), Vec::new(), vec![0i32]);
+        for i in 0..n {
+            let (r, c) = (i / side, i % side);
+            let mut push = |j: usize, v: f64| {
+                values.push(v);
+                col_idx.push(j as i32);
+            };
+            if r > 0 {
+                push(i - side, -1.0);
+            }
+            if c > 0 {
+                push(i - 1, -1.0);
+            }
+            push(i, 4.5);
+            if c + 1 < side {
+                push(i + 1, -1.0);
+            }
+            if r + 1 < side {
+                push(i + side, -1.0);
+            }
+            row_ptr.push(values.len() as i32);
+        }
+        assert!(
+            values.len() >= super::PAR_MIN_WORK,
+            "the test problem is too small to thread"
+        );
+
+        let x: Vec<f64> = (0..n).map(|i| ((i % 71) as f64 / 71.0) - 0.5).collect();
+        let mut threaded = vec![0f64; n];
+        algos::mat_vec_into(&values, &col_idx, &row_ptr, &x, &mut threaded);
+
+        // The same thing, spelled out serially.
+        let mut serial = vec![0f64; n];
+        for r in 0..n {
+            let mut acc = 0f64;
+            for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
+                acc += values[k] * x[col_idx[k] as usize];
+            }
+            serial[r] = acc;
+        }
+        assert_eq!(threaded, serial, "threading moved a value");
+    }
+
+    /// How much of an `IC(0)` solve is the factorisation?
+    ///
+    /// It is recomputed on every call, and a caller with one matrix and many
+    /// right-hand sides pays for it every time. Whether that matters depends
+    /// on its share of the whole, which is what this prints.
+    #[test]
+    #[ignore = "timing, not correctness"]
+    fn bench_ic0_factor_share() {
+        let side = 100usize;
+        let n = side * side;
+        let (mut values, mut col_idx, mut row_ptr) = (Vec::new(), Vec::new(), vec![0i32]);
+        for i in 0..n {
+            let (r, c) = (i / side, i % side);
+            let mut push = |j: usize, v: f64| {
+                values.push(v);
+                col_idx.push(j as i32);
+            };
+            if r > 0 {
+                push(i - side, -1.0);
+            }
+            if c > 0 {
+                push(i - 1, -1.0);
+            }
+            push(i, 4.0);
+            if c + 1 < side {
+                push(i + 1, -1.0);
+            }
+            if r + 1 < side {
+                push(i + side, -1.0);
+            }
+            row_ptr.push(values.len() as i32);
+        }
+        let b: Vec<f64> = (0..n).map(|i| ((i % 17) as f64 / 17.0) - 0.5).collect();
+        let reps = 30;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            algos::ic0_factor(&values, &col_idx, &row_ptr, n).unwrap();
+        }
+        let factor = t0.elapsed() / reps;
+
+        let mut x = vec![0f64; n];
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            algos::ic0_pcg(&values, &col_idx, &row_ptr, &b, &mut x, 5000, 1e-12).unwrap();
+        }
+        let ic0 = t1.elapsed() / reps;
+
+        let t2 = std::time::Instant::now();
+        for _ in 0..reps {
+            algos::pcg_solve(&values, &col_idx, &row_ptr, &b, &mut x, 5000, 1e-12).unwrap();
+        }
+        let jac = t2.elapsed() / reps;
+
+        eprintln!(
+            "  n={n} nnz={}  factor {factor:>9.2?}  ic0 total {ic0:>9.2?} \
+             ({:.0}% is the factorisation)  jacobi {jac:>9.2?}  speedup {:.2}x",
+            values.len(),
+            100.0 * factor.as_secs_f64() / ic0.as_secs_f64(),
+            jac.as_secs_f64() / ic0.as_secs_f64()
+        );
+    }
+
+    /// Where does a sparse iteration actually spend its time?
+    ///
+    /// `A·v` is a gather: each output element reads a contiguous run and
+    /// accumulates into a register. `Aᵀ·u` over the same CSR is a scatter:
+    /// every entry does a read-modify-write into a location the index array
+    /// chooses, which cannot be vectorised and cannot be threaded without
+    /// atomics. LSQR does one of each per iteration, so the ratio between
+    /// them is the ceiling on what any tuning could win.
+    #[test]
+    #[ignore = "timing, not correctness"]
+    fn bench_gather_versus_scatter() {
+        let side = 100usize;
+        let n = side * side;
+        let (mut values, mut col_idx, mut row_ptr) = (Vec::new(), Vec::new(), vec![0i32]);
+        for i in 0..n {
+            let (r, c) = (i / side, i % side);
+            let mut push = |j: usize, v: f64| {
+                values.push(v);
+                col_idx.push(j as i32);
+            };
+            if r > 0 {
+                push(i - side, -1.0);
+            }
+            if c > 0 {
+                push(i - 1, -1.0);
+            }
+            push(i, 4.5);
+            if c + 1 < side {
+                push(i + 1, -1.0);
+            }
+            if r + 1 < side {
+                push(i + side, -1.0);
+            }
+            row_ptr.push(values.len() as i32);
+        }
+        let x: Vec<f64> = (0..n).map(|i| (i % 31) as f64).collect();
+        let reps = 200;
+
+        let mut y = vec![0f64; n];
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            for r in 0..n {
+                let mut acc = 0f64;
+                for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
+                    acc += values[k] * x[col_idx[k] as usize];
+                }
+                y[r] = acc;
+            }
+        }
+        let gather = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            y.fill(0.0);
+            for r in 0..n {
+                for k in row_ptr[r] as usize..row_ptr[r + 1] as usize {
+                    y[col_idx[k] as usize] += values[k] * x[r];
+                }
+            }
+        }
+        let scatter = t1.elapsed();
+
+        eprintln!(
+            "  nnz={} gather {gather:>9.2?}  scatter {scatter:>9.2?}  \
+             scatter is {:.2}x the gather",
+            values.len(),
+            scatter.as_secs_f64() / gather.as_secs_f64()
+        );
+        assert!(y.iter().any(|v| *v != 0.0));
+    }
+
+    /// Not an assertion — a measurement, printed for whoever is deciding
+    /// whether batching is worth it on their problem.
+    ///
+    /// Read the `worst diff` column first: it is the one that means something
+    /// on any machine, and it should be exactly zero. The speedups are
+    /// whatever the box was doing at the time, and a run that is not
+    /// monotonic in `k` is measuring the load rather than the code.
+    #[test]
+    #[ignore = "timing, not correctness"]
+    fn bench_block_versus_separate() {
+        // A 2-D Laplacian, the shape most sparse SPD systems have.
+        let side = 60usize;
+        let n = side * side;
+        let (mut values, mut col_idx, mut row_ptr) = (Vec::new(), Vec::new(), vec![0i32]);
+        for i in 0..n {
+            let (r, c) = (i / side, i % side);
+            let mut push = |j: usize, v: f64| {
+                values.push(v);
+                col_idx.push(j as i32);
+            };
+            if r > 0 {
+                push(i - side, -1.0);
+            }
+            if c > 0 {
+                push(i - 1, -1.0);
+            }
+            push(i, 4.5);
+            if c + 1 < side {
+                push(i + 1, -1.0);
+            }
+            if r + 1 < side {
+                push(i + side, -1.0);
+            }
+            row_ptr.push(values.len() as i32);
+        }
+
+        for k in [1usize, 8, 32, 128] {
+            let b: Vec<f64> = (0..n * k).map(|i| ((i % 97) as f64 / 97.0) - 0.5).collect();
+
+            let t0 = std::time::Instant::now();
+            let mut separate = vec![0f64; n * k];
+            for j in 0..k {
+                let col: Vec<f64> = (0..n).map(|i| b[i * k + j]).collect();
+                let mut x = vec![0f64; n];
+                algos::pcg_solve(&values, &col_idx, &row_ptr, &col, &mut x, 5000, 1e-10).unwrap();
+                for i in 0..n {
+                    separate[i * k + j] = x[i];
+                }
+            }
+            let t_sep = t0.elapsed();
+
+            let t1 = std::time::Instant::now();
+            let mut block = vec![0f64; n * k];
+            algos::pcg_solve(&values, &col_idx, &row_ptr, &b, &mut block, 5000, 1e-10).unwrap();
+            let t_blk = t1.elapsed();
+
+            let worst = separate
+                .iter()
+                .zip(&block)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0, f64::max);
+            eprintln!(
+                "  n={n} k={k:4}  separate {t_sep:>10.2?}  block {t_blk:>10.2?}  \
+                 speedup {:.2}x  worst diff {worst:.2e}",
+                t_sep.as_secs_f64() / t_blk.as_secs_f64()
+            );
+        }
+    }
+
+    /// LSQR must stop when the gradient vanishes, not when the budget does.
+    ///
+    /// `‖A·x − b‖` reaches zero only for a consistent system; an
+    /// overdetermined least-squares problem has a nonzero minimum residual,
+    /// so a test on `‖r‖` alone never fires and the solve runs to `max_iter`
+    /// every time. The quantity that does vanish is `‖Aᵀ·r‖`.
+    #[test]
+    fn lsqr_stops_early_on_an_inconsistent_system() {
+        // 5×3, no exact solution.
+        let values = vec![1.0, 2.0, 3.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0];
+        let col_idx = vec![0, 1, 1, 2, 0, 2, 0, 1, 1, 2];
+        let row_ptr = vec![0, 2, 4, 6, 8, 10];
+        let b = [1.0, 2.0, 3.0, 0.5, 1.5];
+
+        let mut small = vec![0f64; 3];
+        let n_small = algos::lsqr_solve(
+            &values, &col_idx, &row_ptr, &b, &mut small, 50, 1e-12, 3, 0.0,
+        )
+        .unwrap();
+        let mut large = vec![0f64; 3];
+        let n_large = algos::lsqr_solve(
+            &values, &col_idx, &row_ptr, &b, &mut large, 50_000, 1e-12, 3, 0.0,
+        )
+        .unwrap();
+
+        // A thousandfold budget must not mean a thousandfold cost.
+        assert!(
+            n_large <= 50,
+            "raising the cap from 50 to 50,000 took {n_large} iterations, so the \
+             solve is running to the cap rather than converging"
+        );
+        assert_eq!(n_small, n_large, "the cap changed where it stopped");
+        for (a, c) in small.iter().zip(&large) {
+            assert!((a - c).abs() < 1e-12, "{small:?} vs {large:?}");
+        }
+    }
+
+    /// The residual really is orthogonal to the range of A at the answer —
+    /// that is the property the new stopping test asserts, so it is worth
+    /// checking against the matrix rather than trusting the counter.
+    #[test]
+    fn lsqr_leaves_the_residual_orthogonal_to_the_columns() {
+        let values = vec![1.0, 2.0, 3.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0];
+        let col_idx = vec![0, 1, 1, 2, 0, 2, 0, 1, 1, 2];
+        let row_ptr = vec![0, 2, 4, 6, 8, 10];
+        let b = [1.0, 2.0, 3.0, 0.5, 1.5];
+        let (m, n) = (5usize, 3usize);
+
+        let mut x = vec![0f64; n];
+        algos::lsqr_solve(&values, &col_idx, &row_ptr, &b, &mut x, 1000, 1e-14, n, 0.0).unwrap();
+
+        // r = A·x − b, then Aᵀ·r, which is the gradient of ½‖A·x − b‖².
+        let mut r = vec![0f64; m];
+        for row in 0..m {
+            let mut acc = 0f64;
+            for k in row_ptr[row] as usize..row_ptr[row + 1] as usize {
+                acc += values[k] * x[col_idx[k] as usize];
+            }
+            r[row] = acc - b[row];
+        }
+        let mut atr = vec![0f64; n];
+        for row in 0..m {
+            for k in row_ptr[row] as usize..row_ptr[row + 1] as usize {
+                atr[col_idx[k] as usize] += values[k] * r[row];
+            }
+        }
+        let g = atr.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            g < 1e-10,
+            "‖Aᵀr‖ = {g:.3e}, so this is not a least-squares solution"
+        );
+        // And the residual itself is *not* zero — the system is inconsistent,
+        // which is what makes the first stopping test useless here.
+        let rn = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            rn > 1e-3,
+            "the test problem is consistent, so it proves nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_rhs_tests {
+    use super::*;
+
+    /// `ic0_pcg` with `k` right-hand sides gives what `k` separate calls give.
+    ///
+    /// The incomplete Cholesky depends only on the matrix, so handing several
+    /// right-hand sides in at once should factorise once and solve each — not
+    /// change any of the answers. A caller that solves the same system repeatedly
+    /// otherwise pays for the factorisation every time; a super-resolution
+    /// reconstruction runs 1,430 solves against one matrix.
+    #[test]
+    fn ic0_pcg_solves_several_right_hand_sides_exactly_as_it_solves_one() {
+        // A small SPD system with off-diagonal structure, so IC(0) has something
+        // to do and the triangular solves are not trivial.
+        let n = 40usize;
+        let mut vals: Vec<f64> = Vec::new();
+        let mut cidx: Vec<i32> = Vec::new();
+        let mut rptr: Vec<i32> = vec![0];
+        for i in 0..n {
+            for j in i.saturating_sub(2)..(i + 3).min(n) {
+                let v = if i == j {
+                    8.0 + (i % 5) as f64
+                } else {
+                    -1.0 / (1 + i.abs_diff(j)) as f64
+                };
+                cidx.push(j as i32);
+                vals.push(v);
+            }
+            rptr.push(cidx.len() as i32);
+        }
+
+        let k = 5usize;
+        let b: Vec<f64> = (0..n * k)
+            .map(|i| ((i * 37 % 23) as f64 - 11.0) / 3.0)
+            .collect();
+
+        let mut together = vec![0.0f64; n * k];
+        algos::ic0_pcg(&vals, &cidx, &rptr, &b, &mut together, 500, 1e-13).expect("batched solve");
+
+        for j in 0..k {
+            let mut one = vec![0.0f64; n];
+            algos::ic0_pcg(
+                &vals,
+                &cidx,
+                &rptr,
+                &b[j * n..(j + 1) * n],
+                &mut one,
+                500,
+                1e-13,
+            )
+            .expect("single solve");
+            for i in 0..n {
+                let (a, c) = (together[j * n + i], one[i]);
+                assert!(
+                    (a - c).abs() <= 1e-12 * (1.0 + c.abs()),
+                    "rhs {j}, entry {i}: batched {a} against separate {c}"
+                );
+            }
+        }
+
+        // And each column really solves its own system.
+        for j in 0..k {
+            for i in 0..n {
+                let ax: f64 = (rptr[i] as usize..rptr[i + 1] as usize)
+                    .map(|t| vals[t] * together[j * n + cidx[t] as usize])
+                    .sum();
+                let want = b[j * n + i];
+                assert!(
+                    (ax - want).abs() < 1e-8 * (1.0 + want.abs()),
+                    "rhs {j}, row {i}: A·x = {ax}, b = {want}"
+                );
+            }
+        }
     }
 }

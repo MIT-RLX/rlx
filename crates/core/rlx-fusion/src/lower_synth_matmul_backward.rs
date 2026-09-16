@@ -129,7 +129,7 @@ impl Pass for LowerSynthMatMulBackward {
                                 Shape::new(&[p], DType::F32),
                             );
                             g.add_node(
-                                Op::ScatterAdd,
+                                Op::ScatterAdd { axis: 0 },
                                 vec![blocks, idx_f32_flat],
                                 node.shape.clone(),
                             )

@@ -55,7 +55,13 @@ fn f16_weight_matmul_matches_f32_weight() {
             .collect();
 
         for device in [Device::Cpu, Device::Metal] {
-            if device == Device::Metal && !rlx_runtime::is_available(Device::Metal) {
+            if device == Device::Metal
+                && rlx_ir::env::skip_unless_device(
+                    "metal",
+                    true,
+                    rlx_runtime::is_available(Device::Metal),
+                )
+            {
                 eprintln!("skip Metal (unavailable)");
                 continue;
             }

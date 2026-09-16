@@ -746,6 +746,40 @@ pub(crate) fn encode_activation(
     enc.dispatch_threads(grid, tg);
 }
 
+thread_local! {
+    /// True while the currently-open compute encoder was created with
+    /// `MTLDispatchType::Concurrent`. Set by the encoder-open path in
+    /// `encode/mod.rs`.
+    pub(crate) static CONCURRENT_ENCODER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Order two dependent dispatches issued *within a single thunk*.
+///
+/// `concurrent_barrier_set` reasons between thunks, so any encode helper that
+/// emits more than one dispatch (e.g. copy-then-activate-in-place) is opaque to
+/// it and must order its own internal dependency. On a Serial encoder that
+/// ordering is implicit — and `memoryBarrierWithScope:` is only valid on a
+/// concurrent encoder — so this is a no-op there.
+pub(crate) fn intra_thunk_barrier(enc: &crate::mtl::ComputeCommandEncoderRef) {
+    if !CONCURRENT_ENCODER.with(|c| c.get()) {
+        return;
+    }
+    // `RLX_METAL_CONCURRENT_NOBARRIER` means "no hazard barriers at all" — it
+    // measures the wall-clock ceiling of full dispatch overlap, and it is also how
+    // an intra-thunk barrier is shown to be load-bearing (drop it and the output
+    // goes racy). Honour it here too, not only between thunks.
+    static NO_BARRIER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_BARRIER.get_or_init(|| rlx_ir::env::flag("RLX_METAL_CONCURRENT_NOBARRIER")) {
+        return;
+    }
+    unsafe {
+        use objc::{msg_send, runtime::Object, sel, sel_impl};
+        let obj = enc as *const crate::mtl::ComputeCommandEncoderRef as *mut Object;
+        let _: () = msg_send![obj, memoryBarrierWithScope: 1u64];
+    }
+}
+
 pub(crate) fn encode_activation_out(
     enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
@@ -791,7 +825,11 @@ pub(crate) fn encode_activation_out(
         return;
     }
     // Fallback: copy then in-place (still one schedule node; two dispatches).
+    // The in-place activation reads what the copy just wrote — a RAW dependency
+    // the between-thunk hazard analysis cannot see, so order it explicitly for
+    // concurrent encoders.
     encode_copy(enc, k, buffer, src_off, dst_off, len, dt);
+    intra_thunk_barrier(enc);
     encode_activation(enc, k, buffer, dst_off, len, act, dt);
 }
 
@@ -1769,7 +1807,7 @@ pub(crate) fn encode_split_lastax(
 ) {
     use crate::thunk::HalfFlag;
     debug_assert!(batch.segments.len() >= 2);
-    let segs: Vec<NarrowSegGpu> = batch
+    let all_segs: Vec<NarrowSegGpu> = batch
         .segments
         .iter()
         .map(|(dst, start, len)| NarrowSegGpu {
@@ -1778,69 +1816,81 @@ pub(crate) fn encode_split_lastax(
             len: *len,
         })
         .collect();
-    let num_seg = segs.len() as u32;
-    let max_len = segs.iter().map(|s| s.len).max().unwrap_or(0);
-    let use_vec4 = batch.src_axis.is_multiple_of(4)
-        && segs
-            .iter()
-            .all(|s| (s.start % 4) == 0 && (s.len % 4) == 0 && s.len >= 4);
-    if use_vec4 {
-        let src_axis4 = batch.src_axis / 4;
-        let max_len4 = max_len / 4;
-        enc.set_compute_pipeline_state(&k.split_lastax4);
-        // Bind to arena base + pass src byte offset (task #50).
-        enc.set_buffer(0, Some(buffer), 0);
-        enc.set_buffer(1, Some(buffer), 0);
-        enc.set_bytes(2, 4, &batch.outer as *const u32 as *const _);
-        enc.set_bytes(3, 4, &src_axis4 as *const u32 as *const _);
-        enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
-        enc.set_bytes(
-            5,
-            (segs.len() * std::mem::size_of::<NarrowSegGpu>()) as u64,
-            segs.as_ptr() as *const _,
-        );
-        let src_u64 = batch.src as u64;
-        enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
-        let grid = crate::mtl::MTLSize {
-            width: max_len4 as u64,
-            height: batch.outer as u64,
-            depth: num_seg as u64,
-        };
-        // Task #50: cap total threads per threadgroup at 1024.
-        let tg_depth = (1024u64 / (64 * 4)).min(num_seg as u64).max(1);
-        let tg = crate::mtl::MTLSize {
-            width: 64.min(max_len4 as u64),
-            height: 4.min(batch.outer as u64),
-            depth: tg_depth,
-        };
-        enc.dispatch_threads(grid, tg);
-    } else {
-        enc.set_compute_pipeline_state(&k.split_lastax);
-        // Bind to arena base + pass src byte offset (task #50).
-        enc.set_buffer(0, Some(buffer), 0);
-        enc.set_buffer(1, Some(buffer), 0);
-        enc.set_bytes(2, 4, &batch.outer as *const u32 as *const _);
-        enc.set_bytes(3, 4, &batch.src_axis as *const u32 as *const _);
-        enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
-        enc.set_bytes(
-            5,
-            (segs.len() * std::mem::size_of::<NarrowSegGpu>()) as u64,
-            segs.as_ptr() as *const _,
-        );
-        let src_u64 = batch.src as u64;
-        enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
-        let grid = crate::mtl::MTLSize {
-            width: max_len as u64,
-            height: batch.outer as u64,
-            depth: num_seg as u64,
-        };
-        let tg_depth = (1024u64 / (32 * 8)).min(num_seg as u64).max(1);
-        let tg = crate::mtl::MTLSize {
-            width: 32.min(max_len as u64),
-            height: 8.min(batch.outer as u64),
-            depth: tg_depth,
-        };
-        enc.dispatch_threads(grid, tg);
+
+    // `setBytes` takes at most 4 KiB on Apple GPUs, and the driver *aborts the
+    // process* when handed more — `AGX::ComputeContext::setBytes` calls
+    // `abort()`, so there is nothing to catch and no diagnostic. At 16 bytes per
+    // `NarrowSegGpu` that is 256 segments; `rlx-braindyn` batches more and took
+    // the whole backend sweep down with it. Each segment writes its own `dst`
+    // and reads a disjoint slice of `src`, so the batch splits cleanly: encode
+    // one dispatch per chunk.
+    const MTL_SET_BYTES_MAX: usize = 4096;
+    let max_segs = MTL_SET_BYTES_MAX / std::mem::size_of::<NarrowSegGpu>();
+    for segs in all_segs.chunks(max_segs) {
+        let num_seg = segs.len() as u32;
+        let max_len = segs.iter().map(|s| s.len).max().unwrap_or(0);
+        let use_vec4 = batch.src_axis.is_multiple_of(4)
+            && segs
+                .iter()
+                .all(|s| (s.start % 4) == 0 && (s.len % 4) == 0 && s.len >= 4);
+        if use_vec4 {
+            let src_axis4 = batch.src_axis / 4;
+            let max_len4 = max_len / 4;
+            enc.set_compute_pipeline_state(&k.split_lastax4);
+            // Bind to arena base + pass src byte offset (task #50).
+            enc.set_buffer(0, Some(buffer), 0);
+            enc.set_buffer(1, Some(buffer), 0);
+            enc.set_bytes(2, 4, &batch.outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &src_axis4 as *const u32 as *const _);
+            enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
+            enc.set_bytes(
+                5,
+                std::mem::size_of_val(segs) as u64,
+                segs.as_ptr() as *const _,
+            );
+            let src_u64 = batch.src as u64;
+            enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
+            let grid = crate::mtl::MTLSize {
+                width: max_len4 as u64,
+                height: batch.outer as u64,
+                depth: num_seg as u64,
+            };
+            // Task #50: cap total threads per threadgroup at 1024.
+            let tg_depth = (1024u64 / (64 * 4)).min(num_seg as u64).max(1);
+            let tg = crate::mtl::MTLSize {
+                width: 64.min(max_len4 as u64),
+                height: 4.min(batch.outer as u64),
+                depth: tg_depth,
+            };
+            enc.dispatch_threads(grid, tg);
+        } else {
+            enc.set_compute_pipeline_state(&k.split_lastax);
+            // Bind to arena base + pass src byte offset (task #50).
+            enc.set_buffer(0, Some(buffer), 0);
+            enc.set_buffer(1, Some(buffer), 0);
+            enc.set_bytes(2, 4, &batch.outer as *const u32 as *const _);
+            enc.set_bytes(3, 4, &batch.src_axis as *const u32 as *const _);
+            enc.set_bytes(4, 4, &num_seg as *const u32 as *const _);
+            enc.set_bytes(
+                5,
+                std::mem::size_of_val(segs) as u64,
+                segs.as_ptr() as *const _,
+            );
+            let src_u64 = batch.src as u64;
+            enc.set_bytes(6, 8, &src_u64 as *const u64 as *const _);
+            let grid = crate::mtl::MTLSize {
+                width: max_len as u64,
+                height: batch.outer as u64,
+                depth: num_seg as u64,
+            };
+            let tg_depth = (1024u64 / (32 * 8)).min(num_seg as u64).max(1);
+            let tg = crate::mtl::MTLSize {
+                width: 32.min(max_len as u64),
+                height: 8.min(batch.outer as u64),
+                depth: tg_depth,
+            };
+            enc.dispatch_threads(grid, tg);
+        }
     }
     let _ = HalfFlag::F32;
 }
@@ -3397,6 +3447,7 @@ pub(crate) fn encode_rope(
     seq_stride: u32,
     cos_per_token: bool,
     interleaved: bool,
+    cos_row_stride: u32,
 ) {
     use crate::thunk::HalfFlag;
     let pipeline = match dt {
@@ -3455,6 +3506,11 @@ pub(crate) fn encode_rope(
         std::mem::size_of::<u32>() as u64,
         &interleaved_u32 as *const u32 as *const _,
     );
+    enc.set_bytes(
+        13,
+        std::mem::size_of::<u32>() as u64,
+        &cos_row_stride as *const u32 as *const _,
+    );
     let nh = hidden / head_dim;
     let grid = crate::mtl::MTLSize {
         width: head_dim as u64,
@@ -3509,6 +3565,50 @@ pub(crate) fn encode_rms_norm(
         &eps as *const f32 as *const _,
     );
     // One threadgroup per row; power-of-2 tg size for reduction (see encode_layer_norm).
+    let mut tg_w: u64 = 1;
+    while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
+        tg_w *= 2;
+    }
+    let grid = crate::mtl::MTLSize {
+        width: rows as u64,
+        height: 1,
+        depth: 1,
+    };
+    let tg = crate::mtl::MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
+/// ggml `L2_NORM` over the last dim: `out = x / max(sqrt(sum(x²)), eps)`.
+/// One threadgroup per row with a power-of-2 reduction — same dispatch shape as
+/// [`encode_rms_norm`]. `eps_src` is an arena *offset*, not a value: eps
+/// originates as a `Constant` node, so it is only known at run time.
+pub(crate) fn encode_l2_norm_lastdim(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    src: usize,
+    eps_src: usize,
+    dst: usize,
+    rows: u32,
+    h: u32,
+) {
+    enc.set_compute_pipeline_state(&k.l2_norm_lastdim);
+    enc.set_buffer(0, Some(buffer), 0);
+    let src_u64 = src as u64;
+    let eps_u64 = eps_src as u64;
+    let dst_u64 = dst as u64;
+    enc.set_bytes(1, 8, &src_u64 as *const u64 as *const _);
+    enc.set_bytes(2, 8, &eps_u64 as *const u64 as *const _);
+    enc.set_bytes(3, 8, &dst_u64 as *const u64 as *const _);
+    enc.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &h as *const u32 as *const _,
+    );
     let mut tg_w: u64 = 1;
     while tg_w * 2 <= h as u64 && tg_w * 2 <= 256 {
         tg_w *= 2;
@@ -3961,15 +4061,39 @@ pub(crate) fn fab_is_native(node: &rlx_ir::Node) -> bool {
 /// CPU (`Thunk::Nop` catch-all): `FusedConvBiasAct`, `PartitionedConv`,
 /// `FusedTransformerLayer`. Metal-native fused kernels (SwiGLU / FMBA /
 /// ResidualLN / FAB) are left intact.
+///
+/// `FusedConvBiasAct` is expanded even though a bias+ReLU store epilogue is easy
+/// to add to the `conv2d` kernel — measured, that is a large net LOSS: keeping the
+/// fused op routes convolutions away from the faster (MPSGraph) conv path and onto
+/// the naive MSL kernel. On rlx-ocr2 the detector went 8.7 ms -> 57.8 ms while the
+/// recognizer's own conv+bias+relu dispatches did collapse as intended. Fusing
+/// here only pays once `Op::FusedConvBiasAct` also has an MPSGraph lowering.
 pub(crate) fn lower_cpu_nop_fused_for_metal(g: Graph) -> Graph {
-    let needs = g.nodes().iter().any(|n| {
+    let expand = |n: &rlx_ir::Node| -> bool {
+        // The 3D, no-epilogue form is kept fused — `thunk::compile` lowers it
+        // to `Thunk::Conv3d` with a bias, and the 2D reasoning above does not
+        // carry over (no MPSGraph 3D conv path to be routed away from).
+        if let Op::FusedConvBiasAct {
+            activation: None,
+            has_residual: false,
+            ..
+        } = &n.op
+        {
+            if n.shape.rank() == 5
+                && n.inputs.len() == 3
+                && !rlx_ir::env::flag("RLX_METAL_EXPAND_CONV3D_BIAS")
+            {
+                return false;
+            }
+        }
         matches!(
             n.op,
             Op::FusedConvBiasAct { .. }
                 | Op::PartitionedConv { .. }
                 | Op::FusedTransformerLayer { .. }
         )
-    });
+    };
+    let needs = g.nodes().iter().any(&expand);
     if !needs {
         return g;
     }
@@ -3978,13 +4102,10 @@ pub(crate) fn lower_cpu_nop_fused_for_metal(g: Graph) -> Graph {
     let nodes: Vec<rlx_ir::Node> = g.nodes().to_vec();
     for node in &nodes {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-        let new_id = match &node.op {
-            Op::FusedConvBiasAct { .. }
-            | Op::PartitionedConv { .. }
-            | Op::FusedTransformerLayer { .. } => {
-                inline_unfused_fused_op(&mut out, &node.op, &new_inputs, &node.shape)
-            }
-            _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
+        let new_id = if expand(node) {
+            inline_unfused_fused_op(&mut out, &node.op, &new_inputs, &node.shape)
+        } else {
+            out.add_node(node.op.clone(), new_inputs, node.shape.clone())
         };
         id_map.insert(node.id, new_id);
     }
@@ -4255,16 +4376,24 @@ pub(crate) fn rms_norm_bwd_scratch_bytes(graph: &Graph) -> usize {
     max_bytes
 }
 
-/// Scratch bytes for native multi-layer GRU / Elman RNN / LSTM: a ping-pong pair
-/// of `[batch, seq, dirs·hidden]` f32 buffers holding intermediate layer outputs
-/// (the LSTM cell state stays in registers, so no extra scratch). Only
-/// `num_layers > 1` needs it (single-layer writes straight to `dst`; both
-/// directions own disjoint output slices). Shared/reused across ops (sequential
-/// execution) → the max over nodes.
+/// Scratch bytes for native GRU / Elman RNN / LSTM.
+///
+/// Two regions, laid out in this order (see `encode_lstm`):
+///   1. a ping-pong pair of `[batch, seq, dirs·hidden]` f32 buffers for
+///      intermediate layer outputs — only `num_layers > 1` uses it (single-layer
+///      writes straight to `dst`, and the two directions own disjoint output
+///      slices). The LSTM cell state stays in registers, so it needs none.
+///   2. **LSTM only**: one `[batch, seq, 4·hidden]` input-projection table for
+///      `lstm_input_proj`. Every LSTM needs this, single-layer included; layers
+///      and directions reuse the one buffer because their dispatches are ordered.
+///
+/// The region is shared and reused across ops (execution is sequential), so the
+/// requirement is the max over nodes — but region 2's offset depends on region 1
+/// *of the same node*, so the two are summed per node before taking that max.
 pub(crate) fn rnn_gru_scratch_bytes(graph: &Graph) -> usize {
     let mut max_bytes = 0usize;
     for node in graph.nodes() {
-        let (hidden, num_layers, bidirectional) = match &node.op {
+        let (hidden, num_layers, bidirectional, is_lstm) = match &node.op {
             Op::Gru {
                 hidden_size,
                 num_layers,
@@ -4276,24 +4405,28 @@ pub(crate) fn rnn_gru_scratch_bytes(graph: &Graph) -> usize {
                 num_layers,
                 bidirectional,
                 ..
-            }
-            | Op::Lstm {
+            } => (*hidden_size, *num_layers, *bidirectional, false),
+            Op::Lstm {
                 hidden_size,
                 num_layers,
                 bidirectional,
                 ..
-            } => (*hidden_size, *num_layers, *bidirectional),
+            } => (*hidden_size, *num_layers, *bidirectional, true),
             _ => continue,
         };
-        if num_layers <= 1 {
+        if num_layers <= 1 && !is_lstm {
             continue;
         }
         let x_shape = &graph.node(node.inputs[0]).shape;
         let batch = x_shape.dim(0).unwrap_static();
         let seq = x_shape.dim(1).unwrap_static();
         let dirs = if bidirectional { 2 } else { 1 };
+        // Region 1 is always reserved for LSTM so that region 2's offset
+        // (`scratch + 2·layer_elems`) is valid regardless of layer count.
         let layer_elems = batch * seq * dirs * hidden;
-        max_bytes = max_bytes.max(2 * layer_elems * std::mem::size_of::<f32>());
+        let proj_elems = if is_lstm { batch * seq * 4 * hidden } else { 0 };
+        let elems = 2 * layer_elems + proj_elems;
+        max_bytes = max_bytes.max(elems * std::mem::size_of::<f32>());
     }
     max_bytes
 }
@@ -4557,6 +4690,8 @@ pub(crate) fn encode_rope_bwd(
     head_dim: u32,
     n_rot: u32,
     cos_len: u32,
+    cos_row_stride: u32,
+    interleaved: bool,
 ) {
     enc.set_compute_pipeline_state(&k.rope_bwd);
     enc.set_buffer(0, Some(buffer), dy as u64);
@@ -4569,6 +4704,9 @@ pub(crate) fn encode_rope_bwd(
     enc.set_bytes(7, 4, &head_dim as *const u32 as *const _);
     enc.set_bytes(8, 4, &n_rot as *const u32 as *const _);
     enc.set_bytes(9, 4, &cos_len as *const u32 as *const _);
+    enc.set_bytes(10, 4, &cos_row_stride as *const u32 as *const _);
+    let interleaved_u: u32 = interleaved as u32;
+    enc.set_bytes(11, 4, &interleaved_u as *const u32 as *const _);
     let nh = hidden / head_dim.max(1);
     enc.dispatch_threads(
         crate::mtl::MTLSize {
@@ -4840,9 +4978,21 @@ pub(crate) fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             // head [248320,5120] would demand ~5 GiB of dead scratch per graph.
             // (Mirrors wgpu's `gemv_supports_scheme` scratch skip.) The off-switch
             // RLX_METAL_Q1_0_FUSED_DISABLE reverts to the scratch path.
+            let n_probe = node.shape.dim(node.shape.rank() - 1).unwrap_static();
+            let m_probe = node.shape.num_elements().unwrap() / n_probe.max(1);
+            let k_probe = graph.node(node.inputs[0]).shape.num_elements().unwrap() / m_probe.max(1);
             let direct_fused = match scheme {
                 rlx_ir::QuantScheme::GgufQ1_0 => !rlx_ir::env::flag("RLX_METAL_Q1_0_FUSED_DISABLE"),
                 rlx_ir::QuantScheme::GgufQ2_0 => !rlx_ir::env::flag("RLX_METAL_Q2_0_FUSED_DISABLE"),
+                // G8_0 has a fused GEMV for decode only, so `m > 1` still
+                // needs the slab. Pestle's [248320, 5120] head is the whole
+                // reason: ~5 GiB reserved, and re-dequantized per token.
+                rlx_ir::QuantScheme::GgufG8_0 => {
+                    m_probe == 1
+                        && k_probe.is_multiple_of(32)
+                        && n_probe.is_multiple_of(8)
+                        && !rlx_ir::env::flag("RLX_METAL_G8_0_FUSED_DISABLE")
+                }
                 _ => false,
             };
             if direct_fused {
@@ -4990,6 +5140,7 @@ sg_mv_encoder!(encode_q4_0_mv_f32_sg, q4_0_mv_f32_sg, 2, 4);
 sg_mv_encoder!(encode_q4_1_mv_f32_sg, q4_1_mv_f32_sg, 2, 4);
 sg_mv_encoder!(encode_q6k_mv_f32_sg, q6k_mv_f32_sg, 4, 1);
 sg_mv_encoder!(encode_q3k_mv_f32_sg, q3k_mv_f32_sg, 4, 2);
+sg_mv_encoder!(encode_q5k_mv_f32_sg, q5k_mv_f32_sg, 4, 2);
 
 /// Fused Q4_K / Q6_K GEMM (`m > 1`, prefill): `C[m,n] = A[m,k] @ dequant(w)^T`
 /// straight from the packed weight — no f32 scratch, no MPS sgemm. Grid is
@@ -5303,6 +5454,60 @@ pub(crate) fn encode_q1_0_mv_f32(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Fused G8_0 decode GEMV (Doses AI Pestle `token_embd` / lm_head).
+///
+/// Reads the packed weight directly — no f32 dequant scratch. Pestle's head is
+/// `[248320, 5120]`, so the scratch path costs a ~5 GiB slab *and* re-runs the
+/// whole dequant every decoded token. Constraints: `m == 1`, `k % 32 == 0`
+/// (block size), `n % 8 == 0` (caller enforces).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_g8_0_mv_f32_sg(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    w_buffer: &crate::mtl::Buffer,
+    x: usize,
+    w_raw: usize,
+    dst: usize,
+    k_dim: usize,
+    n_dim: usize,
+    x_f16: bool,
+    dst_f16: bool,
+) {
+    enc.set_compute_pipeline_state(&k.g8_0_mv_f32_sg);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_raw as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let k_v = k_dim as u32;
+    enc.set_bytes(4, 4, &k_v as *const u32 as *const _);
+    let n_v = n_dim as u32;
+    enc.set_bytes(5, 4, &n_v as *const u32 as *const _);
+    let flags: u32 = u32::from(x_f16)
+        | (u32::from(dst_f16) << 1)
+        | (u32::from(rlx_ir::env::flag("RLX_METAL_G8_0_SCALAR")) << 2);
+    enc.set_bytes(6, 4, &flags as *const u32 as *const _);
+    enc.set_buffer(7, Some(w_buffer), 0);
+    // NSG=2 simdgroups per threadgroup, G8_NR0=8 rows per simdgroup.
+    const NSG: u64 = 2;
+    let n_output_groups = (n_dim.div_ceil(8)) as u64;
+    let n_threadgroups = n_output_groups.div_ceil(NSG);
+    let grid = crate::mtl::MTLSize {
+        width: n_threadgroups * NSG * 32,
+        height: 1,
+        depth: 1,
+    };
+    let tg = crate::mtl::MTLSize {
+        width: NSG * 32,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
 /// Simdgroup-cooperative Q1_0 GEMV (llama.cpp `kernel_mul_mv_q1_0_f32`).
 /// 32 threads share x reads and produce 8 outputs via `simd_sum`.
 /// Constraint: `n_dim % 8 == 0` (caller enforces).
@@ -5337,7 +5542,10 @@ pub(crate) fn encode_q1_0_mv_f32_sg_flags(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-    let flags: u32 = u32::from(x_f16) | (u32::from(dst_f16) << 1);
+    let flags: u32 = u32::from(x_f16)
+        | (u32::from(dst_f16) << 1)
+        // bit 2: fall back to the scalar byte inner loop (A/B only).
+        | (u32::from(rlx_ir::env::flag("RLX_METAL_Q2_0_SCALAR")) << 2);
     enc.set_bytes(6, 4, &flags as *const u32 as *const _);
     enc.set_buffer(7, Some(w_buffer), 0);
     // NSG=2 simdgroups share a threadgroup x tile (see dequant_gguf.msl).
@@ -5579,7 +5787,10 @@ pub(crate) fn encode_q1_0_swiglu_mv_f32(
     enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
     enc.set_buffer(7, Some(w_buffer), 0);
     if use_sg {
-        let flags: u32 = u32::from(x_f16) | (u32::from(dst_f16) << 1);
+        let flags: u32 = u32::from(x_f16)
+        | (u32::from(dst_f16) << 1)
+        // bit 2: fall back to the scalar byte inner loop (A/B only).
+        | (u32::from(rlx_ir::env::flag("RLX_METAL_Q2_0_SCALAR")) << 2);
         enc.set_bytes(8, 4, &flags as *const u32 as *const _);
         const NSG: u64 = 2;
         let n_output_groups = (n_dim.div_ceil(8)) as u64;
@@ -6838,19 +7049,38 @@ pub(crate) fn encode_dequant_grouped_matmul_gguf(
 pub(crate) fn gdn_ephemeral_state_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
     for node in graph.nodes() {
-        if let Op::GatedDeltaNet {
-            carry_state,
-            state_size,
-            ..
-        } = &node.op
-            && !*carry_state
-        {
-            let q_shape = &graph.node(node.inputs[0]).shape;
-            let elems = q_shape.dim(0).unwrap_static()
-                * q_shape.dim(2).unwrap_static()
-                * state_size
-                * state_size;
-            max = max.max(elems * std::mem::size_of::<f32>());
+        match &node.op {
+            Op::GatedDeltaNet {
+                carry_state,
+                state_size,
+                ..
+            } if !*carry_state => {
+                let q_shape = &graph.node(node.inputs[0]).shape;
+                let elems = q_shape.dim(0).unwrap_static()
+                    * q_shape.dim(2).unwrap_static()
+                    * state_size
+                    * state_size;
+                max = max.max(elems * std::mem::size_of::<f32>());
+            }
+            // The backward replays the scan and keeps the state entering every
+            // timestep, plus one more n×n for the running dS — so
+            // `(seq + 2) · n²` per (batch, head) rather than the forward's `n²`.
+            // That is the memory price of not reconstructing states by dividing
+            // out `exp(g) < 1`, which would amplify rounding without bound.
+            Op::GatedDeltaNetBackward { state_size, .. } => {
+                let q_shape = &graph.node(node.inputs[0]).shape;
+                let (b, seq, heads) = (
+                    q_shape.dim(0).unwrap_static(),
+                    q_shape.dim(1).unwrap_static(),
+                    q_shape.dim(2).unwrap_static(),
+                );
+                // `(seq + 2)·n²` for the state history plus the running dS, and
+                // `seq·n` for the `v − m` the forward records so the reverse
+                // need not re-read the state to recover it.
+                let elems = b * heads * ((seq + 2) * state_size * state_size + seq * state_size);
+                max = max.max(elems * std::mem::size_of::<f32>());
+            }
+            _ => {}
         }
     }
     max
@@ -6940,6 +7170,90 @@ pub(crate) fn encode_gated_delta_net(
     }
 }
 
+/// Native MSL gated-delta-net backward. One thread per `(batch, head)`,
+/// matching the forward. `hist` is the ephemeral scratch holding this
+/// dispatch's state history; the `d*` offsets locate each gradient inside the
+/// packed bundle and come straight from `rlx_ir::GdnBackwardLayout`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gated_delta_net_backward(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    q: usize,
+    k_off: usize,
+    v: usize,
+    g: usize,
+    beta: usize,
+    state: usize,
+    dy: usize,
+    hist: usize,
+    dq: usize,
+    dk: usize,
+    dv: usize,
+    dg: usize,
+    dbeta: usize,
+    dstate: usize,
+    batch: u32,
+    seq: u32,
+    heads: u32,
+    state_size: u32,
+    use_carry: bool,
+    gate_per_channel: bool,
+) {
+    let f32_idx = |byte_off: usize| -> u64 { (byte_off / 4) as u64 };
+    enc.set_compute_pipeline_state(&k.gated_delta_net_backward);
+    enc.set_buffer(0, Some(buffer), 0);
+    let offs: [u64; 9] = [
+        f32_idx(q),
+        f32_idx(k_off),
+        f32_idx(v),
+        f32_idx(g),
+        f32_idx(beta),
+        f32_idx(state),
+        f32_idx(dy),
+        f32_idx(hist),
+        0,
+    ];
+    for (i, o) in offs.iter().take(8).enumerate() {
+        enc.set_bytes(i as u64 + 1, 8, o as *const u64 as *const _);
+    }
+    let dims = [batch, seq, heads, state_size];
+    enc.set_bytes(9, 16, dims.as_ptr() as *const _);
+    let use_carry_u: u32 = if use_carry { 1 } else { 0 };
+    enc.set_bytes(10, 4, &use_carry_u as *const u32 as *const _);
+    let gpc_u: u32 = if gate_per_channel { 1 } else { 0 };
+    enc.set_bytes(11, 4, &gpc_u as *const u32 as *const _);
+    let grads: [u64; 6] = [
+        f32_idx(dq),
+        f32_idx(dk),
+        f32_idx(dv),
+        f32_idx(dg),
+        f32_idx(dbeta),
+        f32_idx(dstate),
+    ];
+    for (i, o) in grads.iter().enumerate() {
+        enc.set_bytes(i as u64 + 12, 8, o as *const u64 as *const _);
+    }
+
+    // One threadgroup per (batch, head), `state_size` threads inside it — the
+    // scalar variant launched only `batch·heads` threads (256 for
+    // Qwen3.5-0.8B at the lens's batch), which leaves the GPU almost entirely
+    // idle. The same lesson the forward learned with `gated_delta_net_sg`.
+    let groups = (batch * heads).max(1) as u64;
+    enc.dispatch_thread_groups(
+        crate::mtl::MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        },
+        crate::mtl::MTLSize {
+            width: state_size.max(1) as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Native MSL selective scan (f32, `state_size <= SSM_MAX_N = 128`). One
 /// thread per `(batch, channel)`; each owns a private state vector and
 /// scans sequentially over the seq axis. Matches `execute_selective_scan_f32`.
@@ -7025,16 +7339,42 @@ pub(crate) fn encode_lstm(
     let out_width = dirs * h;
     let layer_elems = b * s * out_width;
     let scratch_w = scratch / 4;
+    // The input-projection table sits after the multi-layer ping-pong pair. Both
+    // directions and all layers reuse the one `[batch, seq, 4H]` buffer, since
+    // their dispatches are ordered by the barriers below.
+    let proj_w = scratch_w + 2 * layer_elems;
+    let proj_elems = b * s * four_h;
 
-    enc.set_compute_pipeline_state(&k.lstm);
-    enc.set_buffer(0, Some(buffer), 0);
-    let grid = crate::mtl::MTLSize {
+    let recurrence_grid = crate::mtl::MTLSize {
         width: batch as u64,
         height: 1,
         depth: 1,
     };
-    let tg = crate::mtl::MTLSize {
-        width: hidden as u64,
+    // One thread per gate row (`4·hidden`), capped at the pipeline limit. The
+    // caller already guarantees `hidden <= max_tg`, so this stays `>= hidden` and
+    // every hidden unit still gets its own thread in the gate phase.
+    let recurrence_tg_w = (four_h as u64).min(k.lstm.max_total_threads_per_threadgroup().max(1));
+    let recurrence_tg = crate::mtl::MTLSize {
+        width: recurrence_tg_w,
+        height: 1,
+        depth: 1,
+    };
+    // `z_sh`: the 4·hidden gate pre-activations, sized exactly rather than
+    // statically reserved.
+    let z_sh_bytes = (four_h * std::mem::size_of::<f32>()) as u64;
+    // The projection is embarrassingly parallel — one thread per (batch, timestep,
+    // gate row) — so it fills the GPU that the recurrence alone leaves idle.
+    let proj_tg_w = k
+        .lstm_input_proj
+        .max_total_threads_per_threadgroup()
+        .clamp(1, 256);
+    let proj_grid = crate::mtl::MTLSize {
+        width: (proj_elems as u64).div_ceil(proj_tg_w),
+        height: 1,
+        depth: 1,
+    };
+    let proj_tg = crate::mtl::MTLSize {
+        width: proj_tg_w,
         height: 1,
         depth: 1,
     };
@@ -7054,18 +7394,43 @@ pub(crate) fn encode_lstm(
 
         for dir in 0..dirs {
             let ld = l * dirs + dir;
-            let offs: [u32; 5] = [
-                (in_off_w) as u32,
+
+            // Pass 1 — `bias + W_ih·x` for every timestep at once.
+            enc.set_compute_pipeline_state(&k.lstm_input_proj);
+            enc.set_buffer(0, Some(buffer), 0);
+            let proj_offs: [u32; 4] = [
+                in_off_w as u32,
                 (w_ih / 4 + wih_cursor + dir * wih_block) as u32,
-                (w_hh / 4 + ld * four_h * h) as u32,
                 (bias / 4 + ld * four_h) as u32,
-                (out_off_w) as u32,
+                proj_w as u32,
+            ];
+            for (i, o) in proj_offs.iter().enumerate() {
+                enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
+            }
+            let proj_dims = [batch, seq, in_l as u32, four_h as u32];
+            enc.set_bytes(5, 16, proj_dims.as_ptr() as *const _);
+            enc.dispatch_thread_groups(proj_grid, proj_tg);
+
+            // Pass 2 reads what pass 1 just wrote. On a Concurrent encoder that
+            // ordering is not implicit and has to be requested.
+            intra_thunk_barrier(enc);
+
+            // Pass 2 — the sequential recurrence, now only `W_hh · h_prev`.
+            enc.set_compute_pipeline_state(&k.lstm);
+            enc.set_buffer(0, Some(buffer), 0);
+            enc.set_threadgroup_memory_length(0, z_sh_bytes);
+            let offs: [u32; 3] = [
+                proj_w as u32,
+                (w_hh / 4 + ld * four_h * h) as u32,
+                out_off_w as u32,
             ];
             for (i, o) in offs.iter().enumerate() {
                 enc.set_bytes((i + 1) as u64, 4, o as *const u32 as *const _);
             }
-            let dims = [batch, seq, in_l as u32, hidden];
-            enc.set_bytes(6, 16, dims.as_ptr() as *const _);
+            // Slot 2 carries the `carry` flag (the recurrence kernel has no use
+            // for `in_l`); it gates the in-place `hn`/`cn` writeback.
+            let dims = [batch, seq, u32::from(carry), hidden];
+            enc.set_bytes(4, 16, dims.as_ptr() as *const _);
             let h0_off = if carry { h0 / 4 + ld * b * h } else { 0 };
             let c0_off = if carry { c0 / 4 + ld * b * h } else { 0 };
             let more = [
@@ -7074,10 +7439,14 @@ pub(crate) fn encode_lstm(
                 (dir * h) as u32,
                 u32::from(dir == 1),
             ];
-            enc.set_bytes(7, 16, more.as_ptr() as *const _);
+            enc.set_bytes(5, 16, more.as_ptr() as *const _);
             let c0_u = c0_off as u32;
-            enc.set_bytes(8, 4, &c0_u as *const u32 as *const _);
-            enc.dispatch_thread_groups(grid, tg);
+            enc.set_bytes(6, 4, &c0_u as *const u32 as *const _);
+            enc.dispatch_thread_groups(recurrence_grid, recurrence_tg);
+
+            // The next direction overwrites the projection table, and the next
+            // layer reads this layer's output out of the ping-pong slot.
+            intra_thunk_barrier(enc);
         }
 
         wih_cursor += dirs * wih_block;
@@ -7172,6 +7541,9 @@ pub(crate) fn encode_gru(
             enc.dispatch_thread_groups(grid, tg);
         }
 
+        // The next layer reads this layer's output out of the ping-pong slot; on a
+        // Concurrent encoder that ordering has to be requested explicitly.
+        intra_thunk_barrier(enc);
         wih_cursor += dirs * wih_block;
         in_l = out_width;
         in_off_w = scratch_w + (l % 2) * layer_elems;
@@ -7261,6 +7633,9 @@ pub(crate) fn encode_rnn(
             enc.dispatch_thread_groups(grid, tg);
         }
 
+        // The next layer reads this layer's output out of the ping-pong slot; on a
+        // Concurrent encoder that ordering has to be requested explicitly.
+        intra_thunk_barrier(enc);
         wih_cursor += dirs * wih_block;
         in_l = out_width;
         in_off_w = scratch_w + (l % 2) * layer_elems;
@@ -7704,12 +8079,22 @@ pub(crate) fn encode_conv_transpose2d(
     enc.dispatch_threads(grid, tg);
 }
 
+/// Smallest output-position count worth handing the tiled kernel. Tunable
+/// from the environment so the threshold can be swept without a rebuild.
+fn gemm_min_m() -> u32 {
+    rlx_ir::env::parse_or("RLX_METAL_CONV3D_MIN_M", 8)
+}
+
 pub(crate) fn encode_conv3d(
     enc: &crate::mtl::ComputeCommandEncoderRef,
     k: &crate::kernels::Kernels,
     buffer: &crate::mtl::Buffer,
     src: usize,
     weight: usize,
+    bias: Option<usize>,
+    leaky_alpha: Option<f32>,
+    concat_src: Option<(usize, u32)>,
+    upsample: Option<[u32; 3]>,
     dst: usize,
     n: u32,
     c_in: u32,
@@ -7739,8 +8124,45 @@ pub(crate) fn encode_conv3d(
     let c: [u32; 4] = [w_out, kd, kh, kw];
     let dparams: [u32; 4] = [sd, sh, sw, groups];
     let e: [u32; 4] = [pd, ph, pw, dd];
-    let f: [u32; 4] = [dh, dw, 0, 0];
-    enc.set_compute_pipeline_state(&k.conv3d);
+    // `f.z` tells the kernel whether buffer 9 holds a real bias. The buffer is
+    // always bound — to arena offset 0 when there is none — rather than left
+    // nil, so no kernel dereferences an unbound pointer.
+    // `f.w` selects the store epilogue: 0 none, 1 LeakyReLU with `leaky_alpha`.
+    let f: [u32; 4] = [
+        dh,
+        dw,
+        u32::from(bias.is_some()),
+        u32::from(leaky_alpha.is_some()),
+    ];
+    let alpha: f32 = leaky_alpha.unwrap_or(0.0);
+    // With no concat the second source aliases the first and the split is the
+    // full channel count, so the kernel's branch always takes the `src` side.
+    let (src2, c_split) = concat_src.unwrap_or((src, c_in));
+    // All ones when `src` is at the convolution's own resolution.
+    let up: [u32; 4] = upsample.map_or([1, 1, 1, 0], |s| [s[0], s[1], s[2], 0]);
+    // `RLX_METAL_CONV3D=naive` forces the scalar kernel. The two can then be
+    // timed against each other inside one process: this machine's load moves
+    // benchmarks by more than the difference being measured, so numbers from
+    // two separate runs say nothing.
+    let forced = rlx_ir::env::var("RLX_METAL_CONV3D").unwrap_or_default();
+    // The implicit-GEMM kernels are the fast path. They assume ungrouped
+    // convolution, and they only pay off once there is enough work to fill a
+    // 32x32 tile — a 2^3 bottleneck volume has 8 output positions and would
+    // waste three quarters of every tile.
+    let gemm = groups <= 1
+        && !forced.eq_ignore_ascii_case("naive")
+        && (n * d_out * h_out * w_out) >= gemm_min_m()
+        && c_out >= 8;
+    // One input channel per K-tile needs the taps to fit one tile; a 3^3 or
+    // smaller filter does, anything larger falls back to the general tiling.
+    let gemm_c = gemm && (kd * kh * kw) <= 32 && !forced.eq_ignore_ascii_case("gemm");
+    enc.set_compute_pipeline_state(if gemm_c {
+        &k.conv3d_gemm_c
+    } else if gemm {
+        &k.conv3d_gemm
+    } else {
+        &k.conv3d
+    });
     enc.set_buffer(0, Some(buffer), src as u64);
     enc.set_buffer(1, Some(buffer), weight as u64);
     enc.set_buffer(2, Some(buffer), dst as u64);
@@ -7750,6 +8172,29 @@ pub(crate) fn encode_conv3d(
     enc.set_bytes(6, 16, dparams.as_ptr() as *const _);
     enc.set_bytes(7, 16, e.as_ptr() as *const _);
     enc.set_bytes(8, 16, f.as_ptr() as *const _);
+    enc.set_buffer(9, Some(buffer), bias.unwrap_or(0) as u64);
+    enc.set_bytes(10, 4, (&alpha) as *const f32 as *const _);
+    enc.set_buffer(11, Some(buffer), src2 as u64);
+    enc.set_bytes(12, 4, (&c_split) as *const u32 as *const _);
+    enc.set_bytes(13, 16, up.as_ptr() as *const _);
+    if gemm {
+        // One threadgroup of 128 threads per (32 positions x 32 channels) tile.
+        let tiles_m = ((n * d_out * h_out * w_out) as u64).div_ceil(32);
+        let tiles_n = (c_out as u64).div_ceil(32);
+        enc.dispatch_threads(
+            crate::mtl::MTLSize {
+                width: tiles_m * 128,
+                height: tiles_n,
+                depth: 1,
+            },
+            crate::mtl::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     // Grid: (w_out, h_out, n * c_out * d_out). Kernel decodes
     // d_o = z % d_out, then (n, c_out) from z / d_out.
     let grid = crate::mtl::MTLSize {
@@ -7868,6 +8313,68 @@ pub(crate) fn encode_pool2d(
         width: w_out as u64,
         height: h_out as u64,
         depth: (n * c) as u64,
+    };
+    let tg = crate::mtl::MTLSize {
+        width: 8.min(w_out as u64),
+        height: 8.min(h_out as u64),
+        depth: 1,
+    };
+    enc.dispatch_threads(grid, tg);
+}
+
+/// Dispatch a 3-D pool. One thread per output element, with `n`, `c` and the
+/// output depth folded into the grid's z so the dispatch stays 3-D.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_pool3d(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    src: usize,
+    dst: usize,
+    n: u32,
+    c: u32,
+    d: u32,
+    h: u32,
+    w: u32,
+    d_out: u32,
+    h_out: u32,
+    w_out: u32,
+    kd: u32,
+    kh: u32,
+    kw: u32,
+    sd: u32,
+    sh: u32,
+    sw: u32,
+    pd: u32,
+    ph: u32,
+    pw: u32,
+    kind: rlx_ir::op::ReduceOp,
+) {
+    use rlx_ir::op::ReduceOp;
+    let kind_u: u32 = match kind {
+        ReduceOp::Sum => 0,
+        ReduceOp::Mean => 1,
+        ReduceOp::Max => 2,
+        ReduceOp::Min => 3,
+        ReduceOp::Prod => 4,
+    };
+    let ncdh: [u32; 4] = [n, c, d, h];
+    let w_dhw_out: [u32; 4] = [w, d_out, h_out, w_out];
+    let kdhw_sd: [u32; 4] = [kd, kh, kw, sd];
+    let shw_pd: [u32; 4] = [sh, sw, pd, ph];
+    let pw_kind: [u32; 2] = [pw, kind_u];
+    enc.set_compute_pipeline_state(&k.pool3d);
+    enc.set_buffer(0, Some(buffer), src as u64);
+    enc.set_buffer(1, Some(buffer), dst as u64);
+    enc.set_bytes(2, 16, ncdh.as_ptr() as *const _);
+    enc.set_bytes(3, 16, w_dhw_out.as_ptr() as *const _);
+    enc.set_bytes(4, 16, kdhw_sd.as_ptr() as *const _);
+    enc.set_bytes(5, 16, shw_pd.as_ptr() as *const _);
+    enc.set_bytes(6, 8, pw_kind.as_ptr() as *const _);
+    let grid = crate::mtl::MTLSize {
+        width: w_out as u64,
+        height: h_out as u64,
+        depth: (n * c * d_out) as u64,
     };
     let tg = crate::mtl::MTLSize {
         width: 8.min(w_out as u64),
@@ -8435,8 +8942,8 @@ pub(crate) fn encode_transpose_swap12_batched_trailing(
 
 pub(crate) fn metal_host_slices_enabled() -> bool {
     matches!(
-        std::env::var("RLX_METAL_HOST_SLICE").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
+        rlx_ir::env::var("RLX_METAL_HOST_SLICE").as_deref(),
+        Some("1") | Some("true") | Some("on")
     )
 }
 
@@ -8862,12 +9369,28 @@ pub(crate) fn encode_grouped_matmul(
     k_dim: u32,
     n: u32,
     num_experts: u32,
+    // `weight` is `[E, N, K]` with a folded-away transpose. Only ever true on
+    // the `m <= 4` path, which the compiler enforces — the prefill kernel below
+    // has no transposed variant and would read the bank in the wrong layout.
+    w_transposed: bool,
 ) {
     // Decode (small m) has too little column parallelism for the one-thread-per-
     // output kernel; route it to the K-split GEMV instead. Prefill keeps the
     // simple kernel, where m*n threads is already plenty.
+    assert!(
+        !w_transposed || m <= 4,
+        "rlx-metal: grouped matmul with a folded bank transpose reached the \
+         prefill kernel (m = {m}), which reads `[E, K, N]`"
+    );
     if m <= 4 {
-        enc.set_compute_pipeline_state(&k.grouped_gemv_splitk);
+        // The `_bt` variant swaps the threadgroup axes so its lanes span `k`,
+        // which is the contiguous axis of `[E, N, K]` — same coalescing, other
+        // layout. See the kernel for why the mapping has to move with it.
+        enc.set_compute_pipeline_state(if w_transposed {
+            &k.grouped_gemv_splitk_bt
+        } else {
+            &k.grouped_gemv_splitk
+        });
         enc.set_buffer(0, Some(buffer), input as u64);
         enc.set_buffer(1, Some(buffer), weight as u64);
         enc.set_buffer(2, Some(buffer), expert_idx as u64);

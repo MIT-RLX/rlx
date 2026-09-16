@@ -28,6 +28,11 @@ impl Backend for MetalBackend {
         });
         let graph = apply_scan_device_preference(graph, options);
         let graph = crate::precompile::precompile_cleanup(graph, options);
+        // Metal's binary kernels are stride-aware, so it deliberately skips
+        // `LegalizeBroadcast` — but its attention kernel indexes a Custom mask
+        // at a hard-coded `mask[b * S_k + k]`, so a `[1, S_k]` mask still has to
+        // be widened. Just that one rewrite, not the whole pass.
+        let graph = rlx_opt::legalize_custom_attention_mask(graph);
 
         // Hand the policy to MetalExecutable so the rewrite runs AFTER
         // its internal fusion passes (avoids breaking pattern matchers).
@@ -58,6 +63,8 @@ impl Backend for MetalBackend {
         });
         graph = apply_scan_device_preference(graph, options);
         graph = crate::precompile::precompile_cleanup(graph, options);
+        // See `compile` — same one rewrite, for the same reason.
+        graph = rlx_opt::legalize_custom_attention_mask(graph);
         let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
         Box::new(MetalExecutableWrapper {
             inner: MetalExecutable::compile_from_fused(
@@ -258,7 +265,7 @@ impl ExecutableGraph for MetalExecutableWrapper {
             let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
             self.inner.set_param(name, s);
         } else {
-            let diag = data.len() > 1_000_000 && std::env::var("RLX_METAL_PARAM_DIAG").is_ok();
+            let diag = data.len() > 1_000_000 && rlx_ir::env::var("RLX_METAL_PARAM_DIAG").is_some();
             let t0 = std::time::Instant::now();
             let f32_buf = super::widen_bytes_to_f32(data, dtype);
             let t_widen = t0.elapsed().as_secs_f64();

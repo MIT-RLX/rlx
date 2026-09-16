@@ -34,7 +34,7 @@ fn main() {
     // process so the mode persists across the benchmark loop. Built with `--features
     // xrt,direct`; a no-op without RLX_XDNA_TURBO.
     #[cfg(all(feature = "direct", target_os = "linux"))]
-    if std::env::var("RLX_XDNA_TURBO").is_ok() {
+    if rlx_ir::env::var("RLX_XDNA_TURBO").is_some() {
         match rlx_xdna::direct::Npu::open("") {
             Ok(npu) => match npu.set_turbo() {
                 Ok(()) => {
@@ -55,7 +55,7 @@ fn main() {
     // The mlir_aie include tree (holds aie_kernels/aie2/mm.cc + aie_api/).
     // RLX_XDNA_AIE_INCLUDE overrides the AIECC-derived path (needed for pip mlir_aie
     // installs where bin/aiecc isn't at <mlir_aie>/bin) — mirrors the backend.
-    let include = std::env::var("RLX_XDNA_AIE_INCLUDE").unwrap_or_else(|_| {
+    let include = rlx_ir::env::var("RLX_XDNA_AIE_INCLUDE").unwrap_or_else(|| {
         std::path::Path::new(&aiecc)
             .parent()
             .and_then(|p| p.parent())

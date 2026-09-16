@@ -24,7 +24,9 @@
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{CompileOptions, Device, Session, is_available};
+use rlx_runtime::{CompileOptions, Device, Session};
+
+mod common;
 
 /// Brain-JEPA cross-backend tolerance (encoder + predictor ctx).
 const TOL: f32 = 5e-3;
@@ -59,7 +61,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn skip_mlx() -> bool {
-    if !is_available(Device::Mlx) {
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("[mlx_attention_parity] MLX unavailable — skipping");
         return true;
     }
@@ -273,6 +275,7 @@ fn run_predictor_stack(
 
 #[test]
 fn cpu_vs_mlx_attention_bsnh_single_layer() {
+    let _gpu = common::serialize_gpu();
     if skip_mlx() {
         return;
     }
@@ -308,6 +311,7 @@ fn cpu_vs_mlx_attention_bsnh_single_layer() {
 
 #[test]
 fn cpu_vs_mlx_brainjepa_predictor_stack() {
+    let _gpu = common::serialize_gpu();
     if skip_mlx() {
         return;
     }

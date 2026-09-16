@@ -738,8 +738,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn onnx_test_model() -> Option<std::path::PathBuf> {
-        std::env::var("RLX_ONNX_TEST_MODEL")
-            .ok()
+        rlx_ir::env::var("RLX_ONNX_TEST_MODEL")
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists())
     }
@@ -827,7 +826,7 @@ mod tests {
                 .join("../../../../rlx-models")
                 .join(rel),
         ];
-        if let Some(dir) = std::env::var_os("RLX_MODELS_DIR") {
+        if let Some(dir) = rlx_ir::env::var_os("RLX_MODELS_DIR") {
             candidates.push(PathBuf::from(dir).join(rel));
         }
         let Some(path) = candidates.into_iter().find(|p| p.is_file()) else {

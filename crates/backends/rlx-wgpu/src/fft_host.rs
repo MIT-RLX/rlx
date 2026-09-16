@@ -4,7 +4,8 @@
 
 //! Host-side `Op::Fft` for wgpu arenas.
 //!
-//! Thin adapter over [`rlx_gpu_host::run_fft1d`].
+//! Thin adapter over [`rlx_gpu_host::run_fft1d`] and, for the fixed-point
+//! `Op::FftQ`, [`rlx_gpu_host::run_fft1d_q_valued`].
 
 use crate::buffer::Arena;
 use crate::host_stage::WgpuArena;
@@ -37,5 +38,41 @@ pub fn run_fft1d(
         inverse,
         norm_tag,
         dtype,
+    );
+}
+
+/// Fixed-point `Op::FftQ`.
+///
+/// The wgpu arena stores integer tensors as f32 *values*, so the adapter
+/// converts at the boundary; see [`rlx_gpu_host::run_fft1d_q_valued`] for the
+/// exactness bound it enforces.
+#[allow(clippy::too_many_arguments)]
+pub fn run_fft1d_q(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src_byte_off: usize,
+    dst_byte_off: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm_tag: u32,
+    scale_tag: u32,
+) {
+    let mut a = WgpuArena {
+        arena,
+        device,
+        queue,
+        size_bytes: 0,
+    };
+    rlx_gpu_host::run_fft1d_q_valued(
+        &mut a,
+        src_byte_off,
+        dst_byte_off,
+        outer,
+        n_complex,
+        inverse,
+        norm_tag,
+        scale_tag,
     );
 }

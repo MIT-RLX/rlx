@@ -19,12 +19,12 @@ use rlx_runtime::{Device, Session};
 
 #[test]
 fn metal_hf_mlx_one_linear() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
-    let repo = std::env::var("RLX_HF_MLX_REPO").unwrap_or_else(|_| DEFAULT_HF_MLX_REPO.into());
+    let repo = rlx_ir::env::var("RLX_HF_MLX_REPO").unwrap_or_else(|| DEFAULT_HF_MLX_REPO.into());
     let cached = hf_cache_dir().join(repo.replace('/', "--"));
-    let allow_download = std::env::var("RLX_HF_MLX").ok().as_deref() == Some("1");
+    let allow_download = rlx_ir::env::var("RLX_HF_MLX").as_deref() == Some("1");
     let warm = fetch_ok(&cached);
 
     if !warm && !allow_download {

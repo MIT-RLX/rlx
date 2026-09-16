@@ -23,9 +23,36 @@ pub enum AttentionVariant {
     Row,
 }
 
+/// Which physical schedule builds the tiled `matmul` kernel
+/// (`RLX_CUDA_SCHEDULE_MATMUL`).
+///
+/// `Default` is the shipping hand-written `kernels/matmul.cu`. The other two
+/// are *generated* from a `rlx_ir::kernel_schedule::KernelSchedule`, so the
+/// difference between them is a declaration rather than a second kernel file.
+///
+/// `Serial` exists so a win can be attributed. It emits the schedule that
+/// merely *describes* `matmul.cu` — one stage, two block syncs — and should
+/// therefore land on top of the baseline. Without that arm, "the pipeline is
+/// faster" and "the generated code happens to be faster" are the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MatmulScheduleSource {
+    #[default]
+    Default,
+    Serial,
+    /// `stages`-deep `cp.async` rotation, one block sync per K iteration.
+    Pipelined(usize),
+}
+
 /// CUDA backend options (hot-path flags loaded once per process by default).
 #[derive(Debug, Clone)]
 pub struct CudaRuntimeConfig {
+    /// Where the tiled `matmul` source comes from
+    /// (`RLX_CUDA_SCHEDULE_MATMUL=default|serial|pipelined[:N]`).
+    ///
+    /// Requires the `schedule-codegen` cargo feature; without it a non-default
+    /// value warns once and is ignored rather than silently doing nothing —
+    /// `metal-variant-typo-silent` is the defect that rule comes from.
+    pub schedule_matmul: MatmulScheduleSource,
     pub wmma: bool,
     /// Attention kernel variant policy (`RLX_CUDA_ATTENTION=auto|scalar|wmma|row`).
     pub attention: AttentionVariant,
@@ -40,6 +67,12 @@ pub struct CudaRuntimeConfig {
     pub no_tf32: bool,
     pub parity: bool,
     pub no_cublaslt: bool,
+    /// Skip the cuBLAS sgemm tier so dense GEMM lands on rlx's own tiled
+    /// `matmul` kernel (`RLX_CUDA_NO_CUBLAS`). Two uses: A/B-ing the native
+    /// kernel against the vendor library, and giving the dispatch tuner a way
+    /// to reach the tile it is tuning — with cuBLAS in front, the tiled kernel
+    /// is a fallback that a tuning sweep would otherwise never measure.
+    pub no_cublas: bool,
     pub conv_tf32: bool,
     pub nondet_conv: bool,
     /// Prefer stable IMPLICIT_GEMM for conv bwd (default on).
@@ -112,7 +145,39 @@ impl CudaRuntimeConfig {
         let attention_wmma_min_work = reg::var("RLX_CUDA_ATTENTION_WMMA_MIN_WORK")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(12288);
+        // An unrecognized value is reported, not defaulted through. A silent
+        // fall-through here would make an A/B measure the same path twice and
+        // report it as parity (`metal-variant-typo-silent`).
+        let schedule_matmul = match reg::var("RLX_CUDA_SCHEDULE_MATMUL").as_deref() {
+            None => MatmulScheduleSource::Default,
+            Some(v) if v.eq_ignore_ascii_case("default") || v == "0" => {
+                MatmulScheduleSource::Default
+            }
+            Some(v) if v.eq_ignore_ascii_case("serial") => MatmulScheduleSource::Serial,
+            Some(v) if v.to_ascii_lowercase().starts_with("pipelined") => {
+                let stages = v
+                    .split([':', '='])
+                    .nth(1)
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(2);
+                MatmulScheduleSource::Pipelined(stages.max(2))
+            }
+            Some(other) => {
+                eprintln!(
+                    "rlx-cuda: RLX_CUDA_SCHEDULE_MATMUL={other:?} is not one of \
+                     default|serial|pipelined[:N] — using the default schedule"
+                );
+                MatmulScheduleSource::Default
+            }
+        };
+        if schedule_matmul != MatmulScheduleSource::Default && !cfg!(feature = "schedule-codegen") {
+            eprintln!(
+                "rlx-cuda: RLX_CUDA_SCHEDULE_MATMUL={schedule_matmul:?} needs the \
+                 `schedule-codegen` cargo feature; using the default schedule"
+            );
+        }
         Self {
+            schedule_matmul,
             wmma: reg::flag("RLX_CUDA_WMMA"),
             attention,
             attention_wmma_min_work,
@@ -120,6 +185,7 @@ impl CudaRuntimeConfig {
             no_tf32: reg::flag("RLX_CUDA_NO_TF32"),
             parity: reg::flag("RLX_CUDA_PARITY"),
             no_cublaslt: reg::flag("RLX_CUDA_NO_CUBLASLT"),
+            no_cublas: reg::flag("RLX_CUDA_NO_CUBLAS"),
             conv_tf32: reg::flag("RLX_CUDA_CONV_TF32"),
             nondet_conv: reg::flag("RLX_CUDA_NONDET_CONV"),
             conv_stable_bwd: reg::flag_or("RLX_CUDA_CONV_STABLE_BWD", true),

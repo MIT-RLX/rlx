@@ -282,10 +282,10 @@ fn main() {
     );
     println!("# runs={runs}, warmup={warmup}");
     println!("# compile via CompileCache (cache miss + hit columns)");
-    if std::env::var("RLX_CUDA_COMPILE_MODE").is_ok_and(|v| v.eq_ignore_ascii_case("aot")) {
+    if rlx_ir::env::var("RLX_CUDA_COMPILE_MODE").is_some_and(|v| v.eq_ignore_ascii_case("aot")) {
         println!("# RLX_CUDA_COMPILE_MODE=aot (NVRTC prewarm at compile)");
     }
-    if std::env::var("RLX_CUDA_EXEC_MODE").is_ok_and(|v| v.eq_ignore_ascii_case("graph")) {
+    if rlx_ir::env::var("RLX_CUDA_EXEC_MODE").is_some_and(|v| v.eq_ignore_ascii_case("graph")) {
         println!("# RLX_CUDA_EXEC_MODE=graph (CUDA Graph replay after 1st run)");
     }
     println!();

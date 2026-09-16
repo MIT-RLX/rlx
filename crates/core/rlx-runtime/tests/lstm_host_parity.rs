@@ -9,7 +9,9 @@
 #![cfg(all(feature = "cpu", feature = "mlx"))]
 use rlx_ir::op::Op;
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn mk(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
@@ -40,7 +42,7 @@ fn build(b: usize, s: usize, inp: usize, h: usize, bidirectional: bool) -> Graph
 }
 
 fn run_parity(bidirectional: bool) {
-    if !is_available(Device::Mlx) {
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip: no MLX device");
         return;
     }
@@ -72,11 +74,13 @@ fn run_parity(bidirectional: bool) {
 
 #[test]
 fn lstm_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     run_parity(false);
 }
 
 #[test]
 fn bilstm_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     run_parity(true);
 }
 
@@ -84,7 +88,8 @@ fn bilstm_mlx_matches_cpu() {
 /// weight offsets (layer 0 reads `input_size`, later layers read `D*hidden`).
 #[test]
 fn multilayer_bilstm_mlx_matches_cpu() {
-    if !is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip: no MLX device");
         return;
     }
@@ -139,7 +144,8 @@ fn multilayer_bilstm_mlx_matches_cpu() {
 /// Kokoro StyleTTS2 encoder shape: H=256, bidirectional, B=1.
 #[test]
 fn bilstm_kokoro_shape_mlx_matches_cpu() {
-    if !is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("skip: no MLX device");
         return;
     }

@@ -1,5 +1,5 @@
 error: unknown output binding `z`
- --> tests/ui/unknown_output.rs:8:13
-  |
-8 |         out z;   // `z` never declared
-  |             ^
+  --> tests/ui/unknown_output.rs:11:13
+   |
+11 |         out z;   // `z` never declared
+   |             ^

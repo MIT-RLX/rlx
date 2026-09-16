@@ -25,7 +25,7 @@ toml = "0.8"
 # broken by retiering. Keep these PATH-ONLY (no `version`): cargo strips
 # path-only dev-deps from the published manifest, so `cargo publish -p rlx-flow`
 # never resolves them against crates.io. `{ workspace = true }` does NOT work
-# here — it inherits the workspace `version = "0.2.14"`, which cargo then tries
+# here — it inherits the workspace version, which cargo then tries
 # to resolve and fails on ("candidate versions found which didn't match").
 # The path still wins for local `cargo test`.
 rlx-opt = { path = "../rlx-opt" }
@@ -33,3 +33,7 @@ rlx-runtime = { path = "../rlx-runtime", features = ["cpu", "training"] }
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

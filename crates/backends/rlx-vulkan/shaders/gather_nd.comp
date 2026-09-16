@@ -1,0 +1,56 @@
+#version 450
+// ONNX GatherND on the f32-uniform arena. SPIR-V twin of
+// `rlx-gpu-kernels/kernels/indexing_nd.cu` and `rlx-wgpu/kernels/indexing_nd.wgsl`,
+// driven by the same launch plan from `rlx_gpu_dispatch::indexing`.
+//
+// Index slots hold f32-ENCODED integers (`force_indices_f32`), so every index
+// read rounds the float rather than reinterpreting its bits — the bug that
+// zeroed Kitten alignment on discrete NVIDIA.
+//
+// Vulkan has no spare descriptor binding here (0 = activations, 1 = weights), so
+// shapes and strides ride in the push block as `uvec4`s rather than a `meta`
+// storage buffer. `uvec4` is 16-byte aligned under every layout rule, which
+// sidesteps the std140-vs-std430 array-stride question entirely. The 16-word
+// budget caps `k` at 8; the host declines anything larger and keeps the CPU
+// route.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;                 // batch_count * tuples_per_batch * slice
+    uint data_off;
+    uint idx_off;
+    uint dst_off;
+    uint k;
+    uint slice;
+    uint tuples_per_batch;
+    uint batch_stride;
+    uvec4 meta[4];          // [ data_strides[k] , data_dims[k] ]
+} pc;
+
+uint meta_at(uint i) { return pc.meta[i >> 2u][i & 3u]; }
+
+// Wrap negatives, clamp into [0, dim) — the CPU kernels' order exactly.
+uint rlx_idx(float raw, int dim) {
+    int idx = int(round(raw));
+    if (idx < 0) { idx += dim; }
+    if (idx < 0) { idx = 0; }
+    if (dim > 0 && idx >= dim) { idx = dim - 1; }
+    return uint(idx);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+
+    uint t = i / pc.slice;
+    uint j = i - t * pc.slice;
+    uint bi = (pc.tuples_per_batch != 0u) ? (t / pc.tuples_per_batch) : 0u;
+
+    uint off = bi * pc.batch_stride;
+    uint tuple = t * pc.k;
+    for (uint m = 0u; m < pc.k; ++m) {
+        int dim = int(meta_at(pc.k + m));
+        off += rlx_idx(arena_load(pc.idx_off + tuple + m), dim) * meta_at(m);
+    }
+    arena_store(pc.dst_off + i, arena_load(pc.data_off + off + j));
+}

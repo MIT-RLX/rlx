@@ -8,10 +8,24 @@
 # refs to `dyn ::std::any::Any`.
 [package]
 name = "rlx-onnx-proto"
-version = "0.2.14"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
 description = "Vendored pure-Rust ONNX protobuf types (protoc-free)"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["onnx", "protobuf", "serialization", "rlx"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
 
 [dependencies]
 protobuf = "1.7"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

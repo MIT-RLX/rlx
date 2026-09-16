@@ -7,7 +7,9 @@
 #![cfg(all(feature = "cpu", feature = "cuda"))]
 
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn const_f32(g: &mut Graph, xs: &[f32]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
@@ -29,7 +31,8 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_cuda_native_matches_cpu_pow2() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }
@@ -69,7 +72,8 @@ fn fft_cuda_native_matches_cpu_pow2() {
 
 #[test]
 fn fft_cuda_round_trip_f32_pow2() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }

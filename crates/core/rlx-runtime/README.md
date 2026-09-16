@@ -42,7 +42,7 @@ and the device handle.
   MLX per graph; CUDA / ROCm / wgpu use on-disk calibration caches.
 - **Multi-backend runtime** — `GraphDevices`, `DeviceRouter`,
   `FlexibleSession`, `DevicePolicy`, `BackendsManifest`. See
-  [`docs/backend-selection.md`](../docs/backend-selection.md).
+  [`docs/backend-selection.md`](../../../docs/backend-selection.md).
 - **FFT dispatch** — `Op::Fft` on CPU / Metal / MLX / CUDA / ROCm / wgpu /
   TPU. Pow-2 f32 uses native GPU kernels where available; other shapes and
   dtypes use partial host sync. Graph helpers (`rfft`, `irfft`, `stft`, …)
@@ -66,7 +66,7 @@ and the device handle.
   [`CompiledGraph::set_rng`]. Backends: Philox (default), Ort (CPU parity),
   Zero (deterministic tests). GPU backends host-fill unified memory (Metal/MLX)
   or D2H→fill→H2D segments (CUDA/ROCm/wgpu). TPU lowers to XLA `rng`.
-  *(Added in 0.2.7 — see [`CHANGELOG.md`](../CHANGELOG.md).)*
+  *(Added in 0.2.7 — see [`CHANGELOG.md`](../../../CHANGELOG.md).)*
 
 Re-exports: `Tick`, `time_ns` from `rlx_ir::measure`. Use these for any
 sub-ms timing in the user-facing layer.
@@ -91,7 +91,7 @@ sub-ms timing in the user-facing layer.
 
 ```toml
 [dependencies]
-rlx-runtime = { version = "0.2.14", features = ["cpu"] }
+rlx-runtime = { version = "0.2.16", features = ["cpu"] }
 ```
 
 > **Heads-up.** The `mlx` and `rocm` features pull in `rlx-mlx` and
@@ -138,7 +138,7 @@ let mut router = DeviceRouter::from_env(g)?;
 let (device, out) = router.run(&inputs, None)?;
 ```
 
-Full guide: [`docs/backend-selection.md`](../docs/backend-selection.md).
+Full guide: [`docs/backend-selection.md`](../../../docs/backend-selection.md).
 
 ## Build / test
 

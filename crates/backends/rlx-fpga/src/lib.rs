@@ -34,7 +34,10 @@ pub mod model;
 pub mod pack;
 pub mod passes;
 pub mod quant;
+// The sequential target emits files and formats text, so it needs `std`.
 pub mod reference;
+#[cfg(feature = "std")]
+pub mod seq;
 pub mod sideband;
 pub mod tune;
 pub mod verilog;

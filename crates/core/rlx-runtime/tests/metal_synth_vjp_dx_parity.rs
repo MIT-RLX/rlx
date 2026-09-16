@@ -15,6 +15,8 @@ use rlx_ir::op::{BinaryOp, ReduceOp};
 use rlx_ir::{DType, Graph, Op, Shape, SynthKind};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const B: usize = 128; // rows (tokens)
 const D: usize = 4; // entry_dim
 const NE: usize = 256; // num_entries
@@ -90,7 +92,8 @@ fn run_on(dev: Device, backward: &Graph, xv: &[f32], _idx: &[u8], cv: &[f32]) ->
 
 #[test]
 fn metal_synth_vjp_dx_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let (backward, xv, idx, cv) = build();

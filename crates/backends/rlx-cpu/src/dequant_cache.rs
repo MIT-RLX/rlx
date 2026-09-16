@@ -81,6 +81,7 @@ fn scheme_tag(scheme: QuantScheme) -> u8 {
         QuantScheme::GgufQ2_0 => 26,
         QuantScheme::GgufFV5 => 27,
         QuantScheme::GgufFV5B => 28,
+        QuantScheme::GgufG8_0 => 29,
         _ => 255,
     }
 }
@@ -115,6 +116,7 @@ fn dequant_gguf_serial(w_bytes: &[u8], n_elems: usize, scheme: QuantScheme) -> V
         QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(w_bytes, n_elems),
         QuantScheme::GgufFV5 => rlx_gguf::fv5_dequant::dequant_fv5(w_bytes, n_elems),
         QuantScheme::GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(w_bytes, n_elems),
+        QuantScheme::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(w_bytes, n_elems),
         other => panic!("dequant_cache: unsupported GGUF scheme {other:?}"),
     }
     .expect("GGUF dequant failed")

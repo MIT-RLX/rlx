@@ -83,7 +83,15 @@ extern "C" __global__ void attention_bwd(
     unsigned int window,
     unsigned int wrt
 ) {
-    if (head_dim > MAX_HEAD_DIM || seq_k > MAX_ATTN_SEQ || seq_q > MAX_ATTN_SEQ) return;
+    // head_dim is no longer bounded: the only head_dim-sized accumulator is
+    // tiled below. `scores`/`dp` are still fixed at MAX_ATTN_SEQ, so a sequence
+    // past that cannot be served — and returning here writes *nothing*, which
+    // the caller reads as an all-zero gradient. A silent zero gradient is the
+    // worst failure this kernel has: training proceeds and quietly learns
+    // nothing from these tensors. The host asserts the same bound before
+    // launch (see rlx-cuda / rlx-rocm compile.rs) so this is a backstop, not
+    // the diagnostic.
+    if (seq_k > MAX_ATTN_SEQ || seq_q > MAX_ATTN_SEQ) return;
     float scale = __int_as_float((int)scale_bits);
 
     unsigned int bh = blockIdx.x;
@@ -149,69 +157,84 @@ extern "C" __global__ void attention_bwd(
         unsigned int v_base = v_base_g + ki * head_dim;
         unsigned int o_base = out_off + (bh * seq_k + ki) * head_dim;
 
-        float acc[MAX_HEAD_DIM];
-        for (unsigned int d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+        // `acc` is a per-thread register/local array that has to survive the
+        // whole `qi` loop, so its size caps head_dim. Sizing it to the largest
+        // head_dim anyone might use would charge every call for the worst case;
+        // instead sweep head_dim in tiles of MAX_HEAD_DIM. head_dim is uniform
+        // across the block, so every thread runs the same tile count and the
+        // __syncthreads() below stay matched.
+        //
+        // head_dim <= MAX_HEAD_DIM is one tile and byte-for-byte the old path.
+        // Beyond that the per-tile cost is recomputing the scores, which is the
+        // price of not having written anything at all before.
+        for (unsigned int d0 = 0; d0 < head_dim; d0 += MAX_HEAD_DIM) {
+            unsigned int dn = head_dim - d0;
+            if (dn > MAX_HEAD_DIM) dn = MAX_HEAD_DIM;
 
-        for (unsigned int qi = 0; qi < seq_q; ++qi) {
-            unsigned int q_base = q_base_g + qi * head_dim;
-            unsigned int dy_base = dy_base_g + qi * head_dim;
+            float acc[MAX_HEAD_DIM];
+            for (unsigned int d = 0; d < dn; ++d) acc[d] = 0.0f;
 
-            // (1) each key-thread computes its own score s = scale·Q[qi]·K[ki].
-            float s = -3.4e38f;
-            if (active) {
-                float dot = 0.0f;
-                for (unsigned int d = 0; d < head_dim; ++d) {
-                    dot += arena[q_base + d] * arena[k_base + d];
-                }
-                dot *= scale;
-                s = mask_score(dot, qi, ki, bh, seq_q, seq_k, mask_kind, mask_off, window, arena);
-                sh_p[ki] = s;
-            }
-            __syncthreads();
+            for (unsigned int qi = 0; qi < seq_q; ++qi) {
+                unsigned int q_base = q_base_g + qi * head_dim;
+                unsigned int dy_base = dy_base_g + qi * head_dim;
 
-            // (2) each thread reduces the shared row to (max, sum) → P[qi,ki].
-            float m = -3.4e38f;
-            for (unsigned int kk = 0; kk < seq_k; ++kk) m = fmaxf(m, sh_p[kk]);
-            float Z = 0.0f;
-            for (unsigned int kk = 0; kk < seq_k; ++kk) {
-                Z += (sh_p[kk] <= -1e30f) ? 0.0f : expf(sh_p[kk] - m);
-            }
-            float invZ = (Z > 0.0f) ? 1.0f / Z : 0.0f;
-            float p = active ? (((s <= -1e30f) ? 0.0f : expf(s - m)) * invZ) : 0.0f;
-
-            if (wrt == 2u) {
-                // dV[ki,d] += P[qi,ki] · dY[qi,d]
+                // (1) each key-thread computes its own score s = scale·Q[qi]·K[ki].
+                float s = -3.4e38f;
                 if (active) {
+                    float dot = 0.0f;
                     for (unsigned int d = 0; d < head_dim; ++d) {
-                        acc[d] += p * arena[dy_base + d];
+                        dot += arena[q_base + d] * arena[k_base + d];
                     }
-                }
-                __syncthreads(); // sh_p reused by next qi
-            } else {
-                // dK: dp[qi,ki] = dY[qi]·V[ki]; delta = Σ_k P[qi,k]·dp[qi,k]
-                __syncthreads(); // all threads done reading s before overwrite
-                float dpk = 0.0f;
-                if (active) {
-                    for (unsigned int d = 0; d < head_dim; ++d) {
-                        dpk += arena[dy_base + d] * arena[v_base + d];
-                    }
-                    sh_dp[ki] = dpk;
-                    sh_p[ki] = p; // overwrite row scores with P for the delta reduction
+                    dot *= scale;
+                    s = mask_score(dot, qi, ki, bh, seq_q, seq_k, mask_kind, mask_off, window, arena);
+                    sh_p[ki] = s;
                 }
                 __syncthreads();
-                float delta = 0.0f;
-                for (unsigned int kk = 0; kk < seq_k; ++kk) delta += sh_p[kk] * sh_dp[kk];
-                float dscore = active ? (p * (dpk - delta) * scale) : 0.0f;
-                if (active) {
-                    for (unsigned int d = 0; d < head_dim; ++d) {
-                        acc[d] += dscore * arena[q_base + d];
-                    }
+
+                // (2) each thread reduces the shared row to (max, sum) → P[qi,ki].
+                float m = -3.4e38f;
+                for (unsigned int kk = 0; kk < seq_k; ++kk) m = fmaxf(m, sh_p[kk]);
+                float Z = 0.0f;
+                for (unsigned int kk = 0; kk < seq_k; ++kk) {
+                    Z += (sh_p[kk] <= -1e30f) ? 0.0f : expf(sh_p[kk] - m);
                 }
-                __syncthreads(); // sh_p/sh_dp reused by next qi
+                float invZ = (Z > 0.0f) ? 1.0f / Z : 0.0f;
+                float p = active ? (((s <= -1e30f) ? 0.0f : expf(s - m)) * invZ) : 0.0f;
+
+                if (wrt == 2u) {
+                    // dV[ki,d] += P[qi,ki] · dY[qi,d]
+                    if (active) {
+                        for (unsigned int d = 0; d < dn; ++d) {
+                            acc[d] += p * arena[dy_base + d0 + d];
+                        }
+                    }
+                    __syncthreads(); // sh_p reused by next qi
+                } else {
+                    // dK: dp[qi,ki] = dY[qi]·V[ki]; delta = Σ_k P[qi,k]·dp[qi,k]
+                    __syncthreads(); // all threads done reading s before overwrite
+                    float dpk = 0.0f;
+                    if (active) {
+                        for (unsigned int d = 0; d < head_dim; ++d) {
+                            dpk += arena[dy_base + d] * arena[v_base + d];
+                        }
+                        sh_dp[ki] = dpk;
+                        sh_p[ki] = p; // overwrite row scores with P for the delta reduction
+                    }
+                    __syncthreads();
+                    float delta = 0.0f;
+                    for (unsigned int kk = 0; kk < seq_k; ++kk) delta += sh_p[kk] * sh_dp[kk];
+                    float dscore = active ? (p * (dpk - delta) * scale) : 0.0f;
+                    if (active) {
+                        for (unsigned int d = 0; d < dn; ++d) {
+                            acc[d] += dscore * arena[q_base + d0 + d];
+                        }
+                    }
+                    __syncthreads(); // sh_p/sh_dp reused by next qi
+                }
             }
-        }
-        if (active) {
-            for (unsigned int d = 0; d < head_dim; ++d) arena[o_base + d] = acc[d];
+            if (active) {
+                for (unsigned int d = 0; d < dn; ++d) arena[o_base + d0 + d] = acc[d];
+            }
         }
     } else if (wrt == 2u) {
         // ---- Fallback (seq_k > blockDim.x): original thread-per-key dV ----

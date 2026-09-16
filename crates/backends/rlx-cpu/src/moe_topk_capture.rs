@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Capture MoE router [`Op::TopK`] outputs during CPU forward (TIDE refresh input).
+//! Capture MoE router [`Op::TopK`](rlx_ir::Op::TopK) outputs during CPU forward (TIDE refresh input).
 
 use std::sync::{Arc, Mutex};
 

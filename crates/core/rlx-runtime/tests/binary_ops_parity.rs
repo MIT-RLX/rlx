@@ -11,6 +11,8 @@ use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const OPS: [BinaryOp; 6] = [
     BinaryOp::Mod,
     BinaryOp::BitAnd,
@@ -56,6 +58,7 @@ fn operands() -> (Vec<f32>, Vec<f32>) {
 
 #[test]
 fn binary_ops_cpu_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let (a, b) = operands();
     for op in OPS {
         let got = run(Device::Cpu, op, &a, &b);
@@ -97,13 +100,15 @@ fn check_device(device: Device, label: &str) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn binary_ops_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check_device(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn binary_ops_mlx_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         return;
     }
     check_device(Device::Mlx, "mlx");
@@ -112,13 +117,18 @@ fn binary_ops_mlx_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn binary_ops_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     check_device(Device::Gpu, "wgpu");
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn binary_ops_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     check_device(Device::Cuda, "cuda");

@@ -302,8 +302,8 @@ impl MlxWeights {
 
     /// Take a quantized Linear as packed MLX triples for
     /// `Op::DequantMatMul`. Supports [`QuantScheme::MlxAffine`],
-    /// [`MlxMxfp4`] (including mlx-lm `nvfp4`, which shares the mxfp4
-    /// nibble layout with `group_size` typically 16), and [`MlxMxfp8`].
+    /// `MlxMxfp4` (including mlx-lm `nvfp4`, which shares the mxfp4
+    /// nibble layout with `group_size` typically 16), and `MlxMxfp8`.
     /// Consumes `{base}.weight/.scales/.biases`.
     pub fn take_packed_linear(&mut self, hf_key: &str) -> Result<Option<MlxPackedLinear>> {
         if !self.is_quantized_layer(hf_key) {
@@ -607,7 +607,7 @@ fn libc_madv_willneed() -> i32 {
 fn keep_warm() -> bool {
     use std::sync::OnceLock;
     static KW: OnceLock<bool> = OnceLock::new();
-    *KW.get_or_init(|| std::env::var("RLX_MLX_KEEP_WARM").is_ok())
+    *KW.get_or_init(|| rlx_ir::env::var("RLX_MLX_KEEP_WARM").is_some())
 }
 
 /// Cached location of one tensor within its shard mmap — parsed ONCE at open so
@@ -893,8 +893,8 @@ impl LazyMlxWeights {
     }
 
     /// Drop a packed tensor's mmap pages (`MADV_DONTNEED`) after a zero-copy
-    /// [`borrow_packed`] consumer has copied them elsewhere (e.g. onto the device).
-    /// Mirrors the `DONTNEED` that [`materialize`](Self::materialize) does on the
+    /// `borrow_packed` consumer has copied them elsewhere (e.g. onto the device).
+    /// Mirrors the `DONTNEED` that `materialize` does on the
     /// owned path — WITHOUT it the borrowed pages accumulate in the page cache
     /// ALONGSIDE the arena and the OS swaps (a documented 10×-wall regression).
     /// No-op under `RLX_MLX_KEEP_WARM=1` (caller wants pages resident for reuse).

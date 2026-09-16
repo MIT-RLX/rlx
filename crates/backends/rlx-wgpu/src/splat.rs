@@ -1,7 +1,7 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! [`Op::GaussianSplatRender`] / backward for the wgpu backend.
+//! [`Op::GaussianSplatRender`](rlx_ir::Op::GaussianSplatRender) / backward for the wgpu backend.
 
 use crate::buffer::Arena;
 

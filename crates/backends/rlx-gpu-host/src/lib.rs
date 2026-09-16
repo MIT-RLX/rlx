@@ -55,6 +55,7 @@ pub use vision::{
     run_layer_norm2d_nchw, run_mamba2, run_resize_nearest_2x, run_rnn,
 };
 
+pub mod indexing_plan;
 pub mod vmath;
 
 /// Forward a host-fallback op through a backend-specific [`DeviceArena`] wrapper.
@@ -575,6 +576,58 @@ pub fn run_fft1d<A: DeviceArena>(
             host.as_mut_ptr(),
         );
     }
+
+    a.htod(span_off, &host);
+}
+
+/// `Op::FftQ` for backends whose arena holds f32 *values* rather than raw i32
+/// bytes — CUDA, ROCm, and anything else that stores an integer tensor as the
+/// float with the same value.
+///
+/// Reads the staged span as f32, rounds to i32, transforms, and writes the
+/// result back as f32. The conversion is what makes the op work there at all:
+/// reinterpreting those slots as i32 yields float bit patterns, which is
+/// exactly the garbage this replaced.
+///
+/// Exact while every value stays inside f32's exact-integer range. Past that it
+/// **panics** rather than rounding: a fixed-point transform that quietly drops
+/// low bits is worse than one that stops, and the bound is easy to respect —
+/// with `FftQScale::PerStage` the result never exceeds the input, and unscaled
+/// a length-`n` transform of `|x| < 2^24 / n` is always safe.
+pub fn run_fft1d_q_valued<A: DeviceArena>(
+    a: &mut A,
+    src_byte_off: usize,
+    dst_byte_off: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm_tag: u32,
+    scale_tag: u32,
+) {
+    let row_bytes = n_complex * 2 * 4;
+    let (span_off, span_len) =
+        rlx_ir::fft::fft_arena_byte_span(src_byte_off, dst_byte_off, row_bytes, outer);
+    assert_eq!(span_off % 4, 0, "fft_host: span_off must be 4-aligned");
+    assert_eq!(span_len % 4, 0, "fft_host: span_len must be 4-aligned");
+
+    a.sync();
+    let mut host = vec![0u8; span_len];
+    a.dtoh(span_off, &mut host);
+
+    let src_elem = (src_byte_off - span_off) / 4;
+    let dst_elem = (dst_byte_off - span_off) / 4;
+
+    rlx_cpu::thunk::fft1d_q32_f32_valued(
+        &mut host,
+        src_elem,
+        dst_elem,
+        outer,
+        n_complex,
+        inverse,
+        rlx_ir::fft::FftNorm::from_tag(norm_tag),
+        rlx_ir::fft::FftQScale::from_tag(scale_tag),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
 
     a.htod(span_off, &host);
 }
@@ -1106,6 +1159,10 @@ pub fn run_rms_norm_backward_beta<A: DeviceArena>(
 }
 
 /// Host-side `Op::Rope` backward. Byte offsets.
+///
+/// `cos_row_stride` is the cos/sin table's own last dimension. It is passed in
+/// rather than derived because neither `head_dim/2` nor `n_rot/2` is right in
+/// general — see `rlx_cpu::thunk::execute_rope_backward_f32`.
 pub fn run_rope_backward<A: DeviceArena>(
     a: &mut A,
     dy: usize,
@@ -1118,6 +1175,7 @@ pub fn run_rope_backward<A: DeviceArena>(
     head_dim: u32,
     n_rot: u32,
     cos_len: u32,
+    cos_row_stride: u32,
 ) {
     with_whole_arena(a, |base| unsafe {
         rlx_cpu::thunk::execute_rope_backward_f32(
@@ -1131,6 +1189,7 @@ pub fn run_rope_backward<A: DeviceArena>(
             head_dim,
             n_rot,
             cos_len,
+            cos_row_stride,
             base.as_mut_ptr(),
         );
     });
@@ -1211,6 +1270,92 @@ mod tests {
 
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
         bytemuck::cast_slice(v).to_vec()
+    }
+
+    /// The f32-valued conversion is exact for values inside f32's exact-integer
+    /// range, and matches the integer kernel bit for bit.
+    #[test]
+    fn fft_q_valued_round_trips_through_f32_slots() {
+        let n = 128usize;
+        let src_off = 0usize;
+        let dst_off = 2 * n * 4;
+        let mut xi = vec![0i32; 2 * n];
+        for (t, slot) in xi.iter_mut().take(n).enumerate() {
+            *slot = ((t as f64 * 0.31).sin() * 12000.0) as i32;
+        }
+        for scale in [
+            rlx_ir::fft::FftQScale::None,
+            rlx_ir::fft::FftQScale::EveryOther,
+            rlx_ir::fft::FftQScale::PerStage,
+        ] {
+            let xf: Vec<f32> = xi.iter().map(|&v| v as f32).collect();
+            let mut arena = VecArena {
+                data: {
+                    let mut d = f32_bytes(&xf);
+                    d.extend(std::iter::repeat_n(0u8, 2 * n * 4));
+                    d
+                },
+            };
+            run_fft1d_q_valued(
+                &mut arena,
+                src_off,
+                dst_off,
+                1,
+                n,
+                false,
+                rlx_ir::fft::FftNorm::Backward.tag(),
+                scale.tag(),
+            );
+            let got: Vec<f32> =
+                bytemuck::cast_slice(&arena.data[dst_off..dst_off + 2 * n * 4]).to_vec();
+
+            let mut want = xi.clone();
+            rlx_ir::fft::fft1d_q32_block(
+                &mut want,
+                1,
+                n,
+                false,
+                rlx_ir::fft::FftNorm::Backward,
+                scale,
+            )
+            .unwrap();
+            let want_f: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+            assert_eq!(
+                got, want_f,
+                "scale={scale:?}: f32-valued staging is not exact"
+            );
+        }
+    }
+
+    /// Past f32's exact-integer range the conversion would start dropping low
+    /// bits. It must stop loudly instead — a fixed-point transform that quietly
+    /// rounds is worse than one that fails, and this is the whole reason the
+    /// backends using this path document an input bound.
+    #[test]
+    #[should_panic(expected = "exact-integer range")]
+    fn fft_q_valued_refuses_to_silently_round() {
+        let n = 64usize;
+        // Every bin sums to n * amplitude; a DC input of 2^19 overflows 2^24.
+        let xf: Vec<f32> = (0..2 * n)
+            .map(|i| if i < n { 524_288.0 } else { 0.0 })
+            .collect();
+        let mut arena = VecArena {
+            data: {
+                let mut d = f32_bytes(&xf);
+                d.extend(std::iter::repeat_n(0u8, 2 * n * 4));
+                d
+            },
+        };
+        run_fft1d_q_valued(
+            &mut arena,
+            0,
+            2 * n * 4,
+            1,
+            n,
+            false,
+            rlx_ir::fft::FftNorm::Backward.tag(),
+            rlx_ir::fft::FftQScale::None.tag(),
+        );
     }
 
     #[test]

@@ -46,12 +46,78 @@ pub fn mps_graph_supported() -> bool {
     *AVAIL.get_or_init(|| objc::runtime::Class::get("MPSGraph").is_some())
 }
 
+/// What actually happened when we tried to compile synchronously.
+///
+/// The `waitForCompilationCompletion = YES` descriptor is a **mitigation for a
+/// crash in Apple's framework** (see `docs/apple-feedback-mpsgraph-crash.md`):
+/// with a nil descriptor, MPSGraph defers `GPURegionRuntime` construction onto
+/// its own queue, and that deferred path faulted at a measured ~2% per
+/// executable init with no rlx frames on the faulting thread.
+///
+/// Building it is necessarily best-effort — an OS without the class or the
+/// setter has to get the old behaviour rather than a hard failure. But
+/// "best-effort" and "silently back on the crashing path" are the same code
+/// path, and only this enum tells them apart. `rlx-metal/tests/
+/// mpsgraph_sync_compile.rs` asserts [`Applied`](Self::Applied) on this host,
+/// so an OS that drops the selector is a red test rather than a return of the
+/// 2%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncCompile {
+    /// The descriptor exists, the selector responded, and it was set.
+    Applied,
+    /// `RLX_MPSGRAPH_NO_SYNC_COMPILE=1` — the deliberate A/B arm.
+    DisabledByEnv,
+    /// No `MPSGraphCompilationDescriptor` class on this OS.
+    ClassMissing,
+    /// Class present but `setWaitForCompilationCompletion:` did not respond —
+    /// the mitigation is NOT in force and the crash path is live again.
+    SelectorMissing,
+}
+
+/// Build the compilation descriptor, reporting what it managed to do.
+///
+/// Returns a `+1`-retained descriptor (or null) that the caller must release.
+/// Kept as one function so the probe below and the compile path can never
+/// disagree about whether the mitigation applied.
+unsafe fn compilation_descriptor() -> (*mut Object, SyncCompile) {
+    unsafe {
+        if rlx_ir::env::flag("RLX_MPSGRAPH_NO_SYNC_COMPILE") {
+            return (std::ptr::null_mut(), SyncCompile::DisabledByEnv);
+        }
+        let Some(cls) = Class::get("MPSGraphCompilationDescriptor") else {
+            return (std::ptr::null_mut(), SyncCompile::ClassMissing);
+        };
+        let d: *mut Object = msg_send![cls, new];
+        let responds: bool =
+            msg_send![d, respondsToSelector: sel!(setWaitForCompilationCompletion:)];
+        if !responds {
+            return (d, SyncCompile::SelectorMissing);
+        }
+        let _: () = msg_send![d, setWaitForCompilationCompletion: true];
+        (d, SyncCompile::Applied)
+    }
+}
+
+/// Ask whether the synchronous-compile mitigation is in force, without
+/// compiling anything.
+pub fn sync_compile_status() -> SyncCompile {
+    unsafe {
+        let (desc, status) = compilation_descriptor();
+        if !desc.is_null() {
+            let _: () = msg_send![desc, release];
+        }
+        status
+    }
+}
+
 /// Compute composite activations (gelu/silu/…) in the input's low precision
 /// instead of up-casting to f32. Off by default (f32 is correct); opt in with
 /// `RLX_MPS_LOWP_ACT=1` for lower bandwidth at some accuracy cost.
 fn lowp_activations() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("RLX_MPS_LOWP_ACT").is_ok_and(|v| v != "0" && !v.is_empty()))
+    *V.get_or_init(|| {
+        rlx_ir::env::var("RLX_MPS_LOWP_ACT").is_some_and(|v| v != "0" && !v.is_empty())
+    })
 }
 
 /// Owned wrapper around an MPSGraph instance. Drop releases.
@@ -1360,7 +1426,7 @@ impl MpsGraph {
     }
 
     /// Forward 2-D convolution in NCHW/OIHW (training layout). Mirrors
-    /// [`conv2d`] but with the NCHW data layout the autodiff CNN uses, and
+    /// [`Self::conv2d`] but with the NCHW data layout the autodiff CNN uses, and
     /// exposes dilation/groups so the matching gradient descriptors agree.
     pub fn conv2d_nchw(
         &self,
@@ -1672,21 +1738,7 @@ impl MpsGraph {
             // the ~2% crash: zero crashes with it on bounds the rate but says
             // nothing about cause, since an OS update would look identical.
             // See scripts/mpsgraph-soak.sh.
-            let force_nil = rlx_ir::env::flag("RLX_MPSGRAPH_NO_SYNC_COMPILE");
-            let desc: *mut Object = match Class::get("MPSGraphCompilationDescriptor")
-                .filter(|_| !force_nil)
-            {
-                Some(c) => {
-                    let d: *mut Object = msg_send![c, new];
-                    let responds: bool =
-                        msg_send![d, respondsToSelector: sel!(setWaitForCompilationCompletion:)];
-                    if responds {
-                        let _: () = msg_send![d, setWaitForCompilationCompletion: true];
-                    }
-                    d
-                }
-                None => std::ptr::null_mut(),
-            };
+            let (desc, _status) = compilation_descriptor();
             let exec: *mut Object = msg_send![self.obj,
                 compileWithDevice: mpsg_dev
                 feeds: feeds
@@ -2010,6 +2062,38 @@ impl MpsTensor {
         }
     }
 
+    /// Element count of the underlying MPSGraph tensor, as MPSGraph itself sees
+    /// it. `None` when any axis is dynamic (MPSGraph reports `-1`).
+    ///
+    /// This can differ from the IR's declared count: MPSGraph left-pads rank and
+    /// some lowerings hand on a tensor that still carries an axis the IR has
+    /// already reduced. Deciding reshape-vs-broadcast from the IR count alone
+    /// then emits an `mps.reshape` whose operands don't match, and MPSGraph
+    /// answers that with `failed assertion 'original module failed verification'`
+    /// — an `abort()`, which no Rust caller can catch.
+    pub(crate) fn mps_elems(&self) -> Option<usize> {
+        unsafe {
+            let shape: *mut Object = msg_send![self.obj, shape];
+            if shape.is_null() {
+                return None;
+            }
+            let count: usize = msg_send![shape, count];
+            let mut n: usize = 1;
+            for i in 0..count {
+                let dim: *mut Object = msg_send![shape, objectAtIndex: i];
+                if dim.is_null() {
+                    return None;
+                }
+                let v: i64 = msg_send![dim, longLongValue];
+                if v < 0 {
+                    return None; // dynamic axis — no static count to compare
+                }
+                n = n.saturating_mul(v as usize);
+            }
+            Some(n)
+        }
+    }
+
     /// Sequence length for `[B, S, NH·DH]` attention inputs. Prefer `fallback`
     /// when element count matches logical seq; otherwise use padded axis (KV cache).
     fn infer_attn_seq(
@@ -2138,7 +2222,7 @@ unsafe fn mps_tensor_data_from_buffer(
             length: bytes as u64
             options: 0u64 // MTLResourceStorageModeShared
             deallocator: std::ptr::null::<Object>()];
-            if std::env::var_os("RLX_METAL_DEBUG").is_some() && view.is_null() {
+            if rlx_ir::env::var_os("RLX_METAL_DEBUG").is_some() && view.is_null() {
                 eprintln!(
                     "[rlx-metal] newBufferWithBytesNoCopy NIL: offset={offset} bytes={bytes} \
                      ptr_page_aligned={} len_page_aligned={}",
@@ -2146,7 +2230,7 @@ unsafe fn mps_tensor_data_from_buffer(
                     bytes.is_multiple_of(16384),
                 );
             }
-            if std::env::var_os("RLX_MPS_ALIGN_DEBUG").is_some() {
+            if rlx_ir::env::var_os("RLX_MPS_ALIGN_DEBUG").is_some() {
                 eprintln!(
                     "[mps-align] offset={offset} bytes={bytes} ptr_align16k={} off_align16k={} over4g={} null={}",
                     (raw_ptr as usize).is_multiple_of(16384),

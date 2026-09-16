@@ -131,7 +131,7 @@ fn run_case(b: usize, lk: usize, nh: usize, nkv: usize, dh: usize) {
 
 #[test]
 fn w8a8_mha_decode_hd128() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -140,7 +140,7 @@ fn w8a8_mha_decode_hd128() {
 
 #[test]
 fn w8a8_gqa_decode_hd128() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

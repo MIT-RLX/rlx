@@ -10,6 +10,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 #[derive(Clone, Copy)]
 struct Cfg {
     n: usize,
@@ -128,6 +130,7 @@ fn assert_close(what: &str, a: &[f32], b: &[f32]) {
 
 #[test]
 fn im2col_cpu_runs() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         let out = run_on(&cfg, Device::Cpu);
         assert!(out.iter().all(|x| x.is_finite()), "cpu {name}: non-finite");
@@ -137,6 +140,7 @@ fn im2col_cpu_runs() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn im2col_mlx_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     for (name, cfg) in cfgs() {
         assert_close(
             &format!("im2col mlx {name}"),

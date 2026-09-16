@@ -13,7 +13,7 @@ thread_local! {
     static ACTIVE_OPTS: Cell<Option<FusionOptions>> = const { Cell::new(None) };
 }
 
-/// Fusion target for the current compile (set by [`CompilePipeline`]).
+/// Fusion target for the current compile (set by `CompilePipeline`).
 pub fn active_fusion_target() -> Option<FusionTarget> {
     ACTIVE_TARGET.with(|c| c.get())
 }

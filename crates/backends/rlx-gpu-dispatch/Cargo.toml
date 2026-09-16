@@ -1,0 +1,28 @@
+[package]
+name = "rlx-gpu-dispatch"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Shape-keyed GPU kernel-variant dispatch table + tile parameter space shared by every RLX GPU backend."
+authors.workspace      = true
+license.workspace      = true
+keywords = ["gpu", "dispatch", "autotune", "rlx", "kernels"]
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+# Deliberately dependency-free. This crate holds DECISIONS (which physical
+# schedule for which shape on which device) and the parameter space they range
+# over — no kernel sources, no device APIs, no filesystem, no environment. That
+# is what lets every backend depend on it: rlx-metal has no business linking the
+# CUDA/HIP source strings in rlx-gpu-kernels just to read a dispatch table.
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

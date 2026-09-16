@@ -83,10 +83,22 @@ pub fn run_rope_backward(
     head_dim: u32,
     n_rot: u32,
     cos_len: u32,
+    cos_row_stride: u32,
 ) {
     let mut a = arena(arena_buf, device, queue);
     rlx_gpu_host::run_rope_backward(
-        &mut a, dy, cos, sin, dx, batch, seq, hidden, head_dim, n_rot, cos_len,
+        &mut a,
+        dy,
+        cos,
+        sin,
+        dx,
+        batch,
+        seq,
+        hidden,
+        head_dim,
+        n_rot,
+        cos_len,
+        cos_row_stride,
     );
 }
 

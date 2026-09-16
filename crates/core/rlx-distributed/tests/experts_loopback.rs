@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! End-to-end loopback test for the MoE expert-parallel offload: a 2-rank
 //! `TcpTransport` (rank 0 = orchestrator, rank 1 = worker). The orchestrator
 //! dispatches one MoE layer; the worker computes via a deterministic

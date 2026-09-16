@@ -9,6 +9,8 @@
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn const_f32(g: &mut Graph, xs: &[f32]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
     for &x in xs {
@@ -29,6 +31,7 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_mlx_matches_cpu_pow2() {
+    let _gpu = common::serialize_gpu();
     for &n in &[2usize, 4, 8, 16, 32, 64, 256] {
         let mut re: Vec<f32> = Vec::with_capacity(n);
         let mut im: Vec<f32> = Vec::with_capacity(n);
@@ -65,6 +68,7 @@ fn fft_mlx_matches_cpu_pow2() {
 
 #[test]
 fn fft_mlx_forward_ortho_norm() {
+    let _gpu = common::serialize_gpu();
     use rlx_ir::FftNorm;
 
     let n = 16usize;

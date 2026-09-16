@@ -667,22 +667,29 @@ pub(crate) fn exec_batched_dgemm_f64(t: &Thunk, base: *mut u8) {
         m,
         k,
         n,
+        a_bcast,
+        b_bcast,
     } = t
     else {
         unreachable!()
     };
     {
         let (b_, m_, k_, n_) = (*batch as usize, *m as usize, *k as usize, *n as usize);
-        let a_stride = m_ * k_;
-        let b_stride = k_ * n_;
+        let a_mat = m_ * k_;
+        let b_mat = k_ * n_;
         let c_stride = m_ * n_;
+        // A broadcast operand has batch stride 0 — reuse matrix 0 every step.
+        let a_stride = if *a_bcast { 0 } else { a_mat };
+        let b_stride = if *b_bcast { 0 } else { b_mat };
         unsafe {
-            let a_full = sl_f64(*a, base, b_ * a_stride);
-            let b_full = sl_f64(*b, base, b_ * b_stride);
+            let a_full = sl_f64(*a, base, if *a_bcast { a_mat } else { b_ * a_mat });
+            let b_full = sl_f64(*b, base, if *b_bcast { b_mat } else { b_ * b_mat });
             let c_full = sl_mut_f64(*c, base, b_ * c_stride);
             for bi in 0..b_ {
-                let a_slice = &a_full[bi * a_stride..(bi + 1) * a_stride];
-                let b_slice = &b_full[bi * b_stride..(bi + 1) * b_stride];
+                let ao = bi * a_stride;
+                let bo = bi * b_stride;
+                let a_slice = &a_full[ao..ao + a_mat];
+                let b_slice = &b_full[bo..bo + b_mat];
                 let c_slice = &mut c_full[bi * c_stride..(bi + 1) * c_stride];
                 crate::blas::dgemm(a_slice, b_slice, c_slice, m_, k_, n_);
             }

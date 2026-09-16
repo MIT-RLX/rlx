@@ -98,7 +98,7 @@ fn make_maxpool3d_bwd() -> (Graph, Vec<f32>, Vec<f32>) {
 #[test]
 fn conv3d_backward_input_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda c3d_bwd_in] no CUDA device — skipping");
         return;
     }
@@ -119,7 +119,7 @@ fn conv3d_backward_input_matches_cpu() {
 #[test]
 fn conv3d_backward_input_cudnn_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda c3d_bwd_in.cudnn] no CUDA device — skipping");
         return;
     }
@@ -152,7 +152,7 @@ fn conv3d_backward_input_cudnn_matches_cpu() {
 #[test]
 fn conv3d_backward_input_kernel_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda c3d_bwd_in.kernel] no CUDA device — skipping");
         return;
     }
@@ -181,7 +181,7 @@ fn conv3d_backward_input_kernel_matches_cpu() {
 #[test]
 fn conv3d_backward_weight_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda c3d_bwd_w] no CUDA device — skipping");
         return;
     }
@@ -202,7 +202,7 @@ fn conv3d_backward_weight_matches_cpu() {
 #[test]
 fn conv3d_backward_weight_cudnn_matches_cpu() {
     let _guard = path_lock();
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda c3d_bwd_w.cudnn] no CUDA device — skipping");
         return;
     }
@@ -234,7 +234,7 @@ fn conv3d_backward_weight_cudnn_matches_cpu() {
 
 #[test]
 fn maxpool3d_backward_matches_cpu() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         eprintln!("[rlx-cuda mp3d_bwd] no CUDA device — skipping");
         return;
     }

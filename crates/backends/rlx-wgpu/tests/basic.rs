@@ -40,7 +40,7 @@ fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
 
 #[test]
 fn binary_add_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("add");
@@ -58,7 +58,7 @@ fn binary_add_matches_reference() {
 
 #[test]
 fn binary_max_min_pow_match_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     for (op, want) in [
@@ -83,7 +83,7 @@ fn binary_max_min_pow_match_reference() {
 
 #[test]
 fn activations_relu_silu_match_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("act");
@@ -106,7 +106,7 @@ fn activations_relu_silu_match_reference() {
 
 #[test]
 fn compare_then_where_implements_abs() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("cw");
@@ -127,7 +127,7 @@ fn compare_then_where_implements_abs() {
 
 #[test]
 fn reduce_sum_last_axis_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("rsum");
@@ -147,7 +147,7 @@ fn reduce_sum_last_axis_matches_reference() {
 
 #[test]
 fn reduce_mean_max_min_match_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     for (op, want) in [
@@ -171,7 +171,7 @@ fn reduce_mean_max_min_match_reference() {
 
 #[test]
 fn softmax_last_axis_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("smx");
@@ -195,7 +195,7 @@ fn softmax_last_axis_matches_reference() {
 
 #[test]
 fn layer_norm_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("ln");
@@ -227,9 +227,145 @@ fn layer_norm_matches_reference() {
     );
 }
 
+/// Reference GroupNorm on NCHW: statistics per `(batch, group)` over
+/// `(C/G)*H*W`, then a per-CHANNEL scale/shift.
+fn group_norm_ref(
+    x: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    n: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    groups: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let hw = h * w;
+    let cpg = c / groups;
+    let mut y = vec![0f32; n * c * hw];
+    for ni in 0..n {
+        for gi in 0..groups {
+            let base = ni * c * hw + gi * cpg * hw;
+            let span = cpg * hw;
+            let mean = (0..span).map(|i| x[base + i]).sum::<f32>() / span as f32;
+            let var = (0..span).map(|i| (x[base + i] - mean).powi(2)).sum::<f32>() / span as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            for i in 0..span {
+                let ch = gi * cpg + i / hw;
+                y[base + i] = (x[base + i] - mean) * inv * gamma[ch] + beta[ch];
+            }
+        }
+    }
+    y
+}
+
+/// Native WGSL `Op::GroupNorm` against the CPU formula.
+///
+/// Covers `groups == c` (instance norm), `groups == 1` (norm over all of CHW)
+/// and an intermediate — the group indexing and the per-channel gamma/beta
+/// lookup differ in each case. Previously this op lowered to `GroupNormHost`,
+/// a whole-arena device→host→device round-trip per norm.
+#[test]
+fn group_norm_matches_reference() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let (n, c, h, w) = (2usize, 6usize, 5usize, 3usize);
+    let hw = h * w;
+    let xs: Vec<f32> = (0..n * c * hw)
+        .map(|i| ((i * 37 % 101) as f32 / 101.0) - 0.5 + (i % 7) as f32 * 0.25)
+        .collect();
+    let gamma: Vec<f32> = (0..c).map(|i| 1.0 + i as f32 * 0.1).collect();
+    let beta: Vec<f32> = (0..c).map(|i| i as f32 * 0.05 - 0.15).collect();
+
+    for &groups in &[1usize, 3, 6] {
+        let mut g = Graph::new("gn");
+        let x = g.input("x", Shape::new(&[n, c, h, w], DType::F32));
+        let ga = g.param("g", Shape::new(&[c], DType::F32));
+        let be = g.param("b", Shape::new(&[c], DType::F32));
+        let y = g.add_node(
+            Op::GroupNorm {
+                num_groups: groups,
+                eps: 1e-5,
+            },
+            vec![x, ga, be],
+            Shape::new(&[n, c, h, w], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let mut exe = WgpuExecutable::compile(g);
+        exe.set_param("g", &gamma);
+        exe.set_param("b", &beta);
+        let r = exe.run(&[("x", &xs)]);
+        let want = group_norm_ref(&xs, &gamma, &beta, n, c, h, w, groups, 1e-5);
+        assert!(
+            close(&r[0], &want, 1e-3),
+            "group_norm(groups={groups}) mismatch:\n got {:?}\nwant {want:?}",
+            r[0]
+        );
+    }
+}
+
+/// The divergence that motivated the native kernel only showed up once the
+/// norm had a *consumer*: with the norm as the graph output the host staging
+/// round-trip looked right, and the following op read stale data. Chain two
+/// norms with elementwise ops between them so a regression cannot hide behind
+/// a readback.
+#[test]
+fn group_norm_chain_matches_reference() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let (n, c, h, w) = (1usize, 8usize, 6usize, 6usize);
+    let hw = h * w;
+    let xs: Vec<f32> = (0..n * c * hw)
+        .map(|i| ((i * 53 % 197) as f32 / 197.0) - 0.5)
+        .collect();
+    let gamma: Vec<f32> = (0..c).map(|i| 1.0 + i as f32 * 0.05).collect();
+    let beta: Vec<f32> = (0..c).map(|i| i as f32 * 0.02 - 0.08).collect();
+
+    let sh = Shape::new(&[n, c, h, w], DType::F32);
+    let mut g = Graph::new("gn_chain");
+    let x = g.input("x", sh.clone());
+    let ga = g.param("g", Shape::new(&[c], DType::F32));
+    let be = g.param("b", Shape::new(&[c], DType::F32));
+    let n1 = g.add_node(
+        Op::GroupNorm {
+            num_groups: c,
+            eps: 1e-5,
+        },
+        vec![x, ga, be],
+        sh.clone(),
+    );
+    let r1 = g.add_node(Op::Activation(Activation::Relu), vec![n1], sh.clone());
+    let n2 = g.add_node(
+        Op::GroupNorm {
+            num_groups: c,
+            eps: 1e-5,
+        },
+        vec![r1, ga, be],
+        sh.clone(),
+    );
+    let r2 = g.add_node(Op::Activation(Activation::Relu), vec![n2], sh.clone());
+    g.set_outputs(vec![r2]);
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("g", &gamma);
+    exe.set_param("b", &beta);
+    let got = exe.run(&[("x", &xs)]);
+
+    let a = group_norm_ref(&xs, &gamma, &beta, n, c, h, w, c, 1e-5);
+    let a: Vec<f32> = a.iter().map(|v| v.max(0.0)).collect();
+    let b = group_norm_ref(&a, &gamma, &beta, n, c, h, w, c, 1e-5);
+    let want: Vec<f32> = b.iter().map(|v| v.max(0.0)).collect();
+    assert!(
+        close(&got[0], &want, 1e-3),
+        "group_norm chain mismatch:\n got {:?}\nwant {want:?}",
+        got[0]
+    );
+}
+
 #[test]
 fn cumsum_inclusive_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("cs");
@@ -243,7 +379,7 @@ fn cumsum_inclusive_matches_reference() {
 
 #[test]
 fn reshape_passes_data_through() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("rs");
@@ -257,7 +393,7 @@ fn reshape_passes_data_through() {
 
 #[test]
 fn transpose_2x3_to_3x2_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("tr");
@@ -284,7 +420,7 @@ fn transpose_2x3_to_3x2_matches_reference() {
 /// a scratch copy inside a weight-anchored bind window (no writeback).
 #[test]
 fn transpose_param_then_matmul_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("tr_param_mm");
@@ -306,7 +442,7 @@ fn transpose_param_then_matmul_matches_reference() {
 
 #[test]
 fn transpose_bhsd_layout_swap_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // [B=1, H=2, S=2, D=2] → perm [0, 2, 1, 3] → [B, S, H, D]
@@ -335,7 +471,7 @@ fn transpose_bhsd_layout_swap_matches_reference() {
 
 #[test]
 fn narrow_axis2_slice_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // [1, 1, 4] → narrow(axis=2, start=1, len=2) → [1, 1, 2]
@@ -358,7 +494,7 @@ fn narrow_axis2_slice_matches_reference() {
 
 #[test]
 fn concat_axis_minus_one_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("cat");
@@ -380,7 +516,7 @@ fn concat_axis_minus_one_matches_reference() {
 
 #[test]
 fn gather_embedding_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("gat");
@@ -494,7 +630,7 @@ fn cpu_attention_bshd(
 /// EEG-DINO QKV path: mm → reshape [B,S,3,H,D] → narrow×3 → reshape → attention.
 #[test]
 fn matmul_eeg_qkv_shape_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -527,7 +663,7 @@ fn matmul_eeg_qkv_shape_matches_cpu() {
 
 #[test]
 fn eeg_qkv_matmul_batched_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -561,7 +697,7 @@ fn eeg_qkv_matmul_batched_matches_cpu() {
 
 #[test]
 fn eeg_qkv_fmb_and_narrows_match_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -613,7 +749,7 @@ fn eeg_qkv_fmb_and_narrows_match_cpu() {
 
 #[test]
 fn eeg_qkv_tensors_gpu_match_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -698,7 +834,7 @@ fn eeg_qkv_tensors_gpu_match_cpu() {
 
 #[test]
 fn eeg_attention_with_cpu_qkv_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -823,7 +959,7 @@ fn eeg_attention_with_cpu_qkv_matches_cpu() {
 
 #[test]
 fn attention_in_graph_does_not_change_qkv_activations() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -938,7 +1074,7 @@ fn attention_in_graph_does_not_change_qkv_activations() {
 
 #[test]
 fn eeg_qkv4_after_fmb_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -1063,7 +1199,7 @@ fn detect_packed_bshd_on_eeg_chain_graph() {
 
 #[test]
 fn wgpu_chain_attention_uses_packed_qkv_stride() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -1144,7 +1280,7 @@ fn wgpu_chain_attention_uses_packed_qkv_stride() {
 
 #[test]
 fn wgpu_packed_attn_matches_strided_cpu_ref() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -1239,7 +1375,7 @@ fn wgpu_packed_attn_matches_strided_cpu_ref() {
 
 #[test]
 fn encoder_qkv_attention_chain_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -1333,7 +1469,7 @@ fn encoder_qkv_attention_chain_matches_cpu() {
 
 #[test]
 fn attention_bshd_eeg_shape_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let (b, s, nh, dh) = (1, 191, 8, 25);
@@ -1381,7 +1517,7 @@ fn attention_bshd_eeg_shape_matches_cpu() {
 
 #[test]
 fn attention_no_mask_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Tiny attention: B=1, H=1, S=2, D=2. Same hand-computed
@@ -1422,7 +1558,7 @@ fn attention_no_mask_matches_reference() {
 
 #[test]
 fn rope_identity_passes_through() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // cos = 1, sin = 0 → rope is identity.
@@ -1451,7 +1587,7 @@ fn rope_identity_passes_through() {
 
 #[test]
 fn rope_90_degree_rotation_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // cos = 0, sin = 1 at all positions → 90° rotation.
@@ -1493,7 +1629,7 @@ fn rope_90_degree_rotation_matches_reference() {
 /// a result distinct from NeoX. Mirrors `metal_rope_gptj_interleaved_matches_cpu`.
 #[test]
 fn rope_gptj_interleaved_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -1565,7 +1701,7 @@ fn rope_gptj_interleaved_matches_cpu() {
 
 #[test]
 fn expand_broadcast_replicates_values() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Input [1, 3] → expand to [2, 3]. Each row of the output is a
@@ -1587,7 +1723,7 @@ fn expand_broadcast_replicates_values() {
 
 #[test]
 fn dot_general_canonical_matches_matmul() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("dg");
@@ -1613,7 +1749,7 @@ fn dot_general_canonical_matches_matmul() {
 
 #[test]
 fn sample_argmax_picks_dominant_logit() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("samp");
@@ -1636,7 +1772,7 @@ fn sample_argmax_picks_dominant_logit() {
 
 #[test]
 fn pool_2x2_max_stride_2_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("pool");
@@ -1660,7 +1796,7 @@ fn pool_2x2_max_stride_2_matches_reference() {
 
 #[test]
 fn conv2d_1x1_identity_matches_input() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // 1x1 conv with weight=1 and groups=1 → identity copy of input.
@@ -1687,7 +1823,7 @@ fn conv2d_1x1_identity_matches_input() {
 
 #[test]
 fn conv2d_general_matches_cpu_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // General image-shaped conv (kh=kw=3, stride 2, pad 1, 2->3 channels). H_out=
@@ -1762,7 +1898,7 @@ fn conv1d_tiled_one_d_matches_cpu_reference() {
     // `[1, C, 1, L]` with kernel `[k, 1]` and a long length (h_out ≥ the tiled
     // routing threshold), with stride/padding/dilation. Verifies bit-close
     // parity with a hand-computed 1D reference in the same accumulation order.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let (c_in, c_out, l, k, s, p, d) = (3usize, 5usize, 300usize, 3usize, 1usize, 1usize, 2usize);
@@ -1826,7 +1962,7 @@ fn conv1d_tiled_one_d_matches_cpu_reference() {
 
 #[test]
 fn pool1d_max_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("pool1d");
@@ -1849,7 +1985,7 @@ fn pool1d_max_matches_reference() {
 
 #[test]
 fn pool3d_max_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("pool3d");
@@ -1873,7 +2009,7 @@ fn pool3d_max_matches_reference() {
 
 #[test]
 fn conv1d_simple_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("conv1d");
@@ -1900,7 +2036,7 @@ fn conv1d_simple_matches_reference() {
 
 #[test]
 fn conv3d_1x1x1_identity_matches_input() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("conv3d");
@@ -1927,7 +2063,7 @@ fn conv3d_1x1x1_identity_matches_input() {
 
 #[test]
 fn fused_matmul_bias_act_matches_unfused_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // FusedMatMulBiasAct → MatMul + Add(bias) + Relu via the unfusion pass.
@@ -1965,7 +2101,7 @@ fn fused_matmul_bias_act_matches_unfused_reference() {
 
 #[test]
 fn fused_residual_ln_matches_unfused_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // FusedResidualLN(x, residual, bias=None, gamma, beta, eps) → Add + LN.
@@ -2003,7 +2139,7 @@ fn fused_residual_ln_matches_unfused_reference() {
 
 #[test]
 fn fused_residual_rms_norm_matches_unfused_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("frrms");
@@ -2038,7 +2174,7 @@ fn fused_residual_rms_norm_matches_unfused_reference() {
 
 #[test]
 fn fused_swiglu_matches_unfused_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // FusedSwiGLU([..., 2N]) → up * silu(gate) where up = first N, gate = next N.
@@ -2075,7 +2211,7 @@ fn fused_swiglu_matches_unfused_reference() {
 
 #[test]
 fn lora_matmul_matches_unfused_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // LoraMatMul: out = x@W + scale * (x@A) @ B.
@@ -2114,7 +2250,7 @@ fn lora_matmul_matches_unfused_reference() {
 
 #[test]
 fn gelu_eeg_tensor_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx::prelude::*;
@@ -2152,7 +2288,7 @@ fn gelu_eeg_tensor_matches_cpu() {
 
 #[test]
 fn gelu_finite_for_large_inputs() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Regression: naive tanh on the GELU inner expansion overflows
@@ -2183,7 +2319,7 @@ fn gelu_finite_for_large_inputs() {
 
 #[test]
 fn attention_rank3_with_2d_mask_produces_finite_output() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // BERT-flavored: rank-3 [B, S, H*D] inputs, [B, S] padding mask.
@@ -2231,7 +2367,7 @@ fn attention_rank3_with_2d_mask_produces_finite_output() {
 
 #[test]
 fn fused_attention_block_end_to_end() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // FusedAttentionBlock through the unfusion pass exercises the full
@@ -2307,7 +2443,7 @@ fn fused_attention_block_end_to_end() {
 
 #[test]
 fn selective_scan_minimum_config_matches_cpu_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // B=1, S=2, H=2, N=2. Hand-checkable values.
@@ -2368,7 +2504,7 @@ fn selective_scan_minimum_config_matches_cpu_reference() {
 
 #[test]
 fn gated_delta_net_matches_cpu_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let (b, s, h, n) = (1, 4, 2, 3);
@@ -2469,7 +2605,7 @@ fn gated_delta_net_matches_cpu_reference() {
 
 #[test]
 fn dequant_matmul_int8_symmetric_matches_dequant_then_matmul() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::QuantScheme;
@@ -2534,7 +2670,7 @@ fn dequant_matmul_int8_symmetric_matches_dequant_then_matmul() {
 
 #[test]
 fn dequant_matmul_int4_symmetric_matches_dequant_then_matmul() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::QuantScheme;
@@ -2605,7 +2741,7 @@ fn dequant_matmul_int4_symmetric_matches_dequant_then_matmul() {
 
 #[test]
 fn dequant_matmul_nvfp4_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::{NVFP4_GROUP_SIZE, fp4_e2m1_to_f32, fp8_e4m3_scale_to_f32};
@@ -2690,7 +2826,7 @@ fn e5m2_to_f32(byte: u8) -> f32 {
 
 #[test]
 fn dequant_matmul_fp8_e4m3_matches_decode_then_matmul() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::QuantScheme;
@@ -2737,7 +2873,7 @@ fn dequant_matmul_fp8_e4m3_matches_decode_then_matmul() {
 
 #[test]
 fn dequant_matmul_fp8_e5m2_matches_decode_then_matmul() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::QuantScheme;
@@ -2785,7 +2921,7 @@ fn dequant_matmul_fp8_e5m2_matches_decode_then_matmul() {
 
 #[test]
 fn dynamic_shape_auto_infers_at_run_time() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::shape::Dim;
@@ -2825,7 +2961,7 @@ fn dynamic_shape_auto_infers_at_run_time() {
 
 #[test]
 fn dynamic_shape_resolves_via_compile_with_bindings() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::shape::{Dim, DimBinding};
@@ -2867,7 +3003,7 @@ fn dynamic_shape_resolves_via_compile_with_bindings() {
 
 #[test]
 fn op_if_picks_branch_per_predicate() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Build two trivial branches: then = x + 1, else = x * 2.
@@ -2945,7 +3081,7 @@ fn op_if_picks_branch_per_predicate() {
 
 #[test]
 fn op_while_unrolls_until_cond_false() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // body: x = x * 2.   cond: x[0] < 16.
@@ -3007,7 +3143,7 @@ fn op_while_unrolls_until_cond_false() {
 
 #[test]
 fn dot_general_batched_matches_per_batch_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Batched DotGeneral: lhs[B,M,K] · rhs[B,K,N] → [B,M,N].
@@ -3046,7 +3182,7 @@ fn dot_general_batched_matches_per_batch_reference() {
 
 #[test]
 fn dot_general_lhs_transposed_matches_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // lhs[K, M] · rhs[K, N] → [M, N]. Contracting on axis 0 of both inputs.
@@ -3084,7 +3220,7 @@ fn dot_general_lhs_transposed_matches_reference() {
 
 #[test]
 fn sample_top_k_one_collapses_to_argmax() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("samp-k1");
@@ -3162,7 +3298,7 @@ fn threefry_reference_distributes_uniformly() {
 
 #[test]
 fn sample_threefry_seed_is_deterministic_and_distributes() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Force the Sample kernel path (not the greedy argmax fast-path)
@@ -3206,7 +3342,7 @@ fn sample_threefry_seed_is_deterministic_and_distributes() {
 
 #[test]
 fn sample_gumbel_max_concentrates_on_dominant_logit() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Logit profile heavily favors token 3. Gumbel-max draws should
@@ -3244,7 +3380,7 @@ fn sample_gumbel_max_concentrates_on_dominant_logit() {
 
 #[test]
 fn sample_top_p_zero_collapses_to_argmax() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // top_p just barely above zero forces selection of the single largest
@@ -3273,7 +3409,7 @@ fn sample_top_p_zero_collapses_to_argmax() {
 
 #[test]
 fn attention_causal_mask_zeros_future_tokens() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // [B=1, H=1, S=2, D=2]. Causal: token 0 attends only to token 0;
@@ -3321,7 +3457,7 @@ fn attention_causal_mask_zeros_future_tokens() {
 
 #[test]
 fn attention_sliding_window_limits_lookback() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Window=0 means qi attends only to ki==qi (a strictly diagonal mask).
@@ -3357,7 +3493,7 @@ fn attention_sliding_window_limits_lookback() {
 
 #[test]
 fn grouped_matmul_routes_per_token_to_expert() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // 2 tokens, 2 experts. K=2, N=2.
@@ -3402,7 +3538,7 @@ fn grouped_matmul_routes_per_token_to_expert() {
 
 #[test]
 fn topk_picks_largest_three_indices() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let mut g = Graph::new("topk");
@@ -3420,7 +3556,7 @@ fn topk_picks_largest_three_indices() {
 
 #[test]
 fn batched_matmul_3d_by_3d_matches_per_batch_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // [B=2, M=2, K=3] @ [B=2, K=3, N=2] → [B=2, M=2, N=2].
@@ -3454,7 +3590,7 @@ fn batched_matmul_3d_by_3d_matches_per_batch_reference() {
 
 #[test]
 fn batched_matmul_3d_by_2d_matches_per_row_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // [B=2, S=2, K=3] @ [K=3, N=2] → [B=2, S=2, N=2]
@@ -3479,7 +3615,7 @@ fn batched_matmul_3d_by_2d_matches_per_row_reference() {
 
 #[test]
 fn scatter_add_accumulates_into_destination() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     // Output: [3 rows, 2 trailing]. Updates: 4 rows × 2 trailing.
@@ -3490,7 +3626,7 @@ fn scatter_add_accumulates_into_destination() {
     let upd = g.input("upd", Shape::new(&[4, 2], DType::F32));
     let idx = g.input("idx", Shape::new(&[4], DType::F32));
     let y = g.add_node(
-        Op::ScatterAdd,
+        Op::ScatterAdd { axis: 0 },
         vec![upd, idx],
         Shape::new(&[3, 2], DType::F32),
     );
@@ -3545,7 +3681,7 @@ fn wgpu_run_and_check(
 fn bisect_wgpu_gather_only() {
     // Just embedding lookup — simplest BERT op. Tests if `gather`
     // alone produces NaN.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let f = DType::F32;
@@ -3573,7 +3709,7 @@ fn bisect_wgpu_gather_only() {
 
 #[test]
 fn bisect_wgpu_gather_then_layernorm() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let f = DType::F32;
@@ -3618,7 +3754,7 @@ fn bisect_wgpu_gather_then_layernorm() {
 #[test]
 fn bisect_wgpu_matmul_bias_narrow() {
     // matmul + bias + 3 narrows, the QKV pattern.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::BinaryOp;
@@ -3660,7 +3796,7 @@ fn bisect_wgpu_matmul_bias_narrow() {
 #[test]
 fn bisect_wgpu_attention_with_qkv_chain() {
     // Full attention chain: matmul(qkv) + bias + 3 narrows + attention.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::BinaryOp;
@@ -3740,7 +3876,7 @@ fn bisect_wgpu_attention_with_qkv_chain() {
 
 #[test]
 fn bisect_wgpu_fused_residual_ln() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let f = DType::F32;
@@ -3785,7 +3921,7 @@ fn bisect_wgpu_full_bert_layer() {
     // Full BERT layer: embedding → LN → attention block → residual+LN
     // → FFN(gelu) → residual+LN. This replicates the structure that
     // makes the 5way_parity bench output NaN.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::{Activation, BinaryOp};
@@ -3965,7 +4101,7 @@ fn bisect_wgpu_full_bert_realistic_dim() {
     // Same single-layer BERT as `bisect_wgpu_full_bert_layer` but
     // with realistic dims (h=384, the MiniLM6 hidden size). Tests
     // whether wgpu breaks at production-scale shapes.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::{Activation, BinaryOp};
@@ -4138,7 +4274,7 @@ fn bisect_wgpu_full_bert_layer_stack() {
     // Hand-built 2-layer BERT-ish graph (same structure as production
     // BERT builders), then run on wgpu and check for NaN.
     // Smaller cfg than minilm6 to keep the test fast.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let f = DType::F32;
@@ -4300,7 +4436,7 @@ fn bisect_wgpu_full_bert_layer_stack() {
 fn bisect_wgpu_bert_input_prep() {
     // 3 gathers (word + position + token_type) + 2 adds + LN.
     // This is the BERT embedding prep that the bench actually uses.
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::BinaryOp;
@@ -4390,7 +4526,7 @@ fn region_relu_matches_atomic() {
     // the storage-binding path is broken end-to-end. Tests output
     // against CPU-reference values directly (rather than against the
     // atomic graph, which would also be running on wgpu).
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     use rlx_ir::op::{ChainOperand, ChainStep};
@@ -4427,7 +4563,7 @@ fn region_relu_matches_atomic() {
 
 #[test]
 fn matmul_2x3x2_matches_cpu_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("rlx-wgpu: no compatible adapter; skipping test");
         return;
     }
@@ -4450,7 +4586,7 @@ fn matmul_2x3x2_matches_cpu_reference() {
 
 #[test]
 fn welch_peaks_gpu_matches_cpu_reference() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
     let batch = 8usize;

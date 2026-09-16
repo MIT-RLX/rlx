@@ -16,7 +16,7 @@
 //!   layer-structured LLMs (rlx-qwen3 ships a `BlockRunner`).
 //! - **Graph-node pipeline** ([`graph`]) — partition an arbitrary compiled
 //!   [`rlx_ir::Graph`] into weight-sharded subgraph stages joined by named
-//!   boundary tensors ([`graph::partition`]), executed in-process
+//!   boundary tensors ([`graph::partition`](fn@graph::partition)), executed in-process
 //!   ([`graph::run_pipeline_local`]) or over TCP ([`graph::serve_stage`] +
 //!   [`graph::Pipeline::run_tcp`]). Use it when a model isn't a clean layer
 //!   stack (e.g. the DeepSeek-V4 graph) or you want automatic weight sharding.
@@ -31,6 +31,7 @@ pub mod config;
 pub mod experts;
 pub mod graph;
 pub mod launch;
+pub mod paging;
 pub mod partition;
 pub mod pipeline;
 pub mod source;
@@ -45,6 +46,9 @@ pub use pipeline::{BlockInput, BlockOutput, BlockRunner, PipelineCoordinator};
 pub use experts::{
     ExpertProvider, ExpertShards, dispatch_experts, serve_expert_worker, shutdown_expert_workers,
 };
+pub use paging::{BankIx, BankLocation, ExpertPager, PagerStats};
+#[cfg(feature = "gguf")]
+pub use paging::{GGUF_MOE_BANKS, register_gguf_expert_banks};
 
 // Re-export the transport primitives so model crates depend only on
 // `rlx-distributed`, not `rlx-driver` directly.

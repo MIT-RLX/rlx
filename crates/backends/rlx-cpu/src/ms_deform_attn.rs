@@ -14,10 +14,10 @@
 //!   0 query [nq, d]
 //!   1 value_src [seq, d]
 //!   2 reference_points [nq, n_levels, ref_dim]   (ref_dim 2 = centers, 4 = boxes)
-//!   3 value_proj.weight [d, d]        4 value_proj.bias [d]
-//!   5 sampling_offsets.weight [H, d]  6 sampling_offsets.bias [H]   (H = nh*nl*np*2)
-//!   7 attention_weights.weight [A, d] 8 attention_weights.bias [A]  (A = nh*nl*np)
-//!   9 output_proj.weight [d, d]      10 output_proj.bias [d]
+//!   3 value_proj.weight [d, d]        4 value_proj.bias `d`
+//!   5 sampling_offsets.weight [H, d]  6 sampling_offsets.bias `H`   (H = nh*nl*np*2)
+//!   7 attention_weights.weight [A, d] 8 attention_weights.bias `A`  (A = nh*nl*np)
+//!   9 output_proj.weight [d, d]      10 output_proj.bias `d`
 //!
 //! Attributes (LE u32): `[d, nh, np, ref_dim, nl, (h, w) * nl]`.
 

@@ -130,6 +130,15 @@ pub struct CudaExecutable {
     graph: Graph,
     arena: Arena,
     schedule: Vec<Step>,
+    /// Schedule indices that materialise a static weight pack (`Concat` over
+    /// `Param`s — the fused QKV / gate+up weights). Invariant across runs, so
+    /// they are replayed once and skipped after. See `compile.rs` for the two
+    /// conditions that make skipping sound.
+    static_once_steps: std::collections::HashSet<usize>,
+    /// Whether those steps have run at least once, i.e. the skip is armed.
+    /// Cleared by any `set_param*`, or a re-bound weight would never reach the
+    /// pack and the GEMM would silently use stale weights.
+    static_once_done: bool,
     input_offsets: HashMap<String, NodeId>,
     param_offsets: HashMap<String, NodeId>,
     /// Per-step side buffers for kernels that need per-axis u32 metadata
@@ -152,6 +161,10 @@ pub struct CudaExecutable {
     /// same stream they were captured on. Created lazily on the first
     /// segmented run.
     segment_stream: Option<Arc<cudarc::driver::CudaStream>>,
+    /// Event marking the most recent host→device write (`set_param*`), so the
+    /// next dispatch can order itself after it even when the two ran on
+    /// different streams. Consumed by `run_inner`. See `note_host_write`.
+    pending_host_write: Option<cudarc::driver::CudaEvent>,
     /// Whether the first segmented run has warmed the kernel cache. Module load
     /// (`cuModuleLoadData`) and first-use cuBLAS workspace `cudaMalloc` are both
     /// ILLEGAL during stream capture, so the first segmented run dispatches

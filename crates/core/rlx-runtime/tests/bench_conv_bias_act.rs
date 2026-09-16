@@ -17,8 +17,10 @@
 
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::*;
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
 use std::time::Instant;
+
+mod common;
 
 struct Shape5 {
     name: &'static str,
@@ -61,7 +63,8 @@ fn build(s: &Shape5) -> Graph {
 #[test]
 #[ignore = "rig-only conv-bias-act microbenchmark; run with --ignored --nocapture"]
 fn bench_conv_bias_act_cuda() {
-    if !is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("skip: no CUDA device");
         return;
     }

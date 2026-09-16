@@ -7,18 +7,19 @@ use rlx_ir::Op;
 use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
     AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
-    BinaryC64Params, BinaryParams, CastParams, ComplexCastParams, ComplexWirtingerParams,
-    Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
-    CopyParams, CumScanParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams,
-    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
-    FftButterflyStageParams, FmaParams, FusedConvBiasActParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
-    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupNormBwdParams, GroupedMatmulParams, GruParams, Im2Col2dParams,
-    LayerNormBwdParams, LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams,
-    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
-    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScaledGroupedMatmulParams, ScatterAddParams, SceBwdParams, SceParams,
+    BatchNormInferenceParams, BinaryC64Params, BinaryParams, CastParams, ComplexCastParams,
+    ComplexWirtingerParams, Conv1dParams, Conv2dParams, Conv3dBwdInputParams,
+    Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams, CumsumBwdParams, CumsumParams,
+    DequantMatmulMlxParams, DequantMatmulParams, ElementwiseRegionParams, ExpandParams,
+    FakeQuantizeParams, FftButterflyStageParams, FmaParams, FusedConvBiasActParams,
+    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
+    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
+    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
+    GruParams, Im2Col2dParams, IndexingNdParams, LayerNormBwdParams, LayerNormParams, LstmParams,
+    Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
+    Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params,
+    ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams,
+    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
     SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
     WelchPeaksGpuParams, WhereParams,
 };
@@ -44,6 +45,47 @@ pub(crate) struct CastF32ToF16Params {
 }
 unsafe impl bytemuck::Pod for CastF32ToF16Params {}
 unsafe impl bytemuck::Zeroable for CastF32ToF16Params {}
+
+/// Which `batch_norm_inference.wgsl` entry point a
+/// [`Step::BatchNormInference`] dispatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchNormKernel {
+    Forward,
+    BwdInput,
+    BwdGamma,
+    BwdBeta,
+}
+
+/// Which `quant_i8.wgsl` entry point a [`Step::QuantI8`] dispatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuantI8Kernel {
+    Quantize,
+    Dequantize,
+}
+
+/// Which `scaled_lowp.wgsl` entry point a [`Step::ScaledLowp`] dispatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScaledLowpKernel {
+    QuantScale,
+    Quantize,
+    Dequantize,
+    MatmulDecode,
+}
+
+/// Which `indexing_nd.wgsl` entry point a [`Step::IndexingNd`] dispatches.
+///
+/// Separate from `rlx_gpu_dispatch::indexing::KernelKind` because that carries
+/// the kernel's scalars, which here already live in [`IndexingNdParams`], and
+/// because wgpu needs a fifth variant the CUDA path folds into its launch: the
+/// scatter prologue is its own dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexingNdKernel {
+    GatherNd,
+    GatherElements,
+    ScatterElements,
+    ScatterNd,
+    CopySanitize,
+}
 
 /// One dispatch step in the compiled schedule.
 ///
@@ -125,6 +167,11 @@ pub(crate) enum Step {
     LayerNorm {
         params: LayerNormParams,
     },
+    /// Native WGSL NCHW GroupNorm (replaces the whole-arena `GroupNormHost`
+    /// staging on backends where GPU norms are trusted).
+    GroupNorm {
+        params: GroupNormParams,
+    },
     Cumsum {
         params: CumsumParams,
     },
@@ -151,6 +198,19 @@ pub(crate) enum Step {
         norm_tag: u32,
         dtype_tag: u32,
     },
+    /// Fixed-point 1D FFT (`Op::FftQ`) — host fallback.
+    ///
+    /// The arena holds integer tensors as f32 *values*, so the adapter converts
+    /// f32->i32 on the way in and back on the way out.
+    FftQHost {
+        src_byte_off: u32,
+        dst_byte_off: u32,
+        outer: u32,
+        n_complex: u32,
+        inverse: bool,
+        norm_tag: u32,
+        scale_tag: u32,
+    },
     /// Core Riemannian / SPD-manifold op (BiMap / ReEig / LogEig /
     /// SpdBatchNorm / SpdKarcherMean + backwards) — no WGSL eigen kernel, so
     /// each operand's arena span is read back, computed in F64 via
@@ -172,8 +232,60 @@ pub(crate) enum Step {
     },
     /// Native CPU ScatterNd / ScatterElements / GatherNd / GatherElements
     /// via span readback (correct for `I64` indices; no mini-graph rebuild).
+    ///
+    /// The residual fallback for shapes [`Step::IndexingNd`] declines — packed
+    /// I64 indices, non-f32 gathered elements, any non-overwrite reduction, and
+    /// the two CPU-only ScatterElements branches.
     CpuIndexing {
         thunk: rlx_cpu::thunk::IndexingThunk,
+    },
+    /// Native on-device ONNX ND indexing (`indexing_nd.wgsl`).
+    ///
+    /// Replaces the `Step::CpuIndexing` readback → CPU → upload round trip for
+    /// the shapes [`rlx_gpu_dispatch::indexing`] can plan. One step is one
+    /// dispatch, so a scatter emits two: the `CopySanitize` prologue and then
+    /// the scatter itself.
+    IndexingNd {
+        params: IndexingNdParams,
+        kernel: IndexingNdKernel,
+        meta_idx: usize,
+    },
+    /// Native general low-precision quantize / dequantize / decode-GEMM
+    /// (`scaled_lowp.wgsl`), replacing the generic CPU host route for
+    /// `Op::ScaledQuantScale` / `ScaledQuantize` / `ScaledDequantize` /
+    /// `ScaledMatMul`.
+    ScaledLowp {
+        params: ScaledLowpParams,
+        kernel: ScaledLowpKernel,
+        /// 1-D thread count. Unused for `MatmulDecode`, which dispatches 16x16
+        /// tiles derived from `params.m` / `params.n`.
+        threads: u32,
+    },
+    /// Native INT8 `Op::Quantize` / `Op::Dequantize` (`quant_i8.wgsl`).
+    QuantI8 {
+        params: QuantI8Params,
+        kernel: QuantI8Kernel,
+        /// 1-D thread count — output WORDS for quantize, elements for dequantize.
+        threads: u32,
+    },
+    /// Native real-INT8 `Op::QMatMul` (`q_matmul.wgsl`).
+    QMatMul {
+        params: QMatMulParams,
+        /// One thread per output WORD (four packed i8 results).
+        threads: u32,
+    },
+    /// Native real-INT8 `Op::QConv2d` (`q_conv2d.wgsl`).
+    QConv2d {
+        params: QConv2dParams,
+        /// One thread per output WORD (four packed i8 results).
+        threads: u32,
+    },
+    /// Native `Op::BatchNormInference` and its three backwards.
+    BatchNormInference {
+        params: BatchNormInferenceParams,
+        kernel: BatchNormKernel,
+        /// Elements for the forward / input-grad, channels for the reductions.
+        threads: u32,
     },
     /// Welch PSD top-K — D2H → rlx-cpu → H2D.
     WelchPeaksHost {
@@ -1086,6 +1198,7 @@ impl Step {
             | Step::SoftmaxCrossEntropyWithLogits { .. }
             | Step::SoftmaxCrossEntropyBackward { .. }
             | Step::LayerNorm { .. }
+            | Step::GroupNorm { .. }
             | Step::FusedResidualLn { .. }
             | Step::FusedResidualLnTee { .. }
             | Step::FusedResidualRmsNorm { .. }
@@ -1166,6 +1279,7 @@ impl Step {
             // the rest of the schedule.
             Step::FftGpu { .. }
             | Step::FftHost { .. }
+            | Step::FftQHost { .. }
             | Step::ScanHost { .. }
             | Step::HostOp { .. }
             | Step::CpuIndexing { .. }
@@ -1268,6 +1382,20 @@ impl Step {
             | Step::RopeBackward { .. }
             | Step::CumsumBackward { .. }
             | Step::GatherBackward { .. } => false,
+            // The `meta` strides are baked from the full shape, so shrinking the
+            // thread count alone would decompose flat positions against the
+            // wrong extents. Same call as the CUDA/ROCm launches, which skip
+            // `scale()` for these steps for exactly this reason.
+            Step::IndexingNd { .. } => false,
+            // Shapes are baked into the params; scaling only the thread count
+            // would quantize a prefix and leave the rest stale.
+            Step::ScaledLowp { .. } => false,
+            // Shapes are baked into the params; scaling only the thread count
+            // would quantize a prefix and leave the rest stale.
+            Step::QuantI8 { .. }
+            | Step::QMatMul { .. }
+            | Step::QConv2d { .. }
+            | Step::BatchNormInference { .. } => false,
             #[cfg(feature = "splat")]
             Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
@@ -1298,6 +1426,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::CumScan { .. } => "cum_scan",
         Step::FftGpu { .. } => "fft_gpu",
         Step::FftHost { .. } => "fft_host",
+        Step::FftQHost { .. } => "fft_q_host",
         Step::WelchPeaksHost { .. } => "welch_peaks_host",
         Step::LogMelHost { .. } => "log_mel_host",
         Step::LogMelBackwardHost { .. } => "log_mel_backward_host",
@@ -1365,6 +1494,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ConvTranspose2d { .. } => "conv_transpose2d",
         Step::ConvTranspose3d { .. } => "conv_transpose3d",
         Step::ConvTranspose3dHost { .. } => "conv_transpose3d_host",
+        Step::GroupNorm { .. } => "group_norm",
         Step::GroupNormHost { .. } => "group_norm_host",
         Step::LayerNorm2dHost { .. } => "layer_norm2d_host",
         Step::ResizeNearest2xHost { .. } => "resize_nearest2x_host",
@@ -1391,6 +1521,31 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScanHost { .. } => "scan_host",
         Step::HostOp { .. } => "host_op",
         Step::CpuIndexing { .. } => "cpu_indexing",
+        Step::QuantI8 { kernel, .. } => match kernel {
+            QuantI8Kernel::Quantize => "quantize_i8",
+            QuantI8Kernel::Dequantize => "dequantize_i8",
+        },
+        Step::QMatMul { .. } => "q_matmul",
+        Step::QConv2d { .. } => "q_conv2d",
+        Step::BatchNormInference { kernel, .. } => match kernel {
+            BatchNormKernel::Forward => "batch_norm_inference",
+            BatchNormKernel::BwdInput => "batch_norm_inference_bwd_input",
+            BatchNormKernel::BwdGamma => "batch_norm_inference_bwd_gamma",
+            BatchNormKernel::BwdBeta => "batch_norm_inference_bwd_beta",
+        },
+        Step::ScaledLowp { kernel, .. } => match kernel {
+            ScaledLowpKernel::QuantScale => "scaled_quant_scale",
+            ScaledLowpKernel::Quantize => "scaled_quantize",
+            ScaledLowpKernel::Dequantize => "scaled_dequantize",
+            ScaledLowpKernel::MatmulDecode => "scaled_matmul_decode",
+        },
+        Step::IndexingNd { kernel, .. } => match kernel {
+            IndexingNdKernel::GatherNd => "gather_nd",
+            IndexingNdKernel::GatherElements => "gather_elements",
+            IndexingNdKernel::ScatterElements => "scatter_elements",
+            IndexingNdKernel::ScatterNd => "scatter_nd",
+            IndexingNdKernel::CopySanitize => "indexing_copy_sanitize",
+        },
         Step::SpdHost { .. } => "spd_host",
         #[cfg(feature = "splat")]
         Step::GaussianSplatRender { .. } => "gaussian_splat_render",
@@ -1458,6 +1613,7 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
         | Step::CollectiveHost { .. }
         | Step::CustomHost { .. }
         | Step::FftHost { .. }
+        | Step::FftQHost { .. }
         | Step::ScanHost { .. }
         | Step::HostOp { .. }
         | Step::CpuIndexing { .. }

@@ -1,3 +1,6 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // RLX — MIT OR Apache-2.0. Microbench: fused matvec vs materialize-then-matmul.
 use rlx_mlx_io::{dequant_matmul_affine, dequant_matvec_affine};
 fn main() {

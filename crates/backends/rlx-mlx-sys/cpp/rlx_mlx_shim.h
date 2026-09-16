@@ -93,6 +93,17 @@ int rlx_mlx_array_to_bytes(
 // sizing buffers around from_bytes / to_bytes.
 size_t rlx_mlx_dtype_size(rlx_mlx_dtype_t dtype);
 
+// Copy `nelems` elements from `src` at element offset `src_elem_off` into
+// `dst`'s buffer at element offset `dst_elem_off`, IN PLACE — the MLX form of the single-row
+// KV write the other backends do device-side. Both arrays must be
+// row-contiguous and share a dtype; both are evaluated first, which is also
+// the barrier that makes pending GPU writes visible. Mutating the buffer is
+// visible through every array sharing it (the point, for a resident cache).
+int rlx_mlx_array_copy_row_inplace(
+    rlx_mlx_array_t* dst, size_t dst_elem_off,
+    rlx_mlx_array_t* src, size_t src_elem_off,
+    size_t nelems);
+
 // Free a handle. Safe on NULL.
 void rlx_mlx_array_free(rlx_mlx_array_t* h);
 

@@ -385,7 +385,7 @@ const FILL_HELPER: &str = r#"fn rlx_torch_fill(value: f64, dtype: rlx_ir::DType,
 
 /// Generate `graph.rs` using `rlx_flow::ModelFlow` + a single custom stage that
 /// builds the graph through the HIR builder (covers all ops — same per-op
-/// emission as the `graph` style, via [`crate::emit::emit_hir_ops`]).
+/// emission as the `graph` style, via `emit::emit_hir_ops`).
 pub fn emit_flow_graph_rs(lo: &Lowered) -> Result<String> {
     if lo.outputs.len() != 1 {
         bail!("flow style supports single-output models only; use --emit-style graph");

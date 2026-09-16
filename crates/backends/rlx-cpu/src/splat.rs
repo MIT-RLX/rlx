@@ -1,16 +1,33 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! CPU dispatch hooks for [`rlx_ir::Op::GaussianSplatRender`] — bodies registered from `rlx-splat`.
+//! CPU dispatch hooks for [`rlx_ir::Op::GaussianSplatRender`].
+//!
+//! The renderer itself is not in this workspace — `rlx-splat` is a separate
+//! repo that depends on rlx, so the dependency points inward and this module is
+//! the seam it plugs into. Everything here is the *contract*: rlx-ir owns the
+//! opcodes and the packed layouts, `rlx-cpu` owns dispatch, and the six bodies
+//! arrive at runtime through [`register_splat_executors`].
+//!
+//! The executor aliases are public because they are half of that contract. A
+//! downstream renderer needs to name them to hold one in a struct or hand one
+//! back from a builder; leaving them private made the registration signature
+//! uncallable to read even though the function itself was `pub`.
 
 use std::sync::OnceLock;
 
-type RenderExec = Box<dyn Fn(ArenaRenderArgs) + Send + Sync>;
-type RenderBwdExec = Box<dyn Fn(ArenaRenderBwdArgs) + Send + Sync>;
-type PrepareExec = Box<dyn Fn(ArenaPrepareArgs) + Send + Sync>;
-type RasterizeExec = Box<dyn Fn(ArenaRasterizeArgs) + Send + Sync>;
-type HostRenderExec = Box<dyn Fn(HostRenderArgs) -> Vec<f32> + Send + Sync>;
-type HostBackwardExec = Box<dyn Fn(HostBackwardArgs) -> Vec<f32> + Send + Sync>;
+/// Arena-resident forward render. Registered by the downstream renderer.
+pub type RenderExec = Box<dyn Fn(ArenaRenderArgs) + Send + Sync>;
+/// Arena-resident render backward.
+pub type RenderBwdExec = Box<dyn Fn(ArenaRenderBwdArgs) + Send + Sync>;
+/// Arena-resident `GaussianSplatPrepare`.
+pub type PrepareExec = Box<dyn Fn(ArenaPrepareArgs) + Send + Sync>;
+/// Arena-resident `GaussianSplatRasterize`.
+pub type RasterizeExec = Box<dyn Fn(ArenaRasterizeArgs) + Send + Sync>;
+/// Host-slice forward render, returning the framebuffer.
+pub type HostRenderExec = Box<dyn Fn(HostRenderArgs) -> Vec<f32> + Send + Sync>;
+/// Host-slice backward, returning packed gradients.
+pub type HostBackwardExec = Box<dyn Fn(HostBackwardArgs) -> Vec<f32> + Send + Sync>;
 
 static RENDER: OnceLock<RenderExec> = OnceLock::new();
 static RENDER_BWD: OnceLock<RenderBwdExec> = OnceLock::new();
@@ -48,7 +65,7 @@ pub struct ArenaRenderArgs {
     pub base: *mut u8,
 }
 
-/// Arena arguments for [`Op::GaussianSplatPrepare`].
+/// Arena arguments for [`Op::GaussianSplatPrepare`](rlx_ir::Op::GaussianSplatPrepare).
 pub struct ArenaPrepareArgs {
     pub positions_off: usize,
     pub positions_len: usize,
@@ -77,7 +94,7 @@ pub struct ArenaPrepareArgs {
     pub base: *mut u8,
 }
 
-/// Arena arguments for [`Op::GaussianSplatRasterize`].
+/// Arena arguments for [`Op::GaussianSplatRasterize`](rlx_ir::Op::GaussianSplatRasterize).
 pub struct ArenaRasterizeArgs {
     pub prep_off: usize,
     pub prep_len: usize,
@@ -171,7 +188,12 @@ pub struct HostBackwardArgs {
     pub max_anisotropy: f32,
 }
 
-/// Register arena + host splat executors (`rlx_splat::register()`).
+/// Register the six splat executor bodies. Call once per process, before
+/// compiling any graph that references `Op::GaussianSplat*` — the dispatch
+/// hooks below panic with a pointed message if a body is missing.
+///
+/// This is what a downstream renderer (the out-of-tree `rlx-splat`) calls
+/// from its own `register()`.
 pub fn register_splat_executors(
     render: RenderExec,
     backward: RenderBwdExec,
@@ -274,7 +296,7 @@ pub fn backward_host_slices(
     })
 }
 
-/// Execute [`Op::GaussianSplatPrepare`].
+/// Execute [`Op::GaussianSplatPrepare`](rlx_ir::Op::GaussianSplatPrepare).
 #[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
 pub unsafe fn execute_gaussian_splat_prepare(
     positions_off: usize,
@@ -334,7 +356,7 @@ pub unsafe fn execute_gaussian_splat_prepare(
     });
 }
 
-/// Execute [`Op::GaussianSplatRasterize`].
+/// Execute [`Op::GaussianSplatRasterize`](rlx_ir::Op::GaussianSplatRasterize).
 #[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
 pub unsafe fn execute_gaussian_splat_rasterize(
     prep_off: usize,
@@ -376,7 +398,7 @@ pub unsafe fn execute_gaussian_splat_rasterize(
     );
 }
 
-/// Execute [`Op::GaussianSplatRender`] against the arena `base` pointer.
+/// Execute [`Op::GaussianSplatRender`](rlx_ir::Op::GaussianSplatRender) against the arena `base` pointer.
 #[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
 pub unsafe fn execute_gaussian_splat_render(
     positions_off: usize,
@@ -434,7 +456,7 @@ pub unsafe fn execute_gaussian_splat_render(
     });
 }
 
-/// Execute [`Op::GaussianSplatRenderBackward`].
+/// Execute [`Op::GaussianSplatRenderBackward`](rlx_ir::Op::GaussianSplatRenderBackward).
 #[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
 pub unsafe fn execute_gaussian_splat_render_backward(
     positions_off: usize,

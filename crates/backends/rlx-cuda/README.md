@@ -23,7 +23,7 @@ first dispatch (same pattern as rlx-wgpu's WGSL kernels).
   and Q4_1 (21). IQ-family grid LUTs (~33 KB) are staged per context by
   `rlx_cuda::iq_grid::cuda_iq_grid_buffer`. Layout mirrors
   `rlx-metal/src/dequant_gguf.msl` — see
-  [docs/gguf-backend-paths.md](../../docs/gguf-backend-paths.md) for the
+  [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) for the
   full scheme-id table and CUDA/ROCm notes.
 
 ## Install
@@ -89,8 +89,8 @@ self-hosted Linux box.
   attention, conv, etc.). Compiled via NVRTC at first dispatch and
   cached behind `OnceLock`s.
 - `kernels/mod.rs` — NVRTC compile + module/function loader.
-- `backend.rs` — `CudaExecutable`. Full **153/`OpKind`** claim
-  ([`docs/op-coverage.md`](../../docs/op-coverage.md)); native shared
+- `backend.rs` — `CudaExecutable`. Claims **173** of the **187** `OpKind`s
+  ([`docs/op-coverage.md`](../../../docs/op-coverage.md)); native shared
   `rlx-gpu-kernels` for training bwd, QAT, Gru/Rnn/Mamba2, FftButterfly,
   packed-I8 `QMatMul`/`QConv2d`; DenseSolve via cuSOLVER / cuBLAS batched LU.
   Dispatch tier ladder below for matmul.

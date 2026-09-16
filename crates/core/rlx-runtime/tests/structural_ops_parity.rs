@@ -12,6 +12,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn run_clamp(device: Device, dims: &[usize], min: f32, max: f32, x: &[f32]) -> Vec<f32> {
     let mut g = Graph::new("clamp");
     let inp = g.input("x", Shape::new(dims, DType::F32));
@@ -99,6 +101,7 @@ fn trilu_ref(dims: &[usize], upper: bool, diag: i64, x: &[f32]) -> Vec<f32> {
 
 #[test]
 fn clamp_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let x: Vec<f32> = vec![-3.0, -0.5, 0.0, 1.2, 4.0, 2.0, -1.0, 3.5];
     let got = run_clamp(Device::Cpu, &[8], -1.0, 2.5, &x);
     let want: Vec<f32> = x.iter().map(|v| v.clamp(-1.0, 2.5)).collect();
@@ -107,6 +110,7 @@ fn clamp_matches_reference() {
 
 #[test]
 fn tile_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let dims = [2usize, 3];
     let x: Vec<f32> = (1..=6).map(|i| i as f32).collect();
     let reps = vec![2usize, 2];
@@ -118,6 +122,7 @@ fn tile_matches_reference() {
 
 #[test]
 fn trilu_matches_reference() {
+    let _gpu = common::serialize_gpu();
     let dims = [4usize, 4];
     let x: Vec<f32> = (1..=16).map(|i| i as f32).collect();
     for (upper, diag) in [(true, 0), (false, 0), (true, 1), (false, -1)] {
@@ -162,19 +167,25 @@ fn check_device(device: Device, label: &str) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn structural_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check_device(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn structural_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     check_device(Device::Gpu, "wgpu");
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn structural_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     check_device(Device::Cuda, "cuda");

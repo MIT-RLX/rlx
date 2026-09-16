@@ -8,7 +8,7 @@
 //! `begin/end_capture`, replay — from the separate, harder cuBLAS-capture
 //! problem. The graph is pure elementwise (SiLU + Add) blocks split by host
 //! `Op::Sort` steps, so every captured segment is NVRTC kernels that record
-//! cleanly. Run WITH capture engaged on the msi rig:
+//! cleanly. Run WITH capture engaged on the CUDA rig:
 //!
 //!   RLX_CUDA_SEGMENTED_CAPTURE=1 RLX_CUDA_SEGMENTED_CAPTURE_ENGAGE=1 \
 //!   RLX_CUDA_EXEC_MODE=graph RLX_CUDA_CAPTURE_DEBUG=1 \
@@ -19,14 +19,16 @@
 
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 const F: DType = DType::F32;
 
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     }
 }
 
@@ -65,8 +67,9 @@ fn elementwise_graph(m: usize, d: usize, layers: usize, host_every: usize) -> Gr
 
 #[test]
 fn cuda_elementwise_segmented_capture_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip cuda_segmented_capture_elementwise ({dev:?} unavailable)");
         return;
     }

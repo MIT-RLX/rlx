@@ -85,7 +85,7 @@ fn write_dir(dir: &std::path::Path) {
 
 #[test]
 fn metal_mlx_lm_shaped_chain() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

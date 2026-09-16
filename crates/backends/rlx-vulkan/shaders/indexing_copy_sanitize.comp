@@ -1,0 +1,27 @@
+#version 450
+// Scatter prologue: seed `dst` from `data`, optionally zeroing non-finite slots.
+//
+// The zeroing reproduces `scatter_elements_f32`'s CPU prologue, which copies
+// `data` into `out` and *then* zeroes every non-finite slot. `scatter_nd_into_f32`
+// has no such pass, so ScatterND clears `do_sanitize` and gets a plain copy.
+// `do_copy` is 0 when `data` and `dst` already alias, matching the CPU's
+// `ptr::eq` check.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint n;                 // dst_len
+    uint src_off;
+    uint dst_off;
+    uint src_len;
+    uint do_copy;
+    uint do_sanitize;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    float v = arena_load(pc.dst_off + i);
+    if (pc.do_copy != 0u && i < pc.src_len) { v = arena_load(pc.src_off + i); }
+    if (pc.do_sanitize != 0u && (isnan(v) || isinf(v))) { v = 0.0; }
+    arena_store(pc.dst_off + i, v);
+}

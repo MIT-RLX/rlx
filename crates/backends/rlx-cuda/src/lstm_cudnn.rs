@@ -5,7 +5,7 @@
 //! cuDNN LSTM forward for Kitten / DynQuantLSTM (batch=1, f32).
 //!
 //! Packs gate-major PyTorch-order `(i,f,g,o)` weights into a cuDNN weight
-//! space via [`cudnnGetRNNWeightParams`], then runs [`cudnnRNNForward`] in
+//! space via `cudnnGetRNNWeightParams`, then runs `cudnnRNNForward` in
 //! inference mode. Opt out with `RLX_CUDA_LSTM_CUDNN=0`.
 
 use cudarc::cudnn::sys as cudnn_sys;
@@ -39,12 +39,12 @@ fn ensure_work<'a>(
 }
 
 fn env_cudnn_enabled() -> bool {
-    match std::env::var("RLX_CUDA_LSTM_CUDNN") {
-        Ok(v) => {
+    match rlx_ir::env::var("RLX_CUDA_LSTM_CUDNN") {
+        Some(v) => {
             let v = v.trim();
             !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
         }
-        Err(_) => true,
+        None => true,
     }
 }
 

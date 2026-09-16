@@ -125,7 +125,19 @@ pub fn mask_strides_bhsd(heads: u32, seq_q: u32, seq_k: u32) -> (u32, u32, u32, 
     (heads * seq_q * seq_k, seq_q * seq_k, seq_k, 1)
 }
 
-/// Mask address strides from the mask tensor's IR shape (matches wgpu).
+/// Mask address strides `(batch, head, seq_q, seq_k)` from the mask tensor's
+/// IR shape. Shared by every stride-driven attention kernel (CUDA, ROCm, wgpu).
+///
+/// Rank 2 is `[B, S_k]` key padding per [`crate::op::MaskKind::Custom`], NOT
+/// `[S_q, S_k]` — it is not right-aligned against `[B, H, S_q, S_k]` the way
+/// ranks 3 and 4 are.
+///
+/// **An axis of extent 1 gets stride 0.** It is broadcast, and a kernel that
+/// walks it as though it were full reads the wrong element — or off the end of
+/// the tensor. Deriving each stride from the dim product alone (what this did
+/// until 2026-08-23) got `[1, S_k]` wrong for every batch above 0: the batch
+/// stride came out `S_k` on a tensor holding only `S_k` elements, so batch 1
+/// read whatever followed the mask in the arena.
 pub fn mask_strides_for_shape(
     m_dims: &[Dim],
     heads: u32,
@@ -133,10 +145,22 @@ pub fn mask_strides_for_shape(
     seq_k: u32,
 ) -> (u32, u32, u32, u32) {
     let dim = |i: usize| m_dims[i].unwrap_static() as u32;
+    // `stride` unless this axis is broadcast, in which case 0.
+    let bc = |d: u32, stride: u32| if d == 1 { 0 } else { stride };
     match m_dims.len() {
-        2 => (dim(1), 0, 0, 1),
-        3 => (dim(1) * dim(2), 0, dim(2), 1),
-        4 => (dim(1) * dim(2) * dim(3), dim(2) * dim(3), dim(3), 1),
+        2 => (bc(dim(0), dim(1)), 0, 0, bc(dim(1), 1)),
+        3 => (
+            bc(dim(0), dim(1) * dim(2)),
+            0,
+            bc(dim(1), dim(2)),
+            bc(dim(2), 1),
+        ),
+        4 => (
+            bc(dim(0), dim(1) * dim(2) * dim(3)),
+            bc(dim(1), dim(2) * dim(3)),
+            bc(dim(2), dim(3)),
+            bc(dim(3), 1),
+        ),
         _ => mask_strides_bhsd(heads, seq_q, seq_k),
     }
 }

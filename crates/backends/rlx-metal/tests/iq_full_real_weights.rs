@@ -30,7 +30,7 @@ use rlx_metal::mtl::{Buffer, Device, MTLResourceOptions, MTLSize};
 
 fn test_dir() -> PathBuf {
     PathBuf::from(
-        std::env::var("RLX_IQ_TEST_DIR").unwrap_or_else(|_| "/tmp/rlx-iq-test".to_string()),
+        rlx_ir::env::var("RLX_IQ_TEST_DIR").unwrap_or_else(|| "/tmp/rlx-iq-test".to_string()),
     )
 }
 

@@ -16,6 +16,8 @@ use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_optim::{Muon, Optimizer};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const B: usize = 8;
 const C: usize = 3;
 const NB: usize = 5;
@@ -43,7 +45,8 @@ fn spline_ref(x: &[f32], coeff: &[f32]) -> Vec<f32> {
 
 #[test]
 fn resident_kan_spline_layer_trains_on_metal() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     // Data + a ground-truth spline whose output is the (exactly fittable) target.

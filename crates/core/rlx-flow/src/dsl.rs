@@ -169,7 +169,7 @@ impl ModelFlow {
         })
     }
 
-    /// Like [`repeat_dinov2_layers`] but with exact (erf) GELU in the FFN —
+    /// Like `repeat_dinov2_layers` but with exact (erf) GELU in the FFN —
     /// use for parity with checkpoints trained against `torch.nn.GELU()`
     /// (e.g. LaBraM, EEGPT); the default uses the faster tanh approximation.
     pub fn repeat_dinov2_layers_exact(
@@ -310,6 +310,33 @@ impl ModelFlow {
                 num_layers,
                 use_custom_mask: custom_mask,
                 need_past_kv,
+                kv_past_len: None,
+            }));
+        self
+    }
+
+    /// [`Self::bind_decode_inputs`] for caches declared with SPARE CAPACITY.
+    ///
+    /// `past_k_*`/`past_v_*` are `[batch, cap, kv_dim]` holding `past_len` rows
+    /// of real history, `cap > past_len`. A decode layer can then write the new
+    /// token's row in place (`Op::KvAppend`) instead of copying the whole cache.
+    ///
+    /// A separate entry point rather than an argument on
+    /// [`Self::bind_decode_inputs`] because it is a different contract about
+    /// tensors the caller allocates, and defaulting it wrong is silent: with a
+    /// history-shaped cache the in-place write lands on the last real row.
+    pub fn bind_decode_inputs_with_capacity(
+        mut self,
+        num_layers: usize,
+        custom_mask: bool,
+        past_len: usize,
+    ) -> Self {
+        self.stages
+            .push(FlowStage::BindDecodeInputs(BindDecodeInputsStage {
+                num_layers,
+                use_custom_mask: custom_mask,
+                need_past_kv: true,
+                kv_past_len: Some(past_len),
             }));
         self
     }

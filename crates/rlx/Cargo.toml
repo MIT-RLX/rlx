@@ -43,6 +43,9 @@ oneapi          = ["rlx-runtime/oneapi",           "rlx-tensor?/eval-gpu"]
 cuda            = ["rlx-runtime/cuda",             "rlx-tensor?/eval-cuda"]
 rocm            = ["rlx-runtime/rocm",             "rlx-tensor?/eval-rocm"]
 tpu             = ["rlx-runtime/tpu",             "rlx-tensor?/eval"]
+# External GPU on a USB4/Thunderbolt PCIe tunnel (`Device::Egpu`) — discovery +
+# driver-extension transport seam; device bring-up is unimplemented.
+egpu            = ["rlx-runtime/egpu"]
 blas-accelerate = ["rlx-runtime/blas-accelerate", "rlx-tensor?/eval-blas"]
 blas-mkl        = ["rlx-runtime/blas-mkl",         "rlx-tensor?/eval"]
 blas-openblas   = ["rlx-runtime/blas-openblas",    "rlx-tensor?/eval"]
@@ -59,8 +62,19 @@ gguf-convert = ["dep:rlx-gguf-convert", "dep:rlx-gguf"]
 bench   = ["dep:rlx-bench"]
 sparse  = ["dep:rlx-sparse"]
 linalg  = ["dep:rlx-linalg"]
-splat   = []   # rlx-splat moved to ../rlx-splat; no-op feature (was ["dep:rlx-splat"]) — keeps cfg gates valid
+# The in-tree half of 3D Gaussian splatting. The renderer lives out of tree
+# (`rlx-splat` depends on rlx, not the reverse), so what this exposes is the
+# seam it plugs into: rlx-ir's opcodes + packed layouts and rlx-cpu's
+# executor registry, gathered as `rlx::splat`.
+splat   = ["dep:rlx-cpu"]
 umap    = ["dep:rlx-umap"]
+# Parameter-efficient adaptation (LoRA / IA3 / AdaLoRA / DoRA / OFT) as host
+# arithmetic + graph builders. Backend-free on purpose: pick one with `cpu` /
+# `metal` / … and rlx-peft's graph path rides the same rlx-runtime.
+peft    = ["dep:rlx-peft"]
+# Bit-exact numpy / PyTorch random streams. No backend, no rlx-ir — it is the
+# one companion crate that adds nothing to the build but itself.
+rng     = ["dep:rlx-rng"]
 # Exact-integer 2D Delaunay + discrete Voronoi (JFA) custom ops (`geo.delaunay`,
 # `geo.voronoi_grid`) — the CPU op-registration surface (`rlx::geo::register`).
 geo     = ["dep:rlx-geo"]
@@ -100,22 +114,30 @@ rlx-tensor  = { workspace = true, optional = true }
 rlx-opt     = { workspace = true }
 rlx-driver  = { workspace = true }
 rlx-macros  = { workspace = true }
-rlx-runtime = { path = "../core/rlx-runtime", version = "0.2.14", default-features = false }
+rlx-runtime = { path = "../core/rlx-runtime", version = "0.2.16", default-features = false }
 rlx-collectives = { workspace = true, optional = true }
 rlx-gguf     = { workspace = true, optional = true }
 rlx-gguf-convert = { workspace = true, optional = true }
 rlx-bench   = { workspace = true, optional = true }
 rlx-sparse  = { workspace = true, optional = true }
 rlx-linalg  = { workspace = true, optional = true }
-# rlx-splat   = { path = "../rlx-splat",   version = "0.2.14", optional = true, default-features = false, features = ["cpu", "core"] }
-rlx-umap    = { path = "../numerics/rlx-umap", version = "0.2.14", optional = true, default-features = false, features = ["cpu", "graph"] }
-rlx-geo     = { path = "../numerics/rlx-geo", version = "0.2.14", optional = true, default-features = false, features = ["cpu"] }
+# default-features = false: `splat` exposes the dispatch seam and its types;
+# it should not pull rlx-cpu's BLAS linkage in for someone who did not ask
+# for the CPU backend. `rlx/cpu` gives rlx-cpu its normal features anyway.
+rlx-cpu     = { path = "../backends/rlx-cpu", version = "0.2.16", optional = true, default-features = false }
+rlx-umap    = { path = "../numerics/rlx-umap", version = "0.2.16", optional = true, default-features = false, features = ["cpu", "graph"] }
+# default-features = false: rlx-peft's own `cpu` default would forward
+# rlx-runtime/cpu and quietly pick a backend for a consumer who did not ask for
+# one. Enabling `rlx/cpu` gives it the same cpu-enabled rlx-runtime anyway.
+rlx-peft    = { path = "../numerics/rlx-peft", version = "0.2.16", optional = true, default-features = false }
+rlx-rng     = { workspace = true, optional = true }
+rlx-geo     = { path = "../numerics/rlx-geo", version = "0.2.16", optional = true, default-features = false, features = ["cpu"] }
 rlx-optim   = { workspace = true, optional = true }
 # rlx-cortexm is `no_std` by default; we want the host-side parity
 # kernels (the `std` feature) when re-exported from the prelude.
-rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.14", optional = true, default-features = false, features = ["std"] }
+rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.16", optional = true, default-features = false, features = ["std"] }
 rlx-fpga    = { workspace = true, optional = true }
-rlx-onnx    = { path = "../io/rlx-onnx", version = "0.2.14", optional = true, default-features = true }
+rlx-onnx    = { path = "../io/rlx-onnx", version = "0.2.16", optional = true, default-features = true }
 # `rlx::Result` / `rlx::Error` type aliases. Every workspace crate
 # already pulls anyhow in transitively (rlx-runtime, rlx-gguf), so this
 # adds no real bytes — just makes the alias
@@ -131,6 +153,6 @@ workspace = true
 # browsing https://docs.rs/rlx see the full IR / opt / runtime API
 # along with `rlx::gguf`, `rlx::bench`, `rlx::sparse`, `rlx::linalg`.
 [package.metadata.docs.rs]
-features      = ["cpu", "tensor", "gpu", "gguf", "bench", "sparse", "linalg", "geo", "cortexm", "fpga", "optim", "distributed"]
+features      = ["cpu", "tensor", "gpu", "gguf", "bench", "sparse", "linalg", "geo", "peft", "rng", "splat", "cortexm", "fpga", "optim", "distributed"]
 rustdoc-args  = ["--cfg", "docsrs"]
 all-features  = false

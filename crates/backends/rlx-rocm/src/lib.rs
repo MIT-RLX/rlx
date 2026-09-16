@@ -20,6 +20,7 @@
 pub mod arena;
 pub mod backend;
 pub mod supported_ops;
+pub mod tuning;
 pub use supported_ops::SUPPORTED_OPS;
 pub mod calibrate;
 pub mod collective_host;
@@ -28,7 +29,7 @@ pub mod device;
 pub mod eigh_native;
 pub mod fft_dispatch;
 pub mod fft_host {
-    pub use super::host_ops::run_fft1d;
+    pub use super::host_ops::{run_fft1d, run_fft1d_q};
 }
 pub mod gdn_host {
     pub use super::host_ops::run_gated_delta_net;

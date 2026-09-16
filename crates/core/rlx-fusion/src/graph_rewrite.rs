@@ -54,7 +54,33 @@ impl Rewriter {
         }
     }
 
+    /// Copy `node` into the new graph, at most once.
+    ///
+    /// The already-mapped guard is load-bearing, not an optimization. A pass
+    /// that emits a fused node ahead of its position calls
+    /// [`ensure_mapped`](Self::ensure_mapped) to hoist that node's operands,
+    /// which copies them early. The pass's main loop then walks the whole old
+    /// graph and copies every node it did not fuse — reaching those same
+    /// operands a second time. Without this guard that second call emits a
+    /// *duplicate* node and repoints `id_map` at it, so every consumer after
+    /// the fusion site reads the duplicate rather than the hoisted original.
+    ///
+    /// For most ops that is merely wasted work — the duplicate recomputes the
+    /// same value. For `Op::Param` it is silent corruption: parameter binding
+    /// is by name and reaches only one node, so the duplicate keeps whatever
+    /// the arena was initialized with (zeros) and every value flowing through
+    /// it vanishes.
+    ///
+    /// A forward graph hides this, because the fused-away consumer was the
+    /// param's only reader and the duplicate is dead code the compiler drops.
+    /// A *backward* graph does not: `grad_with_loss` mirrors the forward
+    /// alongside the gradient ops, so a weight is read twice — once by the
+    /// mirrored matmul and once by `dX = dY · Wᵀ` — and the duplicate is live.
+    /// That is how `FuseSharedInputMatMul` silently zeroed gradient terms.
     pub fn copy_node(&mut self, node: &Node) -> NodeId {
+        if let Some(&existing) = self.id_map.get(&node.id) {
+            return existing;
+        }
         let new_inputs = self.map_inputs(&node.inputs);
         let new_id = self
             .new_graph

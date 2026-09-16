@@ -12,6 +12,8 @@ use rlx_ir::infer::GraphExt;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn run(
     device: Device,
     dims: &[usize],
@@ -89,6 +91,7 @@ fn cases() -> Vec<(Vec<usize>, usize, usize, usize, i64)> {
 
 #[test]
 fn slice_1d_matches_numpy() {
+    let _gpu = common::serialize_gpu();
     let x: Vec<f32> = (0..6).map(|i| i as f32).collect();
     assert_eq!(run(Device::Cpu, &[6], 0, 0, 3, 2, &x), vec![0., 2., 4.]);
     assert_eq!(run(Device::Cpu, &[6], 0, 1, 3, 2, &x), vec![1., 3., 5.]);
@@ -102,6 +105,7 @@ fn slice_1d_matches_numpy() {
 
 #[test]
 fn slice_cpu_all_cases() {
+    let _gpu = common::serialize_gpu();
     for (dims, axis, start, len, step) in cases() {
         let n: usize = dims.iter().product();
         let x: Vec<f32> = (0..n).map(|i| (i % 9) as f32 * 0.5 - 2.0).collect();
@@ -133,19 +137,25 @@ fn check_device(device: Device, label: &str) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn slice_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check_device(Device::Metal, "metal");
 }
 
 #[test]
 #[cfg(feature = "gpu")]
 fn slice_wgpu_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     check_device(Device::Gpu, "wgpu");
 }
 
 #[test]
 #[cfg(feature = "cuda")]
 fn slice_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         return;
     }
     check_device(Device::Cuda, "cuda");

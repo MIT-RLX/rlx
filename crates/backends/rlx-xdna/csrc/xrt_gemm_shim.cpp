@@ -19,6 +19,18 @@
 //       -o librlx_xdna_shim.so csrc/xrt_gemm_shim.cpp \
 //       -L$XILINX_XRT/lib/x86_64-linux-gnu -Wl,-rpath,$XILINX_XRT/lib/x86_64-linux-gnu \
 //       -lxrt_coreutil
+//
+// When XRT came from a distro package there is no $XILINX_XRT tree — headers
+// are in /usr/include/xrt and libs in /usr/lib/x86_64-linux-gnu. Verified
+// building on Ubuntu with XRT 2.21.75 (RyzenAI-npu1, fw 1.5.5.391):
+//   g++ -O2 -fPIC -shared -std=c++17 -I/usr/include \
+//       -o librlx_xdna_shim.so csrc/xrt_gemm_shim.cpp \
+//       -L/usr/lib/x86_64-linux-gnu -Wl,-rpath,/usr/lib/x86_64-linux-gnu \
+//       -lxrt_coreutil
+// Then point the runtime at it: RLX_XDNA_SHIM=/path/to/librlx_xdna_shim.so.
+// That satisfies the shim half of the gate; a kernel path (AIECC+PEANO, or a
+// precompiled XCLBIN/INSTS overlay) is still required before `is_available`
+// reports Xdna as dispatchable.
 
 #include <cstdint>
 #include <cstdio>

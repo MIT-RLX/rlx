@@ -193,3 +193,53 @@ fn gather_elements_vjp_matches_fd() {
     }
     assert_close(d_data, &fd, 2e-2, "gather_elements d_data");
 }
+
+/// Backward through a gather whose index is a FLAT list.
+///
+/// Gather's output rank is `data_rank - 1 + index_rank`, so a rank-1 index is
+/// legal and keeps the rank unchanged — but every backend computed the gathered
+/// count as `idx_shape.dim(axis)`, which has no dimension at `axis` for this
+/// form and panicked with "Shape::dim(1) out of bounds for rank 1". The forward
+/// pass worked, so this only bit when a graph needed gradients.
+#[test]
+fn gather_backward_accepts_a_rank1_index() {
+    use rlx_ir::GraphExt;
+
+    const D: usize = 3; // trailing width
+    const N: usize = 5; // source positions along the gather axis
+    let idx = [3.0f32, 0.0, 4.0, 0.0]; // repeats on purpose: grads must accumulate
+
+    let build = |g: &mut Graph, data: NodeId, indices: NodeId| -> NodeId {
+        let y = g.gather_(data, indices, 1);
+        sum_loss(g, y)
+    };
+
+    let mut g = Graph::new("gather_rank1");
+    let data = g.param("data", Shape::new(&[1, N, D], DType::F32));
+    let indices = g.input("indices", Shape::new(&[idx.len()], DType::F32));
+    let loss = build(&mut g, data, indices);
+    g.set_outputs(vec![loss]);
+
+    let bwd = grad_with_loss(&g, &[data]);
+    let data_init: Vec<f32> = (0..N * D).map(|i| (i as f32) * 0.1 + 1.0).collect();
+    // Runs on CPU by default; set RLX_FORCE_DEVICE=metal|mlx|gpu|cuda|rocm to
+    // check the same fix on an accelerator, since the bug was present verbatim
+    // in all five backends and compiling is not the same as executing.
+    let device = rlx_ir::env::var("RLX_FORCE_DEVICE")
+        .and_then(|s| rlx::parse_device(&s).ok())
+        .unwrap_or(rlx::Device::Cpu);
+    eprintln!("gather_backward_accepts_a_rank1_index on {device:?}");
+    let mut compiled = rlx::Session::new(device).compile(bwd);
+    compiled.set_param("data", &data_init);
+    let outs = compiled.run(&[("indices", &idx[..]), ("d_output", &[1.0f32])]);
+    let d_data = &outs[1];
+
+    // d(sum of gathered)/d(data[p]) is just how many times p was gathered.
+    let mut want = vec![0f32; N * D];
+    for &p in &idx {
+        for k in 0..D {
+            want[p as usize * D + k] += 1.0;
+        }
+    }
+    assert_close(d_data, &want, 1e-5, "rank-1 gather d_data");
+}

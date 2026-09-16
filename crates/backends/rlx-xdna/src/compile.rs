@@ -34,6 +34,60 @@ pub struct OverlaySpec<'a> {
     pub out_insts: &'a str,
 }
 
+/// Collapse repeated `%name = aie.tile(c, r)` declarations onto one SSA value.
+///
+/// AIE rows are fixed by hardware, so several logical roles legitimately land on
+/// the same physical tile — an attention design has `shim_q`, `shim_kv` and
+/// `shim_out`, and on a 1-column device all three ARE tile (0,0). Declaring it
+/// three times parses and even builds an xclbin, but the objectfifo allocator
+/// then treats them as three tiles and the design returns wrong data (attention
+/// came back at max-rel-err 1.0 — the DMA channel assignment collides). One
+/// declaration, three references, is both what the hardware is and what the
+/// allocator needs.
+fn dedupe_tile_decls(mlir: &str) -> String {
+    use std::collections::HashMap;
+    let mut canon: HashMap<(String, String), String> = HashMap::new();
+    let mut alias: HashMap<String, String> = HashMap::new();
+    let mut kept: Vec<String> = Vec::new();
+
+    for line in mlir.lines() {
+        let t = line.trim();
+        let parsed = t
+            .strip_prefix('%')
+            .and_then(|r| r.split_once(" = aie.tile("))
+            .and_then(|(name, rest)| {
+                let inner = rest.strip_suffix(')')?;
+                let (c, r) = inner.split_once(',')?;
+                Some((name.to_string(), c.trim().to_string(), r.trim().to_string()))
+            });
+        match parsed {
+            Some((name, c, r)) => match canon.get(&(c.clone(), r.clone())) {
+                // Already declared this physical tile — drop the line, alias the name.
+                Some(first) => {
+                    alias.insert(name, first.clone());
+                }
+                None => {
+                    canon.insert((c, r), name);
+                    kept.push(line.to_string());
+                }
+            },
+            None => kept.push(line.to_string()),
+        }
+    }
+    let mut out = kept.join("\n");
+    if mlir.ends_with('\n') {
+        out.push('\n');
+    }
+    // Longest first: `%shim_q` must not be rewritten by a rule for `%shim`.
+    let mut names: Vec<&String> = alias.keys().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for name in names {
+        let to = &alias[name];
+        out = out.replace(&format!("%{name}"), &format!("%{to}"));
+    }
+    out
+}
+
 /// Compile `spec.mlir` to `spec.out_xclbin` + `spec.out_insts` by invoking the
 /// **native** `aiecc` binary (no Python in the loop). Returns the two output
 /// paths on success.
@@ -56,19 +110,87 @@ pub fn compile_overlay_linked(
             spec.aiecc
         )));
     }
-    std::fs::create_dir_all(spec.tmpdir).ok();
-    for obj in link_objs {
-        let base = Path::new(obj)
-            .file_name()
-            .ok_or_else(|| XdnaError(format!("bad link obj path {obj}")))?;
-        let dst = Path::new(spec.tmpdir).join(base);
-        std::fs::copy(obj, &dst)
-            .map_err(|e| XdnaError(format!("copy link obj {obj} → {}: {e}", dst.display())))?;
-    }
+    // Each attempt gets a CLEAN tmpdir. aiecc leaves a `.prj` tree and partial
+    // objects behind on failure, and re-running into that directory makes the
+    // retry fail the same way regardless of the flags — the -O0 rung below
+    // compiles fine by hand and still failed here until this reset existed.
+    let stage = |dir: &str| -> Result<(), XdnaError> {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).map_err(|e| XdnaError(format!("create tmpdir {dir}: {e}")))?;
+        for obj in link_objs {
+            let base = Path::new(obj)
+                .file_name()
+                .ok_or_else(|| XdnaError(format!("bad link obj path {obj}")))?;
+            let dst = Path::new(dir).join(base);
+            std::fs::copy(obj, &dst)
+                .map_err(|e| XdnaError(format!("copy link obj {obj} → {}: {e}", dst.display())))?;
+        }
+        Ok(())
+    };
 
+    // Try the default optimisation level, then -O1, then -O0.
+    //
+    // At -O2 LLVM's own loop vectorizer re-widens a deliberately SCALAR core
+    // loop into 16-lane vector arithmetic, and AIE2 has no datapath for some of
+    // it — `LLVM ERROR: unable to legalize instruction: %98:_(<16 x s32>) =
+    // G_MUL`. These are INT8/BF16 MAC tiles; a 32-bit vector multiply is not a
+    // thing they can do. -O1 leaves the loop scalar and the same kernel builds
+    // and runs. Retrying is better than pinning -O1 everywhere: the ops that do
+    // vectorize keep their -O2 codegen.
+    //
+    // -O0 is the last rung, and it is about SIZE, not legality. An AIE2 core
+    // has 64 KB of data memory but only **16 KB of program memory**, and an
+    // optimised kernel can simply not fit: the attention core builds a 19,456 B
+    // `.text` at -O1/-O2/-O3 and 11,184 B at -O0. aiecc reports that overflow as
+    // `ValueError: Failed to generate cdo because:` with an EMPTY reason, which
+    // is why it reads like a mystery — check `llvm-size -A` on
+    // `<tmpdir>/main_core_0_2.elf` against 16 KB before assuming anything else.
+    // Slower code that fits beats faster code that cannot be placed.
+    let mut last_err = None;
+    for opt in [None, Some("-O1"), Some("-O0")] {
+        stage(spec.tmpdir)?;
+        let src = std::fs::read_to_string(spec.mlir)
+            .map_err(|e| XdnaError(format!("read {}: {e}", spec.mlir)))?;
+        let deduped = Path::new(spec.tmpdir).join("deduped.mlir");
+        std::fs::write(&deduped, dedupe_tile_decls(&src))
+            .map_err(|e| XdnaError(format!("write {}: {e}", deduped.display())))?;
+        let mut spec_d = spec.clone();
+        let deduped_s = deduped.to_string_lossy().into_owned();
+        spec_d.mlir = &deduped_s;
+        match run_aiecc(&spec_d, opt) {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("at least one attempt"))
+}
+
+/// One `aiecc` invocation. `opt` optionally forces an AIE-core optimisation
+/// level; the link objects are already staged in `spec.tmpdir` by the caller.
+fn run_aiecc(spec: &OverlaySpec<'_>, opt: Option<&str>) -> Result<(String, String), XdnaError> {
+    // Delete the outputs first. Success is judged by "did these files appear",
+    // and they live OUTSIDE tmpdir, so a stale artifact from an earlier build
+    // makes a FAILED compile report success and the caller then runs the
+    // previous kernel. That produced a bogus PASS during debugging: aiecc died
+    // on CDO generation, the old xclbin was still on disk, and the example
+    // happily executed it.
+    let _ = std::fs::remove_file(spec.out_xclbin);
+    let _ = std::fs::remove_file(spec.out_insts);
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(o) = opt {
+        extra.push(o.to_string());
+    }
     let status = Command::new(spec.aiecc)
+        .args(extra)
         .args([
-            "--no-xchesscc", // Peano, not Vitis/Chess
+            // Peano, not Vitis/Chess. BOTH flags are required: `--no-xchesscc`
+            // alone still routes core-ELF linking through `xchesscc_wrapper`,
+            // which execs `xchesscc` from an AMD Vitis install that a
+            // peano-only host does not have —
+            //   `xchesscc_wrapper: line 53: xchesscc: command not found`
+            // and aiecc exits 127 after having compiled everything else.
+            "--no-xchesscc",
+            "--no-xbridge",
             "--aie-generate-xclbin",
             "--aie-generate-npu-insts",
             "--no-compile-host",

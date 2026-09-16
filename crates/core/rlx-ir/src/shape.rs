@@ -104,6 +104,34 @@ impl Shape {
         })
     }
 
+    /// How many positions a gather/scatter along `axis` takes, when `self` is
+    /// the shape of the INDEX operand.
+    ///
+    /// Gather's output rank is `data_rank - 1 + index_rank`, so an index may be
+    /// either:
+    ///
+    ///   * rank > `axis` — the usual case, where the index carries a dimension
+    ///     at the gather axis and that dimension is the count; or
+    ///   * a flat list (typically rank 1) that has no dimension at `axis` and
+    ///     whose whole extent IS the count.
+    ///
+    /// Every backend previously wrote `idx_shape.dim(axis)` here, which panics
+    /// with "Shape::dim(1) out of bounds for rank 1" on the second form — so a
+    /// rank-1 gather built a correct forward graph and then blew up the moment
+    /// it needed a backward pass. Sharing the rule keeps the five backends that
+    /// need it from disagreeing about it.
+    pub fn gather_index_count(&self, axis: usize) -> usize {
+        if self.rank() > axis {
+            self.dim(axis).unwrap_static()
+        } else {
+            self.dims
+                .iter()
+                .map(|d| d.unwrap_static())
+                .product::<usize>()
+                .max(1)
+        }
+    }
+
     /// Set of dynamic dim symbols this shape references. Useful for
     /// "what bindings does this graph need?" queries on inputs.
     pub fn dynamic_symbols(&self) -> Vec<u32> {
@@ -405,6 +433,58 @@ pub fn matmul_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape, String> {
     })
 }
 
+/// GGUF [`crate::Op::DequantMatMul`] output shape: `[.., M, K] × [N, K] → [.., M, N]`.
+///
+/// The weight is `[n, k]`, **not** the `[k, n]` [`matmul_shape`] assumes: GGUF
+/// stores a linear's weight in `[out_dim, in_dim]` order (GGML `ne = [in, out]`),
+/// so the op contracts the *last* axis of both operands. The same order is why
+/// `Graph::dequant_grouped_matmul_packed` can take an expert bank straight from
+/// a `ffn_*_exps.weight` blob with no transpose.
+///
+/// Usually a GGUF weight reaches the graph as a rank-1 packed byte blob whose
+/// shape says nothing about `n` or `k` — the block layout carries that, and the
+/// caller declares the output shape directly. This rule is for the case where a
+/// caller declares the *logical* rank-2 shape instead.
+pub fn dequant_matmul_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape, String> {
+    if lhs.rank() < 2 {
+        return Err(format!(
+            "dequant matmul activations require rank >= 2, got {}",
+            lhs.rank()
+        ));
+    }
+    if rhs.rank() != 2 {
+        return Err(format!(
+            "dequant matmul weight must be rank 2 `[n, k]`, got rank {}",
+            rhs.rank()
+        ));
+    }
+    let m = lhs.dims[lhs.rank() - 2];
+    let k_lhs = lhs.dims[lhs.rank() - 1];
+    let n = rhs.dims[0];
+    let k_rhs = rhs.dims[1];
+
+    match (k_lhs, k_rhs) {
+        (Dim::Static(a), Dim::Static(b)) if a != b => {
+            return Err(format!(
+                "dequant matmul K mismatch: {a} vs {b} — the GGUF weight is \
+                 `[n, k]`, so K is its last axis, not its first"
+            ));
+        }
+        (Dim::Dynamic(s), Dim::Dynamic(t)) if s != t => {
+            return Err(format!("dequant matmul K mismatch: ?{s} vs ?{t}"));
+        }
+        _ => {}
+    }
+
+    let mut dims: SmallVec<[Dim; 4]> = lhs.dims[..lhs.rank() - 2].into();
+    dims.push(m);
+    dims.push(n);
+    Ok(Shape {
+        dims,
+        dtype: lhs.dtype,
+    })
+}
+
 /// ONNX Expand: broadcast `input` to `target` (numpy-style).
 pub fn expand_shape(input: &Shape, target: &[i64]) -> Result<Shape, String> {
     if target.iter().any(|&d| d < 0) {
@@ -559,6 +639,26 @@ pub fn concat_shape(inputs: &[&Shape], axis: usize) -> Result<Shape, String> {
             ));
         }
         let ax = axis.min(s.rank().saturating_sub(1));
+        // Every axis OTHER than the concat axis must agree, as it does in
+        // numpy and torch. This used to go unchecked, and the output simply
+        // inherited `inputs[0]`'s dims — so a graph that concatenated a
+        // [B,1,1,31] pad onto a [B,1,C,T] activation was accepted and silently
+        // declared [B,1,1,·], collapsing the channel axis. CPU/Metal/wgpu/
+        // CoreML all ran it; only MLX refused, so the defect looked like a
+        // backend gap instead of a malformed graph (`rlx-eeginceptionerp`).
+        // Dynamic dims are skipped: their extent is not known here.
+        for d in 0..s.rank() {
+            if d == ax {
+                continue;
+            }
+            if let (Dim::Static(a), Dim::Static(b)) = (s.dims[d], base.dims[d])
+                && a != b
+            {
+                return Err(format!(
+                    "concat: axis {d} mismatch {a} vs {b} (concat axis is {axis});                      all axes but the concat axis must match"
+                ));
+            }
+        }
         match s.dims[ax] {
             Dim::Static(n) => static_sum += n,
             Dim::Dynamic(sym) => {
@@ -828,8 +928,68 @@ pub fn conv2d_output_shape(
     ))
 }
 
+/// Row width, in elements, of a RoPE cos/sin table.
+///
+/// Every backend needs this and each used to derive it locally, which is how
+/// the CPU and GPU rules drifted apart in the first place.
+///
+/// * A table shaped `[positions, width]` carries its row width in the last
+///   dimension, and that is what must be used. A table allocated at
+///   `head_dim/2` but only partly filled under partial rotation is *wider* than
+///   `n_rot/2`; assuming otherwise reads the wrong row for every position past
+///   the first.
+/// * A **rank-1** table is different: a flat `positions * n_rot/2` run has no
+///   row structure in its shape, so its last dimension is the whole table.
+///   Taking that as the stride sends position 1 past the end, which reads as
+///   zeros — silently zeroing every position after the first. Rows there are
+///   `n_rot/2` wide by construction.
+pub fn rope_table_stride(cos: &Shape, n_rot: usize) -> usize {
+    if cos.rank() >= 2 {
+        cos.dims()
+            .last()
+            .map_or_else(|| n_rot / 2, |d| d.unwrap_static())
+            .max(1)
+    } else {
+        (n_rot / 2).max(1)
+    }
+}
+
+/// Output shape for NCHW [`crate::Op::Pool`].
+///
+/// Pooling has no weight, so the channel count passes through; only the two
+/// spatial extents shrink, by the same rule convolution uses with dilation 1.
+pub fn pool2d_output_shape(
+    input: &Shape,
+    kernel_size: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+) -> Result<Shape, String> {
+    if input.rank() != 4 {
+        return Err("pool2d requires an NCHW input".into());
+    }
+    if stride[0] == 0 || stride[1] == 0 {
+        return Err("pool2d stride must be non-zero".into());
+    }
+    let n = input.dim(0);
+    let c = input.dim(1);
+    let h = input.dim(2).unwrap_static();
+    let w = input.dim(3).unwrap_static();
+    let h_out = conv2d_spatial_output(h, kernel_size[0], stride[0], padding[0], 1);
+    let w_out = conv2d_spatial_output(w, kernel_size[1], stride[1], padding[1], 1);
+    if h_out == 0 || w_out == 0 {
+        return Err(format!(
+            "pool2d window {kernel_size:?} with stride {stride:?} and padding {padding:?} \
+             leaves no output for a {h}x{w} input"
+        ));
+    }
+    Ok(Shape::from_dims(
+        &[n, c, Dim::Static(h_out), Dim::Static(w_out)],
+        input.dtype(),
+    ))
+}
+
 /// Output shape for NCHW `Op::Im2Col`: `[M, C·kH·kW]` with
-/// `M = N · H_out · W_out`. Dynamic batch maps to [`dynamic::sym::ROWS`].
+/// `M = N · H_out · W_out`. Dynamic batch maps to `dynamic::sym::ROWS`.
 pub fn im2col_output_shape(
     input: &Shape,
     kernel_size: [usize; 2],
@@ -1017,9 +1177,172 @@ pub fn conv_transpose3d_output_shape(
     ))
 }
 
+/// `KvAppend`: write `row` into `cache` at index `pos` along `axis`, and return
+/// the `[..pos+1]` prefix (which ALIASES the cache buffer).
+///
+/// Every operand relationship is checked here rather than left to the backends,
+/// because none of them can check it: by the time a row write reaches a kernel
+/// it is a byte offset and a length, and a `pos` past the cache or a row of the
+/// wrong width is an out-of-bounds store into whatever the memory planner put
+/// next in the arena. That is a corrupted neighbouring tensor, not a crash —
+/// wrong logits with no error anywhere. The op is also the one place where a
+/// caller must size a buffer to a CAPACITY rather than to its current contents
+/// (`pos` indexes into the spare rows), so an off-by-one here is easy to write
+/// and invisible afterwards.
+///
+/// Dynamic dims are skipped rather than guessed at: a symbolic sequence
+/// capacity is legitimate, and the check that matters (`pos < cap`) can only be
+/// made against a static one.
+pub fn kv_append_shape(
+    cache: &Shape,
+    row: &Shape,
+    axis: usize,
+    pos: usize,
+) -> Result<Shape, String> {
+    if axis >= cache.rank() {
+        return Err(format!(
+            "kv_append: axis {axis} is out of range for a rank-{} cache",
+            cache.rank()
+        ));
+    }
+    if row.rank() != cache.rank() {
+        return Err(format!(
+            "kv_append: row rank {} does not match cache rank {} — the row is a \
+             one-step slice of the cache, not a squeezed vector",
+            row.rank(),
+            cache.rank()
+        ));
+    }
+    if row.dtype() != cache.dtype() {
+        return Err(format!(
+            "kv_append: row dtype {:?} does not match cache dtype {:?} — the write \
+             is a raw copy, so a mismatch reinterprets the row's bits",
+            row.dtype(),
+            cache.dtype()
+        ));
+    }
+    if let Dim::Static(cap) = cache.dim(axis)
+        && pos >= cap
+    {
+        return Err(format!(
+            "kv_append: pos {pos} is past the cache's axis-{axis} capacity {cap} — \
+             the cache must be sized to the CAPACITY it will grow to, not to the \
+             number of rows it currently holds"
+        ));
+    }
+    if let Dim::Static(n) = row.dim(axis)
+        && n != 1
+    {
+        return Err(format!(
+            "kv_append: row axis-{axis} extent is {n}, must be 1 (one step)"
+        ));
+    }
+    for i in 0..cache.rank() {
+        if i == axis {
+            continue;
+        }
+        if let (Dim::Static(c), Dim::Static(r)) = (cache.dim(i), row.dim(i))
+            && c != r
+        {
+            return Err(format!(
+                "kv_append: row dim {i} is {r}, cache dim {i} is {c} — every axis but \
+                 {axis} must match or the copy walks off the row"
+            ));
+        }
+    }
+    Ok(cache.clone().with_dim(axis, Dim::Static(pos + 1)))
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A `Concat` whose inputs disagree on a NON-concat axis must be rejected,
+    /// not silently shaped from `inputs[0]`.
+    ///
+    /// `rlx-eeginceptionerp` declared its zero-padding as [B,cin,1,l] while the
+    /// activation was [B,cin,C,T]. The old inference returned [B,cin,1,·],
+    /// collapsing the channel axis of the first block. CPU/Metal/wgpu/CoreML
+    /// executed it anyway; only MLX refused, so a malformed graph looked like a
+    /// backend gap.
+    #[test]
+    fn concat_rejects_non_concat_axis_mismatch() {
+        let pad = Shape::new(&[3, 1, 1, 31], DType::F32);
+        let act = Shape::new(&[3, 1, 8, 1000], DType::F32);
+        let err = concat_shape(&[&pad, &act], 3).unwrap_err();
+        assert!(
+            err.contains("axis 2 mismatch"),
+            "expected the channel-axis mismatch to be named, got: {err}"
+        );
+
+        // The well-formed version still infers normally.
+        let pad_ok = Shape::new(&[3, 1, 8, 31], DType::F32);
+        let out = concat_shape(&[&pad_ok, &act], 3).expect("matching dims must concat");
+        assert_eq!(out.dims()[3].unwrap_static(), 1031);
+        assert_eq!(out.dims()[2].unwrap_static(), 8);
+    }
+
+    /// The concat axis itself is exempt — that is the whole point of it.
+    #[test]
+    fn concat_axis_itself_may_differ() {
+        let a = Shape::new(&[2, 3], DType::F32);
+        let b = Shape::new(&[5, 3], DType::F32);
+        let out = concat_shape(&[&a, &b], 0).expect("concat axis may differ");
+        assert_eq!(out.dims()[0].unwrap_static(), 7);
+    }
+
     use super::*;
+
+    /// A GGUF weight is `[n, k]`. Reading it as `[k, n]` rejects correct graphs
+    /// — a square weight hides that, so both cases here are non-square.
+    #[test]
+    fn dequant_matmul_contracts_the_weights_last_axis() {
+        let (m, k, n) = (2usize, 64usize, 3usize);
+        let x = Shape::new(&[m, k], DType::F32);
+        let w_nk = Shape::new(&[n, k], DType::F32);
+
+        assert_eq!(
+            dequant_matmul_shape(&x, &w_nk).expect("[n,k] weight is the GGUF layout"),
+            Shape::new(&[m, n], DType::F32),
+        );
+
+        // The plain matmul rule reads the same operands backwards. This is the
+        // rejection `coreml_quant::dequant_matmul_through_session` used to hit.
+        assert!(matmul_shape(&x, &w_nk).unwrap_err().contains("K mismatch"));
+
+        // Leading batch axes ride along; only the last two participate.
+        assert_eq!(
+            dequant_matmul_shape(&Shape::new(&[5, m, k], DType::F32), &w_nk).unwrap(),
+            Shape::new(&[5, m, n], DType::F32),
+        );
+
+        // A genuinely wrong K is still caught, and says which axis it means.
+        let err = dequant_matmul_shape(&x, &Shape::new(&[n, k + 1], DType::F32)).unwrap_err();
+        assert!(err.contains("K mismatch"), "{err}");
+        assert!(err.contains("last axis"), "{err}");
+
+        // A packed byte blob has no `[n, k]` to read; the caller declares the
+        // output shape instead, and `infer_shape` never reaches this rule.
+        assert!(dequant_matmul_shape(&x, &Shape::new(&[1024], DType::U8)).is_err());
+    }
+
+    /// The two index forms a gather backward has to accept.
+    #[test]
+    fn gather_index_count_handles_both_index_forms() {
+        // Indexed AT the axis: the count is that dimension.
+        let batched = Shape::new(&[2, 11], DType::F32);
+        assert_eq!(batched.gather_index_count(1), 11);
+        assert_eq!(batched.gather_index_count(0), 2);
+
+        // A flat list with no dimension at the axis: its extent IS the count.
+        // `dim(1)` would panic here, which is exactly the bug this replaced.
+        let flat = Shape::new(&[11], DType::F32);
+        assert_eq!(flat.gather_index_count(1), 11);
+        assert_eq!(flat.gather_index_count(0), 11);
+        assert_eq!(flat.gather_index_count(3), 11, "any axis beyond rank");
+
+        // A scalar index selects exactly one position, never zero.
+        assert_eq!(Shape::new(&[], DType::F32).gather_index_count(0), 1);
+    }
 
     #[test]
     fn static_shape() {

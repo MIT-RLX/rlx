@@ -8,6 +8,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn cumsum_graph() -> Graph {
     let mut g = Graph::new("cumsum_clone");
     let x = g.input("x", Shape::new(&[4], DType::F32));
@@ -18,6 +20,7 @@ fn cumsum_graph() -> Graph {
 
 #[test]
 fn cpu_compiled_graph_clone_matches_original() {
+    let _gpu = common::serialize_gpu();
     let g = cumsum_graph();
     let mut a = Session::new(Device::Cpu).compile(g);
     let mut b = a.clone();
@@ -31,7 +34,8 @@ fn cpu_compiled_graph_clone_matches_original() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_compiled_graph_clone_matches_original() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Metal, "metal") {
         return;
     }
     let g = cumsum_graph();
@@ -47,7 +51,8 @@ fn metal_compiled_graph_clone_matches_original() {
 #[cfg(feature = "mlx")]
 #[test]
 fn mlx_compiled_graph_clone_matches_original() {
-    if !rlx_runtime::is_available(Device::Mlx) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         return;
     }
     let g = cumsum_graph();
@@ -63,7 +68,8 @@ fn mlx_compiled_graph_clone_matches_original() {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_compiled_graph_clone_matches_original() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         return;
     }
     let g = cumsum_graph();

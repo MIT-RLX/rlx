@@ -1,0 +1,39 @@
+[package]
+name = "rlx-corpus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Named kernel corpus that a compiler change must clear, with per-family reporting"
+publish = false
+authors.workspace       = true
+keywords.workspace      = true
+categories.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+readme                  = "README.md"
+
+[dependencies]
+rlx-ir = { workspace = true }
+rlx-opt = { workspace = true }
+
+[dev-dependencies]
+rlx-runtime = { workspace = true, features = ["cpu"] }
+
+# Which backends the DEVICE arm (`tests/device_gate.rs`) can reach. Empty by
+# default on purpose: a bare `cargo test -p rlx-corpus` stays device-free and
+# fast, and — more importantly — cargo unifies features across a workspace
+# build, so turning an Apple-only backend on here by default would turn it on
+# for every crate on Linux too. The host picks: `just check-corpus-device`.
+[features]
+default = []
+apple = ["rlx-runtime/apple"]
+gpu = ["rlx-runtime/gpu"]
+metal = ["rlx-runtime/metal"]
+vulkan = ["rlx-runtime/vulkan"]
+cuda = ["rlx-runtime/cuda"]
+rocm = ["rlx-runtime/rocm"]
+
+[lints]
+workspace = true

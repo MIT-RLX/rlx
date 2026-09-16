@@ -137,7 +137,7 @@ pub fn build_leaf_for(
                     return mlx_c128_leaf_from_bytes(bytes);
                 }
                 let want: usize = shape.iter().product::<usize>() * dt.size_bytes();
-                if bytes.len() != want && std::env::var_os("RLX_DIM_DBG").is_some() {
+                if bytes.len() != want && rlx_ir::env::var_os("RLX_DIM_DBG").is_some() {
                     eprintln!(
                         "[leaf] input '{name}' static_shape={shape:?} bytes={} want={want}",
                         bytes.len()
@@ -198,7 +198,7 @@ pub fn build_leaf_for(
             // proven their lifetime story can re-enable the view.
             if dtype == DType::F32
                 && data.len() == shape.iter().product::<usize>()
-                && std::env::var("RLX_MLX_PARAM_VIEW").as_deref() == Ok("1")
+                && rlx_ir::env::var("RLX_MLX_PARAM_VIEW").as_deref() == Some("1")
             {
                 return unsafe { Array::from_f32_slice_view(data, &shape) };
             }

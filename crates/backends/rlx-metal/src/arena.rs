@@ -341,10 +341,22 @@ impl Arena {
     }
 
     /// Copy raw bytes into the node's arena slot (U8/I8 packed weights).
+    ///
+    /// `element_counts` is in ELEMENTS; the clamp is in BYTES. Comparing the two
+    /// directly truncated every wider-than-byte param to `num_elements` bytes —
+    /// a quarter of an F32 tensor, half an F16 one — and the copy then succeeded
+    /// silently, so `set_param_bytes("w", ..)` left most of `w` at its previous
+    /// value and the model computed a wrong answer with no error anywhere.
+    ///
+    /// It survived because this path is overwhelmingly used for quantised U8
+    /// weights, where `size_bytes() == 1` makes the two units coincide. The
+    /// neighbouring `write_bytes_at` / `copy_node_bytes_from` both convert
+    /// explicitly; this one did not.
     pub fn write_bytes(&mut self, id: NodeId, data: &[u8]) {
         let off = self.byte_offset(id);
-        let cap = *self.element_counts.get(&id).unwrap_or(&0);
-        let len = data.len().min(cap);
+        let byte_cap =
+            *self.element_counts.get(&id).unwrap_or(&0) * self.dtype(id).size_bytes().max(1);
+        let len = data.len().min(byte_cap);
         unsafe {
             let base = (self.buffer.contents() as *mut u8).add(off);
             std::ptr::copy_nonoverlapping(data.as_ptr(), base, len);

@@ -1,0 +1,24 @@
+[package]
+name = "rlx-rng"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Bit-exact reproductions of numpy and PyTorch random streams: MT19937, PCG64, SeedSequence, randperm"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["rng", "mt19937", "pcg64", "numpy", "parity"]
+categories = ["science", "algorithms"]
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_rng"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]

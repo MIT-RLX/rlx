@@ -18,6 +18,8 @@ documentation.workspace = true
 # stage-to-host / run / stage-back plumbing that every GPU backend shared.
 rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-ir = { workspace = true }
+# Dependency-free shape arithmetic for the on-device indexing plans.
+rlx-gpu-dispatch = { workspace = true }
 rlx-mlx-io = { workspace = true }
 # SPD host-fallback builds a one-op CPU graph and plans its arena.
 rlx-compile = { workspace = true }
@@ -26,3 +28,7 @@ half = "2"
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

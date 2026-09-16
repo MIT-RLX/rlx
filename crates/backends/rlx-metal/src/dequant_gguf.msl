@@ -28,6 +28,9 @@
 //     23      | Q5_1      | 32          | 24
 //     24      | Q1_0      | 128         | 18   (prism-ml Bonsai-27B)
 //     25      | Q2_0      | 128         | 34
+//     26      | FV5       | 256         | 104
+//     27      | FV5B      | 256         | 260
+//     28      | G8_0      | 32          | 16   (Doses AI Pestle embed/lm_head)
 //
 // Full backend matrix: docs/gguf-backend-paths.md
 //
@@ -76,6 +79,12 @@ inline float dq_read_f16(device const uchar* b, uint off) {
     // one hardware convert.
     ushort bits = ushort(b[off]) | (ushort(b[off + 1u]) << 8u);
     return float(as_type<half>(bits));
+}
+
+inline float dq_read_bf16(device const uchar* b, uint off) {
+    // bf16 is the top 16 bits of an f32: shift into place and bitcast.
+    uint bits = (uint(b[off]) | (uint(b[off + 1u]) << 8u)) << 16u;
+    return as_type<float>(bits);
 }
 
 inline void dq_get_scale_min_k4(device const uchar* q, uint j, thread uint& sc, thread uint& mn) {
@@ -128,7 +137,7 @@ kernel void dequant_gguf(
     if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
-        && scheme_id != 24u && scheme_id != 25u) {
+        && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u) {
         device float* dst = arena + dst_f32_off + gid * DQ_QK_K;
 
         if (scheme_id == 3u) {
@@ -704,6 +713,23 @@ kernel void dequant_gguf(
         for (uint j = 0u; j < 128u; ++j) {
             uint q = (uint(qs[j >> 2u]) >> ((j & 3u) * 2u)) & 3u;
             dst[j] = float(int(q) - 1) * d;
+        }
+        return;
+    }
+
+    if (scheme_id == 28u) {
+        // G8_0 (Doses AI Pestle): 4 bf16 scales — one per group of 8 —
+        // | 8 two-bit bytes (16 bytes / 32 elements). Value = (q-1)*d[j/8].
+        uint off = gid * 16u;
+        device const uchar* qs = w_base + off + 8u;
+        device float* dst = arena + dst_f32_off + gid * 32u;
+        for (uint g = 0u; g < 4u; ++g) {
+            float d = dq_read_bf16(w_base, off + g * 2u);
+            for (uint t = 0u; t < 8u; ++t) {
+                uint j = g * 8u + t;
+                uint q = (uint(qs[j >> 2u]) >> ((j & 3u) * 2u)) & 3u;
+                dst[j] = float(int(q) - 1) * d;
+            }
         }
         return;
     }
@@ -1989,6 +2015,98 @@ kernel void q3k_mv_f32_sg(
     }
     #pragma unroll
     for (ushort row = 0u; row < Q3K_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) dst[row_idx] = total;
+    }
+}
+
+// ── Simdgroup-cooperative Q5_K GEMV ────────────────────────────────────────
+//
+// Same math as the validated `q5k_mv_f32`, but 32 threads cooperate on one
+// output row via `simd_sum` rather than one thread owning a whole row. Q5_K was
+// the ONLY hot K-quant without a simdgroup variant, and the one-thread-per-row
+// kernel is occupancy-starved: measured 90 GB/s at n=17408 and just 19 GB/s at
+// n=1024, against ~200 / ~120 for Q4_K and Q6_K on the same shapes.
+//
+// Thread `tiisg` owns the 8 consecutive elements `g0 = tiisg*8` of every
+// 256-elem super-block. Because 8 divides 32, all 8 land in the same
+// (group, nibble-half), so the scale index, the `qh` mask bit and the nibble
+// side are loop-invariant and hoist out of the inner loop.
+//
+// Block layout (176 B): d(f16) | dmin(f16) | scales[12] | qh[32] | ql[128].
+// `encode_q5k_mv_f32_sg` (ops.rs) MUST match `Q5K_NSG` / `Q5K_NR0`.
+constant uint Q5K_NSG = 4u;
+constant uint Q5K_NR0 = 2u;
+
+kernel void q5k_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint BLK_BYTES = 2u + 2u + DQ_K_SCALE_SIZE + DQ_QK_K / 8u + DQ_QK_K / 2u; // 176
+    const uint nb = k_dim / DQ_QK_K;
+
+    const uint first_row = (tgpig.x * Q5K_NSG + sgitg) * Q5K_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* y_base = (device const float*)((device char*)arena + x_off);
+    device const uchar* w_base = (device const uchar*)arena + w_off;
+    device float*       dst    = (device float*)((device char*)arena + dst_off);
+
+    const uint g0   = (uint)tiisg * 8u;      // 0,8,...,248
+    const uint grp  = g0 / 64u;              // 0..3 : which scale pair
+    const uint hlf  = (g0 % 64u) / 32u;      // 0 = low nibble, 1 = high nibble
+    const uint l0   = g0 % 32u;              // 0,8,16,24 within the 32-elem half
+    const uint sidx = 2u * grp + hlf;        // scale index 0..7
+    const uint hbit = (hlf == 0u ? 1u : 2u) << (2u * grp);
+
+    float sumf[Q5K_NR0] = {0.f};
+    for (uint b = 0u; b < nb; ++b) {
+        // Query slice loaded ONCE per block, reused across the NR0 rows.
+        float yl[8];
+        device const float* y = y_base + b * DQ_QK_K + g0;
+        #pragma unroll
+        for (uint e = 0u; e < 8u; ++e) yl[e] = y[e];
+
+        #pragma unroll
+        for (ushort row = 0u; row < Q5K_NR0; ++row) {
+            const uint row_idx = first_row + row;
+            if (row_idx >= n_dim) break;
+            device const uchar* blk = w_base + ((ulong)row_idx * nb + b) * BLK_BYTES;
+            const float d    = dq_read_f16(blk, 0u);
+            const float dmin = dq_read_f16(blk, 2u);
+            device const uchar* scales = blk + 4u;
+            device const uchar* qh     = blk + 4u + DQ_K_SCALE_SIZE;
+            device const uchar* ql     = qh + DQ_QK_K / 8u;
+
+            uint sc, mn;
+            dq_get_scale_min_k4(scales, sidx, sc, mn);
+            const float dl = d * float(sc);
+            const float ml = dmin * float(mn);
+
+            device const uchar* qlg = ql + grp * 32u + l0;
+            device const uchar* qhg = qh + l0;
+
+            float s = 0.f;
+            #pragma unroll
+            for (uint e = 0u; e < 8u; ++e) {
+                const uint lo = (hlf == 0u) ? (uint(qlg[e]) & 0x0Fu) : (uint(qlg[e]) >> 4);
+                const uint hi = (qhg[e] & hbit) ? 16u : 0u;
+                s += yl[e] * (float(lo + hi) * dl - ml);
+            }
+            sumf[row] += s;
+        }
+    }
+    #pragma unroll
+    for (ushort row = 0u; row < Q5K_NR0; ++row) {
         const uint row_idx = first_row + row;
         if (row_idx >= n_dim) break;
         const float total = simd_sum(sumf[row]);
@@ -4191,6 +4309,68 @@ kernel void q2_0_mv_f32(
     dst[gid] = q2_0_gemv_row_f32(x, w0, nb);
 }
 
+// Σ y[i]·q[i] over the 16 Q2_0 codes packed into the 4 bytes at `qs`.
+//
+// Two 16-bit loads instead of four byte loads, and each code is masked *in
+// place* (`w & 0x000C` is the code times 4) so the per-element shift leaves
+// the loop — the 2^-2j is applied once at the end. Same structure as
+// `q4k_mv_f32_sg`'s nibble path, and worth ~1.5x on the decode GEMV.
+//
+// Returns Σ y·q, NOT Σ y·(q−1): callers subtract `Σ y` once per block, which
+// removes the per-element int convert and subtract entirely.
+//
+// `qs` must be 2-byte aligned — see `q2_0_qs_aligned16`.
+inline float q2_0_dot16(device const uchar* qs, thread const float* yl) {
+    device const ushort* q16 = (device const ushort*)qs;
+    const ushort w0 = q16[0];
+    const ushort w1 = q16[1];
+    float4 a0, a1, b0, b1;
+    a0[0] = yl[0]  * (w0 & 0x0003u);
+    a0[1] = yl[1]  * (w0 & 0x000Cu);
+    a0[2] = yl[2]  * (w0 & 0x0030u);
+    a0[3] = yl[3]  * (w0 & 0x00C0u);
+    a1[0] = yl[4]  * (w0 & 0x0300u);
+    a1[1] = yl[5]  * (w0 & 0x0C00u);
+    a1[2] = yl[6]  * (w0 & 0x3000u);
+    a1[3] = yl[7]  * (w0 & 0xC000u);
+    b0[0] = yl[8]  * (w1 & 0x0003u);
+    b0[1] = yl[9]  * (w1 & 0x000Cu);
+    b0[2] = yl[10] * (w1 & 0x0030u);
+    b0[3] = yl[11] * (w1 & 0x00C0u);
+    b1[0] = yl[12] * (w1 & 0x0300u);
+    b1[1] = yl[13] * (w1 & 0x0C00u);
+    b1[2] = yl[14] * (w1 & 0x3000u);
+    b1[3] = yl[15] * (w1 & 0xC000u);
+    return (a0[0] + b0[0])
+         + (a0[1] + b0[1]) * (1.f / 4.f)
+         + (a0[2] + b0[2]) * (1.f / 16.f)
+         + (a0[3] + b0[3]) * (1.f / 64.f)
+         + (a1[0] + b1[0]) * (1.f / 256.f)
+         + (a1[1] + b1[1]) * (1.f / 1024.f)
+         + (a1[2] + b1[2]) * (1.f / 4096.f)
+         + (a1[3] + b1[3]) * (1.f / 16384.f);
+}
+
+// Byte-load fallback for a `qs` the 16-bit path cannot address. Also returns
+// Σ y·q.
+inline float q2_0_dot16_scalar(device const uchar* qs, thread const float* yl) {
+    float acc = 0.f;
+    #pragma unroll
+    for (short i = 0; i < 16; ++i) {
+        const uint q = (uint(qs[i / 4]) >> (2u * uint(i & 3))) & 3u;
+        acc += yl[i] * float(q);
+    }
+    return acc;
+}
+
+// Every Q2_0 block is 34 bytes and every per-thread `qs` offset within a row
+// is `w_off + 2 + 4·j`, so the 16-bit path is 2-byte aligned exactly when
+// `w_off` is even — uniform across the dispatch, so the branch is free.
+// Bit 2 of `flags` forces the scalar path for A/B (RLX_METAL_Q2_0_SCALAR=1).
+inline bool q2_0_qs_aligned16(ulong w_off, uint flags) {
+    return (w_off & 1ul) == 0ul && (flags & 4u) == 0u;
+}
+
 kernel void q2_0_mv_f32_sg(
     device float* arena           [[buffer(0)]],
     constant ulong& x_off         [[buffer(1)]],
@@ -4222,30 +4402,148 @@ kernel void q2_0_mv_f32_sg(
         rows[row] = wbuf + w_off + (ulong)(first_row + row) * nb * Q2_BLK_BYTES;
     }
 
+    const bool aligned16 = q2_0_qs_aligned16(w_off, flags);
+
     float yl[16];
     float sums[Q2_NR0] = {0.f};
     for (uint ib = ix; ib < nb; ib += 4u) {
         const uint x_base_i = ib * Q2_QK + (uint)il;
+        float sumy = 0.f;
         #pragma unroll
         for (short i = 0; i < 16; ++i) {
             const uint xi = x_base_i + (uint)i;
             yl[i] = x_f16 ? float(x_half[xi]) : x_base[xi];
+            sumy += yl[i];
         }
         #pragma unroll
         for (ushort row = 0; row < Q2_NR0; ++row) {
             device const uchar* blk = rows[row] + ib * Q2_BLK_BYTES;
-            const float d = dq_read_f16(blk, 0u);
             device const uchar* qs = blk + 2u + (il / 4);
-            float acc = 0.f;
-            #pragma unroll
-            for (short i = 0; i < 16; ++i) {
-                const uint q = (uint(qs[i / 4]) >> (2u * uint(i & 3))) & 3u;
-                acc += yl[i] * float(int(q) - 1);
-            }
-            sums[row] += d * acc;
+            const float acc = aligned16 ? q2_0_dot16(qs, yl)
+                                        : q2_0_dot16_scalar(qs, yl);
+            sums[row] += dq_read_f16(blk, 0u) * (acc - sumy);
         }
     }
     for (ushort row = 0; row < Q2_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sums[row]);
+        if (tiisg == 0u) {
+            if (dst_f16) dst_h[row_idx] = half(total);
+            else dst_f[row_idx] = total;
+        }
+    }
+}
+
+constant uint G8_QK = 32u;
+constant uint G8_BLK_BYTES = 16u;
+constant uint G8_NR0 = 8u;
+
+// Σ y[i]·q[i] over the 8 G8_0 codes packed into the 2 bytes at `qs`.
+//
+// One 16-bit load and in-place masks, the same shape as `q2_0_dot16`. A G8_0
+// group of 8 is exactly one bf16 scale, so a thread that owns one group needs
+// no scale indexing inside the loop. Returns Σ y·q; the caller subtracts Σ y
+// to get Σ y·(q−1).
+inline float g8_0_dot8(device const uchar* qs, thread const float* yl) {
+    const ushort w = *(device const ushort*)qs;
+    float4 a, b;
+    a[0] = yl[0] * (w & 0x0003u);
+    a[1] = yl[1] * (w & 0x000Cu);
+    a[2] = yl[2] * (w & 0x0030u);
+    a[3] = yl[3] * (w & 0x00C0u);
+    b[0] = yl[4] * (w & 0x0300u);
+    b[1] = yl[5] * (w & 0x0C00u);
+    b[2] = yl[6] * (w & 0x3000u);
+    b[3] = yl[7] * (w & 0xC000u);
+    return a[0]
+         + a[1] * (1.f / 4.f)
+         + a[2] * (1.f / 16.f)
+         + a[3] * (1.f / 64.f)
+         + b[0] * (1.f / 256.f)
+         + b[1] * (1.f / 1024.f)
+         + b[2] * (1.f / 4096.f)
+         + b[3] * (1.f / 16384.f);
+}
+
+inline float g8_0_dot8_scalar(device const uchar* qs, thread const float* yl) {
+    float acc = 0.f;
+    #pragma unroll
+    for (short i = 0; i < 8; ++i) {
+        const uint q = (uint(qs[i >> 2]) >> (2u * uint(i & 3))) & 3u;
+        acc += yl[i] * float(q);
+    }
+    return acc;
+}
+
+// Fused G8_0 decode GEMV — reads the packed weight directly, no f32 scratch.
+//
+// Without this, Pestle-27B's `output` head — [248320, 5120] G8_0 — falls to
+// the dequant-to-scratch path, which reserves a ~5 GiB f32 slab *and*
+// re-dequantizes the whole head on every decoded token. Same reason
+// `q1_0_mv_f32_sg` exists for Ternary-Bonsai's tied head.
+//
+// Lane layout: 32 lanes = 8 block-strides x 4 groups. Each lane owns exactly
+// one group of 8, hence exactly one bf16 scale, so `simd_sum` over the lanes
+// is the whole row.
+kernel void g8_0_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    constant uint& flags          [[buffer(6)]],
+    device const uchar* wbuf      [[buffer(7)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const short ix = (short)(tiisg / 4u);
+    const short g  = (short)(tiisg % 4u);
+    const short il = g * 8;
+    const uint nb = k_dim / G8_QK;
+    const bool x_f16 = (flags & 1u) != 0u;
+    const bool dst_f16 = (flags & 2u) != 0u;
+    const uint first_row = (tgpig.x * 2u + sgitg) * G8_NR0;
+    if (first_row >= n_dim) return;
+
+    // Blocks are 16 bytes and the per-lane `qs` offset is `w_off + 8 + 2·g`,
+    // so the 16-bit path is aligned exactly when `w_off` is even.
+    const bool aligned16 = (w_off & 1ul) == 0ul && (flags & 4u) == 0u;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device const half* x_half = (device const half*)((device char*)arena + x_off);
+    device float* dst_f = (device float*)((device char*)arena + dst_off);
+    device half* dst_h = (device half*)((device char*)arena + dst_off);
+    device const uchar* rows[G8_NR0];
+    #pragma unroll
+    for (ushort row = 0; row < G8_NR0; ++row) {
+        rows[row] = wbuf + w_off + (ulong)(first_row + row) * nb * G8_BLK_BYTES;
+    }
+
+    float yl[8];
+    float sums[G8_NR0] = {0.f};
+    for (uint ib = ix; ib < nb; ib += 8u) {
+        const uint x_base_i = ib * G8_QK + (uint)il;
+        float sumy = 0.f;
+        #pragma unroll
+        for (short i = 0; i < 8; ++i) {
+            const uint xi = x_base_i + (uint)i;
+            yl[i] = x_f16 ? float(x_half[xi]) : x_base[xi];
+            sumy += yl[i];
+        }
+        #pragma unroll
+        for (ushort row = 0; row < G8_NR0; ++row) {
+            device const uchar* blk = rows[row] + ib * G8_BLK_BYTES;
+            const float d = dq_read_bf16(blk, (uint)(g * 2));
+            device const uchar* qs = blk + 8u + (uint)(g * 2);
+            const float acc = aligned16 ? g8_0_dot8(qs, yl)
+                                        : g8_0_dot8_scalar(qs, yl);
+            sums[row] += d * (acc - sumy);
+        }
+    }
+    for (ushort row = 0; row < G8_NR0; ++row) {
         const uint row_idx = first_row + row;
         if (row_idx >= n_dim) break;
         const float total = simd_sum(sums[row]);
@@ -4293,39 +4591,37 @@ kernel void q2_0_dual_mv_f32_sg(
         rows1[row] = wbuf + w1_off + row_base;
     }
 
+    const bool aligned16 =
+        q2_0_qs_aligned16(w0_off, dims.w) && q2_0_qs_aligned16(w1_off, dims.w);
+
     float yl[16];
     float sums0[Q2_NR0] = {0.f};
     float sums1[Q2_NR0] = {0.f};
     for (uint ib = ix; ib < nb; ib += 4u) {
         const uint x_base_i = ib * Q2_QK + (uint)il;
+        float sumy = 0.f;
         #pragma unroll
         for (short i = 0; i < 16; ++i) {
             const uint xi = x_base_i + (uint)i;
             yl[i] = x_f16 ? float(x_half[xi]) : x_base[xi];
+            sumy += yl[i];
         }
         #pragma unroll
         for (ushort row = 0; row < Q2_NR0; ++row) {
             const uint row_idx = first_row + row;
             device const uchar* b0 = rows0[row] + ib * Q2_BLK_BYTES;
             device const uchar* b1 = rows1[row] + ib * Q2_BLK_BYTES;
-            float acc0 = 0.f, acc1 = 0.f;
             if (row_idx < n0) {
                 device const uchar* qs = b0 + 2u + (il / 4);
-                #pragma unroll
-                for (short i = 0; i < 16; ++i) {
-                    const uint q = (uint(qs[i / 4]) >> (2u * uint(i & 3))) & 3u;
-                    acc0 += yl[i] * float(int(q) - 1);
-                }
-                sums0[row] += dq_read_f16(b0, 0u) * acc0;
+                const float acc = aligned16 ? q2_0_dot16(qs, yl)
+                                            : q2_0_dot16_scalar(qs, yl);
+                sums0[row] += dq_read_f16(b0, 0u) * (acc - sumy);
             }
             if (row_idx < n1) {
                 device const uchar* qs = b1 + 2u + (il / 4);
-                #pragma unroll
-                for (short i = 0; i < 16; ++i) {
-                    const uint q = (uint(qs[i / 4]) >> (2u * uint(i & 3))) & 3u;
-                    acc1 += yl[i] * float(int(q) - 1);
-                }
-                sums1[row] += dq_read_f16(b1, 0u) * acc1;
+                const float acc = aligned16 ? q2_0_dot16(qs, yl)
+                                            : q2_0_dot16_scalar(qs, yl);
+                sums1[row] += dq_read_f16(b1, 0u) * (acc - sumy);
             }
         }
     }
@@ -4451,15 +4747,20 @@ kernel void q2_0_swiglu_mv_f32_sg(
         gate_rows[row] = wbuf + gate_off + row_base;
         up_rows[row] = wbuf + up_off + row_base;
     }
+    const bool aligned16 =
+        q2_0_qs_aligned16(gate_off, flags) && q2_0_qs_aligned16(up_off, flags);
+
     float yl[16];
     float gate_sums[Q2_NR0] = {0.f};
     float up_sums[Q2_NR0] = {0.f};
     for (uint ib = ix; ib < nb; ib += 4u) {
         const uint x_base_i = ib * Q2_QK + (uint)il;
+        float sumy = 0.f;
         #pragma unroll
         for (short i = 0; i < 16; ++i) {
             const uint xi = x_base_i + (uint)i;
             yl[i] = x_f16 ? float(x_half[xi]) : x_base[xi];
+            sumy += yl[i];
         }
         #pragma unroll
         for (ushort row = 0; row < Q2_NR0; ++row) {
@@ -4467,13 +4768,10 @@ kernel void q2_0_swiglu_mv_f32_sg(
             device const uchar* bu = up_rows[row] + ib * Q2_BLK_BYTES;
             device const uchar* qg = bg + 2u + (il / 4);
             device const uchar* qu = bu + 2u + (il / 4);
-            float ag = 0.f, au = 0.f;
-            #pragma unroll
-            for (short i = 0; i < 16; ++i) {
-                const uint shift = 2u * uint(i & 3);
-                ag += yl[i] * float(int((uint(qg[i / 4]) >> shift) & 3u) - 1);
-                au += yl[i] * float(int((uint(qu[i / 4]) >> shift) & 3u) - 1);
-            }
+            const float ag = (aligned16 ? q2_0_dot16(qg, yl)
+                                        : q2_0_dot16_scalar(qg, yl)) - sumy;
+            const float au = (aligned16 ? q2_0_dot16(qu, yl)
+                                        : q2_0_dot16_scalar(qu, yl)) - sumy;
             gate_sums[row] += dq_read_f16(bg, 0u) * ag;
             up_sums[row] += dq_read_f16(bu, 0u) * au;
         }
@@ -4544,26 +4842,26 @@ kernel void q2_0_mv_residual_f32_sg(
     for (ushort row = 0; row < Q2_NR0; ++row) {
         rows[row] = wbuf + w_off + (ulong)(first_row + row) * nb * Q2_BLK_BYTES;
     }
+    const bool aligned16 = q2_0_qs_aligned16(w_off, flags);
+
     float yl[16];
     float sums[Q2_NR0] = {0.f};
     for (uint ib = ix; ib < nb; ib += 4u) {
         const uint x_base_i = ib * Q2_QK + (uint)il;
+        float sumy = 0.f;
         #pragma unroll
         for (short i = 0; i < 16; ++i) {
             const uint xi = x_base_i + (uint)i;
             yl[i] = x_f16 ? float(x_half[xi]) : x_base[xi];
+            sumy += yl[i];
         }
         #pragma unroll
         for (ushort row = 0; row < Q2_NR0; ++row) {
             device const uchar* blk = rows[row] + ib * Q2_BLK_BYTES;
             device const uchar* qs = blk + 2u + (il / 4);
-            float acc = 0.f;
-            #pragma unroll
-            for (short i = 0; i < 16; ++i) {
-                const uint q = (uint(qs[i / 4]) >> (2u * uint(i & 3))) & 3u;
-                acc += yl[i] * float(int(q) - 1);
-            }
-            sums[row] += dq_read_f16(blk, 0u) * acc;
+            const float acc = aligned16 ? q2_0_dot16(qs, yl)
+                                        : q2_0_dot16_scalar(qs, yl);
+            sums[row] += dq_read_f16(blk, 0u) * (acc - sumy);
         }
     }
     for (ushort row = 0; row < Q2_NR0; ++row) {

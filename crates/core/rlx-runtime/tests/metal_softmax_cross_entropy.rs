@@ -10,6 +10,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 const N: usize = 6;
 const C: usize = 7;
 
@@ -57,6 +59,7 @@ fn ref_loss(logits: &[f32], targets: &[f32]) -> Vec<f32> {
 
 #[test]
 fn metal_softmax_cross_entropy_matches_cpu_and_reference() {
+    let _gpu = common::serialize_gpu();
     let logits = sample_logits();
     let targets = sample_targets();
     let inputs: &[(&str, &[f32])] = &[("logits", &logits), ("targets", &targets)];

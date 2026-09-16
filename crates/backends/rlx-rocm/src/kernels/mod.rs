@@ -143,6 +143,202 @@ pub(crate) fn compile(ctx: &Arc<RocmContext>, src: &str, entry: &str) -> HipKern
     }
 }
 
+/// `matmul` compiled for an explicit tile schedule, cached per tile — the ROCm
+/// twin of `rlx_cuda::kernels::matmul_kernel_tiled`.
+///
+/// The `.cu` sources are shared with CUDA, so the tile parameter space, its
+/// legality rules, and the shape-keyed table that picks a tile are shared too;
+/// only the JIT differs (hipRTC → `.hsaco`, and the cache key already folds the
+/// source hash *and* the gfx arch).
+///
+/// One deliberate difference from the CUDA path: there is no post-compile
+/// hardware-conformance query here. CUDA asks the driver for
+/// `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK` and rejects a tile whose block
+/// exceeds it; this crate exposes no equivalent `hipFuncGetAttributes` binding,
+/// so ROCm relies on the static `TileParams::validate` rule alone. That rule
+/// already rejects the register-file overrun observed on sm_86, but it is a
+/// calibrated estimate rather than the device's own answer — so a ROCm tile that
+/// launches on CUDA is not automatically launchable here. Returning `Option`
+/// keeps the caller's fallback path identical on both backends.
+pub fn matmul_kernel_tiled(
+    ctx: &Arc<RocmContext>,
+    tile: rlx_gpu_kernels::tiles::TileParams,
+) -> Option<&'static HipKernel> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    // Keyed on the schedule as well as the tile, for the reason rlx-cuda's twin
+    // is: an in-process A/B asks for the same tile per arm, and a tile-only key
+    // hands the second arm the first arm's compiled kernel — a 1.00x that reads
+    // as "no difference" rather than "never ran".
+    type Key = (
+        rlx_gpu_kernels::tiles::TileParams,
+        crate::kernels::MatmulScheduleChoice,
+    );
+    type Cache = HashMap<Key, Option<&'static HipKernel>>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key: Key = (tile, current_matmul_schedule());
+    if let Some(k) = cache.lock().expect("tiled matmul cache poisoned").get(&key) {
+        return *k;
+    }
+    let entry = matmul_src_for(tile)
+        .map(|src| -> &'static HipKernel { Box::leak(Box::new(compile(ctx, &src, "matmul"))) });
+    cache
+        .lock()
+        .expect("tiled matmul cache poisoned")
+        .insert(key, entry);
+    entry
+}
+
+/// Which physical schedule the tiled `matmul` is built from.
+///
+/// Without `schedule-codegen` there is exactly one, so this collapses to a unit
+/// and the cache key behaves as it did before.
+#[cfg(feature = "schedule-codegen")]
+pub type MatmulScheduleChoice = rlx_gpu_kernels::MatmulSchedule;
+#[cfg(not(feature = "schedule-codegen"))]
+pub type MatmulScheduleChoice = ();
+
+#[cfg(not(feature = "schedule-codegen"))]
+fn current_matmul_schedule() -> MatmulScheduleChoice {}
+
+#[cfg(not(feature = "schedule-codegen"))]
+fn matmul_src_for(tile: rlx_gpu_kernels::tiles::TileParams) -> Option<String> {
+    rlx_gpu_kernels::matmul_cuda_src_tiled(tile).ok()
+}
+
+/// Encoded schedule choice, so the hot path is one relaxed atomic load.
+///
+/// `OnceLock` would have been simpler and wrong: it freezes the choice for the
+/// process, and an in-process A/B has to change it between arms. A `RwLock`
+/// would work but sits on every matmul dispatch. `0` means "not yet read from
+/// the environment".
+#[cfg(feature = "schedule-codegen")]
+static SCHEDULE_CHOICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "schedule-codegen")]
+fn encode_schedule(s: rlx_gpu_kernels::MatmulSchedule) -> u64 {
+    use rlx_gpu_kernels::MatmulSchedule as S;
+    match s {
+        S::Default => 1,
+        S::EmittedSerial => 2,
+        S::EmittedPipelined { stages } => 3 + stages as u64,
+    }
+}
+
+#[cfg(feature = "schedule-codegen")]
+fn decode_schedule(v: u64) -> rlx_gpu_kernels::MatmulSchedule {
+    use rlx_gpu_kernels::MatmulSchedule as S;
+    match v {
+        2 => S::EmittedSerial,
+        n if n >= 3 => S::EmittedPipelined {
+            stages: (n - 3) as usize,
+        },
+        _ => S::Default,
+    }
+}
+
+/// Override the schedule for the rest of the process (tests, A/B examples).
+///
+/// The public counterpart of `RLX_ROCM_SCHEDULE_MATMUL`, needed because an
+/// experiment that can only set the schedule via the environment has to fork a
+/// process per arm — and then every arm measures a different device state.
+#[cfg(feature = "schedule-codegen")]
+pub fn set_matmul_schedule(s: rlx_gpu_kernels::MatmulSchedule) {
+    SCHEDULE_CHOICE.store(encode_schedule(s), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `RLX_ROCM_SCHEDULE_MATMUL=default|serial|pipelined[:N]`.
+///
+/// An unrecognized value is reported and treated as `Default`, never silently
+/// accepted: a typo that quietly runs the baseline makes an A/B measure one
+/// path twice (`metal-variant-typo-silent`).
+#[cfg(feature = "schedule-codegen")]
+fn current_matmul_schedule() -> MatmulScheduleChoice {
+    use std::sync::atomic::Ordering;
+    let v = SCHEDULE_CHOICE.load(Ordering::Relaxed);
+    if v != 0 {
+        return decode_schedule(v);
+    }
+    let parsed = match rlx_ir::env::var("RLX_ROCM_SCHEDULE_MATMUL") {
+        None => rlx_gpu_kernels::MatmulSchedule::Default,
+        Some(s) => rlx_gpu_kernels::MatmulSchedule::parse(&s).unwrap_or_else(|why| {
+            eprintln!("rlx-rocm: RLX_ROCM_SCHEDULE_MATMUL {why} — using the default schedule");
+            rlx_gpu_kernels::MatmulSchedule::Default
+        }),
+    };
+    SCHEDULE_CHOICE.store(encode_schedule(parsed), Ordering::Relaxed);
+    parsed
+}
+
+/// The schedule-verifier [`Target`] for the attached device.
+///
+/// Resolved from the *proven* gfx arch rather than a guess. An arch with no
+/// calibrated entry falls back to `Target::PORTABLE`, which under-reports both
+/// the LDS budget and the capability list — the safe direction, since a
+/// schedule wrongly refused is recoverable and one wrongly admitted is a launch
+/// failure or silent corruption.
+///
+/// [`Target`]: rlx_ir::kernel_schedule::Target
+#[cfg(feature = "schedule-codegen")]
+pub fn schedule_target() -> rlx_ir::kernel_schedule::Target {
+    use rlx_ir::kernel_schedule::Target;
+    match crate::hip::rocm_target_arch().as_deref() {
+        Some("gfx908") => Target::ROCM_GFX908,
+        Some("gfx1103") => Target::ROCM_GFX1103,
+        _ => Target::PORTABLE,
+    }
+}
+
+#[cfg(feature = "schedule-codegen")]
+fn matmul_src_for(tile: rlx_gpu_kernels::tiles::TileParams) -> Option<String> {
+    use rlx_gpu_kernels::MatmulSchedule as S;
+    use rlx_gpu_kernels::kernel_schedule_emit::Lang;
+
+    let which = current_matmul_schedule();
+    if which == S::Default {
+        return rlx_gpu_kernels::matmul_cuda_src_tiled(tile).ok();
+    }
+    let target = schedule_target();
+    match rlx_gpu_kernels::matmul_src_scheduled(tile, which, target, Lang::Hip) {
+        Ok((src, facts)) => {
+            if rlx_ir::env::flag("RLX_VERBOSE") {
+                eprintln!(
+                    "rlx-rocm: matmul tile {} from schedule {} on {} — {facts:?}",
+                    tile.label(),
+                    which.label(),
+                    target.name
+                );
+            }
+            Some(src)
+        }
+        // Reported, never quietly swapped for the default: a treatment arm that
+        // silently ran the baseline would report parity rather than absence.
+        Err(e) => {
+            eprintln!(
+                "rlx-rocm: schedule {} cannot be emitted for tile {} on {}: {e}",
+                which.label(),
+                tile.label(),
+                target.name
+            );
+            None
+        }
+    }
+}
+
+/// This device's key in the shared GPU dispatch table, with the persisted tuning
+/// cache guaranteed loaded. Twin of `rlx_cuda::backend::gpu_arch`.
+pub fn gpu_arch() -> &'static rlx_gpu_kernels::dispatch::GpuArch {
+    static ARCH: OnceLock<rlx_gpu_kernels::dispatch::GpuArch> = OnceLock::new();
+    ARCH.get_or_init(|| {
+        crate::tuning::ensure_tuning_cache_loaded();
+        match crate::hip::rocm_target_arch() {
+            Some(a) => rlx_gpu_kernels::dispatch::GpuArch::rocm(&a),
+            None => rlx_gpu_kernels::dispatch::GpuArch::unknown(),
+        }
+    })
+}
+
 /// Explain a `hipModuleLoadData` failure in terms of the arch mismatch that
 /// almost always causes it.
 ///
@@ -561,6 +757,31 @@ kernel_cache!(
     SCATTER_ADD_CU,
     "scatter_add_acc"
 );
+kernel_cache!(GATHER_ND, gather_nd_kernel, INDEXING_ND_CU, "gather_nd_f32");
+kernel_cache!(
+    GATHER_ELEMENTS,
+    gather_elements_kernel,
+    INDEXING_ND_CU,
+    "gather_elements_f32"
+);
+kernel_cache!(
+    SCATTER_ELEMENTS,
+    scatter_elements_kernel,
+    INDEXING_ND_CU,
+    "scatter_elements_f32"
+);
+kernel_cache!(
+    SCATTER_ND_REDUCE,
+    scatter_nd_reduce_kernel,
+    INDEXING_ND_CU,
+    "scatter_nd_reduce_f32"
+);
+kernel_cache!(
+    COPY_SANITIZE,
+    copy_sanitize_kernel,
+    INDEXING_ND_CU,
+    "copy_sanitize_f32"
+);
 kernel_cache!(
     DEQUANT_MATMUL,
     dequant_matmul_kernel,
@@ -903,6 +1124,11 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = grouped_matmul_kernel(ctx);
     let _ = scatter_add_zero_kernel(ctx);
     let _ = scatter_add_acc_kernel(ctx);
+    let _ = gather_nd_kernel(ctx);
+    let _ = gather_elements_kernel(ctx);
+    let _ = scatter_elements_kernel(ctx);
+    let _ = scatter_nd_reduce_kernel(ctx);
+    let _ = copy_sanitize_kernel(ctx);
     let _ = dequant_matmul_kernel(ctx);
     let _ = dequant_matmul_mlx_kernel(ctx);
     let _ = dequant_gguf_kernel(ctx);

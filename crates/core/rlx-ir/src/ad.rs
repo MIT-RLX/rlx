@@ -15,7 +15,7 @@
 //!
 //! - **HIR**: use [`crate::hir::FusionPolicy::for_autodiff`] or `Direct` +
 //!   `rlx_autodiff::prepare_graph_for_ad`.
-//! - **MIR**: [`rlx_autodiff::grad_with_loss`] / [`rlx_autodiff::grad_with_loss_module`].
+//! - **MIR**: `rlx_autodiff::grad_with_loss` / `rlx_autodiff::grad_with_loss_module`.
 //! - **LIR**: do not differentiate; lower from MIR first.
 
 /// Named stages in a training-oriented compile flow.

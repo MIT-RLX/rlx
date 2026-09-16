@@ -82,6 +82,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         DequantMatMul,
         SelectiveScan,
         GatedDeltaNet,
+        GatedDeltaNetBackward,
         FusedSwiGLU,
         FusedMatMulBiasAct,
         FusedResidualLN,

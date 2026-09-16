@@ -1,6 +1,6 @@
 # rlx-onnx-import
 
-ONNX → [`rlx-ir`](../rlx-ir) HIR lowering used by [`rlx-onnx`](../rlx-onnx) native execution.
+ONNX → [`rlx-ir`](../../core/rlx-ir) HIR lowering used by [`rlx-onnx`](../rlx-onnx) native execution.
 
 ## Features
 

@@ -5,7 +5,7 @@
 //! wgpu device discovery + capabilities.
 //!
 //! [`wgpu_device`] returns a process-global singleton. [`select_vulkan_backend`]
-//! routes subsequent calls to a Vulkan-only instance (for [`Device::Vulkan`]).
+//! routes subsequent calls to a Vulkan-only instance (for `Device::Vulkan`).
 
 use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
@@ -226,7 +226,7 @@ fn vulkan_device() -> Option<&'static WgpuDevice> {
         .as_ref()
 }
 
-/// Prefer the Vulkan-only wgpu instance for [`Device::Vulkan`] sessions.
+/// Prefer the Vulkan-only wgpu instance for `Device::Vulkan` sessions.
 /// Call before the first [`wgpu_device`] use in that process (or use
 /// `Device::Vulkan` via the runtime registry, which calls this).
 #[cfg(not(target_arch = "wasm32"))]

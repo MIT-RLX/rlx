@@ -104,3 +104,8 @@ name = "predicate_precision"
 
 [[example]]
 name = "delaunay32_bench"
+
+[package.metadata.docs.rs]
+features       = ["cpu"]
+rustdoc-args   = ["--cfg", "docsrs"]
+all-features   = false

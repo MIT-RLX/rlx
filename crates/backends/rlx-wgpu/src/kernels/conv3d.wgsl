@@ -14,7 +14,10 @@ struct Params {
     dd: u32, dh: u32, dw: u32,
     groups: u32,
     in_off: u32, w_off: u32, out_off: u32,
-    _p0: u32,
+    bias_off: u32,   // per-output-channel bias; valid when has_bias != 0
+    has_bias: u32,
+    _p1: u32,
+    _p2: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -66,5 +69,6 @@ fn conv3d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
           }
         }
     }
+    if (params.has_bias != 0u) { acc = acc + arena[params.bias_off + co]; }
     arena[params.out_off + i] = acc;
 }

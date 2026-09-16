@@ -20,6 +20,15 @@ use crate::proto;
 use crate::{CoremlError, Result};
 
 mod helpers;
+
+/// Structural legality of an emitted MIL program, checked before Apple's
+/// compiler sees it.
+///
+/// CoreML is a delegating backend, so there is no rlx schedule to verify — but
+/// the IR rlx *emits* has legality rules, and CAKE's "localized diagnostics
+/// rather than a pass/fail bit" applies to them unchanged. Today a bad reshape
+/// reaches the compiler and `abort()`s the process with no finding.
+pub mod verify;
 pub(crate) use helpers::bytes_to_f32;
 use helpers::simple_op_flex;
 use helpers::*;
@@ -52,7 +61,7 @@ pub struct IoTensor {
 }
 
 impl IoTensor {
-    /// Number of elements (product of dims); use [`runtime_dims`] when flex.
+    /// Number of elements (product of dims); use [`Self::runtime_dims`] when flex.
     pub fn numel(&self) -> usize {
         self.dims.iter().product::<i64>().max(0) as usize
     }
@@ -173,6 +182,10 @@ struct LowerCtx<'a> {
     /// bool tensor reused as a numeric operand (VITS masks feed many ops) is
     /// cast once — re-emitting would redefine the MIL I/O name.
     numeric_casts: HashMap<u32, String>,
+    /// `Op::Narrow` nodes at a non-zero offset that feed an `Op::Reshape`.
+    /// Lowered as `gather` rather than `slice_by_size` — see the note in the
+    /// `Op::Narrow` arm.
+    narrow_needs_gather: std::collections::HashSet<u32>,
     blob: crate::mlpackage::BlobWriter,
     /// Prefix for generated `v{id}` value names. Empty at the top level; set to a
     /// scan-unique string while lowering an `Op::Scan` body into a nested
@@ -196,6 +209,70 @@ mod rnn;
 mod rope;
 mod ssm;
 
+/// `Op::Narrow` nodes at a non-zero offset whose result is reshaped.
+///
+/// Apple's MIL -> MPSGraph lowering folds `reshape(slice_by_size(x, begin))`
+/// into `reshape(x)`, **dropping the offset**. That is only sound at offset 0;
+/// otherwise the reshape receives the un-sliced operand and the module fails
+/// verification —
+/// `'mps.reshape' op the result shape is not compatible with the input shape` —
+/// which aborts the process out of `MPSGraphExecutable`, so no caller can catch
+/// it. The MIL rlx emits is correct; the fold is not.
+///
+/// Two things that do NOT work, both tried and verified against the emitted MIL:
+/// an identity `mul(x, 1.0)` between the two (MPSGraph elides the multiply and
+/// re-applies the same fold), and reordering to `slice(reshape(x))` (valid only
+/// when the sliced axis is last, and it leaves the parent feeding consumers at
+/// two different ranks, which breaks a later `add`).
+///
+/// A `gather` was tried as a third escape — it is not a view, so the slice-fold
+/// should not apply. MPSGraph folded through that too, reporting the reshape's
+/// input as `2x528x936`: it treats slice AND gather alike as aliases and pushes
+/// the reshape onto the root. There is no MIL-level spelling of this that
+/// survives, so the lowering refuses instead of emitting a module that aborts.
+fn narrow_nodes_feeding_reshape(graph: &Graph) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    for node in graph.nodes() {
+        let Op::Reshape { new_shape } = &node.op else {
+            continue;
+        };
+        let Some(&src) = node.inputs.first() else {
+            continue;
+        };
+        let Op::Narrow { axis, start, len } = graph.node(src).op else {
+            continue;
+        };
+        if start == 0 || new_shape.iter().any(|&d| d < 0) {
+            continue;
+        }
+        let parent = graph.shape(graph.node(src).inputs[0]).clone();
+        let prank = parent.rank();
+        if prank == 0 || axis + 1 != prank {
+            continue; // the substitution below is only possible on the last axis
+        }
+        let last = parent.dim(prank - 1).unwrap_static();
+        let new_dims: Vec<usize> = new_shape.iter().map(|&d| d as usize).collect();
+        let lead_new: usize = new_dims[..new_dims.len() - 1].iter().product();
+        let lead_old: usize = (0..prank - 1)
+            .map(|i| parent.dim(i).unwrap_static())
+            .product();
+        // Exactly the shape of the miscompile: MPS rewrites the reshape onto the
+        // slice's PARENT and keeps the parent's last dim. That is only
+        // structurally possible when the reshape re-splits the leading extent and
+        // leaves the sliced (last) axis as the trailing dim — which is when the
+        // dropped offset shows up as `parent_last` where `len` was expected.
+        //
+        // Narrower than "any Reshape(Narrow)" on purpose. Of 26 moabb decoders,
+        // 8 contain some `Reshape(Narrow(start != 0))` and 7 of those run on
+        // CoreML today; only this configuration actually miscompiles. Refusing
+        // the broad pattern would have broken 7 working models.
+        if len != last && lead_new == lead_old && *new_dims.last().unwrap() == len {
+            out.insert(src.0);
+        }
+    }
+    out
+}
+
 impl<'a> LowerCtx<'a> {
     pub(crate) fn new(
         graph: &'a Graph,
@@ -214,6 +291,7 @@ impl<'a> LowerCtx<'a> {
             inputs: Vec::new(),
             used_feature_names: HashMap::new(),
             numeric_casts: HashMap::new(),
+            narrow_needs_gather: narrow_nodes_feeding_reshape(graph),
             blob: crate::mlpackage::BlobWriter::new(),
             name_prefix: String::new(),
         }
@@ -650,6 +728,49 @@ impl<'a> LowerCtx<'a> {
                 )?;
                 self.push_named(id, out_name, op);
             }
+            Op::Narrow { axis, start, len } if self.narrow_needs_gather.contains(&id.0) => {
+                // MPSGraph mis-lowers `Reshape(Slice(x))` in this exact shape: it
+                // folds the reshape onto the slice's PARENT and drops the offset,
+                // then fails module verification and aborts the process from
+                // MPSGraphExecutable (SIGABRT) — uncatchable, so this used to be
+                // refused outright.
+                //
+                // A `gather` is not foldable that way: the offsets live in an index
+                // tensor rather than in slice attributes, so there is nothing for
+                // the reshape to absorb. Emit the same selection as an explicit
+                // gather of [start, start+len) along `axis`. Indices are baked as
+                // f32 and cast to int32, exactly as the `Op::Gather` arm does (this
+                // f32-flow graph carries index data as f32 even where the IR dtype
+                // says otherwise).
+                let x = self.val(node.inputs[0]);
+                let idx_name = format!("{out_name}_gidx");
+                let idx_f: Vec<f32> = (0..*len).map(|i| (*start + i) as f32).collect();
+                let idx_shape = Shape::new(&[*len], DType::F32);
+                self.operations
+                    .push(make_const(&mut self.blob, &idx_name, &idx_shape, &idx_f)?);
+                let idx_i32 = format!("{out_name}_gidx_i32");
+                self.emit(
+                    "cast",
+                    &idx_i32,
+                    &Shape::new(&[*len], DType::I32),
+                    vec![
+                        ("x", bind_name(&idx_name)),
+                        ("dtype", bind_value(scalar_str("int32"))),
+                    ],
+                )?;
+                let op = self.simple_op(
+                    "gather",
+                    &out_name,
+                    &node.shape,
+                    vec![
+                        ("x", bind_name(&x)),
+                        ("indices", bind_name(&idx_i32)),
+                        ("axis", bind_value(scalar_i32(*axis as i32))),
+                        ("validate_indices", bind_value(scalar_bool(false))),
+                    ],
+                )?;
+                self.push_named(id, out_name, op);
+            }
             Op::Narrow { axis, start, len } => {
                 let x = self.val(node.inputs[0]);
                 let rank = node.shape.rank();
@@ -861,7 +982,17 @@ impl<'a> LowerCtx<'a> {
                 )?;
                 self.push_named(id, out_name, op);
             }
-            Op::ScatterAdd => {
+            Op::ScatterAdd { axis } => {
+                // Every backend kernel implements the axis-0 form only;
+                // `rlx_fusion::LowerScatterAddAxis` rewrites any other axis to
+                // transpose/scatter/transpose before lowering. Reaching here with
+                // axis != 0 means that pass did not run, and scattering along axis
+                // 0 anyway would silently produce the wrong tensor.
+                assert_eq!(
+                    *axis, 0,
+                    "rlx-coreml: ScatterAdd axis {{axis}} reached the backend; \
+                 LowerScatterAddAxis must run first"
+                );
                 // out = scatter(zeros, indices, updates, axis=0, mode=add).
                 let updates = self.val(node.inputs[0]);
                 let idx_in = node.inputs[1];
@@ -1270,6 +1401,34 @@ impl<'a> LowerCtx<'a> {
     /// the initial values; op outputs are the final loop vars.
     fn lower_scan(&mut self, id: NodeId, out_name: &str) -> Result<()> {
         let outer_graph: &'a Graph = self.graph;
+        // Apple's MIL compiler is superlinear in a `while_loop`'s trip count even
+        // though the program it compiles is a fixed size. Measured on
+        // `rlx-neuromamba` (19 channels, one selective scan, Ane): 8.8 s at
+        // length 125, 25.8 s at 250, 81.5 s at 500, 307 s at 1000 — while the
+        // same model takes seconds on CPU/Metal/MLX/wgpu and a non-scan model of
+        // any length compiles in 0.04 s. Extrapolated, the backend sweep's 2500
+        // sample window is ~30 minutes, which is why five selective-scan models
+        // recorded as TIMEOUT rather than as anything diagnosable.
+        //
+        // Refusing is strictly better than hanging: the caller gets an immediate,
+        // named reason and can pick another backend. `RLX_COREML_MAX_SCAN_LEN`
+        // raises or removes the cap (`0` disables it).
+        if let Op::Scan { length, .. } = outer_graph.node(id).op {
+            if rlx_ir::env::var("RLX_COREML_SEG_REPORT").is_some() {
+                eprintln!("[coreml] Scan node {} length={length}", id.0);
+            }
+            let cap: u32 = rlx_ir::env::var("RLX_COREML_MAX_SCAN_LEN")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512);
+            if cap > 0 && length > cap {
+                return Err(CoremlError::Unsupported(format!(
+                    "Scan of length {length} exceeds RLX_COREML_MAX_SCAN_LEN ({cap}): \
+                     CoreML's while_loop compile is superlinear in the trip count \
+                     (~{:.0}s here, measured), so this would hang rather than fail",
+                    0.3 * (f64::from(length) / 1000.0).powi(2) * 1000.0
+                )));
+            }
+        }
         // Extract the scan spec + outer operands (node borrow ends with the block).
         let (body, length, num_bcast, num_xs, inputs, carry_shape) = {
             let node = outer_graph.node(id);
@@ -1750,6 +1909,26 @@ impl<'a> LowerCtx<'a> {
             is_updatable: false,
             r#type: Some(proto::model::Type::MlProgram(program)),
         };
+
+        // Structural gate, before Apple's compiler sees the program.
+        //
+        // Reported rather than refused. The checks are cheap and narrow, and a
+        // *new* false positive here would break a working model — so the
+        // default is a loud finding on stderr, and `RLX_COREML_VERIFY=strict`
+        // turns it into an error for CI. Once the gate has run clean across the
+        // corpus for a while, strict becomes the sensible default.
+        //
+        // The alternative is what happens today: a bad reshape reaches CoreML
+        // and `abort()`s the process with no operation name and no repair
+        // target (see `verify` and `scripts/mil-reshape-check.py`).
+        if let Some(text) = verify::report(&model) {
+            eprint!("{text}");
+            if rlx_ir::env::var("RLX_COREML_VERIFY").as_deref() == Some("strict") {
+                return Err(CoremlError::Runtime(format!(
+                    "MIL verification failed (RLX_COREML_VERIFY=strict):\n{text}"
+                )));
+            }
+        }
 
         Ok(LoweredProgram {
             model,

@@ -13,7 +13,7 @@ use crate::{Graph, NodeId};
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeOrigin {
-    /// Source HIR block node, when lowered from [`HirModule`].
+    /// Source HIR block node, when lowered from `HirModule`.
     pub hir: Option<HirNodeId>,
     /// Human label (`layer0.ffn`, `swiglu_ffn`, param name, …).
     pub label: Option<String>,

@@ -108,7 +108,7 @@ fn wgpu_out(build: impl Fn(&mut Graph), inputs: &[(&str, &[f64])]) -> Vec<f32> {
 
 #[test]
 fn reeig_forward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping reeig_forward_matches_cpu");
         return;
     }
@@ -130,7 +130,7 @@ fn reeig_forward_matches_cpu() {
 
 #[test]
 fn logeig_forward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping logeig_forward_matches_cpu");
         return;
     }
@@ -152,7 +152,7 @@ fn logeig_forward_matches_cpu() {
 
 #[test]
 fn bimap_forward_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping bimap_forward_matches_cpu");
         return;
     }
@@ -176,7 +176,7 @@ fn bimap_forward_matches_cpu() {
 
 #[test]
 fn karcher_mean_weighted_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping karcher_mean_weighted");
         return;
     }
@@ -200,7 +200,7 @@ fn karcher_mean_weighted_matches_cpu() {
 
 #[test]
 fn log_map_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping log_map");
         return;
     }
@@ -221,7 +221,7 @@ fn log_map_matches_cpu() {
 
 #[test]
 fn exp_map_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping exp_map");
         return;
     }
@@ -242,7 +242,7 @@ fn exp_map_matches_cpu() {
 
 #[test]
 fn parallel_transport_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping parallel_transport");
         return;
     }
@@ -268,7 +268,7 @@ fn parallel_transport_matches_cpu() {
 
 #[test]
 fn matrix_fn_batch_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping matrix_fn_batch");
         return;
     }
@@ -293,7 +293,7 @@ fn matrix_fn_batch_matches_cpu() {
 /// path (the backward op is F64, host-delegated exactly like the forward).
 #[test]
 fn log_map_grad_matches_cpu() {
-    if !rlx_wgpu::is_available() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("[spd_host_parity] no wgpu device — skipping log_map_grad");
         return;
     }

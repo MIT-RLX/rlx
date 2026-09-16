@@ -63,6 +63,7 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::Transpose,
     OpKind::Narrow,
     OpKind::Concat,
+    OpKind::KvAppend,
     OpKind::Expand,
     OpKind::Gather,
     OpKind::Reverse,
@@ -120,6 +121,10 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     // unified memory, so silent CPU round-trip would be a hidden
     // performance cliff.
     OpKind::Fft,
+    // Fixed-point `Op::FftQ`, host fallback. The arena stores integers as f32
+    // values, so the adapter converts at the boundary; exact to 2^24 and loud
+    // past it (see rlx_gpu_host::run_fft1d_q_valued).
+    OpKind::FftQ,
     // Op::Scan (arbitrary-body recurrence) via readback host fallback —
     // compile the body once, loop it on the CPU against an arena readback.
     // Enables IIR (`biquad`/`sosfilt`) on wgpu.
@@ -224,3 +229,71 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::If,
     OpKind::While,
 ];
+
+/// Does this op get handed to rlx-cpu through the generic `Step::HostOp`
+/// fallback instead of a WGSL kernel?
+///
+/// Exposed so the routing can be checked from outside the crate **without a
+/// GPU**, by `rlx-runtime/tests/host_fallback_never_nops.rs`. The composition
+/// it guards is invisible to any single-crate test: [`SUPPORTED_OPS`] claims an
+/// op (so nothing upstream expands it), no kernel lowers it, this returns true,
+/// and rlx-cpu has no thunk arm for it either — the result is a `Thunk::Nop`
+/// over a zeroed slot, with no panic and no unsupported-op error.
+///
+/// wgpu has already paid for this once: the `PartitionedConv` below is still
+/// routed here, and the note next to it in `SUPPORTED_OPS` records what that
+/// cost (`cpu=0.4 vs gpu=0`). Dropping the claim is what fixed it, so the route
+/// is harmless *today* — and one line re-adding the claim would bring the zeros
+/// straight back. That line is what this predicate exists to catch.
+///
+/// **Scope.** This is the *generic* host route only. The op-specific
+/// `Step::*Host` steps (`ConcatHost`, `FftHost`, `GruHost`, …) each name their
+/// own rlx-cpu entry point, so a missing arm there is a compile error rather
+/// than a silent Nop, and none of them carry a `NO_THUNK_ARM` kind.
+pub fn routes_to_cpu_host(op: &rlx_ir::Op) -> bool {
+    use rlx_ir::Op;
+    matches!(
+        op,
+        Op::BatchNormInference { .. }
+            | Op::BatchNormInferenceBackwardInput { .. }
+            | Op::BatchNormInferenceBackwardGamma { .. }
+            | Op::BatchNormInferenceBackwardBeta
+            | Op::FakeQuantizeBackward { .. }
+            | Op::FakeQuantizeLSQ { .. }
+            | Op::FakeQuantizeLSQBackwardX { .. }
+            | Op::FakeQuantizeLSQBackwardScale { .. }
+            // The native low-precision / INT8 family (`scaled_lowp.wgsl`,
+            // `quant_i8.wgsl`, `q_matmul.wgsl`, `q_conv2d.wgsl`) keeps this
+            // route as a RESIDUAL, and listing it is load-bearing rather than
+            // conservative: those kernels address the arena with absolute
+            // offsets, so their lowering arms are guarded by
+            // `arena_binds_whole_at_zero`, and a failed guard falls through to
+            // the catch-all below. Drop them from this list and that
+            // fall-through becomes a no-kernel panic.
+            //
+            // Quantize / Dequantize additionally fall back when `chan_dim`
+            // exceeds `QUANT_I8_MAX_CHAN` (the affine table stops fitting the
+            // uniform).
+            | Op::ScaledMatMul { .. }
+            | Op::ScaledQuantize { .. }
+            | Op::ScaledQuantScale { .. }
+            | Op::ScaledDequantize { .. }
+            | Op::QMatMul { .. }
+            | Op::QConv2d { .. }
+            | Op::Quantize { .. }
+            | Op::Dequantize { .. }
+            | Op::DenseSolve
+            | Op::BatchedDenseSolve
+            | Op::Cholesky
+            | Op::TriangularSolve { .. }
+            | Op::Det
+            | Op::LogDet
+            | Op::Sort { .. }
+            | Op::Svd { .. }
+            | Op::Qr { .. }
+            | Op::ArgSort { .. }
+            | Op::LoraMatMul { .. }
+            | Op::PartitionedConv { .. }
+            | Op::CustomFn { .. }
+    )
+}

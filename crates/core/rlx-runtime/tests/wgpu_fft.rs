@@ -11,6 +11,8 @@
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn const_f32(g: &mut Graph, xs: &[f32]) -> NodeId {
     let mut bytes = Vec::with_capacity(xs.len() * 4);
     for &x in xs {
@@ -30,6 +32,10 @@ fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn fft_wgpu_native_matches_cpu_pow2() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     // Includes n > 4096 (multi-kernel path with >=2 outer stages) — this used to
     // silently corrupt due to a shared FFT uniform buffer aliasing across stages.
     for &n in &[
@@ -73,6 +79,10 @@ fn fft_wgpu_native_matches_cpu_pow2() {
 // the multi-row packing/bit-reversal/store indexing against CPU.
 #[test]
 fn fft_wgpu_multirow_batched_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     // Multi-row is opt-in (default off — it regresses on wgpu); force it on so
     // this test still validates the kernel's packing/indexing.
     // SAFETY: test process sets a process-local gate before compiling.
@@ -132,6 +142,10 @@ fn fft_wgpu_multirow_batched_matches_cpu() {
 // Multirow is left default-off so these hit the row_grid / dispatch_dims fixes.
 #[test]
 fn fft_wgpu_grid_overflow_matches_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     for &(n, batch) in &[(2usize, 70000usize), (2048usize, 1100usize)] {
         let mut x = Vec::with_capacity(batch * 2 * n);
         for b in 0..batch {
@@ -175,6 +189,10 @@ fn fft_wgpu_grid_overflow_matches_cpu() {
 
 #[test]
 fn fft_wgpu_round_trip_f32_pow2() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
+        return;
+    }
     let n: usize = 32;
     let re: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).sin()).collect();
     let im: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7).cos()).collect();

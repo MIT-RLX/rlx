@@ -16,7 +16,7 @@
 //! — so to actually reach hardware, build with the matching backend:
 //!
 //! ```text
-//! cargo run -p rlx-bench --bin rlx-gpu --features cuda -- --watch          # NVIDIA (msi)
+//! cargo run -p rlx-bench --bin rlx-gpu --features cuda -- --watch          # NVIDIA
 //! cargo run -p rlx-bench --bin rlx-gpu --features rocm -- --device rocm    # AMD (amd)
 //! ```
 //!

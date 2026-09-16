@@ -10,7 +10,7 @@
 //! ```
 //!
 //! There is **no** `Device::Fpga` — FPGA export never goes through
-//! `Session::compile`. Use [`ExportSession`] instead.
+//! `Session::compile`. Use `ExportSession` instead.
 
 #[cfg(feature = "fpga")]
 use std::path::Path;

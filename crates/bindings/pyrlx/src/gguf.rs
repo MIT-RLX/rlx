@@ -19,87 +19,23 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rlx_gguf::{GgmlType, GgufFile, GgufWriter, MetaValue};
 
+/// Parse a GGUF dtype name, case-insensitively.
+///
+/// Delegates to [`GgmlType::from_name`] rather than keeping a table here. The
+/// local copy this replaced had drifted from its printing counterpart: it
+/// rejected seven names `ggml_type_name` emitted, so a dtype pyrlx reported for
+/// a tensor could not be handed back to it.
 fn parse_ggml_type(name: &str) -> PyResult<GgmlType> {
-    use GgmlType::*;
-    Ok(match name.to_ascii_uppercase().as_str() {
-        "F32" => F32,
-        "F16" => F16,
-        "BF16" => BF16,
-        "Q8_0" => Q8_0,
-        "Q4_0" => Q4_0,
-        "Q4_1" => Q4_1,
-        "Q5_0" => Q5_0,
-        "Q5_1" => Q5_1,
-        "Q2_K" => Q2K,
-        "Q3_K" => Q3K,
-        "Q4_K" => Q4K,
-        "Q5_K" => Q5K,
-        "Q6_K" => Q6K,
-        "Q8_K" => Q8K,
-        "IQ4_NL" => IQ4NL,
-        "IQ4_XS" => IQ4XS,
-        "IQ2_XXS" => IQ2XXS,
-        "IQ2_XS" => IQ2XS,
-        "IQ2_S" => IQ2S,
-        "IQ3_XXS" => IQ3XXS,
-        "IQ3_S" => IQ3S,
-        "IQ1_S" => IQ1S,
-        "IQ1_M" => IQ1M,
-        "TQ1_0" => TQ1_0,
-        "TQ2_0" => TQ2_0,
-        "MXFP4" => MXFP4,
-        "NVFP4" => NVFP4,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown GGUF dtype {other:?} — expected e.g. Q4_K, IQ2_XXS, TQ2_0"
-            )));
-        }
+    GgmlType::from_name(name).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "unknown GGUF dtype {name:?} — expected e.g. Q4_K, IQ2_XXS, TQ2_0"
+        ))
     })
 }
 
+/// Canonical name for a GGUF dtype. Inverse of [`parse_ggml_type`].
 fn ggml_type_name(ggml: GgmlType) -> &'static str {
-    use GgmlType::*;
-    match ggml {
-        F32 => "F32",
-        F16 => "F16",
-        BF16 => "BF16",
-        Q8_0 => "Q8_0",
-        Q4_0 => "Q4_0",
-        Q4_1 => "Q4_1",
-        Q5_0 => "Q5_0",
-        Q5_1 => "Q5_1",
-        Q2K => "Q2_K",
-        Q3K => "Q3_K",
-        Q4K => "Q4_K",
-        Q5K => "Q5_K",
-        Q6K => "Q6_K",
-        Q8K => "Q8_K",
-        IQ4NL => "IQ4_NL",
-        IQ4XS => "IQ4_XS",
-        IQ2XXS => "IQ2_XXS",
-        IQ2XS => "IQ2_XS",
-        IQ2S => "IQ2_S",
-        IQ3XXS => "IQ3_XXS",
-        IQ3S => "IQ3_S",
-        IQ1S => "IQ1_S",
-        IQ1M => "IQ1_M",
-        TQ1_0 => "TQ1_0",
-        TQ2_0 => "TQ2_0",
-        MXFP4 => "MXFP4",
-        NVFP4 => "NVFP4",
-        I8 => "I8",
-        I16 => "I16",
-        I32 => "I32",
-        I64 => "I64",
-        F64 => "F64",
-        Q8_1 => "Q8_1",
-        Q1_0 => "Q1_0",
-        Q2_0 => "Q2_0",
-        I2_S => "I2_S",
-        I8_S => "I8_S",
-        FV5 => "FV5",
-        FV5B => "FV5B",
-    }
+    ggml.name()
 }
 
 fn infer_num_elements(ggml: GgmlType, bytes: &[u8]) -> PyResult<usize> {

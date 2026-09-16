@@ -19,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=shaders/arena_f32.inc");
     println!("cargo:rerun-if-changed=shaders/arena_u32.inc");
+    println!("cargo:rerun-if-changed=shaders/lowp_codec.inc");
     println!("cargo:rerun-if-changed=build.rs");
 
     let mut entries: Vec<String> = Vec::new(); // shader names (sorted)
@@ -192,6 +193,8 @@ fn compile_glsl_to_spirv(name: &str, src: &str, shader_dir: &Path) -> Vec<u32> {
     let u32_arena = name.starts_with("dequant")
         || name.starts_with("quantize")
         || name.starts_with("scaled_grouped")
+        // General low-precision codec kernels: packed code / scale bytes.
+        || name.starts_with("scaled_lowp")
         || name.starts_with("q_matmul")
         || name.starts_with("q_conv")
         // Packed-bf16 matmul: reads the weight as u32 words (unpacks bf16→f32).
@@ -201,8 +204,17 @@ fn compile_glsl_to_spirv(name: &str, src: &str, shader_dir: &Path) -> Vec<u32> {
     } else {
         "arena_f32.inc"
     };
-    let inc = fs::read_to_string(shader_dir.join(inc_name))
+    let mut inc = fs::read_to_string(shader_dir.join(inc_name))
         .unwrap_or_else(|e| panic!("rlx-vulkan: read {inc_name}: {e}"));
+    // The low-precision codec is shared by four entry points, and each entry
+    // point is its own SPIR-V module here — so it is injected rather than
+    // copied, for the same reason `arena_*.inc` is.
+    if name.starts_with("scaled_lowp") {
+        let codec = fs::read_to_string(shader_dir.join("lowp_codec.inc"))
+            .unwrap_or_else(|e| panic!("rlx-vulkan: read lowp_codec.inc: {e}"));
+        inc.push('\n');
+        inc.push_str(&codec);
+    }
     let src = inject_arena_include(src, &inc);
 
     let options = Options::from(ShaderStage::Compute);

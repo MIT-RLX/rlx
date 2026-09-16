@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use rlx_nemo::NemoModel;
 
 fn locate_nemo() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RLX_NEMO_TEST_FILE") {
+    if let Some(p) = rlx_ir::env::var("RLX_NEMO_TEST_FILE") {
         let pb = PathBuf::from(p);
         return pb.is_file().then_some(pb);
     }

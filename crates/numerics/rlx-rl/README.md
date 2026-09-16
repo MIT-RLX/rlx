@@ -8,7 +8,7 @@ Flow-map generative policies with **Flow Map Q-Guidance (FMQ)** and **Q-Guided B
 
 | Principle | Implementation |
 |-----------|----------------|
-| **MLP actor/critic** | `rlx-ir` graphs in [`graph/`](src/graph/) — not [`rlx-flow`](../rlx-flow/) |
+| **MLP actor/critic** | `rlx-ir` graphs in [`graph/`](src/graph/) — not [`rlx-flow`](../../core/rlx-flow) |
 | **CPU + autodiff** | [`Session::new(Device::Cpu)`](src/trainer.rs) + `legalize_broadcast` → `grad_with_loss` |
 | **No sim bindings** | Implement [`RlEnv`](src/env.rs); store [`Transition`](src/buffer.rs) in [`ReplayBuffer`](src/buffer.rs) |
 | **Optional QGBS at eval** | [`EvalConfig::with_qgbs`](src/policy.rs) → Algorithm 2 over [`CompiledFlowMapAgent`](src/graph/actor.rs) |

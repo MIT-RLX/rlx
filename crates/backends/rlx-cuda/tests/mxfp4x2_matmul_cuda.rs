@@ -12,7 +12,7 @@ use rlx_ir::{DType, Graph, Op, ScaledFormat, Shape};
 
 #[test]
 fn dequant_matmul_mxfp4x2_cuda_matches_reference() {
-    if !rlx_cuda::is_available() {
+    if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
     let (m, k, n) = (2usize, 32usize, 4usize);

@@ -31,9 +31,15 @@ rlx-gguf = { workspace = true }
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.14", default-features = false, features = ["blas", "splat"] }
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.16", default-features = false, features = ["blas", "splat"] }
 rlx-mlx-io = { workspace = true }
 libc = "0.2"
+
+[dev-dependencies]
+# Back-edge onto later-tier crates, PATH-ONLY (no `version`) so cargo strips
+# them from the published manifest — same pattern as rlx-metal.
+rlx-runtime = { path = "../../core/rlx-runtime", features = ["mlx"] }
+rlx-autodiff = { workspace = true }
 
 [lints]
 workspace = true

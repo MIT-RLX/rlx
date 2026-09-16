@@ -107,7 +107,7 @@ impl Func {
 
     /// The names of every trainable parameter (`Op::Param`) in the graph, in
     /// declaration order — exactly the `wrt` list a full-model training step
-    /// needs, so you never hand-maintain it. Powers [`init_params`], the
+    /// needs, so you never hand-maintain it. Powers `init_params`, the
     /// `*_all` training steps, and checkpoint round-trips.
     pub fn param_names(&self) -> Vec<String> {
         self.graph
@@ -143,7 +143,7 @@ impl Func {
     /// instead of a [`with_param`](Func::with_param) per tensor. Overwrites any
     /// existing bindings. Builder-style: chain before `train_step`.
     ///
-    /// ```ignore
+    /// ```text
     /// let model = Func::from_graph(rlx! { … }).init_params(|name, dims| {
     ///     if name.ends_with(".bias") { vec![0.0; dims.iter().product()] }
     ///     else { he_init(dims) }
@@ -494,6 +494,36 @@ impl Func {
         quant: impl Fn(&mut [f32]),
         inputs: &[(&str, &[f32])],
     ) -> (Func, Vec<f32>) {
+        self.train_step_all_at_on_qat_with(
+            device,
+            opt,
+            schedule,
+            step,
+            max_grad_norm,
+            |_, _, w| quant(w),
+            inputs,
+        )
+    }
+
+    /// [`train_step_all_at_on_qat`](Self::train_step_all_at_on_qat) where the
+    /// quantizer also sees each parameter's name and shape.
+    ///
+    /// Block formats need this. A per-block scale is only usable by hardware if
+    /// its blocks run along the axis a dot product contracts over, and a flat
+    /// `&mut [f32]` does not say which axis that is — blocking the wrong way
+    /// gives every output its own scale mid-dot-product, which no kernel can
+    /// apply. Per-tensor and per-element formats can keep using the simpler
+    /// entry point.
+    pub fn train_step_all_at_on_qat_with(
+        &self,
+        device: rlx_runtime::Device,
+        opt: &mut dyn rlx_optim::Optimizer,
+        schedule: &crate::LrSchedule,
+        step: usize,
+        max_grad_norm: f32,
+        quant: impl Fn(&str, &[usize], &mut [f32]),
+        inputs: &[(&str, &[f32])],
+    ) -> (Func, Vec<f32>) {
         opt.set_lr(schedule.lr_at(step));
         let names = self.param_names();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -504,7 +534,8 @@ impl Func {
                 .param_binding(name)
                 .unwrap_or_else(|| panic!("qat: param {name:?} is not bound"))
                 .to_vec();
-            quant(&mut w);
+            let shape = self.param_shape_of(name).unwrap_or_else(|| vec![w.len()]);
+            quant(name, &shape, &mut w);
             q = q.with_param(name.clone(), w);
         }
         let mut outputs = q.value_and_grad(&refs).run_on(device, inputs);

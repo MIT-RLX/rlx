@@ -94,12 +94,31 @@ fn main() {
         }
     }
 
+    // Count non-finite outputs SEPARATELY. `f32::max` returns the other operand
+    // when one side is NaN, so folding NaNs through `maxrel.max(..)` silently
+    // drops them and `maxrel` stays 0.0 — an all-NaN result reported PASS with
+    // max-rel-err 0.00e0.
+    let bad = out.iter().filter(|v| !v.is_finite()).count();
     let mut maxrel = 0.0f32;
     for i in 0..sd {
-        maxrel = maxrel.max((out[i] - cref[i]).abs() / cref[i].abs().max(1e-3));
+        let r = (out[i] - cref[i]).abs() / cref[i].abs().max(1e-3);
+        if r > maxrel {
+            maxrel = r;
+        }
     }
-    if maxrel.is_nan() || maxrel > 3e-3 {
-        println!("3. NPU attention seq={seq} d={d}: FAIL ✗  max-rel-err {maxrel:.2e}");
+    if bad > 0 || maxrel.is_nan() || maxrel > 3e-3 {
+        println!(
+            "3. NPU attention seq={seq} d={d}: FAIL ✗  max-rel-err {maxrel:.2e}  \
+             non-finite {bad}/{}",
+            out.len()
+        );
+        // A bare max-rel-err says nothing about HOW it is wrong. All-zeros
+        // (kernel never wrote), a constant, and scaled-but-shaped-right are
+        // three different bugs.
+        let nz = out.iter().filter(|v| **v != 0.0).count();
+        println!("   got : {:?}", &out[..6.min(out.len())]);
+        println!("   want: {:?}", &cref[..6.min(cref.len())]);
+        println!("   non-zero outputs: {nz}/{}", out.len());
         std::process::exit(1);
     }
     println!("3. ran on NPU: PASS ✓  max-rel-err {maxrel:.2e} (attention seq={seq} d={d})");

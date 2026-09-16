@@ -8,6 +8,8 @@
 use rlx_ir::*;
 use rlx_runtime::{Device, Session};
 
+mod common;
+
 fn build(c: usize, h: usize, w: usize) -> Graph {
     let f = DType::F32;
     let mut g = Graph::new("expand");
@@ -44,6 +46,7 @@ fn check(name: &str, c: usize, h: usize, w: usize) {
 #[test]
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn expand_metal_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     check("small", 8, 6, 6);
     check("med", 8, 64, 64);
     check("hires", 8, 800, 600);

@@ -204,7 +204,7 @@ fn run_case(down_ggml: rlx_gguf::GgmlType, down_scheme: QuantScheme, label: &str
 
 #[test]
 fn metal_fused_decode_mlp_matches_unfused_and_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

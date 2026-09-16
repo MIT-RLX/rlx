@@ -290,7 +290,7 @@ impl Lib {
         let mut tried: Vec<String> = Vec::new();
         let mut lib: Option<Library> = None;
         let mut names: Vec<String> = Vec::new();
-        if let Ok(p) = std::env::var("RLX_ONEAPI_LOADER") {
+        if let Some(p) = rlx_ir::env::var("RLX_ONEAPI_LOADER") {
             names.push(p);
         }
         names.extend(loader_names().iter().map(|s| s.to_string()));

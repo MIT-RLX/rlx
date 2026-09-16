@@ -1437,13 +1437,20 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     1
                 };
                 let s = if rank >= 2 { x_dims[rank - 2] } else { 1 }.max(1);
-                // Table row stride is `n_rot/2` — the table holds exactly the
-                // rotation angles, NOT head_dim/2 of them. Striding by
-                // head_dim/2 overshoots under PARTIAL rope (n_rot < head_dim),
-                // so every position ≥1 reads a later token's angles. Equal for
-                // full rope (n_rot == head_dim). Matches the CPU reference.
                 let rot_half = n_rot / 2;
-                let tab_half = rot_half.max(1);
+                // Row stride is the cos/sin table's OWN last dimension — not
+                // `n_rot/2`, and not `head_dim/2`. The two differ under partial
+                // rotation and the layout is a per-model choice: Qwen3.5
+                // allocates `[max_pos, head_dim/2]` and uses only the leading
+                // `n_rot/2` columns of each row, while DeepSeek-V4 MLA packs
+                // `[.., n_rot/2]` with no slack. Deriving it either way reads
+                // some other position's angles for every row past the first on
+                // the other layout, so take it from the shape.
+                let tab_half = if cos_dims.len() >= 2 {
+                    cos_dims.last().copied().unwrap_or(rot_half).max(1)
+                } else {
+                    rot_half.max(1)
+                };
                 let cos_rows = cos_dims.first().copied().unwrap_or(1).max(1);
 
                 let mut cos_idx = vec![0u32; n];

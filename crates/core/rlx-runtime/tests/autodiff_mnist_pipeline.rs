@@ -238,7 +238,7 @@ fn load_mnist_split(images_path: &Path, labels_path: &Path) -> Result<MnistSplit
 }
 
 fn mnist_dir() -> Option<std::path::PathBuf> {
-    if let Ok(d) = std::env::var("RLX_MNIST_DIR") {
+    if let Some(d) = rlx_ir::env::var("RLX_MNIST_DIR") {
         return Some(std::path::PathBuf::from(d));
     }
     let home = std::env::var("HOME").ok()?;

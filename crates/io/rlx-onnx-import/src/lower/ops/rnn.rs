@@ -314,7 +314,7 @@ pub(super) fn lower_lstm(
     }
     let bidirectional = direction == "bidirectional";
     let dirs = if bidirectional { 2 } else { 1 };
-    if std::env::var_os("RLX_LSTM_DEBUG").is_some() {
+    if rlx_ir::env::var_os("RLX_LSTM_DEBUG").is_some() {
         eprintln!(
             "[lstm] node={} direction={direction:?} bidir={bidirectional} attrs_keys={:?}",
             node.name,

@@ -4,7 +4,7 @@
 //! Topology helpers over a triangulation: per-triangle neighbor adjacency (the
 //! "halfedge" structure most downstream algorithms want) and the convex hull.
 //! Both use exact `i128` arithmetic and take/return indices into the caller's
-//! `points`/`triangles`, so they compose with [`crate::triangulate`] without
+//! `points`/`triangles`, so they compose with [`fn@crate::triangulate`] without
 //! exposing the internal dart arena.
 
 use std::collections::HashMap;

@@ -48,7 +48,7 @@ fn assert_metal_cpu_close(label: &str, metal: &[f32], cpu: &[f32], tol: f32) {
 
 #[test]
 fn metal_causal_prefill_attention_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -71,7 +71,7 @@ fn metal_causal_prefill_attention_matches_cpu() {
 
 #[test]
 fn metal_causal_prefill_attention_batch2_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -91,7 +91,7 @@ fn metal_causal_prefill_attention_batch2_matches_cpu() {
 
 #[test]
 fn metal_custom_bucket_mask_bshd_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Metal) {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
         eprintln!("skip: Metal unavailable");
         return;
     }

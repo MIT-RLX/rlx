@@ -39,7 +39,7 @@ fn scatter_graph(num_updates: usize, out_dim: usize, trailing: usize) -> Graph {
     let updates = g.input("updates", Shape::new(&[num_updates, trailing], DType::F32));
     let indices = g.input("indices", Shape::new(&[num_updates], DType::F32));
     let out = g.add_node(
-        Op::ScatterAdd,
+        Op::ScatterAdd { axis: 0 },
         vec![updates, indices],
         Shape::new(&[out_dim, trailing], DType::F32),
     );

@@ -194,6 +194,38 @@ impl Graph {
         self.push(Op::Fft { inverse, norm }, vec![x], s, None)
     }
 
+    /// Fixed-point 1D FFT along the last axis (`Op::FftQ`).
+    ///
+    /// `I32` data in the 2N real-block layout, radix-2 only. `scale` decides
+    /// how the datapath stays in range and is a precision decision — see
+    /// [`crate::fft::FftQScale`], whose `bits_lost` and `headroom_needed`
+    /// spell out the trade for a given length.
+    pub fn fft_q(
+        &mut self,
+        x: NodeId,
+        inverse: bool,
+        norm: crate::fft::FftNorm,
+        scale: crate::fft::FftQScale,
+    ) -> NodeId {
+        let s = self.shape(x).clone();
+        let meta = crate::fft::fft_meta(&s);
+        assert!(
+            meta.n_complex.is_power_of_two(),
+            "Op::FftQ length {} is not a power of two; only radix-2 is supported",
+            meta.n_complex
+        );
+        self.push(
+            Op::FftQ {
+                inverse,
+                norm,
+                scale,
+            },
+            vec![x],
+            s,
+            None,
+        )
+    }
+
     /// Ternary pruned radix-2 butterfly stage — see [`Op::FftButterflyStage`].
     pub fn fft_butterfly_stage(
         &mut self,

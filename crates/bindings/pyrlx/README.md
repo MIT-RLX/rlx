@@ -20,9 +20,9 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
   "mlx" | …)`.
 - **Multi-backend runtime** — `GraphDevices`, `DeviceRouter`,
   `DevicePolicy`, `FlexibleSession`, `backends_manifest()`,
-  `parse_device()`. See [`docs/backend-selection.md`](../docs/backend-selection.md).
+  `parse_device()`. See [`docs/backend-selection.md`](../../../docs/backend-selection.md).
 - **In-graph RNG (0.2.7+)** — ONNX `Random*` via upstream `rlx-runtime`
-  (`CompileOptions::rng`, `CompiledGraph::set_rng`). See [`CHANGELOG.md`](../CHANGELOG.md).
+  (`CompileOptions::rng`, `CompiledGraph::set_rng`). See [`CHANGELOG.md`](../../../CHANGELOG.md).
 - **FFT helpers** — `fft`, `fft_norm`, `rfft`, `irfft`, `fftfreq`,
   `rfftfreq`, `psd_real` on `Graph` (see `tests/test_fft.py`).
 - **Autodiff** — `pyrlx.grad(graph, wrt=[…])` returns the backward
@@ -39,7 +39,7 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
   See `tests/test_gguf_quantize.py`, `test_gguf_file.py`, `test_gguf_convert.py`.
 - **RLXP packages** — `rlx.load_rlxp(path)` (manifest summary) and
   `rlx.convert_gguf_to_rlxp(gguf, out, include_graph=False)`. Spec:
-  [`docs/rlxp.md`](../../docs/rlxp.md).
+  [`docs/rlxp.md`](../../../docs/rlxp.md).
 
 ## Install (from source)
 
@@ -107,7 +107,7 @@ router = rlx.DeviceRouter(g, policy=policy)
 device, outs = router.run({"x": x})
 ```
 
-See [`docs/backend-selection.md`](../docs/backend-selection.md),
+See [`docs/backend-selection.md`](../../../docs/backend-selection.md),
 [`docs/dsl.md`](docs/dsl.md) (DSL reference), and
 [`docs/backends.md`](docs/backends.md).
 

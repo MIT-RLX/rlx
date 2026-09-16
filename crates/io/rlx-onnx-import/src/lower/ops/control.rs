@@ -200,7 +200,7 @@ pub(super) fn lower_if_stub(
     // is set, adopt the node's declared `output_meta` shape (which the kitten bundle patch
     // pins to `[1, mel_cap]`) instead of the guess. Gated so no other `If`-using model
     // (moss / chatterbox / f5tts / luxtts-zipformer) changes behaviour.
-    let use_meta = std::env::var("RLX_KITTEN_IF_STUB_META").is_ok();
+    let use_meta = rlx_ir::env::var("RLX_KITTEN_IF_STUB_META").is_some();
     for (i, out_name) in node.outputs.iter().enumerate() {
         let sh = use_meta
             .then(|| node.output_meta.get(i))

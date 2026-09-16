@@ -211,3 +211,6 @@ No cache tiling, no `m`-blocking, no prefetch, single-threaded. These kernels
 exist to *quantify* the schemes and to serve targets without a vendor BLAS — not
 to be the fastest path on hardware that has one (on Apple, that's AMX; see §
 "AMX reality check"). The `f32` numbers here are a *floor*, not the ceiling.
+## License
+
+MIT OR Apache-2.0.

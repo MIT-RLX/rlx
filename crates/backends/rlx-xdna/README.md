@@ -49,8 +49,19 @@ Point the env at them:
 
 ```sh
 export XILINX_XRT=…/xrt LD_LIBRARY_PATH=$XILINX_XRT/lib:$LD_LIBRARY_PATH
-export RLX_XDNA_SHIM=…/libxrt_driver_xdna.so
-export AIECC=…/mlir-aie/bin/aiecc PEANO=…/llvm-aie
+
+# rlx's OWN C-ABI shim over XRT's C++ API — build it once. This is *not*
+# XRT's libxrt_driver_xdna.so; pointing RLX_XDNA_SHIM at that dlopens fine and
+# then fails with `undefined symbol: rlx_xdna_io_open`.
+g++ -O2 -fPIC -shared -std=c++17 -I$XILINX_XRT/include \
+    -o librlx_xdna_shim.so crates/backends/rlx-xdna/csrc/xrt_gemm_shim.cpp \
+    -L$XILINX_XRT/lib -Wl,-rpath,$XILINX_XRT/lib -lxrt_coreutil
+export RLX_XDNA_SHIM=$PWD/librlx_xdna_shim.so
+
+# `aiecc` must be the NATIVE ELF (~212 MB), not the `aiecc.py` wrapper. A pip
+# `mlir_aie` install puts it at <site-packages>/mlir_aie/bin/aiecc, and Peano at
+# <site-packages>/llvm-aie.
+export AIECC=…/mlir_aie/bin/aiecc PEANO=…/llvm-aie
 # pip `mlir_aie` installs: point at the include tree (holds aie_kernels + aie_api),
 # since bin/aiecc there isn't at <mlir_aie>/bin:
 export RLX_XDNA_AIE_INCLUDE=…/site-packages/mlir_aie/include

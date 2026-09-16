@@ -7,11 +7,13 @@
 //! round-trip (`Step::GruHost`, D2H→CPU→H2D) on CUDA/ROCm — a pure
 //! dispatch-latency bubble for streaming/stateful GRU. The native `gru` kernel
 //! now seeds its hidden state from `h0` (Tier-1). This pins the native carry
-//! path against the CPU reference. Runs on the msi rig (`RLX_PARITY_DEVICE=cuda`,
-//! default) and the amd rig (`RLX_PARITY_DEVICE=rocm`); no-ops without the GPU.
+//! path against the CPU reference. Runs on the CUDA rig (`RLX_PARITY_DEVICE=cuda`,
+//! default) and the ROCm rig (`RLX_PARITY_DEVICE=rocm`); no-ops without the GPU.
 
 use rlx_ir::{DType, Graph, Op, Shape};
-use rlx_runtime::{Device, Session, is_available};
+use rlx_runtime::{Device, Session};
+
+mod common;
 
 fn mk(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -27,16 +29,17 @@ fn mk(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn target() -> Device {
-    match std::env::var("RLX_PARITY_DEVICE") {
-        Ok(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
-        Err(_) => Device::Cuda,
+    match rlx_ir::env::var("RLX_PARITY_DEVICE") {
+        Some(s) => rlx_runtime::parse_device(&s).unwrap_or(Device::Cuda),
+        None => Device::Cuda,
     }
 }
 
 #[test]
 fn gru_carry_native_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip gru_carry_native ({dev:?} unavailable)");
         return;
     }
@@ -108,8 +111,9 @@ fn gru_carry_native_matches_cpu() {
 /// through a scratch buffer. This pins every native geometry against CPU.
 #[test]
 fn gru_multilayer_bidir_native_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     let dev = target();
-    if !is_available(dev) {
+    if common::skip_unless(dev) {
         eprintln!("skip gru_multilayer_bidir_native ({dev:?} unavailable)");
         return;
     }

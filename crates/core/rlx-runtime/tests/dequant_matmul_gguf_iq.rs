@@ -137,7 +137,7 @@ fn dequant_matmul_q4_1_metal_matches_cpu() {
 #[test]
 #[cfg(feature = "gpu")]
 fn dequant_matmul_iq2_xxs_wgpu_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Gpu) {
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
         eprintln!("wgpu adapter unavailable, skipping");
         return;
     }
@@ -155,7 +155,7 @@ fn dequant_matmul_iq2_xxs_wgpu_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn dequant_matmul_q4_1_mlx_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Mlx) {
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("MLX unavailable, skipping");
         return;
     }
@@ -173,7 +173,7 @@ fn dequant_matmul_q4_1_mlx_matches_cpu() {
 #[test]
 #[cfg(all(target_os = "macos", feature = "mlx"))]
 fn dequant_matmul_iq2_xxs_mlx_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Mlx) {
+    if common::skip_unless_available(Device::Mlx, "mlx") {
         eprintln!("MLX unavailable, skipping");
         return;
     }
@@ -247,7 +247,7 @@ fn dequant_matmul_iq1_m_metal_fused_mv() {
 #[test]
 #[cfg(feature = "cuda")]
 fn dequant_matmul_iq2_xxs_cuda_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Cuda) {
+    if common::skip_unless_available(Device::Cuda, "cuda") {
         eprintln!("CUDA unavailable, skipping");
         return;
     }

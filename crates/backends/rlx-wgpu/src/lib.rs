@@ -18,8 +18,18 @@
 //! - `backend`  — Backend trait impl + per-op dispatch
 
 pub mod backend;
+pub mod kernel_schedule_port;
+
+/// Generate the tiled `matmul` entry point *from* a typed schedule rather than
+/// from the hand-written `kernels/matmul.wgsl`.
+///
+/// Feature-gated because it is a second implementation of a shipping shader:
+/// until it is measured at least as fast, `matmul.wgsl` stays the default.
+#[cfg(feature = "schedule-codegen")]
+pub mod kernel_schedule_emit;
 pub use backend::bf16_packed_dispatch_count;
 pub mod supported_ops;
+pub mod tuning;
 pub use supported_ops::SUPPORTED_OPS;
 pub mod buffer;
 pub mod calibrate;

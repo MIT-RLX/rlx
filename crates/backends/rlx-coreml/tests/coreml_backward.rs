@@ -107,7 +107,7 @@ fn silu_matmul_forward() -> (Graph, rlx_ir::NodeId) {
 
 #[test]
 fn ane_silu_matmul_grad_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -131,7 +131,7 @@ fn ane_silu_matmul_grad_matches_cpu() {
 
 #[test]
 fn ane_rms_norm_backward_input_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -175,7 +175,7 @@ fn ane_rms_norm_backward_input_matches_cpu() {
 /// Native RMSNorm gamma/beta backward kernels ≈ decompose oracle on CPU.
 #[test]
 fn ane_rms_norm_backward_gamma_beta_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -223,7 +223,7 @@ fn ane_rms_norm_backward_gamma_beta_matches_cpu() {
 /// — the relu→maxpool tie case — which must route to the first position).
 #[test]
 fn ane_max_pool2d_backward_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -271,7 +271,7 @@ fn ane_max_pool2d_backward_matches_cpu() {
 /// (batch-independent for input; the gamma path is FD-verified for N>1).
 #[test]
 fn ane_group_norm_backward_matches_cpu_n2() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -325,7 +325,7 @@ fn ane_group_norm_backward_matches_cpu_n2() {
 /// pure-perf optimization, not a correctness gap.
 #[test]
 fn ane_attention_backward_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -381,7 +381,7 @@ fn ane_attention_backward_matches_cpu() {
 /// the CPU decompose, confirming the layout wrapper (not just canonical) is correct.
 #[test]
 fn ane_attention_backward_bshd_layout_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -435,7 +435,7 @@ fn ane_attention_backward_bshd_layout_matches_cpu() {
 /// `log` op that was emitted without its required `epsilon`, failing model load).
 #[test]
 fn ane_softmax_cross_entropy_grad_runs() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -477,7 +477,7 @@ fn ane_softmax_cross_entropy_grad_runs() {
 #[test]
 fn ane_amp_grad_matches_cpu_direction() {
     use rlx_runtime::PrecisionPolicy;
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }
@@ -519,7 +519,7 @@ fn ane_amp_grad_matches_cpu_direction() {
 /// ANE uses the new MIL compose arm under `training`).
 #[test]
 fn ane_dit_packed_backward_matches_cpu() {
-    if !rlx_runtime::is_available(Device::Ane) {
+    if rlx_ir::env::skip_unless_device("ane", true, rlx_runtime::is_available(Device::Ane)) {
         eprintln!("skip: Device::Ane not available");
         return;
     }

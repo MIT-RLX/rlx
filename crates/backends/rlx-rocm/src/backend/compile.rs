@@ -62,7 +62,7 @@ impl RocmExecutable {
         Self::compile_with_rng(graph, CompileMode::Jit, ExecMode::Stream, rng)
     }
 
-    /// Compile with explicit RNG policy (used by [`rlx-runtime`]).
+    /// Compile with explicit RNG policy (used by `rlx-runtime`).
     pub fn compile_with_rng(
         graph: Graph,
         compile_mode: CompileMode,
@@ -102,6 +102,29 @@ impl RocmExecutable {
         } else {
             0
         };
+        // Arena addressing is 64-bit on the host side now: every `*_byte_off` in
+        // `Step` is `u64` and every construction site casts `arena.offset(..)`
+        // to `u64`, so nothing truncates before launch. That was the bug that
+        // cost a Qwen3.5 trunk its final two gated-delta-net layers — they came
+        // back as exact zeros while the first sixteen matched CPU to 1e-6, which
+        // reads as a layer-specific numerical bug rather than an addressing one.
+        //
+        // It is not sufficient on its own. The *shared* kernels are mixed: 115
+        // offset parameters are `unsigned long long` and 479 are still
+        // `unsigned int`, so an op of the second kind truncates inside the
+        // kernel signature no matter how wide the host field is. Until those are
+        // audited per op, refuse the whole case rather than let the safe ops
+        // through and corrupt the rest — silent corruption at the end of a graph
+        // is far worse than a stop.
+        assert!(
+            plan.arena_size <= u32::MAX as usize,
+            "rlx-rocm: arena is {} bytes, past 4 GiB. Host-side offsets are u64, \
+             but {} of this backend's shared kernels still declare `unsigned int` \
+             offset parameters and would wrap inside the kernel. Split the graph \
+             until those signatures are widened.",
+            plan.arena_size,
+            "479"
+        );
         let mut arena = Arena::from_plan(&ctx, &plan);
         for node in graph.nodes() {
             let slot_bytes = node
@@ -132,16 +155,92 @@ impl RocmExecutable {
                 && arena.has(node.id)
                 && !data.is_empty()
             {
-                let bytes_to_write = data.len().min(arena.len_of(node.id));
-                let n_f32 = bytes_to_write / 4;
-                let f32_view: &[f32] =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_f32) };
+                // WIDEN by declared dtype — do not bit-reinterpret.
+                //
+                // The arena is f32-uniform and the convention (stated at the
+                // `GatherNd`/`ScatterNd` arms below, and matched by CUDA and wgpu)
+                // is that integer indices live as f32 *values*. This loop used to
+                // reinterpret the constant's raw bytes as f32, so an I64 index
+                // constant arrived as denormals: `[0, 2, 4, 6]` read as ~0, and
+                // every gather returned element 0.
+                //
+                // That silently broke `Op::Slice` with |step| > 1, which
+                // decomposes to `gather` over an i64 `[start + j*step]` constant.
+                // CUDA dodged it by claiming `Slice` natively and never
+                // decomposing; ROCm decomposes, so its slice forward returned
+                // `[0,0,0,0]` where `[0,20,40,60]` was expected. Found by
+                // `fd_backward_gate`'s `slice_positive_step` case — as a zero
+                // finite difference, since the sliced elements had no influence on
+                // the output at all.
+                let f32_data: Vec<f32> = match node.shape.dtype() {
+                    rlx_ir::DType::F32 => data
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                    rlx_ir::DType::F64 => data
+                        .chunks_exact(8)
+                        .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect(),
+                    rlx_ir::DType::I64 => data
+                        .chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                        .collect(),
+                    rlx_ir::DType::I32 | rlx_ir::DType::U32 => data
+                        .chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                        .collect(),
+                    rlx_ir::DType::I16 => data
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
+                        .collect(),
+                    rlx_ir::DType::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
+                    rlx_ir::DType::U8 | rlx_ir::DType::Bool => {
+                        data.iter().map(|&b| b as f32).collect()
+                    }
+                    // f16/bf16/c64: raw bytes are already narrower or interleaved —
+                    // keep the bit-reinterpret path, same as CUDA.
+                    _ => data
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                };
+                let n = f32_data.len().min(arena.len_of(node.id) / 4);
                 let off_f32 = arena.offset(node.id) / 4;
-                upload_to_arena(&ctx, arena_ptr, off_f32, f32_view);
+                upload_to_arena(&ctx, arena_ptr, off_f32, &f32_data[..n]);
             }
         }
 
         let mut schedule: Vec<Step> = Vec::new();
+
+        // ── Static weight packs: which Concat steps may be run once ──────────
+        //
+        // The matmul-fusion passes fuse Q/K/V and gate/up into one GEMM by
+        // emitting `Concat` over the weight `Param`s. That concat is invariant
+        // across `run()`s, yet ROCm (like CUDA) lowers it to ONE STEP PER INPUT
+        // and replays all of them every step: 5 launches/layer, 140/token on a
+        // 28-layer Llama, moving ~1.9 GB of constants. Metal measures the same
+        // packs at 47.7% of a decode step's DRAM traffic.
+        //
+        // Both conditions are required, same as CUDA / Metal / wgpu:
+        //   1. the planner's OWN `is_static_weight_tensor`, so the encoder can
+        //      never arm a skip for a pack `plan_memory` did not pin, and
+        //   2. arena-slot exclusivity, because a pin is not a guarantee — where
+        //      it failed the slot is liveness-reused and a later node clobbers
+        //      it, so a skipped pack would read stale bytes on run 2+.
+        let mut static_weight_memo: std::collections::HashMap<rlx_ir::NodeId, bool> =
+            std::collections::HashMap::new();
+        let offset_owner_count: std::collections::HashMap<usize, usize> = {
+            let mut m = std::collections::HashMap::new();
+            for n in graph.nodes() {
+                if rlx_opt::memory::is_pure_view(&graph, n) || !arena.has(n.id) {
+                    continue;
+                }
+                *m.entry(arena.offset(n.id)).or_insert(0usize) += 1;
+            }
+            m
+        };
+        let mut static_once_steps: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         let mut meta_buffers: Vec<HipBuffer<u32>> = Vec::new();
         let mut packed_bshd_attn: HashMap<NodeId, (NodeId, u32)> = HashMap::new();
         if !rlx_ir::env::flag("RLX_ROCM_NO_PACKED_BSHD_ATTN") {
@@ -193,8 +292,8 @@ impl RocmExecutable {
                             // re-pairs the interleaved f32 lanes.
                             schedule.push(Step::ComplexCast {
                                 n: elems,
-                                in_byte_off: arena.offset(node.inputs[0]) as u32,
-                                out_byte_off: arena.offset(node.id) as u32,
+                                in_byte_off: arena.offset(node.inputs[0]) as u64,
+                                out_byte_off: arena.offset(node.id) as u64,
                                 mode,
                             });
                         }
@@ -227,13 +326,13 @@ impl RocmExecutable {
                             m,
                             k,
                             n,
-                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
-                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
-                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
-                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u64,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u64,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                             has_bias: u32::from(*has_bias),
-                            bias_byte_off: bias_byte,
+                            bias_byte_off: bias_byte as u64,
                             lhs_e5m2: u32::from(*lhs_format == rlx_ir::ScaledFormat::F8E5M2),
                             rhs_e5m2: u32::from(*rhs_format == rlx_ir::ScaledFormat::F8E5M2),
                         });
@@ -243,10 +342,10 @@ impl RocmExecutable {
                             m,
                             k,
                             n,
-                            lhs_byte_off: arena.offset(node.inputs[0]) as u32,
-                            rhs_byte_off: arena.offset(node.inputs[1]) as u32,
-                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u32,
-                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                            lhs_byte_off: arena.offset(node.inputs[0]) as u64,
+                            rhs_byte_off: arena.offset(node.inputs[1]) as u64,
+                            lhs_scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                            rhs_scale_byte_off: arena.offset(node.inputs[3]) as u64,
                             out_off_f32: (arena.offset(node.id) / 4) as u32,
                             lhs_fmt: lhs_format.kernel_id(),
                             rhs_fmt: rhs_format.kernel_id(),
@@ -283,10 +382,10 @@ impl RocmExecutable {
                         k,
                         n,
                         num_experts: ne,
-                        input_byte_off: arena.offset(node.inputs[0]) as u32,
-                        weight_byte_off: arena.offset(node.inputs[1]) as u32,
-                        input_scale_byte_off: arena.offset(node.inputs[2]) as u32,
-                        weight_scale_byte_off: arena.offset(node.inputs[3]) as u32,
+                        input_byte_off: arena.offset(node.inputs[0]) as u64,
+                        weight_byte_off: arena.offset(node.inputs[1]) as u64,
+                        input_scale_byte_off: arena.offset(node.inputs[2]) as u64,
+                        weight_scale_byte_off: arena.offset(node.inputs[3]) as u64,
                         idx_off_f32: (arena.offset(node.inputs[4]) / 4) as u32,
                         out_off_f32: (arena.offset(node.id) / 4) as u32,
                         bias_off_f32: bias_byte / 4,
@@ -320,7 +419,7 @@ impl RocmExecutable {
                         let (scale_mode, block) = scale_layout.mode_block();
                         schedule.push(Step::ScaledQuantScaleGeneral {
                             x_off_f32: (arena.offset(x_id) / 4) as u32,
-                            scale_byte_off: arena.offset(node.id) as u32,
+                            scale_byte_off: arena.offset(node.id) as u64,
                             rows,
                             cols,
                             fmt: format.kernel_id(),
@@ -342,7 +441,7 @@ impl RocmExecutable {
                         schedule.push(Step::ScaledQuantizeFp8 {
                             x_off_f32: (arena.offset(x_id) / 4) as u32,
                             scale_off_f32: (arena.offset(scale_id) / 4) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            out_byte_off: arena.offset(node.id) as u64,
                             n,
                             e5m2: u32::from(*format == rlx_ir::ScaledFormat::F8E5M2),
                         });
@@ -354,8 +453,8 @@ impl RocmExecutable {
                         let (scale_mode, block) = scale_layout.mode_block();
                         schedule.push(Step::ScaledQuantizeGeneral {
                             x_off_f32: (arena.offset(x_id) / 4) as u32,
-                            scale_byte_off: arena.offset(scale_id) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            scale_byte_off: arena.offset(scale_id) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                             rows,
                             cols,
                             fmt: format.kernel_id(),
@@ -378,8 +477,8 @@ impl RocmExecutable {
                         graph.node(codes_id).shape.num_elements().unwrap() as u32 / cols.max(1);
                     let (scale_mode, block) = scale_layout.mode_block();
                     schedule.push(Step::ScaledDequantizeGeneral {
-                        codes_byte_off: arena.offset(codes_id) as u32,
-                        scale_byte_off: arena.offset(scale_id) as u32,
+                        codes_byte_off: arena.offset(codes_id) as u64,
+                        scale_byte_off: arena.offset(scale_id) as u64,
                         out_off_f32: (arena.offset(node.id) / 4) as u32,
                         rows,
                         cols,
@@ -515,9 +614,9 @@ impl RocmExecutable {
                         let n_b = graph.node(b_id).shape.num_elements().unwrap_or(0).max(1) as u32;
                         schedule.push(Step::BinaryC64 {
                             n: elems,
-                            a_byte_off: arena.offset(a_id) as u32,
-                            b_byte_off: arena.offset(b_id) as u32,
-                            c_byte_off: arena.offset(node.id) as u32,
+                            a_byte_off: arena.offset(a_id) as u64,
+                            b_byte_off: arena.offset(b_id) as u64,
+                            c_byte_off: arena.offset(node.id) as u64,
                             op: op_code,
                             n_a,
                             n_b,
@@ -1134,8 +1233,7 @@ impl RocmExecutable {
                 Op::KvAppend { axis, pos } => {
                     // In-place append: write input[1] (the new token's row) into
                     // the output buffer, which the memory planner aliases onto
-                    // input 0 (the cache). Output shape == cache shape, so
-                    // `seq_cap` is the output's own axis dim. Mirrors rlx-cuda.
+                    // input 0 (the cache). Mirrors rlx-cuda.
                     let out_shape = &node.shape;
                     let rank = out_shape.rank();
                     let outer: usize = (0..*axis)
@@ -1146,14 +1244,32 @@ impl RocmExecutable {
                         .map(|i| out_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    let seq_cap = out_shape.dim(*axis).unwrap_static();
+                    // Stride from the CACHE, not the output: the output is the
+                    // `[..pos+1]` prefix, so its axis dim is `pos+1`, not the
+                    // buffer's capacity. Mirrors rlx-cuda / rlx-metal.
+                    let seq_cap = graph.node(node.inputs[0]).shape.dim(*axis).unwrap_static();
+                    // The kernel and the `/4` offsets below both count f32
+                    // LANES, not elements. The arena widens most dtypes to one
+                    // lane each but sizes U8/I8 at one byte and complex at 2/4
+                    // lanes, so an element count is the lane count for neither.
+                    let lanes = match out_shape.dtype() {
+                        rlx_ir::DType::C64 => 2,
+                        rlx_ir::DType::C128 => 4,
+                        rlx_ir::DType::U8 | rlx_ir::DType::I8 => panic!(
+                            "rlx-rocm KvAppend: {} cache is byte-packed in the arena while \
+                             the row-write kernel addresses f32 lanes — a quantized KV cache \
+                             needs a byte-addressed kernel, not this one",
+                            out_shape.dtype()
+                        ),
+                        _ => 1,
+                    };
                     schedule.push(Step::KvAppend {
                         src_off: (arena.offset(node.inputs[1]) / 4) as u32,
                         dst_off: (arena.offset(node.id) / 4) as u32,
                         outer: outer as u32,
                         seq_cap: seq_cap as u32,
                         pos: *pos as u32,
-                        inner: inner as u32,
+                        inner: (inner * lanes) as u32,
                     });
                 }
                 Op::Narrow { axis, start, len } => {
@@ -1311,6 +1427,7 @@ impl RocmExecutable {
                     });
                 }
                 Op::Concat { axis } => {
+                    let sched_before = schedule.len();
                     // Caller convention: one Step::Concat per input, copying
                     // each input's slice into the output at the right axis offset.
                     // Complex packs `lanes` contiguous f32 per element; the lane
@@ -1356,6 +1473,17 @@ impl RocmExecutable {
                             out_off: (arena.offset(node.id) / 4) as u32,
                         });
                         start += axis_in;
+                    }
+                    if rlx_opt::memory::is_static_weight_tensor(
+                        &graph,
+                        node.id,
+                        &mut static_weight_memo,
+                    ) && arena.has(node.id)
+                        && offset_owner_count.get(&arena.offset(node.id)).copied() == Some(1)
+                    {
+                        for i in sched_before..schedule.len() {
+                            static_once_steps.insert(i);
+                        }
                     }
                 }
                 Op::Attention {
@@ -1502,6 +1630,27 @@ impl RocmExecutable {
                     if q_shape.len() != 4 {
                         panic!("rlx-rocm AttentionBackward: unfuse should have promoted to rank-4");
                     }
+                    // `scores`/`dp` in attention_bwd.cu are fixed at
+                    // MAX_ATTN_SEQ; past that the kernel returns having written
+                    // nothing and the gradient comes back as exact zeros. A
+                    // silent zero gradient is far worse than a stop — training
+                    // proceeds and learns nothing from these tensors — so refuse
+                    // explicitly. head_dim is no longer bounded: its accumulator
+                    // is tiled at MAX_HEAD_DIM inside the kernel.
+                    const MAX_ATTN_SEQ: usize = 512;
+                    let seq_q_chk = q_shape[2].unwrap_static();
+                    let seq_k_chk = k_shape[2].unwrap_static();
+                    assert!(
+                        seq_q_chk <= MAX_ATTN_SEQ && seq_k_chk <= MAX_ATTN_SEQ,
+                        "{}: seq_q {} / seq_k {} exceed the backward kernel's \
+                         supported {}; it would silently produce zero gradients. \
+                         Decompose Op::AttentionBackward for this shape or extend \
+                         the kernel.",
+                        "rlx-rocm AttentionBackward",
+                        seq_q_chk,
+                        seq_k_chk,
+                        MAX_ATTN_SEQ
+                    );
                     let batch = q_shape[0].unwrap_static() as u32;
                     let heads = q_shape[1].unwrap_static() as u32;
                     let seq_q = q_shape[2].unwrap_static() as u32;
@@ -1567,7 +1716,23 @@ impl RocmExecutable {
                         n_total: total,
                         seq,
                         head_dim: *head_dim as u32,
-                        half: (*head_dim / 2) as u32,
+                        // Row stride of the cos/sin tables, taken from the
+                        // table's own last dimension rather than `head_dim / 2`.
+                        // The two differ under partial rotation and the layout
+                        // is a per-model choice: Qwen3.5 allocates
+                        // `[max_pos, head_dim/2]` and uses the leading
+                        // `n_rot/2` columns, DeepSeek-V4 MLA packs `n_rot/2`
+                        // with no slack. `head_dim/2` reads a wrong-but-valid
+                        // row on the packed layout; `n_rot/2` (what the CPU
+                        // reference assumed) does the same on the padded one.
+                        // Both only agreed when `n_rot == head_dim`.
+                        half: graph
+                            .node(cos_id)
+                            .shape
+                            .dims()
+                            .last()
+                            .map(|d| d.unwrap_static() as u32)
+                            .unwrap_or((*head_dim / 2) as u32),
                         // Partial rotary: rotate only n_rot dims (Gemma); == half for
                         // full rope (qwen/llama). Mirrors rlx-cuda's Step::Rope.
                         rot_half: (*n_rot / 2) as u32,
@@ -1657,7 +1822,17 @@ impl RocmExecutable {
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
-                Op::ScatterAdd => {
+                Op::ScatterAdd { axis } => {
+                    // Every backend kernel implements the axis-0 form only;
+                    // `rlx_fusion::LowerScatterAddAxis` rewrites any other axis to
+                    // transpose/scatter/transpose before lowering. Reaching here with
+                    // axis != 0 means that pass did not run, and scattering along axis
+                    // 0 anyway would silently produce the wrong tensor.
+                    assert_eq!(
+                        *axis, 0,
+                        "rlx-rocm: ScatterAdd axis {{axis}} reached the backend; \
+                     LowerScatterAddAxis must run first"
+                    );
                     let upd_id = node.inputs[0];
                     let idx_id = node.inputs[1];
                     let upd_dims = graph.node(upd_id).shape.dims();
@@ -1719,11 +1894,11 @@ impl RocmExecutable {
                                     k,
                                     n,
                                     scheme: *scheme,
-                                    x_byte_off: arena.offset(x_id) as u32,
-                                    w_byte_off: arena.offset(w_id) as u32,
-                                    scale_byte_off: arena.offset(scale_id) as u32,
-                                    zp_byte_off: arena.offset(zp_id) as u32,
-                                    out_byte_off: arena.offset(node.id) as u32,
+                                    x_byte_off: arena.offset(x_id) as u64,
+                                    w_byte_off: arena.offset(w_id) as u64,
+                                    scale_byte_off: arena.offset(scale_id) as u64,
+                                    zp_byte_off: arena.offset(zp_id) as u64,
+                                    out_byte_off: arena.offset(node.id) as u64,
                                 });
                                 continue;
                             }
@@ -1736,10 +1911,10 @@ impl RocmExecutable {
                                     k,
                                     n,
                                     group: *group_size,
-                                    x_byte_off: arena.offset(x_id) as u32,
-                                    w_byte_off: arena.offset(w_id) as u32,
-                                    scale_byte_off: arena.offset(scale_id) as u32,
-                                    out_byte_off: arena.offset(node.id) as u32,
+                                    x_byte_off: arena.offset(x_id) as u64,
+                                    w_byte_off: arena.offset(w_id) as u64,
+                                    scale_byte_off: arena.offset(scale_id) as u64,
+                                    out_byte_off: arena.offset(node.id) as u64,
                                 });
                                 continue;
                             }
@@ -1781,10 +1956,10 @@ impl RocmExecutable {
                         n,
                         num_experts: ne,
                         scheme_id: crate::gguf_host::gguf_scheme_id(*scheme),
-                        x_byte_off: arena.offset(in_id) as u32,
-                        w_byte_off: arena.offset(w_id) as u32,
-                        idx_byte_off: arena.offset(idx_id) as u32,
-                        out_byte_off: arena.offset(node.id) as u32,
+                        x_byte_off: arena.offset(in_id) as u64,
+                        w_byte_off: arena.offset(w_id) as u64,
+                        idx_byte_off: arena.offset(idx_id) as u64,
+                        out_byte_off: arena.offset(node.id) as u64,
                     });
                 }
                 Op::DequantGroupedMatMulMlx { scheme } => {
@@ -1807,11 +1982,11 @@ impl RocmExecutable {
                             n,
                             num_experts: ne,
                             group_size: *group_size,
-                            x_byte_off: arena.offset(in_id) as u32,
-                            w_byte_off: arena.offset(node.inputs[1]) as u32,
-                            scale_byte_off: arena.offset(scale_id) as u32,
-                            idx_byte_off: arena.offset(node.inputs[4]) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(in_id) as u64,
+                            w_byte_off: arena.offset(node.inputs[1]) as u64,
+                            scale_byte_off: arena.offset(scale_id) as u64,
+                            idx_byte_off: arena.offset(node.inputs[4]) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                         });
                     } else {
                         schedule.push(Step::DequantGroupedMatmulMlxHost {
@@ -1820,12 +1995,12 @@ impl RocmExecutable {
                             n,
                             num_experts: ne,
                             scheme: *scheme,
-                            x_byte_off: arena.offset(in_id) as u32,
-                            w_byte_off: arena.offset(node.inputs[1]) as u32,
-                            scale_byte_off: arena.offset(scale_id) as u32,
-                            zp_byte_off: arena.offset(node.inputs[3]) as u32,
-                            idx_byte_off: arena.offset(node.inputs[4]) as u32,
-                            out_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(in_id) as u64,
+                            w_byte_off: arena.offset(node.inputs[1]) as u64,
+                            scale_byte_off: arena.offset(scale_id) as u64,
+                            zp_byte_off: arena.offset(node.inputs[3]) as u64,
+                            idx_byte_off: arena.offset(node.inputs[4]) as u64,
+                            out_byte_off: arena.offset(node.id) as u64,
                             // BF16 scale params are WIDENED to f32 in this backend's main arena
                             // (mirrors rlx-cuda) — the host-delegate reads the f32 main buffer, so
                             // it must read f32, never bf16 (graph dtype BF16 → every-other value=0).
@@ -1865,8 +2040,8 @@ impl RocmExecutable {
                         && meta.n_complex.is_power_of_two()
                         && meta.n_complex >= 2;
                     schedule.push(Step::Fft {
-                        src_byte_off: arena.offset(in_id) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(in_id) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: meta.outer as u32,
                         n_complex: meta.n_complex as u32,
                         inverse: *inverse,
@@ -1875,15 +2050,38 @@ impl RocmExecutable {
                         use_gpu,
                     });
                 }
+                Op::FftQ {
+                    inverse,
+                    norm,
+                    scale,
+                } => {
+                    // Host fallback. This arena is f32-*valued* — integers live
+                    // in it as the float with the same value — so the adapter
+                    // converts rather than reinterpreting. Reading these slots
+                    // as raw i32 yields float bit patterns, which is the garbage
+                    // this path exists to avoid.
+                    let in_id = node.inputs[0];
+                    let in_shape = graph.node(in_id).shape.clone();
+                    let meta = rlx_ir::fft::fft_meta(&in_shape);
+                    schedule.push(Step::FftQ {
+                        src_byte_off: arena.offset(in_id) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
+                        outer: meta.outer as u32,
+                        n_complex: meta.n_complex as u32,
+                        inverse: *inverse,
+                        norm_tag: norm.tag(),
+                        scale_tag: scale.tag(),
+                    });
+                }
                 Op::LogMel => {
                     let spec_shape = graph.node(node.inputs[0]).shape.clone();
                     let filt_shape = graph.node(node.inputs[1]).shape.clone();
                     let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
                         .unwrap_or_else(|e| panic!("Op::LogMel: {e}"));
                     schedule.push(Step::LogMelHost {
-                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        spec_byte_off: arena.offset(node.inputs[0]) as u64,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: meta.outer as u32,
                         n_fft: meta.n_fft as u32,
                         n_bins: meta.n_bins as u32,
@@ -1896,10 +2094,10 @@ impl RocmExecutable {
                     let meta = rlx_ir::audio::log_mel_meta(&spec_shape, &filt_shape)
                         .unwrap_or_else(|e| panic!("Op::LogMelBackward: {e}"));
                     schedule.push(Step::LogMelBackwardHost {
-                        spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                        filt_byte_off: arena.offset(node.inputs[1]) as u32,
-                        dy_byte_off: arena.offset(node.inputs[2]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        spec_byte_off: arena.offset(node.inputs[0]) as u64,
+                        filt_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dy_byte_off: arena.offset(node.inputs[2]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: meta.outer as u32,
                         n_fft: meta.n_fft as u32,
                         n_bins: meta.n_bins as u32,
@@ -1928,8 +2126,8 @@ impl RocmExecutable {
                         });
                     } else {
                         schedule.push(Step::WelchPeaksHost {
-                            spec_byte_off: arena.offset(node.inputs[0]) as u32,
-                            dst_byte_off: arena.offset(node.id) as u32,
+                            spec_byte_off: arena.offset(node.inputs[0]) as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
                             welch_batch: meta.welch_batch as u32,
                             n_fft: meta.n_fft as u32,
                             n_segments: meta.n_segments as u32,
@@ -1996,8 +2194,8 @@ impl RocmExecutable {
                         dw_dil as usize,
                     ) as u32;
                     schedule.push(Step::Im2ColHost {
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        col_byte_off: arena.offset(node.id) as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        col_byte_off: arena.offset(node.id) as u64,
                         n,
                         c_in,
                         h,
@@ -2028,8 +2226,8 @@ impl RocmExecutable {
                         }
                     }
                     schedule.push(Step::ReverseHost {
-                        src_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         dims,
                         rev_mask,
                         elem_bytes: in_shape.dtype().size_bytes() as u32,
@@ -2048,8 +2246,8 @@ impl RocmExecutable {
                         .product::<usize>()
                         .max(1);
                     schedule.push(Step::ArgReduceHost {
-                        src_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: outer as u32,
                         reduced: reduced as u32,
                         inner: inner as u32,
@@ -2098,13 +2296,13 @@ impl RocmExecutable {
                         0
                     };
                     schedule.push(Step::GatedDeltaNet {
-                        q_byte_off: arena.offset(q_id) as u32,
-                        k_byte_off: arena.offset(node.inputs[1]) as u32,
-                        v_byte_off: arena.offset(node.inputs[2]) as u32,
-                        g_byte_off: arena.offset(node.inputs[3]) as u32,
-                        beta_byte_off: arena.offset(node.inputs[4]) as u32,
-                        state_byte_off: state_off as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        q_byte_off: arena.offset(q_id) as u64,
+                        k_byte_off: arena.offset(node.inputs[1]) as u64,
+                        v_byte_off: arena.offset(node.inputs[2]) as u64,
+                        g_byte_off: arena.offset(node.inputs[3]) as u64,
+                        beta_byte_off: arena.offset(node.inputs[4]) as u64,
+                        state_byte_off: state_off as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         batch: q_shape.dim(0).unwrap_static() as u32,
                         seq: q_shape.dim(1).unwrap_static() as u32,
                         heads: q_shape.dim(2).unwrap_static() as u32,
@@ -2129,13 +2327,13 @@ impl RocmExecutable {
                         (0u32, 0u32)
                     };
                     schedule.push(Step::Lstm {
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
-                        w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
-                        bias_byte_off: arena.offset(node.inputs[3]) as u32,
-                        h0_byte_off: h0,
-                        c0_byte_off: c0,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
+                        w_hh_byte_off: arena.offset(node.inputs[2]) as u64,
+                        bias_byte_off: arena.offset(node.inputs[3]) as u64,
+                        h0_byte_off: h0 as u64,
+                        c0_byte_off: c0 as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         batch: x_shape.dim(0).unwrap_static() as u32,
                         seq: x_shape.dim(1).unwrap_static() as u32,
                         input_size: x_shape.dim(2).unwrap_static() as u32,
@@ -2172,19 +2370,19 @@ impl RocmExecutable {
                             0
                         };
                         schedule.push(Step::Gru {
-                            x_byte_off: arena.offset(node.inputs[0]) as u32,
-                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
-                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
-                            b_ih_byte_off: arena.offset(node.inputs[3]) as u32,
-                            b_hh_byte_off: arena.offset(node.inputs[4]) as u32,
-                            dst_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u64,
+                            b_ih_byte_off: arena.offset(node.inputs[3]) as u64,
+                            b_hh_byte_off: arena.offset(node.inputs[4]) as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
                             batch,
                             seq,
                             input_size,
                             hidden,
                             num_layers: *num_layers as u32,
                             bidirectional: *bidirectional,
-                            h0_byte_off,
+                            h0_byte_off: h0_byte_off as u64,
                         });
                     } else {
                         let h0 = if *carry {
@@ -2193,13 +2391,13 @@ impl RocmExecutable {
                             0u32
                         };
                         schedule.push(Step::GruHost {
-                            x_byte_off: arena.offset(node.inputs[0]) as u32,
-                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
-                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
-                            b_ih_byte_off: arena.offset(node.inputs[3]) as u32,
-                            b_hh_byte_off: arena.offset(node.inputs[4]) as u32,
-                            h0_byte_off: h0,
-                            dst_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u64,
+                            b_ih_byte_off: arena.offset(node.inputs[3]) as u64,
+                            b_hh_byte_off: arena.offset(node.inputs[4]) as u64,
+                            h0_byte_off: h0 as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
                             batch,
                             seq,
                             input_size,
@@ -2237,18 +2435,18 @@ impl RocmExecutable {
                             0u32
                         };
                         schedule.push(Step::Rnn {
-                            x_byte_off: arena.offset(node.inputs[0]) as u32,
-                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
-                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
-                            bias_byte_off: arena.offset(node.inputs[3]) as u32,
-                            dst_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u64,
+                            bias_byte_off: arena.offset(node.inputs[3]) as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
                             batch,
                             seq,
                             input_size,
                             hidden,
                             num_layers: *num_layers as u32,
                             bidirectional: *bidirectional,
-                            h0_byte_off,
+                            h0_byte_off: h0_byte_off as u64,
                             relu: *relu,
                         });
                     } else {
@@ -2258,12 +2456,12 @@ impl RocmExecutable {
                             0u32
                         };
                         schedule.push(Step::RnnHost {
-                            x_byte_off: arena.offset(node.inputs[0]) as u32,
-                            w_ih_byte_off: arena.offset(node.inputs[1]) as u32,
-                            w_hh_byte_off: arena.offset(node.inputs[2]) as u32,
-                            bias_byte_off: arena.offset(node.inputs[3]) as u32,
-                            h0_byte_off: h0,
-                            dst_byte_off: arena.offset(node.id) as u32,
+                            x_byte_off: arena.offset(node.inputs[0]) as u64,
+                            w_ih_byte_off: arena.offset(node.inputs[1]) as u64,
+                            w_hh_byte_off: arena.offset(node.inputs[2]) as u64,
+                            bias_byte_off: arena.offset(node.inputs[3]) as u64,
+                            h0_byte_off: h0 as u64,
+                            dst_byte_off: arena.offset(node.id) as u64,
                             batch,
                             seq,
                             input_size,
@@ -2293,12 +2491,12 @@ impl RocmExecutable {
                     let dst_byte_off = arena.offset(node.id) as u32;
                     if native {
                         schedule.push(Step::Mamba2 {
-                            x_byte_off,
-                            dt_byte_off,
-                            a_byte_off,
-                            b_byte_off,
-                            c_byte_off,
-                            dst_byte_off,
+                            x_byte_off: x_byte_off as u64,
+                            dt_byte_off: dt_byte_off as u64,
+                            a_byte_off: a_byte_off as u64,
+                            b_byte_off: b_byte_off as u64,
+                            c_byte_off: c_byte_off as u64,
+                            dst_byte_off: dst_byte_off as u64,
                             batch,
                             seq,
                             heads,
@@ -2307,12 +2505,12 @@ impl RocmExecutable {
                         });
                     } else {
                         schedule.push(Step::Mamba2Host {
-                            x_byte_off,
-                            dt_byte_off,
-                            a_byte_off,
-                            b_byte_off,
-                            c_byte_off,
-                            dst_byte_off,
+                            x_byte_off: x_byte_off as u64,
+                            dt_byte_off: dt_byte_off as u64,
+                            a_byte_off: a_byte_off as u64,
+                            b_byte_off: b_byte_off as u64,
+                            c_byte_off: c_byte_off as u64,
+                            dst_byte_off: dst_byte_off as u64,
                             batch,
                             seq,
                             heads,
@@ -2337,10 +2535,35 @@ impl RocmExecutable {
                 | Op::GatherElements { .. } => {
                     // f32-uniform arena: I64 indices live as f32 slots (same as
                     // CUDA/wgpu). Force the f32→i64 reader for ScatterNd/Gather*.
-                    schedule.push(Step::CpuIndexing {
-                        thunk: rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.offset(id))
-                            .force_indices_f32(),
-                    });
+                    let thunk = rlx_cpu::rlx_indexing_thunk!(graph, node, |id| arena.offset(id))
+                        .force_indices_f32();
+                    // ...and *because* they live as f32 slots, the shared
+                    // `indexing_nd.cu` kernels can read them directly. Whatever
+                    // the planner declines keeps the host route below.
+                    let launch = if rlx_ir::env::flag("RLX_ROCM_INDEXING_HOST") {
+                        None
+                    } else {
+                        rlx_gpu_host::indexing_plan::plan_indexing(&thunk)
+                    };
+                    match launch {
+                        Some(l) => {
+                            let meta = upload_meta(&ctx, &l.meta);
+                            let meta_idx = meta_buffers.len();
+                            meta_buffers.push(meta);
+                            schedule.push(Step::IndexingNd {
+                                kind: l.kind,
+                                n: l.n,
+                                data_off: l.data_off,
+                                idx_off: l.idx_off,
+                                upd_off: l.upd_off,
+                                dst_off: l.dst_off,
+                                dst_len: l.dst_len,
+                                prologue: l.prologue,
+                                meta_idx,
+                            });
+                        }
+                        None => schedule.push(Step::CpuIndexing { thunk }),
+                    }
                 }
                 Op::Custom { name, attrs, .. } => match name.as_str() {
                     "llada2.group_limited_gate" => {
@@ -3064,7 +3287,7 @@ impl RocmExecutable {
                     meta_buffers.push(meta);
                     schedule.push(Step::QuantizeI8 {
                         in_off: (arena.offset(node.inputs[0]) / 4) as u32,
-                        q_byte_off: arena.offset(node.id) as u32,
+                        q_byte_off: arena.offset(node.id) as u64,
                         n: node.shape.num_elements().unwrap() as u32,
                         chan_dim: chan_dim as u32,
                         inner: inner as u32,
@@ -3098,7 +3321,7 @@ impl RocmExecutable {
                     let meta_idx = meta_buffers.len();
                     meta_buffers.push(meta);
                     schedule.push(Step::DequantizeI8 {
-                        q_byte_off: arena.offset(node.inputs[0]) as u32,
+                        q_byte_off: arena.offset(node.inputs[0]) as u64,
                         out_off: (arena.offset(node.id) / 4) as u32,
                         n: node.shape.num_elements().unwrap() as u32,
                         chan_dim: chan_dim as u32,
@@ -3118,10 +3341,10 @@ impl RocmExecutable {
                         m: x_shape.dim(0).unwrap_static() as u32,
                         k: x_shape.dim(1).unwrap_static() as u32,
                         n: w_shape.dim(1).unwrap_static() as u32,
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        w_byte_off: arena.offset(node.inputs[1]) as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        w_byte_off: arena.offset(node.inputs[1]) as u64,
                         bias_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        out_byte_off: arena.offset(node.id) as u32,
+                        out_byte_off: arena.offset(node.id) as u64,
                         x_zp: *x_zp,
                         w_zp: *w_zp,
                         out_zp: *out_zp,
@@ -3158,10 +3381,10 @@ impl RocmExecutable {
                         dh: dilation.first().copied().unwrap_or(1) as u32,
                         dw: dilation.get(1).copied().unwrap_or(1) as u32,
                         groups: *groups as u32,
-                        x_byte_off: arena.offset(node.inputs[0]) as u32,
-                        w_byte_off: arena.offset(node.inputs[1]) as u32,
+                        x_byte_off: arena.offset(node.inputs[0]) as u64,
+                        w_byte_off: arena.offset(node.inputs[1]) as u64,
                         bias_off: (arena.offset(node.inputs[2]) / 4) as u32,
-                        out_byte_off: arena.offset(node.id) as u32,
+                        out_byte_off: arena.offset(node.id) as u64,
                         x_zp: *x_zp,
                         w_zp: *w_zp,
                         out_zp: *out_zp,
@@ -3226,7 +3449,8 @@ impl RocmExecutable {
                     let in_id = node.inputs[0];
                     let in_dims = graph.node(in_id).shape.dims();
                     let out_dims = node.shape.dims();
-                    let op_id = reduce_op_id(*kind);
+                    // Pool kernels use their own legend; see `pool_op_id`.
+                    let op_id = pool_op_id(*kind);
                     let in_off = (arena.offset(in_id) / 4) as u32;
                     let out_off = (arena.offset(node.id) / 4) as u32;
                     match kernel_size.len() {
@@ -3456,7 +3680,7 @@ impl RocmExecutable {
                 } => {
                     let len = node.shape.num_elements().unwrap_or(0);
                     schedule.push(Step::RngNormal {
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         len: len as u32,
                         mean: *mean,
                         scale: *scale,
@@ -3472,7 +3696,7 @@ impl RocmExecutable {
                 } => {
                     let len = node.shape.num_elements().unwrap_or(0);
                     schedule.push(Step::RngUniform {
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         len: len as u32,
                         low: *low,
                         high: *high,
@@ -3492,11 +3716,11 @@ impl RocmExecutable {
                     match &node.op {
                         Op::RmsNormBackwardInput { .. } => {
                             schedule.push(Step::RmsNormBackwardInput {
-                                x_byte_off: common.0,
-                                gamma_byte_off: common.1,
-                                beta_byte_off: common.2,
-                                dy_byte_off: common.3,
-                                dx_byte_off: arena.offset(node.id) as u32,
+                                x_byte_off: common.0 as u64,
+                                gamma_byte_off: common.1 as u64,
+                                beta_byte_off: common.2 as u64,
+                                dy_byte_off: common.3 as u64,
+                                dx_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
                                 eps_bits: common.6,
@@ -3504,11 +3728,11 @@ impl RocmExecutable {
                         }
                         Op::RmsNormBackwardGamma { .. } => {
                             schedule.push(Step::RmsNormBackwardGamma {
-                                x_byte_off: common.0,
-                                gamma_byte_off: common.1,
-                                beta_byte_off: common.2,
-                                dy_byte_off: common.3,
-                                dgamma_byte_off: arena.offset(node.id) as u32,
+                                x_byte_off: common.0 as u64,
+                                gamma_byte_off: common.1 as u64,
+                                beta_byte_off: common.2 as u64,
+                                dy_byte_off: common.3 as u64,
+                                dgamma_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
                                 eps_bits: common.6,
@@ -3516,11 +3740,11 @@ impl RocmExecutable {
                         }
                         Op::RmsNormBackwardBeta { .. } => {
                             schedule.push(Step::RmsNormBackwardBeta {
-                                x_byte_off: common.0,
-                                gamma_byte_off: common.1,
-                                beta_byte_off: common.2,
-                                dy_byte_off: common.3,
-                                dbeta_byte_off: arena.offset(node.id) as u32,
+                                x_byte_off: common.0 as u64,
+                                gamma_byte_off: common.1 as u64,
+                                beta_byte_off: common.2 as u64,
+                                dy_byte_off: common.3 as u64,
+                                dbeta_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
                                 eps_bits: common.6,
@@ -3529,7 +3753,11 @@ impl RocmExecutable {
                         _ => unreachable!(),
                     }
                 }
-                Op::RopeBackward { head_dim, n_rot } => {
+                Op::RopeBackward {
+                    head_dim,
+                    n_rot,
+                    style,
+                } => {
                     let dy_shape = &graph.node(node.inputs[0]).shape;
                     let (batch, seq, hidden) = if dy_shape.rank() >= 3 {
                         (
@@ -3544,18 +3772,25 @@ impl RocmExecutable {
                             dy_shape.dim(1).unwrap_static() as u32,
                         )
                     };
-                    let cos_len = graph.node(node.inputs[1]).shape.num_elements().unwrap() as u32;
+                    let cos_shape = &graph.node(node.inputs[1]).shape;
+                    let cos_len = cos_shape.num_elements().unwrap() as u32;
+                    // Row width off the table — see the CUDA site.
+                    // Shared with every other backend so the rule cannot drift
+                    // again; a rank-1 table's rows are `n_rot/2`, not its length.
+                    let cos_row_stride = rlx_ir::shape::rope_table_stride(cos_shape, *n_rot) as u32;
                     schedule.push(Step::RopeBackward {
-                        dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                        cos_byte_off: arena.offset(node.inputs[1]) as u32,
-                        sin_byte_off: arena.offset(node.inputs[2]) as u32,
-                        dx_byte_off: arena.offset(node.id) as u32,
+                        dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                        cos_byte_off: arena.offset(node.inputs[1]) as u64,
+                        sin_byte_off: arena.offset(node.inputs[2]) as u64,
+                        dx_byte_off: arena.offset(node.id) as u64,
                         batch,
                         seq,
                         hidden,
                         head_dim: *head_dim as u32,
                         n_rot: *n_rot as u32,
                         cos_len,
+                        cos_row_stride,
+                        interleaved: matches!(style, rlx_ir::op::RopeStyle::GptJ),
                     });
                 }
                 Op::CumsumBackward { exclusive, .. } => {
@@ -3563,8 +3798,8 @@ impl RocmExecutable {
                     let cols = dy_shape.dim(dy_shape.rank() - 1).unwrap_static() as u32;
                     let rows = (dy_shape.num_elements().unwrap() / cols.max(1) as usize) as u32;
                     schedule.push(Step::CumsumBackward {
-                        dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                        dx_byte_off: arena.offset(node.id) as u32,
+                        dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                        dx_byte_off: arena.offset(node.id) as u64,
                         rows,
                         cols,
                         exclusive: *exclusive,
@@ -3588,16 +3823,16 @@ impl RocmExecutable {
                         .map(|i| dy_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
-                    let num_idx = idx_shape.dim(axis_u).unwrap_static();
+                    let num_idx = idx_shape.gather_index_count(axis_u);
                     let trailing: usize = (axis_u + 1..dy_shape.rank())
                         .map(|i| dy_shape.dim(i).unwrap_static())
                         .product::<usize>()
                         .max(1);
                     let axis_dim = out_shape.dim(axis_u).unwrap_static();
                     schedule.push(Step::GatherBackward {
-                        dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                        indices_byte_off: arena.offset(node.inputs[1]) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        dy_byte_off: arena.offset(node.inputs[0]) as u64,
+                        indices_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                         outer: outer as u32,
                         axis_dim: axis_dim as u32,
                         num_idx: num_idx as u32,
@@ -3868,8 +4103,8 @@ impl RocmExecutable {
                     }
                     schedule.push(Step::ComplexNormSq {
                         n: elems,
-                        src_byte_off: arena.offset(src) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(src) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                     });
                 }
                 Op::ComplexNormSqBackward => {
@@ -3883,9 +4118,9 @@ impl RocmExecutable {
                     }
                     schedule.push(Step::ComplexNormSqBackward {
                         n: elems,
-                        z_byte_off: arena.offset(z) as u32,
-                        g_byte_off: arena.offset(g) as u32,
-                        dz_byte_off: arena.offset(node.id) as u32,
+                        z_byte_off: arena.offset(z) as u64,
+                        g_byte_off: arena.offset(g) as u64,
+                        dz_byte_off: arena.offset(node.id) as u64,
                     });
                 }
                 Op::Conjugate => {
@@ -3898,8 +4133,8 @@ impl RocmExecutable {
                     }
                     schedule.push(Step::ConjugateC64 {
                         n: elems,
-                        src_byte_off: arena.offset(src) as u32,
-                        dst_byte_off: arena.offset(node.id) as u32,
+                        src_byte_off: arena.offset(src) as u64,
+                        dst_byte_off: arena.offset(node.id) as u64,
                     });
                 }
                 // Native F32 dense solve via hipSOLVER getrf+getrs /
@@ -3946,17 +4181,11 @@ impl RocmExecutable {
                 // fall here when native libs/dtypes are unavailable; CustomFn
                 // runs the opaque body. `PartitionedConv` is expanded to
                 // Fft/MatMul in `crate::unfuse` before this match.
-                Op::DenseSolve
-                | Op::BatchedDenseSolve
-                | Op::Cholesky
-                | Op::TriangularSolve { .. }
-                | Op::Det
-                | Op::LogDet
-                | Op::Sort { .. }
-                | Op::Svd { .. }
-                | Op::Qr { .. }
-                | Op::ArgSort { .. }
-                | Op::CustomFn { .. } => {
+                // The op list lives in `crate::supported_ops::routes_to_cpu_host`
+                // so the claim and the route can be compared from outside this
+                // crate without a device — see that function, and
+                // `rlx-runtime/tests/host_fallback_never_nops.rs`.
+                other if crate::supported_ops::routes_to_cpu_host(other) => {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });
@@ -4059,6 +4288,8 @@ impl RocmExecutable {
             graph,
             arena,
             schedule,
+            static_once_steps,
+            static_once_done: false,
             input_offsets,
             param_offsets,
             meta_buffers,

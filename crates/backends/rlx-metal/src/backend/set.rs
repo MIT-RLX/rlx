@@ -17,7 +17,25 @@ use std::collections::HashMap;
 use super::*;
 
 impl MetalExecutable {
+    /// Drop the record of which weight packs have already been materialised.
+    ///
+    /// A `Concat`/`Expand` over `Param`s is invariant across `run()`s, so the
+    /// encoder skips re-running it once baked (see `Thunk::Concat`'s
+    /// `weight_const`). That is only true while the params underneath hold
+    /// still: after any write the pack is stale, and skipping it makes the
+    /// consuming GEMM read the previous weights and return a wrong answer with
+    /// no error raised anywhere.
+    ///
+    /// Clearing wholesale rather than tracking which packs consume `name`
+    /// costs one step's worth of concat after a re-bind and cannot be wrong.
+    /// Weight writes are rare next to decode steps, so the trade is lopsided in
+    /// the safe direction.
+    fn invalidate_baked_weight_packs(&mut self) {
+        self.baked_weight_concats.borrow_mut().clear();
+    }
+
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        self.invalidate_baked_weight_packs();
         if let Some(&id) = self.param_ids.get(name) {
             if let Some(slot) = self.weight_slots.get(&id).copied() {
                 self.write_weight_from_f32(slot, data);
@@ -29,6 +47,7 @@ impl MetalExecutable {
     }
 
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
+        self.invalidate_baked_weight_packs();
         if let Some(&id) = self.param_ids.get(name) {
             if let Some(slot) = self.weight_slots.get(&id).copied() {
                 self.write_weight_bytes(slot, data);
@@ -41,11 +60,12 @@ impl MetalExecutable {
     /// Incrementally write `data` into a named param starting `byte_offset` bytes
     /// into its storage (raw bytes, no dtype widen). Returns true if written. Used
     /// to upload ONE changed slot of a large packed-expert residency buffer instead
-    /// of re-copying the whole buffer every step ([`PagedGroupedMoe`] paging). Only
+    /// of re-copying the whole buffer every step (`PagedGroupedMoe` paging). Only
     /// the arena-resident path is supported (unified memory, zero-copy); params
     /// parked in a separate weight MTLBuffer return false so the caller re-uploads
     /// whole. No-op (false) for an unknown name.
     pub fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        self.invalidate_baked_weight_packs();
         let Some(&id) = self.param_ids.get(name) else {
             return false;
         };

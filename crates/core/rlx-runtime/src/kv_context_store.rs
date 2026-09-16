@@ -790,7 +790,7 @@ impl KvContextStore {
         self.read_calls.fetch_add(1, Relaxed);
         self.read_blocks_ct.fetch_add(out.len() as u64, Relaxed);
         self.read_nanos.fetch_add(dt, Relaxed);
-        if std::env::var_os("RLX_KVSTORE_READ_STATS").is_some() {
+        if rlx_ir::env::var_os("RLX_KVSTORE_READ_STATS").is_some() {
             let us = dt as f64 / 1000.0;
             let n = out.len().max(1);
             eprintln!(
