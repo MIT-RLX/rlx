@@ -13752,6 +13752,8 @@ pub struct Kernels {
     /// Simdgroup-cooperative Q1_0 GEMV: 32 threads → 8 outputs via `simd_sum`
     /// (llama.cpp `kernel_mul_mv_q1_0_f32`). Used when `n_dim % 8 == 0`.
     pub q1_0_mv_f32_sg: ComputePipelineState,
+    pub ptq1_0_mv_f32_sg: ComputePipelineState,
+    pub ptq1_0_mv_f32_sg_fp: ComputePipelineState,
     pub q1_0_dual_mv_f32_sg: ComputePipelineState,
     pub q1_0_mm_f32: ComputePipelineState,
     pub q2_0_mv_f32: ComputePipelineState,
@@ -14261,6 +14263,8 @@ impl Kernels {
             q3k_mv_f32_sg: pipeline("q3k_mv_f32_sg"),
             q1_0_mv_f32: pipeline("q1_0_mv_f32"),
             q1_0_mv_f32_sg: pipeline("q1_0_mv_f32_sg"),
+            ptq1_0_mv_f32_sg: pipeline("ptq1_0_mv_f32_sg"),
+            ptq1_0_mv_f32_sg_fp: pipeline("ptq1_0_mv_f32_sg_fp"),
             q1_0_dual_mv_f32_sg: pipeline("q1_0_dual_mv_f32_sg"),
             q1_0_mm_f32: pipeline("q1_0_mm_f32"),
             q2_0_mv_f32: pipeline("q2_0_mv_f32"),

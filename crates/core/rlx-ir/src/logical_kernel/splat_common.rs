@@ -131,7 +131,12 @@ pub fn lower_gaussian_splat_render_backward(
     // mul: weighted = colors2 * op_3
     let d_colors2 = g.mul(d_weighted, op_3);
     let d_op_3 = g.mul(d_weighted, colors2);
-    let d_op_from_mul = g.sum(d_op_3, vec![1], false);
+    // keep_dim, so this stays `[count, 1]` and matches `d_op_from_mean`.
+    // With keep_dim=false it is `[count]`, which broadcasts against `[count, 1]`
+    // into `[count, count]` — and the reshape below then silently kept only the
+    // first `count` of those `count^2` values, so `d_opacities` was the wrong
+    // gradient. Caught by the element-count check in `shape::reshape_shape`.
+    let d_op_from_mul = g.sum(d_op_3, vec![1], true);
     let d_op_2d = g.add(d_op_from_mean, d_op_from_mul);
 
     let d_colors = g.reshape_(d_colors2, vec![(count * 3) as i64]);

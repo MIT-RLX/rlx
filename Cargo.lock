@@ -5314,9 +5314,8 @@ name = "rlx-nemo"
 version = "0.2.16"
 dependencies = [
  "anyhow",
- "flate2",
- "half",
  "rlx-ir",
+ "rlx-torch-ckpt",
  "serde_yaml",
  "tempfile",
 ]
@@ -5587,6 +5586,16 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers",
+]
+
+[[package]]
+name = "rlx-torch-ckpt"
+version = "0.2.16"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "half",
+ "tempfile",
 ]
 
 [[package]]

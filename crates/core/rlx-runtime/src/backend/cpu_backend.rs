@@ -806,9 +806,8 @@ impl ExecutableGraph for CpuExecutable {
             return;
         }
         if dtype == DType::F32 {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-            self.set_param(name, s);
+            let s = rlx_ir::bytes::decode_le::<f32>(data);
+            self.set_param(name, s.as_ref());
         } else {
             let f32_buf = super::widen_bytes_to_f32(data, dtype);
             self.set_param(name, &f32_buf);

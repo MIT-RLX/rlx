@@ -39,6 +39,10 @@ pub fn quant_scheme_for_ggml(dtype: GgmlType) -> Option<QuantScheme> {
         GgmlType::FV5 => Some(QuantScheme::GgufFV5),
         GgmlType::FV5B => Some(QuantScheme::GgufFV5B),
         GgmlType::G8_0 => Some(QuantScheme::GgufG8_0),
+        // PrismML Ternary Bonsai 2: PQ2_0 is byte-identical to Q2_0 at a
+        // distinct type id, PTQ1_0 is base-3 ternary at group 128.
+        GgmlType::PQ2_0 => Some(QuantScheme::GgufQ2_0),
+        GgmlType::PTQ1_0 => Some(QuantScheme::GgufPtq1_0),
         _ => None,
     }
 }

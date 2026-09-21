@@ -433,6 +433,42 @@ impl MetalHwModel {
             if precise {
                 // Accumulator-parity debug: keep the reference path.
                 SgemmVariant::Naive
+            } else if (2..32).contains(&m)
+                && !m.is_multiple_of(8)
+                && k == n
+                && k >= 256
+                && !mps_disabled
+                && !rlx_ir::env::flag("RLX_METAL_NO_SMALL_M_MPS")
+                && crate::mps_blas::mps_supports_matmul()
+            {
+                // Small, 8-UNALIGNED m against a large SQUARE operator.
+                // `aligned_8` below needs `m % 8 == 0`, so `Simd` is out and
+                // these land on `SimdPadded`, which pads m up to a simdgroup
+                // and wastes most of the tile. MPS wins despite its bridging
+                // cost — same reasoning as the `m == 1 && n < 64` case above,
+                // one rung up in n.
+                //
+                // `k == n` is the discriminator, and it is not arbitrary: a
+                // square operator is a rotation/basis change, never a
+                // transformer projection (those are rectangular). Concretely
+                // this is `prism.hadamard`'s rotation on Ternary Bonsai 2 —
+                // the `[-1, 1024]` block view makes m = width/1024, i.e. 5, 6
+                // or 17, against k = n = 1024, ~190 times a token. Without the
+                // `k == n` guard the rule also caught rectangular shapes in
+                // Qwen3.8-27B and cost it 1.6%.
+                //
+                // MEASURED on M4 Pro, arms alternated inside each round
+                // (median over ~79 decode steps, 3 rounds): Bonsai-2 124.2 ->
+                // 117.6 ms/token, won every round. Deliberately excludes
+                // m == 1 — the blanket `RLX_METAL_SGEMM_MPS=1`, which does
+                // catch m == 1, measured 1.4% SLOWER on Qwen3.8-27B-Q3_K_S
+                // (228.0 -> 231.3) and a wash on Bonsai-1, so this is a real
+                // shape class and not a general "MPS is better" result.
+                // Opt out: RLX_METAL_NO_SMALL_M_MPS=1.
+                if rlx_ir::env::flag("RLX_METAL_SMALL_M_MPS_TRACE") {
+                    warn_once(&format!("[small_m_mps] m={m} k={k} n={n}"));
+                }
+                SgemmVariant::Mps
             } else if aligned_8 && m >= 8 && n >= 8 {
                 // `Simd` goes FIRST, exactly as in the `m >= 32` arm below.
                 //

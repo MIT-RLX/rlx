@@ -144,6 +144,16 @@ pub enum QuantScheme {
     /// linears are factorized [`Self::GgufQ2_0`] pairs instead.
     /// See `rlx_gguf::g8_dequant`.
     GgufG8_0,
+    /// PrismML ternary at group 128 (`Ternary-Bonsai-2-27B`, on-disk ggml
+    /// type 143 in that fork's dialect): base-3-packed trits `{−1,0,+1}`
+    /// + one trailing f16 group scale → `w = t·d`. 128 / 28 bytes
+    /// (1.75 bpw). The fork's `PQ2_0` (type 142) is byte-identical to
+    /// [`Self::GgufQ2_0`] and reuses it. See `rlx_gguf::ptq1_dequant`.
+    ///
+    /// These weights are stored in a **Hadamard-rotated basis**; a
+    /// matmul against them is only correct if the activation gets the
+    /// matching `prism.hadamard` transform first.
+    GgufPtq1_0,
 }
 
 /// Single source of truth for GGUF → GPU `dequant_gguf` scheme ids.
@@ -227,11 +237,12 @@ impl QuantScheme {
             Self::GgufTQ2_0 => 20,
             Self::GgufMXFP4 => 42,
             Self::GgufNVFP4 => 45,
-            Self::GgufQ1_0 => 11, // 18 bytes / 128 elems × 8 = 1.125 bpe
-            Self::GgufQ2_0 => 21, // 34 bytes / 128 elems × 8 = 2.125 bpe
-            Self::GgufFV5 => 32,  // 104 bytes / 256 elems × 8 = 3.25 bpe
-            Self::GgufFV5B => 81, // 260 bytes / 256 elems × 8 = 8.125 bpe
-            Self::GgufG8_0 => 40, // 16 bytes / 32 elems × 8 = 4.0 bpe
+            Self::GgufQ1_0 => 11,   // 18 bytes / 128 elems × 8 = 1.125 bpe
+            Self::GgufQ2_0 => 21,   // 34 bytes / 128 elems × 8 = 2.125 bpe
+            Self::GgufFV5 => 32,    // 104 bytes / 256 elems × 8 = 3.25 bpe
+            Self::GgufFV5B => 81,   // 260 bytes / 256 elems × 8 = 8.125 bpe
+            Self::GgufG8_0 => 40,   // 16 bytes / 32 elems × 8 = 4.0 bpe
+            Self::GgufPtq1_0 => 17, // 28 bytes / 128 elems × 8 = 1.75 bpe
         }
     }
 
@@ -272,6 +283,13 @@ impl QuantScheme {
         (GgufFV5, 26),
         (GgufFV5B, 27),
         (GgufG8_0, 28),
+        // Backends treat "has an id" as "has an on-device branch"
+        // (`rlx_metal::has_metal_dequant_kernel` literally returns
+        // `gpu_dequant_scheme_id().is_some()`), so this row and the MSL /
+        // CU / WGSL branches for id 29 must land together — listing it
+        // without them reads the weights as zeros and degrades the model
+        // silently rather than failing.
+        (GgufPtq1_0, 29),
     }
 
     /// True if this scheme requires a per-block scale tensor on the side.
@@ -384,6 +402,7 @@ impl QuantScheme {
             Self::GgufQ1_0 => 128,
             Self::GgufQ2_0 => 128,
             Self::GgufG8_0 => 32,
+            Self::GgufPtq1_0 => 128,
             _ => 0,
         }
     }
@@ -415,11 +434,12 @@ impl QuantScheme {
             Self::GgufTQ2_0 => 66,
             Self::GgufMXFP4 => 17,
             Self::GgufNVFP4 => 9,
-            Self::GgufQ1_0 => 18,  // f16 scale + 128 sign bits
-            Self::GgufQ2_0 => 34,  // Metal fused Q2_0 block (128 elems)
-            Self::GgufFV5 => 104,  // f32 s_lo + f32 s_hi + 3×32B planes (256 elems)
-            Self::GgufFV5B => 260, // f32 s + 256 int8 (256 elems)
-            Self::GgufG8_0 => 16,  // 4 bf16 scales + 32×2-bit codes (32 elems)
+            Self::GgufQ1_0 => 18,   // f16 scale + 128 sign bits
+            Self::GgufQ2_0 => 34,   // Metal fused Q2_0 block (128 elems)
+            Self::GgufFV5 => 104,   // f32 s_lo + f32 s_hi + 3×32B planes (256 elems)
+            Self::GgufFV5B => 260,  // f32 s + 256 int8 (256 elems)
+            Self::GgufG8_0 => 16,   // 4 bf16 scales + 32×2-bit codes (32 elems)
+            Self::GgufPtq1_0 => 28, // 24B qs + 2B qh base-3 trits + f16 scale (128 elems)
             _ => 0,
         }
     }
@@ -460,6 +480,7 @@ impl QuantScheme {
                 | Self::GgufFV5
                 | Self::GgufFV5B
                 | Self::GgufG8_0
+                | Self::GgufPtq1_0
         )
     }
 }
@@ -508,6 +529,7 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufFV5 => write!(f, "gguf_fv5"),
             Self::GgufFV5B => write!(f, "gguf_fv5b"),
             Self::GgufG8_0 => write!(f, "gguf_g8_0"),
+            Self::GgufPtq1_0 => write!(f, "gguf_ptq1_0"),
         }
     }
 }
@@ -995,7 +1017,7 @@ mod tests {
     #[test]
     fn gpu_dequant_scheme_id_is_stable() {
         use QuantScheme::*;
-        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 29);
+        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 30);
         for &(scheme, id) in QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS {
             assert_eq!(scheme.gpu_dequant_scheme_id(), Some(id), "{scheme:?}");
             assert_eq!(

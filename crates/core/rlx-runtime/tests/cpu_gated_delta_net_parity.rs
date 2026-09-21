@@ -310,3 +310,100 @@ fn metal_gated_delta_net_native_matches_cpu_n128() {
         "native metal GDN diverges: maxdiff={maxdiff}"
     );
 }
+
+/// Splitting the scan must not change it: running `s` steps in one call
+/// has to equal running `s-1` steps, carrying the state out, and running
+/// the last step from it.
+///
+/// This is the contract the whole hybrid decode path rests on — prefill
+/// scans the prompt and hands its state to a 1-token decode step — and
+/// nothing else tests it. A leak here is invisible in prefill output and
+/// only shows up as generation that tracks a reference for a few tokens
+/// and then walks off.
+#[test]
+fn cpu_gated_delta_net_carry_splits_without_changing_the_scan() {
+    let _gpu = common::serialize_gpu();
+    let (b, s, h, n) = (1usize, 4usize, 2usize, 3usize);
+
+    let nqkv = b * s * h * n;
+    let ngb = b * s * h;
+    let q: Vec<f32> = (0..nqkv).map(|i| 0.05 + 0.03 * (i as f32)).collect();
+    let k: Vec<f32> = (0..nqkv).map(|i| 0.10 + 0.02 * (i as f32)).collect();
+    let v: Vec<f32> = (0..nqkv).map(|i| 0.30 + 0.05 * (i as f32)).collect();
+    let gg: Vec<f32> = (0..ngb).map(|i| -0.20 - 0.01 * (i as f32)).collect();
+    let beta: Vec<f32> = (0..ngb).map(|i| 0.40 + 0.02 * (i as f32)).collect();
+
+    // `state` is both an input and the buffer the op updates in place, so
+    // the graph exports it alongside the outputs.
+    let carry_graph = |steps: usize| -> Graph {
+        let mut g = Graph::new("gdn_carry");
+        let bshn = Shape::new(&[b, steps, h, n], DType::F32);
+        let bsh = Shape::new(&[b, steps, h], DType::F32);
+        let st = Shape::new(&[b, h, n, n], DType::F32);
+        let q = g.input("q", bshn.clone());
+        let kk = g.input("k", bshn.clone());
+        let vv = g.input("v", bshn.clone());
+        let gi = g.input("g", bsh.clone());
+        let bi = g.input("beta", bsh);
+        let s_in = g.input("state", st);
+        let y = g.gated_delta_net_carry(q, kk, vv, gi, bi, s_in, n, bshn);
+        g.set_outputs(vec![y, s_in]);
+        g
+    };
+
+    let slice_t = |src: &[f32], t0: usize, len: usize, per: usize| -> Vec<f32> {
+        src[t0 * per..(t0 + len) * per].to_vec()
+    };
+
+    let session = Session::new(Device::Cpu);
+
+    // One shot over all `s` steps.
+    let mut whole = session.compile(carry_graph(s));
+    let zero_state = vec![0f32; b * h * n * n];
+    let full = whole.run(&[
+        ("q", &q[..]),
+        ("k", &k[..]),
+        ("v", &v[..]),
+        ("g", &gg[..]),
+        ("beta", &beta[..]),
+        ("state", &zero_state[..]),
+    ]);
+    let want_last = full[0][(s - 1) * h * n..s * h * n].to_vec();
+
+    // Split: s-1 steps, then the final step resuming the carried state.
+    let mut head = session.compile(carry_graph(s - 1));
+    let part = head.run(&[
+        ("q", &slice_t(&q, 0, s - 1, h * n)[..]),
+        ("k", &slice_t(&k, 0, s - 1, h * n)[..]),
+        ("v", &slice_t(&v, 0, s - 1, h * n)[..]),
+        ("g", &slice_t(&gg, 0, s - 1, h)[..]),
+        ("beta", &slice_t(&beta, 0, s - 1, h)[..]),
+        ("state", &zero_state[..]),
+    ]);
+    let carried = part[1].clone();
+
+    let mut tail = session.compile(carry_graph(1));
+    let step = tail.run(&[
+        ("q", &slice_t(&q, s - 1, 1, h * n)[..]),
+        ("k", &slice_t(&k, s - 1, 1, h * n)[..]),
+        ("v", &slice_t(&v, s - 1, 1, h * n)[..]),
+        ("g", &slice_t(&gg, s - 1, 1, h)[..]),
+        ("beta", &slice_t(&beta, s - 1, 1, h)[..]),
+        ("state", &carried[..]),
+    ]);
+
+    assert!(
+        carried.iter().any(|&x| x != 0.0),
+        "carried state is all zeros — the scan exported its input, not its result"
+    );
+    let worst = want_last
+        .iter()
+        .zip(&step[0])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst < 1e-5,
+        "resumed step differs from the one-shot scan by {worst}\n  one-shot: {want_last:?}\n  resumed:  {:?}",
+        step[0]
+    );
+}

@@ -802,9 +802,13 @@ impl<'a> LowerCtx<'a> {
                 self.push_named(id, out_name, op);
             }
             Op::Rope {
-                head_dim, n_rot, ..
+                head_dim,
+                n_rot,
+                style,
             } => {
-                self.lower_rope(id, *head_dim, *n_rot, &out_name)?;
+                // `..` here silently dropped `style`, so every GptJ rotation was
+                // lowered as NeoX. Destructure every field.
+                self.lower_rope(id, *head_dim, *n_rot, *style, &out_name)?;
             }
             Op::Attention {
                 num_heads,

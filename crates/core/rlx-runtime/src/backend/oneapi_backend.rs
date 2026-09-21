@@ -75,9 +75,8 @@ impl ExecutableGraph for OneApiExecutableWrapper {
         match dtype {
             rlx_ir::DType::U8 | rlx_ir::DType::I8 => self.inner.set_param_bytes(name, data),
             rlx_ir::DType::F32 => {
-                let n = data.len() / 4;
-                let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-                self.inner.set_param(name, s);
+                let s = rlx_ir::bytes::decode_le::<f32>(data);
+                self.inner.set_param(name, s.as_ref());
             }
             other => {
                 let f = super::widen_bytes_to_f32(data, other);
@@ -95,8 +94,7 @@ impl ExecutableGraph for OneApiExecutableWrapper {
         let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
         for (name, data, dt) in inputs {
             let v = if *dt == rlx_ir::DType::F32 {
-                let n = data.len() / 4;
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) }.to_vec()
+                rlx_ir::bytes::decode_le_vec::<f32>(data)
             } else {
                 super::widen_bytes_to_f32(data, *dt)
             };

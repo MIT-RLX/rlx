@@ -463,11 +463,28 @@ pub(crate) fn compile_rope(
     {
         let x_shape = &graph.node(node.inputs[0]).shape;
         let (batch, seq, hidden) = if x_shape.rank() >= 3 {
-            (
-                x_shape.dim(0).unwrap_static(),
-                x_shape.dim(1).unwrap_static(),
-                x_shape.dim(2).unwrap_static(),
-            )
+            // `exec_rope` walks `[batch, seq, hidden]`: positions index the
+            // second-to-last axis and each row holds `hidden / head_dim` heads.
+            // So fold every leading axis into `batch` rather than reading dims
+            // 0/1/2 positionally.
+            //
+            // Rank 3 `[B, S, H*D]` is unchanged. Rank 4 `[B, H, S, D]` — the
+            // BHSD multi-head packing that `rope` is fed after a
+            // `transpose(0,2,1,3)` — used to read `seq = H` and `hidden = S`,
+            // mistaking the head count for the sequence length. It then sized
+            // the output as `B*H*S` instead of `B*H*S*D` and wrote only that
+            // prefix, leaving the rest of the destination buffer zero: with
+            // `n_rot == head_dim` nothing copied the tail back either, so the
+            // rotated tensor came out almost entirely zeros. Attention over a
+            // near-zero K is uniform, which reads as a plausible-but-wrong
+            // model rather than a crash.
+            let rank = x_shape.rank();
+            let hidden = x_shape.dim(rank - 1).unwrap_static();
+            let seq = x_shape.dim(rank - 2).unwrap_static();
+            let batch: usize = (0..rank - 2)
+                .map(|i| x_shape.dim(i).unwrap_static())
+                .product();
+            (batch, seq, hidden)
         } else {
             let total = x_shape.num_elements().unwrap();
             (
@@ -550,10 +567,18 @@ pub(crate) fn compile_rope_backward(
     {
         let dy_shape = &graph.node(node.inputs[0]).shape;
         let (batch, seq, hidden) = if dy_shape.rank() >= 3 {
+            // Fold leading axes into `batch` rather than reading dims 0/1/2
+            // positionally — same defect as the forward path, on the gradient.
+            // Rank 3 `[B, S, H*D]` is unchanged; rank 4 `[B, H, S, D]` (BHSD,
+            // what `apply_rope_bhsd` produces) used to take `seq = H` and
+            // `hidden = S`, so most of the gradient was never written.
+            let rank = dy_shape.rank();
             (
-                dy_shape.dim(0).unwrap_static(),
-                dy_shape.dim(1).unwrap_static(),
-                dy_shape.dim(2).unwrap_static(),
+                (0..rank - 2)
+                    .map(|i| dy_shape.dim(i).unwrap_static())
+                    .product::<usize>(),
+                dy_shape.dim(rank - 2).unwrap_static(),
+                dy_shape.dim(rank - 1).unwrap_static(),
             )
         } else {
             (

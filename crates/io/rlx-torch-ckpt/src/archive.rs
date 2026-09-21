@@ -2,12 +2,13 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Self-contained, seek-based readers for the two container formats a
-//! `.nemo` file is built from:
+//! Self-contained, seek-based readers for the two container formats that
+//! wrap PyTorch weights:
 //!
-//!   * an (uncompressed) **TAR** archive — the outer `.nemo` wrapper, and
-//!   * a **ZIP** archive with STORED (method 0) entries — the inner
-//!     `model_weights.ckpt`, which is exactly what `torch.save` emits.
+//!   * a **ZIP** archive with STORED (method 0) entries — exactly what
+//!     `torch.save` emits, and
+//!   * an (uncompressed) **TAR** archive — the outer wrapper used by
+//!     formats that bundle a checkpoint with sidecar files, such as `.nemo`.
 //!
 //! Both operate directly on a [`std::fs::File`] with `seek`/`read` so we
 //! never have to slurp a multi-gigabyte checkpoint into RAM; callers pull
@@ -20,11 +21,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow, bail};
 
 // ─────────────────────────────────────────────────────────────────────
-// gzip handling — `.nemo` files may be gzip-compressed tars
+// gzip handling — tar wrappers such as `.nemo` may be gzip-compressed
 // ─────────────────────────────────────────────────────────────────────
 
-/// A `.nemo` made seekable: either the file itself (plain tar) or a
-/// temporary decompressed copy (gzip tar), removed on drop.
+/// A container made seekable: either the file itself (plain tar / ZIP) or
+/// a temporary decompressed copy (gzip tar), removed on drop.
 pub enum Seekable {
     Direct(PathBuf),
     Temp(TempFile),
@@ -61,8 +62,12 @@ pub fn prepare_seekable(path: &Path) -> Result<Seekable> {
         return Ok(Seekable::Direct(path.to_path_buf()));
     }
     f.seek(SeekFrom::Start(0))?;
-    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("nemo");
-    let tmp = std::env::temp_dir().join(format!("rlx-nemo-{}-{}.tar", std::process::id(), stem));
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("ckpt");
+    let tmp = std::env::temp_dir().join(format!(
+        "rlx-torch-ckpt-{}-{}.tar",
+        std::process::id(),
+        stem
+    ));
     // MultiGzDecoder also handles the common single-stream case.
     let mut dec = flate2::read::MultiGzDecoder::new(BufReader::new(f));
     let mut out = File::create(&tmp).map_err(|e| anyhow!("create temp {}: {e}", tmp.display()))?;
@@ -203,7 +208,7 @@ pub fn list_tar(file: &mut File) -> Result<Vec<TarMember>> {
                 continue;
             }
             b'g' => {
-                // Global pax header — not relevant to a single .nemo.
+                // Global pax header — not relevant to a single checkpoint.
                 pos = data_off.saturating_add(round_up_512(size));
                 continue;
             }
@@ -256,7 +261,7 @@ pub fn read_member(file: &mut File, m: &TarMember) -> Result<Vec<u8>> {
 // ─────────────────────────────────────────────────────────────────────
 
 /// A single entry of the inner `.ckpt` zip, with the **absolute** byte
-/// offset of its payload within the enclosing `.nemo` file.
+/// offset of its payload within the enclosing container file.
 #[derive(Debug, Clone)]
 pub struct ZipEntry {
     pub name: String,
@@ -276,7 +281,7 @@ pub fn list_zip(file: &mut File, zip_start: u64, zip_size: u64) -> Result<Vec<Zi
         bail!("zip region too small ({zip_size} bytes)");
     }
     // The declared zip region comes from an untrusted outer container (a
-    // `.nemo` tar header). Reject a region that runs past EOF up front: this
+    // outer tar header). Reject a region that runs past EOF up front: this
     // both avoids u64 overflow in the offset math below and keeps every
     // subsequent length (tail scan, central directory) bounded by real bytes.
     let file_len = file.metadata()?.len();

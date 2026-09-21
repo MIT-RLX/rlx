@@ -443,10 +443,7 @@ fn op_if_picks_branch_per_element() {
     ]);
     let (out_bytes, out_dt) = &outs[0];
     assert_eq!(*out_dt, DType::F32);
-    let got: Vec<f32> = unsafe {
-        std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_bytes.len() / 4)
-    }
-    .to_vec();
+    let got: Vec<f32> = rlx_ir::bytes::decode_le_vec::<f32>(out_bytes);
     let want = vec![2.0, -2.0, 6.0, -4.0];
     assert!(
         close(&got, &want, 1e-5),
@@ -903,10 +900,7 @@ fn typed_run_with_f16_param_matches_f32_reference() {
     let (out_bytes, out_dt) = &outs[0];
     assert_eq!(*out_dt, DType::F32);
 
-    let out_f32: Vec<f32> = unsafe {
-        std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_bytes.len() / 4)
-    }
-    .to_vec();
+    let out_f32: Vec<f32> = rlx_ir::bytes::decode_le_vec::<f32>(out_bytes);
     let want = expected_output(&xs, &w, &b);
     assert!(
         close(&out_f32, &want, 1e-5),

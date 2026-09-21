@@ -2203,15 +2203,39 @@ impl ThunkSchedule {
                 } => {
                     let x_shape = &graph.node(node.inputs[0]).shape;
                     let (batch, seq, hidden) = if x_shape.rank() >= 3 {
-                        (
-                            x_shape.dim(0).unwrap_static(),
-                            x_shape.dim(1).unwrap_static(),
-                            x_shape.dim(2).unwrap_static(),
-                        )
+                        // The kernel walks `[batch, seq, hidden]`: positions index
+                        // the second-to-last axis and a row holds
+                        // `hidden / head_dim` heads. Fold every leading axis into
+                        // `batch` rather than reading dims 0/1/2 positionally.
+                        //
+                        // Rank 3 `[B, S, H*D]` is unchanged. Rank 4 `[B, H, S, D]`
+                        // — the BHSD packing `rope` is fed after a
+                        // `transpose(0,2,1,3)` — used to take `seq = H` and
+                        // `hidden = S`, sizing the output `B*H*S` instead of
+                        // `B*H*S*D` and leaving the rest of the destination zero.
+                        // Same class of bug as the rank-2 case below, and equally
+                        // silent: attention over a near-zero K is uniform, so the
+                        // model produces confident nonsense instead of failing.
+                        let rank = x_shape.rank();
+                        let hidden = x_shape.dim(rank - 1).unwrap_static();
+                        let seq = x_shape.dim(rank - 2).unwrap_static();
+                        let batch: usize = (0..rank - 2)
+                            .map(|i| x_shape.dim(i).unwrap_static())
+                            .product();
+                        (batch, seq, hidden)
                     } else {
+                        // A rank-2 RoPE input is `[tokens, heads * head_dim]`:
+                        // tokens outermost, heads striding *within* a row. Deriving
+                        // `(total / (s * head_dim), s, head_dim)` instead invents a
+                        // batch of `heads` and then indexes it as `(b * seq + s)`,
+                        // which transposes heads against tokens — silently wrong for
+                        // every multi-head partial RoPE (DeepSeek-V4/V4.1 rotate the
+                        // tail of each head from a `[rows, heads*head_dim]` tensor),
+                        // and a no-op when `heads == 1`, which is why it survived.
+                        // This matches `RopeBackward` below and the CPU thunk.
                         let total = x_shape.num_elements().unwrap();
                         let s = x_shape.dim(x_shape.rank() - 2).unwrap_static();
-                        (total / (s * head_dim), s, *head_dim)
+                        (1, s, total / s)
                     };
                     let _ = node.shape.dtype(); // ensure dtype-aware
                     // Per-token RoPE when the cos table has one row per
@@ -4301,10 +4325,15 @@ impl ThunkSchedule {
                     }
                     let dy_shape = &graph.node(node.inputs[0]).shape;
                     let (batch, seq, hidden) = if dy_shape.rank() >= 3 {
+                        // Fold leading axes into `batch` — same defect as the
+                        // forward path, on the gradient. See `Op::Rope` above.
+                        let rank = dy_shape.rank();
                         (
-                            dy_shape.dim(0).unwrap_static(),
-                            dy_shape.dim(1).unwrap_static(),
-                            dy_shape.dim(2).unwrap_static(),
+                            (0..rank - 2)
+                                .map(|i| dy_shape.dim(i).unwrap_static())
+                                .product::<usize>(),
+                            dy_shape.dim(rank - 2).unwrap_static(),
+                            dy_shape.dim(rank - 1).unwrap_static(),
                         )
                     } else {
                         (

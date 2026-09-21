@@ -55,7 +55,7 @@ pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
 /// adding a scheme id without a branch (or a branch without listing it here)
 /// fails the tests rather than shipping a silent mis-decode.
 pub fn kernel_supports_scheme(scheme_id: u32) -> bool {
-    matches!(scheme_id, 0..=28)
+    matches!(scheme_id, 0..=29)
 }
 
 /// Max f32 scratch for dequantized weights `[n, k]` across all GGUF ops.

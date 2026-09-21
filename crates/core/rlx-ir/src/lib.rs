@@ -29,6 +29,7 @@ pub mod apple_bnns;
 pub mod async_copy;
 pub mod attention_layout;
 pub mod audio;
+pub mod bytes;
 pub mod capability;
 pub mod const_check;
 pub mod dtype;

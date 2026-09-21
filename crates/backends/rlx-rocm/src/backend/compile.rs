@@ -3760,10 +3760,18 @@ impl RocmExecutable {
                 } => {
                     let dy_shape = &graph.node(node.inputs[0]).shape;
                     let (batch, seq, hidden) = if dy_shape.rank() >= 3 {
+                        // Fold leading axes into `batch`: rank 4 `[B, H, S, D]`
+                        // otherwise takes `seq = H` and `hidden = S`, so most of
+                        // the gradient is never written. UNTESTED here (no
+                        // device on this machine); mechanical and a no-op at
+                        // rank 3.
+                        let rank = dy_shape.rank();
                         (
-                            dy_shape.dim(0).unwrap_static() as u32,
-                            dy_shape.dim(1).unwrap_static() as u32,
-                            dy_shape.dim(2).unwrap_static() as u32,
+                            (0..rank - 2)
+                                .map(|i| dy_shape.dim(i).unwrap_static())
+                                .product::<usize>() as u32,
+                            dy_shape.dim(rank - 2).unwrap_static() as u32,
+                            dy_shape.dim(rank - 1).unwrap_static() as u32,
                         )
                     } else {
                         (

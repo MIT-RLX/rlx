@@ -4851,6 +4851,15 @@
         layer: EnvLayer::Backend("egpu"),
     },
     EnvVarEntry {
+        name: "RLX_Q4K_EXACT_GEMV",
+        group: "cpu",
+        summary: "Q4_K decode GEMV dequantizes to f32 per block instead of quantizing the activation to Q8_K (exact, slower)",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Internal,
+        aliases: &[],
+        layer: EnvLayer::Backend("cpu"),
+    },
+    EnvVarEntry {
         name: "RLX_Q4K_FUSED_MIN_N",
         group: "cpu",
         summary: "n above which the fused Q4_K kernel is used instead of dequant",

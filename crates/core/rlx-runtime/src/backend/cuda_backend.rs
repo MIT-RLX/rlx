@@ -221,9 +221,8 @@ impl ExecutableGraph for CudaExecutableWrapper {
             return;
         }
         if dtype == rlx_ir::DType::F32 {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-            self.inner.set_param(name, s);
+            let s = rlx_ir::bytes::decode_le::<f32>(data);
+            self.inner.set_param(name, s.as_ref());
             return;
         }
         if matches!(dtype, rlx_ir::DType::F16 | rlx_ir::DType::BF16) {

@@ -4339,6 +4339,12 @@ pub(crate) fn compile_static_inner(
                     // Partial rotary: rotate only n_rot dims (Gemma 4 global
                     // layers use n_rot < head_dim). Equals half for full rope.
                     rot_half: (*n_rot / 2) as u32,
+                    // The table's own row width, which is `head_dim / 2` for a
+                    // table allocated at full width and only partly rotated.
+                    cos_row_stride: rlx_ir::shape::rope_table_stride(
+                        &graph.node(cos_id).shape,
+                        *n_rot,
+                    ) as u32,
                 };
                 schedule.push(Step::Rope { params: p });
                 let rk = rope_kernel(&dev.device);
@@ -10479,10 +10485,15 @@ pub(crate) fn compile_static_inner(
             } => {
                 let dy_shape = &graph.node(node.inputs[0]).shape;
                 let (batch, seq, hidden) = if dy_shape.rank() >= 3 {
+                    // Fold leading axes into `batch` — same defect as the
+                    // forward path, on the gradient. See `Op::Rope` above.
+                    let rank = dy_shape.rank();
                     (
-                        dy_shape.dim(0).unwrap_static() as u32,
-                        dy_shape.dim(1).unwrap_static() as u32,
-                        dy_shape.dim(2).unwrap_static() as u32,
+                        (0..rank - 2)
+                            .map(|i| dy_shape.dim(i).unwrap_static())
+                            .product::<usize>() as u32,
+                        dy_shape.dim(rank - 2).unwrap_static() as u32,
+                        dy_shape.dim(rank - 1).unwrap_static() as u32,
                     )
                 } else {
                     (

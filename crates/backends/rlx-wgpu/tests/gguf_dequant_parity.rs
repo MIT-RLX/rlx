@@ -34,6 +34,7 @@ fn cpu_dequant_gguf(scheme_id: u32, packed: &[u8], elems: usize) -> Vec<f32> {
         GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(packed, elems).unwrap(),
         GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(packed, elems).unwrap(),
         GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(packed, elems).unwrap(),
+        GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(packed, elems).unwrap(),
         other => panic!("cpu_dequant_gguf: unsupported scheme_id {scheme_id} ({other})"),
     }
 }
@@ -326,6 +327,28 @@ fn tq1_0_encode_wgsl_matches_cpu_reference() {
         .collect();
     let packed = rlx_gguf::tq_quantize::quantize_tq1_0(&w).unwrap();
     parity(8, &packed, 512, 1e-5, "TQ1_0 encode");
+}
+
+#[test]
+fn ptq1_0_wgsl_matches_cpu_reference() {
+    // PTQ1_0 (prism-ml Ternary Bonsai 2): 24 qs + 2 qh + f16 d = 28
+    // bytes / 128 elems. The element -> (byte, base-3 digit) map is
+    // staged, not sequential, so a shader that walked it sequentially
+    // would still produce a valid ternary tensor — just permuted.
+    // Random payload bytes make that permutation visible.
+    let mut seed: u32 = 0x1234_5678;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        ((seed >> 16) & 0xFF) as u8
+    };
+    let mut packed = Vec::new();
+    for b in 0..8u8 {
+        for _ in 0..26 {
+            packed.push(next());
+        }
+        packed.extend_from_slice(&half::f16::from_f32(0.1 + 0.05 * b as f32).to_le_bytes());
+    }
+    parity(29, &packed, 8 * 128, 1e-4, "PTQ1_0");
 }
 
 #[test]

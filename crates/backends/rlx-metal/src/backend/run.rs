@@ -327,8 +327,8 @@ impl MetalExecutable {
                     self.arena.write_bytes(id, data);
                 }
             } else if *dt == rlx_ir::DType::F32 {
-                let n = data.len() / 4;
-                let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
+                let s = rlx_ir::bytes::decode_le::<f32>(data);
+                let s = s.as_ref();
                 if let Some(&id) = self.input_ids.get(*name)
                     && self.arena.has_buffer(id)
                 {

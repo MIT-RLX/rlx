@@ -137,7 +137,8 @@ kernel void dequant_gguf(
     if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
-        && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u) {
+        && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u
+        && scheme_id != 29u) {
         device float* dst = arena + dst_f32_off + gid * DQ_QK_K;
 
         if (scheme_id == 3u) {
@@ -713,6 +714,41 @@ kernel void dequant_gguf(
         for (uint j = 0u; j < 128u; ++j) {
             uint q = (uint(qs[j >> 2u]) >> ((j & 3u) * 2u)) & 3u;
             dst[j] = float(int(q) - 1) * d;
+        }
+        return;
+    }
+
+    if (scheme_id == 29u) {
+        // PTQ1_0 (prism-ml Ternary Bonsai 2): 24 qs | 2 qh | f16 d
+        // (28 bytes / 128 elements). Base-3 trits, five per qs byte and
+        // four per qh byte; digit n of byte b is ((uchar)(b * 3^n) * 3) >> 8,
+        // giving 0/1/2 -> -1/0/+1. Element -> (byte, digit) follows the
+        // fork's own accessor; the staged walk is NOT sequential.
+        uint off = gid * 28u;
+        device const uchar* qs = w_base + off;
+        device const uchar* qh = w_base + off + 24u;
+        float d = dq_read_f16(w_base, off + 26u);
+        device float* dst = arena + dst_f32_off + gid * 128u;
+        for (uint e = 0u; e < 128u; ++e) {
+            uchar b;
+            uint n;
+            if (e < 80u) {
+                b = qs[e & 15u];
+                n = e >> 4u;
+            } else if (e < 120u) {
+                uint t = e - 80u;
+                b = qs[16u + (t & 7u)];
+                n = t >> 3u;
+            } else {
+                uint t = e - 120u;
+                b = qh[t & 1u];
+                n = t >> 1u;
+            }
+            uint v = uint(b);
+            for (uint i = 0u; i < 4u; ++i) {
+                if (i < n) { v = (v * 3u) & 0xFFu; }
+            }
+            dst[e] = float(int((v * 3u) >> 8u) - 1) * d;
         }
         return;
     }
@@ -1308,6 +1344,283 @@ kernel void q1_0_mv_f32(
 // Constraint: `n_dim % 8 == 0` (else fall back to `q1_0_mv_f32`).
 // Grid: one threadgroup per group-of-8 outputs × NSG=2 simdgroups.
 // `flags` bit0: x is f16; bit1: dst is f16 (AMP residual stream).
+constant uint PTQ1_NR0 = 8u;
+constant uint PTQ1_BLK_BYTES = 28u;
+constant uint PTQ1_QK = 128u;
+constant uint PTQ1_POW3[5] = {1u, 3u, 9u, 27u, 81u};
+
+// Fused PTQ1_0 GEMV (m == 1), simdgroup-cooperative — same shape as
+// `q1_0_mv_f32_sg`. Reads the packed 28-byte blocks straight out of the arena
+// (or the external weight buffer) rather than materializing the row to f32,
+// which for a 27B is tens of GB of dequant traffic per token.
+//
+// NOT the default — `ptq1_0_mv_f32_sg_fp` above is 1.49x faster. Kept behind
+// `RLX_METAL_PTQ1_0_INT_PIPE=1` as the A/B reference, because it reads x as 16
+// consecutive floats where the float-pipe kernel strides by 16, so it is the
+// variant to revisit if the access pattern ever becomes the binding cost.
+//
+// Digit extraction is integer: `(b · 3ⁿ) mod 256` is ONE multiply because every
+// 3ⁿ for n < 5 is already < 256, so the reference's repeated `(v*3) & 0xFF`
+// recurrence collapses. Even so, this ISA cannot co-issue integer and
+// floating-point work, which is what the float formulation above avoids.
+//
+// The element -> (byte, base-3 digit) map is staged rather than sequential and
+// depends only on the lane, so it is resolved once per lane below instead of
+// once per row.
+kernel void ptq1_0_mv_f32_sg(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    constant uint& flags          [[buffer(6)]], // bit0: x is f16, bit1: dst is f16
+    device const uchar* wbuf      [[buffer(7)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const short ix = (short)(tiisg / 8u);       // 0..3 — block stride
+    const short il = (short)(tiisg % 8u) * 16;  // 0,16,...,112 within the block
+    const uint nb = k_dim / PTQ1_QK;
+    const bool x_f16 = (flags & 1u) != 0u;
+    const bool dst_f16 = (flags & 2u) != 0u;
+
+    const uint NSG = 2u;
+    const uint first_row = (tgpig.x * NSG + sgitg) * PTQ1_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device const half*  x_half = (device const half*)((device char*)arena + x_off);
+    device float*       dst_f  = (device float*)((device char*)arena + dst_off);
+    device half*        dst_h  = (device half*)((device char*)arena + dst_off);
+
+    device const uchar* ax[PTQ1_NR0];
+    #pragma unroll
+    for (ushort row = 0; row < PTQ1_NR0; ++row) {
+        ax[row] = wbuf + w_off + (ulong)(first_row + row) * (ulong)nb * PTQ1_BLK_BYTES;
+    }
+
+    // Resolve the staged element -> (byte, digit) map ONCE per lane: it depends
+    // only on `il`, not on the block or the row, so recomputing it inside the
+    // row loop costs 8x the branches for the same answer. `pw` holds 3^digit
+    // directly so the inner loop is a multiply, not an indexed constant load.
+    // Offsets are block-relative (`qh` starts at byte 24).
+    ushort boff[16];
+    ushort pw[16];
+    #pragma unroll
+    for (short i = 0; i < 16; ++i) {
+        const uint e = (uint)il + (uint)i;
+        uint off;
+        uint n;
+        if (e < 80u) {
+            off = e & 15u;
+            n = e >> 4u;
+        } else if (e < 120u) {
+            const uint t = e - 80u;
+            off = 16u + (t & 7u);
+            n = t >> 3u;
+        } else {
+            const uint t = e - 120u;
+            off = 24u + (t & 1u);
+            n = t >> 1u;
+        }
+        boff[i] = (ushort)off;
+        pw[i] = (ushort)PTQ1_POW3[n];
+    }
+
+    float yl[16];
+    float sumf[PTQ1_NR0] = {0.f};
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        const uint x_base_i = ib * PTQ1_QK + (uint)il;
+        #pragma unroll
+        for (short i = 0; i < 16; ++i) {
+            const uint xi = x_base_i + (uint)i;
+            yl[i] = x_f16 ? float(x_half[xi]) : x_base[xi];
+        }
+
+        #pragma unroll
+        for (ushort row = 0; row < PTQ1_NR0; ++row) {
+            device const uchar* blk = ax[row] + ib * PTQ1_BLK_BYTES;
+            const float d = dq_read_f16(blk, 26u);
+            float acc = 0.f;
+            #pragma unroll
+            for (short i = 0; i < 16; ++i) {
+                const uint v = (uint(blk[boff[i]]) * uint(pw[i])) & 0xFFu;
+                acc += float(int((v * 3u) >> 8u) - 1) * yl[i];
+            }
+            sumf[row] += d * acc;
+        }
+    }
+
+    for (ushort row = 0; row < PTQ1_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) {
+            if (dst_f16) dst_h[row_idx] = half(total);
+            else         dst_f[row_idx] = total;
+        }
+    }
+}
+
+// PTQ1_0 GEMV (default): the upstream fork's all-float formulation.
+//
+// `digit_n = floor(3^(n+1)·u) - 3·floor(3^n·u)` for `u = b/256`, and
+// `Σ (digit_n - 1)·y_n` telescopes into
+// `Σ_{k=1..4} floor(3^k·u)·(y_{k-1} - 3·y_k) + floor(3^5·u)·y_4 - Σ y_n`,
+// whose coefficients depend only on the activations. One floor and one fma per
+// trit, never leaving the float pipe — this ISA cannot co-issue integer and
+// floating-point work. Each thread also owns whole BYTES, so the eight threads
+// covering a block read its bytes exactly once between them, where
+// `ptq1_0_mv_f32_sg` has five lanes re-reading `qs[0..16]`.
+//
+// 1.49x faster than the integer kernel below (min-of-5 interleaved rounds,
+// 255 vs 381 ms/token; it won every round). Sequential rather than interleaved
+// measurement had said the opposite — the machine was contended and drifting,
+// which is exactly the trap that makes GPU A/Bs here worthless unless the two
+// variants are run back to back. `RLX_METAL_PTQ1_0_INT_PIPE=1` selects the
+// integer kernel for re-testing.
+constant uint PTQ1_FP_NR0 = 4u;
+
+inline float ptq1_0_dot_reg(
+    device const uchar* blk,
+    thread const float* yl,
+    float sumy,
+    short it
+) {
+    float acc = 0.f;
+    #pragma unroll
+    for (short k = 0; k < 2; ++k) {
+        const float u = float(blk[2 * it + k]) * (1.0f / 256.0f);
+        thread const float* c = yl + 5 * k;
+        acc += floor(  3.0f * u) * c[0];
+        acc += floor(  9.0f * u) * c[1];
+        acc += floor( 27.0f * u) * c[2];
+        acc += floor( 81.0f * u) * c[3];
+        acc += floor(243.0f * u) * c[4];
+    }
+    {
+        const float u = float(blk[16 + it]) * (1.0f / 256.0f);
+        thread const float* c = yl + 10;
+        acc += floor(  3.0f * u) * c[0];
+        acc += floor(  9.0f * u) * c[1];
+        acc += floor( 27.0f * u) * c[2];
+        acc += floor( 81.0f * u) * c[3];
+        acc += floor(243.0f * u) * c[4];
+    }
+    {
+        const float u  = float(blk[24 + (it & 1)]) * (1.0f / 256.0f);
+        const float p0 = yl[16];
+        acc += (floor(3.0f * p0 * u) - 3.0f * floor(p0 * u)) * yl[15];
+    }
+    return (acc - sumy) * dq_read_f16(blk, 26u);
+}
+
+kernel void ptq1_0_mv_f32_sg_fp(
+    device float* arena           [[buffer(0)]],
+    constant ulong& x_off         [[buffer(1)]],
+    constant ulong& w_off         [[buffer(2)]],
+    constant ulong& dst_off       [[buffer(3)]],
+    constant uint& k_dim          [[buffer(4)]],
+    constant uint& n_dim          [[buffer(5)]],
+    constant uint& flags          [[buffer(6)]],
+    device const uchar* wbuf      [[buffer(7)]],
+    uint3 tgpig                   [[threadgroup_position_in_grid]],
+    ushort tiisg                  [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]]
+) {
+    const short ix = (short)(tiisg / 8u);
+    const short it = (short)(tiisg % 8u);
+    const uint nb = k_dim / PTQ1_QK;
+    const bool x_f16 = (flags & 1u) != 0u;
+    const bool dst_f16 = (flags & 2u) != 0u;
+
+    // Simdgroups per threadgroup, passed in bits 8..16 of `flags`. It only
+    // affects row indexing, never an unroll bound, so it can be dynamic —
+    // which is the point: rebuilding between values put minutes of machine
+    // drift on the variable being measured, and a sweep needs the arms
+    // alternated, not sequenced.
+    const uint NSG = max(1u, (flags >> 8) & 0xFFu);
+    const uint first_row = (tgpig.x * NSG + sgitg) * PTQ1_FP_NR0;
+    if (first_row >= n_dim) return;
+
+    device const float* x_base = (device const float*)((device char*)arena + x_off);
+    device const half*  x_half = (device const half*)((device char*)arena + x_off);
+    device float*       dst_f  = (device float*)((device char*)arena + dst_off);
+    device half*        dst_h  = (device half*)((device char*)arena + dst_off);
+
+    device const uchar* ax[PTQ1_FP_NR0];
+    #pragma unroll
+    for (ushort row = 0; row < PTQ1_FP_NR0; ++row) {
+        ax[row] = wbuf + w_off + (ulong)(first_row + row) * (ulong)nb * PTQ1_BLK_BYTES;
+    }
+
+    float yl[17];
+    float sumf[PTQ1_FP_NR0] = {0.f};
+    {
+        const float pow3f[4] = {1.0f, 3.0f, 9.0f, 27.0f};
+        yl[16] = pow3f[it >> 1];
+    }
+
+    uint yb = (uint)ix * PTQ1_QK;
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        float sumy = 0.f;
+        #pragma unroll
+        for (short k = 0; k < 2; ++k) {
+            const short m = 2 * it + k;
+            float yv[5];
+            #pragma unroll
+            for (short n = 0; n < 5; ++n) {
+                const uint xi = yb + (uint)(n * 16 + m);
+                yv[n] = x_f16 ? float(x_half[xi]) : x_base[xi];
+                sumy += yv[n];
+            }
+            #pragma unroll
+            for (short n = 0; n < 4; ++n) {
+                yl[5 * k + n] = yv[n] - 3.0f * yv[n + 1];
+            }
+            yl[5 * k + 4] = yv[4];
+        }
+        {
+            float yv[5];
+            #pragma unroll
+            for (short n = 0; n < 5; ++n) {
+                const uint xi = yb + 80u + (uint)(n * 8 + it);
+                yv[n] = x_f16 ? float(x_half[xi]) : x_base[xi];
+                sumy += yv[n];
+            }
+            #pragma unroll
+            for (short n = 0; n < 4; ++n) {
+                yl[10 + n] = yv[n] - 3.0f * yv[n + 1];
+            }
+            yl[14] = yv[4];
+        }
+        {
+            const uint xi = yb + 120u + (uint)it;
+            const float v = x_f16 ? float(x_half[xi]) : x_base[xi];
+            yl[15] = v;
+            sumy += v;
+        }
+        #pragma unroll
+        for (ushort row = 0; row < PTQ1_FP_NR0; ++row) {
+            sumf[row] += ptq1_0_dot_reg(ax[row] + ib * PTQ1_BLK_BYTES, yl, sumy, it);
+        }
+        yb += PTQ1_QK * 4u;
+    }
+
+    for (ushort row = 0; row < PTQ1_FP_NR0; ++row) {
+        const uint row_idx = first_row + row;
+        if (row_idx >= n_dim) break;
+        const float total = simd_sum(sumf[row]);
+        if (tiisg == 0u) {
+            if (dst_f16) dst_h[row_idx] = half(total);
+            else         dst_f[row_idx] = total;
+        }
+    }
+}
+
 constant uint Q1_NR0 = 8u;
 constant uint Q1_BLK_BYTES = 18u;
 constant uint Q1_QK = 128u;

@@ -94,7 +94,7 @@ impl Value {
             })
             .collect()
     }
-    fn as_str(&self) -> Result<String> {
+    pub(crate) fn as_str(&self) -> Result<String> {
         match self {
             Value::Str(s) => Ok(s.to_string()),
             Value::Int(i) => Ok(i.to_string()),
@@ -106,6 +106,18 @@ impl Value {
 /// Unpickle the top-level object from a `data.pkl` byte stream.
 pub fn unpickle(data: &[u8]) -> Result<Value> {
     Machine::new(data).run()
+}
+
+/// Unpickle one object from the *start* of `data` and report how many bytes it
+/// consumed.
+///
+/// The legacy (pre-1.6) `torch.save` container is five pickles concatenated
+/// ahead of the raw storage blobs, so reading it means resuming at the byte
+/// after each `STOP` rather than assuming the stream holds exactly one object.
+pub fn unpickle_prefix(data: &[u8]) -> Result<(Value, usize)> {
+    let mut m = Machine::new(data);
+    let v = m.run()?;
+    Ok((v, m.pos))
 }
 
 struct Machine<'a> {
@@ -429,19 +441,27 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// Decode a `LONG1`/`LONG4` body: `n` little-endian bytes, two's complement.
+    ///
+    /// Python integers are arbitrary precision, so `n` can exceed 8 — torch's
+    /// own file magic `0x1950a86a20f9469cfc6c` is ten bytes wide. Anything past
+    /// the low 64 bits is dropped, which is exactly `value mod 2^64` and the
+    /// only sensible answer for an `i64`; shifting by `8 * i` unguarded instead
+    /// panics in debug and silently wraps the *low* bytes in release.
     fn read_long(&mut self, n: usize) -> Result<i64> {
         if n == 0 {
             return Ok(0);
         }
         let bytes = self.take(n)?;
+        let keep = n.min(8);
         let mut v: i64 = 0;
-        for (i, &b) in bytes.iter().enumerate() {
+        for (i, &b) in bytes.iter().take(keep).enumerate() {
             v |= (b as i64) << (8 * i);
         }
-        // sign-extend from the top byte.
-        let bits = 8 * n;
-        if bits < 64 && (bytes[n - 1] & 0x80) != 0 {
-            v |= -1i64 << bits;
+        // Sign-extend from the top byte, but only when the value was narrower
+        // than the register: a truncated wide long is already full width.
+        if keep < 8 && (bytes[n - 1] & 0x80) != 0 {
+            v |= -1i64 << (8 * keep);
         }
         Ok(v)
     }
@@ -602,5 +622,21 @@ mod tests {
         m.data = &[0xff, 0x00];
         m.pos = 0;
         assert_eq!(m.read_long(2).unwrap(), 255);
+    }
+
+    /// Torch's legacy file magic is a ten-byte Python long. Decoding it must
+    /// truncate to the low 64 bits rather than shift past the register width —
+    /// which panics in debug and corrupts the value in release.
+    #[test]
+    fn long1_wider_than_a_register_truncates() {
+        let magic: u128 = 0x1950_a86a_20f9_469c_fc6c;
+        let bytes = &magic.to_le_bytes()[..10];
+        let mut m = Machine::new(&[]);
+        m.data = bytes;
+        m.pos = 0;
+        assert_eq!(m.read_long(10).unwrap(), magic as u64 as i64);
+        // All ten bytes are consumed even though only eight are used, or every
+        // opcode after this one reads from the wrong offset.
+        assert_eq!(m.pos, 10);
     }
 }

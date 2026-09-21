@@ -13,6 +13,7 @@ use rlx_fusion::control_flow::{LowerControlFlow, LowerScan};
 use rlx_fusion::fusion::UnfuseElementwiseRegions;
 use rlx_fusion::lower_axial_rope2d::LowerAxialRope2d;
 use rlx_fusion::lower_backward_ops::LowerBackwardOps;
+use rlx_fusion::lower_conv_transpose2d::LowerConvTranspose2d;
 use rlx_fusion::lower_cumulative::LowerCumulative;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
 use rlx_fusion::lower_fake_quantize::LowerFakeQuantize;
@@ -280,6 +281,13 @@ pub fn rewrite_for_backend_with_config(
         }
         if bad.contains(&OpKind::ResizeNearest2x) {
             apply(&mut graph, &mut changed, &LowerResizeNearest2x);
+        }
+        if bad.contains(&OpKind::ConvTranspose2d) {
+            // Only Metal and CUDA carry a native transposed-convolution kernel.
+            // Without this every other backend rejects the op outright, which
+            // made the whole Real-CUGAN family (four of them per model)
+            // Metal/CUDA-only.
+            apply(&mut graph, &mut changed, &LowerConvTranspose2d);
         }
         if bad.contains(&OpKind::Pad) {
             // Every backend except Metal/CUDA (which claim `OpKind::Pad`) lowers

@@ -218,6 +218,10 @@ pub fn sync_graph_shapes(graph: &mut Graph) {
 pub fn sync_concat_shapes(graph: &mut Graph) {
     use crate::Op;
     let nodes = graph.nodes().to_vec();
+    // Concats whose shape this pass actually corrected. Their *consumers* were
+    // built from the pre-bind shape and are now stale too, so the correction has
+    // to be carried forward — see the propagation loop below.
+    let mut corrected: BTreeSet<crate::NodeId> = BTreeSet::new();
     for node in &nodes {
         let Op::Concat { axis } = &node.op else {
             continue;
@@ -229,7 +233,42 @@ pub fn sync_concat_shapes(graph: &mut Graph) {
             .collect();
         let refs: Vec<&Shape> = shapes.iter().collect();
         if let Ok(out) = crate::shape::concat_shape(&refs, *axis) {
+            if graph.node(node.id).shape != out {
+                corrected.insert(node.id);
+            }
             graph.node_mut(node.id).shape = out;
+        }
+    }
+    if corrected.is_empty() {
+        return;
+    }
+    // Carry the correction downstream.
+    //
+    // `concat_shape` deliberately under-reports a mixed static+dynamic axis as
+    // just `Dim::Dynamic(sym)` (it cannot add `1` to a symbol), so every node
+    // derived from that concat inherits the symbol *without* the static part.
+    // Binding then turns both into statics that disagree by exactly the dropped
+    // amount: a decode KV concat `[1, PAST_SEQ, d] ++ [1, 1, d]` bound at
+    // PAST_SEQ=4 gives a concat of 5 rows feeding a `Narrow` that still declares
+    // 4. `sync_graph_shapes` sees two static shapes that disagree and panics as
+    // if the graph were malformed, which is how `rlx-gemma`/`rlx-llama32`
+    // dynamic decode failed.
+    //
+    // Only nodes actually downstream of a corrected concat are re-inferred, so
+    // a genuinely malformed graph elsewhere still trips the check.
+    for node in &nodes {
+        if !node.inputs.iter().any(|id| corrected.contains(id)) {
+            continue;
+        }
+        if let Some(shape) = crate::infer_shape::infer_output_shape(graph, node) {
+            if graph.node(node.id).shape != shape {
+                corrected.insert(node.id);
+            }
+            graph.node_mut(node.id).shape = shape;
+        } else {
+            // Shape not inferable here; treat it as still-suspect so consumers
+            // downstream of it are re-inferred too rather than silently kept.
+            corrected.insert(node.id);
         }
     }
 }

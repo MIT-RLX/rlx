@@ -31,80 +31,93 @@ use crate::cpu_low_precision;
 /// (SPD-manifold ops re-widen to f64 inside their CPU host-fallback, so
 /// the eigendecomposition itself stays f64). Panics on dtypes the f32
 /// arena can't carry.
+///
+/// `data` may be **any** alignment — a `&buf[1..]` subslice or a tensor at an
+/// odd offset inside an mmap is 1-aligned, and `data.len() % 4 == 0` says
+/// nothing about the pointer. Decoding goes through [`rlx_ir::bytes::decode_le`],
+/// which borrows zero-copy when the pointer happens to be aligned for the
+/// element type and decodes elementwise when it is not. `data` is interpreted
+/// as little-endian, matching the `to_le_bytes` convention
+/// [`narrow_f32_to_bytes`] writes with.
+///
+/// Reinterpreting the bytes directly (`from_raw_parts(data.as_ptr() as
+/// *const f32, n)`) was undefined behaviour for exactly this reason; see the
+/// `alignment_tests` module below for the regression guard.
 #[allow(dead_code)]
 pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
     use rlx_ir::DType;
     // An empty typed input (e.g. an unused KV-cache slot passed as `Vec::new()`)
-    // has a dangling, 1-byte-aligned pointer. `slice::from_raw_parts` requires an
-    // aligned pointer even for length 0, so reinterpreting it as `*const f32`
-    // trips the UB precondition check. Nothing to widen — return empty.
+    // has a dangling, 1-byte-aligned pointer. Nothing to widen — return empty.
     if data.is_empty() {
         return Vec::new();
     }
+    // `data` is caller-supplied and carries no alignment guarantee — it can be
+    // a subslice like `&buf[1..]` or a tensor at an odd offset inside an mmap.
+    // `decode_le` borrows zero-copy when it *is* aligned and decodes
+    // elementwise when it is not; see `rlx_ir::bytes`.
     match dtype {
-        DType::F32 => {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-            s.to_vec()
-        }
-        DType::F64 => {
-            let n = data.len() / 8;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n) };
-            s.iter().map(|&x| x as f32).collect()
-        }
+        DType::F32 => rlx_ir::bytes::decode_le_vec::<f32>(data),
+        DType::F64 => rlx_ir::bytes::decode_le::<f64>(data)
+            .iter()
+            .map(|&x| x as f32)
+            .collect(),
         DType::F16 => {
-            let n = data.len() / 2;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, n) };
+            // `half::f16` is `repr(transparent)` over `u16`, so decoding the
+            // raw bits keeps the aligned fast path zero-copy while leaving
+            // `rlx-ir` free of a `half` dependency. `from_bits` is a no-op.
+            let bits = rlx_ir::bytes::decode_le::<u16>(data);
+            let bits = bits.as_ref();
             // Parallel for large buffers (e.g. the MXFP4 expert scales: ~124M
             // elements/layer — serial was the measured ~1.9s upload). Elementwise
             // + order-independent → bit-identical to the serial map.
-            if n >= 1 << 20 {
+            if bits.len() >= 1 << 20 {
                 use rayon::prelude::*;
-                s.par_iter().map(|h| h.to_f32()).collect()
+                bits.par_iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect()
             } else {
-                s.iter().map(|h| h.to_f32()).collect()
+                bits.iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect()
             }
         }
         DType::BF16 => {
-            let n = data.len() / 2;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, n) };
-            if n >= 1 << 20 {
+            let bits = rlx_ir::bytes::decode_le::<u16>(data);
+            let bits = bits.as_ref();
+            if bits.len() >= 1 << 20 {
                 use rayon::prelude::*;
-                s.par_iter().map(|h| h.to_f32()).collect()
+                bits.par_iter()
+                    .map(|&b| half::bf16::from_bits(b).to_f32())
+                    .collect()
             } else {
-                s.iter().map(|h| h.to_f32()).collect()
+                bits.iter()
+                    .map(|&b| half::bf16::from_bits(b).to_f32())
+                    .collect()
             }
         }
         // Integer I/O (token ids, durations, masks) widened to f32 for the
         // f32-uniform arena — same convention wgpu already uses. Values are
         // small integers (<2^24), so f32 is exact. This lets TTS/LM graphs
         // that feed I64/I32 inputs run on CUDA/Vulkan (VITS token ids etc.).
-        DType::I64 => {
-            let n = data.len() / 8;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n) };
-            s.iter().map(|&x| x as f32).collect()
-        }
-        DType::I32 => {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n) };
-            s.iter().map(|&x| x as f32).collect()
-        }
-        DType::U32 => {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, n) };
-            s.iter().map(|&x| x as f32).collect()
-        }
+        DType::I64 => rlx_ir::bytes::decode_le::<i64>(data)
+            .iter()
+            .map(|&x| x as f32)
+            .collect(),
+        DType::I32 => rlx_ir::bytes::decode_le::<i32>(data)
+            .iter()
+            .map(|&x| x as f32)
+            .collect(),
+        DType::U32 => rlx_ir::bytes::decode_le::<u32>(data)
+            .iter()
+            .map(|&x| x as f32)
+            .collect(),
         DType::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
         DType::U8 | DType::Bool => data.iter().map(|&b| b as f32).collect(),
         // ── Complex (shared f32-uniform GPU boundary) ───────────────────
         // C64 = 2 f32 lanes `[re, im]`; the host already stores it as
         // interleaved f32 pairs, so widening is a pure reinterpret — no
         // conversion, N complex elements → 2N f32 lanes.
-        DType::C64 => {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-            s.to_vec()
-        }
+        DType::C64 => rlx_ir::bytes::decode_le_vec::<f32>(data),
         // C128 = 4 f32 lanes df64 `[re_hi, re_lo, im_hi, im_lo]`. The host
         // stores it as 2×f64 (16 B/elem); this is the df64 SPLIT boundary:
         // each f64 component `v` becomes `hi=(f32)v` + `lo=(f32)(v-(f64)hi)`
@@ -763,13 +776,11 @@ pub trait ExecutableGraph: Send {
                 data.len()
             );
         }
-        // SAFETY: F32 bytes are 4-aligned by source convention; we
-        // only widen access (read &[f32] from owned &[u8]). Failure
-        // mode if a caller hands us mis-aligned bytes is undefined,
-        // hence the % 4 length check.
-        let n = data.len() / 4;
-        let f32_slice = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-        self.set_param(name, f32_slice);
+        // `data` is caller-supplied, so it carries no alignment guarantee —
+        // the `% 4` length check above says nothing about the pointer. Borrow
+        // zero-copy when it is 4-aligned, decode elementwise when it is not.
+        let f32_slice = rlx_ir::bytes::decode_le::<f32>(data);
+        self.set_param(name, f32_slice.as_ref());
     }
 
     /// Run with typed inputs and typed outputs. Returns
@@ -795,10 +806,7 @@ pub trait ExecutableGraph: Send {
                     data.len()
                 );
             }
-            let n = data.len() / 4;
-            let v: Vec<f32> =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) }.to_vec();
-            owned.push((name.to_string(), v));
+            owned.push((name.to_string(), rlx_ir::bytes::decode_le_vec::<f32>(data)));
         }
         let refs: Vec<(&str, &[f32])> = owned
             .iter()
@@ -1065,3 +1073,102 @@ pub mod xdna_backend;
 /// until device bring-up lands (no CPU masquerade).
 #[cfg(feature = "egpu")]
 pub mod egpu_backend;
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::widen_bytes_to_f32;
+    use rlx_ir::DType;
+
+    /// Build `n_elems` elements of `dtype` as bytes, offset by `skew` filler
+    /// bytes so the tensor data starts at `base + skew`. Returns the whole
+    /// buffer; the caller slices `[skew..]` to get a deliberately misaligned
+    /// `&[u8]`.
+    fn skewed(dtype: DType, n_elems: usize, skew: usize) -> Vec<u8> {
+        let mut out = vec![0xAAu8; skew];
+        for i in 0..n_elems {
+            let x = i as f64 - 3.5;
+            match dtype {
+                DType::F32 => out.extend_from_slice(&(x as f32).to_le_bytes()),
+                DType::F64 => out.extend_from_slice(&x.to_le_bytes()),
+                DType::F16 => out.extend_from_slice(&half::f16::from_f64(x).to_le_bytes()),
+                DType::BF16 => out.extend_from_slice(&half::bf16::from_f64(x).to_le_bytes()),
+                DType::I64 => out.extend_from_slice(&(i as i64).to_le_bytes()),
+                DType::I32 => out.extend_from_slice(&(i as i32).to_le_bytes()),
+                DType::U32 => out.extend_from_slice(&(i as u32).to_le_bytes()),
+                DType::C64 => out.extend_from_slice(&(x as f32).to_le_bytes()),
+                DType::C128 => {
+                    out.extend_from_slice(&x.to_le_bytes());
+                    out.extend_from_slice(&(-x).to_le_bytes());
+                }
+                other => panic!("skewed: unhandled {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// Guard for the `&[u8]` → `&[f32]` unsoundness (issue #1): the host I/O
+    /// boundary takes caller-supplied byte slices, which carry no alignment
+    /// guarantee — `&buf[1..]`, or a tensor at an odd offset inside an mmap,
+    /// is 1-aligned. The old `from_raw_parts(data.as_ptr() as *const f32, n)`
+    /// was UB there (Miri: "encountered an unaligned reference"), and a
+    /// `len % 4 == 0` check says nothing about the pointer.
+    ///
+    /// Skews 0..8 cover every residue class mod 8 relative to the allocator's
+    /// base, so every dtype sees both aligned and misaligned input and all of
+    /// them must decode bit-identically.
+    #[test]
+    fn widen_is_bit_identical_on_misaligned_input() {
+        const DTYPES: &[DType] = &[
+            DType::F32,
+            DType::F64,
+            DType::F16,
+            DType::BF16,
+            DType::I64,
+            DType::I32,
+            DType::U32,
+            DType::C64,
+            DType::C128,
+        ];
+        for &dt in DTYPES {
+            let n = 37;
+            let reference = {
+                let b = skewed(dt, n, 0);
+                widen_bytes_to_f32(&b, dt)
+            };
+            assert!(!reference.is_empty(), "{dt:?}: empty reference");
+            for skew in 1..8usize {
+                let buf = skewed(dt, n, skew);
+                let got = widen_bytes_to_f32(&buf[skew..], dt);
+                assert_eq!(
+                    got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    reference.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "{dt:?} at skew {skew} disagrees with the aligned decode"
+                );
+            }
+        }
+    }
+
+    /// Byte-granular dtypes have no alignment requirement, but they share the
+    /// same match arm, so pin them too.
+    #[test]
+    fn widen_byte_dtypes_ignore_skew() {
+        for dt in [DType::U8, DType::I8, DType::Bool] {
+            let mut buf = vec![0xAAu8; 3];
+            buf.extend_from_slice(&[0u8, 1, 2, 3, 250]);
+            assert_eq!(
+                widen_bytes_to_f32(&buf[3..], dt),
+                widen_bytes_to_f32(&[0u8, 1, 2, 3, 250], dt),
+                "{dt:?}"
+            );
+        }
+    }
+
+    /// An empty typed input (an unused KV-cache slot passed as `Vec::new()`)
+    /// has a dangling pointer; it must not reach a reinterpret at all.
+    #[test]
+    fn widen_empty_is_empty() {
+        for dt in [DType::F32, DType::F16, DType::I64, DType::C128] {
+            assert!(widen_bytes_to_f32(&[], dt).is_empty(), "{dt:?}");
+        }
+    }
+}

@@ -737,6 +737,32 @@ pub fn reshape_shape(input: &Shape, new_shape: &[i64]) -> Result<Shape, String> 
                 dims.push(Dim::Static(d as usize));
             }
         }
+        // A reshape must preserve the element count. Without this check a
+        // fully-concrete target silently reinterprets the buffer: an MoE router
+        // reshaping `[rows, 1, k]` to `[rows, 1]` kept the first `rows` floats
+        // and dropped the rest, so every token was weighted by another token's
+        // routing probability — in range, plausible, and wrong.
+        //
+        // Only enforced when the input's product is actually computable.
+        // `num_elements()` returns None for an over-large/garbage static dim
+        // left by an upstream mis-resolved dynamic axis, and the comment above
+        // documents that a fully-specified target should still be honoured
+        // there rather than aborting the whole import.
+        if let Some(total) = input.num_elements() {
+            let out_total: usize = dims
+                .iter()
+                .map(|d: &Dim| d.unwrap_static())
+                .try_fold(1usize, |a, d| a.checked_mul(d))
+                .unwrap_or(usize::MAX);
+            if out_total != total {
+                return Err(format!(
+                    "reshape: {:?} ({total} elements) -> {new_shape:?} ({out_total} elements); \
+                     a reshape must preserve the element count",
+                    input.dims()
+                ));
+            }
+        }
+
         return Ok(Shape {
             dims,
             dtype: input.dtype,

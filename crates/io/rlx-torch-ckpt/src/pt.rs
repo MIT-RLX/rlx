@@ -5,12 +5,15 @@
 //! Standalone loader for a plain PyTorch `torch.save` checkpoint — a
 //! `.pt` / `.pth` / `pytorch_model.bin` file.
 //!
-//! A `.nemo` wraps the very same checkpoint inside a tar alongside a YAML
-//! config; a `.pt` *is* that checkpoint ZIP, so we parse it directly from
-//! offset 0 and reuse the shared [`crate::index_torch_zip`] /
-//! [`crate::read_torch_tensor`] machinery. Only the modern ZIP format
-//! (PyTorch ≥ 1.6, the default since 2020) is supported — the legacy
-//! non-ZIP pickle format is rejected with a clear error.
+//! Both container generations are handled. A modern `.pt` *is* the `torch.save`
+//! ZIP, so we parse it directly from offset 0
+//! and reuse the shared [`crate::index_torch_zip`] /
+//! [`crate::read_torch_tensor`] machinery — the same routines that serve a
+//! checkpoint nested inside another container (a `.nemo` tar, say) once its
+//! wrapper has been peeled off. The **legacy** pre-1.6 container — five
+//! pickles then raw storages, no ZIP — goes through [`crate::legacy`] instead;
+//! much of the community model back-catalogue predates the switch and is still
+//! in daily use.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -38,7 +41,7 @@ pub struct PtTensor {
 /// as contiguous, row-major f32 regardless of their on-disk dtype.
 ///
 /// ```no_run
-/// use rlx_nemo::PtModel;
+/// use rlx_torch_ckpt::PtModel;
 /// let m = PtModel::open(std::path::Path::new("pytorch_model.bin"))?;
 /// for name in m.names() {
 ///     let t = m.tensor(&name)?; // -> PtTensor (f32)
@@ -47,19 +50,39 @@ pub struct PtTensor {
 /// # anyhow::Ok(())
 /// ```
 pub struct PtModel {
-    /// The seekable source (a temp decompressed copy only in the unlikely
-    /// event the `.pt` is gzip-wrapped; kept alive so tensor reads stay
-    /// valid).
-    source: Seekable,
-    /// Param name → tensor view metadata (from the pickle).
+    /// Param name → tensor view metadata (from the pickle). Shared by both
+    /// container generations; only where the bytes live differs.
     tensors: BTreeMap<String, TensorMeta>,
-    /// Storage key → its (absolute-offset) ZIP entry.
-    storages: HashMap<String, ZipEntry>,
+    store: Store,
+}
+
+/// Where a checkpoint's storages live.
+enum Store {
+    /// Modern ZIP: an index of entries, read on demand so a multi-gigabyte
+    /// checkpoint never lands in memory at once.
+    Zip {
+        /// Kept alive so tensor reads stay valid (a temp decompressed copy
+        /// only in the unlikely event the `.pt` is gzip-wrapped).
+        source: Seekable,
+        entries: HashMap<String, ZipEntry>,
+    },
+    /// Legacy: one sequential stream with no index, so there is nothing to
+    /// seek to and the storages are held decoded.
+    Legacy(HashMap<String, Vec<u8>>),
 }
 
 impl PtModel {
-    /// Open and index a `.pt` / `.pth` / `pytorch_model.bin` file.
+    /// Open and index a `.pt` / `.pth` / `pytorch_model.bin` file, in either
+    /// the modern ZIP or the legacy pre-1.6 container.
     pub fn open(path: &Path) -> Result<Self> {
+        if Self::is_legacy(path)? {
+            let f = crate::legacy::read(path)
+                .with_context(|| format!("reading {} as a legacy torch file", path.display()))?;
+            return Ok(Self {
+                tensors: f.tensors,
+                store: Store::Legacy(f.storages),
+            });
+        }
         let source =
             prepare_seekable(path).with_context(|| format!("preparing {}", path.display()))?;
         let read_path = source.path().to_path_buf();
@@ -78,10 +101,21 @@ impl PtModel {
             .with_context(|| format!("indexing {}", path.display()))?;
 
         Ok(Self {
-            source,
             tensors,
-            storages,
+            store: Store::Zip {
+                source,
+                entries: storages,
+            },
         })
+    }
+
+    /// Peek at the first bytes to pick a container.
+    fn is_legacy(path: &Path) -> Result<bool> {
+        use std::io::Read;
+        let mut head = [0u8; 4];
+        let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let n = f.read(&mut head)?;
+        Ok(crate::legacy::looks_legacy(&head[..n]))
     }
 
     /// All tensor names, sorted.
@@ -114,8 +148,17 @@ impl PtModel {
             .tensors
             .get(name)
             .ok_or_else(|| anyhow!("no tensor named {name:?}"))?;
-        let data = read_torch_tensor(self.source.path(), meta, &self.storages)
-            .with_context(|| format!("reading tensor {name:?}"))?;
+        let data = match &self.store {
+            Store::Zip { source, entries } => read_torch_tensor(source.path(), meta, entries)
+                .with_context(|| format!("reading tensor {name:?}"))?,
+            Store::Legacy(blobs) => {
+                let raw = blobs.get(&meta.storage_key).ok_or_else(|| {
+                    anyhow!("missing storage {:?} for tensor {name:?}", meta.storage_key)
+                })?;
+                crate::storage::gather(meta, &meta.dtype.decode_f32(raw))
+                    .with_context(|| format!("reading tensor {name:?}"))?
+            }
+        };
         Ok(PtTensor {
             name: name.to_string(),
             shape: meta.shape.clone(),

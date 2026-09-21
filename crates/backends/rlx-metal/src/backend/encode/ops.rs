@@ -206,20 +206,20 @@ pub(crate) unsafe fn binary_broadcast_host<T>(
 pub(crate) fn widen_input_bytes_to_f32(data: &[u8], dt: rlx_ir::DType) -> Vec<f32> {
     use rlx_ir::DType;
     match dt {
-        DType::F32 => {
-            let n = data.len() / 4;
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) }.to_vec()
-        }
-        DType::F16 => {
-            let n = data.len() / 2;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, n) };
-            s.iter().map(|h| h.to_f32()).collect()
-        }
-        DType::BF16 => {
-            let n = data.len() / 2;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, n) };
-            s.iter().map(|h| h.to_f32()).collect()
-        }
+        // `data` is caller-supplied host bytes with no alignment guarantee
+        // (a subslice or an mmap'd tensor at an odd offset is 1-aligned), so
+        // decode through `rlx_ir::bytes` rather than reinterpreting blind.
+        // `half::f16`/`bf16` are `repr(transparent)` over `u16`, so decoding
+        // the bits keeps the aligned fast path zero-copy.
+        DType::F32 => rlx_ir::bytes::decode_le_vec::<f32>(data),
+        DType::F16 => rlx_ir::bytes::decode_le::<u16>(data)
+            .iter()
+            .map(|&b| half::f16::from_bits(b).to_f32())
+            .collect(),
+        DType::BF16 => rlx_ir::bytes::decode_le::<u16>(data)
+            .iter()
+            .map(|&b| half::bf16::from_bits(b).to_f32())
+            .collect(),
         // Integer/bool inputs widen to f32 — `widen_integer_activations_to_f32`
         // rewrites their arena slots to F32, so this matches the graph dtype.
         DType::I64 => data
@@ -4993,6 +4993,19 @@ pub(crate) fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
                         && n_probe.is_multiple_of(8)
                         && !rlx_ir::env::flag("RLX_METAL_G8_0_FUSED_DISABLE")
                 }
+                // PTQ1_0 likewise: decode-only fused GEMV, `m > 1` keeps the
+                // slab. Must stay in lockstep with `use_fused_ptq1_0_mv` in
+                // `encode/mod.rs` — this is the compile-time size and that is
+                // the run-time dispatch, and if they disagree the arena either
+                // reserves a slab nothing writes (Ternary Bonsai 2's
+                // [248320, 5120] head alone is ~5 GiB) or omits one the
+                // encoder then needs.
+                rlx_ir::QuantScheme::GgufPtq1_0 => {
+                    m_probe == 1
+                        && k_probe.is_multiple_of(128)
+                        && n_probe.is_multiple_of(8)
+                        && !rlx_ir::env::flag("RLX_METAL_PTQ1_0_FUSED_DISABLE")
+                }
                 _ => false,
             };
             if direct_fused {
@@ -5528,6 +5541,13 @@ pub(crate) fn encode_q1_0_mv_f32_sg_flags(
     let pipeline = match scheme {
         rlx_ir::QuantScheme::GgufQ1_0 => &k.q1_0_mv_f32_sg,
         rlx_ir::QuantScheme::GgufQ2_0 => &k.q2_0_mv_f32_sg,
+        rlx_ir::QuantScheme::GgufPtq1_0 => {
+            if rlx_ir::env::flag("RLX_METAL_PTQ1_0_INT_PIPE") {
+                &k.ptq1_0_mv_f32_sg
+            } else {
+                &k.ptq1_0_mv_f32_sg_fp
+            }
+        }
         _ => unreachable!(),
     };
     enc.set_compute_pipeline_state(pipeline);
@@ -5542,15 +5562,37 @@ pub(crate) fn encode_q1_0_mv_f32_sg_flags(
     enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
     let n_u = n_dim as u32;
     enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+    let (nsg, nr0) = match scheme {
+        rlx_ir::QuantScheme::GgufPtq1_0 => (
+            // Sweepable without a rebuild: RLX_METAL_PTQ1_0_NSG. Default 2,
+            // matching the sibling Q1_0/Q2_0 kernels. 4 looked marginally
+            // better in two of three partial readings but was never
+            // separable from background load on the tuning machine, and an
+            // unjustified default is worse than a boring one — see
+            // `ptq1_0_gemv_bandwidth`, which settles it in one command on an
+            // idle box.
+            rlx_ir::env::parse_or("RLX_METAL_PTQ1_0_NSG", 2u64).clamp(1, 8),
+            4usize,
+        ),
+        _ => (2u64, 8usize),
+    };
     let flags: u32 = u32::from(x_f16)
         | (u32::from(dst_f16) << 1)
         // bit 2: fall back to the scalar byte inner loop (A/B only).
-        | (u32::from(rlx_ir::env::flag("RLX_METAL_Q2_0_SCALAR")) << 2);
+        | (u32::from(rlx_ir::env::flag("RLX_METAL_Q2_0_SCALAR")) << 2)
+        // bits 8..16: simdgroups per threadgroup (PTQ1_0's kernel reads it).
+        | ((nsg as u32 & 0xFF) << 8);
     enc.set_bytes(6, 4, &flags as *const u32 as *const _);
     enc.set_buffer(7, Some(w_buffer), 0);
-    // NSG=2 simdgroups share a threadgroup x tile (see dequant_gguf.msl).
-    const NSG: u64 = 2;
-    let n_output_groups = (n_dim.div_ceil(8)) as u64;
+    // Simdgroups per threadgroup, and rows each accumulates. Both must match
+    // the kernel's `*_NSG` / `*_NR0`. PTQ1_0 carries fewer rows (its dot
+    // stages 17 floats of collapse coefficients per thread) and more
+    // simdgroups, which is what hides the latency of its byte-wise loads.
+
+    let nsg_v = nsg;
+    #[allow(non_snake_case)]
+    let NSG: u64 = nsg_v;
+    let n_output_groups = (n_dim.div_ceil(nr0)) as u64;
     let n_threadgroups = n_output_groups.div_ceil(NSG);
     let grid = crate::mtl::MTLSize {
         width: n_threadgroups * NSG * 32,

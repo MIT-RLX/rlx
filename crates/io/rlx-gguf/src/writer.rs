@@ -193,7 +193,7 @@ impl GgufWriter {
             for &d in &t.shape {
                 w.write_all(&(d as u64).to_le_bytes())?;
             }
-            w.write_all(&(t.dtype as u32).to_le_bytes())?;
+            w.write_all(&t.dtype.to_u32().to_le_bytes())?;
             w.write_all(&off.to_le_bytes())?;
         }
 

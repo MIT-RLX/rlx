@@ -261,9 +261,8 @@ impl ExecutableGraph for MetalExecutableWrapper {
             return;
         }
         if dtype == rlx_ir::DType::F32 {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-            self.inner.set_param(name, s);
+            let s = rlx_ir::bytes::decode_le::<f32>(data);
+            self.inner.set_param(name, s.as_ref());
         } else {
             let diag = data.len() > 1_000_000 && rlx_ir::env::var("RLX_METAL_PARAM_DIAG").is_some();
             let t0 = std::time::Instant::now();

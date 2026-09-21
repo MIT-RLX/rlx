@@ -7782,12 +7782,26 @@ impl MetalExecutable {
                         && n_u.is_multiple_of(8)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufG8_0)
                         && !rlx_ir::env::flag("RLX_METAL_G8_0_FUSED_DISABLE");
+                    // Fused PTQ1_0 decode GEMV (PrismML Ternary Bonsai 2).
+                    // Decode only — no MM kernel yet, so `m > 1` keeps the
+                    // scratch path and `dequant_gguf_scratch_bytes` mirrors
+                    // that. Without this the 27B re-materializes every weight
+                    // to f32 per token: ~90% of decode on the thunk profile.
+                    // Off-switch: RLX_METAL_PTQ1_0_FUSED_DISABLE=1.
+                    let use_fused_ptq1_0_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(128)
+                        && n_u.is_multiple_of(8)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufPtq1_0)
+                        && !rlx_ir::env::flag("RLX_METAL_PTQ1_0_FUSED_DISABLE");
                     // The fused Q1_0 kernels read packed weights directly and need
                     // no dequant scratch, so a zero `dequant_scratch_off` (left
                     // unallocated for Q1_0-only graphs to save ~5 GiB) must NOT
                     // divert them to the host path.
-                    let needs_scratch =
-                        !(use_fused_q1_0_mv || use_fused_q1_0_mm || use_fused_g8_0_mv);
+                    let needs_scratch = !(use_fused_q1_0_mv
+                        || use_fused_q1_0_mm
+                        || use_fused_g8_0_mv
+                        || use_fused_ptq1_0_mv);
                     if !use_gpu_dequant
                         || (needs_scratch && self.dequant_scratch_off == 0)
                         || !has_metal_dequant_kernel(*scheme)
@@ -7954,6 +7968,23 @@ impl MetalExecutable {
                         encode_g8_0_mv_f32_sg(
                             enc,
                             k,
+                            &self.arena.buffer,
+                            w_buf,
+                            *x,
+                            w_raw,
+                            *dst,
+                            k_u,
+                            n_u,
+                            *x_f16,
+                            *dst_f16,
+                        );
+                    } else if use_fused_ptq1_0_mv {
+                        let (w_buf, w_raw) = self.resolve_off(*w_q);
+                        let enc = e!();
+                        encode_q1_0_mv_f32_sg_flags(
+                            enc,
+                            k,
+                            *scheme,
                             &self.arena.buffer,
                             w_buf,
                             *x,
@@ -8326,7 +8357,23 @@ impl MetalExecutable {
                         });
                     } else if dequant_grouped_can_encode_per_row(*scheme, k_u) {
                         // Decode / K-quant fast path: per-token fused GEMV on the
-                        // parent encoder — no host sort, no private cmd_buf wait.
+                        // parent encoder — no host sort, no private cmd_buf.
+                        //
+                        // It still reads `expert_idx` ON THE HOST to pick each
+                        // row's expert slab, so the indices have to be resident
+                        // first. They are when routing is a host-uploaded input,
+                        // and they are NOT when a `TopK` earlier in this same
+                        // command buffer produced them — which is exactly what
+                        // every MoE decoder does. Without this sync the encode
+                        // read stale bytes and routed every row to whatever
+                        // expert the buffer happened to hold (usually 0): in
+                        // range, so the `debug_assert` below passed, and the
+                        // model produced confident nonsense.
+                        //
+                        // The grouped path below syncs for the same reason. This
+                        // costs a flush per call but keeps the fused GEMV and
+                        // still avoids the host sort/unpermute.
+                        sync_gpu!();
                         encode_dequant_grouped_matmul_gguf_per_row(
                             e!(),
                             k,

@@ -336,6 +336,43 @@ mod tests {
         ));
     }
 
+    /// A rank-0 (scalar) bias must NOT be folded into the epilogue.
+    ///
+    /// The epilogue adds the bias **per output column**, so it needs one value per
+    /// column. A rank-0 bias carries exactly one, and the guard only rejects
+    /// `rank > 1` — so `mm + scalar` with a single consumer was accepted and every
+    /// column but the first lost the addend. It is a quiet wrong answer, not a
+    /// crash: downstream cosine stays ~0.99 because only one lane of many is off,
+    /// which is precisely how it survived spot checks. Callers in the `exg`
+    /// workspace worked around it by materialising the scalar with `Graph::full`
+    /// instead of `Graph::constant`; the fusion is where it belongs.
+    #[test]
+    fn a_scalar_bias_is_not_a_per_column_bias() {
+        let mut g = Graph::new("test");
+        let x = g.input("x", f32_shape(&[2, 8]));
+        let w = g.param("w", f32_shape(&[8, 4]));
+        let b = g.param("b", f32_shape(&[])); // rank-0 scalar
+        let mm = g.matmul(x, w, f32_shape(&[2, 4]));
+        let add = g.binary(BinaryOp::Add, mm, b, f32_shape(&[2, 4]));
+        g.set_outputs(vec![add]);
+        let before = g.len();
+
+        let fused = FuseMatMulBiasAct.run(g);
+        assert_eq!(
+            fused.len(),
+            before,
+            "a rank-0 bias was folded into the per-column epilogue; \
+             the add must stay a separate broadcast"
+        );
+        assert!(
+            !fused
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::FusedMatMulBiasAct { .. })),
+            "no FusedMatMulBiasAct should be emitted for a scalar bias"
+        );
+    }
+
     #[test]
     fn fuse_matmul_bias_no_act() {
         let mut g = Graph::new("test");

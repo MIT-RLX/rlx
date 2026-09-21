@@ -1108,8 +1108,14 @@ pub fn lower_with_env_writeback(
                     return Err(MlxError(format!("Rope: x last dim {last} < n_rot {n_rot}")));
                 }
                 let heads_in_last = (last / *head_dim) as i32;
-                let multi_head_packed =
-                    heads_in_last > 1 && last.is_multiple_of(*head_dim) && n >= 3;
+                // Rank 2 packs heads too: `[tokens, heads*head_dim]` is what a
+                // partial (tail) RoPE feeds — DeepSeek-V4/V4.1 rotate the last
+                // `rope_head_dim` dims of every head from exactly that shape.
+                // Requiring rank >= 3 sent those down the single-head path, which
+                // reshapes `[T, H*D]` as one `n_rot`-wide head and fails outright.
+                // The split/transpose below is rank-agnostic: at rank 2 it builds
+                // `[H, T, D]` and rotates along axis `n-1`, same as rank 3.
+                let multi_head_packed = heads_in_last > 1 && last.is_multiple_of(*head_dim);
                 let has_tail = !last.is_multiple_of(*head_dim);
 
                 let rotate = |x_rot: &Array,
@@ -1752,16 +1758,24 @@ pub fn lower_with_env_writeback(
                 ops::reshape(&y4, &[b, s, (nh * hd) as i32])?
             }
             Op::TopK { k } => {
-                // Op::TopK returns f32-encoded indices of the k largest
-                // values along the last axis (descending). We use
-                // argpartition to position them, then a slice extracts
-                // the back end of the result. argpartition with
-                // kth=size-k puts the top-k *largest* in the last k
-                // positions (unsorted relative order — matches
-                // rlx's "ties broken by index" semantics? No — rlx
-                // wants sorted. So we follow with argsort *only over
-                // the last k* via take_along_axis, but to keep things
-                // tractable we leave the order as argpartition gives.
+                // `Op::TopK` returns f32-encoded indices of the `k` largest values
+                // along the last axis, and its contract breaks ties **by smaller
+                // index** — which the CPU and Metal kernels honour by doing
+                // repeated argmax with a strict `>`.
+                //
+                // `argpartition` alone does not: it picks an arbitrary member of a
+                // tied group, and on an all-tied row it selected the *highest*
+                // indices. That is silent, not loud, and it matters —
+                // DeepSeek-V4.1's Indexer rectifies its head scores, so a field
+                // full of exact zeros is normal and the tie rule alone decides
+                // which positions the model attends to.
+                //
+                // So pick the set arithmetically (threshold + running count, which
+                // has no ordering ambiguity), then turn it into indices by
+                // partitioning a key that has no ties left by construction.
+                // Ordering *within* the returned k is index order rather than
+                // descending value — the same guarantee this lowering gave before,
+                // and every rlx consumer treats the result as a set.
                 let x = lookup(&env, node.inputs[0])?;
                 let in_shape = node_input_shape(graph, node.inputs[0]);
                 if in_shape.is_empty() {
@@ -1772,14 +1786,58 @@ pub fn lower_with_env_writeback(
                 if (*k as i32) > last_size {
                     return Err(MlxError(format!("TopK: k={k} > last_dim={last_size}")));
                 }
-                let kth = last_size - (*k as i32);
-                let idx_full = ops::argpartition(x, kth, last_axis)?;
-                // Slice the last `k` indices along the last axis.
-                let mut start = vec![0i32; in_shape.len()];
-                let mut stop = in_shape.clone();
-                start[in_shape.len() - 1] = kth;
-                stop[in_shape.len() - 1] = last_size;
-                let idx = ops::slice(&idx_full, &start, &stop)?;
+                let n = in_shape.len();
+                let one = Array::from_f32_slice(&[1.0], &[1], DType::F32)?;
+                let zero = Array::from_f32_slice(&[0.0], &[1], DType::F32)?;
+
+                // `thr` = the k-th largest value per row
+                let neg = ops::unary(x, MlxUnary::Neg)?;
+                let sorted_asc = ops::sort(&neg, last_axis)?; // ascending on -x
+                let mut tstart = vec![0i32; n];
+                let mut tstop = in_shape.clone();
+                tstart[n - 1] = *k as i32 - 1;
+                tstop[n - 1] = *k as i32;
+                let thr = ops::unary(&ops::slice(&sorted_asc, &tstart, &tstop)?, MlxUnary::Neg)?;
+
+                // Strictly-greater entries always win (there are fewer than k of
+                // them). Only the group *equal* to the threshold is contested, and
+                // there the lowest indices take the remaining slots — which is what
+                // "ties broken by smaller index" means. Folding the two together
+                // and taking the first k at-or-above the threshold is wrong: it
+                // drops a strictly-larger entry that happens to sit later in the
+                // row.
+                let gt = ops::gt(x, &thr)?;
+                let eq = ops::eq(x, &thr)?; // exact: `thr` IS one of the values
+                let gt_f = ops::select(&gt, &one, &zero)?;
+                let eq_f = ops::select(&eq, &one, &zero)?;
+                let n_gt = ops::reduce(&gt_f, MlxReduce::Sum, &[last_axis], /*keep_dim=*/ true)?;
+                let k_arr = Array::from_f32_slice(&[*k as f32], &[1], DType::F32)?;
+                let slots = ops::sub(&k_arr, &n_gt)?; // ties still to fill
+                let rank_eq = ops::cumsum(&eq_f, last_axis, /*exclusive=*/ true)?;
+                let tie_win = ops::lt(&rank_eq, &slots)?;
+                let keep_eq = ops::select(&eq, &ops::select(&tie_win, &one, &zero)?, &zero)?;
+                let keep_f = ops::max(&gt_f, &keep_eq)?;
+
+                // `key = index + (1 - keep) * n` is a permutation with no ties, so
+                // the k smallest are exactly the winners however the partition
+                // orders them.
+                let iota_v: Vec<f32> = (0..last_size).map(|i| i as f32).collect();
+                let mut iota_shape = vec![1i32; n];
+                iota_shape[n - 1] = last_size;
+                let iota = Array::from_f32_slice(
+                    &iota_v,
+                    &iota_shape.iter().map(|d| *d as usize).collect::<Vec<_>>(),
+                    DType::F32,
+                )?;
+                let n_arr = Array::from_f32_slice(&[last_size as f32], &[1], DType::F32)?;
+                let bump = ops::mul(&ops::sub(&one, &keep_f)?, &n_arr)?;
+                let key = ops::add(&iota, &bump)?;
+                let order = ops::argpartition(&key, *k as i32, last_axis)?;
+                let mut kstart = vec![0i32; n];
+                let mut kstop = in_shape.clone();
+                kstop[n - 1] = *k as i32;
+                let idx = ops::slice(&order, &kstart, &kstop)?;
+                kstart[n - 1] = 0;
                 // rlx encodes indices as f32 at the I/O boundary.
                 ops::cast(&idx, DType::F32)?
             }

@@ -194,7 +194,7 @@ SKIPPED=(
 #     dev-dependencies at lock time regardless of features, that made a sibling
 #     `rlx` checkout mandatory just to load that workspace.
 TIERS=(
-    "rlx-ir rlxsl rlx-gguf rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng"
+    "rlx-ir rlxsl rlx-gguf rlx-torch-ckpt rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng"
     "rlx-unfuse rlx-flow rlx-fusion rlx-driver rlx-mlx-io"
     "rlx-autodiff rlx-extend rlx-pkg"
     "rlx-compile"

@@ -66,6 +66,7 @@ members = [
     "crates/io/rlx-hub",         # Shard-aware HuggingFace download + verification (layer→shard planning)
     "crates/io/rlx-mlx-io",      # MLX weight layouts: mlx-community dirs, .npz/.npy, affine/mxfp dequant
     "crates/io/rlx-dduf",        # HuggingFace DDUF (.dduf) ZIP of nested safetensors + JSON
+    "crates/io/rlx-torch-ckpt",  # PyTorch `torch.save` checkpoint reader (.pt/.pth/.bin): ZIP + pickle
     "crates/io/rlx-nemo",        # NVIDIA NeMo `.nemo` loader (tar + torch.save ckpt + YAML)
     "crates/backends/rlx-gpu-dispatch", # Shape-keyed kernel-variant dispatch table shared by ALL GPU backends
     "crates/backends/rlx-gpu-kernels", # Shared CUDA/HIP .cu sources for rlx-cuda + rlx-rocm
@@ -220,6 +221,7 @@ rlx-mlx = { path = "crates/backends/rlx-mlx", version = "0.2.16" }
 rlx-mlx-io = { path = "crates/io/rlx-mlx-io", version = "0.2.16" }
 rlx-mlx-sys = { path = "crates/backends/rlx-mlx-sys", version = "0.2.16" }
 rlx-nemo = { path = "crates/io/rlx-nemo", version = "0.2.16" }
+rlx-torch-ckpt = { path = "crates/io/rlx-torch-ckpt", version = "0.2.16" }
 rlx-oneapi = { path = "crates/backends/rlx-oneapi", version = "0.2.16" }
 rlx-onnx = { path = "crates/io/rlx-onnx", version = "0.2.16" }
 rlx-onnx-conformance = { path = "crates/io/rlx-onnx-conformance", version = "0.2.16" }

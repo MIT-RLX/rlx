@@ -280,3 +280,57 @@ fn narrow_slice() {
         .remove(0);
     approx(&out, &[1.0, 2.0, 5.0, 6.0], 1e-5);
 }
+
+// ── activations that have no direct MIL op ───────────────────────────────
+//
+// These four reach the second match arm in `mil::activation`, and until this
+// test existed all four fell through it into `unreachable!()` — a panic inside
+// the backend rather than an unsupported-op error, for activations the
+// `Activation` OpKind claims wholesale. `Mish` is the one that mattered in
+// practice: it is RealPLKSR's activation, so every RealPLKSR checkpoint
+// crashed CoreML.
+
+/// `mish(x) = x · tanh(softplus(x))`.
+#[test]
+fn mish_matches_its_definition() {
+    let x = [-3.0f32, -1.0, -0.25, 0.0, 0.25, 1.0, 3.0];
+    let want: Vec<f32> = x.iter().map(|&v| v * (v.exp().ln_1p()).tanh()).collect();
+    approx(&run_unary(Activation::Mish, &x), &want, 1e-5);
+}
+
+/// `log_sigmoid(x) = −softplus(−x)`.
+///
+/// Checked at −30 as well as the usual range: the tempting spelling
+/// `log(sigmoid(x))` underflows to −inf there once `sigmoid` rounds to zero,
+/// while the softplus form stays finite and accurate.
+#[test]
+fn log_sigmoid_is_stable_in_the_left_tail() {
+    let x = [-30.0f32, -5.0, -1.0, 0.0, 1.0, 5.0];
+    let want: Vec<f32> = x.iter().map(|&v| -((-v).exp().ln_1p())).collect();
+    let got = run_unary(Activation::LogSigmoid, &x);
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "log_sigmoid produced {got:?}"
+    );
+    approx(&got, &want, 1e-4);
+}
+
+/// `hard_sigmoid(x) = clamp(x/6 + 0.5, 0, 1)` — the PyTorch parameterisation,
+/// which is what MIL's `alpha`/`beta` are set to.
+#[test]
+fn hard_sigmoid_matches_the_pytorch_parameterisation() {
+    let x = [-4.0f32, -3.0, -1.0, 0.0, 1.0, 3.0, 4.0];
+    let want: Vec<f32> = x.iter().map(|&v| (v / 6.0 + 0.5).clamp(0.0, 1.0)).collect();
+    approx(&run_unary(Activation::HardSigmoid, &x), &want, 1e-5);
+}
+
+/// `hard_swish(x) = x · hard_sigmoid(x)`.
+#[test]
+fn hard_swish_matches_its_definition() {
+    let x = [-4.0f32, -3.0, -1.0, 0.0, 1.0, 3.0, 4.0];
+    let want: Vec<f32> = x
+        .iter()
+        .map(|&v| v * (v / 6.0 + 0.5).clamp(0.0, 1.0))
+        .collect();
+    approx(&run_unary(Activation::HardSwish, &x), &want, 1e-5);
+}

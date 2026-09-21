@@ -147,10 +147,8 @@ impl ExecutableGraph for WgpuExecutableWrapper {
                 self.inner.set_param_bytes(name, data);
             }
             rlx_ir::DType::F32 => {
-                let n = data.len() / 4;
-                let f32_slice =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-                self.inner.set_param(name, f32_slice);
+                let f32_slice = rlx_ir::bytes::decode_le::<f32>(data);
+                self.inner.set_param(name, f32_slice.as_ref());
             }
             rlx_ir::DType::BF16 => {
                 // A BF16 matmul weight is kept PACKED (2 B/elem) in the wgpu
@@ -195,36 +193,26 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
         for (name, data, dt) in inputs {
             let v: Vec<f32> = match *dt {
-                rlx_ir::DType::F32 => {
-                    let n = data.len() / 4;
-                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) }.to_vec()
-                }
-                rlx_ir::DType::F16 => {
-                    let n = data.len() / 2;
-                    let s =
-                        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, n) };
-                    s.iter().map(|h| h.to_f32()).collect()
-                }
-                rlx_ir::DType::BF16 => {
-                    let n = data.len() / 2;
-                    let s = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, n)
-                    };
-                    s.iter().map(|h| h.to_f32()).collect()
-                }
+                rlx_ir::DType::F32 => rlx_ir::bytes::decode_le_vec::<f32>(data),
+                rlx_ir::DType::F16 => rlx_ir::bytes::decode_le::<u16>(data)
+                    .iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect(),
+                rlx_ir::DType::BF16 => rlx_ir::bytes::decode_le::<u16>(data)
+                    .iter()
+                    .map(|&b| half::bf16::from_bits(b).to_f32())
+                    .collect(),
                 // Integer/bool inputs (e.g. embedding indices `phone_ids`) are
                 // widened to f32, matching the f32-arena convention shared with
                 // the CPU backend (Gather etc. operate on f32-encoded indices).
-                rlx_ir::DType::I64 => {
-                    let n = data.len() / 8;
-                    let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n) };
-                    s.iter().map(|&x| x as f32).collect()
-                }
-                rlx_ir::DType::I32 => {
-                    let n = data.len() / 4;
-                    let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n) };
-                    s.iter().map(|&x| x as f32).collect()
-                }
+                rlx_ir::DType::I64 => rlx_ir::bytes::decode_le::<i64>(data)
+                    .iter()
+                    .map(|&x| x as f32)
+                    .collect(),
+                rlx_ir::DType::I32 => rlx_ir::bytes::decode_le::<i32>(data)
+                    .iter()
+                    .map(|&x| x as f32)
+                    .collect(),
                 rlx_ir::DType::U8 | rlx_ir::DType::I8 | rlx_ir::DType::Bool => {
                     data.iter().map(|&b| b as f32).collect()
                 }

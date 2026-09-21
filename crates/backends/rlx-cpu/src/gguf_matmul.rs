@@ -60,6 +60,13 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
                 .try_into()
                 .unwrap(),
         ),
+        // 128-element base-3 ternary block (PrismML Ternary Bonsai 2).
+        QuantScheme::GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0_block(
+            block,
+            (&mut out[..rlx_gguf::ptq1_dequant::QK_PTQ1_0])
+                .try_into()
+                .unwrap(),
+        ),
         // 32-element blocks: caller slices `out` to the correct length.
         QuantScheme::GgufMXFP4 => rlx_gguf::mx_dequant::dequant_mxfp4_block(
             block,
@@ -284,6 +291,13 @@ const CACHED_BLAS_MIN_WEIGHT_ELEMS: usize = 32 * 32;
 /// path and flips occasional near-tie greedy tokens — rlx keeps decode on f32
 /// for fidelity (and decode↔prefill parity) by default. Set
 /// `RLX_Q4K_FUSED_MIN_N=4096` (or another crossover) to trade that for speed.
+/// Route Q4_K decode GEMVs through the exact f32-activation kernel instead of
+/// the Q8_K one (`RLX_Q4K_EXACT_GEMV=1`). Costs ALU, keeps decode numerics
+/// independent of whether the f32 dequant cache happened to fit.
+fn q4k_exact_gemv() -> bool {
+    rlx_ir::env::flag("RLX_Q4K_EXACT_GEMV")
+}
+
 fn q4k_fused_decode_min_n() -> usize {
     rlx_ir::env::var("RLX_Q4K_FUSED_MIN_N")
         .and_then(|v| v.parse().ok())
@@ -597,6 +611,7 @@ pub fn dequant_moe_weights_to_grouped_f32(
             QuantScheme::GgufQ1_0 => rlx_gguf::q1_dequant::dequant_q1_0(slab, k * n),
             QuantScheme::GgufQ2_0 => rlx_gguf::q2_dequant::dequant_q2_0(slab, k * n),
             QuantScheme::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(slab, k * n),
+            QuantScheme::GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(slab, k * n),
             other => panic!("dequant_moe_weights: unsupported scheme {other:?}"),
         }
         .expect("dequant_moe_weights: slab dequant failed");
@@ -966,6 +981,55 @@ fn gguf_matmul_bt_m1_parallel(
             let blocks_per_row = k / QK_K;
             let row_bytes = blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES;
             debug_assert_eq!(n * row_bytes, w_bytes.len().min(n * row_bytes));
+            // Exact arm: dequantize each super-block to f32 on the fly and dot
+            // against the *unquantized* activation. Fills the gap between the
+            // two pre-existing options — cached-f32-BLAS is exact but
+            // materializes the whole matrix as f32 (8.6x the checkpoint on
+            // LFM2.5-2.6B), while the Q8_K path reads packed bytes in place but
+            // perturbs the activation. This one reads packed bytes in place and
+            // keeps the activation in f32, trading ALU for both.
+            //
+            // It matters most where the f32 cache does *not* fit: without it,
+            // memory pressure silently downgrades decode numerics, because
+            // `prefer_cached_blas` diverts `m == 1` to the Q8_K kernel as soon
+            // as `cache_thrashing()` trips.
+            //
+            // Measured on LFM2 (arms alternated in one process, min-of-4),
+            // against the two exact options that already existed:
+            //
+            // | exact path | 350M | 2.6B |
+            // |---|---|---|
+            // | cached-f32-BLAS      | 36.0 tok/s | 9.0 tok/s |
+            // | `RLX_DEQUANT_CACHE=0`|  12.0      | 1.8       |
+            // | this kernel          |  23.8      | 5.1       |
+            //
+            // So it does not beat the f32 cache when the cache fits — it is
+            // 2.8x the throughput of the only other exact option when it does
+            // not. `decode_parity_live` passes on 350M and 2.6B with this arm
+            // enabled, and fails with the Q8_K arm.
+            //
+            // NOT established: its effect on RSS. Routing is adaptive
+            // (`cache_thrashing()` is accumulated runtime state), so per-arm
+            // peak-RSS measurements are path-dependent and did not hold still
+            // across flag combinations — including one standing oddity that
+            // reproduces without this kernel, where lowering
+            // `RLX_Q4K_FUSED_MIN_N` from 2048 to 1 *raised* 2.6B RSS from
+            // 5.17 GB to 14.46 GB when it should have lowered it.
+            if q4k_exact_gemv() {
+                let bb = rlx_gguf::Q4K_BLOCK_BYTES;
+                out.par_iter_mut().enumerate().for_each(|(j, slot)| {
+                    let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+                    let mut acc = 0f32;
+                    for b in 0..blocks_per_row {
+                        acc += rlx_gguf::q4_k_dot_f32(
+                            &row[b * bb..(b + 1) * bb],
+                            &x_row[b * QK_K..(b + 1) * QK_K],
+                        );
+                    }
+                    *slot = acc;
+                });
+                return;
+            }
             let mut x_q8 = vec![0u8; blocks_per_row * rlx_gguf::Q8K_BLOCK_BYTES];
             rlx_gguf::quantize_q8_k_row(&x_row[..k], &mut x_q8);
             out.par_iter_mut().enumerate().for_each(|(j, slot)| {
@@ -1507,6 +1571,76 @@ mod tests {
         }
     }
 
+    /// The exact arm (`RLX_Q4K_EXACT_GEMV`) must land far closer to full-f32
+    /// cached BLAS than the Q8_K arm does — that is its whole reason to exist.
+    /// Asserting it is *tighter than* the Q8_K arm, rather than a fixed epsilon,
+    /// keeps the test meaningful if either kernel is retuned.
+    #[test]
+    fn exact_q4k_decode_gemv_beats_the_q8k_arm_on_accuracy() {
+        use crate::dequant_cache::clear_dequant_cache;
+        let k = 512;
+        let n = 96;
+        // Heavy-tailed weights and activations: Q8_K's per-256-block absmax
+        // scale is set by the outlier, so this is where quantizing the
+        // activation actually costs something.
+        let w: Vec<f32> = (0..k * n)
+            .map(|i| {
+                let t = (i as f32 * 0.017).sin();
+                if i % 137 == 0 { 9.0 * t } else { t }
+            })
+            .collect();
+        let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q4K).unwrap();
+        let x: Vec<f32> = (0..k)
+            .map(|i| {
+                let t = (i as f32 * 0.031).cos();
+                if i % 61 == 0 { 12.0 * t } else { t }
+            })
+            .collect();
+
+        let run = |exact: bool| {
+            rlx_ir::env::set("RLX_Q4K_EXACT_GEMV", if exact { "1" } else { "0" });
+            clear_dequant_cache();
+            let mut out = vec![0f32; n];
+            gguf_matmul_bt(&x, &packed, &mut out, 1, k, n, QuantScheme::GgufQ4K);
+            out
+        };
+        let q8 = run(false);
+        let exact = run(true);
+        rlx_ir::env::unset("RLX_Q4K_EXACT_GEMV");
+
+        clear_dequant_cache();
+        let mut reference = vec![0f32; n];
+        gguf_matmul_bt_cached(
+            &x,
+            &packed,
+            &mut reference,
+            1,
+            k,
+            n,
+            QuantScheme::GgufQ4K,
+            0,
+        );
+
+        let err = |v: &[f32]| -> f32 {
+            v.iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+        };
+        let (e_exact, e_q8) = (err(&exact), err(&q8));
+        assert!(
+            e_exact < e_q8,
+            "exact arm should be closer to f32 BLAS: exact={e_exact} q8={e_q8}"
+        );
+        // It shares the weight dequant with BLAS and differs only in summation
+        // order, so it should agree to near f32 round-off on the row scale.
+        let scale = reference.iter().fold(0f32, |a, b| a.max(b.abs())).max(1.0);
+        assert!(
+            e_exact < 1e-4 * scale,
+            "exact arm drifted from f32 BLAS: {e_exact} (scale {scale})"
+        );
+    }
+
     #[test]
     fn cached_blas_matches_fused_q4k_decode() {
         use crate::dequant_cache::clear_dequant_cache;
@@ -1730,6 +1864,59 @@ mod tests {
             }
             let mut fused = vec![0f32; m * n];
             gguf_matmul_bt(&x, &packed, &mut fused, m, k, n, QuantScheme::GgufQ1_0);
+            for i in 0..reference.len() {
+                assert!(
+                    (reference[i] - fused[i]).abs() < 1e-3,
+                    "m={m} i={i}: ref={} fused={}",
+                    reference[i],
+                    fused[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_ptq1_0_matches_full_dequant() {
+        // PrismML Ternary Bonsai 2: base-3 ternary, 128-element blocks.
+        // Same 128-wide group as Q1_0, so this also covers the "block
+        // smaller than QK_K" path through gguf_matmul_bt at m=1 and m>1.
+        use rlx_gguf::ptq1_dequant::QK_PTQ1_0;
+        let k = 256usize; // 2 blocks per row
+        let n = 8usize;
+
+        // Ternary-at-group-128 input round-trips exactly, so the packed
+        // bytes and the f32 reference agree bit-for-bit.
+        let mut w_ref = vec![0f32; n * k];
+        for row in 0..n {
+            for b in 0..(k / QK_PTQ1_0) {
+                let d = half::f16::from_f32(0.1 + 0.05 * (row * 2 + b) as f32).to_f32();
+                for j in 0..QK_PTQ1_0 {
+                    let elem = b * QK_PTQ1_0 + j;
+                    let t = ((row + elem) % 3) as f32 - 1.0;
+                    w_ref[row * k + elem] = t * d;
+                }
+            }
+        }
+        let packed = rlx_gguf::ptq1_dequant::quantize_ptq1_0(&w_ref).unwrap();
+        assert_eq!(
+            rlx_gguf::ptq1_dequant::dequant_ptq1_0(&packed, n * k).unwrap(),
+            w_ref
+        );
+
+        for m in [1usize, 3] {
+            let x: Vec<f32> = (0..m * k).map(|i| 0.01 * i as f32 - 0.3).collect();
+            let mut reference = vec![0f32; m * n];
+            for mi in 0..m {
+                for row in 0..n {
+                    let mut acc = 0f32;
+                    for p in 0..k {
+                        acc += x[mi * k + p] * w_ref[row * k + p];
+                    }
+                    reference[mi * n + row] = acc;
+                }
+            }
+            let mut fused = vec![0f32; m * n];
+            gguf_matmul_bt(&x, &packed, &mut fused, m, k, n, QuantScheme::GgufPtq1_0);
             for i in 0..reference.len() {
                 assert!(
                     (reference[i] - fused[i]).abs() < 1e-3,

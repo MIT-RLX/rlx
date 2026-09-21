@@ -2513,10 +2513,50 @@ fn dgemm_f32_precise(
     }
 }
 
+/// Report a GEMM whose destination overlaps an operand, when
+/// `RLX_BLAS_ALIAS_CHECK=1`.
+///
+/// Every BLAS call site is supposed to detour through a scratch buffer when an
+/// operand lands inside the destination — arena slot reuse makes that routine,
+/// not exotic. A site that forgets streams an operand it is simultaneously
+/// overwriting, which corrupts whichever rows the kernel reached first: a
+/// nondeterministic band of output that `RLX_ARENA_NO_REUSE=1` makes disappear
+/// and no amount of staring at the graph explains. Auditing call sites by hand
+/// does not scale, so this catches them centrally and names the shape.
+#[inline]
+pub(crate) fn alias_check(
+    site: &str,
+    a: &[f32],
+    b: &[f32],
+    c: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    if !rlx_ir::env::flag("RLX_BLAS_ALIAS_CHECK") {
+        return;
+    }
+    let span = |x: &[f32]| {
+        let p = x.as_ptr() as usize;
+        (p, p + std::mem::size_of_val(x))
+    };
+    let (c0, c1) = span(c);
+    for (name, operand) in [("a", a), ("b", b)] {
+        let (o0, o1) = span(operand);
+        if o0 < c1 && c0 < o1 {
+            eprintln!(
+                "[blas-alias] {site}: operand {name} [{o0:#x},{o1:#x}) overlaps dest \
+                 [{c0:#x},{c1:#x}) — m={m} k={k} n={n}"
+            );
+        }
+    }
+}
+
 /// B: [k, n] row-major
 /// C: [m, n] row-major
 #[inline]
 pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    alias_check("sgemm", a, b, c, m, k, n);
     if f64_accum_enabled() {
         dgemm_f32_precise(a, b, c, m, k, n, false);
         return;
@@ -2544,6 +2584,7 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) 
 /// C += alpha * A @ B (accumulate into existing C)
 #[inline]
 pub fn sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    alias_check("sgemm_accumulate", a, b, c, m, k, n);
     if f64_accum_enabled() {
         dgemm_f32_precise(a, b, c, m, k, n, true);
         return;
@@ -2571,6 +2612,7 @@ pub fn sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize,
 /// Like [`sgemm_accumulate`] with the same Rayon-split dispatch as [`sgemm_auto`].
 #[inline]
 pub fn sgemm_accumulate_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    alias_check("sgemm_accumulate_auto", a, b, c, m, k, n);
     // Precision mode wins over the parallel dispatch: the f64-accum path is
     // serial (vendor `dgemm`), so route straight to it and skip `par_sgemm`.
     if f64_accum_enabled() {
@@ -2589,6 +2631,7 @@ pub fn sgemm_accumulate_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: u
 /// C = A @ B^T (B transposed — useful for SDPA Q@K^T)
 #[inline]
 pub fn sgemm_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, alpha: f32) {
+    alias_check("sgemm_bt", a, b, c, m, k, n);
     unsafe {
         cblas_sgemm(
             ROW_MAJOR,
@@ -2694,6 +2737,7 @@ pub fn sgemm_strided(
     lda: usize,
     ldc: usize,
 ) {
+    alias_check("sgemm_strided", a, b, c, m, k, n);
     unsafe {
         cblas_sgemm(
             ROW_MAJOR,
@@ -2797,6 +2841,7 @@ pub unsafe fn sgemm_general(
 /// Auto-dispatches: NEON for tiny matrices, BLAS for everything else.
 #[inline]
 pub fn sgemm_bias(a: &[f32], b: &[f32], bias: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    alias_check("sgemm_bias", a, b, c, m, k, n);
     // Cost model decides: NEON when BLAS overhead dominates the compute.
     if m <= 8 && crate::cost::hw_model().prefer_neon_sgemm(m, k, n) {
         crate::kernels::neon_sgemm_bias_small(a, b, bias, c, m, k, n);
@@ -2832,6 +2877,7 @@ pub fn sgemm_epilogue<E: Fn(f32) -> f32>(
     n: usize,
     epilogue: E,
 ) {
+    alias_check("sgemm_epilogue", a, b, c, m, k, n);
     sgemm(a, b, c, m, k, n);
     for v in c.iter_mut() {
         *v = epilogue(*v);
@@ -2855,6 +2901,7 @@ pub fn sgemm_bias_epilogue<E: Fn(f32) -> f32>(
     n: usize,
     activation: E,
 ) {
+    alias_check("sgemm_bias_epilogue", a, b, c, m, k, n);
     sgemm(a, b, c, m, k, n);
     // Fuse bias + activation in one pass over C.
     for i in 0..m {
@@ -2872,6 +2919,7 @@ pub fn sgemm_bias_epilogue<E: Fn(f32) -> f32>(
 /// Rayon owns outer parallelism. Large DiT/CNN GEMMs go through [`par_sgemm`].
 #[inline]
 pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    alias_check("sgemm_auto", a, b, c, m, k, n);
     // `parity-gemm` feature swaps in the same Rust `gemm` crate that
     // candle uses, yielding bit-exact reduction order. Useful for
     // parity tests and reproducibility-critical workloads; loses AMX.
@@ -2975,6 +3023,7 @@ fn prefer_par_sgemm(m: usize, k: usize, n: usize) -> bool {
 /// beats pure column/row splits — each worker only streams an A-panel and a
 /// B-panel instead of re-reading the full shared operand.
 pub fn par_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    alias_check("par_sgemm", a, b, c, m, k, n);
     let workers = crate::pool::num_threads();
     if !prefer_par_sgemm(m, k, n) {
         sgemm(a, b, c, m, k, n);
@@ -3093,6 +3142,7 @@ pub fn par_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
 
 /// Parallel accumulate GEMM: same split as [`par_sgemm`] but β = 1 (add into C).
 pub fn par_sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    alias_check("par_sgemm_accumulate", a, b, c, m, k, n);
     let workers = crate::pool::num_threads();
     if !prefer_par_sgemm(m, k, n) {
         sgemm_accumulate(a, b, c, m, k, n);
@@ -3257,6 +3307,7 @@ pub fn par_sgemm_bias(
     k: usize,
     n: usize,
 ) {
+    alias_check("par_sgemm_bias", a, b, c, m, k, n);
     let workers = crate::pool::num_threads();
     if !prefer_par_sgemm(m, k, n) {
         sgemm_bias(a, b, bias, c, m, k, n);

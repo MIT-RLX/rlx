@@ -3830,7 +3830,18 @@ fn build_schedule(
                 let sin = node.inputs[2];
                 let xd = dims(graph, x);
                 let (batch, seq, hidden) = if xd.len() >= 3 {
-                    (xd[0], xd[1], xd[2])
+                    // The shader walks `[batch, seq, hidden]`: positions index the
+                    // second-to-last axis and a row holds `hidden / head_dim`
+                    // heads. Fold leading axes into `batch` instead of reading
+                    // dims 0/1/2 positionally — rank 4 `[B, H, S, D]` (BHSD
+                    // packing) otherwise takes `seq = H` and `hidden = S`,
+                    // dispatching `B*H*S` rows of `S` elements over a `B*H*S*D`
+                    // buffer and leaving the rest zero.
+                    let rank = xd.len();
+                    let hidden = xd[rank - 1];
+                    let seq = xd[rank - 2];
+                    let batch: usize = xd[..rank - 2].iter().product();
+                    (batch, seq, hidden)
                 } else {
                     let total = numel(&xd);
                     (1, xd[0], total / xd[0].max(1))
@@ -4025,7 +4036,14 @@ fn build_schedule(
                 let sin = node.inputs[2];
                 let dy_d = dims(graph, dy);
                 let (batch, seq, hidden) = if dy_d.len() >= 3 {
-                    (dy_d[0], dy_d[1], dy_d[2])
+                    // Fold leading axes into `batch` — same defect as the
+                    // forward path, on the gradient. See `Op::Rope` above.
+                    let rank = dy_d.len();
+                    (
+                        dy_d[..rank - 2].iter().product::<usize>(),
+                        dy_d[rank - 2],
+                        dy_d[rank - 1],
+                    )
                 } else {
                     (1, dy_d[0], dy_d[1])
                 };

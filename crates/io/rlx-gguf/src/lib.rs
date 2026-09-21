@@ -79,6 +79,7 @@ pub mod iq_grids;
 pub mod iq_quantize;
 pub mod mx_dequant;
 pub mod mx_quantize;
+pub mod ptq1_dequant;
 pub mod q1_dequant;
 pub mod q2_dequant;
 pub mod quantize;
@@ -152,6 +153,16 @@ pub enum GgmlType {
     // scale per group of 8. `token_embd` / `output` only — Pestle's
     // linears are factorized Q2_0 pairs. See g8_dequant.
     G8_0 = 143,
+    // PrismML llama.cpp fork, Ternary Bonsai 2. `PQ2_0` is the group-128
+    // `Q2_0` codec at its own type id (the fork re-points 42 at a
+    // group-64 variant), so it decodes through `q2_dequant` unchanged.
+    PQ2_0 = 142,
+    // `PTQ1_0` is base-3-packed ternary at group 128. On disk it is type
+    // **143 — the same id Pestle uses for `G8_0`** — so the discriminant
+    // here is synthetic and [`GgmlType::to_u32`] maps it back. Which of
+    // the two a `143` means is decided per file by [`TypeDialect`];
+    // never widen this to a bare `143 =>` arm.
+    PTQ1_0 = 1143,
 }
 
 /// Single source of truth for `GgmlType` ↔ canonical upstream name.
@@ -248,9 +259,69 @@ define_ggml_type_names! {
     (FV5, "FV5"),
     (FV5B, "FV5B"),
     (G8_0, "G8_0"),
+    (PQ2_0, "PQ2_0"),
+    (PTQ1_0, "PTQ1_0"),
+}
+
+/// Which fork's private type-id assignments a GGUF file uses.
+///
+/// Upstream ids are universal, but two forks both claimed **143**:
+/// Doses AI's `mortar.cpp` for [`GgmlType::G8_0`] and PrismML's
+/// llama.cpp for [`GgmlType::PTQ1_0`]. Nothing in the id itself
+/// distinguishes them, so the reader picks a dialect from file
+/// metadata — see [`TypeDialect::from_metadata`] — and a file that
+/// declares neither keeps the historical `G8_0` reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypeDialect {
+    /// Upstream ids plus Doses AI Pestle (`143` = `G8_0`).
+    #[default]
+    Default,
+    /// PrismML llama.cpp (`142` = `PQ2_0`, `143` = `PTQ1_0`).
+    Prism,
+}
+
+impl TypeDialect {
+    /// Pick the dialect from a parsed GGUF metadata map.
+    ///
+    /// PrismML writes its ternary models in a rotated weight basis and
+    /// records that as `prism.hadamard.*`; its loader refuses files that
+    /// lack the key, so its presence is a reliable marker and Pestle
+    /// files never carry it.
+    pub fn from_metadata<S: std::hash::BuildHasher>(
+        metadata: &HashMap<String, MetaValue, S>,
+    ) -> Self {
+        if metadata.keys().any(|k| k.starts_with("prism.")) {
+            Self::Prism
+        } else {
+            Self::Default
+        }
+    }
 }
 
 impl GgmlType {
+    /// The on-disk ggml type id for this variant.
+    ///
+    /// Not always `self as u32`: [`GgmlType::PTQ1_0`] carries a synthetic
+    /// discriminant because its real id collides with [`GgmlType::G8_0`].
+    pub fn to_u32(self) -> u32 {
+        match self {
+            Self::PTQ1_0 => 143,
+            other => other as u32,
+        }
+    }
+
+    /// Resolve an on-disk type id under a specific fork dialect.
+    pub fn from_u32_dialect(v: u32, dialect: TypeDialect) -> Result<Self> {
+        if dialect == TypeDialect::Prism {
+            match v {
+                142 => return Ok(Self::PQ2_0),
+                143 => return Ok(Self::PTQ1_0),
+                _ => {}
+            }
+        }
+        Self::from_u32(v)
+    }
+
     pub fn from_u32(v: u32) -> Result<Self> {
         Ok(match v {
             0 => Self::F32,
@@ -415,6 +486,12 @@ pub struct GgufFile {
     /// File this was mmap'd from, kept so tensors can be re-read with `pread`
     /// instead of borrowed from the mapping. See [`Self::read_tensor_bytes_into`].
     src_path: Option<std::path::PathBuf>,
+    /// Lazily-opened handle on `src_path`, reused across
+    /// [`Self::read_tensor_bytes_into`] calls. Re-opening per tensor cost an
+    /// `open`+`close` and a full path walk for every tensor in the checkpoint
+    /// (hundreds per model) for no benefit — `pread` needs no per-call seek
+    /// state, so one shared read-only descriptor serves every tensor.
+    src_file: std::sync::OnceLock<File>,
 }
 
 impl GgufFile {
@@ -481,6 +558,7 @@ impl GgufFile {
     pub fn empty() -> Self {
         Self {
             src_path: None,
+            src_file: std::sync::OnceLock::new(),
             version: 3,
             alignment: 32,
             metadata: HashMap::new(),
@@ -602,6 +680,10 @@ impl GgufFile {
             .and_then(MetaValue::as_u64)
             .unwrap_or(DEFAULT_ALIGNMENT);
 
+        // Must be decided before the tensor loop: fork-private type ids
+        // (142/143) resolve differently per dialect.
+        let dialect = TypeDialect::from_metadata(&metadata);
+
         // Same untrusted-count hardening as the metadata map above.
         let mut tensors = HashMap::with_capacity((tensor_count as usize).min(1 << 16));
         for _ in 0..tensor_count {
@@ -619,8 +701,8 @@ impl GgufFile {
                 shape.push(d as usize);
             }
             let dtype_raw = read_u32(r)?;
-            let dtype =
-                GgmlType::from_u32(dtype_raw).with_context(|| format!("tensor {name}: dtype"))?;
+            let dtype = GgmlType::from_u32_dialect(dtype_raw, dialect)
+                .with_context(|| format!("tensor {name}: dtype"))?;
             let offset = read_u64(r)?;
             tensors.insert(
                 name.clone(),
@@ -647,6 +729,7 @@ impl GgufFile {
 
         Ok(Self {
             src_path: None,
+            src_file: std::sync::OnceLock::new(),
             version,
             alignment,
             metadata,
@@ -705,67 +788,7 @@ impl GgufFile {
             .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
         let n = t.n_elements();
         let bytes = self.tensor_bytes(t)?;
-        let data = match t.dtype {
-            GgmlType::F32 => dequant_f32_raw(bytes, n)?,
-            GgmlType::F16 => dequant_f16(bytes, n)?,
-            GgmlType::BF16 => dequant_bf16(bytes, n)?,
-            GgmlType::Q8_0 => dequant_q8_0(bytes, n)?,
-            GgmlType::Q4_0 => dequant_q4_0(bytes, n)?,
-            GgmlType::Q4_1 => dequant_q4_1(bytes, n)?,
-            GgmlType::Q5_0 => dequant_q5_0(bytes, n)?,
-            GgmlType::Q5_1 => dequant_q5_1(bytes, n)?,
-            GgmlType::Q4K => dequant_q4_k(bytes, n)?,
-            GgmlType::Q5K => dequant_q5_k(bytes, n)?,
-            GgmlType::Q6K => dequant_q6_k(bytes, n)?,
-            GgmlType::Q8K => dequant_q8_k(bytes, n)?,
-            GgmlType::Q2K => dequant_q2_k(bytes, n)?,
-            GgmlType::Q3K => dequant_q3_k(bytes, n)?,
-            GgmlType::TQ1_0 => tq_dequant::dequant_tq1_0(bytes, n)?,
-            GgmlType::TQ2_0 => tq_dequant::dequant_tq2_0(bytes, n)?,
-            GgmlType::I2_S => i2s_dequant::dequant_i2_s(bytes, n)?,
-            GgmlType::I8_S => i8s_dequant::dequant_i8_s(bytes, n)?,
-            GgmlType::MXFP4 => mx_dequant::dequant_mxfp4(bytes, n)?,
-            GgmlType::NVFP4 => mx_dequant::dequant_nvfp4(bytes, n)?,
-            GgmlType::IQ4NL => iq_dequant::dequant_iq4_nl(bytes, n)?,
-            GgmlType::IQ4XS => iq_dequant::dequant_iq4_xs(bytes, n)?,
-            GgmlType::IQ2XXS => iq_dequant::dequant_iq2_xxs(bytes, n)?,
-            GgmlType::IQ2XS => iq_dequant::dequant_iq2_xs(bytes, n)?,
-            GgmlType::IQ2S => iq_dequant::dequant_iq2_s(bytes, n)?,
-            GgmlType::IQ3XXS => iq_dequant::dequant_iq3_xxs(bytes, n)?,
-            GgmlType::IQ3S => iq_dequant::dequant_iq3_s(bytes, n)?,
-            GgmlType::IQ1S => iq_dequant::dequant_iq1_s(bytes, n)?,
-            GgmlType::IQ1M => iq_dequant::dequant_iq1_m(bytes, n)?,
-            GgmlType::Q1_0 => q1_dequant::dequant_q1_0(bytes, n)?,
-            GgmlType::Q2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
-            GgmlType::FV5 => fv5_dequant::dequant_fv5(bytes, n)?,
-            GgmlType::FV5B => fv5_dequant::dequant_fv5b(bytes, n)?,
-            GgmlType::G8_0 => g8_dequant::dequant_g8_0(bytes, n)?,
-            GgmlType::I8 => {
-                if bytes.len() != n {
-                    bail!("I8 tensor {name}: expected {n} bytes, got {}", bytes.len());
-                }
-                bytes.iter().map(|&b| b as i8 as f32).collect()
-            }
-            GgmlType::I16 => {
-                if bytes.len() != n * 2 {
-                    bail!("I16 tensor {name}: bad byte length {}", bytes.len());
-                }
-                bytes
-                    .chunks_exact(2)
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
-                    .collect()
-            }
-            GgmlType::I32 => {
-                if bytes.len() != n * 4 {
-                    bail!("I32 tensor {name}: bad byte length {}", bytes.len());
-                }
-                bytes
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
-                    .collect()
-            }
-            other => bail!("dequant for {other:?} not implemented yet (tensor {name})"),
-        };
+        let data = dequant_typed(t.dtype, bytes, n, name)?;
         Ok((data, t.shape.clone()))
     }
 
@@ -801,9 +824,24 @@ impl GgufFile {
             .data_offset
             .checked_add(t.offset)
             .ok_or_else(|| anyhow!("tensor {} file offset overflow", t.name))?;
-        buf.clear();
+        // NOTE: no `buf.clear()` here. `Vec::resize` only initializes elements
+        // it *adds*, so clearing first would zero-fill all `nbytes` immediately
+        // before `read_exact_at` overwrites every one of them — a memset of the
+        // whole checkpoint across a load. Resizing from the previous length
+        // instead zeroes only the growth delta, so a reused scratch pays at most
+        // the largest single tensor once.
         buf.resize(nbytes, 0);
-        let f = File::open(path).with_context(|| format!("reopening {}", path.display()))?;
+        let f = match self.src_file.get() {
+            Some(f) => f,
+            None => {
+                let f =
+                    File::open(path).with_context(|| format!("reopening {}", path.display()))?;
+                // Racing initializers are fine: both handles are read-only on
+                // the same path, and the loser is simply dropped.
+                let _ = self.src_file.set(f);
+                self.src_file.get().expect("src_file just set")
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -813,9 +851,9 @@ impl GgufFile {
         #[cfg(not(unix))]
         {
             use std::io::{Read, Seek, SeekFrom};
-            let mut f = f;
-            f.seek(SeekFrom::Start(off))?;
-            f.read_exact(buf)?;
+            let mut fh = f.try_clone()?;
+            fh.seek(SeekFrom::Start(off))?;
+            fh.read_exact(buf)?;
         }
         Ok(true)
     }
@@ -860,6 +898,78 @@ pub const K_SCALE_SIZE: usize = 12;
 
 /// Bytes a tensor of `n` elements occupies in storage for `dtype`.
 /// Returns `None` if `n` doesn't divide the scheme's block size.
+/// Dequantize raw tensor bytes of a given GGML type to `f32`.
+///
+/// Split out of [`GgufFile::dequant_f32`] so a caller can decode a SLICE —
+/// one embedding row out of a packed table, say — without materializing the
+/// whole tensor. `label` only appears in error messages.
+pub fn dequant_typed(dtype: GgmlType, bytes: &[u8], n: usize, label: &str) -> Result<Vec<f32>> {
+    let name = label;
+    let data = match dtype {
+        GgmlType::F32 => dequant_f32_raw(bytes, n)?,
+        GgmlType::F16 => dequant_f16(bytes, n)?,
+        GgmlType::BF16 => dequant_bf16(bytes, n)?,
+        GgmlType::Q8_0 => dequant_q8_0(bytes, n)?,
+        GgmlType::Q4_0 => dequant_q4_0(bytes, n)?,
+        GgmlType::Q4_1 => dequant_q4_1(bytes, n)?,
+        GgmlType::Q5_0 => dequant_q5_0(bytes, n)?,
+        GgmlType::Q5_1 => dequant_q5_1(bytes, n)?,
+        GgmlType::Q4K => dequant_q4_k(bytes, n)?,
+        GgmlType::Q5K => dequant_q5_k(bytes, n)?,
+        GgmlType::Q6K => dequant_q6_k(bytes, n)?,
+        GgmlType::Q8K => dequant_q8_k(bytes, n)?,
+        GgmlType::Q2K => dequant_q2_k(bytes, n)?,
+        GgmlType::Q3K => dequant_q3_k(bytes, n)?,
+        GgmlType::TQ1_0 => tq_dequant::dequant_tq1_0(bytes, n)?,
+        GgmlType::TQ2_0 => tq_dequant::dequant_tq2_0(bytes, n)?,
+        GgmlType::I2_S => i2s_dequant::dequant_i2_s(bytes, n)?,
+        GgmlType::I8_S => i8s_dequant::dequant_i8_s(bytes, n)?,
+        GgmlType::MXFP4 => mx_dequant::dequant_mxfp4(bytes, n)?,
+        GgmlType::NVFP4 => mx_dequant::dequant_nvfp4(bytes, n)?,
+        GgmlType::IQ4NL => iq_dequant::dequant_iq4_nl(bytes, n)?,
+        GgmlType::IQ4XS => iq_dequant::dequant_iq4_xs(bytes, n)?,
+        GgmlType::IQ2XXS => iq_dequant::dequant_iq2_xxs(bytes, n)?,
+        GgmlType::IQ2XS => iq_dequant::dequant_iq2_xs(bytes, n)?,
+        GgmlType::IQ2S => iq_dequant::dequant_iq2_s(bytes, n)?,
+        GgmlType::IQ3XXS => iq_dequant::dequant_iq3_xxs(bytes, n)?,
+        GgmlType::IQ3S => iq_dequant::dequant_iq3_s(bytes, n)?,
+        GgmlType::IQ1S => iq_dequant::dequant_iq1_s(bytes, n)?,
+        GgmlType::IQ1M => iq_dequant::dequant_iq1_m(bytes, n)?,
+        GgmlType::Q1_0 => q1_dequant::dequant_q1_0(bytes, n)?,
+        GgmlType::Q2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
+        GgmlType::FV5 => fv5_dequant::dequant_fv5(bytes, n)?,
+        GgmlType::FV5B => fv5_dequant::dequant_fv5b(bytes, n)?,
+        GgmlType::G8_0 => g8_dequant::dequant_g8_0(bytes, n)?,
+        GgmlType::PQ2_0 => q2_dequant::dequant_q2_0(bytes, n)?,
+        GgmlType::PTQ1_0 => ptq1_dequant::dequant_ptq1_0(bytes, n)?,
+        GgmlType::I8 => {
+            if bytes.len() != n {
+                bail!("I8 tensor {name}: expected {n} bytes, got {}", bytes.len());
+            }
+            bytes.iter().map(|&b| b as i8 as f32).collect()
+        }
+        GgmlType::I16 => {
+            if bytes.len() != n * 2 {
+                bail!("I16 tensor {name}: bad byte length {}", bytes.len());
+            }
+            bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
+                .collect()
+        }
+        GgmlType::I32 => {
+            if bytes.len() != n * 4 {
+                bail!("I32 tensor {name}: bad byte length {}", bytes.len());
+            }
+            bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                .collect()
+        }
+        other => bail!("dequant for {other:?} not implemented yet (tensor {name})"),
+    };
+    Ok(data)
+}
 pub fn bytes_for_public(dtype: GgmlType, n: usize) -> Option<usize> {
     bytes_for(dtype, n)
 }
@@ -911,6 +1021,10 @@ fn bytes_for(dtype: GgmlType, n: usize) -> Option<usize> {
         GgmlType::FV5B => fv5_dequant::fv5b_bytes(n),
         // Pestle exact ternary (Doses AI): 32-elem blocks, 4 bf16 scales.
         GgmlType::G8_0 => g8_dequant::g8_0_bytes(n),
+        // PrismML Ternary Bonsai 2: same 2-bit codec as Q2_0 at its own
+        // type id, and base-3 ternary at 28 bytes / 128 elements.
+        GgmlType::PQ2_0 => q2_dequant::q2_0_bytes(n),
+        GgmlType::PTQ1_0 => ptq1_dequant::ptq1_0_bytes(n),
         GgmlType::I8 => Some(n),
         GgmlType::I16 => Some(n * 2),
         GgmlType::I32 => Some(n * 4),

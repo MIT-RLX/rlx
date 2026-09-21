@@ -15,12 +15,18 @@
 //! `rlx-metal::arena` for actual MTLBuffer transfers.
 
 use crate::Device;
+use rlx_ir::bytes::AlignedBytes;
 use rlx_ir::{DType, Shape};
 
 /// A buffer that knows where its bytes live.
+///
+/// Storage is [`AlignedBytes`] rather than `Vec<u8>` because [`Buffer::as_f32`]
+/// hands out a borrowed `&[f32]` over these bytes, and `Vec<u8>` only promises
+/// alignment 1 — reinterpreting it as `&[f32]` is UB even though the system
+/// allocator happens to return 16-aligned blocks today.
 #[derive(Debug, Clone)]
 pub struct Buffer {
-    bytes: Vec<u8>,
+    bytes: AlignedBytes,
     shape: Shape,
     device: Device,
 }
@@ -32,7 +38,7 @@ impl Buffer {
     /// integrates with the arena.
     pub fn new_host(shape: Shape, data: Vec<u8>) -> Self {
         Self {
-            bytes: data,
+            bytes: AlignedBytes::from_slice(&data),
             shape,
             device: Device::Cpu,
         }
@@ -42,7 +48,7 @@ impl Buffer {
     pub fn zeros(shape: Shape) -> Self {
         let n = shape.size_bytes().unwrap_or(0);
         Self {
-            bytes: vec![0u8; n],
+            bytes: AlignedBytes::zeroed(n),
             shape,
             device: Device::Cpu,
         }
@@ -69,13 +75,15 @@ impl Buffer {
     pub fn as_f32(&self) -> &[f32] {
         assert_eq!(self.dtype(), DType::F32, "as_f32 on non-F32 buffer");
         let n = self.num_elements();
-        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr() as *const f32, n) }
+        // Sound without an alignment check: `AlignedBytes` pins the base at 64
+        // bytes, which covers `align_of::<f32>()`.
+        &self.bytes.as_slice_of::<f32>()[..n]
     }
 
     pub fn as_f32_mut(&mut self) -> &mut [f32] {
         assert_eq!(self.dtype(), DType::F32, "as_f32_mut on non-F32 buffer");
         let n = self.num_elements();
-        unsafe { std::slice::from_raw_parts_mut(self.bytes.as_mut_ptr() as *mut f32, n) }
+        &mut self.bytes.slice_of_mut::<f32>(0, self.bytes.len())[..n]
     }
 
     /// "Move to device" — explicit transfer call. CPU is a no-op

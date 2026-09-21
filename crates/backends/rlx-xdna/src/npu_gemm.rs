@@ -334,8 +334,10 @@ impl NpuIoF32 {
     /// Reinterprets the f32 slice as i32 (identical 4-byte layout) so the shim's
     /// byte-copy DMA is unchanged; the overlay's MLIR defines the f32 semantics.
     pub fn run(&self, input: &[f32]) -> Result<Vec<f32>, XdnaError> {
-        // SAFETY: f32 and i32 share size/alignment; reinterpreting the bit
-        // pattern is exactly what the byte-level DMA already does.
+        // SAFETY: f32 and i32 share size AND alignment, so this does not raise
+        // the alignment requirement; reinterpreting the bit pattern is exactly
+        // what the byte-level DMA already does. Every 4-byte pattern is a
+        // valid i32.
         let as_i32: &[i32] =
             unsafe { std::slice::from_raw_parts(input.as_ptr() as *const i32, input.len()) };
         let out_i32 = self.inner.run(as_i32)?;
@@ -399,15 +401,25 @@ impl NpuIoBf16 {
     /// movement beyond the cast); the overlay's MLIR defines the bf16 semantics.
     pub fn run(&self, input: &[f32]) -> Result<Vec<f32>, XdnaError> {
         assert_eq!(input.len(), self.n, "input must be n bf16 elements");
+        // Pack pairs of bf16 halves into i32 cells for the shim's byte-level
+        // DMA. Built directly rather than by reinterpreting a `Vec<u16>` as
+        // `&[i32]`: that raises the required alignment from 2 to 4, which a
+        // `Vec<u16>` does not promise. Little-endian keeps element order.
         let bf: Vec<u16> = input.iter().map(|&f| f32_to_bf16(f)).collect();
-        // SAFETY: 2 u16 (4 bytes) reinterpreted as 1 i32 — same layout; the DMA
-        // is byte-level and little-endian preserves element order.
-        let as_i32: &[i32] =
-            unsafe { std::slice::from_raw_parts(bf.as_ptr() as *const i32, self.n / 2) };
-        let out_i32 = self.inner.run(as_i32)?;
-        let out_bf: &[u16] =
-            unsafe { std::slice::from_raw_parts(out_i32.as_ptr() as *const u16, self.n) };
-        Ok(out_bf.iter().map(|&b| bf16_to_f32(b)).collect())
+        let as_i32: Vec<i32> = bf
+            .chunks_exact(2)
+            .map(|c| i32::from(c[0]) | (i32::from(c[1]) << 16))
+            .collect();
+        debug_assert_eq!(as_i32.len(), self.n / 2);
+        let out_i32 = self.inner.run(&as_i32)?;
+        // Unpack the i32 cells back into bf16 halves (the inverse of the pack
+        // above; narrowing a `&[i32]` to `&[u16]` would be alignment-sound but
+        // is spelled explicitly here so both directions read the same).
+        Ok(out_i32
+            .iter()
+            .flat_map(|&w| [bf16_to_f32(w as u16), bf16_to_f32((w >> 16) as u16)])
+            .take(self.n)
+            .collect())
     }
 }
 

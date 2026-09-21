@@ -3387,7 +3387,8 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::GgufQ5_0
             | QuantScheme::GgufQ5_1
             | QuantScheme::GgufQ1_0
-            | QuantScheme::GgufQ2_0 => panic!(
+            | QuantScheme::GgufQ2_0
+            | QuantScheme::GgufPtq1_0 => panic!(
                 "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
             ),
             QuantScheme::GgufQ4K

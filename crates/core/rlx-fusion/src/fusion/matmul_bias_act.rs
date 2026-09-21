@@ -176,13 +176,31 @@ fn match_matmul_bias_act(
     };
 
     // The non-matmul operand carries the bias, and the epilogue kernel adds it
-    // per output channel — so it must be rank-≤1.
+    // per output channel — so it must be EXACTLY rank-1 with one value per column.
+    //
+    // `rank() > 1` alone was not enough: it also admitted rank-0. A scalar carries
+    // one element where the epilogue wants `n`, so every column but the first lost
+    // the addend — a quiet wrong answer rather than a crash, and because only one
+    // lane of many is affected the downstream cosine stays around 0.99 and spot
+    // checks pass. Callers had been working around it by materialising the scalar
+    // (`Graph::full` instead of `Graph::constant`); declining the fusion here costs
+    // one un-fused broadcast add and is always correct.
     let bias_id = if add_node.inputs[0] == mm_id {
         add_node.inputs[1]
     } else {
         add_node.inputs[0]
     };
-    if graph.shape(bias_id).rank() > 1 {
+    let bias_shape = graph.shape(bias_id);
+    if bias_shape.rank() != 1 {
+        return None;
+    }
+    // And it must be as wide as the matmul's output columns; a rank-1 bias of any
+    // other length is a broadcast the epilogue does not implement.
+    let out_cols = match graph.shape(mm_id).dims().last() {
+        Some(&n) => n,
+        None => return None,
+    };
+    if bias_shape.dims().last() != Some(&out_cols) {
         return None;
     }
 

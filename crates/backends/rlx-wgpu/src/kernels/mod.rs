@@ -1103,9 +1103,18 @@ pub struct RopeParams {
     pub style: u32,
     /// Partial rotary: half of `n_rot` (the rotated width). Dims `[n_rot,
     /// head_dim)` are copied through unchanged. Equals `half` for full rotation
-    /// (n_rot == head_dim); smaller for p-RoPE (Gemma 4 global layers). The
-    /// cos/sin row stride stays `half` (head_dim/2), matching the CPU reference.
+    /// (n_rot == head_dim); smaller for p-RoPE (Gemma 4 global layers).
     pub rot_half: u32,
+    /// Elements per row of the cos/sin tables — the table's OWN last dimension
+    /// (`rlx_ir::shape::rope_table_stride`), which is not `rot_half`.
+    ///
+    /// A table allocated at `head_dim / 2` and only partly used under partial
+    /// rotation has a wider row than `n_rot / 2`; indexing it by `rot_half`
+    /// reads the wrong row for every position past the first, while still
+    /// producing a correctly-normed rotation, so it looks right. The CPU kernel
+    /// carries the same field for the same reason; the shader used to assume
+    /// `rot_half` and silently disagreed with CPU whenever `n_rot < head_dim`.
+    pub cos_row_stride: u32,
 }
 
 /// Layout for Expand. Mirrors TransposeParams (rank, total, offsets);

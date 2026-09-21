@@ -86,9 +86,8 @@ impl ExecutableGraph for TpuExecutableWrapper {
     /// the original bytes straight through `Buffer_FromHostBuffer`.
     fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
         if dtype == rlx_ir::DType::F32 {
-            let n = data.len() / 4;
-            let s = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-            self.inner.set_param(name, s);
+            let s = rlx_ir::bytes::decode_le::<f32>(data);
+            self.inner.set_param(name, s.as_ref());
         } else {
             let f32_buf = super::widen_bytes_to_f32(data, dtype);
             self.inner.set_param(name, &f32_buf);

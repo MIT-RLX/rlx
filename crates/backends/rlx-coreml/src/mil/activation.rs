@@ -115,7 +115,94 @@ impl<'a> LowerCtx<'a> {
                 )?;
                 self.push_named(id, out_name.to_string(), op);
             }
-            _ => unreachable!("handled above"),
+            // mish(x) = x * tanh(softplus(x))
+            Activation::Mish => {
+                let sp = format!("{out_name}_softplus");
+                let op =
+                    self.simple_op("softplus", &sp, &node.shape, vec![("x", bind_name(&x))])?;
+                self.operations.push(op);
+                let th = format!("{out_name}_tanh");
+                let op = self.simple_op("tanh", &th, &node.shape, vec![("x", bind_name(&sp))])?;
+                self.operations.push(op);
+                let op = self.simple_op(
+                    "mul",
+                    out_name,
+                    &node.shape,
+                    vec![("x", bind_name(&x)), ("y", bind_name(&th))],
+                )?;
+                self.push_named(id, out_name.to_string(), op);
+            }
+            // log_sigmoid(x) = -softplus(-x). Computing it as `log(sigmoid(x))`
+            // instead underflows to -inf once sigmoid rounds to zero, which is
+            // the whole reason the fused form exists.
+            Activation::LogSigmoid => {
+                let neg = format!("{out_name}_neg");
+                let op = self.simple_op(
+                    "mul",
+                    &neg,
+                    &node.shape,
+                    vec![("x", bind_name(&x)), ("y", bind_value(scalar_f32(-1.0)))],
+                )?;
+                self.operations.push(op);
+                let sp = format!("{out_name}_softplus");
+                let op =
+                    self.simple_op("softplus", &sp, &node.shape, vec![("x", bind_name(&neg))])?;
+                self.operations.push(op);
+                let op = self.simple_op(
+                    "mul",
+                    out_name,
+                    &node.shape,
+                    vec![("x", bind_name(&sp)), ("y", bind_value(scalar_f32(-1.0)))],
+                )?;
+                self.push_named(id, out_name.to_string(), op);
+            }
+            // hard_sigmoid(x) = clip(x/6 + 0.5, 0, 1). MIL's own `sigmoid_hard`
+            // takes alpha/beta with exactly this parameterisation.
+            Activation::HardSigmoid => {
+                let op = self.simple_op(
+                    "sigmoid_hard",
+                    out_name,
+                    &node.shape,
+                    vec![
+                        ("x", bind_name(&x)),
+                        ("alpha", bind_value(scalar_f32(1.0 / 6.0))),
+                        ("beta", bind_value(scalar_f32(0.5))),
+                    ],
+                )?;
+                self.push_named(id, out_name.to_string(), op);
+            }
+            // hard_swish(x) = x * hard_sigmoid(x)
+            Activation::HardSwish => {
+                let hs = format!("{out_name}_hard_sigmoid");
+                let op = self.simple_op(
+                    "sigmoid_hard",
+                    &hs,
+                    &node.shape,
+                    vec![
+                        ("x", bind_name(&x)),
+                        ("alpha", bind_value(scalar_f32(1.0 / 6.0))),
+                        ("beta", bind_value(scalar_f32(0.5))),
+                    ],
+                )?;
+                self.operations.push(op);
+                let op = self.simple_op(
+                    "mul",
+                    out_name,
+                    &node.shape,
+                    vec![("x", bind_name(&x)), ("y", bind_name(&hs))],
+                )?;
+                self.push_named(id, out_name.to_string(), op);
+            }
+            // Not `unreachable!`: the `direct` table above and this match are
+            // two lists that have to stay in step, and they have drifted before
+            // — `Mish` reached here and panicked inside the backend rather than
+            // reporting an unsupported op. A new `Activation` variant must
+            // produce a diagnosable error, not a crash.
+            other => {
+                return Err(CoremlError::Unsupported(format!(
+                    "activation {other:?} has no MIL lowering"
+                )));
+            }
         }
         Ok(())
     }

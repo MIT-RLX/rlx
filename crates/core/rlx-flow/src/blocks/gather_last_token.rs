@@ -48,9 +48,19 @@ impl BlockStage for GatherLastTokenStage {
             // Declaring this F32 produced garbage logits (stable wrong
             // token streams like "< as as as…").
             let idx = ctx.input(&self.input_name, Shape::new(&[self.batch], DType::I32));
+            let hidden = input.shape.dim(2).unwrap_static();
             let mut gb = HirMut::new(ctx.hir());
             let idx_2d = gb.reshape_(idx, vec![self.batch as i64, 1]);
-            gb.gather_(input.id, idx_2d, 1)
+            let gathered = gb.gather_(input.id, idx_2d, 1);
+            // ONNX `Gather` splices the index's own shape into the output, so a
+            // rank-2 index on a rank-3 input yields rank 4:
+            // `[batch, 1, 1, hidden]`. The declared `out_shape` below is rank 3,
+            // and a backend that sizes its write from the declared shape then
+            // fills only a fraction of the buffer — on MLX this returned logits
+            // that were partly or entirely zero, silently, for every model
+            // using the dynamic last-token gather. Squeeze the spurious unit
+            // axis so the node's real shape is the one it advertises.
+            gb.reshape_(gathered, vec![self.batch as i64, 1, hidden as i64])
         };
         let out_shape = if input.shape.rank() >= 2 {
             let batch = input.shape.dim(0).unwrap_static();

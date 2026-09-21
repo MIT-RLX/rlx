@@ -10,12 +10,20 @@
 //! generation counter — no deallocation, no reallocation.
 
 use rlx_ir::NodeId;
+use rlx_ir::bytes::AlignedBytes;
 use rlx_opt::memory::MemoryPlan;
 
 /// Pre-allocated memory arena for graph execution.
+///
+/// The backing store is [`AlignedBytes`], not `Vec<u8>`: slots are handed out
+/// as `&[f32]` / `&[f64]`, and `Vec<u8>` only promises alignment 1. Aligning
+/// the planner's *offsets* to 64 does nothing for that — an aligned offset
+/// from an unaligned base is still an unaligned address. `AlignedBytes` pins
+/// the base at 64 bytes, so `base + offset` is genuinely aligned and the
+/// reinterprets below are sound rather than allocator luck.
 #[derive(Clone)]
 pub struct Arena {
-    buf: Vec<u8>,
+    buf: AlignedBytes,
     plan: MemoryPlan,
 }
 
@@ -44,7 +52,7 @@ impl Arena {
                 plan.arena_size as isize - worst as isize
             );
         }
-        let buf = vec![0u8; plan.arena_size];
+        let buf = AlignedBytes::zeroed(plan.arena_size);
         Self { buf, plan }
     }
 
@@ -63,10 +71,10 @@ impl Arena {
             .assignments
             .get(&id)
             .unwrap_or_else(|| panic!("no buffer for {id}"));
-        let bytes = &mut self.buf[slot.offset..slot.offset + slot.size];
-        // SAFETY: buf is aligned to at least 1, but we need f32 alignment.
-        // The memory planner aligns to 64 bytes, so this is safe.
-        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, slot.size / 4) }
+        // 64-aligned base + a planner-aligned offset ⇒ f32-aligned address.
+        // `slice_of_mut` re-checks the offset and panics rather than handing
+        // back a misaligned `&mut [f32]`.
+        self.buf.slice_of_mut::<f32>(slot.offset, slot.size)
     }
 
     /// Get a read-only f32 slice for a node's buffer.
@@ -76,8 +84,7 @@ impl Arena {
             .assignments
             .get(&id)
             .unwrap_or_else(|| panic!("no buffer for {id}"));
-        let bytes = &self.buf[slot.offset..slot.offset + slot.size];
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, slot.size / 4) }
+        self.buf.slice_of::<f32>(slot.offset, slot.size)
     }
 
     /// Get a mutable f64 slice for a node's buffer.
@@ -97,9 +104,7 @@ impl Arena {
             id,
             slot.size
         );
-        let bytes = &mut self.buf[slot.offset..slot.offset + slot.size];
-        // SAFETY: planner aligns slots to 64 bytes ⇒ f64-aligned.
-        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f64, slot.size / 8) }
+        self.buf.slice_of_mut::<f64>(slot.offset, slot.size)
     }
 
     /// Get a read-only f64 slice for a node's buffer.
@@ -115,8 +120,7 @@ impl Arena {
             id,
             slot.size
         );
-        let bytes = &self.buf[slot.offset..slot.offset + slot.size];
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, slot.size / 8) }
+        self.buf.slice_of::<f64>(slot.offset, slot.size)
     }
 
     /// Check if a node has a buffer assignment.
@@ -132,6 +136,15 @@ impl Arena {
             .assignments
             .get(&id)
             .unwrap_or_else(|| panic!("no buffer for {id}"));
+        assert_eq!(
+            slot.offset % std::mem::align_of::<f32>(),
+            0,
+            "raw_ptr: slot offset {} is not 4-aligned",
+            slot.offset
+        );
+        // SAFETY: the arena base is 64-byte aligned and `offset` is 4-aligned
+        // (asserted), so the result is a valid, f32-aligned pointer into the
+        // allocation. Aliasing is the caller's obligation, as documented.
         let ptr = unsafe { self.buf.as_ptr().add(slot.offset) as *mut f32 };
         (ptr, slot.size / 4)
     }
@@ -213,5 +226,40 @@ mod tests {
         // s0's data persists
         let s0_read = arena.slice(NodeId(0));
         assert_eq!(s0_read[0], 42.0);
+    }
+
+    /// The arena hands out `&[f32]` / `&[f64]` views of its byte store, so the
+    /// base must be over-aligned. A `Vec<u8>` base (alignment 1 by contract)
+    /// made those reinterprets UB no matter how the planner aligned offsets.
+    #[test]
+    fn arena_base_is_over_aligned_for_typed_slices() {
+        let plan = MemoryPlan {
+            arena_size: 1024,
+            assignments: {
+                let mut m = HashMap::new();
+                m.insert(
+                    NodeId(0),
+                    BufferSlot {
+                        offset: 0,
+                        size: 64,
+                    },
+                );
+                m.insert(
+                    NodeId(1),
+                    BufferSlot {
+                        offset: 64,
+                        size: 64,
+                    },
+                );
+                m
+            },
+            schedule: vec![NodeId(0), NodeId(1)],
+        };
+        let arena = Arena::from_plan(plan);
+        assert_eq!(arena.raw_buf().as_ptr() as usize % 64, 0);
+        for id in [NodeId(0), NodeId(1)] {
+            assert_eq!(arena.slice(id).as_ptr() as usize % align_of::<f32>(), 0);
+            assert_eq!(arena.slice_f64(id).as_ptr() as usize % align_of::<f64>(), 0);
+        }
     }
 }

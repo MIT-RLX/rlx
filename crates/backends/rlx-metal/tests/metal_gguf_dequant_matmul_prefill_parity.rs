@@ -695,3 +695,252 @@ fn g8_0_decode_gemv_matches_reference() {
         .fold(0.0f32, f32::max);
     assert!(max_abs < 2e-3, "G8_0 decode Metal max_abs={max_abs}");
 }
+
+/// Fused `PTQ1_0` DECODE GEMV (`m == 1`) vs the CPU reference.
+///
+/// This kernel is the whole decode budget for `Ternary-Bonsai-2-27B` — the
+/// thunk profile puts `dequant_matmul_gguf` at ~90% before it exists and ~74%
+/// after — so it runs on every token of every generation. It reads the packed
+/// 28-byte blocks straight out of the arena rather than expanding the row to
+/// f32, and it resolves PTQ1_0's *staged* element → (byte, base-3 digit) map
+/// per lane. A wrong map still produces a well-formed ternary dot product from
+/// permuted weights, which is fluent and wrong rather than obviously broken.
+///
+/// Shapes cover the gate's two constraints (`k % 128`, `n % 8`) and the real
+/// model's widths.
+#[test]
+fn ptq1_0_decode_gemv_matches_cpu() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    // `RLX_METAL_PTQ1_0_NSG` is a runtime tuning knob, so every value it
+    // accepts has to be correct, not just the default — a sweep that trades
+    // a wrong answer for a faster one is not a sweep.
+    for nsg in ["", "1", "2", "4", "8"] {
+        // SAFETY: single-threaded test; read at encode time.
+        if nsg.is_empty() {
+            unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_NSG") };
+        } else {
+            unsafe { std::env::set_var("RLX_METAL_PTQ1_0_NSG", nsg) };
+        }
+        for (k, n) in [(128usize, 8usize), (256, 16), (512, 64), (1024, 24)] {
+            let d = run_case(QuantScheme::GgufPtq1_0, rlx_gguf::GgmlType::PTQ1_0, 1, k, n)
+                .expect("metal available");
+            assert!(
+                d < 1e-3,
+                "PTQ1_0 decode GEMV k={k} n={n} NSG={nsg:?} diverges from CPU by {d}"
+            );
+        }
+    }
+    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_NSG") };
+}
+
+/// The fused GEMV must agree with the scratch path it replaces.
+///
+/// `RLX_METAL_PTQ1_0_FUSED_DISABLE=1` selects the old expand-to-f32 +
+/// `sgemm` route. Both are Metal, so this isolates the new kernel from any
+/// Metal-vs-CPU difference.
+#[test]
+fn ptq1_0_fused_gemv_matches_the_scratch_path() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    let (k, n) = (512usize, 32usize);
+    let w_row: Vec<f32> = (0..k * n)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+        .collect();
+    let packed = rlx_gguf::quantize(&w_row, rlx_gguf::GgmlType::PTQ1_0).expect("quantize");
+    let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.017).sin()).collect();
+
+    let mut g = Graph::new("ptq1_gemv");
+    let x_in = g.input("x", Shape::new(&[1, k], DType::F32));
+    let w = g.param("w", Shape::new(&[packed.len()], DType::U8));
+    let y = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufPtq1_0,
+        },
+        vec![x_in, w],
+        Shape::new(&[1, n], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let run = || -> Vec<f32> {
+        let mut c = Session::new(Device::Metal).compile(g.clone());
+        c.set_param_typed("w", &packed, DType::U8);
+        c.run(&[("x", x.as_slice())]).remove(0)
+    };
+    let fused = run();
+    // SAFETY: single-threaded test; the flag is read at encode time.
+    unsafe { std::env::set_var("RLX_METAL_PTQ1_0_FUSED_DISABLE", "1") };
+    let scratch = run();
+    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_FUSED_DISABLE") };
+
+    let worst = fused
+        .iter()
+        .zip(&scratch)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst < 1e-3,
+        "fused PTQ1_0 GEMV disagrees with the scratch path by {worst}"
+    );
+}
+
+/// The non-default integer PTQ1_0 GEMV must compute the same thing.
+///
+/// `RLX_METAL_PTQ1_0_INT_PIPE=1` selects it (see `dequant_gguf.msl`). It is
+/// kept as the A/B reference for the float-pipe default, so it has to stay
+/// correct even while it is not the one that runs.
+#[test]
+fn ptq1_0_int_pipe_gemv_matches_cpu() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    // SAFETY: single-threaded test; the flag is read at encode time.
+    unsafe { std::env::set_var("RLX_METAL_PTQ1_0_INT_PIPE", "1") };
+    let results: Vec<(usize, usize, Option<f32>)> = [(128usize, 8usize), (512, 64), (1024, 24)]
+        .into_iter()
+        .map(|(k, n)| {
+            (
+                k,
+                n,
+                run_case(QuantScheme::GgufPtq1_0, rlx_gguf::GgmlType::PTQ1_0, 1, k, n),
+            )
+        })
+        .collect();
+    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_INT_PIPE") };
+    for (k, n, d) in results {
+        let d = d.expect("metal available");
+        assert!(d < 1e-3, "integer PTQ1_0 GEMV k={k} n={n} diverges by {d}");
+    }
+}
+
+/// Microbenchmark + `NSG` sweep for the fused `PTQ1_0` decode GEMV, at
+/// Ternary Bonsai 2's real projection shapes.
+///
+/// Two things make a naive timing loop useless here.
+///
+/// **Host overhead.** One `Session::run()` costs 0.11-0.19 ms of round trip,
+/// which is larger than the kernel at these shapes and varies run to run. So
+/// each graph packs `FANOUT` independent GEMVs — distinct `x` inputs against
+/// one shared weight, distinct so CSE cannot collapse them into one node —
+/// and the overhead is amortised `FANOUT`-fold instead of subtracted.
+///
+/// **Machine load.** End-to-end decode swings 2x with background jobs, and so
+/// does this. Worse, running one variant after another puts that drift on the
+/// variable under test: sequential readings claimed NSG=4 was 1.7x faster and
+/// NSG=8 2.7x slower, and interleaved both vanished. So `NSG` is a runtime
+/// flag (`RLX_METAL_PTQ1_0_NSG`, packed into the kernel's `flags` word) and
+/// every round times all variants back to back, keeping the per-variant min.
+///
+/// `cargo test -p rlx-metal --release --test metal_gguf_dequant_matmul_prefill_parity \
+///      ptq1_0_gemv_bandwidth -- --ignored --nocapture`
+#[test]
+#[ignore = "benchmark, not a correctness check"]
+fn ptq1_0_gemv_bandwidth() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    const NSGS: [u64; 3] = [2, 4, 8];
+    const ROUNDS: usize = 5;
+    const ITERS: usize = 8;
+    const FANOUT: usize = 16;
+
+    let shapes: [(usize, usize, &str); 4] = [
+        (5120, 10240, "attn_qkv"),
+        (6144, 5120, "ssm_out"),
+        (5120, 17408, "ffn_up"),
+        (17408, 5120, "ffn_down"),
+    ];
+
+    let mut best = vec![vec![f64::INFINITY; NSGS.len()]; shapes.len()];
+    let mut sessions = Vec::new();
+    let mut feeds_owned: Vec<Vec<(String, Vec<f32>)>> = Vec::new();
+    let mut nbytes = Vec::new();
+
+    for (k, n, _) in shapes {
+        let w: Vec<f32> = (0..k * n)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::PTQ1_0).expect("quantize");
+        let mut g = Graph::new("ptq1_bench");
+        let wp = g.param("w", Shape::new(&[packed.len()], DType::U8));
+        let mut outs = Vec::with_capacity(FANOUT);
+        let mut fx = Vec::with_capacity(FANOUT);
+        for f in 0..FANOUT {
+            let name = format!("x{f}");
+            let x_in = g.input(&name, Shape::new(&[1, k], DType::F32));
+            outs.push(g.add_node(
+                Op::DequantMatMul {
+                    scheme: QuantScheme::GgufPtq1_0,
+                },
+                vec![x_in, wp],
+                Shape::new(&[1, n], DType::F32),
+            ));
+            fx.push((
+                name,
+                (0..k)
+                    .map(|i| ((i + f) as f32 * 0.017).sin())
+                    .collect::<Vec<f32>>(),
+            ));
+        }
+        g.set_outputs(outs);
+        let mut c = Session::new(Device::Metal).compile(g);
+        c.set_param_typed("w", &packed, DType::U8);
+        nbytes.push(packed.len() as f64 * FANOUT as f64);
+        sessions.push(c);
+        feeds_owned.push(fx);
+    }
+
+    macro_rules! run {
+        ($c:expr, $fx:expr) => {{
+            let f: Vec<(&str, &[f32])> = $fx
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_slice()))
+                .collect();
+            let _ = $c.run(&f);
+        }};
+    }
+    for (si, c) in sessions.iter_mut().enumerate() {
+        for _ in 0..2 {
+            run!(c, feeds_owned[si]);
+        }
+    }
+    for _ in 0..ROUNDS {
+        for (ni, nsg) in NSGS.iter().enumerate() {
+            // SAFETY: single-threaded test; read at encode time.
+            unsafe { std::env::set_var("RLX_METAL_PTQ1_0_NSG", nsg.to_string()) };
+            for (si, c) in sessions.iter_mut().enumerate() {
+                let t = std::time::Instant::now();
+                for _ in 0..ITERS {
+                    run!(c, feeds_owned[si]);
+                }
+                let dt = t.elapsed().as_secs_f64() / ITERS as f64;
+                if dt < best[si][ni] {
+                    best[si][ni] = dt;
+                }
+            }
+        }
+    }
+    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_NSG") };
+
+    eprintln!(
+        "  effective weight GB/s, {FANOUT} GEMVs per run, min of {ROUNDS} interleaved rounds"
+    );
+    eprint!("  {:<10}", "shape");
+    for nsg in NSGS {
+        eprint!("   NSG={nsg:<8}");
+    }
+    eprintln!();
+    for (si, (k, n, label)) in shapes.iter().enumerate() {
+        eprint!("  {label:<10}");
+        for ni in 0..NSGS.len() {
+            eprint!("  {:>8.1}   ", nbytes[si] / best[si][ni] / 1e9);
+        }
+        eprintln!("  (k={k}, n={n})");
+    }
+}

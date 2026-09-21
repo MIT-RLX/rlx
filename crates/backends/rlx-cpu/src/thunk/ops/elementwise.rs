@@ -1960,7 +1960,30 @@ pub(crate) fn exec_concat(t: &Thunk, base: *mut u8) {
                 let in_axis = *in_axis as usize;
                 let copy_per_row = in_axis * inner;
                 let dst_col_off = cum * inner;
-                let inp = sl(*src_off, base, (*in_numel as usize).max(1));
+                let numel = (*in_numel as usize).max(1);
+                // An input whose arena slot overlaps the destination has to be
+                // staged first.
+                //
+                // Concat's destination is *wider* than its source, so the write
+                // cursor advances by `row_stride` while the read cursor advances
+                // by `copy_per_row`. Writing row 0 therefore lands on top of the
+                // bytes a later row still has to read, and the result is a
+                // contiguous band of corrupted rows across every column. Arena
+                // slot reuse makes the overlap routine — a concat whose operand
+                // died at the concat itself is free to be given the concat's own
+                // output slot — and it is deterministic per plan, so it looks
+                // like a planner bug until you notice it moves with the arena
+                // assignment rather than with thread scheduling.
+                let d0 = *dst;
+                let d1 = d0 + out_total * 4;
+                let s0 = *src_off;
+                let s1 = s0 + numel * 4;
+                let staged: Option<Vec<f32>> =
+                    (s0 < d1 && d0 < s1).then(|| sl(*src_off, base, numel).to_vec());
+                let inp = match &staged {
+                    Some(v) => v.as_slice(),
+                    None => sl(*src_off, base, numel),
+                };
                 concat_copy_rows_f32(
                     out,
                     inp,

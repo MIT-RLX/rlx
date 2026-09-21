@@ -258,7 +258,13 @@ impl<'a> HirMut<'a> {
     /// arithmetic on the f32 arena (a raw bool operand under-sizes / mis-reads).
     fn gs_cmp_f32(&mut self, op: CmpOp, a: HirNodeId, b: HirNodeId) -> HirNodeId {
         let s = self.shape(a).clone();
-        let cmp = self.0.mir(Op::Compare(op), vec![a, b], s.clone());
+        // The `Compare` result is Bool; declaring it with the operand's dtype
+        // trips the IR verifier the moment one runs (e.g. after a fusion pass).
+        let cmp = self.0.mir(
+            Op::Compare(op),
+            vec![a, b],
+            s.clone().with_dtype(DType::Bool),
+        );
         self.0.mir(Op::Cast { to: DType::F32 }, vec![cmp], s)
     }
     /// `floor(a) = round(a) − (round(a) > a)` — exact for all finite `a`.

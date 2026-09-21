@@ -113,7 +113,7 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         && params.scheme_id != 19u && params.scheme_id != 20u
         && params.scheme_id != 21u && params.scheme_id != 22u && params.scheme_id != 23u
         && params.scheme_id != 24u && params.scheme_id != 25u
-        && params.scheme_id != 28u) {
+        && params.scheme_id != 28u && params.scheme_id != 29u) {
         let dst_base = params.dst_f32_off + gid * 256u;
 
         if (params.scheme_id == 3u) {
@@ -739,6 +739,38 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         for (var j: u32 = 0u; j < 128u; j = j + 1u) {
             let q = (read_w(qs_rel + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u;
             arena[dst_base + j] = f32(i32(q) - 1) * d;
+        }
+        return;
+    }
+
+    if (params.scheme_id == 29u) {
+        // PTQ1_0 (prism-ml Ternary Bonsai 2): 24 qs | 2 qh | f16 d
+        // (28 bytes / 128 elems). Base-3 trits; digit n of byte b is
+        // ((b * 3^n) & 0xFF) * 3 >> 8 -> 0/1/2 -> -1/0/+1. The
+        // element -> (byte, digit) map is staged, not sequential.
+        let off = gid * 28u;
+        let d = dq_read_f16(off + 26u);
+        let dst_base = params.dst_f32_off + gid * 128u;
+        for (var e: u32 = 0u; e < 128u; e = e + 1u) {
+            var b: u32;
+            var n: u32;
+            if (e < 80u) {
+                b = read_w(off + (e & 15u));
+                n = e >> 4u;
+            } else if (e < 120u) {
+                let t = e - 80u;
+                b = read_w(off + 16u + (t & 7u));
+                n = t >> 3u;
+            } else {
+                let t = e - 120u;
+                b = read_w(off + 24u + (t & 1u));
+                n = t >> 1u;
+            }
+            var v: u32 = b;
+            for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+                if (i < n) { v = (v * 3u) & 0xFFu; }
+            }
+            arena[dst_base + e] = f32(i32((v * 3u) >> 8u) - 1) * d;
         }
         return;
     }

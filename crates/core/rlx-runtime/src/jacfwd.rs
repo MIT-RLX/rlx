@@ -39,12 +39,17 @@
 
 use crate::compiled::CompiledGraph;
 use rlx_ir::DType;
+use rlx_ir::bytes::AlignedBytes;
 
 /// One Jacobian per primal output of the original forward graph.
 #[derive(Debug, Clone)]
 pub struct JacobianBytes {
     /// Flat row-major `[output_size, wrt_size]` matrix.
-    pub bytes: Vec<u8>,
+    ///
+    /// [`AlignedBytes`] rather than `Vec<u8>`: [`JacobianBytes::as_f64`] hands
+    /// out a borrowed `&[f64]` over these bytes, which needs an 8-aligned base
+    /// that `Vec<u8>` does not promise. Derefs to `[u8]` for byte-level use.
+    pub bytes: AlignedBytes,
     /// Number of elements in the primal output (= rows).
     pub output_size: usize,
     /// Number of elements in the wrt input (= columns).
@@ -68,11 +73,9 @@ impl JacobianBytes {
             self.output_size * self.wrt_size * 8,
             "as_f64: byte length doesn't match shape"
         );
-        // SAFETY: bytes are 8-aligned (rlx-runtime allocates with at
-        // least 8-byte alignment) and the byte length is a multiple of 8.
-        unsafe {
-            std::slice::from_raw_parts(self.bytes.as_ptr() as *const f64, self.bytes.len() / 8)
-        }
+        // Sound without an alignment check: `AlignedBytes` pins the base at
+        // 64 bytes, which covers `align_of::<f64>()`.
+        self.bytes.as_slice_of::<f64>()
     }
 
     /// Reinterpret as `&[f32]` (row-major). Mirror of `as_f64`.
@@ -84,9 +87,7 @@ impl JacobianBytes {
             self.dtype
         );
         assert_eq!(self.bytes.len(), self.output_size * self.wrt_size * 4);
-        unsafe {
-            std::slice::from_raw_parts(self.bytes.as_ptr() as *const f32, self.bytes.len() / 4)
-        }
+        self.bytes.as_slice_of::<f32>()
     }
 }
 
@@ -144,7 +145,7 @@ pub fn jacfwd(
             );
             let output_size = bytes.len() / elem_size;
             JacobianBytes {
-                bytes: vec![0u8; output_size * wrt_size * elem_size],
+                bytes: AlignedBytes::zeroed(output_size * wrt_size * elem_size),
                 output_size,
                 wrt_size,
                 dtype,

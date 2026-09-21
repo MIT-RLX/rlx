@@ -12,6 +12,7 @@ fn scheme_block_elems(scheme_id: u32) -> usize {
     match scheme_id {
         19..=23 => 32,
         24 => 128, // Q1_0
+        29 => 128, // PTQ1_0
         _ => 256,
     }
 }
@@ -80,6 +81,7 @@ fn parity(scheme_id: u32, packed: &[u8], elems: usize, tol: f32, name: &str) {
         22 => rlx_gguf::dequant_q5_0(packed, elems).unwrap(),
         23 => rlx_gguf::dequant_q5_1(packed, elems).unwrap(),
         24 => rlx_gguf::q1_dequant::dequant_q1_0(packed, elems).unwrap(),
+        29 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(packed, elems).unwrap(),
         26 => rlx_gguf::fv5_dequant::dequant_fv5(packed, elems).unwrap(),
         27 => rlx_gguf::fv5_dequant::dequant_fv5b(packed, elems).unwrap(),
         _ => panic!("bad scheme_id {scheme_id}"),
@@ -249,6 +251,28 @@ fn q1_0_msl_matches_cpu_reference() {
 }
 
 /// Pack one FV5 block (104 bytes) from 256 five-value codes in {-2,-1,0,1,2}.
+#[test]
+fn ptq1_0_msl_matches_cpu_reference() {
+    // PTQ1_0 (prism-ml Ternary Bonsai 2): 24 qs + 2 qh + f16 d = 28
+    // bytes / 128 elems. The element -> (byte, base-3 digit) map is
+    // staged rather than sequential, so a shader that walked it
+    // sequentially would still emit a valid ternary tensor — just a
+    // permuted one. Random bytes make that permutation visible.
+    let mut seed: u32 = 0x1234_5678;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        ((seed >> 16) & 0xFF) as u8
+    };
+    let mut packed = Vec::new();
+    for b in 0..16u8 {
+        for _ in 0..26 {
+            packed.push(next());
+        }
+        packed.extend_from_slice(&half::f16::from_f32(0.1 + 0.05 * b as f32).to_le_bytes());
+    }
+    parity(29, &packed, 16 * 128, 1e-4, "PTQ1_0");
+}
+
 fn pack_fv5_block(codes: &[i8], s_lo: f32, s_hi: f32) -> Vec<u8> {
     let mut b = vec![0u8; 104];
     b[0..4].copy_from_slice(&s_lo.to_le_bytes());

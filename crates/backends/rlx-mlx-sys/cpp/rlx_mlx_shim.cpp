@@ -385,17 +385,33 @@ int rlx_mlx_array_from_bytes(
     });
 }
 
+// Materialize `a` as an evaluated, row-contiguous array.
+//
+// `flags()` is only meaningful once an array has been evaluated. On a lazily
+// built graph it can report `row_contiguous` for what will become a strided
+// view — a sliced column, say — and a caller that then memcpy's `data<T>()`
+// reads the base buffer LINEARLY, silently returning the wrong elements. That
+// surfaced as an MoE router sending every token to the wrong expert: the values
+// were all in range, so nothing downstream complained.
+//
+// Evaluate first, then test, then materialize (and evaluate the copy).
+static mc::array materialize_row_contiguous(mc::array a)
+{
+    a.eval();
+    if (!a.flags().row_contiguous) {
+        a = mc::contiguous(a);
+        a.eval();
+    }
+    return a;
+}
+
 int rlx_mlx_array_to_bytes(
     rlx_mlx_array_t* h,
     void* dst, size_t dst_cap, size_t* out_nbytes)
 {
     return guarded([&] {
         mc::array& a = unwrap(h);
-        mc::array out_arr = a;
-        if (!out_arr.flags().row_contiguous) {
-            out_arr = mc::contiguous(out_arr);
-        }
-        out_arr.eval();
+        mc::array out_arr = materialize_row_contiguous(a);
         size_t n = out_arr.nbytes();
         if (n > dst_cap) {
             throw std::runtime_error("to_bytes: dst buffer too small");
@@ -428,10 +444,15 @@ int rlx_mlx_array_to_bytes(
 // call mc::contiguous() on the destination, because that would hand back a
 // pointer into a temporary and the write would land nowhere.
 static char* rlx_mlx_row_bytes(mc::array& a, const char* what) {
+    // Evaluate BEFORE trusting flags(): on an unevaluated array they describe
+    // nothing yet, so this guard could pass on what is really a strided view
+    // and hand back a pointer that the caller then writes rows through. Same
+    // ordering bug as `materialize_row_contiguous` above, but here it would
+    // corrupt an in-place write rather than a read.
+    a.eval();
     if (!a.flags().row_contiguous) {
         throw std::runtime_error(std::string(what) + ": array is not row-contiguous");
     }
-    a.eval();
     // Drop the graph now that the data exists, so nothing can recompute this
     // array and silently discard rows written into its buffer. MLX's caching
     // appears to prevent that on its own (a write survives repeated reads on a
@@ -543,16 +564,14 @@ int rlx_mlx_array_to_f32(
             : (a.dtype() == mc::float64
                    ? mc::astype(a, mc::float32, mc::default_stream(mc::Device::cpu))
                    : mc::astype(a, mc::float32));
-        // Force a row-contiguous materialization. Ops like transpose
-        // can leave the result as a strided view, so data<float>() on
-        // the original would give the pre-transpose buffer order.
-        // mc::copy is misleadingly named (it just shares the buffer);
-        // mc::contiguous is the primitive that actually rewrites the
-        // bytes into row-major order.
-        if (!f32.flags().row_contiguous) {
-            f32 = mc::contiguous(f32);
-        }
-        f32.eval();
+        // Force a row-contiguous materialization. Ops like transpose or a
+        // column slice leave the result as a strided view, so data<float>()
+        // on the original would read the underlying buffer in the wrong
+        // order. mc::copy is misleadingly named (it just shares the buffer);
+        // mc::contiguous is the primitive that actually rewrites the bytes
+        // into row-major order. See `materialize_row_contiguous` for why the
+        // evaluation has to happen before the flags are trusted.
+        f32 = materialize_row_contiguous(f32);
         if (f32.size() > nelems) {
             throw std::runtime_error("output buffer too small");
         }

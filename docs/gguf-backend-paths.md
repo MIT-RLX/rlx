@@ -43,6 +43,33 @@ kernels. Canonical helpers live in `rlx-gpu-host`
 | 22 | `GgufQ5_0` | 32 | 22 |
 | 23 | `GgufQ5_1` | 32 | 24 |
 | 24 | `GgufQ1_0` | 128 | 18 |
+| 25 | `GgufQ2_0` | 128 | 34 |
+| 26 | `GgufFV5` | 256 | 104 |
+| 27 | `GgufFV5B` | 256 | 260 |
+| 28 | `GgufG8_0` | 32 | 16 |
+| 29 | `GgufPtq1_0` | 128 | 28 |
+
+⚠️ **Adding a scheme takes two edits per backend, not one.** Each
+`dequant_gguf` kernel opens with a guard that routes everything *except* an
+explicit list of small-block ids into a 256-element branch:
+
+```c
+if (scheme_id != 6u && ... && scheme_id != 28u && scheme_id != 29u) { /* 256-elem */ }
+```
+
+A new sub-256 scheme needs its id added to that exclusion list as well as its
+own branch — three copies, in
+`rlx-metal/src/dequant_gguf.msl`, `rlx-gpu-kernels/kernels/dequant_gguf.cu`
+(shared with ROCm) and `rlx-wgpu/src/kernels/dequant_gguf.wgsl`. Miss the
+guard and the branch is unreachable: the weights decode through the wrong
+block geometry and the model degrades silently. Vulkan has no `dequant_gguf`
+path and needs neither.
+
+Note also that backends treat "has an id" as "has an on-device branch" —
+`rlx_metal::has_metal_dequant_kernel` is literally
+`gpu_dequant_scheme_id().is_some()`, and `rlx_gpu_host::gguf_scheme_id`
+*panics* for a scheme without one. So the id row and the kernel branches have
+to land together; omitting the id to "just host-route" crashes instead.
 
 Map GGUF file dtypes to IR: [`rlx_cpu::quant_scheme_for_ggml`](../crates/backends/rlx-cpu/src/gguf_scheme.rs)
 (`GgmlType` → `QuantScheme` for loader / graph builders).

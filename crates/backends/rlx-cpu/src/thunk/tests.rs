@@ -7527,6 +7527,167 @@ fn gated_residual_decompose_matches_native() {
     }
 }
 
+/// The **batched** matmul must survive the same operand-inside-destination
+/// layout as the single one.
+///
+/// `sgemm_operand_inside_destination_is_not_clobbered` covers `SgemmT`; the fix
+/// it describes was applied to the non-batched paths only, and
+/// `Thunk::BatchedSgemm` was left comparing `ptr::eq`. Batched attention is
+/// where this bites hardest — one matmul per head, each reading a `probs` block
+/// out of its own output slot — and the damage is a band of query rows that
+/// moves from run to run with whatever order the kernel happened to reach them
+/// in. DeepSeek-V4.1's 64-head attention hit it on roughly one compile in five;
+/// `RLX_ARENA_NO_REUSE=1` masked it completely, which is what made it look like
+/// a planner bug rather than an execution one.
+#[test]
+fn batched_sgemm_operand_inside_destination_is_not_clobbered() {
+    let (batch, m, k, n) = (4usize, 96usize, 8usize, 8usize);
+    let a: Vec<f32> = (0..batch * m * k)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
+        .collect();
+    let b: Vec<f32> = (0..batch * k * n)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.25)
+        .collect();
+
+    let want = {
+        let mut c = vec![0f32; batch * m * n];
+        for bi in 0..batch {
+            for r in 0..m {
+                for col in 0..n {
+                    let mut acc = 0f64;
+                    for i in 0..k {
+                        acc +=
+                            a[bi * m * k + r * k + i] as f64 * b[bi * k * n + i * n + col] as f64;
+                    }
+                    c[bi * m * n + r * n + col] = acc as f32;
+                }
+            }
+        }
+        c
+    };
+
+    // Arena: [ A | C ], with the whole B stack parked strictly inside C.
+    let a_off = 0usize;
+    let c_off = batch * m * k * 4;
+    let b_off = c_off + 1024;
+    let arena_bytes = c_off + batch * m * n * 4;
+    assert!(
+        b_off + batch * k * n * 4 <= arena_bytes,
+        "B must sit inside C for this to test anything"
+    );
+    let mut arena = vec![0u8; arena_bytes];
+    unsafe {
+        let base = arena.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(a.as_ptr(), base.add(a_off) as *mut f32, a.len());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), base.add(b_off) as *mut f32, b.len());
+    }
+
+    let sched = ThunkSchedule {
+        thunks: vec![Thunk::BatchedSgemm {
+            a: a_off,
+            b: b_off,
+            c: c_off,
+            batch: batch as u32,
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            a_bcast: false,
+            b_bcast: false,
+        }],
+        moe_resident: None,
+        moe_resident_layers: None,
+        moe_topk_capture: None,
+        mask_threshold: 0.0,
+        mask_neg_inf: f32::NEG_INFINITY,
+        score_skip: 0.0,
+        compiled_fns: Vec::new(),
+        rng: Arc::new(std::sync::RwLock::new(rlx_ir::RngOptions::default())),
+    };
+    execute_thunks(&sched, &mut arena);
+
+    let got = unsafe {
+        std::slice::from_raw_parts(arena.as_ptr().add(c_off) as *const f32, batch * m * n)
+    };
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+            "element {i} (batch {}, row {}): got {g}, want {w}",
+            i / (m * n),
+            (i % (m * n)) / n
+        );
+    }
+}
+
+/// A concat whose source overlaps its destination must still copy correctly.
+///
+/// Concat is the one copy-style kernel that had no aliasing guard, and it is
+/// more exposed than a matmul: the destination is *wider* than the source, so
+/// the write cursor advances by `row_stride` while the read cursor advances by
+/// `copy_per_row`. Writing row 0 therefore lands on bytes a later row still has
+/// to read, and the damage is a contiguous band of rows across every column.
+///
+/// Arena reuse makes the overlap ordinary — an operand that dies at the concat
+/// is free to be handed the concat's own output slot.
+#[test]
+fn concat_source_inside_destination_is_not_clobbered() {
+    // out[outer, 2*inner] = [ A | B ], with A parked inside out's own slot.
+    let (outer, inner) = (64usize, 8usize);
+    let a: Vec<f32> = (0..outer * inner).map(|i| i as f32 + 1.0).collect();
+    let b: Vec<f32> = (0..outer * inner).map(|i| -(i as f32) - 1.0).collect();
+
+    let dst_off = 0usize;
+    let out_total = outer * 2 * inner;
+    // A sits one row into the output — well inside it
+    let a_off = dst_off + 2 * inner * 4;
+    let b_off = dst_off + out_total * 4;
+    let arena_bytes = b_off + b.len() * 4;
+    let mut arena = vec![0u8; arena_bytes];
+    unsafe {
+        let base = arena.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(a.as_ptr(), base.add(a_off) as *mut f32, a.len());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), base.add(b_off) as *mut f32, b.len());
+    }
+
+    let sched = ThunkSchedule {
+        thunks: vec![Thunk::Concat {
+            dst: dst_off,
+            outer: outer as u32,
+            inner: inner as u32,
+            total_axis: 2,
+            inputs: vec![
+                (a_off, 1, (outer * inner) as u32),
+                (b_off, 1, (outer * inner) as u32),
+            ],
+        }],
+        moe_resident: None,
+        moe_resident_layers: None,
+        moe_topk_capture: None,
+        mask_threshold: 0.0,
+        mask_neg_inf: f32::NEG_INFINITY,
+        score_skip: 0.0,
+        compiled_fns: Vec::new(),
+        rng: Arc::new(std::sync::RwLock::new(rlx_ir::RngOptions::default())),
+    };
+    execute_thunks(&sched, &mut arena);
+
+    let got =
+        unsafe { std::slice::from_raw_parts(arena.as_ptr().add(dst_off) as *const f32, out_total) };
+    for r in 0..outer {
+        for c in 0..inner {
+            assert_eq!(
+                got[r * 2 * inner + c],
+                a[r * inner + c],
+                "A half, row {r} col {c}"
+            );
+            assert_eq!(
+                got[r * 2 * inner + inner + c],
+                b[r * inner + c],
+                "B half, row {r} col {c}"
+            );
+        }
+    }
+}
+
 /// A matmul whose operand sits *inside* its own destination slot must still
 /// compute the right answer.
 ///

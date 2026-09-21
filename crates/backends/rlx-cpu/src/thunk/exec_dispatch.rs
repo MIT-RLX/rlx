@@ -270,6 +270,22 @@ fn arena_ranges_overlap(a: usize, a_elems: usize, c: usize, c_elems: usize) -> b
     a < c + c_elems * 4 && c < a + a_elems * 4
 }
 
+/// The same range test where only the slices are in hand.
+///
+/// The batched matmul paths build their per-item slices from raw pointers, so
+/// they have no arena offsets to compare — and they were left on `ptr::eq` when
+/// the non-batched paths were fixed. A batched attention (`probs @ V` per head)
+/// is exactly where an operand ends up strictly inside its own output slot, so
+/// the weaker guard let cblas stream an operand it was simultaneously
+/// overwriting: a band of query rows corrupted, varying run to run with the
+/// order BLAS happened to pack in, and cured by `RLX_ARENA_NO_REUSE=1`.
+#[inline]
+fn slices_overlap(a: &[f32], c: &[f32]) -> bool {
+    let (a0, a1) = (a.as_ptr() as usize, a.as_ptr() as usize + a.len() * 4);
+    let (c0, c1) = (c.as_ptr() as usize, c.as_ptr() as usize + c.len() * 4);
+    a0 < c1 && c0 < a1
+}
+
 pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     crate::moe_residency::reset_gmm_counters();
     if let Some(layers) = schedule.moe_resident_layers.clone() {
@@ -653,6 +669,46 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let a_elems = (a_count * a_mat).min(a_cap);
                 let b_elems = (b_count * b_mat).min(b_cap);
                 let c_elems = (b_ * c_mat).min(c_cap);
+                // Whole-span aliasing, decided once for the batch.
+                //
+                // A per-item check cannot see the real hazard here: with an
+                // operand stack parked inside the output slot, writing `C[0]`
+                // destroys `B[1]`, and item 1's own guard compares only its own
+                // `B[1]` against its own `C[1]` — which do not overlap. The
+                // damage lands on whichever items ran after the one that
+                // clobbered them, so it moves with the worker schedule.
+                //
+                // So the operand *stacks* are compared against the output
+                // *stack*, and if they touch at all the whole batch goes through
+                // a scratch buffer.
+                let aliased = arena_ranges_overlap(*a, a_elems, *c, c_elems)
+                    || arena_ranges_overlap(*b, b_elems, *c, c_elems);
+                if aliased {
+                    unsafe {
+                        let a_full = sl(*a, base, a_elems).to_vec();
+                        let b_full = sl(*b, base, b_elems).to_vec();
+                        let mut out = vec![0f32; c_elems];
+                        for bi in 0..b_ {
+                            let (a0, b0, c0) = (bi * a_bstride, bi * b_bstride, bi * c_mat);
+                            if a0 + a_mat > a_full.len()
+                                || b0 + b_mat > b_full.len()
+                                || c0 + c_mat > out.len()
+                            {
+                                break;
+                            }
+                            crate::blas::sgemm_auto(
+                                &a_full[a0..a0 + a_mat],
+                                &b_full[b0..b0 + b_mat],
+                                &mut out[c0..c0 + c_mat],
+                                m_,
+                                k_,
+                                n_,
+                            );
+                        }
+                        sl_mut(*c, base, c_elems).copy_from_slice(&out);
+                    }
+                    continue;
+                }
                 unsafe {
                     let a_full = sl(*a, base, a_elems);
                     let b_full = sl(*b, base, b_elems);
@@ -688,8 +744,8 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     (c_ptr as *mut f32).add(c0),
                                     c_mat,
                                 );
-                                if std::ptr::eq(a_slice.as_ptr(), c_slice.as_mut_ptr())
-                                    || std::ptr::eq(b_slice.as_ptr(), c_slice.as_mut_ptr())
+                                if slices_overlap(a_slice, c_slice)
+                                    || slices_overlap(b_slice, c_slice)
                                 {
                                     let mut tmp = vec![0.0f32; c_mat];
                                     crate::blas::sgemm(a_slice, b_slice, &mut tmp, m_, k_, n_);
@@ -713,8 +769,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             let a_slice = &a_full[a0..a0 + a_mat];
                             let b_slice = &b_full[b0..b0 + b_mat];
                             let c_slice = &mut c_full[c0..c0 + c_mat];
-                            if std::ptr::eq(a_slice.as_ptr(), c_slice.as_mut_ptr())
-                                || std::ptr::eq(b_slice.as_ptr(), c_slice.as_mut_ptr())
+                            if slices_overlap(a_slice, c_slice) || slices_overlap(b_slice, c_slice)
                             {
                                 let mut tmp = vec![0.0f32; c_mat];
                                 crate::blas::sgemm_auto(a_slice, b_slice, &mut tmp, m_, k_, n_);

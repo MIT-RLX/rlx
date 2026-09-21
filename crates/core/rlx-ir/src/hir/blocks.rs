@@ -366,7 +366,14 @@ pub fn lower_qwen35_mtp_head(
     );
 
     let idx_2d = g.reshape_(last_token_idx, vec![batch as i64, 1]);
-    let last = g.gather_(h_ffn, idx_2d, 1);
+    let gathered = g.gather_(h_ffn, idx_2d, 1);
+    // ONNX `Gather` splices the index's own shape in, so a rank-2 index on a
+    // rank-3 input yields rank 4: `[batch, 1, 1, n_embd]`. The element count is
+    // unchanged and the trailing matmul is numerically unaffected, which is why
+    // this survived — but the node's shape then disagrees with the `out_shape`
+    // this head declares, and the assertion below is a hard panic in any test
+    // build. Drop the spurious unit axis so the declared shape is the real one.
+    let last = g.reshape_(gathered, vec![batch as i64, 1, n_embd as i64]);
     let last_norm = g.rms_norm(last, head_norm_w, head_norm_b, eps);
     let logits = g.mm(last_norm, lm_head_w);
     debug_assert_eq!(g.shape(logits), &out_shape);

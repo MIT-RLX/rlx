@@ -299,7 +299,7 @@ impl MetalExecutable {
         let force_unpin = rlx_ir::env::flag("RLX_METAL_FORCE_UNPIN_OUTPUT_ANCESTORS");
         let try_unpin = !force_pin
             && (force_unpin || !has_host_indexing)
-            && (plan.arena_size > max_buffer || plan.arena_size >= MPS_BIND_CLIFF);
+            && should_try_unpin(plan.arena_size, max_buffer);
         if try_unpin {
             if verbose {
                 eprintln!(
@@ -336,27 +336,8 @@ impl MetalExecutable {
             // Keep the pinned plan unless unpin meaningfully helps: under the
             // MPS cliff, or under maxBufferLength when we were over it.
             // FORCE_UNPIN always accepts (repro / bisect old F5 DiT drift).
-            let accept = force_unpin
-                || if plan.arena_size > max_buffer {
-                    unpinned.arena_size <= max_buffer
-                        || unpinned.arena_size + (plan.arena_size / 20) < plan.arena_size
-                } else {
-                    // Under maxBufferLength but over the MPS cliff. Crossing the
-                    // cliff is the best outcome — it restores MPSGraph fusion —
-                    // but it is not the only win. A 12-layer Mamba TRAINING
-                    // graph plans a 22 GiB arena that unpins to 4.8 GiB: fusion
-                    // stays off either way, yet keeping the pinned plan costs
-                    // 17 GiB of resident memory for nothing. Take a substantial
-                    // saving even when it lands above the cliff.
-                    //
-                    // Substantial, not marginal: the F5 DiT case that motivated
-                    // the `has_host_indexing` guard above "saved almost
-                    // nothing", so a 25% floor stays well clear of it while
-                    // still catching a 4.6x reduction. Graphs with host
-                    // indexing never reach here regardless.
-                    unpinned.arena_size < MPS_BIND_CLIFF
-                        || unpinned.arena_size + (plan.arena_size / 4) < plan.arena_size
-                };
+            let accept =
+                accept_unpinned(plan.arena_size, unpinned.arena_size, max_buffer, force_unpin);
             if accept {
                 if verbose {
                     eprintln!(
@@ -1012,6 +993,59 @@ impl MetalExecutable {
 /// True when any `Op::MatMul` in the graph has a BF16 input operand. Such
 /// matmuls are correct only on the MPSGraph path (which casts bf16→f32); the
 /// thunk `Sgemm` has no bf16-weight kernel and would misread the bytes as f32.
+/// ≥4 GiB: MPSGraph / hybrid no-copy binds fail on high offsets.
+pub(crate) const MPS_BIND_CLIFF_BYTES: usize = 1usize << 32;
+
+/// Below this an unpinned re-plan cannot save enough to be worth the host pass.
+pub(crate) const UNPIN_CONSIDER_MIN_BYTES: usize = 64 << 20;
+
+/// Whether to re-plan without the output-ancestor pin at all.
+///
+/// Callers must additionally require `!force_pin` and
+/// (`force_unpin || !has_host_indexing`) — those are correctness conditions,
+/// this is only about whether a saving is plausible enough to pay for a second
+/// planning pass.
+pub(crate) fn should_try_unpin(pinned: usize, max_buffer: usize) -> bool {
+    pinned > max_buffer || pinned >= MPS_BIND_CLIFF_BYTES || pinned >= UNPIN_CONSIDER_MIN_BYTES
+}
+
+/// Whether the unpinned plan is worth taking over the pinned one.
+///
+/// Three regimes, all the same shape — take it if it clears a hard limit, or if
+/// it saves a *substantial* fraction:
+///
+/// * over `maxBufferLength`: getting under it is the win (5% floor otherwise);
+/// * over the MPS bind cliff: getting under it restores MPSGraph fusion;
+/// * under both: nothing is broken, so only a large saving justifies it.
+///
+/// That last regime used not to exist — the re-plan was an overflow escape
+/// hatch, so a graph whose pinned arena fit under the cliff kept it forever.
+/// Measured cost of that: OmniSR ×4 held 2.9 GB where 395 MB was enough, and
+/// CPU and CoreML planned the same graph at ~400 MB.
+///
+/// The 25% floor is deliberate. The F5 DiT case that motivated the
+/// host-indexing guard "saved almost nothing", so a quarter stays well clear of
+/// it while still catching the reductions that matter (4.6× on Real-CUGAN,
+/// 7.5× on OmniSR — both entirely under the cliff).
+pub(crate) fn accept_unpinned(
+    pinned: usize,
+    unpinned: usize,
+    max_buffer: usize,
+    force_unpin: bool,
+) -> bool {
+    if force_unpin {
+        return true;
+    }
+    if pinned > max_buffer {
+        return unpinned <= max_buffer || unpinned + (pinned / 20) < pinned;
+    }
+    if pinned < MPS_BIND_CLIFF_BYTES {
+        return unpinned + (pinned / 4) < pinned;
+    }
+    unpinned < MPS_BIND_CLIFF_BYTES || unpinned + (pinned / 4) < pinned
+}
+
+
 fn graph_has_bf16_matmul(graph: &Graph) -> bool {
     graph.nodes().iter().any(|n| {
         matches!(n.op, Op::MatMul)
@@ -1208,4 +1242,59 @@ fn widen_spd_f64_to_f32(mut graph: Graph) -> Graph {
         node.shape = node.shape.clone().with_dtype(DType::F32);
     }
     graph
+}
+
+#[cfg(test)]
+mod unpin_tests {
+    use super::*;
+
+    const GB: usize = 1 << 30;
+    const MB: usize = 1 << 20;
+    const HUGE: usize = usize::MAX;
+
+    /// The regression this guards: a graph whose pinned arena is *under* the
+    /// cliff was never re-planned, so it paid the pinned footprint forever.
+    /// OmniSR ×4 measured 2.9 GB pinned against 395 MB unpinned.
+    #[test]
+    fn a_large_saving_under_the_cliff_is_taken() {
+        assert!(should_try_unpin(2900 * MB, HUGE));
+        assert!(accept_unpinned(2900 * MB, 395 * MB, HUGE, false));
+    }
+
+    /// A marginal saving is not worth changing the plan — this keeps the F5 DiT
+    /// class of graph on the pinned plan.
+    #[test]
+    fn a_marginal_saving_is_declined() {
+        assert!(!accept_unpinned(1000 * MB, 900 * MB, HUGE, false));
+        assert!(accept_unpinned(1000 * MB, 700 * MB, HUGE, false));
+    }
+
+    /// Small graphs are not re-planned: a second pass cannot pay for itself
+    /// when the whole arena is a few megabytes.
+    #[test]
+    fn small_arenas_are_not_reconsidered() {
+        assert!(!should_try_unpin(8 * MB, HUGE));
+        assert!(should_try_unpin(64 * MB, HUGE));
+    }
+
+    /// Crossing back under the MPS bind cliff restores MPSGraph fusion, so it
+    /// is taken even when the byte saving is small.
+    #[test]
+    fn crossing_under_the_cliff_is_always_worth_it() {
+        assert!(accept_unpinned(5 * GB, 4 * GB - 1, HUGE, false));
+    }
+
+    /// Over `maxBufferLength` the allocation simply fails, so a 5% floor
+    /// applies rather than 25%.
+    #[test]
+    fn over_max_buffer_length_takes_even_a_small_win() {
+        let max = 2 * GB;
+        assert!(accept_unpinned(3 * GB, 2 * GB, max, false));
+        assert!(!accept_unpinned(3 * GB, 3 * GB - MB, max, false));
+    }
+
+    #[test]
+    fn force_unpin_always_accepts() {
+        assert!(accept_unpinned(100 * MB, 100 * MB, HUGE, true));
+    }
 }

@@ -15,9 +15,11 @@
 //! contiguous `f32`, regardless of their on-disk dtype (fp32 / fp16 /
 //! bf16 / int).
 //!
-//! The same `torch.save` machinery also drives [`PtModel`], a standalone
-//! loader for plain PyTorch `.pt` / `.pth` / `pytorch_model.bin`
-//! checkpoints (the checkpoint ZIP without the `.nemo` tar + YAML wrapper).
+//! The `torch.save` half — ZIP index, pickle, dtype decode — lives in
+//! `rlx-torch-ckpt`, which this crate layers the tar + YAML wrapper on top
+//! of. Its [`PtModel`] (re-exported here) loads a plain PyTorch
+//! `.pt` / `.pth` / `pytorch_model.bin`: the same checkpoint ZIP without
+//! the `.nemo` wrapper.
 //!
 //! ```no_run
 //! use rlx_nemo::NemoModel;
@@ -28,31 +30,25 @@
 //! ```
 
 mod arch;
-mod archive;
 mod config;
-mod dtype;
-mod pickle;
-mod pt;
-mod storage;
-mod torch;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 pub use arch::{
     EncoderOpts, TensorShapes, build_nemo_encoder_graph, build_nemo_probe_graph, nemo_arch_summary,
 };
 pub use config::NemoConfig;
-pub use dtype::DType;
-pub use pickle::TensorMeta;
-pub use pt::{PtModel, PtTensor};
+// Re-exported so `.nemo` consumers need not also depend on `rlx-torch-ckpt`.
+pub use rlx_torch_ckpt::{DType, PtModel, PtTensor, TensorMeta};
 
-use archive::{
-    Seekable, ZipEntry, list_tar, list_zip, prepare_seekable, read_member, read_zip_entry,
+use rlx_torch_ckpt::archive::{
+    Seekable, ZipEntry, list_tar, list_zip, prepare_seekable, read_member,
 };
+use rlx_torch_ckpt::{index_torch_zip, read_torch_tensor};
 
 /// A tensor materialized from a `.nemo` checkpoint as contiguous f32.
 #[derive(Debug, Clone)]
@@ -184,66 +180,4 @@ impl NemoModel {
             data,
         })
     }
-}
-
-/// Index a `torch.save` ZIP: unpickle its `data.pkl` into a flat tensor
-/// table and map each storage key to its `data/<key>` ZIP entry. Shared by
-/// the `.nemo` loader and the standalone [`PtModel`] — both wrap the exact
-/// same container, the latter without the outer tar + YAML.
-pub(crate) fn index_torch_zip(
-    file: &mut File,
-    entries: &[ZipEntry],
-) -> Result<(BTreeMap<String, TensorMeta>, HashMap<String, ZipEntry>)> {
-    // Locate `<archive>/data.pkl` and the `<archive>/data/<key>` storages.
-    let pkl_entry = entries
-        .iter()
-        .find(|e| e.name.ends_with("data.pkl"))
-        .ok_or_else(|| anyhow!("no data.pkl in checkpoint zip"))?;
-    let archive_prefix = pkl_entry
-        .name
-        .strip_suffix("data.pkl")
-        .unwrap_or("")
-        .to_string();
-    let data_prefix = format!("{archive_prefix}data/");
-
-    let mut storages = HashMap::new();
-    for e in entries {
-        if let Some(key) = e.name.strip_prefix(&data_prefix) {
-            if !key.is_empty() {
-                storages.insert(key.to_string(), e.clone());
-            }
-        }
-    }
-
-    let pkl_bytes = read_zip_entry(file, pkl_entry)?;
-    let root = pickle::unpickle(&pkl_bytes).context("unpickling data.pkl")?;
-    let tensors = torch::collect_state_dict(&root)?;
-    Ok((tensors, storages))
-}
-
-/// Materialize one tensor's storage view as a contiguous, row-major `f32`
-/// vector, given the container path and the storage-key → ZIP-entry map.
-pub(crate) fn read_torch_tensor(
-    path: &Path,
-    meta: &TensorMeta,
-    storages: &HashMap<String, ZipEntry>,
-) -> Result<Vec<f32>> {
-    let entry = storages
-        .get(&meta.storage_key)
-        .ok_or_else(|| anyhow!("missing storage {:?}", meta.storage_key))?;
-
-    let expected = meta.dtype.size() as u64;
-    if entry.size % expected != 0 {
-        bail!(
-            "storage {:?}: {} bytes not a multiple of dtype width {}",
-            meta.storage_key,
-            entry.size,
-            expected
-        );
-    }
-
-    let mut file = File::open(path)?;
-    let raw = read_zip_entry(&mut file, entry)?;
-    let storage_f32 = meta.dtype.decode_f32(&raw);
-    storage::gather(meta, &storage_f32)
 }

@@ -9,8 +9,8 @@
 //
 // Inputs (offsets in f32 elements):
 //   in_off:  [..., seq, last_dim]  where last_dim % head_dim == 0
-//   cos_off: [max_seq, rot_half]
-//   sin_off: [max_seq, rot_half]
+//   cos_off: [max_seq, cos_row_stride]
+//   sin_off: [max_seq, cos_row_stride]
 // Output:
 //   out_off: same shape as input
 //
@@ -31,6 +31,7 @@ struct Params {
     seq_stride: u32, // full seq, used for per-batch buffer offset.
     style: u32,      // 0 = NeoX rotate-half, 1 = GPT-J interleaved (2i, 2i+1)
     rot_half: u32,   // n_rot/2 (rotated width). dims >= n_rot are copied. == half for full rotation.
+    cos_row_stride: u32, // elements per cos/sin row = the table's own last dim, NOT rot_half.
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -68,8 +69,8 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         // per output element: even lane writes the first of its pair, odd lane
         // the second, mirroring the CPU reference exactly.
         let i = d_in_head / 2u;
-        let c = arena[params.cos_off + pos * rot_half + i];
-        let s = arena[params.sin_off + pos * rot_half + i];
+        let c = arena[params.cos_off + pos * params.cos_row_stride + i];
+        let s = arena[params.sin_off + pos * params.cos_row_stride + i];
         if ((d_in_head & 1u) == 0u) {
             let x1 = arena[params.in_off + buf_idx];        // x[2i]
             let x2 = arena[params.in_off + buf_idx + 1u];   // x[2i+1]
@@ -82,22 +83,23 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         return;
     }
 
-    // NeoX rotate-half: pair (i, i+rot_half). The cos/sin row stride is
-    // `rot_half` (n_rot/2), matching the CPU reference: the table stores exactly
+    // NeoX rotate-half: pair (i, i+rot_half). The cos/sin ROW STRIDE is the
+    // table's own last dim, not `rot_half` — see RopeParams::cos_row_stride.
+    // (Historically this assumed
     // the rotation angles, not head_dim/2 of them. Striding by head_dim/2 under
     // PARTIAL rope reads into the next token's angles from position 1 onward.
     if (d_in_head < rot_half) {
         let xf = arena[params.in_off + buf_idx];
         let xs = arena[params.in_off + head_base + d_in_head + rot_half];
-        let c  = arena[params.cos_off + pos * rot_half + d_in_head];
-        let s  = arena[params.sin_off + pos * rot_half + d_in_head];
+        let c  = arena[params.cos_off + pos * params.cos_row_stride + d_in_head];
+        let s  = arena[params.sin_off + pos * params.cos_row_stride + d_in_head];
         arena[params.out_off + buf_idx] = xf * c - xs * s;
     } else {
         let dl = d_in_head - rot_half;
         let xs = arena[params.in_off + buf_idx];
         let xf = arena[params.in_off + head_base + dl];
-        let c  = arena[params.cos_off + pos * rot_half + dl];
-        let s  = arena[params.sin_off + pos * rot_half + dl];
+        let c  = arena[params.cos_off + pos * params.cos_row_stride + dl];
+        let s  = arena[params.sin_off + pos * params.cos_row_stride + dl];
         arena[params.out_off + buf_idx] = xs * c + xf * s;
     }
 }

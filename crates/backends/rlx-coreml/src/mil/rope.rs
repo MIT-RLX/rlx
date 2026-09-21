@@ -22,24 +22,39 @@ use std::collections::HashMap;
 
 use super::*;
 
-/// Sequence length axis for NeoX RoPE layouts.
-fn rope_seq_len(shape: &Shape, heads_packed: bool) -> Result<usize> {
+/// Everything [`LowerCtx::lower_rope_gptj`] needs from its caller.
+struct LowerRopeGptj<'b> {
+    eff_x: &'b str,
+    eff_shape: &'b Shape,
+    eff_cos: &'b str,
+    eff_sin: &'b str,
+    /// Shape of the sliced cos/sin table, head axis included when packed.
+    eff_table: &'b Shape,
+    head_dim: usize,
+    n_rot: usize,
+    /// Original shape to reshape back to, when the rotation ran on a per-head
+    /// view of a heads-packed tensor.
+    restore: Option<&'b Shape>,
+}
+
+/// Sequence length axis for RoPE layouts.
+fn rope_seq_len(shape: &Shape, _heads_packed: bool) -> Result<usize> {
     let rank = shape.rank();
-    let idx = if heads_packed {
-        // `[B, S, G, head_dim]`
-        1
-    } else if rank == 4 {
-        // `[B, H, S, D]`
-        2
-    } else if rank >= 2 {
-        // `[B, S, D]`
-        1
-    } else {
+    if rank < 2 {
         return Err(CoremlError::Unsupported(format!(
             "rope: cannot infer seq from rank-{rank} shape {:?}",
             shape.dims()
         )));
-    };
+    }
+    // The sequence is always the axis just before the lane axis, whatever the
+    // rank: `[S, D]`, `[B, S, D]`, `[B, H, S, D]` and the heads-packed
+    // `[.., S, G·head_dim]` all put it at `rank - 2`.
+    //
+    // Special-casing per rank got the rank-2 forms wrong in both branches — a
+    // `[S, G·head_dim]` input read its packed lane count as the sequence length,
+    // so the cos/sin tables were reshaped to the wrong width and CoreML refused
+    // to load the model. (Metal had the same bug in its own derivation.)
+    let idx = rank - 2;
     match shape.dim(idx) {
         Dim::Static(s) => Ok(s),
         Dim::Dynamic(s) => Err(CoremlError::DynamicShape(format!("rope seq ?{s}"))),
@@ -47,7 +62,7 @@ fn rope_seq_len(shape: &Shape, heads_packed: bool) -> Result<usize> {
 }
 
 impl<'a> LowerCtx<'a> {
-    /// RoPE (NeoX split-halves). Inputs `[x, cos, sin]`; rotates the first
+    /// RoPE. Inputs `[x, cos, sin]`; rotates the first
     /// `n_rot` of the trailing `head_dim` lane, passes the rest through.
     /// Only the layout where the last axis == `head_dim` is supported
     /// (`[B,H,S,D]` or `[B,S,D]`); the cos/sin tables (`[…,n_rot/2]`)
@@ -57,11 +72,17 @@ impl<'a> LowerCtx<'a> {
     /// `max_pos ≫ seq` (Qwen3.5 / Bonsai: max_pos=262144). Metal/CPU RoPE
     /// index by position; this lowering slices tables to `[seq, rot_half]`
     /// before any mul so Espresso broadcast matches the activation.
+    /// `style` picks the pairing: [`RopeStyle::NeoX`] rotates the two halves of
+    /// the lane against each other, [`RopeStyle::GptJ`] rotates adjacent
+    /// even/odd pairs. The two produce different numbers from the same tables,
+    /// so a lowering that ignores the argument is silently wrong for every model
+    /// using the other convention — which is what this did before.
     pub(crate) fn lower_rope(
         &mut self,
         id: NodeId,
         head_dim: usize,
         n_rot: usize,
+        style: rlx_ir::op::RopeStyle,
         out_name: &str,
     ) -> Result<()> {
         let (shape, in0, in1, in2) = {
@@ -101,8 +122,8 @@ impl<'a> LowerCtx<'a> {
         // (`[.., G*head_dim]`, the fused-QKV layout used by e.g. Qwen3-ASR),
         // reshape to `[.., G, head_dim]`, rotate per head, then reshape back —
         // cos/sin gain a singleton head axis so they broadcast over the heads.
-        let (eff_x, eff_shape, eff_cos, eff_sin, restore) = if last == head_dim {
-            (x, shape.clone(), cos, sin, None)
+        let (eff_x, eff_shape, eff_cos, eff_sin, eff_table, restore) = if last == head_dim {
+            (x, shape.clone(), cos, sin, table_shape.clone(), None)
         } else if heads_packed {
             let groups = last / head_dim;
             let mut gd = shape.dims().to_vec();
@@ -126,7 +147,16 @@ impl<'a> LowerCtx<'a> {
                 self.rope_insert_head_axis_shape(&table_shape, &cos, &format!("{out_name}_cosg"))?;
             let sin_g =
                 self.rope_insert_head_axis_shape(&table_shape, &sin, &format!("{out_name}_sing"))?;
-            (xg, gshape, cos_g, sin_g, Some(shape.clone()))
+            let mut td = table_shape.dims().to_vec();
+            td.insert(td.len() - 1, Dim::Static(1));
+            (
+                xg,
+                gshape,
+                cos_g,
+                sin_g,
+                Shape::from_dims(&td, DType::F32),
+                Some(shape.clone()),
+            )
         } else {
             return Err(CoremlError::Unsupported(format!(
                 "rope: last dim {last} is not a multiple of head_dim {head_dim} \
@@ -145,6 +175,22 @@ impl<'a> LowerCtx<'a> {
             Some(_) => format!("{out_name}_core"),
             None => out_name.to_string(),
         };
+
+        if style == rlx_ir::op::RopeStyle::GptJ {
+            return self.lower_rope_gptj(
+                LowerRopeGptj {
+                    eff_x: &eff_x,
+                    eff_shape: &eff_shape,
+                    eff_cos: &eff_cos,
+                    eff_sin: &eff_sin,
+                    eff_table: &eff_table,
+                    head_dim,
+                    n_rot,
+                    restore: restore.as_ref(),
+                },
+                out_name,
+            );
+        }
 
         // x1 = x[..0:rh], x2 = x[..rh:n_rot]
         let x1 = format!("{out_name}_x1");
@@ -300,6 +346,171 @@ impl<'a> LowerCtx<'a> {
     /// Reshape a rope cos/sin table to gain a singleton head axis just before
     /// its last dim, so it broadcasts over the per-head groups when rope runs
     /// on a fused `[.., G, head_dim]` view.
+    /// Arguments for [`Self::lower_rope_gptj`], which needs the effective
+    /// tensor, table and pass-through shapes all at once.
+    fn lower_rope_gptj(&mut self, a: LowerRopeGptj<'_>, out_name: &str) -> Result<()> {
+        let eff_rank = a.eff_shape.rank();
+        let half = a.n_rot / 2;
+        let pass_len = a.head_dim - a.n_rot;
+        let core = match a.restore {
+            Some(_) => format!("{out_name}_core"),
+            None => out_name.to_string(),
+        };
+
+        // GptJ rotates adjacent lanes, so view the rotated span as `[.., half, 2]`
+        // and take the even and odd members as two `[.., half, 1]` tensors. MIL's
+        // slice has no stride, so this is done with a reshape rather than a
+        // strided read.
+        let rot_shape = with_last(a.eff_shape, a.n_rot);
+        let rot = if pass_len == 0 {
+            a.eff_x.to_string()
+        } else {
+            let r = format!("{out_name}_rotin");
+            self.slice_last(a.eff_x, eff_rank, 0, a.n_rot, &rot_shape, &r)?;
+            r
+        };
+        let pair_dims = {
+            let mut d = a.eff_shape.dims().to_vec();
+            d.pop();
+            d.push(Dim::Static(half));
+            d.push(Dim::Static(2));
+            d
+        };
+        let pair_shape = Shape::from_dims(&pair_dims, DType::F32);
+        let xp = format!("{out_name}_xp");
+        self.emit(
+            "reshape",
+            &xp,
+            &pair_shape,
+            vec![
+                ("x", bind_name(&rot)),
+                ("shape", bind_value(vec_i32(&dims_i32(&pair_dims)))),
+            ],
+        )?;
+        let lane_shape = with_last(&pair_shape, 1);
+        let pair_rank = pair_shape.rank();
+        let (x1, x2) = (format!("{out_name}_e"), format!("{out_name}_o"));
+        self.slice_last(&xp, pair_rank, 0, 1, &lane_shape, &x1)?;
+        self.slice_last(&xp, pair_rank, 1, 1, &lane_shape, &x2)?;
+
+        // the tables gain a trailing singleton so they broadcast over the pair
+        let mut td = a.eff_table.dims().to_vec();
+        td.push(Dim::Static(1));
+        let tshape = Shape::from_dims(&td, DType::F32);
+        let (cos1, sin1) = (format!("{out_name}_cosp"), format!("{out_name}_sinp"));
+        for (src, dst) in [(a.eff_cos, &cos1), (a.eff_sin, &sin1)] {
+            self.emit(
+                "reshape",
+                dst,
+                &tshape,
+                vec![
+                    ("x", bind_name(src)),
+                    ("shape", bind_value(vec_i32(&dims_i32(&td)))),
+                ],
+            )?;
+        }
+
+        // out_even = x1·cos − x2·sin ; out_odd = x2·cos + x1·sin
+        let names = [
+            format!("{out_name}_x1c"),
+            format!("{out_name}_x2s"),
+            format!("{out_name}_x2c"),
+            format!("{out_name}_x1s"),
+        ];
+        for (dst, (l, r)) in
+            names
+                .iter()
+                .zip([(&x1, &cos1), (&x2, &sin1), (&x2, &cos1), (&x1, &sin1)])
+        {
+            self.emit(
+                "mul",
+                dst,
+                &lane_shape,
+                vec![("x", bind_name(l)), ("y", bind_name(r))],
+            )?;
+        }
+        let (o1, o2) = (format!("{out_name}_o1"), format!("{out_name}_o2"));
+        self.emit(
+            "sub",
+            &o1,
+            &lane_shape,
+            vec![("x", bind_name(&names[0])), ("y", bind_name(&names[1]))],
+        )?;
+        self.emit(
+            "add",
+            &o2,
+            &lane_shape,
+            vec![("x", bind_name(&names[2])), ("y", bind_name(&names[3]))],
+        )?;
+
+        // back to `[.., half, 2]` — concatenating on the pair axis *is* the
+        // interleave — then flatten to `[.., n_rot]`
+        let paired = format!("{out_name}_paired");
+        self.emit(
+            "concat",
+            &paired,
+            &pair_shape,
+            vec![
+                ("values", bind_names(&[o1, o2])),
+                ("axis", bind_value(scalar_i32((pair_rank - 1) as i32))),
+                ("interleave", bind_value(scalar_bool(false))),
+            ],
+        )?;
+        let rotated = format!("{out_name}_rotout");
+        let rd = rot_shape.dims().to_vec();
+        self.emit(
+            "reshape",
+            &rotated,
+            &rot_shape,
+            vec![
+                ("x", bind_name(&paired)),
+                ("shape", bind_value(vec_i32(&dims_i32(&rd)))),
+            ],
+        )?;
+
+        if pass_len == 0 {
+            // `core` must name the rotated tensor; emit an identity reshape so
+            // the downstream name resolves without a second code path.
+            self.emit(
+                "reshape",
+                &core,
+                &rot_shape,
+                vec![
+                    ("x", bind_name(&rotated)),
+                    ("shape", bind_value(vec_i32(&dims_i32(&rd)))),
+                ],
+            )?;
+        } else {
+            let pass = format!("{out_name}_pass");
+            let pass_shape = with_last(a.eff_shape, pass_len);
+            self.slice_last(a.eff_x, eff_rank, a.n_rot, pass_len, &pass_shape, &pass)?;
+            self.emit(
+                "concat",
+                &core,
+                a.eff_shape,
+                vec![
+                    ("values", bind_names(&[rotated, pass])),
+                    ("axis", bind_value(scalar_i32((eff_rank - 1) as i32))),
+                    ("interleave", bind_value(scalar_bool(false))),
+                ],
+            )?;
+        }
+
+        if let Some(orig) = a.restore {
+            let od = orig.dims().to_vec();
+            self.emit(
+                "reshape",
+                out_name,
+                orig,
+                vec![
+                    ("x", bind_name(&core)),
+                    ("shape", bind_value(vec_i32(&dims_i32(&od)))),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn rope_insert_head_axis_shape(
         &mut self,
         shape: &Shape,

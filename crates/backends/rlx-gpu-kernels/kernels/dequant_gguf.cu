@@ -82,7 +82,8 @@ extern "C" __global__ void dequant_gguf(
     if (scheme_id != 6u && scheme_id != 10u && scheme_id != 11u
         && scheme_id != 19u && scheme_id != 20u
         && scheme_id != 21u && scheme_id != 22u && scheme_id != 23u
-        && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u) {
+        && scheme_id != 24u && scheme_id != 25u && scheme_id != 28u
+        && scheme_id != 29u) {
         float* dst = arena + dst_f32_off + gid * 256u;
 
         if (scheme_id == 3u) {
@@ -625,6 +626,40 @@ extern "C" __global__ void dequant_gguf(
         for (unsigned int j = 0u; j < 128u; ++j) {
             unsigned int q = (qs[j >> 2u] >> ((j & 3u) * 2u)) & 3u;
             dst[j] = (float)((int)q - 1) * d;
+        }
+        return;
+    }
+
+    if (scheme_id == 29u) {
+        // PTQ1_0 (prism-ml Ternary Bonsai 2): 24 qs | 2 qh | f16 d
+        // (28 bytes / 128 elems). Base-3 trits; digit n of byte b is
+        // ((unsigned char)(b * 3^n) * 3) >> 8 -> 0/1/2 -> -1/0/+1. The
+        // element -> (byte, digit) map is staged, not sequential.
+        unsigned int off = gid * 28u;
+        const unsigned char* qs = w_base + off;
+        const unsigned char* qh = w_base + off + 24u;
+        float d = dq_read_f16(w_base, off + 26u);
+        float* dst = arena + dst_f32_off + gid * 128u;
+        for (unsigned int e = 0u; e < 128u; ++e) {
+            unsigned char b;
+            unsigned int n;
+            if (e < 80u) {
+                b = qs[e & 15u];
+                n = e >> 4u;
+            } else if (e < 120u) {
+                unsigned int t = e - 80u;
+                b = qs[16u + (t & 7u)];
+                n = t >> 3u;
+            } else {
+                unsigned int t = e - 120u;
+                b = qh[t & 1u];
+                n = t >> 1u;
+            }
+            unsigned int v = (unsigned int) b;
+            for (unsigned int i = 0u; i < 4u; ++i) {
+                if (i < n) { v = (v * 3u) & 0xFFu; }
+            }
+            dst[e] = (float) ((int) ((v * 3u) >> 8u) - 1) * d;
         }
         return;
     }

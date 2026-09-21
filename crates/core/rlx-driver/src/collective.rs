@@ -103,8 +103,7 @@ pub fn all_reduce<T: SymmetricTransport>(
             len: buf.len,
         };
         transport.get(src, &mut scratch_bytes)?;
-        let scratch =
-            unsafe { std::slice::from_raw_parts(scratch_bytes.as_ptr() as *const f32, elems) };
+        let scratch = rlx_ir::bytes::decode_le::<f32>(&scratch_bytes[..elems * 4]);
         for (i, &v) in scratch.iter().enumerate() {
             acc[i] = op.fold(acc[i], v);
         }
@@ -161,11 +160,9 @@ pub fn all_gather<T: SymmetricTransport>(
             len: buf.len,
         };
         transport.get(src, &mut scratch_bytes)?;
-        let chunk = unsafe {
-            std::slice::from_raw_parts(scratch_bytes.as_ptr() as *const f32, elems_per_rank)
-        };
+        let chunk = rlx_ir::bytes::decode_le::<f32>(&scratch_bytes[..elems_per_rank * 4]);
         let dst_start = r * elems_per_rank;
-        output[dst_start..dst_start + elems_per_rank].copy_from_slice(chunk);
+        output[dst_start..dst_start + elems_per_rank].copy_from_slice(chunk.as_ref());
     }
     Ok(())
 }
@@ -266,7 +263,7 @@ pub fn ring_all_reduce<T: SymmetricTransport>(
         transport.put(mailbox(right), src)?;
         transport.barrier()?;
         transport.get(mailbox(me), &mut recv)?;
-        let incoming = unsafe { std::slice::from_raw_parts(recv.as_ptr() as *const f32, chunk) };
+        let incoming = rlx_ir::bytes::decode_le::<f32>(&recv[..chunk * 4]);
         let d = recv_idx * chunk;
         for i in 0..chunk {
             local[d + i] = op.fold(local[d + i], incoming[i]);
@@ -282,9 +279,9 @@ pub fn ring_all_reduce<T: SymmetricTransport>(
         transport.put(mailbox(right), src)?;
         transport.barrier()?;
         transport.get(mailbox(me), &mut recv)?;
-        let incoming = unsafe { std::slice::from_raw_parts(recv.as_ptr() as *const f32, chunk) };
+        let incoming = rlx_ir::bytes::decode_le::<f32>(&recv[..chunk * 4]);
         let d = recv_idx * chunk;
-        local[d..d + chunk].copy_from_slice(incoming);
+        local[d..d + chunk].copy_from_slice(incoming.as_ref());
         transport.barrier()?;
     }
 
@@ -347,8 +344,7 @@ mod tests {
                     len: bytes,
                 };
                 t.get(src, &mut scratch).unwrap();
-                let view =
-                    unsafe { std::slice::from_raw_parts(scratch.as_ptr() as *const f32, elems) };
+                let view = rlx_ir::bytes::decode_le::<f32>(&scratch[..elems * 4]);
                 for (i, &v) in view.iter().enumerate() {
                     acc[i] += v;
                 }
@@ -402,10 +398,9 @@ mod tests {
                     len: bytes,
                 };
                 t.get(src, &mut scratch).unwrap();
-                let view =
-                    unsafe { std::slice::from_raw_parts(scratch.as_ptr() as *const f32, chunk) };
+                let view = rlx_ir::bytes::decode_le::<f32>(&scratch[..chunk * 4]);
                 let dst_start = src_r as usize * chunk;
-                output[dst_start..dst_start + chunk].copy_from_slice(view);
+                output[dst_start..dst_start + chunk].copy_from_slice(view.as_ref());
             }
             assert_eq!(
                 output,

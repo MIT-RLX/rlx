@@ -1688,6 +1688,10 @@ impl ExecutableGraph for XdnaDm2Exec {
 
 /// Reinterpret an f32 slice as i32 (same 4-byte cells) for the byte-level shim.
 fn as_i32(x: &[f32]) -> &[i32] {
+    // SAFETY: f32 and i32 have the same size AND the same alignment, so this
+    // neither over-reads nor raises the alignment requirement (unlike a
+    // `&[u8]` → `&[f32]` cast, which does and needs `rlx_ir::bytes`). Every
+    // 4-byte pattern is a valid i32.
     unsafe { std::slice::from_raw_parts(x.as_ptr() as *const i32, x.len()) }
 }
 

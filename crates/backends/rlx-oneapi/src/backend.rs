@@ -2171,7 +2171,16 @@ impl OneApiExecutable {
                 let sin = node.inputs[2];
                 let dyd = dims(&self.graph, dy);
                 let (batch, seq, hidden) = if dyd.len() >= 3 {
-                    (dyd[0], dyd[1], dyd[2])
+                    // Fold leading axes into `batch`: rank 4 `[B, H, S, D]`
+                    // otherwise takes `seq = H` and `hidden = S`. UNTESTED here
+                    // (no oneAPI device on this machine); mechanical and a no-op
+                    // at rank 3.
+                    let rank = dyd.len();
+                    (
+                        dyd[..rank - 2].iter().product::<usize>(),
+                        dyd[rank - 2],
+                        dyd[rank - 1],
+                    )
                 } else {
                     (1, dyd[0], dyd.get(1).copied().unwrap_or(1))
                 };
