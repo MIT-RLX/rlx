@@ -40,12 +40,20 @@ pub struct ChatMessage {
 
 /// Extra Jinja variables for templates that need more than the ChatML
 /// baseline (Gemma 4 thinking channel, tool schemas, …).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ChatRenderOptions {
     pub add_generation_prompt: bool,
     /// Gemma 4 unified templates gate the `<|think|>` prefix and thought
     /// channel on this flag (HF `enable_thinking`, default true for IT).
     pub enable_thinking: bool,
+    /// OpenAI-style tool specifications, exposed to the template as `tools`.
+    ///
+    /// Chat templates for tool-capable models (Qwen3, Llama 3.x, Mistral, …)
+    /// branch on `tools` to emit a system block describing the callable
+    /// functions. Leaving it unset meant that branch never fired, so a caller
+    /// that passed tools got a model that had never been told about them — it
+    /// answers in prose and the tools look broken rather than unsupported.
+    pub tools: Vec<JsonValue>,
 }
 
 impl Default for ChatRenderOptions {
@@ -53,7 +61,20 @@ impl Default for ChatRenderOptions {
         Self {
             add_generation_prompt: true,
             enable_thinking: false,
+            tools: Vec::new(),
         }
+    }
+}
+
+impl ChatTemplate {
+    /// Whether this template has a `tools` branch.
+    ///
+    /// Checked against the template source because that is the only honest
+    /// signal available: a template with no `tools` reference will silently
+    /// ignore anything passed, and a caller needs to be able to say
+    /// "this model cannot do tool calling" rather than answer as if it had.
+    pub fn supports_tools(&self) -> bool {
+        self.source_text.contains("tools")
     }
 }
 
@@ -69,6 +90,7 @@ impl ChatRenderOptions {
         Self {
             add_generation_prompt,
             enable_thinking: true,
+            ..Self::default()
         }
     }
 }
@@ -82,7 +104,19 @@ struct GettableValue(JsonValue);
 impl GettableValue {
     fn from_json(v: JsonValue) -> Value {
         match v {
-            JsonValue::Object(_) | JsonValue::Array(_) => Value::from_object(Self(v)),
+            // Arrays become real minijinja sequences, not wrapped objects. A
+            // wrapper only answers `get_value`, which is indexing — `{% for %}`
+            // over it yields nothing, so a nested array (an assistant turn's
+            // `tool_calls`, a multi-part `content`) rendered as empty with no
+            // error. Objects stay wrapped, because that is what gives templates
+            // the `.get(key)` method they call.
+            JsonValue::Array(items) => Value::from(
+                items
+                    .into_iter()
+                    .map(Self::from_json)
+                    .collect::<Vec<Value>>(),
+            ),
+            JsonValue::Object(_) => Value::from_object(Self(v)),
             JsonValue::String(s) => Value::from(s),
             JsonValue::Number(n) => {
                 if let Some(i) = n.as_i64() {
@@ -108,10 +142,7 @@ impl Object for GettableValue {
                 let k = key.as_str()?;
                 map.get(k).map(|v| GettableValue::from_json(v.clone()))
             }
-            JsonValue::Array(items) => {
-                let idx = key.as_usize()?;
-                items.get(idx).map(|v| GettableValue::from_json(v.clone()))
-            }
+            // Arrays never reach here: `from_json` turns them into sequences.
             _ => None,
         }
     }
@@ -152,18 +183,6 @@ impl Object for GettableValue {
             JsonValue::Object(_) => write!(f, "{{...}}"),
         }
     }
-}
-
-fn chat_messages_to_values(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|m| {
-            GettableValue::from_json(serde_json::json!({
-                "role": m.role,
-                "content": m.content,
-            }))
-        })
-        .collect()
 }
 
 impl ChatMessage {
@@ -219,12 +238,57 @@ fn build_env(source: String) -> Result<Environment<'static>> {
     // Poolside / Unsloth Jinja uses Python str methods (`.strip()`, `.rstrip()`,
     // …). MiniJinja does not expose those on builtins — bridge the common ones.
     env.set_unknown_method_callback(hf_string_method_callback);
+    // Tool-use templates serialize each tool's schema with `| tojson`. MiniJinja
+    // ships that filter only with its `json` feature, which this crate does not
+    // enable, so a tools render fails outright with "unknown filter" — not a
+    // degraded prompt, no render at all. Provide it over `serde_json`, which is
+    // already a dependency, and honour the `indent` argument HF templates pass.
+    env.add_filter(
+        "tojson",
+        |v: Value, kwargs: minijinja::value::Kwargs| -> Result<String, JinjaError> {
+            // `tojson(indent=2)` passes a keyword, which arrives as `Kwargs`
+            // rather than positionally — taking it as `Option<usize>` makes
+            // minijinja try to convert the whole kwargs map and the render dies.
+            let indent: Option<usize> = kwargs.get("indent").ok();
+            kwargs.assert_all_used()?;
+            // A wrapped dict has to be unwrapped first: `GettableValue` exists to
+            // give templates a `.get()` method, and serializing the wrapper
+            // yields `{}` — which renders a tools block listing no tools, the
+            // exact silent-but-plausible failure this is all guarding against.
+            let json: JsonValue = match v.downcast_object_ref::<GettableValue>() {
+                Some(g) => g.0.clone(),
+                None => serde_json::to_value(&v).map_err(|e| {
+                    JinjaError::new(ErrorKind::InvalidOperation, format!("tojson: {e}"))
+                })?,
+            };
+            let out = match indent {
+                Some(n) if n > 0 => {
+                    let pad = vec![b' '; n];
+                    let fmt = serde_json::ser::PrettyFormatter::with_indent(&pad);
+                    let mut buf = Vec::new();
+                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+                    serde::Serialize::serialize(&json, &mut ser).map_err(|e| {
+                        JinjaError::new(ErrorKind::InvalidOperation, format!("tojson: {e}"))
+                    })?;
+                    String::from_utf8(buf).unwrap_or_default()
+                }
+                _ => json.to_string(),
+            };
+            Ok(out)
+        },
+    );
     env.add_template_owned(TEMPLATE_NAME, source)
         .context("compiling chat template")?;
     Ok(env)
 }
 
-/// Minimal HF/Python string method bridge for chat templates.
+/// Python string methods that HF chat templates call, bridged onto MiniJinja.
+///
+/// The set is driven by what real templates use, not by completeness. The
+/// previous version rejected *every* call that had an argument, which meant
+/// `startswith(prefix)`, `endswith`, `split(sep)` and `replace(a, b)` all
+/// failed — Qwen3's template could not render at all, and the error named only
+/// the first method it happened to hit.
 fn hf_string_method_callback(
     _state: &State<'_, '_>,
     value: &Value,
@@ -237,26 +301,164 @@ fn hf_string_method_callback(
             format!("object has no method named {method}"),
         ));
     };
-    if !args.is_empty() {
-        return Err(JinjaError::new(
+
+    let arg_str =
+        |i: usize| -> Option<String> { args.get(i).and_then(|v| v.as_str()).map(str::to_owned) };
+    let wrong_args = |want: &str| {
+        JinjaError::new(
             ErrorKind::InvalidOperation,
-            format!("{method}() takes no arguments in this bridge"),
-        ));
-    }
-    let out = match method {
-        "strip" => s.trim(),
-        "lstrip" => s.trim_start(),
-        "rstrip" => s.trim_end(),
-        "lower" => return Ok(Value::from(s.to_lowercase())),
-        "upper" => return Ok(Value::from(s.to_uppercase())),
-        other => {
-            return Err(JinjaError::new(
-                ErrorKind::UnknownMethod,
-                format!("string has no method named {other}"),
-            ));
-        }
+            format!("{method}() expects {want}"),
+        )
     };
-    Ok(Value::from(out))
+
+    match method {
+        // ── no arguments ──
+        "strip" | "lstrip" | "rstrip" if args.is_empty() => Ok(Value::from(match method {
+            "strip" => s.trim(),
+            "lstrip" => s.trim_start(),
+            _ => s.trim_end(),
+        })),
+        "lower" => Ok(Value::from(s.to_lowercase())),
+        "upper" => Ok(Value::from(s.to_uppercase())),
+        "title" => Ok(Value::from(title_case(s))),
+        "capitalize" => {
+            let mut chars = s.chars();
+            Ok(Value::from(match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }))
+        }
+        "splitlines" => Ok(Value::from(s.lines().map(Value::from).collect::<Vec<_>>())),
+
+        // ── stripping a character set, as Python allows ──
+        "strip" | "lstrip" | "rstrip" => {
+            let chars: Vec<char> = arg_str(0)
+                .ok_or_else(|| wrong_args("a string of characters"))?
+                .chars()
+                .collect();
+            let trimmed = match method {
+                "strip" => s.trim_matches(|c| chars.contains(&c)),
+                "lstrip" => s.trim_start_matches(|c| chars.contains(&c)),
+                _ => s.trim_end_matches(|c| chars.contains(&c)),
+            };
+            Ok(Value::from(trimmed))
+        }
+
+        // ── prefix / suffix tests ──
+        //
+        // Python accepts a tuple of candidates as well as a single string, and
+        // templates do use that form, so both are handled.
+        "startswith" | "endswith" => {
+            let first = args.first().ok_or_else(|| wrong_args("a prefix"))?;
+            let candidates: Vec<String> = match first.as_str() {
+                Some(one) => vec![one.to_owned()],
+                None => first
+                    .try_iter()
+                    .map_err(|_| wrong_args("a string or a sequence of strings"))?
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
+            };
+            let hit = candidates.iter().any(|c| {
+                if method == "startswith" {
+                    s.starts_with(c.as_str())
+                } else {
+                    s.ends_with(c.as_str())
+                }
+            });
+            Ok(Value::from(hit))
+        }
+
+        // ── splitting ──
+        //
+        // Bare `split()` splits on any whitespace run and drops empties, which
+        // is Python's behaviour and *not* the same as splitting on " ".
+        "split" | "rsplit" => {
+            let sep = arg_str(0);
+            let limit = args
+                .get(1)
+                .and_then(|v| v.as_i64())
+                .filter(|n| *n >= 0)
+                .map(|n| n as usize);
+            let parts: Vec<Value> = match (&sep, limit) {
+                (None, _) => s.split_whitespace().map(Value::from).collect(),
+                (Some(sep), None) => s.split(sep.as_str()).map(Value::from).collect(),
+                (Some(sep), Some(n)) if method == "split" => {
+                    s.splitn(n + 1, sep.as_str()).map(Value::from).collect()
+                }
+                (Some(sep), Some(n)) => {
+                    let mut v: Vec<Value> =
+                        s.rsplitn(n + 1, sep.as_str()).map(Value::from).collect();
+                    v.reverse();
+                    v
+                }
+            };
+            Ok(Value::from(parts))
+        }
+
+        "replace" => {
+            let from = arg_str(0).ok_or_else(|| wrong_args("(old, new)"))?;
+            let to = arg_str(1).ok_or_else(|| wrong_args("(old, new)"))?;
+            let count = args.get(2).and_then(|v| v.as_i64()).filter(|n| *n >= 0);
+            Ok(Value::from(match count {
+                Some(n) => s.replacen(from.as_str(), &to, n as usize),
+                None => s.replace(from.as_str(), &to),
+            }))
+        }
+
+        "join" => {
+            let items = args.first().ok_or_else(|| wrong_args("a sequence"))?;
+            let parts: Vec<String> = items
+                .try_iter()
+                .map_err(|_| wrong_args("a sequence"))?
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .collect();
+            Ok(Value::from(parts.join(s)))
+        }
+
+        "count" => {
+            let needle = arg_str(0).ok_or_else(|| wrong_args("a substring"))?;
+            Ok(Value::from(s.matches(needle.as_str()).count()))
+        }
+        // Python's `find` answers -1 rather than raising, and returns a *byte*
+        // index here; templates use it as a containment test.
+        "find" => {
+            let needle = arg_str(0).ok_or_else(|| wrong_args("a substring"))?;
+            Ok(Value::from(
+                s.find(needle.as_str()).map(|i| i as i64).unwrap_or(-1),
+            ))
+        }
+
+        other => Err(JinjaError::new(
+            ErrorKind::UnknownMethod,
+            format!("string has no method named {other} in this bridge"),
+        )),
+    }
+}
+
+/// Python's `str.title()`: capitalize each run of letters.
+fn title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut start_of_word = true;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            if start_of_word {
+                out.extend(c.to_uppercase());
+            } else {
+                out.extend(c.to_lowercase());
+            }
+            start_of_word = false;
+        } else {
+            out.push(c);
+            start_of_word = true;
+        }
+    }
+    out
 }
 
 impl ChatTemplate {
@@ -342,11 +544,57 @@ impl ChatTemplate {
         messages: &[ChatMessage],
         opts: ChatRenderOptions,
     ) -> Result<String> {
-        let msgs = chat_messages_to_values(messages);
+        let msgs: Vec<JsonValue> = messages
+            .iter()
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .collect();
+        self.render_json_with_options(&msgs, opts)
+    }
+
+    /// Render from raw JSON messages, for fields [`ChatMessage`] does not carry.
+    ///
+    /// Tool-use templates read more than `role` and `content`: an assistant turn
+    /// is rendered with its `tool_calls`, and a `tool` turn with the result it
+    /// carries. Without those a multi-turn tool conversation loses the model's own
+    /// call from its history — it is told a result arrived for a call it has no
+    /// record of making, and typically calls the same tool again.
+    ///
+    /// Taking JSON keeps that open-ended: a caller passes whatever keys its
+    /// template reads (`tool_call_id`, `name`, …) without every consumer of
+    /// `ChatMessage` having to grow a field.
+    pub fn render_json_with_options(
+        &self,
+        messages: &[JsonValue],
+        opts: ChatRenderOptions,
+    ) -> Result<String> {
+        let msgs: Vec<Value> = messages
+            .iter()
+            .cloned()
+            .map(GettableValue::from_json)
+            .collect();
+        // `tools` is passed as `none` when empty rather than as an empty list:
+        // templates test `{% if tools %}`, and some then iterate assuming at
+        // least one entry, so an empty list can render an empty tool block.
+        let tools = if opts.tools.is_empty() {
+            Value::from(())
+        } else {
+            // Through `GettableValue`, same as messages: tool-use templates call
+            // `.get("function")` / `.get("parameters", {})` on these dicts, and a
+            // plain serde map has no `get` method — the render fails outright
+            // rather than degrading, so the wrapper is required, not cosmetic.
+            Value::from(
+                opts.tools
+                    .iter()
+                    .cloned()
+                    .map(GettableValue::from_json)
+                    .collect::<Vec<_>>(),
+            )
+        };
         let ctx = minijinja::context! {
             messages => Value::from(msgs),
             add_generation_prompt => opts.add_generation_prompt,
             enable_thinking => opts.enable_thinking,
+            tools => tools,
             bos_token => self.bos_token.clone().unwrap_or_default(),
             eos_token => self.eos_token.clone().unwrap_or_default(),
         };
@@ -567,5 +815,103 @@ mod tests {
             other => panic!("unexpected source: {other:?}"),
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Render a template against one user turn.
+    fn render(source: &str) -> String {
+        ChatTemplate::from_source(source)
+            .expect("compiles")
+            .render(&[ChatMessage::user("hi")], false)
+            .expect("renders")
+    }
+
+    #[test]
+    fn string_methods_take_arguments() {
+        // The bridge used to reject *every* call with an argument, so
+        // `startswith`, `endswith`, `split` and `replace` all failed and Qwen3's
+        // template could not render at all. The error named only whichever one
+        // the template reached first, which made it look like a single missing
+        // method.
+        let cases = [
+            (r#"{{ "hello world".startswith("hello") }}"#, "true"),
+            (r#"{{ "hello world".startswith("nope") }}"#, "false"),
+            (r#"{{ "a.txt".endswith(".txt") }}"#, "true"),
+            // Python accepts a tuple of candidates, and templates use that form.
+            (r#"{{ "a.md".endswith([".txt", ".md"]) }}"#, "true"),
+            (r#"{{ "a.rs".endswith([".txt", ".md"]) }}"#, "false"),
+            (r#"{{ "a,b,c".split(",") | join("|") }}"#, "a|b|c"),
+            (r#"{{ "a,b,c".split(",", 1) | join("|") }}"#, "a|b,c"),
+            (r#"{{ "a b  c".split() | length }}"#, "3"),
+            (r#"{{ "aXbXc".replace("X", "-") }}"#, "a-b-c"),
+            (r#"{{ "aXbXc".replace("X", "-", 1) }}"#, "a-bXc"),
+            (r#"{{ "-".join(["a", "b"]) }}"#, "a-b"),
+            (r#"{{ "xxhixx".strip("x") }}"#, "hi"),
+            (r#"{{ "abcabc".count("bc") }}"#, "2"),
+            (r#"{{ "abc".find("c") }}"#, "2"),
+            (r#"{{ "abc".find("z") }}"#, "-1"),
+        ];
+        for (source, want) in cases {
+            assert_eq!(render(source), want, "rendering {source}");
+        }
+    }
+
+    #[test]
+    fn no_argument_string_methods_still_work() {
+        for (source, want) in [
+            (r#"{{ "  hi  ".strip() }}"#, "hi"),
+            (r#"{{ "  hi".lstrip() + "!" }}"#, "hi!"),
+            (r#"{{ "hi  ".rstrip() + "!" }}"#, "hi!"),
+            (r#"{{ "Hi".lower() }}"#, "hi"),
+            (r#"{{ "hi".upper() }}"#, "HI"),
+            (r#"{{ "hello world".title() }}"#, "Hello World"),
+            (r#"{{ "hELLO".capitalize() }}"#, "Hello"),
+        ] {
+            assert_eq!(render(source), want, "rendering {source}");
+        }
+    }
+
+    #[test]
+    fn split_with_no_separator_collapses_whitespace() {
+        // Python's bare `split()` splits on runs of whitespace and drops the
+        // empties; splitting on a literal " " does not, and templates rely on
+        // the difference.
+        assert_eq!(render(r#"{{ "  a   b ".split() | length }}"#), "2");
+        // `['', '', 'a', '', '', 'b', '']` — the empties are the point.
+        assert_eq!(render(r#"{{ "  a   b ".split(" ") | length }}"#), "7");
+    }
+
+    #[test]
+    fn an_unknown_string_method_still_reports_its_name() {
+        let err = ChatTemplate::from_source(r#"{{ "x".partition("y") }}"#)
+            .expect("compiles")
+            .render(&[ChatMessage::user("hi")], false)
+            .expect_err("partition is not bridged");
+        assert!(
+            format!("{err:#}").contains("partition"),
+            "the error should name the method: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_qwen_shaped_template_renders() {
+        // The shape that failed: a `startswith` guard over the message content,
+        // which is how Qwen3 decides whether a system turn is already present.
+        let source = "\
+{%- for m in messages %}\
+{%- if m['role'] == 'system' and not m['content'].startswith('<|') %}\
+<|im_start|>system\n{{ m['content'] }}<|im_end|>\n\
+{%- else %}\
+<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n\
+{%- endif %}\
+{%- endfor %}";
+        let out = ChatTemplate::from_source(source)
+            .expect("compiles")
+            .render(
+                &[ChatMessage::system("Be brief."), ChatMessage::user("hi")],
+                false,
+            )
+            .expect("renders");
+        assert!(out.contains("<|im_start|>system\nBe brief."), "{out}");
+        assert!(out.contains("<|im_start|>user\nhi"), "{out}");
     }
 }

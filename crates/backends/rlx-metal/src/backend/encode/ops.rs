@@ -275,11 +275,15 @@ pub(crate) fn encode_cast_bufs(
                 HalfFlag::F32 => len,
                 HalfFlag::F16 => len.div_ceil(2),
             };
+            // `copy_f32` takes (arena, src_byte_off, dst_byte_off, len) — NOT
+            // two pre-offset buffers. Binding it the `cast_*` way wrote zeros.
             let p = &k.copy_f32;
+            let (so, doff) = (src as u64, dst as u64);
             enc.set_compute_pipeline_state(p);
-            enc.set_buffer(0, Some(src_buf), src as u64);
-            enc.set_buffer(1, Some(dst_buf), dst as u64);
-            enc.set_bytes(2, 4, &n as *const u32 as *const _);
+            enc.set_buffer(0, Some(src_buf), 0);
+            enc.set_bytes(1, 8, &so as *const u64 as *const _);
+            enc.set_bytes(2, 8, &doff as *const u64 as *const _);
+            enc.set_bytes(3, 4, &n as *const u32 as *const _);
             let tg_w = p.thread_execution_width().min(n as u64);
             enc.dispatch_threads(
                 crate::mtl::MTLSize {
@@ -3595,6 +3599,7 @@ pub(crate) fn encode_l2_norm_lastdim(
     dst: usize,
     rows: u32,
     h: u32,
+    denom_out: usize,
 ) {
     enc.set_compute_pipeline_state(&k.l2_norm_lastdim);
     enc.set_buffer(0, Some(buffer), 0);
@@ -3604,6 +3609,13 @@ pub(crate) fn encode_l2_norm_lastdim(
     enc.set_bytes(1, 8, &src_u64 as *const u64 as *const _);
     enc.set_bytes(2, 8, &eps_u64 as *const u64 as *const _);
     enc.set_bytes(3, 8, &dst_u64 as *const u64 as *const _);
+    // `ULONG_MAX` tells the kernel not to emit the per-row denominator.
+    let denom_u64 = if denom_out == crate::thunk::SENTINEL_OFF {
+        u64::MAX
+    } else {
+        denom_out as u64
+    };
+    enc.set_bytes(5, 8, &denom_u64 as *const u64 as *const _);
     enc.set_bytes(
         4,
         std::mem::size_of::<u32>() as u64,
@@ -3828,6 +3840,7 @@ pub(crate) fn encode_rms_norm_mul_silu(
     rows: u32,
     h: u32,
     eps: f32,
+    silu_out: usize,
 ) {
     enc.set_compute_pipeline_state(&k.rms_norm_mul_silu);
     enc.set_buffer(0, Some(buffer), 0);
@@ -3841,6 +3854,13 @@ pub(crate) fn encode_rms_norm_mul_silu(
     enc.set_bytes(3, 8, &b_u64 as *const u64 as *const _);
     enc.set_bytes(4, 8, &z_u64 as *const u64 as *const _);
     enc.set_bytes(5, 8, &dst_u64 as *const u64 as *const _);
+    // `ULONG_MAX` tells the kernel not to emit `silu(z)`.
+    let silu_u64 = if silu_out == crate::thunk::SENTINEL_OFF {
+        u64::MAX
+    } else {
+        silu_out as u64
+    };
+    enc.set_bytes(8, 8, &silu_u64 as *const u64 as *const _);
     enc.set_bytes(
         6,
         std::mem::size_of::<u32>() as u64,

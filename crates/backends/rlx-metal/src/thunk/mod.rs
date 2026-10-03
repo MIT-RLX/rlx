@@ -141,6 +141,14 @@ impl From<DType> for HalfFlag {
 #[derive(Clone, Debug)]
 pub enum Thunk {
     Nop,
+    /// Round an f32 buffer to BF16 precision, keeping f32 storage — what a
+    /// `Cast(F32 -> BF16)` means on a backend with no `bfloat` kernels, where
+    /// the bf16 slot is f32-wide (`ArenaWidthPolicy::NativeBf16Widened`).
+    RoundBf16 {
+        src: usize,
+        dst: usize,
+        len: u32,
+    },
     /// Cast between f32 and f16 (same element count, dtype change).
     Cast {
         src: usize,
@@ -450,6 +458,9 @@ pub enum Thunk {
         dst: usize,
         rows: u32,
         h: u32,
+        /// Also write the per-row denominator here (`SENTINEL_OFF` = don't), so
+        /// the fusion can absorb the chain when a later thunk still reads it.
+        denom_out: usize,
     },
     BinaryFull {
         lhs: usize,
@@ -581,6 +592,9 @@ pub enum Thunk {
         h: u32,
         eps: f32,
         dt: HalfFlag,
+        /// Also write `silu(z)` here (`SENTINEL_OFF` = don't). Lets the fusion
+        /// absorb the silu thunk even when a later thunk still reads its output.
+        silu_out: usize,
     },
     /// Depthwise 1-D conv on BSC `[B,W,C]` → `[B,out_seq,C]` (+ optional SiLU).
     /// Pattern-merged from Transpose→Copy→Conv2D→Copy→Transpose(+Silu) by
@@ -2473,6 +2487,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::ComplexNormSqBackward { .. } => "complex_norm_sq_backward",
         Thunk::FftButterflyStage { .. } => "fft_butterfly_stage",
         Thunk::ConjugateC64 { .. } => "conjugate_c64",
+        Thunk::RoundBf16 { .. } => "round_bf16",
         Thunk::ElementwiseRegion { .. } => "elementwise_region",
         Thunk::BatchElementwiseRegion { .. } => "batch_elementwise_region",
         Thunk::CustomOp { .. } => "custom_op",
@@ -3406,7 +3421,7 @@ pub(crate) fn concurrent_barrier_set(
     barriers
 }
 
-const SENTINEL_OFF: usize = usize::MAX;
+pub(crate) const SENTINEL_OFF: usize = usize::MAX;
 
 /// Last thunk index in `[0, before)` that writes `off`, or `None`.
 /// Returns `Err(())` if an opaque (`mlp_io == None`) thunk is encountered,
@@ -3437,17 +3452,40 @@ fn mlp_find_forward<F: Fn(&Thunk) -> bool>(
     (after + 1..thunks.len()).find(|&i| pred(&thunks[i]))
 }
 
+/// Per-arena-offset IR use counts — how many graph nodes read the value living
+/// at that offset. Built once per compile from the graph, so it is complete
+/// where a thunk-stream scan is not (an opaque thunk hides its reads).
+pub(crate) type UsesAtOffset = std::collections::HashMap<usize, usize>;
+
 /// True iff the value at `off` written by `producer` is read only by `allowed`
 /// thunks before it is redefined, scanning `producer+1..until` (layer-local
 /// when `until` is the next op outside the fused block). Opaque thunk ⇒ false.
+///
+/// `uses_at` closes the hole that `until` leaves. The scan is bounded on purpose
+/// — a full-graph scan hits an opaque thunk and conservatively rejects, which
+/// would disable these fusions on the decode graphs they exist for — so a reader
+/// AFTER `until` is invisible to it. A forward graph has none, which is why that
+/// was survivable; a BACKWARD graph re-reads the recomputed forward values, and
+/// dropping their producer left the reader on an unwritten slot (Metal returned
+/// zeros for `silu(gate)` and NaN out of the L2-normalize chain, so every
+/// Qwen3.5 GDN parameter gradient came back wrong while the forward stayed
+/// bit-exact). So: refuse outright when the IR says the value has more readers
+/// than this window accounts for. Two readers both INSIDE the window — one
+/// combined matmul feeding two narrows, which is what the decode-MLP fusions
+/// match — still pass, which a graph-output check or a plain "use count > 1"
+/// test would not.
 fn mlp_value_dead_in_range(
     thunks: &[Thunk],
     producer: usize,
     off: usize,
     allowed: &[usize],
     until: usize,
+    uses_at: &UsesAtOffset,
 ) -> bool {
     if off == SENTINEL_OFF {
+        return false;
+    }
+    if uses_at.get(&off).copied().unwrap_or(0) > allowed.len() {
         return false;
     }
     let until = until.min(thunks.len());
@@ -3521,6 +3559,7 @@ fn mlp_gate_up_row_bytes(k: u32, scheme: rlx_ir::quant::QuantScheme) -> usize {
 fn fuse_decode_mlp_combined_gate_up(
     thunks: &mut [Thunk],
     output_offsets: &std::collections::HashSet<usize>,
+    uses_at: &UsesAtOffset,
 ) {
     if rlx_ir::env::var("RLX_METAL_FUSE_DECODE").as_deref() == Some("0") {
         return;
@@ -3777,24 +3816,44 @@ fn fuse_decode_mlp_combined_gate_up(
 
         let layer_until = down_mm_idx + 1;
 
-        let mut dead_ok =
-            mlp_value_dead_in_range(
-                thunks,
-                combined_mm_idx,
-                combined_off,
-                &[gate_narrow_idx, up_narrow_idx],
-                layer_until,
-            ) && mlp_value_dead_in_range(
-                thunks,
-                gate_narrow_idx,
-                gate_src_off,
-                &[act_idx],
-                layer_until,
-            ) && mlp_value_dead_in_range(thunks, up_narrow_idx, up_off, &[mul_idx], layer_until)
-                && mlp_value_dead_in_range(thunks, act_idx, gate_src_off, &[mul_idx], layer_until);
+        let mut dead_ok = mlp_value_dead_in_range(
+            thunks,
+            combined_mm_idx,
+            combined_off,
+            &[gate_narrow_idx, up_narrow_idx],
+            layer_until,
+            uses_at,
+        ) && mlp_value_dead_in_range(
+            thunks,
+            gate_narrow_idx,
+            gate_src_off,
+            &[act_idx],
+            layer_until,
+            uses_at,
+        ) && mlp_value_dead_in_range(
+            thunks,
+            up_narrow_idx,
+            up_off,
+            &[mul_idx],
+            layer_until,
+            uses_at,
+        ) && mlp_value_dead_in_range(
+            thunks,
+            act_idx,
+            gate_src_off,
+            &[mul_idx],
+            layer_until,
+            uses_at,
+        );
         if let Some((add_idx, _, _)) = down_add_tail {
-            dead_ok &=
-                mlp_value_dead_in_range(thunks, down_mm_idx, down_dst, &[add_idx], layer_until);
+            dead_ok &= mlp_value_dead_in_range(
+                thunks,
+                down_mm_idx,
+                down_dst,
+                &[add_idx],
+                layer_until,
+                uses_at,
+            );
         }
         let no_output_clash = ![combined_off, gate_src_off, up_off]
             .iter()
@@ -3804,13 +3863,14 @@ fn fuse_decode_mlp_combined_gate_up(
         // at the same arena slot before it is redefined.
         let gelu_graph_ok = if use_gelu {
             let prod_readers = [down_mm_idx];
-            mlp_value_dead_in_range(thunks, mul_idx, prod, &prod_readers, thunks.len())
+            mlp_value_dead_in_range(thunks, mul_idx, prod, &prod_readers, thunks.len(), uses_at)
                 && mlp_value_dead_in_range(
                     thunks,
                     combined_mm_idx,
                     combined_off,
                     &[gate_narrow_idx, up_narrow_idx],
                     thunks.len(),
+                    uses_at,
                 )
                 && match mlp_last_writer(thunks, combined_mm_idx, comb_x) {
                     Ok(Some(w)) => mlp_unwritten_in_range(thunks, w + 1, mul_idx, comb_x),
@@ -3895,7 +3955,11 @@ fn fuse_decode_mlp_combined_gate_up(
 /// → `FusedMlpGateUpSwiGLU{N,Wg,Wu → prod}` + `FusedMlpDownResidual{prod,Wd,res → out}`.
 /// Six dispatches collapse to two (plus the untouched rms_norm). The leading
 /// rms_norm is NOT required by the matcher — only the matmul/elementwise core.
-fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet<usize>) {
+fn fuse_decode_mlp(
+    thunks: &mut [Thunk],
+    output_offsets: &std::collections::HashSet<usize>,
+    uses_at: &UsesAtOffset,
+) {
     if rlx_ir::env::var("RLX_METAL_FUSE_DECODE").as_deref() == Some("0") {
         return;
     }
@@ -4150,26 +4214,51 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
 
         // Liveness within this layer (offsets are reused across layers).
         let layer_until = down_mm_idx + 1;
-        let dead_ok =
-            mlp_value_dead_in_range(
-                thunks,
-                gate_mm_idx,
-                gate_mm_off,
-                &[copy_idx.unwrap_or(act_idx)],
-                layer_until,
-            ) && mlp_value_dead_in_range(thunks, up_mm_idx, up_off, &[mul_idx], layer_until)
-                && mlp_value_dead_in_range(thunks, act_idx, gate_act_off, &[mul_idx], layer_until)
-                && mlp_value_dead_in_range(thunks, down_mm_idx, down_dst, &[add_idx], layer_until);
+        let dead_ok = mlp_value_dead_in_range(
+            thunks,
+            gate_mm_idx,
+            gate_mm_off,
+            &[copy_idx.unwrap_or(act_idx)],
+            layer_until,
+            uses_at,
+        ) && mlp_value_dead_in_range(
+            thunks,
+            up_mm_idx,
+            up_off,
+            &[mul_idx],
+            layer_until,
+            uses_at,
+        ) && mlp_value_dead_in_range(
+            thunks,
+            act_idx,
+            gate_act_off,
+            &[mul_idx],
+            layer_until,
+            uses_at,
+        ) && mlp_value_dead_in_range(
+            thunks,
+            down_mm_idx,
+            down_dst,
+            &[add_idx],
+            layer_until,
+            uses_at,
+        );
         // None of the dropped intermediates may be a graph output.
         let no_output_clash = ![gate_mm_off, up_off, gate_act_off, down_dst]
             .iter()
             .any(|o| output_offsets.contains(o));
         let gelu_graph_ok = if use_gelu {
-            mlp_value_dead_in_range(thunks, mul_idx, prod, &[down_mm_idx, add_idx], thunks.len())
-                && match mlp_last_writer(thunks, gate_mm_idx, gate_x) {
-                    Ok(Some(w)) => mlp_unwritten_in_range(thunks, w + 1, mul_idx, gate_x),
-                    _ => false,
-                }
+            mlp_value_dead_in_range(
+                thunks,
+                mul_idx,
+                prod,
+                &[down_mm_idx, add_idx],
+                thunks.len(),
+                uses_at,
+            ) && match mlp_last_writer(thunks, gate_mm_idx, gate_x) {
+                Ok(Some(w)) => mlp_unwritten_in_range(thunks, w + 1, mul_idx, gate_x),
+                _ => false,
+            }
         } else {
             true
         };
@@ -4239,7 +4328,11 @@ fn fuse_decode_mlp(thunks: &mut [Thunk], output_offsets: &std::collections::Hash
 /// Pattern: `BinaryFull(Add, x, res → tmp)` then optional `Copy` then
 /// `RmsNorm(tmp → out)`. Requires one add operand to come from a projection
 /// (`DequantMatMul` / `Sgemm` / fused MLP down) so we don't fuse unrelated adds.
-fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet<usize>) {
+fn fuse_residual_rms_norm(
+    thunks: &mut [Thunk],
+    output_offsets: &std::collections::HashSet<usize>,
+    uses_at: &UsesAtOffset,
+) {
     // Default on. Opt out: RLX_METAL_FUSE_RESIDUAL_RMS=0. Liveness requires the
     // add dst to die at the rms — Qwen/Bonsai post-attn (`h+=attn; n=rms(h);
     // h+=ffn(n)`) correctly refuses to fuse. IR-emitted FusedResidualRmsNorm
@@ -4408,7 +4501,8 @@ fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collection
         // h+=ffn(n)`), don't bail — emit the sum from the fused op to `src` so
         // the skip stream still gets it, and drop the standalone add. Only for
         // the simple (no reshape-copy) f32 case; `src` must be the add's dst.
-        let sum_live = !mlp_value_dead_in_range(thunks, add_i, src, &add_readers, thunks.len());
+        let sum_live =
+            !mlp_value_dead_in_range(thunks, add_i, src, &add_readers, thunks.len(), uses_at);
         // The dual write must not alias the operands. `fused_residual_rms_norm`
         // writes `sum` in its FIRST pass and then RE-READS `x` and `res` in the
         // second to recompute `x+res`; if the sum lands on either operand, the
@@ -4440,7 +4534,7 @@ fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collection
                 Thunk::Copy { dst, .. } => *dst,
                 _ => src,
             };
-            if !mlp_value_dead_in_range(thunks, c, copy_dst, &[i], thunks.len()) {
+            if !mlp_value_dead_in_range(thunks, c, copy_dst, &[i], thunks.len(), uses_at) {
                 i += 1;
                 continue;
             }
@@ -4490,7 +4584,11 @@ fn fuse_residual_rms_norm(thunks: &mut [Thunk], output_offsets: &std::collection
 /// is verified link by link; anything unexpected leaves the expansion intact.
 /// Every intermediate is checked against `output_offsets` before being dropped.
 /// Off-switch: `RLX_METAL_FUSE_L2NORM=0`.
-fn fuse_l2_norm(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet<usize>) {
+fn fuse_l2_norm(
+    thunks: &mut [Thunk],
+    output_offsets: &std::collections::HashSet<usize>,
+    uses_at: &UsesAtOffset,
+) {
     if rlx_ir::env::var("RLX_METAL_FUSE_L2NORM").as_deref() == Some("0") {
         return;
     }
@@ -4624,10 +4722,49 @@ fn fuse_l2_norm(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet
                 continue;
             }
         };
-        // Never drop a value the graph hands back.
+        // Never drop a value the graph hands back, or one the IR reads more than
+        // once: every intermediate in this chain has exactly one reader (the next
+        // step), so a second reader is by definition outside the chain — which is
+        // what the Qwen3.5 backward has, and dropping the producer left it on an
+        // unwritten slot (0/0 ⇒ NaN through the normalize backward).
+        // Never drop a value the graph hands back, or one the IR reads more than
+        // once: every intermediate in this chain has exactly one reader (the next
+        // step), so a second reader is by definition outside the chain. That is
+        // what the Qwen3.5 BACKWARD has — it re-reads the recomputed forward
+        // values — and dropping the producer left it on an unwritten slot, giving
+        // 0/0 ⇒ NaN through the normalize backward.
+        //
+        // Declining is deliberate rather than "keep that one producer and fuse
+        // anyway": the fused kernel recomputes the chain, so keeping a producer
+        // sounds free, but the fused output can share an arena slot with the very
+        // intermediate being kept — 24 of 54 gradients went wrong when that was
+        // tried. The cost is ~2x on a Metal training step and nothing on a
+        // forward/decode graph, where these values have a single reader and the
+        // fusion still fires.
         if [sq, sumsq, sum_view, rms, denom]
             .iter()
             .any(|o| output_offsets.contains(o))
+        {
+            i += 1;
+            continue;
+        }
+        // A second reader of the DENOMINATOR is fine: the fused kernel computes
+        // it anyway, so have it emit the value and drop the chain regardless.
+        // That is what a backward graph needs — it recomputes the forward
+        // normalize and re-reads the denominator — and declining there costs ~2x
+        // on a training step. Emitting is sound where "keep the producer" was
+        // not: there is still exactly one writer.
+        let denom_reread = uses_at.get(&denom).copied().unwrap_or(0) > 1;
+        let denom_out = if denom_reread { denom } else { SENTINEL_OFF };
+        if denom_reread && mlp_f32_ranges_overlap(out, mul_len, denom, rows) {
+            i += 1;
+            continue;
+        }
+        // The other intermediates have no such escape — the kernel folds them
+        // into registers and never materialises them.
+        if [sq, sumsq, sum_view, rms]
+            .iter()
+            .any(|o| uses_at.get(o).copied().unwrap_or(0) > 1)
         {
             i += 1;
             continue;
@@ -4646,6 +4783,7 @@ fn fuse_l2_norm(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet
             dst: out,
             rows,
             h,
+            denom_out,
         };
         fused += 1;
         i = i6 + 1;
@@ -4661,7 +4799,11 @@ fn fuse_l2_norm(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet
 /// Anchors on `Mul`; one operand is an `RmsNorm` result, the other is a
 /// `Silu` (optionally after a reshape `Copy`). Collapses silu + rms + mul
 /// (+ copy) into one dispatch — 48× per Bonsai decode step.
-fn fuse_gdn_gated_norm(thunks: &mut [Thunk], output_offsets: &std::collections::HashSet<usize>) {
+fn fuse_gdn_gated_norm(
+    thunks: &mut [Thunk],
+    output_offsets: &std::collections::HashSet<usize>,
+    uses_at: &UsesAtOffset,
+) {
     if rlx_ir::env::var("RLX_METAL_FUSE_DECODE").as_deref() == Some("0")
         || rlx_ir::env::var("RLX_METAL_FUSE_GDN_NORM").as_deref() == Some("0")
     {
@@ -4670,6 +4812,7 @@ fn fuse_gdn_gated_norm(thunks: &mut [Thunk], output_offsets: &std::collections::
     let verbose = rlx_ir::env::flag("RLX_METAL_FUSE_DECODE_LOG");
     let n_thunks = thunks.len();
     let mut fused = 0usize;
+    let mut anchors = 0usize;
     let mut i = 0;
     while i < n_thunks {
         let (mul_lhs, mul_rhs, mul_dst, mul_len, mul_dt) = match &thunks[i] {
@@ -4692,6 +4835,7 @@ fn fuse_gdn_gated_norm(thunks: &mut [Thunk], output_offsets: &std::collections::
             continue;
         }
 
+        anchors += 1;
         // Identify which mul input is rms_norm output.
         let try_rms = |off: usize| -> Option<(usize, usize, usize, usize, u32, u32, f32)> {
             match mlp_last_writer(thunks, i, off) {
@@ -4786,11 +4930,42 @@ fn fuse_gdn_gated_norm(thunks: &mut [Thunk], output_offsets: &std::collections::
 
         // Only scan through this mul — a full-graph scan hits opaque GDN/conv
         // thunks in later layers and falsely rejects (same footgun as MLP fuse).
-        if !mlp_value_dead_in_range(thunks, rms_i, rms_dst, &[i], i + 1) {
+        // `output_offsets` is what covers the readers that scan cannot see:
+        // it carries every node the IR reads more than once, so a value this
+        // fusion would drop while a LATER thunk still reads it is rejected here
+        // (the Qwen3.5 backward re-reads `silu(gate)`, and dropping it returned
+        // zeros).
+        // An intermediate the IR reads more than once has a reader outside this
+        // window (every in-window reader is the mul itself), and the bounded scan
+        // cannot see it. Rather than decline — which costs ~2x on a training step,
+        // where these chains are hot — have the fused kernel EMIT the value it
+        // recomputes anyway, and drop the producer regardless. That is sound in a
+        // way that "keep the producer and fuse" was not: two earlier attempts at
+        // that put 24 of 54, then 1 of 54 Qwen3.5 gradients wrong, because the
+        // fused output can land on the very slot being kept. Here there is only
+        // one writer of `z_side` either way.
+        //
+        // `rms_dst` has no such escape (the kernel folds the norm into the mul
+        // and never materialises it), so a second reader of THAT still declines.
+        let keep_silu = uses_at.get(&z_side).copied().unwrap_or(0) > 1;
+        let silu_out = if keep_silu { z_side } else { SENTINEL_OFF };
+        // Emitting into `z_side` while also writing `mul_dst` needs them disjoint.
+        if keep_silu && mlp_f32_ranges_overlap(mul_dst, mul_len, z_side, mul_len) {
             i += 1;
             continue;
         }
-        if !mlp_value_dead_in_range(thunks, silu_i, z_side, &[i], i + 1) {
+        if uses_at.get(&rms_dst).copied().unwrap_or(0) > 1 {
+            i += 1;
+            continue;
+        }
+        // In-window liveness still has to hold; the use-count veto is handled
+        // above, so pass an empty map rather than double-counting it.
+        let empty = UsesAtOffset::new();
+        if !mlp_value_dead_in_range(thunks, rms_i, rms_dst, &[i], i + 1, &empty) {
+            i += 1;
+            continue;
+        }
+        if !mlp_value_dead_in_range(thunks, silu_i, z_side, &[i], i + 1, &empty) {
             i += 1;
             continue;
         }
@@ -4818,6 +4993,7 @@ fn fuse_gdn_gated_norm(thunks: &mut [Thunk], output_offsets: &std::collections::
             h,
             eps,
             dt: mul_dt,
+            silu_out,
         };
         fused += 1;
         if verbose {
@@ -4825,8 +5001,8 @@ fn fuse_gdn_gated_norm(thunks: &mut [Thunk], output_offsets: &std::collections::
         }
         i += 1;
     }
-    if verbose && fused > 0 {
-        eprintln!("[rlx-metal] fuse_gdn_gated_norm: {fused} blocks fused");
+    if verbose {
+        eprintln!("[rlx-metal] fuse_gdn_gated_norm: {fused} blocks fused of {anchors} mul anchors");
     }
 }
 
@@ -4836,6 +5012,7 @@ fn fuse_gdn_gated_norm(thunks: &mut [Thunk], output_offsets: &std::collections::
 fn fuse_depthwise_conv1d_bsc(
     thunks: &mut [Thunk],
     output_offsets: &std::collections::HashSet<usize>,
+    uses_at: &UsesAtOffset,
 ) {
     if rlx_ir::env::var("RLX_METAL_FUSE_DECODE").as_deref() == Some("0")
         || rlx_ir::env::var("RLX_METAL_FUSE_DEPTHWISE").as_deref() == Some("0")
@@ -5074,12 +5251,12 @@ fn fuse_depthwise_conv1d_bsc(
         if let Some(c) = copy_in_i {
             allowed_bcw.push(c);
         }
-        if !mlp_value_dead_in_range(thunks, transpose_in_i, bcw, &allowed_bcw, until) {
+        if !mlp_value_dead_in_range(thunks, transpose_in_i, bcw, &allowed_bcw, until, uses_at) {
             i += 1;
             continue;
         }
         if let Some(c) = copy_in_i {
-            if !mlp_value_dead_in_range(thunks, c, conv_src, &[i], until) {
+            if !mlp_value_dead_in_range(thunks, c, conv_src, &[i], until, uses_at) {
                 i += 1;
                 continue;
             }
@@ -5090,12 +5267,12 @@ fn fuse_depthwise_conv1d_bsc(
         } else {
             allowed_conv.push(transpose_out_i);
         }
-        if !mlp_value_dead_in_range(thunks, i, conv_dst, &allowed_conv, until) {
+        if !mlp_value_dead_in_range(thunks, i, conv_dst, &allowed_conv, until, uses_at) {
             i += 1;
             continue;
         }
         if let Some(c) = copy_out_i {
-            if !mlp_value_dead_in_range(thunks, c, bcs, &[transpose_out_i], until) {
+            if !mlp_value_dead_in_range(thunks, c, bcs, &[transpose_out_i], until, uses_at) {
                 i += 1;
                 continue;
             }

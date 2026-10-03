@@ -44,11 +44,16 @@
 //! [`archive`] is public because `.nemo` (tar-wrapping-ZIP) and other
 //! container formats need the same seek/list/read primitives; it is a thin
 //! layer, not a general-purpose archive library.
+//!
+//! [`pickle`] is public for the same reason: some checkpoints save a plain
+//! dict whose tensors are only part of the payload, and the scalars beside
+//! them (a fitted temperature, a base model id) are not recoverable from
+//! [`PtModel`], which indexes tensors only. See [`read_torch_pickle_root`].
 
 pub mod archive;
 mod dtype;
 mod legacy;
-mod pickle;
+pub mod pickle;
 mod pt;
 pub(crate) mod storage;
 mod torch;
@@ -101,6 +106,32 @@ pub fn index_torch_zip(
     let root = pickle::unpickle(&pkl_bytes).context("unpickling data.pkl")?;
     let tensors = torch::collect_state_dict(&root)?;
     Ok((tensors, storages))
+}
+
+/// Unpickle a `torch.save` archive's `data.pkl` and return the root object.
+///
+/// [`PtModel`] flattens a checkpoint to its tensors, which is all a
+/// `state_dict` holds. A checkpoint that saved a plain dict also carries
+/// scalars — and those are only reachable from the pickle root, so this
+/// returns it verbatim rather than trying to guess a schema.
+///
+/// Reads only `data.pkl`, not the tensor storages, so it stays cheap on a
+/// multi-gigabyte checkpoint.
+pub fn read_torch_pickle_root(path: &Path) -> Result<pickle::Value> {
+    let source =
+        archive::prepare_seekable(path).with_context(|| format!("preparing {}", path.display()))?;
+    let read_path = source.path().to_path_buf();
+    let mut file =
+        File::open(&read_path).with_context(|| format!("opening {}", read_path.display()))?;
+    let len = file.metadata()?.len();
+    let entries = archive::list_zip(&mut file, 0, len)
+        .with_context(|| format!("reading {} as a torch.save zip", path.display()))?;
+    let pkl_entry = entries
+        .iter()
+        .find(|e| e.name.ends_with("data.pkl"))
+        .ok_or_else(|| anyhow!("no data.pkl in {}", path.display()))?;
+    let bytes = read_zip_entry(&mut file, pkl_entry)?;
+    pickle::unpickle(&bytes).with_context(|| format!("unpickling {}", path.display()))
 }
 
 /// Materialize one tensor's storage view as a contiguous, row-major `f32`

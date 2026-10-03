@@ -27,7 +27,11 @@ use objc::runtime::{BOOL, Class, NO, Object};
 use objc::{class, msg_send, sel, sel_impl};
 use std::sync::OnceLock;
 
-// MetalPerformanceShadersGraph is a separate framework from MPS itself.
+// MetalPerformanceShadersGraph is a separate framework from MPS itself, and the
+// tvOS simulator SDK does not ship it — see `rlx_mps_graph_host` in build.rs.
+// This block declares no symbol, so dropping it there costs the module nothing
+// but the link directive that would otherwise fail.
+#[cfg(rlx_mps_graph_host)]
 #[link(name = "MetalPerformanceShadersGraph", kind = "framework")]
 unsafe extern "C" {}
 

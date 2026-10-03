@@ -213,10 +213,47 @@ impl Pass for MarkElementwiseRegions {
             tail_of_region.insert(*root, *tails[0]);
         }
 
-        // Drop "regions" that aren't worth fusing (size < 2 or non-unique tail).
+        // Drop regions that exceed what a native region kernel can express.
+        //
+        // This check belongs HERE, in the analysis phase, and used to live in
+        // the rewrite below — which was a latent correctness bug, not a style
+        // point. The rewrite replaces every non-tail member with a
+        // `NodeId(u32::MAX)` sentinel on the promise that the tail will emit
+        // the real region and rewire them. Bailing out at the tail broke that
+        // promise after the sentinels were already written, leaving consumers
+        // pointing at a node that does not exist:
+        //
+        //   IR verifier failed after pass `mark_elementwise_regions`:
+        //     at %20: input %4294967295 references non-existent node
+        //
+        // Only `debug_assert_valid!` caught it, so a release build handed the
+        // dangling operand to the backend. Reproduces with 20 distinct inputs
+        // against `max_elementwise_inputs: 16`.
+        let over_limit = |members: &[NodeId]| {
+            let limits = crate::limits::active_fusion_limits();
+            if members.len() as u32 > limits.max_elementwise_steps {
+                return true;
+            }
+            // External inputs = operands of members that are not themselves
+            // members. Counted the same way the rewrite does, so the two
+            // phases cannot disagree about which regions are admissible.
+            let member_set: std::collections::HashSet<NodeId> = members.iter().copied().collect();
+            let mut external: std::collections::HashSet<NodeId> = Default::default();
+            for m in members {
+                for &inp in &graph.node(*m).inputs {
+                    if !member_set.contains(&inp) {
+                        external.insert(inp);
+                    }
+                }
+            }
+            external.len() as u32 > limits.max_elementwise_inputs
+        };
+
+        // Drop "regions" that aren't worth fusing (size < 2 or non-unique tail)
+        // or that no kernel could express.
         let by_region: HashMap<NodeId, Vec<NodeId>> = by_region
             .into_iter()
-            .filter(|(root, _)| tail_of_region.contains_key(root))
+            .filter(|(root, members)| tail_of_region.contains_key(root) && !over_limit(members))
             .collect();
 
         if by_region.is_empty() {
@@ -268,15 +305,26 @@ impl Pass for MarkElementwiseRegions {
                         }
                     }
 
+                    // The analysis phase already dropped over-limit regions,
+                    // so reaching here means the two phases disagreed about
+                    // what is admissible. Bailing out now cannot be done
+                    // safely — this region's non-tail members were replaced by
+                    // sentinels on the way in, and there is no longer anything
+                    // to rewire them to. Say so instead of emitting a graph
+                    // with dangling operands.
                     let limits = crate::limits::active_fusion_limits();
-                    if external_inputs.len() as u32 > limits.max_elementwise_inputs
-                        || ordered.len() as u32 > limits.max_elementwise_steps
-                    {
-                        for &mid in &ordered {
-                            rw.copy_node(graph.node(mid));
-                        }
-                        continue;
-                    }
+                    debug_assert!(
+                        external_inputs.len() as u32 <= limits.max_elementwise_inputs
+                            && ordered.len() as u32 <= limits.max_elementwise_steps,
+                        "mark_elementwise_regions: region at {root:?} passed the analysis \
+                         phase with {} inputs / {} steps but exceeds limits {}/{} — the \
+                         two phases must agree, or members already replaced by sentinels \
+                         are left dangling",
+                        external_inputs.len(),
+                        ordered.len(),
+                        limits.max_elementwise_inputs,
+                        limits.max_elementwise_steps,
+                    );
 
                     let resolve = |id: NodeId| -> ChainOperand {
                         if let Some(&i) = input_idx_of.get(&id) {

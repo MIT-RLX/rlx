@@ -4,6 +4,8 @@
 
 //! Placement helpers for `.rlxp` packages.
 
+#![cfg(feature = "model-io")]
+
 use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_pkg::{BakeWeight, Package, Placement, TensorShard, WriteOptions, package_from_bake};

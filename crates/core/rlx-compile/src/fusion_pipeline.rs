@@ -207,6 +207,45 @@ impl FusionOptions {
     }
 }
 
+/// The limits a compile should actually run with: the target's caps, bounded by
+/// what a region implementation can express whenever regions will survive.
+///
+/// Both this crate's `fuse` entry point and `rlx_runtime::stages::pipeline_for`
+/// need this, and they used to each carry their own copy of the target-default
+/// line. They drifted the moment a clamp was added to one of them — which is
+/// the same failure mode as every other duplicated platform list in this tree,
+/// so there is one function now.
+///
+/// **Why the clamp.** `UNBOUNDED` is only safe while regions are unfused again
+/// straight afterwards, which is why CPU asks for it. When a region instead
+/// survives to execution it has to be expressible, and CPU's region interpreter
+/// carries a fixed `[0f32; 32]` scratch that it indexes by chain step:
+///
+/// ```text
+/// panicked at rlx-cpu/src/thunk/ops/elementwise.rs:
+/// index out of bounds: the len is 32 but the index is 32
+/// ```
+///
+/// Reachable today via `RLX_KEEP_ELEMENTWISE_REGIONS=1`, which removes the
+/// unfuse for CPU, MLX, Metal and wgpu at once without touching their limits.
+pub fn resolve_fusion_limits(target: FusionTarget, opts: &FusionOptions) -> FusionLimits {
+    let mut limits = if opts.fusion_limits == FusionLimits::default() {
+        fusion_limits_for_target(target)
+    } else {
+        opts.fusion_limits
+    };
+    if !opts.unfuse_elementwise_regions {
+        let native = FusionLimits::GPU_NATIVE;
+        limits.max_elementwise_steps = limits
+            .max_elementwise_steps
+            .min(native.max_elementwise_steps);
+        limits.max_elementwise_inputs = limits
+            .max_elementwise_inputs
+            .min(native.max_elementwise_inputs);
+    }
+    limits
+}
+
 /// Elementwise-region caps for `target` (matches GPU kernel encoders).
 pub fn fusion_limits_for_target(target: FusionTarget) -> FusionLimits {
     match target {
@@ -615,9 +654,7 @@ pub fn run_fusion_pipeline(
     opts: FusionOptions,
 ) -> Graph {
     let mut opts = opts.apply_native_fk_defaults(target);
-    if opts.fusion_limits == FusionLimits::default() {
-        opts.fusion_limits = fusion_limits_for_target(target);
-    }
+    opts.fusion_limits = resolve_fusion_limits(target, &opts);
     let limits = opts.fusion_limits;
     let passes = fusion_passes_for_supported(supported, opts, target);
     with_fusion_target(target, || {

@@ -212,6 +212,22 @@ impl ExecutableGraph for MlxExecutableWrapper {
         dst_wrap.inner.copy_params_from(&src_wrap.inner)
     }
 
+    fn share_params_from(&mut self, src: &dyn ExecutableGraph) -> bool {
+        let Some(src_any) = src.executable_as_any() else {
+            return false;
+        };
+        let Some(src_wrap) = src_any.downcast_ref::<MlxExecutableWrapper>() else {
+            return false;
+        };
+        let Some(dst_any) = self.executable_as_any_mut() else {
+            return false;
+        };
+        let Some(dst_wrap) = dst_any.downcast_mut::<MlxExecutableWrapper>() else {
+            return false;
+        };
+        dst_wrap.inner.share_params_from(&src_wrap.inner)
+    }
+
     fn executable_as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }

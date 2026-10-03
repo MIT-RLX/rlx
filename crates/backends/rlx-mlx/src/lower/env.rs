@@ -712,12 +712,33 @@ pub fn lower_with_env_writeback(
                 // then poisoned the MLX runtime lock and took the rest of the
                 // suite with it. Absent beta means no shift, which is the
                 // behaviour those graphs already expected.
-                match node.inputs.get(2) {
+                let y = match node.inputs.get(2) {
                     Some(beta_id) => {
                         let beta = mlx_norm_scale_1d(lookup(&env, *beta_id)?)?;
                         ops::add(&y, &beta)?
                     }
                     None => y,
+                };
+                // The node's output shape may differ in RANK from `x`'s:
+                // `fuse_rms_norm_reshape` folds a following `reshape` into the
+                // norm, flattening `[…, H]` to `[∏leading, H]`. MLX's
+                // `ops::rms_norm` returns `x`'s shape, so without this the
+                // flattening was silently dropped and every downstream shape was
+                // wrong — a `gather` on axis 0 then indexed the batch axis and
+                // handed a rank-3 result to a matmul, which surfaced far away as
+                // "[reshape] Cannot reshape array of size 984 into shape (1,3,8)".
+                // That is why MLX could not compile an `rlx-kev` training graph.
+                let want: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                if y.shape()? == want {
+                    y
+                } else {
+                    let want_i32: Vec<i32> = want.iter().map(|d| *d as i32).collect();
+                    ops::reshape(&y, &want_i32)?
                 }
             }
             Op::Attention {
@@ -2349,7 +2370,57 @@ pub fn lower_with_env_writeback(
                         let x_total = graph.node(node.inputs[0]).shape.num_elements().unwrap();
                         let k = x_total / m.max(1);
                         let packed_cols = k * bits as usize / 32;
-                        wq_u32 = Array::from_bytes(&wq.to_bytes()?, &[n, packed_cols], DType::U32)?;
+                        // MLX wants the packed weight as uint32; the param is
+                        // bound as flat U8. Two rules shape how to get there:
+                        // `to_bytes()` on the device array evaluates it, and eval
+                        // is illegal under `mlx::compile` — so taking that route
+                        // drops the whole graph to Lazy and loses fusion. The
+                        // host bytes are already in `params_typed`, so upload
+                        // from there instead: no readback, nothing to evaluate,
+                        // and compile stays available. Cached by name because the
+                        // bytes are stable, which makes it one upload per weight
+                        // rather than one per token.
+                        let param_name = match &graph.node(node.inputs[1]).op {
+                            rlx_ir::Op::Param { name } => Some(name.clone()),
+                            _ => None,
+                        };
+                        let cache_key = param_name
+                            .as_ref()
+                            .map(|n_| format!("{n_}#mlxaffine-u32:{n}x{packed_cols}"));
+                        let cached = cache_key
+                            .as_deref()
+                            .and_then(|k| mlx_dequant_cache_get(k).ok().flatten());
+                        wq_u32 = match cached {
+                            Some(arr) => arr,
+                            None => {
+                                let host = param_name
+                                    .as_deref()
+                                    .and_then(|n_| params_typed.get(n_))
+                                    .map(|(bytes, _)| bytes.as_slice());
+                                let arr = match host {
+                                    Some(bytes) => {
+                                        Array::from_bytes(bytes, &[n, packed_cols], DType::U32)?
+                                    }
+                                    // Not a bound param (folded constant, say):
+                                    // fall back to the readback. This evaluates,
+                                    // so compile declines the graph and Lazy
+                                    // picks it up — correct, just unfused.
+                                    None => Array::from_bytes(
+                                        &wq.to_bytes()?,
+                                        &[n, packed_cols],
+                                        DType::U32,
+                                    )?,
+                                };
+                                if let Some(key) = cache_key {
+                                    mlx_dequant_cache_put(
+                                        key,
+                                        arr.clone_handle()?,
+                                        n * packed_cols * 4,
+                                    );
+                                }
+                                arr
+                            }
+                        };
                         &wq_u32
                     } else {
                         wq

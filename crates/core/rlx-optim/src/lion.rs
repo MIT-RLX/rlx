@@ -83,9 +83,37 @@ impl Lion {
     }
 }
 
+// ── checkpointing ───────────────────────────────────────────
+
+impl Lion {
+    /// Named accumulators plus the step counter — see
+    /// [`crate::OptimizerState`].
+    pub(crate) fn snapshot(&self) -> crate::OptimizerState {
+        let mut out = crate::OptimizerState {
+            step: 0,
+            buffers: Vec::new(),
+        };
+        out.extend_slot("m", &self.m);
+        out
+    }
+
+    pub(crate) fn restore(&mut self, state: &crate::OptimizerState) {
+        state.take_slot("m", &mut self.m);
+    }
+}
+
 impl Optimizer for Lion {
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+
+    fn state_dict(&self) -> Option<crate::OptimizerState> {
+        Some(self.snapshot())
+    }
+
+    fn load_state_dict(&mut self, state: &crate::OptimizerState) -> bool {
+        self.restore(state);
+        true
     }
 
     fn step(&mut self, name: &str, _shape: &[usize], param: &mut [f32], grad: &[f32]) {

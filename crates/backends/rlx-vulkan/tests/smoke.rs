@@ -12,12 +12,15 @@ use rlx_ir::op::{Activation, BinaryOp, CmpOp};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 
+mod common;
+
 fn s(dims: &[usize]) -> Shape {
     Shape::new(dims, DType::F32)
 }
 
 #[test]
 fn unavailable_is_graceful() {
+    let _gpu = common::serialize_gpu();
     // Must never panic regardless of host. On a driverless host it returns
     // false; with a driver it returns true and names the device.
     let avail = rlx_vulkan::is_available();
@@ -31,6 +34,7 @@ fn unavailable_is_graceful() {
 
 #[test]
 fn elementwise_add_and_relu() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return; // covered by `unavailable_is_graceful`
     }
@@ -56,6 +60,7 @@ fn elementwise_add_and_relu() {
 
 #[test]
 fn matmul_2x3_3x2() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
@@ -89,6 +94,7 @@ fn matmul_2x3_3x2() {
 #[test]
 #[ignore = "scalar-vs-tiled matmul benchmark; run with --ignored --nocapture (needs a Vulkan device)"]
 fn bench_matmul() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("[bench] no Vulkan device — skip");
         return;
@@ -133,6 +139,7 @@ fn bench_matmul() {
 /// normal suite and doubles as the coop correctness check when forced.
 #[test]
 fn matmul_matches_cpu_reference() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
@@ -187,6 +194,7 @@ fn matmul_matches_cpu_reference() {
 /// this is what the Linux/lavapipe Docker container runs.
 #[test]
 fn transpose_reduce_narrow_softmax() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
@@ -259,6 +267,7 @@ fn run1(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 /// so the Linux/lavapipe Docker run validates more than the hot path.
 #[test]
 fn more_ops_exact() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
@@ -375,6 +384,7 @@ fn more_ops_exact() {
 /// reference. Runs on lavapipe in the Docker container.
 #[test]
 fn cum_scan_matches_reference() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }

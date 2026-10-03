@@ -1543,17 +1543,9 @@ impl WgpuExecutable {
                                     );
                                 } else if m_s >= 32 && *n >= 64 {
                                     pass.set_pipeline(&mm_w_active.pipeline);
-                                    let backend = wgpu_device()
-                                        .map(|d| d.backend)
-                                        .unwrap_or(wgpu::Backend::Noop);
-                                    let (gx, gy) = if matches!(
-                                        backend,
-                                        wgpu::Backend::Vulkan | wgpu::Backend::Dx12
-                                    ) {
-                                        (n.div_ceil(64), m_s.div_ceil(64))
-                                    } else {
-                                        (n.div_ceil(64), m_s.div_ceil(32))
-                                    };
+                                    // Same source of truth as the kernel pick.
+                                    let gx = n.div_ceil(64);
+                                    let gy = m_s.div_ceil(crate::kernels::wide_variant().tile_m());
                                     pass.dispatch_workgroups(gx, gy, *batch);
                                 } else {
                                     pass.set_pipeline(&mm_k.pipeline);

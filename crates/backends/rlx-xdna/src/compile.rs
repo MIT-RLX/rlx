@@ -88,6 +88,135 @@ fn dedupe_tile_decls(mlir: &str) -> String {
     out
 }
 
+/// Which `aiecc` command-line generation we are driving.
+///
+/// mlir-aie replaced `aiecc`'s CLI: the Python-era driver took "generate this"
+/// toggles plus `--no-*` opt-outs, while the current native **declarative
+/// driver** (SHA `95b3d1ccc0b`, Sep 2026) builds a compilation graph and you
+/// REQUEST outputs by edge name. Every bare flag we used to pass disappeared in
+/// that change — reported as issue #2, where `aiecc --help` from a current
+/// install accepts none of `--no-xchesscc`, `--no-xbridge`,
+/// `--aie-generate-xclbin`, `--aie-generate-npu-insts` or `--no-compile-host`.
+///
+/// Probed rather than pinned, because both generations are in the wild: a hard
+/// switch would break anyone on an older mlir-aie, and the four `name=value`
+/// flags we pass (`--tmpdir`, `--peano`, `--xclbin-name`, `--npu-insts-name`)
+/// are valid in both, so only the bare flags need to differ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AieccCli {
+    /// Pre-Sep-2026: `--aie-generate-*` toggles, `--no-xchesscc`/`--no-xbridge`
+    /// opt-outs, `--no-compile-host`.
+    Generate,
+    /// Declarative driver: outputs requested via `--get`, and
+    /// xchesscc/xbridge became opt-IN (so omitting them is Peano-only).
+    Declarative,
+}
+
+/// What this `aiecc` accepts, probed once from its own `--help`.
+#[derive(Clone, Debug)]
+struct AieccCaps {
+    cli: AieccCli,
+    /// `--get-<name>` shorthands the binary actually registers. Discovered, not
+    /// assumed: only `--get-xclbin` is named in the help prose, and guessing the
+    /// edge name for the instruction stream would trade one wrong flag for
+    /// another.
+    get_shorthands: Vec<String>,
+}
+
+/// Ask `aiecc` what it supports.
+///
+/// Falls back to [`AieccCli::Generate`] when `--help` cannot be run or says
+/// nothing recognisable, which keeps the historical behaviour for anyone whose
+/// build worked before this probe existed.
+fn probe_aiecc(aiecc: &str) -> AieccCaps {
+    let help = Command::new(aiecc)
+        .arg("--help")
+        .output()
+        .ok()
+        .map(|o| {
+            let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+            t.push_str(&String::from_utf8_lossy(&o.stderr));
+            t
+        })
+        .unwrap_or_default();
+
+    // `--aie-generate-xclbin` is the clearest legacy marker; `--get` is the
+    // declarative one. Check the legacy marker first so a driver that somehow
+    // offers both keeps the behaviour that is known to work.
+    classify_aiecc_help(&help)
+}
+
+/// Classify an `aiecc --help` dump. Split out of [`probe_aiecc`] so the flag
+/// selection is testable on any host — choosing the wrong CLI generation is a
+/// pure string decision, and it should not take an NPU to catch it.
+fn classify_aiecc_help(help: &str) -> AieccCaps {
+    // `--aie-generate-xclbin` is the clearest legacy marker; `--get` is the
+    // declarative one. Check the legacy marker first so a driver that somehow
+    // offers both keeps the behaviour that is known to work. An unreadable or
+    // empty `--help` also lands on Generate, preserving historical behaviour.
+    let cli = if help.contains("--aie-generate-xclbin") {
+        AieccCli::Generate
+    } else if help.contains("--get") {
+        AieccCli::Declarative
+    } else {
+        AieccCli::Generate
+    };
+
+    let mut get_shorthands: Vec<String> = Vec::new();
+    for line in help.lines() {
+        let t = line.trim_start();
+        if !t.starts_with("--get-") {
+            continue;
+        }
+        let name: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if name.len() > "--get-".len() && !get_shorthands.contains(&name) {
+            get_shorthands.push(name);
+        }
+    }
+    AieccCaps {
+        cli,
+        get_shorthands,
+    }
+}
+
+/// The output requests to pass a declarative `aiecc`.
+///
+/// `RLX_XDNA_AIECC_GET` overrides the whole list (comma-separated edge names),
+/// which is the escape hatch for a newer mlir-aie that renames an edge: the
+/// instruction-stream edge name is NOT discoverable from `--help` (only
+/// `--get-xclbin` is named there), and `--emit-dot` is what prints the real
+/// graph. Without the override we request what we can prove and let the
+/// existing "did the file appear" check report the rest.
+fn declarative_get_args(caps: &AieccCaps) -> Vec<String> {
+    if let Some(list) = rlx_ir::env::var("RLX_XDNA_AIECC_GET") {
+        let names: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !names.is_empty() {
+            return vec![format!("--get={}", names.join(","))];
+        }
+    }
+    // Prefer shorthands the binary actually registers.
+    let mut args: Vec<String> = Vec::new();
+    for want in ["xclbin", "npu-insts", "npu_insts", "insts"] {
+        let short = format!("--get-{want}");
+        if caps.get_shorthands.contains(&short) {
+            args.push(short);
+        }
+    }
+    if args.is_empty() {
+        // The help names `--get-xclbin` in prose even when it does not list the
+        // shorthands as their own options, so request it by edge name.
+        args.push("--get=xclbin".to_string());
+    }
+    args
+}
+
 /// Compile `spec.mlir` to `spec.out_xclbin` + `spec.out_insts` by invoking the
 /// **native** `aiecc` binary (no Python in the loop). Returns the two output
 /// paths on success.
@@ -146,6 +275,9 @@ pub fn compile_overlay_linked(
     // is why it reads like a mystery — check `llvm-size -A` on
     // `<tmpdir>/main_core_0_2.elf` against 16 KB before assuming anything else.
     // Slower code that fits beats faster code that cannot be placed.
+    // Probe once, not per attempt: `--help` on a ~212 MB binary is cheap but the
+    // retry loop runs it up to three times, and the answer cannot change mid-compile.
+    let caps = probe_aiecc(spec.aiecc);
     let mut last_err = None;
     for opt in [None, Some("-O1"), Some("-O0")] {
         stage(spec.tmpdir)?;
@@ -157,7 +289,7 @@ pub fn compile_overlay_linked(
         let mut spec_d = spec.clone();
         let deduped_s = deduped.to_string_lossy().into_owned();
         spec_d.mlir = &deduped_s;
-        match run_aiecc(&spec_d, opt) {
+        match run_aiecc(&spec_d, opt, &caps) {
             Ok(v) => return Ok(v),
             Err(e) => last_err = Some(e),
         }
@@ -167,7 +299,11 @@ pub fn compile_overlay_linked(
 
 /// One `aiecc` invocation. `opt` optionally forces an AIE-core optimisation
 /// level; the link objects are already staged in `spec.tmpdir` by the caller.
-fn run_aiecc(spec: &OverlaySpec<'_>, opt: Option<&str>) -> Result<(String, String), XdnaError> {
+fn run_aiecc(
+    spec: &OverlaySpec<'_>,
+    opt: Option<&str>,
+    caps: &AieccCaps,
+) -> Result<(String, String), XdnaError> {
     // Delete the outputs first. Success is judged by "did these files appear",
     // and they live OUTSIDE tmpdir, so a stale artifact from an earlier build
     // makes a FAILED compile report success and the caller then runs the
@@ -180,20 +316,33 @@ fn run_aiecc(spec: &OverlaySpec<'_>, opt: Option<&str>) -> Result<(String, Strin
     if let Some(o) = opt {
         extra.push(o.to_string());
     }
-    let status = Command::new(spec.aiecc)
-        .args(extra)
-        .args([
+    // Bare flags differ by CLI generation; the `name=value` ones below are
+    // accepted by both.
+    match caps.cli {
+        AieccCli::Generate => {
             // Peano, not Vitis/Chess. BOTH flags are required: `--no-xchesscc`
             // alone still routes core-ELF linking through `xchesscc_wrapper`,
             // which execs `xchesscc` from an AMD Vitis install that a
             // peano-only host does not have —
             //   `xchesscc_wrapper: line 53: xchesscc: command not found`
             // and aiecc exits 127 after having compiled everything else.
-            "--no-xchesscc",
-            "--no-xbridge",
-            "--aie-generate-xclbin",
-            "--aie-generate-npu-insts",
-            "--no-compile-host",
+            extra.push("--no-xchesscc".to_string());
+            extra.push("--no-xbridge".to_string());
+            extra.push("--aie-generate-xclbin".to_string());
+            extra.push("--aie-generate-npu-insts".to_string());
+            extra.push("--no-compile-host".to_string());
+        }
+        AieccCli::Declarative => {
+            // No `--no-*` opt-outs here: xchesscc/xbridge became opt-IN, so
+            // omitting them is exactly the Peano-only path the comment above
+            // describes. Nothing is built that was not requested either, which
+            // is what `--no-compile-host` used to buy.
+            extra.extend(declarative_get_args(caps));
+        }
+    }
+    let status = Command::new(spec.aiecc)
+        .args(&extra)
+        .args([
             &format!("--tmpdir={}", spec.tmpdir),
             &format!("--peano={}", spec.peano),
             &format!("--xclbin-name={}", spec.out_xclbin),
@@ -211,6 +360,20 @@ fn run_aiecc(spec: &OverlaySpec<'_>, opt: Option<&str>) -> Result<(String, Strin
     }
     for out in [spec.out_xclbin, spec.out_insts] {
         if !Path::new(out).exists() {
+            // On the declarative driver an artifact can go missing simply
+            // because we never asked for it: outputs are requested by graph
+            // edge name, and the instruction-stream edge is not discoverable
+            // from `--help`. Say so, instead of leaving it as "aiecc did not
+            // produce" with no next step.
+            if caps.cli == AieccCli::Declarative {
+                return Err(XdnaError(format!(
+                    "aiecc did not produce {out} — this driver requests outputs by graph \
+                     edge name and rlx asked for [{}]. Run `aiecc --emit-dot <mlir>` to list \
+                     the real edge names, then set RLX_XDNA_AIECC_GET=<comma,separated> to \
+                     override the request list.",
+                    declarative_get_args(caps).join(" ")
+                )));
+            }
             return Err(XdnaError(format!("aiecc did not produce {out}")));
         }
     }
@@ -272,4 +435,118 @@ pub fn build_mm_kernel(
         return Err(XdnaError(format!("kernel object {out_o} not produced")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `aiecc --help` lines from the current declarative driver, as
+    /// attached to issue #2 (mlir-aie SHA `95b3d1ccc0b`, built Sep 11 2026).
+    /// Verbatim on purpose: the point of the probe is to agree with the actual
+    /// tool, and paraphrasing the fixture would let it agree with a paraphrase.
+    const DECLARATIVE_HELP: &str = "\
+OVERVIEW: aiecc declarative driver
+
+USAGE: aiecc [options] <input mlir> [-- <host cc args>...]
+
+OPTIONS:
+  --get=<name>               - Request graph output(s) by edge name (repeatable / comma-separated); named artifacts also have --get-<name> shorthands (e.g. --get-xclbin)
+  --npu-insts-name=<string>  - Output NPU insts filename template (use {0} for multi-device)
+  --peano=<string>           - Peano install dir
+  --tmpdir=<string>          - Intermediate workdir (default: <input>.prj in cwd)
+  --xbridge                  - Link cores with the Chess toolchain (xbridge/BCF) instead of the default
+  --xchesscc                 - Compile cores with the Chess toolchain (xchesscc) instead of the default
+  --xclbin-name=<string>     - Output xclbin filename template (use {0} for multi-device)
+";
+
+    /// Shape of the pre-Sep-2026 driver we used to target exclusively.
+    const LEGACY_HELP: &str = "\
+OPTIONS:
+  --aie-generate-xclbin      - Generate xclbin
+  --aie-generate-npu-insts   - Generate NPU instructions
+  --no-xchesscc              - Do not use xchesscc
+  --no-xbridge               - Do not use xbridge
+  --no-compile-host          - Do not compile the host program
+  --xclbin-name=<string>     - Output xclbin
+";
+
+    #[test]
+    fn current_driver_is_detected_as_declarative() {
+        let caps = classify_aiecc_help(DECLARATIVE_HELP);
+        assert_eq!(caps.cli, AieccCli::Declarative);
+    }
+
+    #[test]
+    fn older_driver_is_detected_as_generate() {
+        let caps = classify_aiecc_help(LEGACY_HELP);
+        assert_eq!(caps.cli, AieccCli::Generate);
+    }
+
+    /// An `aiecc` we cannot interrogate must keep the behaviour that worked
+    /// before the probe existed, not fall into the newer flag set.
+    #[test]
+    fn unreadable_help_falls_back_to_the_historical_flags() {
+        assert_eq!(classify_aiecc_help("").cli, AieccCli::Generate);
+        assert_eq!(classify_aiecc_help("garbage").cli, AieccCli::Generate);
+    }
+
+    /// The regression this guards: every bare flag rlx used to pass is absent
+    /// from the current driver. If someone re-adds one unconditionally, the
+    /// Declarative branch must not be the place it lands.
+    #[test]
+    fn none_of_the_legacy_bare_flags_exist_in_the_current_driver() {
+        for f in [
+            "--no-xchesscc",
+            "--no-xbridge",
+            "--aie-generate-xclbin",
+            "--aie-generate-npu-insts",
+            "--no-compile-host",
+        ] {
+            assert!(
+                !DECLARATIVE_HELP.contains(f),
+                "{f} unexpectedly present in the declarative driver fixture"
+            );
+        }
+        // …while the `name=value` flags we keep passing in BOTH modes are there.
+        for f in [
+            "--tmpdir=",
+            "--peano=",
+            "--xclbin-name=",
+            "--npu-insts-name=",
+        ] {
+            assert!(DECLARATIVE_HELP.contains(f), "{f} missing from the fixture");
+        }
+    }
+
+    /// Chess became opt-IN, so the Peano-only path is "say nothing" — the
+    /// declarative request list must carry no `--no-*` opt-outs at all.
+    #[test]
+    fn declarative_requests_outputs_and_opts_out_of_nothing() {
+        let caps = classify_aiecc_help(DECLARATIVE_HELP);
+        let args = declarative_get_args(&caps);
+        assert!(
+            args.iter().all(|a| a.starts_with("--get")),
+            "expected only output requests, got {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.contains("xclbin")),
+            "xclbin was never requested: {args:?}"
+        );
+    }
+
+    /// When the binary registers `--get-<name>` shorthands as real options we
+    /// use them, rather than guessing edge names.
+    #[test]
+    fn get_shorthands_are_discovered_not_assumed() {
+        let help = format!(
+            "{DECLARATIVE_HELP}  --get-xclbin  - Request the xclbin\n  --get-npu-insts  - Request the NPU instruction stream\n"
+        );
+        let caps = classify_aiecc_help(&help);
+        assert!(caps.get_shorthands.contains(&"--get-xclbin".to_string()));
+        assert!(caps.get_shorthands.contains(&"--get-npu-insts".to_string()));
+        let args = declarative_get_args(&caps);
+        assert!(args.contains(&"--get-xclbin".to_string()), "{args:?}");
+        assert!(args.contains(&"--get-npu-insts".to_string()), "{args:?}");
+    }
 }

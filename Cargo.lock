@@ -4455,7 +4455,7 @@ dependencies = [
 
 [[package]]
 name = "pyrlx"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4480,6 +4480,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "quickrs-core"
+version = "0.16.2"
+dependencies = [
+ "hashbrown 0.17.0",
+ "libm",
 ]
 
 [[package]]
@@ -4777,7 +4785,7 @@ dependencies = [
 
 [[package]]
 name = "rlx"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "rlx-bench",
@@ -4805,7 +4813,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "half",
  "rlx",
@@ -4816,7 +4824,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bake"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4842,7 +4850,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bbo"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rand 0.8.6",
  "rand_distr",
@@ -4857,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bench"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-cpu",
  "rlx-driver",
@@ -4871,7 +4879,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cerebras"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-ir",
  "rlx-opt",
@@ -4880,7 +4888,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-check"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-ir",
  "rlx-macros",
@@ -4890,7 +4898,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-collectives"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-autodiff",
  "rlx-cpu",
@@ -4906,7 +4914,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -4915,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-coreml"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "bytemuck",
  "cc",
@@ -4933,7 +4941,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-corpus"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-ir",
  "rlx-opt",
@@ -4942,11 +4950,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-cortexm"
-version = "0.2.16"
+version = "0.2.17"
 
 [[package]]
 name = "rlx-cortexm-trainer"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-autodiff",
  "rlx-cpu",
@@ -4956,7 +4964,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "criterion",
  "gemm",
@@ -4974,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cuda"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "bytemuck",
  "cc",
@@ -4996,7 +5004,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dduf"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5009,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-distributed"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "libc",
@@ -5024,7 +5032,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "half",
  "iroh",
@@ -5036,7 +5044,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-egpu"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "libc",
  "rlx-ir",
@@ -5045,7 +5053,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-extend"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-flow",
  "rlx-ir",
@@ -5053,7 +5061,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fdm"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "bytemuck",
  "rlx-autodiff",
@@ -5067,11 +5075,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-fem"
-version = "0.2.16"
+version = "0.2.17"
 
 [[package]]
 name = "rlx-ffi"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-autodiff",
  "rlx-ir",
@@ -5080,7 +5088,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flow"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -5092,7 +5100,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fpga"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-cortexm",
  "rlx-ir",
@@ -5102,7 +5110,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -5111,7 +5119,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-geo"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -5123,7 +5131,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5136,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf-convert"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5150,11 +5158,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-dispatch"
-version = "0.2.16"
+version = "0.2.17"
 
 [[package]]
 name = "rlx-gpu-host"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "bytemuck",
  "half",
@@ -5167,7 +5175,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-kernels"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-gpu-dispatch",
  "rlx-ir",
@@ -5176,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-hub"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "serde",
@@ -5187,7 +5195,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-hwprofile"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -5195,7 +5203,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "aes 0.9.1",
  "bincode",
@@ -5205,8 +5213,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-js"
+version = "0.2.17"
+dependencies = [
+ "quickrs-core",
+ "rlx-dduf",
+ "rlx-gguf",
+ "rlx-gguf-convert",
+ "rlx-ir",
+ "rlx-mlx-io",
+ "rlx-nemo",
+ "rlx-opt",
+ "rlx-optim",
+ "rlx-pkg",
+ "rlx-runtime",
+ "rlx-text",
+ "serde_json",
+]
+
+[[package]]
 name = "rlx-lbm"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-ir",
  "rlx-runtime",
@@ -5214,7 +5241,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-linalg"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -5222,7 +5249,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5231,7 +5258,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-megakernel"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-corpus",
  "rlx-ir",
@@ -5241,7 +5268,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metal"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "bytemuck",
  "half",
@@ -5266,7 +5293,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "half",
  "libc",
@@ -5285,7 +5312,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-io"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "half",
@@ -5303,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-sys"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "cc",
  "cmake",
@@ -5311,7 +5338,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemo"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -5322,7 +5349,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-oneapi"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "half",
  "libloading 0.8.9",
@@ -5337,7 +5364,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5350,7 +5377,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-conformance"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "ort",
@@ -5365,7 +5392,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-import"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5383,14 +5410,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-proto"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "protobuf",
 ]
 
 [[package]]
 name = "rlx-opscope"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5403,7 +5430,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -5413,14 +5440,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-optim"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rlx-peft"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -5429,7 +5456,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-pkg"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5457,7 +5484,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qnn"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "cc",
  "rlx-gguf",
@@ -5469,7 +5496,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-rl"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -5480,11 +5507,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-rng"
-version = "0.2.16"
+version = "0.2.17"
 
 [[package]]
 name = "rlx-rocm"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "cc",
  "libloading 0.8.9",
@@ -5503,7 +5530,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "half",
@@ -5553,7 +5580,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sparse"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rayon",
  "rlx-cpu",
@@ -5564,7 +5591,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tensor"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "ndarray 0.16.1",
  "rlx-autodiff",
@@ -5577,7 +5604,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-text"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "minijinja",
@@ -5590,7 +5617,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-torch-ckpt"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "flate2",
@@ -5600,7 +5627,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-torch-import"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "half",
@@ -5615,7 +5642,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tpu"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "libloading 0.8.9",
  "prost",
@@ -5633,7 +5660,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-umap"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
@@ -5658,14 +5685,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-unfuse"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-ir",
 ]
 
 [[package]]
 name = "rlx-vq"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rayon",
  "rlx-cpu",
@@ -5676,7 +5703,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vulkan"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "ash",
  "bytemuck",
@@ -5696,7 +5723,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-web"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "rlx-autodiff",
  "rlx-ir",
@@ -5711,7 +5738,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-webgl"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "js-sys",
  "rlx-autodiff",
@@ -5727,10 +5754,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "bytemuck",
  "half",
+ "naga 29.0.3",
  "pollster",
  "rlx",
  "rlx-compile",
@@ -5750,7 +5778,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-xdna"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "libc",
  "libloading 0.8.9",
@@ -5759,7 +5787,7 @@ dependencies = [
 
 [[package]]
 name = "rlxsl"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "libm",
  "naga 29.0.3",

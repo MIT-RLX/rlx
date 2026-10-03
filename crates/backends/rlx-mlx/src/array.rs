@@ -63,6 +63,16 @@ impl Array {
     /// Construct an MLX leaf from host f32 data, casting to `dtype`.
     pub fn from_f32_slice(data: &[f32], shape: &[usize], dtype: DType) -> Result<Self, MlxError> {
         let _guard = crate::sync::runtime_guard();
+        // Check here rather than in the C++ shim, which can only say "nelems
+        // doesn't match shape product" — no shape, no length, no dtype, and no
+        // way to tell which boundary tensor was mis-sized.
+        let want: usize = shape.iter().product();
+        if want != data.len() {
+            return Err(MlxError(format!(
+                "shape {shape:?} wants {want} elements, got {} ({dtype:?})",
+                data.len()
+            )));
+        }
         let shape_i: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let mut out: *mut mlx_array_t = ptr::null_mut();
         let rc = unsafe {

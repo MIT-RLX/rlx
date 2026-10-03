@@ -9,7 +9,7 @@
 // ANE + a host optimizer step. These tests fit a tiny realizable linear model and
 // check the loss collapses, the weights converge, the path/eligibility are
 // reported honestly, and the ANE gradient step matches a CPU reference.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_ir::op::{BinaryOp, ReduceOp};
 use rlx_ir::{DType, Graph, Shape};

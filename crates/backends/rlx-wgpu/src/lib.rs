@@ -43,6 +43,7 @@ pub mod conv_host;
 pub mod conv_transpose2d_host;
 pub mod conv_transpose3d_host;
 pub mod coop_f16_vk;
+pub mod coop_probe;
 pub mod custom_host;
 pub mod device;
 pub mod fft_dispatch;

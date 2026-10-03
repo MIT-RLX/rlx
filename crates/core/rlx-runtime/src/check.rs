@@ -111,8 +111,66 @@ pub struct Legality {
     pub unsupported_kinds: usize,
 }
 
+/// What one run of this graph costs on one architecture.
+///
+/// Device-free, like the rest of the checker: every number comes from the same
+/// memory planner and dispatch claim the backend will use, not from a probe.
+/// Nothing here is *wrong* — that is the point of reporting it as notes. It is
+/// the difference between a graph that fits a phone and one that does not, and
+/// between a kernel that runs on the accelerator and one that quietly round
+/// trips through the host.
+#[derive(Debug, Clone, Serialize)]
+pub struct Budget {
+    /// Arena bytes the planner asks for under this backend's width policy.
+    pub arena_bytes: usize,
+    /// Bytes liveness-aware slot reuse saved versus one buffer per node.
+    pub reuse_saved_bytes: usize,
+    /// Extra arena bytes this backend's width policy costs over storing every
+    /// tensor at its native dtype width, with every other planner option held
+    /// fixed. Non-zero only on the f32-uniform backends, and only for graphs
+    /// that actually carry F16/BF16 activations. Deliberately *not*
+    /// `arena_bytes` minus the native plan's: those two plans also differ in
+    /// pinning, and that delta would report a saving where there is none.
+    pub width_overhead_bytes: usize,
+    /// Name of the width policy in force (`native` / `f32-uniform` / `hybrid`).
+    pub width_policy: &'static str,
+    /// Bytes that must cross the host boundary every run: graph inputs read in
+    /// plus graph outputs read back. Parameters are excluded — they are
+    /// uploaded once and stay resident.
+    pub host_io_bytes: usize,
+    /// Ops that will not run on this backend's native fast path (portable
+    /// common-IR or still unsupported), and the output bytes they touch. On a
+    /// GPU backend these are the candidates for a host round trip.
+    pub off_fast_path_ops: usize,
+    pub off_fast_path_bytes: usize,
+    /// `Cast` nodes in the graph — every one is a full pass over a tensor whose
+    /// only product is a different dtype.
+    pub cast_nodes: usize,
+    /// Parameter bytes the graph expects to find already on the device.
+    ///
+    /// Separate from `host_io_bytes` on purpose, and reported rather than
+    /// folded in, because "weights are uploaded once and stay resident" is an
+    /// *assumption* — and it is the assumption that fails. When residency
+    /// silently does not hold, this whole number becomes per-run traffic, and a
+    /// boundary figure that already included it could not show the difference.
+    pub param_bytes: usize,
+    /// Ops left after this backend's fusion pipeline, excluding graph leaves.
+    ///
+    /// An estimate of dispatch count, which on a GPU backend is the quantity
+    /// that multiplies the per-dispatch floor. It is an estimate because one op
+    /// is not always one dispatch — a multi-pass reduction is several — so
+    /// treat it as a floor on dispatches, not an exact count.
+    pub dispatches: usize,
+    /// Bytes the dispatched ops read and write, summed over the fused graph.
+    ///
+    /// An upper bound: it assumes nothing survives in cache or registers
+    /// between ops. Useful as a ratio against `arena_bytes` — a graph moving
+    /// many times its own arena is re-reading the same tensors.
+    pub dram_bytes: usize,
+}
+
 /// Per-backend rollup: fusion coverage (always) + execution legality (when the
-/// backend is compiled in).
+/// backend is compiled in) + resource budget.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackendSummary {
     pub backend: String,
@@ -122,6 +180,9 @@ pub struct BackendSummary {
     /// Count of fused ops produced by the fusion pipeline for this target.
     pub fused_ops: usize,
     pub missed_fusions: usize,
+    /// `None` when the graph did not verify — a budget computed from a graph
+    /// that is not well-formed is a number nobody should act on.
+    pub budget: Option<Budget>,
 }
 
 /// The full result of [`check_graph`].
@@ -154,6 +215,10 @@ pub struct CheckOptions {
     /// ([`rlx_compile::plan_check`]). Errors: an overlapping live buffer does
     /// not degrade output, it returns another tensor's bytes.
     pub plan: bool,
+    /// Per-architecture resource budget: arena bytes, host-boundary traffic and
+    /// precision churn ([`Budget`]). Notes only — this axis reports what a
+    /// correct program will cost, never that it is wrong.
+    pub budget: bool,
 }
 
 impl Default for CheckOptions {
@@ -166,6 +231,7 @@ impl Default for CheckOptions {
             repr: true,
             schedule: true,
             plan: true,
+            budget: true,
         }
     }
 }
@@ -343,6 +409,37 @@ impl CheckReport {
                         );
                     }
                 }
+                // Budget on its own line: it answers a different question from
+                // the legality row above it — not "will this run" but "what
+                // will it spend to run".
+                if let Some(bu) = &b.budget {
+                    let _ = write!(
+                        s,
+                        "         arena={} ({}, reuse saved {})  params={}  host-io/run={}  dispatch={} moving {}",
+                        human_bytes(bu.arena_bytes),
+                        bu.width_policy,
+                        human_bytes(bu.reuse_saved_bytes),
+                        human_bytes(bu.param_bytes),
+                        human_bytes(bu.host_io_bytes),
+                        bu.dispatches,
+                        human_bytes(bu.dram_bytes),
+                    );
+                    if bu.width_overhead_bytes > 0 {
+                        let _ = write!(s, "  width cost={}", human_bytes(bu.width_overhead_bytes));
+                    }
+                    if bu.off_fast_path_ops > 0 {
+                        let _ = write!(
+                            s,
+                            "  off-fast-path={} ops/{}",
+                            bu.off_fast_path_ops,
+                            human_bytes(bu.off_fast_path_bytes)
+                        );
+                    }
+                    if bu.cast_nodes > 0 {
+                        let _ = write!(s, "  casts={}", bu.cast_nodes);
+                    }
+                    let _ = writeln!(s);
+                }
             }
         }
 
@@ -356,6 +453,18 @@ impl CheckReport {
         );
         s
     }
+}
+
+/// Bytes at a glance. Budget rows sit next to each other and the reader is
+/// comparing magnitudes, not auditing exact counts — the JSON carries those.
+fn human_bytes(n: usize) -> String {
+    const UNITS: [(&str, usize); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+    for (suffix, scale) in UNITS {
+        if n >= scale {
+            return format!("{:.1} {suffix}", n as f64 / scale as f64);
+        }
+    }
+    format!("{n} B")
 }
 
 /// `Some(n)` for a statically-known extent, `None` for a dynamic one.
@@ -541,6 +650,230 @@ fn verify_diag(graph: &Graph, e: &VerifyError, code: &str) -> Diagnostic {
 /// Backend dispatch + fusion analysis are skipped when the graph fails
 /// structural or shape verification — fix those first, since downstream passes
 /// assume a well-formed, shape-consistent graph.
+/// Bytes a node's tensor occupies at its declared dtype.
+fn node_bytes(graph: &Graph, id: rlx_ir::NodeId) -> usize {
+    graph.node(id).shape.size_bytes().unwrap_or(0)
+}
+
+/// Per-architecture resource budget for one graph. See [`Budget`].
+///
+/// `off_path_kinds` are the `OpKind` debug names the dispatch claim resolved to
+/// common-IR or left unsupported, passed in rather than re-derived so the bytes
+/// below are the bytes of those exact nodes, not a share-of-kinds estimate.
+fn compute_budget(
+    graph: &Graph,
+    t: FusionTarget,
+    off_path_kinds: &HashSet<String>,
+    fused: Option<&Graph>,
+) -> Budget {
+    use rlx_opt::rlx_compile::memory::{
+        ArenaWidthPolicy, arena_width_policy, plan_memory_aligned, plan_memory_f32_uniform,
+        plan_memory_hybrid, plan_memory_with_policy,
+    };
+
+    let policy = arena_width_policy(t);
+    // 64 B is what `plan_memory` uses; holding it fixed keeps the three plans
+    // below comparable, which is the whole point of `width_overhead_bytes`.
+    const ALIGN: usize = 64;
+    let plan = match policy {
+        ArenaWidthPolicy::Native => plan_memory_aligned(graph, ALIGN),
+        ArenaWidthPolicy::F32Uniform => plan_memory_f32_uniform(graph, ALIGN),
+        ArenaWidthPolicy::Hybrid => plan_memory_hybrid(graph, ALIGN),
+        ArenaWidthPolicy::NativeHalfWidened => {
+            plan_memory_with_policy(graph, ALIGN, ArenaWidthPolicy::NativeHalfWidened)
+        }
+        ArenaWidthPolicy::NativeBf16Widened => {
+            plan_memory_with_policy(graph, ALIGN, ArenaWidthPolicy::NativeBf16Widened)
+        }
+    };
+    // What this architecture's storage convention costs, isolated from every
+    // other planner decision: `plan_memory_with_policy` holds the options fixed
+    // and varies only the width. Differencing the real plans instead would fold
+    // in `pin_output_ancestors` and report a saving on f32 graphs, where the
+    // width policy is free by construction. A native-policy backend is its own
+    // baseline, so skip both plans.
+    let width_overhead_bytes = if policy == ArenaWidthPolicy::Native {
+        0
+    } else {
+        plan_memory_with_policy(graph, ALIGN, policy)
+            .arena_size
+            .saturating_sub(
+                plan_memory_with_policy(graph, ALIGN, ArenaWidthPolicy::Native).arena_size,
+            )
+    };
+
+    // Host boundary: inputs in, declared outputs back. `Param` is excluded —
+    // a weight is uploaded once and stays resident, so counting it here would
+    // swamp the per-run number with a one-off.
+    let mut host_io_bytes = 0usize;
+    for node in graph.nodes() {
+        if matches!(node.op, rlx_ir::Op::Input { .. }) {
+            host_io_bytes += node.shape.size_bytes().unwrap_or(0);
+        }
+    }
+    for id in &graph.outputs {
+        host_io_bytes += node_bytes(graph, *id);
+    }
+
+    // Off the native fast path: ops the backend lowers through portable
+    // common-IR or cannot lower at all. Counted in bytes as well as ops
+    // because one big tensor off the fast path costs more than ten small ones.
+    let mut off_fast_path_ops = 0usize;
+    let mut off_fast_path_bytes = 0usize;
+    if !off_path_kinds.is_empty() {
+        for node in graph.nodes() {
+            if off_path_kinds.contains(&format!("{:?}", node.op.kind())) {
+                off_fast_path_ops += 1;
+                off_fast_path_bytes += node.shape.size_bytes().unwrap_or(0);
+            }
+        }
+    }
+
+    let cast_nodes = graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, rlx_ir::Op::Cast { .. }))
+        .count();
+
+    let param_bytes: usize = graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, rlx_ir::Op::Param { .. }))
+        .map(|n| n.shape.size_bytes().unwrap_or(0))
+        .sum();
+
+    // Leaves are not dispatched: they are where data already is.
+    let is_leaf = |op: &rlx_ir::Op| {
+        matches!(
+            op,
+            rlx_ir::Op::Input { .. } | rlx_ir::Op::Param { .. } | rlx_ir::Op::Constant { .. }
+        )
+    };
+    // Fall back to the unfused graph when fusion did not run (it is wrapped in
+    // `catch_unwind`), so the figure is conservative rather than absent.
+    let sched = fused.unwrap_or(graph);
+    let dispatches = sched.nodes().iter().filter(|n| !is_leaf(&n.op)).count();
+    let dram_bytes: usize = sched
+        .nodes()
+        .iter()
+        .filter(|n| !is_leaf(&n.op))
+        .map(|n| {
+            let out = n.shape.size_bytes().unwrap_or(0);
+            let ins: usize = n
+                .inputs
+                .iter()
+                .map(|id| sched.node(*id).shape.size_bytes().unwrap_or(0))
+                .sum();
+            out + ins
+        })
+        .sum();
+
+    Budget {
+        arena_bytes: plan.arena_size,
+        reuse_saved_bytes: plan.bytes_saved(),
+        width_overhead_bytes,
+        width_policy: match policy {
+            ArenaWidthPolicy::Native => "native",
+            ArenaWidthPolicy::F32Uniform => "f32-uniform",
+            ArenaWidthPolicy::Hybrid => "hybrid",
+            ArenaWidthPolicy::NativeHalfWidened => "native-half-widened",
+            ArenaWidthPolicy::NativeBf16Widened => "native-bf16-widened",
+        },
+        host_io_bytes,
+        off_fast_path_ops,
+        off_fast_path_bytes,
+        cast_nodes,
+        param_bytes,
+        dispatches,
+        dram_bytes,
+    }
+}
+
+/// Notes — never errors. A budget finding says the answer is correct and
+/// something is being spent to get it.
+fn budget_notes(backend: &str, b: &Budget) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let note = |code: &str, message: String, hint: &str| Diagnostic {
+        severity: Severity::Note,
+        code: code.to_string(),
+        message,
+        node: None,
+        context: None,
+        hint: Some(hint.to_string()),
+        backend: Some(backend.to_string()),
+    };
+
+    // Only worth saying when it is a material share of the arena; a few bytes
+    // of alignment padding is not a finding.
+    if b.width_overhead_bytes * 10 > b.arena_bytes && b.width_overhead_bytes > 0 {
+        out.push(note(
+            "budget-width",
+            format!(
+                "{}'s {} arena costs {} extra bytes ({:.0}% of {}) over native dtype widths",
+                backend,
+                b.width_policy,
+                b.width_overhead_bytes,
+                100.0 * b.width_overhead_bytes as f64 / b.arena_bytes.max(1) as f64,
+                b.arena_bytes,
+            ),
+            "this architecture stores activations f32-uniform; a hybrid arena would pack              F16/BF16 activations natively, at the cost of a layout change for anything              that indexes the arena by f32 element",
+        ));
+    }
+    if b.off_fast_path_ops > 0 {
+        out.push(note(
+            "budget-io",
+            format!(
+                "{} node(s) run off {backend}'s native fast path ({} bytes of tensor traffic)",
+                b.off_fast_path_ops, b.off_fast_path_bytes,
+            ),
+            "a kind lowered through common-IR or left unsupported is where a host round              trip appears; `RLX_DISPATCH_REPORT=1` names them per node",
+        ));
+    }
+    // Residency is a claim, not a guarantee. When the weights dwarf the per-run
+    // boundary, whether they actually stay put is the only IO question that
+    // matters — re-uploading them per step costs orders of magnitude more than
+    // anything at the input/output edge.
+    if b.param_bytes > 4 * b.host_io_bytes.max(1) {
+        out.push(note(
+            "budget-residency",
+            format!(
+                "{} of parameters vs {} of per-run boundary traffic on {backend}",
+                human_bytes(b.param_bytes),
+                human_bytes(b.host_io_bytes),
+            ),
+            "the per-run figure assumes these stay resident; if residency does not hold they \
+             become per-step uploads, which is the difference between a fast decode and a \
+             host-bound one",
+        ));
+    }
+    // A graph moving many times its own arena is re-reading the same tensors.
+    if b.arena_bytes > 0 && b.dram_bytes > 4 * b.arena_bytes {
+        out.push(note(
+            "budget-traffic",
+            format!(
+                "{} dispatch(es) move {} against a {} arena ({:.1}x) on {backend}",
+                b.dispatches,
+                human_bytes(b.dram_bytes),
+                human_bytes(b.arena_bytes),
+                b.dram_bytes as f64 / b.arena_bytes as f64,
+            ),
+            "fusion is what removes a round trip through memory between two ops; the \
+             missed-fusion warnings above name the ones that did not collapse",
+        ));
+    }
+    if b.cast_nodes > 0 {
+        out.push(note(
+            "budget-precision",
+            format!(
+                "{} Cast node(s): full passes over a tensor whose only product is a dtype",
+                b.cast_nodes
+            ),
+            "casts at a precision boundary are expected; a cast that immediately feeds its              own inverse is not, and folds away",
+        ));
+    }
+    out
+}
+
 pub fn check_graph(graph: &Graph, opts: &CheckOptions) -> CheckReport {
     let mut diagnostics = Vec::new();
 
@@ -660,7 +993,12 @@ pub fn check_graph(graph: &Graph, opts: &CheckOptions) -> CheckReport {
                 legality: None,
                 fused_ops: 0,
                 missed_fusions: 0,
+                budget: None,
             };
+            // Filled by the legality pass below when the backend is compiled in;
+            // empty otherwise, which makes the budget's fast-path figures zero
+            // rather than wrong.
+            let mut off_path_kinds: HashSet<String> = HashSet::new();
 
             // -- execution legality against the backend's REAL op claim --
             match execution_claim(backend_device(t)) {
@@ -684,6 +1022,14 @@ pub fn check_graph(graph: &Graph, opts: &CheckOptions) -> CheckReport {
                             DispatchPath::CommonIr => leg.common_ir_kinds += 1,
                             DispatchPath::Rewritten => leg.rewritten_kinds += 1,
                             DispatchPath::Unsupported => leg.unsupported_kinds += 1,
+                        }
+                        // Keyed on the debug name: `OpKind` is not `Ord`, and
+                        // the name is what the budget has to match nodes on.
+                        if matches!(
+                            kind_summary.path,
+                            DispatchPath::CommonIr | DispatchPath::Unsupported
+                        ) {
+                            off_path_kinds.insert(format!("{:?}", kind_summary.kind));
                         }
                     }
                     if opts.dispatch {
@@ -730,7 +1076,9 @@ pub fn check_graph(graph: &Graph, opts: &CheckOptions) -> CheckReport {
             let fusion = catch_unwind(AssertUnwindSafe(|| {
                 Fuse::new(t).run_with_report(graph.clone())
             }));
-            if let Ok((_fused, freport)) = fusion {
+            let mut fused_graph: Option<Graph> = None;
+            if let Ok((fused, freport)) = fusion {
+                fused_graph = Some(fused);
                 summary.fused_ops = freport.fused_matmul_bias_act
                     + freport.fused_swiglu
                     + freport.fused_residual_ln
@@ -757,6 +1105,19 @@ pub fn check_graph(graph: &Graph, opts: &CheckOptions) -> CheckReport {
                         }
                     }
                 }
+            }
+
+            // -- resource budget: what this graph costs on this architecture --
+            //
+            // Device-free by construction: the same planner the backend will
+            // run, keyed on the same width policy it plans with, and the op
+            // claim already resolved above.
+            if graph_ok {
+                let b = compute_budget(graph, t, &off_path_kinds, fused_graph.as_ref());
+                if opts.budget {
+                    diagnostics.extend(budget_notes(name, &b));
+                }
+                summary.budget = Some(b);
             }
 
             backends.push(summary);

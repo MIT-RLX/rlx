@@ -103,9 +103,40 @@ impl AdamW {
     }
 }
 
+// ── checkpointing ───────────────────────────────────────────
+
+impl AdamW {
+    /// Named accumulators plus the step counter — see
+    /// [`crate::OptimizerState`].
+    pub(crate) fn snapshot(&self) -> crate::OptimizerState {
+        let mut out = crate::OptimizerState {
+            step: self.step,
+            buffers: Vec::new(),
+        };
+        out.extend_slot("m", &self.m);
+        out.extend_slot("v", &self.v);
+        out
+    }
+
+    pub(crate) fn restore(&mut self, state: &crate::OptimizerState) {
+        self.step = state.step;
+        state.take_slot("m", &mut self.m);
+        state.take_slot("v", &mut self.v);
+    }
+}
+
 impl Optimizer for AdamW {
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+
+    fn state_dict(&self) -> Option<crate::OptimizerState> {
+        Some(self.snapshot())
+    }
+
+    fn load_state_dict(&mut self, state: &crate::OptimizerState) -> bool {
+        self.restore(state);
+        true
     }
 
     fn step(&mut self, name: &str, _shape: &[usize], param: &mut [f32], grad: &[f32]) {

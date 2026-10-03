@@ -147,9 +147,46 @@ pub(crate) fn compile_mat_mul(
                 } else {
                     eff.num_elements().unwrap_or(1) / n.max(1)
                 };
+                // Half-precision RHS: take the packed dequant-on-the-fly GEMM
+                // ONLY when the operand is a `Param`.
+                //
+                // `plan_memory_native_in_order` widens half **activations** to
+                // f32 (they are computed in f32) while half **params** stay
+                // packed at 2 B/elem. So the dtype alone does not say how the
+                // bytes are laid out, and reading a widened activation as
+                // `u16` is reading f32 bytes as pairs of halves. Under bf16
+                // autocast the RHS of a matmul is routinely a cast activation
+                // rather than a weight, which used to panic in
+                // `sgemm_bf16_rhs` ("range end index N out of range for slice
+                // of length 0") or silently compute garbage.
+                //
+                // Drive this off the real SLOT WIDTH rather than `Param`-ness
+                // or the declared dtype. A half tensor lives packed at 2 B/elem
+                // in some slots and widened to f32 in others, and the
+                // dequant-on-the-fly GEMM is correct for exactly one layout:
+                // `A` and `C` f32-wide, `B` packed half. Reading a widened
+                // slot as packed halves (or the reverse) is silent garbage.
+                let is_half =
+                    |d: rlx_ir::DType| matches!(d, rlx_ir::DType::BF16 | rlx_ir::DType::F16);
+                let wide = |id, d: rlx_ir::DType| {
+                    !is_half(d) || super::elementwise::half_slot_is_widened(graph, arena, id)
+                };
+                // `has_buffer` matters: a node with no slot reads back as an
+                // EMPTY slice, and the packed GEMM would index into it
+                // ("range end index 16 out of range for slice of length 0" —
+                // how the bf16 backward graph used to die).
+                let packed = |id, d: rlx_ir::DType| {
+                    is_half(d)
+                        && arena.has_buffer(id)
+                        && !super::elementwise::half_slot_is_widened(graph, arena, id)
+                };
+                let packed_rhs = packed(node.inputs[1], b_shape.dtype());
+                let use_packed_rhs = packed_rhs
+                    && wide(node.inputs[0], a_shape.dtype())
+                    && wide(node.id, shape.dtype());
                 // BF16 weight (rhs) with f32 output → dequant-on-the-fly GEMM
                 // (bf16-resident LM head: half the weight memory traffic).
-                if b_shape.dtype() == rlx_ir::DType::BF16 && shape.dtype() == rlx_ir::DType::F32 {
+                if use_packed_rhs && b_shape.dtype() == rlx_ir::DType::BF16 {
                     return Thunk::SgemmBf16 {
                         a: node_offset(arena, node.inputs[0]),
                         b: node_offset(arena, node.inputs[1]),
@@ -162,7 +199,7 @@ pub(crate) fn compile_mat_mul(
                 // F16 weight (rhs) with f32 output → dequant-on-the-fly GEMM,
                 // IEEE-half twin of the BF16 path (else the F16 bytes are read as
                 // f32 garbage — the qwen35 vision F16-weight regression).
-                if b_shape.dtype() == rlx_ir::DType::F16 && shape.dtype() == rlx_ir::DType::F32 {
+                if use_packed_rhs && b_shape.dtype() == rlx_ir::DType::F16 {
                     return Thunk::SgemmF16 {
                         a: node_offset(arena, node.inputs[0]),
                         b: node_offset(arena, node.inputs[1]),
@@ -170,6 +207,31 @@ pub(crate) fn compile_mat_mul(
                         m: m as u32,
                         k: k_dim as u32,
                         n: n as u32,
+                    };
+                }
+                // Any remaining packed-half operand (a half ACTIVATION the
+                // planner left at 2 B, a packed LHS, or a packed destination)
+                // goes through the general widen→f32-GEMM→round path. The f32
+                // `Sgemm` below would read those 2-byte halves as f32.
+                let kind_of = |id, d: rlx_ir::DType| match d {
+                    rlx_ir::DType::BF16 if packed(id, d) => crate::thunk::HalfKind::Bf16,
+                    rlx_ir::DType::F16 if packed(id, d) => crate::thunk::HalfKind::F16,
+                    _ => crate::thunk::HalfKind::F32,
+                };
+                let a_kind = kind_of(node.inputs[0], a_shape.dtype());
+                let b_kind = kind_of(node.inputs[1], b_shape.dtype());
+                let c_kind = kind_of(node.id, shape.dtype());
+                if a_kind.packed() || b_kind.packed() || c_kind.packed() {
+                    return Thunk::SgemmHalf {
+                        a: node_offset(arena, node.inputs[0]),
+                        b: node_offset(arena, node.inputs[1]),
+                        c: node_offset(arena, node.id),
+                        m: m as u32,
+                        k: k_dim as u32,
+                        n: n as u32,
+                        a_kind,
+                        b_kind,
+                        c_kind,
                     };
                 }
                 match shape.dtype() {

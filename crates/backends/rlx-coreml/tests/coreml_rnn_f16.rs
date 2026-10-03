@@ -6,7 +6,7 @@
 // intermediate tensors in the model's float dtype (not hardcoded f32), so they
 // run entirely in fp16 on the Neural Engine. Verified against the f32 CPU
 // reference within fp16 tolerance.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_coreml::CoremlExecutable;
 use rlx_coreml::mil::LowerOptions;

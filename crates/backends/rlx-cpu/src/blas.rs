@@ -4113,3 +4113,37 @@ mod linalg_fallback_tests {
         );
     }
 }
+
+/// Widen a packed half buffer (`u16` bits, BF16 or IEEE-F16) to f32.
+///
+/// A half tensor is stored packed at 2 B/elem in some arena slots and widened
+/// to 4 B in others; every f32 kernel that reads such a slot must go through
+/// this, or it reinterprets two halves as one f32 (silent NaN/garbage).
+pub fn widen_half_vec(src: &[u16], bf16: bool) -> Vec<f32> {
+    if bf16 {
+        src.iter()
+            .map(|&w| f32::from_bits((w as u32) << 16))
+            .collect()
+    } else {
+        src.iter()
+            .map(|&w| half::f16::from_bits(w).to_f32())
+            .collect()
+    }
+}
+
+/// Round f32 back into a packed half buffer — inverse of [`widen_half_vec`].
+pub fn round_half_into(src: &[f32], dst: &mut [u16], bf16: bool) {
+    if bf16 {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            // round-to-nearest-even on the truncated mantissa, matching the
+            // Cast lowering (plain truncation drifts on long accumulations).
+            let bits = v.to_bits();
+            let round = ((bits >> 16) & 1) + 0x7fff;
+            *d = ((bits.wrapping_add(round)) >> 16) as u16;
+        }
+    } else {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            *d = half::f16::from_f32(v).to_bits();
+        }
+    }
+}

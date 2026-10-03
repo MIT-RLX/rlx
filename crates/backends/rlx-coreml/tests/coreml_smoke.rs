@@ -4,7 +4,7 @@
 // End-to-end smoke tests: build a tiny IR graph, lower it to a CoreML ML
 // Program, run it through CoreML.framework, and check the numbers. These
 // exercise the full proto → .mlpackage → MLModel pipeline on-device.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_coreml::{ComputeUnits, CoremlExecutable, ane_available, chip_info};
 use rlx_ir::op::Activation;

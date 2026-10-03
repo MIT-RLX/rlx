@@ -29,7 +29,7 @@ anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 safetensors = { version = "0.7", optional = true }
-rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.16", optional = true, default-features = false }
+rlx-onnx-import = { path = "../rlx-onnx-import", version = "0.2.17", optional = true, default-features = false }
 rlx-nemo = { workspace = true, optional = true }
 
 [dev-dependencies]

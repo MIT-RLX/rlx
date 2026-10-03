@@ -84,35 +84,16 @@ fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool 
     let r_ptr = r.as_ptr() as usize;
     let o_ptr = o.as_mut_ptr() as usize;
     let run = |i0: usize, i1: usize| unsafe {
-        use std::arch::x86_64::*;
-        let l = l_ptr as *const f32;
-        let r = r_ptr as *const f32;
-        let o = o_ptr as *mut f32;
-        let mut i = i0;
-        // Align to 8-wide when possible within the chunk.
-        while i + 8 <= i1 {
-            let a = _mm256_loadu_ps(l.add(i));
-            let b = _mm256_loadu_ps(r.add(i));
-            let res = match op {
-                BinaryOp::Add => _mm256_add_ps(a, b),
-                BinaryOp::Sub => _mm256_sub_ps(a, b),
-                BinaryOp::Mul => _mm256_mul_ps(a, b),
-                _ => unreachable!(),
-            };
-            _mm256_storeu_ps(o.add(i), res);
-            i += 8;
-        }
-        while i < i1 {
-            let a = *l.add(i);
-            let b = *r.add(i);
-            *o.add(i) = match op {
-                BinaryOp::Add => a + b,
-                BinaryOp::Sub => a - b,
-                BinaryOp::Mul => a * b,
-                _ => unreachable!(),
-            };
-            i += 1;
-        }
+        // SAFETY: AVX2 checked above, `op` is Add/Sub/Mul, and `[i0, i1)` is
+        // within `len` — the bound every caller below is derived from.
+        binary_contig_avx2(
+            l_ptr as *const f32,
+            r_ptr as *const f32,
+            o_ptr as *mut f32,
+            i0,
+            i1,
+            op,
+        )
     };
     if len >= 8192 && crate::pool::num_threads() > 1 {
         crate::pool::par_for(len, crate::pool::chunk_floor(len), &|off, cnt| {
@@ -122,6 +103,61 @@ fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool 
         run(0, len);
     }
     true
+}
+
+/// 8-wide Add/Sub/Mul over `[i0, i1)` of three raw f32 buffers.
+///
+/// Carries `#[target_feature(enable = "avx2")]` for a reason that is invisible
+/// in the source and obvious in the disassembly: `_mm256_*` are themselves
+/// `#[target_feature]` fns, so a caller that merely *checks* AVX2 at runtime
+/// cannot inline them — each becomes a `call` plus a `vzeroupper`, four per 8
+/// lanes. Measured that way this path ran at ~7-9 GB/s against ~70-124 GB/s
+/// for the plain scalar loop it exists to beat, i.e. the "fast path" was an
+/// 8-18x pessimization. With the attribute here the intrinsics inline and it
+/// matches the hand-written-SIMD number. Same shape as every other AVX2
+/// kernel in this crate (`silu_inplace_avx2`, `softmax_rows_avx2`, …): tiny
+/// runtime-gated wrapper, `#[target_feature]` body.
+///
+/// # Safety
+/// Caller has checked `is_x86_feature_detected!("avx2")`, `op` is one of
+/// Add/Sub/Mul, and `[i0, i1)` is in bounds of all three buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn binary_contig_avx2(
+    l: *const f32,
+    r: *const f32,
+    o: *mut f32,
+    i0: usize,
+    i1: usize,
+    op: BinaryOp,
+) {
+    use std::arch::x86_64::*;
+    let mut i = i0;
+    // Align to 8-wide when possible within the chunk.
+    while i + 8 <= i1 {
+        let a = _mm256_loadu_ps(l.add(i));
+        let b = _mm256_loadu_ps(r.add(i));
+        let res = match op {
+            BinaryOp::Add => _mm256_add_ps(a, b),
+            BinaryOp::Sub => _mm256_sub_ps(a, b),
+            BinaryOp::Mul => _mm256_mul_ps(a, b),
+            _ => unreachable!(),
+        };
+        _mm256_storeu_ps(o.add(i), res);
+        i += 8;
+    }
+    while i < i1 {
+        let a = *l.add(i);
+        let b = *r.add(i);
+        *o.add(i) = match op {
+            BinaryOp::Add => a + b,
+            BinaryOp::Sub => a - b,
+            BinaryOp::Mul => a * b,
+            _ => unreachable!(),
+        };
+        i += 1;
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -148,8 +184,6 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
         && rl.is_multiple_of(8)
         && matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub)
         && std::arch::is_x86_feature_detected!("avx2");
-    #[cfg(not(target_arch = "x86_64"))]
-    let _use_avx2 = false;
 
     let run_rows = |row0: usize, row1: usize| unsafe {
         let l = l_ptr as *const f32;
@@ -157,24 +191,9 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
         let o = o_ptr as *mut f32;
         #[cfg(target_arch = "x86_64")]
         if use_avx2 {
-            use std::arch::x86_64::*;
-            let chunks = rl / 8;
-            for row in row0..row1 {
-                let base = row * rl;
-                for c in 0..chunks {
-                    let off = base + c * 8;
-                    let roff = c * 8;
-                    let a = _mm256_loadu_ps(l.add(off));
-                    let b = _mm256_loadu_ps(r.add(roff));
-                    let res = match op {
-                        BinaryOp::Add => _mm256_add_ps(a, b),
-                        BinaryOp::Sub => _mm256_sub_ps(a, b),
-                        BinaryOp::Mul => _mm256_mul_ps(a, b),
-                        _ => unreachable!(),
-                    };
-                    _mm256_storeu_ps(o.add(off), res);
-                }
-            }
+            // SAFETY: AVX2 + `rl % 8 == 0` + Add/Sub/Mul all checked in
+            // `use_avx2`; rows `[row0, row1)` are within `rows`.
+            binary_row_bcast_avx2(l, r, o, row0, row1, rl, op);
             return;
         }
         for row in row0..row1 {
@@ -208,6 +227,47 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
         run_rows(0, rows);
     }
     true
+}
+
+/// Row-broadcast `o[row*rl + j] = op(l[row*rl + j], r[j])`, 8 lanes at a time.
+///
+/// Split out for the same reason as [`binary_contig_avx2`] — the intrinsics
+/// only inline inside a fn that actually has AVX2 enabled.
+///
+/// # Safety
+/// Caller has checked `is_x86_feature_detected!("avx2")`, that `rl` is a
+/// non-zero multiple of 8, that `op` is one of Add/Sub/Mul, and that rows
+/// `[row0, row1)` are in bounds of all three buffers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn binary_row_bcast_avx2(
+    l: *const f32,
+    r: *const f32,
+    o: *mut f32,
+    row0: usize,
+    row1: usize,
+    rl: usize,
+    op: BinaryOp,
+) {
+    use std::arch::x86_64::*;
+    let chunks = rl / 8;
+    for row in row0..row1 {
+        let base = row * rl;
+        for c in 0..chunks {
+            let off = base + c * 8;
+            let roff = c * 8;
+            let a = _mm256_loadu_ps(l.add(off));
+            let b = _mm256_loadu_ps(r.add(roff));
+            let res = match op {
+                BinaryOp::Add => _mm256_add_ps(a, b),
+                BinaryOp::Sub => _mm256_sub_ps(a, b),
+                BinaryOp::Mul => _mm256_mul_ps(a, b),
+                _ => unreachable!(),
+            };
+            _mm256_storeu_ps(o.add(off), res);
+        }
+    }
 }
 
 pub(crate) fn thunk_kind_name(t: &Thunk) -> &'static str {
@@ -517,6 +577,56 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         crate::blas::sgemm_auto(a_sl, b_sl, &mut tmp, m, k, n);
                         c_sl.copy_from_slice(&tmp);
                     } else {
+                        crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
+                    }
+                }
+            }
+
+            Thunk::SgemmHalf {
+                a,
+                b,
+                c,
+                m,
+                k,
+                n,
+                a_kind,
+                b_kind,
+                c_kind,
+            } => {
+                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+                let (a_len, b_len, c_len) = (m * k, k * n, m * n);
+                unsafe {
+                    let a_buf;
+                    let a_sl: &[f32] = if a_kind.packed() {
+                        a_buf = crate::blas::widen_half_vec(
+                            sl_typed::<u16>(*a, base, a_len),
+                            *a_kind == crate::thunk::HalfKind::Bf16,
+                        );
+                        &a_buf
+                    } else {
+                        sl(*a, base, a_len)
+                    };
+                    let b_buf;
+                    let b_sl: &[f32] = if b_kind.packed() {
+                        b_buf = crate::blas::widen_half_vec(
+                            sl_typed::<u16>(*b, base, b_len),
+                            *b_kind == crate::thunk::HalfKind::Bf16,
+                        );
+                        &b_buf
+                    } else {
+                        sl(*b, base, b_len)
+                    };
+                    if c_kind.packed() {
+                        let mut tmp = vec![0f32; c_len];
+                        crate::blas::sgemm_auto(a_sl, b_sl, &mut tmp, m, k, n);
+                        let dst = sl_mut_typed::<u16>(*c, base, c_len);
+                        crate::blas::round_half_into(
+                            &tmp,
+                            dst,
+                            *c_kind == crate::thunk::HalfKind::Bf16,
+                        );
+                    } else {
+                        let c_sl = sl_mut(*c, base, c_len);
                         crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
                     }
                 }
@@ -1824,6 +1934,27 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 }
             }
 
+            Thunk::RoundHalf {
+                src,
+                dst,
+                len,
+                bf16,
+            } => {
+                let len = *len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let inp = unsafe { sl(*src, base, len).to_vec() };
+                let out = unsafe { sl_mut(*dst, base, len) };
+                for (o, v) in out.iter_mut().zip(&inp) {
+                    *o = if *bf16 {
+                        half::bf16::from_f32(*v).to_f32()
+                    } else {
+                        half::f16::from_f32(*v).to_f32()
+                    };
+                }
+            }
+
             Thunk::Copy { src, dst, len } => {
                 let mut len = *len as usize;
                 if *src == *dst || len == 0 {
@@ -2675,16 +2806,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // LN1 (fused residual already done above — just normalize)
                     let g1 = sl(*ln1_g, base, h);
                     let b1 = sl(*ln1_b, base, h);
-                    for r in 0..m {
-                        crate::kernels::layer_norm_row(
-                            &res[r * h..(r + 1) * h],
-                            g1,
-                            b1,
-                            &mut normed[r * h..(r + 1) * h],
-                            h,
-                            *eps1,
-                        );
-                    }
+                    crate::kernels::layer_norm_rows(&res[..], g1, b1, &mut normed[..], m, h, *eps1);
 
                     // FFN: fc1 (parallel across cores) + GELU
                     crate::blas::par_sgemm_bias(
@@ -2734,16 +2856,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // LN2 → output
                     let g2 = sl(*ln2_g, base, h);
                     let b2 = sl(*ln2_b, base, h);
-                    for r in 0..m {
-                        crate::kernels::layer_norm_row(
-                            &res[r * h..(r + 1) * h],
-                            g2,
-                            b2,
-                            &mut dst[r * h..(r + 1) * h],
-                            h,
-                            *eps2,
-                        );
-                    }
+                    crate::kernels::layer_norm_rows(&res[..], g2, b2, &mut dst[..], m, h, *eps2);
                 }
             }
 
@@ -2883,16 +2996,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // LN1
                     let g1 = sl(*ln1_g, base, h);
                     let b1 = sl(*ln1_b, base, h);
-                    for r in 0..m {
-                        crate::kernels::layer_norm_row(
-                            &res[r * h..(r + 1) * h],
-                            g1,
-                            b1,
-                            &mut normed[r * h..(r + 1) * h],
-                            h,
-                            *eps1,
-                        );
-                    }
+                    crate::kernels::layer_norm_rows(&res[..], g1, b1, &mut normed[..], m, h, *eps1);
 
                     // SwiGLU: fused fc11+fc12 sgemm, then split, silu, mul
                     crate::blas::sgemm(&normed, fused_fc_w, &mut ffn_concat, m, h, 2 * id);
@@ -2937,16 +3041,7 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // LN2 → output
                     let g2 = sl(*ln2_g, base, h);
                     let b2 = sl(*ln2_b, base, h);
-                    for r in 0..m {
-                        crate::kernels::layer_norm_row(
-                            &res[r * h..(r + 1) * h],
-                            g2,
-                            b2,
-                            &mut dst[r * h..(r + 1) * h],
-                            h,
-                            *eps2,
-                        );
-                    }
+                    crate::kernels::layer_norm_rows(&res[..], g2, b2, &mut dst[..], m, h, *eps2);
                 }
             }
 

@@ -14,7 +14,9 @@ pub mod sampling;
 pub mod tokenizer;
 pub mod tool_parse;
 
-pub use chat::{ChatMessage, ChatTemplate, ChatTemplateSource, auto_chat_template};
+pub use chat::{
+    ChatMessage, ChatRenderOptions, ChatTemplate, ChatTemplateSource, auto_chat_template,
+};
 pub use detokenize::{StreamingDetokenizer, incremental_emit};
 pub use rlx_runtime::SampleOpts;
 pub use sampling::{argmax, sample_next};

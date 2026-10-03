@@ -117,6 +117,45 @@ pub fn build_leaf_for(
         .map(|d| d.unwrap_static())
         .collect();
     let dtype = node.shape.dtype();
+    // Name the leaf on failure. A size mismatch here used to surface as a bare
+    // "nelems doesn't match shape product" from the C++ shim, with no way to tell
+    // which boundary tensor was wrong.
+    let ctx = |e: MlxError| {
+        MlxError(format!(
+            "{e} — while building leaf {id:?} {:?} dims {shape:?} dtype {dtype:?}",
+            node.op
+        ))
+    };
+    build_leaf_inner(
+        graph,
+        id,
+        node,
+        &shape,
+        dtype,
+        params,
+        inputs,
+        params_typed,
+        inputs_typed,
+        gpu_inputs,
+    )
+    .map_err(ctx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_leaf_inner(
+    graph: &Graph,
+    id: NodeId,
+    node: &rlx_ir::Node,
+    shape: &[usize],
+    dtype: DType,
+    params: &HashMap<String, Vec<f32>>,
+    inputs: &HashMap<String, Vec<f32>>,
+    params_typed: &HashMap<String, (Vec<u8>, DType)>,
+    inputs_typed: &HashMap<String, (Vec<u8>, DType)>,
+    gpu_inputs: Option<&HashMap<String, Array>>,
+) -> Result<Array, MlxError> {
+    let _ = (graph, id);
+    let shape: Vec<usize> = shape.to_vec();
     match &node.op {
         Op::Input { name } => {
             if let Some(map) = gpu_inputs {

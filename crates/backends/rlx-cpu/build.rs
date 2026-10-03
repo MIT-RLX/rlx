@@ -140,7 +140,7 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_default();
     let target = std::env::var("TARGET").unwrap_or_default();
     let native = !host.is_empty() && host == target;
-    let probed_lib_dir = if target_arch != "x86_64" && !pinned && target_os == "linux" && native {
+    let probed_lib_dir = if !pinned && target_os == "linux" && native {
         openblas_search_dirs()
             .into_iter()
             .find(|d| std::path::Path::new(&format!("{d}/libopenblas.so")).exists())
@@ -149,7 +149,14 @@ fn main() {
     };
     if let Some(dir) = &probed_lib_dir {
         println!("cargo:rustc-link-search=native={dir}");
-    } else if target_arch != "x86_64" && !pinned {
+    } else if target_os != "windows" && !pinned && !openblas_links_by_default(native) {
+        // Nothing found and the linker can't resolve it either. x86_64 Linux
+        // used to skip this check and emit a bare `-lopenblas` regardless,
+        // which turned "no OpenBLAS installed" into a hard link error on the
+        // one target where it is most likely to be missing — a container, a
+        // minimal distro, a cross build — while every other target degraded
+        // to the portable gemm. A missing *optional* dependency should never
+        // fail the build.
         println!(
             "cargo:warning=rlx-cpu: no OpenBLAS for {target_arch}-{target_os}; using the \
              pure-Rust fallback (correct but slower — install libopenblas-dev, or set \
@@ -194,13 +201,56 @@ fn main() {
     println!("cargo:rustc-cfg=rlx_cpu_blas_openblas");
 }
 
+/// Ask the C compiler whether `-lopenblas` resolves from the linker's DEFAULT
+/// search path.
+///
+/// Insurance against a false negative from `openblas_search_dirs`, which
+/// enumerates the Debian/Ubuntu layout and so misses Fedora/RHEL's `/usr/lib64`,
+/// a Nix/Homebrew prefix, or anything added via `ld.so.conf`. Getting this
+/// wrong is silent and expensive in both directions: claim it is absent and a
+/// host with a tuned BLAS quietly drops to the portable gemm, claim it is
+/// present and the final link fails. Asking the linker is the only answer that
+/// is actually about the machine being built for.
+///
+/// Only meaningful on a native build — for a cross build `cc` is the host
+/// compiler and would answer about the wrong target, so this returns false and
+/// the caller falls back (`RLX_BLAS_LINK` / `OPENBLAS_LIB_DIR` are the
+/// documented cross escape hatches).
+fn openblas_links_by_default(native: bool) -> bool {
+    if !native {
+        return false;
+    }
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        return false;
+    };
+    let src = std::path::Path::new(&out_dir).join("openblas_probe.c");
+    if std::fs::write(&src, "int main(void){return 0;}").is_err() {
+        return false;
+    }
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    println!("cargo:rerun-if-env-changed=CC");
+    let probe = std::process::Command::new(cc)
+        .arg(&src)
+        .arg("-lopenblas")
+        .arg("-o")
+        .arg(std::path::Path::new(&out_dir).join("openblas_probe"))
+        .output();
+    matches!(probe, Ok(o) if o.status.success())
+}
+
 /// Library dirs to probe for a distro OpenBLAS on Linux, most-generic first.
 /// Enumerates the Debian/Ubuntu multiarch dirs (the triple isn't derivable
 /// from `target_arch` — 32-bit Pi is arch `arm`, dir `arm-linux-gnueabihf`),
 /// plus the `openblas-{pthread,openmp,serial}` variant subdirs Debian installs
 /// the real `libopenblas.so*` into.
 fn openblas_search_dirs() -> Vec<String> {
-    let mut base = vec!["/usr/lib".to_string(), "/usr/local/lib".to_string()];
+    // `lib64` covers the Fedora/RHEL/SUSE layout, on x86_64 and aarch64 alike.
+    let mut base = vec![
+        "/usr/lib".to_string(),
+        "/usr/local/lib".to_string(),
+        "/usr/lib64".to_string(),
+        "/usr/local/lib64".to_string(),
+    ];
     if let Ok(rd) = std::fs::read_dir("/usr/lib") {
         for e in rd.flatten() {
             let p = e.path();

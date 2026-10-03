@@ -120,10 +120,18 @@ LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
 
 # Crates with `publish = false` in their Cargo.toml (cargo skips them;
 # listed here for tier-coverage validation only).
+#
+# This is a hand-copy of what the manifests already say, so it drifts: rlx-js
+# joined the workspace with `publish = false` and was never added here, and the
+# symptom was a confusing "TIERS missing workspace crates: rlx-js" — a demand
+# for a tier for a crate cargo will never publish. `validate_tier_coverage`
+# now diffs this list against `cargo metadata` and fails loudly on divergence,
+# so the next addition cannot reproduce that.
 SKIPPED=(
     pyrlx
     rlx-cortexm-trainer
     rlx-corpus
+    rlx-js
     rlx-megakernel
 )
 
@@ -270,6 +278,32 @@ validate_tier_coverage() {
     if ! command -v jq >/dev/null 2>&1; then
         yellow "jq not found — skipping tier coverage check (install jq to enable)."
         return 0
+    fi
+
+    # Guard the hand-copy above against the manifests. `publish = false` is the
+    # ground truth; `SKIPPED` only restates it, and a restatement that nobody
+    # checks is a restatement that drifts. Compare the two sorted sets and say
+    # exactly which way they disagree, because the downstream symptom ("TIERS
+    # missing workspace crates") points at the wrong file entirely.
+    local derived_unpub listed_unpub
+    derived_unpub=$(
+        cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | jq -r '.workspace_members[] as $m | .packages[]
+                     | select(.id == $m)
+                     | select(.publish != null and (.publish | length == 0))
+                     | .name' \
+            | sort
+    )
+    listed_unpub=$(printf '%s\n' "${SKIPPED[@]}" | sort)
+    if [[ "$derived_unpub" != "$listed_unpub" ]]; then
+        red "SKIPPED is out of sync with the manifests' \`publish = false\` set:"
+        while IFS= read -r n; do
+            [[ -n "$n" ]] && red "  + $n  has publish = false but is not in SKIPPED"
+        done < <(comm -23 <(printf '%s\n' "$derived_unpub") <(printf '%s\n' "$listed_unpub"))
+        while IFS= read -r n; do
+            [[ -n "$n" ]] && red "  - $n  is in SKIPPED but is publishable"
+        done < <(comm -13 <(printf '%s\n' "$derived_unpub") <(printf '%s\n' "$listed_unpub"))
+        exit 1
     fi
 
     while IFS= read -r name; do
@@ -903,6 +937,25 @@ publish_one_attempt() {
     args+=("--package" "$crate")
     if (( DRY_RUN )); then
         args+=("--dry-run" "--allow-dirty")
+    fi
+    # rlx-mlx-sys vendors MLX as a git submodule pinned to a clean upstream
+    # commit, and `build.rs` applies the tracked `patches/` to that working
+    # tree before CMake configures — so merely BUILDING the crate leaves three
+    # files modified and `cargo publish` refuses with "files in the working
+    # directory contain changes that were not yet committed into git".
+    #
+    # The dirt is build output, not uncommitted work: the patches themselves
+    # are tracked, and the fix cannot live as a submodule commit because
+    # `git submodule update` would discard it and the parent repo would never
+    # record it. Published 0.2.16 shipped these sources pre-patched for the
+    # same reason, and `apply_vendor_patches` is idempotent (it tries
+    # `git apply --check --reverse` first), so a consumer building from the
+    # tarball detects them as already applied and skips.
+    #
+    # Scoped to this one crate on purpose. A blanket `--allow-dirty` would let
+    # genuinely uncommitted work ship silently from any of the other 70-odd.
+    if [[ "$crate" == "rlx-mlx-sys" ]]; then
+        args+=("--allow-dirty")
     fi
     if (( NO_VERIFY )); then
         args+=("--no-verify")

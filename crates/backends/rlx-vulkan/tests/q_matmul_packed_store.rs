@@ -30,6 +30,8 @@ use rlx_ir::{DType, Graph, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+mod common;
+
 /// Skip when no Vulkan device is present.
 ///
 /// `rlx_ir::env::skip_unless_device` rather than a bare
@@ -80,6 +82,7 @@ fn wave(n: usize, phase: f32, amp: f32) -> Vec<f32> {
 
 #[test]
 fn every_packed_output_is_written_and_runs_agree() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -142,6 +145,7 @@ fn every_packed_output_is_written_and_runs_agree() {
 /// `zero_point` both came back 0 and every quantized tensor was zeros.
 #[test]
 fn quantize_dequantize_roundtrip_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }

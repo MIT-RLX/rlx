@@ -31,7 +31,10 @@ const ORT_REF_UNIFORM_LIKE: [f32; 6] = [
 const ORT_REF_UNIFORM: [f32; 4] = [0.000_157_345_09, 0.595_227_1, 0.209_468_23, 0.241_278_95];
 
 #[test]
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 fn random_normal_like_ort_parity() {
     let path = synthetic::random_normal_like_fixture();
     let opts = ImportOptions {
@@ -56,7 +59,10 @@ fn random_normal_like_ort_parity() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 fn random_normal_ort_parity() {
     let path = synthetic::random_normal_fixture();
     let opts = ImportOptions {
@@ -78,7 +84,10 @@ fn random_normal_ort_parity() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 fn random_uniform_like_ort_parity() {
     let path = synthetic::random_uniform_like_fixture();
     let opts = ImportOptions {
@@ -103,7 +112,10 @@ fn random_uniform_like_ort_parity() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 fn random_uniform_ort_parity() {
     let path = synthetic::random_uniform_fixture();
     let opts = ImportOptions {

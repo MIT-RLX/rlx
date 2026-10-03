@@ -10,6 +10,8 @@
 use rlx_ir::{DType, Graph, ScaleLayout, ScaledFormat, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 
+mod common;
+
 fn build(m: usize, k: usize, n: usize, e_cnt: usize) -> Graph {
     let mut g = Graph::new("sgmm");
     let x = g.input("x", Shape::new(&[m, k], DType::F32));
@@ -61,10 +63,12 @@ fn parity(m: usize, k: usize, n: usize, e_cnt: usize, idx: Vec<f32>) {
 
 #[test]
 fn scaled_grouped_matmul_cpu_vulkan_gemv() {
+    let _gpu = common::serialize_gpu();
     parity(1, 64, 8, 3, vec![2.0]);
 }
 
 #[test]
 fn scaled_grouped_matmul_cpu_vulkan_gemm() {
+    let _gpu = common::serialize_gpu();
     parity(6, 64, 8, 3, vec![0.0, 1.0, 2.0, 1.0, 0.0, 2.0]);
 }

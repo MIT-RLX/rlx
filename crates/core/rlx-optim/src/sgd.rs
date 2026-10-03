@@ -88,25 +88,70 @@ impl Sgd {
     }
 }
 
+// ── checkpointing ───────────────────────────────────────────
+
+impl Sgd {
+    /// Named accumulators plus the step counter — see
+    /// [`crate::OptimizerState`].
+    pub(crate) fn snapshot(&self) -> crate::OptimizerState {
+        let mut out = crate::OptimizerState {
+            step: 0,
+            buffers: Vec::new(),
+        };
+        out.extend_slot("v", &self.v);
+        out
+    }
+
+    pub(crate) fn restore(&mut self, state: &crate::OptimizerState) {
+        state.take_slot("v", &mut self.v);
+    }
+}
+
 impl Optimizer for Sgd {
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
     }
 
+    fn state_dict(&self) -> Option<crate::OptimizerState> {
+        Some(self.snapshot())
+    }
+
+    fn load_state_dict(&mut self, state: &crate::OptimizerState) -> bool {
+        self.restore(state);
+        true
+    }
+
     fn step(&mut self, name: &str, _shape: &[usize], param: &mut [f32], grad: &[f32]) {
         debug_assert_eq!(param.len(), grad.len());
-        let v = zeros_entry(&mut self.v, name, param.len());
         let mu = self.momentum;
         let wd = self.weight_decay;
         let lr = self.lr;
-        for i in 0..param.len() {
-            let g = grad[i] + wd * param[i];
-            if mu == 0.0 {
-                param[i] -= lr * g;
-            } else {
-                v[i] = mu * v[i] + g;
-                let update = if self.nesterov { g + mu * v[i] } else { v[i] };
-                param[i] -= lr * update;
+        // Read out of `self` *before* the loop. Both of these used to be tested
+        // per element, and `self.nesterov` was read through a live `&mut self`
+        // borrow, which stopped the loop vectorizing: SGD measured 1.06
+        // ns/element against Lion's 0.28 while doing strictly less arithmetic.
+        let nesterov = self.nesterov;
+        let v = zeros_entry(&mut self.v, name, param.len());
+
+        // One specialized loop per configuration rather than one loop with the
+        // configuration inside it. The arithmetic is unchanged, so results stay
+        // bit-identical.
+        if mu == 0.0 {
+            for (p, g) in param.iter_mut().zip(grad) {
+                let d = *g + wd * *p;
+                *p -= lr * d;
+            }
+        } else if nesterov {
+            for ((p, vi), g) in param.iter_mut().zip(v.iter_mut()).zip(grad) {
+                let d = *g + wd * *p;
+                *vi = mu * *vi + d;
+                *p -= lr * (d + mu * *vi);
+            }
+        } else {
+            for ((p, vi), g) in param.iter_mut().zip(v.iter_mut()).zip(grad) {
+                let d = *g + wd * *p;
+                *vi = mu * *vi + d;
+                *p -= lr * *vi;
             }
         }
     }

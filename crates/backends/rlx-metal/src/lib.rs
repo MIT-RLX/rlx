@@ -26,6 +26,15 @@
 //! - 273 GB/s memory bandwidth (vs 120 on CPU)
 //! - MPSMatrixMultiplication uses dedicated matmul hardware
 
+// `objc` 0.2 only knows macOS and iOS; on the other Apple platforms it falls
+// back to the GNUstep runtime and fails to link. See the module docs.
+#[cfg(all(
+    rlx_metal_host,
+    target_vendor = "apple",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+mod objc_apple_shim;
+
 #[cfg(rlx_metal_host)]
 pub mod device;
 

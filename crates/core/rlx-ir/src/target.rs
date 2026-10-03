@@ -78,10 +78,25 @@ pub const fn has_neon() -> bool {
     cfg!(target_arch = "aarch64")
 }
 
-/// True if AVX2 is reasonably likely to be present at runtime.
-/// This is a *static* prediction — explicit runtime detection
-/// belongs in the dispatch path; this is for "should we even
-/// compile the AVX2 code path?"
+/// True only when this build was *pinned* to AVX2 at compile time, i.e. it
+/// was given `-C target-cpu=native` (or `x86-64-v3`, or an explicit
+/// `+avx2`). It is NOT "this CPU has AVX2": a stock `cargo build` answers
+/// false on an AVX-512 server, because a stock build deliberately stays
+/// baseline so one artifact runs everywhere.
+///
+/// Do not use this to pick a code path. It reads like a capability check and
+/// is really a build-flag check, and acting on it is how a kernel ends up
+/// existing only in a non-portable artifact: `rlx-cpu`'s `bias_gelu` and
+/// `layer_norm_row` were gated this way, so the portable build silently lost
+/// their AVX2 kernels and the only way to get them was a binary that
+/// `SIGILL`s on any pre-Gracemont Atom. Both now dispatch on
+/// `is_x86_feature_detected!`, which is the pattern to copy — compile the
+/// path unconditionally, choose it at runtime. `just check-isa` enforces it.
+#[deprecated(
+    since = "0.2.17",
+    note = "a build-flag check masquerading as a capability check; dispatch on \
+            `std::arch::is_x86_feature_detected!(\"avx2\")` at runtime instead"
+)]
 pub const fn has_avx2_likely() -> bool {
     cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
 }

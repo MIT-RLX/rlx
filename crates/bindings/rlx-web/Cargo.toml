@@ -31,7 +31,7 @@ browser = ["webgpu", "webgl"]
 rlx-ir = { workspace = true }
 rlx-autodiff = { workspace = true }
 rlx-opt = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.16", default-features = false, features = ["cpu"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.17", default-features = false, features = ["cpu"] }
 wasm-bindgen = "0.2.118"
 rlx-wgpu = { workspace = true, optional = true }
 rlx-webgl = { workspace = true, optional = true }

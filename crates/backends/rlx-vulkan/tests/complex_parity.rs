@@ -26,6 +26,8 @@ use rlx_runtime::backend::{narrow_f32_to_bytes, widen_bytes_to_f32};
 use rlx_vulkan::backend::VulkanExecutable;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+mod common;
+
 fn available() -> bool {
     rlx_vulkan::is_available()
 }
@@ -152,6 +154,7 @@ fn vulkan_binary_c64_lanes(
 
 #[test]
 fn cast_real_to_c64_and_back() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping real↔C64");
         return;
@@ -167,6 +170,7 @@ fn cast_real_to_c64_and_back() {
 
 #[test]
 fn cast_real_to_c128_and_back() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping real↔C128");
         return;
@@ -187,6 +191,7 @@ fn cast_real_to_c128_and_back() {
 
 #[test]
 fn cast_c64_c128_both_ways() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping C64↔C128");
         return;
@@ -225,6 +230,7 @@ fn max_rel_complex(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn c64_add_sub_bit_exact() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping C64 add/sub");
         return;
@@ -242,6 +248,7 @@ fn c64_add_sub_bit_exact() {
 
 #[test]
 fn c64_mul_div_close() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping C64 mul/div");
         return;
@@ -263,6 +270,7 @@ fn c64_mul_div_close() {
 
 #[test]
 fn c64_scalar_vector_broadcast_mul() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping C64 broadcast");
         return;
@@ -307,6 +315,7 @@ fn c64_scalar_vector_broadcast_mul() {
 
 #[test]
 fn df64_boundary_round_trip() {
+    let _gpu = common::serialize_gpu();
     // Pure host-boundary check (no device needed): host f64 → widen(SPLIT) →
     // C128 lanes → narrow(COMBINE) → host f64. Sweeps π, 1/3, and exactly
     // f32-representable values (must round-trip bit-exact).
@@ -358,6 +367,7 @@ fn df64_boundary_round_trip() {
 
 #[test]
 fn slot_sizing_c64_c128() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping slot sizing");
         return;
@@ -430,6 +440,7 @@ fn vulkan_expand_bytes(
 
 #[test]
 fn expand_complex_materialized() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping complex Expand");
         return;
@@ -491,6 +502,7 @@ fn vulkan_op1_bytes(
 
 #[test]
 fn transpose_complex() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping complex Transpose");
         return;
@@ -520,6 +532,7 @@ fn transpose_complex() {
 
 #[test]
 fn narrow_complex() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping complex Narrow");
         return;
@@ -551,6 +564,7 @@ fn narrow_complex() {
 
 #[test]
 fn concat_complex() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping complex Concat");
         return;
@@ -599,6 +613,7 @@ fn concat_complex() {
 
 #[test]
 fn gather_complex() {
+    let _gpu = common::serialize_gpu();
     if !available() {
         eprintln!("[complex_parity] no Vulkan device — skipping complex Gather");
         return;

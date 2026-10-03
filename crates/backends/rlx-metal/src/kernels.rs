@@ -1026,6 +1026,27 @@ kernel void fused_attn_block(
     }
 }
 
+// Round an f32 buffer to BF16 precision, keeping f32 STORAGE.
+//
+// Metal has no `bfloat` kernels — `HalfFlag` has no BF16 lane, so every kernel
+// reads a bf16 tensor as f32 and `ArenaWidthPolicy::NativeBf16Widened` gives it
+// a 4 B/elem slot. A `Cast(F32 -> BF16)` therefore has to round in place rather
+// than pack, exactly like rlx-cpu's `RoundHalf` thunk.
+kernel void round_bf16_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& len      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+    uint b = as_type<uint>(src[gid]);
+    // NaN/Inf keep their payload; rounding the mantissa could turn an Inf into
+    // a NaN by carrying into the exponent.
+    if ((b & 0x7f800000u) == 0x7f800000u) { dst[gid] = src[gid]; return; }
+    uint r = ((b >> 16) & 1u) + 0x7fffu;  // round-to-nearest-even
+    dst[gid] = as_type<float>((b + r) & 0xffff0000u);
+}
+
 // Cast f32 → f16 (used at I/O boundary)
 kernel void cast_f32_to_f16(
     device const float* src [[buffer(0)]],
@@ -8579,6 +8600,11 @@ kernel void l2_norm_lastdim(
     constant ulong& eps_off [[buffer(2)]],
     constant ulong& out_off [[buffer(3)]],
     constant uint& h [[buffer(4)]],
+    // Optional second output: the per-row `max(sqrt(Σx²), eps)` this kernel
+    // computes anyway. `ULONG_MAX` = not wanted. Lets the fusion absorb the
+    // chain even when a later thunk still reads the denominator — which a
+    // backward graph does, since it recomputes the forward normalize.
+    constant ulong& denom_out_off [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tsize [[threads_per_threadgroup]]
@@ -8601,6 +8627,9 @@ kernel void l2_norm_lastdim(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float denom = max(sqrt(partial[0]), eps);
+    if (denom_out_off != ULONG_MAX && tid == 0) {
+        ((device float*)(arena + denom_out_off))[row] = denom;
+    }
     for (uint i = tid; i < h; i += tsize) {
         output[row * h + i] = input[row * h + i] / denom;
     }
@@ -8616,6 +8645,12 @@ kernel void rms_norm_mul_silu(
     constant ulong& out_off [[buffer(5)]],
     constant uint& h [[buffer(6)]],
     constant float& eps [[buffer(7)]],
+    // Optional second output: `silu(z)`, which this kernel computes anyway.
+    // `ULONG_MAX` = not wanted. It exists so the fusion can absorb the standalone
+    // silu thunk even when a LATER thunk still reads its result — a backward
+    // graph re-reads the recomputed forward values, and without this the fusion
+    // has to decline there, which costs ~2x on a training step.
+    constant ulong& silu_out_off [[buffer(8)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tsize [[threads_per_threadgroup]]
@@ -8625,6 +8660,10 @@ kernel void rms_norm_mul_silu(
     device const float* beta = (device const float*)(arena + b_off);
     device const float* z = (device const float*)(arena + z_off);
     device float* output = (device float*)(arena + out_off);
+    const bool want_silu = silu_out_off != ULONG_MAX;
+    device float* silu_out = want_silu
+        ? (device float*)(arena + silu_out_off)
+        : (device float*)0;
     threadgroup float partial_sumsq[256];
     float local_sumsq = 0.0f;
     for (uint i = tid; i < h; i += tsize) {
@@ -8643,6 +8682,9 @@ kernel void rms_norm_mul_silu(
     for (uint i = tid; i < h; i += tsize) {
         float zv = z[row * h + i];
         float silu = zv / (1.0f + exp(-zv));
+        if (want_silu) {
+            silu_out[row * h + i] = silu;
+        }
         output[row * h + i] =
             (input[row * h + i] * inv_rms * gamma[i] + beta[i]) * silu;
     }
@@ -13493,6 +13535,7 @@ pub struct Kernels {
     /// Native f32 fused-attention core for `Op::FusedAttentionBlock`.
     pub fused_attn_block: ComputePipelineState,
     pub rope_h: ComputePipelineState,
+    pub round_bf16_f32: ComputePipelineState,
     pub cast_f32_to_f16: ComputePipelineState,
     pub cast_f16_to_f32: ComputePipelineState,
     pub copy_f32: ComputePipelineState,
@@ -14030,6 +14073,7 @@ impl Kernels {
             sdpa_h: pipeline("sdpa_h"),
             fused_attn_block: pipeline("fused_attn_block"),
             rope_h: pipeline("rope_h"),
+            round_bf16_f32: pipeline("round_bf16_f32"),
             cast_f32_to_f16: pipeline("cast_f32_to_f16"),
             cast_f16_to_f32: pipeline("cast_f16_to_f32"),
             copy_f32: pipeline("copy_f32"),

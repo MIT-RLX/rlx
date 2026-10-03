@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Per-op parity tests for the MIL lowering, run through CoreML on-device.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 // The erf reference constants are deliberately written at full published
 // precision; they're truncated to f32 at compile time.
 #![allow(clippy::excessive_precision)]

@@ -35,7 +35,7 @@ rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gguf = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 # rlx-splat moved out of tree; restore with the native-splat feature below.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.16", optional = true, default-features = false, features = ["reference", "metal"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.17", optional = true, default-features = false, features = ["reference", "metal"] }
 
 [features]
 default = []

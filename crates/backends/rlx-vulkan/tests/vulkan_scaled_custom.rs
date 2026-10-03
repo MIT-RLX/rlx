@@ -15,6 +15,8 @@
 use rlx_ir::{DType, Graph, Op, ScaleLayout, ScaledFormat, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 
+mod common;
+
 fn build_scaled_mm_graph(
     fmt: ScaledFormat,
     layout: ScaleLayout,
@@ -108,6 +110,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// ScaledQuantize [U8 output] → ScaledMatMul) through the mapped arena.
 #[test]
 fn vulkan_scaled_f4e3m0_grid_is_exact() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("skip: no Vulkan device");
         return;
@@ -139,6 +142,7 @@ fn vulkan_scaled_f4e3m0_grid_is_exact() {
 /// f4e3m0 on smooth data with block-MX scaling tracks the f32 matmul.
 #[test]
 fn vulkan_scaled_f4e3m0_tracks_f32() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
@@ -159,6 +163,7 @@ fn vulkan_scaled_f4e3m0_tracks_f32() {
 /// Named E4M3 through the same host-fallback path is high-fidelity.
 #[test]
 fn vulkan_scaled_named_e4m3() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }

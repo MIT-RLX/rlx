@@ -4,7 +4,7 @@
 // Native (on-device) `Op::Lstm` on CoreML/ANE, unrolled over the sequence into
 // MIL primitives. Verified against the CPU backend (the reference executor)
 // through the public Session API — no CPU host-eval in the ANE path.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_ir::op::Op;
 use rlx_ir::{DType, Graph, Shape};

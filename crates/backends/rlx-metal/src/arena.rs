@@ -20,6 +20,11 @@ pub struct Arena {
     pub offsets: HashMap<NodeId, usize>, // byte offsets per node
     pub element_counts: HashMap<NodeId, usize>, // element counts per node
     pub dtypes: HashMap<NodeId, DType>,  // per-node dtype (for f16 vs f32 dispatch)
+    pub slot_bytes: HashMap<NodeId, usize>, // planned slot size (may exceed dtype width)
+    /// Logical element count from the node's shape, which is NOT
+    /// `element_counts` (that one is the slot capacity). Only `bytes_per_elem`
+    /// needs it, and only when the two disagree.
+    shape_elems: HashMap<NodeId, usize>,
 }
 
 impl Arena {
@@ -78,15 +83,28 @@ impl Arena {
         let mut offsets = HashMap::with_capacity(plan.assignments.len());
         let mut element_counts = HashMap::with_capacity(plan.assignments.len());
         let mut dtypes = HashMap::with_capacity(plan.assignments.len());
+        let mut slot_bytes = HashMap::with_capacity(plan.assignments.len());
+        let mut shape_elems = HashMap::with_capacity(plan.assignments.len());
         for (node_id, slot) in &plan.assignments {
             offsets.insert(*node_id, slot.offset);
             // Element count derived from byte size and dtype
             let dt = graph
                 .map(|g| g.node(*node_id).shape.dtype())
                 .unwrap_or(DType::F32);
+            // `element_counts` stays the SLOT CAPACITY in elements: the
+            // host-delegate bind path uses it to bound reads and writes, so
+            // shrinking it to the logical count truncates ops whose runtime
+            // output is padded (it broke every `spd_host_parity` test).
             let elem_size = dt.size_bytes();
             element_counts.insert(*node_id, slot.size / elem_size.max(1));
+            // The LOGICAL count, for `bytes_per_elem` only — a bf16 activation
+            // widened to 4 B/elem must not report 2 B just because its slot is
+            // twice the packed size.
+            if let Some(n) = graph.and_then(|g| g.node(*node_id).shape.num_elements()) {
+                shape_elems.insert(*node_id, n);
+            }
             dtypes.insert(*node_id, dt);
+            slot_bytes.insert(*node_id, slot.size);
         }
         Self {
             buffer,
@@ -94,7 +112,24 @@ impl Arena {
             offsets,
             element_counts,
             dtypes,
+            slot_bytes,
+            shape_elems,
         }
+    }
+
+    /// Planned bytes per element for a node's slot. A low-precision tensor can
+    /// be stored PACKED at its native width or WIDENED to 4 B, depending on the
+    /// [`rlx_opt::memory::ArenaWidthPolicy`] the backend planned with, and a
+    /// kernel has to read it at the width it was actually given.
+    pub fn bytes_per_elem(&self, id: NodeId) -> usize {
+        let n = self
+            .shape_elems
+            .get(&id)
+            .copied()
+            .or_else(|| self.element_counts.get(&id).copied())
+            .unwrap_or(0);
+        let b = self.slot_bytes.get(&id).copied().unwrap_or(0);
+        b.checked_div(n).unwrap_or(0)
     }
 
     pub fn has_buffer(&self, id: NodeId) -> bool {

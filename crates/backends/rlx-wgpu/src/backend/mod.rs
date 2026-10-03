@@ -793,7 +793,19 @@ impl WgpuExecutable {
                     }
                     _ => out_bytes,
                 };
+                if rlx_ir::env::flag("RLX_WGPU_FEED_TRACE") {
+                    eprintln!(
+                        "[feed] {name}: out#{} id={:?} -> in id={:?}  out_bytes={out_bytes} copy={copy_bytes} extent={extent:?}                          out_len={} in_len={}",
+                        out_idx,
+                        out_id,
+                        in_id,
+                        self.arena.len_of(out_id),
+                        self.arena.len_of(in_id)
+                    );
+                }
                 self.dispatch_arena_copy_bytes(dev, enc, out_id, in_id, copy_bytes);
+            } else if rlx_ir::env::flag("RLX_WGPU_FEED_TRACE") {
+                eprintln!("[feed] {name}: in_id == out_id ({in_id:?}) — aliased, no copy");
             }
             self.gpu_handle_resident.insert(name.clone());
             self.gpu_handles.insert(name.clone(), Vec::new());
@@ -805,6 +817,29 @@ impl WgpuExecutable {
         dev: &crate::device::WgpuDevice,
         inputs: &[(&str, &[f32])],
     ) {
+        if rlx_ir::env::flag("RLX_WGPU_FEED_TRACE") {
+            let mut names: Vec<String> = self.gpu_handle_feeds.keys().cloned().collect();
+            // Also the per-step scalars: lr, the Adam bias corrections and the
+            // per-parameter gate. These change every step and are fed as inputs.
+            for k in self.input_offsets.keys() {
+                if k.starts_with("__") || k.ends_with("__scale") {
+                    names.push(k.clone());
+                }
+            }
+            for name in names {
+                if let Some(&id) = self.input_offsets.get(name.as_str())
+                    && self.arena.has(id)
+                {
+                    let v = self.arena.read_f32(&dev.device, &dev.queue, id);
+                    eprintln!(
+                        "[stage] {name}: in id={id:?} first={:?} resident={} host_len={}",
+                        v.first(),
+                        self.gpu_handle_resident.contains(&name),
+                        self.gpu_handles.get(&name).map(|h| h.len()).unwrap_or(0)
+                    );
+                }
+            }
+        }
         for (name, data) in &self.gpu_handles {
             if self.gpu_handle_resident.contains(name) || inputs.iter().any(|(n, _)| n == name) {
                 continue;
@@ -2248,13 +2283,15 @@ fn derive_matmul_compute_default(
         && has_coop
         && dev.features().contains(wgpu::Features::SHADER_F16)
         && b_is_param
-        && coop16_aligned;
+        && coop16_aligned
+        && crate::coop_probe::coop16_path_ok();
 
     let coop_f16_vk_ok = !any_low
         && coop_f16_vk_eligible(dev, m, k, n)
         && b_is_param
         && !mirror_acts.contains(&a_id)
-        && !mirror_acts.contains(&b_id);
+        && !mirror_acts.contains(&b_id)
+        && crate::coop_probe::f16_vk_path_ok(n);
 
     // CoopF32 (`simdgroup_float8x8` on Apple): the f32 hardware-GEMM
     // path. Used whenever cooperative-matrix is available, B is a
@@ -2262,30 +2299,63 @@ fn derive_matmul_compute_default(
     // tiled `matmul_wide` path with no precision loss vs the f32
     // baseline (BERT max|Δ| stays at 2.3e-3 vs CPU on Apple).
     //
-    // CoopF32: Metal-only by default. Vulkan portable 8×8 is opt-in via
+    // CoopF32: on by default on Metal. Vulkan portable 8×8 is opt-in via
     // RLX_WGPU_FORCE_COOP_F32 (RTX lacks 8×8 f32 coop; output is unreliable).
     let disabled = rlx_ir::env::flag("RLX_WGPU_NO_COOP_F32");
     let forced = rlx_ir::env::flag("RLX_WGPU_FORCE_COOP_F32");
-    // Metal `simdgroup_float8x8` CoopF32 produced ORTHOGONAL GARBAGE (not mere
-    // imprecision) on Gemma-4 vision/audio f32 param-weight matmuls — e.g.
-    // scaled[1,64,768] @ input_proj[768,768] (all axes aligned) gave cos 0.016
-    // vs CPU; forcing the plain F32 kernel restores cos 1.0. GGUF text models
-    // dodged this via the DequantMatMul path. Until the kernel is root-caused,
-    // Metal CoopF32 is opt-in via RLX_WGPU_FORCE_COOP_F32.
-    let metal_coop = !disabled && has_coop && coop_f32_metal_aligned && b_is_param && forced;
-    let _ = backend;
+    // This was opt-in because Metal `simdgroup_float8x8` CoopF32 produced
+    // ORTHOGONAL GARBAGE (not mere imprecision) on Gemma-4 vision/audio f32
+    // param-weight matmuls — scaled[1,64,768] @ input_proj[768,768], all axes
+    // aligned, gave cos 0.016 vs CPU. GGUF text models dodged it via the
+    // DequantMatMul path.
+    //
+    // ROOT CAUSE, and why "orthogonal" was the exact right word: the kernel
+    // computed `b·a` instead of `a·b`. For two unrelated matrices those are
+    // near-orthogonal, hence cos≈0 rather than a merely noisy cos≈1. Every
+    // `coopLoad` from row-major memory yields the transpose under this path's
+    // column-major fragment convention, so `ã·b̃ = aᵀbᵀ = (b·a)ᵀ`, and the
+    // equally-transposed `coopStore` writes that back as `b·a`. Loading each
+    // operand into the OTHER fragment role fixes it; see the note in
+    // `kernels/matmul_coop_f32.wgsl`. The same bug was in
+    // `matmul_qkv_coop_f32.wgsl` and `matmul_coop16.wgsl`.
+    //
+    // Measured after the fix, M4 Pro, f32 square GEMM against `matmul_wide`:
+    //   512³   88 → 403 GF/s   (4.6×)
+    //   1024³  96 → 745 GF/s   (7.8×)
+    //   2048³ 100 → 990 GF/s   (9.9×)
+    // and the Gemma-4 shape above is now BIT-EXACT vs CPU (cos 1.000000,
+    // max|Δ| 0.0). `RLX_WGPU_NO_COOP_F32=1` opts back out.
+    // A BF16 rhs param keeps the PACKED path (`matmul_bf16w`), which reads 2 B
+    // per element instead of 4 and is installed by the caller only when this
+    // function answers `F32`. Letting default-on CoopF32 outrank it silently
+    // disabled the packed path for every aligned bf16 shape — correct numbers,
+    // but twice the weight bandwidth, and
+    // `rlx-runtime/tests/wgpu_bf16_weight_matmul.rs` asserts the packed
+    // dispatch actually happens. `RLX_WGPU_FORCE_COOP_F32` still overrides.
+    let metal_coop = !disabled
+        && has_coop
+        && coop_f32_metal_aligned
+        && b_is_param
+        && (forced || (matches!(backend, Some(wgpu::Backend::Metal)) && !(any_bf16 && b_is_param)));
     let vulkan_coop = !disabled
         && has_coop
         && coop_f32_portable_aligned
         && b_is_param
         && crate::device::coop_discrete_backend()
         && crate::device::coop_f32_8x8_supported();
-    let coop_f32_ok = metal_coop
+    let coop_f32_ok = (metal_coop
         || vulkan_coop
         || (forced
             && has_coop
             && b_is_param
-            && (coop_f32_metal_aligned || coop_f32_portable_aligned));
+            && (coop_f32_metal_aligned || coop_f32_portable_aligned)))
+        // Final gate: the kernel must have been shown to compute `a·b` ON THIS
+        // DEVICE. `coopLoad`/`coopLoadT` mean different things on Metal and
+        // Vulkan (naga's one `row_major` bool becomes Metal's
+        // `transpose_matrix` but SPIR-V's `RowMajorKHR`/`ColumnMajorKHR`), so
+        // no compile-time choice can be right everywhere. Memoized; see
+        // `crate::coop_probe`.
+        && crate::coop_probe::f32_path_ok(backend);
 
     let eligible = MatmulEligibility {
         coop16: coop16_ok,

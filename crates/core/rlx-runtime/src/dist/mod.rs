@@ -83,6 +83,19 @@ fn split_frag(rest: &str) -> Result<(&str, &str), String> {
         .ok_or_else(|| format!("weight URI needs a #<tensor> fragment: {rest}"))
 }
 
+/// Error for a scheme this build recognises but cannot read.
+///
+/// `rlxp://`, `mlx://`, `npz://` and `dduf://` come from the `model-io`
+/// feature; a node build drops it (see rlx-runtime's Cargo.toml). Saying
+/// "unsupported scheme" there would send the reader hunting for a typo in a
+/// URI that is perfectly well formed, so name the feature instead.
+#[cfg(not(feature = "model-io"))]
+fn needs_model_io(scheme: &str) -> String {
+    format!(
+        "weight URI scheme `{scheme}` needs rlx-runtime's `model-io` feature,          which this build does not have. gguf://, safetensors:// and file://          work without it."
+    )
+}
+
 /// Resolve a weight tensor to f32 from its source URI. Supported schemes:
 ///   `gguf://<path>#<tensor>`         — dequantize a GGUF tensor (any K-quant)
 ///   `safetensors://<path>#<tensor>`  — read a safetensors tensor (F32/F16/BF16)
@@ -101,30 +114,45 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
         let gguf = rlx_gguf::GgufFile::from_reader(&mut f).map_err(|e| e.to_string())?;
         let (data, _dims) = gguf.dequant_f32(tensor).map_err(|e| e.to_string())?;
         Ok(data)
-    } else if let Some(rest) = uri.strip_prefix("rlxp://") {
-        let (path, tensor) = split_frag(rest)?;
-        let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
-        pack.tensor_f32(tensor).map_err(|e| e.to_string())
+    } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
+        #[cfg(feature = "model-io")]
+        {
+            let (path, tensor) = split_frag(_rest)?;
+            let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
+            pack.tensor_f32(tensor).map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "model-io"))]
+        Err(needs_model_io("rlxp"))
     } else if let Some(rest) = uri.strip_prefix("safetensors://") {
         let (path, tensor) = split_frag(rest)?;
         let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         read_safetensors_f32(&bytes, tensor)
-    } else if let Some(rest) = uri
+    } else if let Some(_rest) = uri
         .strip_prefix("mlx://")
         .or_else(|| uri.strip_prefix("npz://"))
     {
-        let (path, tensor) = split_frag(rest)?;
-        let w = rlx_mlx_io::load_path(path).map_err(|e| e.to_string())?;
-        let map = w.into_f32_map().map_err(|e| e.to_string())?;
-        map.get(tensor)
-            .cloned()
-            .ok_or_else(|| format!("tensor not found in mlx weights: {tensor}"))
-    } else if let Some(rest) = uri.strip_prefix("dduf://") {
-        let (path, tensor) = split_frag(rest)?;
-        let f = rlx_dduf::DdufFile::open(path).map_err(|e| e.to_string())?;
-        f.tensor_f32(tensor)
-            .map(|s| s.to_vec())
-            .map_err(|e| e.to_string())
+        #[cfg(feature = "model-io")]
+        {
+            let (path, tensor) = split_frag(_rest)?;
+            let w = rlx_mlx_io::load_path(path).map_err(|e| e.to_string())?;
+            let map = w.into_f32_map().map_err(|e| e.to_string())?;
+            map.get(tensor)
+                .cloned()
+                .ok_or_else(|| format!("tensor not found in mlx weights: {tensor}"))
+        }
+        #[cfg(not(feature = "model-io"))]
+        Err(needs_model_io("mlx/npz"))
+    } else if let Some(_rest) = uri.strip_prefix("dduf://") {
+        #[cfg(feature = "model-io")]
+        {
+            let (path, tensor) = split_frag(_rest)?;
+            let f = rlx_dduf::DdufFile::open(path).map_err(|e| e.to_string())?;
+            f.tensor_f32(tensor)
+                .map(|s| s.to_vec())
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "model-io"))]
+        Err(needs_model_io("dduf"))
     } else if let Some(path) = uri.strip_prefix("file://") {
         let b = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         Ok(b.chunks_exact(4)
@@ -149,10 +177,15 @@ pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
             .get(tensor)
             .ok_or_else(|| format!("tensor not found: {tensor}"))?;
         Ok(gguf.tensor_bytes(t).map_err(|e| e.to_string())?.to_vec())
-    } else if let Some(rest) = uri.strip_prefix("rlxp://") {
-        let (path, tensor) = split_frag(rest)?;
-        let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
-        pack.tensor_bytes(tensor).map_err(|e| e.to_string())
+    } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
+        #[cfg(feature = "model-io")]
+        {
+            let (path, tensor) = split_frag(_rest)?;
+            let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
+            pack.tensor_bytes(tensor).map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "model-io"))]
+        Err(needs_model_io("rlxp"))
     } else if let Some(path) = uri.strip_prefix("file://") {
         std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
     } else {
@@ -168,6 +201,7 @@ pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
 #[derive(Default)]
 pub struct WeightCache {
     gguf: HashMap<String, rlx_gguf::GgufFile>,
+    #[cfg(feature = "model-io")]
     rlxp: HashMap<String, rlx_pkg::Package>,
 }
 
@@ -185,6 +219,7 @@ impl WeightCache {
         Ok(&self.gguf[path])
     }
 
+    #[cfg(feature = "model-io")]
     fn rlxp_pack(&mut self, path: &str) -> Result<&rlx_pkg::Package, String> {
         if !self.rlxp.contains_key(path) {
             let p = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
@@ -202,11 +237,16 @@ impl WeightCache {
                 .dequant_f32(tensor)
                 .map_err(|e| e.to_string())?;
             Ok(data)
-        } else if let Some(rest) = uri.strip_prefix("rlxp://") {
-            let (path, tensor) = split_frag(rest)?;
-            self.rlxp_pack(path)?
-                .tensor_f32(tensor)
-                .map_err(|e| e.to_string())
+        } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
+            #[cfg(feature = "model-io")]
+            {
+                let (path, tensor) = split_frag(_rest)?;
+                self.rlxp_pack(path)?
+                    .tensor_f32(tensor)
+                    .map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "model-io"))]
+            Err(needs_model_io("rlxp"))
         } else if uri.starts_with("safetensors://")
             || uri.starts_with("file://")
             || uri.starts_with("mlx://")
@@ -228,11 +268,16 @@ impl WeightCache {
                 .get(tensor)
                 .ok_or_else(|| format!("tensor not found: {tensor}"))?;
             Ok(g.tensor_bytes(t).map_err(|e| e.to_string())?.to_vec())
-        } else if let Some(rest) = uri.strip_prefix("rlxp://") {
-            let (path, tensor) = split_frag(rest)?;
-            self.rlxp_pack(path)?
-                .tensor_bytes(tensor)
-                .map_err(|e| e.to_string())
+        } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
+            #[cfg(feature = "model-io")]
+            {
+                let (path, tensor) = split_frag(_rest)?;
+                self.rlxp_pack(path)?
+                    .tensor_bytes(tensor)
+                    .map_err(|e| e.to_string())
+            }
+            #[cfg(not(feature = "model-io"))]
+            Err(needs_model_io("rlxp"))
         } else {
             resolve_weight_bytes(uri)
         }
@@ -390,6 +435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "model-io")]
     fn resolve_rlxp_f32() {
         use rlx_ir::op::BinaryOp;
         use rlx_ir::{DType, Graph, Shape};

@@ -1206,15 +1206,16 @@ fn q4k_scale_min_x86(j: usize, q: &[u8]) -> (u8, u8) {
 #[inline]
 unsafe fn hsum_i32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
     use std::arch::x86_64::*;
-    unsafe {
-        let lo = _mm256_castsi256_si128(v);
-        let hi = _mm256_extracti128_si256(v, 1);
-        let s = _mm_add_epi32(lo, hi);
-        let sh = _mm_shuffle_epi32(s, 0b01_00_11_10);
-        let s = _mm_add_epi32(s, sh);
-        let sh2 = _mm_shuffle_epi32(s, 0b10_11_00_01);
-        _mm_cvtsi128_si32(_mm_add_epi32(s, sh2))
-    }
+    // No `unsafe` block: every intrinsic here is register-only, and those are
+    // safe fns once the enabling `#[target_feature]` is on the signature. The
+    // block was this crate's only warning.
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256(v, 1);
+    let s = _mm_add_epi32(lo, hi);
+    let sh = _mm_shuffle_epi32(s, 0b01_00_11_10);
+    let s = _mm_add_epi32(s, sh);
+    let sh2 = _mm_shuffle_epi32(s, 0b10_11_00_01);
+    _mm_cvtsi128_si32(_mm_add_epi32(s, sh2))
 }
 
 /// BOTH nibble halves of one 32-byte Q4 group, from a SINGLE load.
@@ -1608,18 +1609,24 @@ mod tests {
         let exact = run(true);
         rlx_ir::env::unset("RLX_Q4K_EXACT_GEMV");
 
+        // Reference: dequantize the packed weights to f32 and dot them in f64.
+        // Deliberately NOT `gguf_matmul_bt_cached` — that is only a dequant+BLAS
+        // reference when a BLAS is linked; under `not(rlx_cpu_blas)` it forwards
+        // straight to `gguf_matmul_bt`, i.e. to the q8 arm being measured, so
+        // `e_q8` came out exactly 0 and the comparison could never hold. An
+        // independent f64 oracle is the right reference in either build, and it
+        // is a stricter one even where BLAS exists.
         clear_dequant_cache();
-        let mut reference = vec![0f32; n];
-        gguf_matmul_bt_cached(
-            &x,
-            &packed,
-            &mut reference,
-            1,
-            k,
-            n,
-            QuantScheme::GgufQ4K,
-            0,
-        );
+        let w_f32 = crate::dequant_cache::gguf_weight_f32(0, &packed, k, n, QuantScheme::GgufQ4K);
+        let reference: Vec<f32> = (0..n)
+            .map(|j| {
+                let row = &w_f32[j * k..(j + 1) * k];
+                row.iter()
+                    .zip(&x)
+                    .map(|(w, a)| f64::from(*w) * f64::from(*a))
+                    .sum::<f64>() as f32
+            })
+            .collect();
 
         let err = |v: &[f32]| -> f32 {
             v.iter()
@@ -1630,14 +1637,15 @@ mod tests {
         let (e_exact, e_q8) = (err(&exact), err(&q8));
         assert!(
             e_exact < e_q8,
-            "exact arm should be closer to f32 BLAS: exact={e_exact} q8={e_q8}"
+            "exact arm should be closer to the f64 oracle: exact={e_exact} q8={e_q8}"
         );
-        // It shares the weight dequant with BLAS and differs only in summation
-        // order, so it should agree to near f32 round-off on the row scale.
+        // It shares the weight dequant with the oracle and differs only in
+        // summation order, so it should agree to near f32 round-off on the
+        // row scale.
         let scale = reference.iter().fold(0f32, |a, b| a.max(b.abs())).max(1.0);
         assert!(
             e_exact < 1e-4 * scale,
-            "exact arm drifted from f32 BLAS: {e_exact} (scale {scale})"
+            "exact arm drifted from the f64 oracle: {e_exact} (scale {scale})"
         );
     }
 

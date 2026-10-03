@@ -392,8 +392,14 @@ pub fn grad_with_loss_wrt(forward: &Graph, wrt: &[Wrt], opts: GradWithLossOption
             Some(g) => g,
             None if opts.zero_missing_wrt => {
                 let shape = forward.node(id).shape.clone();
-                let n = shape.num_elements().unwrap_or(0);
-                let data: Vec<u8> = (0..n).flat_map(|_| 0.0f32.to_le_bytes()).collect();
+                // Size the payload by the SHAPE's dtype, not f32: a low-precision
+                // `wrt` (autocast graphs have them) got a 4-byte-per-element
+                // payload under a 2-byte declaration, and the mismatch surfaced
+                // far away — `promote_to_f32` widened those f32 bytes a second
+                // time as if they were bf16, and MLX then refused the leaf
+                // ("shape [1,41,2,1] wants 82 elements, got 164"). Zero is zero
+                // in every float format, so only the length matters here.
+                let data = vec![0u8; shape.size_bytes().unwrap_or(0)];
                 bwd.add_node(Op::Constant { data }, vec![], shape)
             }
             None => {
@@ -1166,10 +1172,10 @@ fn vjp(
             );
             let zero_bytes = vec![
                 0u8;
+                // By dtype width, not a hardcoded 4 — see `zero_missing_wrt`.
                 upstream_shape
-                    .num_elements()
+                    .size_bytes()
                     .expect("Min/Max VJP: dyn shape")
-                    * 4
             ];
             let zero = bwd.add_node(
                 Op::Constant { data: zero_bytes },

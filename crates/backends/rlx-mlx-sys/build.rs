@@ -20,6 +20,158 @@ use std::process::Command;
 
 const OPENBLAS_VERSION: &str = "0.3.31";
 
+/// An Apple platform other than macOS that MLX can target: cross-compiled,
+/// SDK-selected, and steered through CMake's non-Darwin branch.
+///
+/// **watchOS is deliberately absent.** It has no public Metal API, so there is
+/// no MLX backend to build there and `rlx_mlx_host` never turns it on.
+#[derive(Clone, Copy)]
+struct AppleEmbedded {
+    /// `CMAKE_SYSTEM_NAME`. Also what MLX's own CMake branches on to keep
+    /// `MLX_BUILD_METAL` enabled.
+    system_name: &'static str,
+    /// `CMAKE_OSX_SYSROOT`, and — via the tracked patch — the SDK the Metal
+    /// toolchain compiles the kernels with. Getting this wrong does not fail
+    /// the build; it produces a metallib stamped for the wrong platform that
+    /// the Metal runtime refuses to load at first use.
+    sdk: &'static str,
+    /// Environment variable carrying this platform's deployment target, and the
+    /// default when it is unset. These are the names rustc itself honours, so a
+    /// caller setting one gets MLX and the Rust objects at the same floor.
+    ///
+    /// The defaults are **MLX's floor, not ours**: its kernels use Metal's
+    /// native `bfloat`, which is Metal 3.1. Measured against the Metal
+    /// compiler — `bfloat` is unknown at iOS 16.0 and tvOS 16.0, available from
+    /// 17.0 on both, and available at visionOS 1.0, which shipped past that
+    /// line already. Below the floor the build does not fail on `bfloat`
+    /// alone; MLX falls back to its emulated bf16 header and the failure
+    /// arrives as a wall of `redefinition of 'abs'`.
+    deploy_env: &'static str,
+    deploy_default: &'static str,
+    /// `libclang_rt.<suffix>.a` — needed for `___isPlatformVersionAtLeast`,
+    /// which MLX's `__builtin_available` checks emit. Rust links with
+    /// `-nodefaultlibs`, so it is on us.
+    clang_rt: &'static str,
+}
+
+impl AppleEmbedded {
+    fn for_target(target_os: &str, simulator: bool) -> Option<Self> {
+        let (system_name, sdk, deploy_env, deploy_default, clang_rt) = match (target_os, simulator)
+        {
+            ("ios", false) => (
+                "iOS",
+                "iphoneos",
+                "IPHONEOS_DEPLOYMENT_TARGET",
+                "17.0",
+                "ios",
+            ),
+            ("ios", true) => (
+                "iOS",
+                "iphonesimulator",
+                "IPHONEOS_DEPLOYMENT_TARGET",
+                "17.0",
+                "iossim",
+            ),
+            ("tvos", false) => (
+                "tvOS",
+                "appletvos",
+                "TVOS_DEPLOYMENT_TARGET",
+                "17.0",
+                "tvos",
+            ),
+            ("tvos", true) => (
+                "tvOS",
+                "appletvsimulator",
+                "TVOS_DEPLOYMENT_TARGET",
+                "17.0",
+                "tvossim",
+            ),
+            ("visionos", false) => ("visionOS", "xros", "XROS_DEPLOYMENT_TARGET", "1.0", "xros"),
+            ("visionos", true) => (
+                "visionOS",
+                "xrsimulator",
+                "XROS_DEPLOYMENT_TARGET",
+                "1.0",
+                "xrossim",
+            ),
+            _ => return None,
+        };
+        Some(Self {
+            system_name,
+            sdk,
+            deploy_env,
+            deploy_default,
+            clang_rt,
+        })
+    }
+}
+
+/// Apply the tracked patches in `patches/` to the MLX submodule working tree.
+///
+/// `vendor/mlx` is a **git submodule** pinned to a clean upstream commit, so a
+/// local fix cannot just live in the tree: `git submodule update` discards it
+/// and the parent repo never records it. The patches are tracked in this crate
+/// instead and applied before CMake configures.
+///
+/// Idempotent by checking `--reverse` first: a patch that applies backwards is
+/// already in the tree, and re-applying it would fail. A patch that applies
+/// neither way means the submodule moved underneath it — that is a hard error
+/// naming the commit, not a silent skip, because the failure it would otherwise
+/// cause (a metallib stamped for the wrong platform) does not surface until
+/// something tries to load it on a device.
+fn apply_vendor_patches(manifest_dir: &Path, mlx_src: &Path) {
+    let dir = manifest_dir.join("patches");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut patches: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "patch"))
+        .collect();
+    patches.sort();
+
+    for patch in patches {
+        println!("cargo:rerun-if-changed={}", patch.display());
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(mlx_src)
+                .args(args)
+                .arg(&patch)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if git(&["apply", "--check", "--reverse"]) {
+            continue; // already applied
+        }
+        if git(&["apply", "--check"]) {
+            assert!(
+                git(&["apply"]),
+                "rlx-mlx-sys: `git apply` failed for {} after its own --check passed",
+                patch.display()
+            );
+            continue;
+        }
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(mlx_src)
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        panic!(
+            "rlx-mlx-sys: {} applies neither forward nor in reverse to vendor/mlx at {head}. \
+             The submodule moved underneath the patch; re-base it with \
+             `git -C {} apply --3way {}`, resolve, then re-export with `git diff`.",
+            patch.display(),
+            mlx_src.display(),
+            patch.display(),
+        );
+    }
+}
+
 struct LapackPaths {
     include_dir: PathBuf,
     prefix_dir: PathBuf,
@@ -31,21 +183,38 @@ fn main() {
     let mlx_src = manifest_dir.join("vendor").join("mlx");
 
     // MLX builds where `rlx-mlx` exposes a real backend (`rlx_mlx_host`):
-    // macOS, Linux, Windows and iOS (device + simulator — MLX's CMake has a
-    // native iOS branch and the Metal backend runs on-device / in the sim).
-    // Every other target (tvOS / watchOS / visionOS / wasm / android) gets the
-    // stub that links no MLX symbols, so skip the CMake cross-compile entirely.
-    // Returning before the submodule check also means those builds don't
-    // require `vendor/mlx` to be populated.
+    // macOS, Linux, Windows, and the Apple platforms that ship Metal — iOS,
+    // tvOS and visionOS, device and simulator. **watchOS is excluded**: it has
+    // no public Metal API, so MLX has no backend to build there.
+    // Every other target (watchOS / wasm / android) gets the stub that links no
+    // MLX symbols, so skip the CMake cross-compile entirely. Returning before
+    // the submodule check also means those builds don't require `vendor/mlx` to
+    // be populated.
+    //
+    // Keep this list in sync with `rlx-mlx/build.rs` and `rlx-runtime/build.rs`
+    // — they gate `rlx_mlx_host` and the runtime's MLX registry entry on the
+    // same fact, and out of sync gives "no backend registered for MLX".
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target = env::var("TARGET").unwrap_or_default();
-    if !matches!(target_os.as_str(), "macos" | "linux" | "windows" | "ios") {
+    let mlx_host = matches!(
+        target_os.as_str(),
+        "macos" | "linux" | "windows" | "ios" | "tvos" | "visionos"
+    );
+    // Emit the cfg before the early return so `src/lib.rs` can gate `mod ffi`
+    // on the same fact this script decides, instead of repeating the OS list a
+    // fourth time. It used to repeat it, and adding tvOS/visionOS here without
+    // touching there produced `unresolved import rlx_mlx_sys::ffi` — a
+    // compile error one crate downstream, with nothing pointing back to the
+    // list that caused it.
+    println!("cargo::rustc-check-cfg=cfg(rlx_mlx_host)");
+    if mlx_host {
+        println!("cargo:rustc-cfg=rlx_mlx_host");
+    } else {
         return;
     }
-    // iOS: arm64 device (aarch64-apple-ios) vs the arm64 simulator
-    // (aarch64-apple-ios-sim). They differ only by SDK.
-    let is_ios = target_os == "ios";
-    let ios_sim = is_ios && target.ends_with("-sim");
+    // A simulator target differs from its device sibling only by SDK.
+    let is_sim = target.ends_with("-sim");
+    let apple_embedded = AppleEmbedded::for_target(&target_os, is_sim);
 
     if !mlx_src.join("CMakeLists.txt").exists() {
         panic!(
@@ -57,6 +226,8 @@ fn main() {
             mlx_src.display()
         );
     }
+
+    apply_vendor_patches(&manifest_dir, &mlx_src);
 
     let is_macos = target_os == "macos";
 
@@ -86,7 +257,11 @@ fn main() {
         .define("MLX_BUILD_PYTHON_STUBS", "OFF")
         .define(
             "MLX_BUILD_METAL",
-            if is_macos || is_ios { "ON" } else { "OFF" },
+            if is_macos || apple_embedded.is_some() {
+                "ON"
+            } else {
+                "OFF"
+            },
         )
         .define("MLX_BUILD_CPU", "ON")
         .define("MLX_BUILD_GGUF", "OFF")
@@ -114,28 +289,25 @@ fn main() {
         None
     };
 
-    // iOS cross-compile: drive CMake into its `CMAKE_SYSTEM_NAME == iOS`
+    // Apple cross-compile: drive CMake into the matching `CMAKE_SYSTEM_NAME`
     // branch and point it at the device or simulator SDK. arm64 only (the
-    // x86_64 sim is not an RLX target). MLX uses Accelerate for BLAS/LAPACK on
-    // Apple, so no OpenBLAS bootstrap is needed.
-    let ios_deploy = if is_ios {
-        let sdk = if ios_sim {
-            "iphonesimulator"
-        } else {
-            "iphoneos"
-        };
-        let deploy = env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "16.0".into());
+    // x86_64 simulators are Rust tier 3 and not RLX targets). MLX uses
+    // Accelerate for BLAS/LAPACK on Apple, so no OpenBLAS bootstrap is needed.
+    //
+    // CMAKE_OSX_SYSROOT and CMAKE_OSX_DEPLOYMENT_TARGET are also what the
+    // patched kernel build reads to pick the Metal toolchain SDK — see
+    // `apply_vendor_patches`.
+    let embedded_deploy = apple_embedded.map(|p| {
+        let deploy = env::var(p.deploy_env).unwrap_or_else(|_| p.deploy_default.into());
         mlx_cfg
-            .define("CMAKE_SYSTEM_NAME", "iOS")
-            .define("CMAKE_OSX_SYSROOT", sdk)
+            .define("CMAKE_SYSTEM_NAME", p.system_name)
+            .define("CMAKE_OSX_SYSROOT", p.sdk)
             .define("CMAKE_OSX_ARCHITECTURES", "arm64")
             .define("CMAKE_OSX_DEPLOYMENT_TARGET", deploy.as_str());
-        Some(deploy)
-    } else {
-        None
-    };
+        deploy
+    });
 
-    let use_ccache = (is_macos || is_ios)
+    let use_ccache = (is_macos || apple_embedded.is_some())
         && env_flag("RLX_MLX_NO_CCACHE") != Some(true)
         && Command::new("ccache")
             .arg("--version")
@@ -207,13 +379,23 @@ fn main() {
     if let Some(ref deploy) = macos_deploy {
         shim.flag(format!("-mmacosx-version-min={deploy}"));
     }
-    if let Some(ref deploy) = ios_deploy {
-        // Match the deployment target MLX was built at, per SDK.
-        shim.flag(if ios_sim {
-            format!("-mios-simulator-version-min={deploy}")
-        } else {
-            format!("-miphoneos-version-min={deploy}")
-        });
+    // Match the deployment target MLX was built at. This is set as an env var
+    // rather than passed as a flag because `cc` already encodes the target in
+    // `--target=arm64-apple-<os><ver>` and reads these same variables to build
+    // it. Passing a flag as well is at best redundant and on visionOS is a hard
+    // error:
+    //
+    //   clang++: error: cannot specify '-mtargetos=xros1.0' along with
+    //                   '--target=arm64-apple-xros26.5'
+    //
+    // Left unset, `cc` would take the version from the SDK (26.5 above) while
+    // MLX was built at our floor — a mismatch the linker reports once per
+    // object.
+    //
+    // SAFETY: build scripts are single-threaded here; nothing else in this
+    // process reads the environment concurrently.
+    if let (Some(p), Some(deploy)) = (apple_embedded, embedded_deploy.as_ref()) {
+        unsafe { env::set_var(p.deploy_env, deploy) };
     }
     if target_os == "windows" {
         shim.define("NOMINMAX", None)
@@ -250,17 +432,17 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
         // MLX Metal uses __builtin_available → ___isPlatformVersionAtLeast (compiler-rt).
         link_apple_clang_rt("osx");
-    } else if is_ios {
-        // iOS links the same Apple frameworks as macOS, minus the macOS-only
-        // JACCL / IOKit Thunderbolt distributed path (not built on iOS).
-        if let Some(deploy) = ios_deploy {
-            println!("cargo:rustc-env=IPHONEOS_DEPLOYMENT_TARGET={deploy}");
+    } else if let Some(p) = apple_embedded {
+        // iOS / tvOS / visionOS link the same Apple frameworks as macOS, minus
+        // the macOS-only JACCL / IOKit Thunderbolt distributed path.
+        if let Some(deploy) = embedded_deploy {
+            println!("cargo:rustc-env={}={deploy}", p.deploy_env);
         }
         for fw in &["Metal", "Foundation", "QuartzCore", "Accelerate"] {
             println!("cargo:rustc-link-lib=framework={fw}");
         }
         println!("cargo:rustc-link-lib=c++");
-        link_apple_clang_rt(if ios_sim { "iossim" } else { "ios" });
+        link_apple_clang_rt(p.clang_rt);
     } else if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=dl");
@@ -441,8 +623,8 @@ fn force_remove_dir_all(path: &Path) {
 
 /// `libclang_rt.<variant>` — required for `___isPlatformVersionAtLeast` from
 /// MLX `__builtin_available` checks. Rust's default link line omits it
-/// (`-nodefaultlibs`). `variant` is the Apple runtime suffix: `"osx"` (macOS),
-/// `"ios"` (device) or `"iossim"` (simulator).
+/// (`-nodefaultlibs`). `variant` is the Apple runtime suffix: `"osx"`,
+/// `"ios"` / `"iossim"`, `"tvos"` / `"tvossim"`, `"xros"` / `"xrossim"`.
 fn link_apple_clang_rt(variant: &str) {
     let libname = format!("libclang_rt.{variant}.a");
     let output = match Command::new("clang")

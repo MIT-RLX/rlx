@@ -84,6 +84,7 @@ impl MetalExecutable {
         rng: rlx_ir::RngOptions,
         disable_mpsgraph: bool,
     ) -> Self {
+        assert_bf16_compute_unsupported(policy.as_ref());
         let verbose = rlx_ir::env::var("RLX_VERBOSE")
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(0)
@@ -238,7 +239,7 @@ impl MetalExecutable {
                 }
                 _ => false,
             });
-        let mut plan = memory::plan_memory_with_options(
+        let mut plan = memory::plan_memory_with_options_policy(
             &fused,
             128,
             memory::MemoryPlanOptions {
@@ -271,6 +272,7 @@ impl MetalExecutable {
                 elide_requires_small_m: true,
                 ..Default::default()
             },
+            memory::ArenaWidthPolicy::NativeBf16Widened,
         );
         let max_buffer = crate::device::metal_device()
             .map(|d| d.device.max_buffer_length() as usize)
@@ -315,7 +317,7 @@ impl MetalExecutable {
                     }
                 );
             }
-            let unpinned = memory::plan_memory_with_options(
+            let unpinned = memory::plan_memory_with_options_policy(
                 &fused,
                 128,
                 memory::MemoryPlanOptions {
@@ -332,12 +334,17 @@ impl MetalExecutable {
                     dequant_host_fallback,
                     ..Default::default()
                 },
+                memory::ArenaWidthPolicy::NativeBf16Widened,
             );
             // Keep the pinned plan unless unpin meaningfully helps: under the
             // MPS cliff, or under maxBufferLength when we were over it.
             // FORCE_UNPIN always accepts (repro / bisect old F5 DiT drift).
-            let accept =
-                accept_unpinned(plan.arena_size, unpinned.arena_size, max_buffer, force_unpin);
+            let accept = accept_unpinned(
+                plan.arena_size,
+                unpinned.arena_size,
+                max_buffer,
+                force_unpin,
+            );
             if accept {
                 if verbose {
                     eprintln!(
@@ -378,7 +385,49 @@ impl MetalExecutable {
                     && n.shape.num_elements().unwrap_or(0) * n.shape.dtype().size_bytes()
                         >= EXTERNAL_WEIGHT_MIN
             });
-        if (plan.arena_size >= MPS_BIND_CLIFF || ext_quant_split)
+        // Share-driven split: externalize large *non-quant* weights once they are
+        // big enough that duplicating them per executable dominates, even when the
+        // arena is under the MPS cliff.
+        //
+        // The cliff test above exists to dodge MPS's 4 GiB binding limit, not to
+        // save memory — so a model whose arena sits just under it inlines its own
+        // copy of the weights into every graph. A transformer keeps several alive
+        // (a prefill graph per prompt length, a decode graph per KV bucket), and
+        // measured on an f32 0.6B that was ~2.4 GB duplicated per graph: 2.95 GB
+        // after load, 12.89 GB after two prefill shapes and two decode buckets.
+        // With the weights in their own buffer, `share_weights_from` retains one
+        // copy for all of them.
+        //
+        // Restricted to F32/F16 on purpose. Packed U8/I8 weights are the bigger
+        // prize but the fused GGUF encoders bind the activation arena directly and
+        // never resolve `WEIGHT_BUF_TAG`, so externalizing them reads the wrong
+        // memory — see the note on `RLX_METAL_EXTERNALIZE_QUANT`. The per-param
+        // `all_consumers_tag_aware` test below is what keeps this honest: a param
+        // whose consumers cannot resolve the tag stays in the arena regardless.
+        let share_split_bytes: usize = fused
+            .nodes()
+            .iter()
+            .filter(|n| matches!(&n.op, Op::Param { .. }))
+            .filter(|n| matches!(n.shape.dtype(), rlx_ir::DType::F32 | rlx_ir::DType::F16))
+            .map(|n| n.shape.num_elements().unwrap_or(0) * n.shape.dtype().size_bytes())
+            .filter(|nb| *nb >= EXTERNAL_WEIGHT_MIN)
+            .sum();
+        // Only worth the re-plan when the duplicate would be substantial; small
+        // models keep the simpler single-arena layout. Overridable so a test can
+        // exercise the split without allocating half a gigabyte.
+        const SHARE_SPLIT_MIN: usize = 512 * 1024 * 1024;
+        let share_split_min = rlx_ir::env::var("RLX_METAL_WEIGHT_SPLIT_MIN")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(SHARE_SPLIT_MIN);
+        let share_split =
+            share_split_bytes >= share_split_min && !rlx_ir::env::flag("RLX_METAL_NO_WEIGHT_SPLIT");
+        if verbose && share_split {
+            eprintln!(
+                "[rlx-metal] share-driven weight split: {:.2} GB of large F32/F16 params",
+                share_split_bytes as f64 / 1e9
+            );
+        }
+        if (plan.arena_size >= MPS_BIND_CLIFF || ext_quant_split || share_split)
             && !rlx_ir::env::flag("RLX_METAL_FORCE_INLINE_PARAMS")
         {
             // Keep output-ancestor pin when host indexing is present (F5 DiT
@@ -386,7 +435,7 @@ impl MetalExecutable {
             // above just to park large Linears externally.
             // FORCE_UNPIN overrides for A/B repro.
             let pin_act = (force_pin || has_host_indexing) && !force_unpin;
-            let mut act_plan = memory::plan_memory_with_options(
+            let mut act_plan = memory::plan_memory_with_options_policy(
                 &fused,
                 128,
                 memory::MemoryPlanOptions {
@@ -397,6 +446,7 @@ impl MetalExecutable {
                     dequant_host_fallback,
                     ..Default::default()
                 },
+                memory::ArenaWidthPolicy::NativeBf16Widened,
             );
             // Append small params into the activation arena; large ones → weight buf.
             let mut tail = act_plan.arena_size;
@@ -879,6 +929,7 @@ impl MetalExecutable {
             // bail also miscompiles inside a hybrid MPSGraph segment — keep the
             // whole graph on the correct thunk path.
             && !crate::mps_graph_lower::graph_has_mps_hostile_reduce(&fused)
+            && !crate::mps_graph_lower::graph_has_bf16_activation(&fused)
         {
             crate::mps_graph_hybrid::build_hybrid_plan(&fused, None)
                 .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
@@ -1044,7 +1095,6 @@ pub(crate) fn accept_unpinned(
     }
     unpinned < MPS_BIND_CLIFF_BYTES || unpinned + (pinned / 4) < pinned
 }
-
 
 fn graph_has_bf16_matmul(graph: &Graph) -> bool {
     graph.nodes().iter().any(|n| {
@@ -1242,6 +1292,44 @@ fn widen_spd_f64_to_f32(mut graph: Graph) -> Graph {
         node.shape = node.shape.clone().with_dtype(DType::F32);
     }
     graph
+}
+
+/// Metal has no bf16 compute kernels, so refuse a policy that asks for them.
+///
+/// `HalfFlag` is `{F32, F16}` and `From<DType>` maps everything else — BF16
+/// included — to `F32`. A bf16-tagged node therefore runs an f32 kernel over
+/// bf16 bytes: two bf16 values are read as one f32. Measured on a 32×32 matmul
+/// under `AutoMixedBf16`, that produced a non-finite output and a relative error
+/// of 2.3e38, with no error raised anywhere.
+///
+/// BF16 as *weight storage* is fine and unaffected — those paths widen on load
+/// and never take a bf16 element size through `HalfFlag`. It is bf16 **compute**
+/// that has no kernel.
+///
+/// Refusing loudly is the same call as `rlx-runtime`'s host-fallback rule: a
+/// backend that cannot execute something must say so, not return numbers.
+fn assert_bf16_compute_unsupported(policy: Option<&rlx_opt::PrecisionPolicy>) {
+    use rlx_opt::{OpKind, Precision};
+    let Some(policy) = policy else { return };
+    let offenders: Vec<&str> = [
+        (OpKind::Compute, "compute"),
+        (OpKind::Reduction, "reduction"),
+        (OpKind::Elementwise, "elementwise"),
+        (OpKind::DataMovement, "dataMovement"),
+        (OpKind::Boundary, "boundary"),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| policy.precision_for(*kind) == Precision::BF16)
+    .map(|(_, name)| name)
+    .collect();
+    assert!(
+        offenders.is_empty(),
+        "rlx-metal: this precision policy asks for BF16 on {}, and Metal has no \
+         bf16 compute kernels — the f32 kernel would read two bf16 values as one \
+         f32 and return non-finite garbage rather than an error. Use f16 (or \
+         'mixed', which keeps compute at f32). BF16 weight STORAGE is unaffected.",
+        offenders.join(", ")
+    );
 }
 
 #[cfg(test)]

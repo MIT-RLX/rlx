@@ -37,6 +37,8 @@ use rlx_ir::{DType, Graph, Op, RngBackend, RngOptions, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+mod common;
+
 /// Serialize device use — rlx-vulkan submits to a process-global `VkQueue`,
 /// which Vulkan requires callers to externally synchronize.
 /// Skip when no Vulkan device is present.
@@ -157,6 +159,7 @@ fn assert_close(what: &str, got: &[f32], want: &[f32]) {
 
 #[test]
 fn normal_stream_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -174,6 +177,7 @@ fn normal_stream_matches_cpu() {
 
 #[test]
 fn normal_mean_and_scale_are_applied() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -187,6 +191,7 @@ fn normal_mean_and_scale_are_applied() {
 
 #[test]
 fn uniform_stream_matches_cpu_bit_exactly() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -203,6 +208,7 @@ fn uniform_stream_matches_cpu_bit_exactly() {
 
 #[test]
 fn uniform_range_is_applied() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -220,6 +226,7 @@ fn uniform_range_is_applied() {
 
 #[test]
 fn distinct_seeds_produce_distinct_streams() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -236,6 +243,7 @@ fn distinct_seeds_produce_distinct_streams() {
 
 #[test]
 fn zero_backend_fills_zeros() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }

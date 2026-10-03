@@ -26,6 +26,8 @@
 use rlx_ir::{DType, Graph, GraphExt, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 
+mod common;
+
 /// `x @ concat([w_a, w_b], axis=1)` — the fused-projection shape, minimally.
 fn packed_matmul_graph() -> Graph {
     let mut g = Graph::new("packed");
@@ -43,6 +45,7 @@ const X: [f32; 2] = [1.0, 2.0];
 
 #[test]
 fn rebinding_a_param_updates_a_static_weight_pack() {
+    let _gpu = common::serialize_gpu();
     if device_missing() {
         return;
     }
@@ -69,6 +72,7 @@ fn rebinding_a_param_updates_a_static_weight_pack() {
 /// its own invalidation.
 #[test]
 fn rebinding_via_set_param_bytes_also_updates_the_pack() {
+    let _gpu = common::serialize_gpu();
     if device_missing() {
         return;
     }
@@ -95,6 +99,7 @@ fn rebinding_via_set_param_bytes_also_updates_the_pack() {
 /// let an activation reuse.
 #[test]
 fn repeated_runs_agree_once_the_pack_is_skipped() {
+    let _gpu = common::serialize_gpu();
     if device_missing() {
         return;
     }
@@ -122,6 +127,7 @@ fn repeated_runs_agree_once_the_pack_is_skipped() {
 /// which is why this check exists separately.
 #[test]
 fn the_static_weight_skip_arms_after_the_first_run() {
+    let _gpu = common::serialize_gpu();
     if device_missing() {
         return;
     }
@@ -181,6 +187,7 @@ fn device_missing() -> bool {
 /// count actually scales with depth instead of collapsing.
 #[test]
 fn the_skip_scales_with_graph_depth() {
+    let _gpu = common::serialize_gpu();
     if device_missing() {
         return;
     }

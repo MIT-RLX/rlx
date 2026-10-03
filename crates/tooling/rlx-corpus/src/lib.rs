@@ -144,6 +144,90 @@ fn planners() -> Vec<Planner> {
 
 // ── The corpus ──────────────────────────────────────────────────────────────
 
+/// Shape at an explicit dtype, for the low-precision family.
+fn shape_at(dims: &[usize], dtype: DType) -> Shape {
+    Shape::new(dims, dtype)
+}
+
+/// **Low-precision cases.** Everything else in this corpus is F32 (plus three
+/// U8 packed-weight cases), so until these existed a compiler change could
+/// regress F16/BF16 handling and clear the whole corpus — while every model
+/// anyone actually runs is low precision.
+///
+/// These earn their place against the *planner* configurations in
+/// [`planners`], which is where dtype width stops being cosmetic: `native`
+/// sizes a BF16 slot at 2 B/elem and `f32_uniform` at 4, so the same graph gets
+/// two different arenas and two different sets of neighbours. That is the exact
+/// shape of defect `check_plan` exists to catch — a tensor whose bytes land on
+/// top of a live one — and it could not previously arise, because no case had a
+/// slot whose width depended on the policy.
+fn low_precision_cases() -> Vec<Case> {
+    let mut out = Vec::new();
+
+    for (dtype, tag) in [(DType::BF16, "bf16"), (DType::F16, "f16")] {
+        let s = shape_at(&[32, 64], dtype);
+
+        let mut g = Graph::new(format!("{tag}_ew_chain"));
+        let x = g.input("x", s.clone());
+        let y = g.input("y", s.clone());
+        let a = g.add(x, y);
+        let b = g.mul(a, x);
+        let c = g.sub(b, a);
+        g.set_outputs(vec![c]);
+        out.push(Case {
+            family: "low_precision",
+            name: if tag == "bf16" {
+                "bf16_elementwise"
+            } else {
+                "f16_elementwise"
+            },
+            graph: g,
+        });
+
+        // Weights and activations both low precision: the arena holds a mix of
+        // `Param` and intermediate slots, which the width policies treat
+        // differently (packed params keep native width even under f32-uniform).
+        let mut g = Graph::new(format!("{tag}_mlp"));
+        let x = g.input("x", shape_at(&[32, 64], dtype));
+        let w1 = g.param("w1", shape_at(&[64, 128], dtype));
+        let w2 = g.param("w2", shape_at(&[128, 64], dtype));
+        let h = g.matmul(x, w1, shape_at(&[32, 128], dtype));
+        let h = g.relu(h);
+        let o = g.matmul(h, w2, shape_at(&[32, 64], dtype));
+        g.set_outputs(vec![o]);
+        out.push(Case {
+            family: "low_precision",
+            name: if tag == "bf16" { "bf16_mlp" } else { "f16_mlp" },
+            graph: g,
+        });
+    }
+
+    // A real mixed-precision boundary: low-precision weights feeding an F32
+    // accumulation, with the `Cast` that makes the transition explicit. This is
+    // the case `ArenaWidthPolicy::Hybrid` was written for — low-precision
+    // activations packed native while everything else stays f32-uniform — and
+    // nothing exercised it.
+    let mut g = Graph::new("mixed_bf16_f32");
+    let x = g.input("x", shape_at(&[32, 64], DType::BF16));
+    let w = g.param("w", shape_at(&[64, 64], DType::BF16));
+    let h = g.matmul(x, w, shape_at(&[32, 64], DType::BF16));
+    let h32 = g.add_node(
+        Op::Cast { to: DType::F32 },
+        vec![h],
+        shape_at(&[32, 64], DType::F32),
+    );
+    let b = g.param("b", shape_at(&[32, 64], DType::F32));
+    let o = g.add(h32, b);
+    g.set_outputs(vec![o]);
+    out.push(Case {
+        family: "low_precision",
+        name: "mixed_bf16_f32_cast",
+        graph: g,
+    });
+
+    out
+}
+
 fn elementwise_cases() -> Vec<Case> {
     let s = shape(&[32, 64]);
     let mut out = Vec::new();
@@ -545,6 +629,7 @@ pub fn cases() -> Vec<Case> {
     all.extend(view_cases());
     all.extend(quantized_cases());
     all.extend(structural_cases());
+    all.extend(low_precision_cases());
     all
 }
 

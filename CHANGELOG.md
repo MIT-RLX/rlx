@@ -23,6 +23,380 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+## [0.2.17] — 2026-10-03
+
+### Fixed
+
+- **A checkpointed scan's backward indexed its upstream by the wrong axis.** With
+  partial checkpointing a scan emits one row per *checkpoint*, so `trajectory`
+  and `upstream` carry `k_total` rows while `xs` carries `length` — but
+  `process_t` narrowed `upstream` at the time step. With `length = 4` and 2
+  checkpoints it asked for row 3 of a 2-row tensor. It now maps the time step to
+  its checkpoint index and omits the upstream term at non-checkpoint steps, whose
+  cotangent arrives through `dcarry`. Second-derivative CPU-parity tests
+  (`higher_order_decompose_parity`) cover it.
+
+  Previously silent: `narrow_` inferred the output shape without checking
+  `start`, so the graph was built with an out-of-range window and no complaint.
+  The bounds check that surfaced this is a genuine improvement, not the bug.
+- **`CompiledGraph`'s narrow-boundary conversion fired on `F64`.** The f32 entry
+  points convert an `F16`/`BF16` boundary rather than reinterpreting it, but the
+  predicate matched *any* non-`F32` dtype. SPD / Riemannian-geometry graphs
+  declare theirs `F64`, which already round-trips through the plain f32 path, so
+  they were converted and returned garbage — every `spd_host_parity` test failed
+  with max|Δ| in the single digits. Scoped to `F16 | BF16`.
+
+### Added
+
+- **`rms_norm_mul_silu` and `l2_norm_lastdim` can emit the intermediate they
+  recompute** (`silu(z)` and the per-row denominator, both optional). This lets
+  those fusions absorb a producer whose value a *later* thunk still reads —
+  a backward graph re-reads the recomputed forward values — where before they had
+  to decline. Sound because there is still exactly one writer, unlike the two
+  earlier attempts at keeping the producer alongside the fusion, which put 24 of
+  54 and then 1 of 54 Qwen3.5 gradients wrong.
+
+  **No measured speedup on the graph that motivated it**: instrumenting the
+  pattern shows *0 blocks fused of 34 mul anchors* in that backward, so the
+  decline was never the cost. The earlier attribution of ~2× to it was wrong.
+  Measured per-step cost is 10.2 s against a ~6.2 s f32 roofline, i.e. the step
+  is compute-bound and there is no large dispatch overhead to recover. The verbose
+  fusion log now reports anchors alongside fusions, which is how this was caught.
+
+- **MLX could not run a low-precision training graph at all.** Two independent
+  bugs, both of which only bite once a graph is differentiated:
+  - `grad_with_loss` sized a zero cotangent `Constant` at a hardcoded 4 bytes per
+    element while taking the shape — dtype included — from a graph node. On an
+    autocast graph that node is bf16, so the constant declared 2 B/elem and held
+    4. The consequence landed far away: `cpu_low_precision::promote_to_f32`
+    widened those f32 bytes a *second* time as if they were bf16, and MLX refused
+    the leaf. Both sites (`zero_missing_wrt` and the Min/Max VJP) now size by
+    `Shape::size_bytes`. Pinned by `rlx-autodiff`'s
+    `constant_payload_matches_dtype` — a length invariant, which is what catches
+    this: zero is zero in every float format, so no value check would have.
+  - MLX's `Op::RmsNorm` lowering returned `ops::rms_norm(x, …)`, i.e. **`x`'s**
+    shape, ignoring the node's declared output shape. `fuse_rms_norm_reshape`
+    folds a following `reshape` into the norm and so changes its RANK, and
+    dropping that made a following `gather(axis=0)` index the batch axis; a
+    matmul then produced rank 3 and the failure surfaced as "[reshape] Cannot
+    reshape array of size 984 into shape (1,3,8)". Pinned by rlx-mlx's
+    `gather_after_fused_rmsnorm_reshape` — whose parent node must be *computed*,
+    since with a graph `Input` there the fusion declines and the test passes
+    vacuously.
+
+  Together these make bf16 training work on MLX (CPU, Metal and MLX now all
+  reproduce the f32 run), and they are what let `rlx-kev` re-enable MLX in its
+  backend-parity test.
+
+- **Metal returned NaN or zero for most parameter gradients of a Qwen3.5 trunk
+  while computing the forward bit-identically to CPU** (32 of 54 on a 4-token
+  synthetic trunk). Nothing in a training run said so — the loss looked healthy,
+  it just sat on `ln(n_options)`, the chance floor — and it cost a 1529-step
+  `rlx-kev` reproduction. Two independent causes, both invisible to per-op tests
+  because every op was correct in isolation:
+  - **Thunk-level fusions dropped a producer that a later thunk still read.**
+    `fuse_gdn_gated_norm` and `fuse_l2_norm` `Nop` out the thunks that produced
+    the intermediates they collapse, guarding only against graph *outputs*. Their
+    liveness scan stops at the fused window — deliberately, because a full scan
+    hits an opaque thunk and conservatively rejects, which would disable the
+    fusion on the decode graphs it exists for — so a reader *after* the window
+    was invisible. A forward graph has none; a BACKWARD graph re-reads the
+    recomputed forward values, which then read an unwritten slot (zeros for
+    `silu(gate)`, and 0/0 NaN out of the L2-normalize chain). They now also
+    consult a `protected_offsets` set built from IR **use counts**, which is
+    complete whatever the thunk scan can analyze.
+  - **The conv weight gradient was history-dependent at `N == 1`.** That case
+    took a per-group im2col+GEMM path whose answer depended on what was already
+    in the arena: a one-shot run agreed with finite differences, but after other
+    compiles had dirtied memory the same shapes came back 30–50% off. `N == 1`
+    now uses the same two-pass kernels as `N > 1`, which write every element they
+    read back; the scratch was already sized for them.
+
+  Pinned by `rlx-qwen35`'s `trunk_backward_device_parity` (whole-trunk, with the
+  forward as a control, ~2 s), `rlx-metal`'s `thunk_fusion_second_reader` (the
+  fusion hazard in isolation) and `conv_backward_weight_parity` (with a
+  finite-difference oracle, and a multi-shape sweep in one process — the history
+  is what made the old path fail, and a single-shape test passed right through
+  it).
+
+  The criterion is *use count ≤ readers inside the window*, not "use count > 1":
+  two readers that are both inside the fused window — one combined matmul feeding
+  two narrows, which is what the decode-MLP fusions match — are legitimate, and a
+  coarser test declines them (`metal_fused_decode_mlp_parity` catches that).
+  Declining when a reader IS outside costs ~2× on a Metal training step, where
+  these chains are hot, and nothing on a forward/decode graph, where the values
+  have a single reader and the fusion still fires. Fusing anyway while keeping
+  the still-read producer was tried and is *wrong*: the fused output can share an
+  arena slot with the intermediate being kept (24 of 54 gradients went bad).
+- **`AutoMixedBf16` produced NaN on CPU and Metal.** One root cause, six
+  symptoms: a low-precision tensor lives in the arena either PACKED at 2 B/elem
+  or WIDENED to 4 B, and kernels on both backends read one layout out of the
+  other. Every op kind, and the full policy, now match the f32 run on CPU, Metal
+  and MLX. The NaN surfaced at an innocent downstream op whose own input was
+  intact, which is what made it hard to place.
+  - `ArenaWidthPolicy::NativeHalfWidened` (new, now CPU's policy): params and
+    integer/bool tensors stay native, f16/bf16 **activations** widen to 4 B —
+    what a thunk executor that computes in f32 and reads every activation slot
+    as `&[f32]` actually needs. `Native` packed them, contradicting the comments
+    that claimed otherwise.
+  - `ArenaWidthPolicy::NativeBf16Widened` (new, now Metal's policy): widens bf16
+    activations only. Metal has genuine `half` kernels, but `HalfFlag` has no
+    BF16 lane, so every Metal kernel reads a bf16 tensor as f32.
+  - rlx-cpu `Op::MatMul` picked the packed dequant GEMM from `Param`-ness and
+    the declared dtype instead of the real slot width; a packed operand or
+    destination now goes through a new `Thunk::SgemmHalf`, and a node with no
+    buffer is no longer mistaken for a packed one (that was the bf16 backward's
+    "range end index 16 out of range for slice of length 0").
+  - rlx-metal `Op::Cast` to/from BF16 decoded 4 B f32 words as packed bf16
+    pairs — every odd element right, every even one mantissa junk. It now rounds
+    in place via a new `round_bf16_f32` MSL kernel or plain-copies.
+  - rlx-metal refuses an MPSGraph plan for a graph with bf16 activations
+    (`graph_has_bf16_activation`): it would be handed `MPSDataTypeBFloat16` for
+    an f32-wide buffer.
+  - rlx-metal's arena derived element counts by dividing the slot size by the
+    dtype width, double-counting any widened slot; it now takes them from the
+    shape, and exposes `Arena::bytes_per_elem` so a kernel can ask.
+- **rlx-metal `encode_cast` wrote zeros** for a same-dtype cast: it bound
+  `copy_f32` as if it took two pre-offset buffers when it takes
+  `(arena, src_byte_off, dst_byte_off, len)`.
+
+### Changed
+
+- **MLX reports which boundary tensor was mis-sized.** `Array::from_f32_slice`
+  checks the shape/length agreement itself, and `build_leaf_for` names the node,
+  so a mismatch reads "shape [1,41,2,1] wants 82 elements, got 164 (F32) — while
+  building leaf NodeId(903) Constant …" instead of a bare "nelems doesn't match
+  shape product" from the C++ shim, which said nothing about which tensor, shape
+  or dtype was involved.
+
+### Added
+
+- **tvOS, watchOS and visionOS join the Apple platform set.** `just check-apple`
+  now cross-compiles all four Apple OSes, device *and* simulator (8 targets), and
+  `just test-apple-sim` **executes** the backend smoke + parity tests on all four
+  simulators rather than only cross-compiling them.
+  `ios/build-xcframework.sh` emits one `RlxNode.xcframework` with 8 slices, and
+  `ios/Demo` builds four apps from one source tree. Backend surface: CPU + Metal +
+  CoreML/ANE + MLX on iOS/tvOS/visionOS; **watchOS is CPU/Accelerate only** — it
+  has no public Metal API and no CoreML runtime model-compile.
+  `--all-archs` adds `arm64_32-apple-watchos` (Apple Watch Series 4–8, which
+  cannot load the arm64 slice at all) plus the x86_64 tvOS/watchOS simulators via
+  `-Zbuild-std`.
+- **MLX builds for every Metal-capable Apple platform**, device and simulator,
+  via two tracked patches to the MLX submodule
+  (`crates/backends/rlx-mlx-sys/patches/`). Submodule bumped to **v0.32.2**.
+- **`rlx-runtime/model-io` feature** (in `default`) gates the `.rlxp` / MLX /
+  DDUF readers. A distributed node receives its stage over the wire and never
+  opens a model file, so dropping them keeps the Apple/embedded archive a compute
+  artifact rather than a file-format library.
+- **Per-architecture budget axis in `cargo rlx check`.** Reports what a graph
+  *costs* on a backend — arena bytes, liveness reuse, width-policy overhead,
+  per-run host-boundary traffic, parameter residency, dispatch count and bytes
+  moved — as notes, never errors. Rendered in the CLI and in `--json`.
+  Supporting: `arena_width_policy(FusionTarget)` as one source of truth for how
+  each architecture stores an activation, and `plan_memory_with_policy` so the
+  width policy can be priced with every other planner option held fixed.
+- **`ios/build-xcframework.sh` emits MLX's kernel library** to
+  `ios/build/metallib/<target>/mlx.metallib` when built with `--apple`. A static
+  archive cannot carry it — MLX looks it up next to the executable at the first
+  GPU kernel — so the xcframework alone shipped an MLX that linked, reported
+  itself available, and failed at first use. Copy it into the `.app` beside the
+  executable.
+- **First low-precision coverage in `rlx-corpus`.** The corpus was entirely F32
+  plus three U8 packed-weight cases; a `low_precision` family now carries
+  bf16/f16 elementwise and MLP graphs plus a mixed `bf16 → Cast → f32` case.
+
+### Fixed
+
+- **An over-limit `ElementwiseRegion` emitted a dangling operand.** The fusion
+  pass replaces every non-tail region member with a `NodeId(u32::MAX)` sentinel
+  on the promise that the tail will emit the region and rewire them; the limit
+  check ran *at the tail*, so bailing out left consumers pointing at a node that
+  does not exist. Caught only by a debug assertion — a release build handed the
+  dangling operand to the backend. The check now runs in the analysis phase,
+  before anything is rewritten.
+- **`RLX_KEEP_ELEMENTWISE_REGIONS=1` could overrun the CPU region interpreter.**
+  It removes the unfuse pass for CPU, MLX, Metal and wgpu at once without
+  touching their fusion limits, and CPU asks for `FusionLimits::UNBOUNDED`
+  precisely *because* it normally unfuses — so an arbitrarily long chain reached
+  an interpreter whose scratch is a fixed `[0f32; 32]`. Limit resolution now
+  lives in one shared `resolve_fusion_limits`; it had been two copies of the same
+  line, and a clamp added to one never ran on the path the runtime takes.
+- **An `F16`/`BF16` boundary was reinterpreted rather than converted.**
+  `run(&[(name, &[f32])])` handed f32 bytes to the backend to be read as pairs of
+  halves — `[1,2,3,4] + 0` returned `[2.0038757, 4.007843, 0.0, 0.0]` on CPU, with
+  no error. Root cause: `cpu_low_precision::promote_to_f32` promoted the *ops* to
+  F32 while keeping every `Input`/`Param` at its declared dtype with no `Cast`
+  between them, so a BF16 input got a 2 B/elem slot the promoted f32 thunk read
+  4 B/elem from. A boundary now keeps low precision only while every consumer
+  does too — conditional because `KvAppend` aliases its cache input's buffer and
+  strides from the node's dtype.
+- **The tvOS *simulator* SDK ships MPS without MPSGraph**, so the Metal backend
+  failed to link there. Gated behind `rlx_mps_graph_host`; nothing in the
+  MPSGraph module binds a framework symbol at link time, so only the `#[link]`
+  directive had to go.
+- **`objc` 0.2 does not know tvOS or visionOS exist.** It selects its dispatch
+  backend with `cfg(any(target_os = "macos", target_os = "ios"))` and falls
+  through to the **GNUstep** runtime otherwise, so every app link failed on
+  `_objc_msg_lookup`. `rlx-metal` now supplies both lookup symbols from Apple's
+  runtime.
+- **MLX stamped every metallib as macOS.** Upstream hardcodes
+  `xcrun -sdk macosx metal`, so an iOS/tvOS/visionOS cross-build produced a macOS
+  metallib that Metal refuses to load — verified by the platform byte at offset
+  `0x0B` (macOS `81`, iOS `82`, tvOS `83`, visionOS `8b`). Fixed by patch 0001.
+- **MLX's CPU backend called `system()`/`popen()`**, both unavailable on tvOS and
+  visionOS, failing the build at the capability probe itself. Patch 0002.
+- **`tolerance_for` in `rlx-corpus` derived an f32 bound for every graph**, asking
+  a BF16 case to be more accurate than the format can represent. Now scaled from
+  the format's own unit roundoff.
+- **`rlx-onnx-conformance` required ORT on platforms it has no binaries for**
+  (tvOS/watchOS/visionOS), failing the build script rather than linking.
+- **`is_available(Device::Mlx)` answered from a `cfg`, not from the device.** It
+  returned `true` for any target linking the native MLX stack, while callers
+  treat it as a probe — `fastest_device()` picks the best *available* backend and
+  then runs on it. On an iPad with MLX's kernel library missing from the app
+  bundle, selection returned MLX and execution then failed with
+  `Failed to load the default metallib. library not found`. MLX loads that
+  library lazily at the first GPU kernel, so it now probes with a one-element add
+  plus `eval` (the add alone is lazy), cached and `catch_unwind`-guarded.
+  Verified both ways on hardware: without the metallib MLX reports unavailable
+  and selection falls to Metal; with it, MLX is selected and matches CPU.
+
+### Changed
+
+- **iOS and tvOS deployment floors raised to 17.0.** That is where Metal gained
+  native `bfloat`, which MLX's kernels use — measured against the Metal compiler,
+  `bfloat` is an unknown type at 16.0 on both. visionOS stays at 1.0 (already past
+  that line); watchOS is 26.0, because rustup's prebuilt `std` for
+  `aarch64-apple-watchos` is itself compiled at 26.0.
+- **The Apple xcframework builds with a size-tuned `apple` cargo profile** (LTO,
+  one codegen unit, `panic = "abort"` — safe because every `rlx-ffi` entry point
+  is `extern "C"` and already aborts on unwind). `opt-level` stays at 3
+  deliberately: this is numeric kernel code on a thermally-limited device.
+
+### Validated
+
+- **All four Apple backends executed on hardware** — iPad Pro 11-inch (3rd gen),
+  iOS 26.5.2 — each matching the CPU reference at `max|Δ| = 1.49e-8`:
+
+  | backend | vs CPU |
+  |---|---|
+  | Metal | 1.49e-8 |
+  | CoreML / ANE | 1.49e-8 |
+  | MLX | 1.49e-8 |
+  | wgpu | 1.49e-8 |
+
+  This is the first execution of Metal, MLX and wgpu on an Apple platform other
+  than the macOS host. A headless `simctl spawn` exposes no Metal device, so on
+  every simulator these three report `unavailable` and skip — meaning the parity
+  assertions for them had never actually run. `skipped: []` on device is the line
+  that says they finally did.
+
+### Performance
+
+- **Apple release artifact: 11.46 MB → 6.36 MB** for a linked watchOS app
+  (−44.5%), measured. `__eh_frame` 709 KB → 38.6 KB, `__gcc_except_tab`
+  329 KB → 6.0 KB, `__unwind_info` 124 KB → 14.4 KB. Numerics unchanged:
+  ANE-vs-CPU max|Δ| is 1.49e-8 under both the stock release and the `apple`
+  profile, and `just test-apple-sim apple` re-runs the simulator suite under the
+  shipped settings as a standing precision gate.
+
+### Added
+
+- **Portable polynomial transcendentals in `rlx_cpu::vmath`** — `exp`, `log`,
+  `ln_1p`, `softplus`, `tanh`, `sin`, `cos`, `tan`, `atan`, plus
+  `vv{sin,cos,tan,atan}f_fast` and the `vvlogf_fast` / `vvlogf_hot` pair that
+  `exp` and `tanh` already had. Written in plain Rust rather than intrinsics on
+  purpose: with no libm call and no branches they auto-vectorize to **baseline
+  SSE2** and to NEON, so they need no `#[target_feature]` and no CPUID gate and
+  land on every CPU of the architecture — including the pre-AVX Atoms, plus
+  wasm and riscv. Accuracy is pinned by guard tests with bounds set from
+  measurement on both architectures: `exp` 2.53e-7 rel, `log` 1.19e-7 rel over
+  2^±30 including denormals, `sin`/`cos` 1.19e-7 abs to |x| = 1e6, `tan`
+  2.15e-7 rel (finite and accurate at the poles), `atan` 1.19e-7 abs.
+- `kernels::swiglu_rows`, `kernels::softmax_rows_poly`, `kernels::layer_norm_rows`.
+- **ISA portability gate** — `just check-isa` runs
+  `crates/backends/rlx-cpu/tools/isa_portability.py`. `scan` attributes every
+  above-baseline instruction to its enclosing symbol and fails on any that is
+  not runtime-gated, judged against the baseline of the target the binary was
+  built *for* (`sdot` is baseline on `aarch64-apple-darwin`, a finding on
+  `aarch64-unknown-linux-gnu`); it also catches the inverse, a
+  `-C target-cpu=native` artifact with above-baseline code smeared across
+  ordinary symbols where no runtime dispatch can help. `atom` and `arm` build
+  and run the suite under `qemu-user` on an emulated Goldmont Atom and
+  Cortex-A53.
+
+### Changed
+
+- **`bias_gelu` and `layer_norm_row` dispatch on CPUID at runtime** instead of
+  `cfg(target_feature = "avx2")`. One artifact now takes the AVX2 kernel on a
+  capable host and the portable loop on a pre-AVX one. Previously a portable
+  build silently *lost* those AVX2 kernels, and the only way to get them was a
+  `-C target-cpu=native` binary that `SIGILL`s on any pre-Gracemont Atom.
+  `x86_dispatch_arms_agree` pins the two arms together (measured divergence
+  1.19e-7 and 4.77e-7).
+- Nine `Activation` arms — Sigmoid, Softplus, Elu, Mish, LogSigmoid, Sin, Cos,
+  Tan, Atan — and `Erf` now use the polynomial arms, matching Tanh/Exp (via
+  `vmath::*_hot`) and Gelu/Silu (via `kernels`), which already did.
+  `Activation::Log`, log-softmax and the cross-entropy `ln` deliberately stay
+  on accurate libm: they feed losses, and that is worth more than throughput.
+- `rlx-cpu/build.rs` probes for OpenBLAS on every native Linux target, searches
+  `/usr/lib64` (Fedora/RHEL/SUSE), and asks the C compiler whether
+  `-lopenblas` resolves before giving up.
+
+### Deprecated
+
+- `rlx_ir::target::has_avx2_likely` — it reads as a capability check and is
+  really a build-flag check, which is how `bias_gelu` ended up existing only in
+  non-portable artifacts. Dispatch on `is_x86_feature_detected!` instead.
+
+### Fixed
+
+- **x86-64 Linux could not build without OpenBLAS.** `build.rs` probed only
+  when `target_arch != "x86_64"`, so x86-64 fell through to an unconditional
+  `-lopenblas` and a hard `unable to find library -lopenblas` on the one target
+  most likely to lack it — a container, a minimal distro, a cross build — while
+  every other target degraded to the portable gemm.
+- **A Q4_K accuracy test compared a kernel against itself.**
+  `exact_q4k_decode_gemv_beats_the_q8k_arm_on_accuracy` took its reference from
+  `gguf_matmul_bt_cached`, which under `cfg(not(rlx_cpu_blas))` forwards to the
+  arm being measured, so the error was identically 0 and the assertion could
+  never hold. Now an independent f64 oracle, which is stricter in every build.
+- **`exec_dispatch`'s AVX2 elementwise path could not inline its intrinsics.**
+  The runtime check and the `_mm256_*` calls sat in the same function, which
+  carried no `#[target_feature]`, so each intrinsic stayed an out-of-lined
+  `call` plus a `vzeroupper` — four per 8 lanes.
+- Redundant `unsafe` block in `hsum_i32_avx2` (the crate's only warning).
+
+### Performance
+
+Measured; Apple figures are real hardware, x86 figures are from a
+Rosetta-backed container and so are indicative rather than final.
+
+- **SwiGLU 1.63–1.78× (M4) / 2.69–3.16× (x86).** Both `Thunk::FusedSwiGLU`
+  paths had the loop inlined byte-identically with a libm `expf` per element on
+  *every* architecture — no NEON arm, no AVX2 arm — so the FFN activation of
+  every modern transformer was scalar on Apple Silicon too. Now one shared
+  `kernels::swiglu_rows`.
+- **Row softmax ~2.0× (M4) / ~2.5× (x86)**, of which 1.42–1.51× / 1.19–1.28×
+  comes from giving the `max` and `sum` reductions four independent
+  accumulators so they vectorize at all.
+- **`exp` ~3× on x86** (746–797 vs 247 Melem/s): the pre-AVX2 fallback was a
+  libm call per element, which is both slow and unvectorizable.
+- **`atan` 3.93× (M4) / 6.95× (x86)**; `sin` 1.25× / 1.63× (lower because its
+  argument reduction must run in f64, halving the lane count).
+- **LayerNorm +13.2% at h = 32.** Every transformer-block path called
+  `layer_norm_row` inside `for r in 0..m`, running the CPUID check once per
+  *row*; `layer_norm_rows` checks once per op. 2.4% at h = 128, nil by h = 1024.
+
+### Known issues
+
+- `kernels::avx2_exp8` builds its clamp from `_mm256_max_ps` / `_mm256_min_ps`,
+  which return the non-NaN operand, so the AVX2 arm turns a NaN input into
+  ~1e-38 where `vmath::exp_poly` now propagates it. Fixing it costs a compare
+  and a blend per call in the AVX2 kernel; recorded rather than copied.
+
+
 ## [0.2.16] — 2026-09-15
 
 ### Added
@@ -3751,7 +4125,8 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.16...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.17...HEAD
+[0.2.17]: https://github.com/MIT-RLX/rlx/compare/v0.2.16...v0.2.17
 [0.2.16]: https://github.com/MIT-RLX/rlx/compare/v0.2.15...v0.2.16
 [0.2.15]: https://github.com/MIT-RLX/rlx/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/MIT-RLX/rlx/compare/v0.2.13...v0.2.14

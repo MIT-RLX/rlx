@@ -114,7 +114,9 @@ rlx-tensor  = { workspace = true, optional = true }
 rlx-opt     = { workspace = true }
 rlx-driver  = { workspace = true }
 rlx-macros  = { workspace = true }
-rlx-runtime = { path = "../core/rlx-runtime", version = "0.2.16", default-features = false }
+# `model-io` explicitly: this manifest takes no defaults, and the umbrella
+# re-exports `Package` / `compile_rlxp` unconditionally.
+rlx-runtime = { path = "../core/rlx-runtime", version = "0.2.17", default-features = false, features = ["model-io"] }
 rlx-collectives = { workspace = true, optional = true }
 rlx-gguf     = { workspace = true, optional = true }
 rlx-gguf-convert = { workspace = true, optional = true }
@@ -124,20 +126,20 @@ rlx-linalg  = { workspace = true, optional = true }
 # default-features = false: `splat` exposes the dispatch seam and its types;
 # it should not pull rlx-cpu's BLAS linkage in for someone who did not ask
 # for the CPU backend. `rlx/cpu` gives rlx-cpu its normal features anyway.
-rlx-cpu     = { path = "../backends/rlx-cpu", version = "0.2.16", optional = true, default-features = false }
-rlx-umap    = { path = "../numerics/rlx-umap", version = "0.2.16", optional = true, default-features = false, features = ["cpu", "graph"] }
+rlx-cpu     = { path = "../backends/rlx-cpu", version = "0.2.17", optional = true, default-features = false }
+rlx-umap    = { path = "../numerics/rlx-umap", version = "0.2.17", optional = true, default-features = false, features = ["cpu", "graph"] }
 # default-features = false: rlx-peft's own `cpu` default would forward
 # rlx-runtime/cpu and quietly pick a backend for a consumer who did not ask for
 # one. Enabling `rlx/cpu` gives it the same cpu-enabled rlx-runtime anyway.
-rlx-peft    = { path = "../numerics/rlx-peft", version = "0.2.16", optional = true, default-features = false }
+rlx-peft    = { path = "../numerics/rlx-peft", version = "0.2.17", optional = true, default-features = false }
 rlx-rng     = { workspace = true, optional = true }
-rlx-geo     = { path = "../numerics/rlx-geo", version = "0.2.16", optional = true, default-features = false, features = ["cpu"] }
+rlx-geo     = { path = "../numerics/rlx-geo", version = "0.2.17", optional = true, default-features = false, features = ["cpu"] }
 rlx-optim   = { workspace = true, optional = true }
 # rlx-cortexm is `no_std` by default; we want the host-side parity
 # kernels (the `std` feature) when re-exported from the prelude.
-rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.16", optional = true, default-features = false, features = ["std"] }
+rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.17", optional = true, default-features = false, features = ["std"] }
 rlx-fpga    = { workspace = true, optional = true }
-rlx-onnx    = { path = "../io/rlx-onnx", version = "0.2.16", optional = true, default-features = true }
+rlx-onnx    = { path = "../io/rlx-onnx", version = "0.2.17", optional = true, default-features = true }
 # `rlx::Result` / `rlx::Error` type aliases. Every workspace crate
 # already pulls anyhow in transitively (rlx-runtime, rlx-gguf), so this
 # adds no real bytes — just makes the alias

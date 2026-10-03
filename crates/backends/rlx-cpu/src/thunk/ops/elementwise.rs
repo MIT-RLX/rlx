@@ -202,6 +202,31 @@ pub(crate) fn compile_cast(
                 dst,
                 len: len as u32,
             }
+        // A half-typed **activation** is stored widened to f32 (4 B/elem);
+        // only half **params** stay packed at 2 B. So route the cast by the
+        // slot's real width, not by the declared dtype — packing halves into a
+        // widened slot reads back as pairs of halves, which is how bf16
+        // autocast produced NaN before this.
+        } else if half_slot_is_widened(graph, arena, node.id)
+            && matches!(out_dtype, rlx_ir::DType::BF16 | rlx_ir::DType::F16)
+            && in_dtype == rlx_ir::DType::F32
+        {
+            Thunk::RoundHalf {
+                src,
+                dst,
+                len: len as u32,
+                bf16: out_dtype == rlx_ir::DType::BF16,
+            }
+        } else if matches!(in_dtype, rlx_ir::DType::BF16 | rlx_ir::DType::F16)
+            && out_dtype == rlx_ir::DType::F32
+            && half_slot_is_widened(graph, arena, node.inputs[0])
+        {
+            // Source is already f32-wide: widening is a copy.
+            Thunk::Copy {
+                src,
+                dst,
+                len: len as u32,
+            }
         } else if in_dtype == rlx_ir::DType::F32 && out_dtype == rlx_ir::DType::F16 {
             // f32 → f16 narrowing (4-byte src → 2-byte f16 dst).
             Thunk::CastF32ToF16 {
@@ -1845,7 +1870,13 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                 Activation::GeluApprox => crate::kernels::par_gelu_approx_inplace(d),
                 Activation::Silu => crate::kernels::par_silu_inplace(d),
                 Activation::Relu => apply!(|x: f32| x.max(0.0)),
-                Activation::Sigmoid => apply!(|x: f32| 1.0 / (1.0 + (-x).exp())),
+                // These five used a libm call per element while their siblings
+                // (Tanh/Exp above, Gelu/Silu via `kernels`) all run polynomial
+                // arms unconditionally. Matching them removes the call and lets
+                // the loop vectorize on every arch.
+                Activation::Sigmoid => {
+                    apply!(|x: f32| 1.0 / (1.0 + crate::vmath::exp_poly(-x)))
+                }
                 Activation::Tanh => crate::vmath::vvtanhf_hot_inplace(d),
                 Activation::Exp => crate::vmath::vvexpf_hot_inplace(d),
                 Activation::Log => crate::vmath::vvlogf_inplace(d),
@@ -1854,10 +1885,13 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                 Activation::Neg => apply!(|x: f32| -x),
                 Activation::Abs => apply!(|x: f32| x.abs()),
                 Activation::Round => apply!(|x: f32| x.round()),
-                Activation::Sin => apply!(|x: f32| x.sin()),
-                Activation::Cos => apply!(|x: f32| x.cos()),
-                Activation::Tan => apply!(|x: f32| x.tan()),
-                Activation::Atan => apply!(|x: f32| x.atan()),
+                // Range-guarded fast arms: they fall back to libm for
+                // arguments too large to reduce in f32, so defaulting them on
+                // cannot trade accuracy for speed behind the caller's back.
+                Activation::Sin => crate::vmath::vvsinf_fast_inplace(d),
+                Activation::Cos => crate::vmath::vvcosf_fast_inplace(d),
+                Activation::Tan => crate::vmath::vvtanf_fast_inplace(d),
+                Activation::Atan => crate::vmath::vvatanf_fast_inplace(d),
                 Activation::Recip => crate::vmath::vvrecf_inplace(d),
                 Activation::Floor => apply!(|x: f32| x.floor()),
                 Activation::Ceil => apply!(|x: f32| x.ceil()),
@@ -1870,17 +1904,24 @@ pub(crate) fn exec_activation_in_place(t: &Thunk, base: *mut u8) {
                         0.0
                     })
                 }
-                Activation::Softplus => apply!(|x: f32| x.max(0.0) + (-(x.abs())).exp().ln_1p()),
-                Activation::Elu => apply!(|x: f32| if x > 0.0 { x } else { x.exp() - 1.0 }),
+                Activation::Softplus => apply!(crate::vmath::softplus_poly),
+                Activation::Elu => {
+                    apply!(|x: f32| if x > 0.0 {
+                        x
+                    } else {
+                        crate::vmath::exp_poly(x) - 1.0
+                    })
+                }
                 Activation::Erf => apply!(|x: f32| erf_f32(x)),
                 Activation::HardSwish => apply!(|x: f32| x * (x + 3.0).clamp(0.0, 6.0) / 6.0),
                 Activation::HardSigmoid => apply!(|x: f32| (x / 6.0 + 0.5).clamp(0.0, 1.0)),
                 Activation::Mish => {
-                    apply!(|x: f32| x * (x.max(0.0) + (-(x.abs())).exp().ln_1p()).tanh())
+                    apply!(|x: f32| x * crate::vmath::tanh_poly(crate::vmath::softplus_poly(x)))
                 }
                 Activation::Softsign => apply!(|x: f32| x / (1.0 + x.abs())),
                 Activation::LogSigmoid => {
-                    apply!(|x: f32| x.min(0.0) - (-(x.abs())).exp().ln_1p())
+                    apply!(|x: f32| x.min(0.0)
+                        - crate::vmath::ln_1p_poly(crate::vmath::exp_poly(-x.abs())))
                 }
             }
         }
@@ -3389,6 +3430,9 @@ pub(crate) fn erf_f64(x: f64) -> f64 {
         - (((((1.061_405_43 * t - 1.453_152_03) * t) + 1.421_413_75) * t - 0.284_496_74) * t
             + 0.254_829_59)
             * t
+            // Stays libm at f64 width on purpose: `vmath::exp_poly` is f32, and
+            // narrowing here would throw away the precision this variant exists
+            // for. The f32 twin below does use it.
             * (-x * x).exp();
     s * y
 }
@@ -3404,7 +3448,7 @@ pub(crate) fn erf_f32(x: f32) -> f32 {
         - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_74) * t
             + 0.254_829_6)
             * t
-            * (-x * x).exp();
+            * crate::vmath::exp_poly(-x * x);
     s * y
 }
 
@@ -3647,4 +3691,29 @@ pub(crate) fn binary_op_f64(op: BinaryOp, a: f64, b: f64) -> f64 {
         BinaryOp::Shl => ((a as i64) << (b as i64)) as f64,
         BinaryOp::Shr => ((a as i64) >> (b as i64)) as f64,
     }
+}
+
+/// Whether a half-typed node's arena slot is the **widened** 4-byte form.
+///
+/// `plan_memory_native_in_order` widens half *activations* (the thunks compute
+/// in f32) and leaves half *params* packed at 2 B. Asking the arena for the
+/// slot's real element width is the only reliable way to tell them apart —
+/// the declared dtype says nothing about the layout.
+pub(crate) fn half_slot_is_widened(
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    id: rlx_ir::NodeId,
+) -> bool {
+    let node = graph.node(id);
+    if !matches!(node.shape.dtype(), rlx_ir::DType::BF16 | rlx_ir::DType::F16) {
+        return false;
+    }
+    if matches!(node.op, rlx_ir::Op::Param { .. }) {
+        return false;
+    }
+    let n = node.shape.num_elements().unwrap_or(0);
+    if n == 0 || !arena.has_buffer(id) {
+        return false;
+    }
+    arena.byte_size(id) / n >= 4
 }

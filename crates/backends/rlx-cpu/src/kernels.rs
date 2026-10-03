@@ -125,12 +125,14 @@ pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
-pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+/// Erf-GELU + bias via AVX2+FMA.
+///
+/// # Safety
+/// Caller has checked `is_x86_feature_detected!("avx2")` and `"fma"`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::excessive_precision)]
+unsafe fn bias_gelu_avx2(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     use std::arch::x86_64::*;
     let chunks = n / 8;
     unsafe {
@@ -186,20 +188,67 @@ pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     }
 }
 
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )
-)))]
-pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+/// Portable bias + erf-GELU. Shared by the non-SIMD targets and by x86-64's
+/// runtime fallback, so one binary covers AVX2 hosts and pre-AVX ones
+/// (every Atom through Tremont) without recompiling.
+#[cfg(not(target_arch = "aarch64"))]
+fn bias_gelu_scalar(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
     for row in 0..m {
         let base = row * n;
         for i in 0..n {
             let x = data[base + i] + bias[i];
             data[base + i] = scalar_gelu(x);
+        }
+    }
+}
+
+/// x86-64 bias + GELU. Dispatched on CPUID at runtime rather than on
+/// `cfg(target_feature)`: a compile-time gate meant the portable build lost
+/// the AVX2 kernel entirely and the only way to get it was a
+/// `-C target-cpu=native` artifact that SIGILLs on an Atom.
+#[cfg(target_arch = "x86_64")]
+pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: both feature bits just checked.
+        unsafe { bias_gelu_avx2(data, bias, m, n) };
+        return;
+    }
+    bias_gelu_scalar(data, bias, m, n);
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub fn bias_gelu(data: &mut [f32], bias: &[f32], m: usize, n: usize) {
+    bias_gelu_scalar(data, bias, m, n);
+}
+
+/// SwiGLU over `outer` rows: `out[i] = up[i] · silu(gate[i])`, where each input
+/// row holds the two halves concatenated (`gate_first` says which comes first).
+///
+/// Exists because both `Thunk::FusedSwiGLU` execution paths had this loop
+/// inlined, byte-identically, with a libm `expf` CALL PER ELEMENT — on every
+/// architecture, not just the ones without SIMD. This is the FFN activation of
+/// every modern transformer, so it was scalar on Apple Silicon and AVX2 x86
+/// too. Hoisting the `gate_first` branch out of the inner loop leaves two
+/// contiguous runs and a body of pure float ops over
+/// `vmath::exp_poly` (crate-private), which auto-vectorizes to NEON on
+/// baseline SSE2 on x86.
+///
+/// Matches `Activation::Silu`, which already uses a polynomial sigmoid on
+/// every arch, so this makes the fused and unfused paths agree rather than
+/// introducing a new approximation.
+pub fn swiglu_rows(inp: &[f32], out: &mut [f32], outer: usize, n: usize, gate_first: bool) {
+    debug_assert!(inp.len() >= outer * 2 * n && out.len() >= outer * n);
+    for o in 0..outer {
+        let in_row = &inp[o * 2 * n..(o + 1) * 2 * n];
+        let out_row = &mut out[o * n..(o + 1) * n];
+        let (gate, up) = if gate_first {
+            (&in_row[..n], &in_row[n..])
+        } else {
+            (&in_row[n..], &in_row[..n])
+        };
+        for i in 0..n {
+            let g = gate[i];
+            out_row[i] = up[i] * (g / (1.0 + crate::vmath::exp_poly(-g)));
         }
     }
 }
@@ -273,9 +322,11 @@ pub fn silu_inplace(data: &mut [f32]) {
         unsafe { silu_inplace_avx2(data) };
         return;
     }
+    // Same sigmoid form as `silu_inplace_avx2`, over `exp_poly` so the loop
+    // vectorizes to baseline SSE2 instead of calling libm per element.
     for v in data.iter_mut() {
         let x = *v;
-        *v = x / (1.0 + (-x).exp());
+        *v = x / (1.0 + crate::vmath::exp_poly(-x));
     }
 }
 
@@ -283,7 +334,7 @@ pub fn silu_inplace(data: &mut [f32]) {
 pub fn silu_inplace(data: &mut [f32]) {
     for v in data.iter_mut() {
         let x = *v;
-        *v = x / (1.0 + (-x).exp());
+        *v = x / (1.0 + crate::vmath::exp_poly(-x));
     }
 }
 
@@ -350,12 +401,13 @@ pub fn layer_norm_row(
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
-pub fn layer_norm_row(
+/// Two-pass LayerNorm over one row via AVX2+FMA.
+///
+/// # Safety
+/// Caller has checked `is_x86_feature_detected!("avx2")` and `"fma"`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn layer_norm_row_avx2(
     input: &[f32],
     gamma: &[f32],
     beta: &[f32],
@@ -423,15 +475,10 @@ pub fn layer_norm_row(
     }
 }
 
-#[cfg(not(any(
-    target_arch = "aarch64",
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )
-)))]
-pub fn layer_norm_row(
+/// Portable two-pass LayerNorm over one row. Shared by the non-SIMD targets
+/// and by x86-64's runtime fallback.
+#[cfg(not(target_arch = "aarch64"))]
+fn layer_norm_row_scalar(
     input: &[f32],
     gamma: &[f32],
     beta: &[f32],
@@ -455,6 +502,102 @@ pub fn layer_norm_row(
     let inv = 1.0 / (var + eps).sqrt();
     for i in 0..h {
         output[i] = (input[i] - mean) * inv * gamma[i] + beta[i];
+    }
+}
+
+/// x86-64 LayerNorm row. CPUID-dispatched at runtime so the same artifact
+/// takes the AVX2 kernel on a capable host and the portable two-pass loop on
+/// a pre-AVX one (Atom Bonnell..Tremont) — see [`bias_gelu`].
+#[cfg(target_arch = "x86_64")]
+pub fn layer_norm_row(
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    output: &mut [f32],
+    h: usize,
+    eps: f32,
+) {
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: both feature bits just checked.
+        unsafe { layer_norm_row_avx2(input, gamma, beta, output, h, eps) };
+        return;
+    }
+    layer_norm_row_scalar(input, gamma, beta, output, h, eps);
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub fn layer_norm_row(
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    output: &mut [f32],
+    h: usize,
+    eps: f32,
+) {
+    layer_norm_row_scalar(input, gamma, beta, output, h, eps);
+}
+
+/// LayerNorm over `rows` contiguous rows of width `h`.
+///
+/// Exists to hoist the CPUID dispatch out of the caller's row loop. Every
+/// transformer-block path here calls `layer_norm_row` inside `for r in 0..m`,
+/// which ran the `is_x86_feature_detected!` pair once per ROW. That check is a
+/// cached relaxed load, so it reads as free — measured, it is **13.2% of the
+/// work at h = 32**, 2.4% at h = 128, and nothing by h = 1024. Short rows are
+/// not exotic, so the estimate was worth checking rather than trusting.
+///
+/// No behaviour change: same kernel, same order, one check per op.
+pub fn layer_norm_rows(
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    h: usize,
+    eps: f32,
+) {
+    debug_assert!(input.len() >= rows * h && output.len() >= rows * h);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            for r in 0..rows {
+                // SAFETY: both feature bits checked once, above the loop.
+                unsafe {
+                    layer_norm_row_avx2(
+                        &input[r * h..(r + 1) * h],
+                        gamma,
+                        beta,
+                        &mut output[r * h..(r + 1) * h],
+                        h,
+                        eps,
+                    )
+                };
+            }
+            return;
+        }
+        for r in 0..rows {
+            layer_norm_row_scalar(
+                &input[r * h..(r + 1) * h],
+                gamma,
+                beta,
+                &mut output[r * h..(r + 1) * h],
+                h,
+                eps,
+            );
+        }
+    }
+    // Other targets dispatch at compile time, so there is nothing to hoist.
+    #[cfg(not(target_arch = "x86_64"))]
+    for r in 0..rows {
+        layer_norm_row(
+            &input[r * h..(r + 1) * h],
+            gamma,
+            beta,
+            &mut output[r * h..(r + 1) * h],
+            h,
+            eps,
+        );
     }
 }
 
@@ -779,13 +922,104 @@ pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
             softmax_rows_avx2(d, r, c);
         });
     } else {
-        par_softmax_rows(data, rows, cols, &crate::naive::softmax);
+        par_softmax_rows(data, rows, cols, &softmax_rows_poly);
+    }
+}
+
+pub fn softmax_rows_poly(data: &mut [f32], rows: usize, cols: usize) {
+    for r in 0..rows {
+        softmax_row_poly(&mut data[r * cols..(r + 1) * cols]);
+    }
+}
+
+/// Horizontal max over four independent accumulators.
+///
+/// `iter().fold(NEG_INFINITY, f32::max)` does NOT vectorize: a float reduction
+/// is not reassociable without fast-math, which Rust never enables, so LLVM is
+/// obliged to keep one serial dependency chain. Four lanes that only combine at
+/// the end give it four chains it can fuse into `maxps` / `fmaxnm`.
+///
+/// This DOES change the order of operations, and for `max` that is exactly
+/// equivalent (max is associative and commutative over non-NaN floats, and the
+/// NaN behaviour of `f32::max` — return the non-NaN operand — is unchanged by
+/// regrouping).
+#[inline]
+fn reduce_max4(row: &[f32]) -> f32 {
+    let mut acc = [f32::NEG_INFINITY; 4];
+    let mut it = row.chunks_exact(4);
+    for ch in &mut it {
+        for i in 0..4 {
+            acc[i] = acc[i].max(ch[i]);
+        }
+    }
+    let mut m = acc[0].max(acc[1]).max(acc[2].max(acc[3]));
+    for &v in it.remainder() {
+        m = m.max(v);
+    }
+    m
+}
+
+/// Horizontal sum over four independent accumulators — see [`reduce_max4`] for
+/// why `iter().sum()` cannot vectorize.
+///
+/// Unlike `max`, regrouping a float *sum* does change the result. It changes it
+/// for the better: pairing partial sums is a (shallow) tree reduction, whose
+/// error grows like log(n) rather than n, so this is more accurate than the
+/// sequential sum it replaces, not less.
+#[inline]
+fn reduce_sum4(row: &[f32]) -> f32 {
+    let mut acc = [0f32; 4];
+    let mut it = row.chunks_exact(4);
+    for ch in &mut it {
+        for i in 0..4 {
+            acc[i] += ch[i];
+        }
+    }
+    let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for &v in it.remainder() {
+        s += v;
+    }
+    s
+}
+
+/// Row softmax over the portable [`crate::vmath::exp_poly`] — the fast arm for
+/// hosts without AVX2 (every Atom through Tremont, plus wasm/riscv).
+///
+/// Was `crate::naive::softmax`, which is the *accuracy reference* parity tests
+/// compare kernels against and so deliberately calls libm per element; that
+/// left pre-AVX2 x86 with no SIMD on the hottest op in attention. `naive`
+/// stays untouched as the reference, and this arm uses the same polynomial as
+/// `softmax_rows_avx2`, so the two dispatch arms agree.
+///
+/// Three loops rather than one on purpose: the exp and scale passes vectorize,
+/// while the max and sum reductions cannot (float reductions are not
+/// reassociable without fast-math, which Rust never enables). Fusing them
+/// would sink the whole thing back to scalar.
+// Dead on aarch64 by design (NEON arm always wins); kept compiled so the
+// guard test runs on an Apple dev machine.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn softmax_row_poly(row: &mut [f32]) {
+    let max_v = reduce_max4(row);
+    if !max_v.is_finite() {
+        // All -inf (a fully masked row) or a NaN: defer to the reference,
+        // which has the careful handling for these.
+        let n = row.len();
+        crate::naive::softmax(row, 1, n);
+        return;
+    }
+    for v in row.iter_mut() {
+        *v = crate::vmath::exp_poly(*v - max_v);
+    }
+    let sum = reduce_sum4(row);
+    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+    for v in row.iter_mut() {
+        *v *= inv;
     }
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn neon_softmax(data: &mut [f32], rows: usize, cols: usize) {
-    par_softmax_rows(data, rows, cols, &crate::naive::softmax);
+    par_softmax_rows(data, rows, cols, &softmax_rows_poly);
 }
 
 // ── GELU in-place (no bias) ────────────────────────────────────────────
@@ -1156,7 +1390,12 @@ fn scalar_erf(x: f32) -> f32 {
     let y = t
         * (0.254_829_6
             + t * (-0.284_496_72 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
-    sign * (1.0 - y * (-xa * xa).exp())
+    // `exp_poly`, not libm: this is the scalar arm of an approximation whose
+    // vector arms already use the same polynomial (`avx2_exp8` / `neon_exp4`),
+    // so matching it both removes a libm call per element and makes the arms
+    // agree. A&S 7.1.26 itself is only ~1.5e-7 accurate, so the polynomial's
+    // 2.5e-7 on the inner exp is well inside the erf approximation's own error.
+    sign * (1.0 - y * crate::vmath::exp_poly(-xa * xa))
 }
 
 /// NCHW LayerNorm2d (candle / SAM semantics): normalize across channels at
@@ -1491,6 +1730,148 @@ mod tests {
         let g = scalar_gelu(x);
         // Reference: gelu(1.5) ≈ 1.3990
         assert!((g - 1.3990).abs() < 0.01, "gelu(1.5) = {g}");
+    }
+
+    /// The two CPUID-dispatched arms of `bias_gelu` / `layer_norm_row` must
+    /// agree. One artifact now takes the AVX2 kernel on a capable host and the
+    /// portable one on a pre-AVX host (every Atom through Tremont), so a
+    /// divergence here is a numerics difference that depends on which machine
+    /// runs the binary — the hardest kind to reproduce. The arms use the same
+    /// Abramowitz & Stegun 7.1.26 erf and the same two-pass LayerNorm; only
+    /// `exp` (fast polynomial vs libm) and the summation order differ.
+    ///
+    /// Returns early rather than failing where AVX2 is absent: there the
+    /// scalar arm is the only one reachable, and `just check-isa` exercises
+    /// exactly that leg on an emulated Atom.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn x86_dispatch_arms_agree() {
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma"))
+        {
+            return;
+        }
+        let (m, n) = (3usize, 64usize);
+        let data: Vec<f32> = (0..m * n).map(|i| i as f32 * 0.37 - 35.0).collect();
+        let bias: Vec<f32> = (0..n).map(|j| j as f32 * 0.11 - 3.5).collect();
+        let mut simd = data.clone();
+        let mut scalar = data.clone();
+        // SAFETY: both feature bits checked above.
+        unsafe { bias_gelu_avx2(&mut simd, &bias, m, n) };
+        bias_gelu_scalar(&mut scalar, &bias, m, n);
+        let worst = simd
+            .iter()
+            .zip(&scalar)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        // Measured 1.19e-7 — exactly one f32 ULP at this magnitude. The
+        // bound leaves ~16 ULP of headroom; anything near it means the two
+        // arms stopped computing the same function.
+        assert!(worst < 2e-6, "bias_gelu arms diverge by {worst}");
+
+        let h = 128usize;
+        let input: Vec<f32> = (0..h)
+            .map(|i| ((i * 37) % 19) as f32 * 0.25 - 2.0)
+            .collect();
+        let gamma: Vec<f32> = (0..h).map(|i| 1.0 + i as f32 * 0.01).collect();
+        let beta: Vec<f32> = (0..h).map(|i| i as f32 * -0.02).collect();
+        let mut simd = vec![0f32; h];
+        let mut scalar = vec![0f32; h];
+        // SAFETY: both feature bits checked above.
+        unsafe { layer_norm_row_avx2(&input, &gamma, &beta, &mut simd, h, 1e-5) };
+        layer_norm_row_scalar(&input, &gamma, &beta, &mut scalar, h, 1e-5);
+        let worst = simd
+            .iter()
+            .zip(&scalar)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        // Measured 4.77e-7 — 4 ULP, from vector vs sequential summation
+        // order in the two reduction passes, not a formulation difference.
+        assert!(worst < 4e-6, "layer_norm_row arms diverge by {worst}");
+    }
+
+    /// `softmax_rows_poly` is the arm that runs wherever AVX2 is absent — i.e.
+    /// on an Atom, never on the machine this is usually developed on. Nothing
+    /// covered it, so a defect there would have been invisible locally and
+    /// wrong in production. Pin it against `naive::softmax`, the reference.
+    #[test]
+    fn softmax_poly_arm_matches_the_reference() {
+        let cases: Vec<Vec<f32>> = vec![
+            (0..64)
+                .map(|i| ((i * 37) % 23) as f32 * 0.3 - 3.0)
+                .collect(),
+            // Large magnitudes: the max-subtraction has to keep this finite.
+            (0..48).map(|i| i as f32 * 4.0 - 90.0).collect(),
+            // Already-uniform row, and a single dominant element.
+            vec![1.0; 33],
+            {
+                let mut v = vec![-50.0f32; 17];
+                v[9] = 50.0;
+                v
+            },
+            // Fully masked row — exercises the non-finite early return.
+            vec![f32::NEG_INFINITY; 8],
+        ];
+        for (ci, src) in cases.iter().enumerate() {
+            let cols = src.len();
+            let mut poly = src.clone();
+            let mut want = src.clone();
+            softmax_rows_poly(&mut poly, 1, cols);
+            crate::naive::softmax(&mut want, 1, cols);
+            let worst = poly
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            // Measured 4.66e-10 on the realistic rows: the polynomial's
+            // relative error largely cancels in the normalization, since it
+            // scales numerator and denominator alike.
+            assert!(worst < 1e-6, "case {ci}: softmax poly arm off by {worst:e}");
+            if src.iter().any(|v| v.is_finite()) {
+                let sum: f32 = poly.iter().sum();
+                assert!((sum - 1.0).abs() < 1e-5, "case {ci}: rows sum to {sum}");
+            }
+        }
+    }
+
+    /// `swiglu_rows` is the FFN activation of every modern transformer and had
+    /// no CPU-side test at all — its only coverage was GPU parity tests in
+    /// which the CPU *is* the reference, so a CPU regression would have
+    /// silently moved the thing everything else is checked against.
+    #[test]
+    fn swiglu_rows_matches_a_libm_reference() {
+        for &gate_first in &[true, false] {
+            let (outer, n) = (5usize, 37usize);
+            let inp: Vec<f32> = (0..outer * 2 * n)
+                .map(|i| ((i * 29) % 61) as f32 * 0.4 - 12.0)
+                .collect();
+            let mut got = vec![0f32; outer * n];
+            swiglu_rows(&inp, &mut got, outer, n, gate_first);
+
+            let mut want = vec![0f32; outer * n];
+            for o in 0..outer {
+                for i in 0..n {
+                    let row = &inp[o * 2 * n..(o + 1) * 2 * n];
+                    let (up, gate) = if gate_first {
+                        (row[n + i], row[i])
+                    } else {
+                        (row[i], row[n + i])
+                    };
+                    want[o * n + i] = up * (gate / (1.0 + (-gate).exp()));
+                }
+            }
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            println!("swiglu gate_first={gate_first} worst abs diff {worst:e}");
+            // Measured 2.38e-7 / 1.19e-7, i.e. 1-2 ULP at these magnitudes.
+            assert!(
+                worst < 1e-5,
+                "swiglu off by {worst:e} (gate_first={gate_first})"
+            );
+        }
     }
 
     #[test]

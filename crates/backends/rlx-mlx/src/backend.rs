@@ -102,6 +102,53 @@ impl Drop for MlxExecutable {
     }
 }
 
+/// Widen host bytes to the dtype the graph declares for that leaf.
+///
+/// `prepare_f32_exec_graph` rewrites low-precision leaves to F32, so a caller
+/// handing over the dtype it actually holds (ONNX-f16 weights, a BF16
+/// checkpoint) would otherwise mismatch the rewritten graph. Widening at the
+/// boundary keeps `set_param_typed` / `run_typed` callers from having to track
+/// which leaves MLX rewrote.
+///
+/// Returns the bytes unchanged when no widening applies, so a genuine
+/// mismatch still reaches the leaf builder's dtype check and errors there.
+fn widen_host_bytes_to_graph_dtype(data: &[u8], dt: DType, graph_dt: DType) -> (Vec<u8>, DType) {
+    match (dt, graph_dt) {
+        (DType::F16, DType::F32) => {
+            let f: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect();
+            (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+        }
+        (DType::BF16, DType::F32) => {
+            let f: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect();
+            (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+        }
+        // Metal/CPU widen I64 activations to F32; MLX graphs after
+        // prepare_f32 may still declare I64 inputs while some leaves
+        // were rewritten — also accept I64/I32 host bytes for F32 slots.
+        (DType::I64, DType::F32) => {
+            let f: Vec<f32> = data
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                .collect();
+            (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+        }
+        (DType::I32, DType::F32) => {
+            let f: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                .collect();
+            (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
+        }
+        _ => (data.to_vec(), dt),
+    }
+}
+
 impl MlxExecutable {
     fn current_rng(&self) -> rlx_ir::RngOptions {
         *self.rng.read().expect("rng lock")
@@ -320,11 +367,75 @@ impl MlxExecutable {
     /// widen/narrow round-trip — the bytes feed straight into
     /// Array::from_bytes during lowering.
     pub fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: DType) {
+        // Widen to the dtype the graph declares, exactly as `run_typed` already
+        // does for typed INPUTS. The two channels disagreed: a BF16 param
+        // against a graph `prepare_f32_exec_graph` had rewritten to F32 reached
+        // the leaf builder's dtype check and was rejected outright, while the
+        // identical bytes through the untyped `set_param` path converted fine.
+        // A `low_precision` corpus family (`bf16_mlp`) found it.
+        let graph_dt = self
+            .graph
+            .nodes()
+            .iter()
+            .find(|n| matches!(&n.op, Op::Param { name: nme } if nme == name))
+            .map(|n| n.shape.dtype())
+            .unwrap_or(dtype);
+        let (bytes, stored_dt) = widen_host_bytes_to_graph_dtype(data, dtype, graph_dt);
         self.params_typed
-            .insert(name.to_string(), (data.to_vec(), dtype));
+            .insert(name.to_string(), (bytes, stored_dt));
         // Drop any f32 override so subsequent runs see the typed data.
         self.params.remove(name);
         self.gpu_params.remove(name);
+    }
+
+    /// Share another executable's device-resident weights instead of uploading
+    /// our own.
+    ///
+    /// MLX arrays are refcounted, so handing over cloned handles costs a
+    /// refcount bump and leaves one device buffer backing both graphs. That
+    /// matters because a transformer keeps several graphs alive at once — a
+    /// prefill graph per prompt length, a decode graph per KV bucket — and each
+    /// would otherwise hold a full private copy of the weights, host and device.
+    ///
+    /// Only valid when both graphs expect the same parameters: same names, same
+    /// byte lengths, same dtypes. Returns false otherwise, and the caller must
+    /// bind normally.
+    pub fn share_params_from(&mut self, other: &Self) -> bool {
+        if other.gpu_params.is_empty() {
+            return false; // nothing materialized yet — nothing to share
+        }
+        // The source must already cover every param this graph needs, in the
+        // same layout. Comparing the typed/f32 maps catches a shape or dtype
+        // mismatch before we alias a buffer of the wrong size.
+        for (name, (bytes, dtype)) in &self.params_typed {
+            match other.params_typed.get(name) {
+                Some((ob, od)) if ob.len() == bytes.len() && od == dtype => {}
+                _ => return false,
+            }
+        }
+        for (name, data) in &self.params {
+            match other.params.get(name) {
+                Some(od) if od.len() == data.len() => {}
+                _ => return false,
+            }
+        }
+        let mut shared: HashMap<String, Array> = HashMap::with_capacity(other.gpu_params.len());
+        for (name, arr) in &other.gpu_params {
+            match arr.clone_handle() {
+                Ok(h) => {
+                    shared.insert(name.clone(), h);
+                }
+                // Partial sharing would leave some params aliased and others
+                // stale, so give up wholesale and let the caller bind.
+                Err(_) => return false,
+            }
+        }
+        self.gpu_params = shared;
+        // The host bytes are now dead weight: every param is resident, so no
+        // leaf is ever rebuilt from them. Dropping them is most of the saving.
+        self.params_typed.clear();
+        self.params.clear();
+        true
     }
 
     /// Copy named params from another executable (decode bucket weight sharing).
@@ -488,40 +599,7 @@ impl MlxExecutable {
                 .find(|n| matches!(&n.op, Op::Input { name: nme } if nme == name))
                 .map(|n| n.shape.dtype())
                 .unwrap_or(*dt);
-            let (bytes, stored_dt) = match (*dt, graph_dt) {
-                (DType::F16, DType::F32) => {
-                    let f: Vec<f32> = data
-                        .chunks_exact(2)
-                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                        .collect();
-                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
-                }
-                (DType::BF16, DType::F32) => {
-                    let f: Vec<f32> = data
-                        .chunks_exact(2)
-                        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
-                        .collect();
-                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
-                }
-                // Metal/CPU widen I64 activations to F32; MLX graphs after
-                // prepare_f32 may still declare I64 inputs while some leaves
-                // were rewritten — also accept I64/I32 host bytes for F32 slots.
-                (DType::I64, DType::F32) => {
-                    let f: Vec<f32> = data
-                        .chunks_exact(8)
-                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
-                        .collect();
-                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
-                }
-                (DType::I32, DType::F32) => {
-                    let f: Vec<f32> = data
-                        .chunks_exact(4)
-                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
-                        .collect();
-                    (f.iter().flat_map(|v| v.to_le_bytes()).collect(), DType::F32)
-                }
-                _ => (data.to_vec(), *dt),
-            };
+            let (bytes, stored_dt) = widen_host_bytes_to_graph_dtype(data, *dt, graph_dt);
             self.inputs_typed
                 .insert(name.to_string(), (bytes, stored_dt));
         }
@@ -619,12 +697,25 @@ impl MlxExecutable {
         let mut leaves: Vec<Array> = Vec::with_capacity(order.len());
         for (id, key) in &order {
             let leaf = match key {
+                // Already resident: either this graph materialized it on an
+                // earlier run, or `share_params_from` aliased another graph's
+                // buffer. Either way there is nothing to upload, and the host
+                // bytes may well be gone.
+                LeafKey::Param(name) if self.gpu_params.contains_key(name) => self
+                    .gpu_params
+                    .get(name)
+                    .expect("checked by the guard")
+                    .clone_handle()?,
+                // Typed params count too: quantized weights are bound through
+                // `set_param_typed`, so excluding them meant every packed tensor
+                // was rebuilt from host bytes on every run — the exact copy this
+                // cache exists to avoid, and for a 4-bit model that is most of
+                // the weights. Both setters and `copy_params_from` drop the
+                // cached handle, so a rebind is still seen.
                 LeafKey::Param(name)
-                    if !self.params_typed.contains_key(name) && self.params.contains_key(name) =>
+                    if self.params_typed.contains_key(name) || self.params.contains_key(name) =>
                 {
-                    if let Some(cached) = self.gpu_params.get(name) {
-                        cached.clone_handle()?
-                    } else {
+                    {
                         let a = lower::build_leaf_for(
                             &self.graph,
                             *id,

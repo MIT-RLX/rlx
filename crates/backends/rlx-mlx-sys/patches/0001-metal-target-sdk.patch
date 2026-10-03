@@ -1,0 +1,131 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index feb7ce5e..0ee3a735 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,8 +70,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+       message(WARNING "Building for x86_64 arch is not officially supported.")
+     endif()
+   endif()
+-elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+-  # Enable the Metal backend by default on iOS; the caller selects the SDK.
++elseif(
++  CMAKE_SYSTEM_NAME STREQUAL "iOS"
++  OR CMAKE_SYSTEM_NAME STREQUAL "tvOS"
++  OR CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++  # Enable the Metal backend by default on the Apple platforms that ship Metal;
++  # the caller selects the SDK. watchOS is deliberately absent — it has no
++  # public Metal API, so it falls through to the MLX_BUILD_METAL OFF branch.
+ else()
+   set(MLX_BUILD_METAL OFF)
+ endif()
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+index ecabbda5..039e616f 100644
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -9,6 +9,73 @@ set(BASE_HEADERS
+     logging.h
+     utils.h)
+ 
++# ── target SDK selection (rlx patch) ──────────────────────────────────────
++#
++# The Metal toolchain has to target the same platform as the rest of the build.
++# `xcrun -sdk macosx metal` was hardcoded below, so an iOS / tvOS / visionOS
++# cross-build still emitted a *macOS* metallib and the Metal runtime refuses to
++# load it on those platforms. It is not a build error and not a wrong number —
++# the library simply fails to load at first use. There is no fallback either:
++# `device.cpp` loads this metallib or nothing, and MLX_METAL_JIT only shrinks
++# it rather than removing it.
++#
++# Platform is taken from CMAKE_SYSTEM_NAME and simulator-ness from the sysroot,
++# because CMake may have expanded CMAKE_OSX_SYSROOT from a name
++# ("iphonesimulator") to a full SDK path by this point.
++#
++# Verified platform byte at offset 0x0B of the produced metallib:
++#   macosx 0x81 | iphoneos 0x82 | iphonesimulator 0x87
++#   appletvos 0x83 | appletvsimulator 0x88 | xros 0x8b | xrsimulator 0x8c
++string(TOLOWER "${CMAKE_OSX_SYSROOT}" MLX_METAL_SYSROOT_LOWER)
++set(MLX_METAL_IS_SIMULATOR FALSE)
++if(MLX_METAL_SYSROOT_LOWER MATCHES "simulator")
++  set(MLX_METAL_IS_SIMULATOR TRUE)
++endif()
++
++set(MLX_METAL_VERSION_FLAGS)
++if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++  if(MLX_METAL_IS_SIMULATOR)
++    set(MLX_METAL_SDK "iphonesimulator")
++    set(MLX_METAL_MIN_PREFIX "-mios-simulator-version-min=")
++  else()
++    set(MLX_METAL_SDK "iphoneos")
++    set(MLX_METAL_MIN_PREFIX "-mios-version-min=")
++  endif()
++elseif(CMAKE_SYSTEM_NAME STREQUAL "tvOS")
++  if(MLX_METAL_IS_SIMULATOR)
++    set(MLX_METAL_SDK "appletvsimulator")
++    set(MLX_METAL_MIN_PREFIX "-mtvos-simulator-version-min=")
++  else()
++    set(MLX_METAL_SDK "appletvos")
++    set(MLX_METAL_MIN_PREFIX "-mtvos-version-min=")
++  endif()
++elseif(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++  # visionOS has no `-mxros-version-min`; it takes the -mtargetos= form, where
++  # the version is part of the value and the simulator is a suffix.
++  if(MLX_METAL_IS_SIMULATOR)
++    set(MLX_METAL_SDK "xrsimulator")
++    set(MLX_METAL_TARGETOS_SUFFIX "-simulator")
++  else()
++    set(MLX_METAL_SDK "xros")
++    set(MLX_METAL_TARGETOS_SUFFIX "")
++  endif()
++  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
++    set(MLX_METAL_VERSION_FLAGS
++        "-mtargetos=xros${CMAKE_OSX_DEPLOYMENT_TARGET}${MLX_METAL_TARGETOS_SUFFIX}")
++  endif()
++else()
++  set(MLX_METAL_SDK "macosx")
++  set(MLX_METAL_MIN_PREFIX "-mmacosx-version-min=")
++endif()
++
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "visionOS"
++   AND NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
++  set(MLX_METAL_VERSION_FLAGS
++      "${MLX_METAL_MIN_PREFIX}${CMAKE_OSX_DEPLOYMENT_TARGET}")
++endif()
++
++message(STATUS "MLX metallib target: sdk=${MLX_METAL_SDK} ${MLX_METAL_VERSION_FLAGS}")
++
+ function(build_kernel_base TARGET SRCFILE DEPS)
+   set(METAL_FLAGS
+       -x
+@@ -25,12 +92,11 @@ function(build_kernel_base TARGET SRCFILE DEPS)
+   if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND MLX_METAL_VERSION GREATER_EQUAL 320)
+     set(METAL_FLAGS ${METAL_FLAGS} -fmetal-enable-logging)
+   endif()
+-  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+-    set(METAL_FLAGS ${METAL_FLAGS}
+-                    "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++  if(NOT MLX_METAL_VERSION_FLAGS STREQUAL "")
++    set(METAL_FLAGS ${METAL_FLAGS} ${MLX_METAL_VERSION_FLAGS})
+   endif()
+   add_custom_command(
+-    COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
++    COMMAND xcrun -sdk ${MLX_METAL_SDK} metal ${METAL_FLAGS} -c ${SRCFILE}
+             -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
+     DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
+     OUTPUT ${TARGET}.air
+@@ -186,14 +252,11 @@ if(NOT MLX_METAL_JIT)
+ 
+ endif()
+ 
+-set(METAL_LINK_FLAGS)
+-if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+-  set(METAL_LINK_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+-endif()
++set(METAL_LINK_FLAGS ${MLX_METAL_VERSION_FLAGS})
+ 
+ add_custom_command(
+   OUTPUT ${MLX_METAL_PATH}/mlx.metallib
+-  COMMAND xcrun -sdk macosx metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
++  COMMAND xcrun -sdk ${MLX_METAL_SDK} metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
+           ${MLX_METAL_PATH}/mlx.metallib
+   DEPENDS ${KERNEL_AIR}
+   COMMENT "Building mlx.metallib"

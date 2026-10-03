@@ -11,7 +11,7 @@
 // the op the ANE/XDNA accelerate. Input I/O is O(D+T) (the matmul expands to D×T on-chip),
 // vs O(D·T) for the elementwise feed. Benchmarks the matmul vs elementwise vs CPU.
 //   cargo run -p rlx-coreml --example delaunay_incircle_gemm_ane --release -- [K] [Tchunk]
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 mod imp {
     use rlx_coreml::{ComputeUnits, CoremlExecutable};
     use rlx_ir::{DType, Graph, Shape};
@@ -296,8 +296,8 @@ mod imp {
 }
 
 fn main() {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
     imp::run();
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
     println!("CoreML/ANE is Apple-only.");
 }

@@ -1130,6 +1130,17 @@ pub fn plan_memory_with_options(
     plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Native)
 }
 
+/// [`plan_memory_with_options`] with the width policy spelled out, for a backend
+/// whose kernel coverage is not plain [`ArenaWidthPolicy::Native`].
+pub fn plan_memory_with_options_policy(
+    graph: &Graph,
+    alignment: usize,
+    opts: MemoryPlanOptions,
+    policy: ArenaWidthPolicy,
+) -> MemoryPlan {
+    plan_memory_aligned_inner(graph, alignment, opts, None, policy)
+}
+
 /// Plan memory with custom alignment (inference defaults).
 pub fn plan_memory_aligned(graph: &Graph, alignment: usize) -> MemoryPlan {
     plan_memory_aligned_inner(
@@ -1202,7 +1213,13 @@ pub fn plan_memory_native_in_order(graph: &Graph, alignment: usize) -> MemoryPla
         fold_conv3d_epilogue: false,
         ..MemoryPlanOptions::default()
     };
-    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Native)
+    plan_memory_aligned_inner(
+        graph,
+        alignment,
+        opts,
+        None,
+        ArenaWidthPolicy::NativeHalfWidened,
+    )
 }
 
 /// **Hybrid** sibling of [`plan_memory_f32_uniform`]: `Param` weights AND F16/BF16
@@ -1218,6 +1235,28 @@ pub fn plan_memory_hybrid(graph: &Graph, alignment: usize) -> MemoryPlan {
         ..MemoryPlanOptions::default()
     };
     plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Hybrid)
+}
+
+/// Plan with an explicit [`ArenaWidthPolicy`], holding every other option fixed
+/// at what the f32-uniform / hybrid planners use.
+///
+/// This exists so a caller can price the **width policy on its own**. Comparing
+/// [`plan_memory_f32_uniform`] against [`plan_memory_aligned`] does not do that:
+/// they also differ in `pin_output_ancestors`, so the delta mixes two effects
+/// and comes out *negative* for an f32 graph, where the width policy is free by
+/// definition. `rlx_runtime::check`'s budget axis reports that delta to a human,
+/// and a number that silently conflates storage width with pinning policy is
+/// exactly the kind of plausible-looking figure that gets acted on wrongly.
+pub fn plan_memory_with_policy(
+    graph: &Graph,
+    alignment: usize,
+    policy: ArenaWidthPolicy,
+) -> MemoryPlan {
+    let opts = MemoryPlanOptions {
+        pin_output_ancestors: graph_has_host_indexing(graph),
+        ..MemoryPlanOptions::default()
+    };
+    plan_memory_aligned_inner(graph, alignment, opts, None, policy)
 }
 
 /// Same as [`plan_memory_f32_uniform`] but leaves `Op::Param` nodes UNassigned
@@ -1317,10 +1356,131 @@ pub enum ArenaWidthPolicy {
     /// overrun of full `Native` — for backends that run f16/bf16 kernels natively
     /// but widen integer/bool tensors to f32.
     Hybrid,
+    /// The exact complement of [`Self::Hybrid`]: `Param` weights and every
+    /// integer/bool tensor keep their native packed width, while F16/BF16
+    /// **activations** are widened to 4 B/elem.
+    ///
+    /// This is what the CPU thunk executor actually needs. Its kernels compute
+    /// in f32 and read an activation slot as `&[f32]`; the only packed reads it
+    /// performs are the dequant-on-the-fly GEMMs, whose packed side is always a
+    /// weight. Under full [`Self::Native`] an autocast graph (`AutoMixedBf16`)
+    /// puts bf16 ACTIVATIONS in 2 B slots, and every f32 kernel then reads two
+    /// halves as one f32 — which is where the mixed-precision NaNs came from.
+    /// Going all the way to [`Self::F32Uniform`] would fix that but also widen
+    /// i8/u8 activations, which `ConvInteger`/`MatMulInteger` DO read packed.
+    NativeHalfWidened,
+    /// Like [`Self::NativeHalfWidened`] but widens **BF16 activations only** —
+    /// F16 stays packed.
+    ///
+    /// Metal's shape: it has genuine `half` kernels (f16 KV cache, f16 SDPA,
+    /// f16 copy/cast), so widening F16 activations would break the very paths
+    /// that read them packed; but outside `MPSGraph` it has essentially no
+    /// `bfloat` kernels, so a bf16 ACTIVATION slot is read and written as f32 —
+    /// reading two halves as one f32 and overrunning the 2 B slot into its
+    /// neighbour. That overrun is why an `AutoMixedBf16` graph produced NaN at
+    /// an unrelated downstream node (a `Softplus` whose input was intact when
+    /// evaluated on its own).
+    NativeBf16Widened,
+}
+
+/// The arena width policy a backend actually plans with.
+///
+/// This is one fact — "how does this architecture store an activation" — that
+/// was previously spelled out at each backend's plan site, which is the shape
+/// that let `advisory_capabilities` drift from `capabilities()` on 4 of 7
+/// backends. Reading it from here means the analysis in
+/// `rlx_runtime::check` and the backend that does the planning cannot disagree
+/// about what a graph will cost.
+///
+/// Today every entry matches what the backend already did; this centralizes the
+/// fact, it does not change any of them. The interesting case is wgpu/Vulkan:
+/// both keep an f32-uniform arena *by design* — wgpu pairs it with a shadow f16
+/// side-buffer indexed by the same logical element index, so packing F16/BF16
+/// activations at native width under [`ArenaWidthPolicy::Hybrid`] would be a
+/// layout change, not a free saving. `rlx_runtime::check`'s budget axis reports
+/// what Hybrid *would* save so that trade can be made against a number.
+pub const fn arena_width_policy(target: crate::fusion_pipeline::FusionTarget) -> ArenaWidthPolicy {
+    use crate::fusion_pipeline::FusionTarget as T;
+    match target {
+        // Native low-precision activations and weights: the thunk executor
+        // addresses each tensor at its true byte width.
+        // The CPU thunk executor computes in f32 and reads activation slots as
+        // `&[f32]`; only weights are ever read packed.
+        T::Cpu => ArenaWidthPolicy::NativeHalfWidened,
+        // Native `half` kernels, but no `bfloat` ones: `HalfFlag` has no BF16
+        // lane, so every Metal kernel reads a bf16 tensor as f32.
+        T::Metal => ArenaWidthPolicy::NativeBf16Widened,
+        T::Mlx | T::Cuda | T::Rocm => ArenaWidthPolicy::Native,
+        // f32-uniform arena; see the note above.
+        T::Wgpu => ArenaWidthPolicy::F32Uniform,
+        // TPU/XLA hands memory management to the plugin; f32-uniform is the
+        // conservative description of what crosses the boundary.
+        T::Tpu => ArenaWidthPolicy::F32Uniform,
+    }
+}
+
+/// Nodes that must keep their NATIVE (packed) low-precision width even under a
+/// widening policy, because a kernel addresses them at their declared dtype.
+///
+/// Two seeds, both cases where the op — not the planner — owns the layout:
+///
+/// * `Op::Custom`: user-registered kernels execute at the declared dtype. The
+///   f32-promotion pass (`rlx_runtime::cpu_low_precision::needs_f32_exec`)
+///   exempts them for exactly that reason, so the arena has to as well.
+/// * `Op::KvAppend`: every backend takes the cache row stride from the KvAppend
+///   node's dtype, which is also why that pass keeps it low-precision.
+///
+/// The seeds are then closed over **alias families**: a view and its root share
+/// bytes, so the two cannot disagree about how wide an element is. Empty unless
+/// the policy widens, since that is the only case it is consulted in.
+fn native_width_nodes(
+    graph: &Graph,
+    policy: ArenaWidthPolicy,
+) -> std::collections::HashSet<rlx_ir::NodeId> {
+    let mut seeds = std::collections::HashSet::new();
+    if !matches!(
+        policy,
+        ArenaWidthPolicy::NativeHalfWidened | ArenaWidthPolicy::NativeBf16Widened
+    ) {
+        return seeds;
+    }
+    for n in graph.nodes() {
+        if matches!(
+            n.op,
+            rlx_ir::Op::Custom { .. } | rlx_ir::Op::KvAppend { .. }
+        ) {
+            seeds.insert(n.id);
+            seeds.extend(n.inputs.iter().copied());
+        }
+    }
+    if seeds.is_empty() {
+        return seeds;
+    }
+    let mut family: std::collections::HashMap<rlx_ir::NodeId, Vec<rlx_ir::NodeId>> =
+        std::collections::HashMap::new();
+    for n in graph.nodes() {
+        family
+            .entry(resolve_view_root(graph, n.id).0)
+            .or_default()
+            .push(n.id);
+    }
+    let mut out = seeds.clone();
+    for (root, members) in family {
+        if seeds.contains(&root) || members.iter().any(|m| seeds.contains(m)) {
+            out.insert(root);
+            out.extend(members);
+        }
+    }
+    out
 }
 
 #[inline]
-fn node_slot_bytes(node: &rlx_ir::Node, policy: ArenaWidthPolicy) -> usize {
+/// Bytes the arena must reserve for one node under `policy`.
+///
+/// `keep_native` marks a node from [`native_width_nodes`] — one a kernel
+/// addresses at its DECLARED dtype, so a widening policy must leave it packed
+/// or the kernel writes 2 B/elem into a slot the reader walks 4 B/elem.
+fn node_slot_bytes(node: &rlx_ir::Node, policy: ArenaWidthPolicy, keep_native: bool) -> usize {
     // See ArenaWidthPolicy for the rationale. `native` = the tensor's true byte
     // width; `f32_wide` = the 4-B/elem width a slot needs if the backend binds /
     // widens it as f32 (never shrink a tensor already stored wider than 4 B).
@@ -1342,6 +1502,22 @@ fn node_slot_bytes(node: &rlx_ir::Node, policy: ArenaWidthPolicy) -> usize {
                 native
             } else {
                 f32_wide()
+            }
+        }
+        ArenaWidthPolicy::NativeHalfWidened => {
+            // f16/bf16 activations widened; params and int/bool stay native.
+            if low_prec_act && !keep_native {
+                f32_wide()
+            } else {
+                native
+            }
+        }
+        ArenaWidthPolicy::NativeBf16Widened => {
+            let bf16_act = !is_param && node.shape.dtype() == rlx_ir::DType::BF16;
+            if bf16_act && !keep_native {
+                f32_wide()
+            } else {
+                native
             }
         }
     }
@@ -1391,6 +1567,7 @@ fn plan_memory_aligned_inner(
         death: usize,
     }
 
+    let keep_native = native_width_nodes(graph, width);
     let mut buffers: Vec<BufInfo> = Vec::new();
     for node in graph.nodes() {
         // Skip view nodes — they alias their parent's buffer (handled
@@ -1404,7 +1581,7 @@ fn plan_memory_aligned_inner(
         {
             continue;
         }
-        let raw_size = node_slot_bytes(node, width);
+        let raw_size = node_slot_bytes(node, width, keep_native.contains(&node.id));
         let size = if raw_size == 0 {
             boundary_min_slot_bytes(&node.op, alignment)
         } else {
@@ -1559,7 +1736,7 @@ fn plan_memory_aligned_inner(
             let Some(out) = assignments.get(&id).cloned() else {
                 continue;
             };
-            let out_size = node_slot_bytes(node, width).max(1);
+            let out_size = node_slot_bytes(node, width, keep_native.contains(&node.id)).max(1);
             let out_end = out.offset + out_size;
             let mut overlaps_input = false;
             for &inp in &node.inputs {
@@ -1568,7 +1745,9 @@ fn plan_memory_aligned_inner(
                     continue;
                 }
                 if let Some(rs) = assignments.get(&root) {
-                    let r_size = node_slot_bytes(graph.node(root), width).max(1);
+                    let r_size =
+                        node_slot_bytes(graph.node(root), width, keep_native.contains(&root))
+                            .max(1);
                     if out.offset < rs.offset + r_size && out_end > rs.offset {
                         overlaps_input = true;
                         break;
@@ -1600,7 +1779,7 @@ fn plan_memory_aligned_inner(
         if pure_view_offset(graph, node).is_some() {
             let (root, off) = resolve_view_root(graph, node.id);
             if let Some(root_slot) = assignments.get(&root).cloned() {
-                let view_size = node_slot_bytes(node, width);
+                let view_size = node_slot_bytes(node, width, keep_native.contains(&node.id));
                 assignments.insert(
                     node.id,
                     BufferSlot {
@@ -1690,8 +1869,8 @@ fn plan_memory_aligned_inner(
                 continue;
             }
             let (root, off) = resolve_view_root(graph, node.id);
-            let view_size = node_slot_bytes(node, width);
-            let root_size = node_slot_bytes(graph.node(root), width);
+            let view_size = node_slot_bytes(node, width, keep_native.contains(&node.id));
+            let root_size = node_slot_bytes(graph.node(root), width, keep_native.contains(&root));
             if off + view_size > root_size {
                 view_ovf += 1;
                 if view_ovf <= 20 {
@@ -1745,20 +1924,28 @@ mod tests {
 
         // A non-F32 Param weight stays PACKED (native, 2 B) under every policy.
         for p in [F32Uniform, Native, Hybrid] {
-            assert_eq!(node_slot_bytes(g.node(wbf), p), ne * 2, "bf16 param {p:?}");
+            assert_eq!(
+                node_slot_bytes(g.node(wbf), p, false),
+                ne * 2,
+                "bf16 param {p:?}"
+            );
         }
         // A bf16 ACTIVATION: f32-uniform widens (4 B); native + hybrid pack (2 B).
-        assert_eq!(node_slot_bytes(g.node(abf), F32Uniform), ne * 4);
-        assert_eq!(node_slot_bytes(g.node(abf), Native), ne * 2);
-        assert_eq!(node_slot_bytes(g.node(abf), Hybrid), ne * 2);
+        assert_eq!(node_slot_bytes(g.node(abf), F32Uniform, false), ne * 4);
+        assert_eq!(node_slot_bytes(g.node(abf), Native, false), ne * 2);
+        assert_eq!(node_slot_bytes(g.node(abf), Hybrid, false), ne * 2);
         // A bool ACTIVATION: hybrid keeps it f32-wide (safe for widen-at-compute),
         // only full Native shrinks it to 1 B/elem.
-        assert_eq!(node_slot_bytes(g.node(abool), F32Uniform), ne * 4);
-        assert_eq!(node_slot_bytes(g.node(abool), Native), ne);
-        assert_eq!(node_slot_bytes(g.node(abool), Hybrid), ne * 4);
+        assert_eq!(node_slot_bytes(g.node(abool), F32Uniform, false), ne * 4);
+        assert_eq!(node_slot_bytes(g.node(abool), Native, false), ne);
+        assert_eq!(node_slot_bytes(g.node(abool), Hybrid, false), ne * 4);
         // A plain f32 activation is 4 B/elem under every policy.
         for p in [F32Uniform, Native, Hybrid] {
-            assert_eq!(node_slot_bytes(g.node(x), p), ne * 4, "f32 input {p:?}");
+            assert_eq!(
+                node_slot_bytes(g.node(x), p, false),
+                ne * 4,
+                "f32 input {p:?}"
+            );
         }
     }
 

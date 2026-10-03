@@ -1,61 +1,136 @@
-# XcodeGen spec for the RLX node demo app.
+# XcodeGen spec for the RLX node demo — one app per Apple OS, one shared
+# source tree.
 #
 #   ios/build-xcframework.sh        # produces ../build/RlxNode.xcframework
 #   cd ios/Demo && xcodegen generate
 #   open RlxDemo.xcodeproj
 #
 # Or build headlessly — see ios/README.md.
+#
+# The four targets differ only in platform chrome (device family, launch
+# screen, watch bundle key). The Rust node behind them is the same archive,
+# sliced per platform by the xcframework.
 name: RlxDemo
 options:
   bundleIdPrefix: com.mit.rlx
+  # Match the deployment targets ios/build-xcframework.sh stamps into the Rust
+  # objects. iOS/tvOS 17.0 is where Metal gained native `bfloat` (MLX's kernels
+  # need it); watchOS 26.0 is where rustup's prebuilt `std` for
+  # aarch64-apple-watchos is compiled — see that script's header for both.
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "17.0"
+    tvOS: "17.0"
+    watchOS: "26.0"
+    visionOS: "1.0"
   createIntermediateGroups: true
+
+# ── shared build settings ────────────────────────────────────────────────────
+# A static archive carries no link directives, so every app target must name
+# what the Rust code needs: Accelerate for rlx-cpu's BLAS/LAPACK/vForce
+# (cblas_*, dgesvd_, vvexpf, ...), plus libresolv/libc++ for Rust std.
+settings:
+  base:
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/RlxDemo-Bridging-Header.h
+    # The C ABI header lives with the crate that defines it.
+    HEADER_SEARCH_PATHS:
+      - $(inherited)
+      - $(SRCROOT)/../../crates/bindings/rlx-ffi/include
+    OTHER_LDFLAGS:
+      - $(inherited)
+      - -framework
+      - Accelerate
+      - -lresolv
+      - -lc++
 
 targets:
   RlxDemo:
     type: application
     platform: iOS
-    sources:
+    sources: &demoSources
       - path: Sources
       # The shared Swift wrapper, compiled straight into the app so the demo
       # needs no SwiftPM resolution step.
       - path: ../Sources/RlxNode
-    dependencies:
+    dependencies: &demoDeps
       # Static archive: linked, not embedded.
       - framework: ../build/RlxNode.xcframework
         embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.mit.rlx.nodedemo
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/RlxDemo-Bridging-Header.h
-        # The C ABI header lives with the crate that defines it.
-        HEADER_SEARCH_PATHS:
-          - $(inherited)
-          - $(SRCROOT)/../../crates/bindings/rlx-ffi/include
-        # A static archive carries no link directives, so the app must name
-        # what the Rust code needs: Accelerate for rlx-cpu's BLAS/LAPACK/vForce
-        # (cblas_*, dgesvd_, vvexpf, ...), plus libresolv/libc++ for Rust std.
-        OTHER_LDFLAGS:
-          - $(inherited)
-          - -framework
-          - Accelerate
-          - -lresolv
-          - -lc++
         TARGETED_DEVICE_FAMILY: "1,2"
     info:
-      path: Sources/Info.plist
-      properties:
+      path: Info/iOS.plist
+      properties: &demoInfo
         CFBundleDisplayName: RLX Node
-        UILaunchScreen: {}
-        UISupportedInterfaceOrientations:
-          - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
-        # REQUIRED. Without this key iOS blocks LAN peer traffic — including
-        # plain TCP to a host:port — and the node silently reaches nothing.
+        # REQUIRED. Without this key the OS blocks LAN peer traffic —
+        # including plain TCP to a host:port — and the node silently reaches
+        # nothing. iOS, tvOS and visionOS all gate on it.
         NSLocalNetworkUsageDescription: >-
           Joins a nearby RLX compute cluster to share model execution.
         # Only needed for mDNS-based discovery (the `mdns` feature).
         NSBonjourServices:
           - _rlx-coord._udp
+
+  RlxDemoTV:
+    type: application
+    platform: tvOS
+    sources: *demoSources
+    dependencies: *demoDeps
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mit.rlx.nodedemo.tv
+        # Rust publishes no prebuilt std for the x86_64 tvOS/watchOS/visionOS
+        # simulators, so those xcframework slices are arm64-only and the app
+        # has to match — otherwise Xcode builds a fat simulator binary and the
+        # link drowns in `ignoring file ... found architecture 'arm64'`. On the
+        # watch this also pins arm64 over arm64_32.
+        ARCHS: arm64
+        TARGETED_DEVICE_FAMILY: "3"
+    info:
+      path: Info/tvOS.plist
+      properties: *demoInfo
+
+  RlxDemoVision:
+    type: application
+    platform: visionOS
+    sources: *demoSources
+    dependencies: *demoDeps
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mit.rlx.nodedemo.vision
+        # Rust publishes no prebuilt std for the x86_64 tvOS/watchOS/visionOS
+        # simulators, so those xcframework slices are arm64-only and the app
+        # has to match — otherwise Xcode builds a fat simulator binary and the
+        # link drowns in `ignoring file ... found architecture 'arm64'`. On the
+        # watch this also pins arm64 over arm64_32.
+        ARCHS: arm64
+        TARGETED_DEVICE_FAMILY: "7"
+    info:
+      path: Info/visionOS.plist
+      properties: *demoInfo
+
+  RlxDemoWatch:
+    type: application
+    platform: watchOS
+    sources: *demoSources
+    dependencies: *demoDeps
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mit.rlx.nodedemo.watch
+        # Rust publishes no prebuilt std for the x86_64 tvOS/watchOS/visionOS
+        # simulators, so those xcframework slices are arm64-only and the app
+        # has to match — otherwise Xcode builds a fat simulator binary and the
+        # link drowns in `ignoring file ... found architecture 'arm64'`. On the
+        # watch this also pins arm64 over arm64_32.
+        ARCHS: arm64
+        TARGETED_DEVICE_FAMILY: "4"
+    info:
+      path: Info/watchOS.plist
+      properties:
+        CFBundleDisplayName: RLX Node
+        # Single-target watch app (watchOS 7+): no companion iOS app, so the
+        # bundle has to say it is the application itself.
+        WKApplication: true
+        NSLocalNetworkUsageDescription: >-
+          Joins a nearby RLX compute cluster to share model execution.

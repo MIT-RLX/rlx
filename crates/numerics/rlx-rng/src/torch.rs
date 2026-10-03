@@ -79,6 +79,16 @@ impl RandomState {
     /// The rejection condition is `r2 >= 1.0 || r2 == 0.0`, and the returned
     /// variate is `f * x2` with `f * x1` cached. Returning `f*x1` first instead
     /// produces a valid Gaussian sequence that does not match numpy's.
+    ///
+    /// **`r2` is computed with a fused multiply-add.** numpy's C is
+    /// `r2 = x1*x1 + x2*x2`, and clang contracts that into
+    /// `fma(x1, x1, x2*x2)` within the statement (`-ffp-contract=on`, its default).
+    /// An unfused sum differs from numpy in the last bit of `r2` often enough to
+    /// matter: on seed 0 it diverges on 4 of the first 40 draws, always in pairs,
+    /// because both variates from a loop share `f`. The draws are still a valid
+    /// Gaussian stream either way — only the bit-exact match with
+    /// `np.random.RandomState(seed).normal(...)` is lost, which is the entire point
+    /// of this type.
     pub fn standard_normal(&mut self) -> f64 {
         if self.has_gauss {
             self.has_gauss = false;
@@ -87,7 +97,7 @@ impl RandomState {
         loop {
             let x1 = 2.0 * self.random_double() - 1.0;
             let x2 = 2.0 * self.random_double() - 1.0;
-            let r2 = x1 * x1 + x2 * x2;
+            let r2 = x1.mul_add(x1, x2 * x2);
             if r2 < 1.0 && r2 != 0.0 {
                 let f = (-2.0 * r2.ln() / r2).sqrt();
                 self.gauss = f * x1;
@@ -105,22 +115,59 @@ impl RandomState {
     }
 }
 
+impl RandomState {
+    /// One `torch.rand(...)` draw at torch's **default dtype, float32**.
+    ///
+    /// ATen's `uniform_real_distribution<float>` is
+    /// `(random() & ((1 << 24) - 1)) * 2^-24` — 24 bits, the float32 mantissa
+    /// width, out of one 32-bit word.
+    ///
+    /// **`torch.rand(n)` is float32 unless you ask otherwise**, and
+    /// `torch.rand(1, dtype=torch.float64)` consumes the stream differently and
+    /// returns a different value from the same seed (measured: 0.8822692632675171
+    /// vs 0.05815448596142969 at seed 42). Porting a `torch.rand(1).item()` call
+    /// site as an f64 draw gives plausible numbers that diverge immediately.
+    pub fn rand_f32(&mut self) -> f32 {
+        ((self.genrand_u32() & 0x00FF_FFFF) as f32) * (1.0f32 / 16_777_216.0)
+    }
+
+    /// `torch.rand(1).item()` — [`Self::rand_f32`] widened to `f64`, which is what
+    /// `.item()` hands back to Python. The value has a float32's precision; the
+    /// widening is exact.
+    pub fn rand(&mut self) -> f64 {
+        self.rand_f32() as f64
+    }
+
+    /// `torch.randperm(n)` **continuing this generator's stream**.
+    ///
+    /// Use this rather than [`randperm`] whenever the call site passes a
+    /// `torch.Generator` that has already been drawn from — torch's `randperm`
+    /// shares the generator with any preceding `rand`, so restarting from the seed
+    /// gives a different permutation (measured at seed 42, n=6:
+    /// `[5, 2, 4, 3, 0, 1]` continuing vs `[0, 3, 2, 4, 1, 5]` fresh).
+    pub fn randperm(&mut self, n: usize) -> Vec<usize> {
+        let mut r: Vec<usize> = (0..n).collect();
+        if n < 2 {
+            return r;
+        }
+        for i in 0..(n - 1) {
+            let z = (self.genrand_u32() as usize) % (n - i);
+            r.swap(i, z + i);
+        }
+        r
+    }
+}
+
 /// `torch.randperm(n)` after `torch.manual_seed(seed)`.
 ///
 /// Fisher–Yates walking FORWARD with `random() % (n - i)`, which is the
 /// direction torch uses; the more common backward variant consumes the same
 /// draws in a different order and yields a different permutation.
+///
+/// This starts a **fresh** generator. If the call site shares a generator with
+/// earlier draws, use [`RandomState::randperm`] instead.
 pub fn randperm(n: usize, seed: u32) -> Vec<usize> {
-    let mut r: Vec<usize> = (0..n).collect();
-    if n < 2 {
-        return r;
-    }
-    let mut g = RandomState::new(seed);
-    for i in 0..(n - 1) {
-        let z = (g.genrand_u32() as usize) % (n - i);
-        r.swap(i, z + i);
-    }
-    r
+    RandomState::new(seed).randperm(n)
 }
 
 /// The reference's `_get_subsample_indices`: the first `k` of a permutation.

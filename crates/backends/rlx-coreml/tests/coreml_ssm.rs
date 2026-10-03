@@ -4,7 +4,7 @@
 // State-space ops (Mamba selective scan, Qwen3.5 gated delta-net), lowered
 // by unrolling over the sequence. Verified against the CPU backend — the
 // reference executor — through the public Session API.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session};

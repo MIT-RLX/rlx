@@ -99,10 +99,14 @@ fn mid_chain_half_cast_rounds_before_the_next_step() {
     );
 }
 
-/// A region whose operands are *packed* F16 (2 bytes/lane, as
-/// `plan_memory_native_in_order` assigns them) must address them at their real
-/// width. Reading a fixed 4-byte f32 lane out of a packed half tensor walks off
-/// by a factor of two and returns garbage; writing one overruns the slot.
+/// A region whose operands are *packed* F16 (2 bytes/lane) must address them at
+/// their real width. Reading a fixed 4-byte f32 lane out of a packed half tensor
+/// walks off by a factor of two and returns garbage; writing one overruns the slot.
+///
+/// Planned with an explicit `Native` policy: the CPU's own planner widens half
+/// ACTIVATIONS to 4 B (`ArenaWidthPolicy::NativeHalfWidened`, because the thunks
+/// compute in f32), so a graph input no longer lands packed. Packed half operands
+/// still reach regions as `Param` weights, which is the branch under test here.
 #[test]
 fn packed_f16_region_reads_and_writes_half_lanes() {
     use rlx_ir::op::BinaryOp;
@@ -127,8 +131,8 @@ fn packed_f16_region_reads_and_writes_half_lanes() {
     );
     g.set_outputs(vec![region]);
 
-    // Native widths: this is the plan the CPU backend actually runs.
-    let plan = rlx_opt::memory::plan_memory_native_in_order(&g, 64);
+    let plan =
+        rlx_opt::memory::plan_memory_with_policy(&g, 64, rlx_opt::memory::ArenaWidthPolicy::Native);
     let mut arena = Arena::from_plan(plan);
     let sched = compile_thunks(&g, &arena);
 

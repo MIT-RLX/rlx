@@ -186,6 +186,9 @@ struct LowerCtx<'a> {
     /// Lowered as `gather` rather than `slice_by_size` — see the note in the
     /// `Op::Narrow` arm.
     narrow_needs_gather: std::collections::HashSet<u32>,
+    /// Narrows MPSGraph miscompiles even as a gather — the lowering refuses
+    /// rather than emitting a module that aborts the process.
+    narrow_unsupported: std::collections::HashSet<u32>,
     blob: crate::mlpackage::BlobWriter,
     /// Prefix for generated `v{id}` value names. Empty at the top level; set to a
     /// scan-unique string while lowering an `Op::Scan` body into a nested
@@ -225,20 +228,87 @@ mod ssm;
 /// when the sliced axis is last, and it leaves the parent feeding consumers at
 /// two different ranks, which breaks a later `add`).
 ///
-/// A `gather` was tried as a third escape — it is not a view, so the slice-fold
-/// should not apply. MPSGraph folded through that too, reporting the reshape's
-/// input as `2x528x936`: it treats slice AND gather alike as aliases and pushes
-/// the reshape onto the root. There is no MIL-level spelling of this that
-/// survives, so the lowering refuses instead of emitting a module that aborts.
+/// A `gather` is the escape actually used: the offsets live in an index tensor
+/// rather than in slice attributes, so there is nothing for the reshape to
+/// absorb. See the `Op::Narrow`/`narrow_needs_gather` arm in `lower_op`.
+///
+/// **The reshape need not consume the narrow directly**, and the distinction
+/// decides whether the gather escape works:
+///
+/// * `Reshape(Narrow(x))` — gather survives. This is the moabb-decoder shape
+///   the escape was added for.
+/// * `Reshape(elementwise…(Narrow(x)))` — gather does **not** survive.
+///   MPSGraph folds through the elementwise op and then through the gather,
+///   and still rewrites the reshape onto the root. Verified on Qwen3.5's
+///   Gated DeltaNet prologue (one fused projection narrowed into q/k/v, z and
+///   beta, each through `sigmoid`/`softplus` before being reshaped to
+///   `[batch, seq, …]`): with the gather emitted, MPS still reports the
+///   reshape's input as `4x16x8208`.
+///
+/// So the two are separated: the direct shape takes the gather, the indirect
+/// shape is refused. Refusing is strictly better than what happened before,
+/// which was emitting a module that fails MPSGraph verification and calls
+/// `abort()` from `MPSGraphExecutable` — uncatchable, so no caller could even
+/// report it, let alone fall back to another device.
+/// Follow `id` back through single-input, shape-preserving ops (activations,
+/// unary maths, same-shape casts) and return the `Op::Narrow` at the root, if
+/// any.
+///
+/// Shape-preserving is the whole safety condition: if every hop has the same
+/// shape as the narrow's output, then reshaping after the chain is equivalent
+/// to reshaping immediately after the narrow, which is the rewrite MPSGraph
+/// performs — and mis-performs.
+fn walk_to_narrow(graph: &Graph, id: NodeId) -> Option<NodeId> {
+    let mut cur = id;
+    // Bounded so a malformed graph cannot spin here.
+    for _ in 0..16 {
+        let node = graph.node(cur);
+        if matches!(node.op, Op::Narrow { .. }) {
+            return Some(cur);
+        }
+        if node.inputs.len() != 1 {
+            return None;
+        }
+        let parent = node.inputs[0];
+        if graph.shape(parent) != graph.shape(cur) {
+            return None;
+        }
+        cur = parent;
+    }
+    None
+}
+
 fn narrow_nodes_feeding_reshape(graph: &Graph) -> std::collections::HashSet<u32> {
+    narrow_nodes_feeding_reshape_inner(graph, false)
+}
+
+/// The same miscompile, but with a shape-preserving elementwise chain between
+/// the narrow and the reshape — where the gather escape does not help.
+fn narrow_nodes_miscompiled_through_elementwise(graph: &Graph) -> std::collections::HashSet<u32> {
+    narrow_nodes_feeding_reshape_inner(graph, true)
+}
+
+fn narrow_nodes_feeding_reshape_inner(
+    graph: &Graph,
+    indirect_only: bool,
+) -> std::collections::HashSet<u32> {
     let mut out = std::collections::HashSet::new();
     for node in graph.nodes() {
         let Op::Reshape { new_shape } = &node.op else {
             continue;
         };
-        let Some(&src) = node.inputs.first() else {
+        let Some(&first) = node.inputs.first() else {
             continue;
         };
+        let Some(src) = walk_to_narrow(graph, first) else {
+            continue;
+        };
+        if indirect_only && src == first {
+            continue; // direct: the gather escape handles it
+        }
+        if !indirect_only && src != first {
+            continue; // indirect: gather does not survive, handled separately
+        }
         let Op::Narrow { axis, start, len } = graph.node(src).op else {
             continue;
         };
@@ -292,6 +362,7 @@ impl<'a> LowerCtx<'a> {
             used_feature_names: HashMap::new(),
             numeric_casts: HashMap::new(),
             narrow_needs_gather: narrow_nodes_feeding_reshape(graph),
+            narrow_unsupported: narrow_nodes_miscompiled_through_elementwise(graph),
             blob: crate::mlpackage::BlobWriter::new(),
             name_prefix: String::new(),
         }
@@ -727,6 +798,25 @@ impl<'a> LowerCtx<'a> {
                     ],
                 )?;
                 self.push_named(id, out_name, op);
+            }
+            Op::Narrow { axis, start, len } if self.narrow_unsupported.contains(&id.0) => {
+                // Reshape(elementwise…(Narrow(x, start != 0))) on the last
+                // axis. MPSGraph rewrites the reshape onto the narrow's parent
+                // and drops the offset, then fails module verification and
+                // calls abort() — which no caller can catch. The gather escape
+                // used for the direct Reshape(Narrow) shape does not survive
+                // the elementwise hop (verified: MPS folds through gather too).
+                //
+                // Fail the compile instead, so the caller gets a named reason
+                // and can pick another device.
+                return Err(CoremlError::Unsupported(format!(
+                    "Narrow(axis={axis}, start={start}, len={len}) feeding a Reshape \
+                     through an elementwise op (node {}): MPSGraph miscompiles this \
+                     shape and aborts the process during module verification. \
+                     Qwen3.5-style Gated DeltaNet trunks hit this; use \
+                     cpu/metal/mlx for such models.",
+                    id.0
+                )));
             }
             Op::Narrow { axis, start, len } if self.narrow_needs_gather.contains(&id.0) => {
                 // MPSGraph mis-lowers `Reshape(Slice(x))` in this exact shape: it
@@ -1946,3 +2036,73 @@ impl<'a> LowerCtx<'a> {
 // --------------------------------------------------------------------------
 // proto builders
 // --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod narrow_fold_tests {
+    use super::*;
+    use rlx_ir::infer::GraphExt;
+    use rlx_ir::{DType, Shape};
+
+    /// `[512, 8208] -> narrow(axis 1, 8192, 16) -> [optional elementwise] ->
+    /// reshape [4, 128, 16]` — the Qwen3.5 Gated DeltaNet prologue.
+    fn gdn_prologue(with_elementwise: bool) -> (Graph, u32) {
+        let mut g = Graph::new("t");
+        let x = g.input("x", Shape::new(&[512, 8208], DType::F32));
+        let n = g.narrow_(x, 1, 8192, 16);
+        let feed = if with_elementwise { g.sigmoid(n) } else { n };
+        let out = g.reshape_(feed, vec![4, 128, 16]);
+        g.set_outputs(vec![out]);
+        (g, n.0)
+    }
+
+    /// Direct `Reshape(Narrow)` keeps the gather escape, which works.
+    #[test]
+    fn direct_reshape_of_narrow_takes_the_gather_path() {
+        let (g, narrow) = gdn_prologue(false);
+        assert!(narrow_nodes_feeding_reshape(&g).contains(&narrow));
+        assert!(!narrow_nodes_miscompiled_through_elementwise(&g).contains(&narrow));
+    }
+
+    /// With an elementwise op between, MPSGraph folds through the gather too,
+    /// so the lowering must refuse rather than emit an aborting module.
+    #[test]
+    fn reshape_through_an_elementwise_op_is_unsupported_not_gathered() {
+        let (g, narrow) = gdn_prologue(true);
+        assert!(
+            !narrow_nodes_feeding_reshape(&g).contains(&narrow),
+            "the gather escape does not survive the elementwise hop"
+        );
+        assert!(
+            narrow_nodes_miscompiled_through_elementwise(&g).contains(&narrow),
+            "the indirect shape must be detected"
+        );
+    }
+
+    /// Offset 0 is sound — the fold drops nothing — and must stay on the fast
+    /// path. Refusing it would break working models.
+    #[test]
+    fn offset_zero_is_never_flagged() {
+        let mut g = Graph::new("t");
+        let x = g.input("x", Shape::new(&[512, 8208], DType::F32));
+        let n = g.narrow_(x, 1, 0, 16);
+        let s = g.sigmoid(n);
+        let out = g.reshape_(s, vec![4, 128, 16]);
+        g.set_outputs(vec![out]);
+        assert!(narrow_nodes_feeding_reshape(&g).is_empty());
+        assert!(narrow_nodes_miscompiled_through_elementwise(&g).is_empty());
+    }
+
+    /// The walk must stop at ops that change shape, or it would flag narrows
+    /// whose reshape has nothing to do with them.
+    #[test]
+    fn the_walk_stops_at_a_shape_changing_op() {
+        let mut g = Graph::new("t");
+        let x = g.input("x", Shape::new(&[512, 8208], DType::F32));
+        let n = g.narrow_(x, 1, 8192, 16);
+        // A reshape in between changes the shape, so the chain is broken.
+        let mid = g.reshape_(n, vec![8192]);
+        let out = g.reshape_(mid, vec![4, 128, 16]);
+        g.set_outputs(vec![out]);
+        assert!(narrow_nodes_miscompiled_through_elementwise(&g).is_empty());
+    }
+}

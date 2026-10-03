@@ -54,6 +54,13 @@ pub struct CompileCache {
     entries: Vec<(u64, CompiledGraph)>,
     // Insertion order for eviction.
     order: VecDeque<u64>,
+    /// Key of the entry whose uploaded weight buffer other entries retain.
+    ///
+    /// Entries here are the *same model at different shapes* — a prefill graph
+    /// per prompt length — so they want identical weights. Uploading per entry
+    /// costs a full copy each, which for an f32 0.6B model measured ~4.6 GB per
+    /// prefill graph against 2.4 GB of actual weights.
+    weight_donor: Option<u64>,
 }
 
 impl CompileCache {
@@ -76,6 +83,7 @@ impl CompileCache {
             policy,
             entries: Vec::with_capacity(capacity),
             order: VecDeque::with_capacity(capacity),
+            weight_donor: None,
         }
     }
 
@@ -112,10 +120,104 @@ impl CompileCache {
         {
             sync_evicted_entry(&mut self.entries, evict_key);
             self.entries.retain(|(k, _)| *k != evict_key);
+            if self.weight_donor == Some(evict_key) {
+                // The buffer itself survives as long as a sharer holds it; what
+                // must not survive is the key, or a later entry would try to
+                // share from an entry that is gone.
+                self.weight_donor = None;
+            }
         }
         self.entries.push((key, compiled));
         self.order.push_back(key);
         &mut self.entries.last_mut().unwrap().1
+    }
+
+    /// Compile `key` if absent, then give it weights — retaining another entry's
+    /// uploaded buffer when the layout matches, and uploading `params` only when
+    /// it does not.
+    ///
+    /// The point of the cache is holding several shapes of one model at once, so
+    /// without sharing its own hit rate is what costs the memory: each extra
+    /// prompt length is another full copy of the weights, host and device.
+    pub fn ensure_with_params(
+        &mut self,
+        key: u64,
+        graph: Graph,
+        params: &HashMap<String, Vec<f32>>,
+        options: &crate::CompileOptions,
+    ) -> &mut CompiledGraph {
+        if self.contains(key) {
+            return self.get_or_compile_with_options(
+                key,
+                || unreachable!("checked present"),
+                options,
+            );
+        }
+        self.get_or_compile_with_options(key, || graph, options);
+        // Only from a *different* entry: sharing with itself would report success
+        // and skip the upload, leaving a graph with no weights.
+        let has_other = self.entries.iter().any(|(k, _)| *k != key);
+        if has_other && self.try_share_params_from_donor(key) {
+            self.weight_donor.get_or_insert(key);
+            return self.get_or_compile_with_options(
+                key,
+                || unreachable!("compiled above"),
+                options,
+            );
+        }
+        let compiled =
+            self.get_or_compile_with_options(key, || unreachable!("compiled above"), options);
+        for (name, data) in params {
+            compiled.set_param(name, data);
+        }
+        self.weight_donor.get_or_insert(key);
+        self.get_or_compile_with_options(key, || unreachable!("compiled above"), options)
+    }
+
+    /// Retain another entry's weight buffer for `dst_key`. False when there is no
+    /// compatible entry and the caller must upload.
+    pub fn try_share_params_from_donor(&mut self, dst_key: u64) -> bool {
+        if rlx_ir::env::var("RLX_METAL_NO_SHARE").is_some() {
+            return false;
+        }
+        let mut candidates: Vec<u64> = Vec::new();
+        if let Some(d) = self.weight_donor.filter(|d| *d != dst_key) {
+            candidates.push(d);
+        }
+        for (k, _) in &self.entries {
+            if *k != dst_key && !candidates.contains(k) {
+                candidates.push(*k);
+            }
+        }
+        for src_key in candidates {
+            if self.try_share_params_between(dst_key, src_key) {
+                self.weight_donor = Some(src_key);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn try_share_params_between(&mut self, dst_key: u64, src_key: u64) -> bool {
+        if dst_key == src_key {
+            return false;
+        }
+        let dst_idx = self.entries.iter().position(|(k, _)| *k == dst_key);
+        let src_idx = self.entries.iter().position(|(k, _)| *k == src_key);
+        let (Some(dst_idx), Some(src_idx)) = (dst_idx, src_idx) else {
+            return false;
+        };
+        if dst_idx == src_idx {
+            return false;
+        }
+        let (dst, src) = if dst_idx < src_idx {
+            let (left, right) = self.entries.split_at_mut(src_idx);
+            (&mut left[dst_idx].1, &right[0].1)
+        } else {
+            let (left, right) = self.entries.split_at_mut(dst_idx);
+            (&mut right[0].1, &left[src_idx].1)
+        };
+        dst.share_params_from(src)
     }
 
     /// Like [`Self::get_or_compile_with_options`] but builds and compiles HIR directly.
@@ -141,6 +243,12 @@ impl CompileCache {
         {
             sync_evicted_entry(&mut self.entries, evict_key);
             self.entries.retain(|(k, _)| *k != evict_key);
+            if self.weight_donor == Some(evict_key) {
+                // The buffer itself survives as long as a sharer holds it; what
+                // must not survive is the key, or a later entry would try to
+                // share from an entry that is gone.
+                self.weight_donor = None;
+            }
         }
         self.entries.push((key, compiled));
         self.order.push_back(key);
@@ -926,12 +1034,40 @@ impl BucketedCompileCache {
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
             }
-            let mut compiled = session.compile_with(graph, options);
-            for (name, data) in params {
-                compiled.set_param(&name, &data);
-            }
+            let compiled = session.compile_with(graph, options);
             self.buckets[idx].compiled = Some(compiled);
-            self.buckets[idx].resident_bytes = bytes;
+            // Every bucket of a model compiles from the same weights and differs
+            // only in its KV extent, so retaining a sibling's uploaded buffer
+            // beats uploading another copy: one buffer backs them all. Without
+            // this, a decode that climbs the ladder holds a full set of weights
+            // per rung — for a 0.6B f32 model that was ~10 GB of duplicates.
+            //
+            // Done here rather than at each call site because every caller of
+            // this method wants it; `rlx-llama32` and `rlx-qwen35` had to
+            // hand-roll compile-then-share to get it, and `rlx-qwen3` simply
+            // never did.
+            // Only share from a *different* bucket: `try_share_params_between_uppers`
+            // short-circuits to true when source and destination match, so a
+            // stale self-referential donor would skip the upload and leave this
+            // graph with no weights at all.
+            let has_other_donor = self
+                .buckets
+                .iter()
+                .enumerate()
+                .any(|(i, b)| i != idx && b.compiled.is_some());
+            if has_other_donor && self.try_share_params_from_donor(upper) {
+                // Shared: no private weights, so this bucket is not "large" for
+                // eviction purposes — which also keeps the donor from being
+                // evicted on behalf of a bucket that is aliasing it.
+                self.buckets[idx].resident_bytes = 0;
+            } else {
+                let compiled = self.buckets[idx].compiled.as_mut().expect("just inserted");
+                for (name, data) in params {
+                    compiled.set_param(&name, &data);
+                }
+                self.buckets[idx].resident_bytes = bytes;
+            }
+            self.set_weight_donor(upper);
         }
         self.touch(idx);
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))

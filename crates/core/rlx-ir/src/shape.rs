@@ -554,8 +554,31 @@ pub fn transpose_shape(input: &Shape, perm: &[usize]) -> Result<Shape, String> {
 
 /// Narrow: slice along one axis.
 pub fn narrow_shape(input: &Shape, axis: usize, len: usize) -> Result<Shape, String> {
+    narrow_shape_at(input, axis, 0, len)
+}
+
+/// [`narrow_shape`], validating the window against the axis.
+///
+/// `start + len` past the axis produced a *larger* output shape than the input
+/// with no complaint — `[2, 3]` narrowed to `len` 9 inferred `[2, 9]`, which
+/// compiles, passes `check`, and reads out of bounds at execution. The window
+/// has to be checked where `start` is known, and only the builder knows it.
+pub fn narrow_shape_at(
+    input: &Shape,
+    axis: usize,
+    start: usize,
+    len: usize,
+) -> Result<Shape, String> {
     if axis >= input.rank() {
         return Err(format!("axis {axis} >= rank {}", input.rank()));
+    }
+    // A dynamic axis has no bound to check against at build time.
+    if let Dim::Static(extent) = input.dim(axis) {
+        if start + len > extent {
+            return Err(format!(
+                "narrow: window start {start} + len {len} exceeds axis {axis} extent {extent}"
+            ));
+        }
     }
     Ok(input.clone().with_dim(axis, Dim::Static(len)))
 }

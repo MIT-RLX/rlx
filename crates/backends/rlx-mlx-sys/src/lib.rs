@@ -7,12 +7,11 @@
 //!
 //! Higher-level graph lowering lives in [`rlx-mlx`](../rlx-mlx).
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "linux",
-    target_os = "windows",
-    target_os = "ios"
-))]
+// `rlx_mlx_host` is set by this crate's own build.rs — the one place that
+// decides whether libmlx was cross-compiled at all. Gating on it rather than on
+// a repeated `target_os` list is what keeps this module from disagreeing with
+// the archive that is (or is not) there to link against.
+#[cfg(rlx_mlx_host)]
 pub mod ffi;
 
 /// Ensures this crate is linked so `build.rs` native artifacts propagate.

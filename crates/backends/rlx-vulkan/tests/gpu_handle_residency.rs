@@ -14,6 +14,8 @@ use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 
+mod common;
+
 fn approx(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6)
 }
@@ -28,6 +30,7 @@ fn s(dims: &[usize]) -> Shape {
 /// the accumulator would not advance and the asserts would fail.
 #[test]
 fn resident_handle_accumulates_across_runs() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         eprintln!("rlx-vulkan: no device — skipping residency test");
         return;
@@ -85,6 +88,7 @@ fn resident_handle_accumulates_across_runs() {
 /// not the previously accumulated resident value.
 #[test]
 fn rebind_reseeds_resident_handle() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }
@@ -121,6 +125,7 @@ fn rebind_reseeds_resident_handle() {
 /// resident `past` slot at the active position — leaving the prefix untouched.
 #[test]
 fn row_feed_appends_new_token_into_resident_slot() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }

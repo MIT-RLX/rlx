@@ -496,7 +496,8 @@ impl GraphExt for Graph {
     }
 
     fn narrow_(&mut self, x: NodeId, axis: usize, start: usize, len: usize) -> NodeId {
-        let s = shape::narrow_shape(self.shape(x), axis, len).expect("narrow shape inference");
+        let s = shape::narrow_shape_at(self.shape(x), axis, start, len)
+            .expect("narrow shape inference");
         self.add_node(Op::Narrow { axis, start, len }, vec![x], s)
     }
 

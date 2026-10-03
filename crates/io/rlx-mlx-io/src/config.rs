@@ -116,6 +116,20 @@ pub struct MlxArchConfig {
 }
 
 impl MlxArchConfig {
+    /// Whether this architecture applies RMSNorm to Q and K per head before
+    /// RoPE.
+    ///
+    /// Qwen3 does; Llama, Mistral and the rest do not. There is no config
+    /// field for it — the checkpoint simply carries
+    /// `self_attn.q_norm.weight` / `k_norm.weight` — so the architecture name
+    /// is the signal. Getting this wrong is silent: attention still runs and
+    /// still produces tokens, they are just wrong.
+    pub fn uses_qk_norm(&self) -> bool {
+        self.model_type.starts_with("qwen3")
+    }
+}
+
+impl MlxArchConfig {
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads.max(1))

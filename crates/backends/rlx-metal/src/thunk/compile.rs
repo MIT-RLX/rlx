@@ -1126,6 +1126,14 @@ impl ThunkSchedule {
                     // (A widened U8/I8 tensor arrives as src_dtype==F32, excluded here;
                     // a Custom-op operand keeps its dtype but its literal bytes are
                     // likewise packed, so the true-width host read stays correct.)
+                    // Is a BF16 side of this cast stored f32-wide? Under
+                    // `ArenaWidthPolicy::NativeBf16Widened` a bf16 ACTIVATION gets a
+                    // 4 B/elem slot (Metal has no `bfloat` kernels, so everything
+                    // downstream reads it as f32), while a bf16 *Param* stays packed.
+                    let wide =
+                        |id: rlx_ir::NodeId| arena.has_buffer(id) && arena.bytes_per_elem(id) >= 4;
+                    let bf16_wide_cast_src = src_dtype == DType::BF16 && wide(node.inputs[0]);
+                    let bf16_wide_cast_dst = out_dtype == DType::BF16 && wide(node.id);
                     let packed_int_src = matches!(src_dtype, DType::U8 | DType::I8)
                         && matches!(
                             graph.node(node.inputs[0]).op,
@@ -1154,6 +1162,28 @@ impl ThunkSchedule {
                             len: len as u32,
                             src_dt: src_dtype,
                             dst_dt: DType::F32,
+                        }
+                    } else if bf16_wide_cast_src || bf16_wide_cast_dst {
+                        // BF16 with an f32-WIDE slot: there is nothing to pack.
+                        // Casting *to* bf16 rounds the mantissa in place (the
+                        // precision the policy asked for); casting *from* it is a
+                        // plain copy. Falling through to `CastHost` here would
+                        // decode the 4 B f32 words as packed bf16 pairs — the
+                        // AutoMixedBf16 NaN: every odd element survived and every
+                        // even one came back as mantissa junk.
+                        if bf16_wide_cast_dst {
+                            Thunk::RoundBf16 {
+                                src: off(node.inputs[0]),
+                                dst: off(node.id),
+                                len: len as u32,
+                            }
+                        } else {
+                            Thunk::Copy {
+                                src: off(node.inputs[0]),
+                                dst: off(node.id),
+                                len: len as u32,
+                                dt: HalfFlag::F32,
+                            }
                         }
                     } else {
                         let half_ok = matches!(
@@ -1970,7 +2000,21 @@ impl ThunkSchedule {
                         mask_kind: mask_kind_u32,
                         window,
                         dt: node.shape.dtype().into(),
-                        kv_f16: graph.node(node.inputs[1]).shape.dtype() == rlx_ir::DType::F16,
+                        // `kv_f16` means "an F16-RESIDENT KV CACHE against an
+                        // f32 query", which is what `sdpa_decode_m1_f16kv`
+                        // implements: K/V are read as `half`, while Q, the
+                        // accumulator and the output stay f32. It is NOT "K
+                        // happens to be tagged F16".
+                        //
+                        // Under a whole-graph f16 precision policy the attention
+                        // node itself is F16, so Q and the output are f16 as
+                        // well — and that kernel then read Q as f32 from f16
+                        // bytes and wrote f32 into an f16-sized slot. The output
+                        // came back as 256/256 exact zeros, silently. Require the
+                        // op's own dtype to still be f32 before claiming the
+                        // mixed KV-cache layout.
+                        kv_f16: graph.node(node.inputs[1]).shape.dtype() == rlx_ir::DType::F16
+                            && node.shape.dtype() == rlx_ir::DType::F32,
                         bhsd,
                         score_scale: score_scale.unwrap_or(0.0),
                         attn_logit_softcap: attn_logit_softcap.unwrap_or(0.0),
@@ -4845,18 +4889,45 @@ impl ThunkSchedule {
         rewrite_dense_binary_broadcast(&mut thunks);
         let output_offsets: std::collections::HashSet<usize> =
             graph.outputs.iter().map(|&id| off(id)).collect();
-        fuse_decode_mlp_combined_gate_up(&mut thunks, &output_offsets);
+        // Per-offset IR use counts, so the thunk fusions below can tell "two
+        // readers, both inside the window I am fusing" (legitimate: one combined
+        // matmul feeding two narrows) from "a reader after the window" (the
+        // Qwen3.5 BACKWARD re-reading a recomputed forward value). Their own
+        // liveness scan is bounded at the fused window on purpose — a full scan
+        // hits an opaque thunk and rejects — so it cannot see the latter.
+        let uses_at: crate::thunk::UsesAtOffset = {
+            let mut uses: std::collections::HashMap<rlx_ir::NodeId, usize> =
+                std::collections::HashMap::new();
+            for n in graph.nodes() {
+                for i in &n.inputs {
+                    *uses.entry(*i).or_default() += 1;
+                }
+            }
+            let mut at: crate::thunk::UsesAtOffset = std::collections::HashMap::new();
+            for n in graph.nodes() {
+                if !arena.has_buffer(n.id) {
+                    continue;
+                }
+                let c = uses.get(&n.id).copied().unwrap_or(0);
+                // Arena reuse can put several nodes at one offset; take the max,
+                // which over-protects rather than under-protects.
+                let e = at.entry(off(n.id)).or_insert(0);
+                *e = (*e).max(c);
+            }
+            at
+        };
+        fuse_decode_mlp_combined_gate_up(&mut thunks, &output_offsets, &uses_at);
         fuse_narrow_clusters(&mut thunks);
 
         // Fused decode-layer MLP (m == 1 packed SwiGLU/GeGLU). Off-switch:
         // RLX_METAL_FUSE_DECODE=0. Output offsets stay live (never fused away).
-        fuse_decode_mlp(&mut thunks, &output_offsets);
-        fuse_gdn_gated_norm(&mut thunks, &output_offsets);
+        fuse_decode_mlp(&mut thunks, &output_offsets, &uses_at);
+        fuse_gdn_gated_norm(&mut thunks, &output_offsets, &uses_at);
         // ggml L2_NORM: 6 thunks → 1, twice per Gated-DeltaNet layer.
         // Off-switch: RLX_METAL_FUSE_L2NORM=0.
-        fuse_l2_norm(&mut thunks, &output_offsets);
-        fuse_depthwise_conv1d_bsc(&mut thunks, &output_offsets);
-        fuse_residual_rms_norm(&mut thunks, &output_offsets);
+        fuse_l2_norm(&mut thunks, &output_offsets, &uses_at);
+        fuse_depthwise_conv1d_bsc(&mut thunks, &output_offsets, &uses_at);
+        fuse_residual_rms_norm(&mut thunks, &output_offsets, &uses_at);
 
         Self {
             thunks,

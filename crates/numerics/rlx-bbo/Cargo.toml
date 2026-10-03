@@ -17,7 +17,7 @@ categories.workspace    = true
 rlx-ir      = { workspace = true }
 rlx-opt     = { workspace = true, features = ["training"] }
 rlx-optim   = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.16", default-features = false, features = ["cpu"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.17", default-features = false, features = ["cpu"] }
 rand       = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 rand_distr = { version = "0.4", default-features = false, features = ["std_math"] }
 serde      = { version = "1", features = ["derive"] }

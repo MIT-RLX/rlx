@@ -26,6 +26,8 @@
 use rlx_ir::{DType, Graph, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 
+mod common;
+
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
@@ -70,6 +72,7 @@ const SHAPES: &[(usize, usize, usize)] = &[
 
 #[test]
 fn every_emitted_schedule_matches_the_shipping_kernel_bit_for_bit() {
+    let _gpu = common::serialize_gpu();
     if rlx_vulkan::device::vulkan_device().is_none() {
         eprintln!("no Vulkan device; skipping");
         return;
@@ -119,6 +122,7 @@ fn every_emitted_schedule_matches_the_shipping_kernel_bit_for_bit() {
 /// believes its output.
 #[test]
 fn the_scheduled_kernel_name_is_memoized_for_the_process() {
+    let _gpu = common::serialize_gpu();
     use rlx_vulkan::kernel_schedule_emit::scheduled_kernel_name;
     rlx_ir::env::set("RLX_VULKAN_SCHEDULE_MATMUL", "pipelined:3");
     let first = scheduled_kernel_name();
@@ -136,6 +140,7 @@ fn the_scheduled_kernel_name_is_memoized_for_the_process() {
 /// before any rig time is spent.
 #[test]
 fn every_generated_name_resolves_and_compiles() {
+    let _gpu = common::serialize_gpu();
     use rlx_vulkan::kernel_schedule_emit::{SHIPPING_TS, device_target, spirv_for_name};
     for name in [
         "matmul_sched_serial",
@@ -161,6 +166,7 @@ fn every_generated_name_resolves_and_compiles() {
 /// they differ from the portable floor in the ways a real device must.
 #[test]
 fn the_vulkan_target_is_read_off_the_device() {
+    let _gpu = common::serialize_gpu();
     use rlx_ir::kernel_schedule::{Features, Target};
     use rlx_vulkan::kernel_schedule_emit::device_target;
 

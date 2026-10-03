@@ -14,7 +14,21 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [features]
-default = ["cpu"]
+default = ["cpu", "model-io"]
+
+# On-disk model containers: `.rlxp` packages, MLX weight dirs / `.npz`, and
+# HuggingFace `.dduf`. In `default` so nothing that takes the defaults notices,
+# but separable — a distributed **node** receives its stage over the wire and
+# never opens a model file, and these three crates drag in the whole archive
+# stack (zip ×2, zstd, bzip2, flate2, zopfli, npyz, safetensors, serde_yaml,
+# aes/sha1/sha2/pbkdf2, and pest + num-bigint via the NeMo pickle reader).
+# Dropping them is what lets `rlx-ffi`'s Apple/embedded archive stay a compute
+# artifact instead of a file-format library.
+#
+# `gguf://`, `safetensors://` and `file://` weight URIs keep working without
+# it: rlx-gguf is small and its quant kernels back `quantized_kv`, and the
+# safetensors reader here is a 40-line header parse, not the crate.
+model-io = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf"]
 
 # ── CPU backends ─────────────────────────────────────────────
 # Base CPU with SIMD kernels (NEON/AVX) + persistent thread pool
@@ -217,11 +231,11 @@ anyhow = "1"
 inventory = "0.3"
 memmap2 = { version = "0.9", optional = true }
 rlx-gguf = { workspace = true }
-rlx-pkg = { workspace = true }
-rlx-mlx-io = { workspace = true }
-rlx-dduf = { workspace = true }
-# rlx-gpu = { path = "../rlx-gpu", version = "0.2.16", optional = true }
-# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.16", optional = true }
+rlx-pkg = { workspace = true, optional = true }
+rlx-mlx-io = { workspace = true, optional = true }
+rlx-dduf = { workspace = true, optional = true }
+# rlx-gpu = { path = "../rlx-gpu", version = "0.2.17", optional = true }
+# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.17", optional = true }
 
 # rlx-metal is Apple-only (Metal is an Apple API). Make it a dependency solely on
 # Apple targets — excluding watchOS, which has no Metal compute — so the `metal`
@@ -255,7 +269,7 @@ rlx-flow = { workspace = true }
 rayon = "1"
 rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.16", default-features = false, features = ["test-support", "io"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.17", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # `metal`/`mlx` are enabled ONLY on macOS (see the target-specific
 # dev-dependencies below) — those backends exist solely on Apple, and on a

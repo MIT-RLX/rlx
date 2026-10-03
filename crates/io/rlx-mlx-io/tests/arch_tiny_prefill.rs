@@ -117,9 +117,12 @@ fn tiny_llama_prefill_cpu() {
     let tokens_i32: Vec<i32> = (0..batch * seq)
         .map(|i| (i % arch.vocab_size) as i32)
         .collect();
-    let token_bytes: Vec<u8> = tokens_i32.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let token_bytes: Vec<u8> = tokens_i32
+        .iter()
+        .flat_map(|t| (*t as f32).to_le_bytes())
+        .collect();
     let out = c
-        .run_typed(&[("tokens", token_bytes.as_slice(), rlx_ir::DType::I32)])
+        .run_typed(&[("tokens", token_bytes.as_slice(), rlx_ir::DType::F32)])
         .remove(0);
     assert_eq!(out.1, rlx_ir::DType::F32);
     let logits: Vec<f32> = out

@@ -4,6 +4,7 @@
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 ![rust](https://img.shields.io/badge/rust-edition%202024-orange)
 [![repo](https://img.shields.io/badge/github-MIT--RLX%2Frlx-black)](https://github.com/MIT-RLX/rlx)
+[![arXiv](https://img.shields.io/badge/arXiv-2609.37916-b31b1b)](https://arxiv.org/abs/2609.37916)
 
 RLX is an ML compiler and runtime for neural-network inference **and**
 training. At its core is a small, serializable tensor IR with JAX-shaped
@@ -17,6 +18,10 @@ from ONNX, PyTorch (`torch.export`), and GGUF / safetensors; does
 quantization (GGUF K/IQ/TQ/MX, INT8/INT4, QAT) and multi-node distributed
 execution; and keeps the core model-agnostic — model crates live in
 sibling repos.
+
+The design, IR, and cross-backend benchmarks are written up in
+[*RLX: A Unified Multi-Backend Tensor Compiler and Distributed Runtime in
+Rust*](https://arxiv.org/abs/2609.37916) (arXiv:2609.37916).
 
 ## Table of Contents
 
@@ -91,10 +96,10 @@ rlx = { version = "0.2", features = ["cpu", "metal"] }
 | feature             | backend                              | platform                  |
 |---------------------|--------------------------------------|---------------------------|
 | `cpu` *(default)*   | NEON / AVX + Accelerate / OpenBLAS   | every host                |
-| `metal`             | Metal Performance Shaders + MSL      | macOS (Apple Silicon)     |
-| `mlx`               | Apple MLX (vendored)                 | macOS (Apple Silicon)     |
+| `metal`             | Metal Performance Shaders + MSL      | macOS / iOS / tvOS / visionOS |
+| `mlx`               | Apple MLX (vendored)                 | macOS / iOS / tvOS / visionOS |
 | `mlx-cuda`          | Apple MLX's CUDA backend             | Linux + NVIDIA            |
-| `coreml`            | CoreML / Neural Engine (`Device::Ane`)| macOS / iOS (Apple)      |
+| `coreml`            | CoreML / Neural Engine (`Device::Ane`)| macOS / iOS / tvOS / visionOS |
 | `gpu`               | wgpu (Vulkan / DX12 / WebGPU / Metal)| cross-platform            |
 | `vulkan`            | native Vulkan compute (`ash` + SPIR-V)| Linux / Windows (+ MoltenVK)|
 | `oneapi`            | Intel oneAPI Level Zero (SPIR-V)     | Linux + Intel GPU         |
@@ -105,6 +110,18 @@ rlx = { version = "0.2", features = ["cpu", "metal"] }
 | `blas-accelerate`   | macOS Accelerate                     | macOS                     |
 | `blas-mkl`          | Intel MKL                            | Intel / AMD CPUs          |
 | `blas-openblas`     | OpenBLAS                             | cross-platform CPU        |
+
+**Apple platforms.** macOS, iOS, tvOS and visionOS carry CPU + Metal +
+CoreML/ANE + MLX. **watchOS is CPU/Accelerate only** — it has no public Metal API
+and no CoreML runtime model-compile, so there is no backend to build there.
+`just check-apple` cross-compiles all four OSes (device *and* simulator) and
+`just test-apple-sim` runs the backend smoke + parity tests on all four
+simulators. Metal, MLX and wgpu skip on simulators — a headless `simctl spawn`
+exposes no Metal device — so they are validated on hardware instead: all four
+backends match the CPU reference at `max|Δ| = 1.49e-8` on an iPad Pro (iOS 26.5).
+tvOS, watchOS and visionOS hardware remains untested. See
+[`ios/README.md`](ios/README.md) for the slice matrix, the deployment floors, and
+packaging.
 
 Convenience aggregates roll up the common setup for a target:
 `apple-silicon` (`cpu` + `metal` + `blas-accelerate`), `nvidia` (`cpu` +
@@ -146,8 +163,9 @@ exposed through the prelude:
   enable `rlx-runtime`'s `qnn` feature, not on the umbrella prelude).
 - `rlx-cerebras` — Cerebras WSE: IR → CSL → fabric simulator. No `Device`
   variant; the fabric is targeted through codegen, not a runtime backend.
-- `rlx-ffi` — C ABI over the distributed node, for iOS (staticlib →
-  xcframework) and embedded hosts (cdylib).
+- `rlx-ffi` — C ABI over the distributed node, for the Apple platforms
+  (staticlib → one xcframework spanning iOS / tvOS / watchOS / visionOS) and
+  embedded hosts (cdylib).
 
 ## Quickstart
 
@@ -528,7 +546,7 @@ tooling/
 
 bindings/
   pyrlx              Python bindings (PyO3) — run RLX graphs + HF models on any backend
-  rlx-ffi            C ABI for the distributed node — iOS xcframework + embedded hosts
+  rlx-ffi            C ABI for the distributed node — Apple xcframework + embedded hosts
   rlx-web            WebAssembly entry point — run models in-browser (CPU; WebGPU bring-up)
 ```
 
@@ -716,8 +734,23 @@ Eugene Hauptmann, Nataliya Kosmyna ([MIT-RLX](https://github.com/MIT-RLX)).
 
 ## Citing RLX
 
-If you use RLX in academic work, please cite it. Machine-readable metadata is
-in [`CITATION.cff`](CITATION.cff); a plain-text form:
+If you use RLX in academic work, please cite the paper
+([arXiv:2609.37916](https://arxiv.org/abs/2609.37916)):
+
+```bibtex
+@misc{rlx2026,
+  title         = {RLX: A Unified Multi-Backend Tensor Compiler and Distributed Runtime in Rust},
+  author        = {Hauptmann, Eugene and Kosmyna, Nataliya},
+  year          = {2026},
+  eprint        = {2609.37916},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DC},
+  url           = {https://arxiv.org/abs/2609.37916}
+}
+```
+
+To cite a specific version of the implementation instead, machine-readable
+metadata is in [`CITATION.cff`](CITATION.cff); a plain-text form:
 
 ```bibtex
 @software{rlx,

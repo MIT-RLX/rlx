@@ -21,6 +21,8 @@ use rlx_ir::{DType, Graph, ScaleLayout, ScaledFormat, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+mod common;
+
 /// Skip when no Vulkan device is present.
 ///
 /// `rlx_ir::env::skip_unless_device` rather than a bare
@@ -85,6 +87,7 @@ fn roundtrip(rows: usize, cols: usize, fmt: ScaledFormat, layout: ScaleLayout) -
 
 #[test]
 fn quantize_dequantize_roundtrip_is_bit_exact() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -112,6 +115,7 @@ fn quantize_dequantize_roundtrip_is_bit_exact() {
 
 #[test]
 fn roundtrip_survives_the_hard_inputs() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -194,6 +198,7 @@ fn close(what: &str, got: &[f32], want: &[f32]) {
 
 #[test]
 fn scaled_matmul_decode_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -221,6 +226,7 @@ fn scaled_matmul_decode_matches_cpu() {
 
 #[test]
 fn scaled_matmul_decode_handles_a_single_tile() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }

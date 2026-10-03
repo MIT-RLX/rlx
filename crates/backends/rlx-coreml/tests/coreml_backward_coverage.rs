@@ -6,7 +6,7 @@
 // differentiate w.r.t. a parameter, run the backward graph on the ANE (which
 // decomposes / natively-lowers it), and compare to the SAME backward graph
 // pre-decomposed and run on the CPU.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_ir::op::{Activation, ReduceOp};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};

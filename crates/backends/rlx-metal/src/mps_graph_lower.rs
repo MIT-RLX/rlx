@@ -283,6 +283,22 @@ pub fn try_lower(graph: &Graph) -> Option<MpsGraphPlan> {
 /// guard stays BROAD (any interior rank≥4 reduce → thunks); the ~2.8× MPSGraph
 /// "speedup" is a mirage (it's fast because it skips/miscomputes work). The correct
 /// floor is the per-op thunk backbone (~764 ms/tok).
+/// True when `graph` has a BF16 **activation** — a non-`Param` bf16 tensor.
+///
+/// Metal stores those f32-wide (`ArenaWidthPolicy::NativeBf16Widened`, because
+/// no Metal kernel has a `bfloat` lane), but MPSGraph would be handed
+/// `MPSDataTypeBFloat16` for the same buffer and read 4 B f32 words as packed
+/// bf16 pairs. A bf16 *weight* is still packed, so it stays lowerable.
+///
+/// Refusing the plan costs nothing real: an `AutoMixedBf16` graph has no Metal
+/// fast path to lose, and the thunk backbone is correct.
+pub fn graph_has_bf16_activation(graph: &Graph) -> bool {
+    graph
+        .nodes()
+        .iter()
+        .any(|n| n.shape.dtype() == DType::BF16 && !matches!(n.op, Op::Param { .. }))
+}
+
 pub fn graph_has_mps_hostile_reduce(graph: &Graph) -> bool {
     graph.nodes().iter().any(|n| {
         let Op::Reduce { axes, .. } = &n.op else {
@@ -386,6 +402,15 @@ pub fn try_lower_with_constants(
             eprintln!(
                 "[rlx-metal] mps: refusing plan (hand-rolled softmax into a \
                  matmul over a concat — crashes Apple's CanonicalizeSDPA; using thunks)"
+            );
+        }
+        return None;
+    }
+    if graph_has_bf16_activation(graph) {
+        if rlx_ir::env::flag("RLX_MPSGRAPH_TRACE") {
+            eprintln!(
+                "[rlx-metal] mps: refusing plan (bf16 activation — the arena stores \
+                 it f32-wide; using thunks)"
             );
         }
         return None;

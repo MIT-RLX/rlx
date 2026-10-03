@@ -153,6 +153,9 @@ type Router = (&'static str, &'static [OpKind], fn(&Op) -> bool);
 // `vec![]` literal — which is the shape the lint assumes.
 #[allow(clippy::vec_init_then_push)]
 fn routers() -> Vec<Router> {
+    // Every push below is feature-gated, so with no backend features enabled
+    // they all compile away and the `mut` has nothing left to justify it.
+    #[allow(unused_mut)]
     let mut out: Vec<Router> = Vec::new();
     #[cfg(feature = "vulkan")]
     out.push((

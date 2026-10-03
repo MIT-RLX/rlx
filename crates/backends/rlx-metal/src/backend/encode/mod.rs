@@ -1545,6 +1545,21 @@ impl MetalExecutable {
             let _span = rlx_ir::perfetto::TraceSpan::new(crate::thunk::thunk_name(&thunk), "metal");
             match &thunk {
                 Thunk::Nop => {}
+                Thunk::RoundBf16 { src, dst, len } => {
+                    let len = scale(*len);
+                    if len == 0 {
+                        continue;
+                    }
+                    crate::backend::encode::ops::encode_arena_cast(
+                        e!(),
+                        &k.round_bf16_f32,
+                        &self.arena.buffer,
+                        *src,
+                        *dst,
+                        len,
+                    );
+                }
+
                 Thunk::Cast {
                     src,
                     dst,
@@ -2603,6 +2618,7 @@ impl MetalExecutable {
                     dst,
                     rows,
                     h,
+                    denom_out,
                 } => {
                     let rows = scale(*rows);
                     if rows == 0 {
@@ -2617,6 +2633,7 @@ impl MetalExecutable {
                         *dst,
                         rows,
                         *h,
+                        *denom_out,
                     );
                 }
                 Thunk::BiasAdd {
@@ -3175,6 +3192,7 @@ impl MetalExecutable {
                     h,
                     eps,
                     dt,
+                    silu_out,
                 } => {
                     let _ = dt;
                     let rows = scale(*rows);
@@ -3193,6 +3211,7 @@ impl MetalExecutable {
                         rows,
                         *h,
                         *eps,
+                        *silu_out,
                     );
                 }
                 Thunk::FusedDepthwiseConv1dBsc {
@@ -4028,13 +4047,25 @@ impl MetalExecutable {
                     if n == 0 {
                         continue;
                     }
-                    if n > 1 && self.conv_bwd_scratch_off != 0 {
+                    if self.conv_bwd_scratch_off != 0 {
                         // Native GPU weight-grad, two-pass (batch-parallel):
                         //   pass 1 — one thread per (n, co, ci, ki, kj) writes a
                         //            per-sample partial into scratch (threads scale
                         //            with N, fixing conv1's 288-thread starvation);
                         //   pass 2 — one thread per dw element reduces over N.
                         // Deterministic (no atomics), no GPU→CPU sync.
+                        //
+                        // Used for N == 1 as well, which the per-group
+                        // im2col+GEMM path below used to handle. That path
+                        // returned a *history-dependent* answer for a depthwise
+                        // conv (right on a fresh arena, wrong once the
+                        // surrounding memory was dirty), which is how the
+                        // Qwen3.5 `ssm_conv1d` weight gradient came back wrong
+                        // on Metal while matching finite differences in a
+                        // one-shot run. These two kernels write every element
+                        // they read back, so there is nothing to inherit.
+                        // `conv_bwd_scratch_bytes` already sizes the scratch for
+                        // whichever path is larger, including at N == 1.
                         encode_conv2d_backward_weight_2pass(
                             e!(),
                             k,

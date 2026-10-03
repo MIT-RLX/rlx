@@ -334,16 +334,26 @@ pub fn run_expand_host_cached(
 ) {
     let rank = out_dims.len();
     assert_eq!(in_dims.len(), rank);
-    let in_elems: usize = in_dims
-        .iter()
-        .map(|&d| d as usize)
-        .product::<usize>()
-        .max(1);
-    let out_elems: usize = out_dims
-        .iter()
-        .map(|&d| d as usize)
-        .product::<usize>()
-        .max(1);
+    // `.max(1)` is for RANK 0 — a scalar has no dims but one element. It must
+    // not be applied to a rank>0 shape carrying a zero extent, which has no
+    // elements at all: the old unconditional `.max(1)` turned `[0, 4]` into one
+    // element and the indexing loop below then evaluated `rem % 0`. That is
+    // unreachable on Metal (Expand is native there) but live on Vulkan/DX12,
+    // which host-stage it — caught by running this suite on Linux/lavapipe.
+    let elems = |dims: &[u32]| -> usize {
+        if dims.is_empty() {
+            1
+        } else {
+            dims.iter().map(|&d| d as usize).product::<usize>()
+        }
+    };
+    let in_elems = elems(in_dims);
+    let out_elems = elems(out_dims);
+    if out_elems == 0 {
+        // Nothing to write. Returning early leaves every other tensor in the
+        // arena untouched, which is what an empty output means.
+        return;
+    }
     let mut a = WgpuArena {
         arena,
         device,

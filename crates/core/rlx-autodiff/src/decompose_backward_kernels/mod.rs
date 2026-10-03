@@ -303,8 +303,20 @@ fn run_scan_backward_steps(
 
     let mut process_t = |g: &mut Graph, t: usize, carry_t: NodeId| {
         let mut d_out = dcarry;
-        if save_trajectory {
-            let up_t = narrow_step(g, upstream, t, out_shape);
+        // `upstream` is indexed the way the scan's OUTPUT is, which is not the
+        // time index when checkpointing is partial: the op then emits one row per
+        // checkpoint, so `upstream` (and `trajectory`) have `k_total` rows while
+        // `xs` has `l`. Narrowing it at `t` walked off the end — with l=4 and 2
+        // checkpoints it asked for row 3 of a 2-row tensor. Steps that are not
+        // checkpoints have no upstream term at all; their cotangent reaches them
+        // through `dcarry`.
+        let up_idx = if is_partial {
+            (0..k_total).find(|&k| checkpoint_t_for_k(k, k_total, l) == t)
+        } else {
+            Some(t)
+        };
+        if save_trajectory && let Some(ui) = up_idx {
+            let up_t = narrow_step(g, upstream, ui, out_shape);
             d_out = g.add(d_out, up_t);
             reconcile_node_shape(g, d_out);
         }

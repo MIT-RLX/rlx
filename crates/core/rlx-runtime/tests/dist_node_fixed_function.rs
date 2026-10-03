@@ -287,3 +287,38 @@ fn a_fixed_function_rank_is_refused_a_training_job() {
             .unwrap_or_else(|e| panic!("rank {i}: {e}"));
     }
 }
+
+/// A node's platform tag must actually name the platform it was compiled for.
+///
+/// `platform_tag` is a hand-written `cfg!` ladder, so a target it has never
+/// heard of falls through to `"unknown"` — silently, and only visible in a
+/// coordinator log nobody reads until a mesh misbehaves. Apple ships five OSes
+/// that RLX builds nodes for and the ladder has to name each one; this pins
+/// that, plus the desktop tags, against the target the test itself is built
+/// for.
+#[test]
+fn platform_tag_names_this_target() {
+    let tag = rlx_runtime::dist::node::platform_tag();
+    let expected = if cfg!(target_os = "ios") {
+        "ios"
+    } else if cfg!(target_os = "tvos") {
+        "tvos"
+    } else if cfg!(target_os = "watchos") {
+        "watchos"
+    } else if cfg!(target_os = "visionos") {
+        "visionos"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        // Some other target: only require that it is named at all.
+        assert_ne!(tag, "unknown", "platform_tag has no arm for this target");
+        return;
+    };
+    assert_eq!(tag, expected);
+}

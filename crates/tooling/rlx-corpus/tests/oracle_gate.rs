@@ -81,6 +81,7 @@ fn corpus_results_match_an_independent_oracle() {
         let mut params: Vec<(&str, Vec<f32>)> = Vec::new();
         let mut packed: Vec<(&str, Vec<u8>)> = Vec::new();
         let mut ok = true;
+        let why = "dynamic shape";
         for (i, node) in case.graph.nodes().iter().enumerate() {
             let is_u8 = node.shape.dtype() == rlx_ir::DType::U8;
             match &node.op {
@@ -107,7 +108,7 @@ fn corpus_results_match_an_independent_oracle() {
             }
         }
         if !ok {
-            unvalidated.push(format!("{}::{} (dynamic shape)", case.family, case.name));
+            unvalidated.push(format!("{}::{} ({why})", case.family, case.name));
             continue;
         }
 

@@ -8,6 +8,8 @@ use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_vulkan::backend::VulkanExecutable;
 
+mod common;
+
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -138,17 +140,20 @@ fn run_mxfp(m: usize, k: usize, n: usize, group_size: u32, mxfp8: bool) {
 
 #[test]
 fn vulkan_mlx_affine4_parity() {
+    let _gpu = common::serialize_gpu();
     run_affine(2, 64, 8, 4, 64);
     run_affine(1, 64, 8, 4, 64);
 }
 
 #[test]
 fn vulkan_mlx_affine_odd_bits_parity() {
+    let _gpu = common::serialize_gpu();
     run_affine(2, 64, 4, 3, 64);
 }
 
 #[test]
 fn vulkan_mlx_mxfp_parity() {
+    let _gpu = common::serialize_gpu();
     run_mxfp(2, 64, 8, 32, false);
     run_mxfp(1, 64, 4, 32, true);
 }

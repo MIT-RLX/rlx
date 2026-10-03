@@ -911,18 +911,7 @@ pub(crate) fn exec_fused_swi_g_l_u(t: &Thunk, base: *mut u8) {
         unsafe {
             let inp = sl(*src, base, in_total);
             let out = sl_mut(*dst, base, t);
-            for o in 0..outer {
-                let in_row = &inp[o * 2 * n..(o + 1) * 2 * n];
-                let out_row = &mut out[o * n..(o + 1) * n];
-                for i in 0..n {
-                    let (up, gate) = if gate_first {
-                        (in_row[n + i], in_row[i])
-                    } else {
-                        (in_row[i], in_row[n + i])
-                    };
-                    out_row[i] = up * (gate / (1.0 + (-gate).exp()));
-                }
-            }
+            crate::kernels::swiglu_rows(inp, out, outer, n, gate_first);
         }
     }
 }

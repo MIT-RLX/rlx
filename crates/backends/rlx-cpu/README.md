@@ -91,6 +91,38 @@ cargo build -p rlx-cpu --release
 cargo test  -p rlx-cpu --release   # 26 tests — mostly parity vs. naive
 ```
 
+### ISA portability gate
+
+One binary has to run on the AVX-512 server or M4 that built it *and* on
+an Atom box or a Raspberry Pi, so every above-baseline instruction must
+sit inside a function reached through a runtime CPU-feature check.
+`cargo build` enforces none of that and the failure mode is a bare
+`Illegal instruction` on hardware you don't own, so
+`tools/isa_portability.py` checks both halves:
+
+```sh
+just check-isa                                 # emulated Atom (x86-64)
+just check-isa arm                             # emulated ARMv8.0 (Pi 3/4)
+just check-isa scan target/release/<binary>    # static scan, no Docker needed
+```
+
+`scan` attributes every above-baseline instruction to its enclosing symbol
+and fails on any that isn't runtime-gated. "Above baseline" is per-target,
+not per-arch: `sdot` is baseline on `aarch64-apple-darwin` (apple-m1, v8.5)
+and a finding on `aarch64-unknown-linux-gnu` (ARMv8.0-A), so the check is
+judged against the baseline of the target the binary was built for.
+`--baseline` overrides that to ask the cross-target question ("would this
+survive a Cortex-A53?"), and the report says so when you do. It also catches
+the inverse problem: a `-C target-cpu=native` artifact smears above-baseline
+code across ordinary symbols (`Op::clone` included) where no runtime
+dispatch can save it.
+
+`atom` and `arm` run the suite for real. Docker `--platform linux/amd64`
+supplies an x86-64 Linux toolchain and `qemu-user-static -cpu Denverton`
+emulates a Goldmont Atom that traps AVX (`Snowridge` = Tremont, `Haswell` =
+control); `arm` uses `linux/arm64` — fully native on Apple Silicon — with
+`-cpu cortex-a53`, which has neither DotProd nor FP16 arithmetic.
+
 ## Gotchas
 
 - `Thunk::Attention` carries `mask_kind: MaskKind` (plan #20). Custom

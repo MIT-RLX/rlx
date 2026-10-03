@@ -6,7 +6,7 @@
 
 use crate::backend::ExecutableGraph;
 use rlx_driver::Device;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Param-invariant "prepare" stage attached to a compiled graph.
 ///
@@ -41,6 +41,18 @@ pub struct CompiledGraph {
     device: Device,
     /// Optional param-invariant prepare stage (None = ordinary graph).
     staging: Option<Box<Staging>>,
+    /// Declared dtype of each named `Input` / `Param`, for boundaries that are
+    /// not `f32`.
+    ///
+    /// [`Self::run`] and [`Self::set_param`] take `&[f32]`, which is the right
+    /// shape for the overwhelmingly common case and wrong for an `F16`/`BF16`
+    /// tensor: the bytes used to go to the backend verbatim and be read as
+    /// pairs of halves. Feeding `[1,2,3,4]` to a BF16 input and adding zero
+    /// returned `[2.0038757, 4.007843, 0.0, 0.0]` — no error, no panic.
+    ///
+    /// Empty means "not known" (e.g. compiled straight from HIR), in which case
+    /// the f32 fast path is taken unchanged.
+    io_dtypes: HashMap<String, rlx_ir::DType>,
 }
 
 impl Clone for CompiledGraph {
@@ -50,6 +62,7 @@ impl Clone for CompiledGraph {
         Self {
             inner: self.inner.clone_box(),
             device: self.device,
+            io_dtypes: self.io_dtypes.clone(),
             staging: self.staging.as_ref().map(|s| {
                 Box::new(Staging {
                     prepare: s.prepare.clone(),
@@ -71,6 +84,35 @@ impl CompiledGraph {
             inner,
             device,
             staging: None,
+            io_dtypes: HashMap::new(),
+        }
+    }
+
+    /// Record the declared dtype of each named `Input` / `Param`.
+    ///
+    /// Called by the compile paths that still have the graph in hand. Without
+    /// it the f32 entry points cannot tell a genuine `f32` boundary from an
+    /// `F16`/`BF16` one being fed as f32 — see [`Self::io_dtypes`].
+    pub(crate) fn set_io_dtypes(
+        &mut self,
+        dtypes: impl IntoIterator<Item = (String, rlx_ir::DType)>,
+    ) {
+        self.io_dtypes = dtypes.into_iter().collect();
+    }
+
+    /// Declared dtype of a named boundary tensor when it is a float NARROWER
+    /// than `f32` — the only case the f32 entry points get wrong.
+    ///
+    /// Deliberately not "any dtype that is not F32". `F64` boundaries (the SPD /
+    /// Riemannian-geometry graphs declare theirs that way) already round-trip
+    /// through the plain f32 path, and routing them here instead converted the
+    /// values and returned garbage — every `spd_host_parity` test failed with
+    /// max|Δ| in the single digits. Integer boundaries are likewise widened by
+    /// the backends already and must not be touched here.
+    fn narrow_boundary(&self, name: &str) -> Option<rlx_ir::DType> {
+        match self.io_dtypes.get(name) {
+            Some(&dt) if matches!(dt, rlx_ir::DType::F16 | rlx_ir::DType::BF16) => Some(dt),
+            _ => None,
         }
     }
 
@@ -127,6 +169,14 @@ impl CompiledGraph {
     /// Set a named parameter (model weight).
     /// Call once per parameter after compilation.
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        // A narrower-than-f32 weight needs converting, not reinterpreting:
+        // `set_param` writes the bytes as given, and 4 bytes of f32 read as two
+        // halves silently doubles the element count.
+        if let Some(dt) = self.narrow_boundary(name) {
+            let bytes = crate::backend::narrow_f32_to_bytes(data, dt);
+            self.set_param_typed(name, &bytes, dt);
+            return;
+        }
         if let Some(st) = self.staging.as_mut() {
             if st.prepare_params.contains(name) {
                 st.prepare.set_param(name, data);
@@ -143,6 +193,16 @@ impl CompiledGraph {
     /// Execute the graph with named inputs.
     /// Returns one `Vec<f32>` per graph output (copies from arena).
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        // Any input declared narrower than f32 has to be converted before it
+        // reaches the backend. `run_typed` is the path that carries a dtype per
+        // input; nine backends implement it. Only taken when a narrow boundary
+        // is actually present, so the f32 case keeps its direct path.
+        if inputs
+            .iter()
+            .any(|(n, _)| self.narrow_boundary(n).is_some())
+        {
+            return self.run_narrowed(inputs);
+        }
         self.ensure_prepared();
         match self.staging.as_ref() {
             Some(st) if !st.bound => {
@@ -156,6 +216,31 @@ impl CompiledGraph {
             }
             _ => self.inner.run(inputs),
         }
+    }
+
+    /// [`Self::run`] for graphs with an `F16`/`BF16` input boundary.
+    ///
+    /// Narrows each input to its declared dtype, runs the typed path, and
+    /// widens the outputs back to `f32` so the return type is unchanged. The
+    /// widening is lossless — `f32` holds every `F16`/`BF16` value exactly.
+    fn run_narrowed(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.ensure_prepared();
+        let owned: Vec<(&str, Vec<u8>, rlx_ir::DType)> = inputs
+            .iter()
+            .map(|(name, vals)| {
+                let dt = self.narrow_boundary(name).unwrap_or(rlx_ir::DType::F32);
+                (*name, crate::backend::narrow_f32_to_bytes(vals, dt), dt)
+            })
+            .collect();
+        let typed: Vec<(&str, &[u8], rlx_ir::DType)> = owned
+            .iter()
+            .map(|(n, b, d)| (*n, b.as_slice(), *d))
+            .collect();
+        self.inner
+            .run_typed(&typed)
+            .into_iter()
+            .map(|(bytes, dt)| crate::backend::widen_bytes_to_f32(&bytes, dt))
+            .collect()
     }
 
     /// Async WebGPU execution on wasm (non-blocking GPU→CPU readback).

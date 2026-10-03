@@ -151,7 +151,39 @@ pub fn tolerance_for(graph: &Graph) -> f64 {
             )
         })
         .count();
-    (REL_TOL * reductions.max(1) as f64).min(MAX_DERIVED_TOL)
+    let scale = narrowest_float_scale(graph);
+    (REL_TOL * scale * reductions.max(1) as f64).min(MAX_DERIVED_TOL * scale)
+}
+
+/// How much looser the bound has to be for the narrowest float in the graph.
+///
+/// `REL_TOL` is an f32 figure. Applying it to a BF16 graph asks the result to
+/// be more accurate than the format can represent — BF16 carries an 8-bit
+/// mantissa, so its unit roundoff is ~2^-8 ≈ 3.9e-3, twenty times f32's. The
+/// low-precision corpus cases failed at 4.99e-3 against a 2.0e-4 bound purely
+/// for that reason, while agreeing with f64 to exactly the precision they can
+/// hold.
+///
+/// Scaled from the format's own unit roundoff rather than by a hand-tuned
+/// constant, for the same reason `tolerance_for` derives per reduction instead
+/// of loosening one global number: a fudge factor large enough for BF16 would
+/// silently weaken every f32 case in the corpus.
+fn narrowest_float_scale(graph: &Graph) -> f64 {
+    // f32 eps 2^-24, f16 2^-11, bf16 2^-8 — expressed relative to f32.
+    const F16_SCALE: f64 = 8192.0; // 2^13
+    const BF16_SCALE: f64 = 65536.0; // 2^16
+    let mut scale: f64 = 1.0;
+    for n in graph.nodes() {
+        let s = match n.shape.dtype() {
+            rlx_ir::DType::BF16 => BF16_SCALE,
+            rlx_ir::DType::F16 => F16_SCALE,
+            _ => 1.0,
+        };
+        if s > scale {
+            scale = s;
+        }
+    }
+    scale
 }
 
 /// A dense f64 tensor for the reference evaluation.

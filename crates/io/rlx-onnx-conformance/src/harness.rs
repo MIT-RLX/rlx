@@ -2,7 +2,14 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+// `.context(...)` is only called from the ORT-backed `OrtSession`, so on the
+// stub targets the trait import is dead and `-W unused` says so.
+#[cfg(not(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
+use anyhow::Context;
 
 /// Max absolute difference allowed between ORT and RLX outputs.
 pub const DEFAULT_ATOL: f32 = 1e-4;
@@ -25,12 +32,18 @@ pub fn compare_tensors(a: &[f32], b: &[f32], atol: f32) -> (f32, bool) {
     (max_diff, max_diff <= atol)
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 pub struct OrtSession {
     session: ort::session::Session,
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 impl OrtSession {
     pub fn from_bytes(model: &[u8]) -> Result<Self> {
         let session = ort::session::Session::builder()
@@ -89,10 +102,20 @@ impl OrtSession {
     }
 }
 
-#[cfg(any(target_os = "ios", target_os = "android"))]
+/// Stub for the targets ORT has no prebuilt binaries for — Android, iOS,
+/// tvOS, watchOS and visionOS. Conformance compares RLX against ORT, so
+/// there is nothing to compare against on a phone; the stub keeps the crate
+/// compiling in a cross-build of the whole workspace and says so at runtime.
+#[cfg(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+))]
 pub struct OrtSession;
 
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    target_os = "android",
+    all(target_vendor = "apple", not(target_os = "macos"))
+))]
 impl OrtSession {
     pub fn from_bytes(_model: &[u8]) -> Result<Self> {
         anyhow::bail!("ORT conformance harness unavailable on this target")

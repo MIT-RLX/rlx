@@ -15,7 +15,7 @@
 // upstream caught it: MPSGraph did, by `abort()`ing the process with
 // `original module failed verification`. An `abort()` inside a vendor framework
 // cannot be caught, so this test is the guard.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_coreml::CoremlExecutable;
 use rlx_ir::op::MaskKind;

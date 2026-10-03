@@ -2,6 +2,12 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! `import-mlx --keep-packed` → `.rlxp` → `compile_rlxp_bind_params` → run.
+//!
+//! `.rlxp` support lives behind rlx-runtime's `model-io` feature — a node
+//! build drops the package readers entirely — so this test compiles only when
+//! that feature is on. Without the gate, `cargo test --no-default-features
+//! --features cpu` fails to build the whole test target.
+#![cfg(feature = "model-io")]
 
 use std::collections::HashMap;
 use std::fs;

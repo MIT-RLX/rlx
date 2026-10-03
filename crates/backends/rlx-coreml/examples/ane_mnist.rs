@@ -26,7 +26,7 @@
 
 // CoreML/ANE is Apple-only; wrap the example so non-Apple hosts still compile
 // (with a stub `main`) instead of failing with "main function not found".
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 mod imp {
     use rlx_coreml::{ComputeUnits, CoremlExecutable, ane_available, chip_info};
     use rlx_ir::op::*;
@@ -233,12 +233,12 @@ mod imp {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 fn main() {
     imp::run();
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
 fn main() {
     eprintln!("ane_mnist requires macOS/iOS (CoreML / Apple Neural Engine)");
 }

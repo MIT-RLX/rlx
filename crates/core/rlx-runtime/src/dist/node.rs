@@ -206,9 +206,21 @@ impl NodeCaps {
 
 /// Compile-time platform tag. Not a capability — just an identifier, so a
 /// coordinator log says *which* kind of node answered.
+///
+/// The Apple arms come first and are listed individually: every one of them
+/// also satisfies `target_vendor = "apple"`, and a tvOS rank reported as
+/// `macos` is worse than useless in a mesh log. `visionos` is spelled the way
+/// Rust spells the target (Apple's SDK and `xcodebuild` call the same platform
+/// `xros`).
 pub const fn platform_tag() -> &'static str {
     if cfg!(target_os = "ios") {
         "ios"
+    } else if cfg!(target_os = "tvos") {
+        "tvos"
+    } else if cfg!(target_os = "watchos") {
+        "watchos"
+    } else if cfg!(target_os = "visionos") {
+        "visionos"
     } else if cfg!(target_os = "android") {
         "android"
     } else if cfg!(target_os = "macos") {

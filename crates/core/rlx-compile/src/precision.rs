@@ -267,6 +267,31 @@ pub enum PrecisionPolicy {
     ///   DataMovement → BF16
     ///   Boundary → F32
     AutoMixedBf16,
+    /// BF16 with the **`AutoMixed` shape**: low precision only where it is
+    /// safe on CPU/Metal-class backends.
+    ///
+    /// `AutoMixedBf16` is the TPU/XLA policy — everything BF16, because
+    /// XLA's codegen accumulates in f32. On CPU that diverges. Measured on a
+    /// Qwen3.5 trunk forward, enabling BF16 one op kind at a time:
+    ///
+    /// | op kind | result |
+    /// |---|---|
+    /// | Elementwise | finite |
+    /// | Reduction | finite |
+    /// | Compute (matmul) | **NaN** |
+    /// | DataMovement | **NaN** |
+    ///
+    /// Exactly the split [`PrecisionPolicy::AutoMixed`] already records for
+    /// F16 (Rope/Gather/Narrow and the residual stream are the sensitive
+    /// paths). So this is that policy with BF16 as the low precision — the
+    /// one to use for mixed-precision **training** on CPU/Metal, where the
+    /// win is activation memory rather than matmul throughput.
+    ///   Compute → F32
+    ///   Reduction → BF16
+    ///   Elementwise → BF16
+    ///   DataMovement → F32
+    ///   Boundary → F32
+    AutoMixedBf16Safe,
     /// Explicit per-op-kind override.
     Custom(HashMap<OpKind, Precision>),
 }
@@ -294,6 +319,13 @@ impl PrecisionPolicy {
                 OpKind::Compute => Precision::F32,
                 OpKind::Reduction => Precision::F32,
                 OpKind::Elementwise => Precision::F16,
+                OpKind::DataMovement => Precision::F32,
+                OpKind::Boundary => Precision::F32,
+            },
+            PrecisionPolicy::AutoMixedBf16Safe => match kind {
+                OpKind::Compute => Precision::F32,
+                OpKind::Reduction => Precision::BF16,
+                OpKind::Elementwise => Precision::BF16,
                 OpKind::DataMovement => Precision::F32,
                 OpKind::Boundary => Precision::F32,
             },
@@ -408,9 +440,26 @@ impl Pass for AutoMixedPrecision {
                 | Op::SoftmaxCrossEntropy
                 | Op::SoftmaxCrossEntropyWithLogits
                 | Op::SoftmaxCrossEntropyBackward
+                // The LayerNorm BACKWARDs were listed; the FORWARD was not.
+                // Measured: `LayerNorm2d` under `AlwaysF16` on Metal produced a
+                // non-finite output at rel 3.6e4. Found by
+                // `rlx-metal/tests/precision_policy_f16_attention.rs`'s sweep.
+                | Op::LayerNorm2d { .. }
                 | Op::LayerNormBackwardInput { .. }
                 | Op::LayerNormBackwardGamma { .. }
                 | Op::GroupNorm { .. }
+                // `Op::Attention` and its backward. Metal dispatches the SAME
+                // f32 sdpa kernel regardless of the node's dtype — the `dt`
+                // flag does not select an f16 variant because none exists — so
+                // tagging the node F16 leaves an f32 kernel reading f16 bytes
+                // and writing f32 into an f16-sized slot. Measured: a single
+                // attention op under `AlwaysF16` returned 256/256 EXACT ZEROS,
+                // which is this comment's "zeros the residual stream" at the
+                // scale of one op. `FusedAttentionBlock` was already listed; the
+                // unfused op was not. Guarded by
+                // `rlx-metal/tests/precision_policy_f16_attention.rs`.
+                | Op::Attention { .. }
+                | Op::AttentionBackward { .. }
                 | Op::FusedAttentionBlock { .. }
                 | Op::TopK { .. }
                 | Op::ScatterAdd { .. }

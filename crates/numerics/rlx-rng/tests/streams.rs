@@ -16,6 +16,11 @@
 //! np.random.Generator(np.random.PCG64(12345))       -> gen_*
 //! np.random.SeedSequence(12345).generate_state(4)   -> seedseq
 //! torch.manual_seed(42); torch.randperm(10)         -> randperm
+//! np.random.Generator(np.random.PCG64(12345)).random(8)        -> gen_random
+//! rs=np.random.RandomState(12345); [rs.choice(4,p=P4)]*12      -> choice_p_4
+//! rs=np.random.RandomState(777);   [rs.choice(2,p=P2)]*12      -> choice_p_2
+//! torch.manual_seed(42); torch.rand(5)                          -> torch_rand
+//! torch.manual_seed(42); torch.rand(1); torch.randperm(6)       -> randperm_after_rand
 //! ```
 
 use rlx_rng::numpy;
@@ -213,4 +218,156 @@ fn the_two_numpy_generators_are_different_streams() {
             .any(|(a, b)| (a - b).abs() > 1e-9),
         "RandomState and Generator produced the same stream"
     );
+}
+
+#[test]
+fn generator_random_matches_numpy() {
+    // `Generator.random()` is `(next_u64() >> 11) * 2^-53` — the top 53 bits of
+    // ONE 64-bit draw. `RandomState::random_double` assembles 53 bits from TWO
+    // 32-bit draws instead; the two are not interchangeable.
+    let expect = [
+        0.22733602246716966,
+        0.31675833970975287,
+        0.7973654573327341,
+        0.6762546707509746,
+        0.391109550601909,
+        0.33281392786638453,
+        0.5983087535871898,
+        0.18673418560371335,
+    ];
+    let mut g = numpy::Generator::new(12345);
+    for (i, e) in expect.iter().enumerate() {
+        let got = g.random();
+        assert!(close(got, *e), "gen.random()[{i}]: {got} != {e}");
+    }
+}
+
+#[test]
+fn generator_uniform_is_bit_identical_to_random() {
+    // numpy's `random_uniform(state, off, rng)` is `off + rng * next_double`, so
+    // the default range makes `uniform()` the same VALUE and the same stream
+    // position as `random()`. Verified against numpy 2.4.3 rather than assumed —
+    // if a future numpy adds an offset step, this is where it surfaces.
+    let mut a = numpy::Generator::new(12345);
+    let mut b = numpy::Generator::new(12345);
+    for i in 0..8 {
+        let (x, y) = (a.random(), b.uniform());
+        assert_eq!(x.to_bits(), y.to_bits(), "uniform() != random() at {i}");
+    }
+}
+
+#[test]
+fn default_rng_seeding_matches_generator() {
+    // `np.random.default_rng(s)` is `Generator(PCG64(s))` — the same SeedSequence
+    // path. torch_brain's `TriangleDistribution` uses `default_rng`, so this is
+    // the edge its parity rests on.
+    let mut g = numpy::Generator::new(12345);
+    assert!(
+        close(g.random(), 0.22733602246716966),
+        "default_rng(12345) first draw"
+    );
+}
+
+#[test]
+fn legacy_choice_p_matches_numpy() {
+    // ONE `random_sample()` per call and `searchsorted(cdf, u, side='right')`.
+    // A rejection loop would also be a valid weighted sampler and would consume
+    // the stream differently, desynchronising everything after it.
+    let p4 = [0.1, 0.2, 0.3, 0.4];
+    let expect4 = [3usize, 2, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3];
+    let mut rs = numpy::RandomState::new(12345);
+    for (i, e) in expect4.iter().enumerate() {
+        assert_eq!(rs.choice_p(&p4), *e, "choice(4, p) draw {i}");
+    }
+
+    // Unnormalised weights: numpy divides by `cdf[-1]`, so [1, 3] == [0.25, 0.75].
+    let p2 = [1.0, 3.0];
+    let expect2 = [0usize, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0];
+    let mut rs2 = numpy::RandomState::new(777);
+    for (i, e) in expect2.iter().enumerate() {
+        assert_eq!(rs2.choice_p(&p2), *e, "choice(2, unnormalised p) draw {i}");
+    }
+}
+
+#[test]
+fn choice_p_consumes_exactly_one_draw() {
+    // The stream position after one choice_p must equal the position after one
+    // random_sample. If this fails, every draw downstream of a RandomChoice
+    // diverges from the reference even though the choices themselves look right.
+    let p = [0.3, 0.7];
+    let mut a = numpy::RandomState::new(99);
+    a.choice_p(&p);
+    let after_choice = a.random_double();
+
+    let mut b = numpy::RandomState::new(99);
+    b.random_sample();
+    let after_sample = b.random_double();
+
+    assert_eq!(after_choice.to_bits(), after_sample.to_bits());
+}
+
+#[test]
+fn choice_p_edges() {
+    let mut rs = numpy::RandomState::new(1);
+    assert_eq!(rs.choice_p(&[]), 0, "empty p");
+    assert_eq!(rs.choice_p(&[1.0]), 0, "single outcome");
+    // A zero-weight outcome must never be selected: its cdf entry equals the
+    // previous one, so no `u` can land strictly between them.
+    let p = [0.5, 0.0, 0.5];
+    let mut rs2 = numpy::RandomState::new(4);
+    for _ in 0..200 {
+        assert_ne!(rs2.choice_p(&p), 1, "zero-weight outcome was chosen");
+    }
+}
+
+#[test]
+fn torch_rand_is_a_float32_draw() {
+    // `torch.rand` defaults to float32: 24 bits out of one 32-bit word, scaled by
+    // 2^-24. Reading the call site as an f64 draw would give plausible values that
+    // diverge from torch immediately — `torch.rand(1, dtype=torch.float64)` at the
+    // same seed is 0.05815448596142969, nothing like the first value below.
+    let expect: [f64; 5] = [
+        0.8822692632675171,
+        0.9150039553642273,
+        0.38286375999450684,
+        0.9593056440353394,
+        0.3904482126235962,
+    ];
+    let mut g = torch::RandomState::new(42);
+    for (i, e) in expect.iter().enumerate() {
+        let got = g.rand();
+        assert_eq!(
+            got.to_bits(),
+            e.to_bits(),
+            "torch.rand()[{i}]: {got} != {e}"
+        );
+    }
+}
+
+#[test]
+fn torch_randperm_continues_a_shared_generator() {
+    // A sampler that draws a jitter with `rand` and then shuffles with `randperm`
+    // passes ONE generator to both, so the shuffle must continue the stream.
+    // Restarting from the seed is a different permutation — the two are recorded
+    // here so the distinction cannot be lost.
+    let mut g = torch::RandomState::new(42);
+    let _jitter = g.rand();
+    assert_eq!(
+        g.randperm(6),
+        vec![5, 2, 4, 3, 0, 1],
+        "randperm continuing the stream after one rand"
+    );
+    assert_eq!(
+        torch::randperm(6, 42),
+        vec![0, 3, 2, 4, 1, 5],
+        "randperm from a fresh seed — different, as it must be"
+    );
+}
+
+#[test]
+fn the_free_randperm_still_matches_the_method() {
+    for n in [0usize, 1, 2, 7, 25] {
+        let mut g = torch::RandomState::new(3);
+        assert_eq!(torch::randperm(n, 3), g.randperm(n), "n = {n}");
+    }
 }

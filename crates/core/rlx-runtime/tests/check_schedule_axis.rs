@@ -51,8 +51,10 @@ fn gpu_opts() -> CheckOptions {
         repr: false,
         schedule: true,
         // Off: this file isolates the schedule (hint) axis. The plan gates are
-        // errors and would drown the notes under test.
+        // errors and would drown the notes under test, and the budget axis adds
+        // notes of its own.
         plan: false,
+        budget: false,
     }
 }
 

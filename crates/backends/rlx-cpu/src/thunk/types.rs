@@ -120,6 +120,22 @@ pub enum Thunk {
     /// `C[m,n] = A[m,k](f32) @ B[k,n](BF16)` — dequant-on-the-fly GEMM with a
     /// BF16 right-hand (half the weight memory traffic; used for a bf16-resident
     /// LM head). `b` is a BF16 arena buffer (`k*n` `u16`), `a`/`c` are f32.
+    /// `C[m,n] = A[m,k] @ B[k,n]` where any operand may live in the arena
+    /// PACKED at 2 B/elem. Packed sides are widened to f32, the GEMM runs in
+    /// f32, and a packed `c` is rounded back. This is the general fallback for
+    /// autocast graphs, where a half tensor is often a plain activation rather
+    /// than a weight and the planner may or may not have widened its slot.
+    SgemmHalf {
+        a: usize,
+        b: usize,
+        c: usize,
+        m: u32,
+        k: u32,
+        n: u32,
+        a_kind: HalfKind,
+        b_kind: HalfKind,
+        c_kind: HalfKind,
+    },
     SgemmBf16 {
         a: usize,
         b: usize,
@@ -896,6 +912,21 @@ pub enum Thunk {
         src: usize,
         dst: usize,
         len: u32,
+    },
+    /// Round f32 values to half precision **in f32 storage**.
+    ///
+    /// A half-typed *activation* gets a 4-byte slot holding f32
+    /// (`plan_memory_native_in_order` widens them because the thunks compute
+    /// in f32); only half *params* stay packed at 2 B. So a `Cast` to BF16/F16
+    /// whose destination is an activation must round the value and keep the
+    /// f32 layout — writing packed halves into a widened slot reads back as
+    /// pairs of halves and corrupts everything downstream.
+    RoundHalf {
+        src: usize,
+        dst: usize,
+        len: u32,
+        /// `true` = bf16, `false` = IEEE f16.
+        bf16: bool,
     },
     /// LayerNorm standalone
     LayerNorm {
@@ -3176,6 +3207,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::ConcatF64 { inputs, .. } => inputs.iter().map(|(off, _, _)| *off).collect(),
         Thunk::Narrow { src, .. } => vec![*src],
         Thunk::Copy { src, .. } => vec![*src],
+        Thunk::RoundHalf { src, .. } => vec![*src],
         Thunk::Gather { table, idx, .. } => vec![*table, *idx],
         Thunk::Histogram { src, .. } => vec![*src],
         // Anything not enumerated → return the dst as a "read" too,
@@ -3211,5 +3243,23 @@ impl std::fmt::Debug for ScanBodyPlan {
             .field("num_bcast", &self.bcast_body_offs.len())
             .field("num_xs", &self.xs_body_offs.len())
             .finish()
+    }
+}
+
+/// How one GEMM operand is laid out in the arena: full f32, or packed 2 B/elem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalfKind {
+    /// 4 B/elem f32 — either a genuine f32 tensor or a widened half slot.
+    F32,
+    /// 2 B/elem bfloat16 bits.
+    Bf16,
+    /// 2 B/elem IEEE binary16 bits.
+    F16,
+}
+
+impl HalfKind {
+    /// Packed layouts need widening before an f32 kernel may read them.
+    pub fn packed(self) -> bool {
+        !matches!(self, HalfKind::F32)
     }
 }

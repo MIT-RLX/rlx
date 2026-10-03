@@ -17,6 +17,7 @@ pub const MATMUL_WGSL: &str = include_str!("matmul.wgsl");
 pub const MATMUL_BF16W_WGSL: &str = include_str!("matmul_bf16w.wgsl");
 pub const MATMUL_WIDE_WGSL: &str = include_str!("matmul_wide.wgsl");
 pub const MATMUL_WIDE_NV_WGSL: &str = include_str!("matmul_wide_nv.wgsl");
+pub const MATMUL_WIDE_VEC4_WGSL: &str = include_str!("matmul_wide_vec4.wgsl");
 pub const MATMUL_F16W_WGSL: &str = include_str!("matmul_f16w.wgsl");
 pub const MATMUL_F16_COMPUTE_WGSL: &str = include_str!("matmul_f16_compute.wgsl");
 pub const MATMUL_COOP16_WGSL: &str = include_str!("matmul_coop16.wgsl");
@@ -2639,6 +2640,20 @@ pub fn matmul_wide_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 /// 64×64 / 256-thread variant for discrete GPUs (Vulkan path).
+/// Vectorised 64×64 wide tile — see `matmul_wide_vec4.wgsl`. Measured 2.8×
+/// `matmul_wide` on an M4 Pro and bit-identical to it.
+pub fn matmul_wide_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    static MATMUL_WIDE_VEC4: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
+    MATMUL_WIDE_VEC4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_wide_vec4",
+            MATMUL_WIDE_VEC4_WGSL,
+            "matmul_wide_vec4",
+        )
+    })
+}
+
 pub fn matmul_wide_nv_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL_WIDE_NV.get_or_init(|| {
         build_kernel(
@@ -2810,7 +2825,7 @@ pub fn matmul_coop_f16_vulkan_widen_f32acc_kernel(
         .as_ref()
 }
 
-fn coop_f16_vk_use_f32acc(device: &wgpu::Device) -> bool {
+pub(crate) fn coop_f16_vk_use_f32acc(device: &wgpu::Device) -> bool {
     !rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_NO_F32ACC")
         && matmul_coop_f16_vulkan_f32acc_kernel(device).is_some()
 }
@@ -2823,13 +2838,31 @@ fn pick_coop_f16_vk_matmul(
     widen: fn(&wgpu::Device) -> Option<&'static Kernel>,
     widen_f32acc: fn(&wgpu::Device) -> Option<&'static Kernel>,
 ) -> Option<&'static Kernel> {
-    if coop_f16_vk_use_f32acc(device) {
-        if coop_f16_vk_widen_b_load(n) {
+    let f32acc = coop_f16_vk_use_f32acc(device);
+    // WHICH B-LOAD IS CORRECT IS MEASURED, NOT GUESSED.
+    //
+    // `matmul_coop_f16_vulkan.wgsl` and `..._widen.wgsl` differ by exactly one
+    // token — `coopLoadT` vs `coopLoad` on B — against the same `b_ptr` and the
+    // same `params.n` stride. This used to pick between them on `n > 768`. A
+    // memory layout is a property of the bytes, not of N: the same buffer cannot
+    // be row-major at n=768 and column-major at n=769, so at most one of the two
+    // is right and the threshold was serving a transposed product to one half of
+    // the N range. `f16_vk_widen_choice` runs a non-commuting probe on the actual
+    // device (memoized) and returns the variant that computes `a·b`, keeping the
+    // old size-based preference only as a tie-break between two correct kernels.
+    //
+    // `None` means neither variant is correct here. `derive_matmul_compute`
+    // gates on the same probe so this path should already be ineligible, but
+    // refuse anyway rather than hand back a kernel known to produce wrong
+    // numbers.
+    let widen_b = crate::coop_probe::f16_vk_widen_choice(n, f32acc)?;
+    if f32acc {
+        if widen_b {
             return widen_f32acc(device).or_else(|| loadt_f32acc(device));
         }
         return loadt_f32acc(device);
     }
-    if coop_f16_vk_widen_b_load(n) {
+    if widen_b {
         widen(device).or_else(|| loadt(device))
     } else {
         loadt(device)
@@ -2899,12 +2932,56 @@ pub fn matmul_coop_f32_active_kernel(device: &wgpu::Device) -> Option<&'static K
     }
 }
 /// Wide f32 matmul kernel for the active backend.
-pub fn matmul_wide_active_kernel(device: &wgpu::Device) -> &'static Kernel {
-    match crate::device::wgpu_device().map(|d| d.backend) {
-        Some(wgpu::Backend::Vulkan) | Some(wgpu::Backend::Dx12) => matmul_wide_nv_kernel(device),
-        _ => matmul_wide_kernel(device),
+/// Which wide-tile matmul kernel this adapter uses, and its output tile height.
+///
+/// The kernel and the dispatch grid MUST be derived from this one function.
+/// They were previously chosen by two separate `matches!(backend, ...)`
+/// expressions, which is the same shape of bug as the cooperative-matrix
+/// base/widen split: two places deciding the same thing, free to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WideVariant {
+    /// `matmul_wide` — 32×64 tile, 64 threads. Scalar; ~2.5% of peak.
+    Std,
+    /// `matmul_wide_nv` — 64×64 tile, 256 threads. Scalar.
+    Nv,
+    /// `matmul_wide_vec4` — 64×64 tile, 256 threads, `vec4` tiles. Default:
+    /// measured 3.0–4.4× `Std` on an M4 Pro and bit-identical to it
+    /// (`tests/matmul_vec4_parity.rs`).
+    Vec4,
+}
+
+impl WideVariant {
+    /// Output rows per workgroup — the `m` divisor for the dispatch grid. All
+    /// three variants are 64 columns wide.
+    pub fn tile_m(self) -> u32 {
+        match self {
+            WideVariant::Std => 32,
+            WideVariant::Nv | WideVariant::Vec4 => 64,
+        }
     }
 }
+
+/// Escape hatches: `RLX_WGPU_WIDE_STD` / `RLX_WGPU_WIDE_NV` pin the older
+/// scalar kernels, for A/B measurement or if a driver mishandles the vectorised
+/// one.
+pub fn wide_variant() -> WideVariant {
+    if rlx_ir::env::flag("RLX_WGPU_WIDE_STD") {
+        return WideVariant::Std;
+    }
+    if rlx_ir::env::flag("RLX_WGPU_WIDE_NV") {
+        return WideVariant::Nv;
+    }
+    WideVariant::Vec4
+}
+
+pub fn matmul_wide_active_kernel(device: &wgpu::Device) -> &'static Kernel {
+    match wide_variant() {
+        WideVariant::Std => matmul_wide_kernel(device),
+        WideVariant::Nv => matmul_wide_nv_kernel(device),
+        WideVariant::Vec4 => matmul_wide_vec4_kernel(device),
+    }
+}
+
 /// Mirrors a region of the f32 arena into the f16 shadow buffer.
 /// Used before `matmul_coop16` for the matmul's activation operand
 /// (intermediate activations don't go through `set_param` /

@@ -51,7 +51,7 @@ pub(crate) fn sample_row(
     }
     let mut sum = 0.0f32;
     for x in scaled.iter_mut() {
-        *x = (*x - max_l).exp();
+        *x = crate::vmath::exp_poly(*x - max_l);
         sum += *x;
     }
     let inv = 1.0 / sum.max(f32::MIN_POSITIVE);
@@ -679,7 +679,7 @@ pub(crate) fn softmax_strided(data: &mut [f32], outer: usize, cols: usize, inner
                     // Subtracting the max before exponentiating is what keeps a
                     // large logit from overflowing to inf and taking the whole
                     // normalisation to NaN.
-                    let e = (*x - m).exp();
+                    let e = crate::vmath::exp_poly(*x - m);
                     *x = e;
                     *s += e;
                 }
@@ -958,7 +958,7 @@ pub(crate) fn exec_softmax_cross_entropy_dense(t: &Thunk, base: *mut u8) {
                 }
                 let mut sum = 0f32;
                 for &v in row {
-                    sum += (v - m).exp();
+                    sum += crate::vmath::exp_poly(v - m);
                 }
                 let lse = m + sum.ln();
                 // loss = lse - Σ_c targets[c]·logits[c].
@@ -1002,7 +1002,7 @@ pub(crate) fn exec_softmax_cross_entropy(t: &Thunk, base: *mut u8) {
                 }
                 let mut sum = 0f32;
                 for &v in row {
-                    sum += (v - m).exp();
+                    sum += crate::vmath::exp_poly(v - m);
                 }
                 let lse = m + sum.ln();
                 let label_idx = lb[ni] as usize;
@@ -1046,12 +1046,12 @@ pub(crate) fn exec_softmax_cross_entropy_backward(t: &Thunk, base: *mut u8) {
                 }
                 let mut sum = 0f32;
                 for &v in row {
-                    sum += (v - m).exp();
+                    sum += crate::vmath::exp_poly(v - m);
                 }
                 let inv_sum = 1.0 / sum;
                 let dst_row = &mut out[ni * c..(ni + 1) * c];
                 for k in 0..c {
-                    let p = (row[k] - m).exp() * inv_sum;
+                    let p = crate::vmath::exp_poly(row[k] - m) * inv_sum;
                     let one_hot = if k == label_idx { 1.0 } else { 0.0 };
                     dst_row[k] = (p - one_hot) * scale;
                 }
@@ -1214,7 +1214,7 @@ mod softmax_axis_tests {
     /// reference the strided kernel has to reproduce.
     fn reference(row: &[f32]) -> Vec<f32> {
         let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let e: Vec<f32> = row.iter().map(|x| (x - m).exp()).collect();
+        let e: Vec<f32> = row.iter().map(|x| crate::vmath::exp_poly(x - m)).collect();
         let s: f32 = e.iter().sum();
         e.iter().map(|x| x / s).collect()
     }

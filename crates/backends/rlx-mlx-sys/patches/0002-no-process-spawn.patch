@@ -1,0 +1,65 @@
+diff --git a/mlx/backend/cpu/jit_compiler.cpp b/mlx/backend/cpu/jit_compiler.cpp
+index 530637e5..2a4538ff 100644
+--- a/mlx/backend/cpu/jit_compiler.cpp
++++ b/mlx/backend/cpu/jit_compiler.cpp
+@@ -11,6 +11,27 @@
+ 
+ #include <fmt/format.h>
+ 
++// ── rlx patch: platforms with no process spawning ──────────────────────────
++//
++// tvOS, watchOS and visionOS mark both `system()` and `popen()` unavailable —
++// they have no shell, no runtime toolchain, and no way to spawn one. This file
++// exists to compile CPU kernels by shelling out to `g++` at runtime, so on
++// those platforms the honest answer is "no JIT compiler", not a call that
++// cannot link. Without this the build fails outright:
++//
++//   jit_compiler.cpp:212:28: error: 'system' is unavailable: not available on tvOS
++//
++// MLX already treats `JitCompiler::available() == false` as a supported state
++// and falls back to its non-compiled CPU kernels, so this costs a fast path
++// that could never have existed here rather than any functionality.
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#if TARGET_OS_TV || TARGET_OS_WATCH || \
++    (defined(TARGET_OS_VISION) && TARGET_OS_VISION)
++#define MLX_NO_PROCESS_SPAWN 1
++#endif
++#endif
++
+ #if defined(_MSC_VER) && \
+     (defined(_M_X64) || defined(_M_IX86) || defined(_M_AMD64))
+ #include <intrin.h>
+@@ -194,7 +215,10 @@ const std::tuple<bool, std::string, std::string>& JitCompiler::get_preamble() {
+ }
+ 
+ bool JitCompiler::available() {
+-#ifdef _MSC_VER
++#if defined(MLX_NO_PROCESS_SPAWN)
++  // No shell to ask, and asking is itself unavailable. See the note above.
++  return false;
++#elif defined(_MSC_VER)
+   static bool result = [] {
+     try {
+       bool use_include = std::get<0>(get_preamble());
+@@ -279,6 +303,12 @@ std::string JitCompiler::build_command(
+ }
+ 
+ std::string JitCompiler::exec(const std::string& cmd) {
++#if defined(MLX_NO_PROCESS_SPAWN)
++  // Unreachable: every caller gates on `available()`, which is false here. It
++  // still has to compile, and `popen` is as unavailable as `system` was.
++  throw std::runtime_error(
++      "mlx: runtime kernel compilation is unavailable on this platform");
++#else
+ #ifdef _MSC_VER
+   FILE* pipe = _popen(cmd.c_str(), "r");
+ #else
+@@ -324,6 +354,7 @@ std::string JitCompiler::exec(const std::string& cmd) {
+             ret));
+   }
+   return ret;
++#endif
+ }
+ 
+ } // namespace mlx::core

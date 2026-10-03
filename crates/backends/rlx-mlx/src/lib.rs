@@ -99,11 +99,65 @@ pub use distributed::MlxTransport;
 #[cfg(rlx_mlx_host)]
 pub use lower::MlxMode;
 
-/// True when this target links the native MLX stack (macOS Metal, CPU MLX on
-/// Linux / Windows).
+/// True when MLX can actually **run** here — not merely when it is linked in.
+///
+/// This used to answer `true` for any target that links the native MLX stack,
+/// which is a compile-time fact rather than a device probe, and callers treat
+/// it as the latter: `fastest_device()` picks the best *available* backend and
+/// then runs on it.
+///
+/// On an iPad with the MLX kernel library missing from the app bundle, that gap
+/// was visible — `is_available(Mlx)` said yes, `fastest_device()` returned MLX,
+/// and execution then failed with
+///
+/// ```text
+/// Failed to load the default metallib. library not found
+/// ```
+///
+/// MLX loads that library lazily on the first GPU kernel, so nothing short of
+/// running one detects it. The probe is a single-element add plus an `eval` to
+/// force materialization — cheap, and it exercises exactly the path that was
+/// failing. Cached: the answer cannot change within a process, and callers ask
+/// on every device-selection decision.
 #[cfg(rlx_mlx_host)]
 pub fn is_available() -> bool {
-    true
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(probe_one_kernel)
+}
+
+/// Run the smallest possible MLX GPU kernel and report whether it worked.
+///
+/// Wrapped in `catch_unwind` as well as checked by return code: a missing
+/// kernel library surfaces from MLX's C++ side, and a probe that aborts the
+/// process would be worse than the wrong answer it exists to prevent.
+#[cfg(rlx_mlx_host)]
+fn probe_one_kernel() -> bool {
+    use rlx_mlx_sys::ffi::{
+        MlxDtype, RLX_MLX_OK, mlx_array_t, rlx_mlx_array_free, rlx_mlx_array_from_data,
+        rlx_mlx_eval, rlx_mlx_op_add,
+    };
+    std::panic::catch_unwind(|| unsafe {
+        let dims: [std::ffi::c_int; 1] = [1];
+        let data: [std::ffi::c_float; 1] = [1.0];
+        let mut a: *mut mlx_array_t = std::ptr::null_mut();
+        if rlx_mlx_array_from_data(dims.as_ptr(), 1, data.as_ptr(), 1, MlxDtype::F32, &mut a)
+            != RLX_MLX_OK
+            || a.is_null()
+        {
+            return false;
+        }
+        let mut sum: *mut mlx_array_t = std::ptr::null_mut();
+        let added = rlx_mlx_op_add(a, a, &mut sum) == RLX_MLX_OK && !sum.is_null();
+        // `add` is lazy; only `eval` makes MLX load its kernel library.
+        let ok = added && rlx_mlx_eval([sum].as_ptr(), 1) == RLX_MLX_OK;
+        if !sum.is_null() {
+            rlx_mlx_array_free(sum);
+        }
+        rlx_mlx_array_free(a);
+        ok
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(not(rlx_mlx_host))]

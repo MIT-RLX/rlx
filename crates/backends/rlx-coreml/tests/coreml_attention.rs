@@ -4,7 +4,7 @@
 // RoPE + Attention MIL lowering, validated on-device against explicit
 // hand references (NeoX split-halves rope; causal scaled-dot-product
 // attention), then composed into a full transformer attention block.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 #![allow(clippy::useless_vec)] // `vec![..; CONST]` reads clearly in test scaffolding
 
 use rlx_coreml::CoremlExecutable;

@@ -528,8 +528,38 @@ impl CpuExecutable {
     }
 
     /// Write a f32 input slice into the arena, casting to the node's dtype.
+    /// How a node is actually *stored*, which is not always its declared dtype.
+    ///
+    /// The lane rule the fused regions already follow
+    /// (`thunk::types::LaneKind::resolve`): a slot's width is what the memory
+    /// plan assigned, and a 4-byte slot holding an `F16`/`BF16`-typed node
+    /// contains a widened `f32`. `plan_memory_native_in_order` widens half
+    /// *activations* to f32 (`ArenaWidthPolicy::NativeHalfWidened`) because the
+    /// thunks compute in f32; half *params* stay packed at 2 B.
+    ///
+    /// Reading the declared dtype instead — which these two used to do — writes
+    /// 2 B/elem into a 4 B/elem slot and reads it back as pairs of halves:
+    ///
+    /// ```text
+    /// [1,2,3,4] into a BF16 input, + 0  ->  [2.0038757, 4.007843, 0.0, 0.0]
+    /// ```
+    fn storage_dtype(&self, id: NodeId) -> DType {
+        let declared = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
+        if !matches!(declared, DType::F16 | DType::BF16) {
+            return declared;
+        }
+        let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
+        if n_elems == 0 {
+            return declared;
+        }
+        match self.arena.byte_size(id) / n_elems {
+            2 => declared,   // packed at its true width
+            _ => DType::F32, // widened by the plan
+        }
+    }
+
     fn write_input(&mut self, id: NodeId, data: &[f32]) {
-        let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
+        let dtype = self.storage_dtype(id);
         let off = self.arena.byte_offset(id);
         let buf = self.arena.raw_buf_mut();
         let elem_size = dtype.size_bytes();
@@ -539,9 +569,10 @@ impl CpuExecutable {
         }
     }
 
-    /// Read a node's arena bytes back as Vec<f32>, casting from its dtype.
+    /// Read a node's arena bytes back as Vec<f32>, casting from how it is
+    /// *stored* (see [`Self::storage_dtype`]), not from what it is declared.
     fn read_output(&self, id: NodeId) -> Vec<f32> {
-        let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
+        let dtype = self.storage_dtype(id);
         let off = self.arena.byte_offset(id);
         let buf = self.arena.raw_buf();
         let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
@@ -855,8 +886,7 @@ impl ExecutableGraph for CpuExecutable {
         } else {
             // Mixed-dtype path: dtypes that survive untouched
             // through the f32-aliased arena (F64, I32, I64, U32)
-            // go in as bytes; F32 and the half-precision family
-            // route through widen-to-f32 + run.
+            // go in as bytes; F32 routes through widen-to-f32 + run.
             let mut f32_owned: Vec<(String, Vec<f32>)> = Vec::new();
             for (name, data, dt) in inputs {
                 let direct = matches!(
@@ -909,16 +939,16 @@ impl ExecutableGraph for CpuExecutable {
             .map(|(idx, &id)| {
                 let exec_dtype = self.graph.node(id).shape.dtype();
                 let declared = self.io_manifest.output_dtype(idx, exec_dtype);
+                // F16/BF16 are deliberately absent: under
+                // `ArenaWidthPolicy::NativeHalfWidened` a half *activation*
+                // occupies f32 width and holds f32 bits, because that is what
+                // the thunks compute in. Reading `n_elems * 2` raw bytes here
+                // would take half the buffer and call it the answer. They fall
+                // through to the f32 read + `narrow_f32_to_bytes` below, which
+                // emits the declared boundary dtype.
                 if matches!(
                     exec_dtype,
-                    DType::F64
-                        | DType::F16
-                        | DType::BF16
-                        | DType::I32
-                        | DType::I64
-                        | DType::U32
-                        | DType::C64
-                        | DType::C128
+                    DType::F64 | DType::I32 | DType::I64 | DType::U32 | DType::C64 | DType::C128
                 ) {
                     let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
                     let n_bytes = n_elems * exec_dtype.size_bytes();
@@ -927,7 +957,7 @@ impl ExecutableGraph for CpuExecutable {
                     return (bytes, declared);
                 }
                 let f32_vals = self.read_output(id);
-                if declared != exec_dtype {
+                if declared != exec_dtype || matches!(declared, DType::F16 | DType::BF16) {
                     return (super::narrow_f32_to_bytes(&f32_vals, declared), declared);
                 }
                 let bytes = f32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();

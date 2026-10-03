@@ -6,17 +6,26 @@
 //! On Vulkan/DX12 the portable coop kernel auto-enables when 8×8 f32
 //! cooperative-matrix support is present.
 
+use rlx_ir::infer::GraphExt;
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_wgpu::backend::WgpuExecutable;
 
-/// Apple `simdgroup_float8x8` (and the Vulkan portable 8×8 coop path) use
-/// reduced-precision internal accumulators — see `rlx-metal` cost notes on
-/// `RLX_METAL_PRECISE`. Uniform-magnitude probes (`coop_f32_uses_real_f32`)
-/// still pin the f32 operand path; sin/cos parity here allows hw-class drift.
+/// `simdgroup_float8x8` is a genuine f32 multiply with an f32 accumulator, so
+/// these shapes land within f32 rounding of a host f64-free reference.
+///
+/// This gate used to read `ATOL = 0.05, RTOL = 10.0` — a 1000% relative
+/// tolerance — justified as "reduced-precision internal accumulators". There is
+/// no such reduced precision. The loose bound was hiding a transposed product
+/// (the kernel computed `b·a`; see the operand-role note in
+/// `kernels/matmul_coop_f32.wgsl`), which has roughly the same magnitude as the
+/// right answer and so passed a magnitude-relative check. Measured max|Δ| at
+/// the three shapes below is 2.1e-8 / 3.0e-8 / 2.4e-8.
+///
+/// Keep this tight. A tolerance a wrong answer can pass is not a test.
 fn coop_f32_close(max_diff: f32, abs_max_expected: f32) -> bool {
-    const ATOL: f32 = 0.05;
-    const RTOL: f32 = 10.0;
+    const ATOL: f32 = 1e-6;
+    const RTOL: f32 = 1e-4;
     max_diff < ATOL.max(abs_max_expected * RTOL)
 }
 
@@ -268,4 +277,154 @@ fn coop_f32_correct_with_bias_via_fmb() {
         coop_f32_close(max_diff, abs_max),
         "FMB CoopF32 diverges: max|Δ|={max_diff}"
     );
+}
+
+/// The probe that would have caught the transposed product on day one.
+///
+/// Every other case in this file multiplies two dense operands, which the old
+/// loose tolerance let slide. This one is shaped so that `a·b` and `b·a` differ
+/// *structurally*, not just numerically, so no tolerance can paper over it:
+///
+///   A is a column vector (only k=0 populated), B is a row vector (only k=0).
+///   `a·b` is the full rank-1 outer product — every one of the 32×32 outputs is
+///   non-zero. `b·a` collapses each 8×8 fragment to a single dot product parked
+///   at its [0][0], leaving 63/64 of the output exactly zero.
+///
+/// The lesson this encodes: the pre-existing tests multiplied by an identity
+/// (`A·I`, `I·B`) or by another dense matrix. An identity *commutes*, so it
+/// cannot distinguish `a·b` from `b·a` — a swapped-operand bug passes both.
+/// Two structurally different non-commuting operands are what it takes.
+#[test]
+fn coop_f32_operand_order_is_not_commuted() {
+    if !require_coop_f32_test() {
+        return;
+    }
+    // One workgroup, one k-tile: the smallest case that exercises the
+    // fragment roles at all.
+    const M: usize = 32;
+    const K: usize = 8;
+    const N: usize = 32;
+
+    let mut g = Graph::new("coop_f32_outer");
+    let a = g.input("a", Shape::new(&[M, K], DType::F32));
+    let b = g.param("b", Shape::new(&[K, N], DType::F32));
+    let c = g.matmul(a, b, Shape::new(&[M, N], DType::F32));
+    g.set_outputs(vec![c]);
+
+    let mut a_data = vec![0.0_f32; M * K];
+    for (i, row) in a_data.chunks_mut(K).enumerate() {
+        row[0] = i as f32 + 1.0;
+    }
+    let mut b_data = vec![0.0_f32; K * N];
+    for (j, v) in b_data[..N].iter_mut().enumerate() {
+        *v = (j as f32 + 1.0) * 0.01;
+    }
+
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("b", &b_data);
+    let outs = exe.run(&[("a", a_data.as_slice())]);
+    let out = &outs[0];
+
+    let mut max_diff = 0.0_f32;
+    let mut zeros = 0usize;
+    for i in 0..M {
+        for j in 0..N {
+            let want = (i as f32 + 1.0) * (j as f32 + 1.0) * 0.01;
+            let got = out[i * N + j];
+            max_diff = max_diff.max((got - want).abs());
+            if got == 0.0 {
+                zeros += 1;
+            }
+        }
+    }
+    eprintln!(
+        "outer-product max|Δ| = {max_diff}, exact zeros = {zeros}/{}",
+        M * N
+    );
+    // `b·a` leaves 1008/1024 outputs at exactly zero; `a·b` leaves none.
+    assert_eq!(
+        zeros,
+        0,
+        "{zeros}/{} outputs are exactly zero — the rank-1 outer product collapsed, \
+         which is the signature of a transposed/commuted operand pair",
+        M * N
+    );
+    assert!(
+        max_diff < 1e-5,
+        "outer product diverges from a·b: max|Δ|={max_diff}"
+    );
+}
+
+/// The fused split-QKV variant, `kernels/matmul_qkv_coop_f32.wgsl`.
+///
+/// It is a separate shader from `matmul_coop_f32.wgsl` with the same tile
+/// structure, reached only when a `FusedMatMulBiasAct` is followed by three
+/// `Narrow`s along the last axis (the Q/K/V split) — so the plain matmul tests
+/// above never touch it, and it carried an identical transposed product.
+///
+/// Q, K and V are checked separately: a fault in the column routing shows up in
+/// one slice and not the others.
+#[test]
+fn coop_f32_qkv_split_matches_reference() {
+    if !require_coop_f32_test() {
+        return;
+    }
+    // m%32, k%8, n%32 — and n = 3*H so the three narrows are 32-aligned too.
+    const M: usize = 64;
+    const K: usize = 128;
+    const H: usize = 64;
+    const N: usize = 3 * H;
+
+    let mut g = Graph::new("coop_f32_qkv");
+    let x = g.input("x", Shape::new(&[M, K], DType::F32));
+    let w = g.param("w", Shape::new(&[K, N], DType::F32));
+    let bias = g.param("bias", Shape::new(&[N], DType::F32));
+    let fmb = g.add_node(
+        Op::FusedMatMulBiasAct { activation: None },
+        vec![x, w, bias],
+        Shape::new(&[M, N], DType::F32),
+    );
+    let q = g.narrow_(fmb, 1, 0, H);
+    let k = g.narrow_(fmb, 1, H, H);
+    let v = g.narrow_(fmb, 1, 2 * H, H);
+    g.set_outputs(vec![q, k, v]);
+
+    let x_data: Vec<f32> = (0..M * K).map(|i| 0.1 * (i as f32 * 0.37).sin()).collect();
+    let w_data: Vec<f32> = (0..K * N).map(|i| 0.05 * (i as f32 * 0.71).cos()).collect();
+    let bias_data: Vec<f32> = (0..N).map(|i| 0.01 * (i as f32).sin()).collect();
+
+    let mut full = vec![0f32; M * N];
+    for i in 0..M {
+        for j in 0..N {
+            let mut acc = bias_data[j];
+            for kk in 0..K {
+                acc += x_data[i * K + kk] * w_data[kk * N + j];
+            }
+            full[i * N + j] = acc;
+        }
+    }
+
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("w", &w_data);
+    exe.set_param("bias", &bias_data);
+    let outs = exe.run(&[("x", x_data.as_slice())]);
+
+    for (slice, name) in [(0usize, "Q"), (1, "K"), (2, "V")] {
+        let got = &outs[slice];
+        assert_eq!(got.len(), M * H, "{name} has the wrong length");
+        let mut max_diff = 0.0_f32;
+        let mut abs_max = 0.0_f32;
+        for i in 0..M {
+            for j in 0..H {
+                let want = full[i * N + slice * H + j];
+                max_diff = max_diff.max((got[i * H + j] - want).abs());
+                abs_max = abs_max.max(want.abs());
+            }
+        }
+        eprintln!("qkv {name}: max|Δ| = {max_diff}, max|expected| = {abs_max}");
+        assert!(
+            coop_f32_close(max_diff, abs_max),
+            "split-QKV CoopF32 {name} diverges: max|Δ|={max_diff}"
+        );
+    }
 }

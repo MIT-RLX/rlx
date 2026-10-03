@@ -19,8 +19,11 @@
 //!
 //! Unset (a developer laptop, CI without hardware) this is a no-op.
 
+mod common;
+
 #[test]
 fn the_device_this_crate_targets_is_actually_present() {
+    let _gpu = common::serialize_gpu();
     if rlx_ir::env::skip_unless_device("vulkan", true, rlx_vulkan::is_available()) {
         return;
     }

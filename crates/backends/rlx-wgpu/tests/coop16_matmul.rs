@@ -212,12 +212,18 @@ fn matmul_coop16_matches_cpu_reference() {
     // allow mixing simdgroup-matrix dtypes via naga 29's emit (the
     // mixed-precision path errors with "no known conversion from
     // simdgroup_matrix<half> to simdgroup_matrix<float>"). Until naga
-    // 30 fixes that, we keep both inputs and acc in f16. Each FMA has
-    // ~3 ulps of f16 noise; over K=64 the cumulative drift can reach
-    // ~3e-1 in worst-case dot products. Reference uses f32 acc so the
-    // diff captures that quantization fully.
+    // 30 fixes that, we keep both inputs and acc in f16. Reference uses
+    // an f32 accumulator, so the diff captures that quantization fully;
+    // measured max|Δ| at this shape is 6.5e-4.
+    //
+    // This bound used to be `max_abs < 1.0` — wide enough that the kernel's
+    // output could be, and was, entirely unrelated to the reference. It
+    // computed `b·a` (see the operand-role note in `kernels/matmul_coop16.wgsl`)
+    // and reported max|Δ|=5.6e-1 with max_rel=2.1e4 while passing. `max_rel` is
+    // left unasserted because f16 noise against near-zero reference cells makes
+    // it meaninglessly large; max|Δ| is the gate that has teeth.
     assert!(
-        max_abs < 1.0,
+        max_abs < 5e-3,
         "coop16 matmul output drifted unreasonably far: max|Δ|={max_abs}"
     );
 }

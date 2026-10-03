@@ -26,8 +26,9 @@ pub mod demo;
 pub mod scaffold;
 
 pub use rlx_runtime::check::{
-    BackendSummary, CheckOptions, CheckReport, Diagnostic, Legality, Severity, all_backends,
-    backend_device, backend_name, check_graph, default_backends, model_self_check, parse_backend,
+    BackendSummary, Budget, CheckOptions, CheckReport, Diagnostic, Legality, Severity,
+    all_backends, backend_device, backend_name, check_graph, default_backends, model_self_check,
+    parse_backend,
 };
 
 use rlx_ir::Graph;

@@ -1443,6 +1443,26 @@ pub fn compile_thunks_with_rng(
                     })
                 }
 
+                Thunk::RoundHalf {
+                    src,
+                    dst,
+                    len,
+                    bf16,
+                } => {
+                    let len = len as usize;
+                    Arc::new(move |base: *mut u8| unsafe {
+                        let inp = sl(src, base, len).to_vec();
+                        let out = sl_mut(dst, base, len);
+                        for (o, v) in out.iter_mut().zip(&inp) {
+                            *o = if bf16 {
+                                half::bf16::from_f32(*v).to_f32()
+                            } else {
+                                half::f16::from_f32(*v).to_f32()
+                            };
+                        }
+                    })
+                }
+
                 Thunk::SgemmBf16 { a, b, c, m, k, n } => {
                     let (m, k, n) = (m as usize, k as usize, n as usize);
                     Arc::new(move |base: *mut u8| unsafe {
@@ -2471,7 +2491,10 @@ pub fn compile_thunks_with_rng(
                                 // rlx-metal / rlx-cuda native attention.
                                 if softcap > 0.0 {
                                     for s in sc.iter_mut() {
-                                        *s = softcap * (*s / softcap).tanh();
+                                        // Polynomial tanh, not libm: this
+                                        // runs per score inside attention.
+                                        *s = softcap
+                                            * crate::vmath::tanh_poly(*s / softcap);
                                     }
                                 }
                                 crate::naive::softmax(&mut sc, q_s, k_s);
@@ -2514,18 +2537,7 @@ pub fn compile_thunks_with_rng(
                     Arc::new(move |base: *mut u8| unsafe {
                         let inp = sl(src, base, in_total);
                         let out = sl_mut(dst, base, t);
-                        for o in 0..outer {
-                            let in_row = &inp[o * 2 * n..(o + 1) * 2 * n];
-                            let out_row = &mut out[o * n..(o + 1) * n];
-                            for i in 0..n {
-                                let (up, gate) = if gate_first {
-                                    (in_row[n + i], in_row[i])
-                                } else {
-                                    (in_row[i], in_row[n + i])
-                                };
-                                out_row[i] = up * (gate / (1.0 + (-gate).exp()));
-                            }
-                        }
+                        crate::kernels::swiglu_rows(inp, out, outer, n, gate_first);
                     })
                 }
 

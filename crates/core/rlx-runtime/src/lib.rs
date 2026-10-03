@@ -112,6 +112,7 @@ pub mod onnx_active;
 pub mod op_registry;
 pub mod options;
 pub mod paged_kv;
+#[cfg(feature = "model-io")]
 pub mod pkg;
 pub mod precision;
 pub mod precompile;
@@ -126,6 +127,9 @@ pub mod session;
 pub mod stages;
 pub mod subgraph;
 pub mod trace;
+/// Device-resident training: the optimizer update fused into the graph.
+#[cfg(feature = "training")]
+pub mod train;
 pub mod weight_registry;
 pub mod weights;
 pub mod worker_pool;
@@ -278,6 +282,7 @@ pub use rlx_cpu::moe_residency::MoeResidencyStats;
 #[cfg(not(feature = "cpu"))]
 #[derive(Debug, Clone, Default)]
 pub struct MoeResidencyStats;
+#[cfg(feature = "model-io")]
 pub use pkg::{
     compile_rlxp, compile_rlxp_bind_params, compile_rlxp_with, load_rlxp_graph,
     load_rlxp_placement, open_rlxp, tensors_for_rank, weight_names_for_rank,
@@ -294,6 +299,7 @@ pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
 pub use rlx_ir::{EnvVarDoc, format_env_catalog, public_catalog_docs as ENV_CATALOG};
 /// `.rlxp` package types — re-exported so `open_rlxp`’s return type is nameable
 /// without a direct `rlx-pkg` dependency.
+#[cfg(feature = "model-io")]
 pub use rlx_pkg::{MaterializeMode, Package, Placement};
 pub use session::Session;
 pub use stages::{

@@ -1,0 +1,77 @@
+[package]
+name = "rlx-js"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Embedded JavaScript bindings for rlx — drive RLX graphs, backends and weights from a script"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+# Not on crates.io yet: the engine dependency (`quickrs-core`) is young and
+# the JS surface is still moving. Build from the workspace.
+publish = false
+
+[features]
+# Mirrors rlx-runtime's backend gates. `cpu` is the only one every host has.
+default = ["cpu", "gguf", "weights", "training", "text"]
+
+cpu             = ["rlx-runtime/cpu"]
+blas-accelerate = ["rlx-runtime/blas-accelerate"]
+blas-mkl        = ["rlx-runtime/blas-mkl"]
+blas-openblas   = ["rlx-runtime/blas-openblas"]
+metal           = ["rlx-runtime/metal"]
+mlx             = ["rlx-runtime/mlx"]
+gpu             = ["rlx-runtime/gpu"]
+cuda            = ["rlx-runtime/cuda"]
+rocm            = ["rlx-runtime/rocm"]
+vulkan          = ["rlx-runtime/vulkan"]
+
+# `rlx.openGguf` — read / dequantize / write GGUF from script.
+gguf = ["dep:rlx-gguf"]
+
+# `rlx.loadTokenizer` / `renderChat` / `sampleNext` — the LM text layer.
+text = ["dep:rlx-text", "dep:serde_json"]
+
+# `rlx.Trainer` / `rlx.Optimizer` — Adam, AdamW, Muon, SOAP, … from script.
+training = ["dep:rlx-optim", "rlx-runtime/training"]
+
+# `rlx.convertToGguf` — safetensors → GGUF with per-tensor quant schemes.
+gguf-convert = ["gguf", "dep:rlx-gguf-convert"]
+
+# `rlx.loadMlx` / `loadDduf` / `loadNemo` / `loadPt` / `openRlxp` / `toRlxp`.
+weights = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:rlx-nemo"]
+
+# `graph.toJSON()`. Off by default: it needs `rlx-ir/serialize`, and feature
+# unification would switch that on for every crate in a `--workspace` build.
+graph-json = ["rlx-ir/serialize", "dep:serde_json"]
+
+[dependencies]
+# Pure-Rust QuickJS-ng. Taken from the sibling checkout rather than crates.io:
+# the engine and this binding are moving together, and a path dep means a fix
+# on either side is one `cargo build` away. Mirrors how rlx-models pins rlx.
+quickrs-core = { path = "../../../../quickjs-rs/crates/quickrs-core", version = "0.16", default-features = false, features = ["std"] }
+
+rlx-ir      = { workspace = true }
+rlx-opt     = { workspace = true }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.17", default-features = false, features = ["model-io"] }
+rlx-gguf    = { workspace = true, optional = true }
+serde_json  = { version = "1", optional = true }
+rlx-pkg     = { workspace = true, optional = true }
+rlx-mlx-io  = { workspace = true, optional = true }
+rlx-dduf    = { workspace = true, optional = true }
+rlx-nemo    = { workspace = true, optional = true }
+rlx-optim   = { workspace = true, optional = true }
+rlx-text    = { workspace = true, optional = true }
+rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.17", optional = true, default-features = false, features = ["safetensors"] }
+
+[[bin]]
+name = "rlx-js"
+path = "src/bin/rlx_js.rs"
+
+[lints]
+workspace = true

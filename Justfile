@@ -350,6 +350,50 @@ test-gpu:
 test-gguf-grouped:
     cargo test -p rlx-runtime --test dequant_grouped_matmul_gguf -- --test-threads=1
 
+# rlx-js: the JS surface. Needs the sibling ../quickjs-rs checkout.
+# `FEATURES` picks backends the same way rlx-runtime does.
+test-js FEATURES="cpu,gguf":
+    cargo test -p rlx-js --no-default-features --features {{FEATURES}}
+
+# MNIST from JavaScript. Fetches the dataset into the cache dir if missing.
+# Usage: just js-mnist            (MLP, ~8s on Metal)
+#        just js-mnist --cnn
+js-mnist *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    D="$HOME/.cache/torchvision-mnist/MNIST/raw"
+    mkdir -p "$D"
+    for f in train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+        # Re-fetch on a truncated file too: a failed download leaves a short one.
+        if [[ ! -s "$D/$f" || $(wc -c <"$D/$f") -lt 10000 ]]; then
+            echo "fetching $f"
+            curl -sSfL "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz" -o "$D/$f.gz"
+            gunzip -f "$D/$f.gz"
+        fi
+    done
+    cargo run -q --release -p rlx-js --features "${FEATURES:-cpu,gguf,weights,training,text}" \
+        --bin rlx-js -- crates/bindings/rlx-js/examples/mnist.js {{ARGS}}
+
+# LoRA from JavaScript: adapt a frozen MNIST model to inverted pixels.
+# Trains the base first if the checkpoint is missing.
+js-lora *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CK="${CKPT:-/tmp/rlx-mnist-base.gguf}"
+    FEATURES="${FEATURES:-cpu,gguf,weights,training,text}"
+    if [[ ! -s "$CK" ]]; then
+        echo "no base checkpoint; training one first"
+        FEATURES="$FEATURES" just js-mnist --save "$CK"
+    fi
+    cargo run -q --release -p rlx-js --features "$FEATURES" \
+        --bin rlx-js -- crates/bindings/rlx-js/examples/mnist_lora.js "$CK" {{ARGS}}
+
+# Run a JavaScript file against the RLX API.
+# Usage: just js crates/bindings/rlx-js/examples/train.js
+#        just js FEATURES=metal ... -- extra args for the script
+js SCRIPT *ARGS:
+    cargo run -q -p rlx-js --features "{{env('FEATURES', 'cpu,gguf')}}" --bin rlx-js -- {{SCRIPT}} {{ARGS}}
+
 # pyrlx: build extension into crates/bindings/pyrlx/.venv (first run) and run pytest.
 test-pyrlx:
     #!/usr/bin/env bash
@@ -582,29 +626,66 @@ check-wasm:
     cargo test -p rlx-webgl
 
 # Cross-compile gate: the Apple on-device stack must build for every Apple
-# platform. The native backends are rlx-cpu (Accelerate/AMX), rlx-metal
-# (Metal + MPS + MPSGraph) and rlx-coreml (ANE) — each compiles the *real*
-# backend, not the non-Apple stub. Platform support matrix:
+# platform, device *and* simulator. The native backends are rlx-cpu
+# (Accelerate/AMX), rlx-metal (Metal + MPS + MPSGraph) and rlx-coreml (ANE) —
+# each compiles the *real* backend, not the non-Apple stub. Platform support
+# matrix:
 #   macOS / iOS / tvOS / visionOS → CPU + Metal + CoreML
 #   watchOS                        → CPU/Accelerate only (no Metal API; CoreML
 #                                    runtime model-compilation is unavailable)
-# Compile-only — shipping to a device needs Xcode packaging (XCFramework).
+#
+# Compile-only. `just test-apple-sim` is the gate that actually *runs* on the
+# simulators, and `ios/build-xcframework.sh` is what packages a build for a
+# device.
+#
 # `check-ios` kept as an alias for the common iPhone/iPad case.
 check-ios: check-apple
 check-apple:
-    # iOS is Rust tier-2 (prebuilt std): plain stable cargo. Driving the full
-    # runtime pulls in the backend crates transitively. The `apple` umbrella
-    # also exercises wgpu (Metal-on-Apple) + the MLX stub.
-    rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-    cargo check -p rlx-runtime --features apple --target aarch64-apple-ios
-    cargo check -p rlx-runtime --no-default-features --features cpu,metal,coreml --target aarch64-apple-ios-sim
-    # tvOS / watchOS / visionOS are Rust tier-3 — build std from source (nightly).
-    rustup component add rust-src --toolchain nightly
-    # tvOS + visionOS ship Metal + CoreML, same surface as iOS.
-    cargo +nightly check -Zbuild-std -p rlx-runtime --no-default-features --features cpu,metal,coreml --target aarch64-apple-tvos
-    cargo +nightly check -Zbuild-std -p rlx-runtime --no-default-features --features cpu,metal,coreml --target aarch64-apple-visionos
-    # watchOS: CPU/Accelerate backend only (no Metal API; no CoreML runtime compile).
-    cargo +nightly check -Zbuild-std -p rlx-runtime --no-default-features --features cpu --target aarch64-apple-watchos
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{justfile_directory()}}
+
+    # iOS has shipped a prebuilt std for years; tvOS, watchOS and visionOS only
+    # got one in a recent stable. Use it where rustup has it and fall back to
+    # building std from source on nightly where it does not, so this gate means
+    # the same thing on either toolchain rather than quietly not running.
+    apple_check() {
+        local target="$1"; shift
+        echo "==> $target ($*)"
+        if rustup target add "$target" >/dev/null 2>&1; then
+            cargo check -p rlx-runtime "$@" --target "$target"
+        else
+            echo "note: no prebuilt std for $target — building std from source (nightly)" >&2
+            rustup toolchain install nightly >/dev/null
+            rustup component add rust-src --toolchain nightly >/dev/null
+            cargo +nightly check -Zbuild-std -p rlx-runtime "$@" --target "$target"
+        fi
+    }
+
+    # Device targets carry the widest surface: the `apple` umbrella adds wgpu
+    # (Metal-on-Apple) and MLX on top of CPU + Metal + CoreML.
+    #
+    # MLX on the device targets is the expensive part of this gate — it
+    # cross-compiles libmlx (a large C++ tree) per platform — and it is also the
+    # part that earns its keep. Every MLX defect on these platforms was invisible
+    # to a `cpu,metal,coreml` check and showed up the moment libmlx was actually
+    # built: a metallib stamped for macOS, `bfloat` missing below the Metal 3.1
+    # floor, and `system()`/`popen()` being unavailable on tvOS and visionOS.
+    for t in aarch64-apple-ios aarch64-apple-tvos aarch64-apple-visionos; do
+        apple_check "$t" --features apple
+    done
+
+    # Simulators: CPU + Metal + CoreML. The simulator slices are exercised for
+    # real by `just test-apple-sim`, and MLX is excluded there for the reason
+    # that recipe documents — a headless `simctl spawn` has no Metal device.
+    for t in aarch64-apple-ios-sim aarch64-apple-tvos-sim aarch64-apple-visionos-sim; do
+        apple_check "$t" --no-default-features --features cpu,metal,coreml
+    done
+
+    # watchOS: CPU/Accelerate only — no Metal API, no CoreML runtime compile.
+    for t in aarch64-apple-watchos aarch64-apple-watchos-sim; do
+        apple_check "$t" --no-default-features --features cpu
+    done
 
 # Gates keyed on the WHOLE op set, not the subset some test happened to build.
 #
@@ -676,7 +757,7 @@ demo-android:
 # Layers, innermost first:
 #   rlx-driver + rlx-collectives  transport + in-graph collectives (no platform gating)
 #   rlx-runtime (dist::node)      the node driver + ship-graph worker
-#   rlx-ffi                       C ABI shell (iOS xcframework, embedded C hosts)
+#   rlx-ffi                       C ABI shell (Apple xcframework, embedded C hosts)
 #
 # Android is gated on the NDK being installed: `cargo check` still runs C build
 # scripts (zstd/bzip2 via the GGUF reader), which need the NDK's clang. The
@@ -687,13 +768,23 @@ check-nodes:
     set -euo pipefail
     cd {{justfile_directory()}}
 
-    echo "==> iOS (aarch64-apple-ios)"
-    rustup target add aarch64-apple-ios >/dev/null
-    cargo check -p rlx-driver -p rlx-collectives --target aarch64-apple-ios
-    cargo check -p rlx-runtime --no-default-features --features cpu --target aarch64-apple-ios
-    # staticlib only: a cdylib must resolve every symbol at link time and
-    # zstd-sys does not on iOS. This is the archive the xcframework wraps.
-    cargo build -p rlx-ffi --lib --target aarch64-apple-ios
+    # Every Apple OS, device slice. These are what ios/build-xcframework.sh
+    # packages, so a break here is a break in the shipped xcframework. The
+    # simulator slices are covered by `just test-apple-sim`, which runs on them.
+    for t in aarch64-apple-ios aarch64-apple-tvos aarch64-apple-watchos aarch64-apple-visionos; do
+      echo "==> Apple node ($t)"
+      if ! rustup target add "$t" >/dev/null 2>&1; then
+        echo "SKIPPED: no prebuilt std for $t in this toolchain." >&2
+        echo "         That platform's node support was NOT verified by this run." >&2
+        continue
+      fi
+      cargo check -p rlx-driver -p rlx-collectives --target "$t"
+      cargo check -p rlx-runtime --no-default-features --features cpu --target "$t"
+      # staticlib only: a cdylib must resolve every symbol at link time and
+      # zstd-sys does not on these targets. This is the archive the
+      # xcframework wraps.
+      cargo build -p rlx-ffi --lib --target "$t"
+    done
 
     echo "==> Android (aarch64-linux-android)"
     if ndk_env="$(android/ndk-env.sh 2>/dev/null)"; then
@@ -711,10 +802,14 @@ check-nodes:
     cargo test -p rlx-runtime --no-default-features --features cpu --test dist_node_fixed_function
     cargo test -p rlx-ffi
 
-# Run the Apple backend smoke + parity test ON an iOS simulator. Boots a sim
-# (override with RLX_SIM_DEVICE=<name|udid>) and runs the test binary inside it
-# via `simctl spawn` — real on-simulator execution, not just a cross-compile.
-# Needs Xcode + the iOS simulator runtime.
+# Run the Apple backend smoke + parity tests ON the simulators — iOS, tvOS,
+# watchOS and visionOS. Real on-simulator execution, not just a cross-compile:
+# scripts/apple-sim-runner.sh reads each test binary's Mach-O platform, boots a
+# simulator of that family (override the device with RLX_SIM_DEVICE=<name|udid>)
+# and runs the binary inside it via `simctl spawn`.
+#
+# Needs Xcode plus the simulator runtime for each platform; a platform whose
+# runtime is not installed fails with the runner's own message naming it.
 #
 # Backends: cpu,metal,coreml. MLX is intentionally excluded from the *sim test*:
 # a headless `simctl spawn` exposes no Metal device (so MLX/Metal can't run
@@ -722,12 +817,45 @@ check-nodes:
 # (MTLTensor) that need a high link deployment target. MLX-on-iOS compile is
 # covered by `just check-apple` (the `apple` umbrella includes mlx) + the host
 # parity test in this same file.
-test-apple-sim:
-    rustup target add aarch64-apple-ios-sim
-    CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER={{justfile_directory()}}/scripts/apple-sim-runner.sh \
-        cargo test -p rlx-runtime --no-default-features --features cpu,metal,coreml \
-        --target aarch64-apple-ios-sim \
-        --test apple_backends_sim -- --nocapture --test-threads=1
+#
+# watchOS runs `apple_platform_sim` only: it has no Metal API and no CoreML
+# runtime-compile path, so the accelerator parity test is compiled out there
+# and the CPU floor is the whole of what there is to check.
+#
+# `just test-apple-sim apple` re-runs everything under the size-tuned `apple`
+# profile — the one `ios/build-xcframework.sh` ships. That is a *precision*
+# gate, not a second smoke test: fat LTO and one codegen unit change how the
+# numeric kernels are inlined, and the point is that they must not change what
+# the kernels compute. `apple_platform_sim` asserts hand-computed values and
+# `apple_backends_sim` compares ANE against CPU, so a drift shows up as a
+# failure rather than as a plausible-looking number in production.
+#
+# Run the backend smoke + parity tests on all four Apple simulators.
+test-apple-sim profile="dev":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{justfile_directory()}}
+
+    runner={{justfile_directory()}}/scripts/apple-sim-runner.sh
+    export CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER="$runner"
+    export CARGO_TARGET_AARCH64_APPLE_TVOS_SIM_RUNNER="$runner"
+    export CARGO_TARGET_AARCH64_APPLE_WATCHOS_SIM_RUNNER="$runner"
+    export CARGO_TARGET_AARCH64_APPLE_VISIONOS_SIM_RUNNER="$runner"
+
+    for t in aarch64-apple-ios-sim aarch64-apple-tvos-sim aarch64-apple-visionos-sim; do
+        echo "==> $t (cpu,metal,coreml, profile {{profile}})"
+        rustup target add "$t" >/dev/null
+        cargo test --profile {{profile}} -p rlx-runtime \
+            --no-default-features --features cpu,metal,coreml \
+            --target "$t" --test apple_backends_sim --test apple_platform_sim \
+            -- --nocapture --test-threads=1
+    done
+
+    echo "==> aarch64-apple-watchos-sim (cpu, profile {{profile}})"
+    rustup target add aarch64-apple-watchos-sim >/dev/null
+    cargo test --profile {{profile}} -p rlx-runtime --no-default-features --features cpu \
+        --target aarch64-apple-watchos-sim --test apple_platform_sim \
+        -- --nocapture --test-threads=1
 
 # Android cross-compile gate — CPU (NEON) + wgpu via the `android` feature.
 # Needs NDK (ANDROID_NDK_HOME / ANDROID_HOME) for C deps (bzip2-sys, etc.).
@@ -848,3 +976,60 @@ micro NAME:
 micro-all:
     {{justfile_directory()}}/scripts/check-throttle.sh
     cargo bench -p rlx-cpu
+
+# ── rlx-wgpu portability validation ─────────────────────────────────
+#
+# macOS only ever exercises wgpu's Metal backend and wgpu-native's WGSL
+# superset. These three targets cover the other surfaces the crate ships to.
+
+# Builds for the host arch, so it runs native (not emulated) on Apple silicon.
+# Found the zero-extent Expand divide-by-zero that Metal cannot reach.
+# Run the rlx-wgpu suite on a real Linux Vulkan ICD (Mesa lavapipe) in Docker.
+test-wgpu-linux:
+    docker build -q -t rlx-wgpu-vk {{justfile_directory()}}/crates/backends/rlx-wgpu/docker
+    docker run --rm \
+        -v "{{justfile_directory()}}:/rlx" \
+        -v "{{justfile_directory()}}/../quickjs-rs:/quickjs-rs" \
+        -v rlx-vk-target:/target \
+        rlx-wgpu-vk \
+        cargo test -p rlx-wgpu --tests --no-fail-fast -- --test-threads=1
+
+# Checks the browser-reachable kernels compute correctly there, AND that the
+# cooperative-matrix kernels are rejected — `enable wgpu_cooperative_matrix`
+# is wgpu-native-only and must never reach a browser.
+# Run the shipped WGSL through a spec-compliant WebGPU host (Deno).
+test-wgpu-webgpu:
+    deno run --unstable-webgpu --allow-read \
+        {{justfile_directory()}}/crates/backends/rlx-wgpu/webgpu/validate.js
+
+# Confirm the browser crate still builds for wasm with the WebGPU path on.
+build-wasm-webgpu:
+    cargo build --target wasm32-unknown-unknown -p rlx-web --features webgpu
+
+# All three portability surfaces: WebGPU spec, wasm build, Linux Vulkan.
+test-wgpu-portability: test-wgpu-webgpu build-wasm-webgpu test-wgpu-linux
+
+# Portability gate for the CPU backend: ONE binary has to run on the AVX-512
+# host or M4 that built it *and* on an Atom box or a Raspberry Pi. That only
+# holds while every above-baseline instruction sits inside a function reached
+# through a runtime CPU-feature check — `cargo build` enforces nothing, and the
+# failure mode is a bare `Illegal instruction` on hardware the author never
+# sees.
+#
+#   just check-isa                                 # emulated Atom (x86-64)
+#   just check-isa arm                             # emulated ARMv8.0 (Pi 3/4)
+#   just check-isa scan target/release/cargo-rlx   # static scan, no Docker
+#
+# `atom` (the default) and `arm` need Docker. `--platform linux/amd64` supplies
+# a real x86-64 Linux toolchain (Rosetta-backed on Apple Silicon, so near-native
+# build speed) and `qemu-user-static -cpu Denverton` inside it emulates a
+# Goldmont Atom that traps AVX; `arm` uses `linux/arm64` (fully native here)
+# with `-cpu cortex-a53`, which has neither DotProd nor FP16 arithmetic.
+#
+# `scan` needs only objdump. It judges a binary against the baseline of the
+# target it was BUILT for — `sdot` is baseline on aarch64-apple and a finding
+# on aarch64-linux — and also catches the inverse problem, a
+# `-C target-cpu=native` artifact that smears AVX across ordinary symbols
+# (`Op::clone` included) where no runtime dispatch can rescue it.
+check-isa *ARGS:
+    python3 crates/backends/rlx-cpu/tools/isa_portability.py {{ARGS}}

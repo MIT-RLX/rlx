@@ -6,6 +6,10 @@ import SwiftUI
 
 /// Joins an RLX mesh as a worker rank.
 ///
+/// One view, four Apple OSes: iOS, tvOS, watchOS and visionOS all build this
+/// file. The `#if os(...)` seams below are the places where SwiftUI genuinely
+/// differs — text entry on a watch, picker styles on a TV — not styling.
+///
 /// Pair with the desktop coordinator:
 /// ```
 /// cargo run -p rlx-ffi --example node_coordinator -- --world 2 \
@@ -60,7 +64,12 @@ struct NodeView: View {
                         Text("Inference").tag(RlxNode.Mode.infer)
                         Text("Training").tag(RlxNode.Mode.train)
                     }
+                    // `.segmented` is iOS/macOS/visionOS only. A TV picks with
+                    // focus and a watch with the crown, and the default style
+                    // is the native shape on both.
+                    #if !os(tvOS) && !os(watchOS)
                     .pickerStyle(.segmented)
+                    #endif
                     if mode == .train {
                         Text("A training rank cannot leave partway — the gradient reduce is a barrier, so backgrounding the app stalls every other rank.")
                             .font(.caption)
@@ -84,7 +93,11 @@ struct NodeView: View {
             }
             .navigationTitle("RLX Node")
         }
+        // visionOS puts a NavigationView in its own window; forcing the stack
+        // style there is both unavailable and wrong.
+        #if !os(visionOS)
         .navigationViewStyle(.stack)
+        #endif
         .onReceive(tick) { _ in status = RlxNode.status }
         .onAppear { applyLaunchArguments() }
     }
@@ -99,6 +112,15 @@ struct NodeView: View {
         _ text: Binding<String>,
         numeric: Bool = false
     ) -> some View {
+        #if os(watchOS)
+        // A watch row is too narrow for a label beside its field, and watchOS
+        // has no `keyboardType` — text entry is dictation/scribble, and the
+        // numeric hint has nowhere to land.
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            TextField(hint, text: text)
+        }
+        #else
         HStack {
             Text(label).frame(width: 100, alignment: .leading)
             TextField(hint, text: text)
@@ -107,6 +129,7 @@ struct NodeView: View {
                 .textInputAutocapitalization(.never)
                 .keyboardType(numeric ? .numberPad : .default)
         }
+        #endif
     }
 
     /// Seed the form from launch arguments and optionally join immediately.

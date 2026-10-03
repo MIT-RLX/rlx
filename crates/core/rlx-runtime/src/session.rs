@@ -126,13 +126,25 @@ impl Session {
     /// Wrap a dynamic-shape graph so it specializes + recompiles per input shape.
     fn compile_deferred(&self, graph: Graph, options: crate::CompileOptions) -> CompiledGraph {
         let backend = self.create_backend();
+        let io_dtypes: Vec<(String, rlx_ir::DType)> = graph
+            .nodes()
+            .iter()
+            .filter_map(|n| match &n.op {
+                rlx_ir::Op::Input { name } | rlx_ir::Op::Param { name } => {
+                    Some((name.clone(), n.shape.dtype()))
+                }
+                _ => None,
+            })
+            .collect();
         let inner = Box::new(crate::deferred::DeferredExecutable::new(
             graph,
             backend,
             options,
             self.device,
         ));
-        CompiledGraph::new(inner, self.device)
+        let mut compiled = CompiledGraph::new(inner, self.device);
+        compiled.set_io_dtypes(io_dtypes);
+        compiled
     }
 
     /// Explicit legacy alias — same as [`Self::compile`].
@@ -198,8 +210,14 @@ impl Session {
         options: &crate::CompileOptions,
     ) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
         let backend = self.create_backend();
+        // Read the declared boundary dtypes before `module` is consumed: the
+        // f32 entry points need them to convert rather than reinterpret an
+        // F16/BF16 boundary. Every `Session::compile*` path funnels here.
+        let io_dtypes = module.io_dtypes();
         let executable = backend.compile_module(module, self.device, options)?;
-        Ok(CompiledGraph::new(executable, self.device))
+        let mut compiled = CompiledGraph::new(executable, self.device);
+        compiled.set_io_dtypes(io_dtypes);
+        Ok(compiled)
     }
 
     fn default_options(&self) -> crate::CompileOptions {

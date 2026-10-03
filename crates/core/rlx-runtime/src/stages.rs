@@ -10,10 +10,7 @@ use rlx_ir::GraphModule;
 use rlx_ir::OpKind;
 use rlx_ir::hir::HirModule;
 use rlx_ir::lir::LirModule;
-use rlx_opt::{
-    CompilePipeline, CompileResult, FusionLimits, FusionOptions, FusionReport, FusionTarget,
-    fusion_limits_for_target,
-};
+use rlx_opt::{CompilePipeline, CompileResult, FusionOptions, FusionReport, FusionTarget};
 
 use crate::CompileOptions;
 
@@ -76,10 +73,11 @@ pub fn pipeline_for(device: Device, options: &CompileOptions) -> CompilePipeline
     }
     let mut pipe = CompilePipeline::new(target);
     pipe.opts = opts;
-    if pipe.opts.fusion_limits == FusionLimits::default() {
-        pipe.opts.fusion_limits = fusion_limits_for_target(target);
-    }
     pipe.opts = pipe.opts.apply_native_fk_defaults(target);
+    // One shared resolver: this used to be its own copy of the target-default
+    // line, and a clamp added to the other copy simply never ran here.
+    pipe.opts.fusion_limits =
+        rlx_opt::rlx_compile::fusion_pipeline::resolve_fusion_limits(target, &pipe.opts);
     pipe.arena_alignment = options.arena_alignment;
     pipe.assert_fusion_clean = options.assert_fusion_clean;
     // Device token for legalize errors — Vulkan / OneAPI share Wgpu fusion

@@ -11,6 +11,7 @@
 pub mod activation_deriv;
 pub mod autodiff;
 pub mod autodiff_fwd;
+pub mod checkpoint;
 pub mod compose;
 pub mod decompose_backward;
 pub mod decompose_backward_kernels;

@@ -21,6 +21,8 @@ use rlx_ir::{DType, Graph, ScatterNdReduction, Shape};
 use rlx_vulkan::backend::VulkanExecutable;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+mod common;
+
 /// Skip when no Vulkan device is present.
 ///
 /// `rlx_ir::env::skip_unless_device` rather than a bare
@@ -65,6 +67,7 @@ fn both(what: &str, build: impl Fn() -> Graph, inputs: &[(&str, Vec<f32>)]) {
 
 #[test]
 fn gather_nd_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -111,6 +114,7 @@ fn gather_nd_matches_cpu() {
 
 #[test]
 fn gather_elements_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -167,6 +171,7 @@ fn gather_elements_matches_cpu() {
 
 #[test]
 fn scatter_elements_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -219,6 +224,7 @@ fn scatter_elements_matches_cpu() {
 
 #[test]
 fn scatter_nd_matches_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }
@@ -283,6 +289,7 @@ fn scatter_nd_matches_cpu() {
 
 #[test]
 fn declined_shapes_still_match_cpu() {
+    let _gpu = common::serialize_gpu();
     if skip() {
         return;
     }

@@ -95,6 +95,34 @@ impl GraphModule {
         hir.named(name, build)
     }
 
+    /// Declared dtype of every named `Input` / `Param`, when this module is at
+    /// a stage that has a graph.
+    ///
+    /// The f32-shaped entry points (`CompiledGraph::run`,
+    /// `CompiledGraph::set_param`) need this to tell a boundary that is
+    /// genuinely `f32` from one that is `F16`/`BF16` and merely being *fed* as
+    /// f32. Without it those bytes are handed to the backend verbatim and read
+    /// as pairs of halves — no error, plausible-looking numbers.
+    ///
+    /// Empty at HIR stage, where names are not yet bound to graph nodes.
+    pub fn io_dtypes(&self) -> Vec<(String, crate::DType)> {
+        let graph = match &self.stage {
+            Stage::Mir(m) => m.as_graph(),
+            Stage::Lir(l) => l.as_graph(),
+            Stage::Hir(_) => return Vec::new(),
+        };
+        graph
+            .nodes()
+            .iter()
+            .filter_map(|n| match &n.op {
+                crate::Op::Input { name } | crate::Op::Param { name } => {
+                    Some((name.clone(), n.shape.dtype()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn fusion_policy(&self) -> Option<FusionPolicy> {
         self.as_hir().map(|h| h.fusion_policy)
     }

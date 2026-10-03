@@ -163,11 +163,49 @@ pub fn promote_to_f32(graph: Graph) -> Graph {
     }
     let mut out = Graph::new(format!("{}_f32_exec", graph.name));
     let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+
+    // Consumers in the SOURCE graph, to decide whether a boundary may stay
+    // low-precision. See `boundary_stays_lowp`.
+    let mut consumers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in graph.nodes() {
+        for &i in &n.inputs {
+            consumers.entry(i).or_default().push(n.id);
+        }
+    }
+    // A low-precision `Input` / `Param` may keep its dtype only while every
+    // consumer also stays low-precision.
+    //
+    // Keeping *every* boundary low-p is load-bearing for one case and wrong for
+    // the rest. Load-bearing: `KvAppend` aliases its cache input's buffer and
+    // every backend takes the row stride from the KvAppend node's dtype, so
+    // promoting the op while the cache stays half-width strides a layout the
+    // buffer does not have (see the test below). Wrong for the rest: a BF16
+    // `Input` feeding a promoted F32 `Binary` gets a 2 B/elem slot that the f32
+    // thunk then reads 4 B/elem from, and the values come back as pairs of
+    // halves —
+    //
+    //   [1,2,3,4] into a BF16 input, + 0  ->  [2.0038757, 4.007843, 0.0, 0.0]
+    //
+    // with no error and no cast anywhere between them. Promoting the boundary
+    // is what makes producer and consumer agree on the width; the *declared*
+    // dtype is not lost, because `IoDtypeManifest` records it and
+    // `CompiledGraph::io_dtypes` narrows at the API edge.
+    let boundary_stays_lowp = |id: NodeId| -> bool {
+        match consumers.get(&id) {
+            // Nothing reads it — nothing to disagree with.
+            None => true,
+            Some(cs) => cs.iter().all(|&c| {
+                let cn = graph.node(c);
+                is_lowp_layout_op(&cn.op) && matches!(cn.shape.dtype(), DType::F16 | DType::BF16)
+            }),
+        }
+    };
     // Node ids in the *source* graph whose dtype we intentionally kept low-p.
     let mut kept_lowp: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     for node in graph.nodes() {
         let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-        let is_boundary = matches!(&node.op, Op::Param { .. } | Op::Input { .. });
+        let is_boundary =
+            matches!(&node.op, Op::Param { .. } | Op::Input { .. }) && boundary_stays_lowp(node.id);
         let is_layout_of_lowp = is_lowp_layout_op(&node.op)
             && matches!(node.shape.dtype(), DType::F16 | DType::BF16)
             && !node.inputs.is_empty()

@@ -24,7 +24,7 @@ schedule-codegen = []
 
 [dependencies]
 rlx-ir = { workspace = true }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.16", default-features = false, features = ["compile", "training"] }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.17", default-features = false, features = ["compile", "training"] }
 rlx-unfuse = { workspace = true }
 rlx-compile = { workspace = true }
 # CPU reference kernels for the host-fallback path. On a host with no Intel
@@ -42,7 +42,7 @@ rlx-compile = { workspace = true }
 # OpenBLAS — rlx-cpu's build.rs leaves the BLAS link off there and falls back to
 # SIMD, so the driverless build still needs no BLAS; only the eigen SPD ops
 # (BiMap, pure GEMM, still works) are unavailable in that narrow case.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.16", default-features = false, features = [
+rlx-cpu = { path = "../rlx-cpu", version = "0.2.17", default-features = false, features = [
     "blas",
     "splat",
 ] }

@@ -57,22 +57,22 @@ fn matmul_qkv_coop_f32(
     }
     workgroupBarrier();
 
-    var acc_00: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_01: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_02: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_03: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_10: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_11: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_12: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_13: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_20: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_21: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_22: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_23: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_30: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_31: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_32: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
-    var acc_33: coop_mat8x8<f32, C> = coopLoad<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_00: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_01: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_02: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_03: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_10: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_11: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_12: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_13: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_20: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_21: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_22: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_23: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_30: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_31: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_32: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
+    var acc_33: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&acc_scratch[0], 8u);
 
     let n_tiles = (params.k + TILE_K - 1u) / TILE_K;
     for (var t: u32 = 0u; t < n_tiles; t = t + 1u) {
@@ -85,15 +85,39 @@ fn matmul_qkv_coop_f32(
         }
         workgroupBarrier();
 
-        let a_0: coop_mat8x8<f32, A> = coopLoad<coop_mat8x8<f32, A>>(&a_stage[0u  ], 8u);
-        let a_1: coop_mat8x8<f32, A> = coopLoad<coop_mat8x8<f32, A>>(&a_stage[64u ], 8u);
-        let a_2: coop_mat8x8<f32, A> = coopLoad<coop_mat8x8<f32, A>>(&a_stage[128u], 8u);
-        let a_3: coop_mat8x8<f32, A> = coopLoad<coop_mat8x8<f32, A>>(&a_stage[192u], 8u);
+        // ROW-MAJOR LOADS/STORES ARE LOAD-BEARING — the `T` suffixes are not
+        // decoration. `coopLoad`/`coopStore` (no T) and `coopLoadT`/`coopStoreT`
+        // differ only by naga's `row_major = function_name.ends_with("T")` in the
+        // shared WGSL frontend, but that one bool reaches the two backends as
+        // DIFFERENT things: the MSL backend feeds it to Metal's
+        // `simdgroup_load(..., transpose_matrix)`, while the SPIR-V backend turns
+        // it into `RowMajorKHR`/`ColumnMajorKHR` on
+        // `OpCooperativeMatrixLoadKHR`. So the same WGSL does NOT mean the same
+        // thing on Metal and Vulkan, and a convention validated on one is not
+        // transferable to the other. Measured both ways (see below).
+        //
+        // With the non-T forms this kernel computed `b·a` instead of `a·b`: for
+        // unrelated matrices those are near-orthogonal, which is the cos≈0.016
+        // "orthogonal garbage" that kept Metal CoopF32 opt-in. Probe, at
+        // M=N=32/K=8 with A a column vector and B a row vector — `a·b` is a dense
+        // rank-1 outer product, `b·a` collapses to one value per 8x8 fragment:
+        // out[0][0] was 0.01*SUM (c+1)^2 = 2.04 and out[0][8] was
+        // 0.01*SUM (c+1)(c+9) = 4.92, both exactly `b·a`.
+        //
+        // The Vulkan siblings use a DIFFERENT and equally deliberate convention
+        // (`coopLoad` on A, `coopLoadT` on B — see the header of
+        // `matmul_coop_f16_vulkan.wgsl`, established on RTX). That convention was
+        // measured here and is WRONG on Metal: it leaves only the first column of
+        // each 8x8 tile correct and zeroes the rest. Do not unify them.
+        let a_0: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&a_stage[0u  ], 8u);
+        let a_1: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&a_stage[64u ], 8u);
+        let a_2: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&a_stage[128u], 8u);
+        let a_3: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&a_stage[192u], 8u);
         let b_row = params.b_off + k_off * params.n + col_base;
-        let b_0: coop_mat8x8<f32, B> = coopLoad<coop_mat8x8<f32, B>>(&arena[b_row + 0u],  params.n);
-        let b_1: coop_mat8x8<f32, B> = coopLoad<coop_mat8x8<f32, B>>(&arena[b_row + 8u],  params.n);
-        let b_2: coop_mat8x8<f32, B> = coopLoad<coop_mat8x8<f32, B>>(&arena[b_row + 16u], params.n);
-        let b_3: coop_mat8x8<f32, B> = coopLoad<coop_mat8x8<f32, B>>(&arena[b_row + 24u], params.n);
+        let b_0: coop_mat8x8<f32, B> = coopLoadT<coop_mat8x8<f32, B>>(&arena[b_row + 0u],  params.n);
+        let b_1: coop_mat8x8<f32, B> = coopLoadT<coop_mat8x8<f32, B>>(&arena[b_row + 8u],  params.n);
+        let b_2: coop_mat8x8<f32, B> = coopLoadT<coop_mat8x8<f32, B>>(&arena[b_row + 16u], params.n);
+        let b_3: coop_mat8x8<f32, B> = coopLoadT<coop_mat8x8<f32, B>>(&arena[b_row + 24u], params.n);
 
         acc_00 = coopMultiplyAdd(a_0, b_0, acc_00);
         acc_01 = coopMultiplyAdd(a_0, b_1, acc_01);
@@ -114,22 +138,22 @@ fn matmul_qkv_coop_f32(
         workgroupBarrier();
     }
 
-    coopStore(acc_00, &acc_scratch[0u   * 32u + 0u ], 32u);
-    coopStore(acc_01, &acc_scratch[0u   * 32u + 8u ], 32u);
-    coopStore(acc_02, &acc_scratch[0u   * 32u + 16u], 32u);
-    coopStore(acc_03, &acc_scratch[0u   * 32u + 24u], 32u);
-    coopStore(acc_10, &acc_scratch[8u   * 32u + 0u ], 32u);
-    coopStore(acc_11, &acc_scratch[8u   * 32u + 8u ], 32u);
-    coopStore(acc_12, &acc_scratch[8u   * 32u + 16u], 32u);
-    coopStore(acc_13, &acc_scratch[8u   * 32u + 24u], 32u);
-    coopStore(acc_20, &acc_scratch[16u  * 32u + 0u ], 32u);
-    coopStore(acc_21, &acc_scratch[16u  * 32u + 8u ], 32u);
-    coopStore(acc_22, &acc_scratch[16u  * 32u + 16u], 32u);
-    coopStore(acc_23, &acc_scratch[16u  * 32u + 24u], 32u);
-    coopStore(acc_30, &acc_scratch[24u  * 32u + 0u ], 32u);
-    coopStore(acc_31, &acc_scratch[24u  * 32u + 8u ], 32u);
-    coopStore(acc_32, &acc_scratch[24u  * 32u + 16u], 32u);
-    coopStore(acc_33, &acc_scratch[24u  * 32u + 24u], 32u);
+    coopStoreT(acc_00, &acc_scratch[0u   * 32u + 0u ], 32u);
+    coopStoreT(acc_01, &acc_scratch[0u   * 32u + 8u ], 32u);
+    coopStoreT(acc_02, &acc_scratch[0u   * 32u + 16u], 32u);
+    coopStoreT(acc_03, &acc_scratch[0u   * 32u + 24u], 32u);
+    coopStoreT(acc_10, &acc_scratch[8u   * 32u + 0u ], 32u);
+    coopStoreT(acc_11, &acc_scratch[8u   * 32u + 8u ], 32u);
+    coopStoreT(acc_12, &acc_scratch[8u   * 32u + 16u], 32u);
+    coopStoreT(acc_13, &acc_scratch[8u   * 32u + 24u], 32u);
+    coopStoreT(acc_20, &acc_scratch[16u  * 32u + 0u ], 32u);
+    coopStoreT(acc_21, &acc_scratch[16u  * 32u + 8u ], 32u);
+    coopStoreT(acc_22, &acc_scratch[16u  * 32u + 16u], 32u);
+    coopStoreT(acc_23, &acc_scratch[16u  * 32u + 24u], 32u);
+    coopStoreT(acc_30, &acc_scratch[24u  * 32u + 0u ], 32u);
+    coopStoreT(acc_31, &acc_scratch[24u  * 32u + 8u ], 32u);
+    coopStoreT(acc_32, &acc_scratch[24u  * 32u + 16u], 32u);
+    coopStoreT(acc_33, &acc_scratch[24u  * 32u + 24u], 32u);
     workgroupBarrier();
 
     // Split-write epilogue. Identical layout decision to `matmul_qkv.wgsl`:

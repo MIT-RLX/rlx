@@ -1840,7 +1840,12 @@ pub unsafe fn execute_lstm_f32(
 ) {
     #[inline]
     fn sigmoid(z: f32) -> f32 {
-        1.0 / (1.0 + (-z).exp())
+        // Polynomial, not libm: this runs 3x per hidden unit per timestep, and
+        // for small/medium hidden the gate transcendentals outweigh the gate
+        // matmuls. `exp_poly` is Cody-Waite range-reduced, i.e. the same class
+        // of approximation as the fix for the wide-LSTM break on Metal, not
+        // the `fast::exp` that caused it.
+        1.0 / (1.0 + crate::vmath::exp_poly(-z))
     }
 
     let bptr = base as usize;
@@ -1909,11 +1914,11 @@ pub unsafe fn execute_lstm_f32(
                         for k in 0..hidden {
                             let i_g = sigmoid(z[k]);
                             let f_g = sigmoid(z[hidden + k]);
-                            let g_g = z[2 * hidden + k].tanh();
+                            let g_g = crate::vmath::tanh_poly(z[2 * hidden + k]);
                             let o_g = sigmoid(z[3 * hidden + k]);
                             let c_new = f_g * c[k] + i_g * g_g;
                             c[k] = c_new;
-                            let h_new = o_g * c_new.tanh();
+                            let h_new = o_g * crate::vmath::tanh_poly(c_new);
                             h[k] = h_new;
                             // [batch, seq, D*hidden]; this direction owns the
                             // `dir*hidden .. dir*hidden+hidden` feature slice.
@@ -1971,7 +1976,12 @@ pub unsafe fn execute_gru_f32(
 ) {
     #[inline]
     fn sigmoid(z: f32) -> f32 {
-        1.0 / (1.0 + (-z).exp())
+        // Polynomial, not libm: this runs 3x per hidden unit per timestep, and
+        // for small/medium hidden the gate transcendentals outweigh the gate
+        // matmuls. `exp_poly` is Cody-Waite range-reduced, i.e. the same class
+        // of approximation as the fix for the wide-LSTM break on Metal, not
+        // the `fast::exp` that caused it.
+        1.0 / (1.0 + crate::vmath::exp_poly(-z))
     }
 
     let bptr = base as usize;
@@ -2035,7 +2045,9 @@ pub unsafe fn execute_gru_f32(
                             let rg = sigmoid(xi[k] + hi[k]);
                             let zg = sigmoid(xi[hidden + k] + hi[hidden + k]);
                             // Reset applied to hidden term after its bias.
-                            let ng = (xi[2 * hidden + k] + rg * hi[2 * hidden + k]).tanh();
+                            let ng = crate::vmath::tanh_poly(
+                                xi[2 * hidden + k] + rg * hi[2 * hidden + k],
+                            );
                             let h_new = (1.0 - zg) * ng + zg * h[k];
                             h[k] = h_new;
                             *lo.add((b * seq + t) * out_width + dir * hidden + k) = h_new;
@@ -2133,7 +2145,11 @@ pub unsafe fn execute_rnn_f32(
                             for (j, &hj) in h.iter().enumerate() {
                                 acc += hr[j] * hj;
                             }
-                            h_new[k] = if relu { acc.max(0.0) } else { acc.tanh() };
+                            h_new[k] = if relu {
+                                acc.max(0.0)
+                            } else {
+                                crate::vmath::tanh_poly(acc)
+                            };
                         }
                         for k in 0..hidden {
                             h[k] = h_new[k];
@@ -2268,7 +2284,7 @@ pub unsafe fn execute_selective_scan_f32(
                     let mut acc = 0f32;
                     for ni in 0..n {
                         // Discretize: exp(d * a) and d * b.
-                        let da = (d * am[ci * n + ni]).exp();
+                        let da = crate::vmath::exp_poly(d * am[ci * n + ni]);
                         state[ci * n + ni] = da * state[ci * n + ni] + d * b_row[ni] * xv;
                         acc += c_row[ni] * state[ci * n + ni];
                     }
@@ -2798,5 +2814,91 @@ pub(crate) fn compile_gated_delta_net_backward(
         state_size: *state_size as u32,
         gate_per_channel: *gate_per_channel,
         carry_state: *carry_state,
+    }
+}
+
+#[cfg(test)]
+mod poly_gate_accumulation_tests {
+    /// The LSTM cell state is RECURRENT, so a per-step error in the gate
+    /// transcendentals does not just sit there — it feeds back through `h` into
+    /// the next step's pre-activations. That accumulation, not width on its
+    /// own, is what made a fast exp/tanh break wide LSTM on Metal before, so
+    /// the question for `exp_poly`/`tanh_poly` is not "how accurate is one
+    /// gate" but "where is the state after T steps".
+    ///
+    /// Drives the exact cell recurrence both ways — polynomial gates vs libm
+    /// gates — over a long sequence and compares the final state.
+    #[test]
+    fn lstm_cell_recurrence_does_not_drift_with_polynomial_gates() {
+        fn run(hidden: usize, steps: usize, poly: bool) -> (Vec<f32>, Vec<f32>) {
+            let mut c = vec![0f32; hidden];
+            let mut h = vec![0f32; hidden];
+            for t in 0..steps {
+                for k in 0..hidden {
+                    // Deterministic pre-activations that depend on h, so the
+                    // recurrence actually feeds back.
+                    let base = ((t * 31 + k * 17) % 97) as f32 * 0.04 - 1.9;
+                    let z_i = base + 0.5 * h[k];
+                    let z_f = base * 0.7 + 1.0 + 0.25 * h[k];
+                    let z_g = base * 1.3 - 0.2 + 0.5 * h[k];
+                    let z_o = base * 0.9 + 0.1 * h[k];
+                    let (i_g, f_g, o_g, g_g) = if poly {
+                        (
+                            1.0 / (1.0 + crate::vmath::exp_poly(-z_i)),
+                            1.0 / (1.0 + crate::vmath::exp_poly(-z_f)),
+                            1.0 / (1.0 + crate::vmath::exp_poly(-z_o)),
+                            crate::vmath::tanh_poly(z_g),
+                        )
+                    } else {
+                        (
+                            1.0 / (1.0 + (-z_i).exp()),
+                            1.0 / (1.0 + (-z_f).exp()),
+                            1.0 / (1.0 + (-z_o).exp()),
+                            z_g.tanh(),
+                        )
+                    };
+                    let c_new = f_g * c[k] + i_g * g_g;
+                    c[k] = c_new;
+                    h[k] = o_g
+                        * if poly {
+                            crate::vmath::tanh_poly(c_new)
+                        } else {
+                            c_new.tanh()
+                        };
+                }
+            }
+            (c, h)
+        }
+
+        // Wide and long: the regime that previously broke.
+        for &(hidden, steps) in &[(32usize, 64usize), (128, 256), (512, 512)] {
+            let (cp, hp) = run(hidden, steps, true);
+            let (cl, hl) = run(hidden, steps, false);
+            let dc = cp
+                .iter()
+                .zip(&cl)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let dh = hp
+                .iter()
+                .zip(&hl)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let scale = cl.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            println!("hidden={hidden} steps={steps}: |dc|={dc:e} |dh|={dh:e} (|c|max={scale:e})");
+            // Measured, flat across every size on BOTH arches: aarch64
+            // 2.38e-7 / 1.19e-7, baseline x86 1.49e-7 / 5.96e-8. It does not
+            // accumulate because the recurrence is contractive (f_g < 1), so
+            // per-step error decays instead of compounding. A bound set from
+            // one arch would be the trap here (FMA contraction differs).
+            assert!(
+                dc < 1e-5,
+                "cell state drifted {dc:e} at hidden={hidden} steps={steps}"
+            );
+            assert!(
+                dh < 1e-5,
+                "hidden state drifted {dh:e} at hidden={hidden} steps={steps}"
+            );
+        }
     }
 }

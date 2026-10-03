@@ -5,7 +5,7 @@
 // `[N, K]` (B-transposed); the backend host-dequantizes them to f32 and
 // matmuls with transpose_y. We quantize a known f32 weight, run through
 // CoreML, and compare to the full-precision matmul within Q8_0 tolerance.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_coreml::CoremlExecutable;
 use rlx_ir::quant::QuantScheme;

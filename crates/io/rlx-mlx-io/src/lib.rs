@@ -36,8 +36,11 @@ mod npz;
 mod rope;
 
 pub use arch::{
-    build_llama_decoder_layer, build_llama_like_decode, build_llama_like_from_dir,
-    build_llama_like_prefill,
+    EmbedSource, build_llama_decoder_layer, build_llama_decoder_layer_kv, build_llama_like_decode,
+    build_llama_like_decode_dyn, build_llama_like_decode_masked,
+    build_llama_like_decode_masked_embedded, build_llama_like_from_dir, build_llama_like_prefill,
+    build_llama_like_prefill_kv, build_llama_like_prefill_kv_embedded, decode_keep_mask,
+    decode_rope_row,
 };
 pub use config::{MlxArchConfig, MlxConfig, MlxQuantConfig, MlxQuantMode};
 pub use dequant::{

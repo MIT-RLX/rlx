@@ -5,7 +5,7 @@
 // expand, cumsum, scatter-add, the norm family, LoRA, and the vision ops
 // (conv / conv_transpose / pool). Each checks CoreML output against a hand
 // reference.
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
 
 use rlx_coreml::CoremlExecutable;
 use rlx_ir::op::{CmpOp, ReduceOp};
