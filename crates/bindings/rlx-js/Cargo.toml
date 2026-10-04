@@ -12,8 +12,8 @@ readme                 = "README.md"
 repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
-# Not on crates.io yet: the engine dependency (`quickrs-core`) is young and
-# the JS surface is still moving. Build from the workspace.
+# Not on crates.io yet: the JS surface is still moving. (The engine,
+# `quickrs-core`, is published, so this is the only thing holding it back.)
 publish = false
 
 [features]
@@ -51,10 +51,11 @@ weights = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:rlx-nemo"]
 graph-json = ["rlx-ir/serialize", "dep:serde_json"]
 
 [dependencies]
-# Pure-Rust QuickJS-ng. Taken from the sibling checkout rather than crates.io:
-# the engine and this binding are moving together, and a path dep means a fix
-# on either side is one `cargo build` away. Mirrors how rlx-models pins rlx.
-quickrs-core = { path = "../../../../quickjs-rs/crates/quickrs-core", version = "0.16", default-features = false, features = ["std"] }
+# Pure-Rust QuickJS-ng, from crates.io. To iterate on the engine alongside
+# this binding, add a `[patch.crates-io]` entry for a local checkout rather
+# than reintroducing a path dep — a path dep makes the whole workspace
+# unresolvable for anyone without that sibling directory.
+quickrs-core = { version = "0.16.2", default-features = false, features = ["std"] }
 
 rlx-ir      = { workspace = true }
 rlx-opt     = { workspace = true }

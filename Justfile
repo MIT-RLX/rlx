@@ -350,9 +350,11 @@ test-gpu:
 test-gguf-grouped:
     cargo test -p rlx-runtime --test dequant_grouped_matmul_gguf -- --test-threads=1
 
-# rlx-js: the JS surface. Needs the sibling ../quickjs-rs checkout.
-# `FEATURES` picks backends the same way rlx-runtime does.
-test-js FEATURES="cpu,gguf":
+# rlx-js: the JS surface. `FEATURES` picks backends the same way rlx-runtime
+# does. The default is the crate's own default set, so a bare `just test-js`
+# covers the whole surface; tests for a feature that is off are cfg'd out, so
+# a narrower set is green rather than full of "undefined is not a constructor".
+test-js FEATURES="cpu,gguf,weights,training,text":
     cargo test -p rlx-js --no-default-features --features {{FEATURES}}
 
 # MNIST from JavaScript. Fetches the dataset into the cache dir if missing.
@@ -989,7 +991,6 @@ test-wgpu-linux:
     docker build -q -t rlx-wgpu-vk {{justfile_directory()}}/crates/backends/rlx-wgpu/docker
     docker run --rm \
         -v "{{justfile_directory()}}:/rlx" \
-        -v "{{justfile_directory()}}/../quickjs-rs:/quickjs-rs" \
         -v rlx-vk-target:/target \
         rlx-wgpu-vk \
         cargo test -p rlx-wgpu --tests --no-fail-fast -- --test-threads=1

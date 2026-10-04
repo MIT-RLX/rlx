@@ -408,14 +408,9 @@ def cmd_emulate(
     def dk(*args: str, **kw) -> subprocess.CompletedProcess:
         return subprocess.run([exe, *args], **kw)
 
-    # rlx-js depends on a sibling ../quickjs-rs checkout; cargo resolves the
-    # whole workspace, so the mount has to be there even to build rlx-cpu.
     repo = repo_root()
-    sibling = repo.parent / "quickjs-rs"
     # Named volume for CARGO_TARGET_DIR so a second run is incremental.
     mounts = ["-v", f"{repo}:/src", "-v", f"rlx-isa-target-{which}:/build"]
-    if sibling.is_dir():
-        mounts += ["-v", f"{sibling}:/quickjs-rs"]
 
     container = f"{CONTAINER}-{which}"
     dk("rm", "-f", container, capture_output=True)

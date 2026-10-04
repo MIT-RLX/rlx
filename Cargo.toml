@@ -118,7 +118,6 @@ members = [
     "crates/bindings/pyrlx",           # PyO3 + maturin: run any RLX backend from Python
 
     # Embedded JavaScript — quickrs (pure-Rust QuickJS-ng) driving the RLX API.
-    # Needs the sibling `../quickjs-rs` checkout; see its Cargo.toml.
     "crates/bindings/rlx-js",
 
     # C ABI for the distributed node — iOS (staticlib → xcframework) and

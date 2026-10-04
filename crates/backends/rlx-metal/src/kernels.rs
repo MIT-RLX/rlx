@@ -427,15 +427,16 @@ kernel void hgemm_simd_4x4(
 
     for (uint kk = 0; kk < K; kk += 32) {
         uint linear = sgid * 32 + slid;
+        // Zero-padded edge loads — see `sgemm_simd_4x4`.
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint ar = idx / 32, ac = idx % 32;
-            A_tg[idx] = A[(tg_row_base + ar) * K + (kk + ac)];
+            uint ar = tg_row_base + idx / 32, ac = kk + idx % 32;
+            A_tg[idx] = (ar < M && ac < K) ? A[ar * K + ac] : 0.0h;
         }
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint br = idx / 32, bc = idx % 32;
-            B_tg[idx] = B[(kk + br) * N + (tg_col_base + bc)];
+            uint br = kk + idx / 32, bc = tg_col_base + idx % 32;
+            B_tg[idx] = (br < K && bc < N) ? B[br * N + bc] : 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -449,7 +450,25 @@ kernel void hgemm_simd_4x4(
 
     uint out_row = tg_row_base + sg_row * 8;
     uint out_col = tg_col_base + sg_col * 8;
-    simdgroup_store(c, &C[out_row * N + out_col], N);
+    if (out_row + 8u <= M && out_col + 8u <= N) {
+        simdgroup_store(c, &C[out_row * N + out_col], N);
+    } else if (out_row < M && out_col < N) {
+        // Masked edge store — see `sgemm_simd_4x4`. This is the only half
+        // GEMM in the file, so there is no padded variant to fall back to:
+        // `metal_hgemm_bufs` dispatches ceil-div threadgroups and relies on
+        // this mask for any M/N that is not a multiple of 32.
+        threadgroup half* stage = &A_tg[sgid * 64];
+        simdgroup_store(c, stage, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid;
+            uint r = out_row + idx / 8;
+            uint cc = out_col + idx % 8;
+            if (r < M && cc < N) {
+                C[r * N + cc] = stage[idx];
+            }
+        }
+    }
 }
 
 // Half-precision matmul + bias + activation fused.
@@ -479,15 +498,16 @@ kernel void hgemm_simd_4x4_bias(
 
     for (uint kk = 0; kk < K; kk += 32) {
         uint linear = sgid * 32 + slid;
+        // Zero-padded edge loads — see `sgemm_simd_4x4`.
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint ar = idx / 32, ac = idx % 32;
-            A_tg[idx] = A[(tg_row_base + ar) * K + (kk + ac)];
+            uint ar = tg_row_base + idx / 32, ac = kk + idx % 32;
+            A_tg[idx] = (ar < M && ac < K) ? A[ar * K + ac] : 0.0h;
         }
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint br = idx / 32, bc = idx % 32;
-            B_tg[idx] = B[(kk + br) * N + (tg_col_base + bc)];
+            uint br = kk + idx / 32, bc = tg_col_base + idx % 32;
+            B_tg[idx] = (br < K && bc < N) ? B[br * N + bc] : 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -507,16 +527,20 @@ kernel void hgemm_simd_4x4_bias(
     uint out_col_base = tg_col_base + sg_col * 8;
     for (uint i = 0; i < 2; ++i) {
         uint idx = i * 32 + slid;
-        uint r = idx / 8;
-        uint cc = idx % 8;
+        uint r = out_row_base + idx / 8;
+        uint cc = out_col_base + idx % 8;
+        // Ragged M/N — see `sgemm_simd_4x4_bias`.
+        if (r >= M || cc >= N) {
+            continue;
+        }
         // Promote to fp32 for activation math (more accurate)
-        float v = float(tile[sgid * 64 + idx]) + float(bias[out_col_base + cc]);
+        float v = float(tile[sgid * 64 + idx]) + float(bias[cc]);
         if (act_kind == 1) {
             v = rlx_gelu_scalar(v);
         } else if (act_kind == 2) {
             v = rlx_silu_scalar(v);
         }
-        C[(out_row_base + r) * N + (out_col_base + cc)] = half(v);
+        C[r * N + cc] = half(v);
     }
 }
 
@@ -1138,7 +1162,13 @@ kernel void sgemm_simd(
 // Each B element is reused 4× across rows of simdgroups; each A element 4× across cols.
 // K loaded in 32-wide stripes into threadgroup memory.
 //
-// Requires M%32==K%32==N%32==0. Falls back to sgemm_simd for smaller dims.
+// Tuned for M%32==K%32==N%32==0 — which is what `pick_sgemm` gates the
+// `Simd4x4` variant to — but correct at any M/K/N: the tile loads zero-pad and
+// the store masks. That matters because this kernel is also the MSL stand-in
+// for the `Mps` variant (`dispatch_sgemm_variant`), which weight-split graphs
+// fall back to whenever an operand lives in the separate weight MTLBuffer and
+// the single-buffer MPS helpers cannot encode it — at whatever shape the model
+// has. Unmasked, a ragged M wrote whole extra tile rows past C.
 kernel void sgemm_simd_4x4(
     device const float* A [[buffer(0)]],
     device const float* B [[buffer(1)]],
@@ -1166,18 +1196,20 @@ kernel void sgemm_simd_4x4(
     for (uint kk = 0; kk < K; kk += 32) {
         // Cooperative load: 16 simdgroups × 32 threads = 512 threads
         // load 32×32 A tile and 32×32 B tile (1024 floats each = 4 elements per thread)
+        // Zero-padded at the edges so a ragged M/K/N contributes nothing to the
+        // accumulator instead of multiplying in whatever the planner put next.
         uint linear = sgid * 32 + slid; // 0..511
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint ar = idx / 32;
-            uint ac = idx % 32;
-            A_tg[idx] = A[(tg_row_base + ar) * K + (kk + ac)];
+            uint ar = tg_row_base + idx / 32;
+            uint ac = kk + idx % 32;
+            A_tg[idx] = (ar < M && ac < K) ? A[ar * K + ac] : 0.0f;
         }
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint br = idx / 32;
-            uint bc = idx % 32;
-            B_tg[idx] = B[(kk + br) * N + (tg_col_base + bc)];
+            uint br = kk + idx / 32;
+            uint bc = tg_col_base + idx % 32;
+            B_tg[idx] = (br < K && bc < N) ? B[br * N + bc] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1192,7 +1224,29 @@ kernel void sgemm_simd_4x4(
 
     uint out_row = tg_row_base + sg_row * 8;
     uint out_col = tg_col_base + sg_col * 8;
-    simdgroup_store(c, &C[out_row * N + out_col], N);
+    if (out_row + 8u <= M && out_col + 8u <= N) {
+        simdgroup_store(c, &C[out_row * N + out_col], N);
+    } else if (out_row < M && out_col < N) {
+        // Edge tile. `simdgroup_store` has no mask, so storing the full 8×8
+        // here would write past C — a ragged M used to land 16 extra rows on
+        // top of whatever the memory planner placed next (nomic-bert prefill
+        // at m=16 overwrote the embedding gather's output with zeros). Stage
+        // through the A tile, dead once the K loop has ended, and copy only
+        // the in-range elements. Each simdgroup owns its own 64-float slice,
+        // and the branch is simdgroup-uniform, so a simdgroup-scoped barrier
+        // is the right (and legal) synchronisation here.
+        threadgroup float* stage = &A_tg[sgid * 64];
+        simdgroup_store(c, stage, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 2; ++i) {
+            uint idx = i * 32 + slid; // 0..63
+            uint r = out_row + idx / 8;
+            uint cc = out_col + idx % 8;
+            if (r < M && cc < N) {
+                C[r * N + cc] = stage[idx];
+            }
+        }
+    }
 }
 
 // Register-blocked simdgroup GEMM family (plain + split-K) — generated per tile
@@ -1238,17 +1292,18 @@ kernel void sgemm_simd_4x4_bias(
 
     for (uint kk = 0; kk < K; kk += 32) {
         uint linear = sgid * 32 + slid;
+        // Zero-padded edge loads — see `sgemm_simd_4x4`.
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint ar = idx / 32;
-            uint ac = idx % 32;
-            A_tg[idx] = A[(tg_row_base + ar) * K + (kk + ac)];
+            uint ar = tg_row_base + idx / 32;
+            uint ac = kk + idx % 32;
+            A_tg[idx] = (ar < M && ac < K) ? A[ar * K + ac] : 0.0f;
         }
         for (uint i = 0; i < 2; ++i) {
             uint idx = i * 512 + linear;
-            uint br = idx / 32;
-            uint bc = idx % 32;
-            B_tg[idx] = B[(kk + br) * N + (tg_col_base + bc)];
+            uint br = kk + idx / 32;
+            uint bc = tg_col_base + idx % 32;
+            B_tg[idx] = (br < K && bc < N) ? B[br * N + bc] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1269,15 +1324,21 @@ kernel void sgemm_simd_4x4_bias(
     uint out_col_base = tg_col_base + sg_col * 8;
     for (uint i = 0; i < 2; ++i) {
         uint idx = i * 32 + slid;
-        uint r = idx / 8;
-        uint cc = idx % 8;
-        float v = tile[sgid * 64 + idx] + bias[out_col_base + cc];
+        uint r = out_row_base + idx / 8;
+        uint cc = out_col_base + idx % 8;
+        // Ragged M/N: the dispatch rounds the grid up to whole 32×32 tiles, so
+        // the trailing tile has rows/cols past the end of C. Writing them would
+        // corrupt the next tensor in the arena — see `sgemm_simd_4x4`.
+        if (r >= M || cc >= N) {
+            continue;
+        }
+        float v = tile[sgid * 64 + idx] + bias[cc];
         if (act_kind == 1) {
             v = rlx_gelu_scalar(v);
         } else if (act_kind == 2) {
             v = rlx_silu_scalar(v);
         }
-        C[(out_row_base + r) * N + (out_col_base + cc)] = v;
+        C[r * N + cc] = v;
     }
 }
 

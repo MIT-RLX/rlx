@@ -17,6 +17,7 @@ fn eval(source: &str) -> String {
 }
 
 /// A runtime with file access, for the tests that read a fixture.
+#[cfg(feature = "text")]
 fn eval_with_fs(source: &str) -> String {
     let mut rt = Runtime::new();
     rt.allow_filesystem();
@@ -383,6 +384,7 @@ fn extended_ops_compute_the_right_numbers() {
     );
 }
 
+#[cfg(feature = "gguf")]
 #[test]
 fn quantize_round_trips_through_gguf_packing() {
     // Q8_0 over a 32-element block: lossy, but a round trip that came back
@@ -509,6 +511,7 @@ fn check_rejects_an_unknown_backend_by_name() {
 
 // ── training ─────────────────────────────────────────────────
 
+#[cfg(feature = "training")]
 #[test]
 fn optimizer_moves_weights_downhill() {
     // AdamW's first step is ±lr per element regardless of gradient magnitude
@@ -527,6 +530,7 @@ fn optimizer_moves_weights_downhill() {
     assert_eq!(out, "descended");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn every_optimizer_kind_constructs_and_steps() {
     let out = eval(
@@ -550,6 +554,7 @@ fn every_optimizer_kind_constructs_and_steps() {
     assert_eq!(out, "all ok");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn trainer_learns_a_linear_map() {
     let out = eval(
@@ -581,6 +586,7 @@ fn trainer_learns_a_linear_map() {
     assert_eq!(out, "learned");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn trainer_round_trips_weights_through_set_params() {
     // Resuming from a checkpoint has to actually restore the loss, or a
@@ -617,6 +623,7 @@ fn trainer_round_trips_weights_through_set_params() {
     assert_eq!(out, "restored");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn trainer_rejects_a_graph_that_is_not_a_scalar_loss() {
     // `grad` seeds d_output with 1, which only means "differentiate the loss"
@@ -636,6 +643,7 @@ fn trainer_rejects_a_graph_that_is_not_a_scalar_loss() {
     );
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn trainer_names_the_params_it_has_when_wrt_is_wrong() {
     let err = eval_err(
@@ -653,6 +661,7 @@ fn trainer_names_the_params_it_has_when_wrt_is_wrong() {
     );
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn trainer_catches_an_init_shape_mismatch() {
     let err = eval_err(
@@ -737,6 +746,7 @@ fn a_class_prototype_cannot_be_swapped_out() {
     assert_eq!(out, "true");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn every_optimizer_actually_descends() {
     // Constructing and stepping is not the same as working: a wrong
@@ -803,6 +813,7 @@ fn a_uniform_cross_entropy_target_sits_at_its_minimum() {
 
 // ── sampling: state that has to survive across calls ─────────
 
+#[cfg(feature = "text")]
 #[test]
 fn sampler_actually_samples_across_calls() {
     // The bug this guards: seeding an RNG per call makes every draw identical,
@@ -836,6 +847,7 @@ fn sampler_actually_samples_across_calls() {
     assert_eq!(out, "samples");
 }
 
+#[cfg(feature = "text")]
 #[test]
 fn sampler_keeps_history_for_the_repetition_penalty() {
     // A penalty that cannot see what was already generated does nothing, so the
@@ -869,6 +881,7 @@ fn sampler_keeps_history_for_the_repetition_penalty() {
     assert_eq!(out, "3|3|true|1,2,3|0");
 }
 
+#[cfg(feature = "text")]
 #[test]
 fn one_shot_sample_next_is_documented_as_deterministic() {
     // Kept as a test helper, and honest about it: same seed, same token. The
@@ -916,6 +929,7 @@ fn reused_input_buffers_do_not_leak_between_calls() {
     assert_eq!(out, "11,11,11,11 22,22,22,22 33,33,33,33 | 3,3,3,3");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn a_training_loop_is_stable_over_many_steps() {
     // The scratch is moved out of the handle and back on every step. If that
@@ -953,6 +967,7 @@ fn a_training_loop_is_stable_over_many_steps() {
 
 /// Weights live in the sibling rlx-models repo; try a repo-relative path first,
 /// then `$RLX_MODELS_DIR`, and skip if absent.
+#[cfg(feature = "text")]
 fn tokenizer_fixture() -> Option<std::path::PathBuf> {
     let rel = "weights/qwen3-0.6b/tokenizer.json";
     let mut candidates = vec![
@@ -966,6 +981,7 @@ fn tokenizer_fixture() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+#[cfg(feature = "text")]
 #[test]
 fn streaming_decode_loses_no_text_including_zwj_graphemes() {
     let Some(path) = tokenizer_fixture() else {
@@ -1340,17 +1356,27 @@ fn the_runtime_is_sandboxed_until_an_embedder_says_otherwise() {
         "Runtime::new must not expose the filesystem"
     );
 
-    // Every *other* path-taking function must refuse rather than act.
-    for call in [
+    // Every *other* path-taking function must refuse rather than act. Each one
+    // arrives with a feature, and probing a name that was compiled out would
+    // assert nothing, so the list follows the build.
+    #[allow(unused_mut)]
+    let mut calls: Vec<&str> = Vec::new();
+    #[cfg(feature = "gguf")]
+    calls.extend([
         r#"rlx.openGguf("/etc/hosts")"#,
         r#"rlx.writeGguf("/tmp/rlx-should-not-exist.gguf", {})"#,
-        r#"rlx.loadTokenizer("/etc/hosts")"#,
+    ]);
+    #[cfg(feature = "text")]
+    calls.push(r#"rlx.loadTokenizer("/etc/hosts")"#);
+    #[cfg(feature = "weights")]
+    calls.extend([
         r#"rlx.loadPt("/etc/hosts")"#,
         r#"rlx.loadMlx("/etc/hosts")"#,
         r#"rlx.openRlxp("/etc/hosts")"#,
         r#"rlx.toRlxp("/etc/hosts", "/tmp/x", { from: "gguf" })"#,
         r#"rlx.verifyRlxp("/etc/hosts")"#,
-    ] {
+    ]);
+    for call in calls {
         let err = match sealed.eval(call) {
             Ok(v) => panic!("sandboxed runtime allowed `{call}` -> {v}"),
             Err(e) => e,
@@ -1369,10 +1395,14 @@ fn the_runtime_is_sandboxed_until_an_embedder_says_otherwise() {
     opened.allow_filesystem();
     assert_eq!(opened.eval(probe).unwrap(), "function,function,function");
     // Now it gets as far as the file itself rather than the permission check.
-    let err = opened.eval(r#"rlx.openGguf("/etc/hosts")"#).unwrap_err();
-    assert!(!err.contains("no filesystem access"), "still gated: {err}");
+    #[cfg(feature = "gguf")]
+    {
+        let err = opened.eval(r#"rlx.openGguf("/etc/hosts")"#).unwrap_err();
+        assert!(!err.contains("no filesystem access"), "still gated: {err}");
+    }
 }
 
+#[cfg(feature = "text")]
 #[test]
 fn an_inline_chat_template_needs_no_permission() {
     // Rendering a template *string* touches nothing, so it must keep working in
@@ -1414,6 +1444,7 @@ fn file_reads_round_trip_and_report_real_errors() {
 // ── MNIST (needs the dataset) ────────────────────────────────
 
 /// The cache directories `rlx-vision-bench` uses, so a prior download is found.
+#[cfg(feature = "training")]
 fn mnist_dir() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let files = [
@@ -1441,6 +1472,7 @@ fn mnist_dir() -> Option<std::path::PathBuf> {
     })
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn mnist_trains_past_ninety_percent() {
     let Some(dir) = mnist_dir() else {
@@ -1561,6 +1593,7 @@ fn mnist_trains_past_ninety_percent() {
 
 // ── training lifecycle ───────────────────────────────────────
 
+#[cfg(feature = "training")]
 #[test]
 fn params_covers_every_parameter_not_only_the_trainable_ones() {
     // The invariant: `setParams(trainer.params())` on a matching inference graph
@@ -1599,6 +1632,7 @@ fn params_covers_every_parameter_not_only_the_trainable_ones() {
     assert_eq!(out, "base,delta|true|5.50,5.50,7.25");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn run_reports_early_stop_and_resumes_where_it_left_off() {
     let out = eval(
@@ -1626,6 +1660,7 @@ fn run_reports_early_stop_and_resumes_where_it_left_off() {
     assert_eq!(out, "true:10:false:5:15");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn a_batch_provider_returning_null_ends_the_run() {
     // How a finite dataset signals exhaustion without the script tracking counts.
@@ -1651,6 +1686,7 @@ fn a_batch_provider_returning_null_ends_the_run() {
     assert_eq!(out, "7:true");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn gradient_clipping_bounds_the_step() {
     // A deliberately huge gradient: without clipping the first AdamW step is
@@ -1685,6 +1721,7 @@ fn gradient_clipping_bounds_the_step() {
     assert_eq!(out, "true|true|true|true");
 }
 
+#[cfg(all(feature = "training", feature = "gguf"))]
 #[test]
 fn a_checkpoint_round_trips_through_gguf() {
     // Checkpoints are GGUF, so `rlx.openGguf` can read one — which is how a
@@ -1748,6 +1785,7 @@ fn a_checkpoint_round_trips_through_gguf() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(all(feature = "training", feature = "gguf"))]
 #[test]
 fn loading_a_checkpoint_from_a_different_optimizer_is_refused() {
     // Adam's moments mean nothing to Lion. Loading them anyway would train,
@@ -1841,6 +1879,7 @@ fn a_promise_that_can_never_settle_is_reported_as_such() {
     assert!(err.contains("never settle"), "unhelpful: {err}");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn training_can_yield_between_chunks() {
     // There are no threads here, so "async training" means cooperative
@@ -2042,6 +2081,7 @@ fn a_narrow_window_past_its_axis_is_rejected() {
     assert_eq!(out, "[2,2]");
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn a_trainable_parameter_the_loss_ignores_is_reported() {
     // `grad_with_loss` panics on a `wrt` with no gradient path — a typo, or a
@@ -2084,6 +2124,7 @@ fn grad_on_an_unreachable_parameter_is_reported() {
 
 /// The fused update is only offered where it is both correct and faster, so the
 /// refusals are part of the contract, not an implementation detail.
+#[cfg(feature = "training")]
 #[test]
 fn the_resident_path_refuses_backends_where_it_does_not_pay() {
     // CPU has no device buffers: the fused graph would feed parameters and
@@ -2109,6 +2150,7 @@ fn the_resident_path_refuses_backends_where_it_does_not_pay() {
     );
 }
 
+#[cfg(feature = "training")]
 #[test]
 fn the_resident_path_refuses_what_it_cannot_fuse() {
     let build = r#"
