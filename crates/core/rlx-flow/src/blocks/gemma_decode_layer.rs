@@ -11,6 +11,7 @@ use rlx_ir::{DType, Shape};
 
 use std::sync::{Arc, Mutex};
 
+use super::kv_cache::append_kv_row;
 use super::{BlockStage, GemmaLayerStyle};
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
@@ -187,8 +188,8 @@ impl BlockStage for GemmaDecodeLayerStage {
         let q_rope = gb.rope_n(q, decode_cos, decode_sin, spec.head_dim, spec.n_rot);
         let k_rope = gb.rope_n(k, decode_cos, decode_sin, spec.head_dim, spec.n_rot);
 
-        let new_k = gb.concat_(vec![past_k, k_rope], 1);
-        let new_v = gb.concat_(vec![past_v, v], 1);
+        let new_k = append_kv_row(&mut gb, past_k, k_rope, 1, decode.past_len);
+        let new_v = append_kv_row(&mut gb, past_v, v, 1, decode.past_len);
         self.kv_out.lock().expect("kv out").push(new_k);
         self.kv_out.lock().expect("kv out").push(new_v);
 

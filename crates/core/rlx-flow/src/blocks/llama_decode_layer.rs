@@ -9,6 +9,7 @@ use rlx_ir::op::MaskKind;
 use rlx_ir::shape;
 
 use super::BlockStage;
+use super::kv_cache::append_kv_row;
 use crate::context::FlowCtx;
 use crate::value::FlowValue;
 #[derive(Debug, Clone)]
@@ -121,8 +122,8 @@ impl BlockStage for LlamaDecodeLayerStage {
 
         let (new_k, new_v) = match (past_k, past_v) {
             (Some(past_k), Some(past_v)) => (
-                gb.concat_(vec![*past_k, k_rope], 1),
-                gb.concat_(vec![*past_v, v], 1),
+                append_kv_row(&mut gb, *past_k, k_rope, 1, decode.past_len),
+                append_kv_row(&mut gb, *past_v, v, 1, decode.past_len),
             ),
             _ => (k_rope, v),
         };

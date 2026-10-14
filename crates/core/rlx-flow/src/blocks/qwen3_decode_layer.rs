@@ -11,6 +11,7 @@ use rlx_ir::shape;
 use std::sync::{Arc, Mutex};
 
 use super::BlockStage;
+use super::kv_cache::append_kv_row;
 use super::qwen3_decoder::per_head_rms;
 use super::self_attn::repeat_kv;
 use crate::context::FlowCtx;
@@ -250,38 +251,12 @@ impl BlockStage for Qwen3DecodeLayerStage {
             (k_rope, v)
         };
 
-        // In-place KV append: write the new row into `past_k/v` at index
-        // `past_len` instead of concat-copying the whole O(context) cache.
-        //
-        // Gated on the CACHE CONTRACT, not on an env flag. `RLX_QWEN3_INPLACE_KV`
-        // used to be the whole switch, with `pos` taken as `past_k.dim(1) - 1`
-        // — which is only the append position when the caller declared the cache
-        // with a spare row. Against an ordinary history-shaped cache that writes
-        // the new token OVER the last real row and returns a prefix one row
-        // short: wrong logits, no error, on every backend. The distinction is
-        // not visible in the shape, so it has to come from the caller
-        // (`bind_decode_inputs_with_capacity`); the env flag now only opts OUT.
-        let inplace_kv = decode
-            .past_len
-            .filter(|_| !rlx_ir::env::flag("RLX_QWEN3_NO_INPLACE_KV"));
-        let (new_k, new_v) = if let Some(past_len) = inplace_kv {
-            let cap = gb.shape(past_k).dim(1).unwrap_static();
-            anyhow::ensure!(
-                past_len < cap,
-                "qwen3 decode layer {}: in-place KV needs a cache with spare capacity, \
-                 got past_len={past_len} in a [.., {cap}, ..] cache",
-                self.layer_idx
-            );
-            (
-                gb.kv_append(past_k, k_rope, 1, past_len),
-                gb.kv_append(past_v, v, 1, past_len),
-            )
-        } else {
-            (
-                gb.concat_(vec![past_k, k_rope], 1),
-                gb.concat_(vec![past_v, v], 1),
-            )
-        };
+        // Grow the K/V cache by one row — in place when the flow declared the
+        // cache contract, by `concat` otherwise. The decision lives in
+        // `blocks::kv_cache` so that every family shares it with the
+        // `kv_spare_rows` the flow used to shape the cache.
+        let new_k = append_kv_row(&mut gb, past_k, k_rope, 1, decode.past_len);
+        let new_v = append_kv_row(&mut gb, past_v, v, 1, decode.past_len);
         self.kv_out.lock().expect("kv out").push(new_k);
         self.kv_out.lock().expect("kv out").push(new_v);
 

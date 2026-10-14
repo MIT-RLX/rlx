@@ -23,6 +23,7 @@ mod gemma_decode_layer;
 mod gemma_kv_tap;
 mod gemma_layer;
 mod gemma_rms_norm;
+mod kv_cache;
 mod layer_norm;
 mod layer_scale;
 mod linear;
@@ -73,6 +74,7 @@ pub use gemma_layer::{
     gemma2_layer_mask,
 };
 pub use gemma_rms_norm::GemmaRmsNormStage;
+pub use kv_cache::{NO_INPLACE_KV, append_kv_row, kv_append_can_alias, kv_spare_rows};
 pub use layer_norm::LayerNormStage;
 pub use layer_scale::LayerScaleStage;
 pub use linear::LinearStage;
