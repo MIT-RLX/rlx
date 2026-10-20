@@ -28,6 +28,8 @@ fn devices() -> Vec<(&'static str, Device)> {
     out.push(("cuda", Device::Cuda));
     #[cfg(feature = "rocm")]
     out.push(("rocm", Device::Rocm));
+    #[cfg(feature = "vulkan")]
+    out.push(("vulkan", Device::Vulkan));
     out
 }
 

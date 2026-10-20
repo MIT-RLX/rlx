@@ -37,6 +37,8 @@ fn backends() -> Vec<(&'static str, &'static str, Device, &'static str)> {
     ));
     #[cfg(feature = "gpu")]
     out.push(("wgpu", "wgpu", Device::Gpu, "WGSL radix-2 (n<=2048)"));
+    #[cfg(feature = "vulkan")]
+    out.push(("vulkan","vulkan", Device::Vulkan, "Vulkan port of WGPU"));
     #[cfg(feature = "mlx")]
     out.push(("mlx", "mlx", Device::Mlx, "MLX vendor FFT"));
     #[cfg(feature = "coreml")]

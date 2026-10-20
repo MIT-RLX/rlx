@@ -41,6 +41,10 @@ fn devices() -> Vec<(&'static str, Device)> {
     if is_available(Device::Gpu) {
         out.push(("wgpu", Device::Gpu));
     }
+    #[cfg(feature = "vulkan")]
+    if is_available(Device::Vulkan) {
+        out.push(("vulkan", Device::Vulkan));
+    }
     #[cfg(feature = "cuda")]
     if is_available(Device::Cuda) {
         out.push(("cuda", Device::Cuda));
