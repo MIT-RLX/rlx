@@ -2,3 +2,6 @@
 	path = crates/backends/rlx-mlx-sys/vendor/mlx
 	url = https://github.com/ml-explore/mlx.git
 	shallow = true
+	# build.rs applies patches/*.patch into this checkout; only a commit change
+	# should show in `git status`.
+	ignore = dirty

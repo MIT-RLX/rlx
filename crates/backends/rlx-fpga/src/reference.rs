@@ -12,6 +12,9 @@
 //! requantize call changes (`quant::requantize_q31` instead of
 //! `rlx_cortexm::quant::requantize`).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::model::{Layer, Model};
 use crate::quant::{q31_to_q15, requantize_q15, requantize_q31, sat_i8};
 use crate::tune::RequantPrecision;

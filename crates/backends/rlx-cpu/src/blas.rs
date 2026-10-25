@@ -158,7 +158,7 @@ pub fn limit_inner_threads() {
             "VECLIB_MAXIMUM_THREADS",
         ]
         .iter()
-        .any(|k| std::env::var_os(k).is_some());
+        .any(|k| rlx_ir::env::read_os(k).is_some());
         if user_set {
             return;
         }
@@ -594,6 +594,22 @@ unsafe extern "C" {
         info_out: *mut i32,
     );
 
+    /// ssyevd — single-precision twin of dsyevd.
+    #[link_name = "ssyevd_"]
+    fn lapack_ssyevd(
+        jobz: *const i8,
+        uplo: *const i8,
+        n: *const i32,
+        a: *mut f32,
+        lda: *const i32,
+        w: *mut f32,
+        work: *mut f32,
+        lwork: *const i32,
+        iwork: *mut i32,
+        liwork: *const i32,
+        info_out: *mut i32,
+    );
+
     /// dgeqrf — QR factorization. On output, A's upper triangle holds R;
     /// elementary reflectors stored below the diagonal + scalar factors `tau`.
     #[link_name = "dgeqrf_"]
@@ -947,6 +963,36 @@ unsafe fn lapack_sgesv(
 
 /// f64 GEMM. C = A @ B, all row-major, A: [m, k], B: [k, n], C: [m, n].
 #[inline]
+/// `C = A @ Bᵀ` for `f64`, row-major, with `B` stored as `[n, k]` — the f64 twin of
+/// [`sgemm_bt`].
+///
+/// This is the shape `numpy` uses for `np.dot(x, x.T)`: it passes the *same* buffer twice
+/// with `TransB` set rather than materialising the transpose, so reproducing a numpy Gram
+/// matrix bit-for-bit needs this entry point and not `dgemm` on a transposed copy.
+/// Measured on a 6x400 Gram matrix: `TransB` gives 36 of 36 entries bit-identical where a
+/// materialised transpose gives 12 and a non-BLAS loop gives 7.
+pub fn dgemm_bt(a: &[f64], b: &[f64], c: &mut [f64], m: usize, k: usize, n: usize, alpha: f64) {
+    alias_check("dgemm_bt", a, b, c, m, k, n);
+    unsafe {
+        cblas_dgemm(
+            ROW_MAJOR,
+            NO_TRANS,
+            TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            k as i32, // B is [n, k], transposed to [k, n]
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
+        );
+    }
+}
+
 pub fn dgemm(a: &[f64], b: &[f64], c: &mut [f64], m: usize, k: usize, n: usize) {
     unsafe {
         cblas_dgemm(
@@ -2105,6 +2151,91 @@ pub fn dsyevd(a: &mut [f64], w: &mut [f64], n: usize) -> i32 {
     info
 }
 
+/// [`dsyevd`] reading an explicit triangle: `lower = true` is `uplo = 'L'`,
+/// which is how `torch.linalg.eigh` (default `UPLO='L'`) calls LAPACK. The
+/// two triangles of an exactly symmetric matrix hold the same numbers, but
+/// the tridiagonal reduction walks them differently, so `'U'` and `'L'`
+/// disagree in the last bits.
+pub fn dsyevd_uplo(a: &mut [f64], w: &mut [f64], n: usize, lower: bool) -> i32 {
+    assert_eq!(a.len(), n * n);
+    assert_eq!(w.len(), n);
+    let jobz: i8 = b'V' as i8;
+    let uplo: i8 = if lower { b'L' } else { b'U' } as i8;
+    let nn = n as i32;
+    let mut info: i32 = 0;
+    let lwork = (1 + 6 * n + 2 * n * n) as i32;
+    let liwork = (3 + 5 * n) as i32;
+    let mut work = vec![0f64; lwork.max(1) as usize];
+    let mut iwork = vec![0i32; liwork.max(1) as usize];
+    unsafe {
+        lapack_dsyevd(
+            &jobz,
+            &uplo,
+            &nn,
+            a.as_mut_ptr(),
+            &nn,
+            w.as_mut_ptr(),
+            work.as_mut_ptr(),
+            &lwork,
+            iwork.as_mut_ptr(),
+            &liwork,
+            &mut info,
+        );
+    }
+    info
+}
+
+/// Single-precision [`dsyevd_uplo`]: `a` (row-major, symmetric) is
+/// overwritten with the eigenvectors in LAPACK's column-major layout, so
+/// `a[i + j·n]` is component `i` of eigenvector `j`; `w` gets the
+/// eigenvalues ascending.
+///
+/// With the platform LAPACK this is `ssyevd_` itself — on macOS, Accelerate's,
+/// which is what `torch.linalg.eigh` runs on a float32 CPU tensor (measured
+/// bit-identical with `lower = true`, eigenvalues and eigenvectors, on nine
+/// EEG sensor-graph Laplacians of 16–64 channels). Without BLAS it widens to
+/// the f64 fallback and narrows.
+pub fn ssyevd(a: &mut [f32], w: &mut [f32], n: usize, lower: bool) -> i32 {
+    assert_eq!(a.len(), n * n);
+    assert_eq!(w.len(), n);
+    #[cfg(rlx_cpu_blas)]
+    {
+        let jobz: i8 = b'V' as i8;
+        let uplo: i8 = if lower { b'L' } else { b'U' } as i8;
+        let nn = n as i32;
+        let mut info: i32 = 0;
+        let lwork = (1 + 6 * n + 2 * n * n) as i32;
+        let liwork = (3 + 5 * n) as i32;
+        let mut work = vec![0f32; lwork.max(1) as usize];
+        let mut iwork = vec![0i32; liwork.max(1) as usize];
+        unsafe {
+            lapack_ssyevd(
+                &jobz,
+                &uplo,
+                &nn,
+                a.as_mut_ptr(),
+                &nn,
+                w.as_mut_ptr(),
+                work.as_mut_ptr(),
+                &lwork,
+                iwork.as_mut_ptr(),
+                &liwork,
+                &mut info,
+            );
+        }
+        info
+    }
+    #[cfg(not(rlx_cpu_blas))]
+    {
+        let mut a64: Vec<f64> = a.iter().map(|&v| v as f64).collect();
+        let mut w64 = vec![0f64; n];
+        let info = dsyevd_uplo(&mut a64, &mut w64, n, lower);
+        a.iter_mut().zip(&a64).for_each(|(d, &s)| *d = s as f32);
+        w.iter_mut().zip(&w64).for_each(|(d, &s)| *d = s as f32);
+        info
+    }
+}
+
 /// QR factorization. Inputs:
 ///   - `a`: m×n row-major matrix (overwritten by the factorization)
 ///   - `q_out`: m×k row-major, k = min(m, n) — receives Q
@@ -2517,6 +2648,129 @@ pub fn dgelsd_solve(
     0
 }
 
+// NumPy ≥ 2.0 on macOS links Accelerate's *new* LAPACK with 64-bit integers —
+// `dgelsd$NEWLAPACK$ILP64` — not the legacy CLAPACK `dgelsd_`. They are different
+// implementations: on 7-row least-squares problems they disagree in the last bits
+// of ~16% of solutions (measured against `np.polyfit`). Matching
+// `np.linalg.lstsq` / `np.polyfit` therefore needs this symbol.
+#[cfg(rlx_cpu_blas_accelerate)]
+unsafe extern "C" {
+    #[link_name = "dgelsd$NEWLAPACK$ILP64"]
+    fn lapack_dgelsd_newlapack_ilp64(
+        m: *const i64,
+        n: *const i64,
+        nrhs: *const i64,
+        a: *mut f64,
+        lda: *const i64,
+        b: *mut f64,
+        ldb: *const i64,
+        s: *mut f64,
+        rcond: *const f64,
+        rank: *mut i64,
+        work: *mut f64,
+        lwork: *const i64,
+        iwork: *mut i64,
+        info_out: *mut i64,
+    );
+}
+
+/// `np.linalg.lstsq(A, B, rcond)` exactly as NumPy computes it: on Accelerate,
+/// the `dgelsd$NEWLAPACK$ILP64` driver NumPy itself links, called the way
+/// `_umath_linalg`'s `lstsq` does (Fortran-order copies, `ldb = max(1, m, n)`,
+/// a workspace query whose `work` size is truncated to an integer). Elsewhere it
+/// is [`dgelsd_solve`] (NumPy then uses that platform's LAPACK).
+///
+/// `a`: m×n row-major, `b`: m×nrhs row-major, `x`: n×nrhs row-major output.
+/// Returns LAPACK's `info`.
+pub fn dgelsd_solve_numpy(
+    a: &[f64],
+    b: &[f64],
+    m: usize,
+    n: usize,
+    nrhs: usize,
+    rcond: f64,
+    x: &mut [f64],
+) -> i32 {
+    #[cfg(rlx_cpu_blas_accelerate)]
+    {
+        assert_eq!(a.len(), m * n);
+        assert_eq!(b.len(), m * nrhs);
+        assert_eq!(x.len(), n * nrhs);
+        let k = m.min(n);
+        let ldb = m.max(n).max(1);
+        let lda = m.max(1);
+        let mut a_col = transpose_to_col(a, m, n);
+        let mut b_col = vec![0f64; ldb * nrhs];
+        for i in 0..m {
+            for j in 0..nrhs {
+                b_col[i + j * ldb] = b[i * nrhs + j];
+            }
+        }
+        let (mm, nn, nr, lda_i, ldb_i) = (m as i64, n as i64, nrhs as i64, lda as i64, ldb as i64);
+        let mut s = vec![0f64; k.max(1)];
+        let mut rank: i64 = 0;
+        let mut info: i64 = 0;
+        let mut wq = [0f64; 1];
+        let mut iwq = [0i64; 1];
+        let m1: i64 = -1;
+        unsafe {
+            lapack_dgelsd_newlapack_ilp64(
+                &mm,
+                &nn,
+                &nr,
+                a_col.as_mut_ptr(),
+                &lda_i,
+                b_col.as_mut_ptr(),
+                &ldb_i,
+                s.as_mut_ptr(),
+                &rcond,
+                &mut rank,
+                wq.as_mut_ptr(),
+                &m1,
+                iwq.as_mut_ptr(),
+                &mut info,
+            );
+        }
+        if info != 0 {
+            return info as i32;
+        }
+        let lwork = wq[0] as i64;
+        let mut work = vec![0f64; lwork.max(1) as usize];
+        let mut iwork = vec![0i64; iwq[0].max(1) as usize];
+        unsafe {
+            lapack_dgelsd_newlapack_ilp64(
+                &mm,
+                &nn,
+                &nr,
+                a_col.as_mut_ptr(),
+                &lda_i,
+                b_col.as_mut_ptr(),
+                &ldb_i,
+                s.as_mut_ptr(),
+                &rcond,
+                &mut rank,
+                work.as_mut_ptr(),
+                &lwork,
+                iwork.as_mut_ptr(),
+                &mut info,
+            );
+        }
+        if info != 0 {
+            return info as i32;
+        }
+        for i in 0..n {
+            for j in 0..nrhs {
+                x[i * nrhs + j] = b_col[i + j * ldb];
+            }
+        }
+        0
+    }
+    #[cfg(not(rlx_cpu_blas_accelerate))]
+    {
+        dgelsd_solve(a, b, m, n, nrhs, rcond, x)
+    }
+}
+
 /// Solve `op(A) · X = B` (or `X · op(A) = B` for `right`) where A is
 /// triangular. Row-major callers throughout. Overwrites B with X.
 ///
@@ -2625,19 +2879,15 @@ fn dgemm_f32_precise(
 /// and no amount of staring at the graph explains. Auditing call sites by hand
 /// does not scale, so this catches them centrally and names the shape.
 #[inline]
-pub(crate) fn alias_check(
-    site: &str,
-    a: &[f32],
-    b: &[f32],
-    c: &[f32],
-    m: usize,
-    k: usize,
-    n: usize,
-) {
-    if !rlx_ir::env::flag("RLX_BLAS_ALIAS_CHECK") {
+pub(crate) fn alias_check<T>(site: &str, a: &[T], b: &[T], c: &[T], m: usize, k: usize, n: usize) {
+    // Read once: this runs on every GEMM, and an uncached read costs a key
+    // allocation, a lock and a `getenv` scan — ~20% of a small-matrix training
+    // step (TensorCSPNet) went here. A debug knob set before the process starts.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| rlx_ir::env::flag("RLX_BLAS_ALIAS_CHECK")) {
         return;
     }
-    let span = |x: &[f32]| {
+    let span = |x: &[T]| {
         let p = x.as_ptr() as usize;
         (p, p + std::mem::size_of_val(x))
     };
@@ -3745,8 +3995,52 @@ fn saxpy_bf16(scale: f32, b: &[u16], acc: &mut [f32]) {
 /// `[N]` partial, then reduces. NOTE: on Apple the f32 path runs on the AMX
 /// coprocessor (Accelerate) and still wins; this helps non-AMX CPUs + is the
 /// reference the GPU/ANE backends' native BF16 matmuls match. Precision-approximate.
+/// Rows from which a half-weight GEMM widens `B` once and calls [`sgemm`]
+/// instead of a SAXPY sweep per row. The sweep re-reads and re-converts all of
+/// `B` for every row — a 200-token prefill read each weight 200 times, 8.5x
+/// slower end to end than f32 weights on d1-3B. Below this, decode-shaped
+/// calls keep the sweep (no widen pass, half the bytes read).
+const HALF_RHS_WIDEN_MIN_M: usize = 4;
+
+thread_local! {
+    /// Reused f32 copy of the widened weight (one weight at a time, per thread).
+    static HALF_RHS_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `C = A · widen(B)` through BLAS, `B` widened once into a thread-local
+/// scratch. Exact: widening bf16 / f16 to f32 loses nothing, so this equals an
+/// f32 GEMM over the same rounded weights.
+fn sgemm_half_rhs_widened(
+    a: &[f32],
+    b: &[u16],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    widen: fn(u16) -> f32,
+) {
+    use rayon::prelude::*;
+    HALF_RHS_SCRATCH.with(|cell| {
+        let mut w = cell.borrow_mut();
+        w.clear();
+        w.resize(k * n, 0.0);
+        w.par_chunks_mut(64 * 1024)
+            .zip(b[..k * n].par_chunks(64 * 1024))
+            .for_each(|(dst, src)| {
+                for (d, &x) in dst.iter_mut().zip(src) {
+                    *d = widen(x);
+                }
+            });
+        sgemm(a, &w, c, m, k, n);
+    });
+}
+
 pub fn sgemm_bf16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
     use rayon::prelude::*;
+    if m >= HALF_RHS_WIDEN_MIN_M {
+        sgemm_half_rhs_widened(a, b, c, m, k, n, |x| f32::from_bits((x as u32) << 16));
+        return;
+    }
     if m == 1 {
         let nthreads = rayon::current_num_threads().max(1);
         let kchunk = k.div_ceil(nthreads).max(1);
@@ -3791,6 +4085,10 @@ fn saxpy_f16(scale: f32, b: &[u16], acc: &mut [f32]) {
 /// F16 weight as f32 garbage (there was only a BF16 path before).
 pub fn sgemm_f16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
     use rayon::prelude::*;
+    if m >= HALF_RHS_WIDEN_MIN_M {
+        sgemm_half_rhs_widened(a, b, c, m, k, n, |x| half::f16::from_bits(x).to_f32());
+        return;
+    }
     if m == 1 {
         let nthreads = rayon::current_num_threads().max(1);
         let kchunk = k.div_ceil(nthreads).max(1);
@@ -3824,7 +4122,7 @@ mod bf16_gemm_tests {
     #[test]
     fn sgemm_bf16_rhs_matches_f32_rounded() {
         // B is [K, N] (standard): out[i,j] = Σ_k a[i,k]·bf16(b[k,j]).
-        for &(m, k, n) in &[(1usize, 128usize, 64usize), (3, 96, 40)] {
+        for &(m, k, n) in &[(1usize, 128usize, 64usize), (3, 96, 40), (8, 96, 40)] {
             let a: Vec<f32> = (0..m * k)
                 .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1)
                 .collect();

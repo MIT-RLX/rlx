@@ -152,6 +152,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         FakeQuantize,
         FakeQuantizeBackward,
         RoundToFormat,
+        // f64 as (hi, lo) f32 pairs, through `fast::metal_kernel`.
+        DoubleSingle,
         // User-registered custom ops dispatched through
         // `rlx_mlx::op_registry`. Lowering looks up the
         // registered `MlxKernel` and calls its `execute` method

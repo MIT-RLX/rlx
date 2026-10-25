@@ -9,6 +9,7 @@
 //! residual RMSNorm) as first-class ops and lowers to MIR via
 //! [`HirModule::lower_to_mir`].
 
+use crate::prelude::*;
 mod blocks;
 mod conv;
 mod fusion;
@@ -35,8 +36,8 @@ pub use lower::LowerError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HirNodeId(pub u32);
 
-impl std::fmt::Display for HirNodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for HirNodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "h{}", self.0)
     }
 }
@@ -192,6 +193,10 @@ pub struct HirModule {
     pub name: String,
     nodes: Vec<HirNode>,
     pub outputs: Vec<HirNodeId>,
+    /// Output names, `(output index, name)`; lowering puts them on the
+    /// graph ([`crate::Graph::output_names`]).
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub output_names: Vec<(usize, String)>,
     /// How block ops lower to MIR. Default: [`FusionPolicy::Direct`]
     /// for new model code (fusion as a first-class citizen).
     pub fusion_policy: FusionPolicy,
@@ -203,6 +208,7 @@ impl HirModule {
             name: name.into(),
             nodes: Vec::new(),
             outputs: Vec::new(),
+            output_names: Vec::new(),
             fusion_policy: FusionPolicy::Direct,
         }
     }
@@ -935,7 +941,7 @@ impl HirModule {
     /// Wrap an existing MIR `Graph` as a HIR module (`HirOp::Mir` per node).
     /// Enables `Session::compile_hir` for legacy graph builders during migration.
     pub fn wrap_mir_graph(graph: crate::Graph) -> Self {
-        use std::collections::HashMap;
+        use crate::collections::HashMap;
         let mut hir = Self::new(graph.name.clone()).with_fusion_policy(FusionPolicy::Direct);
         let mut map: HashMap<crate::NodeId, HirNodeId> = HashMap::new();
         for node in graph.nodes() {
@@ -974,8 +980,8 @@ pub(crate) fn default_hir_block_label(op: &HirOp) -> Option<String> {
     })
 }
 
-impl std::fmt::Display for HirModule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for HirModule {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(f, "hir @{} {{", self.name)?;
         for node in &self.nodes {
             write!(f, "  {} = {:?}", node.id, node.op)?;

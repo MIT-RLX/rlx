@@ -11,6 +11,7 @@
 
 use crate::infer::GraphExt;
 use crate::op::Activation;
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {

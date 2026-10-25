@@ -1,0 +1,8 @@
+opam-version: "2.0"
+name: "rlx"
+version: "0.2.18"
+synopsis: "OCaml bindings for rlx over its C ABI"
+license: "MIT OR Apache-2.0"
+authors: ["Eugene Hauptmann" "Nataliya Kosmyna"]
+depends: ["ocaml" {>= "4.14"} "dune" {>= "3.0"}]
+build: ["dune" "build" "-p" name "-j" jobs]

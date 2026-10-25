@@ -643,7 +643,7 @@ pub fn seeded_peers(seed: &[u8], world: u32) -> Vec<IrohPeer> {
 /// Uses [`connect_discovered`](IrohTransport::connect_discovered): peers are
 /// reached by `EndpointId` alone (n0 relays + pkarr/DNS discovery).
 pub fn process_group_from_env() -> Result<Arc<crate::transport::ProcessGroup>, CollectiveError> {
-    let var = |k: &str| std::env::var(k).ok();
+    let var = |k: &str| rlx_ir::env::read(k).ok();
     let rank: u32 = var("RANK")
         .ok_or_else(|| terr("RANK not set"))?
         .trim()

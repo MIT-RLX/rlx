@@ -1,0 +1,22 @@
+[package]
+name = "rlx-nnpack"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "torch CPU's NNPACK 16x16 Fourier convolution reproduced bit-for-bit in pure Rust (portable, wasm-ready)"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["pytorch", "nnpack", "convolution", "parity"]
+categories = ["science", "mathematics"]
+repository.workspace   = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_nnpack"
+path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

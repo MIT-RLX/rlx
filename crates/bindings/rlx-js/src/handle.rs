@@ -41,6 +41,10 @@ pub const CLASS_TOKENIZER: u32 = 0x524C_5808;
 pub const CLASS_TRAINER: u32 = 0x524C_5809;
 pub const CLASS_SAMPLER: u32 = 0x524C_580A;
 pub const CLASS_TENSOR: u32 = 0x524C_580B;
+pub const CLASS_FLEXIBLE: u32 = 0x524C_580C;
+pub const CLASS_GROUP: u32 = 0x524C_580D;
+pub const CLASS_MODEL: u32 = 0x524C_580E;
+pub const CLASS_PARTITION: u32 = 0x524C_580F;
 
 /// Where the prototypes live. Non-writable, non-configurable and
 /// non-enumerable, so a script cannot swap one out and make every later

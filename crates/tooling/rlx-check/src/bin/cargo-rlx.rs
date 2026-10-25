@@ -25,6 +25,7 @@ fn main() -> ExitCode {
 
     match args.first().map(String::as_str) {
         Some("check") => run_check(&args[1..]),
+        Some("debug") => run_debug(&args[1..]),
         Some("new-op") => run_scaffold(&args[1..], Kind::Op),
         Some("new-model") => run_scaffold(&args[1..], Kind::Model),
         None | Some("-h") | Some("--help") | Some("help") => {
@@ -177,31 +178,9 @@ fn run_check(args: &[String]) -> ExitCode {
     }
 
     // Resolve the graph to check.
-    let graph = match (demo_name, file) {
-        (Some(name), _) => match demo::build(&name) {
-            Some(g) => g,
-            None => {
-                return usage_err(&format!(
-                    "unknown demo '{name}' — run `cargo rlx check --list-demos`"
-                ));
-            }
-        },
-        (None, Some(path)) => match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_graph_json(&text) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("cargo-rlx: could not parse '{path}' as a graph JSON: {e}");
-                    return ExitCode::FAILURE;
-                }
-            },
-            Err(e) => {
-                eprintln!("cargo-rlx: could not read '{path}': {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        (None, None) => {
-            return usage_err("provide a graph JSON file, or --demo <name> (see --list-demos)");
-        }
+    let graph = match load_graph(demo_name, file) {
+        Ok(g) => g,
+        Err(code) => return code,
     };
 
     let report = check_graph(&graph, &opts);
@@ -226,6 +205,125 @@ fn run_check(args: &[String]) -> ExitCode {
     }
 }
 
+/// The graph named by `--demo` or a JSON file path.
+fn load_graph(demo_name: Option<String>, file: Option<String>) -> Result<rlx_ir::Graph, ExitCode> {
+    match (demo_name, file) {
+        (Some(name), _) => demo::build(&name).ok_or_else(|| {
+            usage_err(&format!(
+                "unknown demo '{name}' — run `cargo rlx check --list-demos`"
+            ))
+        }),
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(text) => parse_graph_json(&text).map_err(|e| {
+                eprintln!("cargo-rlx: could not parse '{path}' as a graph JSON: {e}");
+                ExitCode::FAILURE
+            }),
+            Err(e) => {
+                eprintln!("cargo-rlx: could not read '{path}': {e}");
+                Err(ExitCode::FAILURE)
+            }
+        },
+        (None, None) => Err(usage_err(
+            "provide a graph JSON file, or --demo <name> (see --list-demos)",
+        )),
+    }
+}
+
+/// `cargo rlx debug <GRAPH.json> --device <dev> [--probe] [--bisect]` — run the
+/// graph on a device against CPU and diagnose a failure
+/// (`rlx_runtime::debug`).
+fn run_debug(args: &[String]) -> ExitCode {
+    let mut file: Option<String> = None;
+    let mut demo_name: Option<String> = None;
+    let mut device: Option<rlx_runtime::Device> = None;
+    let mut probe = false;
+    let mut bisect = false;
+    let mut atol: Option<f32> = None;
+    let mut rtol: Option<f32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let value = |i: usize, what: &str| -> Result<String, ExitCode> {
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| usage_err(&format!("{a} needs {what}")))
+        };
+        match a {
+            "--device" | "-d" => {
+                i += 1;
+                let v = match value(i, "a device name") {
+                    Ok(v) => v,
+                    Err(c) => return c,
+                };
+                match v.parse() {
+                    Ok(d) => device = Some(d),
+                    Err(_) => return usage_err(&format!("unknown device '{v}'")),
+                }
+            }
+            "--demo" => {
+                i += 1;
+                match value(i, "a name (see `cargo rlx check --list-demos`)") {
+                    Ok(v) => demo_name = Some(v),
+                    Err(c) => return c,
+                }
+            }
+            "--atol" | "--rtol" => {
+                i += 1;
+                let v = match value(i, "a number") {
+                    Ok(v) => v,
+                    Err(c) => return c,
+                };
+                let Ok(x) = v.parse::<f32>() else {
+                    return usage_err(&format!("{a}: '{v}' is not a number"));
+                };
+                if a == "--atol" {
+                    atol = Some(x);
+                } else {
+                    rtol = Some(x);
+                }
+            }
+            "--probe" => probe = true,
+            "--bisect" => bisect = true,
+            "--all" => {
+                probe = true;
+                bisect = true;
+            }
+            "-h" | "--help" => {
+                print_help();
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with('-') => {
+                return usage_err(&format!("unknown flag '{other}'"));
+            }
+            other => file = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let Some(device) = device else {
+        return usage_err("debug needs --device <name> (metal, mlx, gpu, cuda, rocm, …)");
+    };
+    let graph = match load_graph(demo_name, file) {
+        Ok(g) => g,
+        Err(code) => return code,
+    };
+    let mut opts = rlx_runtime::debug::DebugOptions::new(device);
+    opts.probe = probe;
+    opts.bisect = bisect;
+    if let Some(x) = atol {
+        opts.atol = x;
+    }
+    if let Some(x) = rtol {
+        opts.rtol = x;
+    }
+    let report = rlx_runtime::debug::debug_graph(&graph, &opts);
+    print!("{report}");
+    if report.outcome.passed() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn usage_err(msg: &str) -> ExitCode {
     eprintln!("cargo-rlx: {msg}");
     ExitCode::from(2)
@@ -237,8 +335,16 @@ fn print_help() {
          \n\
          SUBCOMMANDS:\n\
          \x20   check       device-free static analysis of an rlx graph\n\
+         \x20   debug       run a graph on a device vs CPU; classify, probe options, bisect\n\
          \x20   new-op      scaffold a custom op (OpExtension + lower/kernel)\n\
          \x20   new-model   scaffold a LayerStage model block\n\
+         \n\
+         DEBUG:\n\
+         \x20   cargo rlx debug <GRAPH.json> --device <dev> [--probe] [--bisect] [--all]\n\
+         \x20                   [--atol X] [--rtol X]   (or --demo <name>)\n\
+         \x20   --probe   rerun with one compile option changed at a time\n\
+         \x20   --bisect  expose every op as an output; name the first that diverges\n\
+         \x20   Backends need their feature: cargo install … --features metal,gpu\n\
          \n\
          SCAFFOLD:\n\
          \x20   cargo rlx new-op <Name>     [--stdout] [--force]\n\

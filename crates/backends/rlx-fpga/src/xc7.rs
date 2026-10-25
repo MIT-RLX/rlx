@@ -11,7 +11,10 @@
 //! pins, and the `openFPGALoader -b` name. Pins are from the Digilent
 //! master XDC files.
 
-use std::fmt;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::fmt;
 
 /// UART baud rate of the emitted host link.
 pub const UART_BAUD: u32 = 115_200;

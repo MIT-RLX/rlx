@@ -170,3 +170,70 @@ backend_parity!(
 backend_parity!(attn_bias_gpu, cfg(feature = "gpu"), Device::Gpu);
 backend_parity!(attn_bias_cuda, cfg(feature = "cuda"), Device::Cuda);
 backend_parity!(attn_bias_rocm, cfg(feature = "rocm"), Device::Rocm);
+
+/// Fewer queries than keys (a speculative check: a few tokens after a long
+/// cache), with a bias that hides the keys after each query's position, on
+/// every available device against the CPU.
+#[test]
+fn a_few_queries_over_many_keys_take_their_bias() {
+    let (b, nh, hd, sq, sk) = (1usize, 4usize, 128usize, 4usize, 37usize);
+    let dim = nh * hd;
+    let f = |n: usize, k: f32| {
+        (0..n)
+            .map(|i| ((i * 37 % 101) as f32 / 101.0 - 0.5) * k)
+            .collect::<Vec<f32>>()
+    };
+    let (q, k, v) = (
+        f(b * sq * dim, 1.0),
+        f(b * sk * dim, 0.9),
+        f(b * sk * dim, 1.1),
+    );
+    // Query i sees keys 0..=29 + i.
+    let bias: Vec<f32> = (0..b * nh * sq * sk)
+        .map(|i| {
+            let (key, query) = (i % sk, (i / sk) % sq);
+            if key <= 29 + query { 0.0 } else { -1e9 }
+        })
+        .collect();
+    let run = |device: Device| {
+        let mut g = Graph::new("attn_bias_rect");
+        let qi = g.input("q", Shape::new(&[b, sq, dim], DType::F32));
+        let ki = g.input("k", Shape::new(&[b, sk, dim], DType::F32));
+        let vi = g.input("v", Shape::new(&[b, sk, dim], DType::F32));
+        let bi = g.input("bias", Shape::new(&[b, nh, sq, sk], DType::F32));
+        let y = g.add_node(
+            Op::Attention {
+                num_heads: nh,
+                head_dim: hd,
+                v_head_dim: None,
+                mask_kind: MaskKind::Bias,
+                score_scale: None,
+                attn_logit_softcap: None,
+            },
+            vec![qi, ki, vi, bi],
+            Shape::new(&[b, sq, dim], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        Session::new(device)
+            .compile(g)
+            .run(&[("q", &q), ("k", &k), ("v", &v), ("bias", &bias)])
+            .remove(0)
+    };
+    let _gpu = common::serialize_gpu();
+    let want = run(Device::Cpu);
+    for (name, dev) in [
+        ("metal", Device::Metal),
+        ("mlx", Device::Mlx),
+        ("wgpu", Device::Gpu),
+        ("cuda", Device::Cuda),
+        ("rocm", Device::Rocm),
+        ("vulkan", Device::Vulkan),
+    ] {
+        if common::skip_unless(dev) {
+            continue;
+        }
+        let err = max_abs(&run(dev), &want);
+        eprintln!("{name}: max |diff| {err:.2e}");
+        assert!(err < 1e-4, "{name} differs by {err}");
+    }
+}

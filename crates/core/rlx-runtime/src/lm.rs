@@ -77,6 +77,112 @@ pub trait LmRunner: Send {
         Ok(produced)
     }
 
+    /// Greedy generation after each of `prompts`: up to `n_new` tokens
+    /// each, a sequence ending at its first id in `stop` (left out). The
+    /// default runs them one after another; a runner with a batched step
+    /// decodes them together.
+    fn generate_batch(
+        &mut self,
+        prompts: &[Vec<u32>],
+        n_new: usize,
+        stop: &[u32],
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
+        prompts
+            .iter()
+            .map(|p| {
+                let mut out = self.generate(p, n_new, &mut |t| !stop.contains(&t))?;
+                if out.last().is_some_and(|t| stop.contains(t)) {
+                    out.pop();
+                }
+                Ok(out)
+            })
+            .collect()
+    }
+
+    /// Beam search after `prompt`: the best of `beams` hypotheses kept
+    /// each step ([`beam_search`]), up to `n_new` tokens, a hypothesis ending
+    /// at an id in `stop` (left out). The default extends each hypothesis
+    /// through [`Self::predict_logits`] on its whole context (correct, a
+    /// prompt's work a token); a runner with a batched step keeps the beams
+    /// in it.
+    fn generate_beam(
+        &mut self,
+        prompt: &[u32],
+        beams: usize,
+        n_new: usize,
+        stop: &[u32],
+        length_penalty: f32,
+    ) -> anyhow::Result<Vec<u32>> {
+        let first = self.predict_logits(prompt)?;
+        let mut contexts: Vec<Vec<u32>> = vec![prompt.to_vec()];
+        beam_search(
+            &first,
+            beams,
+            n_new,
+            stop,
+            length_penalty,
+            |parents, tokens| {
+                contexts = parents
+                    .iter()
+                    .zip(tokens)
+                    .map(|(&p, &t)| {
+                        let mut c = contexts[p].clone();
+                        c.push(t);
+                        c
+                    })
+                    .collect();
+                contexts.iter().map(|c| self.predict_logits(c)).collect()
+            },
+        )
+    }
+
+    /// Continuous batching: room for `slots` sequences decoded together,
+    /// which requests join ([`Self::serve_add`]) and leave
+    /// ([`Self::serve_remove`]) between steps. Default: unsupported.
+    fn serve_open(&mut self, _slots: usize) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "{} serves no batch of requests",
+            self.family()
+        ))
+    }
+
+    /// A request in a free slot; its slot. Its prompt goes in a token a
+    /// step, from the batch's current position.
+    fn serve_add(&mut self, _prompt: &[u32]) -> anyhow::Result<usize> {
+        Err(anyhow::anyhow!(
+            "{} serves no batch of requests",
+            self.family()
+        ))
+    }
+
+    /// One step of every request in the batch: `(slot, token)` for each
+    /// whose prompt is in (its greedy next token, which it is fed next).
+    fn serve_step(&mut self) -> anyhow::Result<Vec<(usize, u32)>> {
+        Err(anyhow::anyhow!(
+            "{} serves no batch of requests",
+            self.family()
+        ))
+    }
+
+    /// The request in `slot` is done; the slot takes the next.
+    fn serve_remove(&mut self, _slot: usize) {}
+
+    /// Prefill `ids` with `media` (images, …) in place of their placeholder
+    /// tokens: each run of a media kind's placeholder id becomes as many
+    /// positions as the media's embedding has rows. The prompt as decoding
+    /// continues it (the placeholders expanded), and the next position's
+    /// logits. The default takes no media.
+    fn prefill_with_media(
+        &mut self,
+        _ids: &[u32],
+        _media: &[crate::model::Tensor],
+    ) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+        Err(anyhow::anyhow!(
+            "{} takes no images or other media",
+            self.family()
+        ))
+    }
+
     /// Prefill `prompt_ids`, seed the decode KV cache, and return the
     /// last-position logits `[vocab]`. Together with `decode_logits` this
     /// gives a **host-driven** decode loop: the caller owns sampling, logit
@@ -168,6 +274,38 @@ pub trait LmRunner: Send {
     }
 }
 
+/// Beam search from `first` (the logits after the prompt). Each step every
+/// live hypothesis proposes its `2 × beams` likeliest tokens; the best
+/// `beams` that do not stop live on, and a stop token among the best
+/// `beams` finishes its hypothesis, scored by its log-probability over
+/// `length ^ length_penalty`. `step(parents, tokens)` extends the
+/// hypotheses: the `i`-th new one is hypothesis `parents[i]` of the last
+/// step plus `tokens[i]`, and it returns each one's next logits. Ends with
+/// `beams` finished hypotheses or `n_new` tokens; returns the best finished
+/// or live one's tokens. Ties go to the earlier hypothesis, then the lower
+/// id, so every implementation of `step` picks the same.
+///
+/// The Hugging Face rule of [`crate::search::BeamConfig::new`]; use
+/// [`crate::search::beam_search`] directly for n-best, masks, or other rules.
+pub fn beam_search(
+    first: &[f32],
+    beams: usize,
+    n_new: usize,
+    stop: &[u32],
+    length_penalty: f32,
+    mut step: impl FnMut(&[usize], &[u32]) -> anyhow::Result<Vec<Vec<f32>>>,
+) -> anyhow::Result<Vec<u32>> {
+    let cfg = rlx_search::BeamConfig::new(beams, n_new)
+        .stop(stop)
+        .length_penalty(length_penalty as f64);
+    let best = rlx_search::beam_search(cfg, &[], first, &mut (), |s| step(s.parents, s.tokens))?;
+    Ok(best
+        .into_iter()
+        .next()
+        .map(|h| h.tokens)
+        .unwrap_or_default())
+}
+
 /// A boxed runner is a runner.
 ///
 /// Needed because a server holds `Box<dyn LmRunner>` — the engine is chosen
@@ -186,6 +324,50 @@ impl LmRunner for Box<dyn LmRunner> {
 
     fn predict_logits(&mut self, prompt_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
         (**self).predict_logits(prompt_ids)
+    }
+
+    fn generate_batch(
+        &mut self,
+        prompts: &[Vec<u32>],
+        n_new: usize,
+        stop: &[u32],
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
+        (**self).generate_batch(prompts, n_new, stop)
+    }
+
+    fn generate_beam(
+        &mut self,
+        prompt: &[u32],
+        beams: usize,
+        n_new: usize,
+        stop: &[u32],
+        length_penalty: f32,
+    ) -> anyhow::Result<Vec<u32>> {
+        (**self).generate_beam(prompt, beams, n_new, stop, length_penalty)
+    }
+
+    fn prefill_with_media(
+        &mut self,
+        ids: &[u32],
+        media: &[crate::model::Tensor],
+    ) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+        (**self).prefill_with_media(ids, media)
+    }
+
+    fn serve_open(&mut self, slots: usize) -> anyhow::Result<()> {
+        (**self).serve_open(slots)
+    }
+
+    fn serve_add(&mut self, prompt: &[u32]) -> anyhow::Result<usize> {
+        (**self).serve_add(prompt)
+    }
+
+    fn serve_step(&mut self) -> anyhow::Result<Vec<(usize, u32)>> {
+        (**self).serve_step()
+    }
+
+    fn serve_remove(&mut self, slot: usize) {
+        (**self).serve_remove(slot)
     }
 
     fn generate(
@@ -343,6 +525,51 @@ impl<R: LmRunner> LmRunner for HostDriven<R> {
         self.inner.predict_logits(prompt_ids)
     }
 
+    fn generate_batch(
+        &mut self,
+        prompts: &[Vec<u32>],
+        n_new: usize,
+        stop: &[u32],
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
+        self.inner.generate_batch(prompts, n_new, stop)
+    }
+
+    fn generate_beam(
+        &mut self,
+        prompt: &[u32],
+        beams: usize,
+        n_new: usize,
+        stop: &[u32],
+        length_penalty: f32,
+    ) -> anyhow::Result<Vec<u32>> {
+        self.inner
+            .generate_beam(prompt, beams, n_new, stop, length_penalty)
+    }
+
+    fn prefill_with_media(
+        &mut self,
+        ids: &[u32],
+        media: &[crate::model::Tensor],
+    ) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+        self.inner.prefill_with_media(ids, media)
+    }
+
+    fn serve_open(&mut self, slots: usize) -> anyhow::Result<()> {
+        self.inner.serve_open(slots)
+    }
+
+    fn serve_add(&mut self, prompt: &[u32]) -> anyhow::Result<usize> {
+        self.inner.serve_add(prompt)
+    }
+
+    fn serve_step(&mut self) -> anyhow::Result<Vec<(usize, u32)>> {
+        self.inner.serve_step()
+    }
+
+    fn serve_remove(&mut self, slot: usize) {
+        self.inner.serve_remove(slot)
+    }
+
     fn generate(
         &mut self,
         prompt_ids: &[u32],
@@ -438,16 +665,8 @@ impl<R: LmRunner> LmRunner for HostDriven<R> {
     }
 }
 
-fn argmax_u32(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as u32
+pub(crate) fn argmax_u32(logits: &[f32]) -> u32 {
+    rlx_search::argmax_u32(logits)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -944,6 +1163,40 @@ pub fn auto_runner_name(arch: &str, path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Greedy takes the likelier first token into a flat continuation; two
+    /// beams find the pair that is likelier as a whole.
+    #[test]
+    fn beam_search_finds_the_likelier_sequence() {
+        let ln = |p: &[f32]| p.iter().map(|v| v.ln()).collect::<Vec<f32>>();
+        // Tokens 0 and 1, 2 stops. After 0 nothing is likely; after 1, 0 is.
+        let first = ln(&[0.6, 0.4, 1e-6]);
+        let after = |t: u32| {
+            if t == 0 {
+                ln(&[0.34, 0.33, 0.33])
+            } else {
+                ln(&[0.95, 0.04, 0.01])
+            }
+        };
+        let run = |beams: usize| {
+            let mut hyps: Vec<Vec<u32>> = vec![vec![]];
+            beam_search(&first, beams, 2, &[2], 1.0, |parents, tokens| {
+                hyps = parents
+                    .iter()
+                    .zip(tokens)
+                    .map(|(&p, &t)| {
+                        let mut h = hyps[p].clone();
+                        h.push(t);
+                        h
+                    })
+                    .collect();
+                Ok(hyps.iter().map(|h| after(*h.last().unwrap())).collect())
+            })
+            .unwrap()
+        };
+        assert_eq!(run(1), vec![0, 0], "one beam is greedy");
+        assert_eq!(run(2), vec![1, 0]);
+    }
 
     #[test]
     fn config_source_default_is_embedded() {

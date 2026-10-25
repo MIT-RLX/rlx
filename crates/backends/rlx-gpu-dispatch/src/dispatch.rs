@@ -48,6 +48,20 @@ impl GpuArch {
     pub fn cuda(major: u32, minor: u32) -> Self {
         Self(format!("sm_{major}{minor}"))
     }
+    /// NVIDIA compute capability plus an SM-count band, e.g. 58 SMs on sm_86 →
+    /// `sm_86.sms32` (band = largest power of two ≤ the SM count). One compute
+    /// capability spans a 20-SM laptop part and an 84-SM datacenter part, and
+    /// tile choice is occupancy-sensitive, so a winner measured on one is not
+    /// evidence for the other — which matters once rows ship
+    /// ([`crate::shipped`]). Banding keeps neighbouring SKUs sharing rows.
+    pub fn cuda_with_sms(major: u32, minor: u32, sms: u32) -> Self {
+        let band = if sms == 0 {
+            0
+        } else {
+            1u32 << (31 - sms.leading_zeros())
+        };
+        Self(format!("sm_{major}{minor}.sms{band}"))
+    }
     /// AMD GCN/RDNA target, e.g. `gfx908`.
     pub fn rocm(gfx: &str) -> Self {
         Self(gfx.to_string())
@@ -1571,6 +1585,17 @@ mod tests {
     #[test]
     fn arch_labels_separate_vendors() {
         assert!(GpuArch::cuda(8, 6).is_cuda());
+        assert!(GpuArch::cuda_with_sms(8, 6, 58).is_cuda());
+        assert_eq!(GpuArch::cuda_with_sms(8, 6, 58).as_str(), "sm_86.sms32");
+        assert_eq!(
+            GpuArch::cuda_with_sms(8, 6, 40),
+            GpuArch::cuda_with_sms(8, 6, 58),
+            "neighbouring SKUs share a band"
+        );
+        assert_ne!(
+            GpuArch::cuda_with_sms(8, 6, 28),
+            GpuArch::cuda_with_sms(8, 6, 84)
+        );
         assert!(!GpuArch::rocm("gfx908").is_cuda());
         assert_ne!(GpuArch::cuda(8, 6), GpuArch::cuda(9, 0));
     }

@@ -143,14 +143,22 @@ fn assert_exact(what: &str, got: &[f32], want: &[f32]) {
 /// The tolerance is still tight enough to be a real gate: every failure mode
 /// this test exists to catch — wrong counter, swapped lane halves, dropped key
 /// increment, ignored seed — produces a *different sample*, not a 1-ULP one.
+///
+/// It is relative above 1 and absolute below, at 1e-5. A sample is
+/// `sqrt(-2 ln u1) * cos(2π u2)`: a last-ULP difference in `cos` (and in its
+/// argument, up to 2π) comes out scaled by a radius of up to ~4, and near the
+/// zero crossing it is most of a small sample — NVIDIA gives 0.010012069 for
+/// the CPU's 0.010016218, 4e-6 apart, a relative 4e-4. Vulkan itself only
+/// promises `cos` to 2^-11 absolute; 1e-5 is far inside that and still far
+/// below what a wrong sample differs by.
 fn assert_close(what: &str, got: &[f32], want: &[f32]) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     let mut worst = 0f32;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let rel = (g - w).abs() / w.abs().max(1e-6);
+        let rel = (g - w).abs() / w.abs().max(1.0);
         worst = worst.max(rel);
         assert!(
-            rel <= 1e-6,
+            rel <= 1e-5,
             "{what}: element {i} — gpu {g} vs cpu {w} (rel {rel:e})"
         );
     }

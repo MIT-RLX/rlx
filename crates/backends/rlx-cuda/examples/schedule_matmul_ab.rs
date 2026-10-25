@@ -346,8 +346,7 @@ fn main() {
         g.set_outputs(vec![x]);
         let _ = CudaExecutable::compile(g);
         rlx_cuda::device::cuda_context()
-            .and_then(|ctx| ctx.compute_capability().ok())
-            .map(|(maj, min)| GpuArch::cuda(maj as u32, min as u32))
+            .map(|ctx| rlx_cuda::tuning::arch_for(&ctx))
             .unwrap_or_else(GpuArch::unknown)
     };
     // Load the persisted tuning cache NOW, then clear it. It otherwise loads

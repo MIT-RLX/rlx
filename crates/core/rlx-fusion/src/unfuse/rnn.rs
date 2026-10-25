@@ -18,6 +18,17 @@ pub(super) fn unfuse_gated_delta_net(
     new_inputs: Vec<NodeId>,
     out: &mut Graph,
 ) -> NodeId {
+    unfuse_gated_delta_net_with_state(node, new_inputs, out).0
+}
+
+/// [`unfuse_gated_delta_net`], also returning the final state `[B, H, N, N]`
+/// when the node carries one (`carry_state`) — the value the fused kernel
+/// leaves in its state input's buffer.
+pub(super) fn unfuse_gated_delta_net_with_state(
+    node: &rlx_ir::Node,
+    new_inputs: Vec<NodeId>,
+    out: &mut Graph,
+) -> (NodeId, Option<NodeId>) {
     let Op::GatedDeltaNet {
         state_size,
         carry_state,
@@ -260,11 +271,27 @@ pub(super) fn unfuse_gated_delta_net(
             ys.push(out_b1hn);
         }
 
-        if ys.len() == 1 {
+        let final_state = carry_state.then(|| {
+            out.reshape(
+                state,
+                vec![b_dim as i64, h_dim as i64, n as i64, n as i64],
+                IrShape::from_dims(
+                    &[
+                        Dim::Static(b_dim),
+                        Dim::Static(h_dim),
+                        Dim::Static(n),
+                        Dim::Static(n),
+                    ],
+                    dtype,
+                ),
+            )
+        });
+        let y = if ys.len() == 1 {
             ys.pop().unwrap()
         } else {
             out.add_node(Op::Concat { axis: 1 }, ys, node.shape.clone())
-        }
+        };
+        (y, final_state)
     }
 }
 

@@ -61,19 +61,13 @@ fn fft_max_radix() -> u32 {
 /// (n<=2048) is enabled by `RLX_FFT_WGPU_ONCHIP=1`; the 32 KB radix-8 path
 /// (n<=4096) additionally needs `RLX_FFT_WGPU_BIG=1`.
 #[cfg(feature = "native-gpu-fft")]
-fn env_on(key: &str) -> bool {
-    rlx_ir::env::var(key)
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
-}
-
-#[cfg(feature = "native-gpu-fft")]
 fn wgpu_onchip_enabled() -> bool {
-    env_on("RLX_FFT_WGPU_ONCHIP") || env_on("RLX_FFT_WGPU_BIG")
+    rlx_ir::env::flag("RLX_FFT_WGPU_ONCHIP") || rlx_ir::env::flag("RLX_FFT_WGPU_BIG")
 }
 
 #[cfg(feature = "native-gpu-fft")]
 fn wgpu_big_enabled() -> bool {
-    env_on("RLX_FFT_WGPU_BIG")
+    rlx_ir::env::flag("RLX_FFT_WGPU_BIG")
 }
 
 /// Multi-row small-n path (default OFF, opt-in via `RLX_FFT_MULTIROW=1`): packs

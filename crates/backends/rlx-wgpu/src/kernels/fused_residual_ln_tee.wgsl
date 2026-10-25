@@ -39,13 +39,28 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
 
+// One 64-thread workgroup per row (as `layernorm.wgsl`): a decode step has a
+// single row, and one thread walking it three times serially was ~1 ms.
+var<workgroup> scratch: array<f32, 64>;
+
+fn tree_sum(tid: u32) {
+    for (var stride: u32 = 32u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            scratch[tid] = scratch[tid] + scratch[tid + stride];
+        }
+        workgroupBarrier();
+    }
+}
+
 @compute @workgroup_size(64)
 fn fused_residual_ln_tee(
-    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) ngs: vec3<u32>,
 ) {
-    let row = gid.x + gid.y * ngs.x * 64u;
+    let row = wid.x + wid.y * ngs.x;
     if (row >= params.outer || params.inner == 0u) { return; }
+    let tid = lid.x;
     let in_base  = params.in_off       + row * params.inner;
     let res_base = params.residual_off + row * params.inner;
     let sum_base = params.sum_off      + row * params.inner;
@@ -54,30 +69,36 @@ fn fused_residual_ln_tee(
     let eps = bitcast<f32>(params.eps_bits);
     let with_bias = params.has_bias != 0u;
 
-    // Pass 1: write the SUM to sum_base and accumulate the mean.
-    var sum_x: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    // Pass 1: write the SUM to sum_base and accumulate the mean. Each thread
+    // owns elements tid, tid+64, …, and re-reads only its own writes below.
+    var partial: f32 = 0.0;
+    for (var i: u32 = tid; i < params.inner; i = i + 64u) {
         var v = arena[in_base + i] + arena[res_base + i];
         if (with_bias) { v = v + arena[params.bias_off + i]; }
         arena[sum_base + i] = v;
-        sum_x = sum_x + v;
+        partial = partial + v;
     }
-    let mean = sum_x * n_inv;
-    // Pass 1b: STABLE TWO-PASS variance = mean((x − mean)²), reading the
-    // summed value back from sum_base. The one-pass E[x²] − (E[x])²
-    // identity catastrophically cancels in f32 under a large DC offset
-    // (pre-norm transformer activations) and corrupts the norm on wgpu
-    // only; two-pass matches CPU/Metal/MLX/CoreML.
-    var sum_sq: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    scratch[tid] = partial;
+    workgroupBarrier();
+    tree_sum(tid);
+    let mean = scratch[0] * n_inv;
+    workgroupBarrier(); // everyone has read scratch[0] before it is reused.
+
+    // Pass 1b: STABLE TWO-PASS variance = mean((x − mean)²). The one-pass
+    // E[x²] − (E[x])² identity catastrophically cancels in f32 under a large
+    // DC offset (pre-norm transformer activations); two-pass matches
+    // CPU/Metal/MLX/CoreML.
+    partial = 0.0;
+    for (var i: u32 = tid; i < params.inner; i = i + 64u) {
         let d = arena[sum_base + i] - mean;
-        sum_sq = sum_sq + d * d;
+        partial = partial + d * d;
     }
-    let var_ = sum_sq * n_inv;
-    // RMS norm scales by 1/sqrt(mean(x^2)) and does NOT recentre. Reuse the
-    // same stable two-pass accumulation: mean(x^2) = mean((x-mean)^2) + mean^2,
-    // which avoids the f32 cancellation a one-pass sum(x^2) suffers under the
-    // large DC offset pre-norm transformer activations carry.
+    scratch[tid] = partial;
+    workgroupBarrier();
+    tree_sum(tid);
+    let var_ = scratch[0] * n_inv;
+    // RMS norm scales by 1/sqrt(mean(x^2)) and does NOT recentre:
+    // mean(x^2) = mean((x-mean)^2) + mean^2, the same stable accumulation.
     let rms_only = params.is_rms != 0u;
     let inv_scale = select(
         inverseSqrt(var_ + eps),
@@ -87,7 +108,7 @@ fn fused_residual_ln_tee(
 
     // Pass 2: read sum_base, write the norm result to out_base. Two distinct
     // slots — the sum stays available for the other consumer.
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    for (var i: u32 = tid; i < params.inner; i = i + 64u) {
         let g = arena[params.gamma_off + i];
         let b = arena[params.beta_off  + i];
         let v = arena[sum_base + i];

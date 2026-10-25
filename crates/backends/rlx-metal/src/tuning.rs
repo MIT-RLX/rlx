@@ -21,16 +21,33 @@ use std::sync::OnceLock;
 /// This device's key in the shared dispatch table, with the persisted tuning
 /// cache guaranteed loaded.
 ///
-/// Keyed by Apple GPU family rather than the full device name: that is the
-/// granularity Metal's own cost model already varies at (`MetalHwModel`), and a
-/// finer key would fragment the cache without changing any decision.
+/// Keyed by Apple GPU family **and tier** (`metal-m4-pro`), not the full
+/// device name. Family alone lumped a 10-core M4 with a 40-core M4 Max, and the
+/// sgemm choice is occupancy-sensitive (`Simd64` needs enough threadgroups to
+/// fill the GPU), so a winner measured on one tier is not evidence for another
+/// — which matters once rows ship (`rlx_gpu_dispatch::shipped`).
 pub fn gpu_arch() -> &'static rlx_gpu_dispatch::dispatch::GpuArch {
     static ARCH: OnceLock<rlx_gpu_dispatch::dispatch::GpuArch> = OnceLock::new();
     ARCH.get_or_init(|| {
         ensure_tuning_cache_loaded();
-        let family = format!("{:?}", crate::cost::hw_model().gpu_family).to_lowercase();
-        rlx_gpu_dispatch::dispatch::GpuArch::metal(&family)
+        let hw = crate::cost::hw_model();
+        rlx_gpu_dispatch::dispatch::GpuArch::metal(&arch_family_tier(
+            &format!("{:?}", hw.gpu_family),
+            &hw.gpu_name,
+        ))
     })
+}
+
+/// `family-tier` from the cost model's family and `MTLDevice.name`
+/// (`"M4"`, `"Apple M4 Pro"` → `m4-pro`). Tier is `base` unless the name says
+/// pro / max / ultra.
+fn arch_family_tier(family: &str, device_name: &str) -> String {
+    let lower = device_name.to_lowercase();
+    let tier = ["ultra", "max", "pro"]
+        .into_iter()
+        .find(|t| lower.split_whitespace().any(|w| w == *t))
+        .unwrap_or("base");
+    format!("{}-{tier}", family.to_lowercase())
 }
 
 /// Where the tuning cache lives. `RLX_GPU_TUNING_CACHE` overrides; otherwise
@@ -58,6 +75,10 @@ pub fn tuning_cache_path() -> Option<PathBuf> {
 pub fn ensure_tuning_cache_loaded() {
     static LOADED: OnceLock<()> = OnceLock::new();
     LOADED.get_or_init(|| {
+        // Shipped per-arch rows first; the user cache below overrides them.
+        if !rlx_ir::env::flag("RLX_GPU_NO_SHIPPED_TUNING") {
+            rlx_gpu_dispatch::shipped::load();
+        }
         let Some(path) = tuning_cache_path() else {
             return;
         };
@@ -85,4 +106,22 @@ pub fn save_tuning_cache() -> Option<PathBuf> {
     }
     std::fs::write(&path, rlx_gpu_dispatch::dispatch::save_overrides()).ok()?;
     Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arch_family_tier;
+
+    /// Tiers of one family must not share tuning rows.
+    #[test]
+    fn arch_key_separates_tiers() {
+        assert_eq!(arch_family_tier("M4", "Apple M4 Pro"), "m4-pro");
+        assert_eq!(arch_family_tier("M4", "Apple M4"), "m4-base");
+        assert_eq!(arch_family_tier("M4", "Apple M4 Max"), "m4-max");
+        assert_eq!(arch_family_tier("M1Pro", "Apple M1 Ultra"), "m1pro-ultra");
+        assert_ne!(
+            arch_family_tier("M4", "Apple M4"),
+            arch_family_tier("M4", "Apple M4 Pro")
+        );
+    }
 }

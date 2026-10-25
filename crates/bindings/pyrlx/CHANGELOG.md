@@ -6,6 +6,82 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.19] — 2026-10-24
+
+### Added
+
+- **`Group` — distributed nodes** (`connect`, `from_env`, `send` / `recv`,
+  `all_reduce`, `all_gather`, `broadcast`, `barrier`, `collect_caps`,
+  `ship_stage` / `serve_worker`, `send_activation` / `recv_activation`,
+  `ship_train` / `run_train` / `serve_trainer`) and `loopback_peers`. Every
+  blocking call releases the GIL, so a local mesh can be Python threads.
+- `Graph.clone()` / `Graph.is_consumed()`, `load_weights(format, path)` (also
+  `"safetensors"`), `to_rlxp(from_, src, dst, options)`,
+  `GraphDevices.resolve` / `run_on` / `set_params`, `DeviceRouter.set_params` —
+  the rows the shared runtime API table (`rlx-bind/src/api.idl`) found missing;
+  `tests/test_api_contract.py` now checks the module against that table both
+  ways.
+- Five runtime examples — `examples/{inference,training,loading,distributed,
+  backends}.py` — the same five as the JS and Swift bindings, run by
+  `tests/test_examples.py`.
+
+- **The rest of the `rlx_ir::Graph` builder surface** (~140 methods, now ~200
+  in all): conv 1d/3d and transposed variants, `im2col`, pooling,
+  interpolation, `attention_bias` / `attention_kind_vdim` / `attention_opts`
+  (score scale, logit softcap), `rope(style="gptj")`, `axial_rope2d`, batch /
+  adaLN / fused residual norms, LSTM / GRU / RNN, selective scan, Mamba-2,
+  Gated DeltaNet, `scan` over a body graph, `custom_fn_multi`, `custom_op`,
+  `expand`, scatter / gather ND, `pad`, `slice`, `tile`, `trilu`, `roll`,
+  ordering ops, Cholesky / QR / SVD / eigh / det / triangular solve,
+  per-channel and block-scaled quantization, `dequant_matmul` and its packed /
+  grouped / NVFP4 forms, `q_matmul` / `q_conv2d`, `synth_matmul`, VQ and
+  residual VQ, KAN splines, N-D FFT, FIR / IIR / biquad / SOS filters, Hilbert,
+  resampling, spectrogram / band power / log-mel, SPD manifold layers, and
+  `param_names` / `op_kinds` / `outputs`. Output shapes are inferred.
+- `check` / `check_backends` — device-free static diagnostics.
+- Precision policies: `Session(policy=...)`, `compile_with(policy=...)`,
+  `FlexibleSession.compile_with_resolved(policy=...)`.
+- `CompiledGraph.set_params`, `output_shapes`, `output_dtypes`;
+  `FusionOptions.disable_conv_bias_act_fusion`; `verify_rlxp`.
+- `Trainer` / `Optimizer` (feature `training`) and `load_tokenizer` /
+  `Tokenizer` / `Sampler` / `sample_next` / `argmax` / `render_chat`
+  (feature `text`), ported from rlx-js. Trainer checkpoints use rlx-js's GGUF
+  layout, so either binding resumes the other's.
+
+### Changed
+
+- Aligned with RLX workspace **0.2.19**.
+- The `Graph` builders and the runtime (`Session`, `CompiledGraph`, `Trainer`,
+  `Optimizer`, tokenizer / sampler, `check`, GGUF, RLXP, weight loaders) are
+  now generated from / delegated to `rlx-bind`, the core rlx-js and the C ABI
+  share. Every public name and signature is kept; a trailing options group
+  (`conv2d`'s `kernel_size` … `groups`, `sample`'s `top_k` … `dtype`) now has
+  defaults, and pair options accept an int (`stride=2`).
+- `CompiledGraph.run` refuses non-f32 outputs instead of reinterpreting their
+  bytes; use `run_typed`, or `cast` to f32 in the graph.
+- A Rust panic inside any call raises `RuntimeError` (it was pyo3's
+  `PanicException`, which `except Exception` does not catch).
+- `dequant_gguf` handles every GGUF type (F16 / BF16 were refused);
+  `GgufFile.metadata()` returns arrays as lists (shortened past 64 entries —
+  `metadata_value(key)` returns one in full) rather than a debug string.
+- New spellings from the shared table: `ifft`, `le_`, `node_count`, `name`,
+  `fused_residual_layer_norm` (`fused_residual_ln` stays).
+
+- Default cargo features now include `training` and `text`, matching rlx-js.
+- `activation` / `binary` read `Activation::ALL` / `BinaryOp::ALL`, so all 29
+  activations and 14 binary ops (`softplus`, `erf`, `mish`, `atan2`, `mod`,
+  bitwise, shifts, …) are reachable by name; before, 13 and 7 were.
+
+### Fixed
+
+- The `.pyi` stubs typed `grad` / `jvp` / `hvp`'s `wrt` as names and gave
+  `nth_order_grad` / `directional_nth_grad` the wrong parameter order; they
+  take node ids, and `(graph, wrt_name, order)` respectively.
+- `load_rlxp`, `convert_*_to_rlxp`, `load_mlx` / `load_dduf` / `load_nemo` /
+  `load_pt` and (with `fpga`) `export_fpga` were compiled into the extension
+  but never re-exported, so `rlx.load_rlxp` — as the README documents it —
+  raised `AttributeError`.
+
 ## [0.2.18] — 2026-10-15
 
 Covers 0.2.17 as well — `pyproject.toml` had stayed at 0.2.16 there.

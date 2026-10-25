@@ -4,7 +4,7 @@
 
 //! WebGL2 render-to-texture executor for a [`Plan`].
 //!
-//! Every tensor is an `RGBA32F` texture (value in the `R` channel); every op
+//! Every tensor is an `R32F` texture (one float per texel); every op
 //! is a fragment shader that writes one output element per fragment. The GLSL
 //! mirrors [`crate::exec_cpu`] one-to-one (same op/activation codes), so the
 //! numerics are the ones the native parity test verifies — only the GL
@@ -22,9 +22,17 @@ use web_sys::{
 const HEAD: &str = "#version 300 es\nprecision highp float; precision highp int;\n";
 
 // Activation forward/derivative — must match `exec_cpu::act_f` / `act_df`.
-// Codes: 0 Relu 1 Neg 2 Exp 3 Log 4 Sqrt 5 Rsqrt 6 Sigmoid 7 Tanh 8 Abs 9 Sin 10 Cos 11 Silu 12 Recip.
+// Codes: 0 Relu 1 Neg 2 Exp 3 Log 4 Sqrt 5 Rsqrt 6 Sigmoid 7 Tanh 8 Abs 9 Sin 10 Cos 11 Silu 12 Recip
+// 13 Gelu 14 GeluApprox 15 Softplus.
 const ACT_FNS: &str = r#"
 float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+float erfAS(float x) {
+    float t = 1.0 / (1.0 + 0.3275911 * abs(x));
+    float p = t * (0.2548296 + t * (-0.28449674 + t * (1.4214138 + t * (-1.4531521 + t * 1.0614054))));
+    float r = 1.0 - p * exp(-x * x);
+    return x < 0.0 ? -r : r;
+}
+float geluArg(float x) { return clamp(0.7978846 * (x + 0.044715 * x * x * x), -15.0, 15.0); }
 float actF(int k, float x) {
     if (k == 0) return max(x, 0.0);
     else if (k == 1) return -x;
@@ -38,6 +46,9 @@ float actF(int k, float x) {
     else if (k == 9) return sin(x);
     else if (k == 10) return cos(x);
     else if (k == 11) return x * sigmoidf(x);
+    else if (k == 13) return 0.5 * x * (1.0 + erfAS(x * 0.70710678));
+    else if (k == 14) return 0.5 * x * (1.0 + tanh(geluArg(x)));
+    else if (k == 15) return max(x, 0.0) + log(1.0 + exp(-abs(x)));
     else return 1.0 / x;
 }
 float actDF(int k, float x) {
@@ -53,6 +64,12 @@ float actDF(int k, float x) {
     else if (k == 9) return cos(x);
     else if (k == 10) return -sin(x);
     else if (k == 11) { float s = sigmoidf(x); return s + x * s * (1.0 - s); }
+    else if (k == 13) return 0.5 * (1.0 + erfAS(x * 0.70710678)) + x * exp(-0.5 * x * x) * 0.3989423;
+    else if (k == 14) {
+        float t = tanh(geluArg(x));
+        return 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * 0.7978846 * (1.0 + 0.134145 * x * x);
+    }
+    else if (k == 15) return sigmoidf(x);
     else return -1.0 / (x * x);
 }
 "#;
@@ -111,13 +128,17 @@ void main() {
     o = vec4(c != 0.0 ? texelFetch(A, p, 0).r : texelFetch(B, p, 0).r, 0.0, 0.0, 1.0);
 }"#;
 
+// Rows of `A` and of the output run over all batch blocks (`batch·m`); block
+// `p.y / uM` reads its own `k` rows of `B` when `uBBatched`, else the shared ones.
 const FS_MATMUL: &str = r#"uniform highp sampler2D A; uniform highp sampler2D B; uniform int uK;
+uniform int uM; uniform int uBBatched;
 out vec4 o;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy); // x=col, y=row
+    int bRow0 = uBBatched != 0 ? (p.y / uM) * uK : 0;
     float s = 0.0;
     for (int l = 0; l < uK; l++) {
-        s += texelFetch(A, ivec2(l, p.y), 0).r * texelFetch(B, ivec2(p.x, l), 0).r;
+        s += texelFetch(A, ivec2(l, p.y), 0).r * texelFetch(B, ivec2(p.x, bRow0 + l), 0).r;
     }
     o = vec4(s, 0.0, 0.0, 1.0);
 }"#;
@@ -133,7 +154,7 @@ void main() {
 }"#;
 
 const FS_REDUCE: &str = r#"uniform highp sampler2D SRC; uniform highp isampler2D GROUPS;
-uniform int uFanin; uniform int uSrcCols; uniform int uOutCols; uniform int uOp;
+uniform int uFanin; uniform int uSrcCols; uniform int uOutCols; uniform int uGCols; uniform int uOp;
 out vec4 o;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -141,7 +162,8 @@ void main() {
     float acc = uOp == 2 ? -3.0e38 : uOp == 3 ? 3.0e38 : uOp == 4 ? 1.0 : 0.0;
     float count = 0.0;
     for (int j = 0; j < uFanin; j++) {
-        int g = texelFetch(GROUPS, ivec2(j, oi), 0).r;
+        int gl = oi * uFanin + j;
+        int g = texelFetch(GROUPS, ivec2(gl % uGCols, gl / uGCols), 0).r;
         if (g >= 0) {
             float v = texelFetch(SRC, ivec2(g % uSrcCols, g / uSrcCols), 0).r;
             count += 1.0;
@@ -208,7 +230,7 @@ void main() {
 }"#;
 
 const FS_ARGREDUCE: &str = r#"uniform highp sampler2D SRC; uniform highp isampler2D GROUPS;
-uniform int uFanin; uniform int uSrcCols; uniform int uOutCols; uniform int uIsMax;
+uniform int uFanin; uniform int uSrcCols; uniform int uOutCols; uniform int uGCols; uniform int uIsMax;
 out vec4 o;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -216,7 +238,8 @@ void main() {
     float best = uIsMax == 1 ? -3.0e38 : 3.0e38;
     int bj = 0;
     for (int j = 0; j < uFanin; j++) {
-        int g = texelFetch(GROUPS, ivec2(j, oi), 0).r;
+        int gl = oi * uFanin + j;
+        int g = texelFetch(GROUPS, ivec2(gl % uGCols, gl / uGCols), 0).r;
         float v = texelFetch(SRC, ivec2(g % uSrcCols, g / uSrcCols), 0).r;
         if ((uIsMax == 1 && v > best) || (uIsMax == 0 && v < best)) { best = v; bj = j; }
     }
@@ -312,6 +335,9 @@ fn act_code(a: Act) -> i32 {
         Act::Cos => 10,
         Act::Silu => 11,
         Act::Recip => 12,
+        Act::Gelu => 13,
+        Act::GeluApprox => 14,
+        Act::Softplus => 15,
     }
 }
 
@@ -358,6 +384,20 @@ fn red_code(r: Red) -> i32 {
 /// A compiled WebGL2 backend (programs + framebuffer). Reusable across runs.
 pub struct GlBackend {
     gl: GL,
+    /// `MAX_TEXTURE_SIZE`: every tensor is one 2-D texture, so no tensor may
+    /// have more rows (or columns) than this.
+    max_texture: usize,
+    /// Param / constant leaf textures by slot, kept across runs: weights are
+    /// uploaded once, not on every call (an LM decode step used to re-upload
+    /// the whole model). [`GlBackend::forget_param`] drops one.
+    leaf_cache: std::cell::RefCell<HashMap<usize, WebGlTexture>>,
+    /// Slot of each cached param, by name.
+    param_slots: std::cell::RefCell<HashMap<String, usize>>,
+    /// Index textures (gather / reduce groups) by `(step, which)` — fixed by
+    /// the plan, so built once.
+    idx_cache: std::cell::RefCell<HashMap<(usize, u8), WebGlTexture>>,
+    /// Column count of each [`GlBackend::cached_linear_int`] texture.
+    idx_cols: std::cell::RefCell<HashMap<(usize, u8), usize>>,
     fbo: web_sys::WebGlFramebuffer,
     unary: WebGlProgram,
     actback: WebGlProgram,
@@ -395,6 +435,12 @@ impl GlBackend {
             .map_err(|e| err("get_extension", e))?
             .ok_or_else(|| WebglError("EXT_color_buffer_float unavailable".into()))?;
 
+        let max_texture = gl
+            .get_parameter(GL::MAX_TEXTURE_SIZE)
+            .ok()
+            .and_then(|v| v.as_f64())
+            .map_or(4096, |v| v as usize);
+
         let fbo = gl
             .create_framebuffer()
             .ok_or_else(|| WebglError("create_framebuffer".into()))?;
@@ -404,6 +450,11 @@ impl GlBackend {
         let with_act = |body: &str| Self::program(&gl, &format!("{HEAD}{ACT_FNS}{body}"));
 
         Ok(Self {
+            max_texture,
+            leaf_cache: Default::default(),
+            param_slots: Default::default(),
+            idx_cache: Default::default(),
+            idx_cols: Default::default(),
             unary: with_act(FS_UNARY)?,
             actback: with_act(FS_ACTBACK)?,
             binary: plain(FS_BINARY)?,
@@ -465,31 +516,53 @@ impl GlBackend {
         self.gl.get_uniform_location(p, name)
     }
 
+    /// A tensor laid out as `h` rows of `w` must fit one texture.
+    fn check_size(&self, w: usize, h: usize) -> Result<()> {
+        if w > self.max_texture || h > self.max_texture {
+            return Err(WebglError(format!(
+                "tensor of {h} rows x {w} columns exceeds this browser's MAX_TEXTURE_SIZE \
+                 {} — keep it off the WebGL graph (e.g. gather embeddings on the host)",
+                self.max_texture
+            )));
+        }
+        Ok(())
+    }
+
     fn data_texture(&self, w: usize, h: usize, data: &[f32]) -> Result<WebGlTexture> {
+        self.check_size(w, h)?;
         let gl = &self.gl;
         let tex = gl
             .create_texture()
             .ok_or_else(|| WebglError("create_texture".into()))?;
         gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
-        let mut rgba = vec![0f32; w * h * 4];
-        for (i, &v) in data.iter().enumerate() {
-            rgba[i * 4] = v;
-        }
+        // Single-channel R32F: one float per texel. (RGBA32F with the value in
+        // R spent 16 bytes per value, plus a 4x staging copy on upload — a
+        // 230M-parameter model needed ~3.7 GB of textures.) Shaders read `.r`
+        // either way. A short `data` (a slot smaller than its texture) is
+        // zero-padded.
+        let mut padded;
+        let data = if data.len() < w * h {
+            padded = data.to_vec();
+            padded.resize(w * h, 0.0);
+            &padded[..]
+        } else {
+            &data[..w * h]
+        };
         // SAFETY: the view is consumed by tex_image_2d before any JS alloc.
         unsafe {
-            let view = js_sys::Float32Array::view(&rgba);
+            let view = js_sys::Float32Array::view(data);
             gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
                 GL::TEXTURE_2D,
                 0,
-                GL::RGBA32F as i32,
+                GL::R32F as i32,
                 w as i32,
                 h as i32,
                 0,
-                GL::RGBA,
+                GL::RED,
                 GL::FLOAT,
                 Some(&view),
             )
-            .map_err(|e| err("tex_image_2d(rgba32f)", e))?;
+            .map_err(|e| err("tex_image_2d(r32f)", e))?;
         }
         self.set_nearest();
         Ok(tex)
@@ -521,6 +594,7 @@ impl GlBackend {
     }
 
     fn target_texture(&self, w: usize, h: usize) -> Result<WebGlTexture> {
+        self.check_size(w, h)?;
         let gl = &self.gl;
         let tex = gl
             .create_texture()
@@ -529,11 +603,13 @@ impl GlBackend {
         gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
             GL::TEXTURE_2D,
             0,
-            GL::RGBA32F as i32,
+            // Renderable with EXT_color_buffer_float, which this backend
+            // already requires for float targets.
+            GL::R32F as i32,
             w as i32,
             h as i32,
             0,
-            GL::RGBA,
+            GL::RED,
             GL::FLOAT,
             None,
         )
@@ -608,15 +684,77 @@ impl GlBackend {
         Ok(t)
     }
 
+    /// Drop the cached texture of param `name` (its value changed); it is
+    /// uploaded again on the next run.
+    pub fn forget_param(&self, name: &str) {
+        if let Some(slot) = self.param_slots.borrow_mut().remove(name)
+            && let Some(t) = self.leaf_cache.borrow_mut().remove(&slot)
+        {
+            self.gl.delete_texture(Some(&t));
+        }
+    }
+
+    /// A plan-fixed index list as a texture read by LINEAR index (`lin %
+    /// cols`, `lin / cols`), as wide as the browser allows: a reduce's group
+    /// table has one row per output otherwise, which overflows
+    /// `MAX_TEXTURE_SIZE` for any output with more than ~16k elements.
+    /// Returns the texture and its column count.
+    fn cached_linear_int(
+        &self,
+        key: (usize, u8),
+        data: impl FnOnce() -> Vec<i32>,
+    ) -> Result<(WebGlTexture, usize)> {
+        let cols_key = (key.0, key.1 | 0x80);
+        if let (Some(t), Some(c)) = (
+            self.idx_cache.borrow().get(&key),
+            self.idx_cols.borrow().get(&cols_key),
+        ) {
+            return Ok((t.clone(), *c));
+        }
+        let mut d = data();
+        let cols = d.len().clamp(1, self.max_texture);
+        let rows = d.len().div_ceil(cols).max(1);
+        d.resize(cols * rows, -1);
+        let t = self.int_texture(cols, rows, &d)?;
+        self.idx_cache.borrow_mut().insert(key, t.clone());
+        self.idx_cols.borrow_mut().insert(cols_key, cols);
+        Ok((t, cols))
+    }
+
+    /// An index texture fixed by the plan: built on first use, then reused.
+    fn cached_int(
+        &self,
+        key: (usize, u8),
+        w: usize,
+        h: usize,
+        data: impl FnOnce() -> Vec<i32>,
+    ) -> Result<WebGlTexture> {
+        if let Some(t) = self.idx_cache.borrow().get(&key) {
+            return Ok(t.clone());
+        }
+        // A widened output slot has a padded last row; its padding texels
+        // read index 0 (in range) and are never read back.
+        let mut d = data();
+        d.resize(w * h, 0);
+        let t = self.int_texture(w, h, &d)?;
+        self.idx_cache.borrow_mut().insert(key, t.clone());
+        Ok(t)
+    }
+
     /// Execute `plan` with the given named inputs/params on the GPU.
     pub fn run(&self, plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> {
         let input_map: HashMap<&str, &[f32]> = inputs.iter().copied().collect();
         let mut tex: Vec<Option<WebGlTexture>> = (0..plan.slot_len.len()).map(|_| None).collect();
         let dims = |s: usize| plan.slot_dims[s];
 
-        for step in &plan.steps {
+        for (si, step) in plan.steps.iter().enumerate() {
             match step {
                 Step::Leaf { out, src } => {
+                    let persistent = !matches!(src, LeafSource::Input(_));
+                    if persistent && let Some(t) = self.leaf_cache.borrow().get(out) {
+                        tex[*out] = Some(t.clone());
+                        continue;
+                    }
                     let data: Vec<f32> = match src {
                         LeafSource::Input(name) | LeafSource::Param(name) => input_map
                             .get(name.as_str())
@@ -625,7 +763,14 @@ impl GlBackend {
                         LeafSource::Const(d) => d.clone(),
                     };
                     let (r, c) = dims(*out);
-                    tex[*out] = Some(self.data_texture(c, r, &data)?);
+                    let t = self.data_texture(c, r, &data)?;
+                    if persistent {
+                        self.leaf_cache.borrow_mut().insert(*out, t.clone());
+                        if let LeafSource::Param(name) = src {
+                            self.param_slots.borrow_mut().insert(name.clone(), *out);
+                        }
+                    }
+                    tex[*out] = Some(t);
                 }
                 Step::Unary { out, a, act } => {
                     let (r, c) = dims(*out);
@@ -671,19 +816,30 @@ impl GlBackend {
                     self.draw();
                     tex[*out] = Some(t);
                 }
-                Step::MatMul { out, a, b, m, k, n } => {
-                    let t = self.begin(&self.matmul, *n, *m)?;
+                Step::MatMul {
+                    out,
+                    a,
+                    b,
+                    m,
+                    k,
+                    n,
+                    batch,
+                    b_batched,
+                } => {
+                    let t = self.begin(&self.matmul, *n, batch * m)?;
                     self.bind_tex_unit(&self.matmul, "A", 0, self.tex(&tex, *a)?);
                     self.bind_tex_unit(&self.matmul, "B", 1, self.tex(&tex, *b)?);
                     self.set_i32(&self.matmul, "uK", *k as i32);
+                    self.set_i32(&self.matmul, "uM", *m as i32);
+                    self.set_i32(&self.matmul, "uBBatched", i32::from(*b_batched));
                     self.draw();
                     tex[*out] = Some(t);
                 }
                 Step::Gather { out, src, idx } => {
                     let (r, c) = dims(*out);
                     let (_sr, sc) = dims(*src);
-                    let idx_i32: Vec<i32> = idx.iter().map(|&v| v as i32).collect();
-                    let idx_tex = self.int_texture(c, r, &idx_i32)?;
+                    let idx_tex =
+                        self.cached_int((si, 0), c, r, || idx.iter().map(|&v| v as i32).collect())?;
                     let t = self.begin(&self.gather, c, r)?;
                     self.bind_tex_unit(&self.gather, "SRC", 0, self.tex(&tex, *src)?);
                     self.bind_tex_unit(&self.gather, "IDX", 1, &idx_tex);
@@ -700,15 +856,16 @@ impl GlBackend {
                 } => {
                     let (r, c) = dims(*out);
                     let (_sr, sc) = dims(*src);
-                    let n_out = r * c;
-                    let groups_i32: Vec<i32> = groups.iter().map(|&v| v as i32).collect();
-                    let g_tex = self.int_texture(*fanin, n_out, &groups_i32)?;
+                    let (g_tex, g_cols) = self.cached_linear_int((si, 0), || {
+                        groups.iter().map(|&v| v as i32).collect()
+                    })?;
                     let t = self.begin(&self.reduce, c, r)?;
                     self.bind_tex_unit(&self.reduce, "SRC", 0, self.tex(&tex, *src)?);
                     self.bind_tex_unit(&self.reduce, "GROUPS", 1, &g_tex);
                     self.set_i32(&self.reduce, "uFanin", *fanin as i32);
                     self.set_i32(&self.reduce, "uSrcCols", sc as i32);
                     self.set_i32(&self.reduce, "uOutCols", c as i32);
+                    self.set_i32(&self.reduce, "uGCols", g_cols as i32);
                     self.set_i32(&self.reduce, "uOp", red_code(*op));
                     self.draw();
                     tex[*out] = Some(t);
@@ -765,14 +922,16 @@ impl GlBackend {
                 } => {
                     let (r, c) = dims(*out);
                     let (_sr, sc) = dims(*src);
-                    let g_i32: Vec<i32> = groups.iter().map(|&v| v as i32).collect();
-                    let g_tex = self.int_texture(*fanin, r * c, &g_i32)?;
+                    let (g_tex, g_cols) = self.cached_linear_int((si, 0), || {
+                        groups.iter().map(|&v| v as i32).collect()
+                    })?;
                     let t = self.begin(&self.argreduce, c, r)?;
                     self.bind_tex_unit(&self.argreduce, "SRC", 0, self.tex(&tex, *src)?);
                     self.bind_tex_unit(&self.argreduce, "GROUPS", 1, &g_tex);
                     self.set_i32(&self.argreduce, "uFanin", *fanin as i32);
                     self.set_i32(&self.argreduce, "uSrcCols", sc as i32);
                     self.set_i32(&self.argreduce, "uOutCols", c as i32);
+                    self.set_i32(&self.argreduce, "uGCols", g_cols as i32);
                     self.set_i32(&self.argreduce, "uIsMax", if *is_max { 1 } else { 0 });
                     self.draw();
                     tex[*out] = Some(t);
@@ -788,10 +947,10 @@ impl GlBackend {
                     let (r, c) = dims(*out);
                     let (_tr, tc) = dims(*table);
                     let (_ir, ic) = dims(*indices);
-                    let which_i: Vec<i32> = which.iter().map(|&v| v as i32).collect();
-                    let base_i: Vec<i32> = base.iter().map(|&v| v as i32).collect();
-                    let which_tex = self.int_texture(c, r, &which_i)?;
-                    let base_tex = self.int_texture(c, r, &base_i)?;
+                    let which_tex = self
+                        .cached_int((si, 0), c, r, || which.iter().map(|&v| v as i32).collect())?;
+                    let base_tex = self
+                        .cached_int((si, 1), c, r, || base.iter().map(|&v| v as i32).collect())?;
                     let t = self.begin(&self.gather_rt, c, r)?;
                     self.bind_tex_unit(&self.gather_rt, "TABLE", 0, self.tex(&tex, *table)?);
                     self.bind_tex_unit(&self.gather_rt, "IDXT", 1, self.tex(&tex, *indices)?);
@@ -858,13 +1017,27 @@ impl GlBackend {
             }
         }
 
-        plan.outputs
+        let outs = plan
+            .outputs
             .iter()
             .map(|&s| {
                 let (r, c) = dims(s);
-                self.read_back(self.tex(&tex, s)?, c, r)
+                let mut v = self.read_back(self.tex(&tex, s)?, c, r)?;
+                v.truncate(plan.slot_len[s]);
+                Ok(v)
             })
-            .collect()
+            .collect();
+        // Free this run's own textures (inputs and intermediates); the cached
+        // weights and index textures stay.
+        let cache = self.leaf_cache.borrow();
+        for (slot, t) in tex.iter().enumerate() {
+            if let Some(t) = t
+                && !cache.contains_key(&slot)
+            {
+                self.gl.delete_texture(Some(t));
+            }
+        }
+        outs
     }
 
     fn tex<'a>(&self, tex: &'a [Option<WebGlTexture>], slot: usize) -> Result<&'a WebGlTexture> {

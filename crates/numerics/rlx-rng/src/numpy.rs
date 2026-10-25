@@ -189,6 +189,18 @@ impl RandomState {
         v
     }
 
+    /// `rng.uniform(low, high)` for scalar bounds.
+    ///
+    /// numpy computes `range = high - low` once, then each draw as
+    /// `random_uniform(lower, range)` = `lower + range * next_double` — a C
+    /// expression clang contracts into **one FMA**. Measured against numpy 2.3.5:
+    /// the unfused `low + range * u` differs on ~50 % of draws; `fma(range, u, low)`
+    /// on none.
+    pub fn uniform_range(&mut self, low: f64, high: f64) -> f64 {
+        let range = high - low;
+        range.mul_add(self.random_double(), low)
+    }
+
     /// `rng.random_sample()` — numpy's own name for [`Self::random_double`].
     ///
     /// Same draw, same stream position; provided because call sites are ported
@@ -408,6 +420,13 @@ impl Generator {
         self.random()
     }
 
+    /// `Generator.uniform(low, high)` for scalar bounds: `fma(high - low, random(), low)`
+    /// (numpy's `random_uniform` is FMA-contracted; see [`RandomState::uniform_range`]).
+    pub fn uniform_range(&mut self, low: f64, high: f64) -> f64 {
+        let range = high - low;
+        range.mul_add(self.random(), low)
+    }
+
     /// numpy's `random_interval(bitgen, max)` — uniform on `[0, max]` by
     /// **masked rejection**, the draw `Generator.shuffle` uses.
     ///
@@ -610,7 +629,12 @@ mod randint_tests {
     fn generator_permutation_matches_numpy() {
         let cases: [(u128, usize, &[usize], usize); 4] = [
             (0, 10, &[4, 6, 2, 7, 3, 5, 9, 0, 8, 1], 195),
-            (12345, 37, &[24, 27, 12, 22, 18, 0, 32, 9, 19, 20, 33, 26], 11537),
+            (
+                12345,
+                37,
+                &[24, 27, 12, 22, 18, 0, 32, 9, 19, 20, 33, 26],
+                11537,
+            ),
             (
                 4_294_967_295,
                 1000,

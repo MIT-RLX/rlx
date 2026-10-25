@@ -5,6 +5,7 @@
 //! Element-wise builders: binary ops, activations (plan #53).
 
 use crate::op::{Activation, BinaryOp};
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {

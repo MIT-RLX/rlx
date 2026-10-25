@@ -370,10 +370,13 @@ pub struct Arena {
     pub f16_buffer: Option<wgpu::Buffer>,
     /// Optional PACKED-BF16 weight side-buffer (raw bf16 bits, 2 per u32
     /// word). Holds `Op::MatMul` weight params whose IR dtype is BF16 that
-    /// would otherwise widen to f32 in `buffer`. Indexed by the SAME logical
-    /// element index as `buffer` (bf16 element i ↔ f32 element i), so the
-    /// packed matmul kernel (`matmul_bf16w`) reads B at `b_off` = the global
-    /// arena f32-word index and byte offset `f32_byte_off / 2`. Written by
+    /// would otherwise widen to f32 in `buffer`. A param's packed bytes sit at
+    /// its own ARENA BYTE OFFSET (the planner gives a BF16 param a native
+    /// 2 B/elem slot, so those ranges never overlap), and `matmul_bf16w` reads
+    /// B at `b_off = arena_byte_off / 2` bf16 elements. (It used to sit at
+    /// `arena_byte_off / 2`, the "bf16 element i ↔ f32 element i" layout of an
+    /// f32-wide slot — with 2 B slots the second BF16 weight landed inside the
+    /// first one's packed range, so any graph with two of them was wrong.) Written by
     /// [`Arena::write_bf16_packed`] (and mirrored from [`Arena::write_f32`]);
     /// the shader unpacks `bitcast<f32>(bits << 16)`. Allocated on first
     /// [`Arena::register_bf16_packed`]. Halves B read bandwidth AND avoids the
@@ -830,6 +833,21 @@ impl Arena {
         graph: &Graph,
         scratch_bytes: usize,
     ) -> Self {
+        Self::from_plan_split_opts(device, plan, graph, scratch_bytes, true)
+    }
+
+    /// [`Self::from_plan_split`]; `global_share` lets the weight buffer be
+    /// reused by any later executable whose weight layout fingerprint matches
+    /// (`RLX_WGPU_SHARE_WEIGHTS`). Without it the buffer is this arena's own,
+    /// and only an explicit `WgpuExecutable::share_weights_from` hands it on —
+    /// a layout match alone cannot tell two checkpoints of the same shape apart.
+    pub fn from_plan_split_opts(
+        device: &wgpu::Device,
+        plan: &MemoryPlan,
+        graph: &Graph,
+        scratch_bytes: usize,
+        global_share: bool,
+    ) -> Self {
         use rlx_ir::Op;
         let _ = plan;
         // Start from a COMPACT activations-only plan (params unassigned), then
@@ -872,8 +890,14 @@ impl Arena {
                 );
             }
         }
+        // A generic op reads a parked f32 param through a host copy into the
+        // act window; in the browser that copy would wait on a buffer map the
+        // single thread can never deliver (the page spins forever). There, park
+        // only packed quant — the fused GEMV binds the weight buffer in place.
+        let host_staging_ok = !cfg!(target_arch = "wasm32");
         let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
-            || ((new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
+            || (host_staging_ok
+                && (new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
                 // Multi-shard weight buffers (~2 GiB × N) OOM on VirtIO/WARP
                 // and other adapters whose *total* GPU budget is ≈ one
                 // `max_buffer_size`. Only park-all when everything fits in one
@@ -883,7 +907,7 @@ impl Arena {
             // one bind window, parking only the >512 MiB F32 tensors leaves
             // the rest in the act arena → multi-×2 GiB act shards + weight
             // OOM. If all params fit in one weight buffer, park them all.
-            || (param_bytes_est <= weight_shard_cap && max_buf <= (2usize << 30));
+            || (host_staging_ok && param_bytes_est <= weight_shard_cap && max_buf <= (2usize << 30));
         // Prefer parking the largest params first so lm_head / embeddings land
         // in the weight buffer when only a subset fits. Tie-break by param
         // name (not NodeId) so prefill/decode graphs pack identically and can
@@ -923,7 +947,7 @@ impl Arena {
         // packing only >512 MiB params into the weight buffer leaves the rest
         // in the act arena → multi-shard act + weight OOMs. Fill the single
         // weight shard with any param while room remains (largest first).
-        let fill_weight_shard = max_buf <= (2usize << 30);
+        let fill_weight_shard = host_staging_ok && max_buf <= (2usize << 30);
         let mut named_weight_slots: Vec<(String, usize, usize)> = Vec::new();
         for (id, ne, nbytes, dt, is_param, name) in park_candidates {
             let packed_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8);
@@ -1070,7 +1094,8 @@ impl Arena {
             named_weight_slots.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
             let fp = weight_layout_fingerprint(weight_cursor, &named_weight_slots);
             let shard_size = if n_shards > 1 { weight_shard_cap } else { 0 };
-            let reused = if share_weights_enabled() {
+            let global_share = global_share && share_weights_enabled();
+            let reused = if global_share {
                 let guard = SHARED_WEIGHTS.lock().unwrap_or_else(|e| e.into_inner());
                 match guard.as_ref() {
                     Some(shared)
@@ -1106,7 +1131,13 @@ impl Arena {
                 let mut shards = Vec::with_capacity(n_shards);
                 for i in 0..n_shards {
                     let begin = i * weight_shard_cap;
-                    let this = (weight_cursor - begin).min(weight_shard_cap).max(4);
+                    // Rounded up: uploads pad to 4 bytes and GEMV bind windows to
+                    // 16, so a 210-byte Q6_K weight needs a 224-byte buffer.
+                    let this = (weight_cursor - begin)
+                        .min(weight_shard_cap)
+                        .max(4)
+                        .div_ceil(16)
+                        * 16;
                     shards.push(device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("rlx-wgpu weight buffer (packed quant)"),
                         size: this as u64,
@@ -1118,7 +1149,7 @@ impl Arena {
                 }
                 let first = shards.remove(0);
                 let extras = shards;
-                if share_weights_enabled() {
+                if global_share {
                     if let Ok(mut guard) = SHARED_WEIGHTS.lock() {
                         *guard = Some(SharedWeightBuffers {
                             fingerprint: fp,
@@ -1283,6 +1314,56 @@ impl Arena {
             // validation error even when the ranges do not overlap.
             enc.copy_buffer_to_buffer(src_buf, src_local as u64, staging, 0, chunk as u64);
             enc.copy_buffer_to_buffer(staging, 0, dst_buf, dst_local as u64, chunk as u64);
+            done += chunk;
+        }
+        queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// GPU copy of `bytes` from a weight-tagged offset into the activation
+    /// arena. The weight buffer is a different `wgpu::Buffer` from the arena,
+    /// so a direct `copy_buffer_to_buffer` is legal — no staging bounce and,
+    /// unlike the host round trip it replaces, no `poll(wait)` per copy.
+    /// Split wherever either side crosses a shard. Queue-ordered against the
+    /// passes submitted before and after it.
+    pub fn copy_weight_to_act(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src_tagged: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        assert!(is_weight_off(src_tagged) && !is_weight_off(dst_off));
+        assert!(
+            raw_weight_off(src_tagged).is_multiple_of(4)
+                && dst_off.is_multiple_of(4)
+                && bytes.is_multiple_of(4),
+            "rlx-wgpu: copy_weight_to_act needs 4-byte alignment"
+        );
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rlx-wgpu weight→arena copy"),
+        });
+        let mut done = 0usize;
+        while done < bytes {
+            let (src_buf, src_local) = self.resolve_w(src_tagged + done);
+            let (dst_buf, dst_local) = self.resolve_act(dst_off + done);
+            let mut chunk = bytes - done;
+            if self.weight_shard_size > 0 {
+                chunk = chunk.min(self.weight_shard_size - src_local % self.weight_shard_size);
+            }
+            if self.is_sharded() && self.shard_size > 0 {
+                chunk = chunk.min(self.shard_size - dst_local % self.shard_size);
+            }
+            enc.copy_buffer_to_buffer(
+                src_buf,
+                src_local as u64,
+                dst_buf,
+                dst_local as u64,
+                chunk as u64,
+            );
             done += chunk;
         }
         queue.submit(std::iter::once(enc.finish()));
@@ -1544,9 +1625,8 @@ impl Arena {
     /// unsharded arena params (callers gate on [`Self::bf16_packed_eligible`]).
     pub fn register_bf16_packed(&mut self, device: &wgpu::Device, id: NodeId) {
         if self.bf16_weight_buffer.is_none() {
-            // Half the arena: bf16 element i pairs with f32 element i, so the
-            // packed buffer must span up to the highest weight element index.
-            let bytes = (self.size / 2).max(256);
+            // Spans the arena: packed bytes sit at the param's arena byte offset.
+            let bytes = self.size.max(256);
             self.bf16_weight_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu arena bf16 packed weights"),
                 size: bytes as u64,
@@ -1572,7 +1652,7 @@ impl Arena {
         let max_binding = device.limits().max_storage_buffer_binding_size as usize;
         // Whole packed buffer is bound at offset 0 (global bf16 indexing), so
         // it must fit one binding.
-        (self.size / 2).max(256) <= max_binding
+        self.size.max(256) <= max_binding
     }
 
     /// Write raw bf16 weight bytes for `id` into the packed side-buffer.
@@ -1586,7 +1666,7 @@ impl Arena {
     }
 
     /// Downcast host f32 → bf16 and write into the packed side-buffer at the
-    /// slot for f32-byte-offset `off` (packed byte offset `off / 2`).
+    /// param's arena byte offset `off`.
     fn write_bf16_packed_at(&self, queue: &wgpu::Queue, off: usize, data: &[f32]) {
         let mut bytes: Vec<u8> = Vec::with_capacity(data.len() * 2);
         for &v in data {
@@ -1595,14 +1675,14 @@ impl Arena {
         self.write_bf16_packed_bytes_at(queue, off, &bytes);
     }
 
-    /// Write a raw bf16 byte stream into the packed side-buffer. The packed
-    /// slot begins at byte `off / 2` (bf16 element i ↔ f32 element i). Pads to
-    /// a u32-word boundary so the shader's `array<u32>` view is well-formed.
+    /// Write a raw bf16 byte stream into the packed side-buffer at the param's
+    /// arena byte offset `off`. Pads to a u32-word boundary so the shader's
+    /// `array<u32>` view is well-formed.
     fn write_bf16_packed_bytes_at(&self, queue: &wgpu::Queue, off: usize, data: &[u8]) {
         let Some(buf) = &self.bf16_weight_buffer else {
             return;
         };
-        let packed_off = off / 2; // f32 byte off → bf16 byte off (parallel index)
+        let packed_off = off;
         // Round the write up to a multiple of 4 bytes (one u32 word) so a
         // trailing odd bf16 element still lands in a fully-written word.
         let mut owned;
@@ -1793,7 +1873,17 @@ impl Arena {
                 break;
             }
             let (buf, local) = self.resolve_w(byte_off + off);
-            queue.write_buffer(buf, local as u64, &data[off..off + n]);
+            if !n.is_multiple_of(4) {
+                // `write_buffer` sizes must be multiples of 4 (a packed Q6_K
+                // tensor of one block is 210 bytes). Slots start 4-aligned,
+                // so the bytes up to the next multiple are this slot's own
+                // padding: zero-fill them.
+                let mut tail = data[off..off + n].to_vec();
+                tail.resize(n.next_multiple_of(4), 0);
+                queue.write_buffer(buf, local as u64, &tail);
+            } else {
+                queue.write_buffer(buf, local as u64, &data[off..off + n]);
+            }
             off += n;
         }
     }

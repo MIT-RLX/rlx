@@ -352,25 +352,15 @@ impl<'a> LowerCtx<'a> {
                 head_dim,
                 n_rot,
                 style,
-            } => {
-                // `lower_rope_backward` emits NeoX rotate-half only — as does
-                // `lower_rope` on the forward side, which ignores `style`
-                // entirely. Accepting GptJ here would produce a wrong gradient
-                // silently; refuse until both sides learn the interleaved
-                // pairing.
-                assert!(
-                    matches!(style, rlx_ir::op::RopeStyle::NeoX),
-                    "rlx-tpu RopeBackward: only RopeStyle::NeoX is implemented, got {style:?}"
-                );
-                self.lower_rope_backward(
-                    n.inputs[0],
-                    n.inputs[1],
-                    n.inputs[2],
-                    *head_dim,
-                    *n_rot,
-                    out_shape,
-                )
-            }
+            } => self.lower_rope_backward(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                *head_dim,
+                *n_rot,
+                *style,
+                out_shape,
+            ),
 
             Op::Conv2dBackwardInput {
                 kernel_size,
@@ -468,9 +458,19 @@ impl<'a> LowerCtx<'a> {
                 self.lower_attention(&n.inputs, *num_heads, *head_dim, *mask_kind, out_shape)
             }
 
-            Op::Rope { head_dim, .. } => {
-                self.lower_rope(n.inputs[0], n.inputs[1], n.inputs[2], *head_dim, out_shape)
-            }
+            Op::Rope {
+                head_dim,
+                n_rot,
+                style,
+            } => self.lower_rope(
+                n.inputs[0],
+                n.inputs[1],
+                n.inputs[2],
+                *head_dim,
+                *n_rot,
+                *style,
+                out_shape,
+            ),
 
             Op::Reshape { new_shape: _ } => {
                 let x = self.hlo(n.inputs[0]);
@@ -531,7 +531,9 @@ impl<'a> LowerCtx<'a> {
                 self.lower_cum_scan(n.inputs[0], *axis, *exclusive, true, out_shape)
             }
 
-            Op::Fft { inverse, norm } => self.lower_fft(n.inputs[0], *inverse, *norm, out_shape),
+            Op::Fft { inverse, norm, .. } => {
+                self.lower_fft(n.inputs[0], *inverse, *norm, out_shape)
+            }
 
             Op::Conv {
                 kernel_size,
@@ -1678,7 +1680,7 @@ impl<'a> LowerCtx<'a> {
         &mut self,
         x_id: NodeId,
         gamma_id: NodeId,
-        _beta_id: NodeId,
+        beta_id: NodeId,
         axis: i32,
         eps: f32,
         out: Shape,
@@ -1725,7 +1727,13 @@ impl<'a> LowerCtx<'a> {
         let normed = self.entry.binary("multiply", x, inv_b, out.clone());
         let g_dims = self.ir_shape_dims(gamma_id);
         let g_b = self.broadcast_param_to_axis(gamma, &g_dims, ax, &x_dims, prim_ty);
-        self.entry.binary("multiply", normed, g_b, out)
+        let scaled = self.entry.binary("multiply", normed, g_b, out.clone());
+        // `y = x̂·γ + β`, as on every other backend. Beta used to be dropped
+        // here, so a graph with a non-zero shift was wrong on TPU only.
+        let beta = self.hlo(beta_id);
+        let b_dims = self.ir_shape_dims(beta_id);
+        let b_b = self.broadcast_param_to_axis(beta, &b_dims, ax, &x_dims, prim_ty);
+        self.entry.binary("add", scaled, b_b, out)
     }
 
     // ── FusedResidualLN ────────────────────────────────────────
@@ -2312,8 +2320,40 @@ impl<'a> LowerCtx<'a> {
                 w as i64,
                 prim_ty,
             ),
-            MaskKind::Custom | MaskKind::Bias => {
-                // 4th input is the mask, additive [B, ?, S_q, S_k].
+            MaskKind::Custom => {
+                // `[B, S_k]` keep-mask (`1` = attend, `< 0.5` = ignore): an
+                // ignored key's score is replaced by −1e9, as the CPU kernel
+                // does. It used to be *added*, so a 0/1 mask masked nothing.
+                let mask = self.hlo(inputs[3]);
+                let mask_dims = self.ir_shape_dims(inputs[3]);
+                let m_dt = self.dtype(inputs[3]);
+                let f32_ty = prim_of(DType::F32);
+                let mask_f = if m_dt == DType::F32 {
+                    mask
+                } else {
+                    self.entry.convert(mask, Shape::array(f32_ty, &mask_dims))
+                };
+                let half = self.entry.constant_f32_scalar(0.5);
+                let half_b = self
+                    .entry
+                    .broadcast(half, &[], Shape::array(f32_ty, &mask_dims));
+                let drop = self
+                    .entry
+                    .compare(mask_f, half_b, "LT", Shape::pred(&mask_dims));
+                let target = Shape::pred(&[b_dim, h_dim, s_q, s_k]);
+                // `[B, S_k]` as declared, or already expanded to the score
+                // shape by an earlier pass.
+                let drop_b = match mask_dims.len() {
+                    2 => self.entry.broadcast(drop, &[0, 3], target),
+                    1 => self.entry.broadcast(drop, &[3], target),
+                    _ => self.broadcast_to_target(drop, &mask_dims, target),
+                };
+                let neg = self.const_in_dtype(prim_ty, -1e9);
+                let neg_b = self.entry.broadcast(neg, &[], qk_shape.clone());
+                self.entry.select(drop_b, neg_b, scaled, qk_shape.clone())
+            }
+            MaskKind::Bias => {
+                // 4th input is an additive bias [B, ?, S_q, S_k].
                 let mask = self.hlo(inputs[3]);
                 let mask_dims = self.ir_shape_dims(inputs[3]);
                 let mask_b = self.broadcast_to_target(mask, &mask_dims, qk_shape.clone());
@@ -2340,50 +2380,172 @@ impl<'a> LowerCtx<'a> {
         cos_id: NodeId,
         sin_id: NodeId,
         head_dim: usize,
+        n_rot: usize,
+        style: rlx_ir::op::RopeStyle,
         out: Shape,
     ) -> i64 {
-        // Standard non-interleaved RoPE: split last dim in halves
-        // (x1, x2). Output: [x1*cos - x2*sin, x1*sin + x2*cos].
         let x = self.hlo(x_id);
         let cos = self.hlo(cos_id);
         let sin = self.hlo(sin_id);
         let x_dims = self.ir_shape_dims(x_id);
-        let dt = self.dtype(x_id);
-        let prim_ty = prim_of(dt);
-        let half = head_dim / 2;
-        let last = x_dims.len() - 1;
-
-        let mut starts1 = vec![0i64; x_dims.len()];
-        let mut limits1 = x_dims.clone();
-        let mut starts2 = vec![0i64; x_dims.len()];
-        let mut limits2 = x_dims.clone();
-        let strides = vec![1i64; x_dims.len()];
-        starts1[last] = 0;
-        limits1[last] = half as i64;
-        starts2[last] = half as i64;
-        limits2[last] = head_dim as i64;
-        let mut half_dims = x_dims.clone();
-        half_dims[last] = half as i64;
-        let half_shape = Shape::array(prim_ty, &half_dims);
-        let x1 = self
-            .entry
-            .slice(x, &starts1, &limits1, &strides, half_shape.clone());
-        let x2 = self
-            .entry
-            .slice(x, &starts2, &limits2, &strides, half_shape.clone());
-
         let cos_dims = self.ir_shape_dims(cos_id);
-        let sin_dims = self.ir_shape_dims(sin_id);
-        let cos_b = self.broadcast_to_target(cos, &cos_dims, half_shape.clone());
-        let sin_b = self.broadcast_to_target(sin, &sin_dims, half_shape.clone());
+        let prim_ty = prim_of(self.dtype(x_id));
+        self.rope_rotate(
+            x, &x_dims, cos, sin, &cos_dims, head_dim, n_rot, style, prim_ty, out,
+        )
+    }
 
-        let x1c = self.entry.binary("multiply", x1, cos_b, half_shape.clone());
-        let x2s = self.entry.binary("multiply", x2, sin_b, half_shape.clone());
+    /// RoPE on `x = [..., S, H·D]`, matching the CPU kernel: per head, the
+    /// first `n_rot` dims rotate — NeoX pairs `(i, i + n_rot/2)`, GPT-J pairs
+    /// `(2i, 2i+1)` — and the rest pass through. `cos`/`sin` rows are indexed
+    /// by sequence position (or per token when the table has `B·S` rows), and
+    /// only their first `n_rot/2` columns are read. The backward pass is the
+    /// same rotation with `sin` negated.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rope_rotate(
+        &mut self,
+        x: i64,
+        x_dims: &[i64],
+        cos: i64,
+        sin: i64,
+        cos_dims: &[i64],
+        head_dim: usize,
+        n_rot: usize,
+        style: rlx_ir::op::RopeStyle,
+        prim_ty: i32,
+        out: Shape,
+    ) -> i64 {
+        let r = x_dims.len();
+        assert!(r >= 2, "rlx-tpu Rope: input rank {r} < 2");
+        let hd = head_dim as i64;
+        let hidden = x_dims[r - 1];
+        assert!(
+            hd > 0 && hidden % hd == 0,
+            "rlx-tpu Rope: last dim {hidden} is not a multiple of head_dim {hd}"
+        );
+        let nh = hidden / hd;
+        let seq = x_dims[r - 2];
+        let lead = &x_dims[..r - 2];
+        let batch: i64 = lead.iter().product();
+        let nr = (n_rot.min(head_dim) as i64) & !1;
+        let rh = nr / 2;
+        if rh == 0 {
+            return x;
+        }
+
+        // x → [lead.., S, H, D]
+        let mut x5 = lead.to_vec();
+        x5.extend([seq, nh, hd]);
+        let xr = self.entry.reshape(x, Shape::array(prim_ty, &x5));
+        let ax = x5.len() - 1;
+        let mut half = x5.clone();
+        half[ax] = rh;
+        let half_shape = Shape::array(prim_ty, &half);
+
+        // Table → [rows, rh], then broadcast to `half`.
+        let (rows, width) = match cos_dims.len() {
+            0 => (1, 1),
+            1 => (1, cos_dims[0]),
+            n => (cos_dims[..n - 1].iter().product::<i64>(), cos_dims[n - 1]),
+        };
+        assert!(
+            width >= rh,
+            "rlx-tpu Rope: table width {width} < n_rot/2 {rh}"
+        );
+        let per_token = rows == batch * seq && rows != seq;
+        let table = |this: &mut Self, t: i64| -> i64 {
+            let flat = this.entry.reshape(t, Shape::array(prim_ty, &[rows, width]));
+            let used = if per_token { rows } else { seq };
+            assert!(
+                rows >= used,
+                "rlx-tpu Rope: table has {rows} rows for sequence length {seq}"
+            );
+            let t2 = this.entry.slice(
+                flat,
+                &[0, 0],
+                &[used, rh],
+                &[1, 1],
+                Shape::array(prim_ty, &[used, rh]),
+            );
+            if per_token {
+                let mut d = lead.to_vec();
+                d.extend([seq, rh]);
+                let t3 = this.entry.reshape(t2, Shape::array(prim_ty, &d));
+                let mut bd: Vec<i64> = (0..=lead.len() as i64).collect();
+                bd.push(lead.len() as i64 + 2);
+                this.entry.broadcast(t3, &bd, half_shape.clone())
+            } else {
+                let bd = [lead.len() as i64, lead.len() as i64 + 2];
+                this.entry.broadcast(t2, &bd, half_shape.clone())
+            }
+        };
+        let c = table(self, cos);
+        let sn = table(self, sin);
+
+        let ones = vec![1i64; x5.len()];
+        let slice_last = |this: &mut Self, v: i64, dims: &[i64], lo: i64, hi: i64| -> i64 {
+            let mut st = vec![0i64; dims.len()];
+            let mut lim = dims.to_vec();
+            st[dims.len() - 1] = lo;
+            lim[dims.len() - 1] = hi;
+            let mut od = dims.to_vec();
+            od[dims.len() - 1] = hi - lo;
+            let strides = vec![1i64; dims.len()];
+            this.entry
+                .slice(v, &st, &lim, &strides, Shape::array(prim_ty, &od))
+        };
+        let _ = &ones;
+        let interleaved = matches!(style, rlx_ir::op::RopeStyle::GptJ);
+        let (x1, x2) = if interleaved {
+            // [.., D] → [.., rh, 2]
+            let rot = slice_last(self, xr, &x5, 0, nr);
+            let mut pd = half.clone();
+            pd.push(2);
+            let pairs = self.entry.reshape(rot, Shape::array(prim_ty, &pd));
+            let a = slice_last(self, pairs, &pd, 0, 1);
+            let b = slice_last(self, pairs, &pd, 1, 2);
+            (
+                self.entry.reshape(a, half_shape.clone()),
+                self.entry.reshape(b, half_shape.clone()),
+            )
+        } else {
+            (
+                slice_last(self, xr, &x5, 0, rh),
+                slice_last(self, xr, &x5, rh, nr),
+            )
+        };
+        let x1c = self.entry.binary("multiply", x1, c, half_shape.clone());
+        let x2s = self.entry.binary("multiply", x2, sn, half_shape.clone());
         let r1 = self.entry.binary("subtract", x1c, x2s, half_shape.clone());
-        let x1s = self.entry.binary("multiply", x1, sin_b, half_shape.clone());
-        let x2c = self.entry.binary("multiply", x2, cos_b, half_shape.clone());
-        let r2 = self.entry.binary("add", x1s, x2c, half_shape);
-        self.entry.concat(&[r1, r2], last as i64, out)
+        let x2c = self.entry.binary("multiply", x2, c, half_shape.clone());
+        let x1s = self.entry.binary("multiply", x1, sn, half_shape.clone());
+        let r2 = self.entry.binary("add", x2c, x1s, half_shape.clone());
+
+        let mut rot_dims = x5.clone();
+        rot_dims[ax] = nr;
+        let rotated = if interleaved {
+            let mut pd = half.clone();
+            pd.push(1);
+            let a = self.entry.reshape(r1, Shape::array(prim_ty, &pd));
+            let b = self.entry.reshape(r2, Shape::array(prim_ty, &pd));
+            let mut pd2 = half.clone();
+            pd2.push(2);
+            let st = self
+                .entry
+                .concat(&[a, b], pd.len() as i64 - 1, Shape::array(prim_ty, &pd2));
+            self.entry.reshape(st, Shape::array(prim_ty, &rot_dims))
+        } else {
+            self.entry
+                .concat(&[r1, r2], ax as i64, Shape::array(prim_ty, &rot_dims))
+        };
+        let full = if nr < hd {
+            let tail = slice_last(self, xr, &x5, nr, hd);
+            self.entry
+                .concat(&[rotated, tail], ax as i64, Shape::array(prim_ty, &x5))
+        } else {
+            rotated
+        };
+        self.entry.reshape(full, out)
     }
 
     // ── FFT ────────────────────────────────────────────────────
@@ -3392,7 +3554,8 @@ impl<'a> LowerCtx<'a> {
             | QuantScheme::GgufQ5_1
             | QuantScheme::GgufQ1_0
             | QuantScheme::GgufQ2_0
-            | QuantScheme::GgufPtq1_0 => panic!(
+            | QuantScheme::GgufPtq1_0
+            | QuantScheme::GgufBF16 => panic!(
                 "rlx-tpu: GGUF / NVFP4 quant schemes have no HLO lowering — dequantize on CPU first."
             ),
             QuantScheme::GgufQ4K

@@ -1026,7 +1026,9 @@ pub(crate) fn conv_transpose2d_forward_gemm(
 
     let out_addr = out.as_mut_ptr() as usize;
     if crate::pool::num_threads() > 1 && n * groups > 1 {
-        crate::pool::par_for(n, 1, &|off, cnt| {
+        // work-aware grain: a small item (EEG trials) is cheaper than a wake-up
+        let grain = crate::pool::grain_for(groups * m_dim * n_dim * k_dim);
+        crate::pool::par_for(n, grain, &|off, cnt| {
             let mut col = vec![0f32; m_dim * n_dim];
             for ni in off..off + cnt {
                 for g in 0..groups {
@@ -1662,7 +1664,8 @@ pub(crate) fn exec_conv2d_backward_input(t: &Thunk, base: *mut u8) {
             // offsets into its own dx window.
             if fast_conv_enabled() {
                 let dx_addr = dxs.as_mut_ptr() as usize;
-                crate::pool::par_for(n, 1, &|off, cnt| {
+                let grain = crate::pool::grain_for(groups * m_dim * n_dim * k_dim);
+                crate::pool::par_for(n, grain, &|off, cnt| {
                     let mut dcol = vec![0f32; m_dim * n_dim];
                     for ni in off..off + cnt {
                         for g in 0..groups {
@@ -1824,15 +1827,16 @@ pub(crate) fn exec_conv2d_backward_weight(t: &Thunk, base: *mut u8) {
             }
 
             // dw is a cross-batch reduction (β=1 accumulate), so the
-            // parallel path gives each worker a private `local` dw,
-            // accumulates into it over its slice of the batch, then adds
-            // it into the shared `dws` once under a lock — O(threads)
-            // contention, not O(batch). RLX_FAST_CONV gates it.
+            // parallel path gives each chunk of the batch a private `local`
+            // dw and adds the chunks into `dws` IN CHUNK ORDER afterwards.
+            // (It used to add them under a lock in finishing order, so the
+            // f32 sum — and the trained weights — varied from run to run.)
+            // Deterministic for a given thread count. RLX_FAST_CONV gates it.
             if fast_conv_enabled() {
                 let dw_len = dws.len();
-                let dws_addr = dws.as_mut_ptr() as usize;
-                let lock = std::sync::Mutex::new(());
-                crate::pool::par_for(n, 1, &|off, cnt| {
+                let parts = std::sync::Mutex::new(Vec::<(usize, Vec<f32>)>::new());
+                let grain = crate::pool::grain_for(groups * m_dim * n_dim * k_dim);
+                crate::pool::par_for(n, grain, &|off, cnt| {
                     let mut col = vec![0f32; n_dim * k_dim];
                     let mut local = vec![0f32; dw_len];
                     for ni in off..off + cnt {
@@ -1879,12 +1883,18 @@ pub(crate) fn exec_conv2d_backward_weight(t: &Thunk, base: *mut u8) {
                             );
                         }
                     }
-                    let _guard = lock.lock().unwrap();
-                    let dws = std::slice::from_raw_parts_mut(dws_addr as *mut f32, dw_len);
+                    parts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((off, local));
+                });
+                let mut parts = parts.into_inner().unwrap_or_else(|e| e.into_inner());
+                parts.sort_unstable_by_key(|p| p.0);
+                for (_, local) in parts {
                     for (d, l) in dws.iter_mut().zip(local.iter()) {
                         *d += *l;
                     }
-                });
+                }
             } else {
                 let mut col = vec![0f32; n_dim * k_dim];
                 for ni in 0..n {
@@ -2821,7 +2831,9 @@ pub(crate) fn conv2d_forward_im2col(
     // Hand each worker the output base as a raw address: every (ni, g) writes
     // a disjoint `[out_stride_g]` window, so the aliasing is provably safe.
     let out_addr = out.as_mut_ptr() as usize;
-    crate::pool::par_for(n, 1, &|off, cnt| {
+    // work-aware grain: a small item (EEG trials) is cheaper than a wake-up
+    let grain = crate::pool::grain_for(groups * c_out_per_g * k_dim * p_dim);
+    crate::pool::par_for(n, grain, &|off, cnt| {
         let mut col = vec![0f32; k_dim * p_dim];
         for ni in off..off + cnt {
             for g in 0..groups {
@@ -2892,10 +2904,6 @@ pub(crate) fn im2col_par(
         );
         return;
     }
-    let h_isz = h as isize;
-    let w_isz = w as isize;
-    let ph_isz = ph as isize;
-    let pw_isz = pw as isize;
     let col_addr = col.as_mut_ptr() as usize;
     crate::pool::par_for(c_in, 1, &|off, cnt| {
         for ci in off..off + cnt {
@@ -2908,25 +2916,9 @@ pub(crate) fn im2col_par(
                     let col_row = unsafe {
                         std::slice::from_raw_parts_mut((col_addr as *mut f32).add(row_off), n_dim)
                     };
-                    for ho in 0..h_out {
-                        let hi = (ho * sh + ki * dh) as isize - ph_isz;
-                        if hi < 0 || hi >= h_isz {
-                            for wo in 0..w_out {
-                                col_row[ho * w_out + wo] = 0.0;
-                            }
-                            continue;
-                        }
-                        let hi = hi as usize;
-                        let in_row_off = (ci * h + hi) * w;
-                        for wo in 0..w_out {
-                            let wi = (wo * sw + kj * dw_dil) as isize - pw_isz;
-                            col_row[ho * w_out + wo] = if wi < 0 || wi >= w_isz {
-                                0.0
-                            } else {
-                                x[in_row_off + wi as usize]
-                            };
-                        }
-                    }
+                    fill_col_row(
+                        x, col_row, ci, ki, kj, h, w, w_out, sh, sw, ph, pw, dh, dw_dil,
+                    );
                 }
             }
         }
@@ -2953,37 +2945,92 @@ pub(crate) fn im2col(
     let n_dim = h_out * w_out;
     debug_assert_eq!(col.len(), c_in * kh * kw * n_dim);
     debug_assert_eq!(x.len(), c_in * h * w);
-    let h_isz = h as isize;
-    let w_isz = w as isize;
-    let ph_isz = ph as isize;
-    let pw_isz = pw as isize;
     for ci in 0..c_in {
         for ki in 0..kh {
             for kj in 0..kw {
                 let row = ((ci * kh) + ki) * kw + kj;
-                let row_off = row * n_dim;
-                for ho in 0..h_out {
-                    let hi = (ho * sh + ki * dh) as isize - ph_isz;
-                    if hi < 0 || hi >= h_isz {
-                        for wo in 0..w_out {
-                            col[row_off + ho * w_out + wo] = 0.0;
-                        }
-                        continue;
-                    }
-                    let hi = hi as usize;
-                    let in_row_off = (ci * h + hi) * w;
-                    for wo in 0..w_out {
-                        let wi = (wo * sw + kj * dw_dil) as isize - pw_isz;
-                        col[row_off + ho * w_out + wo] = if wi < 0 || wi >= w_isz {
-                            0.0
-                        } else {
-                            x[in_row_off + wi as usize]
-                        };
-                    }
-                }
+                let col_row = &mut col[row * n_dim..(row + 1) * n_dim];
+                fill_col_row(
+                    x, col_row, ci, ki, kj, h, w, w_out, sh, sw, ph, pw, dh, dw_dil,
+                );
             }
         }
     }
+}
+
+/// One im2col row: kernel tap `(ki, kj)` of input channel `ci` at every output
+/// position, `[h_out · w_out]`. The in-bounds positions `wo` of an output row
+/// are one range `lo..hi` (it depends on `kj` alone): zero the padding on
+/// either side, copy the range (one slice at stride 1).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn fill_col_row(
+    x: &[f32],
+    col_row: &mut [f32],
+    ci: usize,
+    ki: usize,
+    kj: usize,
+    h: usize,
+    w: usize,
+    w_out: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    dh: usize,
+    dw_dil: usize,
+) {
+    if w_out == 0 {
+        return;
+    }
+    let (lo, hi, base) = wo_range(kj, dw_dil, pw, sw, w, w_out);
+    for (ho, out) in col_row.chunks_exact_mut(w_out).enumerate() {
+        let hr = (ho * sh + ki * dh) as isize - ph as isize;
+        if hr < 0 || hr >= h as isize || lo == hi {
+            out.fill(0.0);
+            continue;
+        }
+        let xrow = &x[(ci * h + hr as usize) * w..][..w];
+        out[..lo].fill(0.0);
+        out[hi..].fill(0.0);
+        let first = (lo as isize * sw as isize + base) as usize;
+        if sw == 1 {
+            out[lo..hi].copy_from_slice(&xrow[first..first + (hi - lo)]);
+        } else {
+            for (j, v) in out[lo..hi].iter_mut().enumerate() {
+                *v = xrow[first + j * sw];
+            }
+        }
+    }
+}
+
+/// The output columns `wo` (as `lo..hi`) whose input column
+/// `wo·sw + kj·dw − pw` lies in `0..w`, and that offset `kj·dw − pw`. It
+/// depends on the kernel column alone, so im2col and col2im work it out once
+/// per tap instead of testing every position.
+fn wo_range(
+    kj: usize,
+    dw_dil: usize,
+    pw: usize,
+    sw: usize,
+    w: usize,
+    w_out: usize,
+) -> (usize, usize, isize) {
+    let base = (kj * dw_dil) as isize - pw as isize;
+    let (sw, w) = (sw as isize, w as isize);
+    let lo = if base >= 0 {
+        0
+    } else {
+        ((-base + sw - 1) / sw) as usize
+    }
+    .min(w_out);
+    let hi = if base >= w {
+        0
+    } else {
+        ((w - base + sw - 1) / sw) as usize
+    }
+    .clamp(lo, w_out);
+    (lo, hi, base)
 }
 
 /// col2im — inverse of `im2col` with scatter-accumulation. The caller
@@ -3013,31 +3060,313 @@ pub(crate) fn col2im(
     let n_dim = h_out * w_out;
     debug_assert_eq!(col.len(), c_in * kh * kw * n_dim);
     debug_assert_eq!(x.len(), c_in * h * w);
-    let h_isz = h as isize;
-    let w_isz = w as isize;
-    let ph_isz = ph as isize;
-    let pw_isz = pw as isize;
+    // Each input element receives the same additions in the same order as a
+    // per-position loop with a bounds test; the in-bounds outputs of a row are
+    // just one range (`wo_range`), added as one slice at stride 1.
     for ci in 0..c_in {
         for ki in 0..kh {
             for kj in 0..kw {
-                let row = ((ci * kh) + ki) * kw + kj;
-                let row_off = row * n_dim;
+                let row_off = (((ci * kh) + ki) * kw + kj) * n_dim;
+                let (lo, hi_wo, base) = wo_range(kj, dw_dil, pw, sw, w, w_out);
+                if lo == hi_wo {
+                    continue;
+                }
                 for ho in 0..h_out {
-                    let hi = (ho * sh + ki * dh) as isize - ph_isz;
-                    if hi < 0 || hi >= h_isz {
+                    let hi = (ho * sh + ki * dh) as isize - ph as isize;
+                    if hi < 0 || hi >= h as isize {
                         continue;
                     }
-                    let hi = hi as usize;
-                    let in_row_off = (ci * h + hi) * w;
-                    for wo in 0..w_out {
-                        let wi = (wo * sw + kj * dw_dil) as isize - pw_isz;
-                        if wi < 0 || wi >= w_isz {
-                            continue;
+                    let xrow = &mut x[(ci * h + hi as usize) * w..][..w];
+                    let src = &col[row_off + ho * w_out + lo..row_off + ho * w_out + hi_wo];
+                    let first = (lo as isize * sw as isize + base) as usize;
+                    if sw == 1 {
+                        for (xv, cv) in xrow[first..first + src.len()].iter_mut().zip(src) {
+                            *xv += *cv;
                         }
-                        x[in_row_off + wi as usize] += col[row_off + ho * w_out + wo];
+                    } else {
+                        for (j, cv) in src.iter().enumerate() {
+                            xrow[first + j * sw] += *cv;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-element loop `fill_col_row` replaced, as the definition.
+    #[allow(clippy::too_many_arguments)]
+    fn im2col_reference(
+        x: &[f32],
+        col: &mut [f32],
+        c_in: usize,
+        h: usize,
+        w: usize,
+        h_out: usize,
+        w_out: usize,
+        kh: usize,
+        kw: usize,
+        sh: usize,
+        sw: usize,
+        ph: usize,
+        pw: usize,
+        dh: usize,
+        dw_dil: usize,
+    ) {
+        let n_dim = h_out * w_out;
+        for ci in 0..c_in {
+            for ki in 0..kh {
+                for kj in 0..kw {
+                    let row_off = (((ci * kh) + ki) * kw + kj) * n_dim;
+                    for ho in 0..h_out {
+                        for wo in 0..w_out {
+                            let hi = (ho * sh + ki * dh) as isize - ph as isize;
+                            let wi = (wo * sw + kj * dw_dil) as isize - pw as isize;
+                            col[row_off + ho * w_out + wo] =
+                                if hi < 0 || hi >= h as isize || wi < 0 || wi >= w as isize {
+                                    0.0
+                                } else {
+                                    x[(ci * h + hi as usize) * w + wi as usize]
+                                };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Timing, not correctness: `im2col` against the per-element loop on EEG
+    /// decoder conv shapes, alternating which runs first.
+    #[test]
+    #[ignore]
+    fn forward_gather_timing() {
+        let shapes = [
+            ("eegnet temporal", 1, 8, 256, 1, 64, 32),
+            ("eegnet spatial", 16, 8, 256, 8, 1, 0),
+            ("shallow temporal", 1, 22, 512, 1, 25, 0),
+            ("pointwise", 16, 1, 256, 1, 1, 0),
+            ("short rows", 16, 8, 6, 3, 3, 1),
+        ];
+        for (name, c_in, h, w, kh, kw, pw) in shapes {
+            let h_out = h - kh + 1;
+            let w_out = w + 2 * pw - kw + 1;
+            let x: Vec<f32> = (0..c_in * h * w).map(|i| i as f32).collect();
+            let mut col = vec![0f32; c_in * kh * kw * h_out * w_out];
+            let reps = (2_000_000 / col.len()).max(3);
+            let mut t = [0f64; 2];
+            for round in 0..6 {
+                for which in [round % 2, 1 - round % 2] {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        if which == 0 {
+                            im2col_reference(
+                                &x, &mut col, c_in, h, w, h_out, w_out, kh, kw, 1, 1, 0, pw, 1, 1,
+                            );
+                        } else {
+                            im2col(
+                                &x, &mut col, c_in, h, w, h_out, w_out, kh, kw, 1, 1, 0, pw, 1, 1,
+                            );
+                        }
+                        std::hint::black_box(&col);
+                    }
+                    t[which] += t0.elapsed().as_secs_f64();
+                }
+            }
+            println!(
+                "im2col {name:18}: old {:.3}s  new {:.3}s  new/old {:.2}",
+                t[0],
+                t[1],
+                t[1] / t[0]
+            );
+            let mut xg = vec![0f32; c_in * h * w];
+            let mut t = [0f64; 2];
+            for round in 0..6 {
+                for which in [round % 2, 1 - round % 2] {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        if which == 0 {
+                            col2im_reference(
+                                &col, &mut xg, c_in, h, w, h_out, w_out, kh, kw, 1, 1, 0, pw, 1, 1,
+                            );
+                        } else {
+                            col2im(
+                                &col, &mut xg, c_in, h, w, h_out, w_out, kh, kw, 1, 1, 0, pw, 1, 1,
+                            );
+                        }
+                        std::hint::black_box(&xg);
+                    }
+                    t[which] += t0.elapsed().as_secs_f64();
+                }
+            }
+            println!(
+                "col2im {name:18}: old {:.3}s  new {:.3}s  new/old {:.2}",
+                t[0],
+                t[1],
+                t[1] / t[0]
+            );
+        }
+    }
+
+    /// The original `col2im`, a bounds test per position, as the definition.
+    #[allow(clippy::too_many_arguments)]
+    fn col2im_reference(
+        col: &[f32],
+        x: &mut [f32],
+        c_in: usize,
+        h: usize,
+        w: usize,
+        h_out: usize,
+        w_out: usize,
+        kh: usize,
+        kw: usize,
+        sh: usize,
+        sw: usize,
+        ph: usize,
+        pw: usize,
+        dh: usize,
+        dw_dil: usize,
+    ) {
+        let n_dim = h_out * w_out;
+        for ci in 0..c_in {
+            for ki in 0..kh {
+                for kj in 0..kw {
+                    let row_off = (((ci * kh) + ki) * kw + kj) * n_dim;
+                    for ho in 0..h_out {
+                        let hi = (ho * sh + ki * dh) as isize - ph as isize;
+                        if hi < 0 || hi >= h as isize {
+                            continue;
+                        }
+                        let in_row_off = (ci * h + hi as usize) * w;
+                        for wo in 0..w_out {
+                            let wi = (wo * sw + kj * dw_dil) as isize - pw as isize;
+                            if wi < 0 || wi >= w as isize {
+                                continue;
+                            }
+                            x[in_row_off + wi as usize] += col[row_off + ho * w_out + wo];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `col2im` bit for bit against the original over the same shapes as the
+    /// im2col test, accumulating into a non-zero `x` (the order of additions
+    /// into each element is what has to match).
+    #[test]
+    fn col2im_matches_the_per_element_loop() {
+        let mut cases = 0;
+        for &(c_in, h, w) in &[
+            (3usize, 1usize, 1usize),
+            (3, 1, 7),
+            (2, 3, 5),
+            (3, 4, 9),
+            (2, 2, 16),
+            (2, 3, 40),
+        ] {
+            for &(kh, kw) in &[(1usize, 1usize), (1, 3), (2, 2), (1, 9), (3, 4)] {
+                for &(sh, sw) in &[(1usize, 1usize), (2, 3), (1, 2)] {
+                    for &(ph, pw) in &[(0usize, 0usize), (1, 2), (0, 5), (2, 9)] {
+                        for &(dh, dw) in &[(1usize, 1usize), (2, 3), (1, 2)] {
+                            let (reach_h, reach_w) = ((kh - 1) * dh + 1, (kw - 1) * dw + 1);
+                            if h + 2 * ph < reach_h || w + 2 * pw < reach_w {
+                                continue;
+                            }
+                            let h_out = (h + 2 * ph - reach_h) / sh + 1;
+                            let w_out = (w + 2 * pw - reach_w) / sw + 1;
+                            let col: Vec<f32> = (0..c_in * kh * kw * h_out * w_out)
+                                .map(|i| ((i * 37) % 101) as f32 * 0.013 - 0.6)
+                                .collect();
+                            let x0: Vec<f32> =
+                                (0..c_in * h * w).map(|i| 1.0 / (i as f32 + 3.0)).collect();
+                            let (mut got, mut want) = (x0.clone(), x0);
+                            col2im(
+                                &col, &mut got, c_in, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw,
+                                dh, dw,
+                            );
+                            col2im_reference(
+                                &col, &mut want, c_in, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw,
+                                dh, dw,
+                            );
+                            assert!(
+                                got.iter()
+                                    .zip(&want)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "c{c_in} h{h} w{w} k{kh}x{kw} s{sh},{sw} p{ph},{pw} d{dh},{dw}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 600, "{cases} cases");
+    }
+
+    /// `im2col` and `im2col_par` bit for bit against the per-element loop over
+    /// strides, padding (wider than the kernel's reach too), dilation and
+    /// kernels wider than the input; the last size is large enough for
+    /// `im2col_par` to take its parallel path.
+    #[test]
+    fn im2col_matches_the_per_element_loop() {
+        let mut cases = 0;
+        let mut shapes: Vec<(usize, usize, usize)> =
+            vec![(3, 1, 1), (3, 1, 7), (2, 3, 5), (3, 4, 9), (2, 2, 16)];
+        shapes.push((16, 8, 512)); // parallel path
+        for &(c_in, h, w) in &shapes {
+            for &(kh, kw) in &[(1usize, 1usize), (1, 3), (2, 2), (1, 9), (3, 4)] {
+                for &(sh, sw) in &[(1usize, 1usize), (2, 3), (1, 2)] {
+                    for &(ph, pw) in &[(0usize, 0usize), (1, 2), (0, 5), (2, 9)] {
+                        for &(dh, dw) in &[(1usize, 1usize), (2, 3), (1, 2)] {
+                            let (reach_h, reach_w) = ((kh - 1) * dh + 1, (kw - 1) * dw + 1);
+                            if h + 2 * ph < reach_h || w + 2 * pw < reach_w {
+                                continue;
+                            }
+                            let h_out = (h + 2 * ph - reach_h) / sh + 1;
+                            let w_out = (w + 2 * pw - reach_w) / sw + 1;
+                            let x: Vec<f32> =
+                                (0..c_in * h * w).map(|i| i as f32 * 0.25 - 3.0).collect();
+                            let len = c_in * kh * kw * h_out * w_out;
+                            let mut want = vec![f32::NAN; len];
+                            im2col_reference(
+                                &x, &mut want, c_in, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw,
+                                dh, dw,
+                            );
+                            let what = format!(
+                                "c{c_in} h{h} w{w} k{kh}x{kw} s{sh},{sw} p{ph},{pw} d{dh},{dw}"
+                            );
+                            let mut got = vec![f32::NAN; len];
+                            im2col(
+                                &x, &mut got, c_in, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw, dh,
+                                dw,
+                            );
+                            assert!(
+                                got.iter()
+                                    .zip(&want)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "im2col {what}"
+                            );
+                            let mut got = vec![f32::NAN; len];
+                            im2col_par(
+                                &x, &mut got, c_in, h, w, h_out, w_out, kh, kw, sh, sw, ph, pw, dh,
+                                dw,
+                            );
+                            assert!(
+                                got.iter()
+                                    .zip(&want)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "im2col_par {what}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 600, "{cases} cases");
     }
 }

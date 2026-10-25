@@ -23,6 +23,19 @@ fn run_bwd(bwd: Graph, slots: &[(&str, &[f32])], out_idx: usize) -> Vec<f32> {
     let plan = rlx_opt::memory::plan_memory(&bwd);
     let mut arena = Arena::from_plan(plan);
     let sched = compile_thunks(&bwd, &arena);
+    // Constants live in the arena; the runtime writes them after allocation,
+    // and so must a harness that drives thunks directly. Leaving them to the
+    // arena's initial bytes only works while every constant is zero.
+    for n in bwd.nodes() {
+        if let Op::Constant { data } = &n.op
+            && arena.has_buffer(n.id)
+        {
+            let off = arena.byte_offset(n.id);
+            let buf = arena.raw_buf_mut();
+            let len = data.len().min(buf.len() - off);
+            buf[off..off + len].copy_from_slice(&data[..len]);
+        }
+    }
     for (name, data) in slots {
         let id = bwd
             .nodes()

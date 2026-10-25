@@ -47,7 +47,12 @@ pub(crate) fn compile_fft(
     rng_shared: &std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
     rng: rlx_ir::RngOptions,
 ) -> Thunk {
-    let Op::Fft { inverse, norm } = &node.op else {
+    let Op::Fft {
+        inverse,
+        norm,
+        algo,
+    } = &node.op
+    else {
         unreachable!()
     };
     {
@@ -69,6 +74,7 @@ pub(crate) fn compile_fft(
             inverse: *inverse,
             norm_tag: norm.tag(),
             dtype,
+            algo: *algo,
         }
     }
 }
@@ -201,10 +207,27 @@ pub(crate) fn exec_fft1d(t: &Thunk, base: *mut u8) {
         inverse,
         norm_tag,
         dtype,
+        algo,
     } = t
     else {
         unreachable!()
     };
+    if *algo != rlx_ir::FftAlgo::Native {
+        unsafe {
+            execute_fft1d_pocketfft(
+                *src,
+                *dst,
+                *outer as usize,
+                *n_complex as usize,
+                *inverse,
+                *norm_tag,
+                *dtype,
+                *algo,
+                base,
+            )
+        };
+        return;
+    }
     unsafe {
         match dtype {
             rlx_ir::DType::F64 => execute_fft1d_f64(
@@ -1538,5 +1561,135 @@ pub(crate) fn fft_bluestein_inplace_f32(
         let yi = s.ai[k] * inv_m;
         re[k] = yr * s.w_re[k] - yi * s.w_im[k];
         im[k] = yr * s.w_im[k] + yi * s.w_re[k];
+    }
+}
+
+/// `Op::Fft` with [`rlx_ir::FftAlgo::PocketFft`]: each row through
+/// `rlx_pocketfft::engine` (pocketfft's passes, the requested contraction and
+/// twiddles), one plan shared by every row. The normalization is pocketfft's `fct`
+/// (the [`rlx_ir::FftNorm`] scale rounded to the element type), applied inside the
+/// transform as `scipy.fft` does. Layouts as the native kernels: F32/F64 the 2N
+/// real block, C64 interleaved f32 pairs.
+///
+/// # Safety
+/// As [`execute_fft1d_f64`]: `base + src` / `base + dst` valid for `outer` rows.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn execute_fft1d_pocketfft(
+    src: usize,
+    dst: usize,
+    outer: usize,
+    n_complex: usize,
+    inverse: bool,
+    norm_tag: u32,
+    dtype: rlx_ir::DType,
+    algo: rlx_ir::FftAlgo,
+    base: *mut u8,
+) {
+    use rlx_pocketfft::engine::{C2cPlan, Contraction, Cx, Options, Real, Twiddles};
+    let rlx_ir::FftAlgo::PocketFft {
+        contraction,
+        twiddles,
+    } = algo
+    else {
+        unreachable!("execute_fft1d_pocketfft needs FftAlgo::PocketFft")
+    };
+    let opt = Options {
+        contraction: match contraction {
+            rlx_ir::FftContraction::Clang => Contraction::Clang,
+            rlx_ir::FftContraction::None => Contraction::None,
+        },
+        twiddles: match twiddles {
+            rlx_ir::FftTwiddles::Platform => Twiddles::Platform,
+            rlx_ir::FftTwiddles::AppleSinCos => Twiddles::AppleSinCos,
+            rlx_ir::FftTwiddles::Separate => Twiddles::Separate,
+        },
+    };
+    let scale = rlx_ir::fft::FftNorm::from_tag(norm_tag).output_scale(n_complex, inverse);
+    let n = n_complex;
+    /// One row: read `n` complex values, transform, write them back.
+    /// Plans are pure functions of `(T, n, opt)`: built once per process (a few
+    /// dozen live at most; the cache resets past 64 entries).
+    fn plan<T: Real + Send + Sync + 'static>(n: usize, opt: Options) -> std::sync::Arc<C2cPlan<T>> {
+        use std::any::{Any, TypeId};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        type Cache = HashMap<(TypeId, usize, Options), Arc<dyn Any + Send + Sync>>;
+        static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+        let key = (TypeId::of::<T>(), n, opt);
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(p) = cache.lock().unwrap().get(&key) {
+            return p.clone().downcast::<C2cPlan<T>>().expect("plan cache type");
+        }
+        let p = Arc::new(C2cPlan::<T>::new(n, opt));
+        let mut c = cache.lock().unwrap();
+        if c.len() >= 64 {
+            c.clear();
+        }
+        c.insert(key, p.clone());
+        p
+    }
+    unsafe fn rows<T: Real + Send + Sync + 'static>(
+        src: usize,
+        dst: usize,
+        outer: usize,
+        n: usize,
+        interleaved: bool,
+        forward: bool,
+        fct: T,
+        opt: Options,
+        base: *mut u8,
+    ) {
+        let plan = plan::<T>(n, opt);
+        let sz = std::mem::size_of::<T>();
+        let run = |bp: *mut u8, row: &mut Vec<Cx<T>>, o: usize| {
+            let s = unsafe {
+                std::slice::from_raw_parts(bp.add(src + o * 2 * n * sz) as *const T, 2 * n)
+            };
+            row.clear();
+            if interleaved {
+                row.extend((0..n).map(|k| Cx::new(s[2 * k], s[2 * k + 1])));
+            } else {
+                row.extend((0..n).map(|k| Cx::new(s[k], s[n + k])));
+            }
+            plan.exec(row, forward, fct);
+            let d = unsafe {
+                std::slice::from_raw_parts_mut(bp.add(dst + o * 2 * n * sz) as *mut T, 2 * n)
+            };
+            for (k, c) in row.iter().enumerate() {
+                if interleaved {
+                    d[2 * k] = c.r;
+                    d[2 * k + 1] = c.i;
+                } else {
+                    d[k] = c.r;
+                    d[n + k] = c.i;
+                }
+            }
+        };
+        if outer >= 8 && (outer as u64) * (n as u64) >= (1 << 15) && cpu_fft_parallel_enabled() {
+            use rayon::prelude::*;
+            let p = FftArenaPtr(base);
+            (0..outer)
+                .into_par_iter()
+                .for_each_init(|| Vec::with_capacity(n), move |row, o| run(p.ptr(), row, o));
+        } else {
+            let mut row = Vec::with_capacity(n);
+            for o in 0..outer {
+                run(base, &mut row, o);
+            }
+        }
+    }
+    unsafe {
+        match dtype {
+            rlx_ir::DType::F64 => {
+                rows::<f64>(src, dst, outer, n, false, !inverse, scale, opt, base)
+            }
+            rlx_ir::DType::F32 => {
+                rows::<f32>(src, dst, outer, n, false, !inverse, scale as f32, opt, base)
+            }
+            rlx_ir::DType::C64 => {
+                rows::<f32>(src, dst, outer, n, true, !inverse, scale as f32, opt, base)
+            }
+            other => panic!("Op::Fft on CPU requires F32/F64/C64, got {other:?}"),
+        }
     }
 }

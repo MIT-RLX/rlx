@@ -111,6 +111,12 @@ pub fn compile_leaf_order(graph: &Graph) -> Vec<(NodeId, LeafKey)> {
 pub fn first_host_eval_op(graph: &Graph) -> Option<&'static str> {
     for node in graph.nodes() {
         match &node.op {
+            // Q2_0 lowers to native `quantized_matmul` from the bound param
+            // bytes (see `q2_0_to_mlx_affine`) — nothing evaluates on the host.
+            Op::DequantMatMul {
+                scheme: rlx_ir::QuantScheme::GgufQ2_0,
+            } if !rlx_ir::env::flag("RLX_MLX_Q2_0_DEQUANT")
+                && !crate::config::runtime_config().gguf_host_fallback => {}
             Op::DequantMatMul { scheme }
                 if (scheme.is_gguf()
                     || matches!(scheme, rlx_ir::QuantScheme::Nvfp4Block)
@@ -293,7 +299,7 @@ fn mlx_profile_kind(op: &Op) -> &'static str {
         rlx_ir::OpKind::Scan => "Scan",
         rlx_ir::OpKind::ScanBackward | rlx_ir::OpKind::ScanBackwardXs => "ScanBackward",
         rlx_ir::OpKind::SelectiveScan => "SelectiveScan",
-        rlx_ir::OpKind::Fft => "Fft",
+        rlx_ir::OpKind::Fft | rlx_ir::OpKind::FftPocketFft => "Fft",
         rlx_ir::OpKind::Conv => "Conv",
         _ => "Other",
     }

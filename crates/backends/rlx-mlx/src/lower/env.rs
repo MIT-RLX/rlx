@@ -84,7 +84,25 @@ pub fn lower_with_env_writeback(
     // Depth of the fusable-op chain rooted at each node (0 = materialized leaf /
     // non-fusable). Tracks the real data-dependency subtree, not iteration order.
     let mut fuse_depth: HashMap<NodeId, usize> = HashMap::new();
-    for node in graph.nodes() {
+    // Liveness: drop an intermediate's handle at its last consumer. The lazy
+    // path builds the whole graph before evaluating it, and MLX frees a buffer
+    // during evaluation only once nothing references its array — so keeping
+    // every node's handle in `env` until the end held every activation of the
+    // forward at once (a Qwen3.5-4B prefill peaked ~17 GB above its weights at
+    // 1024 tokens). Outputs and caller-bound leaves are never dropped.
+    // `RLX_MLX_KEEP_ENV=1` restores the old behaviour.
+    let drop_dead = !rlx_ir::env::flag("RLX_MLX_KEEP_ENV");
+    let mut last_use: HashMap<NodeId, usize> = HashMap::new();
+    if drop_dead {
+        for (pos, node) in graph.nodes().iter().enumerate() {
+            for &input in &node.inputs {
+                last_use.insert(input, pos);
+            }
+        }
+    }
+    let outputs: std::collections::HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    let mut lowered_here: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for (pos, node) in graph.nodes().iter().enumerate() {
         let id = node.id;
         if env.contains_key(&id) {
             // Pre-populated leaf — already bound by the caller.
@@ -613,7 +631,7 @@ pub fn lower_with_env_writeback(
                 let x = lookup(&env, node.inputs[0])?;
                 ops::cummax(x, *axis, *exclusive)?
             }
-            Op::Fft { inverse, norm } => {
+            Op::Fft { inverse, norm, .. } => {
                 let x = lookup(&env, node.inputs[0])?;
                 ops::fft(x, *inverse, norm.tag())?
             }
@@ -1276,7 +1294,28 @@ pub fn lower_with_env_writeback(
                 // c_in/g · k · out_spatial. Decomposed ISTFT ConvTranspose
                 // (F5 Vocos: k=1024, out≈149k) → ~627 GB MTL alloc. Mirror
                 // rlx-cpu's IM2COL_MAX and host-eval the naive kernel instead.
-                if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) {
+                let in_rank = node_input_shape(graph, node.inputs[0]).len();
+                let out_dims: Vec<usize> =
+                    node.shape.dims().iter().map(|d| d.unwrap_static()).collect();
+                if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups)
+                    && kernel_size.len() == 2
+                    && in_rank == 4
+                    && out_dims.len() == 4
+                    && out_dims[2] > 1
+                    && out_dims[3] > 1
+                {
+                    let g = |v: &[usize], i: usize, dflt: usize| v.get(i).copied().unwrap_or(dflt) as i32;
+                    conv2d_banded(
+                        lookup(&env, node.inputs[0])?,
+                        lookup(&env, node.inputs[1])?,
+                        (g(stride, 0, 1), g(stride, 1, 1)),
+                        (g(padding, 0, 0), g(padding, 1, 0)),
+                        (g(dilation, 0, 1), g(dilation, 1, 1)),
+                        *groups as i32,
+                        out_dims[2],
+                        out_dims[3],
+                    )?
+                } else if mlx_conv_im2col_too_large(graph, node, kernel_size, *groups) {
                     host_eval_op_f32(graph, node, &env)?
                 } else {
                 let in_shape = node_input_shape(graph, node.inputs[0]);
@@ -2153,6 +2192,94 @@ pub fn lower_with_env_writeback(
                             let w_kn = ops::transpose(&w_nk, &[1, 0])?;
                             ops::matmul(x, &w_kn)?
                         }
+                    } else if matches!(scheme, rlx_ir::QuantScheme::GgufQ2_0)
+                        && !use_host_fallback
+                        && !rlx_ir::env::flag("RLX_MLX_Q2_0_DEQUANT")
+                    {
+                        // Q2_0 as MLX affine 2-bit, exactly: its codes already
+                        // sit at bit 2·(j mod 16) of u32 word j/16 within each
+                        // 128-group — MLX's packing — and `(q − 1)·d` is
+                        // `scale = d`, `bias = −d`. So strip the per-block f16
+                        // scale out of the 34-byte blocks and run the native
+                        // `quantized_matmul` instead of dequantizing the whole
+                        // matrix to f32 on the host (≈ 0.2 → tens of tok/s for
+                        // a 1.7B ternary LM). Off: `RLX_MLX_Q2_0_DEQUANT=1`.
+                        let param_name = match &graph.node(node.inputs[1]).op {
+                            rlx_ir::Op::Param { name } => Some(name.clone()),
+                            _ => None,
+                        };
+                        let key = param_name.as_ref().map(|p| format!("{p}#q2_0-affine:{n}x{k}"));
+                        let cached = key.as_deref().and_then(|k| {
+                            let w = mlx_dequant_cache_get(&format!("{k}:w")).ok().flatten()?;
+                            let s = mlx_dequant_cache_get(&format!("{k}:s")).ok().flatten()?;
+                            let b = mlx_dequant_cache_get(&format!("{k}:b")).ok().flatten()?;
+                            Some((w, s, b))
+                        });
+                        let (w_u32, sc, bi) = match cached {
+                            Some(t) => t,
+                            None => {
+                                let host = param_name
+                                    .as_deref()
+                                    .and_then(|n_| params_typed.get(n_))
+                                    .map(|(b, _)| b.clone());
+                                let bytes = match host {
+                                    Some(b) => b,
+                                    None => wq.to_bytes()?,
+                                };
+                                let t = q2_0_to_mlx_affine(&bytes, n, k)?;
+                                if let Some(key) = &key {
+                                    mlx_dequant_cache_put(format!("{key}:w"), t.0.clone_handle()?, n * k / 4);
+                                    mlx_dequant_cache_put(format!("{key}:s"), t.1.clone_handle()?, n * k / 32);
+                                    mlx_dequant_cache_put(format!("{key}:b"), t.2.clone_handle()?, n * k / 32);
+                                }
+                                t
+                            }
+                        };
+                        ops::quantized_matmul_mode(x, &w_u32, &sc, Some(&bi), true, 128, 2, "affine")?
+                    } else if matches!(scheme, rlx_ir::QuantScheme::GgufQ8_0)
+                        && !use_host_fallback
+                        && !rlx_ir::env::flag("RLX_MLX_Q8_0_DEQUANT")
+                    {
+                        // Q8_0 as MLX affine 8-bit, group 32, exactly: each block
+                        // is an f16 `d` and 32 signed codes, `w = d·q`. With the
+                        // codes shifted to `u = q + 128` that is `scale = d`,
+                        // `bias = −128·d` (`d·u` and `128·d` are exact in f32, and
+                        // so is their difference). The host dequant path instead
+                        // kept an f32 copy of every weight — 4 B/param, ~19 GB of
+                        // a 4.8B model's 34 GB MLX footprint (pplx-decider).
+                        // Off: `RLX_MLX_Q8_0_DEQUANT=1`.
+                        let param_name = match &graph.node(node.inputs[1]).op {
+                            rlx_ir::Op::Param { name } => Some(name.clone()),
+                            _ => None,
+                        };
+                        let key = param_name.as_ref().map(|p| format!("{p}#q8_0-affine:{n}x{k}"));
+                        let cached = key.as_deref().and_then(|k| {
+                            let w = mlx_dequant_cache_get(&format!("{k}:w")).ok().flatten()?;
+                            let s = mlx_dequant_cache_get(&format!("{k}:s")).ok().flatten()?;
+                            let b = mlx_dequant_cache_get(&format!("{k}:b")).ok().flatten()?;
+                            Some((w, s, b))
+                        });
+                        let (w_u32, sc, bi) = match cached {
+                            Some(t) => t,
+                            None => {
+                                let host = param_name
+                                    .as_deref()
+                                    .and_then(|n_| params_typed.get(n_))
+                                    .map(|(b, _)| b.clone());
+                                let bytes = match host {
+                                    Some(b) => b,
+                                    None => wq.to_bytes()?,
+                                };
+                                let t = q8_0_to_mlx_affine(&bytes, n, k)?;
+                                if let Some(key) = &key {
+                                    mlx_dequant_cache_put(format!("{key}:w"), t.0.clone_handle()?, n * k);
+                                    mlx_dequant_cache_put(format!("{key}:s"), t.1.clone_handle()?, n * k / 8);
+                                    mlx_dequant_cache_put(format!("{key}:b"), t.2.clone_handle()?, n * k / 8);
+                                }
+                                t
+                            }
+                        };
+                        ops::quantized_matmul_mode(x, &w_u32, &sc, Some(&bi), true, 32, 8, "affine")?
                     } else {
                     let w_bytes = wq.to_bytes()?;
                     if use_host_fallback {
@@ -3636,6 +3763,32 @@ pub fn lower_with_env_writeback(
                 ops::mul(&inv_std, &inner)?
             }
 
+            Op::DoubleSingle(op) => {
+                let dims = |id: NodeId| -> Vec<usize> {
+                    graph
+                        .node(id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect()
+                };
+                let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(i)).collect();
+                let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                let out = dims(node.id);
+                let plan = rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &out)
+                    .map_err(MlxError)?;
+                let numel = |v: &[usize]| v.iter().product::<usize>();
+                let a = (lookup(&env, node.inputs[0])?, numel(&ins[0]));
+                let b = match node.inputs.get(1) {
+                    Some(&b) => Some((lookup(&env, b)?, numel(&ins[1]))),
+                    None => None,
+                };
+                let flat = crate::double_single::double_single_ondevice(op, &plan, a, b)?;
+                let shape: Vec<i32> = out.iter().map(|&d| d as i32).collect();
+                ops::reshape(&flat, &shape)?
+            }
+
             Op::RoundToFormat { format, scaling } => {
                 let x = lookup(&env, node.inputs[0])?;
                 let shape = node_input_shape(graph, node.inputs[0]);
@@ -3870,12 +4023,32 @@ pub fn lower_with_env_writeback(
                     ops::reshape(&perm, &[c_in, kh, kw, c_out_per_g])?
                 };
 
+                // MLX's `conv_general` returns wrong values (or NaN) when it
+                // pads implicitly by ≥ 16 on an axis of a flipped conv — the
+                // input gradient of any conv whose kernel is ≥ 17 tall, e.g.
+                // LEAF's 65×1 spatial conv (`tests/conv_backward_input_tall_kernel.rs`).
+                // Without input dilation, zero-pad `dy` explicitly and give
+                // `conv_general` only the (negative, over-produce-and-slice)
+                // remainder. With input dilation the pad must follow the
+                // dilation, so that path is left as MLX's vjp has it.
+                let (dy_input, conv_pad_lo, conv_pad_hi) = if conv_input_dilation == [1, 1]
+                    && pad_lo.iter().chain(pad_hi.iter()).any(|&p| p > 0)
+                {
+                    let lo: Vec<i32> = vec![0, pad_lo[0].max(0), pad_lo[1].max(0), 0];
+                    let hi: Vec<i32> = vec![0, pad_hi[0].max(0), pad_hi[1].max(0), 0];
+                    let padded = ops::pad(&dy_input, &lo, &hi, 0.0)?;
+                    let clo: Vec<i32> = pad_lo.iter().map(|&p| p.min(0)).collect();
+                    let chi: Vec<i32> = pad_hi.iter().map(|&p| p.min(0)).collect();
+                    (padded, clo, chi)
+                } else {
+                    (dy_input, pad_lo.clone(), pad_hi.clone())
+                };
                 let raw = ops::conv_general(
                     &dy_input,
                     &w_t,
                     /* stride          = */ &[1, 1],
-                    /* padding_lo      = */ &pad_lo,
-                    /* padding_hi      = */ &pad_hi,
+                    /* padding_lo      = */ &conv_pad_lo,
+                    /* padding_hi      = */ &conv_pad_hi,
                     /* kernel_dilation = */ &[d(0), d(1)],
                     /* input_dilation  = */ &conv_input_dilation,
                     /* groups          = */ g,
@@ -5149,8 +5322,46 @@ pub fn lower_with_env_writeback(
                 let a = lookup(&env, node.inputs[0])?;
                 let b = lookup(&env, node.inputs[1])?;
                 let c = lookup(&env, node.inputs[2])?;
-                let ab = ops::mul(a, b)?;
-                ops::add(&ab, c)?
+                // f32: one Metal `fma()` per element, the single rounding Op::Fma
+                // promises (MLX has no fused elementwise op; `mul` + `add` rounds
+                // twice and differed from CPU in ~12-19% of elements). Other dtypes
+                // keep the two-rounding fallback.
+                #[cfg(rlx_mlx_host)]
+                let fused = if node.shape.dtype() == DType::F32
+                    && node.inputs.iter().all(|&i| graph.node(i).shape.dtype() == DType::F32)
+                {
+                    let dims: Vec<i32> = node
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static() as i32)
+                        .collect();
+                    let n: usize = dims.iter().map(|&d| d as usize).product();
+                    let flat = |x: &Array| -> Result<Array, MlxError> {
+                        ops::reshape(&ops::broadcast_to(x, &dims)?, &[n as i32])
+                    };
+                    let (fa, fb, fc) = (flat(a)?, flat(b)?, flat(c)?);
+                    let out = crate::round_to_format::dispatch(
+                        "rlx_fma_f32",
+                        "uint i = thread_position_in_grid.x;\nout[i] = fma(a[i], b[i], c[i]);\n",
+                        "",
+                        &[("a", &fa), ("b", &fb), ("c", &fc)],
+                        n,
+                        (n.max(1), n.clamp(1, 256)),
+                    )?;
+                    Some(ops::reshape(&out, &dims)?)
+                } else {
+                    None
+                };
+                #[cfg(not(rlx_mlx_host))]
+                let fused: Option<Array> = None;
+                match fused {
+                    Some(v) => v,
+                    None => {
+                        let ab = ops::mul(a, b)?;
+                        ops::add(&ab, c)?
+                    }
+                }
             }
 
             Op::Conv3d {
@@ -5650,6 +5861,15 @@ pub fn lower_with_env_writeback(
                 fuse_depth.insert(id, 0);
             }
         }
+        if drop_dead {
+            lowered_here.insert(id);
+            for &input in node.inputs.iter().chain(std::iter::once(&id)) {
+                let dead = last_use.get(&input).is_none_or(|&last| last <= pos);
+                if dead && lowered_here.contains(&input) && !outputs.contains(&input) {
+                    env.remove(&input);
+                }
+            }
+        }
     }
 
     // Look outputs up by reference — `graph.outputs` may legitimately
@@ -5761,4 +5981,52 @@ fn lstm_carry_host(
         .collect();
     Array::from_f32_slice(&arena[dst_off..dst_off + dst_len], &out_shape, DType::F32)
         .map_err(Into::into)
+}
+
+/// GGUF `Q8_0` (`[n, k]`, 34-byte blocks of f16 `d` + 32 signed codes) →
+/// MLX affine 8-bit, group 32: `(w: u32 [n, k/4], scales: f32 [n, k/32],
+/// biases: f32 [n, k/32])` with codes `q + 128`, `scale = d`, `bias = −128·d`.
+/// Exact. MLX packs element `j` of a row into byte `j mod 4` of word `j / 4`
+/// (little-endian), which is the codes' byte order already.
+fn q8_0_to_mlx_affine(bytes: &[u8], n: usize, k: usize) -> Result<(Array, Array, Array), MlxError> {
+    const BLOCK: usize = 34;
+    if !k.is_multiple_of(32) || bytes.len() != n * k / 32 * BLOCK {
+        return Err(MlxError(format!("Q8_0 [{n}, {k}]: {} bytes", bytes.len())));
+    }
+    let blocks = n * k / 32;
+    let mut codes = Vec::with_capacity(n * k);
+    let mut scales = Vec::with_capacity(blocks);
+    for b in bytes.as_chunks::<BLOCK>().0 {
+        scales.push(half::f16::from_le_bytes([b[0], b[1]]).to_f32());
+        codes.extend(b[2..].iter().map(|&q| (q as i8 as i16 + 128) as u8));
+    }
+    let biases: Vec<f32> = scales.iter().map(|s| -128.0 * s).collect();
+    Ok((
+        Array::from_bytes(&codes, &[n, k / 4], DType::U32)?,
+        Array::from_f32_slice(&scales, &[n, k / 32], DType::F32)?,
+        Array::from_f32_slice(&biases, &[n, k / 32], DType::F32)?,
+    ))
+}
+
+/// GGUF `Q2_0` (`[n, k]`, 34-byte blocks of f16 `d` + 128 two-bit codes)
+/// → MLX affine 2-bit `(w: u32 [n, k/16], scales: f32 [n, k/128],
+/// biases: f32 [n, k/128])` with `scale = d`, `bias = −d`. Exact.
+fn q2_0_to_mlx_affine(bytes: &[u8], n: usize, k: usize) -> Result<(Array, Array, Array), MlxError> {
+    const BLOCK: usize = 34;
+    if !k.is_multiple_of(128) || bytes.len() != n * k / 128 * BLOCK {
+        return Err(MlxError(format!("Q2_0 [{n}, {k}]: {} bytes", bytes.len())));
+    }
+    let blocks = n * k / 128;
+    let mut codes = Vec::with_capacity(blocks * 32);
+    let mut scales = Vec::with_capacity(blocks);
+    for b in bytes.as_chunks::<BLOCK>().0 {
+        scales.push(half::f16::from_le_bytes([b[0], b[1]]).to_f32());
+        codes.extend_from_slice(&b[2..]);
+    }
+    let biases: Vec<f32> = scales.iter().map(|s| -s).collect();
+    Ok((
+        Array::from_bytes(&codes, &[n, k / 16], DType::U32)?,
+        Array::from_f32_slice(&scales, &[n, k / 128], DType::F32)?,
+        Array::from_f32_slice(&biases, &[n, k / 128], DType::F32)?,
+    ))
 }

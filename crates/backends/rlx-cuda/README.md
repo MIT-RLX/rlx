@@ -232,7 +232,7 @@ Env diagnostics / ablation:
   well within transformer-inference precision tolerance.
 
 - **NVTX profiling ranges.** Each `Step` dispatch is wrapped in an
-  `nvtx::scoped_range` named `rlx::<StepKind>`. Negligible overhead
+  `nvtx::scoped_range` named after the step (`rlx::Matmul`, …). Negligible overhead
   when no profiler is attached; nsight-systems / nvprof traces show
   step boundaries cleanly so devs can see where time goes.
 
@@ -257,6 +257,12 @@ Env diagnostics / ablation:
     3. Optional bias / activation epilogue runs as a separate
        `matmul_epilogue.cu` pass after.
 
+  Separately, F16 / BF16 `Op::Param`s whose every reader is a matmul taking
+  them as the B operand keep a native 2-byte slot automatically
+  (`arena::matmul_only_half_params`); each GEMM widens them into one shared
+  f32 scratch, halving their resident size. Not combined with
+  `RLX_CUDA_SHARED_PARAMS`.
+
 - **`ExecMode::Stream`** (default) — every `run()` dispatches each
   step on the default stream.
 - **`ExecMode::Graph`** — first `run()` captures the schedule into
@@ -276,10 +282,10 @@ Env diagnostics / ablation:
 |----------|--------|
 | `RLX_CUDA_COMPILE_MODE=aot` | NVRTC prewarm all kernels at compile (once per process). |
 | `RLX_CUDA_CONV_T_KERNEL=1` | Force naive `conv_transpose2d` CUDA kernel (skip cuDNN BackwardData). |
-| `RLX_CUDA_CONV_T_CUDNN=1` | (legacy) no-op; cuDNN is the default for ConvTranspose2d. |
 | `RLX_CUDA_EXEC_MODE=graph` | Capture schedule into a CUDA Graph on first run; replay thereafter. D2H for outputs is captured inside the graph. |
 | `RLX_CUDA_PTX_CACHE` | Directory for persistent NVRTC PTX cache (default: `~/.cache/rlx-cuda`). |
-| `RLX_CUDA_PARITY=1` | Encoder/CPU parity: strict f32 cuBLASLt (`CUBLAS_COMPUTE_32F`), tiled `matmul.cu` instead of cuBLASLt/cuBLAS heuristics. Implies `RLX_CUDA_NO_TF32`. |
+| `RLX_CUDA_PARITY=1` | Encoder/CPU parity: strict f32 cuBLASLt (`CUBLAS_COMPUTE_32F`), tiled `matmul.cu` instead of cuBLASLt/cuBLAS heuristics, and cuDNN forward conv restricted to the GEMM algorithms (Winograd/FFT transforms lose ~10× accuracy). Implies `RLX_CUDA_NO_TF32`. |
+| `RLX_CUDA_NONDET_CONV=1` | Allow non-deterministic cuDNN conv algorithms (atomics; faster). Default: fastest deterministic algorithm that fits the workspace. |
 | `RLX_CUDA_NO_TF32=1` | Strict f32 cuBLASLt only (no TF32 tensor cores). Matmul may still use cuBLASLt unless `RLX_CUDA_NO_CUBLASLT` or `RLX_CUDA_PARITY` is set. |
 | `RLX_CUDA_NO_CUBLASLT=1` | Skip cuBLASLt fused matmul; use tiled `matmul.cu` (or cuBLAS sgemm fallback). |
 | `RLX_CUDA_PINNED_IO=1` | Also pin **input** H2D staging in stream mode (outputs are pinned by default). |
@@ -306,8 +312,6 @@ For autoregressive packed decode (`past_k_*` / `past_v_*` resident handles):
   bucket from the outgoing executable (experimental D2D fast path; see
   `rlx-llama32/docs/cuda-gguf-decode.md`).
 
-Set `ORPHEUS_RESIDENT_KV=0` or `RLX_CUDA_FULL_KV_READBACK=1` to fall back to full-tensor
-K/V readback per step.
 
 ### BSHD encoder notes
 

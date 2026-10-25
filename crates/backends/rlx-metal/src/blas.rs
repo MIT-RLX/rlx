@@ -186,6 +186,11 @@ pub fn buffers_sgemm_sync(a: &Buffer, b: &Buffer, c: &Buffer, m: usize, k: usize
 
 /// C = A @ B via custom MSL kernel. Issues set_pipeline+dispatch on a shared
 /// compute encoder; caller is responsible for encoder lifecycle.
+/// The most rows [`metal_sgemm_bufs`] runs as split-K GEMVs (four a pass)
+/// rather than the tiled sgemm. Measured on Qwen3-0.6B decode (M4 Pro):
+/// two passes at eight rows lost to the sgemm (38 vs 31 ms a step).
+const GEMV_ROWS_MAX: usize = 4;
+
 pub fn metal_sgemm_bufs(
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
@@ -242,6 +247,37 @@ pub fn metal_sgemm_bufs(
                 depth: 1,
             },
         );
+        return;
+    }
+    // A few rows (sequences decoded together): the same split-K GEMV, every
+    // weight read once per four rows. `RLX_METAL_GEMV_ROWS=0` opts out.
+    if (2..=GEMV_ROWS_MAX).contains(&m)
+        && n >= 64
+        && rlx_ir::env::var("RLX_METAL_GEMV_SPLITK").as_deref() != Some("0")
+        && rlx_ir::env::var("RLX_METAL_GEMV_ROWS").as_deref() != Some("0")
+    {
+        let kk = kernels();
+        enc.set_compute_pipeline_state(&kk.gemv_f32_splitk_rows);
+        enc.set_bytes(4, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(5, 4, &n_u as *const _ as *const _);
+        for r in (0..m).step_by(4) {
+            let rows = (m - r).min(4) as u32;
+            enc.set_buffer(0, Some(a), (a_off + r * k * 4) as u64);
+            enc.set_buffer(2, Some(c), (c_off + r * n * 4) as u64);
+            enc.set_bytes(3, 4, &rows as *const _ as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize {
+                    width: (n as u64).div_ceil(32),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 32,
+                    height: 32,
+                    depth: 1,
+                },
+            );
+        }
         return;
     }
     // Split-K needs a pre-zeroed C (atomic accumulate) + a 3D grid + the split
@@ -584,6 +620,110 @@ pub fn metal_sgemm_f16w_bufs(
             },
         );
     }
+}
+
+/// C = A_f32 @ B_bf16 → C_f32 for decode-sized `m` (≤ 4), reading the packed
+/// bf16 weight in-kernel. Returns `false` (nothing encoded) for shapes it does
+/// not cover; the caller then unpacks to f32 and runs the general GEMM.
+#[allow(clippy::too_many_arguments)]
+pub fn metal_sgemm_bf16w_small_bufs(
+    enc: &ComputeCommandEncoderRef,
+    a: &Buffer,
+    a_off: usize,
+    b: &Buffer,
+    b_off: usize,
+    c: &Buffer,
+    c_off: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    if m == 0
+        || m > 4
+        || n < 64
+        || !n.is_multiple_of(2)
+        || rlx_ir::env::flag("RLX_METAL_BF16W_DISABLE")
+    {
+        return false;
+    }
+    let kk = kernels();
+    let (m_u, k_u, n_u) = (m as u32, k as u32, n as u32);
+    enc.set_buffer(0, Some(a), a_off as u64);
+    enc.set_buffer(1, Some(b), b_off as u64);
+    enc.set_buffer(2, Some(c), c_off as u64);
+    // Narrow tile (64 columns, 64-way K split) when the wide one would
+    // launch too few threadgroups to fill the GPU — the 1–3 k-wide
+    // projections. Measured on S2-Pro decode: wide-only 221 ms/step, narrow
+    // for N < 16 k 192 ms (both under load; the ordering held across runs).
+    let tile = if n.div_ceil(256) < 64 { 64 } else { 256 };
+    if m == 1 && n.is_multiple_of(8) && tile == 64 {
+        enc.set_compute_pipeline_state(&kk.gemv_bf16w_splitk8_n64);
+        enc.set_bytes(3, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &n_u as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: (n as u64).div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 8,
+                height: 64,
+                depth: 1,
+            },
+        );
+    } else if m == 1 && n.is_multiple_of(8) {
+        enc.set_compute_pipeline_state(&kk.gemv_bf16w_splitk8);
+        enc.set_bytes(3, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &n_u as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: (n as u64).div_ceil(256),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 16,
+                depth: 1,
+            },
+        );
+    } else if m == 1 {
+        const KSPLIT: u64 = 32;
+        enc.set_compute_pipeline_state(&kk.gemv_bf16w_splitk);
+        enc.set_bytes(3, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &n_u as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: (n as u64).div_ceil(64),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: KSPLIT,
+                depth: 1,
+            },
+        );
+    } else {
+        enc.set_compute_pipeline_state(&kk.sgemm_bf16w_small_m);
+        enc.set_bytes(3, 4, &m_u as *const _ as *const _);
+        enc.set_bytes(4, 4, &k_u as *const _ as *const _);
+        enc.set_bytes(5, 4, &n_u as *const _ as *const _);
+        enc.dispatch_threads(
+            MTLSize {
+                width: n as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64u64.min(n as u64),
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    true
 }
 
 pub fn metal_sgemm_f16w(

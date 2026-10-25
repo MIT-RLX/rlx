@@ -39,6 +39,10 @@ pub struct GemmaDecodeLayerSpec {
     pub mask: MaskKind,
     pub score_scale: Option<f32>,
     pub attn_logit_softcap: Option<f32>,
+    /// With `use_custom_mask`: the named value (`state.named`) this layer
+    /// masks with instead of the step's mask, a sliding layer's windowed
+    /// one. `None` ⇒ the step's.
+    pub mask_input: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,17 +154,17 @@ impl BlockStage for GemmaDecodeLayerStage {
             None
         };
 
-        let q_w = ctx.load_param(&format!("{lp}.self_attn.q_proj.weight"), true)?;
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
+        let q_w = ctx.load_matrix(&format!("{lp}.self_attn.q_proj.weight"), true)?;
+        let k_w = ctx.load_matrix(&format!("{lp}.self_attn.k_proj.weight"), true)?;
         let v_w = if spec.k_eq_v {
             None
         } else {
-            Some(ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?)
+            Some(ctx.load_matrix(&format!("{lp}.self_attn.v_proj.weight"), true)?)
         };
-        let o_w = ctx.load_param(&format!("{lp}.self_attn.o_proj.weight"), true)?;
-        let gate_w = ctx.load_param(&format!("{lp}.mlp.gate_proj.weight"), true)?;
-        let up_w = ctx.load_param(&format!("{lp}.mlp.up_proj.weight"), true)?;
-        let down_w = ctx.load_param(&format!("{lp}.mlp.down_proj.weight"), true)?;
+        let o_w = ctx.load_matrix(&format!("{lp}.self_attn.o_proj.weight"), true)?;
+        let gate_w = ctx.load_matrix(&format!("{lp}.mlp.gate_proj.weight"), true)?;
+        let up_w = ctx.load_matrix(&format!("{lp}.mlp.up_proj.weight"), true)?;
+        let down_w = ctx.load_matrix(&format!("{lp}.mlp.down_proj.weight"), true)?;
 
         let head_norms = match style.head_norm(lp, spec.eps) {
             Some(n) => Some(super::self_attn::LoadedHeadNorms::load(
@@ -200,6 +204,13 @@ impl BlockStage for GemmaDecodeLayerStage {
             (decode.cos, decode.sin)
         };
 
+        // A layer's own mask (a sliding layer's windowed one), by name.
+        let named_mask = match spec.mask_input.as_deref() {
+            Some(name) => Some(ctx.state.named.get(name).copied().ok_or_else(|| {
+                anyhow::anyhow!("Gemma decode layer masks with `{name}`, which is not bound")
+            })?),
+            None => None,
+        };
         let mut gb = HirMut::new(ctx.hir());
         let in_gamma = gb.add(in_ln_ones, in_ln_w);
         let normed_in = gb.rms_norm(input.id, in_gamma, zero_beta, spec.eps);
@@ -238,10 +249,30 @@ impl BlockStage for GemmaDecodeLayerStage {
 
         let attn_shape = shape::attention_shape(gb.shape(q_rope));
         let attn = if spec.use_custom_mask {
-            let mask = decode
-                .mask
-                .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?;
-            gb.attention_(q_rope, k_rep, v_rep, mask, spec.num_heads, spec.head_dim)
+            let mask = match named_mask {
+                Some(m) => m,
+                None => decode
+                    .mask
+                    .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?,
+            };
+            if spec.score_scale.is_none() && spec.attn_logit_softcap.is_none() {
+                gb.attention_(q_rope, k_rep, v_rep, mask, spec.num_heads, spec.head_dim)
+            } else {
+                // Gemma 2's `query_pre_attn_scalar` and logit soft-cap hold
+                // under the caller's mask too.
+                gb.0.mir(
+                    rlx_ir::ops::attention::attention_kind_op(
+                        spec.num_heads,
+                        spec.head_dim,
+                        None,
+                        MaskKind::Custom,
+                        spec.score_scale,
+                        spec.attn_logit_softcap,
+                    ),
+                    vec![q_rope, k_rep, v_rep, mask],
+                    attn_shape,
+                )
+            }
         } else {
             gb.attention_kind_opts(
                 q_rope,

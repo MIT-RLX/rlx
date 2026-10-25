@@ -24,6 +24,9 @@
 //!   replace the M0 / shift ROMs with `localparam`s (saves 2 BRAMs)
 //! * `requant_precision` — Q0.31 (default, bit-exact) or Q0.15 (smaller)
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::{Artifact, LayerArtifacts};
 use crate::codegen::relu::bits_for;
 use crate::model::Layer;

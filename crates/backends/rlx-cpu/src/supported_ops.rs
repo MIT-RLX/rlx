@@ -57,6 +57,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Narrow,
         Concat,
         KvAppend,
+        DynamicUpdateSlice,
         Expand,
         Gather,
         Reverse,
@@ -134,6 +135,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         FakeQuantize,
         FakeQuantizeBackward,
         RoundToFormat,
+        DoubleSingle,
         // LSQ (learned step size) QAT — native CPU thunks in thunk.rs.
         FakeQuantizeLSQ,
         FakeQuantizeLSQBackwardX,
@@ -181,6 +183,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // power-of-2 sizes). Other backends panic at lowering;
         // pin FFT-containing graphs to Device::Cpu for now.
         Fft,
+        // Op::Fft with FftAlgo::PocketFft: the native pocketfft row kernel.
+        FftPocketFft,
         FftQ,
         FftButterflyStage,
         LogMel,

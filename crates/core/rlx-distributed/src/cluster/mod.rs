@@ -35,6 +35,7 @@ pub mod config;
 pub mod cost;
 pub mod discover;
 pub mod placement;
+pub mod sizing;
 pub mod stats;
 
 pub use caps::{DeviceInfo, NodeCaps, probe_local, probe_remote};

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name            = "pyrlx"
 # Single source of truth — must match `Cargo.toml` `[package].version`.
-version         = "0.2.18"
+version         = "0.2.19"
 description     = "Run RLX (Rust ML compiler) graphs on any backend — CPU, Metal, MLX, CUDA, ROCm, wgpu — from Python."
 readme          = "README.md"
 license         = { text = "MIT OR Apache-2.0" }
@@ -76,7 +76,9 @@ include             = [
 
 # ── Suggested feature combos ─────────────────────────────────────
 #
-# Default `pip install pyrlx` builds with cargo `default` features
+# The release wheels add `metal,blas-accelerate` on macOS, and ship
+# `cuda` as the `pyrlx-cu12` distribution (.github/workflows/bindings-release.yml).
+# A source build (`pip install` of the sdist) uses cargo `default` features
 # (= `cpu` only). For backends, install editable with `--features`
 # forwarded through maturin's PEP 517 build-args:
 #

@@ -80,7 +80,7 @@ fn load_f32(
         }
     }
     if let Some(c) = cache.as_mut() {
-        c.flush_offset(a, byte_off);
+        c.flush_range(a, byte_off, n * 4);
     }
     let mut v = vec![0f32; n];
     a.dtoh(byte_off, bytemuck::cast_slice_mut(v.as_mut_slice()));

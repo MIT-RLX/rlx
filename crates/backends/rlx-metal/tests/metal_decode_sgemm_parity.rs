@@ -63,3 +63,42 @@ fn metal_decode_m2_sgemm_matches_cpu() {
 
     rlx_ir::env::unset("RLX_DISABLE_MPS");
 }
+
+/// A few rows (sequences decoded together) run the split-K GEMV each row
+/// alone runs: every row bit-identical to it at m = 1, at a column tail
+/// (n not a multiple of 32) and a K tail.
+#[test]
+fn metal_few_row_gemv_matches_each_row_alone() {
+    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+        eprintln!("skip: Metal unavailable");
+        return;
+    }
+    let (k, n) = (300usize, 197usize);
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| ((i * 7 % 23) as f32) * 0.013 - 0.14)
+        .collect();
+    let matmul = |m: usize, a: &[f32]| -> Vec<f32> {
+        let mut g = Graph::new("few_rows");
+        let a_in = g.input("a", Shape::new(&[m, k], DType::F32));
+        let w = g.param("w", Shape::new(&[k, n], DType::F32));
+        let y = g.mm(a_in, w);
+        g.set_outputs(vec![y]);
+        let mut c = Session::new(Device::Metal).compile(g);
+        c.set_param("w", &b);
+        c.run(&[("a", a)]).remove(0)
+    };
+    for m in 2..=4usize {
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 5 % 19) as f32) * 0.011 - 0.1)
+            .collect();
+        let together = matmul(m, &a);
+        for r in 0..m {
+            let alone = matmul(1, &a[r * k..(r + 1) * k]);
+            assert_eq!(
+                together[r * n..(r + 1) * n],
+                alone[..],
+                "m={m} row {r} differs from the row alone"
+            );
+        }
+    }
+}

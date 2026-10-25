@@ -27,6 +27,11 @@ use rlx_unfuse::DecomposePolicy;
 pub(crate) struct WgpuPolicy;
 
 impl DecomposePolicy for WgpuPolicy {
+    /// `Op::While` runs as a host loop (`Step::HostOp`).
+    fn while_native(&self) -> bool {
+        true
+    }
+
     fn fold_matmul_bias_act(&self) -> bool {
         !rlx_ir::env::flag("RLX_WGPU_NO_FOLD_MMBA")
     }

@@ -176,8 +176,9 @@ pub fn estimate(graph: &Graph, registry: &WeightRegistry) -> MemoryEstimate {
 }
 
 /// Available unified-memory budget on the running machine. On
-/// macOS / iOS reads `hw.memsize` via sysctl; everywhere else returns
-/// `None` so callers can fall back to a user-supplied budget.
+/// macOS / iOS reads `hw.memsize` via sysctl, on Linux `/proc/meminfo`'s
+/// `MemTotal`; elsewhere returns `None` so callers can fall back to a
+/// user-supplied budget.
 pub fn available_unified_memory() -> Option<usize> {
     #[cfg(target_vendor = "apple")]
     {
@@ -205,7 +206,20 @@ pub fn available_unified_memory() -> Option<usize> {
         };
         if rc == 0 { Some(val as usize) } else { None }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: usize = info
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
         None
     }
@@ -239,41 +253,40 @@ pub fn soft_memory_budget_bytes() -> Option<usize> {
 pub fn process_rss_bytes() -> Option<usize> {
     #[cfg(target_vendor = "apple")]
     {
-        use std::mem::MaybeUninit;
         unsafe extern "C" {
             fn mach_task_self() -> u32;
             fn task_info(
                 target_task: u32,
                 flavor: u32,
-                task_info_out: *mut std::os::raw::c_char,
+                task_info_out: *mut i32,
                 task_info_out_cnt: *mut u32,
             ) -> i32;
         }
-        const TASK_BASIC_INFO: u32 = 5;
-        #[repr(C)]
-        struct TaskBasicInfo {
-            suspend_count: u32,
-            virtual_size: u64,
-            resident_size: u64,
-            user_time: u64,
-            system_time: u64,
-            policy: i32,
-        }
-        let mut info = MaybeUninit::<TaskBasicInfo>::uninit();
-        let mut count = (std::mem::size_of::<TaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+        // MACH_TASK_BASIC_INFO (20): `mach_task_basic_info` under
+        // `#pragma pack(4)` — virtual_size, resident_size, resident_size_max
+        // (u64), two time_value_t, policy, suspend_count: 12 naturals.
+        // This used the legacy TASK_BASIC_INFO (5) with a `repr(C)` mirror
+        // that ignored the packing, and read a resident size of 0 — every
+        // soft-budget check here saw an empty process on macOS. An i32
+        // buffer plus an unaligned read leaves no layout to get wrong.
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        let mut info = [0i32; 12];
+        let mut count = info.len() as u32;
+        // SAFETY: `info` holds `count` naturals, the size this flavor writes.
         let rc = unsafe {
             task_info(
                 mach_task_self(),
-                TASK_BASIC_INFO,
-                info.as_mut_ptr().cast(),
+                MACH_TASK_BASIC_INFO,
+                info.as_mut_ptr(),
                 &mut count,
             )
         };
-        if rc == 0 {
-            Some(unsafe { info.assume_init() }.resident_size as usize)
-        } else {
-            None
+        if rc != 0 {
+            return None;
         }
+        // SAFETY: resident_size is the second u64 of the 48-byte buffer.
+        let resident = unsafe { std::ptr::read_unaligned((info.as_ptr() as *const u64).add(1)) };
+        Some(resident as usize)
     }
     #[cfg(target_os = "linux")]
     {
@@ -427,6 +440,24 @@ mod tests {
         let err = est.fits_in(1024).unwrap_err();
         assert!(err.peak_bytes > err.budget_bytes);
         assert!(format!("{err}").contains("exceeds"));
+    }
+
+    #[test]
+    fn process_rss_is_the_real_resident_size() {
+        // A process running this test is tens of MB resident; allocating and
+        // touching 64 MiB more must show up.
+        let Some(before) = process_rss_bytes() else {
+            return;
+        };
+        assert!(before > 1 << 20, "RSS {before} B is not a running process");
+        // black_box: in release an unused buffer is optimised away
+        let buf = std::hint::black_box(vec![1u8; 64 << 20]);
+        let after = process_rss_bytes().unwrap();
+        assert!(
+            after >= before + (48 << 20),
+            "RSS {before} → {after} after touching 64 MiB"
+        );
+        drop(buf);
     }
 
     #[test]

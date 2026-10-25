@@ -10,6 +10,7 @@
 //! the underlying `Op::Fft` nodes via thunks or host fallback.
 
 use crate::infer::GraphExt as _;
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, Op, Shape, fft::FftNorm};
 
 impl Graph {
@@ -131,7 +132,7 @@ impl Graph {
         let batch: usize = (0..last).map(|i| xs.dim(i).unwrap_static()).product();
 
         // Host-build the [n, n/2+1] DFT matrices in f64, baked as f32 constants.
-        let two_pi = 2.0 * std::f64::consts::PI;
+        let two_pi = 2.0 * core::f64::consts::PI;
         let mut cos_m = vec![0f32; n * n_freq];
         let mut nsin_m = vec![0f32; n * n_freq];
         for t in 0..n {

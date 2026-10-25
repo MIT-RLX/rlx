@@ -106,6 +106,20 @@ For end-to-end conversion from safetensors / ONNX / PyTorch, see the companion
 [`rlx-gguf-convert`](../rlx-gguf-convert/) crate or **pyrlx** (`convert_to_gguf`,
 `load_gguf`, `write_gguf` — no backend required).
 
+### Part of a model
+
+For a process that runs one pipeline stage, or a wasm32 page that can't hold a
+file twice:
+
+- `GgufFile::from_bytes(bytes)` parses a GGUF already in memory, keeping the
+  allocation as the data segment instead of copying it.
+- `retain(keep)` / `retain_map` drop every tensor `keep` rejects and compact
+  the data segment to the rest; `tensor_ranges` gives each tensor's byte range
+  for HTTP `Range` requests.
+- `begin_partial(keep)` → `PartialGguf`: assemble a file from downloaded pieces
+  (`feed` each, `finish`), allocating the compact segment once, so the peak is
+  the kept tensors plus one piece.
+
 For HF-name lookup + MTP-head isolation, use the `GgufLoader` adapter
 in the separate model-builders repo (applies the safetensors
 convention swap automatically for HF-named keys).

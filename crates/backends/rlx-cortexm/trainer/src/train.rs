@@ -31,12 +31,6 @@ pub struct TrainedModel {
     pub fp32_test_accuracy: f64,
 }
 
-fn env_flag(key: &str) -> bool {
-    matches!(
-        std::env::var(key).ok().as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    )
-}
 /// `RLX_FAST_CONV` — im2col+BLAS forward conv (mirrors `rlx_cpu::fast_conv`).
 /// On by default; only an explicit `0`/`off`/`false`/`no` selects the reference
 /// scalar path (the unfused `rlx` bench bar).
@@ -49,7 +43,7 @@ fn fast_conv_label() -> bool {
 /// `RLX_GRAPH_FUSED` — fold the SGD+momentum update into the graph and run the
 /// whole fwd+bwd+update step as one region-fused compiled schedule.
 fn graphfused_enabled() -> bool {
-    env_flag("RLX_GRAPH_FUSED")
+    rlx_ir::env::flag("RLX_GRAPH_FUSED")
 }
 
 pub fn run(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String> {
@@ -308,7 +302,7 @@ fn run_graphfused(dataset: &Dataset, args: &Args) -> Result<TrainedModel, String
     // instead of unfusing back to per-op thunks. Disable prologue/FK/batch
     // fusion so only plain scalar-chain regions form (what the interpreter
     // handles).
-    let opts = if env_flag("RLX_REGIONS") {
+    let opts = if rlx_ir::env::flag("RLX_REGIONS") {
         rlx_opt::fusion_pipeline::FusionOptions {
             unfuse_elementwise_regions: false,
             fuse_region_prologue: false,

@@ -10,6 +10,9 @@
 //! read latency we use a small {READ, WAIT, UPDATE} cycle per input
 //! sample, then a WRITE state at the end of each window.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::{Artifact, LayerArtifacts};
 use crate::codegen::relu::bits_for;
 use crate::model::Layer;

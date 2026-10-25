@@ -30,7 +30,7 @@ overhead. This crate does not claim it is a speedup.
 It does not implement a megakernel. RLX has no schedule IR in which "one
 device program" is expressible — roles, barriers and pipeline stages are not
 declared, so there is nothing to fuse them into. This measures the gap rather
-than closing it, which is the honest thing a standalone study can do.
+than closing it, which is what a standalone study can do.
 
 ## Running it
 

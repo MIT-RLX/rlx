@@ -16,6 +16,7 @@
 //! the rigorous version.
 
 use crate::op::{AttentionBwdWrt, MaskKind};
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, Op, Shape};
 
 impl Graph {

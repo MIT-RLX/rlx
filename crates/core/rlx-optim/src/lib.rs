@@ -82,7 +82,7 @@ pub use soap::Soap;
 pub use sophia::Sophia;
 pub use stiefel::Stiefel;
 
-pub use common::{global_grad_clip_scale, l2_norm};
+pub use common::{clip_grad_norm_torch, global_grad_clip_scale, l2_norm};
 
 /// Common parameter-update interface.
 ///

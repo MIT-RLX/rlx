@@ -291,15 +291,16 @@ pub use rlx_opt::{
     nth_order_grad, prepare_graph_for_ad, supported_for_target, supports_op, vmap,
 };
 pub use rlx_runtime::{
-    BackendsManifest, BytesWeightLoader, CompileOptions, CompiledGraph, DeviceBenchResult,
-    DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy, DeviceRouter,
-    FlexibleSession, GraphDevices, MaterializeMode, Package, ParseDeviceError, Placement,
-    Precision, Session, WeightLoader, available_devices, benchmark_devices, compile_rlxp,
-    compile_rlxp_bind_params, compile_rlxp_with, device_chain_from_env, device_from_env,
-    device_label, device_report, devices_for, devices_for_with_policy, fastest_device,
-    fastest_device_for, graph_param_names, is_available, load_rlxp_graph, load_rlxp_placement,
-    open_rlxp, parse_device, parse_device_list, resolve_device, resolve_device_chain,
-    run_with_fallback, tensors_for_rank, weight_names_for_rank,
+    BackendsManifest, BytesWeightLoader, CompileError, CompileOptions, CompiledGraph,
+    DeviceBenchResult, DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy,
+    DeviceRouter, FlexibleSession, GraphDevices, IoError, MaterializeMode, Package,
+    ParseDeviceError, Placement, Precision, Session, TensorInfo, WeightLoader, available_devices,
+    benchmark_devices, compile_rlxp, compile_rlxp_bind_params, compile_rlxp_with,
+    device_chain_from_env, device_from_env, device_label, device_report, devices_for,
+    devices_for_with_policy, fastest_device, fastest_device_for, graph_param_names, is_available,
+    load_rlxp_graph, load_rlxp_placement, open_rlxp, parse_device, parse_device_list,
+    resolve_device, resolve_device_chain, run_with_fallback, tensors_for_rank,
+    weight_names_for_rank,
 };
 #[cfg(feature = "fpga")]
 pub use rlx_runtime::{
@@ -521,6 +522,13 @@ pub mod splat {
 /// For focused imports without the full star set, prefer
 /// [`crate::ops`], [`crate::autodiff`], [`crate::quant`], [`crate::pkg`],
 /// [`crate::compile`].
+/// The workspace README's Rust examples, compiled and run as doctests:
+/// `cargo test -p rlx --doc --features cpu,tensor,optim`. Keeps the first
+/// code a reader copies from going stale.
+#[cfg(all(doctest, feature = "cpu", feature = "tensor", feature = "optim"))]
+#[doc = include_str!("../../../README.md")]
+pub struct ReadmeDoctests;
+
 pub mod prelude {
     // Tensor DSL (expression-style graph building) — feature `tensor`.
     #[cfg(feature = "tensor")]
@@ -530,16 +538,16 @@ pub mod prelude {
 
     // Core graph + runtime
     pub use crate::{
-        BackendsManifest, BytesWeightLoader, CompileOptions, CompiledGraph, DType, Device,
-        DeviceBenchResult, DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy,
-        DeviceRouter, Dim, Element, Error, FlexibleSession, FusionPolicy, Graph, GraphDevices,
-        GraphExt, GraphModule, GraphStage, Node, NodeId, Op, OpKind, ParseDeviceError, Result,
-        Session, Shape, Tick, VerifyError, WeightLoader, available_devices, benchmark_devices,
-        device_chain_from_env, device_from_env, device_label, device_report, devices_for,
-        devices_for_with_policy, fastest_device, fastest_device_for, graph_param_names,
-        is_available, parse_device, parse_device_list, pipeline_schedule, resolve_device,
-        resolve_device_chain, rlx_model, run_with_fallback, scalar_constant_bytes, verify,
-        verify_all, verify_shapes,
+        BackendsManifest, BytesWeightLoader, CompileError, CompileOptions, CompiledGraph, DType,
+        Device, DeviceBenchResult, DeviceCandidate, DeviceFallbackError, DevicePickStrategy,
+        DevicePolicy, DeviceRouter, Dim, Element, Error, FlexibleSession, FusionPolicy, Graph,
+        GraphDevices, GraphExt, GraphModule, GraphStage, IoError, Node, NodeId, Op, OpKind,
+        ParseDeviceError, Result, Session, Shape, Tick, VerifyError, WeightLoader,
+        available_devices, benchmark_devices, device_chain_from_env, device_from_env, device_label,
+        device_report, devices_for, devices_for_with_policy, fastest_device, fastest_device_for,
+        graph_param_names, is_available, parse_device, parse_device_list, pipeline_schedule,
+        resolve_device, resolve_device_chain, rlx_model, run_with_fallback, scalar_constant_bytes,
+        verify, verify_all, verify_shapes,
     };
 
     // IR builder helpers

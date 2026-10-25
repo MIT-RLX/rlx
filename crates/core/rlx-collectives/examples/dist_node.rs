@@ -102,7 +102,7 @@ use std::time::{Duration, Instant};
 const GID: u64 = 0;
 
 fn env(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    rlx_ir::env::read(key).unwrap_or_else(|_| default.to_string())
 }
 
 // ── deterministic global problems (same on every rank) ─────────────

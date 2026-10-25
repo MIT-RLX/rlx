@@ -336,7 +336,7 @@ features left for later.
 
 ### Unsafe & API hygiene
 
-The concurrent build/merge lean on raw pointers; three things keep that honest:
+The concurrent build/merge lean on raw pointers; three things keep that sound:
 
 - **One merge, not two.** The Guibas-Stolfi merge and all navigation / predicates
   live once as default methods on a `DartStore` trait; the serial arena and the
@@ -467,27 +467,30 @@ count — the edge hash stores half-edge ids and recomputes keys on probe (no
 16-bit-key cap), and all kernels use 2D dispatch (fixed x, `gid.y*65536+gid.x`)
 so they scale past the 65 535-workgroups-per-dimension limit to millions.
 
-### Full on-device construction (`insert_gpu::delaunay_gpu`)
+### Full on-device construction (`construct_gpu::delaunay_gpu_native`)
 
-Delaunay **from scratch on the GPU**, not just flipping: seed a CCW fan of the
-convex hull (all real points — no super triangle, so coordinates stay in-span and
-there is no bounding-triangle hull deficit), then **parallel incremental
-insertion** of the interior points (per round: rebuild adjacency by hash → walk
-each pending point to its containing triangle → `atomicMin`-claim the triangle(s)
-it rewrites → 3-way / on-edge 2- or 4-way split), then the exact flip. Validated
-**exact at 200/1k/5k/60k/200k/1M** (Metal + Vulkan). Because splits only touch
-disjoint claimed/allocated triangles the round is race-free, and adjacency is
-rebuilt each round so no incremental-adjacency bookkeeping is needed.
+Delaunay **from scratch on the GPU**: the host only computes a bounding box and
+every point is inserted on the device (gDel2D-style), removing the serial CPU
+`hull_seed`. Insertion is **association-based**, not walk-based (the walk-based
+`insert_gpu` it replaces was slow): each point stores the triangle that contains
+it; per round every triangle picks its lowest-id point (`atomicMin`), splits
+into three around it, and re-associates its other points to the right child by
+two `orient` tests. Triangle count grows geometrically, so all points land in
+~O(log n) rounds. The result, a triangulation over the points plus 3 bounding
+vertices, goes to the flip; bounding-incident triangles are dropped after.
 
-**Measured (idle NVIDIA RTX 3080 Ti, exact):** 60k ≈ 31 ms, 200k ≈ 117 ms,
-1M ≈ 871 ms. That is **~16–24× slower than the 20-core CPU D&C** (2 / 6 / 37 ms) —
-and the gap *widens* with n. This is the expected outcome: the construction is a
-sequence of ~25 insertion + ~54 flip **synchronized full-mesh rounds**, whereas
-the CPU D&C is one cache-friendly near-optimal pass; the workload is latency- and
-branch-bound, exactly where a many-core CPU beats a GPU. Published GPU-DT work
-beats *single-threaded* Triangle, not a tuned 20-core build. **Use the GPU path
-for data already resident in VRAM (no host transfer); for host-resident points the
-CPU wins at every scale.**
+`orient` is the exact emulated-i64 cross product (span ≤ ~4.3e7 with the
+bounding margin; larger spans return `None` and the caller uses the CPU seed),
+and the insertion is exact. **Not yet exact at the hull:** the finite bounding
+triangle leaves a small deficit (4 / 8 / 58 real triangles at 60k / 200k / 1M)
+where a hull triangle's circumcircle contains a bounding vertex. The fix is
+ghost (∞) vertices in the flip's `in_circle`; this path is a prototype.
+
+**Measured (M4 Pro, random points):** construction beats the CPU `hull_seed` at
+1M (24.7 ms vs 37.5 ms) but is slower below ~500k (fixed GPU overhead). The full
+path (construct → flip → drop) is still ~9× the parallel CPU, because the flip
+dominates. **Use the GPU path for data already resident in VRAM; for
+host-resident points the CPU wins.**
 
 ### Seed: JFA-Voronoi dual extraction
 
@@ -500,7 +503,7 @@ path. Measured (`tests/dual.rs`, and `gpu_validate`'s `dual seed` line):
 - **recall ~0.90** — it recovers the interior exactly but **misses hull
   triangles**, whose circumcenters (Voronoi vertices) fall outside any finite grid
   (for near-collinear hull points the circumcenter → ∞). This is a fundamental
-  grid-dual limitation, not a resolution knob.
+  grid-dual limitation, not a resolution setting.
 
 So the dual is an exact **interior** seed but misses the hull.
 

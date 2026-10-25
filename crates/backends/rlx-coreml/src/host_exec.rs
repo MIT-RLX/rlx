@@ -260,7 +260,7 @@ pub fn run_host_node(
             .ok_or_else(|| CoremlError::Runtime(format!("host_exec: missing value for v{}", nid.0)))
     };
     match &node.op {
-        Op::Fft { inverse, norm } => {
+        Op::Fft { inverse, norm, .. } => {
             let x = load(node.inputs[0])?;
             // The FFT row is the innermost dim (real-block layout: first N real,
             // second N imag → row = 2N). Deriving it from x.len() collapses the

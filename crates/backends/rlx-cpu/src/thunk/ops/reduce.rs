@@ -118,11 +118,15 @@ pub(crate) fn compile_sample(
     };
     {
         let in_shape = &graph.node(node.inputs[0]).shape;
-        // Logits are [batch, vocab] (or [vocab] → batch=1).
+        // Logits are [..., vocab]: one draw per output element, from the
+        // leading rows in order (`[batch, vocab]` → `[batch]`; a multi-token
+        // step's `[batch, seq, vocab]` → `[batch, seq]`). `[vocab]` is one row.
         let (batch, vocab) = if in_shape.rank() >= 2 {
+            let vocab = in_shape.dim(in_shape.rank() - 1).unwrap_static();
+            let rows = in_shape.num_elements().unwrap_or(0) / vocab.max(1);
             (
-                in_shape.dim(0).unwrap_static(),
-                in_shape.dim(in_shape.rank() - 1).unwrap_static(),
+                rows.min(node.shape.num_elements().unwrap_or(1).max(1)),
+                vocab,
             )
         } else {
             (1, in_shape.num_elements().unwrap_or(0))
@@ -803,58 +807,110 @@ pub(crate) fn exec_reduce(t: &Thunk, base: *mut u8) {
     else {
         unreachable!()
     };
-    {
-        let outer = *outer as usize;
-        let reduced = *reduced as usize;
-        let inner = *inner as usize;
-        let in_total = outer * reduced * inner;
-        let out_total = outer * inner;
-        unsafe {
-            let inp = sl(*src, base, in_total);
-            let out = sl_mut(*dst, base, out_total);
-            // Each output element reduces a disjoint strided strip, so
-            // the output range parallelizes (the bias-gradient reductions
-            // read the big [N,C,H,W] tensors down to [C]; that's C-way).
-            let reduce_one = |oi: usize| -> f32 {
-                let o = oi / inner;
-                let i = oi % inner;
-                let mut acc = match op {
+    let (outer, reduced, inner) = (*outer as usize, *reduced as usize, *inner as usize);
+    unsafe {
+        let inp = sl(*src, base, outer * reduced * inner);
+        let out = sl_mut(*dst, base, outer * inner);
+        let parallel =
+            fast_conv_enabled() && crate::pool::should_parallelize(inp.len()) && out.len() > 1;
+        reduce_into(inp, out, reduced, inner, *op, parallel);
+    }
+}
+
+/// Reduce `inp`, laid out `[outer, reduced, inner]`, over its middle axis
+/// into `out` (`[outer, inner]`). Each output element reduces its own strip in
+/// `r` order; Sum and Mean accumulate in f64 (a sequential f32 sum over a long
+/// axis, like autodiff's broadcast reductions in a BatchNorm backward over
+/// B·C·P ≈ 10⁴ rows, loses ~3 digits to cancellation, and Adam turns that
+/// gradient noise into ±lr steps). With `inner > 1` the strips are strided, so
+/// whole rows of `inner` values are accumulated at a time (contiguous reads);
+/// each element still sees the same operations in the same order.
+pub(crate) fn reduce_into(
+    inp: &[f32],
+    out: &mut [f32],
+    reduced: usize,
+    inner: usize,
+    op: ReduceOp,
+    parallel: bool,
+) {
+    // outputs pos..pos+len, all within one outer index
+    let strip = |pos: usize, dst: &mut [f32]| {
+        let (o, i, len) = (pos / inner, pos % inner, dst.len());
+        let at = |r: usize| (o * reduced + r) * inner + i;
+        if len == 1 {
+            // a single strip (every strip, when the reduced axis is last)
+            dst[0] = match op {
+                ReduceOp::Sum | ReduceOp::Mean => {
+                    let sum = (0..reduced).fold(0f64, |a, r| a + inp[at(r)] as f64);
+                    (if matches!(op, ReduceOp::Mean) {
+                        sum / reduced as f64
+                    } else {
+                        sum
+                    }) as f32
+                }
+                ReduceOp::Max => (0..reduced).fold(f32::NEG_INFINITY, |a, r| a.max(inp[at(r)])),
+                ReduceOp::Min => (0..reduced).fold(f32::INFINITY, |a, r| a.min(inp[at(r)])),
+                ReduceOp::Prod => (0..reduced).fold(1.0f32, |a, r| a * inp[at(r)]),
+            };
+            return;
+        }
+        let row = |r: usize| &inp[at(r)..][..len];
+        match op {
+            ReduceOp::Sum | ReduceOp::Mean => {
+                let mut acc = vec![0f64; len];
+                for r in 0..reduced {
+                    for (a, v) in acc.iter_mut().zip(row(r)) {
+                        *a += *v as f64;
+                    }
+                }
+                let mean = matches!(op, ReduceOp::Mean);
+                for (d, a) in dst.iter_mut().zip(acc) {
+                    *d = (if mean { a / reduced as f64 } else { a }) as f32;
+                }
+            }
+            ReduceOp::Max | ReduceOp::Min | ReduceOp::Prod => {
+                dst.fill(match op {
                     ReduceOp::Max => f32::NEG_INFINITY,
                     ReduceOp::Min => f32::INFINITY,
-                    ReduceOp::Prod => 1.0f32,
-                    _ => 0.0f32, // Sum / Mean
-                };
+                    _ => 1.0,
+                });
                 for r in 0..reduced {
-                    let v = inp[o * reduced * inner + r * inner + i];
-                    acc = match op {
-                        ReduceOp::Sum | ReduceOp::Mean => acc + v,
-                        ReduceOp::Max => acc.max(v),
-                        ReduceOp::Min => acc.min(v),
-                        ReduceOp::Prod => acc * v,
-                    };
-                }
-                if matches!(op, ReduceOp::Mean) {
-                    acc /= reduced as f32;
-                }
-                acc
-            };
-            if fast_conv_enabled() && crate::pool::should_parallelize(in_total) && out_total > 1 {
-                let out_addr = out.as_mut_ptr() as usize;
-                crate::pool::par_for(
-                    out_total,
-                    crate::pool::outer_chunk(out_total),
-                    &|off, cnt| {
-                        for oi in off..off + cnt {
-                            *((out_addr as *mut f32).add(oi)) = reduce_one(oi);
-                        }
-                    },
-                );
-            } else {
-                for oi in 0..out_total {
-                    out[oi] = reduce_one(oi);
+                    for (d, v) in dst.iter_mut().zip(row(r)) {
+                        *d = match op {
+                            ReduceOp::Max => d.max(*v),
+                            ReduceOp::Min => d.min(*v),
+                            _ => *d * *v,
+                        };
+                    }
                 }
             }
         }
+    };
+    // a run of outputs, split where it crosses into the next outer index
+    let run = |start: usize, dst: &mut [f32]| {
+        let mut pos = start;
+        let end = start + dst.len();
+        while pos < end {
+            let len = (end - pos).min(inner - pos % inner);
+            strip(pos, &mut dst[pos - start..pos - start + len]);
+            pos += len;
+        }
+    };
+    if parallel {
+        let out_total = out.len();
+        let out_addr = out.as_mut_ptr() as usize;
+        crate::pool::par_for(
+            out_total,
+            crate::pool::outer_chunk(out_total),
+            &|off, cnt| {
+                // SAFETY: par_for hands out disjoint ranges of `out`.
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(off), cnt) };
+                run(off, dst);
+            },
+        );
+    } else {
+        run(0, out);
     }
 }
 
@@ -1303,6 +1359,147 @@ mod softmax_axis_tests {
         for i in [0usize, 8191, 8192, inner - 1] {
             let sum: f32 = (0..cols).map(|c| data[c * inner + i]).sum();
             assert!((sum - 1.0).abs() < 1e-5, "i={i} sums to {sum}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod reduce_tests {
+    use super::*;
+
+    /// The original kernel: one output element at a time, walking its strip
+    /// with stride `inner`. The definition `reduce_into` must reproduce.
+    fn reference(inp: &[f32], out: &mut [f32], reduced: usize, inner: usize, op: ReduceOp) {
+        for (oi, d) in out.iter_mut().enumerate() {
+            let (o, i) = (oi / inner, oi % inner);
+            if matches!(op, ReduceOp::Sum | ReduceOp::Mean) {
+                let mut acc = 0.0f64;
+                for r in 0..reduced {
+                    acc += inp[o * reduced * inner + r * inner + i] as f64;
+                }
+                if matches!(op, ReduceOp::Mean) {
+                    acc /= reduced as f64;
+                }
+                *d = acc as f32;
+                continue;
+            }
+            let mut acc = match op {
+                ReduceOp::Max => f32::NEG_INFINITY,
+                ReduceOp::Min => f32::INFINITY,
+                _ => 1.0f32,
+            };
+            for r in 0..reduced {
+                let v = inp[o * reduced * inner + r * inner + i];
+                acc = match op {
+                    ReduceOp::Max => acc.max(v),
+                    ReduceOp::Min => acc.min(v),
+                    _ => acc * v,
+                };
+            }
+            *d = acc;
+        }
+    }
+
+    /// Bit for bit against the original, serial and parallel, for every op,
+    /// over shapes whose parallel chunks cross outer boundaries, with NaN, ±0
+    /// and values that cancel in the sum (±1e17 against 1.0, so a sum in any
+    /// other order lands on different bits, even in f64).
+    #[test]
+    fn reduce_into_matches_the_strided_loop() {
+        let ops = [
+            ReduceOp::Sum,
+            ReduceOp::Mean,
+            ReduceOp::Max,
+            ReduceOp::Min,
+            ReduceOp::Prod,
+        ];
+        let mut cases = 0;
+        for &(outer, reduced, inner) in &[
+            (1usize, 1usize, 1usize),
+            (1, 7, 1),
+            (3, 5, 1),
+            (1, 4, 9),
+            (5, 3, 7),
+            (2, 1000, 3),
+            (64, 9, 129),
+            (7, 33, 1000),
+        ] {
+            let n = outer * reduced * inner;
+            let inp: Vec<f32> = (0..n)
+                .map(|k| match k % 97 {
+                    13 => f32::NAN,
+                    29 => -0.0,
+                    41 => 1.0e7,
+                    42 => -1.0e7,
+                    // order-sensitive even in f64: an ulp of 1e17 is 16, so a
+                    // 1.0 added next to it is lost or kept depending on when
+                    55 => 1.0e17,
+                    71 => -1.0e17,
+                    _ if k % 5 == 0 => 1.0,
+                    _ => ((k * 2654435761) % 1000) as f32 * 0.00137 - 0.6,
+                })
+                .collect();
+            for op in ops {
+                let mut want = vec![f32::NAN; outer * inner];
+                reference(&inp, &mut want, reduced, inner, op);
+                for parallel in [false, true] {
+                    let mut got = vec![f32::NAN; outer * inner];
+                    reduce_into(&inp, &mut got, reduced, inner, op, parallel);
+                    let same = got
+                        .iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    assert!(
+                        same,
+                        "{op:?} outer {outer} reduced {reduced} inner {inner} parallel {parallel}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 8 * 5 * 2);
+    }
+
+    /// Timing, not correctness: against the original on the reductions an
+    /// EEG decoder's backward runs (bias gradients over the batch, BatchNorm
+    /// statistics), alternating which runs first.
+    #[test]
+    #[ignore]
+    fn reduce_timing() {
+        // (name, outer, reduced, inner)
+        let shapes = [
+            ("bias grad [N,C,T]->[C]", 1, 64, 16 * 512),
+            ("batch mean [N,F]", 1, 128, 4096),
+            ("last axis", 4096, 128, 1),
+            ("per-channel [C,N*T]", 16, 64 * 512, 1),
+        ];
+        for (name, outer, reduced, inner) in shapes {
+            let inp: Vec<f32> = (0..outer * reduced * inner)
+                .map(|k| (k % 1000) as f32 * 0.001)
+                .collect();
+            let mut out = vec![0f32; outer * inner];
+            let reps = (20_000_000 / inp.len()).max(3);
+            let mut t = [0f64; 2];
+            for round in 0..6 {
+                for which in [round % 2, 1 - round % 2] {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        if which == 0 {
+                            reference(&inp, &mut out, reduced, inner, ReduceOp::Sum);
+                        } else {
+                            reduce_into(&inp, &mut out, reduced, inner, ReduceOp::Sum, false);
+                        }
+                        std::hint::black_box(&out);
+                    }
+                    t[which] += t0.elapsed().as_secs_f64();
+                }
+            }
+            println!(
+                "reduce {name:24}: old {:.3}s  new {:.3}s  new/old {:.2}",
+                t[0],
+                t[1],
+                t[1] / t[0]
+            );
         }
     }
 }

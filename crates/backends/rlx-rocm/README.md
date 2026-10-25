@@ -72,7 +72,14 @@ Feeds `RocmCostModel` in `rlx-runtime` for backend ranking.
 * **Attention** — BSHD `[B,S,H,D]` and BHSD both use tiled flash
   (`attention_kernel`) when `head_dim ≤ 128`; `RLX_ROCM_FORCE_ATTENTION_ROW=1`
   forces `attention_row_kernel`. Packed QKV: `RLX_ROCM_NO_PACKED_BSHD_ATTN`.
+  Decode with too few rows to fill the device splits `seq_k` across groups
+  (`attention_warp_split`, shape rule shared with `rlx-cuda`);
+  `RLX_ROCM_ATTENTION_KV_SPLITS=<n>` pins the group count (0 = off).
   `run_slots` + `arena_ptr` mirror `rlx-cuda`.
+* **`Op::DoubleSingle`** — f64 as `(hi, lo)` f32 pairs, the
+  `double_single.cu` kernel shared with `rlx-cuda`.
+* **Dispatch tuning** — shipped per-arch rows from `rlx-gpu-dispatch` load
+  below the user cache (`RLX_GPU_NO_SHIPPED_TUNING=1` skips them).
 * **Kernel cache** (`src/kernels/`) — hipRTC compile + per-kernel
   `OnceLock<HipKernel>` cache + persistent `.hsaco` disk cache at
   `$RLX_ROCM_HSACO_CACHE` / `$XDG_CACHE_HOME/rlx-rocm/hsaco-rocm`.

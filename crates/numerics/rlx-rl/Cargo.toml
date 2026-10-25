@@ -31,8 +31,8 @@ toy = []
 [dependencies]
 rlx-ir = { workspace = true }
 rlx-autodiff = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.18", default-features = false, features = ["cpu"], optional = true }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.18", default-features = false, features = ["training"], optional = true }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.19", default-features = false, features = ["cpu"], optional = true }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.19", default-features = false, features = ["training"], optional = true }
 rlx-compile = { workspace = true, optional = true }
 
 [[example]]

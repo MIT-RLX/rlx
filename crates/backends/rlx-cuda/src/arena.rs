@@ -61,6 +61,9 @@ pub struct Arena {
     /// elements). Lets the matmul dispatch ask "is this input
     /// half-stored?" given only the `*_off_f32` it has at hand.
     pub half_by_f32_off: HashMap<u32, (usize, HalfDtype)>,
+    /// F16 / BF16 params stored at 2 B in their own (native-width) slot of the
+    /// main buffer — see [`matmul_only_half_params`]. Uploads narrow into it.
+    pub native_half: HashMap<NodeId, HalfDtype>,
     /// Total half-buffer size in u16 elements.
     pub half_size: usize,
 
@@ -438,6 +441,59 @@ pub fn plan_f32_uniform_excluding(
     align: usize,
     exclude: &HashSet<NodeId>,
 ) -> MemoryPlan {
+    plan_f32_uniform_with_half(graph, align, exclude, &HashMap::new())
+}
+
+/// F16 / BF16 `Op::Param`s whose every reader is a matmul taking them as the
+/// unbatched B operand. Those can keep a native 2-B slot: the matmul step
+/// widens them into an f32 scratch right before its GEMM (`Step::Matmul`'s
+/// `b_half`), so no kernel ever reads them as f32 in place. Any other reader
+/// (a Concat, a view, a Gather) keeps the f32-wide slot.
+pub fn matmul_only_half_params(graph: &Graph) -> HashMap<NodeId, HalfDtype> {
+    let mut out: HashMap<NodeId, HalfDtype> = HashMap::new();
+    for node in graph.nodes() {
+        if !matches!(node.op, Op::Param { .. }) {
+            continue;
+        }
+        let dt = match node.shape.dtype() {
+            DType::F16 => HalfDtype::F16,
+            DType::BF16 => HalfDtype::Bf16,
+            _ => continue,
+        };
+        if node.shape.rank() == 2 && node.shape.num_elements().is_some_and(|n| n > 0) {
+            out.insert(node.id, dt);
+        }
+    }
+    for &o in &graph.outputs {
+        out.remove(&o);
+    }
+    for node in graph.nodes() {
+        let matmul =
+            matches!(node.op, Op::MatMul | Op::FusedMatMulBiasAct { .. }) && node.inputs.len() >= 2;
+        for (slot, inp) in node.inputs.iter().enumerate() {
+            if !out.contains_key(inp) {
+                continue;
+            }
+            let as_b = matmul && slot == 1 && node.inputs[0] != *inp && {
+                let a = &graph.node(node.inputs[0]).shape;
+                a.rank() >= 2 && node.shape.rank() == a.rank()
+            };
+            if !as_b {
+                out.remove(inp);
+            }
+        }
+    }
+    out
+}
+
+/// [`plan_f32_uniform_excluding`], with the `native_half` params (see
+/// [`matmul_only_half_params`]) given 2-B slots instead of f32-wide ones.
+pub fn plan_f32_uniform_with_half(
+    graph: &Graph,
+    align: usize,
+    exclude: &HashSet<NodeId>,
+    native_half: &HashMap<NodeId, HalfDtype>,
+) -> MemoryPlan {
     let align = align.max(1);
     let nodes = graph.nodes();
     let n = nodes.len();
@@ -569,7 +625,10 @@ pub fn plan_f32_uniform_excluding(
         // otherwise byte-pack. A COMPLEX cast, however, produces a genuine
         // multi-lane (C64=2, C128=4) output — it must keep its complex-sized
         // slot (`arena_slot_bytes`), not the `elems * 4` single-lane sizing.
-        let size = if cast_is_kernel(graph, node) && !node.shape.dtype().is_complex() {
+        let size = if native_half.contains_key(&node.id) {
+            let elems = node.shape.num_elements().unwrap_or(0).max(1);
+            (elems * 2).div_ceil(align) * align
+        } else if cast_is_kernel(graph, node) && !node.shape.dtype().is_complex() {
             let elems = node.shape.num_elements().unwrap_or(0).max(1);
             (elems * 4).div_ceil(align) * align
         } else {
@@ -854,6 +913,7 @@ impl Arena {
             half_buffer: None,
             half_offsets: HashMap::new(),
             half_by_f32_off: HashMap::new(),
+            native_half: HashMap::new(),
             half_size: 0,
             vmem: None,
             shared_skip_upload: HashSet::new(),
@@ -903,6 +963,7 @@ impl Arena {
             half_buffer: None,
             half_offsets: HashMap::new(),
             half_by_f32_off: HashMap::new(),
+            native_half: HashMap::new(),
             half_size: 0,
             vmem: Some(va),
             shared_skip_upload: skip_upload,

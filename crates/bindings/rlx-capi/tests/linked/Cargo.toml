@@ -1,0 +1,19 @@
+# A static C library with model plugins linked in, for hosts that cannot load
+# a plugin at run time (iOS, Android, wasm). `tests/c_program.rs` links
+# examples/models.c against it with no RLX_MODEL_PLUGINS set.
+[package]
+name = "rlx-capi-linked"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+rlx-capi         = { path = "../.." }
+rlx-runtime      = { path = "../../../../core/rlx-runtime", default-features = false, features = ["linked-plugins"] }
+rlx-model-plugin = { path = "../../../rlx-model-plugin" }
+
+# Not a member of the rlx workspace.
+[workspace]

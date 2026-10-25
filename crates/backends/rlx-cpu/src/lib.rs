@@ -25,17 +25,22 @@ pub mod dequant_cache;
 pub mod dispatch;
 pub mod executor;
 pub mod expand;
+pub mod f64_kernels;
+pub mod geev;
+pub mod numpy_blas; // the exact Accelerate symbols NumPy / SciPy call ($NEWLAPACK$ILP64 / $NEWLAPACK) // F64 RmsNorm/LayerNorm/Softmax/Rope/Attention for graphs promoted to F64
 pub use expand::{NO_THUNK_ARM, expand_cpu_nop_fused, prepare_graph_for_thunks};
 pub mod gdn;
 pub mod gguf_matmul;
 pub mod gguf_scheme;
 pub mod iir; // IIR biquad zero-phase Butterworth filtering (filter-bank front-end)
 pub mod spd; // SPD-manifold Riemannian kernels (logm/expm/sqrtm, AIRM distance, Karcher mean, batched eigh)
+pub mod spd_batched; // batched, differentiable ReEig/LogEig custom ops (f64 LAPACK per matrix, rayon over the batch)
 pub mod spd_kernels; // CpuKernel impls for the core SPDNet ops (BiMap/ReEig/LogEig/SpdBatchNorm)
 pub use gguf_scheme::quant_scheme_for_ggml;
 pub mod im2col;
 #[cfg(all(feature = "int8-gemv", target_arch = "x86_64"))]
 mod int8_gemv;
+pub mod int_storage;
 pub mod intrinsics;
 pub mod kernel_config;
 pub mod kernels;

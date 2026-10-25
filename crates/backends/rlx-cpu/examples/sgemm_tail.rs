@@ -35,7 +35,7 @@ fn read(path: &str) -> Vec<f32> {
 }
 
 fn env_usize(key: &str) -> usize {
-    std::env::var(key)
+    rlx_ir::env::read(key)
         .unwrap_or_else(|_| panic!("set {key}"))
         .parse()
         .unwrap_or_else(|e| panic!("{key}: {e}"))
@@ -43,7 +43,12 @@ fn env_usize(key: &str) -> usize {
 
 fn main() {
     let dir = std::env::var("DUMP_DIR").expect("set DUMP_DIR");
-    let node = |key: &str| format!("{dir}/node_{}.f32", std::env::var(key).expect("set {key}"));
+    let node = |key: &str| {
+        format!(
+            "{dir}/node_{}.f32",
+            rlx_ir::env::read(key).expect("set {key}")
+        )
+    };
     let (m, k, n) = (env_usize("M"), env_usize("K"), env_usize("N"));
     let (a, w, bias) = (read(&node("A")), read(&node("W")), read(&node("BIAS")));
     assert_eq!(a.len(), m * k, "A is not [{m}, {k}]");

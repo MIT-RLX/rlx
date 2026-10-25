@@ -9,6 +9,7 @@
 //! buffer size computation for memory planning.
 
 use crate::DType;
+use crate::prelude::*;
 use smallvec::SmallVec;
 
 /// A single dimension — either a concrete size or a symbolic dynamic dim.
@@ -41,8 +42,8 @@ impl From<usize> for Dim {
     }
 }
 
-impl std::fmt::Display for Dim {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Dim {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Static(n) => write!(f, "{n}"),
             Self::Dynamic(s) => write!(f, "?{s}"),
@@ -898,8 +899,8 @@ pub fn attention_shape_vdim(
     q.clone().with_dim(rank - 1, Dim::Static(new_last))
 }
 
-impl std::fmt::Display for Shape {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Shape {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "[")?;
         for (i, d) in self.dims.iter().enumerate() {
             if i > 0 {
@@ -1224,6 +1225,41 @@ pub fn conv_transpose3d_output_shape(
         ],
         input.dtype(),
     ))
+}
+
+/// `DynamicUpdateSlice`: `operand`'s shape, where `update` matches it on
+/// every axis but `axis`, is no longer there, and has its dtype.
+pub fn dynamic_update_slice_shape(
+    operand: &Shape,
+    update: &Shape,
+    axis: usize,
+) -> Result<Shape, String> {
+    if axis >= operand.rank() || update.rank() != operand.rank() {
+        return Err(format!(
+            "dynamic_update_slice: update {update} into {operand} along axis {axis}"
+        ));
+    }
+    if update.dtype() != operand.dtype() {
+        return Err(format!(
+            "dynamic_update_slice: update dtype {:?} is not operand dtype {:?}",
+            update.dtype(),
+            operand.dtype()
+        ));
+    }
+    for i in 0..operand.rank() {
+        let (o, u) = (operand.dim(i), update.dim(i));
+        let fits = match (o, u) {
+            (Dim::Static(o), Dim::Static(u)) if i == axis => u <= o,
+            _ if i == axis => true,
+            _ => o == u,
+        };
+        if !fits {
+            return Err(format!(
+                "dynamic_update_slice: update {update} does not fit {operand} on axis {i}"
+            ));
+        }
+    }
+    Ok(operand.clone())
 }
 
 /// `KvAppend`: write `row` into `cache` at index `pos` along `axis`, and return
@@ -1653,7 +1689,7 @@ mod tests {
 /// runtime. Plan #54.
 #[derive(Debug, Clone, Default)]
 pub struct DimBinding {
-    map: std::collections::HashMap<u32, usize>,
+    map: crate::collections::HashMap<u32, usize>,
 }
 
 impl DimBinding {
@@ -1674,5 +1710,22 @@ impl DimBinding {
     }
     pub fn iter(&self) -> impl Iterator<Item = (u32, usize)> + '_ {
         self.map.iter().map(|(&s, &n)| (s, n))
+    }
+
+    /// Builder form of [`Self::set`]; see also `DimBinding::from_pairs` /
+    /// `batch_seq` (in `dynamic.rs`) and `collect()` from `(symbol, size)`.
+    pub fn with(mut self, symbol: u32, size: usize) -> Self {
+        self.set(symbol, size);
+        self
+    }
+}
+
+impl FromIterator<(u32, usize)> for DimBinding {
+    fn from_iter<I: IntoIterator<Item = (u32, usize)>>(iter: I) -> Self {
+        let mut b = Self::new();
+        for (s, n) in iter {
+            b.set(s, n);
+        }
+        b
     }
 }

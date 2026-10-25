@@ -21,83 +21,36 @@ use quickrs_core::context::Context;
 use quickrs_core::gc::Gc;
 use quickrs_core::object::JsObject;
 use quickrs_core::value::{JsResult, Value};
-use rlx_runtime::{Device, DevicePolicy, DeviceRouter, GraphDevices};
+use rlx_bind::runtime::devices::{self, Router, Runner};
+use rlx_runtime::DevicePolicy;
 
-use crate::api::graph::{parse_dtype, take_graph};
+use crate::api::bind::{lift, report, to_json};
+use crate::api::graph::take_graph;
 use crate::convert::*;
 use crate::handle::{self, CLASS_ROUTER, CLASS_RUNNER};
 
-fn runner_of<'a>(ctx: &mut Context, this: &Value) -> JsResult<&'a mut GraphDevices> {
+fn runner_of<'a>(ctx: &mut Context, this: &Value) -> JsResult<&'a mut Runner> {
     handle::borrow_mut(ctx, this, CLASS_RUNNER, "rlx.Runner")
 }
 
-fn router_of<'a>(ctx: &mut Context, this: &Value) -> JsResult<&'a mut DeviceRouter> {
+fn router_of<'a>(ctx: &mut Context, this: &Value) -> JsResult<&'a mut Router> {
     handle::borrow_mut(ctx, this, CLASS_ROUTER, "rlx.Router")
 }
 
-fn device_list(ctx: &mut Context, v: &Value, what: &str) -> JsResult<Vec<Device>> {
-    let names = to_string_vec(ctx, v)?;
-    let mut out = Vec::with_capacity(names.len());
-    for name in names {
-        match rlx_runtime::parse_device(&name) {
-            Ok(d) => out.push(d),
-            Err(e) => return ctx.throw_type(&format!("{what}: {e}")),
-        }
-    }
-    Ok(out)
-}
-
-/// `{only, deny, prefer, benchmarkRuns}` — or `"env"` to read `RLX_DEVICES`
-/// and friends. Omitted entirely means every device this build has.
+/// `"env"`, `"all"`, or `{only, deny, prefer, benchmarkRuns}`.
 pub fn parse_policy(ctx: &mut Context, v: &Value) -> JsResult<DevicePolicy> {
+    let json = to_json(ctx, v)?;
+    lift(ctx, devices::policy(&json))
+}
+
+fn optional_device(ctx: &mut Context, v: &Value) -> JsResult<Option<String>> {
     if is_nullish(v) {
-        return Ok(DevicePolicy::all());
-    }
-    if let Some(s) = v.as_string() {
-        let label = s.to_string_lossy();
-        return match label.trim().to_ascii_lowercase().as_str() {
-            "env" => Ok(DevicePolicy::from_env()),
-            "all" => Ok(DevicePolicy::all()),
-            other => ctx.throw_type(&format!(
-                "device policy must be 'env', 'all' or an object, got '{other}'"
-            )),
-        };
-    }
-
-    let only_v = field(ctx, v, "only")?;
-    let deny_v = field(ctx, v, "deny")?;
-    let prefer_v = field(ctx, v, "prefer")?;
-    let runs_v = field(ctx, v, "benchmarkRuns")?;
-
-    let mut policy = if is_nullish(&only_v) {
-        DevicePolicy::all()
+        Ok(None)
     } else {
-        DevicePolicy::only(device_list(ctx, &only_v, "policy.only")?)
-    };
-    if !is_nullish(&deny_v) {
-        policy = policy.with_deny(device_list(ctx, &deny_v, "policy.deny")?);
-    }
-    if !is_nullish(&prefer_v) {
-        policy = policy.with_prefer(device_list(ctx, &prefer_v, "policy.prefer")?);
-    }
-    if !is_nullish(&runs_v) {
-        policy = policy.with_benchmark_pick(to_usize(ctx, &runs_v, "policy.benchmarkRuns")?);
-    }
-    Ok(policy)
-}
-
-fn optional_device(ctx: &mut Context, v: &Value, what: &str) -> JsResult<Option<Device>> {
-    if is_nullish(v) {
-        return Ok(None);
-    }
-    let name = ctx.to_rust_string(v)?;
-    match rlx_runtime::parse_device(&name) {
-        Ok(d) => Ok(Some(d)),
-        Err(e) => ctx.throw_type(&format!("{what}: {e}")),
+        Ok(Some(ctx.to_rust_string(v)?))
     }
 }
 
-/// `{name: Float32Array}` → owned buffers, converted before any handle borrow.
 fn collect(ctx: &mut Context, bag: &Value) -> JsResult<Vec<(String, Vec<f32>)>> {
     let names = own_keys(ctx, bag)?;
     let mut out = Vec::with_capacity(names.len());
@@ -109,9 +62,19 @@ fn collect(ctx: &mut Context, bag: &Value) -> JsResult<Vec<(String, Vec<f32>)>> 
     Ok(out)
 }
 
-fn outputs_to_js(ctx: &mut Context, outs: Vec<Vec<f32>>) -> Value {
+fn pairs(owned: &[(String, Vec<f32>)]) -> Vec<(&str, &[f32])> {
+    owned
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect()
+}
+
+/// `{device, outputs: [Float32Array, …]}`.
+fn ran(ctx: &mut Context, device: &str, outs: Vec<Vec<f32>>) -> Value {
+    let label = new_string(ctx, device);
     let values: Vec<Value> = outs.iter().map(|o| new_f32_array(ctx, o)).collect();
-    new_array(ctx, values)
+    let outputs = new_array(ctx, values);
+    new_object(ctx, vec![("device", label), ("outputs", outputs)])
 }
 
 // ── Runner (GraphDevices) ───────────────────────────────────
@@ -119,37 +82,30 @@ fn outputs_to_js(ctx: &mut Context, outs: Vec<Vec<f32>>) -> Value {
 fn runner_new(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let policy = parse_policy(ctx, arg(args, 1))?;
     let graph = take_graph(ctx, arg(args, 0))?;
-    Ok(handle::wrap(
-        ctx,
-        CLASS_RUNNER,
-        GraphDevices::with_policy(graph, policy),
-    ))
+    Ok(handle::wrap(ctx, CLASS_RUNNER, Runner::new(graph, policy)))
+}
+
+/// `Runner.fromEnv(graph)` — the policy from `RLX_DEVICE*`.
+fn runner_from_env(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
+    let graph = take_graph(ctx, arg(args, 0))?;
+    Ok(handle::wrap(ctx, CLASS_RUNNER, Runner::from_env(graph)))
 }
 
 fn runner_devices(ctx: &mut Context, this: &Value, _args: &[Value], _m: i32) -> JsResult<Value> {
-    let names: Vec<&'static str> = runner_of(ctx, this)?
-        .devices()
-        .iter()
-        .map(|d| rlx_runtime::device_label(*d))
-        .collect();
+    let names = runner_of(ctx, this)?.devices();
     Ok(new_string_array(ctx, &names))
 }
 
 fn runner_fastest(ctx: &mut Context, this: &Value, _args: &[Value], _m: i32) -> JsResult<Value> {
-    let label = rlx_runtime::device_label(runner_of(ctx, this)?.fastest());
+    let label = runner_of(ctx, this)?.fastest();
     Ok(new_string(ctx, label))
 }
 
-/// `resolve(hint?)` — what the policy would actually pick.
 fn runner_resolve(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
-    let hint = optional_device(ctx, arg(args, 0), "resolve hint")?;
-    match runner_of(ctx, this)?.resolve(hint) {
-        Ok(d) => {
-            let label = rlx_runtime::device_label(d);
-            Ok(new_string(ctx, label))
-        }
-        Err(e) => ctx.throw_internal(&e),
-    }
+    let hint = optional_device(ctx, arg(args, 0))?;
+    let r = runner_of(ctx, this)?.resolve(hint.as_deref());
+    let label = lift(ctx, r)?;
+    Ok(new_string(ctx, label))
 }
 
 fn runner_set_param(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
@@ -178,27 +134,18 @@ fn runner_set_param_typed(
     let name = ctx.to_rust_string(arg(args, 0))?;
     let bytes = to_bytes(ctx, arg(args, 1), &format!("setParamTyped('{name}')"))?;
     let label = ctx.to_rust_string(arg(args, 2))?;
-    let dtype = parse_dtype(ctx, &label)?;
-    runner_of(ctx, this)?.set_param_typed(&name, &bytes, dtype);
+    let r = runner_of(ctx, this)?.set_param_typed(&name, &bytes, &label);
+    lift(ctx, r)?;
     Ok(Value::Undefined)
 }
 
-/// Compile every viable backend up front, so a later `run` is not paying for
-/// a first compile inside whatever you are timing.
 fn runner_warm_all(ctx: &mut Context, this: &Value, _args: &[Value], _m: i32) -> JsResult<Value> {
-    match runner_of(ctx, this)?.warm_all() {
-        Ok(devices) => {
-            let names: Vec<&'static str> = devices
-                .iter()
-                .map(|d| rlx_runtime::device_label(*d))
-                .collect();
-            Ok(new_string_array(ctx, &names))
-        }
-        Err(e) => ctx.throw_internal(&e),
-    }
+    let r = runner_of(ctx, this)?.warm_all();
+    let names = lift(ctx, r)?;
+    Ok(new_string_array(ctx, &names))
 }
 
-/// `benchmark(inputs, runs)` → `[{device, compileMs, execMs}]`, median exec.
+/// `benchmark(inputs, runs = 3)` → `[{device, compileMs, execMs}]`.
 fn runner_benchmark(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let bag = arg(args, 0).clone();
     let owned = collect(ctx, &bag)?;
@@ -207,86 +154,72 @@ fn runner_benchmark(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) ->
     } else {
         to_usize(ctx, arg(args, 1), "benchmark runs")?
     };
-    let results = {
-        let pairs: Vec<(&str, &[f32])> = owned
-            .iter()
-            .map(|(n, d)| (n.as_str(), d.as_slice()))
-            .collect();
-        match runner_of(ctx, this)?.benchmark(&pairs, runs) {
-            Ok(r) => r,
-            Err(e) => return ctx.throw_internal(&e),
-        }
-    };
-    let rows: Vec<Value> = results
-        .into_iter()
-        .map(|r| {
-            let device = new_string(ctx, r.label);
-            new_object(
-                ctx,
-                vec![
-                    ("device", device),
-                    ("compileMs", Value::number(r.compile_ns as f64 / 1e6)),
-                    ("execMs", Value::number(r.median_exec_ns as f64 / 1e6)),
-                ],
-            )
-        })
-        .collect();
-    Ok(new_array(ctx, rows))
+    let r = runner_of(ctx, this)?.benchmark(&pairs(&owned), runs);
+    let json = lift(ctx, r)?;
+    Ok(report(ctx, &json))
 }
 
-/// `run(inputs, device?)` → `{device, outputs}`. Without a device the policy
-/// decides; the answer is reported back so a caller never has to guess which
-/// backend produced the numbers.
+/// `run(inputs, device?)` → `{device, outputs}`.
 fn runner_run(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let bag = arg(args, 0).clone();
     let owned = collect(ctx, &bag)?;
-    let hint = optional_device(ctx, arg(args, 1), "run device")?;
-    let (device, outs) = {
-        let pairs: Vec<(&str, &[f32])> = owned
-            .iter()
-            .map(|(n, d)| (n.as_str(), d.as_slice()))
-            .collect();
-        let runner = runner_of(ctx, this)?;
-        let device = match runner.resolve(hint) {
-            Ok(d) => d,
-            Err(e) => return ctx.throw_internal(&e),
-        };
-        match runner.run(device, &pairs) {
-            Ok(outs) => (device, outs),
-            Err(e) => return ctx.throw_internal(&e),
-        }
-    };
-    let label = new_string(ctx, rlx_runtime::device_label(device));
-    let outputs = outputs_to_js(ctx, outs);
-    Ok(new_object(
-        ctx,
-        vec![("device", label), ("outputs", outputs)],
-    ))
+    let hint = optional_device(ctx, arg(args, 1))?;
+    let r = runner_of(ctx, this)?.run(&pairs(&owned), hint.as_deref());
+    let (device, outs) = lift(ctx, r)?;
+    Ok(ran(ctx, device, outs))
+}
+
+/// `runOn(device, inputs)` → `[Float32Array, …]` — exactly that device.
+fn runner_run_on(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
+    let device = ctx.to_rust_string(arg(args, 0))?;
+    let bag = arg(args, 1).clone();
+    let owned = collect(ctx, &bag)?;
+    let r = runner_of(ctx, this)?.run_on(&device, &pairs(&owned));
+    let outs = lift(ctx, r)?;
+    let values: Vec<Value> = outs.iter().map(|o| new_f32_array(ctx, o)).collect();
+    Ok(new_array(ctx, values))
+}
+
+/// `runTry(["cuda", "cpu"], inputs)` → `{device, outputs}` from the first that runs.
+fn runner_run_try(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
+    let chain = to_string_vec(ctx, arg(args, 0))?;
+    let bag = arg(args, 1).clone();
+    let owned = collect(ctx, &bag)?;
+    let r = runner_of(ctx, this)?.run_try(&chain, &pairs(&owned));
+    let (device, outs) = lift(ctx, r)?;
+    Ok(ran(ctx, device, outs))
+}
+
+/// `runChain(inputs, device?)` → `{device, outputs}`, falling back down the policy.
+fn runner_run_chain(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
+    let bag = arg(args, 0).clone();
+    let owned = collect(ctx, &bag)?;
+    let hint = optional_device(ctx, arg(args, 1))?;
+    let r = runner_of(ctx, this)?.run_chain(&pairs(&owned), hint.as_deref());
+    let (device, outs) = lift(ctx, r)?;
+    Ok(ran(ctx, device, outs))
+}
+
+/// `runWithInputs(inputs, device?)` → `[Float32Array, …]`, resolving with the
+/// inputs in hand (input-shape-aware).
+fn runner_run_with_inputs(
+    ctx: &mut Context,
+    this: &Value,
+    args: &[Value],
+    _m: i32,
+) -> JsResult<Value> {
+    let bag = arg(args, 0).clone();
+    let owned = collect(ctx, &bag)?;
+    let hint = optional_device(ctx, arg(args, 1))?;
+    let r = runner_of(ctx, this)?.run_with_inputs(&pairs(&owned), hint.as_deref());
+    let outs = lift(ctx, r)?;
+    let values: Vec<Value> = outs.iter().map(|o| new_f32_array(ctx, o)).collect();
+    Ok(new_array(ctx, values))
 }
 
 fn runner_report(ctx: &mut Context, this: &Value, _args: &[Value], _m: i32) -> JsResult<Value> {
-    let report = runner_of(ctx, this)?.report();
-    let rows: Vec<Value> = report
-        .into_iter()
-        .map(|c| {
-            let device = new_string(ctx, c.label);
-            let blocker = match &c.blocker {
-                Some(text) => new_string(ctx, text),
-                None => Value::Null,
-            };
-            new_object(
-                ctx,
-                vec![
-                    ("device", device),
-                    ("available", Value::Bool(c.available)),
-                    ("supportsGraph", Value::Bool(c.supports_graph)),
-                    ("recommended", Value::Bool(c.recommended)),
-                    ("blocker", blocker),
-                ],
-            )
-        })
-        .collect();
-    Ok(new_array(ctx, rows))
+    let json = runner_of(ctx, this)?.report();
+    Ok(report(ctx, &json))
 }
 
 // ── Router (DeviceRouter) ───────────────────────────────────
@@ -294,10 +227,15 @@ fn runner_report(ctx: &mut Context, this: &Value, _args: &[Value], _m: i32) -> J
 fn router_new(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let policy = parse_policy(ctx, arg(args, 1))?;
     let graph = take_graph(ctx, arg(args, 0))?;
-    match DeviceRouter::new(graph, policy) {
-        Ok(router) => Ok(handle::wrap(ctx, CLASS_ROUTER, router)),
-        Err(e) => ctx.throw_internal(&e),
-    }
+    let router = lift(ctx, Router::new(graph, policy))?;
+    Ok(handle::wrap(ctx, CLASS_ROUTER, router))
+}
+
+/// `Router.fromEnv(graph)` — the policy from `RLX_DEVICE*`.
+fn router_from_env(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
+    let graph = take_graph(ctx, arg(args, 0))?;
+    let router = lift(ctx, Router::from_env(graph))?;
+    Ok(handle::wrap(ctx, CLASS_ROUTER, router))
 }
 
 fn router_devices(ctx: &mut Context, this: &Value, _args: &[Value], _m: i32) -> JsResult<Value> {
@@ -322,50 +260,53 @@ fn router_set_params(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -
     Ok(Value::number(params.len() as f64))
 }
 
-/// `run(inputs, hint?)` (magic 0) — policy pick.
-/// `runChain(inputs, hint?)` (magic 1) — fallback chain; on total failure the
-/// error lists every device tried and why each one declined.
+fn router_set_param_typed(
+    ctx: &mut Context,
+    this: &Value,
+    args: &[Value],
+    _m: i32,
+) -> JsResult<Value> {
+    let name = ctx.to_rust_string(arg(args, 0))?;
+    let bytes = to_bytes(ctx, arg(args, 1), &format!("setParamTyped('{name}')"))?;
+    let label = ctx.to_rust_string(arg(args, 2))?;
+    let r = router_of(ctx, this)?.set_param_typed(&name, &bytes, &label);
+    lift(ctx, r)?;
+    Ok(Value::Undefined)
+}
+
+/// `runOn(device, inputs)` → `[Float32Array, …]` — exactly that device.
+fn router_run_on(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
+    let device = ctx.to_rust_string(arg(args, 0))?;
+    let bag = arg(args, 1).clone();
+    let owned = collect(ctx, &bag)?;
+    let r = router_of(ctx, this)?.run_on(&device, &pairs(&owned));
+    let outs = lift(ctx, r)?;
+    let values: Vec<Value> = outs.iter().map(|o| new_f32_array(ctx, o)).collect();
+    Ok(new_array(ctx, values))
+}
+
 fn router_run(ctx: &mut Context, this: &Value, args: &[Value], magic: i32) -> JsResult<Value> {
     let bag = arg(args, 0).clone();
     let owned = collect(ctx, &bag)?;
-    let hint = optional_device(ctx, arg(args, 1), "run device")?;
-    let (device, outs) = {
-        let pairs: Vec<(&str, &[f32])> = owned
-            .iter()
-            .map(|(n, d)| (n.as_str(), d.as_slice()))
-            .collect();
-        let router = router_of(ctx, this)?;
-        if magic == 0 {
-            match router.run(&pairs, hint) {
-                Ok(v) => v,
-                Err(e) => return ctx.throw_internal(&e),
-            }
-        } else {
-            match router.run_chain(&pairs, hint) {
-                Ok(v) => v,
-                Err(e) => return ctx.throw_internal(&format!("{e}")),
-            }
-        }
+    let hint = optional_device(ctx, arg(args, 1))?;
+    let router = router_of(ctx, this)?;
+    let r = if magic == 0 {
+        router.run(&pairs(&owned), hint.as_deref())
+    } else {
+        router.run_chain(&pairs(&owned), hint.as_deref())
     };
-    let label = new_string(ctx, rlx_runtime::device_label(device));
-    let outputs = outputs_to_js(ctx, outs);
-    Ok(new_object(
-        ctx,
-        vec![("device", label), ("outputs", outputs)],
-    ))
+    let (device, outs) = lift(ctx, r)?;
+    Ok(ran(ctx, device, outs))
 }
 
-/// Policy pick.
 fn router_run_policy(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     router_run(ctx, this, args, 0)
 }
 
-/// Fallback chain: on total failure the error lists every device tried.
 fn router_run_chain(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     router_run(ctx, this, args, 1)
 }
 
-/// Re-benchmark when the picked device starts thermal-throttling.
 fn router_rebench(ctx: &mut Context, this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let enabled = to_bool(arg(args, 0));
     router_of(ctx, this)?.set_rebench_on_throttle(enabled);
@@ -391,8 +332,13 @@ pub fn install(ctx: &mut Context, namespace: &Gc<JsObject>) {
             "warmAll" => runner_warm_all, 0;
             "benchmark" => runner_benchmark, 2;
             "run" => runner_run, 2;
+            "runOn" => runner_run_on, 2;
+            "runTry" => runner_run_try, 2;
+            "runChain" => runner_run_chain, 2;
+            "runWithInputs" => runner_run_with_inputs, 2;
         }
     };
+    js_statics! { ctx, namespace, "Runner"; "fromEnv" => runner_from_env, 1; };
     js_class! {
         ctx, namespace;
         name: "Router",
@@ -405,6 +351,9 @@ pub fn install(ctx: &mut Context, namespace: &Gc<JsObject>) {
             "setRebenchOnThrottle" => router_rebench, 1;
             "run" => router_run_policy, 2;
             "runChain" => router_run_chain, 2;
+            "runOn" => router_run_on, 2;
+            "setParamTyped" => router_set_param_typed, 3;
         }
     };
+    js_statics! { ctx, namespace, "Router"; "fromEnv" => router_from_env, 1; };
 }

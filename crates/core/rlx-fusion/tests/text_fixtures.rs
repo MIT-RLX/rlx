@@ -41,20 +41,20 @@ fn lower_fma_expands_to_mul_add() {
         &LowerFma,
         r#"
         graph @fma {
-          %0 = {"Input":{"name":"a"}} : [8] f32
-          %1 = {"Input":{"name":"b"}} : [8] f32
-          %2 = {"Input":{"name":"c"}} : [8] f32
-          %3 = Fma(%0, %1, %2) : [8] f32
+          %0 = {"Input":{"name":"a"}} : [8] f64
+          %1 = {"Input":{"name":"b"}} : [8] f64
+          %2 = {"Input":{"name":"c"}} : [8] f64
+          %3 = Fma(%0, %1, %2) : [8] f64
           return %3
         }
         "#,
         r#"
         graph @fma {
-          %0 = {"Input":{"name":"a"}} : [8] f32
-          %1 = {"Input":{"name":"b"}} : [8] f32
-          %2 = {"Input":{"name":"c"}} : [8] f32
-          %3 = {"Binary":"Mul"}(%0, %1) : [8] f32
-          %4 = {"Binary":"Add"}(%3, %2) : [8] f32
+          %0 = {"Input":{"name":"a"}} : [8] f64
+          %1 = {"Input":{"name":"b"}} : [8] f64
+          %2 = {"Input":{"name":"c"}} : [8] f64
+          %3 = {"Binary":"Mul"}(%0, %1) : [8] f64
+          %4 = {"Binary":"Add"}(%3, %2) : [8] f64
           return %4
         }
         "#,
@@ -81,21 +81,21 @@ fn lower_fma_handles_several_fmas_and_shared_operands() {
         &LowerFma,
         r#"
         graph @chain {
-          %0 = {"Input":{"name":"a"}} : [2] f32
-          %1 = {"Input":{"name":"b"}} : [2] f32
-          %2 = Fma(%0, %1, %1) : [2] f32
-          %3 = Fma(%2, %1, %0) : [2] f32
+          %0 = {"Input":{"name":"a"}} : [2] f64
+          %1 = {"Input":{"name":"b"}} : [2] f64
+          %2 = Fma(%0, %1, %1) : [2] f64
+          %3 = Fma(%2, %1, %0) : [2] f64
           return %3
         }
         "#,
         r#"
         graph @chain {
-          %0 = {"Input":{"name":"a"}} : [2] f32
-          %1 = {"Input":{"name":"b"}} : [2] f32
-          %2 = {"Binary":"Mul"}(%0, %1) : [2] f32
-          %3 = {"Binary":"Add"}(%2, %1) : [2] f32
-          %4 = {"Binary":"Mul"}(%3, %1) : [2] f32
-          %5 = {"Binary":"Add"}(%4, %0) : [2] f32
+          %0 = {"Input":{"name":"a"}} : [2] f64
+          %1 = {"Input":{"name":"b"}} : [2] f64
+          %2 = {"Binary":"Mul"}(%0, %1) : [2] f64
+          %3 = {"Binary":"Add"}(%2, %1) : [2] f64
+          %4 = {"Binary":"Mul"}(%3, %1) : [2] f64
+          %5 = {"Binary":"Add"}(%4, %0) : [2] f64
           return %5
         }
         "#,

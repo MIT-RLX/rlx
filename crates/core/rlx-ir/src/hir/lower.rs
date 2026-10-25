@@ -4,7 +4,8 @@
 
 //! HIR → MIR lowering.
 
-use std::collections::HashMap;
+use crate::collections::HashMap;
+use crate::prelude::*;
 
 use crate::hir::{HirModule, HirNodeId, HirOp, default_hir_block_label};
 use crate::infer::GraphExt;
@@ -31,8 +32,8 @@ pub enum LowerError {
     },
 }
 
-impl std::fmt::Display for LowerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for LowerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::WrongInputCount { op, expected, got } => {
                 write!(f, "{op}: expected {expected} inputs, got {got}")
@@ -43,7 +44,7 @@ impl std::fmt::Display for LowerError {
     }
 }
 
-impl std::error::Error for LowerError {}
+impl core::error::Error for LowerError {}
 
 type SharedPairKey = (HirNodeId, HirNodeId, HirNodeId);
 
@@ -432,6 +433,8 @@ pub fn lower_module(hir: HirModule) -> Result<MirModule, LowerError> {
     }
 
     let outputs: Vec<NodeId> = hir.outputs.iter().map(|id| map[id]).collect();
+    // Names first: `set_outputs` drops any past the output count.
+    g.set_output_names(hir.output_names.clone());
     g.set_outputs(outputs);
     Ok(MirModule::from_graph(g))
 }

@@ -4,6 +4,7 @@
 
 //! Graph I/O builders: inputs, parameters (plan #53).
 
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {
@@ -189,9 +190,30 @@ impl Graph {
 
     /// 1D FFT with explicit normalization mode.
     pub fn fft_norm(&mut self, x: NodeId, inverse: bool, norm: crate::fft::FftNorm) -> NodeId {
+        self.fft_algo(x, inverse, norm, crate::fft::FftAlgo::Native)
+    }
+
+    /// 1D FFT with explicit normalization and algorithm (rounding) — see
+    /// [`crate::fft::FftAlgo`]; `FftAlgo::SCIPY` reproduces `scipy.fft` bits.
+    pub fn fft_algo(
+        &mut self,
+        x: NodeId,
+        inverse: bool,
+        norm: crate::fft::FftNorm,
+        algo: crate::fft::FftAlgo,
+    ) -> NodeId {
         let s = self.shape(x).clone();
         crate::fft::fft_meta(&s);
-        self.push(Op::Fft { inverse, norm }, vec![x], s, None)
+        self.push(
+            Op::Fft {
+                inverse,
+                norm,
+                algo,
+            },
+            vec![x],
+            s,
+            None,
+        )
     }
 
     /// Fixed-point 1D FFT along the last axis (`Op::FftQ`).

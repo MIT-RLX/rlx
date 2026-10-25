@@ -106,7 +106,9 @@ fn div_rn(a: f32, b: f32) -> f32 {
 fn is_nan(v: f32) -> bool { return v != v; }
 fn is_inf(v: f32) -> bool { return abs(v) > 3.4028235e38; }
 fn is_finite(v: f32) -> bool { return !is_nan(v) && !is_inf(v); }
-fn quiet_nan() -> f32 { return bitcast<f32>(0x7fc00000u); }
+// `seed` is any runtime value: a NaN bit pattern built from constants alone is
+// a const-expression, which Tint (Chrome/Dawn WebGPU) rejects outright.
+fn quiet_nan(seed: u32) -> f32 { return bitcast<f32>(0x7fc00000u | (seed & 0u)); }
 // Built from bits rather than by overflowing a literal: naga's GLSL front end
 // rejects a constant-folded infinity outright, and the two ports are kept
 // spelled the same on purpose.
@@ -161,14 +163,14 @@ fn decode_lowp(fmt: u32, code: u32) -> f32 {
     let max_exp = (1u << e_bits) - 1u;
 
     if (fnuz) {
-        if (sign_bit != 0u && exp == 0u && mant == 0u) { return quiet_nan(); }
+        if (sign_bit != 0u && exp == 0u && mant == 0u) { return quiet_nan(mant); }
     } else if (has_inf) {
         if (exp == max_exp) {
             if (mant == 0u) { return signed_inf(sign); }
-            return quiet_nan();
+            return quiet_nan(mant);
         }
     } else if (e4m3ocp) {
-        if (exp == max_exp && mant == ((1u << m_bits) - 1u)) { return quiet_nan(); }
+        if (exp == max_exp && mant == ((1u << m_bits) - 1u)) { return quiet_nan(mant); }
     }
 
     let m_div = f32(1u << m_bits);
@@ -242,7 +244,7 @@ fn encode_lowp(fmt: u32, x_in: f32) -> u32 {
 }
 
 fn e8m0(b: u32) -> f32 {
-    if (b == 0xFFu) { return quiet_nan(); }
+    if (b == 0xFFu) { return quiet_nan(b); }
     // Same as `bitcast<f32>(b << 23)`; written via pow2i to keep the
     // "no transcendentals in the codec" rule visible in one place.
     return pow2i(i32(b) - 127);

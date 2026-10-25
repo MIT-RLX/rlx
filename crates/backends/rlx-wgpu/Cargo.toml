@@ -33,10 +33,12 @@ rlxsl = { workspace = true }
 
 [dependencies]
 rlx-ir = { workspace = true }
+# Double-single prelude for `Op::DoubleSingle` (same EFT library as Metal).
+rlxsl = { workspace = true }
 # Shape-keyed kernel-variant dispatch table, shared with CUDA/ROCm/Metal.
 rlx-gpu-dispatch = { workspace = true }
 rlx-unfuse = { workspace = true }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.18", default-features = false, features = ["compile"] }
+rlx-opt = { path = "../../core/rlx-opt", version = "0.2.19", default-features = false, features = ["compile"] }
 rlx-compile = { workspace = true }
 rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gpu-host = { workspace = true }

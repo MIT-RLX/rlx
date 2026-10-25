@@ -1,0 +1,128 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# rlx-web and its browser examples on GitHub Pages: the forward/backward demo
+# (index.html), the vision bench and the tab cluster, all from one wasm bundle
+# built with both browser GPU paths (WebGPU and WebGL2). Plus the Qwen3.5 chat
+# (qwen/chat.html) from MIT-RLX/rlx-models' rlx-models-web, built against this
+# checkout of rlx; its weights stream from the Hugging Face Hub, not from Pages.
+#
+# One-time setup: Settings → Pages → Source: "GitHub Actions".
+# Locally: `just build-pages` assembles the same site in ./_site.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push waits rather than cancelling a
+# deployment halfway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: MIT-RLX/rlx-models
+          path: rlx-models
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pages
+          workspaces: |
+            . -> target
+            rlx-models -> target/wasm
+
+      # build.py refuses a wasm-bindgen CLI that differs from the locked crate.
+      - name: Locked wasm-bindgen version
+        id: wasm-bindgen
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'EOF'
+          import tomllib
+          lock = tomllib.load(open("Cargo.lock", "rb"))
+          print("version=" + next(p["version"] for p in lock["package"] if p["name"] == "wasm-bindgen"))
+          EOF
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
+
+      - name: Build the wasm bundle (CPU + WebGPU + WebGL2)
+        run: python3 crates/bindings/rlx-web/build.py --all
+
+      # rlx-models pins published rlx; patch every crate of this checkout in,
+      # so the chat is built from the same rlx as the rest of the site.
+      - name: Point rlx-models at this rlx checkout
+        run: |
+          mkdir -p rlx-models/.cargo
+          cargo metadata --no-deps --format-version 1 > /tmp/rlx-metadata.json
+          python3 - > rlx-models/.cargo/config.toml <<'EOF'
+          import json, os
+          print("[patch.crates-io]")
+          for p in json.load(open("/tmp/rlx-metadata.json"))["packages"]:
+              if p["name"].startswith("rlx"):
+                  path = os.path.relpath(os.path.dirname(p["manifest_path"]), "rlx-models")
+                  print('%s = { path = "%s" }' % (p["name"], path))
+          EOF
+          cat rlx-models/.cargo/config.toml
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      # The same build as rlx-models' `just web-models-build web`.
+      - name: Build the Qwen chat (rlx-models-web, WebGPU + WebGL2)
+        working-directory: rlx-models
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js" -C target-feature=+simd128
+          CARGO_TARGET_DIR: target/wasm
+        run: >
+          wasm-pack build crates/rlx-models-web --target web --release
+          --out-dir web/pkg --no-typescript -- --features webgpu,webgl
+
+      # Copies only what the pages reference and fails if any local reference
+      # does not resolve, so a missing module cannot ship.
+      - name: Assemble the site
+        run: >
+          python3 crates/bindings/rlx-web/tools/build_site.py --all-pages --out _site
+          --qwen rlx-models/crates/rlx-models-web/web
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

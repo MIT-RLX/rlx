@@ -7,6 +7,9 @@
 //! by 2^31), same rounding-divide-by-power-of-two, same saturating cast
 //! to i8.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::verilog::V;
 
 /// Q0.15 variant: half-width epilogue. M0 is i16, the multiplier

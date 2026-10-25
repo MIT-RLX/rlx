@@ -422,24 +422,18 @@ impl<'a> LowerCtx<'a> {
         sin_id: NodeId,
         head_dim: usize,
         n_rot: usize,
+        style: rlx_ir::op::RopeStyle,
         out: Shape,
     ) -> i64 {
+        // RoPE is a rotation per pair, so its adjoint is the rotation by −θ:
+        // the forward lowering with `sin` negated.
         let dy = self.hlo(dy_id);
         let cos = self.hlo(cos_id);
         let sin = self.hlo(sin_id);
         let dims = self.ir_shape_dims(dy_id);
-        let dt = self.dtype(dy_id);
-        let prim_ty = prim_of(dt);
-        let last = dims.len() - 1;
-        let rot = n_rot.min(head_dim);
-        let half = rot / 2;
-        assert!(
-            dims[last] >= rot as i64,
-            "rlx-tpu RopeBackward: last dim {} < n_rot {n_rot}",
-            dims[last]
-        );
-
+        let prim_ty = prim_of(self.dtype(dy_id));
         let sin_dims = self.ir_shape_dims(sin_id);
+        let cos_dims = self.ir_shape_dims(cos_id);
         let neg = self.const_in_dtype(prim_ty, -1.0);
         let neg_s = self
             .entry
@@ -447,68 +441,9 @@ impl<'a> LowerCtx<'a> {
         let sin_neg = self
             .entry
             .binary("multiply", sin, neg_s, Shape::array(prim_ty, &sin_dims));
-
-        let strides = vec![1i64; dims.len()];
-        let mut starts1 = vec![0i64; dims.len()];
-        let mut limits1 = dims.clone();
-        let mut starts2 = vec![0i64; dims.len()];
-        let mut limits2 = dims.clone();
-        starts1[last] = 0;
-        limits1[last] = half as i64;
-        starts2[last] = half as i64;
-        limits2[last] = rot as i64;
-        let mut half_dims = dims.clone();
-        half_dims[last] = half as i64;
-        let half_shape = Shape::array(prim_ty, &half_dims);
-
-        let mut rot_stop = dims.clone();
-        rot_stop[last] = rot as i64;
-        let rot_part = self.entry.slice(
-            dy,
-            &vec![0i64; dims.len()],
-            &rot_stop,
-            &strides,
-            Shape::array(prim_ty, &rot_stop),
-        );
-        let x1 = self
-            .entry
-            .slice(rot_part, &starts1, &limits1, &strides, half_shape.clone());
-        let x2 = self
-            .entry
-            .slice(rot_part, &starts2, &limits2, &strides, half_shape.clone());
-
-        let cos_dims = self.ir_shape_dims(cos_id);
-        let cos_b = self.broadcast_to_target(cos, &cos_dims, half_shape.clone());
-        let sin_b = self.broadcast_to_target(sin_neg, &sin_dims, half_shape.clone());
-
-        let x1c = self.entry.binary("multiply", x1, cos_b, half_shape.clone());
-        let x2s = self.entry.binary("multiply", x2, sin_b, half_shape.clone());
-        let r1 = self.entry.binary("subtract", x1c, x2s, half_shape.clone());
-        let x1s = self.entry.binary("multiply", x1, sin_b, half_shape.clone());
-        let x2c = self.entry.binary("multiply", x2, cos_b, half_shape.clone());
-        let r2 = self.entry.binary("add", x1s, x2c, half_shape);
-        let rotated = self
-            .entry
-            .concat(&[r1, r2], last as i64, Shape::array(prim_ty, &rot_stop));
-
-        if dims[last] == rot as i64 {
-            rotated
-        } else {
-            let mut tail_start = vec![0i64; dims.len()];
-            tail_start[last] = rot as i64;
-            let tail = self.entry.slice(
-                dy,
-                &tail_start,
-                &dims,
-                &strides,
-                Shape::array(prim_ty, &{
-                    let mut t = dims.clone();
-                    t[last] = dims[last] - rot as i64;
-                    t
-                }),
-            );
-            self.entry.concat(&[rotated, tail], last as i64, out)
-        }
+        self.rope_rotate(
+            dy, &dims, cos, sin_neg, &cos_dims, head_dim, n_rot, style, prim_ty, out,
+        )
     }
 
     /// FakeQuantizeLSQ forward = Fixed-scale fake-quant.

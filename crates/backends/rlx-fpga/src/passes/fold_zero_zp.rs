@@ -19,6 +19,9 @@
 //! today) every layer qualifies. The optimizer always sets the hint
 //! when `tune.fold_zero_zp` is on; codegen drops the subtractors.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::conv_dense_zps;
 use crate::model::Layer;
 

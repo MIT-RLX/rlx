@@ -15,9 +15,9 @@
 // and is BIT-EXACT to an f32 matmul whose weights were bf16-rounded
 // (bf16→f32 is exact — it only zero-extends the mantissa).
 //
-// `b_off` / `b_batch_stride` are in bf16 ELEMENTS. The packed buffer is
-// indexed parallel to the f32 arena (bf16 element i ↔ f32 element i), so
-// these are the same numeric values the plain f32 kernel would use.
+// `b_off` / `b_batch_stride` are in bf16 ELEMENTS. A param's packed bytes
+// sit at its arena BYTE offset (its native 2 B/elem slot), so `b_off` is
+// that offset / 2 — not the f32-word index the plain kernel uses.
 //
 // A (activation) and C (output) stay f32 in the arena (binding 0).
 // Pure WGSL u32 ops — no `enable f16`, runs on any wgpu backend.
@@ -27,7 +27,7 @@ struct Params {
     k: u32,
     n: u32,
     a_off: u32,
-    b_off: u32,        // bf16-element offset (== global arena f32-word index)
+    b_off: u32,        // bf16-element offset (== the param's arena byte offset / 2)
     c_off: u32,
     batch: u32,
     a_batch_stride: u32,

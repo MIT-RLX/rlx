@@ -51,6 +51,15 @@ pub trait WeightSource {
         Ok(None)
     }
 
+    /// Whether [`Self::take_packed`] would hand out a packed weight for `key`,
+    /// without taking it. A block with a dense layout of its own (BERT's host-
+    /// fused QKV) asks this to pick its packed branch and leave the dense one
+    /// byte-for-byte as it was. Default: `false`.
+    fn has_packed(&self, key: &str) -> bool {
+        let _ = key;
+        false
+    }
+
     /// Optional packed (quantized) **expert bank** for the MoE weight `key`.
     ///
     /// The grouped sibling of [`Self::take_packed`]. When this returns `Some`,
@@ -75,6 +84,30 @@ pub trait WeightSource {
     fn keys(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// The float dtype `key` is stored in (F32 / F16 / BF16), when the source
+    /// knows. `take` always widens to f32; this is how
+    /// [`crate::WeightStorage::Auto`] learns it can keep a half tensor at
+    /// 2 B/elem without loss. Default `None` (treated as f32).
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        let _ = key;
+        None
+    }
+
+    /// The rank-2 tensor `key` as its raw half-precision bytes (little-endian,
+    /// in the dtype [`Self::stored_dtype`] reports), transposed when asked:
+    /// the values [`Self::take`] returns, without the f32 round trip. When the
+    /// flow keeps the tensor at that width ([`crate::WeightStorage`]) it queues
+    /// these bytes in `typed_params` rather than an f32 copy in `params`,
+    /// which halves the host transient and skips the widen-then-narrow.
+    ///
+    /// Opt-in, because whoever reads `typed_params` must then upload each
+    /// entry by its dtype rather than treat every entry as a quant blob
+    /// (`rlx_core::flow_util::compile_built` does). Default `None`.
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        let _ = (key, transpose);
+        Ok(None)
+    }
 }
 
 impl<T: WeightSource + ?Sized> WeightSource for &mut T {
@@ -91,11 +124,20 @@ impl<T: WeightSource + ?Sized> WeightSource for &mut T {
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
         (**self).take_packed(key)
     }
+    fn has_packed(&self, key: &str) -> bool {
+        (**self).has_packed(key)
+    }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         (**self).take_packed_bank(key)
     }
     fn keys(&self) -> Vec<String> {
         (**self).keys()
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        (**self).stored_dtype(key)
+    }
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        (**self).take_half(key, transpose)
     }
 }
 
@@ -109,11 +151,20 @@ impl<T: WeightSource + ?Sized> WeightSource for Box<T> {
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
         (**self).take_packed(key)
     }
+    fn has_packed(&self, key: &str) -> bool {
+        (**self).has_packed(key)
+    }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         (**self).take_packed_bank(key)
     }
     fn keys(&self) -> Vec<String> {
         (**self).keys()
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        (**self).stored_dtype(key)
+    }
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        (**self).take_half(key, transpose)
     }
 }
 
@@ -280,8 +331,18 @@ impl<S: WeightSource, F: Fn(&str) -> String> WeightSource for Renamed<S, F> {
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
         self.inner.take_packed(&(self.map)(key))
     }
+    fn has_packed(&self, key: &str) -> bool {
+        self.inner.has_packed(&(self.map)(key))
+    }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         self.inner.take_packed_bank(&(self.map)(key))
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        self.inner.stored_dtype(&(self.map)(key))
+    }
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        let k = (self.map)(key);
+        self.inner.take_half(&k, transpose)
     }
 }
 
@@ -326,11 +387,28 @@ impl<A: WeightSource, B: WeightSource> WeightSource for Fallback<A, B> {
             None => Ok(None),
         }
     }
+    fn has_packed(&self, key: &str) -> bool {
+        self.primary.has_packed(key) || (!self.primary.has(key) && self.fallback.has_packed(key))
+    }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         match self.primary.take_packed_bank(key)? {
             Some(p) => Ok(Some(p)),
             None if !self.primary.has(key) => self.fallback.take_packed_bank(key),
             None => Ok(None),
+        }
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        if self.primary.has(key) {
+            self.primary.stored_dtype(key)
+        } else {
+            self.fallback.stored_dtype(key)
+        }
+    }
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        if self.primary.has(key) {
+            self.primary.take_half(key, transpose)
+        } else {
+            self.fallback.take_half(key, transpose)
         }
     }
 }
@@ -359,9 +437,19 @@ impl<S: WeightSource> WeightSource for Prefixed<S> {
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
         self.inner.take_packed(&format!("{}{key}", self.prefix))
     }
+    fn has_packed(&self, key: &str) -> bool {
+        self.inner.has_packed(&format!("{}{key}", self.prefix))
+    }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         self.inner
             .take_packed_bank(&format!("{}{key}", self.prefix))
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        self.inner.stored_dtype(&format!("{}{key}", self.prefix))
+    }
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        let k = format!("{}{key}", self.prefix);
+        self.inner.take_half(&k, transpose)
     }
     fn keys(&self) -> Vec<String> {
         self.inner
@@ -403,12 +491,22 @@ impl<S: WeightSource> WeightSource for Aliased<S> {
         let k = self.resolve(key).to_string();
         self.inner.take_packed(&k)
     }
+    fn has_packed(&self, key: &str) -> bool {
+        self.inner.has_packed(self.resolve(key))
+    }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         let k = self.resolve(key).to_string();
         self.inner.take_packed_bank(&k)
     }
     fn keys(&self) -> Vec<String> {
         self.inner.keys()
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        self.inner.stored_dtype(self.resolve(key))
+    }
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        let k = self.resolve(key).to_string();
+        self.inner.take_half(&k, transpose)
     }
 }
 
@@ -446,6 +544,9 @@ where
             return Ok(None);
         }
         self.inner.take_packed(key)
+    }
+    fn has_packed(&self, key: &str) -> bool {
+        !(self.select)(key) && self.inner.has_packed(key)
     }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         if (self.select)(key) {
@@ -549,6 +650,9 @@ impl<S: WeightSource> WeightSource for Tracked<S> {
         }
         Ok(r)
     }
+    fn has_packed(&self, key: &str) -> bool {
+        self.inner.has_packed(key)
+    }
     fn take_packed_bank(&mut self, key: &str) -> Result<Option<GgufPackedBank>> {
         let r = self.inner.take_packed_bank(key)?;
         if r.is_some() {
@@ -558,6 +662,16 @@ impl<S: WeightSource> WeightSource for Tracked<S> {
     }
     fn keys(&self) -> Vec<String> {
         self.inner.keys()
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        self.inner.stored_dtype(key)
+    }
+    fn take_half(&mut self, key: &str, transpose: bool) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+        let r = self.inner.take_half(key, transpose)?;
+        if r.is_some() {
+            self.served.insert(key.to_string());
+        }
+        Ok(r)
     }
 }
 

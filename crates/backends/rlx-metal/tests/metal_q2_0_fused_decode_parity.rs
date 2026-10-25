@@ -195,11 +195,8 @@ fn q2_0_unfused_decode_mlp_matches_reference() {
         eprintln!("skip: Metal unavailable");
         return;
     }
-    // SAFETY: single-threaded test process; read once at first encode.
-    unsafe {
-        std::env::set_var("RLX_METAL_Q2_0_FUSED_DISABLE", "1");
-        std::env::set_var("RLX_METAL_Q2_DUAL_DISABLE", "1");
-    }
+    rlx_ir::env::set("RLX_METAL_Q2_0_FUSED_DISABLE", "1");
+    rlx_ir::env::set("RLX_METAL_Q2_DUAL_DISABLE", "1");
     check("fusions disabled");
 }
 
@@ -211,9 +208,6 @@ fn q2_0_scalar_inner_loop_matches_reference() {
         eprintln!("skip: Metal unavailable");
         return;
     }
-    // SAFETY: single-threaded test process; read once at first encode.
-    unsafe {
-        std::env::set_var("RLX_METAL_Q2_0_SCALAR", "1");
-    }
+    rlx_ir::env::set("RLX_METAL_Q2_0_SCALAR", "1");
     check("scalar inner loop");
 }

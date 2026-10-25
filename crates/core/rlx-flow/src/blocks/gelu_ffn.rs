@@ -109,9 +109,9 @@ impl GeluFfnStage {
 
 impl BlockStage for GeluFfnStage {
     fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
-        let int_w = ctx.load_param(&self.intermediate_w, true)?;
+        let int_w = ctx.load_matrix(&self.intermediate_w, true)?;
         let int_b = ctx.load_param(&self.intermediate_b, false)?;
-        let out_w = ctx.load_param(&self.output_w, true)?;
+        let out_w = ctx.load_matrix(&self.output_w, true)?;
         let out_b = ctx.load_param(&self.output_b, false)?;
 
         let mut gb = HirMut::new(ctx.hir());

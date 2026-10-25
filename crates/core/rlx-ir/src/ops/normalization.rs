@@ -4,6 +4,7 @@
 
 //! Normalization builders: LayerNorm, fused residual+LN (plan #53).
 
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {

@@ -1,0 +1,2996 @@
+rlxmodel 1
+opset 1
+
+graph @Input {
+  %0 = Input{name: "x"} : f32[4]
+  return %0
+}
+
+graph @Input_0 {
+  %0 = Input{name: "x"} : f32[4]
+  return %0
+}
+
+graph @Param {
+  %0 = Param{name: "x"} : f32[4]
+  return %0
+}
+
+graph @Param_0 {
+  %0 = Param{name: "x"} : f32[4]
+  return %0
+}
+
+graph @Constant {
+  %0 = Constant{data: []} : f32[4]
+  return %0
+}
+
+graph @Constant_0 {
+  %0 = Constant{data: []} : f32[4]
+  return %0
+}
+
+graph @Activation {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Activation(Gelu) %0 : f32[4]
+  return %1
+}
+
+graph @Activation_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Activation(Gelu) %0 : f32[4]
+  return %1
+}
+
+graph @Cast {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Cast{to: F32} %0 : f32[4]
+  return %1
+}
+
+graph @Cast_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Cast{to: F32} %0 : f32[4]
+  return %1
+}
+
+graph @StopGradient {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = StopGradient %0 : f32[4]
+  return %1
+}
+
+graph @StopGradient_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = StopGradient %0 : f32[4]
+  return %1
+}
+
+graph @Quantize {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Quantize{axis: none, scales: [], zero_points: []} %0 : f32[4]
+  return %1
+}
+
+graph @Quantize_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Quantize{axis: none, scales: [], zero_points: []} %0 : f32[4]
+  return %1
+}
+
+graph @Dequantize {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Dequantize{axis: none, scales: [], zero_points: []} %0 : f32[4]
+  return %1
+}
+
+graph @Dequantize_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Dequantize{axis: none, scales: [], zero_points: []} %0 : f32[4]
+  return %1
+}
+
+graph @FakeQuantize {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = FakeQuantize{bits: 1, axis: none, ste: Identity, scale_mode: PerBatch} %0 : f32[4]
+  return %1
+}
+
+graph @FakeQuantize_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = FakeQuantize{bits: 1, axis: none, ste: Identity, scale_mode: PerBatch} %0 : f32[4]
+  return %1
+}
+
+graph @FakeQuantize_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = FakeQuantize{bits: 1, axis: none, ste: Identity, scale_mode: Fixed} %0, %1 : f32[4]
+  return %2
+}
+
+graph @FakeQuantizeLSQ {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = FakeQuantizeLSQ{bits: 1, axis: none} %0, %1 : f32[4]
+  return %2
+}
+
+graph @FakeQuantizeLSQ_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = FakeQuantizeLSQ{bits: 1, axis: none} %0, %1 : f32[4]
+  return %2
+}
+
+graph @FakeQuantizeLSQBackwardX {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FakeQuantizeLSQBackwardX{bits: 1, axis: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FakeQuantizeLSQBackwardX_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FakeQuantizeLSQBackwardX{bits: 1, axis: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FakeQuantizeLSQBackwardScale {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FakeQuantizeLSQBackwardScale{bits: 1, axis: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FakeQuantizeLSQBackwardScale_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FakeQuantizeLSQBackwardScale{bits: 1, axis: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @RoundToFormat {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = RoundToFormat{format: {exp_bits: 5, man_bits: 10, bias: 15, max_normal: 65504.0}, scaling: None} %0 : f32[4]
+  return %1
+}
+
+graph @RoundToFormat_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = RoundToFormat{format: {exp_bits: 5, man_bits: 10, bias: 15, max_normal: 65504.0}, scaling: None} %0 : f32[4]
+  return %1
+}
+
+graph @RoundToFormat_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = RoundToFormat{format: {exp_bits: 5, man_bits: 10, bias: 15, max_normal: 65504.0}, scaling: Block(32)} %0 : f32[4]
+  return %1
+}
+
+graph @DoubleSingle {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = DoubleSingle(Add) %0, %1 : f32[4]
+  return %2
+}
+
+graph @DoubleSingle_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = DoubleSingle(Add) %0, %1 : f32[4]
+  return %2
+}
+
+graph @Binary {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Binary(Add) %0, %1 : f32[4]
+  return %2
+}
+
+graph @Binary_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Binary(Add) %0, %1 : f32[4]
+  return %2
+}
+
+graph @Compare {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Compare(Eq) %0, %1 : f32[4]
+  return %2
+}
+
+graph @Compare_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Compare(Eq) %0, %1 : f32[4]
+  return %2
+}
+
+graph @Where {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Where %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @Where_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Where %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @Fma {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Fma %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @Fma_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Fma %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ElementwiseRegion {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ElementwiseRegion{chain: [], num_inputs: 1, scalar_input_mask: 1, input_modulus: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], prologue: None, prologue_input: 1} %0 : f32[4]
+  return %1
+}
+
+graph @ElementwiseRegion_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ElementwiseRegion{chain: [], num_inputs: 1, scalar_input_mask: 1, input_modulus: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], prologue: None, prologue_input: 1} %0 : f32[4]
+  return %1
+}
+
+graph @TransformRegion {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = TransformRegion{steps: [], num_inputs: 1} %0 : f32[4]
+  return %1
+}
+
+graph @TransformRegion_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = TransformRegion{steps: [], num_inputs: 1} %0 : f32[4]
+  return %1
+}
+
+graph @BatchElementwiseRegion {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = BatchElementwiseRegion{chain: [], num_batch_inputs: 1, scalar_input_mask: 1, input_modulus: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], prologue: None, prologue_input: 1} %0 : f32[4]
+  return %1
+}
+
+graph @BatchElementwiseRegion_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = BatchElementwiseRegion{chain: [], num_batch_inputs: 1, scalar_input_mask: 1, input_modulus: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], prologue: None, prologue_input: 1} %0 : f32[4]
+  return %1
+}
+
+graph @MatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = MatMul %0, %1 : f32[4]
+  return %2
+}
+
+graph @MatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = MatMul %0, %1 : f32[4]
+  return %2
+}
+
+graph @DotGeneral {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = DotGeneral{lhs_contracting: [], rhs_contracting: [], lhs_batch: [], rhs_batch: []} %0, %1 : f32[4]
+  return %2
+}
+
+graph @DotGeneral_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = DotGeneral{lhs_contracting: [], rhs_contracting: [], lhs_batch: [], rhs_batch: []} %0, %1 : f32[4]
+  return %2
+}
+
+graph @DenseSolve {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = DenseSolve %0, %1 : f32[4]
+  return %2
+}
+
+graph @DenseSolve_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = DenseSolve %0, %1 : f32[4]
+  return %2
+}
+
+graph @BatchedDenseSolve {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = BatchedDenseSolve %0, %1 : f32[4]
+  return %2
+}
+
+graph @BatchedDenseSolve_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = BatchedDenseSolve %0, %1 : f32[4]
+  return %2
+}
+
+graph @Cholesky {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Cholesky %0 : f32[4]
+  return %1
+}
+
+graph @Cholesky_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Cholesky %0 : f32[4]
+  return %1
+}
+
+graph @TriangularSolve {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = TriangularSolve{lower: false, transpose: false} %0, %1 : f32[4]
+  return %2
+}
+
+graph @TriangularSolve_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = TriangularSolve{lower: false, transpose: false} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Det {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Det %0 : f32[4]
+  return %1
+}
+
+graph @Det_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Det %0 : f32[4]
+  return %1
+}
+
+graph @LogDet {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = LogDet %0 : f32[4]
+  return %1
+}
+
+graph @LogDet_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = LogDet %0 : f32[4]
+  return %1
+}
+
+graph @Sort {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Sort{axis: 1, descending: false} %0 : f32[4]
+  return %1
+}
+
+graph @Sort_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Sort{axis: 1, descending: false} %0 : f32[4]
+  return %1
+}
+
+graph @ArgSort {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ArgSort{axis: 1, descending: false} %0 : f32[4]
+  return %1
+}
+
+graph @ArgSort_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ArgSort{axis: 1, descending: false} %0 : f32[4]
+  return %1
+}
+
+graph @Svd {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Svd{part: U} %0 : f32[4]
+  return %1
+}
+
+graph @Svd_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Svd{part: U} %0 : f32[4]
+  return %1
+}
+
+graph @Qr {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Qr{part: Q} %0 : f32[4]
+  return %1
+}
+
+graph @Qr_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Qr{part: Q} %0 : f32[4]
+  return %1
+}
+
+graph @LayerNorm {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LayerNorm{axis: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LayerNorm_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LayerNorm{axis: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LayerNorm2d {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LayerNorm2d{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LayerNorm2d_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LayerNorm2d{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @GroupNorm {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = GroupNorm{num_groups: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @GroupNorm_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = GroupNorm{num_groups: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @BatchNormInference {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = BatchNormInference{eps: 1.0} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @BatchNormInference_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = BatchNormInference{eps: 1.0} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @RmsNorm {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = RmsNorm{axis: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @RmsNorm_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = RmsNorm{axis: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ResizeNearest2x {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ResizeNearest2x %0 : f32[4]
+  return %1
+}
+
+graph @ResizeNearest2x_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ResizeNearest2x %0 : f32[4]
+  return %1
+}
+
+graph @Interpolate3d {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Interpolate3d{size: []} %0 : f32[4]
+  return %1
+}
+
+graph @Interpolate3d_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Interpolate3d{size: []} %0 : f32[4]
+  return %1
+}
+
+graph @Attention {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Attention{num_heads: 1, head_dim: 1, v_head_dim: none, mask_kind: None, score_scale: none, attn_logit_softcap: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @Attention_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Attention{num_heads: 1, head_dim: 1, v_head_dim: none, mask_kind: None, score_scale: none, attn_logit_softcap: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @Attention_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Attention{num_heads: 1, head_dim: 1, v_head_dim: none, mask_kind: Custom, score_scale: none, attn_logit_softcap: none} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @Rope {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Rope{head_dim: 1, n_rot: 1, style: NeoX} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @Rope_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Rope{head_dim: 1, n_rot: 1, style: NeoX} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @AxialRope2d {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = AxialRope2d{end_x: 1, end_y: 1, head_dim: 1, num_heads: 1, theta: 1.0, repeat_factor: 1} %0 : f32[4]
+  return %1
+}
+
+graph @AxialRope2d_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = AxialRope2d{end_x: 1, end_y: 1, head_dim: 1, num_heads: 1, theta: 1.0, repeat_factor: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Reshape {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Reshape{new_shape: []} %0 : f32[4]
+  return %1
+}
+
+graph @Reshape_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Reshape{new_shape: []} %0 : f32[4]
+  return %1
+}
+
+graph @Transpose {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Transpose{perm: []} %0 : f32[4]
+  return %1
+}
+
+graph @Transpose_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Transpose{perm: []} %0 : f32[4]
+  return %1
+}
+
+graph @Narrow {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Narrow{axis: 1, start: 1, len: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Narrow_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Narrow{axis: 1, start: 1, len: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Concat {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Concat{axis: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Concat_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Concat{axis: 1} %0 : f32[4]
+  return %1
+}
+
+graph @KvAppend {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = KvAppend{axis: 1, pos: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @KvAppend_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = KvAppend{axis: 1, pos: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Expand {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Expand{target_shape: []} %0 : f32[4]
+  return %1
+}
+
+graph @Expand_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Expand{target_shape: []} %0 : f32[4]
+  return %1
+}
+
+graph @Gather {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Gather{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Gather_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Gather{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Reverse {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Reverse{axes: []} %0 : f32[4]
+  return %1
+}
+
+graph @Reverse_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Reverse{axes: []} %0 : f32[4]
+  return %1
+}
+
+graph @Pad {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Pad{pads: [], mode: Constant(0.0)} %0 : f32[4]
+  return %1
+}
+
+graph @Pad_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Pad{pads: [], mode: Constant(0.0)} %0 : f32[4]
+  return %1
+}
+
+graph @Slice {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Slice{axis: 1, start: 1, len: 1, step: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Slice_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Slice{axis: 1, start: 1, len: 1, step: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Roll {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Roll{shifts: [], dims: []} %0 : f32[4]
+  return %1
+}
+
+graph @Roll_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Roll{shifts: [], dims: []} %0 : f32[4]
+  return %1
+}
+
+graph @Clamp {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Clamp{min: 1.0, max: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @Clamp_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Clamp{min: 1.0, max: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @Tile {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Tile{reps: []} %0 : f32[4]
+  return %1
+}
+
+graph @Tile_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Tile{reps: []} %0 : f32[4]
+  return %1
+}
+
+graph @Trilu {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Trilu{upper: false, diagonal: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Trilu_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Trilu{upper: false, diagonal: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Reduce {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Reduce{op: Sum, axes: [], keep_dim: false} %0 : f32[4]
+  return %1
+}
+
+graph @Reduce_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Reduce{op: Sum, axes: [], keep_dim: false} %0 : f32[4]
+  return %1
+}
+
+graph @Histogram {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Histogram{bins: 1, min: 1.0, max: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @Histogram_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Histogram{bins: 1, min: 1.0, max: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @Softmax {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Softmax{axis: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Softmax_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Softmax{axis: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Cumsum {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Cumsum{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @Cumsum_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Cumsum{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @CumProd {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CumProd{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @CumProd_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CumProd{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @CumMax {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CumMax{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @CumMax_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CumMax{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @ArgMax {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ArgMax{axis: 1, keep_dim: false} %0 : f32[4]
+  return %1
+}
+
+graph @ArgMax_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ArgMax{axis: 1, keep_dim: false} %0 : f32[4]
+  return %1
+}
+
+graph @ArgMin {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ArgMin{axis: 1, keep_dim: false} %0 : f32[4]
+  return %1
+}
+
+graph @ArgMin_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ArgMin{axis: 1, keep_dim: false} %0 : f32[4]
+  return %1
+}
+
+graph @TopK {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = TopK{k: 1} %0 : f32[4]
+  return %1
+}
+
+graph @TopK_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = TopK{k: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Sample {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Sample{top_k: 1, top_p: 1.0, temperature: 1.0, seed: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Sample_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Sample{top_k: 1, top_p: 1.0, temperature: 1.0, seed: 1} %0 : f32[4]
+  return %1
+}
+
+graph @RngNormal {
+  %0 = RngNormal{mean: 1.0, scale: 1.0, key: 1, op_seed: none} : f32[4]
+  return %0
+}
+
+graph @RngNormal_0 {
+  %0 = RngNormal{mean: 1.0, scale: 1.0, key: 1, op_seed: none} : f32[4]
+  return %0
+}
+
+graph @RngUniform {
+  %0 = RngUniform{low: 1.0, high: 1.0, key: 1, op_seed: none} : f32[4]
+  return %0
+}
+
+graph @RngUniform_0 {
+  %0 = RngUniform{low: 1.0, high: 1.0, key: 1, op_seed: none} : f32[4]
+  return %0
+}
+
+graph @Conv {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Im2Col {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Im2Col{kernel_size: [], stride: [], padding: [], dilation: []} %0 : f32[4]
+  return %1
+}
+
+graph @Im2Col_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Im2Col{kernel_size: [], stride: [], padding: [], dilation: []} %0 : f32[4]
+  return %1
+}
+
+graph @ConvTranspose2d {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ConvTranspose2d{kernel_size: [], stride: [], padding: [], dilation: [], output_padding: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ConvTranspose2d_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ConvTranspose2d{kernel_size: [], stride: [], padding: [], dilation: [], output_padding: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv3d {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv3d{stride: [1, 1, 1], padding: [1, 1, 1], dilation: [1, 1, 1], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv3d_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv3d{stride: [1, 1, 1], padding: [1, 1, 1], dilation: [1, 1, 1], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ConvTranspose3d {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ConvTranspose3d{stride: [1, 1, 1], padding: [1, 1, 1], dilation: [1, 1, 1], output_padding: [1, 1, 1], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ConvTranspose3d_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ConvTranspose3d{stride: [1, 1, 1], padding: [1, 1, 1], dilation: [1, 1, 1], output_padding: [1, 1, 1], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Pool {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Pool{kind: Sum, kernel_size: [], stride: [], padding: []} %0 : f32[4]
+  return %1
+}
+
+graph @Pool_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Pool{kind: Sum, kernel_size: [], stride: [], padding: []} %0 : f32[4]
+  return %1
+}
+
+graph @ReluBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ReluBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @ReluBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ReluBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @ActivationBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ActivationBackward{kind: Gelu} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ActivationBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ActivationBackward{kind: Gelu} %0, %1 : f32[4]
+  return %2
+}
+
+graph @FakeQuantizeBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = FakeQuantizeBackward{bits: 1, axis: none, ste: Identity} %0, %1 : f32[4]
+  return %2
+}
+
+graph @FakeQuantizeBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = FakeQuantizeBackward{bits: 1, axis: none, ste: Identity} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ComplexNormSq {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ComplexNormSq %0 : f32[4]
+  return %1
+}
+
+graph @ComplexNormSq_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ComplexNormSq %0 : f32[4]
+  return %1
+}
+
+graph @ComplexNormSqBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ComplexNormSqBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @ComplexNormSqBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ComplexNormSqBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conjugate {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Conjugate %0 : f32[4]
+  return %1
+}
+
+graph @Conjugate_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Conjugate %0 : f32[4]
+  return %1
+}
+
+graph @MaxPool2dBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = MaxPool2dBackward{kernel_size: [], stride: [], padding: []} %0, %1 : f32[4]
+  return %2
+}
+
+graph @MaxPool2dBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = MaxPool2dBackward{kernel_size: [], stride: [], padding: []} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv2dBackwardInput {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv2dBackwardInput{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv2dBackwardInput_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv2dBackwardInput{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv2dBackwardWeight {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv2dBackwardWeight{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv2dBackwardWeight_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv2dBackwardWeight{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @MaxPool3dBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = MaxPool3dBackward{kernel_size: [], stride: [], padding: []} %0, %1 : f32[4]
+  return %2
+}
+
+graph @MaxPool3dBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = MaxPool3dBackward{kernel_size: [], stride: [], padding: []} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv3dBackwardInput {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv3dBackwardInput{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv3dBackwardInput_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv3dBackwardInput{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv3dBackwardWeight {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv3dBackwardWeight{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Conv3dBackwardWeight_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Conv3dBackwardWeight{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SoftmaxCrossEntropy {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SoftmaxCrossEntropy %0, %1 : f32[4]
+  return %2
+}
+
+graph @SoftmaxCrossEntropy_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SoftmaxCrossEntropy %0, %1 : f32[4]
+  return %2
+}
+
+graph @SoftmaxCrossEntropyWithLogits {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SoftmaxCrossEntropyWithLogits %0, %1 : f32[4]
+  return %2
+}
+
+graph @SoftmaxCrossEntropyWithLogits_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SoftmaxCrossEntropyWithLogits %0, %1 : f32[4]
+  return %2
+}
+
+graph @SoftmaxCrossEntropyBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SoftmaxCrossEntropyBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SoftmaxCrossEntropyBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SoftmaxCrossEntropyBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @AttentionBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = AttentionBackward{num_heads: 1, head_dim: 1, mask_kind: None, wrt: Query} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @AttentionBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = AttentionBackward{num_heads: 1, head_dim: 1, mask_kind: None, wrt: Query} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @AttentionBackward_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = AttentionBackward{num_heads: 1, head_dim: 1, mask_kind: Custom, wrt: Query} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @AttentionBackwardAll {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = AttentionBackwardAll{num_heads: 1, head_dim: 1, mask_kind: None} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @AttentionBackwardAll_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = AttentionBackwardAll{num_heads: 1, head_dim: 1, mask_kind: None} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @AttentionBackwardAll_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = AttentionBackwardAll{num_heads: 1, head_dim: 1, mask_kind: Custom} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @LayerNormBackwardInput {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LayerNormBackwardInput{axis: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LayerNormBackwardInput_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LayerNormBackwardInput{axis: 1, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LayerNormBackwardGamma {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = LayerNormBackwardGamma{axis: 1, eps: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @LayerNormBackwardGamma_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = LayerNormBackwardGamma{axis: 1, eps: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @RmsNormBackwardInput {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = RmsNormBackwardInput{axis: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @RmsNormBackwardInput_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = RmsNormBackwardInput{axis: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @RmsNormBackwardGamma {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = RmsNormBackwardGamma{axis: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @RmsNormBackwardGamma_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = RmsNormBackwardGamma{axis: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @RmsNormBackwardBeta {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = RmsNormBackwardBeta{axis: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @RmsNormBackwardBeta_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = RmsNormBackwardBeta{axis: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @RopeBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = RopeBackward{head_dim: 1, n_rot: 1, style: NeoX} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @RopeBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = RopeBackward{head_dim: 1, n_rot: 1, style: NeoX} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @GroupNormBackwardInput {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = GroupNormBackwardInput{num_groups: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @GroupNormBackwardInput_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = GroupNormBackwardInput{num_groups: 1, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @GroupNormBackwardGamma {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GroupNormBackwardGamma{num_groups: 1, eps: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GroupNormBackwardGamma_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GroupNormBackwardGamma{num_groups: 1, eps: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GroupNormBackwardBeta {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GroupNormBackwardBeta{num_groups: 1, eps: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GroupNormBackwardBeta_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GroupNormBackwardBeta{num_groups: 1, eps: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @BatchNormInferenceBackwardInput {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = BatchNormInferenceBackwardInput{eps: 1.0} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @BatchNormInferenceBackwardInput_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = BatchNormInferenceBackwardInput{eps: 1.0} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @BatchNormInferenceBackwardGamma {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = BatchNormInferenceBackwardGamma{eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @BatchNormInferenceBackwardGamma_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = BatchNormInferenceBackwardGamma{eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @BatchNormInferenceBackwardBeta {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = BatchNormInferenceBackwardBeta %0 : f32[4]
+  return %1
+}
+
+graph @BatchNormInferenceBackwardBeta_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = BatchNormInferenceBackwardBeta %0 : f32[4]
+  return %1
+}
+
+graph @CumsumBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CumsumBackward{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @CumsumBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CumsumBackward{axis: 1, exclusive: false} %0 : f32[4]
+  return %1
+}
+
+graph @GatherBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GatherBackward{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GatherBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GatherBackward{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GroupedMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = GroupedMatMul %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @GroupedMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = GroupedMatMul %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @DequantGroupedMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = DequantGroupedMatMul{scheme: Int8Block{block_size: 32}} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @DequantGroupedMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = DequantGroupedMatMul{scheme: Int8Block{block_size: 32}} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @DequantGroupedMatMulMlx {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = DequantGroupedMatMulMlx{scheme: Int8Block{block_size: 32}} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @DequantGroupedMatMulMlx_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = DequantGroupedMatMulMlx{scheme: Int8Block{block_size: 32}} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @DequantMoEWeights {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = DequantMoEWeights{scheme: Int8Block{block_size: 32}} %0 : f32[4]
+  return %1
+}
+
+graph @DequantMoEWeights_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = DequantMoEWeights{scheme: Int8Block{block_size: 32}} %0 : f32[4]
+  return %1
+}
+
+graph @ScaledGroupedMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = ScaledGroupedMatMul{lhs_format: F8E4M3, rhs_format: F8E4M3, scale_layout: PerTensor, has_bias: false} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @ScaledGroupedMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = ScaledGroupedMatMul{lhs_format: F8E4M3, rhs_format: F8E4M3, scale_layout: PerTensor, has_bias: false} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @ScaledGroupedMatMul_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = ScaledGroupedMatMul{lhs_format: F8E4M3, rhs_format: F8E4M3, scale_layout: PerTensor, has_bias: true} %0, %1, %2, %3, %4, %5 : f32[4]
+  return %6
+}
+
+graph @ScatterAdd {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ScatterAdd{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ScatterAdd_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ScatterAdd{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ScatterNd {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = ScatterNd{reduction: None} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ScatterNd_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = ScatterNd{reduction: None} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ScatterElements {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = ScatterElements{axis: 1, reduction: None} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ScatterElements_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = ScatterElements{axis: 1, reduction: None} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @GatherNd {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GatherNd{batch_dims: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GatherNd_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GatherNd{batch_dims: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GatherElements {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GatherElements{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GatherElements_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GatherElements{axis: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @LoraMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = LoraMatMul{scale: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @LoraMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = LoraMatMul{scale: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @PartitionedConv {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = PartitionedConv{block: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @PartitionedConv_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = PartitionedConv{block: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @DequantMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = DequantMatMul{scheme: Int8Block{block_size: 32}} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @DequantMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = DequantMatMul{scheme: Int8Block{block_size: 32}} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @DequantMatMul_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = DequantMatMul{scheme: GgufQ4K} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SynthMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SynthMatMul{kind: Codebook{entry_dim: 2, num_entries: 2}} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SynthMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SynthMatMul{kind: Codebook{entry_dim: 2, num_entries: 2}} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SynthMatMulBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = SynthMatMulBackward{kind: Codebook{entry_dim: 2, num_entries: 2}, wrt: Dx} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @SynthMatMulBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = SynthMatMulBackward{kind: Codebook{entry_dim: 2, num_entries: 2}, wrt: Dx} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @SynthReconstruct {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SynthReconstruct{kind: Codebook{entry_dim: 2, num_entries: 2}} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SynthReconstruct_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SynthReconstruct{kind: Codebook{entry_dim: 2, num_entries: 2}} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SplineActivation {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SplineActivation{num_basis: 1, grid_min: 1.0, grid_max: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SplineActivation_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SplineActivation{num_basis: 1, grid_min: 1.0, grid_max: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SplineActivationBackwardX {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SplineActivationBackwardX{num_basis: 1, grid_min: 1.0, grid_max: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SplineActivationBackwardX_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SplineActivationBackwardX{num_basis: 1, grid_min: 1.0, grid_max: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SplineActivationBackwardCoeff {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SplineActivationBackwardCoeff{num_basis: 1, grid_min: 1.0, grid_max: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SplineActivationBackwardCoeff_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SplineActivationBackwardCoeff{num_basis: 1, grid_min: 1.0, grid_max: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @QMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = QMatMul{x_zp: 1, w_zp: 1, out_zp: 1, mult: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @QMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = QMatMul{x_zp: 1, w_zp: 1, out_zp: 1, mult: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @QConv2d {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = QConv2d{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1, x_zp: 1, w_zp: 1, out_zp: 1, mult: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @QConv2d_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = QConv2d{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1, x_zp: 1, w_zp: 1, out_zp: 1, mult: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ScaledMatMul {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = ScaledMatMul{lhs_format: F8E4M3, rhs_format: F8E4M3, scale_layout: PerTensor, has_bias: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @ScaledMatMul_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = ScaledMatMul{lhs_format: F8E4M3, rhs_format: F8E4M3, scale_layout: PerTensor, has_bias: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @ScaledMatMul_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = ScaledMatMul{lhs_format: F8E4M3, rhs_format: F8E4M3, scale_layout: PerTensor, has_bias: true} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @ScaledQuantize {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ScaledQuantize{format: F8E4M3, scale_layout: PerTensor} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ScaledQuantize_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ScaledQuantize{format: F8E4M3, scale_layout: PerTensor} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ScaledQuantScale {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ScaledQuantScale{format: F8E4M3, scale_layout: PerTensor} %0 : f32[4]
+  return %1
+}
+
+graph @ScaledQuantScale_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ScaledQuantScale{format: F8E4M3, scale_layout: PerTensor} %0 : f32[4]
+  return %1
+}
+
+graph @ScaledDequantize {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ScaledDequantize{format: F8E4M3, scale_layout: PerTensor} %0, %1 : f32[4]
+  return %2
+}
+
+graph @ScaledDequantize_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = ScaledDequantize{format: F8E4M3, scale_layout: PerTensor} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SelectiveScan {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = SelectiveScan{state_size: 1} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @SelectiveScan_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = SelectiveScan{state_size: 1} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @GatedDeltaNet {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = GatedDeltaNet{state_size: 1, carry_state: false, gate_per_channel: false} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @GatedDeltaNet_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = GatedDeltaNet{state_size: 1, carry_state: false, gate_per_channel: false} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @GatedDeltaNet_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = GatedDeltaNet{state_size: 1, carry_state: true, gate_per_channel: false} %0, %1, %2, %3, %4, %5 : f32[4]
+  return %6
+}
+
+graph @GatedDeltaNetBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = GatedDeltaNetBackward{state_size: 1, carry_state: false, gate_per_channel: false} %0, %1, %2, %3, %4, %5 : f32[4]
+  return %6
+}
+
+graph @GatedDeltaNetBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = GatedDeltaNetBackward{state_size: 1, carry_state: false, gate_per_channel: false} %0, %1, %2, %3, %4, %5 : f32[4]
+  return %6
+}
+
+graph @GatedDeltaNetBackward_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = GatedDeltaNetBackward{state_size: 1, carry_state: true, gate_per_channel: false} %0, %1, %2, %3, %4, %5, %6 : f32[4]
+  return %7
+}
+
+graph @Lstm {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Lstm{hidden_size: 1, num_layers: 1, bidirectional: false, carry: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @Lstm_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Lstm{hidden_size: 1, num_layers: 1, bidirectional: false, carry: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @Lstm_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Lstm{hidden_size: 1, num_layers: 1, bidirectional: false, carry: true} %0, %1, %2, %3, %4, %5 : f32[4]
+  return %6
+}
+
+graph @Gru {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Gru{hidden_size: 1, num_layers: 1, bidirectional: false, carry: false} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @Gru_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Gru{hidden_size: 1, num_layers: 1, bidirectional: false, carry: false} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @Gru_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Gru{hidden_size: 1, num_layers: 1, bidirectional: false, carry: true} %0, %1, %2, %3, %4, %5 : f32[4]
+  return %6
+}
+
+graph @Rnn {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Rnn{hidden_size: 1, num_layers: 1, bidirectional: false, carry: false, relu: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @Rnn_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Rnn{hidden_size: 1, num_layers: 1, bidirectional: false, carry: false, relu: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @Rnn_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Rnn{hidden_size: 1, num_layers: 1, bidirectional: false, carry: true, relu: false} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @Mamba2 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Mamba2{head_dim: 1, state_size: 1} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @Mamba2_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Mamba2{head_dim: 1, state_size: 1} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @FusedSwiGLU {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = FusedSwiGLU{cast_to: none, gate_first: false} %0 : f32[4]
+  return %1
+}
+
+graph @FusedSwiGLU_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = FusedSwiGLU{cast_to: none, gate_first: false} %0 : f32[4]
+  return %1
+}
+
+graph @FusedMatMulBiasAct {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FusedMatMulBiasAct{activation: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FusedMatMulBiasAct_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FusedMatMulBiasAct{activation: none} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FusedMatMulResidual {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FusedMatMulResidual %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FusedMatMulResidual_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FusedMatMulResidual %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FusedConvBiasAct {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FusedConvBiasAct{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1, activation: none, has_residual: false} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FusedConvBiasAct_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = FusedConvBiasAct{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1, activation: none, has_residual: false} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @FusedConvBiasAct_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = FusedConvBiasAct{kernel_size: [], stride: [], padding: [], dilation: [], groups: 1, activation: none, has_residual: true} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @FusedResidualLN {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = FusedResidualLN{has_bias: false, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @FusedResidualLN_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = FusedResidualLN{has_bias: false, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @FusedResidualLN_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = FusedResidualLN{has_bias: true, eps: 1.0} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @FusedResidualRmsNorm {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = FusedResidualRmsNorm{has_bias: false, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @FusedResidualRmsNorm_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = FusedResidualRmsNorm{has_bias: false, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @FusedResidualRmsNorm_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = FusedResidualRmsNorm{has_bias: true, eps: 1.0} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @FusedAttentionBlock {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = FusedAttentionBlock{num_heads: 1, head_dim: 1, has_bias: false, has_rope: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @FusedAttentionBlock_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = FusedAttentionBlock{num_heads: 1, head_dim: 1, has_bias: false, has_rope: false} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @FusedAttentionBlock_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = Input{name: "x7"} : f32[4] name "x7"
+  %8 = FusedAttentionBlock{num_heads: 1, head_dim: 1, has_bias: true, has_rope: true} %0, %1, %2, %3, %4, %5, %6, %7 : f32[4]
+  return %8
+}
+
+graph @FusedTransformerLayer {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = Input{name: "x7"} : f32[4] name "x7"
+  %8 = FusedTransformerLayer{num_heads: 1, head_dim: 1, intermediate_size: 1, eps1: 1.0, eps2: 1.0, activation: Gelu, has_bias: false} %0, %1, %2, %3, %4, %5, %6, %7 : f32[4]
+  return %8
+}
+
+graph @FusedTransformerLayer_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = Input{name: "x7"} : f32[4] name "x7"
+  %8 = FusedTransformerLayer{num_heads: 1, head_dim: 1, intermediate_size: 1, eps1: 1.0, eps2: 1.0, activation: Gelu, has_bias: false} %0, %1, %2, %3, %4, %5, %6, %7 : f32[4]
+  return %8
+}
+
+graph @FusedTransformerLayer_1 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = Input{name: "x7"} : f32[4] name "x7"
+  %8 = Input{name: "x8"} : f32[4] name "x8"
+  %9 = Input{name: "x9"} : f32[4] name "x9"
+  %10 = Input{name: "x10"} : f32[4] name "x10"
+  %11 = Input{name: "x11"} : f32[4] name "x11"
+  %12 = Input{name: "x12"} : f32[4] name "x12"
+  %13 = Input{name: "x13"} : f32[4] name "x13"
+  %14 = FusedTransformerLayer{num_heads: 1, head_dim: 1, intermediate_size: 1, eps1: 1.0, eps2: 1.0, activation: Gelu, has_bias: true} %0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13 : f32[4]
+  return %14
+}
+
+graph @If {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = If{then_branch: graph @b {
+    return
+  }, else_branch: graph @b {
+    return
+  }} %0 : f32[4]
+  return %1
+}
+
+graph @If_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = If{then_branch: graph @b {
+    return
+  }, else_branch: graph @b {
+    return
+  }} %0 : f32[4]
+  return %1
+}
+
+graph @While {
+  %0 = While{cond: graph @b {
+    return
+  }, body: graph @b {
+    return
+  }, max_iterations: none} : f32[4]
+  return %0
+}
+
+graph @While_0 {
+  %0 = While{cond: graph @b {
+    return
+  }, body: graph @b {
+    return
+  }, max_iterations: none} : f32[4]
+  return %0
+}
+
+graph @Scan {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Scan{body: graph @b {
+    return
+  }, length: 1, save_trajectory: false, num_bcast: 1, num_xs: 1, num_checkpoints: 1} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @Scan_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Scan{body: graph @b {
+    return
+  }, length: 1, save_trajectory: false, num_bcast: 1, num_xs: 1, num_checkpoints: 1} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ScanBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = ScanBackward{body_vjp: graph @b {
+    return
+  }, length: 1, save_trajectory: false, num_xs: 1, num_checkpoints: 1, forward_body: none} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @ScanBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = ScanBackward{body_vjp: graph @b {
+    return
+  }, length: 1, save_trajectory: false, num_xs: 1, num_checkpoints: 1, forward_body: none} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @ScanBackwardXs {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = ScanBackwardXs{body_vjp: graph @b {
+    return
+  }, length: 1, save_trajectory: false, num_xs: 1, xs_idx: 1, num_checkpoints: 1, forward_body: none} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @ScanBackwardXs_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = ScanBackwardXs{body_vjp: graph @b {
+    return
+  }, length: 1, save_trajectory: false, num_xs: 1, xs_idx: 1, num_checkpoints: 1, forward_body: none} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @GaussianSplatRender {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = GaussianSplatRender{width: 1, height: 1, tile_size: 1, radius_scale: 1.0, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1} %0, %1, %2, %3, %4, %5, %6 : f32[4]
+  return %7
+}
+
+graph @GaussianSplatRender_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = GaussianSplatRender{width: 1, height: 1, tile_size: 1, radius_scale: 1.0, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1} %0, %1, %2, %3, %4, %5, %6 : f32[4]
+  return %7
+}
+
+graph @GaussianSplatRenderBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = Input{name: "x7"} : f32[4] name "x7"
+  %8 = GaussianSplatRenderBackward{width: 1, height: 1, tile_size: 1, radius_scale: 1.0, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1, loss_grad_clip: 1.0, sh_band: 1, max_anisotropy: 1.0} %0, %1, %2, %3, %4, %5, %6, %7 : f32[4]
+  return %8
+}
+
+graph @GaussianSplatRenderBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = Input{name: "x7"} : f32[4] name "x7"
+  %8 = GaussianSplatRenderBackward{width: 1, height: 1, tile_size: 1, radius_scale: 1.0, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1, loss_grad_clip: 1.0, sh_band: 1, max_anisotropy: 1.0} %0, %1, %2, %3, %4, %5, %6, %7 : f32[4]
+  return %8
+}
+
+graph @GaussianSplatPrepare {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = GaussianSplatPrepare{width: 1, height: 1, tile_size: 1, radius_scale: 1.0, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1} %0, %1, %2, %3, %4, %5, %6 : f32[4]
+  return %7
+}
+
+graph @GaussianSplatPrepare_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = Input{name: "x5"} : f32[4] name "x5"
+  %6 = Input{name: "x6"} : f32[4] name "x6"
+  %7 = GaussianSplatPrepare{width: 1, height: 1, tile_size: 1, radius_scale: 1.0, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1} %0, %1, %2, %3, %4, %5, %6 : f32[4]
+  return %7
+}
+
+graph @GaussianSplatRasterize {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GaussianSplatRasterize{width: 1, height: 1, tile_size: 1, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @GaussianSplatRasterize_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = GaussianSplatRasterize{width: 1, height: 1, tile_size: 1, alpha_cutoff: 1.0, max_splat_steps: 1, transmittance_threshold: 1.0, max_list_entries: 1} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Custom {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Custom{name: "x", num_inputs: 1, attrs: []} %0 : f32[4]
+  return %1
+}
+
+graph @Custom_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Custom{name: "x", num_inputs: 1, attrs: []} %0 : f32[4]
+  return %1
+}
+
+graph @CustomFn {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CustomFn{fwd_body: graph @b {
+    return
+  }, vjp_body: none, jvp_body: none, num_inputs: 1} %0 : f32[4]
+  return %1
+}
+
+graph @CustomFn_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = CustomFn{fwd_body: graph @b {
+    return
+  }, vjp_body: none, jvp_body: none, num_inputs: 1} %0 : f32[4]
+  return %1
+}
+
+graph @Fft {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Fft{inverse: false, norm: Backward} %0 : f32[4]
+  return %1
+}
+
+graph @Fft_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Fft{inverse: false, norm: Backward} %0 : f32[4]
+  return %1
+}
+
+graph @FftQ {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = FftQ{inverse: false, norm: Backward, scale: None} %0 : f32[4]
+  return %1
+}
+
+graph @FftQ_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = FftQ{inverse: false, norm: Backward, scale: None} %0 : f32[4]
+  return %1
+}
+
+graph @FftButterflyStage {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = FftButterflyStage{stage: 1, n_fft: 1} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @FftButterflyStage_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = Input{name: "x4"} : f32[4] name "x4"
+  %5 = FftButterflyStage{stage: 1, n_fft: 1} %0, %1, %2, %3, %4 : f32[4]
+  return %5
+}
+
+graph @LogMel {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = LogMel %0, %1 : f32[4]
+  return %2
+}
+
+graph @LogMel_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = LogMel %0, %1 : f32[4]
+  return %2
+}
+
+graph @LogMelBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LogMelBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LogMelBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LogMelBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @WelchPeaks {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = WelchPeaks{k: 1, n_segments: 1} %0 : f32[4]
+  return %1
+}
+
+graph @WelchPeaks_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = WelchPeaks{k: 1, n_segments: 1} %0 : f32[4]
+  return %1
+}
+
+graph @BiMap {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = BiMap %0, %1 : f32[4]
+  return %2
+}
+
+graph @BiMap_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = BiMap %0, %1 : f32[4]
+  return %2
+}
+
+graph @ReEig {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ReEig{eps: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @ReEig_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = ReEig{eps: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @LogEig {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = LogEig{eps: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @LogEig_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = LogEig{eps: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @SpdBatchNorm {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdBatchNorm{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdBatchNorm_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdBatchNorm{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdKarcherMean {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = SpdKarcherMean{iters: 1, tol: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @SpdKarcherMean_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = SpdKarcherMean{iters: 1, tol: 1.0} %0 : f32[4]
+  return %1
+}
+
+graph @ReEigBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = ReEigBackward{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @ReEigBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = ReEigBackward{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LogEigBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LogEigBackward{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @LogEigBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = LogEigBackward{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdBatchNormBackwardX {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdBatchNormBackwardX{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdBatchNormBackwardX_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdBatchNormBackwardX{eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdBatchNormBackwardG {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = SpdBatchNormBackwardG{eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @SpdBatchNormBackwardG_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = SpdBatchNormBackwardG{eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @SpdKarcherMeanWeighted {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdKarcherMeanWeighted{iters: 1, tol: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SpdKarcherMeanWeighted_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdKarcherMeanWeighted{iters: 1, tol: 1.0} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SpdLogMap {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdLogMap %0, %1 : f32[4]
+  return %2
+}
+
+graph @SpdLogMap_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdLogMap %0, %1 : f32[4]
+  return %2
+}
+
+graph @SpdExpMap {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdExpMap %0, %1 : f32[4]
+  return %2
+}
+
+graph @SpdExpMap_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdExpMap %0, %1 : f32[4]
+  return %2
+}
+
+graph @SpdParallelTransport {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdParallelTransport %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdParallelTransport_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdParallelTransport %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdMatrixFnBatch {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = SpdMatrixFnBatch{kind: Logm} %0 : f32[4]
+  return %1
+}
+
+graph @SpdMatrixFnBatch_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = SpdMatrixFnBatch{kind: Logm} %0 : f32[4]
+  return %1
+}
+
+graph @SpdLogMapBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdLogMapBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdLogMapBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdLogMapBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdExpMapBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdExpMapBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdExpMapBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = SpdExpMapBackward %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @SpdParallelTransportBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = SpdParallelTransportBackward %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @SpdParallelTransportBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = SpdParallelTransportBackward %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @SpdMatrixFnBatchBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdMatrixFnBatchBackward{kind: Logm} %0, %1 : f32[4]
+  return %2
+}
+
+graph @SpdMatrixFnBatchBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = SpdMatrixFnBatchBackward{kind: Logm} %0, %1 : f32[4]
+  return %2
+}
+
+graph @Eigh {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Eigh %0 : f32[4]
+  return %1
+}
+
+graph @Eigh_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Eigh %0 : f32[4]
+  return %1
+}
+
+graph @EighBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = EighBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @EighBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = EighBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @EighBatch {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = EighBatch %0 : f32[4]
+  return %1
+}
+
+graph @EighBatch_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = EighBatch %0 : f32[4]
+  return %1
+}
+
+graph @EighBatchBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = EighBatchBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @EighBatchBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = EighBatchBackward %0, %1 : f32[4]
+  return %2
+}
+
+graph @AdaLayerNorm {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = AdaLayerNorm{norm: LayerNorm, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @AdaLayerNorm_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = AdaLayerNorm{norm: LayerNorm, eps: 1.0} %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @AdaLayerNormBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = AdaLayerNormBackward{norm: LayerNorm, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @AdaLayerNormBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = AdaLayerNormBackward{norm: LayerNorm, eps: 1.0} %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @GatedResidual {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = GatedResidual %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @GatedResidual_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = GatedResidual %0, %1, %2 : f32[4]
+  return %3
+}
+
+graph @GatedResidualBackward {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = GatedResidualBackward %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @GatedResidualBackward_0 {
+  %0 = Input{name: "x0"} : f32[4] name "x0"
+  %1 = Input{name: "x1"} : f32[4] name "x1"
+  %2 = Input{name: "x2"} : f32[4] name "x2"
+  %3 = Input{name: "x3"} : f32[4] name "x3"
+  %4 = GatedResidualBackward %0, %1, %2, %3 : f32[4]
+  return %4
+}
+
+graph @DynamicUpdateSlice {
+  %x0 = input : f32[4]
+  %x1 = input : f32[4]
+  %x2 = input : f32[4]
+  %3 = DynamicUpdateSlice{axis: 1} %x0, %x1, %x2 : f32[4]
+  return %3
+}
+
+graph @DynamicUpdateSlice_0 {
+  %x0 = input : f32[4]
+  %x1 = input : f32[4]
+  %x2 = input : f32[4]
+  %3 = DynamicUpdateSlice{axis: 1} %x0, %x1, %x2 : f32[4]
+  return %3
+}

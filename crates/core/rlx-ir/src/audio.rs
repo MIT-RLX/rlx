@@ -4,6 +4,7 @@
 
 //! Audio frontend helpers for `Op::LogMel` / `Op::LogMelBackward`.
 
+use crate::prelude::*;
 use crate::{DType, Shape, shape::Dim};
 
 /// Geometry for `Op::LogMel` from input spectrum + filter shapes.
@@ -210,7 +211,7 @@ fn log_mel_vjp_frame(
         }
     }
 
-    let ln10 = std::f32::consts::LN_10;
+    let ln10 = core::f32::consts::LN_10;
     for m in 0..n_mels {
         if mel_energy[m] <= 1e-10 {
             continue;
@@ -405,7 +406,7 @@ fn accumulate_block_power_row(row: &mut [f32], block: &[f32], n_fft: usize, scal
 }
 
 fn topk_peaks_one(psd: &[f32], k: usize) -> Vec<(usize, f32)> {
-    use std::cmp::Ordering;
+    use core::cmp::Ordering;
     let n_bins = psd.len();
     let k = k.min(n_bins).max(1);
     let mut top: Vec<(usize, f32)> = Vec::with_capacity(k);

@@ -197,7 +197,7 @@ impl DextConfigBuilder {
         let file = read_config_file(path);
         let pick = |explicit: Option<String>, env: &str, key: &str| -> Option<String> {
             explicit
-                .or_else(|| std::env::var(env).ok())
+                .or_else(|| rlx_ir::env::read(env).ok())
                 .or_else(|| file.get(key).cloned())
         };
         let defaults = DextConfig::default();

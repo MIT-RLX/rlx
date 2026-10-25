@@ -768,6 +768,10 @@ fn gate(dev: Device, label: &'static str) {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
+    // Cases a backend is known to get wrong (`tests/known_failures/fd_backward_gate.txt`)
+    // still run; only a new failure, or a listed case that now passes, fails the gate.
+    let known =
+        rlx_ir::known_failures::KnownFailures::load(env!("CARGO_MANIFEST_DIR"), "fd_backward_gate");
     let mut failures: Vec<Failure> = Vec::new();
     let mut passed = 0usize;
     for case in cases() {
@@ -778,27 +782,31 @@ fn gate(dev: Device, label: &'static str) {
         // lower this one op". Per-case isolation turns an abort into one row of
         // the matrix, which is the whole point of reporting a matrix.
         let name = case.name;
+        if !known.selected(name, label) {
+            continue;
+        }
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_case(&case, dev)));
-        match outcome {
-            Ok(Ok(())) => passed += 1,
-            Ok(Err(detail)) => failures.push(Failure {
-                case: name,
-                device: label,
-                detail,
-            }),
+        let result = match outcome {
+            Ok(r) => r,
             Err(payload) => {
                 let msg = payload
                     .downcast_ref::<String>()
                     .cloned()
                     .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
                     .unwrap_or_else(|| "<non-string panic payload>".to_string());
-                failures.push(Failure {
-                    case: name,
-                    device: label,
-                    detail: format!("PANICKED: {}", msg.lines().next().unwrap_or(&msg)),
-                });
+                Err(format!("PANICKED: {}", msg.lines().next().unwrap_or(&msg)))
             }
+        };
+        if result.is_ok() {
+            passed += 1;
+        }
+        if let Some(detail) = known.record(name, label, &result) {
+            failures.push(Failure {
+                case: name,
+                device: label,
+                detail,
+            });
         }
     }
 

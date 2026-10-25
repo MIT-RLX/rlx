@@ -1,0 +1,18 @@
+[package]
+name = "rlx-program"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "RLX programs — the host logic a package runs as WebAssembly (tokenize, phonemize, search, decode loops) around its graphs: the guest SDK and the message format both sides share."
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+repository.workspace   = true
+documentation.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

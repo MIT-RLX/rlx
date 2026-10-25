@@ -1,0 +1,70 @@
+[package]
+name = "rlx-bind"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Language-neutral binding core for rlx — the one op table every language binding (JS, Python, C, Swift, …) is generated from"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+# Moves with rlx-js / pyrlx, which are not on crates.io either.
+publish = false
+
+[features]
+default = []
+# GGUF weight-scheme names (`"Q4_K"`, `"IQ2_XXS"`, …) in `quant_scheme`, read
+# from rlx-gguf's own table rather than a second copy here.
+gguf = ["dep:rlx-gguf", "rlx-gguf/ir"]
+# Sessions, compiled graphs, autodiff, check, devices — the runtime surface.
+# Backend features are not forwarded: a binding enables `rlx-runtime/<backend>`
+# itself and feature unification reaches this crate's copy.
+runtime = ["dep:rlx-runtime", "dep:rlx-opt", "dep:rlx-driver", "dep:serde_json"]
+# GGUF read / write / quantize — `runtime::io::gguf`.
+gguf-io = ["runtime", "gguf", "dep:anyhow"]
+# safetensors (+ PyTorch / ONNX) → GGUF with per-tensor schemes.
+gguf-convert = ["gguf-io", "dep:rlx-gguf-convert"]
+gguf-pt = ["gguf-convert", "rlx-gguf-convert/pt"]
+gguf-onnx = ["gguf-convert", "rlx-gguf-convert/onnx"]
+# MLX / DDUF / NeMo / PyTorch weight loaders and `.rlxp` packages.
+# `Optimizer` / `Trainer` (rlx-optim; the resident path needs rlx-runtime's
+# training support). Checkpoints need `gguf-io` as well.
+training = ["runtime", "dep:rlx-optim", "rlx-runtime/training"]
+# Tokenizers, sampling and chat templates (rlx-text).
+text = ["runtime", "dep:rlx-text"]
+# `export_fpga` — SystemVerilog export (rlx-fpga).
+fpga = ["runtime", "rlx-runtime/fpga", "dep:rlx-fpga"]
+# `Model` — any provider's models (`.rlxp` packages, plugins such as
+# downstream collections) — `runtime::model`.
+models = ["runtime", "dep:anyhow", "rlx-runtime/model-io", "rlx-runtime/model-plugins"]
+weights = ["runtime", "dep:anyhow", "dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:rlx-nemo"]
+
+[dependencies]
+rlx-ir   = { workspace = true }
+rlx-gguf = { workspace = true, optional = true }
+rlx-opt  = { workspace = true, optional = true }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.18", default-features = false, optional = true }
+rlx-driver  = { workspace = true, optional = true }
+rlx-fpga    = { workspace = true, optional = true }
+serde_json  = { version = "1", optional = true }
+anyhow      = { version = "1", optional = true }
+rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.18", default-features = false, features = ["safetensors"], optional = true }
+rlx-pkg     = { workspace = true, optional = true }
+rlx-mlx-io  = { workspace = true, optional = true }
+rlx-dduf    = { workspace = true, optional = true }
+rlx-nemo    = { workspace = true, optional = true }
+rlx-text    = { workspace = true, optional = true }
+rlx-optim   = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The IR drift check parses rlx-ir's sources to list its public builders.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
+# A package trained through `Trainer::from_package` (`tests/package_trainer.rs`).
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -39,8 +39,28 @@ See ``docs/backend-selection.md``.
 
 Transforms
 ----------
-``grad``, ``jvp``, ``hvp``, ``vmap``, ``nth_order_grad`` — build derivative /
-batched graphs from a forward graph before compile.
+``grad``, ``jvp``, ``hvp``, ``vmap``, ``nth_order_grad``,
+``directional_nth_grad`` — build derivative / batched graphs from a forward
+graph before compile.
+
+Compose
+-------
+``splice(target, source, bind=..., prefix=...)`` copies one graph into
+another; ``parallel`` / ``sequential`` combine two; ``extract`` takes the
+subgraph computing some nodes; ``Partition`` (``split_at``, ``components``,
+``merge``) splits a graph into self-contained parts that run in order. See
+``docs/graph-compose.md``.
+
+Check
+-----
+``check(graph, backends=[...])`` — device-free static diagnostics (op legality
+per backend, missed fusions, numeric hazards, memory-plan safety).
+
+Training / text
+---------------
+``Trainer`` / ``Optimizer`` (``rlx-optim``: Adam, AdamW, Muon, SOAP, …) and
+``load_tokenizer`` / ``Sampler`` / ``render_chat`` (``rlx-text``) — cargo
+features ``training`` and ``text``, both on by default.
 
 GGUF
 ----
@@ -67,6 +87,13 @@ from ._pyrlx import (        # type: ignore[attr-defined]
     nth_order_grad,
     directional_nth_grad,
     vmap,
+    splice,
+    parallel,
+    sequential,
+    extract,
+    Partition,
+    check,
+    check_backends,
     quantize_gguf,
     dequant_gguf,
     GgufFile,
@@ -74,6 +101,21 @@ from ._pyrlx import (        # type: ignore[attr-defined]
     write_gguf,
     convert_to_gguf,
     GgufConvertReport,
+    load_rlxp,
+    verify_rlxp,
+    convert_gguf_to_rlxp,
+    convert_mlx_to_rlxp,
+    convert_dduf_to_rlxp,
+    convert_nemo_to_rlxp,
+    convert_pt_to_rlxp,
+    load_mlx,
+    load_dduf,
+    load_nemo,
+    load_pt,
+    load_weights,
+    to_rlxp,
+    Group,
+    loopback_peers,
     Graph,
     Session,
     CompiledGraph,
@@ -86,6 +128,23 @@ from ._pyrlx import (        # type: ignore[attr-defined]
     DeviceRouter,
     __version__,
 )
+
+from . import _pyrlx as _native
+
+# Feature-gated native surface: present only when the wheel was built with the
+# matching cargo feature (`training`, `text` — both default — and `fpga`).
+_OPTIONAL = (
+    "Trainer", "Optimizer",                                   # training
+    "Tokenizer", "Sampler", "load_tokenizer", "argmax",       # text
+    "sample_next", "render_chat",
+    "export_fpga",                                            # fpga
+    "Model", "model_providers", "load_model_plugin",          # models
+    "save_model",
+)
+for _name in _OPTIONAL:
+    if hasattr(_native, _name):
+        globals()[_name] = getattr(_native, _name)
+del _name
 
 from .dsl import (
     Node,
@@ -119,6 +178,13 @@ __all__ = [
     "directional_nth_grad",
     "vmap",
     "jacfwd",
+    "splice",
+    "parallel",
+    "sequential",
+    "extract",
+    "Partition",
+    "check",
+    "check_backends",
     "quantize",
     "dequant",
     "quantize_gguf",
@@ -128,6 +194,17 @@ __all__ = [
     "write_gguf",
     "convert_to_gguf",
     "GgufConvertReport",
+    "load_rlxp",
+    "verify_rlxp",
+    "convert_gguf_to_rlxp",
+    "convert_mlx_to_rlxp",
+    "convert_dduf_to_rlxp",
+    "convert_nemo_to_rlxp",
+    "convert_pt_to_rlxp",
+    "load_mlx",
+    "load_dduf",
+    "load_nemo",
+    "load_pt", "load_weights", "to_rlxp", "Group", "loopback_peers",
     "Graph",
     "Session",
     "CompiledGraph",
@@ -146,6 +223,7 @@ __all__ = [
     "numpy_dtype",
     "dtype_str",
     "__version__",
+    *(n for n in _OPTIONAL if hasattr(_native, n)),
 ]
 
 

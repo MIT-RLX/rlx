@@ -6,6 +6,9 @@
 
     python3 crates/bindings/rlx-web/tools/build_site.py           # → ./examples/tab-cluster
     python3 crates/bindings/rlx-web/tools/build_site.py --out /tmp/site --open
+    python3 crates/bindings/rlx-web/tools/build_site.py --all-pages --out _site  # GitHub Pages
+    python3 crates/bindings/rlx-web/tools/build_site.py --all-pages --out _site \
+        --qwen ../rlx-models/crates/rlx-models-web/web     # + the Qwen3.5 chat, at qwen/
 
 The output is deployable to any static host — GitHub Pages, Netlify, S3 — with
 no server component: the page builds, trains and distributes entirely in the
@@ -39,6 +42,11 @@ ENTRY = "cluster.html"
 # relative paths, so renaming it is safe.
 ENTRY_AS = "index.html"
 
+# `--all-pages`: every page under its own name, the demo at the root. The
+# pages link each other by these names (the nav in index.html and
+# vision-bench.html), so none is renamed.
+PAGES = ["index.html", "vision-bench.html", "cluster.html"]
+
 # `<script src>`, `<img src>`, `<link href>` — local only.
 HTML_REFS = re.compile(r'(?:src|href)="(?!https?:|//|#|mailto:)([^"]+)"')
 # `import x from "./y.js"`, `export … from "./y.js"`, `import("./y.js")`, and
@@ -50,10 +58,19 @@ JS_REFS = re.compile(
     r'(?:from|import)\s*\(?\s*["\'](\.[^"\']+)["\']'
     r'|new\s+(?:Shared)?Worker\s*\(\s*["\'](\.[^"\']+)["\']'
     r'|importScripts\s*\(\s*["\'](\.[^"\']+)["\']'
+    # A worker URL made first, `new URL("./y.js", import.meta.url)`, then
+    # handed to `new Worker(url)` (rlx-models-web's pipeline.js).
+    r'|new\s+URL\s*\(\s*["\'](\.[^"\']+\.m?js)["\']\s*,\s*import\.meta\.url'
 )
 
+# `--qwen DIR`: rlx-models-web's chat page (Qwen3.5 on WebGPU, weights streamed
+# from the Hugging Face Hub) under `qwen/`, with its own wasm package.
+QWEN_ENTRY = "chat.html"
+QWEN_AT = "qwen"
+QWEN_NAV = '      <a href="./qwen/chat.html">Qwen chat</a>\n    </nav>'
 
-def discover(entry: Path) -> set[Path]:
+
+def discover(entry: Path, web: Path = WEB) -> set[Path]:
     """Every local file the page needs, following imports transitively."""
     seen: set[Path] = set()
     queue = [entry]
@@ -71,7 +88,7 @@ def discover(entry: Path) -> set[Path]:
                 continue
             ref = ref.split("?")[0].split("#")[0]
             target = (path.parent / ref).resolve()
-            if WEB.resolve() in target.parents or target.parent == WEB.resolve():
+            if web.resolve() in target.parents or target.parent == web.resolve():
                 queue.append(target)
             elif target.is_file():
                 queue.append(target)
@@ -228,12 +245,41 @@ Licensed MIT OR Apache-2.0.
 """
 
 
+def copy_qwen(web: Path, out: Path) -> int:
+    """The chat page, its modules and workers, and its wasm package."""
+    pkg = web / "pkg"
+    if not (pkg / "rlx_models_web_bg.wasm").exists():
+        raise SystemExit(f"\n✗ no wasm package in {pkg}: run `just web-models-build` in rlx-models")
+    files = discover(web / QWEN_ENTRY, web)
+    files |= {f.resolve() for f in pkg.glob("rlx_models_web*") if f.suffix in {".js", ".wasm"}}
+    total = 0
+    for src in sorted(files):
+        dest = out / src.relative_to(web.resolve())
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        total += dest.stat().st_size
+    print(f"· qwen/: {len(files)} files, {total / 1e6:.2f} MB")
+    return total
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
         "--out",
         default=str(WORKSPACE / "examples" / "tab-cluster"),
         help="output directory (default: ./examples/tab-cluster)",
+    )
+    ap.add_argument(
+        "--all-pages",
+        action="store_true",
+        help="every page (demo, vision bench, tab cluster) under its own name — "
+        "the GitHub Pages site",
+    )
+    ap.add_argument(
+        "--qwen",
+        metavar="DIR",
+        help="rlx-models-web's web/ directory (built with `just web-models-build`): "
+        "adds its Qwen3.5 chat at qwen/ and links it from every page",
     )
     ap.add_argument("--open", action="store_true", help="serve and open it")
     ap.add_argument("--port", type=int, default=8100)
@@ -245,7 +291,11 @@ def main() -> int:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    files = discover(WEB / ENTRY)
+    entries = PAGES if args.all_pages else [ENTRY]
+    rename = {} if args.all_pages else {ENTRY: ENTRY_AS}
+    files: set[Path] = set()
+    for entry in entries:
+        files |= discover(WEB / entry)
     # The wasm glue loads its `.wasm` through `new URL(…, import.meta.url)`,
     # which no static scan can see — copy the package wholesale.
     for extra in (WEB / "pkg").glob("*"):
@@ -256,17 +306,33 @@ def main() -> int:
     total = 0
     for src in sorted(files):
         rel = src.relative_to(WEB.resolve())
-        dest = out / (ENTRY_AS if rel.name == ENTRY else rel)
+        dest = out / rename.get(str(rel), rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         total += dest.stat().st_size
 
-    (out / ".nojekyll").touch()
-    (out / "README.md").write_text(README)
+    if args.qwen:
+        total += copy_qwen(Path(args.qwen).resolve(), out / QWEN_AT)
+        for entry in entries:
+            page = out / rename.get(entry, entry)
+            text = page.read_text()
+            # cluster.html has no nav (it is also the standalone Space page).
+            if "</nav>" not in text:
+                continue
+            if text.count("    </nav>") != 1:
+                raise SystemExit(f"\n✗ {page.name}: expected one <nav> to link the Qwen chat from")
+            page.write_text(text.replace("    </nav>", QWEN_NAV, 1))
 
-    prologue_problem = check_ascii_prologue(out / ENTRY_AS)
-    if prologue_problem:
-        raise SystemExit(f"\n✗ {prologue_problem}")
+    (out / ".nojekyll").touch()
+    if not args.all_pages:
+        # The Space card describes the tab cluster alone.
+        (out / "README.md").write_text(README)
+
+    for entry in entries:
+        page = out / rename.get(entry, entry)
+        prologue_problem = check_ascii_prologue(page)
+        if prologue_problem:
+            raise SystemExit(f"\n✗ {page.name}: {prologue_problem}")
 
     missing = verify(out)
     if missing:
@@ -283,7 +349,7 @@ def main() -> int:
     print(f"  {len(files)} files, {total / 1e6:.2f} MB")
     for src in sorted(files):
         rel = src.relative_to(WEB.resolve())
-        name = ENTRY_AS if rel.name == ENTRY else str(rel)
+        name = rename.get(str(rel), str(rel))
         print(f"    {name:34} {src.stat().st_size / 1024:8.1f} KB")
 
     if args.open:

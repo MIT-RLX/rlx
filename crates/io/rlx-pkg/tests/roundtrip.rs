@@ -331,3 +331,73 @@ fn weight_only_and_zip_hybrid() {
     assert!(pack.graph().is_err());
     assert_eq!(pack.tensor_bytes("blob").unwrap(), warm_raw);
 }
+
+/// New packages store the graph as `.rlxmodel` text, readable in a
+/// directory pack; packages from before it (bincode `graph/mir.bin`) still
+/// open.
+#[test]
+fn graphs_are_rlxmodel_text_and_bincode_packages_still_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("pkg");
+    let g = tiny_graph();
+    let opts = WriteOptions {
+        container: ContainerKind::Dir,
+        name: "pkg_tiny".into(),
+        ..WriteOptions::default()
+    };
+    package_from_bake(&out, &g, &[weight_f32()], opts).expect("write dir");
+    let text = std::fs::read_to_string(out.join("graph/model.rlxmodel")).unwrap();
+    assert!(text.starts_with("rlxmodel 1\nopset 1\n"), "{text}");
+    assert!(text.contains("Binary(Mul) %x, %w : f32[4]"), "{text}");
+    let fresh = Package::open(&out).unwrap().graph().unwrap();
+    assert_eq!(fresh.len(), g.len());
+
+    // The same package as an older rlx wrote it.
+    std::fs::remove_file(out.join("graph/model.rlxmodel")).unwrap();
+    std::fs::write(out.join("graph/mir.bin"), bincode::serialize(&g).unwrap()).unwrap();
+    let manifest = out.join("rlx.json");
+    let mut m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    m["graph"] = serde_json::json!({"path": "graph/mir.bin", "encoding": "bincode_graph_v1"});
+    std::fs::write(&manifest, serde_json::to_vec(&m).unwrap()).unwrap();
+    let old = Package::open(&out).unwrap().graph().unwrap();
+    assert_eq!(old.len(), g.len());
+    assert_eq!(rlx_ir::rlxmodel::to_text(&old).unwrap(), text);
+}
+
+/// A package holds a whole model: several graphs and the `.rlxmodel` header
+/// with the model's name and version, in every container.
+#[test]
+fn a_package_holds_a_module_with_its_model_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut second = tiny_graph();
+    second.name = "decode".into();
+    for (container, file) in [
+        (ContainerKind::Flat, "m.rlxp"),
+        (ContainerKind::Dir, "m_dir"),
+        (ContainerKind::Zip, "m.zip"),
+    ] {
+        let out = dir.path().join(file);
+        let opts = WriteOptions {
+            container,
+            name: "pkg_tiny".into(),
+            extra_graphs: vec![second.clone()],
+            model: Some(serde_json::json!({"name": "tiny", "version": "1.2.0", "task": "graph"})),
+            requires_rlx: Some("0.2.0".into()),
+            ..WriteOptions::default()
+        };
+        package_from_bake(&out, &tiny_graph(), &[weight_f32()], opts).expect("write");
+        let pack = Package::open(&out).expect("open");
+        let m = pack.module().expect("module");
+        let names: Vec<&str> = m.graphs.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["pkg_tiny", "decode"], "{file}");
+        assert_eq!(
+            (m.model_name(), m.model_version()),
+            (Some("tiny"), Some("1.2.0"))
+        );
+        assert_eq!(m.requires.as_deref(), Some("0.2.0"));
+        assert_eq!(m.rlx.as_deref(), Some(rlx_ir::rlxmodel::RLX_VERSION));
+        // `graph()` is still the main one.
+        assert_eq!(pack.graph().unwrap().name, "pkg_tiny");
+    }
+}

@@ -97,14 +97,7 @@ fn relu_inplace(x: &mut [f32]) {
     }
 }
 
-fn forward(
-    x: &[f32],
-    w1: &[f32],
-    b1: &[f32],
-    w2: &[f32],
-    b2: &[f32],
-    batch: usize,
-) -> Vec<f32> {
+fn forward(x: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32], batch: usize) -> Vec<f32> {
     let mut h = matmul(x, w1, batch, IN, HIDDEN);
     add_bias_rows(&mut h, b1, batch, HIDDEN);
     relu_inplace(&mut h);
@@ -121,7 +114,13 @@ fn argmax(row: &[f32]) -> usize {
         .0
 }
 
-fn train(images: &[f32], labels: &[usize], n: usize, epochs: usize, lr: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+fn train(
+    images: &[f32],
+    labels: &[usize],
+    n: usize,
+    epochs: usize,
+    lr: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut w1 = he_init(IN, HIDDEN, 1);
     let mut b1 = vec![0.1; HIDDEN];
     let mut w2 = he_init(HIDDEN, OUT, 2);
@@ -253,7 +252,10 @@ fn main() {
     fs::create_dir_all(&out_dir).unwrap();
 
     let n = 8_000;
-    eprintln!("loading {n} MNIST train samples from {}", mnist_dir().display());
+    eprintln!(
+        "loading {n} MNIST train samples from {}",
+        mnist_dir().display()
+    );
     let (images, labels) = load_train(n);
     let (w1, b1, w2, b2) = train(&images, &labels, n, 4, 0.05);
 

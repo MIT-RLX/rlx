@@ -4,6 +4,7 @@
 
 //! Audio frontend graph builders.
 
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op};
 
 impl Graph {

@@ -1673,6 +1673,13 @@ pub fn build_hir_from_parts(
         }
     }
     m.0.set_outputs(outs);
+    // The model's own output names; tapped tensors stay unnamed.
+    m.0.output_names = manifest
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(i, o)| (i, o.name.clone()))
+        .collect();
 
     validate_nchw_ops(&m)?;
 

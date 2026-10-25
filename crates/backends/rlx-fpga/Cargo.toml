@@ -16,26 +16,36 @@ documentation.workspace = true
 
 [features]
 default = ["std"]
-std = []
+# Graph import/export, file emission and the sequential target. Without it
+# the crate is `no_std` + `alloc`: Model → passes (IR-verified through
+# rlx-ir's `no_std` core) → in-memory Verilog artifacts, for a target with no OS.
+std = ["rlx-ir/std", "rlx-cortexm/std"]
 
 # Pull in the cortexm crate so the first model we can target — TinyConv-MNIST
 # — uses exactly the same weight blob, scales, and shapes that the M4F path
 # already validates against. The kernels themselves we re-derive (cortexm
 # uses an f32 requantize; FPGA fabric needs integer-only Q0.31).
 [dependencies]
-rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.18", default-features = false, features = ["std"] }
-rlx-ir = { workspace = true }
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.19", default-features = false }
+# Not `workspace = true`: an inherited dependency cannot turn default
+# features off, and rlx-ir's default is `std`.
+rlx-ir = { path = "../../core/rlx-ir", version = "0.2.19", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
-rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.18", default-features = false, features = ["std"] }
+rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.19", default-features = false, features = ["std"] }
 
 [lib]
 path = "src/lib.rs"
 
+[[example]]
+name = "export_mnist"
+required-features = ["std"]
+
 [[bin]]
 name = "rlx-fpga-emit"
 path = "src/bin/emit.rs"
+required-features = ["std"]
 
 [lints]
 workspace = true

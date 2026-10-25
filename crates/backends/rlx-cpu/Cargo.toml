@@ -45,6 +45,11 @@ portable-gemm = ["dep:gemm"]
 # Takes effect where decode reaches the packed kernel: BLAS-less builds, or a
 # thrashing dequant cache.
 int8-gemv = []
+# Inter-thunk parallelism: runs of thunks with exact arena access summaries are
+# levelled by byte-range conflicts and each level runs concurrently on the
+# pool. Targets dispatch-bound schedules (decode, small models) where single
+# kernels cannot fill the cores. `RLX_CPU_WAVES=0` disables it at run time.
+wave-exec = []
 # 3D Gaussian splat (`Op::GaussianSplatRender*`) — executors registered from `rlx-splat`.
 splat = []
 
@@ -71,7 +76,11 @@ amx-dense = []
 amx-sme = []
 
 [dependencies]
+libm = "0.2"
 rlx-ir = { workspace = true }
+rlx-pocketfft = { workspace = true }
+# Double-single (df) host arithmetic — the reference every df kernel matches.
+rlxsl = { workspace = true }
 rlx-opt = { workspace = true }
 # GGUF K-quant block decoders — used by Op::DequantMatMul's GGUF
 # schemes so packed weight bytes can stay in the arena until matmul
@@ -135,3 +144,7 @@ workspace = true
 features       = ["splat"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[example]]
+name = "wave_bench"
+required-features = ["wave-exec"]

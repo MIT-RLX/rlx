@@ -1,0 +1,229 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Standalone language-binding releases. A `v*` tag (or a manual run) builds the
+# C ABI (librlx_capi) for five platforms plus CUDA variants, the pyrlx and
+# pyrlx-cu12 wheels and the Swift XCFramework, packages every binding in
+# crates/bindings/ with the prebuilt libraries (one package per platform where
+# the registry can pick one: scripts/bindings_release.py), and attaches it all
+# to a DRAFT GitHub Release. Nothing is pushed to a package registry: publishing
+# each package is a manual, reviewed step — docs/releasing-bindings.md.
+
+name: Bindings release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Every binding manifest must carry the workspace version.
+      - run: python3 scripts/bindings_release.py versions --check
+
+  capi:
+    needs: versions
+    strategy:
+      fail-fast: false
+      # Extra backends per platform: Metal and Accelerate are part of every
+      # macOS, so the macOS builds always have them. CUDA is a variant
+      # (`<platform>-cuda`): cudarc loads libcuda/NVRTC/cuBLAS at first device
+      # use, so it builds without the toolkit and runs where there is no GPU.
+      matrix:
+        include:
+          - { platform: macos-arm64, os: macos-14, target: aarch64-apple-darwin, features: "metal,blas-accelerate" }
+          - { platform: macos-x64, os: macos-14, target: x86_64-apple-darwin, features: "metal,blas-accelerate" }
+          - { platform: linux-x64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, features: "" }
+          - { platform: linux-arm64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, features: "" }
+          - { platform: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc, features: "" }
+          - { platform: linux-x64-cuda, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, features: "cuda" }
+          - { platform: windows-x64-cuda, os: windows-latest, target: x86_64-pc-windows-msvc, features: "cuda" }
+    runs-on: ${{ matrix.os }}
+    # The oldest macOS the libraries run on (the C dependencies compiled by
+    # cc otherwise target the runner's SDK), as ios/build-xcframework.sh.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capi-${{ matrix.platform }}
+      - name: Build librlx_capi
+        shell: bash
+        run: cargo build --release -p rlx-capi --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p natives/${{ matrix.platform }}
+          cd target/${{ matrix.target }}/release
+          for f in librlx_capi.dylib librlx_capi.so librlx_capi.a rlx_capi.dll rlx_capi.dll.lib rlx_capi.lib; do
+            [ -f "$f" ] && cp "$f" "$GITHUB_WORKSPACE/natives/${{ matrix.platform }}/"
+          done
+          ls -la "$GITHUB_WORKSPACE/natives/${{ matrix.platform }}"
+      # rustc records the build path as the dylib's install name; an app that
+      # links the SDK must find it through its own rpath instead. Re-sign:
+      # editing the header invalidates the linker's ad-hoc signature.
+      - name: Relocatable install name
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          lib=natives/${{ matrix.platform }}/librlx_capi.dylib
+          install_name_tool -id @rpath/librlx_capi.dylib "$lib"
+          codesign --force -s - "$lib"
+          otool -D "$lib"
+      # The system libraries a static link of librlx_capi needs, for the C
+      # SDK's pkg-config and CMake files.
+      - name: Static link libraries
+        shell: bash
+        run: |
+          cargo rustc --release -p rlx-capi --target ${{ matrix.target }} --lib --crate-type staticlib \
+            ${{ matrix.features && format('--features {0}', matrix.features) || '' }} -- --print native-static-libs 2>&1 \
+            | grep -o 'native-static-libs:.*' | tail -1 | tee natives/${{ matrix.platform }}/native-static-libs.txt
+          test -s natives/${{ matrix.platform }}/native-static-libs.txt
+      # A prebuilt library must not need a system BLAS: with none linked, rlx-cpu
+      # uses its portable GEMM and pure-Rust linear algebra.
+      - name: No system BLAS dependency
+        if: startsWith(matrix.platform, 'linux')
+        run: |
+          ldd natives/${{ matrix.platform }}/librlx_capi.so
+          ! ldd natives/${{ matrix.platform }}/librlx_capi.so | grep -i -E 'openblas|lapack'
+      # The CUDA variant must load CUDA at run time, never link it: the same
+      # library has to start on a machine without the driver.
+      - name: No CUDA link dependency
+        if: startsWith(matrix.platform, 'linux')
+        run: "! ldd natives/${{ matrix.platform }}/librlx_capi.so | grep -E 'libcuda|libnvrtc|libcublas'"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: natives-${{ matrix.platform }}
+          path: natives/
+
+  # `pyrlx` (CPU; Metal + Accelerate on macOS) and `pyrlx-cu12` (CUDA 12):
+  # two distributions of the same `import pyrlx`, as onnxruntime and
+  # onnxruntime-gpu are — a user installs one.
+  pyrlx:
+    needs: versions
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { package: pyrlx, os: macos-14, target: aarch64-apple-darwin, features: "metal,blas-accelerate" }
+          - { package: pyrlx, os: macos-14, target: x86_64-apple-darwin, features: "metal,blas-accelerate" }
+          - { package: pyrlx, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, features: "" }
+          - { package: pyrlx, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, features: "" }
+          - { package: pyrlx, os: windows-latest, target: x86_64-pc-windows-msvc, features: "" }
+          - { package: pyrlx-cu12, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, features: "cuda" }
+          - { package: pyrlx-cu12, os: windows-latest, target: x86_64-pc-windows-msvc, features: "cuda" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Distribution name
+        if: matrix.package != 'pyrlx'
+        shell: bash
+        run: $(command -v python3 || command -v python) scripts/bindings_release.py pyrlx-name ${{ matrix.package }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/bindings/pyrlx
+          target: ${{ matrix.target }}
+          args: --release --out dist ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyrlx-${{ matrix.package }}-${{ matrix.target }}
+          path: crates/bindings/pyrlx/dist/*.whl
+
+  # The source distribution, for platforms without a wheel: builds the CPU
+  # backend with a Rust toolchain (`pip install pyrlx` falls back to it).
+  pyrlx-sdist:
+    needs: versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/bindings/pyrlx
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pyrlx-sdist
+          path: crates/bindings/pyrlx/dist/*.tar.gz
+
+  xcframework:
+    needs: versions
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: xcframework
+      # `--apple`: Metal (and Accelerate) in every slice, as the macOS
+      # librlx_capi builds above.
+      - name: Build RLX.xcframework (iOS + macOS)
+        run: ios/build-xcframework.sh --capi --apple
+      - name: Zip
+        run: |
+          cd crates/bindings/rlx-swift/build
+          ditto -c -k --keepParent RLX.xcframework RLX.xcframework.zip
+          swift package compute-checksum RLX.xcframework.zip | tee RLX.xcframework.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcframework
+          path: |
+            crates/bindings/rlx-swift/build/RLX.xcframework.zip
+            crates/bindings/rlx-swift/build/RLX.xcframework.zip.sha256
+
+  package:
+    needs: [capi, pyrlx, pyrlx-sdist, xcframework]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: natives-*
+          path: natives
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pyrlx-*
+          path: dist/pyrlx
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: xcframework
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      # The per-platform npm / gem / NuGet packages and Maven classifier jars,
+      # every other binding with all five platforms' libraries inside, and the
+      # per-platform C ABI SDKs.
+      - name: Package the bindings
+        run: python3 scripts/bindings_release.py stage --natives natives --out dist --build
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist/staging
+          tag="${GITHUB_REF_NAME}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || tag="v$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --draft --title "$tag" --notes "Language bindings for $tag. See docs/releasing-bindings.md to publish each package."
+          gh release upload "$tag" dist/*.* dist/pyrlx/*.whl dist/pyrlx/*.tar.gz --clobber

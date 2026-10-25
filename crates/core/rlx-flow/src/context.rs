@@ -17,6 +17,15 @@ use crate::profile::CompileProfile;
 use crate::value::FlowValue;
 use crate::weight::WeightSource;
 
+/// Whether this process computes in f64 (`RLX_NUMBER_FORMAT=f64` / `f64x2`),
+/// where [`FlowCtx::synth_param_f64`] keeps synthesized values exact.
+pub fn f64_format() -> bool {
+    use rlx_ir::NumberFormat;
+    rlx_ir::env::var("RLX_NUMBER_FORMAT")
+        .and_then(|s| s.parse::<NumberFormat>().ok())
+        .is_some_and(|f| matches!(f, NumberFormat::F64 | NumberFormat::F64x2))
+}
+
 /// Handles for a [`Op::GatedDeltaNet`](rlx_ir::Op::GatedDeltaNet) / carry scan.
 #[derive(Debug, Clone, Copy)]
 pub struct GdnInputSlots {
@@ -57,6 +66,10 @@ pub struct FlowState {
     /// weights (GGUF/MLX). Drained into [`crate::BuiltModel::typed_params`] at
     /// build end and uploaded at session time via `set_param_typed`.
     pub typed_params: Vec<(String, Vec<u8>, DType)>,
+    /// How dense matmul weights are stored ([`crate::WeightStorage`]); `None`
+    /// = `RLX_WEIGHT_STORAGE`, else f32. Set by
+    /// [`crate::ModelFlow::with_weight_storage`].
+    pub weight_storage: Option<crate::WeightStorage>,
     /// Packed-linear dedup: `weight_key` → (registered U8 param node, out_dim,
     /// scheme). Lets a projection loaded by more than one stage (KV tap +
     /// decoder) reuse the same node without re-`take_packed`-ing a *consuming*
@@ -119,6 +132,19 @@ impl FlowCtx<'_> {
         self.load_param_typed(key, transpose, DType::F32)
     }
 
+    /// Load a matmul weight matrix under the flow's
+    /// [`WeightStorage`](crate::WeightStorage) — f16 / bf16 at 2 B/elem when
+    /// the setting asks for it, f32 otherwise. Use for the `B` of a matmul;
+    /// norms, biases, embeddings (gathered) and conv kernels keep
+    /// [`Self::load_param`].
+    pub fn load_matrix(&mut self, key: &str, transpose: bool) -> Result<HirNodeId> {
+        let hir = self
+            .module
+            .as_hir_mut()
+            .ok_or_else(|| anyhow::anyhow!("flow context requires HIR stage"))?;
+        load_matrix_into(hir, self.params, self.weights, self.state, key, transpose)
+    }
+
     /// Load a param with an explicit graph dtype. The weight bytes come from
     /// the loader as `f32` and are stored in the flow `params` map as `f32`;
     /// when `dtype` is `F16`/`BF16` the backend converts f32→low-precision at
@@ -167,6 +193,24 @@ impl FlowCtx<'_> {
         let id = self.hir().param(name, shape);
         self.params.insert(name.to_string(), data);
         id
+    }
+
+    /// [`Self::synth_param`] from f64 values. When this process computes in
+    /// f64 ([`f64_format`]) the param also carries what rounding to f32 lost,
+    /// as a `{name}.lo` param added to it: once the graph is promoted to F64,
+    /// `hi + lo` is the value to ~1e-14 rather than to f32 rounding.
+    pub fn synth_param_f64(&mut self, name: &str, data: &[f64], shape: Shape) -> HirNodeId {
+        let hi = data.iter().map(|&x| x as f32).collect();
+        let id = self.synth_param(name, hi, shape.clone());
+        if !f64_format() {
+            return id;
+        }
+        let lo = data
+            .iter()
+            .map(|&x| (x - (x as f32) as f64) as f32)
+            .collect();
+        let lo_id = self.synth_param(&format!("{name}.lo"), lo, shape);
+        HirMut::new(self.hir()).add(id, lo_id)
     }
 
     pub fn synth_zeros(&mut self, name: &str, len: usize) -> HirNodeId {
@@ -272,7 +316,7 @@ impl FlowCtx<'_> {
         if let Some(packed) = self.weights.take_packed(weight_key)? {
             return self.register_packed_linear(input, weight_key, packed);
         }
-        let w = self.load_param(weight_key, transpose)?;
+        let w = self.load_matrix(weight_key, transpose)?;
         Ok(self.binary_shaped(|gb| gb.mm(input.id, w)))
     }
 
@@ -361,9 +405,13 @@ impl FlowCtx<'_> {
                 scheme,
             });
         }
-        Ok(LinearWeight::Dense(
-            self.load_param_typed(key, transpose, dtype)?,
-        ))
+        // An F32 request is "no explicit choice": the flow's `WeightStorage`
+        // decides (f32 unless set). An explicit F16 / BF16 request is kept.
+        Ok(LinearWeight::Dense(if dtype == DType::F32 {
+            self.load_matrix(key, transpose)?
+        } else {
+            self.load_param_typed(key, transpose, dtype)?
+        }))
     }
 
     /// Fused multi-projection resolve: concatenate several PACKED weights that
@@ -434,6 +482,29 @@ impl FlowCtx<'_> {
                     }
                     Ok(FusedProj::Separate(ws))
                 }
+            }
+            // Under a half `WeightStorage`, an F32 request resolves per key;
+            // keep the projections separate (see the BF16 arm below).
+            None if dtype == DType::F32
+                && self.state.weight_storage() != crate::WeightStorage::F32 =>
+            {
+                let mut ws = Vec::with_capacity(keys.len());
+                for &key in keys {
+                    ws.push(LinearWeight::Dense(self.load_matrix(key, transpose)?));
+                }
+                Ok(FusedProj::Separate(ws))
+            }
+            None if dtype == DType::BF16 => {
+                // BF16 weights stay separate matmuls: a `Concat` of packed BF16
+                // params is misread on the backends that widen BF16 activations
+                // (Metal, wgpu) — see rlx-fusion's `FuseSharedInputMatMul`.
+                let mut ws = Vec::with_capacity(keys.len());
+                for &key in keys {
+                    ws.push(LinearWeight::Dense(
+                        self.load_param_typed(key, transpose, dtype)?,
+                    ));
+                }
+                Ok(FusedProj::Separate(ws))
             }
             None => {
                 // Dense (F16/F32): concat the [in, out_i] weight nodes along the out
@@ -559,6 +630,65 @@ impl FlowCtx<'_> {
         };
         self.wrap(id, shape)
     }
+}
+
+impl FlowState {
+    /// The weight storage in force: the flow's own setting, else
+    /// `RLX_WEIGHT_STORAGE`, else f32.
+    pub fn weight_storage(&self) -> crate::WeightStorage {
+        self.weight_storage
+            .or_else(crate::WeightStorage::from_env)
+            .unwrap_or(crate::WeightStorage::F32)
+    }
+}
+
+/// Load a matmul weight under the flow's [`crate::WeightStorage`]: a rank-2
+/// tensor whose storage resolves to f16 / bf16 becomes a param of that dtype;
+/// anything else loads as f32 like `load_param`. Shared by
+/// [`FlowCtx::load_matrix`] and [`crate::Emit::load_matrix`].
+///
+/// The values normally travel in the f32 `params` map and the backend narrows
+/// them at bind time (`set_param` into an F16 / BF16 slot — pinned on CPU,
+/// Metal, MLX, wgpu and CUDA by `rlx-models-core`'s `half_weight_matmul`
+/// test). Many model crates read `typed_params` as packed quant blobs, so a
+/// half matrix goes there only from a source that opts in through
+/// [`WeightSource::take_half`] — it then skips the f32 host copy.
+pub(crate) fn load_matrix_into(
+    hir: &mut HirModule,
+    params: &mut HashMap<String, Vec<f32>>,
+    weights: &mut dyn WeightSource,
+    state: &mut FlowState,
+    key: &str,
+    transpose: bool,
+) -> Result<HirNodeId> {
+    let cache_key = param_cache_key(key, transpose);
+    if let Some(&id) = state.loaded_params.get(&cache_key) {
+        return Ok(id);
+    }
+    let stored = weights.stored_dtype(key);
+    let dtype = state.weight_storage().resolve(stored);
+    if matches!(dtype, DType::F16 | DType::BF16) && stored == Some(dtype) {
+        if let Some((bytes, shape)) = weights.take_half(key, transpose)? {
+            anyhow::ensure!(
+                shape.len() == 2 && bytes.len() == 2 * shape.iter().product::<usize>(),
+                "take_half `{key}`: {} bytes for shape {shape:?}",
+                bytes.len()
+            );
+            let id = hir.param(key, Shape::new(&shape, dtype));
+            state.typed_params.push((key.to_string(), bytes, dtype));
+            state.loaded_params.insert(cache_key, id);
+            return Ok(id);
+        }
+    }
+    let (data, shape) = weights.take(key, transpose)?;
+    let half = matches!(dtype, DType::F16 | DType::BF16) && shape.len() == 2;
+    let id = hir.param(
+        key,
+        Shape::new(&shape, if half { dtype } else { DType::F32 }),
+    );
+    params.insert(key.to_string(), data);
+    state.loaded_params.insert(cache_key, id);
+    Ok(id)
 }
 
 fn param_cache_key(key: &str, transpose: bool) -> String {

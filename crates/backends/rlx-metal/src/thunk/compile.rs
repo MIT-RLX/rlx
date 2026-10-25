@@ -767,7 +767,9 @@ impl ThunkSchedule {
             );
         }
 
+        let mut node_start: Vec<usize> = Vec::with_capacity(graph.len() + 1);
         for node in graph.nodes() {
+            node_start.push(thunks.len());
             #[cfg(feature = "native-gpu-fft")]
             if fft_real_skip.contains(&node.id) {
                 thunks.push(Thunk::Nop);
@@ -895,6 +897,7 @@ impl ThunkSchedule {
                         n: (3 * inner) as u32,
                         dt,
                         b_f16: false,
+                        b_bf16: false,
                         a_f16: false,
                         ta: false,
                         tb: false,
@@ -930,6 +933,7 @@ impl ThunkSchedule {
                         n: inner as u32,
                         dt,
                         b_f16: false,
+                        b_bf16: false,
                         a_f16: false,
                         ta: false,
                         tb: false,
@@ -945,6 +949,8 @@ impl ThunkSchedule {
                     let a_shape = &graph.node(node.inputs[0]).shape;
                     let b_shape = &graph.node(node.inputs[1]).shape;
                     let b_f16 = matches!(b_shape.dtype(), rlx_ir::DType::F16);
+                    let b_bf16 = matches!(b_shape.dtype(), rlx_ir::DType::BF16)
+                        && matches!(graph.node(node.inputs[1]).op, Op::Param { .. });
                     let a_f16 = matches!(a_shape.dtype(), rlx_ir::DType::F16);
                     // Any-rank batched matmul: all leading dims (except the
                     // last 2) match between A, B, and output, and the last
@@ -1047,6 +1053,7 @@ impl ThunkSchedule {
                             n: n as u32,
                             dt: shape.dtype().into(),
                             b_f16,
+                            b_bf16,
                             a_f16,
                             ta,
                             tb,
@@ -1790,6 +1797,7 @@ impl ThunkSchedule {
                         num_idx: idx_len as u32,
                         trailing: trailing as u32,
                         dt: node.shape.dtype().into(),
+                        idx_dt: graph.node(node.inputs[1]).shape.dtype().into(),
                     }
                 }
 
@@ -1904,6 +1912,15 @@ impl ThunkSchedule {
                             ),
                         "rlx-metal: asymmetric v_head_dim (MLA) requires f32 attention \
                          (f16 sdpa_h path unmodified)"
+                    );
+                    // Every SDPA kernel keeps a query/output row in per-thread
+                    // registers sized for head_dim <= 512 (`sdpa_long`'s
+                    // MAX_HEAD_DIM, `sdpa_prefill_hd256`'s MAX_DPL); a wider
+                    // head overruns them and returns wrong numbers silently.
+                    assert!(
+                        *head_dim <= 512 && v_head_dim <= 512,
+                        "rlx-metal: attention head_dim {head_dim} / v_head_dim {v_head_dim} \
+                         exceeds the 512 the SDPA kernels support"
                     );
                     let (mask_kind_u32, window): (u32, u32) = match mask_kind {
                         rlx_ir::op::MaskKind::None => (0, 0),
@@ -2372,6 +2389,37 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::DynamicUpdateSlice { axis } => {
+                    let operand = &graph.node(node.inputs[0]).shape;
+                    let update = &graph.node(node.inputs[1]).shape;
+                    let dim = |s: &rlx_ir::Shape, i: usize| s.dim(i).unwrap_static();
+                    let outer: usize = (0..*axis).map(|i| dim(operand, i)).product();
+                    let inner: usize = (*axis + 1..operand.rank())
+                        .map(|i| dim(operand, i))
+                        .product();
+                    let row_bytes = inner.max(1) * operand.dtype().size_bytes().max(1);
+                    assert!(
+                        row_bytes.is_multiple_of(2),
+                        "rlx-metal DynamicUpdateSlice: a {row_bytes}-byte row has no 2-byte lanes"
+                    );
+                    let start_kind = match graph.node(node.inputs[2]).shape.dtype() {
+                        rlx_ir::DType::F32 => 0,
+                        rlx_ir::DType::I32 => 1,
+                        rlx_ir::DType::I64 => 2,
+                        rlx_ir::DType::U32 => 3,
+                        other => panic!("rlx-metal DynamicUpdateSlice: start of dtype {other:?}"),
+                    };
+                    Thunk::DynamicUpdateSlice {
+                        src: off(node.inputs[1]),
+                        dst: off(node.id),
+                        start: off(node.inputs[2]),
+                        start_kind,
+                        outer: outer.max(1) as u32,
+                        extent: dim(operand, *axis) as u32,
+                        rows: dim(update, *axis) as u32,
+                        row_bytes: row_bytes as u32,
+                    }
+                }
                 Op::KvAppend { axis, pos } => {
                     // In-place append: write input[1] (the new row) into the
                     // output buffer (aliased to `cache`) at sequence index `pos`.
@@ -3053,12 +3101,37 @@ impl ThunkSchedule {
                     }
                 }
 
+                Op::DoubleSingle(op) => {
+                    let dims = |id: rlx_ir::NodeId| -> Vec<usize> {
+                        graph
+                            .node(id)
+                            .shape
+                            .dims()
+                            .iter()
+                            .map(|d| d.unwrap_static())
+                            .collect()
+                    };
+                    let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(i)).collect();
+                    let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                    let plan =
+                        rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &dims(node.id))
+                            .unwrap_or_else(|e| panic!("rlx-metal: {e}"));
+                    Thunk::DoubleSingle {
+                        op: op.clone(),
+                        plan,
+                        a: off(node.inputs[0]),
+                        b: node.inputs.get(1).map(|&b| off(b)),
+                        dst: off(node.id),
+                    }
+                }
+
                 Op::RoundToFormat { format, scaling } => {
                     use rlx_ir::FormatScaling;
                     let (mode, block) = match scaling {
                         FormatScaling::None => (0, 0),
                         FormatScaling::PerTensor => (1, 0),
                         FormatScaling::Block(b) => (2, *b),
+                        FormatScaling::FineBlock(b) => (3, *b),
                     };
                     Thunk::RoundToFormat {
                         src: off(node.inputs[0]),
@@ -3447,7 +3520,7 @@ impl ThunkSchedule {
                     }
                 }
 
-                Op::Fft { inverse, norm } => {
+                Op::Fft { inverse, norm, .. } => {
                     let shape = &node.shape;
                     let meta = rlx_ir::fft::fft_meta(shape);
                     let dtype = shape.dtype();
@@ -3508,9 +3581,13 @@ impl ThunkSchedule {
                         desc: rlx_cpu::rlx_scan_host_desc!(graph, node, &off),
                     }
                 }
-                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => Thunk::HostOp {
-                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, &off),
-                },
+                // `Op::While`: a loop at run time on the host (rlx-cpu's
+                // `Thunk::While`).
+                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } | Op::While { .. } => {
+                    Thunk::HostOp {
+                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, &off),
+                    }
+                }
                 Op::ScatterNd { .. }
                 | Op::ScatterElements { .. }
                 | Op::GatherNd { .. }
@@ -4904,7 +4981,8 @@ impl ThunkSchedule {
             }
         }
 
-        rewrite_simple_elementwise_regions(&mut thunks);
+        node_start.push(thunks.len());
+        rewrite_simple_elementwise_regions(&mut thunks, &mut node_start);
         rewrite_dense_binary_broadcast(&mut thunks);
         let output_offsets: std::collections::HashSet<usize> =
             graph.outputs.iter().map(|&id| off(id)).collect();
@@ -4948,9 +5026,11 @@ impl ThunkSchedule {
         fuse_depthwise_conv1d_bsc(&mut thunks, &output_offsets, &uses_at);
         fuse_residual_rms_norm(&mut thunks, &output_offsets, &uses_at);
 
+        debug_assert_eq!(node_start.last().copied(), Some(thunks.len()));
         Self {
             thunks,
             rng: rng_shared,
+            node_start,
         }
     }
 }

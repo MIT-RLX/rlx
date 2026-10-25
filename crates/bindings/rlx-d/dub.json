@@ -1,0 +1,10 @@
+{
+    "name": "rlx",
+    "description": "D bindings for rlx over its C ABI: graphs, sessions, device selection, autodiff, training, weights, text and distributed nodes.",
+    "version": "0.2.19",
+    "authors": ["Eugene Hauptmann", "Nataliya Kosmyna"],
+    "license": "MIT OR Apache-2.0",
+    "targetType": "library",
+    "libs": ["rlx_capi"],
+    "lflags-posix": ["-L$RLX_CAPI_LIB_DIR", "-rpath=$RLX_CAPI_LIB_DIR"]
+}

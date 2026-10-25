@@ -17,6 +17,35 @@ use rlx_opt::CompileResult;
 use crate::stages;
 use crate::{CompileOptions, CompiledGraph, Device};
 
+/// Does `options` ask for a rewrite only `Session::compile_with` applies?
+///
+/// A number format rewrites the MIR graph (rounding, f64 promotion) and sets
+/// how the compiled graph converts weights on upload. The template paths here
+/// and in [`crate::DynamicDimCompileCache`] go straight to LIR and would drop
+/// it without a word.
+pub(crate) fn needs_mir_route(options: &CompileOptions) -> bool {
+    options
+        .number_format
+        .is_some_and(|f| f != rlx_ir::NumberFormat::F32)
+}
+
+/// Lower `build_hir` to MIR, bind its dims and compile it through
+/// `Session::compile_with`: the specialize-per-shape result, without the
+/// shared template.
+pub(crate) fn compile_bound_mir<F: FnOnce() -> HirModule>(
+    device: Device,
+    build_hir: F,
+    binding: &DimBinding,
+    options: &CompileOptions,
+) -> Result<CompiledGraph, rlx_ir::hir::LowerError> {
+    let mir = build_hir().lower_to_mir()?.into_graph();
+    let mut bound = rlx_ir::dynamic::bind_graph(&mir, binding);
+    rlx_ir::dynamic::sync_graph_shapes(&mut bound);
+    let mut opts = options.clone();
+    opts.dim_binding = None;
+    Ok(crate::Session::new(device).compile_with(bound, &opts))
+}
+
 /// Compile-once / specialize-per-variant pipeline with optional FIFO cache.
 pub struct ModelCompilePipeline {
     device: Device,
@@ -110,13 +139,17 @@ impl ModelCompilePipeline {
         if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
             return Ok(&mut self.entries[idx].1);
         }
-        let mut template_opts = options.clone();
-        template_opts.dim_binding = None;
-        self.build_template(build_hir, &template_opts)?;
-        let specialized = self.specialize_template(binding, &template_opts);
         let mut compile_opts = options.clone();
         compile_opts.dim_binding = None;
-        let compiled = self.compile_lir(specialized, &compile_opts);
+        let compiled = if needs_mir_route(options) {
+            compile_bound_mir(self.device, build_hir, binding, &compile_opts)?
+        } else {
+            let mut template_opts = options.clone();
+            template_opts.dim_binding = None;
+            self.build_template(build_hir, &template_opts)?;
+            let specialized = self.specialize_template(binding, &template_opts);
+            self.compile_lir(specialized, &compile_opts)
+        };
 
         if self.entries.len() >= self.capacity
             && let Some(evict) = self.order.pop_front()
@@ -204,8 +237,14 @@ impl ModelCompilePipeline {
             return Ok(&mut self.entries[idx].1);
         }
         let device = self.device;
-        let template = self.ensure_template(build_hir, options)?;
-        let compiled = aot.specialize_cached(disk_base, binding, device, template, options)?;
+        let compiled = if needs_mir_route(options) {
+            // The AOT cache stores LIR without the rewrite; compile fresh.
+            compile_bound_mir(device, build_hir, binding, options)
+                .map_err(crate::AotCacheError::from)?
+        } else {
+            let template = self.ensure_template(build_hir, options)?;
+            aot.specialize_cached(disk_base, binding, device, template, options)?
+        };
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
         {

@@ -9,22 +9,26 @@
 //! `rlx-tribev2-audio` not yet exonerated on metal (its LayerNorms, its whole
 //! FFN1 chain and its depthwise conv are all bit-exact there), so this covers
 //! the bias path directly at that model's shape: 16 heads, head_dim 64, seq 16.
+//!
+//! One-query cases (`sq = 1` over a longer key sequence) are the decode shape:
+//! there the single-row kernels (`sdpa_decode_m1`, the split-K partials) once
+//! had no bias branch and attended to every key, unmasked.
 
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
-fn case(b: usize, nh: usize, hd: usize, seq: usize) -> Option<f32> {
+fn case(b: usize, nh: usize, hd: usize, sq: usize, sk: usize) -> Option<f32> {
     if rlx_ir::env::skip_unless_device("metal", true, rlx_metal::is_available()) {
         eprintln!("skip: metal unavailable");
         return None;
     }
     let dim = nh * hd;
     let mut g = Graph::new("attn_bias");
-    let q = g.input("q", Shape::new(&[b, seq, dim], DType::F32));
-    let k = g.input("k", Shape::new(&[b, seq, dim], DType::F32));
-    let v = g.input("v", Shape::new(&[b, seq, dim], DType::F32));
-    let bias = g.input("bias", Shape::new(&[b, nh, seq, seq], DType::F32));
+    let q = g.input("q", Shape::new(&[b, sq, dim], DType::F32));
+    let k = g.input("k", Shape::new(&[b, sk, dim], DType::F32));
+    let v = g.input("v", Shape::new(&[b, sk, dim], DType::F32));
+    let bias = g.input("bias", Shape::new(&[b, nh, sq, sk], DType::F32));
     let y = g.add_node(
         Op::Attention {
             num_heads: nh,
@@ -35,26 +39,30 @@ fn case(b: usize, nh: usize, hd: usize, seq: usize) -> Option<f32> {
             attn_logit_softcap: None,
         },
         vec![q, k, v, bias],
-        Shape::new(&[b, seq, dim], DType::F32),
+        Shape::new(&[b, sq, dim], DType::F32),
     );
     g.set_outputs(vec![y]);
 
-    let qs: Vec<f32> = (0..b * seq * dim)
+    let qs: Vec<f32> = (0..b * sq * dim)
         .map(|i| ((i as f32) * 0.011).sin())
         .collect();
-    let ks: Vec<f32> = (0..b * seq * dim)
+    let ks: Vec<f32> = (0..b * sk * dim)
         .map(|i| ((i as f32) * 0.013).cos())
         .collect();
-    let vs: Vec<f32> = (0..b * seq * dim)
+    let vs: Vec<f32> = (0..b * sk * dim)
         .map(|i| ((i as f32) * 0.017).sin())
         .collect();
     // A relative-position bias: depends on (qi - ki), clamped to a window, with
-    // distinct left/right extents like W2v-BERT's 64/8.
-    let bs: Vec<f32> = (0..b * nh * seq * seq)
+    // distinct left/right extents like W2v-BERT's 64/8. With one query, every
+    // third key is closed outright, the way a cache mask closes empty rows.
+    let bs: Vec<f32> = (0..b * nh * sq * sk)
         .map(|i| {
-            let ki = (i % seq) as i64;
-            let qi = ((i / seq) % seq) as i64;
-            let h = (i / (seq * seq)) % nh;
+            let ki = (i % sk) as i64;
+            let qi = ((i / sk) % sq) as i64;
+            let h = (i / (sq * sk)) % nh;
+            if sq == 1 && ki % 3 == 1 {
+                return -1e30;
+            }
             let d = (qi - ki).clamp(-64, 8) as f32;
             (d * 0.05 + h as f32 * 0.01).tanh()
         })
@@ -82,18 +90,26 @@ fn case(b: usize, nh: usize, hd: usize, seq: usize) -> Option<f32> {
 
 #[test]
 fn attention_bias_mask_matches_cpu() {
-    // (b, heads, head_dim, seq); the last is W2v-BERT's real geometry.
+    // (b, heads, head_dim, query len, key len); W2v-BERT's real geometry,
+    // then one-query decode shapes on both single-row routes (key lengths
+    // either side of the split-K threshold, head_dim either side of 128).
     let cases = [
-        (1usize, 4usize, 32usize, 8usize),
-        (1, 16, 64, 16),
-        (2, 16, 64, 16),
+        (1usize, 4usize, 32usize, 8usize, 8usize),
+        (1, 16, 64, 16, 16),
+        (2, 16, 64, 16, 16),
+        (1, 4, 32, 1, 17),
+        (1, 8, 128, 1, 40),
+        (1, 8, 128, 1, 300),
+        (1, 4, 256, 1, 300),
     ];
     let mut bad = Vec::new();
-    for (b, nh, hd, s) in cases {
-        let Some(d) = case(b, nh, hd, s) else { return };
-        eprintln!("attn bias b={b} heads={nh} hd={hd} seq={s}: max_abs={d:.6e}");
+    for (b, nh, hd, sq, sk) in cases {
+        let Some(d) = case(b, nh, hd, sq, sk) else {
+            return;
+        };
+        eprintln!("attn bias b={b} heads={nh} hd={hd} sq={sq} sk={sk}: max_abs={d:.6e}");
         if d > 1e-4 {
-            bad.push((b, nh, hd, s, d));
+            bad.push((b, nh, hd, sq, sk, d));
         }
     }
     assert!(

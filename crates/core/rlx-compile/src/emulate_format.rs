@@ -21,7 +21,17 @@
 //! - non-float tensors (indices, masks);
 //! - graph outputs, which keep the unrounded `f32` value so callers (an LM's
 //!   sampler, a forecaster's quantile map) see full precision;
-//! - anything matched by [`EmulateOptions::keep`].
+//! - for formats of 8 bits or fewer, params with fewer than two dimensions
+//!   (norm scales, biases, scalars; [`rounds_param_shape`]). Low-bit
+//!   deployments quantize the matrices and keep these in high precision: they
+//!   are a negligible share of the bytes, and per-channel gains spanning more
+//!   binades than a 6-bit block covers flush to zero (Gemma 3's norm weights
+//!   took its f6 perplexity from 15 to 500). Values computed from params and
+//!   constants alone, like Gemma's `1 + w` norm gain, count as params here;
+//! - position tables: params read only as a `Rope` op's cos/sin tables
+//!   ([`position_table_params`]). They are precomputed from positions, not
+//!   learned, and rounded to a few bits they scramble every position;
+//! - anything matched by [`EmulateOptions::keep_ops`] / [`EmulateOptions::keep_params`].
 //!
 //! The inserted op has a straight-through gradient, so the same rewrite turns a
 //! forward graph into a quantization-aware-training graph.
@@ -59,6 +69,14 @@ pub struct EmulateOptions {
     pub keep_params: Vec<String>,
     /// Op kinds whose outputs are not rounded.
     pub keep_ops: Vec<OpKind>,
+    /// Round the residual stream: values read by a normalization (`RmsNorm`,
+    /// `LayerNorm`, …), which in a pre-norm network are the running sum every
+    /// block adds into. `None` rounds it for formats wider than 8 bits and
+    /// keeps it in f32 for narrower ones, as FP8/FP4 inference keeps the
+    /// residual in high precision and quantizes what the matmuls read:
+    /// rounded to 4 bits after every block add, the error compounds through
+    /// the depth of the network.
+    pub round_residual: Option<bool>,
 }
 
 impl EmulateOptions {
@@ -89,14 +107,49 @@ pub fn emulate_float_format(
     scaling: FormatScaling,
     opts: &EmulateOptions,
 ) -> Graph {
+    let f = Some((format, scaling));
+    emulate_number_format(graph, f, f, opts)
+}
+
+/// [`emulate_float_format`] with weights and intermediates in their own
+/// formats (`NumberFormat::Mixed`); `None` leaves that side in f32. Weights
+/// here means params rounded in-graph (`params_in_graph`) and values computed
+/// from params alone; params rounded on upload never reach this pass.
+pub fn emulate_number_format(
+    graph: Graph,
+    weights: Option<(FloatFormat, FormatScaling)>,
+    activations: Option<(FloatFormat, FormatScaling)>,
+    opts: &EmulateOptions,
+) -> Graph {
     let softmax_feed = if opts.round_softmax_inputs {
         std::collections::HashSet::new()
     } else {
         softmax_feeds(&graph)
     };
+    let tables = position_table_params(&graph);
+    // Computed from params and constants alone: a weight in all but name.
+    let mut weight_derived: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    for n in graph.nodes() {
+        let derived = match &n.op {
+            Op::Param { .. } | Op::Constant { .. } => true,
+            Op::Input { .. } => false,
+            _ => !n.inputs.is_empty() && n.inputs.iter().all(|i| weight_derived.contains(i)),
+        };
+        if derived {
+            weight_derived.insert(n.id);
+        }
+    }
+    let narrow = activations.is_some_and(|(f, _)| 1 + f.exp_bits as u32 + f.man_bits as u32 <= 8);
+    let residual = if opts.round_residual.unwrap_or(!narrow) {
+        std::collections::HashSet::new()
+    } else {
+        norm_inputs(&graph)
+    };
+    // A weight of `shape` rounded under `weights`, if it is.
+    let weight_fmt = |shape: &Shape| weights.filter(|&(f, _)| rounds_param_shape(f, shape));
     let mut out = Graph::new(&graph.name);
-    // Old id → (id in `out`, whether consumers read a rounded copy).
-    let mut map: HashMap<NodeId, (NodeId, bool)> = HashMap::new();
+    // Old id → (id in `out`, the format consumers read it rounded to).
+    let mut map: HashMap<NodeId, (NodeId, Option<(FloatFormat, FormatScaling)>)> = HashMap::new();
     // Rounded copies, made on first use so a value only the caller reads
     // (a graph output) never gets one.
     let mut rounded: HashMap<NodeId, NodeId> = HashMap::new();
@@ -105,31 +158,41 @@ pub fn emulate_float_format(
         let inputs: Vec<NodeId> = node
             .inputs
             .iter()
-            .map(|i| {
-                let (raw, round) = map[i];
-                if round {
-                    *rounded
-                        .entry(raw)
-                        .or_insert_with(|| round_node(&mut out, raw, format, scaling))
-                } else {
-                    raw
-                }
+            .map(|i| match map[i] {
+                (raw, Some((f, sc))) => *rounded
+                    .entry(raw)
+                    .or_insert_with(|| round_node(&mut out, raw, f, sc)),
+                (raw, None) => raw,
             })
             .collect();
         let raw = out.add_node(node.op.clone(), inputs, node.shape.clone());
-        let skip = !node.shape.dtype().is_float()
+        let fmt = if !node.shape.dtype().is_float()
             || is_data_movement(&node.op)
             || softmax_feed.contains(&node.id)
+            || residual.contains(&node.id)
             || opts.keep_ops.contains(&node.op.kind())
-            || match &node.op {
+        {
+            None
+        } else {
+            match &node.op {
                 Op::Param { name } => {
-                    !opts.params_in_graph || opts.params_prerounded || opts.keeps_param(name)
+                    if !opts.params_in_graph
+                        || opts.params_prerounded
+                        || opts.keeps_param(name)
+                        || tables.contains(name)
+                    {
+                        None
+                    } else {
+                        weight_fmt(&node.shape)
+                    }
                 }
-                Op::Input { .. } => !opts.round_inputs,
-                Op::Constant { .. } => !opts.round_constants,
-                _ => false,
-            };
-        map.insert(node.id, (raw, !skip));
+                Op::Input { .. } => activations.filter(|_| opts.round_inputs),
+                Op::Constant { .. } => activations.filter(|_| opts.round_constants),
+                _ if weight_derived.contains(&node.id) => weight_fmt(&node.shape),
+                _ => activations,
+            }
+        };
+        map.insert(node.id, (raw, fmt));
     }
 
     let outputs: Vec<NodeId> = graph.outputs.iter().map(|o| map[o].0).collect();
@@ -166,6 +229,85 @@ fn softmax_feeds(graph: &Graph) -> std::collections::HashSet<NodeId> {
         }
     }
     feeds
+}
+
+/// Whether a weight of `shape` is rounded under `format`: always for formats
+/// wider than 8 bits, otherwise only matrices and higher-rank tensors (see the
+/// module docs).
+pub fn rounds_param_shape(format: FloatFormat, shape: &Shape) -> bool {
+    1 + format.exp_bits as u32 + format.man_bits as u32 > 8 || shape.rank() >= 2
+}
+
+/// Names of params read only as a `Rope` op's cos/sin tables, directly or
+/// through data movement (a decode step gathers its row; a prefill narrows the
+/// table to its length). They are position encodings, not weights.
+pub fn position_table_params(graph: &Graph) -> std::collections::HashSet<String> {
+    let mut consumers: HashMap<NodeId, Vec<(NodeId, usize)>> = HashMap::new();
+    for n in graph.nodes() {
+        for (k, &i) in n.inputs.iter().enumerate() {
+            consumers.entry(i).or_default().push((n.id, k));
+        }
+    }
+    let outputs: std::collections::HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    // Whether every use of `id` ends as a Rope table operand.
+    fn only_tables(
+        graph: &Graph,
+        consumers: &HashMap<NodeId, Vec<(NodeId, usize)>>,
+        outputs: &std::collections::HashSet<NodeId>,
+        id: NodeId,
+        depth: usize,
+    ) -> bool {
+        let Some(users) = consumers.get(&id) else {
+            return false;
+        };
+        if outputs.contains(&id) || depth > 8 {
+            return false;
+        }
+        users.iter().all(|&(u, k)| match &graph.node(u).op {
+            Op::Rope { .. } => k >= 1,
+            // A gathered row of the table, not the indices.
+            Op::Gather { .. } if k != 0 => false,
+            op if is_data_movement(op) => only_tables(graph, consumers, outputs, u, depth + 1),
+            _ => false,
+        })
+    }
+    graph
+        .nodes()
+        .iter()
+        .filter_map(|n| match &n.op {
+            Op::Param { name } if only_tables(graph, &consumers, &outputs, n.id, 0) => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Nodes read by a normalization op (looking through data movement): the
+/// residual stream of a pre-norm network.
+fn norm_inputs(graph: &Graph) -> std::collections::HashSet<NodeId> {
+    graph
+        .nodes()
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.op.kind(),
+                OpKind::RmsNorm
+                    | OpKind::LayerNorm
+                    | OpKind::LayerNorm2d
+                    | OpKind::GroupNorm
+                    | OpKind::BatchNormInference
+            )
+        })
+        .filter_map(|n| {
+            // Through reshapes and the like to the op that computed the value.
+            let mut x = *n.inputs.first()?;
+            while is_data_movement(&graph.node(x).op) {
+                x = *graph.node(x).inputs.first()?;
+            }
+            Some(x)
+        })
+        .collect()
 }
 
 /// `RoundToFormat(x)`, adding the tensor-wide max magnitude for per-tensor scaling.
@@ -291,5 +433,109 @@ mod tests {
                 assert_eq!(n.inputs.len(), 2, "per-tensor scaling carries amax");
             }
         }
+    }
+
+    /// A pre-norm block: `h = x·w1; r = x + h; n = rms_norm(r, g, b);
+    /// y = rope(n·w2, cos, sin)`, with `g' = g + 1` computed in the graph.
+    fn pre_norm_block() -> Graph {
+        let f = DType::F32;
+        let mut g = Graph::new("block");
+        let s = Shape::new(&[2, 4], f);
+        let v = Shape::new(&[4], f);
+        let x = g.input("x", s.clone());
+        let w1 = g.param("w1", Shape::new(&[4, 4], f));
+        let w2 = g.param("w2", Shape::new(&[4, 4], f));
+        let gamma = g.param("norm.weight", v.clone());
+        let one = g.add_node(
+            Op::Constant {
+                data: 1f32.to_le_bytes().repeat(4),
+            },
+            vec![],
+            v.clone(),
+        );
+        let gain = g.binary(rlx_ir::op::BinaryOp::Add, gamma, one, v.clone());
+        let beta = g.param("norm.bias", v.clone());
+        let cos = g.param("rope.cos", Shape::new(&[2, 2], f));
+        let sin = g.param("rope.sin", Shape::new(&[2, 2], f));
+        let h = g.add_node(Op::MatMul, vec![x, w1], s.clone());
+        let r = g.binary(rlx_ir::op::BinaryOp::Add, x, h, s.clone());
+        let n = g.add_node(
+            Op::RmsNorm {
+                axis: -1,
+                eps: 1e-6,
+            },
+            vec![r, gain, beta],
+            s.clone(),
+        );
+        let q = g.add_node(Op::MatMul, vec![n, w2], s.clone());
+        let y = g.add_node(
+            Op::Rope {
+                head_dim: 4,
+                n_rot: 4,
+                style: Default::default(),
+            },
+            vec![q, cos, sin],
+            s.clone(),
+        );
+        g.set_outputs(vec![y]);
+        g
+    }
+
+    fn rounded_inputs_of(g: &Graph, kind: OpKind) -> Vec<bool> {
+        let n = g.nodes().iter().find(|n| n.op.kind() == kind).unwrap();
+        n.inputs
+            .iter()
+            .map(|&i| matches!(g.node(i).op, Op::RoundToFormat { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn narrow_formats_keep_residual_vectors_and_position_tables() {
+        let f8 = FloatFormat::parse("f8").unwrap();
+        let opts = EmulateOptions {
+            params_in_graph: true,
+            ..Default::default()
+        };
+        let g = emulate_float_format(pre_norm_block(), f8, FormatScaling::Block(32), &opts);
+        // The residual sum, the computed gain and the bias reach the norm unrounded.
+        assert_eq!(
+            rounded_inputs_of(&g, OpKind::RmsNorm),
+            vec![false, false, false]
+        );
+        // The matmul reads the rounded norm output and weight; RoPE reads its
+        // tables as they are.
+        assert_eq!(
+            rounded_inputs_of(&g, OpKind::Rope),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            position_table_params(&pre_norm_block()),
+            ["rope.cos", "rope.sin"].map(String::from).into()
+        );
+        // f16 rounds the residual and the vectors (not the tables).
+        let g16 = emulate_float_format(
+            pre_norm_block(),
+            FloatFormat::F16,
+            FormatScaling::None,
+            &opts,
+        );
+        assert_eq!(
+            rounded_inputs_of(&g16, OpKind::RmsNorm),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            rounded_inputs_of(&g16, OpKind::Rope),
+            vec![true, false, false]
+        );
+        // Forcing the residual on under f8.
+        let forced = EmulateOptions {
+            round_residual: Some(true),
+            ..opts
+        };
+        let g = emulate_float_format(pre_norm_block(), f8, FormatScaling::Block(32), &forced);
+        assert_eq!(
+            rounded_inputs_of(&g, OpKind::RmsNorm),
+            vec![true, false, false]
+        );
     }
 }

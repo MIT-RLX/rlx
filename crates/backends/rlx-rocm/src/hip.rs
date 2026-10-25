@@ -540,7 +540,7 @@ fn all_gfx_tokens(s: &str) -> Vec<String> {
 /// (unfiltered) agent list so kernels build for the device we actually run on.
 fn visible_device_index() -> usize {
     for key in ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"] {
-        if let Ok(v) = std::env::var(key) {
+        if let Ok(v) = rlx_ir::env::read(key) {
             if let Some(first) = v.split(',').next() {
                 if let Ok(i) = first.trim().parse::<usize>() {
                     return i;

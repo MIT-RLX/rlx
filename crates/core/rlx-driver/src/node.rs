@@ -142,7 +142,7 @@ impl Node {
     ///   `TOPOLOGY=mesh|star` (`DIAL_OUT=1` = star)
     ///   `HEAP_MB`                             — per-rank heap (optional)
     pub fn from_env() -> Result<Self, String> {
-        let var = |k: &str| std::env::var(k).ok();
+        let var = |k: &str| rlx_ir::env::read(k).ok();
         let rank: u32 = var("RANK")
             .as_deref()
             .unwrap_or("0")

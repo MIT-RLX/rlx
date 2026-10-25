@@ -66,6 +66,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Narrow,
         Concat,
         KvAppend,
+        DynamicUpdateSlice,
         Expand,
         Gather,
         Reverse,
@@ -168,6 +169,9 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Scan,
         ScanBackward,
         ScanBackwardXs,
+        // Op::While, a loop at run time on the host (rlx-cpu's
+        // `Thunk::While`) through the one-op host fallback.
+        While,
         LogMel,
         LogMelBackward,
         WelchPeaks,
@@ -212,6 +216,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Dequantize,
         FakeQuantize,
         RoundToFormat,
+        DoubleSingle,
         FakeQuantizeLSQ,
         FakeQuantizeLSQBackwardX,
         FakeQuantizeLSQBackwardScale,

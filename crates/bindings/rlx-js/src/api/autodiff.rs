@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Graph-to-graph transforms: `grad`, `jvp`, `hvp`, `vmap`.
+//! Graph-to-graph transforms: `grad`, `jvp`, `hvp`, `vmap`, and the
+//! higher-order `nthOrderGrad` / `directionalNthGrad`.
 //!
 //! Each borrows the forward graph and returns a new one, so the same forward
 //! can be differentiated against several `wrt` sets:
@@ -17,8 +18,9 @@ use quickrs_core::context::Context;
 use quickrs_core::gc::Gc;
 use quickrs_core::object::JsObject;
 use quickrs_core::value::{JsResult, Value};
-use rlx_ir::NodeId;
+use rlx_bind::runtime::autodiff;
 
+use crate::api::bind::lift;
 use crate::api::graph::{graph_ref, wrap_graph};
 use crate::convert::*;
 
@@ -29,12 +31,7 @@ use crate::convert::*;
 fn f_grad(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let wrt = to_u32_vec(ctx, arg(args, 1), "grad wrt")?;
     let forward = graph_ref(ctx, arg(args, 0))?;
-    let ids: Vec<NodeId> = wrt.into_iter().map(NodeId).collect();
-    // A `wrt` the loss does not depend on, or an op with no VJP rule, is a
-    // `panic!` inside rlx — surfaced here instead of aborting the host.
-    let backward = crate::panics::catch(ctx, "grad", || {
-        rlx_opt::autodiff::grad_with_loss(forward, &ids)
-    })?;
+    let backward = lift(ctx, autodiff::grad(forward, wrt))?;
     Ok(wrap_graph(ctx, backward))
 }
 
@@ -43,8 +40,7 @@ fn f_grad(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult
 fn f_jvp(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let wrt = to_u32_vec(ctx, arg(args, 1), "jvp tangentFor")?;
     let forward = graph_ref(ctx, arg(args, 0))?;
-    let ids: Vec<NodeId> = wrt.into_iter().map(NodeId).collect();
-    let out = crate::panics::catch(ctx, "jvp", || rlx_opt::autodiff_fwd::jvp(forward, &ids))?;
+    let out = lift(ctx, autodiff::jvp(forward, wrt))?;
     Ok(wrap_graph(ctx, out))
 }
 
@@ -52,8 +48,7 @@ fn f_jvp(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<
 fn f_hvp(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let wrt = to_u32_vec(ctx, arg(args, 1), "hvp wrt")?;
     let forward = graph_ref(ctx, arg(args, 0))?;
-    let ids: Vec<NodeId> = wrt.into_iter().map(NodeId).collect();
-    let out = crate::panics::catch(ctx, "hvp", || rlx_opt::autodiff_fwd::hvp(forward, &ids))?;
+    let out = lift(ctx, autodiff::hvp(forward, wrt))?;
     Ok(wrap_graph(ctx, out))
 }
 
@@ -62,8 +57,7 @@ fn f_vmap(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult
     let names = to_string_vec(ctx, arg(args, 1))?;
     let batch = to_usize(ctx, arg(args, 2), "vmap batchSize")?;
     let forward = graph_ref(ctx, arg(args, 0))?;
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let out = crate::panics::catch(ctx, "vmap", || rlx_opt::vmap::vmap(forward, &refs, batch))?;
+    let out = lift(ctx, autodiff::vmap(forward, names, batch))?;
     Ok(wrap_graph(ctx, out))
 }
 
@@ -72,9 +66,23 @@ fn f_nth_order_grad(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -
     let name = ctx.to_rust_string(arg(args, 1))?;
     let order = to_usize(ctx, arg(args, 2), "nthOrderGrad order")?;
     let forward = graph_ref(ctx, arg(args, 0))?;
-    let out = crate::panics::catch(ctx, "nthOrderGrad", || {
-        rlx_opt::rlx_autodiff::higher_order::nth_order_grad(forward, &name, order)
-    })?;
+    let out = lift(ctx, autodiff::nth_order_grad(forward, &name, order))?;
+    Ok(wrap_graph(ctx, out))
+}
+
+/// `directionalNthGrad(graph, "x", order)` — the order-`n` derivative
+/// contracted against one direction per level, for non-scalar `x`. The result
+/// gains inputs `dir_0` … `dir_{order-1}` holding those directions.
+fn f_directional_nth_grad(
+    ctx: &mut Context,
+    _this: &Value,
+    args: &[Value],
+    _m: i32,
+) -> JsResult<Value> {
+    let name = ctx.to_rust_string(arg(args, 1))?;
+    let order = to_usize(ctx, arg(args, 2), "directionalNthGrad order")?;
+    let forward = graph_ref(ctx, arg(args, 0))?;
+    let out = lift(ctx, autodiff::directional_nth_grad(forward, &name, order))?;
     Ok(wrap_graph(ctx, out))
 }
 
@@ -86,5 +94,6 @@ pub fn install(ctx: &mut Context, namespace: &Gc<JsObject>) {
         "hvp" => f_hvp, 2;
         "vmap" => f_vmap, 3;
         "nthOrderGrad" => f_nth_order_grad, 3;
+        "directionalNthGrad" => f_directional_nth_grad, 3;
     };
 }

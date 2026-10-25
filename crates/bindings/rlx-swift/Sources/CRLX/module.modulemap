@@ -1,0 +1,5 @@
+module CRLX [system] {
+    header "shim.h"
+    link "rlx_capi"
+    export *
+}

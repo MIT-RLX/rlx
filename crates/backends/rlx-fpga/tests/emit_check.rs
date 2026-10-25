@@ -7,6 +7,9 @@
 //! non-empty, and the SystemVerilog source contains the module names
 //! `top` references.
 
+// Emits files / goes through `rlx-ir`: both need the `std` feature.
+#![cfg(feature = "std")]
+
 use std::fs;
 
 use rlx_fpga::codegen::emit_model;

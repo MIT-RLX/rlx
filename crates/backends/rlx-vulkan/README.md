@@ -88,6 +88,8 @@ Native SPIR-V covers the transformer / vision / training hot path:
 - **QAT / I8**: FakeQuantize Fixed/PerBatch/LSQ (+ STE bwd), packed-I8
   Quantize/Dequantize/QMatMul/QConv2d.
 - **C64**: ComplexNormSq / Backward / Conjugate (interleaved).
+- **Extended precision**: `DoubleSingle` (f64 as `(hi, lo)` f32 pairs; the
+  `rlxsl::dw` prelude prepended at build time) and `RoundToFormat`.
 
 Fused residual norms / SwiGLU, `FusedMatMulBiasAct`, fusion regions,
 `LoraMatMul` / `FusedTransformerLayer` / `If` / `While` / `DotGeneral` /
@@ -97,7 +99,8 @@ Fused residual norms / SwiGLU, `FusedMatMulBiasAct`, fusion regions,
 
 **Host-fallback** (no native SPIR-V yet, or exceeds a native size cap —
 run on the CPU reference against the host-visible mapped arena): oversized
-RNN/SSM, `Fft`, quantized matmul (`DequantMatMul` + GGUF block decode),
+RNN/SSM, `Fft`, `DequantMatMul` schemes without a native shader (native:
+Q4_K / Q6_K / Q1_0 / Q2_0 decode GEMV, Q4_K / Q6_K prefill, tiled Q1_0 prefill),
 `DequantGroupedMatMul`/`DequantMoEWeights`, `RngNormal`/`RngUniform`/`Sample`,
 DenseSolve (HostOpDesc → LAPACK), `CustomFn`, splat prepare/rasterize.
 The run loop submits GPU dispatches in segments and flushes around each host op.
@@ -114,7 +117,7 @@ enough to prove the SPIR-V and push-constant layout are right, but neither is a
 real GPU driver:
 - **MoltenVK** (Vulkan→Metal translation, manual setup — see the Apple-Silicon
   note above) — a Vulkan↔CPU parity suite
-  (`crates/rlx-runtime/tests/vulkan_parity.rs`, ~99 op-variant checks across 50
+  (`crates/core/rlx-runtime/tests/vulkan_parity.rs`, ~99 op-variant checks across 50
   tests): every Binary/Activation/Compare/Reduce variant, attention across mask
   kinds + both head layouts, RoPE (NeoX/GptJ × full/partial), matmul, norms,
   softmax, vision (conv/pool/im2col/resize), MoE grouped-matmul, Mamba SSM, and
@@ -128,7 +131,7 @@ strided-copy kernel; a missing RMSNorm `beta` term), both fixed.
 **Not yet validated on a native Vulkan driver / real GPU** — that's the pending
 step on the Linux CUDA rig. Kernels are also still naive (correctness first):
 shared-memory tiling, a device-local arena + staging, grid-stride dispatch, and
-promoting remaining hot host ops (esp. `DequantMatMul` / GGUF) to native SPIR-V
+promoting the remaining GGUF schemes and other hot host ops to native SPIR-V
 are the perf follow-ups, best done there.
 
 Run the parity suite locally with a Vulkan driver present:

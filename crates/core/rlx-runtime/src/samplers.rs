@@ -129,15 +129,7 @@ impl SamplerChain {
 /// Index of the largest logit. Ties go to the lowest index, so the result
 /// does not depend on iteration order.
 pub fn argmax_logits(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as u32
+    rlx_search::argmax_u32(logits)
 }
 
 impl Default for SamplerChain {
@@ -216,11 +208,19 @@ pub fn sample_from_logits(logits: &mut [f32], rng: &mut Philox4x32) -> u32 {
     sample_from_probs(logits, rng)
 }
 
-/// Sorted-descending index/value pairs. Used by every top-something sampler.
+/// Sorted-descending index/value pairs, equal values in index order. Used by
+/// every top-something sampler.
 fn sorted_desc(logits: &[f32]) -> Vec<(usize, f32)> {
     let mut v: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sort_desc_by_value(&mut v);
     v
+}
+
+/// Descending by value, ties by index: the order a stable sort of index-ordered
+/// input gives, at unstable-sort speed (a vocabulary row is 150k+ entries). A
+/// total order, so NaN cannot make the sort panic.
+fn sort_desc_by_value(v: &mut [(usize, f32)]) {
+    v.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 }
 
 // ─── Temperature ─────────────────────────────────────────────────────
@@ -290,8 +290,13 @@ impl Sampler for TopK {
         if self.k == 0 || self.k >= v {
             return;
         }
-        let sorted = sorted_desc(logits);
-        let cutoff = sorted[self.k - 1].1;
+        // The k-th largest by selection, O(vocab) — a full sort of a 248k
+        // LM-head row cost ~10 ms per token for one number.
+        let mut vals: Vec<f32> = logits.to_vec();
+        let (_, kth, _) = vals.select_nth_unstable_by(self.k - 1, |a, b| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let cutoff = *kth;
         for x in logits.iter_mut() {
             if *x < cutoff {
                 *x = f32::NEG_INFINITY;
@@ -319,17 +324,52 @@ impl Sampler for TopP {
         if v == 0 {
             return;
         }
-        let mut probs: Vec<f32> = logits.to_vec();
+        // Only the finite logits: masked ones (an earlier top-k leaves 20 of
+        // 248k) have probability 0, so they change neither the softmax nor
+        // the nucleus — and sorting just the survivors is what keeps this
+        // cheap. Ties break by index, as a stable sort of index-ordered input.
+        let finite: Vec<(usize, f32)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, x)| x.is_finite())
+            .collect();
+        if finite.is_empty() {
+            return;
+        }
+        let mut probs: Vec<f32> = finite.iter().map(|&(_, x)| x).collect();
         softmax_inplace(&mut probs);
-        let sorted = sorted_desc(&probs);
-        let mut keep = vec![false; v];
-        let mut cum = 0.0f32;
-        for (rank, (idx, p)) in sorted.iter().enumerate() {
-            keep[*idx] = true;
-            cum += *p;
-            if cum >= self.p && rank + 1 >= self.min_keep {
-                break;
+        let mut order: Vec<(usize, f32)> = finite
+            .iter()
+            .zip(&probs)
+            .map(|(&(i, _), &p)| (i, p))
+            .collect();
+        // The nucleus is a prefix of the sorted order, and usually a short one:
+        // sort only the top `k`, growing it until the prefix reaches `p`. The
+        // prefix comes out in exactly the full sort's order, so the result
+        // does too.
+        let n = order.len();
+        let desc = |a: &(usize, f32), b: &(usize, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+        let mut k = 64.max(self.min_keep).min(n);
+        let kept = loop {
+            if k < n {
+                order.select_nth_unstable_by(k - 1, desc);
             }
+            order[..k].sort_unstable_by(desc);
+            let mut cum = 0.0f32;
+            let hit = order[..k].iter().enumerate().position(|(rank, &(_, p))| {
+                cum += p;
+                cum >= self.p && rank + 1 >= self.min_keep
+            });
+            match hit {
+                Some(rank) => break rank + 1,
+                None if k == n => break n,
+                None => k = (k * 4).min(n),
+            }
+        };
+        let mut keep = vec![false; v];
+        for &(idx, _) in &order[..kept] {
+            keep[idx] = true;
         }
         for (i, x) in logits.iter_mut().enumerate() {
             if !keep[i] {
@@ -493,7 +533,7 @@ impl Sampler for TypicalP {
                 (i, p, dev)
             })
             .collect();
-        scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_unstable_by(|a, b| a.2.total_cmp(&b.2).then(a.0.cmp(&b.0)));
         let mut keep = vec![false; v];
         let mut cum = 0.0f32;
         for (rank, (idx, p, _)) in scored.iter().enumerate() {
@@ -872,6 +912,124 @@ impl Sampler for RepetitionPenalty {
 
 #[cfg(test)]
 mod tests {
+
+    /// `TopP` as a full sort of every finite probability: what the prefix
+    /// search in `TopP::apply` must reproduce exactly.
+    fn top_p_full_sort(logits: &mut [f32], p: f32, min_keep: usize) {
+        let finite: Vec<(usize, f32)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, x)| x.is_finite())
+            .collect();
+        let mut probs: Vec<f32> = finite.iter().map(|&(_, x)| x).collect();
+        softmax_inplace(&mut probs);
+        let mut order: Vec<(usize, f32)> = finite
+            .iter()
+            .zip(&probs)
+            .map(|(&(i, _), &q)| (i, q))
+            .collect();
+        order.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut keep = vec![false; logits.len()];
+        let mut cum = 0.0f32;
+        for (rank, &(idx, q)) in order.iter().enumerate() {
+            keep[idx] = true;
+            cum += q;
+            if cum >= p && rank + 1 >= min_keep {
+                break;
+            }
+        }
+        for (i, x) in logits.iter_mut().enumerate() {
+            if !keep[i] {
+                *x = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    #[test]
+    fn top_p_prefix_search_matches_a_full_sort() {
+        let mut rng = Philox4x32::new(11);
+        for case in 0..300 {
+            let v = [7, 300, 5000][case % 3];
+            let scale = [0.5f32, 4.0, 20.0][(case / 3) % 3];
+            // Coarse values give exact ties, which must break by index.
+            let coarse = case % 5 == 0;
+            let mut row: Vec<f32> = (0..v)
+                .map(|_| {
+                    let x = rng.next_f32() * scale;
+                    if coarse { (x * 4.0).round() / 4.0 } else { x }
+                })
+                .collect();
+            if case % 4 == 1 {
+                TopK { k: 40 }.apply(&mut row, &[], &mut SamplerState::new(), &mut rng);
+            }
+            for (p, min_keep) in [(0.5f32, 1usize), (0.9, 1), (0.99, 3), (0.3, 100)] {
+                let mut want = row.clone();
+                top_p_full_sort(&mut want, p, min_keep);
+                let mut got = row.clone();
+                TopP { p, min_keep }.apply(&mut got, &[], &mut SamplerState::new(), &mut rng);
+                assert_eq!(got, want, "case {case} p={p} min_keep={min_keep}");
+            }
+        }
+    }
+
+    /// `TopK` (selection) and `TopP` (finite logits only) against their
+    /// full-sort definitions, on rows with ties and with masked entries.
+    #[test]
+    fn topk_topp_match_full_sort_definitions() {
+        use super::*;
+        let reference_topk = |l: &mut Vec<f32>, k: usize| {
+            let sorted = sorted_desc(l);
+            let cutoff = sorted[k - 1].1;
+            l.iter_mut().for_each(|x| {
+                if *x < cutoff {
+                    *x = f32::NEG_INFINITY
+                }
+            });
+        };
+        let reference_topp = |l: &mut Vec<f32>, p: f32| {
+            let mut probs = l.clone();
+            softmax_inplace(&mut probs);
+            let sorted = sorted_desc(&probs);
+            let mut keep = vec![false; l.len()];
+            let mut cum = 0.0f32;
+            for (rank, (idx, pr)) in sorted.iter().enumerate() {
+                keep[*idx] = true;
+                cum += *pr;
+                if cum >= p && rank + 1 >= 1 {
+                    break;
+                }
+            }
+            l.iter_mut().enumerate().for_each(|(i, x)| {
+                if !keep[i] {
+                    *x = f32::NEG_INFINITY
+                }
+            });
+        };
+        let mut rng = Philox4x32::new(7);
+        for (v, k, p) in [
+            (1000usize, 20usize, 0.8f32),
+            (5000, 1, 0.5),
+            (257, 50, 0.95),
+            (64, 63, 0.3),
+        ] {
+            // Coarse values so ties are common.
+            let row: Vec<f32> = (0..v).map(|i| ((i * 7919 % 97) as f32) / 8.0).collect();
+            let (mut a, mut b) = (row.clone(), row.clone());
+            TopK { k }.apply(&mut a, &[], &mut SamplerState::new(), &mut rng);
+            reference_topk(&mut b, k);
+            assert_eq!(a, b, "top-k v={v} k={k}");
+            let (mut c, mut d) = (a.clone(), a.clone());
+            TopP { p, min_keep: 1 }.apply(&mut c, &[], &mut SamplerState::new(), &mut rng);
+            reference_topp(&mut d, p);
+            assert_eq!(c, d, "top-p after top-k v={v} p={p}");
+            let (mut e, mut f) = (row.clone(), row.clone());
+            TopP { p, min_keep: 1 }.apply(&mut e, &[], &mut SamplerState::new(), &mut rng);
+            reference_topp(&mut f, p);
+            assert_eq!(e, f, "top-p alone v={v} p={p}");
+        }
+    }
+
     use super::*;
 
     fn rng() -> Philox4x32 {

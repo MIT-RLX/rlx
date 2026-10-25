@@ -22,11 +22,11 @@ toml = "0.8"
 rlx-gguf = { workspace = true, features = ["ir"], optional = true }
 memmap2 = { version = "0.9", optional = true }
 serde_json = { version = "1", optional = true }
-half = { version = "2", optional = true }
+half = "2"
 
 [features]
 default = []
-formats = ["dep:rlx-gguf", "dep:memmap2", "dep:serde_json", "dep:half"]
+formats = ["dep:rlx-gguf", "dep:memmap2", "dep:serde_json"]
 
 [dev-dependencies]
 # Back-edges: rlx-opt (tier 4) and rlx-runtime (tier 7) both publish AFTER

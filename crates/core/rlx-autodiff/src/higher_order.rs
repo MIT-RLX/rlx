@@ -59,6 +59,34 @@ pub fn nth_order_grad(forward: &Graph, wrt_name: &str, order: usize) -> Graph {
 }
 
 fn nth_order_grad_inner(forward: &Graph, wrt_name: &str, order: usize, do_fuse: bool) -> Graph {
+    let mut g = nth_order_grad_layers(forward, wrt_name, order, do_fuse);
+    keep_forward_inputs(forward, &mut g);
+    g
+}
+
+/// Declare every `Input` of `forward` that `g` no longer has (dead-code
+/// elimination drops the ones the derivative stops reading, and a zero
+/// derivative keeps only `wrt`), so the derivative graph takes exactly the
+/// feeds its forward graph does — an undeclared feed is an error at run time.
+fn keep_forward_inputs(forward: &Graph, g: &mut Graph) {
+    let have: std::collections::HashSet<String> = g
+        .nodes()
+        .iter()
+        .filter_map(|n| match &n.op {
+            rlx_ir::Op::Input { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    for n in forward.nodes() {
+        if let rlx_ir::Op::Input { name } = &n.op
+            && !have.contains(name)
+        {
+            g.input(name, n.shape.clone());
+        }
+    }
+}
+
+fn nth_order_grad_layers(forward: &Graph, wrt_name: &str, order: usize, do_fuse: bool) -> Graph {
     assert_eq!(
         forward.outputs.len(),
         1,
@@ -66,7 +94,7 @@ fn nth_order_grad_inner(forward: &Graph, wrt_name: &str, order: usize, do_fuse: 
     );
     let wrt = find_input_by_name(forward, wrt_name)
         .unwrap_or_else(|| panic!("nth_order_grad: no Input/Param named '{wrt_name}'"));
-    let dtype = forward.node(wrt).shape.dtype();
+    let wrt_shape = forward.node(wrt).shape.clone();
     let loss = forward.outputs[0];
     if order == 0 {
         let mut g = forward.clone();
@@ -74,7 +102,11 @@ fn nth_order_grad_inner(forward: &Graph, wrt_name: &str, order: usize, do_fuse: 
         return g;
     }
     if !output_depends_on_differentiable(forward, loss, wrt) {
-        return zero_derivative_graph(&format!("{}_d{order}_zero", forward.name), wrt_name, dtype);
+        return zero_derivative_graph(
+            &format!("{}_d{order}_zero", forward.name),
+            wrt_name,
+            &wrt_shape,
+        );
     }
 
     let mut g = forward.clone();
@@ -84,7 +116,7 @@ fn nth_order_grad_inner(forward: &Graph, wrt_name: &str, order: usize, do_fuse: 
             return zero_derivative_graph(
                 &format!("{}_d{order}_zero", forward.name),
                 wrt_name,
-                dtype,
+                &wrt_shape,
             );
         }
         let grad_g = grad_with_loss(&g, &[wrt_id]);
@@ -104,6 +136,12 @@ fn nth_order_grad_inner(forward: &Graph, wrt_name: &str, order: usize, do_fuse: 
 /// `directions.len()` is the derivative order. Each direction is exposed as
 /// `"dir_<level>"`. Order-2 with the same direction twice yields `<v, H v>`.
 pub fn directional_nth_grad(forward: &Graph, wrt_name: &str, directions: &[&str]) -> Graph {
+    let mut g = directional_nth_grad_layers(forward, wrt_name, directions);
+    keep_forward_inputs(forward, &mut g);
+    g
+}
+
+fn directional_nth_grad_layers(forward: &Graph, wrt_name: &str, directions: &[&str]) -> Graph {
     assert_eq!(
         forward.outputs.len(),
         1,
@@ -124,7 +162,7 @@ pub fn directional_nth_grad(forward: &Graph, wrt_name: &str, directions: &[&str]
         return zero_derivative_graph(
             &format!("{}_dir_d{order}_zero", forward.name),
             wrt_name,
-            dtype,
+            &wrt_shape,
         );
     }
 
@@ -136,7 +174,7 @@ pub fn directional_nth_grad(forward: &Graph, wrt_name: &str, directions: &[&str]
             return zero_derivative_graph(
                 &format!("{}_dir_d{order}_zero", forward.name),
                 wrt_name,
-                dtype,
+                &wrt_shape,
             );
         }
         let grad_g = grad_with_loss(&g, &[wrt_id]);

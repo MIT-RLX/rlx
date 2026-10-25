@@ -71,9 +71,7 @@ fn leaf(name: &str, n: usize) -> Vec<f32> {
 
 fn run(g: &Graph, threshold: &str, want_fused: bool) -> Vec<f32> {
     // Decided at compile time; this test owns its process so the env is safe.
-    unsafe {
-        std::env::set_var("RLX_FUSE_ATTN_THRESHOLD", threshold);
-    }
+    rlx_ir::env::set("RLX_FUSE_ATTN_THRESHOLD", threshold);
     let plan = rlx_opt::memory::plan_memory(g);
     let mut arena = Arena::from_plan(plan);
     let sched = compile_thunks(g, &arena);
@@ -127,9 +125,7 @@ fn fused_attn_block_honors_rope_style() {
     let g_gptj = build(RopeStyle::GptJ);
     let fused = run(&g_gptj, "64", true); // batch·seq=5 ≤ 64 → FusedAttnBlock
     let unfused = run(&g_gptj, "0", false); // no fusion → base RoPE kernel
-    unsafe {
-        std::env::remove_var("RLX_FUSE_ATTN_THRESHOLD");
-    }
+    rlx_ir::env::remove("RLX_FUSE_ATTN_THRESHOLD");
     let max_abs = fused
         .iter()
         .zip(&unfused)
@@ -144,9 +140,7 @@ fn fused_attn_block_honors_rope_style() {
     // from NeoX on the same weights.
     let g_neox = build(RopeStyle::NeoX);
     let fused_neox = run(&g_neox, "64", true);
-    unsafe {
-        std::env::remove_var("RLX_FUSE_ATTN_THRESHOLD");
-    }
+    rlx_ir::env::remove("RLX_FUSE_ATTN_THRESHOLD");
     let style_diff = fused
         .iter()
         .zip(&fused_neox)

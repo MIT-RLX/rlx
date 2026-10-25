@@ -7,6 +7,8 @@ mod conv;
 pub use conv::*;
 mod custom;
 pub(crate) use custom::*;
+mod double_single;
+pub(crate) use double_single::*;
 mod elementwise;
 pub use elementwise::*;
 pub(crate) mod helpers;

@@ -54,8 +54,7 @@ fn chain() -> Graph {
 
 #[test]
 fn keeping_regions_cannot_overrun_the_cpu_interpreter() {
-    // SAFETY: single-threaded test; no other thread reads the environment here.
-    unsafe { std::env::set_var("RLX_KEEP_ELEMENTWISE_REGIONS", "1") };
+    rlx_ir::env::set("RLX_KEEP_ELEMENTWISE_REGIONS", "1");
 
     let xs = vec![1.0f32; N];
     let ys = vec![0.25f32; N];
@@ -65,7 +64,7 @@ fn keeping_regions_cannot_overrun_the_cpu_interpreter() {
         .pop()
         .expect("one output");
 
-    unsafe { std::env::remove_var("RLX_KEEP_ELEMENTWISE_REGIONS") };
+    rlx_ir::env::remove("RLX_KEEP_ELEMENTWISE_REGIONS");
 
     assert_eq!(out.len(), N);
     for (i, v) in out.iter().enumerate() {

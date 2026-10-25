@@ -10,7 +10,7 @@ Block assembly-line API for RLX model builders — **no HIR/Graph in model code*
 | 1 | `CompileProfile` / `*.rlx.toml` | fusion, precision, passes |
 | 2 | `.custom()` + `rlx_flow::escape::Emit` | novel subgraphs — promote to blocks when stable |
 
-## Model author quick start
+## Getting started for model authors
 
 ```rust
 use rlx_flow::prelude::*;
@@ -60,6 +60,16 @@ eprintln!("{}", w.report());                    // served / missing / unused key
 A missing key's error names the closest keys the source has
 (`missing weight: model.x (closest: language_model.model.x)`).
 
+### Weight storage
+
+Loaders hand builders f32, so a bf16 checkpoint used to land in the arena at
+twice its file size. `ModelFlow::with_weight_storage(WeightStorage::Auto)` (or
+`RLX_WEIGHT_STORAGE=auto|f32|f16|bf16` for every flow in the process) stores
+rank-2 matmul weights at their own width instead — every backend's matmul reads
+f16 / bf16 weights and computes in f32, so `Auto` gives the same products at
+half the memory. Packed quantized weights stay packed; norms, biases,
+embeddings and conv kernels stay f32. Without either, flows keep f32.
+
 ## Small composable blocks
 
 | Block | DSL | Purpose |
@@ -69,7 +79,7 @@ A missing key's error names the closest keys the source has
 | `layer_norm` | `.layer_norm(gamma, beta, eps)` | BERT-style LayerNorm |
 | `gelu_ffn` | `.gelu_ffn(layer_prefix)` | BERT GELU FFN |
 | `bert_encoder_layer` | `.bert_encoder_layer(spec)` / `.repeat_bert_layers(...)` | full BERT encoder layer |
-| `nomic_encoder_layer` | `.repeat_nomic_layers(...)` | NomicBERT RoPE + SwiGLU layer |
+| `NomicEncoderLayerStage` | `.repeat_nomic_layers(...)` | NomicBERT RoPE + SwiGLU layer |
 | `gather_add` | `.gather_add(input, weight)` | add position/type embeddings |
 | `linear` | `.linear(key, transpose)` | matmul |
 | `residual_save` / `residual_add` | `.residual_save()` … `.residual_add()` | skip connections |

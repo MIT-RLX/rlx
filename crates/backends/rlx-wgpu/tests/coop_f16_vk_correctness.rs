@@ -369,18 +369,12 @@ fn coop_f16_vk_bench_vs_wide_dispatch_only() {
     let mut exe_coop = WgpuExecutable::compile(g.clone());
     exe_coop.set_param("b", &b_data);
 
-    unsafe {
-        std::env::set_var("RLX_WGPU_NO_COOP_F16_VK", "1");
-    }
+    rlx_ir::env::set("RLX_WGPU_NO_COOP_F16_VK", "1");
     let mut exe_wide = WgpuExecutable::compile(g);
     exe_wide.set_param("b", &b_data);
-    unsafe {
-        std::env::remove_var("RLX_WGPU_NO_COOP_F16_VK");
-    }
+    rlx_ir::env::remove("RLX_WGPU_NO_COOP_F16_VK");
 
-    unsafe {
-        std::env::set_var("RLX_BENCH_DISPATCH_ONLY", "1");
-    }
+    rlx_ir::env::set("RLX_BENCH_DISPATCH_ONLY", "1");
     let _ = exe_coop.run(&[("a", a_data.as_slice())]);
     let t0 = Tick::now();
     for _ in 0..5 {
@@ -394,9 +388,7 @@ fn coop_f16_vk_bench_vs_wide_dispatch_only() {
         let _ = exe_wide.run(&[("a", a_data.as_slice())]);
     }
     let wide_us = Tick::now().elapsed_us(t1) / 5.0;
-    unsafe {
-        std::env::remove_var("RLX_BENCH_DISPATCH_ONLY");
-    }
+    rlx_ir::env::remove("RLX_BENCH_DISPATCH_ONLY");
 
     eprintln!("CoopF16Vk 1024³ dispatch-only ≈ {coop_us} µs vs wide_nv ≈ {wide_us} µs");
 }

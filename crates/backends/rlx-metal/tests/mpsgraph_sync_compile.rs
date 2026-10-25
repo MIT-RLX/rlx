@@ -99,13 +99,9 @@ fn sync_compile_mitigation_is_in_force() {
 #[test]
 fn the_env_override_still_selects_the_control_arm() {
     let _lock = env_arm_lock();
-    // SAFETY: `set_var` mutates process-global state, so being single-threaded
-    // *within this test* is not the property that matters — the sibling test
-    // reads the same variable from another thread. `ENV_ARM_LOCK` is what makes
-    // this sound: no other test in this binary reads the value while it is set.
-    unsafe { std::env::set_var("RLX_MPSGRAPH_NO_SYNC_COMPILE", "1") };
+    rlx_ir::env::set("RLX_MPSGRAPH_NO_SYNC_COMPILE", "1");
     let status = sync_compile_status();
-    unsafe { std::env::remove_var("RLX_MPSGRAPH_NO_SYNC_COMPILE") };
+    rlx_ir::env::remove("RLX_MPSGRAPH_NO_SYNC_COMPILE");
     assert_eq!(
         status,
         SyncCompile::DisabledByEnv,

@@ -582,6 +582,9 @@ impl OpExtension for ReduceFromParallelExt {
 struct AllReduceCpu;
 
 impl CpuKernel for AllReduceCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         ALL_REDUCE
     }
@@ -606,6 +609,9 @@ impl CpuKernel for AllReduceCpu {
 struct AllGatherCpu;
 
 impl CpuKernel for AllGatherCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         ALL_GATHER
     }
@@ -644,6 +650,9 @@ impl CpuKernel for AllGatherCpu {
 struct ReduceScatterCpu;
 
 impl CpuKernel for ReduceScatterCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         REDUCE_SCATTER
     }
@@ -718,6 +727,9 @@ impl CpuKernel for CopyToParallelCpu {
 struct ReduceFromParallelCpu;
 
 impl CpuKernel for ReduceFromParallelCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         REDUCE_FROM_PARALLEL
     }
@@ -949,6 +961,9 @@ impl OpExtension for BroadcastExt {
 
 struct BroadcastCpu;
 impl CpuKernel for BroadcastCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         BROADCAST
     }
@@ -998,6 +1013,9 @@ impl OpExtension for ReduceExt {
 
 struct ReduceCpu;
 impl CpuKernel for ReduceCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         REDUCE
     }
@@ -1056,6 +1074,9 @@ impl OpExtension for AllToAllExt {
 
 struct AllToAllCpu;
 impl CpuKernel for AllToAllCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         ALL_TO_ALL
     }
@@ -1110,6 +1131,9 @@ impl OpExtension for PpermuteExt {
 
 struct PpermuteCpu;
 impl CpuKernel for PpermuteCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         PPERMUTE
     }
@@ -1208,6 +1232,9 @@ impl OpExtension for SendExt {
 
 struct SendCpu;
 impl CpuKernel for SendCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         SEND
     }
@@ -1248,6 +1275,9 @@ impl OpExtension for RecvExt {
 
 struct RecvCpu;
 impl CpuKernel for RecvCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         RECV
     }

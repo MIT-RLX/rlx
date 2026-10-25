@@ -59,6 +59,7 @@ mod side;
 mod stage;
 mod stage_contract;
 mod stage_interfaces;
+pub mod storage;
 pub mod stream;
 mod value;
 mod weight;
@@ -75,7 +76,7 @@ pub use blocks::{
 pub use composite::LayerComposition;
 // `FlowCtx` is the emission surface a downstream `LayerStage` receives, so it
 // must be nameable outside the crate for the extension seam to be usable.
-pub use context::{DecodeBindings, FlowCtx, FlowState, GdnInputSlots};
+pub use context::{DecodeBindings, FlowCtx, FlowState, GdnInputSlots, f64_format};
 pub use escape::Emit;
 pub use execution::{ExecutionPreset, ModelExecutionConfig};
 pub use extension::FlowExtensionPlan;
@@ -99,6 +100,7 @@ pub use side::SideOutputs;
 pub use stage::FlowStage;
 pub use stage_contract::{BlockAsLayer, DynStage, LayerStage, StageArtifacts};
 pub use stage_interfaces::{AttentionStage, FfnStage, KvCacheContract, NormStage};
+pub use storage::{WEIGHT_STORAGE_ENV, WeightStorage};
 pub use stream::{
     DualStreamStage, LoadStreamStage, StoreStreamStage, dual_stream_stage, id as stream_id,
 };

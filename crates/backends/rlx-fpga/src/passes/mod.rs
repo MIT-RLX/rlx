@@ -13,6 +13,9 @@
 //! see hints at all) bit-identical to the unoptimized model — exactly
 //! what we want for a parity oracle.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::model::{Layer, Model};
 use crate::tune::{RequantPrecision, Tune};
 
@@ -115,7 +118,7 @@ pub struct OptimizedModel {
     /// the number of independent BRAMs to emit for that slot — 1
     /// (default, single byte-wide BRAM) or `P_ic` (e.g. 4, when a
     /// consumer needs ic-parallel reads). Populated by `arena::run`.
-    pub arena_bank: std::collections::BTreeMap<u8, u8>,
+    pub arena_bank: alloc::collections::BTreeMap<u8, u8>,
 }
 
 impl OptimizedModel {
@@ -189,7 +192,7 @@ pub fn optimize(model: &Model, tune: &Tune) -> OptimizedModel {
     let arena_bank = if tune.arena_plan {
         arena::run(model, &mut hints)
     } else {
-        std::collections::BTreeMap::new()
+        alloc::collections::BTreeMap::new()
     };
 
     OptimizedModel {
@@ -221,7 +224,7 @@ pub fn summary(opt: &OptimizedModel) -> String {
     let max_p = opt.hints.iter().map(|h| h.parallelism).max().unwrap_or(1);
     let fused = opt.hints.iter().filter(|h| h.fuses_relu).count();
     let elided = opt.hints.iter().filter(|h| h.elided).count();
-    let arena_slots: std::collections::BTreeSet<u8> = opt
+    let arena_slots: alloc::collections::BTreeSet<u8> = opt
         .hints
         .iter()
         .flat_map(|h| [h.bram_slot_in, h.bram_slot_out])

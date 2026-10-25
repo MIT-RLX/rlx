@@ -43,7 +43,12 @@ fn workgroup_sum(tid: u32, val: f32) -> f32 {
         workgroupBarrier();
         stride = stride >> 1u;
     }
-    return scratch_wg[0];
+    let total = scratch_wg[0];
+    // The kernels call this back-to-back; without a barrier here, lane 0's
+    // write for the NEXT sum races the other lanes' read of this one, and the
+    // result depends on scheduling (64×64 rows failed while 65×64 passed).
+    workgroupBarrier();
+    return total;
 }
 
 // dx kernel: one workgroup per row, 64 lanes cooperate.
@@ -114,16 +119,17 @@ fn layer_norm_bwd_input(
 // `dgamma` partial sums: one workgroup per chunk of ROWS_PER_WG rows.
 // `gamma_partial[wg_idx, d] = sum over rows in chunk of dy[r,d] * x_hat[r,d]`.
 //
-// Each workgroup uses its 64 lanes for the per-row mean+var
-// reductions; lane d (d < H) also accumulates its column's
-// contribution in a private register across the row chunk, then
-// writes the final per-chunk partial to `scratch[wg_idx, d]`.
+// The 64 lanes first reduce each row's mean / inv_std cooperatively (kept in
+// workgroup memory), then stride over the columns — lane `t` owns columns
+// `t, t+64, …` — so any H is covered. (Lanes previously owned only column
+// `t`, so every column ≥ 64 got no gradient: a 512-wide LayerNorm's dgamma
+// was wrong in 7/8 of its entries.)
 //
 // Caller dispatches `num_workgroups = ceil(rows / ROWS_PER_WG)` and
 // allocates `scratch_off` for `num_workgroups * H` f32 entries.
 const ROWS_PER_WG: u32 = 16u;
 
-var<workgroup> row_mean_inv: vec2<f32>;
+var<workgroup> row_stats: array<vec2<f32>, 16>;
 
 @compute @workgroup_size(64)
 fn layer_norm_bwd_gamma_partial(
@@ -141,13 +147,8 @@ fn layer_norm_bwd_gamma_partial(
     if (row_start >= rows) { return; }
     let row_end = min(row_start + ROWS_PER_WG, rows);
 
-    // Each lane d (d < H) holds its accumulator across the chunk.
-    var acc: f32 = 0.0;
     for (var r: u32 = row_start; r < row_end; r = r + 1u) {
         let x_base = params.x_off + r * h;
-        let dy_base = params.dy_off + r * h;
-
-        // Cooperative mean(x_r).
         var s: f32 = 0.0;
         var i: u32 = tid;
         loop {
@@ -155,12 +156,7 @@ fn layer_norm_bwd_gamma_partial(
             s = s + arena[x_base + i];
             i = i + 64u;
         }
-        let sum_x = workgroup_sum(tid, s);
-        if (tid == 0u) { row_mean_inv.x = sum_x * n_inv; }
-        workgroupBarrier();
-        let mean = row_mean_inv.x;
-
-        // Cooperative var(x_r).
+        let mean = workgroup_sum(tid, s) * n_inv;
         var s2: f32 = 0.0;
         i = tid;
         loop {
@@ -169,36 +165,42 @@ fn layer_norm_bwd_gamma_partial(
             s2 = s2 + dv * dv;
             i = i + 64u;
         }
-        let var_sum = workgroup_sum(tid, s2);
-        if (tid == 0u) { row_mean_inv.y = inverseSqrt(var_sum * n_inv + eps); }
-        workgroupBarrier();
-        let inv_std = row_mean_inv.y;
-
-        // Lanes d < H accumulate dy[r,d] * x_hat[r,d].
-        if (tid < h) {
-            let xv = arena[x_base + tid];
-            let dyv = arena[dy_base + tid];
-            acc = acc + dyv * (xv - mean) * inv_std;
-        }
+        let inv_std = inverseSqrt(workgroup_sum(tid, s2) * n_inv + eps);
+        if (tid == 0u) { row_stats[r - row_start] = vec2<f32>(mean, inv_std); }
     }
-    // Write per-chunk partial.
-    if (tid < h) {
-        arena[params.scratch_off + wg * h + tid] = acc;
+    workgroupBarrier();
+
+    var c: u32 = tid;
+    loop {
+        if (c >= h) { break; }
+        var acc: f32 = 0.0;
+        for (var r: u32 = row_start; r < row_end; r = r + 1u) {
+            let st = row_stats[r - row_start];
+            let xv = arena[params.x_off + r * h + c];
+            let dyv = arena[params.dy_off + r * h + c];
+            acc = acc + dyv * (xv - st.x) * st.y;
+        }
+        arena[params.scratch_off + wg * h + c] = acc;
+        c = c + 64u;
     }
 }
 
-// Final reduce: one workgroup, lanes d sum `scratch[*, d]` across all
-// chunks into `dgamma[d]`. `outer` in this dispatch carries the partial
+// Final reduce: one workgroup; lane t sums `scratch[*, d]` for columns
+// d = t, t+64, … into `dgamma[d]`. `outer` in this dispatch carries the partial
 // chunk count (= the original `num_workgroups`).
 @compute @workgroup_size(64)
 fn layer_norm_bwd_gamma_reduce(@builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x;
     let h = params.inner;
-    if (tid >= h || h == 0u) { return; }
     let num_chunks = params.outer;
-    var acc: f32 = 0.0;
-    for (var c: u32 = 0u; c < num_chunks; c = c + 1u) {
-        acc = acc + arena[params.scratch_off + c * h + tid];
+    var d: u32 = tid;
+    loop {
+        if (d >= h) { break; }
+        var acc: f32 = 0.0;
+        for (var c: u32 = 0u; c < num_chunks; c = c + 1u) {
+            acc = acc + arena[params.scratch_off + c * h + d];
+        }
+        arena[params.out_off + d] = acc;
+        d = d + 64u;
     }
-    arena[params.out_off + tid] = acc;
 }

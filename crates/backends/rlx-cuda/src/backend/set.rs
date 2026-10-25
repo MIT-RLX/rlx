@@ -129,6 +129,21 @@ impl CudaExecutable {
             if self.arena.shared_skip_upload.contains(&id) {
                 return;
             }
+            // A 2-B weight slot: narrow here; an f32 write would overrun it.
+            if let Some(&dt) = self.arena.native_half.get(&id) {
+                let bytes: Vec<u8> = match dt {
+                    crate::arena::HalfDtype::F16 => data
+                        .iter()
+                        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                        .collect(),
+                    crate::arena::HalfDtype::Bf16 => data
+                        .iter()
+                        .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+                        .collect(),
+                };
+                self.set_param_bytes(name, &bytes);
+                return;
+            }
             let off_f32 = self.arena.offset(id) / 4;
             let stream = self.ctx.default_stream();
             let mut slot = self
@@ -169,6 +184,14 @@ impl CudaExecutable {
         }
     }
 
+    /// The 2-B storage of `name` when it has a native half slot
+    /// ([`crate::arena::matmul_only_half_params`]); such a param must not also
+    /// get an f32 upload.
+    pub fn native_half_dtype(&self, name: &str) -> Option<crate::arena::HalfDtype> {
+        let id = self.param_offsets.get(name)?;
+        self.arena.native_half.get(id).copied()
+    }
+
     /// Upload a param as packed half-precision bits (`u16` per element).
     /// Caller passes the raw IEEE-754 binary16 (`F16`) or BFloat16
     /// (`Bf16`) bit pattern; the backend stores it in the half-arena
@@ -186,6 +209,23 @@ impl CudaExecutable {
             Some(&id) if self.arena.has(id) => id,
             _ => return,
         };
+        // Stored in its own 2-B slot (see `Arena::native_half`): no side copy.
+        if let Some(&own) = self.arena.native_half.get(&id) {
+            if own == dtype {
+                let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+                self.set_param_bytes(name, &bytes);
+            } else {
+                let wide: Vec<f32> = bits
+                    .iter()
+                    .map(|&b| match dtype {
+                        crate::arena::HalfDtype::F16 => half::f16::from_bits(b).to_f32(),
+                        crate::arena::HalfDtype::Bf16 => half::bf16::from_bits(b).to_f32(),
+                    })
+                    .collect();
+                self.set_param(name, &wide);
+            }
+            return;
+        }
         let f32_off = (self.arena.offset(id) / 4) as u32;
         let off = self
             .arena

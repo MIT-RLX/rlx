@@ -362,11 +362,20 @@ dependencies = [
 
 [[package]]
 name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec 0.8.0",
+]
+
+[[package]]
+name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34ddef2995421ab6a5c779542c81ee77c115206f4ad9d5a8e05f4ff49716a3dd"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.9.1",
 ]
 
 [[package]]
@@ -375,8 +384,14 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.9.1",
 ]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bit-vec"
@@ -1375,6 +1390,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
+name = "fancy-regex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+dependencies = [
+ "bit-set 0.8.0",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,6 +1461,12 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "foldhash"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -1729,9 +1761,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1859,6 +1893,9 @@ name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+dependencies = [
+ "foldhash 0.1.5",
+]
 
 [[package]]
 name = "hashbrown"
@@ -1868,7 +1905,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.2.0",
  "serde",
  "serde_core",
 ]
@@ -1879,7 +1916,7 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "foldhash",
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -2659,6 +2696,12 @@ name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+
+[[package]]
+name = "leb128fmt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lexical-core"
@@ -4415,6 +4458,7 @@ checksum = "f402062616ab18202ae8319da13fa4279883a2b8a9d9f83f20dbade813ce1884"
 dependencies = [
  "cfg-if",
  "indoc",
+ "inventory",
  "libc",
  "memoffset",
  "once_cell",
@@ -4472,21 +4516,15 @@ dependencies = [
 
 [[package]]
 name = "pyrlx"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
- "anyhow",
- "bytemuck",
  "numpy",
  "pyo3",
- "rlx-dduf",
+ "rlx-bind",
  "rlx-fpga",
- "rlx-gguf",
  "rlx-gguf-convert",
  "rlx-ir",
- "rlx-mlx-io",
- "rlx-nemo",
  "rlx-opt",
- "rlx-pkg",
  "rlx-runtime",
 ]
 
@@ -4804,7 +4842,7 @@ dependencies = [
 
 [[package]]
 name = "rlx"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "rlx-bench",
@@ -4812,6 +4850,7 @@ dependencies = [
  "rlx-cortexm",
  "rlx-cpu",
  "rlx-driver",
+ "rlx-extend",
  "rlx-fpga",
  "rlx-geo",
  "rlx-gguf",
@@ -4832,7 +4871,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "half",
  "rlx",
@@ -4843,7 +4882,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bake"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4869,7 +4908,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bbo"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rand 0.8.8",
  "rand_distr",
@@ -4884,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bench"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-cpu",
  "rlx-driver",
@@ -4897,8 +4936,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-bind"
+version = "0.2.19"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "rlx-dduf",
+ "rlx-driver",
+ "rlx-fpga",
+ "rlx-gguf",
+ "rlx-gguf-convert",
+ "rlx-ir",
+ "rlx-mlx-io",
+ "rlx-nemo",
+ "rlx-opt",
+ "rlx-optim",
+ "rlx-pkg",
+ "rlx-runtime",
+ "rlx-text",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+]
+
+[[package]]
+name = "rlx-bindgen"
+version = "0.2.19"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rlx-bind",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "rlx-capi"
+version = "0.2.19"
+dependencies = [
+ "rlx-bind",
+ "rlx-ir",
+ "rlx-runtime",
+]
+
+[[package]]
 name = "rlx-cerebras"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
  "rlx-opt",
@@ -4907,7 +4989,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-check"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
  "rlx-macros",
@@ -4917,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-collectives"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-cpu",
@@ -4933,7 +5015,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -4942,7 +5024,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-coreml"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "cc",
@@ -4960,7 +5042,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-corpus"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
  "rlx-opt",
@@ -4969,11 +5051,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-cortexm"
-version = "0.2.18"
+version = "0.2.19"
 
 [[package]]
 name = "rlx-cortexm-trainer"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-cpu",
@@ -4983,17 +5065,20 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "criterion",
  "gemm",
  "half",
+ "libm",
  "rayon",
  "rlx-gguf",
  "rlx-gpu-dispatch",
  "rlx-ir",
  "rlx-mlx-io",
  "rlx-opt",
+ "rlx-pocketfft",
+ "rlxsl",
  "serde",
  "strum_macros",
  "toml 0.8.23",
@@ -5001,11 +5086,12 @@ dependencies = [
 
 [[package]]
 name = "rlx-cuda"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "cc",
  "cudarc",
+ "half",
  "libloading 0.8.9",
  "rlx-autodiff",
  "rlx-cpu",
@@ -5023,7 +5109,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dduf"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5036,7 +5122,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-distributed"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "libc",
@@ -5051,7 +5137,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "half",
  "iroh",
@@ -5063,7 +5149,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-egpu"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "libc",
  "rlx-ir",
@@ -5072,7 +5158,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-extend"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-flow",
  "rlx-ir",
@@ -5080,7 +5166,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fdm"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "rlx-autodiff",
@@ -5094,11 +5180,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-fem"
-version = "0.2.18"
+version = "0.2.19"
 
 [[package]]
 name = "rlx-ffi"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-ir",
@@ -5107,7 +5193,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flow"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "half",
@@ -5123,7 +5209,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fpga"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-cortexm",
  "rlx-ir",
@@ -5132,16 +5218,17 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
  "rlx-opt",
+ "rlx-pocketfft",
 ]
 
 [[package]]
 name = "rlx-geo"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -5153,7 +5240,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5167,7 +5254,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf-convert"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5181,11 +5268,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-dispatch"
-version = "0.2.18"
+version = "0.2.19"
 
 [[package]]
 name = "rlx-gpu-host"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "half",
@@ -5198,7 +5285,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-kernels"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-gpu-dispatch",
  "rlx-ir",
@@ -5207,7 +5294,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-hub"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -5217,7 +5304,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-hwprofile"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -5225,10 +5312,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "aes 0.9.3",
  "bincode",
+ "libm",
  "serde",
  "serde_json",
  "smallvec",
@@ -5236,26 +5324,18 @@ dependencies = [
 
 [[package]]
 name = "rlx-js"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "quickrs-core",
- "rlx-dduf",
- "rlx-gguf",
- "rlx-gguf-convert",
+ "rlx-bind",
  "rlx-ir",
- "rlx-mlx-io",
- "rlx-nemo",
- "rlx-opt",
- "rlx-optim",
- "rlx-pkg",
  "rlx-runtime",
- "rlx-text",
  "serde_json",
 ]
 
 [[package]]
 name = "rlx-lbm"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
  "rlx-runtime",
@@ -5263,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-linalg"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -5271,7 +5351,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5280,7 +5360,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-megakernel"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-corpus",
  "rlx-ir",
@@ -5290,7 +5370,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metal"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "half",
@@ -5314,8 +5394,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-micro"
+version = "0.2.19"
+dependencies = [
+ "rlx-cortexm",
+]
+
+[[package]]
 name = "rlx-mlx"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "half",
  "libc",
@@ -5328,13 +5415,14 @@ dependencies = [
  "rlx-mlx-sys",
  "rlx-opt",
  "rlx-runtime",
+ "rlxsl",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "rlx-mlx-io"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "half",
@@ -5352,15 +5440,25 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-sys"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "cc",
  "cmake",
 ]
 
 [[package]]
+name = "rlx-model-plugin"
+version = "0.2.19"
+dependencies = [
+ "anyhow",
+ "rlx-ir",
+ "rlx-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "rlx-nemo"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -5370,8 +5468,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-nnpack"
+version = "0.2.19"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "rlx-numpy"
+version = "0.2.19"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "rlx-oneapi"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "half",
  "libloading 0.8.9",
@@ -5386,7 +5498,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -5399,7 +5511,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-conformance"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "ort",
@@ -5414,13 +5526,15 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-import"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "bytemuck",
  "half",
  "protobuf",
+ "rlx-compile",
  "rlx-cpu",
+ "rlx-fusion",
  "rlx-ir",
  "rlx-onnx-proto",
  "rlx-runtime",
@@ -5432,14 +5546,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-proto"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "protobuf",
 ]
 
 [[package]]
 name = "rlx-opscope"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5452,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -5462,14 +5576,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-optim"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rlx-peft"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-cpu",
  "rlx-ir",
@@ -5478,7 +5592,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-pkg"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5505,8 +5619,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-pocketfft"
+version = "0.2.19"
+
+[[package]]
+name = "rlx-program"
+version = "0.2.19"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "rlx-qnn"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "cc",
  "rlx-gguf",
@@ -5518,7 +5643,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-rl"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -5529,11 +5654,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-rng"
-version = "0.2.18"
+version = "0.2.19"
 
 [[package]]
 name = "rlx-rocm"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "cc",
  "libloading 0.8.9",
@@ -5552,11 +5677,12 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "half",
  "inventory",
+ "libloading 0.8.9",
  "memmap2",
  "rayon",
  "rlx-autodiff",
@@ -5583,9 +5709,13 @@ dependencies = [
  "rlx-opt",
  "rlx-optim",
  "rlx-pkg",
+ "rlx-pocketfft",
+ "rlx-program",
  "rlx-qnn",
  "rlx-rocm",
+ "rlx-search",
  "rlx-sparse",
+ "rlx-stablehlo",
  "rlx-tpu",
  "rlx-vulkan",
  "rlx-webgl",
@@ -5595,14 +5725,28 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "wasmi",
+]
+
+[[package]]
+name = "rlx-search"
+version = "0.2.19"
+
+[[package]]
+name = "rlx-signal"
+version = "0.2.19"
+dependencies = [
+ "rlx-cpu",
+ "rlx-numpy",
 ]
 
 [[package]]
 name = "rlx-sparse"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rayon",
  "rlx-cpu",
@@ -5612,8 +5756,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-special"
+version = "0.2.19"
+
+[[package]]
+name = "rlx-stablehlo"
+version = "0.2.19"
+dependencies = [
+ "prost",
+ "rlx-autodiff",
+ "rlx-compile",
+ "rlx-flow",
+ "rlx-ir",
+ "rlx-runtime",
+ "rlx-tpu",
+]
+
+[[package]]
 name = "rlx-tensor"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "ndarray 0.16.1",
  "rlx-autodiff",
@@ -5626,7 +5787,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-text"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "minijinja",
@@ -5639,7 +5800,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-torch-ckpt"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "flate2",
@@ -5649,7 +5810,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-torch-import"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "half",
@@ -5664,7 +5825,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tpu"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "libloading 0.8.9",
  "prost",
@@ -5682,7 +5843,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-umap"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
@@ -5707,14 +5868,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-unfuse"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
 ]
 
 [[package]]
 name = "rlx-vq"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rayon",
  "rlx-cpu",
@@ -5725,7 +5886,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vulkan"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "ash",
  "bytemuck",
@@ -5745,7 +5906,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-web"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-ir",
@@ -5760,7 +5921,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-webgl"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "js-sys",
  "rlx-autodiff",
@@ -5776,7 +5937,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "half",
@@ -5800,7 +5961,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-xdna"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "libc",
  "libloading 0.8.9",
@@ -5809,7 +5970,7 @@ dependencies = [
 
 [[package]]
 name = "rlxsl"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "libm",
  "naga 29.0.4",
@@ -6370,6 +6531,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "string-interner"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23de088478b31c349c9ba67816fa55d9355232d63c3afea8bf513e31f0f1d2c0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "serde",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6659,6 +6830,7 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
+ "fancy-regex",
  "getrandom 0.3.4",
  "itertools 0.14.0",
  "log",
@@ -7303,6 +7475,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.262.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4495a6f85dd94c411c749303efcbc5defade0b0cbdbc0541495241ab917a9b5a"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.262.0",
+]
+
+[[package]]
 name = "wasm-streams"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7313,6 +7495,89 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "wasmi"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78693fcdd618e0fc34af59c6b8efa9ac5d58c68df940beff4bedddb6acfe7c27"
+dependencies = [
+ "spin 0.9.9",
+ "wasmi_collections",
+ "wasmi_core",
+ "wasmi_ir",
+ "wasmparser 0.228.0",
+ "wat",
+]
+
+[[package]]
+name = "wasmi_collections"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a8be2aa467cf2d29e96ff759472c36eeb44a3c81c67fc9cb76c9a24c519c557"
+dependencies = [
+ "string-interner",
+]
+
+[[package]]
+name = "wasmi_core"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69372d5fda3ea3d1e0aa6603c7888110e0187e88ea17cd8fc2e2df0a0e1f37fa"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "wasmi_ir"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f17b774caa13c618c7244f1ee51fe23c5e7b8538a471fa46d9949779758aed6"
+dependencies = [
+ "wasmi_core",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.228.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4abf1132c1fdf747d56bbc1bb52152400c70f336870f968b85e89ea422198ae3"
+dependencies = [
+ "bitflags 2.13.2",
+ "indexmap",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.262.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "974d643b125b272607e2fff8012ea14a8328acd7621e4bafa7afb32500052b1b"
+dependencies = [
+ "bitflags 2.13.2",
+ "indexmap",
+]
+
+[[package]]
+name = "wast"
+version = "262.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30612a0c29249b5f185888a107e8a519d920226b7d07f9d351fd094e9f75eb23"
+dependencies = [
+ "bumpalo",
+ "leb128fmt",
+ "memchr",
+ "unicode-width",
+ "wasm-encoder",
+]
+
+[[package]]
+name = "wat"
+version = "1.262.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e228027f2b07bbaf946980ebbe2437fca73be6f54c40c2a8d4f42f277075f8d1"
+dependencies = [
+ "wast",
 ]
 
 [[package]]
@@ -7412,7 +7677,7 @@ checksum = "14c018fce9b6270aa203c2fdd56f3cce996713534bd757e4ea58c8560b121f14"
 dependencies = [
  "arrayvec",
  "bit-set 0.10.0",
- "bit-vec",
+ "bit-vec 0.9.1",
  "bitflags 2.13.2",
  "bytemuck",
  "cfg_aliases",
@@ -8105,979 +8370,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "kitten_tts_mini_rlx"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-assets"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-bert"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-bioclip2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-bonsai"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-chatterbox"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-cli"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-clinicalbert"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-cohere"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-conformer-ctc"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-dac"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-diamond"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-diarize"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-dinov2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-dinov3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-embed"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-encodec"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-f0"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-f5tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-fara"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-fft"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-fireredaudio"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-florence2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-flux2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-funasr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-gemma"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-gepard"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-granite"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-hoct"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-hy-mt"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-inflect-nano"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-jina-ocr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-kittentts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-kokoro"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-kyutai-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-lfm"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-lfm-vl"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llada2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llama-base"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llama32"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llama4"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-locateanything"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-luxtts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-maya1"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-melotts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-metavoice"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mimi"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-minicpm5"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-minimax"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-miotts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-miratts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mistral"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mistral-vl"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mllama"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-models"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-models-core"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-moonshine"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-moshi"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-moss-nano"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nanbeige"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nanocodec"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nanowakeword"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nemotron"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nemotron-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-neutrino"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-neutts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nllb"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nomic"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ocr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-omnicoder"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-openwakeword"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-orpheus"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-parlertts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-phi"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-piper"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-pocket-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-porcupine"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3-vl"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen35"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-s1"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam-ir"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sesame"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-soprano"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ssm"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-styletts2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-supertonic"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ten-vad"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ten-vad-core"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-timesfm3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tiny-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tinyllama"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-translategemma"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-trellis2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tts-bench"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-uni2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-unlimited-ocr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vad"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vibevoice-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vision"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vjepa2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vlm-base"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voice-gender"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voxrt"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voxtral"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voxtral-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wake"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wakeword"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wakeword-core"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wav2vec2-bert"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wespeaker"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-whisper"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-xcodec"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-zipvoice"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-zonos"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "kitten_tts_mini_rlx"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-assets"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-bert"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-bioclip2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-bonsai"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-chatterbox"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-cli"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-clinicalbert"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-cohere"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-conformer-ctc"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-dac"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-diamond"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-diarize"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-dinov2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-dinov3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-embed"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-encodec"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-f0"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-f5tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-fara"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-fft"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-fireredaudio"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-florence2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-flux2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-funasr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-gemma"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-gepard"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-granite"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-hoct"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-hy-mt"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-inflect-nano"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-jina-ocr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-kittentts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-kokoro"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-kyutai-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-lfm"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-lfm-vl"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llada2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llama-base"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llama32"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-llama4"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-locateanything"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-luxtts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-maya1"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-melotts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-metavoice"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mimi"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-minicpm5"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-minimax"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-miotts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-miratts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mistral"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mistral-vl"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-mllama"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-models"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-models-core"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-moonshine"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-moshi"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-moss-nano"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nanbeige"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nanocodec"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nanowakeword"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nemotron"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nemotron-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-neutrino"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-neutts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nllb"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-nomic"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ocr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-omnicoder"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-openwakeword"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-orpheus"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-parlertts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-phi"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-piper"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-pocket-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-porcupine"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen3-vl"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-qwen35"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-s1"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam-ir"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sam3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-sesame"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-soprano"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ssm"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-styletts2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-supertonic"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ten-vad"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-ten-vad-core"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-timesfm3"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tiny-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tinyllama"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-translategemma"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-trellis2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-tts-bench"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-uni2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-unlimited-ocr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vad"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vibevoice-asr"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vision"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vjepa2"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-vlm-base"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voice-gender"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voxrt"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voxtral"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-voxtral-tts"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wake"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wakeword"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wakeword-core"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wav2vec2-bert"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-wespeaker"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-whisper"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-xcodec"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-zipvoice"
-version = "0.2.16"
-
-[[patch.unused]]
-name = "rlx-zonos"
-version = "0.2.16"

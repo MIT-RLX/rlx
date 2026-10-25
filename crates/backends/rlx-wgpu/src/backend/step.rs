@@ -18,10 +18,10 @@ use crate::kernels::{
     GruParams, Im2Col2dParams, IndexingNdParams, LayerNormBwdParams, LayerNormParams, LstmParams,
     Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
     Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params,
-    ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, RoundToFormatParams,
-    SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams,
-    SceParams, SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams,
-    UnaryParams, WelchPeaksGpuParams, WhereParams,
+    ReduceParams, ResizeNearest2xParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    RoundToFormatParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams,
+    ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
+    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
 
 use super::helpers::{MatmulCompute, MatmulQkvKind};
@@ -912,6 +912,10 @@ pub(crate) enum Step {
         theta: f32,
         repeat_factor: u32,
     },
+    /// Native WGSL `Op::ResizeNearest2x` (NCHW nearest 2× upsample).
+    ResizeNearest2x {
+        params: ResizeNearest2xParams,
+    },
     /// Native WGSL `Op::AxialRope2d`.
     AxialRope2d {
         params: AxialRope2dParams,
@@ -919,6 +923,10 @@ pub(crate) enum Step {
     /// Native WGSL `Op::RoundToFormat`.
     RoundToFormat {
         params: RoundToFormatParams,
+    },
+    /// Native WGSL `Op::DoubleSingle`.
+    DoubleSingle {
+        params: crate::kernels::DoubleSingleParams,
     },
     /// Native WGSL `Op::FakeQuantize` Fixed (scale input).
     FakeQuantizeFixed {
@@ -1270,9 +1278,11 @@ impl Step {
             | Step::Conv3dBackwardInput { .. }
             | Step::Conv3dBackwardWeight { .. }
             | Step::AxialRope2d { .. }
+            | Step::ResizeNearest2x { .. }
             | Step::FakeQuantizeFixed { .. }
             | Step::FakeQuantizePerBatch { .. }
             | Step::RoundToFormat { .. }
+            | Step::DoubleSingle { .. }
             | Step::GroupNormBackwardInput { .. }
             | Step::GroupNormBackwardGamma { .. }
             | Step::GroupNormBackwardBeta { .. }
@@ -1507,8 +1517,10 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ArgReduceHost { .. } => "argreduce_host",
         Step::AxialRope2dHost { .. } => "axial_rope2d_host",
         Step::AxialRope2d { .. } => "axial_rope2d",
+        Step::ResizeNearest2x { .. } => "resize_nearest2x",
         Step::FakeQuantizeFixed { .. } => "fake_quantize_fixed",
         Step::RoundToFormat { .. } => "round_to_format",
+        Step::DoubleSingle { .. } => "double_single",
         Step::FakeQuantizePerBatch { .. } => "fake_quantize_perbatch",
         Step::GroupNormBackwardInput { .. } => "group_norm_backward_input",
         Step::GroupNormBackwardGamma { .. } => "group_norm_backward_gamma",

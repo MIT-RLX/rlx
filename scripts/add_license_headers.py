@@ -63,6 +63,12 @@ def workspace_members() -> list[str]:
     return members
 
 
+def is_third_party_licence(path: Path) -> bool:
+    """A vendored project's own licence (LICENSE-POCKETFFT.md, …): third-party
+    text, never ours to stamp."""
+    return path.name.startswith("LICENSE-")
+
+
 def iter_targets() -> list[Path]:
     paths: list[Path] = []
     for member in workspace_members():
@@ -104,7 +110,7 @@ def iter_targets() -> list[Path]:
             if path.suffix in EXTS or path.suffix in DOC_EXTS:
                 paths.append(path)
 
-    return sorted(set(paths))
+    return sorted(p for p in set(paths) if not is_third_party_licence(p))
 
 
 def comment_prefix(path: Path) -> str:

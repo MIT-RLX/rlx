@@ -13,7 +13,7 @@ are [`export_graph`](src/export.rs) / `rlx_runtime::export` (feature
 See **[docs/fpga-export.md](../../../docs/fpga-export.md)** for the
 full export configuration and `HwTarget` matrix.
 
-## Quick start
+## Getting started
 
 ```sh
 cargo test  -p rlx-fpga --release
@@ -62,6 +62,15 @@ Ternary (BitNet b1.58) weights + QAT → FPGA: [docs/bitnet-fpga.md](../../../do
 - **`codegen`** — per-op emitters + `emit_with_config`
 - **`reference`** — Rust forward pass (parity vs Verilog)
 - **`bin/rlx-fpga-emit`** — CLI
+
+## `no_std`
+
+The default `std` feature carries graph import/export, writing the RTL tree to
+disk, and the sequential target. With `--no-default-features` the crate is
+`no_std` + `alloc`: `Model` → `optimize` (still verified through rlx-ir's
+`no_std` graph/verify core) → in-memory artifacts (`collect_artifacts`), plus
+the reference model and weight packing.
+`just check-no-std` builds it for `thumbv7em-none-eabihf`.
 
 ## License
 

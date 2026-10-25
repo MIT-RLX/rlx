@@ -81,6 +81,15 @@ impl PyDeviceRouter {
         Ok(())
     }
 
+    /// Set several f32 parameters from `{name: array}`; returns how many.
+    fn set_params(&mut self, params: &Bound<'_, PyDict>) -> PyResult<usize> {
+        let owned = crate::graph_devices::dict_to_owned_inputs(params)?;
+        for (name, data) in &owned {
+            self.inner.set_param(name, data);
+        }
+        Ok(owned.len())
+    }
+
     fn run_on<'py>(
         &mut self,
         py: Python<'py>,

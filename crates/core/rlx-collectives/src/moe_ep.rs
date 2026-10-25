@@ -290,6 +290,9 @@ impl OpExtension for MoeCombineExt {
 
 struct MoeDispatchCpu;
 impl CpuKernel for MoeDispatchCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         MOE_DISPATCH
     }
@@ -395,6 +398,9 @@ impl CpuKernel for MoeDispatchCpu {
 
 struct MoeCombineCpu;
 impl CpuKernel for MoeCombineCpu {
+    fn waits_on_peers(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         MOE_COMBINE
     }

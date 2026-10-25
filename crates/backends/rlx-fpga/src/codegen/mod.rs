@@ -17,13 +17,23 @@
 //! Prefer [`emit_with_config`] when you need a hardware target
 //! ([`crate::export_config::HwTarget::Generic`] by default) or synth scripts.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+#[cfg(feature = "std")]
 use std::fs;
+#[cfg(feature = "std")]
 use std::io;
+#[cfg(feature = "std")]
 use std::path::Path;
 
+#[cfg(feature = "std")]
 use crate::export_config::FpgaExportConfig;
 use crate::model::Model;
-use crate::passes::{OptimizedModel, optimize, optimize_default};
+#[cfg(feature = "std")]
+use crate::passes::optimize;
+use crate::passes::{OptimizedModel, optimize_default};
+#[cfg(feature = "std")]
 use crate::tune::Tune;
 
 pub mod argmax;
@@ -66,11 +76,13 @@ pub struct LayerArtifacts {
 /// Emit a complete hardware tree for `model` under `out_dir`, using
 /// the default `Tune` (the `Precision` preset). For full control, see
 /// [`emit_model_tuned`], [`emit_with_config`], and [`emit_optimized`].
+#[cfg(feature = "std")]
 pub fn emit_model(model: &Model, out_dir: &Path) -> io::Result<()> {
     emit_with_config(model, &FpgaExportConfig::default(), out_dir)
 }
 
 /// Emit `model` tuned for `tune` (e.g. `Tune::for_target(OptTarget::Energy)`).
+#[cfg(feature = "std")]
 pub fn emit_model_tuned(model: &Model, tune: &Tune, out_dir: &Path) -> io::Result<()> {
     let cfg = FpgaExportConfig::default().with_tune(*tune);
     emit_with_config(model, &cfg, out_dir)
@@ -78,6 +90,7 @@ pub fn emit_model_tuned(model: &Model, tune: &Tune, out_dir: &Path) -> io::Resul
 
 /// Emit RTL + optional synth/constraint sidecars from a full
 /// [`FpgaExportConfig`] (tune + [`crate::export_config::HwTarget`]).
+#[cfg(feature = "std")]
 pub fn emit_with_config(model: &Model, cfg: &FpgaExportConfig, out_dir: &Path) -> io::Result<()> {
     let opt = optimize(model, &cfg.tune);
     emit_optimized_with_config(&opt, cfg, out_dir)
@@ -100,12 +113,14 @@ pub fn emit_with_config(model: &Model, cfg: &FpgaExportConfig, out_dir: &Path) -
 ///     top.sv                 — controller FSM + instances + scratch BRAMs
 ///     tb.sv                  — image-driven testbench (Verilator)
 /// ```
+#[cfg(feature = "std")]
 pub fn emit_optimized(opt: &OptimizedModel, out_dir: &Path) -> io::Result<()> {
     emit_optimized_with_config(opt, &FpgaExportConfig::default(), out_dir)
 }
 
 /// Like [`emit_optimized`], but also writes synth scripts / constraints
 /// according to `cfg`.
+#[cfg(feature = "std")]
 pub fn emit_optimized_with_config(
     opt: &OptimizedModel,
     cfg: &FpgaExportConfig,

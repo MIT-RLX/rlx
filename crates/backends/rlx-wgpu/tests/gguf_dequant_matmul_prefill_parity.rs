@@ -42,10 +42,25 @@ fn run_case(
     };
 
     let gpu = run(Device::Gpu);
-    let cpu = run(Device::Cpu);
     assert_eq!(gpu.len(), m * n);
-    assert_eq!(cpu.len(), m * n);
-    let max_abs = cpu
+    // rlx-cpu's single-row Q2_0 path quantizes the activation to int8 (as
+    // llama.cpp does), so it is not a reference for an f32 kernel: compare
+    // Q2_0 against the dequantized weights multiplied exactly instead.
+    let reference = if ggml == rlx_gguf::GgmlType::Q2_0 {
+        let w = rlx_gguf::dequant_typed(ggml, &packed, k * n, "w").expect("dequant");
+        (0..m * n)
+            .map(|i| {
+                let (r, j) = (i / n, i % n);
+                (0..k)
+                    .map(|c| x[r * k + c] as f64 * w[j * k + c] as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect()
+    } else {
+        run(Device::Cpu)
+    };
+    assert_eq!(reference.len(), m * n);
+    let max_abs = reference
         .iter()
         .zip(&gpu)
         .map(|(a, b)| (a - b).abs())
@@ -57,6 +72,32 @@ fn run_case(
 #[test]
 fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
     let cases: &[(QuantScheme, rlx_gguf::GgmlType, usize, usize, usize, f32)] = &[
+        // Q8_0 m >= 8 takes the tiled GEMM (`dequant_gemm_q8_0.wgsl`): a full
+        // 64×64 tile, ragged rows/columns, and a FLUX.1 projection at 160 px.
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            64,
+            256,
+            64,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            21,
+            96,
+            70,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            228,
+            3072,
+            9216,
+            1e-2,
+        ),
         (
             QuantScheme::GgufQ4K,
             rlx_gguf::GgmlType::Q4K,
@@ -175,6 +216,33 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
             5120,
             5120,
             2e-2,
+        ),
+        // Q2_0 (ternary, 128-elem blocks) through the cooperative 32-weight
+        // sub-block GEMV: decode width at KittenTTS 2's projection sizes, and a
+        // few rows.
+        (
+            QuantScheme::GgufQ2_0,
+            rlx_gguf::GgmlType::Q2_0,
+            1,
+            2048,
+            6144,
+            1e-3,
+        ),
+        (
+            QuantScheme::GgufQ2_0,
+            rlx_gguf::GgmlType::Q2_0,
+            1,
+            6144,
+            2048,
+            1e-3,
+        ),
+        (
+            QuantScheme::GgufQ2_0,
+            rlx_gguf::GgmlType::Q2_0,
+            3,
+            512,
+            384,
+            1e-3,
         ),
     ];
     for (scheme, ggml, m, k, n, tol) in cases {

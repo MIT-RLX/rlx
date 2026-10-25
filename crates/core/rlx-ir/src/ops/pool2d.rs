@@ -5,6 +5,7 @@
 //! NCHW pooling builder (`Op::Pool`).
 
 use crate::op::ReduceOp;
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op};
 
 impl Graph {

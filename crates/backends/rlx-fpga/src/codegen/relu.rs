@@ -7,6 +7,9 @@
 //! cycle to write — 3 cycles per element. Could be pipelined to 1
 //! cycle/elem; not worth it for our sizes.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::{Artifact, LayerArtifacts};
 use crate::model::Layer;
 use crate::verilog::V;

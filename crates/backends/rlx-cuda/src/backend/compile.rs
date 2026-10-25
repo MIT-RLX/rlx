@@ -86,6 +86,9 @@ impl CudaExecutable {
         // before memory planning. Fusion may reintroduce mid-axis Reduce
         // (e.g. EEG temporal mean); CUDA only schedules last-axis Reduce.
         let graph = LowerNonLastAxisReduce.run(crate::unfuse::unfuse(graph));
+        // The attention kernels read K / V as `num_heads` heads: repeat shared
+        // ones (grouped-query attention) first, or they return a wrong tensor.
+        let graph = rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph);
         t = mark("unfuse", t);
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
@@ -157,8 +160,29 @@ impl CudaExecutable {
         }
         let shared_ids: std::collections::HashSet<rlx_ir::NodeId> =
             shared_param_offsets.keys().copied().collect();
-        let mut plan = crate::arena::plan_f32_uniform_excluding(&graph, 16, &shared_ids);
+        // Matmul-only F16/BF16 weights keep 2-B slots (widened per GEMM into
+        // one shared f32 scratch). Not with shared params: those slots live in
+        // the device-wide region, sized and uploaded elsewhere.
+        let native_half = if shared_ids.is_empty() {
+            crate::arena::matmul_only_half_params(&graph)
+        } else {
+            HashMap::new()
+        };
+        let half_widen_scratch = native_half
+            .keys()
+            .map(|&id| graph.node(id).shape.num_elements().unwrap_or(0) * 4)
+            .max()
+            .unwrap_or(0);
+        let mut plan =
+            crate::arena::plan_f32_uniform_with_half(&graph, 16, &shared_ids, &native_half);
         t = mark("arena_plan", t);
+        let half_widen_scratch_off = if half_widen_scratch > 0 {
+            let aligned = plan.arena_size.div_ceil(16) * 16;
+            plan.arena_size = aligned + half_widen_scratch;
+            aligned
+        } else {
+            0
+        };
         let mut dequant_scratch_off = if dequant_scratch > 0 {
             let aligned = plan.arena_size.div_ceil(16) * 16;
             plan.arena_size = aligned + dequant_scratch;
@@ -220,6 +244,8 @@ impl CudaExecutable {
                 gdn_scratch_off += arena_act_base;
             }
         }
+        let half_widen_scratch_f32 = ((half_widen_scratch_off + arena_act_base) / 4) as u32;
+        arena.native_half = native_half;
         let fab_scratch_base_f32 = (fab_scratch_off / 4) as u32;
         for node in graph.nodes() {
             let slot_bytes = node
@@ -750,6 +776,7 @@ impl CudaExecutable {
                 Op::MatMul => {
                     let (m, k, n, batch, a_bs, b_bs, c_bs, a_id, b_id) =
                         matmul_shape(&graph, node, "MatMul");
+                    let (b_off_f32, b_half) = half_b_operand(&arena, b_id, half_widen_scratch_f32);
                     schedule.push(Step::Matmul {
                         m,
                         k,
@@ -759,16 +786,18 @@ impl CudaExecutable {
                         b_batch_stride: b_bs,
                         c_batch_stride: c_bs,
                         a_off_f32: (arena.offset(a_id) / 4) as u32,
-                        b_off_f32: (arena.offset(b_id) / 4) as u32,
+                        b_off_f32,
                         c_off_f32: (arena.offset(node.id) / 4) as u32,
                         has_bias: 0,
                         bias_off_f32: 0,
                         act_id: 0xFFFF,
+                        b_half,
                     });
                 }
                 Op::FusedMatMulBiasAct { activation } => {
                     let (m, k, n, batch, a_bs, b_bs, c_bs, a_id, b_id) =
                         matmul_shape(&graph, node, "FusedMatMulBiasAct");
+                    let (b_off_f32, b_half) = half_b_operand(&arena, b_id, half_widen_scratch_f32);
                     let bias_id = node.inputs[2];
                     let act_id = match activation {
                         None => 0xFFFFu32,
@@ -783,11 +812,12 @@ impl CudaExecutable {
                         b_batch_stride: b_bs,
                         c_batch_stride: c_bs,
                         a_off_f32: (arena.offset(a_id) / 4) as u32,
-                        b_off_f32: (arena.offset(b_id) / 4) as u32,
+                        b_off_f32,
                         c_off_f32: (arena.offset(node.id) / 4) as u32,
                         has_bias: 1,
                         bias_off_f32: (arena.offset(bias_id) / 4) as u32,
                         act_id,
+                        b_half,
                     });
                 }
                 Op::FusedConvBiasAct {
@@ -2030,6 +2060,7 @@ impl CudaExecutable {
                         has_bias: bias_flag,
                         bias_off_f32: qkv_b_off,
                         act_id: 0xFFFF,
+                        b_half: None,
                     });
                     let scale = 1.0f32 / (hd as f32).sqrt();
                     schedule.push(Step::FusedAttn {
@@ -2060,6 +2091,7 @@ impl CudaExecutable {
                         has_bias: bias_flag,
                         bias_off_f32: out_b_off,
                         act_id: 0xFFFF,
+                        b_half: None,
                     });
                 }
                 Op::AttentionBackward {
@@ -2482,7 +2514,7 @@ impl CudaExecutable {
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
-                Op::Fft { inverse, norm } => {
+                Op::Fft { inverse, norm, .. } => {
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.clone();
                     let meta = rlx_ir::fft::fft_meta(&in_shape);
@@ -3122,7 +3154,9 @@ impl CudaExecutable {
                         desc: rlx_cpu::rlx_scan_host_desc!(graph, node, |id| arena.offset(id)),
                     });
                 }
-                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
+                // `Op::While`: a loop at run time on the host (rlx-cpu's
+                // `Thunk::While`), unbounded or not.
+                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } | Op::While { .. } => {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });
@@ -3776,12 +3810,37 @@ impl CudaExecutable {
                         eps_bits: eps.to_bits(),
                     });
                 }
+                Op::DoubleSingle(op) => {
+                    let dims = |id: rlx_ir::NodeId| -> Vec<usize> {
+                        graph
+                            .node(id)
+                            .shape
+                            .dims()
+                            .iter()
+                            .map(|d| d.unwrap_static())
+                            .collect()
+                    };
+                    let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(i)).collect();
+                    let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                    let plan =
+                        rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &dims(node.id))
+                            .unwrap_or_else(|e| panic!("rlx-cuda: {e}"));
+                    let mut args = rlx_gpu_kernels::DfArgs::from_plan(op, &plan);
+                    args.a_off = (arena.offset(node.inputs[0]) / 4) as u32;
+                    args.b_off = node
+                        .inputs
+                        .get(1)
+                        .map_or(args.a_off, |&b| (arena.offset(b) / 4) as u32);
+                    args.out_off = (arena.offset(node.id) / 4) as u32;
+                    schedule.push(Step::DoubleSingle { args });
+                }
                 Op::RoundToFormat { format, scaling } => {
                     use rlx_ir::FormatScaling;
                     let (mode, block) = match scaling {
                         FormatScaling::None => (0u32, 1u32),
                         FormatScaling::PerTensor => (1, 1),
                         FormatScaling::Block(b) => (2, (*b).max(1)),
+                        FormatScaling::FineBlock(b) => (3, (*b).max(1)),
                     };
                     schedule.push(Step::RoundToFormat {
                         in_off: (arena.offset(node.inputs[0]) / 4) as u32,
@@ -5048,5 +5107,18 @@ impl CudaExecutable {
     pub fn eager(graph: Graph, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         let mut exec = Self::compile_with(graph, CompileMode::Jit, ExecMode::Eager);
         exec.run(inputs)
+    }
+}
+
+/// B operand of a matmul step: a 2-B half weight (`Arena::native_half`) is read
+/// from the widen scratch, which the step fills from the weight's own slot.
+fn half_b_operand(
+    arena: &Arena,
+    b_id: rlx_ir::NodeId,
+    scratch_f32: u32,
+) -> (u32, Option<(u64, crate::arena::HalfDtype)>) {
+    match arena.native_half.get(&b_id) {
+        Some(&dt) => (scratch_f32, Some((arena.offset(b_id) as u64, dt))),
+        None => ((arena.offset(b_id) / 4) as u32, None),
     }
 }

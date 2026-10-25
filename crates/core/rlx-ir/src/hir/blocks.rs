@@ -8,6 +8,7 @@ use crate::dynamic::sym;
 use crate::hir::LowerError;
 use crate::infer::GraphExt;
 use crate::op::{Activation, MaskKind};
+use crate::prelude::*;
 use crate::shape::{self, Dim};
 use crate::{DType, Graph, NodeId, Shape};
 

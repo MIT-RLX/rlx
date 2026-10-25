@@ -23,12 +23,12 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Backend selection mirrors rlx-runtime. Default = whatever's
 # always available everywhere (cpu).
-default = ["cpu", "gguf-convert"]
+default = ["cpu", "gguf-convert", "training", "text", "models"]
 
 cpu             = ["rlx-runtime/cpu"]
-gguf-convert    = ["rlx-gguf-convert/safetensors"]
-gguf-onnx       = ["rlx-gguf-convert/onnx"]
-gguf-pt         = ["rlx-gguf-convert/pt"]
+gguf-convert    = ["rlx-gguf-convert/safetensors", "rlx-bind/gguf-convert"]
+gguf-onnx       = ["rlx-gguf-convert/onnx", "rlx-bind/gguf-onnx"]
+gguf-pt         = ["rlx-gguf-convert/pt", "rlx-bind/gguf-pt"]
 blas-accelerate = ["rlx-runtime/blas-accelerate"]
 blas-mkl        = ["rlx-runtime/blas-mkl"]
 blas-openblas   = ["rlx-runtime/blas-openblas"]
@@ -37,22 +37,22 @@ mlx             = ["rlx-runtime/mlx"]
 gpu             = ["rlx-runtime/gpu"]
 cuda            = ["rlx-runtime/cuda"]
 fpga            = ["rlx-runtime/fpga", "dep:rlx-fpga"]
+# `pyrlx.Trainer` / `pyrlx.Optimizer` — Adam, AdamW, Muon, SOAP, … (rlx-optim).
+training        = ["rlx-runtime/training", "rlx-bind/training"]
+# `pyrlx.load_tokenizer` / `render_chat` / `Sampler` — the LM text layer (rlx-text).
+text            = ["rlx-bind/text"]
+# `Model` — models from any provider (`.rlxp`, plugins).
+models          = ["rlx-bind/models"]
 
 [dependencies]
-pyo3      = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+pyo3      = { version = "0.22", features = ["abi3-py39", "multiple-pymethods"] }
 numpy     = "0.22"
 
+rlx-bind = { workspace = true, features = ["gguf-io", "weights", "runtime"] }
 rlx-ir = { workspace = true }
 rlx-opt = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.18", default-features = false, features = ["model-io"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.19", default-features = false, features = ["model-io"] }
 rlx-fpga = { workspace = true, optional = true }
-rlx-gguf = { workspace = true }
-rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.18", default-features = false, features = ["safetensors"] }
-rlx-pkg = { workspace = true }
-rlx-mlx-io = { workspace = true }
-rlx-dduf = { workspace = true }
-rlx-nemo = { workspace = true }
-anyhow = "1"
-bytemuck = "1"
+rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.19", default-features = false, features = ["safetensors"] }
 [lints]
 workspace = true

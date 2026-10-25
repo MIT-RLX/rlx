@@ -348,15 +348,44 @@ pub(super) fn lower_arg_reduce(
     } else if axis < dims.len() {
         dims.remove(axis);
     }
-    let out_s = Shape::from_dims(&dims, DType::I64);
     let op = if is_max {
         Op::ArgMax { axis, keep_dim }
     } else {
         Op::ArgMin { axis, keep_dim }
     };
-    let id = m.add_node(op, vec![x], out_s);
+    let id = arg_reduce_i64(m, op, x, &dims);
     ctx.env.insert(node.outputs[0].clone(), id);
     Ok(true)
+}
+
+/// `ArgMax` / `ArgMin` of `x` as ONNX's int64 indices, `out_dims` the
+/// reduced dims. The IR op returns f32-encoded indices (its output has the
+/// f32 input's dtype; see `infer_shape`), so a non-f32 input is widened first
+/// — exact for every half-precision value — and the indices are cast to i64.
+/// Declaring the op itself i64 is an IR the verifier rejects.
+pub(super) fn arg_reduce_i64(
+    m: &mut HirMut<'_>,
+    op: Op,
+    x: HirNodeId,
+    out_dims: &[Dim],
+) -> HirNodeId {
+    let in_s = m.shape(x).clone();
+    let x = if in_s.dtype() == DType::F32 {
+        x
+    } else {
+        let dims: Vec<Dim> = (0..in_s.rank()).map(|d| in_s.dim(d)).collect();
+        m.add_node(
+            Op::Cast { to: DType::F32 },
+            vec![x],
+            Shape::from_dims(&dims, DType::F32),
+        )
+    };
+    let idx = m.add_node(op, vec![x], Shape::from_dims(out_dims, DType::F32));
+    m.add_node(
+        Op::Cast { to: DType::I64 },
+        vec![idx],
+        Shape::from_dims(out_dims, DType::I64),
+    )
 }
 
 pub(super) fn lower_cumsum(

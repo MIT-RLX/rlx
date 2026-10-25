@@ -64,6 +64,10 @@ pub fn tuning_cache_path() -> Option<PathBuf> {
 pub fn ensure_tuning_cache_loaded() {
     static LOADED: OnceLock<()> = OnceLock::new();
     LOADED.get_or_init(|| {
+        // Shipped per-arch rows first; the user cache below overrides them.
+        if !rlx_ir::env::flag("RLX_GPU_NO_SHIPPED_TUNING") {
+            rlx_gpu_dispatch::shipped::load();
+        }
         let Some(path) = tuning_cache_path() else {
             return;
         };

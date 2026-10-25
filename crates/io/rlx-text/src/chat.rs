@@ -225,7 +225,46 @@ pub struct ChatTemplate {
 
 const TEMPLATE_NAME: &str = "chat";
 
+/// HF's `{% generation %}…{% endgeneration %}` (transformers' assistant-mask
+/// extension, LFM2's and SmolLM3's templates) marks the assistant's tokens for
+/// a training mask and renders its body as is. MiniJinja has no such tag, so
+/// each becomes `{% if true %}` / `{% endif %}`, whitespace control kept.
+fn hf_generation_blocks(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(open) = rest.find("{%") {
+        let Some(close) = rest[open..].find("%}").map(|c| open + c) else {
+            break;
+        };
+        let inner = &rest[open + 2..close];
+        let lead = inner.len() - inner.trim_start_matches(['-', '+']).len();
+        let trail = inner.len() - inner.trim_end_matches(['-', '+']).len();
+        let core = inner[lead..inner.len() - trail].trim();
+        let swap = match core {
+            "generation" => Some("if true"),
+            "endgeneration" => Some("endif"),
+            _ => None,
+        };
+        out.push_str(&rest[..open + 2]);
+        match swap {
+            Some(tag) => {
+                out.push_str(&inner[..lead]);
+                out.push(' ');
+                out.push_str(tag);
+                out.push(' ');
+                out.push_str(&inner[inner.len() - trail..]);
+            }
+            None => out.push_str(inner),
+        }
+        out.push_str("%}");
+        rest = &rest[close + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn build_env(source: String) -> Result<Environment<'static>> {
+    let source = hf_generation_blocks(&source);
     let mut env = Environment::new();
     // HF templates occasionally call `raise_exception(msg)` for invariant
     // checks (e.g. "system must come first"). Wire it to a Jinja error.
@@ -655,6 +694,33 @@ mod tests {
                         <|im_start|>user\nhi<|im_end|>\n\
                         <|im_start|>assistant\n";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn hf_generation_tags_render_their_body_as_is() {
+        // LFM2's shape: the assistant's content inside the tags, whitespace
+        // control on both. The same template without them is the reference.
+        let tagged = "{% for m in messages %}<|im_start|>{{ m.role }}\n\
+                      {%- if m.role == 'assistant' -%}{%- generation -%}\n{{ m.content }}\
+                      {%- endgeneration -%}{% else %}\n{{ m.content }}{% endif %}<|im_end|>\n\
+                      {% endfor %}";
+        let plain = "{% for m in messages %}<|im_start|>{{ m.role }}\n\
+                     {%- if m.role == 'assistant' -%}{%- if true -%}\n{{ m.content }}\
+                     {%- endif -%}{% else %}\n{{ m.content }}{% endif %}<|im_end|>\n\
+                     {% endfor %}";
+        let conv = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
+        let a = ChatTemplate::from_source(tagged).unwrap();
+        let b = ChatTemplate::from_source(plain).unwrap();
+        assert_eq!(
+            a.render(&conv, false).unwrap(),
+            b.render(&conv, false).unwrap()
+        );
+        assert!(a.render(&conv, false).unwrap().contains("hello"));
+        // A tag that only looks alike is left alone.
+        assert_eq!(
+            hf_generation_blocks("{% set generation_done = 1 %}{%- endgeneration +%}"),
+            "{% set generation_done = 1 %}{%- endif +%}"
+        );
     }
 
     #[test]

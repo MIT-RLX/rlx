@@ -1390,7 +1390,7 @@ fn vjp(
             stride,
             padding,
         } => vjp_maxpool3d_backward(node, upstream, upstream_shape, fwd_map, bwd),
-        Op::Fft { inverse, norm } => vjp_fft(node, upstream, upstream_shape, fwd_map, bwd),
+        Op::Fft { .. } => vjp_fft(node, upstream, upstream_shape, fwd_map, bwd),
         Op::LogMel => vjp_log_mel(node, upstream, upstream_shape, fwd_map, bwd),
         // ── Riemannian / SPD-manifold layers ─────────────────────
         Op::BiMap => vjp_bimap(node, upstream, upstream_shape, fwd_map, bwd),
@@ -6087,7 +6087,12 @@ fn vjp_fft(
     fwd_map: &HashMap<NodeId, NodeId>,
     bwd: &mut Graph,
 ) -> Vec<(usize, NodeId)> {
-    let Op::Fft { inverse, norm } = &node.op else {
+    let Op::Fft {
+        inverse,
+        norm,
+        algo,
+    } = &node.op
+    else {
         unreachable!()
     };
     {
@@ -6099,7 +6104,7 @@ fn vjp_fft(
         } else {
             upstream
         };
-        let dx = bwd.fft(z, !*inverse);
+        let dx = bwd.fft_algo(z, !*inverse, rlx_ir::FftNorm::Backward, *algo);
         vec![(0, dx)]
     }
 }

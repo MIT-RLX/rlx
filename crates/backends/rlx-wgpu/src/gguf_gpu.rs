@@ -24,9 +24,11 @@ use rlx_ir::{Graph, Op};
 
 use crate::buffer::Arena;
 use crate::gguf_host::scheme_from_id;
+use crate::kernels::GemvEntry;
 use crate::kernels::{
     DequantGemmQ10Params, DequantGemvGgufParams, DequantGgufParams, Kernel, MatmulParams,
-    dequant_gemm_q1_0_kernel, dequant_gemv_gguf_kernel, dequant_gguf_kernel, matmul_bt_kernel,
+    dequant_gemm_q1_0_kernel, dequant_gemm_q8_0_kernel, dequant_gemv_gguf_kernel,
+    dequant_gguf_kernel, matmul_bt_kernel,
 };
 
 /// Schemes the fused decode GEMV ([`run_dequant_matmul_gguf_gemv`]) handles
@@ -36,7 +38,61 @@ use crate::kernels::{
 /// 27B to f32 every token (~200s/tok → fused) AND avoids the multi-GiB dequant
 /// scratch that blew wgpu's storage-buffer binding limit.
 pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
-    matches!(scheme_id, 0 | 2 | 24)
+    matches!(scheme_id, 0 | 1 | 2 | 20 | 24)
+        || b32_scheme(scheme_id)
+        || scheme_id == crate::gguf_host::BF16_SCHEME_ID
+}
+
+/// The 32-weight block formats `dequant_gemv_b32x16` reads: IQ4_NL (6),
+/// IQ4_XS (7, as 32-weight sub-blocks), Q4_0 (19), Q8_0 (20), Q4_1 (21),
+/// Q5_0 (22), Q5_1 (23), Q2_0 (25, as 32-weight sub-blocks of its 128).
+///
+/// Q2_0 used to fall to the one-thread-per-column `dequant_gemv` — and before
+/// that to no fused GEMV at all, so every ternary projection of a decode step
+/// (197 on KittenTTS 2's Qwen3-1.7B) took the dequant-to-scratch path with its
+/// own submit and host sync: 3.4 s per token on Apple wgpu.
+fn b32_scheme(scheme_id: u32) -> bool {
+    matches!(scheme_id, 6 | 7 | 19 | 20 | 21 | 22 | 23 | 25)
+}
+
+/// Whether `graph` has packed (U8/I8) params and every one of them is only
+/// the weight operand of a GGUF matmul the fused GEMV runs on the GPU — the
+/// one consumer that binds the weight buffer in place. Anything else reading
+/// a packed param (a view, a gather, a host-dequant scheme) would have to
+/// stage it through the host.
+pub fn packed_weights_bind_in_place(graph: &Graph) -> bool {
+    use std::collections::HashSet;
+    let packed: HashSet<rlx_ir::NodeId> = graph
+        .nodes()
+        .iter()
+        .filter(|n| {
+            matches!(n.op, Op::Param { .. })
+                && matches!(n.shape.dtype(), rlx_ir::DType::U8 | rlx_ir::DType::I8)
+        })
+        .map(|n| n.id)
+        .collect();
+    if packed.is_empty() || graph.outputs.iter().any(|o| packed.contains(o)) {
+        return false;
+    }
+    graph.nodes().iter().all(|node| {
+        let reads_packed = node.inputs.iter().any(|i| packed.contains(i));
+        if !reads_packed {
+            return true;
+        }
+        let Op::DequantMatMul { scheme } = &node.op else {
+            return false;
+        };
+        if !scheme.is_gguf() {
+            return false;
+        }
+        let id = crate::gguf_host::gguf_scheme_id(*scheme);
+        // Q1_0 (24) prefers a tiled GEMM for m > 1 that is not weight-buffer aware.
+        gemv_supports_scheme(id)
+            && id != 24
+            && node.inputs.len() >= 2
+            && !packed.contains(&node.inputs[0])
+            && node.inputs[2..].iter().all(|i| !packed.contains(i))
+    })
 }
 
 /// Scheme ids the WGSL `dequant_gguf` kernel actually has a branch for.
@@ -393,11 +449,12 @@ pub fn encode_dequant_matmul_gguf_into(
     if scheme_id == 24
         && m > 1
         && !rlx_ir::env::flag("RLX_WGPU_Q1_0_GEMM_DISABLE")
-        && encode_dequant_matmul_gguf_gemm_q1_0(
+        && encode_dequant_matmul_gguf_gemm(
             arena,
             device,
             queue,
             enc,
+            gemm_q1_0(device),
             m,
             k,
             n,
@@ -408,12 +465,36 @@ pub fn encode_dequant_matmul_gguf_into(
     {
         return;
     }
-    for row in 0..m {
+    if q8_0_gemm_applies(scheme_id, m, k)
+        && encode_dequant_matmul_gguf_gemm(
+            arena,
+            device,
+            queue,
+            enc,
+            gemm_q8_0(device),
+            m,
+            k,
+            n,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+        )
+    {
+        return;
+    }
+    // Rows go in one dispatch (grid y); chunked only so the bound activation
+    // window and the pooled output stay well inside one storage binding.
+    let max_bind = device.limits().max_storage_buffer_binding_size as usize;
+    let rows_per = (max_bind / 2 / (k.max(n) * 4).max(1)).clamp(1, 65_535);
+    let mut row = 0;
+    while row < m {
+        let rows = (m - row).min(rows_per);
         encode_dequant_matmul_gguf_gemv_one(
             arena,
             device,
             queue,
             enc,
+            rows,
             k,
             n,
             scheme_id,
@@ -421,6 +502,7 @@ pub fn encode_dequant_matmul_gguf_into(
             w_byte_off,
             out_byte_off + row * n * 4,
         );
+        row += rows;
     }
 }
 
@@ -461,13 +543,63 @@ pub fn run_dequant_matmul_gguf_gemv_rows(
     queue.submit(std::iter::once(enc.finish()));
 }
 
-/// Tiled Q1_0 GEMM into `enc`. Returns `false` when X/W cannot fit a shard window.
+/// Q8_0 with several rows takes the tiled GEMM ([`gemm_q8_0`]): it reads each
+/// weight block once per 64-row tile instead of once per row, as the per-row
+/// GEMV does. The in-arena GEMV plan declines these so they reach it.
+/// Off-switch: `RLX_WGPU_Q8_0_GEMM_DISABLE`.
+fn q8_0_gemm_applies(scheme_id: u32, m: usize, k: usize) -> bool {
+    scheme_id == 20
+        && m >= 8
+        && k.is_multiple_of(32)
+        && !rlx_ir::env::flag("RLX_WGPU_Q8_0_GEMM_DISABLE")
+}
+
+/// A fused GGUF GEMM kernel (`DequantGemmQ10Params` layout, bindings
+/// `x / params / w / out`) and the grid it wants.
+struct TiledGemm {
+    kernel: &'static Kernel,
+    label: &'static str,
+    block_elems: usize,
+    block_bytes: usize,
+    /// Output columns per workgroup (grid x).
+    tile_n: u32,
+    /// Output rows per workgroup (grid y).
+    tile_m: u32,
+}
+
+/// Q1_0: one thread per (column, 8-row tile), 64 columns per workgroup.
+fn gemm_q1_0(device: &wgpu::Device) -> TiledGemm {
+    TiledGemm {
+        kernel: dequant_gemm_q1_0_kernel(device),
+        label: "dequant_gemm_q1_0",
+        block_elems: 128,
+        block_bytes: 18,
+        tile_n: 64,
+        tile_m: 8,
+    }
+}
+
+/// Q8_0: 64×64 output tiles staged in workgroup memory
+/// (`dequant_gemm_q8_0.wgsl`).
+fn gemm_q8_0(device: &wgpu::Device) -> TiledGemm {
+    TiledGemm {
+        kernel: dequant_gemm_q8_0_kernel(device),
+        label: "dequant_gemm_q8_0",
+        block_elems: 32,
+        block_bytes: 34,
+        tile_n: 64,
+        tile_m: 64,
+    }
+}
+
+/// Tiled GGUF GEMM into `enc`. Returns `false` when X/W cannot fit a shard window.
 #[allow(clippy::too_many_arguments)]
-fn encode_dequant_matmul_gguf_gemm_q1_0(
+fn encode_dequant_matmul_gguf_gemm(
     arena: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     enc: &mut wgpu::CommandEncoder,
+    gemm: TiledGemm,
     m: usize,
     k: usize,
     n: usize,
@@ -475,9 +607,12 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
     w_byte_off: usize,
     out_byte_off: usize,
 ) -> bool {
-    debug_assert!(k.is_multiple_of(128), "Q1_0 GEMM requires k % 128 == 0");
-    let block_elems = 128usize;
-    let block_bytes = 18usize;
+    debug_assert!(
+        k.is_multiple_of(gemm.block_elems),
+        "{} needs whole blocks",
+        gemm.label
+    );
+    let (block_elems, block_bytes) = (gemm.block_elems, gemm.block_bytes);
     let w_total_bytes = (k * n) / block_elems * block_bytes;
 
     let x0 = x_byte_off as u64;
@@ -519,16 +654,16 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
             _p0: 0,
             _p1: 0,
         };
-        let dk = dequant_gemm_q1_0_kernel(device);
+        let dk = gemm.kernel;
         let u = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rlx-wgpu dequant_gemm_q1_0 uni"),
+            label: Some(gemm.label),
             size: std::mem::size_of::<DequantGemmQ10Params>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rlx-wgpu dequant_gemm_q1_0 bg"),
+            label: Some(gemm.label),
             layout: &dk.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -560,13 +695,16 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
 
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rlx-wgpu dequant_gemm_q1_0 pass"),
+                label: Some(gemm.label),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&dk.pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            const TM: u32 = 8;
-            pass.dispatch_workgroups((n as u32).div_ceil(64), (m as u32).div_ceil(TM), 1);
+            pass.dispatch_workgroups(
+                (n as u32).div_ceil(gemm.tile_n),
+                (m as u32).div_ceil(gemm.tile_m),
+                1,
+            );
         }
 
         let (dst0, dst0_off) = arena.resolve_act(out_byte_off);
@@ -621,6 +759,7 @@ pub fn run_dequant_matmul_gguf_gemv(
         device,
         queue,
         &mut enc,
+        1,
         k,
         n,
         scheme_id,
@@ -636,6 +775,7 @@ fn encode_dequant_matmul_gguf_gemv_one(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     enc: &mut wgpu::CommandEncoder,
+    m: usize,
     k: usize,
     n: usize,
     scheme_id: u32,
@@ -652,7 +792,7 @@ fn encode_dequant_matmul_gguf_gemv_one(
     let x_base = (x0 / STORAGE_ALIGN) * STORAGE_ALIGN;
     let (x_buf, x_local) = arena.resolve_act(x_base as usize);
     let x_local = x_local as u64;
-    let x_size = ((x0 + (k * 4) as u64 - x_base).div_ceil(16) * 16)
+    let x_size = ((x0 + (m * k * 4) as u64 - x_base).div_ceil(16) * 16)
         .min(x_buf.size().saturating_sub(x_local));
 
     let (w_buf, w_raw) = arena.resolve_w(w_byte_off);
@@ -682,9 +822,17 @@ fn encode_dequant_matmul_gguf_gemv_one(
     let budget = max_bind.saturating_sub(STORAGE_ALIGN + 16).max(row_bytes);
     let rows_per_chunk = ((budget / row_bytes.max(1)) as usize).max(1);
 
-    let out_bytes = ((n * 4).max(4) as u64).div_ceil(16) * 16;
+    let out_bytes = ((m * n * 4).max(4) as u64).div_ceil(16) * 16;
+    let entry = gemv_entry(scheme_id);
     with_pooled_out_buf(device, out_bytes, |out_buf| {
-        let dk = dequant_gemv_gguf_kernel(device);
+        let dk = match entry {
+            GemvEntry::Q4k16 => crate::kernels::dequant_gemv_gguf_q4k16_kernel(device),
+            GemvEntry::Q5k16 => crate::kernels::dequant_gemv_gguf_q5k16_kernel(device),
+            GemvEntry::Q6k16 => crate::kernels::dequant_gemv_gguf_q6k16_kernel(device),
+            GemvEntry::B32x16 => crate::kernels::dequant_gemv_gguf_b32x16_kernel(device),
+            GemvEntry::Rows8 => crate::kernels::dequant_gemv_gguf_rows8_kernel(device),
+            GemvEntry::Serial => dequant_gemv_gguf_kernel(device),
+        };
         let mut n0 = 0usize;
         while n0 < n {
             let n_chunk = (n - n0).min(rows_per_chunk);
@@ -704,8 +852,8 @@ fn encode_dequant_matmul_gguf_gemv_one(
                 x_f32_off: ((x0 - x_base) / 4) as u32,
                 w_byte_off: (w0 - w_base) as u32,
                 out_f32_off: n0 as u32,
-                _p0: 0,
-                _p1: 0,
+                out_stride: n as u32,
+                m_rows: m as u32,
             };
 
             let u = device.create_buffer(&wgpu::BufferDescriptor {
@@ -754,13 +902,190 @@ fn encode_dequant_matmul_gguf_gemv_one(
                 });
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups((n_chunk as u32).div_ceil(64), 1, 1);
+                let [gx, gy, gz] = gemv_dispatch(entry, m, n_chunk);
+                pass.dispatch_workgroups(gx, gy, gz);
             }
             n0 += n_chunk;
         }
         let (dst, dst_off) = arena.resolve_act(out_byte_off);
-        enc.copy_buffer_to_buffer(out_buf, 0, dst, dst_off as u64, (n * 4) as u64);
+        enc.copy_buffer_to_buffer(out_buf, 0, dst, dst_off as u64, (m * n * 4) as u64);
     });
+}
+
+/// The GEMV entry point for a scheme. Lanes share an output column where the
+/// shader has that path, one thread per column otherwise; the serial kernel
+/// has no branch for the 32-weight formats, so they always take theirs.
+fn gemv_entry(scheme_id: u32) -> GemvEntry {
+    let serial = rlx_ir::env::flag("RLX_WGPU_GGUF_GEMV_SERIAL");
+    match scheme_id {
+        0 if !serial => GemvEntry::Q4k16,
+        1 if !serial => GemvEntry::Q5k16,
+        2 if !serial => GemvEntry::Q6k16,
+        id if b32_scheme(id) && (id != 20 || !serial) => GemvEntry::B32x16,
+        id if id == crate::gguf_host::BF16_SCHEME_ID && !serial => GemvEntry::Rows8,
+        _ => GemvEntry::Serial,
+    }
+}
+
+/// 16 columns × up to 8 rows per workgroup (the K-quants and 32-weight
+/// formats), against 8 columns × one row (bf16) or a thread per column.
+fn gemv_entry_is_wide(entry: GemvEntry) -> bool {
+    !matches!(entry, GemvEntry::Serial | GemvEntry::Rows8)
+}
+
+/// Workgroups for `m` rows × `n` columns: column groups over x (and z past one
+/// dimension's 65535 limit), row groups over y.
+fn gemv_dispatch(entry: GemvEntry, m: usize, n: usize) -> [u32; 3] {
+    if entry == GemvEntry::Serial {
+        return [(n as u32).div_ceil(64), m as u32, 1];
+    }
+    let wide = gemv_entry_is_wide(entry);
+    let groups = (n as u32).div_ceil(if wide { 16 } else { 8 });
+    let gx = groups.min(32_768);
+    let gy = if wide {
+        (m as u32).div_ceil(8)
+    } else {
+        m as u32
+    };
+    [gx, gy, groups.div_ceil(gx)]
+}
+
+/// A GGUF GEMV step made ready to encode: bind groups, params and workgroup
+/// counts built once and reused by every later run of the step.
+pub struct GemvPlan {
+    kernel: &'static crate::kernels::Kernel,
+    bind_group: wgpu::BindGroup,
+    dispatch: [u32; 3],
+    _params: wgpu::Buffer,
+}
+
+impl GemvPlan {
+    /// One dispatch inside an open compute pass.
+    pub fn dispatch(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.kernel.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        let [x, y, z] = self.dispatch;
+        pass.dispatch_workgroups(x, y, z);
+    }
+
+    pub fn encode(&self, enc: &mut wgpu::CommandEncoder) {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rlx-wgpu dequant_gemv_gguf in-arena pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.kernel.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        let [x, y, z] = self.dispatch;
+        pass.dispatch_workgroups(x, y, z);
+    }
+}
+
+/// [`encode_dequant_matmul_gguf_into`] as a reusable [`GemvPlan`] that reads
+/// the activations and writes the output in place in the arena — no output
+/// buffer, no copy, no per-run bind groups. Only for a weight held in the
+/// weight buffer (the arena is then free to bind read-write) and an
+/// activation/output pair that fits one storage binding without
+/// overlapping; `None` sends the caller to the general path.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_dequant_gemv_in_arena(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) -> Option<GemvPlan> {
+    use crate::buffer::is_weight_off;
+    if m == 0
+        || scheme_id == 24
+        || q8_0_gemm_applies(scheme_id, m, k)
+        || !is_weight_off(w_byte_off)
+        || is_weight_off(x_byte_off)
+        || is_weight_off(out_byte_off)
+        || arena.is_sharded()
+        || rlx_ir::env::flag("RLX_WGPU_GGUF_GEMV_COPY_OUT")
+    {
+        return None;
+    }
+    let max_bind = device.limits().max_storage_buffer_binding_size;
+    let (x0, x1) = (x_byte_off as u64, (x_byte_off + m * k * 4) as u64);
+    let (o0, o1) = (out_byte_off as u64, (out_byte_off + m * n * 4) as u64);
+    if x0 < o1 && o0 < x1 {
+        return None;
+    }
+    let base = (x0.min(o0) / STORAGE_ALIGN) * STORAGE_ALIGN;
+    let (a_buf, a_local) = arena.resolve_act(base as usize);
+    let a_size = (x1.max(o1) - base).div_ceil(16) * 16;
+    if a_size > max_bind || a_local as u64 + a_size > a_buf.size() {
+        return None;
+    }
+
+    let scheme = scheme_from_id(scheme_id);
+    let w_total =
+        (k * n) / (scheme.gguf_block_size() as usize).max(1) * scheme.gguf_block_bytes() as usize;
+    let (w_buf, w_raw) = arena.resolve_w(w_byte_off);
+    let w0 = w_raw as u64;
+    let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
+    let w_size = ((w0 + w_total as u64 - w_base).div_ceil(16) * 16).min(w_buf.size() - w_base);
+    if w_size > max_bind || w0 + w_total as u64 > w_buf.size() {
+        return None;
+    }
+
+    let entry = gemv_entry(scheme_id);
+    let kernel = crate::kernels::dequant_gemv_gguf_in_arena_kernel(device, entry);
+    let p = DequantGemvGgufParams {
+        k: k as u32,
+        n: n as u32,
+        scheme_id,
+        x_f32_off: ((x0 - base) / 4) as u32,
+        w_byte_off: (w0 - w_base) as u32,
+        out_f32_off: ((o0 - base) / 4) as u32,
+        out_stride: n as u32,
+        m_rows: m as u32,
+    };
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rlx-wgpu dequant_gemv_gguf in-arena params"),
+        size: std::mem::size_of::<DequantGemvGgufParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&params, 0, bytemuck::bytes_of(&p));
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rlx-wgpu dequant_gemv_gguf in-arena bg"),
+        layout: &kernel.bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: a_buf,
+                    offset: a_local as u64,
+                    size: wgpu::BufferSize::new(a_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: w_buf,
+                    offset: w_base,
+                    size: wgpu::BufferSize::new(w_size),
+                }),
+            },
+        ],
+    });
+    Some(GemvPlan {
+        kernel,
+        bind_group,
+        dispatch: gemv_dispatch(entry, m, n),
+        _params: params,
+    })
 }
 
 /// GPU dequant + grouped matmul for MoE packed expert stacks.

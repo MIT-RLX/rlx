@@ -14,7 +14,10 @@
 //! individual fields if the preset doesn't match the board you're
 //! targeting.
 
-use std::fmt;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::fmt;
 
 /// What you're optimizing the design for. Each variant maps to a
 /// different default [`Tune`] via [`Tune::for_target`].

@@ -27,7 +27,7 @@ const S: usize = 3;
 const HID: usize = 8;
 const NH: usize = 2;
 const QLORA: usize = 6;
-const KVLORA: usize = 4;
+const KVLORA: usize = 5; // != NOPE so the latent width differs from the score dim
 const NOPE: usize = 4;
 const ROPE: usize = 2;
 const VH: usize = 3;
@@ -61,11 +61,18 @@ fn rms(x: &[f32], g: &[f32], eps: f32) -> Vec<f32> {
     (0..n).map(|i| x[i] * inv * g[i]).collect()
 }
 
-/// Run the MLA prefill block on CPU and check it against the reference. `lite`
-/// selects the V2-Lite (direct `q_proj`) query path instead of the LoRA pair.
-fn run_mla_cpu(lite: bool) {
-    // ── Weights (HF `[out, in]` layout; the block loads them transposed). ──
-    // Query weights depend on the variant; the unused pair is left empty.
+/// HF `[out, in]` MLA weights; the unused query variant is left empty.
+struct MlaWeights {
+    q_a: Vec<f32>,
+    q_a_ln: Vec<f32>,
+    q_b: Vec<f32>,
+    q_proj: Vec<f32>,
+    kv_a: Vec<f32>,
+    kv_a_ln: Vec<f32>,
+    kv_b: Vec<f32>,
+}
+
+fn mla_weights(lite: bool) -> MlaWeights {
     let (q_a, q_a_ln, q_b, q_proj) = if lite {
         (vec![], vec![], vec![], fill(NH * QK * HID, 0.15))
     } else {
@@ -76,9 +83,82 @@ fn run_mla_cpu(lite: bool) {
             vec![],
         )
     };
-    let kv_a = fill((KVLORA + ROPE) * HID, 0.4);
-    let kv_a_ln = gamma(KVLORA, 0.5);
-    let kv_b = fill(NH * (NOPE + VH) * KVLORA, 0.6);
+    MlaWeights {
+        q_a,
+        q_a_ln,
+        q_b,
+        q_proj,
+        kv_a: fill((KVLORA + ROPE) * HID, 0.4),
+        kv_a_ln: gamma(KVLORA, 0.5),
+        kv_b: fill(NH * (NOPE + VH) * KVLORA, 0.6),
+    }
+}
+
+fn map_weights(mw: &MlaWeights, lite: bool) -> MapWeights {
+    let lp = "model.layers.0";
+    let mut w = MapWeights::default();
+    if lite {
+        w.insert(
+            format!("{lp}.self_attn.q_proj.weight"),
+            mw.q_proj.clone(),
+            vec![NH * QK, HID],
+        );
+    } else {
+        w.insert(
+            format!("{lp}.self_attn.q_a_proj.weight"),
+            mw.q_a.clone(),
+            vec![QLORA, HID],
+        );
+        w.insert(
+            format!("{lp}.self_attn.q_a_layernorm.weight"),
+            mw.q_a_ln.clone(),
+            vec![QLORA],
+        );
+        w.insert(
+            format!("{lp}.self_attn.q_b_proj.weight"),
+            mw.q_b.clone(),
+            vec![NH * QK, QLORA],
+        );
+    }
+    w.insert(
+        format!("{lp}.self_attn.kv_a_proj_with_mqa.weight"),
+        mw.kv_a.clone(),
+        vec![KVLORA + ROPE, HID],
+    );
+    w.insert(
+        format!("{lp}.self_attn.kv_a_layernorm.weight"),
+        mw.kv_a_ln.clone(),
+        vec![KVLORA],
+    );
+    w.insert(
+        format!("{lp}.self_attn.kv_b_proj.weight"),
+        mw.kv_b.clone(),
+        vec![NH * (NOPE + VH), KVLORA],
+    );
+    w
+}
+
+fn mla_spec(lite: bool) -> MlaAttnPrefillSpec {
+    let lp = "model.layers.0";
+    if lite {
+        MlaAttnPrefillSpec::deepseek_lite_layer(lp, NH, KVLORA, NOPE, ROPE, VH, EPS)
+    } else {
+        MlaAttnPrefillSpec::deepseek_layer(lp, NH, QLORA, KVLORA, NOPE, ROPE, VH, EPS)
+    }
+}
+
+/// Run the MLA prefill block on CPU and check it against the reference. `lite`
+/// selects the V2-Lite (direct `q_proj`) query path instead of the LoRA pair.
+fn run_mla_cpu(lite: bool) {
+    let MlaWeights {
+        q_a,
+        q_a_ln,
+        q_b,
+        q_proj,
+        kv_a,
+        kv_a_ln,
+        kv_b,
+    } = mla_weights(lite);
     let x = fill(B * S * HID, 0.7);
 
     // Neutralized RoPE: sin = 0, cos = per-position scale. Table is
@@ -149,52 +229,8 @@ fn run_mla_cpu(lite: bool) {
     }
 
     // ── Build the flow and run on CPU. ──
-    let lp = "model.layers.0";
-    let mut w = MapWeights::default();
-    if lite {
-        w.insert(
-            format!("{lp}.self_attn.q_proj.weight"),
-            q_proj,
-            vec![NH * QK, HID],
-        );
-    } else {
-        w.insert(
-            format!("{lp}.self_attn.q_a_proj.weight"),
-            q_a,
-            vec![QLORA, HID],
-        );
-        w.insert(
-            format!("{lp}.self_attn.q_a_layernorm.weight"),
-            q_a_ln,
-            vec![QLORA],
-        );
-        w.insert(
-            format!("{lp}.self_attn.q_b_proj.weight"),
-            q_b,
-            vec![NH * QK, QLORA],
-        );
-    }
-    w.insert(
-        format!("{lp}.self_attn.kv_a_proj_with_mqa.weight"),
-        kv_a,
-        vec![KVLORA + ROPE, HID],
-    );
-    w.insert(
-        format!("{lp}.self_attn.kv_a_layernorm.weight"),
-        kv_a_ln,
-        vec![KVLORA],
-    );
-    w.insert(
-        format!("{lp}.self_attn.kv_b_proj.weight"),
-        kv_b,
-        vec![NH * (NOPE + VH), KVLORA],
-    );
-
-    let spec = if lite {
-        MlaAttnPrefillSpec::deepseek_lite_layer(lp, NH, KVLORA, NOPE, ROPE, VH, EPS)
-    } else {
-        MlaAttnPrefillSpec::deepseek_layer(lp, NH, QLORA, KVLORA, NOPE, ROPE, VH, EPS)
-    };
+    let mut w = map_weights(&mla_weights(lite), lite);
+    let spec = mla_spec(lite);
 
     let built = ModelFlow::new("mla")
         .input("x", Shape::new(&[B, S, HID], DType::F32))
@@ -232,4 +268,102 @@ fn mla_prefill_matches_reference_on_cpu() {
 #[test]
 fn mla_lite_prefill_matches_reference_on_cpu() {
     run_mla_cpu(true);
+}
+
+/// The absorbed latent-cache decode step for the last token reproduces the
+/// materialized prefill's last row: same scores, same values, without ever
+/// building per-head K/V. The past cache is built by hand (normalized `c_KV`
+/// ++ RoPE'd shared key), so this also pins the cache layout.
+fn run_mla_decode_cpu(lite: bool) {
+    // Scale the projections so softmax is far from uniform: with the base
+    // fills every score is ~0 and a wrong scale or score term goes unnoticed.
+    let mut mw = mla_weights(lite);
+    for v in [&mut mw.q_b, &mut mw.q_proj, &mut mw.kv_a, &mut mw.kv_b] {
+        v.iter_mut().for_each(|x| *x *= 4.0);
+    }
+    let x = fill(B * S * HID, 0.7);
+    let cos = [0.5f32, 0.75, 1.0];
+
+    // Materialized prefill over all S tokens (checked against the reference
+    // by `run_mla_cpu`).
+    let mut w = map_weights(&mw, lite);
+    let built = ModelFlow::new("mla")
+        .input("x", Shape::new(&[B, S, HID], DType::F32))
+        .stage(FlowStage::RopeTables(RopeTablesStage::param(
+            S,
+            1,
+            cos.to_vec(),
+            vec![0.0; S],
+        )))
+        .layer_stage(MlaAttnPrefillStage::new(mla_spec(lite)))
+        .build(&mut w)
+        .expect("prefill flow");
+    let (g, params) = built.into_graph_parts().expect("graph parts");
+    let mut c = Session::new(Device::Cpu).compile(g);
+    for (k, v) in &params {
+        c.set_param(k.as_str(), v.as_slice());
+    }
+    let prefill = c.run(&[("x", &x)]).remove(0);
+    let want = &prefill[(S - 1) * NH * VH..];
+
+    // Latent cache rows for tokens 0..S-1.
+    const LAT: usize = KVLORA + ROPE;
+    let mut past = Vec::with_capacity((S - 1) * LAT);
+    for (s, &c) in cos.iter().enumerate().take(S - 1) {
+        let kva = matvec(&mw.kv_a, LAT, HID, &x[s * HID..(s + 1) * HID]);
+        past.extend(rms(&kva[..KVLORA], &mw.kv_a_ln, EPS));
+        past.extend(kva[KVLORA..].iter().map(|v| v * c));
+    }
+
+    let kv_out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut w = map_weights(&mw, lite);
+    let built = ModelFlow::new("mla_decode")
+        .input("x", Shape::new(&[B, 1, HID], DType::F32))
+        .input("rope_cos", Shape::new(&[1, ROPE / 2], DType::F32))
+        .input("rope_sin", Shape::new(&[1, ROPE / 2], DType::F32))
+        .input("past_k_0", Shape::new(&[B, S - 1, LAT], DType::F32))
+        .input("past_v_0", Shape::new(&[B, 1, 1], DType::F32))
+        .bind_decode_inputs(1, false, true)
+        .layer_stage(MlaAttnDecodeStage::new(mla_spec(lite), 0, kv_out.clone()))
+        .build(&mut w)
+        .expect("decode flow");
+    let (g, params) = built.into_graph_parts().expect("graph parts");
+    let mut c = Session::new(Device::Cpu).compile(g);
+    for (k, v) in &params {
+        c.set_param(k.as_str(), v.as_slice());
+    }
+    let x_last = &x[(S - 1) * HID..];
+    let outs = c.run(&[
+        ("x", x_last),
+        ("rope_cos", &[cos[S - 1]]),
+        ("rope_sin", &[0.0]),
+        ("past_k_0", &past),
+        ("past_v_0", &[0.0]),
+    ]);
+    let got = &outs[0];
+    assert_eq!(got.len(), want.len());
+    let max_err = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        max_err < 2e-4,
+        "absorbed MLA decode diverged from prefill (lite={lite}, max_err={max_err:e})\n  got ={got:?}\n  want={want:?}"
+    );
+    assert_eq!(
+        kv_out.lock().unwrap().len(),
+        1,
+        "one latent cache per layer"
+    );
+}
+
+#[test]
+fn mla_absorbed_decode_matches_prefill_on_cpu() {
+    run_mla_decode_cpu(false);
+}
+
+#[test]
+fn mla_lite_absorbed_decode_matches_prefill_on_cpu() {
+    run_mla_decode_cpu(true);
 }

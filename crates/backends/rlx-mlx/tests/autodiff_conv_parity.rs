@@ -811,3 +811,57 @@ fn end_to_end_grad_through_conv_layer() {
         outs[1]
     );
 }
+
+/// Input gradient of a conv whose kernel is ≥ 17 tall. Its MLX vjp pads `dy`
+/// by `kh − 1 ≥ 16` inside a flipped `conv_general`, which MLX computed wrongly
+/// (rel. error ~1.5, or NaN when `h > kh`); LEAF's 65×1 spatial conv hit it.
+/// The lowering now pads explicitly. Bounded data, relative check.
+#[test]
+fn conv2d_backward_input_tall_kernel() {
+    for &(c, kh, h, w_in) in &[
+        (8, 17, 17, 101),
+        (8, 32, 32, 16),
+        (8, 65, 65, 101),
+        (8, 65, 70, 101),
+        (64, 65, 65, 101),
+    ] {
+        let (n, c_out, kw) = (2, c, 1);
+        let xs: Vec<f32> = (0..n * c * h * w_in)
+            .map(|i| ((i * 37 % 101) as f32) * 0.02 - 1.0)
+            .collect();
+        let ws: Vec<f32> = (0..c_out * c * kh * kw)
+            .map(|i| ((i * 53 % 97) as f32) * 0.02 - 1.0)
+            .collect();
+        let (_y, h_out, w_out) =
+            conv2d_forward_ref(&xs, &ws, n, c, h, w_in, c_out, kh, kw, 1, 1, 0, 0, 1, 1);
+        let dys: Vec<f32> = (0..n * c_out * h_out * w_out)
+            .map(|i| ((i * 29 % 89) as f32) * 0.02 - 0.9)
+            .collect();
+        let mut g = Graph::new("conv_bwd_in_tall");
+        let dy = g.input("dy", Shape::new(&[n, c_out, h_out, w_out], DType::F32));
+        let w = g.input("w", Shape::new(&[c_out, c, kh, kw], DType::F32));
+        let dx = g.conv2d_backward_input(
+            dy,
+            w,
+            Shape::new(&[n, c, h, w_in], DType::F32),
+            vec![kh, kw],
+            vec![1, 1],
+            vec![0, 0],
+            vec![1, 1],
+            1,
+        );
+        g.set_outputs(vec![dx]);
+        let want = conv2d_backward_input_ref(
+            &dys, &ws, n, c, h, w_in, c_out, h_out, w_out, kh, kw, 1, 1, 0, 0, 1, 1,
+        );
+        let got = run(g, &[("dy", &dys), ("w", &ws)]);
+        let num: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
+        let den: f64 = want.iter().map(|b| (*b as f64).powi(2)).sum();
+        let rel = (num / den).sqrt();
+        assert!(rel < 1e-5, "c={c} k={kh}x1 h={h} w={w_in}: rel {rel:e}");
+    }
+}

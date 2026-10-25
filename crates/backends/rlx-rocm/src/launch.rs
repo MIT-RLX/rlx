@@ -19,7 +19,11 @@
 
 #[macro_export]
 macro_rules! launch_kernel {
-    ($kernel:expr, $stream:expr, $grid:expr, $block:expr, [$($arg:expr),* $(,)?]) => {{
+    ($kernel:expr, $stream:expr, $grid:expr, $block:expr, [$($arg:expr),* $(,)?]) => {
+        $crate::launch_kernel!($kernel, $stream, $grid, $block, shmem = 0, [$($arg),*])
+    };
+    // Same, with `shmem` bytes of dynamic shared memory.
+    ($kernel:expr, $stream:expr, $grid:expr, $block:expr, shmem = $shmem:expr, [$($arg:expr),* $(,)?]) => {{
         use core::ffi::c_void;
         // Bind metavars in a safe context first so the unsafe block
         // only references locals — keeps clippy::macro_metavars_in_unsafe
@@ -28,6 +32,7 @@ macro_rules! launch_kernel {
         let stream = $stream;
         let grid = $grid;
         let block = $block;
+        let shmem: u32 = $shmem;
         let mut params: Vec<*mut c_void> = vec![
             $( $arg as *const _ as *mut c_void, )*
         ];
@@ -37,7 +42,7 @@ macro_rules! launch_kernel {
         // place for that check — a count mismatch here is invisible to HIP and
         // has already shipped once (see `gguf_gpu::launch_dequant_gguf`).
         let _result = unsafe {
-            kernel.launch_checked(stream, grid, block, 0, &mut params)
+            kernel.launch_checked(stream, grid, block, shmem, &mut params)
         };
         // Errors swallowed silently for parity with cudarc's
         // launch_builder — surface via dispatch-time assertions.

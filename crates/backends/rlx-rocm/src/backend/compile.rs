@@ -92,6 +92,9 @@ impl RocmExecutable {
         // Running it here — the single entrance to this crate's compile —
         // covers every caller, not just the runtime backend wrapper.
         let graph = LowerNonLastAxisReduce.run(crate::unfuse::unfuse(graph));
+        // The attention kernels read K / V as `num_heads` heads: repeat shared
+        // ones (grouped-query attention) first, or they return a wrong tensor.
+        let graph = rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph);
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
         let mut plan = plan_f32_uniform(&graph, 16);
@@ -2043,7 +2046,7 @@ impl RocmExecutable {
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
-                Op::Fft { inverse, norm } => {
+                Op::Fft { inverse, norm, .. } => {
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.clone();
                     let meta = rlx_ir::fft::fft_meta(&in_shape);
@@ -2536,7 +2539,9 @@ impl RocmExecutable {
                         desc: rlx_cpu::rlx_scan_host_desc!(graph, node, |id| arena.offset(id)),
                     });
                 }
-                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
+                // `Op::While`: a loop at run time on the host (rlx-cpu's
+                // `Thunk::While`), unbounded or not.
+                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } | Op::While { .. } => {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });
@@ -3084,12 +3089,37 @@ impl RocmExecutable {
                         eps_bits: eps.to_bits(),
                     });
                 }
+                Op::DoubleSingle(op) => {
+                    let dims = |id: rlx_ir::NodeId| -> Vec<usize> {
+                        graph
+                            .node(id)
+                            .shape
+                            .dims()
+                            .iter()
+                            .map(|d| d.unwrap_static())
+                            .collect()
+                    };
+                    let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(i)).collect();
+                    let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                    let plan =
+                        rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &dims(node.id))
+                            .unwrap_or_else(|e| panic!("rlx-rocm: {e}"));
+                    let mut args = rlx_gpu_kernels::DfArgs::from_plan(op, &plan);
+                    args.a_off = (arena.offset(node.inputs[0]) / 4) as u32;
+                    args.b_off = node
+                        .inputs
+                        .get(1)
+                        .map_or(args.a_off, |&b| (arena.offset(b) / 4) as u32);
+                    args.out_off = (arena.offset(node.id) / 4) as u32;
+                    schedule.push(Step::DoubleSingle { args });
+                }
                 Op::RoundToFormat { format, scaling } => {
                     use rlx_ir::FormatScaling;
                     let (mode, block) = match scaling {
                         FormatScaling::None => (0u32, 1u32),
                         FormatScaling::PerTensor => (1, 1),
                         FormatScaling::Block(b) => (2, (*b).max(1)),
+                        FormatScaling::FineBlock(b) => (3, (*b).max(1)),
                     };
                     schedule.push(Step::RoundToFormat {
                         in_off: (arena.offset(node.inputs[0]) / 4) as u32,

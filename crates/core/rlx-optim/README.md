@@ -42,6 +42,16 @@ holds the state for *every* tensor in a model. Matrix-aware
 optimizers (Adafactor, SOAP, Muon, Kron-PSGD) look at `shape` and fall
 back to a plain elementwise rule for 1-D / higher-rank tensors.
 
+## Matching PyTorch exactly
+
+`AdamW::torch(lr, betas, weight_decay)` is `torch.optim.AdamW` operation for
+operation: `with_torch_math(true)` reproduces its f32 arithmetic (`lerp_` for
+the first moment, `sqrt(v) / sqrt(bc2) + eps` rather than `sqrt(v / bc2)`,
+hyperparameters held as f64), and `set_lr_f64` keeps a scheduled learning rate
+at f64 as torch does. `clip_grad_norm_torch` is `torch.nn.utils.clip_grad_norm_`
+(`max / (total + 1e-6)`, clamped at 1, always applied). The default arithmetic
+differs from torch by last-bit roundings that compound over a training run.
+
 ## Design notes
 
 * No external dependencies. Reference Rust; backends that ship a

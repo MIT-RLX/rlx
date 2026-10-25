@@ -1,0 +1,3 @@
+# Known failures for tests/fd_backward_gate.rs — format and env options:
+# `rlx_ir::known_failures`. Columns: case  device[@os]  issue  [note].
+# The device is the gate's label: cpu | metal | mlx | wgpu | cuda | rocm.

@@ -102,6 +102,105 @@ pub const RMS_NORM_BWD_CU: &str = include_str!("../kernels/rms_norm_backward.cu"
 pub const FAKE_QUANTIZE_CU: &str = include_str!("../kernels/fake_quantize.cu");
 /// `Op::RoundToFormat` (`round_to_format`).
 pub const ROUND_TO_FORMAT_CU: &str = include_str!("../kernels/round_to_format.cu");
+/// `Op::DoubleSingle` (`double_single`): the `rlxsl::dw` CUDA prelude plus
+/// `kernels/double_single.cu`, joined at build time.
+pub const DOUBLE_SINGLE_CU: &str = include_str!(concat!(env!("OUT_DIR"), "/double_single.cu"));
+
+/// `double_single.cu`'s `DfParams`, passed by value (CUDA and ROCm): the
+/// shared `rlx_ir::double_single::DfPlan` plus f32 arena offsets.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DfArgs {
+    pub len: u32,
+    pub rank: u32,
+    pub op: u32,
+    pub kind: u32,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a_batch: u32,
+    pub b_batch: u32,
+    pub red_len: u32,
+    pub kept_rank: u32,
+    pub red_rank: u32,
+    pub a_off: u32,
+    pub b_off: u32,
+    pub out_off: u32,
+    pub pad: u32,
+    pub d0: [u32; 8],
+    pub s0: [u32; 8],
+    pub s1: [u32; 8],
+    pub d1: [u32; 8],
+    pub s2: [u32; 8],
+}
+
+impl DfArgs {
+    /// Kernel arguments for `plan` (offsets filled in by the caller).
+    pub fn from_plan(
+        op: &rlx_ir::double_single::DfOp,
+        plan: &rlx_ir::double_single::DfPlan,
+    ) -> Self {
+        use rlx_ir::double_single::DfPlan;
+        let mut p = Self {
+            op: op.code(),
+            ..Self::default()
+        };
+        match plan {
+            DfPlan::Elementwise {
+                len,
+                rank,
+                out_dims,
+                a_strides,
+                b_strides,
+            } => {
+                p.kind = 0;
+                p.len = *len as u32;
+                p.rank = *rank as u32;
+                p.d0 = *out_dims;
+                p.s0 = *a_strides;
+                p.s1 = *b_strides;
+            }
+            DfPlan::MatMul {
+                batch,
+                m,
+                k,
+                n,
+                a_batch,
+                b_batch,
+            } => {
+                p.kind = 1;
+                p.len = (batch * m * n) as u32;
+                p.m = *m as u32;
+                p.k = *k as u32;
+                p.n = *n as u32;
+                p.a_batch = *a_batch as u32;
+                p.b_batch = *b_batch as u32;
+            }
+            DfPlan::Sum {
+                out_len,
+                red_len,
+                kept_rank,
+                kept_dims,
+                kept_strides,
+                red_rank,
+                red_dims,
+                red_strides,
+            } => {
+                p.kind = 2;
+                p.len = *out_len as u32;
+                p.red_len = *red_len as u32;
+                p.kept_rank = *kept_rank as u32;
+                p.red_rank = *red_rank as u32;
+                p.d0 = *kept_dims;
+                p.s0 = *kept_strides;
+                p.d1 = *red_dims;
+                p.s2 = *red_strides;
+            }
+        }
+        p
+    }
+}
+
 /// INT8 asymmetric Quantize / Dequantize (`quantize_i8` / `dequantize_i8`).
 pub const QUANTIZE_CU: &str = include_str!("../kernels/quantize.cu");
 /// Real INT8 `Op::QMatMul` (`q_matmul`) — packed i8 x/w/out + f32-lane bias.
@@ -140,6 +239,60 @@ pub const KV_APPEND_CU: &str = include_str!("../kernels/kv_append.cu");
 /// the head-dim accumulators stay in registers instead of spilling to local
 /// memory, and decode (`seq_q == 1`) gets 32x the lanes per row.
 pub const ATTENTION_WARP_CU: &str = include_str!("../kernels/attention_warp.cu");
+
+/// 32-lane groups per block for `attention_warp_split` (entry point in
+/// [`ATTENTION_WARP_CU`]), or `0` when the row count already fills the device
+/// and the one-group-per-row kernels should run instead.
+///
+/// The split kernel runs one block per (batch, head, q_row) and divides seq_k
+/// across that block's groups, so decode (`rows = batch * heads`, a few dozen)
+/// stops walking the whole cache on one group. The rule aims at ~1024 resident
+/// groups (sm_86, 58 SMs: 16 groups up to 64 rows, 8 at 128 rows were the
+/// measured best). Measured on an RTX 3080 Ti at heads 16 × head_dim 128,
+/// seq_k 1024: 16 groups 168 µs vs 812 µs tiled flash and 1913 µs one group
+/// per row. `override_groups` (from the backend's env option)
+/// bypasses the rule; `Some(0)` or `Some(1)` turns splitting off.
+pub fn attention_kv_split_groups(
+    rows: u32,
+    seq_k: u32,
+    head_dim: u32,
+    override_groups: Option<u32>,
+) -> u32 {
+    const TARGET_GROUPS: u32 = 1024;
+    // The kernel declares `__launch_bounds__(512)`: 16 groups of 32 lanes.
+    const MAX_GROUPS: u32 = 16;
+    const MAX_SMEM_BYTES: u32 = 48 * 1024;
+    if rows == 0 || head_dim > 512 {
+        return 0;
+    }
+    let max_by_smem = MAX_SMEM_BYTES / (attention_kv_split_smem_bytes(1, head_dim));
+    let (groups, min_groups) = match override_groups {
+        Some(g) => (g.min(MAX_GROUPS), 2),
+        None => {
+            let by_rows = (TARGET_GROUPS / rows).clamp(1, MAX_GROUPS);
+            // Power of two below the bound, and at least 4 keys per group.
+            let g = 1u32 << (31 - by_rows.leading_zeros());
+            // A 2-way split lost to tiled flash at 512 rows (624 vs 547 µs).
+            (g.min((seq_k / 4).max(1)), 4)
+        }
+    };
+    let groups = groups.min(max_by_smem);
+    if groups >= min_groups { groups } else { 0 }
+}
+
+/// Dynamic shared memory for `attention_warp_split` with `groups` groups: per
+/// group a running max, a running sum and a `32 * EPL` accumulator, where EPL
+/// is the per-lane head-dim width the kernel specialises on.
+pub fn attention_kv_split_smem_bytes(groups: u32, head_dim: u32) -> u32 {
+    let epl = match head_dim {
+        0..=32 => 1,
+        33..=64 => 2,
+        65..=128 => 4,
+        129..=256 => 8,
+        _ => 16,
+    };
+    groups * (2 + 32 * epl) * 4
+}
 pub const ATTENTION_BWD_CU: &str = include_str!("../kernels/attention_bwd.cu");
 pub const ARGMAX_CU: &str = include_str!("../kernels/argmax.cu");
 pub const ROPE_CU: &str = include_str!("../kernels/rope.cu");
@@ -465,7 +618,13 @@ pub fn declared_param_count(src: &str, entry: &str) -> Option<usize> {
     let open = loop {
         let g = src[from..].find("__global__")? + from;
         let after = &src[g..];
-        let paren_rel = after.find('(')?;
+        let mut paren_rel = after.find('(')?;
+        // `__global__ void __launch_bounds__(N) name(` — step over the
+        // qualifier's own parentheses to reach the parameter list.
+        if after[..paren_rel].trim_end().ends_with("__launch_bounds__") {
+            let close = after[paren_rel..].find(')')? + paren_rel;
+            paren_rel = after[close..].find('(')? + close;
+        }
         let head = &after[..paren_rel];
         // The token immediately before `(` must be the entry name.
         let name = head
@@ -597,6 +756,23 @@ mod param_count_tests {
     use super::declared_param_count;
 
     #[test]
+    fn steps_over_launch_bounds() {
+        let src =
+            "extern \"C\" __global__ void __launch_bounds__(THREADS) foo(float* a, int n) {}\n";
+        assert_eq!(declared_param_count(src, "foo"), Some(2));
+        // Real kernels: the split variant shares `attention_warp`'s 31 params.
+        assert_eq!(
+            declared_param_count(super::ATTENTION_WARP_CU, "attention_warp"),
+            Some(31)
+        );
+        assert_eq!(
+            declared_param_count(super::ATTENTION_WARP_CU, "attention_warp_split"),
+            Some(31)
+        );
+        assert!(declared_param_count(super::ATTENTION_CU, "attention").is_some());
+    }
+
+    #[test]
     fn counts_plain_signatures() {
         let src = "__global__ void foo(float* a, int n) {}\n\
                    __global__ void bar(float* a) {}\n\
@@ -645,5 +821,41 @@ mod param_count_tests {
         let src = "extern \"C\" __global__ void wide(\n    const float* __restrict__ a,\n\
                    \n    float* out,\n    unsigned int n)\n{\n}\n";
         assert_eq!(declared_param_count(src, "wide"), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod attention_kv_split_tests {
+    use super::{attention_kv_split_groups as groups, attention_kv_split_smem_bytes};
+
+    #[test]
+    fn decode_rows_split_and_prefill_rows_do_not() {
+        // Decode (rows = batch * heads) — the measured winners on sm_86.
+        assert_eq!(groups(16, 1024, 128, None), 16);
+        assert_eq!(groups(10, 4096, 256, None), 16);
+        assert_eq!(groups(64, 1024, 128, None), 16);
+        assert_eq!(groups(128, 1024, 128, None), 8);
+        // 512 rows: a 2-way split lost to tiled flash.
+        assert_eq!(groups(512, 512, 128, None), 0);
+        // Too few keys to divide.
+        assert_eq!(groups(2, 5, 80, None), 0);
+        assert_eq!(groups(16, 16, 128, None), 4);
+    }
+
+    #[test]
+    fn override_and_limits() {
+        assert_eq!(groups(16, 1024, 128, Some(0)), 0);
+        assert_eq!(groups(16, 1024, 128, Some(1)), 0);
+        assert_eq!(groups(512, 512, 128, Some(2)), 2);
+        assert_eq!(groups(16, 1024, 128, Some(64)), 16);
+        assert_eq!(groups(16, 1024, 513, None), 0);
+        // Every rule result fits the 48 KiB default shared-memory window.
+        for d in [32, 64, 80, 128, 200, 256, 512] {
+            let g = groups(1, 1 << 16, d, None);
+            assert!(
+                attention_kv_split_smem_bytes(g, d) <= 48 * 1024,
+                "d={d} g={g}"
+            );
+        }
     }
 }

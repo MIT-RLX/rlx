@@ -53,7 +53,7 @@
 // point below switches once (grid-uniform, so no divergence) into the
 // specialisation that covers it.
 template <int EPL>
-__device__ __forceinline__ void rlx_attention_warp_impl(
+__device__ __forceinline__ void rlx_attention_warp_partial(
     float* arena,
     unsigned int heads,
     unsigned int seq_q,
@@ -85,7 +85,13 @@ __device__ __forceinline__ void rlx_attention_warp_impl(
     unsigned int o_seq_stride,
     float softcap,
     unsigned int row,
-    unsigned int lane
+    unsigned int lane,
+    unsigned int s_begin,
+    unsigned int s_end,
+    float (&o_acc)[EPL],
+    float& m_out,
+    float& l_out,
+    unsigned int& o_base_out
 ) {
     unsigned int qi = row % seq_q;
     unsigned int q1 = row / seq_q;
@@ -116,7 +122,6 @@ __device__ __forceinline__ void rlx_attention_warp_impl(
     // Lane-strided ownership of the head-dim axis. `head_dim` need not be a
     // multiple of 32; out-of-range slots hold 0 and are never stored back.
     float q_reg[EPL];
-    float o_acc[EPL];
     #pragma unroll
     for (int e = 0; e < EPL; ++e) {
         unsigned int d = (unsigned int)e * RLX_ATTN_LANES + lane;
@@ -127,7 +132,7 @@ __device__ __forceinline__ void rlx_attention_warp_impl(
     float m = -3.4e38f;
     float l = 0.0f;
 
-    for (unsigned int s = 0; s < seq_k; ++s) {
+    for (unsigned int s = s_begin; s < s_end; ++s) {
         unsigned int k_base = k_bh + s * k_seq_stride;
         float part = 0.0f;
         #pragma unroll
@@ -172,11 +177,119 @@ __device__ __forceinline__ void rlx_attention_warp_impl(
         m = m_new;
     }
 
+    m_out = m;
+    l_out = l;
+    o_base_out = o_base;
+}
+
+// The whole key range for one row, normalised and stored.
+template <int EPL>
+__device__ __forceinline__ void rlx_attention_warp_row(
+    float* arena, unsigned int heads, unsigned int seq_q, unsigned int seq_k,
+    unsigned int head_dim, unsigned int q_off, unsigned int k_off,
+    unsigned int v_off, unsigned int out_off, unsigned int mask_off,
+    unsigned int mask_kind, float scale, unsigned int window,
+    unsigned int seq_q_stride, unsigned int seq_k_stride,
+    unsigned int mask_batch_stride, unsigned int mask_head_stride,
+    unsigned int q_batch_stride, unsigned int q_head_stride,
+    unsigned int q_seq_stride, unsigned int k_batch_stride,
+    unsigned int k_head_stride, unsigned int k_seq_stride,
+    unsigned int v_batch_stride, unsigned int v_head_stride,
+    unsigned int v_seq_stride, unsigned int o_batch_stride,
+    unsigned int o_head_stride, unsigned int o_seq_stride, float softcap,
+    unsigned int row, unsigned int lane
+) {
+    float o_acc[EPL];
+    float m, l;
+    unsigned int o_base;
+    rlx_attention_warp_partial<EPL>(
+        arena, heads, seq_q, seq_k, head_dim, q_off, k_off, v_off, out_off,
+        mask_off, mask_kind, scale, window, seq_q_stride, seq_k_stride,
+        mask_batch_stride, mask_head_stride, q_batch_stride, q_head_stride,
+        q_seq_stride, k_batch_stride, k_head_stride, k_seq_stride,
+        v_batch_stride, v_head_stride, v_seq_stride, o_batch_stride,
+        o_head_stride, o_seq_stride, softcap, row, lane, 0u, seq_k, o_acc, m,
+        l, o_base);
     float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
     #pragma unroll
     for (int e = 0; e < EPL; ++e) {
         unsigned int d = (unsigned int)e * RLX_ATTN_LANES + lane;
         if (d < head_dim) { arena[o_base + d] = o_acc[e] * inv_l; }
+    }
+}
+
+// Split-KV variant for decode. With seq_q == 1 the row count is only
+// `batch * heads`, so one group per row leaves most lanes idle while each
+// group walks the whole cache serially. Here one BLOCK serves one row: its
+// `blockDim.x / 32` groups each take a contiguous slice of seq_k, then the
+// partial (max, sum, acc) states are merged in shared memory with the usual
+// log-sum-exp rescale. Single launch, no arena scratch, so it is safe inside
+// a captured graph. Same parameter list as `attention_warp`.
+//
+// Dynamic shared memory: `groups * (2 + 32 * EPL)` floats, where EPL is the
+// specialisation picked for head_dim (the launcher sizes it with the same
+// rule as the switch below).
+template <int EPL>
+__device__ __forceinline__ void rlx_attention_warp_split_row(
+    float* arena, unsigned int heads, unsigned int seq_q, unsigned int seq_k,
+    unsigned int head_dim, unsigned int q_off, unsigned int k_off,
+    unsigned int v_off, unsigned int out_off, unsigned int mask_off,
+    unsigned int mask_kind, float scale, unsigned int window,
+    unsigned int seq_q_stride, unsigned int seq_k_stride,
+    unsigned int mask_batch_stride, unsigned int mask_head_stride,
+    unsigned int q_batch_stride, unsigned int q_head_stride,
+    unsigned int q_seq_stride, unsigned int k_batch_stride,
+    unsigned int k_head_stride, unsigned int k_seq_stride,
+    unsigned int v_batch_stride, unsigned int v_head_stride,
+    unsigned int v_seq_stride, unsigned int o_batch_stride,
+    unsigned int o_head_stride, unsigned int o_seq_stride, float softcap,
+    unsigned int row, unsigned int group, unsigned int lane,
+    unsigned int groups, float* smem
+) {
+    const unsigned int width = (unsigned int)EPL * RLX_ATTN_LANES;
+    unsigned int chunk = (seq_k + groups - 1) / groups;
+    unsigned int s_begin = min(group * chunk, seq_k);
+    unsigned int s_end = min(s_begin + chunk, seq_k);
+
+    float o_acc[EPL];
+    float m, l;
+    unsigned int o_base;
+    rlx_attention_warp_partial<EPL>(
+        arena, heads, seq_q, seq_k, head_dim, q_off, k_off, v_off, out_off,
+        mask_off, mask_kind, scale, window, seq_q_stride, seq_k_stride,
+        mask_batch_stride, mask_head_stride, q_batch_stride, q_head_stride,
+        q_seq_stride, k_batch_stride, k_head_stride, k_seq_stride,
+        v_batch_stride, v_head_stride, v_seq_stride, o_batch_stride,
+        o_head_stride, o_seq_stride, softcap, row, lane, s_begin, s_end,
+        o_acc, m, l, o_base);
+
+    float* s_m = smem;
+    float* s_l = smem + groups;
+    float* s_o = smem + 2 * groups;
+    if (lane == 0) { s_m[group] = m; s_l[group] = l; }
+    #pragma unroll
+    for (int e = 0; e < EPL; ++e) {
+        s_o[group * width + (unsigned int)e * RLX_ATTN_LANES + lane] = o_acc[e];
+    }
+    __syncthreads();
+
+    // Every thread computes the shared max and denominator (cheap: `groups`
+    // terms), then the block covers head_dim with a block-strided loop.
+    float m_all = -3.4e38f;
+    for (unsigned int g = 0; g < groups; ++g) { m_all = fmaxf(m_all, s_m[g]); }
+    float l_all = 0.0f;
+    for (unsigned int g = 0; g < groups; ++g) {
+        float w = (s_m[g] <= -1e30f) ? 0.0f : expf(s_m[g] - m_all);
+        l_all += w * s_l[g];
+    }
+    float inv_l = (l_all > 0.0f) ? 1.0f / l_all : 0.0f;
+    for (unsigned int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int g = 0; g < groups; ++g) {
+            float w = (s_m[g] <= -1e30f) ? 0.0f : expf(s_m[g] - m_all);
+            acc += w * s_o[g * width + d];
+        }
+        arena[o_base + d] = acc * inv_l;
     }
 }
 
@@ -231,7 +344,7 @@ extern "C" __global__ void attention_warp(
     if (row >= total) return;
 
 #define RLX_ATTN_WARP_CALL(EPL_)                                               \
-    rlx_attention_warp_impl<EPL_>(                                             \
+    rlx_attention_warp_row<EPL_>(                                              \
         arena, heads, seq_q, seq_k, head_dim, q_off, k_off, v_off, out_off,    \
         mask_off, mask_kind, scale, window, seq_q_stride, seq_k_stride,        \
         mask_batch_stride, mask_head_stride, q_batch_stride, q_head_stride,    \
@@ -246,4 +359,69 @@ extern "C" __global__ void attention_warp(
     else                       { RLX_ATTN_WARP_CALL(16); }
 
 #undef RLX_ATTN_WARP_CALL
+}
+
+// 16 groups max: 1024-thread blocks run out of registers at EPL >= 4.
+extern "C" __global__ void __launch_bounds__(512) attention_warp_split(
+    float* arena,
+    unsigned int batch,
+    unsigned int heads,
+    unsigned int seq_q,
+    unsigned int seq_k,
+    unsigned int head_dim,
+    unsigned int q_off,
+    unsigned int k_off,
+    unsigned int v_off,
+    unsigned int out_off,
+    unsigned int mask_off,
+    unsigned int mask_kind,
+    unsigned int scale_bits,
+    unsigned int window,
+    unsigned int seq_q_stride,
+    unsigned int seq_k_stride,
+    unsigned int mask_batch_stride,
+    unsigned int mask_head_stride,
+    unsigned int q_batch_stride,
+    unsigned int q_head_stride,
+    unsigned int q_seq_stride,
+    unsigned int k_batch_stride,
+    unsigned int k_head_stride,
+    unsigned int k_seq_stride,
+    unsigned int v_batch_stride,
+    unsigned int v_head_stride,
+    unsigned int v_seq_stride,
+    unsigned int o_batch_stride,
+    unsigned int o_head_stride,
+    unsigned int o_seq_stride,
+    unsigned int softcap_bits
+) {
+    extern __shared__ float rlx_attn_split_smem[];
+    if (head_dim > RLX_ATTN_WARP_MAX_HEAD_DIM) return;
+    float scale = __int_as_float((int)scale_bits);
+    float softcap = __int_as_float((int)softcap_bits);
+
+    // One block per query row; block-uniform, so __syncthreads is safe.
+    unsigned int row = blockIdx.x;
+    if (row >= batch * heads * seq_q) return;
+    unsigned int group = threadIdx.x / RLX_ATTN_LANES;
+    unsigned int lane = threadIdx.x % RLX_ATTN_LANES;
+    unsigned int groups = blockDim.x / RLX_ATTN_LANES;
+
+#define RLX_ATTN_SPLIT_CALL(EPL_)                                              \
+    rlx_attention_warp_split_row<EPL_>(                                        \
+        arena, heads, seq_q, seq_k, head_dim, q_off, k_off, v_off, out_off,    \
+        mask_off, mask_kind, scale, window, seq_q_stride, seq_k_stride,        \
+        mask_batch_stride, mask_head_stride, q_batch_stride, q_head_stride,    \
+        q_seq_stride, k_batch_stride, k_head_stride, k_seq_stride,             \
+        v_batch_stride, v_head_stride, v_seq_stride, o_batch_stride,           \
+        o_head_stride, o_seq_stride, softcap, row, group, lane, groups,        \
+        rlx_attn_split_smem)
+
+    if (head_dim <= 32u)       { RLX_ATTN_SPLIT_CALL(1); }
+    else if (head_dim <= 64u)  { RLX_ATTN_SPLIT_CALL(2); }
+    else if (head_dim <= 128u) { RLX_ATTN_SPLIT_CALL(4); }
+    else if (head_dim <= 256u) { RLX_ATTN_SPLIT_CALL(8); }
+    else                       { RLX_ATTN_SPLIT_CALL(16); }
+
+#undef RLX_ATTN_SPLIT_CALL
 }

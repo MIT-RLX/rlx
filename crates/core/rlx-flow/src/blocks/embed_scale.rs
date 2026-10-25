@@ -25,9 +25,9 @@ impl EmbedScaleStage {
 
 impl BlockStage for EmbedScaleStage {
     fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
-        let scale = (self.hidden_size as f32).sqrt();
+        let scale = (self.hidden_size as f64).sqrt();
         let name = format!("gemma.embed_scale.{}", self.hidden_size);
-        let scale_id = ctx.synth_param(&name, vec![scale], Shape::new(&[1], DType::F32));
+        let scale_id = ctx.synth_param_f64(&name, &[scale], Shape::new(&[1], DType::F32));
         let mut gb = HirMut::new(ctx.hir());
         let out = gb.mul(input.id, scale_id);
         Ok(Some(ctx.wrap(out, input.shape.clone())))

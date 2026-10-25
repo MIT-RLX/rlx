@@ -1,6 +1,6 @@
 # RLX
 
-![status](https://img.shields.io/badge/status-0.2.18-blue)
+![status](https://img.shields.io/badge/status-0.2.19-blue)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 ![rust](https://img.shields.io/badge/rust-edition%202024-orange)
 [![repo](https://img.shields.io/badge/github-MIT--RLX%2Frlx-black)](https://github.com/MIT-RLX/rlx)
@@ -28,6 +28,7 @@ Rust*](https://arxiv.org/abs/2609.37916) (arXiv:2609.37916).
 - [Why another one](#why-another-one)
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Language bindings](#language-bindings)
 - [Examples](#examples)
   - [Simple example](#simple-example)
   - [Advanced example](#advanced-example)
@@ -158,7 +159,8 @@ exposed through the prelude:
 
 - `rlx-cortexm` — `no_std` ARMv7E-M INT8 kernels.
 - `rlx-fpga` — IR → SystemVerilog → bitstream (first-class export via
-  `rlx_runtime::export` / `pyrlx.export_fpga` under the `fpga` feature).
+  `rlx_runtime::export` / `pyrlx.export_fpga` under the `fpga` feature);
+  `no_std` + `alloc` without its default `std` feature.
 - `rlx-qnn` — Qualcomm Hexagon / QNN codegen + FFI runtime (`Device::Hexagon`;
   enable `rlx-runtime`'s `qnn` feature, not on the umbrella prelude).
 - `rlx-cerebras` — Cerebras WSE: IR → CSL → fabric simulator. No `Device`
@@ -178,7 +180,8 @@ use rlx::prelude::*;
 let mut g = Graph::new("hello");
 let x = g.input("x", Shape::new(&[1, 4], DType::F32));
 let w = g.param("w", Shape::new(&[4, 2], DType::F32));
-let y = g.matmul(x, w, Shape::new(&[1, 2], DType::F32));
+let y = g.mm(x, w); // GraphExt builders infer the output shape
+let y = g.relu(y);
 g.set_outputs(vec![y]);
 
 let mut compiled = Session::new(Device::Cpu).compile(g);
@@ -187,25 +190,34 @@ let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 assert_eq!(out[0], vec![4.0, 6.0]); // `run` returns one Vec<f32> per graph output
 ```
 
+Mistakes at the boundary are reported by name: a misspelled input
+(`the graph has no input `X` (did you mean `x`?)`) or a buffer of the wrong
+length panics in `run` / `set_param`, and `try_run` returns the same as an
+`IoError`. Inputs left unsupplied and params never set are named in a one-time
+warning; `check_bindings` returns them as an error.
+
+`g.matmul(x, w, shape)` and the other explicit-shape builders remain for
+graphs whose output shape you want to state yourself.
+
 Prefer NumPy-style expressions? The `rlx::tensor` DSL ([`rlx-tensor`](crates/core/rlx-tensor/README.md))
 builds the same IR with operator-overloaded, lazy `Tensor` handles —
 `(&a + &b).relu()` traces instead of executing, then fuses + memory-plans
 across any backend when you call `.to_vec()`:
 
 ```rust
-use rlx_tensor::Tensor; // crate `rlx-tensor`, feature `eval`
+use rlx::prelude::*; // features `cpu` + `tensor`
 
 let a = Tensor::from_vec(vec![1.0, 2.0, 3.0], [3]);
 let c = (&a + &Tensor::ones([3])).relu();
-assert_eq!(c.to_vec(), vec![2.0, 3.0, 4.0]); // auto-picks the fastest backend
+assert_eq!(c.to_vec(), vec![2.0, 3.0, 4.0]); // runs on the fastest backend built in
 ```
 
-Or declare the graph in a compact little language with `rlx!` (feature `tensor`,
-on by default) — `@` is matmul with NumPy precedence, shapes/wiring/outputs are
+Or declare the graph in a compact little language with `rlx!` (feature `tensor`;
+the `rlx` crate has no default features, so enable it explicitly) — `@` is matmul with NumPy precedence, shapes/wiring/outputs are
 inferred, and it lowers to the same IR:
 
 ```rust
-use rlx::rlx;
+use rlx::prelude::*; // feature `tensor`
 
 let g = rlx! {
     graph "mlp";
@@ -217,6 +229,7 @@ let g = rlx! {
     let y = h @ w2 + b2;
     out y;                          // → rlx_ir::Graph
 };
+assert_eq!(g.outputs.len(), 1);
 ```
 
 Domain-specific namespaces if you want narrower star-imports:
@@ -226,6 +239,49 @@ via `rlx::ir::…` / `rlx::opt::…` / `rlx::runtime::…` etc. — every
 workspace crate is reachable as a module on `rlx`. Or depend on each
 crate directly (`rlx-ir`, `rlx-opt`, `rlx-runtime`, …) for the
 smallest possible dep tree.
+
+## Language bindings
+
+RLX is the same API in every language: the same graph builders and the same
+runtime (sessions, device selection, autodiff, training, weights, text,
+distributed nodes), generated from one source and tested one-to-one against
+it. Each language's package has the same six runnable examples — inference,
+training, loading, distributed, backends, models — printing the same numbers.
+
+| Language | Package | Examples |
+|----------|---------|----------|
+| Python | [`crates/bindings/pyrlx`](crates/bindings/pyrlx) | [`pyrlx/examples/`](crates/bindings/pyrlx/examples/README.md) |
+| JavaScript | [`crates/bindings/rlx-js`](crates/bindings/rlx-js) | [`rlx-js/examples/`](crates/bindings/rlx-js/examples/README.md) |
+| Swift (iOS, macOS) | [`crates/bindings/rlx-swift`](crates/bindings/rlx-swift) | [`rlx-swift/Examples/`](crates/bindings/rlx-swift/Examples/README.md) |
+| Go | [`crates/bindings/rlx-go`](crates/bindings/rlx-go/README.md) | [`rlx-go/examples/`](crates/bindings/rlx-go/examples) |
+| Java (FFM) | [`crates/bindings/rlx-java`](crates/bindings/rlx-java/README.md) | [`rlx-java/examples/`](crates/bindings/rlx-java/examples/org/rlx/examples) |
+| C# / .NET | [`crates/bindings/rlx-csharp`](crates/bindings/rlx-csharp/README.md) | [`rlx-csharp/examples/`](crates/bindings/rlx-csharp/examples/Rlx.Examples) |
+| Ruby | [`crates/bindings/rlx-ruby`](crates/bindings/rlx-ruby/README.md) | [`rlx-ruby/examples/`](crates/bindings/rlx-ruby/examples) |
+| Julia | [`crates/bindings/rlx-julia`](crates/bindings/rlx-julia/README.md) | [`rlx-julia/examples/`](crates/bindings/rlx-julia/examples) |
+| Zig | [`crates/bindings/rlx-zig`](crates/bindings/rlx-zig/README.md) | [`rlx-zig/examples/`](crates/bindings/rlx-zig/examples) |
+| C++ | [`crates/bindings/rlx-cpp`](crates/bindings/rlx-cpp/README.md) | [`rlx-cpp/examples/`](crates/bindings/rlx-cpp/examples) |
+| Node.js / TypeScript | [`crates/bindings/rlx-node`](crates/bindings/rlx-node/README.md) | [`rlx-node/examples/`](crates/bindings/rlx-node/examples) |
+| Kotlin (JVM, Android) | [`crates/bindings/rlx-kotlin`](crates/bindings/rlx-kotlin/README.md) | [`rlx-kotlin/examples/`](crates/bindings/rlx-kotlin/examples) |
+| Dart / Flutter | [`crates/bindings/rlx-dart`](crates/bindings/rlx-dart/README.md) | [`rlx-dart/example/`](crates/bindings/rlx-dart/example) |
+| Lua | [`crates/bindings/rlx-lua`](crates/bindings/rlx-lua/README.md) | [`rlx-lua/examples/`](crates/bindings/rlx-lua/examples) |
+| MATLAB / Octave | [`crates/bindings/rlx-matlab`](crates/bindings/rlx-matlab/README.md) | [`rlx-matlab/examples/`](crates/bindings/rlx-matlab/examples) |
+| R | [`crates/bindings/rlx-r`](crates/bindings/rlx-r/README.md) | [`rlx-r/inst/examples/`](crates/bindings/rlx-r/inst/examples) |
+| PHP | [`crates/bindings/rlx-php`](crates/bindings/rlx-php/README.md) | [`rlx-php/examples/`](crates/bindings/rlx-php/examples) |
+| Nim | [`crates/bindings/rlx-nim`](crates/bindings/rlx-nim/README.md) | [`rlx-nim/examples/`](crates/bindings/rlx-nim/examples) |
+| D | [`crates/bindings/rlx-d`](crates/bindings/rlx-d/README.md) | [`rlx-d/examples/`](crates/bindings/rlx-d/examples) |
+| V | [`crates/bindings/rlx-v`](crates/bindings/rlx-v/README.md) | [`rlx-v/examples/`](crates/bindings/rlx-v/examples) |
+| Haskell | [`crates/bindings/rlx-haskell`](crates/bindings/rlx-haskell/README.md) | [`rlx-haskell/examples/`](crates/bindings/rlx-haskell/examples) |
+| OCaml | [`crates/bindings/rlx-ocaml`](crates/bindings/rlx-ocaml/README.md) | [`rlx-ocaml/examples/`](crates/bindings/rlx-ocaml/examples) |
+| Elixir | [`crates/bindings/rlx-elixir`](crates/bindings/rlx-elixir/README.md) | [`rlx-elixir/examples/`](crates/bindings/rlx-elixir/examples) |
+| Odin | [`crates/bindings/rlx-odin`](crates/bindings/rlx-odin/README.md) | [`rlx-odin/examples/`](crates/bindings/rlx-odin/examples) |
+| C / any FFI language | [`crates/bindings/rlx-capi`](crates/bindings/rlx-capi) | [`rlx-capi/examples/`](crates/bindings/rlx-capi/examples/README.md) |
+| Browser (wasm) | [`crates/bindings/rlx-web`](crates/bindings/rlx-web) | [`rlx-web/README.md`](crates/bindings/rlx-web/README.md) |
+
+Start at [`crates/bindings/README.md`](crates/bindings/README.md) for build
+commands and a side-by-side snippet per language;
+[`docs/bindings-api.md`](docs/bindings-api.md) maps every function's name across
+languages, and [`docs/bindings.md`](docs/bindings.md) covers adding an op, a
+runtime function or a new language.
 
 ## Examples
 
@@ -240,23 +296,26 @@ returns one `Vec<f32>` per graph output.
 
 ```rust
 use rlx::prelude::*;
-use rlx_ir::op::Activation;
 
 let mut g = Graph::new("mlp");
 let x  = g.input("x",  Shape::new(&[1, 4], DType::F32));
 let w1 = g.param("w1", Shape::new(&[4, 8], DType::F32));
 let w2 = g.param("w2", Shape::new(&[8, 2], DType::F32));
-
-let h = g.matmul(x, w1, Shape::new(&[1, 8], DType::F32));
-let h = g.activation(Activation::Relu, h, Shape::new(&[1, 8], DType::F32));
-let y = g.matmul(h, w2, Shape::new(&[1, 2], DType::F32));
+let h = g.mm(x, w1);
+let h = g.relu(h);
+let y = g.mm(h, w2);
 g.set_outputs(vec![y]);
 
-let mut net = Session::new(Device::Cpu).compile(g);
-net.set_param("w1", &w1_weights); // &[f32], len 4*8
-net.set_param("w2", &w2_weights); // &[f32], len 8*2
-let out = net.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
-println!("{:?}", out[0]);          // the 2 outputs
+// `try_compile` / `try_run` return errors instead of panicking.
+let mut net = Session::new(Device::Cpu).try_compile(g).expect("compiles");
+net.set_param("w1", &[0.1; 4 * 8]);
+net.set_param("w2", &[0.1; 8 * 2]);
+let out = net.try_run(&[("x", &[1.0, 2.0, 3.0, 4.0])]).expect("inputs match");
+assert_eq!(out[0].len(), 2); // one Vec<f32> per graph output
+println!("{:?}", out[0]);
+
+// Mistakes are named: `the graph has no input `X` (did you mean `x`?)`.
+assert!(net.try_run(&[("X", &[0.0; 4])]).is_err());
 ```
 
 ### Browser example — a training cluster across tabs and devices
@@ -295,16 +354,24 @@ present on the machine, and print what the compiler did per op.
 
 ```rust
 use rlx::prelude::*;
-use rlx_autodiff::grad;
-use rlx_runtime::fastest_device;
 
-// `forward` is a graph with input `x` (node `x_id`); build ∂output/∂x:
-let grad_graph = grad(&forward, &[x_id]);
+// f(x) = Σ tanh(x)², and its gradient ∂f/∂x = 2·tanh(x)·(1 − tanh(x)²).
+let mut f = Graph::new("f");
+let x = f.input("x", Shape::new(&[4], DType::F32));
+let t = f.tanh(x);
+let sq = f.mul(t, t);
+let s = f.sum(sq, vec![0], false);
+f.set_outputs(vec![s]);
 
+let df = grad(&f, &[x]);                       // reverse mode; outputs [∂f/∂x]
 let device = fastest_device();                 // Metal / CUDA / wgpu / … else CPU
-std::env::set_var("RLX_DISPATCH_REPORT", "1"); // native vs common-ir per OpKind
-let mut compiled = Session::new(device).compile(grad_graph);
-let grads = compiled.run(&[("x", &x_values)]);
+let mut c = Session::new(device).try_compile(df).expect("compiles");
+let xs = [0.5f32, -1.0, 2.0, 0.0];
+let g = c.run(&[("x", &xs), ("d_output", &[1.0])]); // `d_output`: the seed ∂f/∂f
+for (gi, xi) in g[0].iter().zip(xs) {
+    let th = xi.tanh();
+    assert!((gi - 2.0 * th * (1.0 - th * th)).abs() < 1e-4);
+}
 ```
 
 Mixed precision, compile caching, and per-op dispatch overrides all go through
@@ -319,28 +386,36 @@ whose outputs are `[loss, ∂loss/∂param…]` and which takes a unit loss-seed
 named `d_output`.
 
 ```rust
-use rlx::prelude::*;
-use rlx_autodiff::grad_with_loss;
-use rlx_optim::{Adam, Optimizer};
+use rlx::prelude::*; // feature `optim` for the optimizers
 
-// `forward`: a graph whose FIRST output is a scalar loss, with trainable param
-// `w` (node `w_id`). See examples/int8_qat_train.rs for a full forward graph.
-let backward = grad_with_loss(&forward, &[w_id]);  // outputs: [loss, dW]
-let mut compiled = Session::new(Device::Cpu).compile(backward);
+// Fit y = x·w to targets made with w* = [2, -3]: loss = Σ (x·w − y)².
+let mut f = Graph::new("linreg");
+let x = f.input("x", Shape::new(&[4, 2], DType::F32));
+let y = f.input("target", Shape::new(&[4, 1], DType::F32));
+let w = f.param("w", Shape::new(&[2, 1], DType::F32));
+let pred = f.mm(x, w);
+let err = f.sub(pred, y);
+let sq = f.mul(err, err);
+let loss = f.sum(sq, vec![0, 1], false);
+f.set_outputs(vec![loss]);
 
-let mut opt = Adam::new(1e-3);
-let mut w = init_weights();                         // Vec<f32>
-for step in 0..200 {
-    let out = compiled.run(&[
-        ("x", &x), ("target", &target),
-        ("w", &w),                                 // feed the current params in
-        ("d_output", &[1.0]),                      // ∂loss/∂loss = 1
-    ]);
-    let (loss, grad) = (out[0][0], &out[1]);
-    opt.step("w", &[w.len()], &mut w, grad);       // in-place Adam update
+let backward = grad_with_loss(&f, &[w]);          // outputs: [loss, ∂loss/∂w]
+let mut c = Session::new(Device::Cpu).try_compile(backward).expect("compiles");
+
+let xs = [1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, -1.0];
+let ys = [2.0f32, -3.0, -1.0, 7.0];
+let mut wv = vec![0.0f32; 2];
+let mut opt = Adam::new(0.1);
+let mut last = f32::MAX;
+for step in 0..300 {
+    c.set_param("w", &wv);                             // upload the current weights
+    let out = c.run(&[("x", &xs), ("target", &ys), ("d_output", &[1.0])]); // seed ∂loss/∂loss = 1
+    last = out[0][0];
+    opt.step("w", &[2, 1], &mut wv, &out[1]);          // in-place Adam update
     opt.end_iteration();
-    if step % 20 == 0 { println!("step {step}: loss {loss:.6}"); }
+    if step % 100 == 0 { println!("step {step}: loss {last:.5}"); }
 }
+assert!(last < 1e-3 && (wv[0] - 2.0).abs() < 0.05 && (wv[1] + 3.0).abs() < 0.05);
 ```
 
 ### Distributed example
@@ -397,7 +472,9 @@ impl LayerStage for GatedMlp {
     }
 }
 
-let flow = ModelFlow::new("my_model").input("x", shape).layer_stage(GatedMlp { /* … */ });
+let flow = ModelFlow::new("my_model")
+    .input("x", Shape::new(&[1, 16], DType::F32))
+    .layer_stage(GatedMlp { gate: "gate".into(), up: "up".into(), down: "down".into() });
 ```
 
 For a new **op** (a custom primitive with its own shape / autodiff / lowering
@@ -486,15 +563,15 @@ and [`docs/gguf-backend-paths.md`](docs/gguf-backend-paths.md)).
 ## Workspace layout
 
 The umbrella `rlx` crate is a prelude that re-exports the framework; the
-first-party workspace is 72 crates under
+first-party workspace is 85 crates under
 `crates/{core,backends,io,numerics,tooling,bindings}/`, each with its own
 `README.md`.
 
-```
+```text
 rlx                  umbrella prelude — re-exports the framework + common types
 
 core/  — IR, compiler, autodiff, runtime
-  rlx-ir             tensor IR: types, shapes, Op enum, verifier, serialization (leaf)
+  rlx-ir             tensor IR: types, shapes, Op enum, verifier, serialization (leaf; no_std core)
   rlx-tensor         NumPy-style symbolic Tensor DSL (lazy: trace → fuse → any backend)
   rlx-flow           block assembly-line API for model builders (fusion-first)
   rlx-autodiff       JAX-shaped transforms on the MIR — grad / jvp / hvp / vmap
@@ -526,7 +603,7 @@ backends/  — one crate per hardware target
   rlx-webgl          WebGL2 GPGPU — render-to-texture graph execution in-browser
   rlx-qnn            Qualcomm Hexagon NPU — IR → QNN model (Device::Hexagon)
   rlx-cortexm        Cortex-M INT8 kernels for ARMv7E-M microcontrollers (no_std)
-  rlx-fpga           FPGA — per-graph datapath synthesis (IR → Verilog → bitstream)
+  rlx-fpga           FPGA — per-graph datapath synthesis (IR → Verilog → bitstream; no_std)
   rlx-cerebras       Cerebras Wafer-Scale Engine — IR → CSL → fabric simulator
   rlx-egpu           external GPU over USB4/Thunderbolt — IOKit PCI discovery + DriverKit
   rlx-gpu-host       backend-agnostic host-fallback kernels (D2H → CPU → H2D)
@@ -542,12 +619,15 @@ io/  — model + weight loading, conversion, packaging
   rlx-onnx-proto     vendored pure-Rust ONNX protobuf types (protoc-free)
   rlx-onnx-conformance   ONNX op-level conformance tests (ORT vs RLX)
   rlx-torch-import   PyTorch (torch.export) → RLX HIR (aten→rlx registry + gen crate)
+  rlx-torch-ckpt     native PyTorch checkpoint reader (.pt / .pth / .bin) — no libtorch
   rlx-nemo           native loader for NVIDIA NeMo .nemo files
   rlx-dduf           HuggingFace DDUF (.dduf) package loader
   rlx-mlx-io         MLX weight layouts (mlx-community safetensors / .npz / affine+mxfp)
   rlx-hub            HuggingFace shard-aware download + verify (resumable, layer→shard)
   rlx-pkg            RLX package format (.rlxp) — flat hybrid mmap packs
   rlx-bake           offline bake: graph + weights → optimized *.rlx (optional encrypt)
+  rlx-stablehlo      graph → StableHLO MLIR for IREE / MLIR toolchains (+ parameter files)
+  rlx-program        package host logic as WebAssembly (tokenize, decode loops) — guest SDK
   rlx-text           tokenizers, chat templates, sampling for downstream LM apps
 
 numerics/  — downstream domain packages (register against the custom-op scaffold)
@@ -563,6 +643,8 @@ numerics/  — downstream domain packages (register against the custom-op scaffo
   rlx-rl             flow-map generative policies (FMQ / QGBS)
   rlx-peft           parameter-efficient adaptation — LoRA / IA3 / AdaLoRA / DoRA / OFT
   rlx-rng            bit-exact numpy + PyTorch random streams (MT19937 / PCG64 / randperm)
+  rlx-numpy          numpy host numerics bit-for-bit (pairwise sum, half-even round, …)
+  rlx-search         decode-side search: argmax / top-k, beam, CTC, forced alignment
 
 tooling/
   rlx-check          device-free static graph checker (shape / dispatch / fusion / NaN)
@@ -572,10 +654,19 @@ tooling/
   rlx-opscope        data-pattern recorder — inject stat taps, sweep, mine exploitable structure
   rlx-megakernel     standalone study: how far MoE composes toward one device program
   rlxsl              scalar-expr manifest → per-language activation kernels (WGSL/CUDA/MSL/…)
+  rlx-bindgen        generates the C header, C glue, Swift and `.pyi` from rlx-bind's tables
 
-bindings/
+bindings/            (one API in every language — see crates/bindings/README.md)
+  rlx-bind           the language-neutral core: op table + runtime API table (api.idl)
   pyrlx              Python bindings (PyO3) — run RLX graphs + HF models on any backend
+  rlx-js             JavaScript bindings — an embedded QuickJS runtime with `rlx.*`
+  rlx-capi           C ABI (generated `rlx.h`) — the hub for Swift and any FFI language
+  rlx-swift          Swift package on the C ABI — iOS / macOS, `RLX.xcframework`
+  rlx-go, rlx-java, rlx-csharp, rlx-ruby, rlx-julia, rlx-zig
+                     generated bindings on the C ABI, one package per language
   rlx-ffi            C ABI for the distributed node — Apple xcframework + embedded hosts
+  rlx-micro          C ABI for the Cortex-M kernels — no_std, no heap (MCU firmware)
+  rlx-model-plugin   reference model plugin (a provider in a shared library)
   rlx-web            WebAssembly entry point — run models in-browser (CPU; WebGPU bring-up)
 ```
 
@@ -621,11 +712,14 @@ Topic guides live in [`docs/`](docs/README.md); the most useful entry points:
 | [`weight-compute-caching.md`](docs/weight-compute-caching.md) | computing weight-derived tensors once, not every forward |
 | [`rlx-bake.md`](docs/rlx-bake.md) | offline bake: graph + weights → optimized / encrypted `*.rlx` |
 | [`fpga-export.md`](docs/fpga-export.md) | IR → SystemVerilog → bitstream export |
+| [`rlx-stablehlo`](crates/io/rlx-stablehlo/README.md) | graph → StableHLO MLIR for IREE / MLIR toolchains |
 | [`scaled-matmul-fp8.md`](docs/scaled-matmul-fp8.md) | native FP8 / FP6 / FP4 GEMM + `fNeXmY` minifloats |
 | [`distributed.md`](docs/distributed.md) / [`iroh-transport.md`](docs/iroh-transport.md) | data / tensor / expert-parallel training + NAT-traversing transport |
+| [`troubleshooting.md`](docs/troubleshooting.md) | **start here when something is wrong** — run/compile errors, wrong numbers on one device, NaN, slowness |
 | [`nan-debugging.md`](docs/nan-debugging.md) | `RLX_DEBUG_NANS` / `RLX_LINT_NUMERICS` NaN / Inf localization |
 | [`extending.md`](docs/extending.md) | extension seams for downstream crates (custom ops / stages) |
 | [`development.md`](docs/development.md) | contributor workflow, gates, and conventions |
+| [`adr/`](docs/adr/README.md) | architecture decision records — why core is shaped the way it is |
 
 ## Kernel dispatch and transparency
 
@@ -651,27 +745,24 @@ includes both legalization details and the dispatch report.
 
 ```rust
 use rlx::prelude::*;
-use rlx::runtime::{
-    dispatch_report_for_device, legalize_graph_for_device_with_options, CompileOptions,
-    ModelReflection,
-};
 use rlx::opt::format_dispatch_report;
-use rlx_flow::ModelExecutionConfig;
-use rlx_ir::CompilationMode;
+use rlx::runtime::{dispatch_report_for_device, legalize_graph_for_device_with_report};
 
-// Unified component (variant + dispatch + eager/lazy/AOT + profile + layer stack)
-let config = ModelExecutionConfig::qwen35_prefill(1, 512)
-    .with_compilation_mode(CompilationMode::Lazy);
-let _key = config.cache_key();
+let mut g = Graph::new("probe");
+let x = g.input("x", Shape::new(&[2, 8], DType::F32));
+let w = g.param("w", Shape::new(&[8, 8], DType::F32));
+let h = g.mm(x, w);
+let y = g.gelu(h);
+g.set_outputs(vec![y]);
 
-// Static probe (common-ir kinds only; no unfuse)
-let report = dispatch_report_for_device(&graph, Device::Metal)?;
+// Static probe: which op kinds run natively, lower to common IR, or are missing.
+let report = dispatch_report_for_device(&g, Device::Cpu).expect("cpu is built in");
 eprintln!("{}", format_dispatch_report(&report));
 
-// Full rewrite + legalize probe (same path as compile)
-let opts = CompileOptions::new(); // or compile_options_for_device(&config, Device::Metal)
-let (graph, report) =
-    legalize_graph_for_device_with_options(graph, Device::Metal, &opts)?;
+// The full rewrite + legalize path `compile` takes, without compiling.
+let (_legal, report) =
+    legalize_graph_for_device_with_report(g, Device::Cpu).expect("legal on cpu");
+assert!(report.compile_ready);
 ```
 
 [`supports_graph`](crates/core/rlx-runtime/src/device_ext.rs) uses the backend
@@ -759,6 +850,8 @@ LAMB / Adafactor / SOAP / Muon / Sophia / MARS.
 | DiT modulation (`AdaLayerNorm` / `GatedResidual`) | First-class fused ops on every backend; fused **forward + backward** (packed reverse kernels), exact JVP + `vmap`; ONNX adaLN import fuses after param specialization. See [`docs/op-coverage.md`](docs/op-coverage.md). |
 | Eigendecomposition (`Op::Eigh` / `EighBatch`) | Differentiable symmetric eigensolver on all backends: CPU-native (LAPACK `dsyevd` f64), native on-device CUDA/ROCm batched Jacobi (cuSOLVER / hipSOLVER `SsyevjBatched`, `n ≤ 32`), f64 host-fallback elsewhere. Full reverse mode (`EighBackward`). |
 | SPD-manifold Riemannian primitives | `SpdKarcherMeanWeighted` / `SpdLogMap` / `SpdExpMap` / `SpdParallelTransport` / `SpdMatrixFnBatch` as first-class ops on all backends, fully differentiable (analytic Riemannian VJPs, incl. the base point). |
+| StableHLO / IREE export         | `rlx-stablehlo` / `ExportTarget::StableHlo`: shared rlx-tpu lowering printed as StableHLO; NCHW kept; weights as args or a safetensors parameter file; int8 weights as `i8`; multi-length specializations. IREE round trip (llvm-cpu) matches CPU on MLP, conv, Llama and BERT layers. |
+| Run / compile errors            | `CompiledGraph::try_run`, `Session::try_compile` / `try_new` return `IoError` / `CompileError` that name the input, node, or device; `run` panics with the same messages. See [`docs/troubleshooting.md`](docs/troubleshooting.md). |
 | Static graph checker            | `rlx_runtime::check` folds shape/dtype verify + backend dispatch + missed-fusion hints + provable-NaN/Inf lint into one `CheckReport`; `cargo rlx check` (`--json`) and `#[rlx_model(check)]` (`RLX_CHECK`). |
 | Weight-compute caching          | Compile-time `CompileOptions::param_bindings` (bake + broadcasting `ConstantFolding`) and run-time `cache_param_invariant` / `RLX_CACHE_PARAM_INVARIANT=1` (split prepare graph) compute weight-derived tensors once, not every forward. Validated CPU + CUDA. |
 | Offline bake (`rlx-bake`)       | Merge graph + weights into a deployable `*.rlx` (skip-zero / ternary TQ2_0 / opt-in Q8_0, optional encrypt). CLI + crate; walkthrough [`docs/rlx-bake.md`](docs/rlx-bake.md). |

@@ -26,10 +26,128 @@ use std::ffi::OsString;
 use std::str::FromStr;
 use std::sync::{OnceLock, RwLock};
 
-static OVERRIDES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+/// Code overrides. `None` is an explicit removal ([`remove`]): the key reads
+/// as unset even when the process environment has it.
+static OVERRIDES: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
 
-fn map() -> &'static RwLock<HashMap<String, String>> {
+fn map() -> &'static RwLock<HashMap<String, Option<String>>> {
     OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+thread_local! {
+    /// Thread-scoped overrides ([`scoped`]), newest last. Checked before the
+    /// global overrides and the resolved cache, and seen only by this thread.
+    static SCOPED: std::cell::RefCell<Vec<(String, Option<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The thread-scoped value of `key`, if this thread has one: `Some(None)` is
+/// a scoped removal.
+fn scoped_value(key: &str) -> Option<Option<String>> {
+    SCOPED.with(|s| {
+        let s = s.borrow();
+        if s.is_empty() {
+            return None;
+        }
+        s.iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    })
+}
+
+/// Override `key` on **this thread only** until the guard drops.
+///
+/// For per-model settings read at graph-build time (`RLX_DROPOUT`) when two
+/// models build on two threads at once: a process-wide [`set`] or
+/// `std::env::set_var` would hand each the other's value. Reads on other
+/// threads — including rayon workers this thread hands work to — do not see
+/// it, so scope only keys read by the thread that builds.
+#[must_use = "the override ends when the guard drops"]
+pub fn scoped(key: impl AsRef<str>, value: impl Into<String>) -> ScopedVar {
+    push_scoped(normalize_key(key.as_ref()), Some(value.into()))
+}
+
+/// [`scoped`], making `key` read as unset on this thread.
+#[must_use = "the override ends when the guard drops"]
+pub fn scoped_remove(key: impl AsRef<str>) -> ScopedVar {
+    push_scoped(normalize_key(key.as_ref()), None)
+}
+
+fn push_scoped(key: String, value: Option<String>) -> ScopedVar {
+    let depth = SCOPED.with(|s| {
+        let mut s = s.borrow_mut();
+        s.push((key, value));
+        s.len() - 1
+    });
+    ScopedVar {
+        depth,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Guard from [`scoped`] / [`scoped_remove`]; restores on drop. Not `Send`:
+/// it belongs to the thread whose reads it changes.
+pub struct ScopedVar {
+    depth: usize,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for ScopedVar {
+    fn drop(&mut self) {
+        SCOPED.with(|s| s.borrow_mut().truncate(self.depth));
+    }
+}
+
+/// Every key read so far, resolved (override, else process environment).
+/// A read is then one map lookup under a read lock, no allocation and no
+/// `getenv`: backends read their `RLX_*` switches per dispatch, ~80-100 ns
+/// each uncached. Any override change empties it; a process-environment
+/// change made with `std::env::set_var` after a read needs [`reload`].
+static RESOLVED: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
+
+fn resolved() -> &'static RwLock<HashMap<String, Option<String>>> {
+    RESOLVED.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Forget every resolved value, so the next read sees the process
+/// environment as it is now. For code that changes `RLX_*` variables with
+/// `std::env::set_var` / `remove_var` after they were read; [`set`],
+/// [`remove`], [`unset`] and [`clear_overrides`] do it themselves.
+pub fn reload() {
+    if let Ok(mut g) = resolved().write() {
+        g.clear();
+    }
+}
+
+/// `f` of the value of `key` (an `RLX_*` name, or one without the prefix):
+/// from the resolved cache, else resolved now and kept.
+fn with_value<R>(key: &str, f: impl FnOnce(Option<&str>) -> R) -> R {
+    let key: std::borrow::Cow<'_, str> = if key.starts_with("RLX_") {
+        std::borrow::Cow::Borrowed(key)
+    } else {
+        std::borrow::Cow::Owned(format!("RLX_{key}"))
+    };
+    if let Some(v) = scoped_value(key.as_ref()) {
+        return f(v.as_deref());
+    }
+    if let Ok(g) = resolved().read()
+        && let Some(v) = g.get(key.as_ref())
+    {
+        return f(v.as_deref());
+    }
+    // An override, else the process environment, by the registry's
+    // spelling of the key (canonical, aliases, deprecated replacement).
+    let raw = |k: &str| match map().read().ok().and_then(|g| g.get(k).cloned()) {
+        Some(v) => v,
+        None => std::env::var(k).ok(),
+    };
+    let value = crate::env_registry::resolve(key.as_ref(), raw);
+    let out = f(value.as_deref());
+    if let Ok(mut g) = resolved().write() {
+        g.insert(key.into_owned(), value);
+    }
+    out
 }
 
 /// Normalize to `RLX_*` form.
@@ -46,8 +164,20 @@ pub fn normalize_key(key: &str) -> String {
 pub fn set(key: impl AsRef<str>, value: impl Into<String>) {
     let key = normalize_key(key.as_ref());
     if let Ok(mut g) = map().write() {
-        g.insert(key, value.into());
+        g.insert(key, Some(value.into()));
     }
+    reload();
+}
+
+/// Make `key` read as unset — even when the process environment sets it.
+/// The in-process counterpart of `std::env::remove_var`; [`unset`] instead
+/// drops the code override and lets the process value show through again.
+pub fn remove(key: impl AsRef<str>) {
+    let key = normalize_key(key.as_ref());
+    if let Ok(mut g) = map().write() {
+        g.insert(key, None);
+    }
+    reload();
 }
 
 /// Remove a code override for `key`; subsequent reads fall back to process env.
@@ -56,6 +186,7 @@ pub fn unset(key: impl AsRef<str>) {
     if let Ok(mut g) = map().write() {
         g.remove(&key);
     }
+    reload();
 }
 
 /// Drop every code override.
@@ -63,17 +194,42 @@ pub fn clear_overrides() {
     if let Ok(mut g) = map().write() {
         g.clear();
     }
+    reload();
 }
 
 /// Read configuration: code override first, then `std::env::var`.
 pub fn var(key: &str) -> Option<String> {
-    let key = normalize_key(key);
-    if let Ok(g) = map().read() {
-        if let Some(v) = g.get(&key) {
-            return Some(v.clone());
-        }
+    with_value(key, |v| v.map(String::from))
+}
+
+/// Read ANY variable, `std::env::var`-shaped: `RLX_*` keys through [`var`]
+/// (code overrides first), every other key straight from the process
+/// environment. For helpers handed a key at run time, which may be `RLX_…`
+/// or a foreign name such as `HF_TOKEN` — [`var`] would prefix the latter to
+/// `RLX_HF_TOKEN`.
+pub fn read(key: &str) -> Result<String, std::env::VarError> {
+    if key.starts_with("RLX_") {
+        var_result(key)
+    } else {
+        std::env::var(key)
     }
-    std::env::var(&key).ok()
+}
+
+/// [`read`] returning an `OsString`, `std::env::var_os`-shaped.
+pub fn read_os(key: &str) -> Option<OsString> {
+    if key.starts_with("RLX_") {
+        var_os(key)
+    } else {
+        std::env::var_os(key)
+    }
+}
+
+/// [`var`] shaped like `std::env::var` — `Err(NotPresent)` when unset — so a
+/// `crate::env::var_result("RLX_…")` call site can switch over without changing its
+/// handling. Every `RLX_*` read goes through this module, so code overrides
+/// (and wasm32, which has no process environment) reach it.
+pub fn var_result(key: &str) -> Result<String, std::env::VarError> {
+    var(key).ok_or(std::env::VarError::NotPresent)
 }
 
 /// Like [`var`] but returns an `OsString` (mirrors `std::env::var_os`).
@@ -92,24 +248,18 @@ pub fn var_os(key: &str) -> Option<OsString> {
 /// True when the variable is set to a truthy value (`1`, `true`, `yes`, `on`, …).
 /// False when unset or set to `0` / `false` / `off` / `no` / empty.
 pub fn flag(key: &str) -> bool {
-    match var(key) {
-        Some(v) => truthy(&v),
-        None => false,
-    }
+    with_value(key, |v| v.is_some_and(truthy))
 }
 
 /// Like [`flag`], but returns `default` when the key is unset. Use for
 /// failsafe defaults that must stay on unless explicitly disabled (`=0`).
 pub fn flag_or(key: &str, default: bool) -> bool {
-    match var(key) {
-        Some(v) => truthy(&v),
-        None => default,
-    }
+    with_value(key, |v| v.map_or(default, truthy))
 }
 
 /// True when neither a code override nor process env provides the key.
 pub fn is_unset(key: &str) -> bool {
-    var(key).is_none()
+    with_value(key, |v| v.is_none())
 }
 
 /// Should a device-gated test skip, given whether the backend is built and
@@ -157,7 +307,7 @@ pub fn skip_unless_device(label: &str, compiled: bool, available: bool) -> bool 
 
 /// Parse an integer/bool/string knob, falling back to `default`.
 pub fn parse_or<T: FromStr>(key: &str, default: T) -> T {
-    var(key).and_then(|s| s.parse().ok()).unwrap_or(default)
+    with_value(key, |v| v.and_then(|s| s.parse().ok())).unwrap_or(default)
 }
 
 fn truthy(v: &str) -> bool {
@@ -165,12 +315,17 @@ fn truthy(v: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    match s.to_ascii_lowercase().as_str() {
-        "0" | "false" | "off" | "no" => false,
-        "1" | "true" | "yes" | "on" => true,
-        _ if s.chars().all(|c| c.is_ascii_digit()) => s != "0",
-        _ => true, // any other non-empty value counts as enabled
+    let is = |w: &str| s.eq_ignore_ascii_case(w);
+    if is("0") || is("false") || is("off") || is("no") {
+        return false;
     }
+    if is("1") || is("true") || is("yes") || is("on") {
+        return true;
+    }
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return s != "0";
+    }
+    true // any other non-empty value counts as enabled
 }
 
 /// Bulk builder for code-side `RLX_*` overrides.
@@ -207,7 +362,8 @@ impl RlxEnv {
 
 /// RAII guard: installs overrides on construction, restores previous values on drop.
 pub struct RuntimeOverrides {
-    saved: Vec<(String, Option<String>)>,
+    /// Previous override per key: `None` = there was none.
+    saved: Vec<(String, Option<Option<String>>)>,
 }
 
 impl RuntimeOverrides {
@@ -228,7 +384,12 @@ impl Drop for RuntimeOverrides {
     fn drop(&mut self) {
         for (key, prev) in self.saved.drain(..) {
             match prev {
-                Some(v) => set(&key, v),
+                Some(v) => {
+                    if let Ok(mut g) = map().write() {
+                        g.insert(key, v);
+                    }
+                    reload();
+                }
                 None => unset(&key),
             }
         }
@@ -251,6 +412,19 @@ mod tests {
     }
 
     #[test]
+    fn remove_hides_and_unset_restores() {
+        with_clean_overrides(|| {
+            set("RLX_TEST_REMOVE_KEY", "1");
+            assert_eq!(var_result("RLX_TEST_REMOVE_KEY").as_deref(), Ok("1"));
+            remove("RLX_TEST_REMOVE_KEY");
+            assert!(var("RLX_TEST_REMOVE_KEY").is_none());
+            assert!(var_result("RLX_TEST_REMOVE_KEY").is_err());
+            unset("RLX_TEST_REMOVE_KEY");
+            assert!(var("RLX_TEST_REMOVE_KEY").is_none());
+        });
+    }
+
+    #[test]
     fn code_override_wins_over_process_env() {
         with_clean_overrides(|| {
             let _g = RuntimeOverrides::install([("VERBOSE", "2")]);
@@ -264,6 +438,28 @@ mod tests {
         with_clean_overrides(|| {
             set("RLX_DISABLE_MPSGRAPH", "0");
             assert!(!flag("RLX_DISABLE_MPSGRAPH"));
+        });
+    }
+
+    #[test]
+    fn scoped_is_per_thread_and_nests() {
+        with_clean_overrides(|| {
+            set("RLX_TEST_SCOPED_KEY", "global");
+            {
+                let _a = scoped("TEST_SCOPED_KEY", "0.25");
+                assert_eq!(var("RLX_TEST_SCOPED_KEY").as_deref(), Some("0.25"));
+                // Another thread keeps the global value.
+                let other = std::thread::spawn(|| var("RLX_TEST_SCOPED_KEY"))
+                    .join()
+                    .unwrap();
+                assert_eq!(other.as_deref(), Some("global"));
+                {
+                    let _b = scoped_remove("RLX_TEST_SCOPED_KEY");
+                    assert_eq!(var("RLX_TEST_SCOPED_KEY"), None);
+                }
+                assert_eq!(var("RLX_TEST_SCOPED_KEY").as_deref(), Some("0.25"));
+            }
+            assert_eq!(var("RLX_TEST_SCOPED_KEY").as_deref(), Some("global"));
         });
     }
 

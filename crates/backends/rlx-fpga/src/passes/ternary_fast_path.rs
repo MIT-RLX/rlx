@@ -20,6 +20,9 @@
 //! adder. On real silicon this is the largest single energy / area
 //! win in the whole tuning surface for ternary models.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::model::Layer;
 
 /// True when the layer is `weight_bits = 2` *and* `w_zp = 0` — the

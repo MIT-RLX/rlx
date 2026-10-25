@@ -67,14 +67,14 @@ impl BlockStage for LlamaDecoderStage {
             .ok_or_else(|| anyhow::anyhow!("LlamaDecoder requires RopeTables stage"))?;
 
         let in_ln_g = ctx.load_param(&format!("{lp}.input_layernorm.weight"), false)?;
-        let q_w = ctx.load_param(&format!("{lp}.self_attn.q_proj.weight"), true)?;
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
-        let v_w = ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?;
-        let o_w = ctx.load_param(&format!("{lp}.self_attn.o_proj.weight"), true)?;
+        let q_w = ctx.load_matrix(&format!("{lp}.self_attn.q_proj.weight"), true)?;
+        let k_w = ctx.load_matrix(&format!("{lp}.self_attn.k_proj.weight"), true)?;
+        let v_w = ctx.load_matrix(&format!("{lp}.self_attn.v_proj.weight"), true)?;
+        let o_w = ctx.load_matrix(&format!("{lp}.self_attn.o_proj.weight"), true)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
-        let gate_w = ctx.load_param(&format!("{lp}.mlp.gate_proj.weight"), true)?;
-        let up_w = ctx.load_param(&format!("{lp}.mlp.up_proj.weight"), true)?;
-        let down_w = ctx.load_param(&format!("{lp}.mlp.down_proj.weight"), true)?;
+        let gate_w = ctx.load_matrix(&format!("{lp}.mlp.gate_proj.weight"), true)?;
+        let up_w = ctx.load_matrix(&format!("{lp}.mlp.up_proj.weight"), true)?;
+        let down_w = ctx.load_matrix(&format!("{lp}.mlp.down_proj.weight"), true)?;
 
         let id = ctx.hir().llama_decoder_block(
             input.id,

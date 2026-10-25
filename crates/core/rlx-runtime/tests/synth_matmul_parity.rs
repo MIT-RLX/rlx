@@ -377,9 +377,7 @@ fn metal_tiled_matches_cpu() {
             entries: 5,
         }, // d=1, ragged
     ];
-    // SAFETY: test-local env toggle; the tiled path is correct regardless, so even a
-    // concurrent Metal test that observes the flag stays bit-correct.
-    unsafe { std::env::set_var("RLX_METAL_SYNTH_TILED", "1") };
+    rlx_ir::env::set("RLX_METAL_SYNTH_TILED", "1");
     for c in &tiled_cases {
         let (x, indices, codebook) = make_inputs(c);
         let cpu = run_native(c, &x, &indices, &codebook);
@@ -397,7 +395,7 @@ fn metal_tiled_matches_cpu() {
         );
         assert!(err < 1e-3, "tiled diverges from cpu: err {err}");
     }
-    unsafe { std::env::remove_var("RLX_METAL_SYNTH_TILED") };
+    rlx_ir::env::remove("RLX_METAL_SYNTH_TILED");
 }
 
 // f16 ("relaxed precision") tiled kernel: `simdgroup_half8x8` MMAs (f16 inputs, f32
@@ -435,8 +433,8 @@ fn metal_tiled_f16_matches_cpu() {
             entries: 16,
         },
     ];
-    unsafe { std::env::set_var("RLX_METAL_SYNTH_TILED", "1") };
-    unsafe { std::env::set_var("RLX_METAL_SYNTH_TILED_F16", "1") };
+    rlx_ir::env::set("RLX_METAL_SYNTH_TILED", "1");
+    rlx_ir::env::set("RLX_METAL_SYNTH_TILED_F16", "1");
     for c in &cases {
         let (x, indices, codebook) = make_inputs(c);
         let cpu = run_native(c, &x, &indices, &codebook);
@@ -455,8 +453,8 @@ fn metal_tiled_f16_matches_cpu() {
         );
         assert!(rel < 3e-2, "f16 tiled diverges from cpu: rel {rel}");
     }
-    unsafe { std::env::remove_var("RLX_METAL_SYNTH_TILED_F16") };
-    unsafe { std::env::remove_var("RLX_METAL_SYNTH_TILED") };
+    rlx_ir::env::remove("RLX_METAL_SYNTH_TILED_F16");
+    rlx_ir::env::remove("RLX_METAL_SYNTH_TILED");
 }
 
 // Opt-in f16 reconstruct → MPS-f16 prefill path (RLX_METAL_SYNTH_RECON_F16): the m>8
@@ -488,7 +486,7 @@ fn metal_recon_f16_matches_cpu() {
             entries: 16,
         },
     ];
-    unsafe { std::env::set_var("RLX_METAL_SYNTH_RECON_F16", "1") };
+    rlx_ir::env::set("RLX_METAL_SYNTH_RECON_F16", "1");
     for c in &cases {
         let (x, indices, codebook) = make_inputs(c);
         let cpu = run_native(c, &x, &indices, &codebook);
@@ -507,7 +505,7 @@ fn metal_recon_f16_matches_cpu() {
         );
         assert!(rel < 3e-2, "f16 recon diverges from cpu: rel {rel}");
     }
-    unsafe { std::env::remove_var("RLX_METAL_SYNTH_RECON_F16") };
+    rlx_ir::env::remove("RLX_METAL_SYNTH_RECON_F16");
 }
 
 // FINDING (measured: err ≈ 2.69): wgpu fails SynthMatMul via the decompose with

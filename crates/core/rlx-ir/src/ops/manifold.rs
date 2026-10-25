@@ -11,6 +11,7 @@
 //! `rlx_cpu::spd` for the compute bodies and `Op::BiMap` &co for the
 //! math.
 
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape, SpdMatFn};
 
 impl Graph {

@@ -24,6 +24,7 @@
 
 use crate::dtype::scalar_constant_bytes;
 use crate::op::*;
+use crate::prelude::*;
 use crate::shape;
 use crate::{DType, Graph, NodeId, Op, Shape};
 

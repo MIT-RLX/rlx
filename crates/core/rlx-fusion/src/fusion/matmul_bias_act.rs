@@ -165,11 +165,12 @@ fn match_matmul_bias_act(
     }
     let mm_id = node.id;
 
-    // The matmul's result must be consumed solely by the bias add.
-    let mm_users = uses.users(mm_id);
-    if mm_users.len() != 1 {
+    // The matmul's result must be consumed solely by the bias add, and must
+    // not be a graph output: fusing would hand that output the post-bias value.
+    if !uses.has_single_use(mm_id) {
         return None;
     }
+    let mm_users = uses.users(mm_id);
     let add_node = graph.node(mm_users[0]);
     let Op::Binary(BinaryOp::Add) = &add_node.op else {
         return None;
@@ -208,7 +209,7 @@ fn match_matmul_bias_act(
     let mut activation = None;
     let mut act_id = None;
     let add_users = uses.users(add_node.id);
-    if add_users.len() == 1 {
+    if uses.has_single_use(add_node.id) {
         let act_node = graph.node(add_users[0]);
         if let Op::Activation(a) = &act_node.op
             && fusible_mm_bias_epilogue_activation(*a)

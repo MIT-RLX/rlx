@@ -20,8 +20,8 @@ use crate::device::{
 };
 use crate::kernels::{
     ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, attention_row_kernel, attention_warp_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    attention_kernel, attention_row_kernel, attention_warp_kernel, attention_warp_split_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_kernel, compare_kernel, concat_kernel,
     conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel,
@@ -64,10 +64,7 @@ pub(crate) fn gpu_arch(ctx: &Arc<CudaContext>) -> &'static rlx_gpu_kernels::disp
     static ARCH: OnceLock<rlx_gpu_kernels::dispatch::GpuArch> = OnceLock::new();
     ARCH.get_or_init(|| {
         crate::tuning::ensure_tuning_cache_loaded();
-        match device_cc(ctx) {
-            (0, 0) => rlx_gpu_kernels::dispatch::GpuArch::unknown(),
-            (maj, min) => rlx_gpu_kernels::dispatch::GpuArch::cuda(maj as u32, min as u32),
-        }
+        crate::tuning::arch_for(ctx)
     })
 }
 
@@ -174,6 +171,14 @@ pub(crate) struct TensorMapArg(pub cudarc::driver::sys::CUtensorMap);
 // pointers or drop glue; copying its bytes into the kernel param bank is exactly
 // what the driver expects for a grid-constant tensor-map parameter.
 unsafe impl DeviceRepr for TensorMapArg {}
+
+/// `rlx_gpu_kernels::DfArgs` as a by-value kernel argument.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DfArg(pub rlx_gpu_kernels::DfArgs);
+
+// SAFETY: plain `u32` fields in the kernel's declared layout, no pointers.
+unsafe impl DeviceRepr for DfArg {}
 
 /// Encode a 2D tiled row-major f32 tensor-map. `dim0` is the fastest-varying
 /// (contiguous) logical dimension, `dim1` the outer one; `stride1_bytes` is the
@@ -767,10 +772,19 @@ pub(crate) unsafe fn pick_conv_fwd_algo(
             perfs.as_mut_ptr() as *mut cudnn_sys::cudnnConvolutionFwdAlgoPerf_t,
         )?;
         let base = perfs.as_ptr() as *const cudnn_sys::cudnnConvolutionFwdAlgoPerf_t;
+        let gemm_only = crate::runtime_config().conv_fwd_gemm_only();
         for i in 0..(returned.max(0) as usize).min(CUDNN_ALGO_CANDIDATES) {
             let p = base.add(i).read();
+            use cudnn_sys::cudnnConvolutionFwdAlgo_t as A;
+            let is_gemm = matches!(
+                p.algo,
+                A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
+                    | A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
+                    | A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM
+            );
             if matches!(p.status, cudnn_sys::cudnnStatus_t::CUDNN_STATUS_SUCCESS)
                 && p.memory <= workspace_size
+                && (is_gemm || !gemm_only)
             {
                 return Ok(p.algo);
             }
@@ -2390,6 +2404,7 @@ pub(crate) fn prewarm_all_kernels(ctx: &Arc<CudaContext>) {
     let _ = attention_kernel(ctx);
     let _ = attention_row_kernel(ctx);
     let _ = attention_warp_kernel(ctx);
+    let _ = attention_warp_split_kernel(ctx);
     let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);
     let _ = rope_kernel(ctx);

@@ -47,19 +47,19 @@ use crate::kernels::{
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
     lstm_kernel, mamba2_kernel, matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel,
     matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop16_kernel,
-    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
+    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_gemv_kernel, matmul_kernel,
     matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
     matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
     maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel,
     pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
-    reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, round_to_format_kernel, sample_kernel,
-    scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel,
-    scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
-    scatter_nd_reduce_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
-    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    reduce_kernel, resize_nearest2x_kernel, rms_norm_backward_kernel,
+    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel,
+    round_to_format_kernel, sample_kernel, scaled_dequantize_kernel,
+    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
+    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
+    selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -189,7 +189,23 @@ impl WgpuExecutable {
     /// a graph with small outputs returns via the "tiny" path and never armed,
     /// silently rebuilding its constant weight packs on every run. Routing all
     /// five through one helper is what keeps that from drifting apart again.
+    /// First step at or after `i` that this run will execute: static-once
+    /// weight packs are skipped once armed, so the host/GPU transition logic
+    /// must decide on what actually runs next, not on the raw schedule.
+    fn next_live_step(&self, mut i: usize) -> usize {
+        while i < self.schedule.len()
+            && self.static_once_done
+            && self.static_once_steps.contains(&i)
+            && step_runs_on_host(&self.schedule[i])
+        {
+            i += 1;
+        }
+        i
+    }
+
     fn arm_static_once(&mut self) {
+        // Every readback return passes through here once its GPU work is done.
+        crate::step_profile::end_run();
         if !rlx_compile::memory::static_weight_pack_skip_enabled() {
             return;
         }
@@ -237,9 +253,26 @@ impl WgpuExecutable {
             return;
         };
         let total = self.schedule.len();
-        eprintln!("[wgpu-snapshot] replaying {total} steps, reading each node as it is produced");
+        // Cost is O(n^2) dispatches, which is fine for a few hundred nodes and
+        // is not fine for a model: AXON's 3392 steps are ~5.8M dispatches, and
+        // the divergence that needed finding was at step 58. `RLX_WGPU_SNAPSHOT_FROM`
+        // / `_TO` bound the replay to a step window, which costs O(window * n)
+        // instead — the prefix still runs in full, so every value read is the one
+        // the graph really computed; only the reporting is narrowed.
+        let from = rlx_ir::env::parse_or::<usize>("RLX_WGPU_SNAPSHOT_FROM", 0).max(1);
+        let to = rlx_ir::env::parse_or::<usize>("RLX_WGPU_SNAPSHOT_TO", total).min(total);
+        if from > 1 || to < total {
+            eprintln!(
+                "[wgpu-snapshot] replaying steps {from}..={to} of {total} \
+                 (window set by RLX_WGPU_SNAPSHOT_FROM/_TO)"
+            );
+        } else {
+            eprintln!(
+                "[wgpu-snapshot] replaying {total} steps, reading each node as it is produced"
+            );
+        }
         self.in_snapshot = true;
-        for k in 1..=total {
+        for k in from..=to {
             // `Step` is not `Clone`, so stop the loop by index rather than by
             // rebuilding a truncated schedule — which also keeps the bind-group
             // and uniform indices identical to the full run.
@@ -350,10 +383,31 @@ impl WgpuExecutable {
     /// panic with a clear message rather than hang.
     #[cfg(target_arch = "wasm32")]
     pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.run_read_outputs_async(inputs, None).await
+    }
+
+    /// [`Self::run_read_outputs`] for the browser: only `read_indices` come
+    /// back, and bound GPU handles are fed from their outputs on the device,
+    /// so a decode loop's state stays resident between steps.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn run_read_outputs_async(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+        read_indices: Option<&[usize]>,
+    ) -> Vec<Vec<f32>> {
+        self.pending_read_indices = read_indices.map(|s| s.to_vec());
+        let outs = self.run_async_inner(inputs).await;
+        self.pending_read_indices = None;
+        outs
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn run_async_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         // Name what is actually in the way. "Contains host-executed ops (GGUF
         // dequant, LSTM, collectives, FFT-host, …)" listed what it might have
         // been; a conv graph's real answer is one `Conv2dHost` per conv.
-        if let Some(summary) = self.host_summary() {
+        if self.blocks_on_host() {
+            let summary = self.host_summary().unwrap_or_default();
             panic!("rlx-wgpu run_async: unsupported on wasm — {summary}");
         }
 
@@ -370,7 +424,22 @@ impl WgpuExecutable {
         let out_ids_all: Vec<_> = self.graph.outputs.clone();
         let out_ids: Vec<_> = plan.iter().map(|&i| out_ids_all[i]).collect();
         let layout = ReadbackLayout::for_nodes(&self.arena, &out_ids);
+
+        let mut enc = dev
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rlx-wgpu async readback"),
+            });
+        // A dispatch-only run skips the feed copies the blocking path makes
+        // before its readback; make them here, in the same submission.
+        if !self.gpu_handle_feeds.is_empty() {
+            self.propagate_gpu_handle_feeds_on_gpu(&dev, &mut enc);
+        }
+        // Nothing to read (`read_indices = Some(&[])`, e.g. a prompt token of a
+        // decode loop): submit and return without waiting on a map — the queue
+        // orders the next run after this one.
         if layout.regions.is_empty() {
+            dev.queue.submit(std::iter::once(enc.finish()));
             return Vec::new();
         }
         ReadbackStaging::prepare(&dev.device, &mut self.readback_staging, layout.total_bytes);
@@ -380,12 +449,6 @@ impl WgpuExecutable {
             .expect("readback staging")
             .buffer()
             .clone();
-
-        let mut enc = dev
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rlx-wgpu async readback"),
-            });
         encode_readback_copies(&mut enc, &self.arena, &staging_buf, &out_ids, &layout);
         dev.queue.submit(std::iter::once(enc.finish()));
 
@@ -404,6 +467,42 @@ impl WgpuExecutable {
         self.schedule
             .iter()
             .any(|s| super::step_runs_on_host(s) || super::step_is_tail_host(s))
+    }
+
+    /// Like [`Self::requires_host_execution`], but only steps that make the
+    /// host WAIT on the GPU (map a buffer, compute on the CPU). A GGUF matmul
+    /// that takes the fused GEMV only encodes and submits its own dispatches,
+    /// so the browser can run it: the queue orders it like any GPU step.
+    /// A `BufferCopy` the run loop encodes as a plain GPU copy (see
+    /// [`buffer_copy_gpu_window`]) rather than staging through the host.
+    fn buffer_copy_is_gpu_only(&self, step: &Step) -> bool {
+        let Step::BufferCopy {
+            src_byte_off,
+            dst_byte_off,
+            bytes,
+        } = *step
+        else {
+            return false;
+        };
+        crate::device::wgpu_device().is_some_and(|dev| {
+            buffer_copy_gpu_window(
+                &self.arena,
+                src_byte_off,
+                dst_byte_off,
+                u64::from(bytes),
+                dev.device.limits().max_storage_buffer_binding_size,
+            )
+            .is_some()
+        })
+    }
+
+    pub fn blocks_on_host(&self) -> bool {
+        self.schedule.iter().any(|s| {
+            (super::step_runs_on_host(s)
+                && !gguf_step_is_gpu_only(s, self.active_extent)
+                && !self.buffer_copy_is_gpu_only(s))
+                || super::step_is_tail_host(s)
+        })
     }
 
     /// What this schedule asks the host to do, and which of those asks are
@@ -1013,6 +1112,13 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::ResizeNearest2x { params } => {
+                        let mut p = *params;
+                        p.planes = scale(p.planes);
+                        p.n_total = p.planes * 4 * p.h * p.w;
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::AxialRope2d { params } => {
                         let mut p = *params;
                         p.batch = scale(p.batch);
@@ -1044,6 +1150,14 @@ impl WgpuExecutable {
                         p.n = scale(p.n);
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    // Static shapes only (`lower_f64` rejects dynamic dims).
+                    Step::DoubleSingle { params } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
                     }
                     Step::Conv2d { params } | Step::Conv2dTiled { params } => {
                         let mut p = *params;
@@ -1320,6 +1434,8 @@ impl WgpuExecutable {
 
         // Encode + submit.
         let mm_k = matmul_kernel(&dev.device);
+        let mm_gemv = matmul_gemv_kernel(&dev.device);
+        let no_gemv = rlx_ir::env::flag("RLX_WGPU_NO_GEMV");
         let mm_w_active = matmul_wide_active_kernel(&dev.device);
         let mm_f16w = matmul_f16w_kernel(&dev.device);
         let mm_bf16w = matmul_bf16w_kernel(&dev.device);
@@ -1339,8 +1455,10 @@ impl WgpuExecutable {
         // slots (the source of nondeterministic deep-graph results on wgpu).
         // The snapshot needs exactly one step per submitted pass so it can stop
         // after a chosen step and read what that step produced.
-        let one_op_per_pass =
-            rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS") || self.snapshot_stop.is_some();
+        let one_op_per_pass = rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS")
+            || self.snapshot_stop.is_some()
+            || crate::step_profile::active();
+        crate::step_profile::begin_run();
         let mut step_i = 0;
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
@@ -1355,1789 +1473,1965 @@ impl WgpuExecutable {
                 || step_is_tail_host(&self.schedule[step_i]);
             let mut pass_dispatched = false;
             if !starting_on_host {
+                // Deferred host writes must reach the device before any GPU
+                // step reads them. The end-of-host-step flush below does this,
+                // but the hosted `BufferCopy` branch `continue`s past it — so
+                // a KV append deferred its row, the next section encoded the
+                // layer's attention against the old cache, and the row landed
+                // one host step too late (wrong decode on discrete NVIDIA,
+                // where every copy is hosted). Flush at the section start
+                // instead, which no host branch can skip. `write_buffer` is
+                // applied before this section's submit, so no poll is needed.
+                if host_cache.has_deferred_writes() {
+                    let mut a = crate::host_stage::WgpuArena {
+                        arena: &self.arena,
+                        device: &dev.device,
+                        queue: &dev.queue,
+                        size_bytes: 0,
+                    };
+                    host_cache.flush_to_device(&mut a);
+                }
                 let mut enc = dev
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("rlx-wgpu run"),
                     });
-                {
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("rlx-wgpu compute pass"),
-                        timestamp_writes: None,
-                    });
-                    while step_i < self.schedule.len() {
-                        if step_is_tail_host(&self.schedule[step_i]) {
-                            step_i += 1;
-                            continue;
-                        }
-                        if self.static_once_done && self.static_once_steps.contains(&step_i) {
-                            let step = &self.schedule[step_i];
-                            if step_runs_on_host(step) {
+                loop {
+                    {
+                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("rlx-wgpu compute pass"),
+                            timestamp_writes: crate::step_profile::pass_writes(),
+                        });
+                        while step_i < self.schedule.len() {
+                            if step_is_tail_host(&self.schedule[step_i]) {
                                 step_i += 1;
                                 continue;
                             }
-                            if !matches!(step, Step::FftGpu { .. }) {
-                                gpu_bi += 1;
-                            }
-                            step_i += 1;
-                            continue;
-                        }
-                        if step_runs_on_host(&self.schedule[step_i]) {
-                            break;
-                        }
-                        // Vulkan/DX12: end the pass after unary/cast so f32→f16
-                        // mirrors are visible to the next step. Only split once
-                        // we've dispatched in *this* pass — otherwise the step that
-                        // needs the flush would never run (infinite empty passes).
-                        if pass_dispatched
-                            && step_i > 0
-                            && step_needs_pass_flush(
-                                &self.schedule[step_i],
-                                &self.schedule[step_i - 1],
-                            )
-                        {
-                            break;
-                        }
-                        // NOTE: the match arms below skip a dispatch whose scaled extent is
-                        // zero (`if m_s == 0 { … continue; }` and ~78 siblings). Such a skip
-                        // must still consume this step's bind group and advance the cursor —
-                        // the same idiom as the `static_once` skip above — because the only
-                        // `step_i += 1` for a dispatched step is at the very bottom of this
-                        // loop. A bare `continue` re-entered the loop on the same step and
-                        // spun forever; a bare `step_i += 1` would shift every later step onto
-                        // the wrong bind group.
-                        let step = &self.schedule[step_i];
-                        // PLAN L3: per-step Perfetto trace span; no-op when
-                        // env var RLX_TRACE_PERFETTO unset.
-                        let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
-                        if rlx_ir::env::var("RLX_DBG_STEP").is_some() {
-                            eprintln!("[wgpu-step] {}", step_name(step));
-                        }
-                        match step {
-                            Step::CastF32ToF16 { params } => {
-                                // Pre-pass for matmul_coop16: mirror f32 arena
-                                // region into f16 shadow buffer so the matmul
-                                // kernel can read A as f16. One thread per
-                                // element; 64-thread workgroups.
-                                if let Some(cast_k) = mm_cast {
-                                    pass.set_pipeline(&cast_k.pipeline);
-                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                    let (gx, gy, gz) = dispatch_dims(params.len, 64);
-                                    pass.dispatch_workgroups(gx, gy, gz);
+                            if self.static_once_done && self.static_once_steps.contains(&step_i) {
+                                let step = &self.schedule[step_i];
+                                if step_runs_on_host(step) {
+                                    step_i += 1;
+                                    continue;
                                 }
+                                if !matches!(step, Step::FftGpu { .. }) {
+                                    gpu_bi += 1;
+                                }
+                                step_i += 1;
+                                continue;
                             }
-                            Step::Matmul {
-                                m,
-                                n,
-                                batch,
-                                b_off_f32,
-                                b_is_param,
-                                compute_precision,
-                                ..
-                            } =>
-                            // The dispatch branches below use a chain of
-                            // `is_some() && …unwrap()` to pick a pipeline
-                            // because each variant cares about a different
-                            // Option<Pipeline>. `if let Some(p) = …` chains
-                            // would require nesting per variant; the flat
-                            // form is the readable shape here.
+                            // A GGUF GEMV that reads and writes the arena in place is
+                            // one more dispatch in this pass: no output buffer to copy
+                            // back, so no reason to end the pass for it.
+                            if !one_op_per_pass
+                                && !rlx_ir::env::flag("RLX_WGPU_GGUF_OWN_SUBMIT")
+                                && gguf_step_is_gpu_only(&self.schedule[step_i], active)
+                                && let Step::DequantMatmulGguf {
+                                    m,
+                                    k,
+                                    n,
+                                    scheme_id,
+                                    x_byte_off,
+                                    w_byte_off,
+                                    out_byte_off,
+                                } = self.schedule[step_i]
                             {
-                                #[allow(clippy::unnecessary_unwrap)]
-                                // Safe at any batch (see safe_for_active_extent
-                                // comment); scale m, output rows past m_s per
-                                // batch retain prior values via c_batch_stride.
-                                let m_s = scale(*m);
-                                if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
+                                let rows = scale(m) as usize;
+                                let mut plans =
+                                    self.gemv_plans.lock().unwrap_or_else(|e| e.into_inner());
+                                let plan = plans.entry((step_i, rows)).or_insert_with(|| {
+                                    crate::gguf_gpu::plan_dequant_gemv_in_arena(
+                                        &self.arena,
+                                        &dev.device,
+                                        &dev.queue,
+                                        rows,
+                                        k as usize,
+                                        n as usize,
+                                        scheme_id,
+                                        x_byte_off as usize,
+                                        w_byte_off as usize,
+                                        out_byte_off as usize,
+                                    )
+                                });
+                                if let Some(plan) = plan {
+                                    plan.dispatch(&mut pass);
                                     step_i += 1;
+                                    pass_dispatched = true;
                                     continue;
                                 }
-                                let coop_f16_wide = mm_coop_f16_vk.is_some()
-                                    && *compute_precision == MatmulCompute::CoopF16Vk
-                                    && crate::coop_f16_vk::use_wide_matmul(
-                                        *b_off_f32,
-                                        *n,
-                                        &self.coop_f16_b_param,
-                                        &self.coop_f16_vk_wide_b,
-                                    );
-                                pass.set_bind_group(
-                                    0,
-                                    coop_f16_vk_bind_group(self, gpu_bi, coop_f16_wide),
-                                    &[],
-                                );
-                                // Kernel selection priority:
-                                //   1. compute_precision == F16 + b_is_param +
-                                //      SHADER_F16 → matmul_f16_compute
-                                //      (f16 multiply, f32 acc — 2× ALU on Apple)
-                                //   2. legacy RLX_WGPU_F16_WEIGHTS opt-in →
-                                //      matmul_f16w (storage-only f16; experimental,
-                                //      currently regresses on Apple)
-                                //   3. wide-N (m≥32, n≥64)   → matmul_wide
-                                //   4. otherwise            → matmul (small/skinny)
-                                let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
-                                if *b_is_param && *compute_precision == MatmulCompute::Bf16Packed {
-                                    // Packed-BF16 weight, unpacked in-shader.
-                                    // Same 32×32-tile grid as the plain matmul.
-                                    crate::backend::bf16_packed_dispatch_inc();
-                                    pass.set_pipeline(&mm_bf16w.pipeline);
-                                    pass.dispatch_workgroups(
-                                        n.div_ceil(32),
-                                        m_s.div_ceil(32),
-                                        *batch,
-                                    );
-                                } else if let Some(coop) = mm_coop.as_ref()
-                                    && *b_is_param
-                                    && *compute_precision == MatmulCompute::Coop16
+                            }
+                            if step_runs_on_host(&self.schedule[step_i]) {
+                                break;
+                            }
+                            // Vulkan/DX12: end the pass after unary/cast so f32→f16
+                            // mirrors are visible to the next step. Only split once
+                            // we've dispatched in *this* pass — otherwise the step that
+                            // needs the flush would never run (infinite empty passes).
+                            if pass_dispatched
+                                && step_i > 0
+                                && step_needs_pass_flush(
+                                    &self.schedule[step_i],
+                                    &self.schedule[step_i - 1],
+                                )
+                            {
+                                break;
+                            }
+                            // NOTE: the match arms below skip a dispatch whose scaled extent is
+                            // zero (`if m_s == 0 { … continue; }` and ~78 siblings). Such a skip
+                            // must still consume this step's bind group and advance the cursor —
+                            // the same idiom as the `static_once` skip above — because the only
+                            // `step_i += 1` for a dispatched step is at the very bottom of this
+                            // loop. A bare `continue` re-entered the loop on the same step and
+                            // spun forever; a bare `step_i += 1` would shift every later step onto
+                            // the wrong bind group.
+                            let step = &self.schedule[step_i];
+                            // PLAN L3: per-step Perfetto trace span; no-op when
+                            // env var RLX_TRACE_PERFETTO unset.
+                            let _perf = rlx_ir::perfetto::TraceSpan::new(step_name(step), "wgpu");
+                            if rlx_ir::env::var("RLX_DBG_STEP").is_some() {
+                                eprintln!("[wgpu-step] {}", step_name(step));
+                            }
+                            match step {
+                                Step::CastF32ToF16 { params } => {
+                                    // Pre-pass for matmul_coop16: mirror f32 arena
+                                    // region into f16 shadow buffer so the matmul
+                                    // kernel can read A as f16. One thread per
+                                    // element; 64-thread workgroups.
+                                    if let Some(cast_k) = mm_cast {
+                                        pass.set_pipeline(&cast_k.pipeline);
+                                        pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                        let (gx, gy, gz) = dispatch_dims(params.len, 64);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    }
+                                }
+                                Step::Matmul {
+                                    m,
+                                    n,
+                                    batch,
+                                    b_off_f32,
+                                    b_is_param,
+                                    compute_precision,
+                                    ..
+                                } =>
+                                // The dispatch branches below use a chain of
+                                // `is_some() && …unwrap()` to pick a pipeline
+                                // because each variant cares about a different
+                                // Option<Pipeline>. `if let Some(p) = …` chains
+                                // would require nesting per variant; the flat
+                                // form is the readable shape here.
                                 {
-                                    // Hardware GEMM via simdgroup_matrix /
-                                    // KHR_cooperative_matrix. 32×32 output tile
-                                    // per workgroup (16 hardware-GEMM ops with
-                                    // shared A/B loads). Caller guaranteed m, n,
-                                    // k are multiples of 32/32/8.
-                                    pass.set_pipeline(&coop.pipeline);
-                                    pass.dispatch_workgroups(
-                                        n.div_ceil(32),
-                                        m_s.div_ceil(32),
-                                        *batch,
-                                    );
-                                } else if mm_coop_f16_vk.is_some()
-                                    && *compute_precision == MatmulCompute::CoopF16Vk
-                                {
-                                    if coop_f16_wide {
-                                        dispatch_wide_f32_matmul(
-                                            &mut pass,
-                                            mm_w_active,
-                                            mm_k,
-                                            m_s,
-                                            *n,
-                                            *batch,
-                                        );
-                                    } else {
-                                        let n_eff = scale(*n);
-                                        let coop_vk = matmul_coop_f16_vulkan_active_kernel(
-                                            &dev.device,
-                                            n_eff,
-                                        )
-                                        .expect("coop f16 vk kernel missing");
-                                        pass.set_pipeline(&coop_vk.pipeline);
-                                        pass.dispatch_workgroups(
-                                            m_s.div_ceil(16),
-                                            n.div_ceil(16),
-                                            *batch,
-                                        );
-                                    }
-                                } else if let Some(coop_f32) = mm_coop_f32.as_ref()
-                                    && *b_is_param
-                                    && *compute_precision == MatmulCompute::CoopF32
-                                {
-                                    // CoopF32: Metal uses 32×32 simdgroup tiles;
-                                    // Vulkan uses 8×8 coopLoadT portable kernel.
-                                    pass.set_pipeline(&coop_f32.pipeline);
-                                    let backend = wgpu_device()
-                                        .map(|d| d.backend)
-                                        .unwrap_or(wgpu::Backend::Noop);
-                                    let (gx, gy) = if backend == wgpu::Backend::Metal {
-                                        (n.div_ceil(32), m_s.div_ceil(32))
-                                    } else {
-                                        (m_s.div_ceil(8), n.div_ceil(8))
-                                    };
-                                    pass.dispatch_workgroups(gx, gy, *batch);
-                                } else if let Some(f16c) = mm_f16c.as_ref()
-                                    && *b_is_param
-                                    && *compute_precision == MatmulCompute::F16
-                                {
-                                    pass.set_pipeline(&f16c.pipeline);
-                                    pass.dispatch_workgroups(
-                                        n.div_ceil(32),
-                                        m_s.div_ceil(32),
-                                        *batch,
-                                    );
-                                } else if let Some(f16w) = mm_f16w.as_ref()
-                                    && *b_is_param
-                                    && f16w_opt_in
-                                {
-                                    pass.set_pipeline(&f16w.pipeline);
-                                    pass.dispatch_workgroups(
-                                        n.div_ceil(32),
-                                        m_s.div_ceil(32),
-                                        *batch,
-                                    );
-                                } else if m_s >= 32 && *n >= 64 {
-                                    pass.set_pipeline(&mm_w_active.pipeline);
-                                    // Same source of truth as the kernel pick.
-                                    let gx = n.div_ceil(64);
-                                    let gy = m_s.div_ceil(crate::kernels::wide_variant().tile_m());
-                                    pass.dispatch_workgroups(gx, gy, *batch);
-                                } else {
-                                    pass.set_pipeline(&mm_k.pipeline);
-                                    pass.dispatch_workgroups(
-                                        n.div_ceil(32),
-                                        m_s.div_ceil(32),
-                                        *batch,
-                                    );
-                                }
-                            }
-                            Step::Binary { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                pass.set_pipeline(&bk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Compare { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                pass.set_pipeline(&ck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Unary { params, f16_mirror } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                if *f16_mirror {
-                                    if let Some(uk_f16) = unary_f16_mirror_kernel(&dev.device) {
-                                        pass.set_pipeline(&uk_f16.pipeline);
-                                    } else {
-                                        pass.set_pipeline(&uk.pipeline);
-                                    }
-                                } else {
-                                    pass.set_pipeline(&uk.pipeline);
-                                }
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Where { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                pass.set_pipeline(&wk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Fma { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                pass.set_pipeline(&fk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ReluBackward { params } | Step::ActivationBackward { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                pass.set_pipeline(&abk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Reduce { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let rk = reduce_kernel(&dev.device);
-                                pass.set_pipeline(&rk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total_out = outer_s.saturating_mul(params.inner);
-                                if params.reduce_dim <= 64 {
-                                    // Fast path: 1 thread per output cell.
-                                    let (gx, gy, gz) = dispatch_dims(total_out, 64);
-                                    pass.dispatch_workgroups(gx, gy, gz);
-                                } else {
-                                    // Tree-reduce path: 1 workgroup (64
-                                    // threads) per output cell, parallel
-                                    // reduction with shared scratch.
-                                    let (gx, gy, gz) = dispatch_dims(total_out, 1);
-                                    pass.dispatch_workgroups(gx, gy, gz);
-                                }
-                            }
-                            Step::Softmax { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let sk = softmax_kernel(&dev.device);
-                                pass.set_pipeline(&sk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One workgroup (64 threads) per row → shared-mem
-                                // reduction over the softmax axis.
-                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::SoftmaxCrossEntropy { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let sk = softmax_cross_entropy_kernel(&dev.device);
-                                pass.set_pipeline(&sk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::SoftmaxCrossEntropyWithLogits { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let sk = softmax_cross_entropy_with_logits_kernel(&dev.device);
-                                pass.set_pipeline(&sk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::SoftmaxCrossEntropyBackward { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let sk = softmax_cross_entropy_backward_kernel(&dev.device);
-                                pass.set_pipeline(&sk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::LayerNorm { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let lk = layernorm_kernel(&dev.device);
-                                pass.set_pipeline(&lk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One workgroup (64 threads) per row → tree
-                                // reduction over the feature dim.
-                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::GroupNorm { params } => {
-                                if params.groups_total == 0 || params.group_elems == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let gk = group_norm_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One workgroup (64 threads) per (batch, group)
-                                // → tree reduction over the group's elements.
-                                let (gx, gy, gz) =
-                                    dispatch_dims(params.groups_total.saturating_mul(64), 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FusedSwiGLU { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = fused_swiglu_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One thread per output element (outer * n_half).
-                                let (gx, gy, gz) =
-                                    dispatch_dims(outer_s.saturating_mul(params.n_half), 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::RmsNormBackwardInput { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let rk = rms_norm_backward_kernel(&dev.device);
-                                pass.set_pipeline(&rk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(outer_s, 1, 1);
-                            }
-                            Step::RmsNormBackwardGamma { params }
-                            | Step::RmsNormBackwardBeta { params } => {
-                                if params.inner == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let rk = rms_norm_backward_param_kernel(&dev.device);
-                                pass.set_pipeline(&rk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(1, 1, 1);
-                            }
-                            Step::LayerNormBackwardInput { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let lk = layer_norm_backward_input_kernel(&dev.device);
-                                pass.set_pipeline(&lk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(outer_s, 1, 1);
-                            }
-                            Step::LayerNormBackwardGammaPartial {
-                                params,
-                                num_workgroups,
-                            } => {
-                                if params.inner == 0 || *num_workgroups == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let lk = layer_norm_backward_gamma_partial_kernel(&dev.device);
-                                pass.set_pipeline(&lk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(*num_workgroups, 1, 1);
-                            }
-                            Step::LayerNormBackwardGammaReduce { params } => {
-                                if params.inner == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let lk = layer_norm_backward_gamma_reduce_kernel(&dev.device);
-                                pass.set_pipeline(&lk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(1, 1, 1);
-                            }
-                            Step::CumsumBackward { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck = cumsum_backward_kernel(&dev.device);
-                                pass.set_pipeline(&ck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::RopeBackward { params } => {
-                                let seq_s = scale(params.seq);
-                                if seq_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let rk = rope_backward_kernel(&dev.device);
-                                pass.set_pipeline(&rk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.batch * seq_s * params.hidden;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::GatherBackward { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let total = outer_s * params.axis_dim * params.trailing;
-                                if total > 0 {
-                                    let zk = gather_backward_zero_kernel(&dev.device);
-                                    pass.set_pipeline(&zk.pipeline);
-                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                    let (gx, _, _) = dispatch_dims(total, 256);
-                                    pass.dispatch_workgroups(gx, 1, 1);
-                                }
-                                let ak = gather_backward_acc_kernel(&dev.device);
-                                pass.set_pipeline(&ak.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(outer_s, 1, 1);
-                            }
-                            Step::Cumsum { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck2 = cumsum_kernel(&dev.device);
-                                pass.set_pipeline(&ck2.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::CumScan { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck2 = cum_scan_kernel(&dev.device);
-                                pass.set_pipeline(&ck2.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FftGpu {
-                                src_off,
-                                dst_off,
-                                outer,
-                                n,
-                                inverse,
-                                norm_scale,
-                            } => {
-                                let res = &self.fft_gpu_steps[fft_i];
-                                fft_i += 1;
-                                crate::fft_dispatch::dispatch_fft_gpu_in_pass(
-                                    &dev.device,
-                                    &dev.queue,
-                                    &mut pass,
-                                    res,
-                                    *src_off,
-                                    *dst_off,
-                                    *outer,
-                                    *n,
-                                    *inverse != 0,
-                                    *norm_scale,
-                                );
-                            }
-                            Step::Copy { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck2 = copy_kernel(&dev.device);
-                                pass.set_pipeline(&ck2.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Cast { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let cast_k = cast_kernel(&dev.device);
-                                pass.set_pipeline(&cast_k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ComplexCast { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = complex_cast_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::BinaryC64 { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = binary_c64_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ComplexNormSq { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = complex_norm_sq_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ComplexNormSqBackward { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = complex_norm_sq_backward_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ConjugateC64 { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = conjugate_c64_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FftButterflyStage { params } => {
-                                let batch_s = scale(params.batch);
-                                let n = batch_s.saturating_mul(params.half);
-                                if n == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = fft_butterfly_stage_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::BufferCopy { .. } => {
-                                // Host step: `copy_buffer_to_buffer` runs outside compute passes.
-                            }
-                            Step::ElementwiseRegion { params } => {
-                                let len_s = scale(params.len);
-                                if len_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                if params.prologue == rlx_ir::REGION_PROLOGUE_RESIZE_NEAREST_2X_NCHW
-                                {
-                                    let ek = elementwise_region_spatial_kernel(&dev.device);
-                                    pass.set_pipeline(&ek.pipeline);
-                                    let (gx, gy, gz) = dispatch_prologue_nchw(
-                                        params.out_w,
-                                        params.out_h,
-                                        params.out_n * params.out_c,
-                                    );
-                                    pass.dispatch_workgroups(gx, gy, gz);
-                                } else {
-                                    let ek = elementwise_region_kernel(&dev.device);
-                                    pass.set_pipeline(&ek.pipeline);
-                                    let (gx, gy, gz) = dispatch_dims(len_s, 64);
-                                    pass.dispatch_workgroups(gx, gy, gz);
-                                }
-                            }
-                            Step::BatchElementwiseRegion { params } => {
-                                let slice_len_s = scale(params.slice_len);
-                                let num_batch_s = scale(params.num_batch);
-                                if slice_len_s == 0 || num_batch_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ek = batch_elementwise_region_kernel(&dev.device);
-                                pass.set_pipeline(&ek.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, _) = dispatch_dims(slice_len_s, 64);
-                                pass.dispatch_workgroups(gx, gy, num_batch_s);
-                            }
-                            Step::Transpose { params, .. } => {
-                                // Compute scaled grid count to match the
-                                // uniform's scaled out_total when bucket axis
-                                // is outermost.
-                                let total_s =
-                                    if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
-                                        let scaled_d0 = scale(params.out_dim_0);
-                                        let inner = params.out_total / params.out_dim_0;
-                                        scaled_d0 * inner
-                                    } else {
-                                        params.out_total
-                                    };
-                                if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let tk = transpose_kernel(&dev.device);
-                                pass.set_pipeline(&tk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Narrow { params } => {
-                                let total_s = scale(params.total);
-                                if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let nk = narrow_kernel(&dev.device);
-                                pass.set_pipeline(&nk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Concat { params } => {
-                                let total_s = scale(params.total);
-                                if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let cck = concat_kernel(&dev.device);
-                                pass.set_pipeline(&cck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Gather { params } => {
-                                let n_out_s = scale(params.n_out);
-                                if n_out_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let gk = gather_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::GatherAxis { params } => {
-                                // Trim only the leading (outer) dim; see the
-                                // uniform-write path above.
-                                let total_s =
-                                    scale(params.outer) * params.num_idx * params.trailing;
-                                if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let gk = gather_axis_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Attention { params, .. } => {
-                                // Scale seq_q for grid dim; per-head strides
-                                // come from seq_q_stride / seq_k_stride (full
-                                // extent) inside the WGSL.
-                                let seq_q_s = scale(params.seq_q);
-                                if seq_q_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ak = attention_kernel(&dev.device);
-                                pass.set_pipeline(&ak.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.batch * params.heads * seq_q_s;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::AttentionBackward { params, .. } => {
-                                let axis = if params.wrt == 0 {
-                                    params.seq_q
-                                } else {
-                                    params.seq_k
-                                };
-                                let axis_s = scale(axis);
-                                if axis_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ak = attention_bwd_kernel(&dev.device);
-                                pass.set_pipeline(&ak.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.batch * params.heads * axis_s;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Rope { params } => {
-                                // Multi-batch via stride-field WGSL fix:
-                                // iterate `batch * scaled_seq * last_dim` items.
-                                let s_active = scale(params.seq);
-                                let total_s = params.batch * s_active * params.last_dim;
-                                if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let rk = rope_kernel(&dev.device);
-                                pass.set_pipeline(&rk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::QuantI8 {
-                                kernel, threads, ..
-                            } => {
-                                if *threads == 0 {
-                                    gpu_bi += 1;
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = match kernel {
-                                    QuantI8Kernel::Quantize => quantize_i8_kernel(&dev.device),
-                                    QuantI8Kernel::Dequantize => dequantize_i8_kernel(&dev.device),
-                                };
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::BatchNormInference {
-                                kernel, threads, ..
-                            } => {
-                                if *threads == 0 {
-                                    gpu_bi += 1;
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = match kernel {
-                                    BatchNormKernel::Forward => {
-                                        batch_norm_inference_kernel(&dev.device)
-                                    }
-                                    BatchNormKernel::BwdInput => {
-                                        batch_norm_inference_bwd_input_kernel(&dev.device)
-                                    }
-                                    BatchNormKernel::BwdGamma => {
-                                        batch_norm_inference_bwd_gamma_kernel(&dev.device)
-                                    }
-                                    BatchNormKernel::BwdBeta => {
-                                        batch_norm_inference_bwd_beta_kernel(&dev.device)
-                                    }
-                                };
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::QConv2d { threads, .. } => {
-                                if *threads == 0 {
-                                    gpu_bi += 1;
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = q_conv2d_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::QMatMul { threads, .. } => {
-                                if *threads == 0 {
-                                    gpu_bi += 1;
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = q_matmul_kernel(&dev.device);
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(*threads, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ScaledLowp {
-                                params,
-                                kernel,
-                                threads,
-                            } => {
-                                if matches!(kernel, ScaledLowpKernel::MatmulDecode) {
-                                    if params.m == 0 || params.n == 0 {
-                                        gpu_bi += 1;
+                                    #[allow(clippy::unnecessary_unwrap)]
+                                    // Safe at any batch (see safe_for_active_extent
+                                    // comment); scale m, output rows past m_s per
+                                    // batch retain prior values via c_batch_stride.
+                                    let m_s = scale(*m);
+                                    if m_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
                                         step_i += 1;
                                         continue;
                                     }
-                                    let k = scaled_matmul_decode_kernel(&dev.device);
+                                    let coop_f16_wide = mm_coop_f16_vk.is_some()
+                                        && *compute_precision == MatmulCompute::CoopF16Vk
+                                        && crate::coop_f16_vk::use_wide_matmul(
+                                            *b_off_f32,
+                                            *n,
+                                            &self.coop_f16_b_param,
+                                            &self.coop_f16_vk_wide_b,
+                                        );
+                                    pass.set_bind_group(
+                                        0,
+                                        coop_f16_vk_bind_group(self, gpu_bi, coop_f16_wide),
+                                        &[],
+                                    );
+                                    // Kernel selection priority:
+                                    //   1. compute_precision == F16 + b_is_param +
+                                    //      SHADER_F16 → matmul_f16_compute
+                                    //      (f16 multiply, f32 acc — 2× ALU on Apple)
+                                    //   2. legacy RLX_WGPU_F16_WEIGHTS opt-in →
+                                    //      matmul_f16w (storage-only f16; experimental,
+                                    //      currently regresses on Apple)
+                                    //   3. wide-N (m≥32, n≥64)   → matmul_wide
+                                    //   4. m ≤ 4 (decode)        → matmul_gemv
+                                    //   5. otherwise            → matmul (small/skinny)
+                                    let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
+                                    if *b_is_param
+                                        && *compute_precision == MatmulCompute::Bf16Packed
+                                    {
+                                        // Packed-BF16 weight, unpacked in-shader.
+                                        // Same 32×32-tile grid as the plain matmul.
+                                        crate::backend::bf16_packed_dispatch_inc();
+                                        pass.set_pipeline(&mm_bf16w.pipeline);
+                                        pass.dispatch_workgroups(
+                                            n.div_ceil(32),
+                                            m_s.div_ceil(32),
+                                            *batch,
+                                        );
+                                    } else if let Some(coop) = mm_coop.as_ref()
+                                        && *b_is_param
+                                        && *compute_precision == MatmulCompute::Coop16
+                                    {
+                                        // Hardware GEMM via simdgroup_matrix /
+                                        // KHR_cooperative_matrix. 32×32 output tile
+                                        // per workgroup (16 hardware-GEMM ops with
+                                        // shared A/B loads). Caller guaranteed m, n,
+                                        // k are multiples of 32/32/8.
+                                        pass.set_pipeline(&coop.pipeline);
+                                        pass.dispatch_workgroups(
+                                            n.div_ceil(32),
+                                            m_s.div_ceil(32),
+                                            *batch,
+                                        );
+                                    } else if mm_coop_f16_vk.is_some()
+                                        && *compute_precision == MatmulCompute::CoopF16Vk
+                                    {
+                                        if coop_f16_wide {
+                                            dispatch_wide_f32_matmul(
+                                                &mut pass,
+                                                mm_w_active,
+                                                mm_k,
+                                                m_s,
+                                                *n,
+                                                *batch,
+                                            );
+                                        } else {
+                                            let n_eff = scale(*n);
+                                            let coop_vk = matmul_coop_f16_vulkan_active_kernel(
+                                                &dev.device,
+                                                n_eff,
+                                            )
+                                            .expect("coop f16 vk kernel missing");
+                                            pass.set_pipeline(&coop_vk.pipeline);
+                                            pass.dispatch_workgroups(
+                                                m_s.div_ceil(16),
+                                                n.div_ceil(16),
+                                                *batch,
+                                            );
+                                        }
+                                    } else if let Some(coop_f32) = mm_coop_f32.as_ref()
+                                        && *b_is_param
+                                        && *compute_precision == MatmulCompute::CoopF32
+                                    {
+                                        // CoopF32: Metal uses 32×32 simdgroup tiles;
+                                        // Vulkan uses 8×8 coopLoadT portable kernel.
+                                        pass.set_pipeline(&coop_f32.pipeline);
+                                        let backend = wgpu_device()
+                                            .map(|d| d.backend)
+                                            .unwrap_or(wgpu::Backend::Noop);
+                                        let (gx, gy) = if backend == wgpu::Backend::Metal {
+                                            (n.div_ceil(32), m_s.div_ceil(32))
+                                        } else {
+                                            (m_s.div_ceil(8), n.div_ceil(8))
+                                        };
+                                        pass.dispatch_workgroups(gx, gy, *batch);
+                                    } else if let Some(f16c) = mm_f16c.as_ref()
+                                        && *b_is_param
+                                        && *compute_precision == MatmulCompute::F16
+                                    {
+                                        pass.set_pipeline(&f16c.pipeline);
+                                        pass.dispatch_workgroups(
+                                            n.div_ceil(32),
+                                            m_s.div_ceil(32),
+                                            *batch,
+                                        );
+                                    } else if let Some(f16w) = mm_f16w.as_ref()
+                                        && *b_is_param
+                                        && f16w_opt_in
+                                    {
+                                        pass.set_pipeline(&f16w.pipeline);
+                                        pass.dispatch_workgroups(
+                                            n.div_ceil(32),
+                                            m_s.div_ceil(32),
+                                            *batch,
+                                        );
+                                    } else if m_s <= 4 && !no_gemv {
+                                        let cols = crate::kernels::gemv_cols_for(*n);
+                                        let k = if cols == 32 {
+                                            mm_gemv
+                                        } else {
+                                            crate::kernels::matmul_gemv_kernel_cols(
+                                                &dev.device,
+                                                cols,
+                                            )
+                                        };
+                                        pass.set_pipeline(&k.pipeline);
+                                        pass.dispatch_workgroups(n.div_ceil(cols), 1, *batch);
+                                    } else if m_s >= 32 && *n >= 64 {
+                                        pass.set_pipeline(&mm_w_active.pipeline);
+                                        // Same source of truth as the kernel pick.
+                                        let gx = n.div_ceil(64);
+                                        let gy =
+                                            m_s.div_ceil(crate::kernels::wide_variant().tile_m());
+                                        pass.dispatch_workgroups(gx, gy, *batch);
+                                    } else {
+                                        pass.set_pipeline(&mm_k.pipeline);
+                                        pass.dispatch_workgroups(
+                                            n.div_ceil(32),
+                                            m_s.div_ceil(32),
+                                            *batch,
+                                        );
+                                    }
+                                }
+                                Step::Binary { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    pass.set_pipeline(&bk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Compare { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    pass.set_pipeline(&ck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Unary { params, f16_mirror } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    if *f16_mirror {
+                                        if let Some(uk_f16) = unary_f16_mirror_kernel(&dev.device) {
+                                            pass.set_pipeline(&uk_f16.pipeline);
+                                        } else {
+                                            pass.set_pipeline(&uk.pipeline);
+                                        }
+                                    } else {
+                                        pass.set_pipeline(&uk.pipeline);
+                                    }
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Where { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    pass.set_pipeline(&wk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Fma { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    pass.set_pipeline(&fk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ReluBackward { params }
+                                | Step::ActivationBackward { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    pass.set_pipeline(&abk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Reduce { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let rk = reduce_kernel(&dev.device);
+                                    pass.set_pipeline(&rk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total_out = outer_s.saturating_mul(params.inner);
+                                    if params.reduce_dim <= 64 {
+                                        // Fast path: 1 thread per output cell.
+                                        let (gx, gy, gz) = dispatch_dims(total_out, 64);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    } else {
+                                        // Tree-reduce path: 1 workgroup (64
+                                        // threads) per output cell, parallel
+                                        // reduction with shared scratch.
+                                        let (gx, gy, gz) = dispatch_dims(total_out, 1);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    }
+                                }
+                                Step::Softmax { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let sk = softmax_kernel(&dev.device);
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // One workgroup (64 threads) per row → shared-mem
+                                    // reduction over the softmax axis.
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(outer_s.saturating_mul(64), 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::SoftmaxCrossEntropy { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let sk = softmax_cross_entropy_kernel(&dev.device);
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::SoftmaxCrossEntropyWithLogits { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let sk = softmax_cross_entropy_with_logits_kernel(&dev.device);
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::SoftmaxCrossEntropyBackward { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let sk = softmax_cross_entropy_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::LayerNorm { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let lk = layernorm_kernel(&dev.device);
+                                    pass.set_pipeline(&lk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // One workgroup (64 threads) per row → tree
+                                    // reduction over the feature dim.
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(outer_s.saturating_mul(64), 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::GroupNorm { params } => {
+                                    if params.groups_total == 0 || params.group_elems == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let gk = group_norm_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // One workgroup (64 threads) per (batch, group)
+                                    // → tree reduction over the group's elements.
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(params.groups_total.saturating_mul(64), 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FusedSwiGLU { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = fused_swiglu_kernel(&dev.device);
                                     pass.set_pipeline(&k.pipeline);
                                     pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                    // 16x16 output tiles, matching the shader's
-                                    // workgroup_size(16, 16).
-                                    pass.dispatch_workgroups(
-                                        params.n.div_ceil(16),
-                                        params.m.div_ceil(16),
-                                        1,
+                                    // One thread per output element (outer * n_half).
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(outer_s.saturating_mul(params.n_half), 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::RmsNormBackwardInput { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let rk = rms_norm_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&rk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(outer_s, 1, 1);
+                                }
+                                Step::RmsNormBackwardGamma { params }
+                                | Step::RmsNormBackwardBeta { params } => {
+                                    if params.inner == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let rk = rms_norm_backward_param_kernel(&dev.device);
+                                    pass.set_pipeline(&rk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(1, 1, 1);
+                                }
+                                Step::LayerNormBackwardInput { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let lk = layer_norm_backward_input_kernel(&dev.device);
+                                    pass.set_pipeline(&lk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(outer_s, 1, 1);
+                                }
+                                Step::LayerNormBackwardGammaPartial {
+                                    params,
+                                    num_workgroups,
+                                } => {
+                                    if params.inner == 0 || *num_workgroups == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let lk = layer_norm_backward_gamma_partial_kernel(&dev.device);
+                                    pass.set_pipeline(&lk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(*num_workgroups, 1, 1);
+                                }
+                                Step::LayerNormBackwardGammaReduce { params } => {
+                                    if params.inner == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let lk = layer_norm_backward_gamma_reduce_kernel(&dev.device);
+                                    pass.set_pipeline(&lk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(1, 1, 1);
+                                }
+                                Step::CumsumBackward { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck = cumsum_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&ck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::RopeBackward { params } => {
+                                    let seq_s = scale(params.seq);
+                                    if seq_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let rk = rope_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&rk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = params.batch * seq_s * params.hidden;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::GatherBackward { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let total = outer_s * params.axis_dim * params.trailing;
+                                    if total > 0 {
+                                        let zk = gather_backward_zero_kernel(&dev.device);
+                                        pass.set_pipeline(&zk.pipeline);
+                                        pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                        let (gx, _, _) = dispatch_dims(total, 256);
+                                        pass.dispatch_workgroups(gx, 1, 1);
+                                    }
+                                    let ak = gather_backward_acc_kernel(&dev.device);
+                                    pass.set_pipeline(&ak.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(outer_s, 1, 1);
+                                }
+                                Step::Cumsum { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck2 = cumsum_kernel(&dev.device);
+                                    pass.set_pipeline(&ck2.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::CumScan { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck2 = cum_scan_kernel(&dev.device);
+                                    pass.set_pipeline(&ck2.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FftGpu {
+                                    src_off,
+                                    dst_off,
+                                    outer,
+                                    n,
+                                    inverse,
+                                    norm_scale,
+                                } => {
+                                    let res = &self.fft_gpu_steps[fft_i];
+                                    fft_i += 1;
+                                    crate::fft_dispatch::dispatch_fft_gpu_in_pass(
+                                        &dev.device,
+                                        &dev.queue,
+                                        &mut pass,
+                                        res,
+                                        *src_off,
+                                        *dst_off,
+                                        *outer,
+                                        *n,
+                                        *inverse != 0,
+                                        *norm_scale,
                                     );
-                                } else {
+                                }
+                                Step::Copy { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck2 = copy_kernel(&dev.device);
+                                    pass.set_pipeline(&ck2.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Cast { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let cast_k = cast_kernel(&dev.device);
+                                    pass.set_pipeline(&cast_k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ComplexCast { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = complex_cast_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::BinaryC64 { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = binary_c64_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ComplexNormSq { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = complex_norm_sq_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ComplexNormSqBackward { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = complex_norm_sq_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ConjugateC64 { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = conjugate_c64_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FftButterflyStage { params } => {
+                                    let batch_s = scale(params.batch);
+                                    let n = batch_s.saturating_mul(params.half);
+                                    if n == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = fft_butterfly_stage_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::BufferCopy { .. } => {
+                                    // Host step: `copy_buffer_to_buffer` runs outside compute passes.
+                                }
+                                Step::ElementwiseRegion { params } => {
+                                    let len_s = scale(params.len);
+                                    if len_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    if params.prologue
+                                        == rlx_ir::REGION_PROLOGUE_RESIZE_NEAREST_2X_NCHW
+                                    {
+                                        let ek = elementwise_region_spatial_kernel(&dev.device);
+                                        pass.set_pipeline(&ek.pipeline);
+                                        let (gx, gy, gz) = dispatch_prologue_nchw(
+                                            params.out_w,
+                                            params.out_h,
+                                            params.out_n * params.out_c,
+                                        );
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    } else {
+                                        let ek = elementwise_region_kernel(&dev.device);
+                                        pass.set_pipeline(&ek.pipeline);
+                                        let (gx, gy, gz) = dispatch_dims(len_s, 64);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    }
+                                }
+                                Step::BatchElementwiseRegion { params } => {
+                                    let slice_len_s = scale(params.slice_len);
+                                    let num_batch_s = scale(params.num_batch);
+                                    if slice_len_s == 0 || num_batch_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ek = batch_elementwise_region_kernel(&dev.device);
+                                    pass.set_pipeline(&ek.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, _) = dispatch_dims(slice_len_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, num_batch_s);
+                                }
+                                Step::Transpose { params, .. } => {
+                                    // Compute scaled grid count to match the
+                                    // uniform's scaled out_total when bucket axis
+                                    // is outermost.
+                                    let total_s =
+                                        if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
+                                            let scaled_d0 = scale(params.out_dim_0);
+                                            let inner = params.out_total / params.out_dim_0;
+                                            scaled_d0 * inner
+                                        } else {
+                                            params.out_total
+                                        };
+                                    if total_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let tk = transpose_kernel(&dev.device);
+                                    pass.set_pipeline(&tk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Narrow { params } => {
+                                    let total_s = scale(params.total);
+                                    if total_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let nk = narrow_kernel(&dev.device);
+                                    pass.set_pipeline(&nk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Concat { params } => {
+                                    let total_s = scale(params.total);
+                                    if total_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let cck = concat_kernel(&dev.device);
+                                    pass.set_pipeline(&cck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Gather { params } => {
+                                    let n_out_s = scale(params.n_out);
+                                    if n_out_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let gk = gather_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_out_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::GatherAxis { params } => {
+                                    // Trim only the leading (outer) dim; see the
+                                    // uniform-write path above.
+                                    let total_s =
+                                        scale(params.outer) * params.num_idx * params.trailing;
+                                    if total_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let gk = gather_axis_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Attention { params, .. } => {
+                                    // Scale seq_q for grid dim; per-head strides
+                                    // come from seq_q_stride / seq_k_stride (full
+                                    // extent) inside the WGSL.
+                                    let seq_q_s = scale(params.seq_q);
+                                    if seq_q_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let total = params.batch * params.heads * seq_q_s;
+                                    // Few rows (decode, short prefill): a workgroup per row;
+                                    // a thread per row could not fill the GPU.
+                                    if total <= ATTENTION_COOP_MAX_ROWS
+                                        && !rlx_ir::env::flag("RLX_WGPU_ATTENTION_SERIAL")
+                                    {
+                                        let ak = crate::kernels::attention_coop_kernel(&dev.device);
+                                        pass.set_pipeline(&ak.pipeline);
+                                        pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                        let gx = total.min(32_768);
+                                        pass.dispatch_workgroups(gx, 1, total.div_ceil(gx));
+                                    } else {
+                                        let ak = attention_kernel(&dev.device);
+                                        pass.set_pipeline(&ak.pipeline);
+                                        pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                        let (gx, gy, gz) = dispatch_dims(total, 64);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    }
+                                }
+                                Step::AttentionBackward { params, .. } => {
+                                    let axis = if params.wrt == 0 {
+                                        params.seq_q
+                                    } else {
+                                        params.seq_k
+                                    };
+                                    let axis_s = scale(axis);
+                                    if axis_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ak = attention_bwd_kernel(&dev.device);
+                                    pass.set_pipeline(&ak.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = params.batch * params.heads * axis_s;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Rope { params } => {
+                                    // Multi-batch via stride-field WGSL fix:
+                                    // iterate `batch * scaled_seq * last_dim` items.
+                                    let s_active = scale(params.seq);
+                                    let total_s = params.batch * s_active * params.last_dim;
+                                    if total_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let rk = rope_kernel(&dev.device);
+                                    pass.set_pipeline(&rk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::QuantI8 {
+                                    kernel, threads, ..
+                                } => {
                                     if *threads == 0 {
                                         gpu_bi += 1;
                                         step_i += 1;
                                         continue;
                                     }
                                     let k = match kernel {
-                                        ScaledLowpKernel::QuantScale => {
-                                            scaled_quant_scale_kernel(&dev.device)
+                                        QuantI8Kernel::Quantize => quantize_i8_kernel(&dev.device),
+                                        QuantI8Kernel::Dequantize => {
+                                            dequantize_i8_kernel(&dev.device)
                                         }
-                                        ScaledLowpKernel::Quantize => {
-                                            scaled_quantize_kernel(&dev.device)
-                                        }
-                                        _ => scaled_dequantize_kernel(&dev.device),
                                     };
                                     pass.set_pipeline(&k.pipeline);
                                     pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                     let (gx, gy, gz) = dispatch_dims(*threads, 64);
                                     pass.dispatch_workgroups(gx, gy, gz);
                                 }
-                            }
-                            Step::IndexingNd { params, kernel, .. } => {
-                                if params.n == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                Step::BatchNormInference {
+                                    kernel, threads, ..
+                                } => {
+                                    if *threads == 0 {
                                         gpu_bi += 1;
+                                        step_i += 1;
+                                        continue;
                                     }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let k = match kernel {
-                                    IndexingNdKernel::GatherNd => gather_nd_kernel(&dev.device),
-                                    IndexingNdKernel::GatherElements => {
-                                        gather_elements_kernel(&dev.device)
-                                    }
-                                    IndexingNdKernel::ScatterElements => {
-                                        scatter_elements_kernel(&dev.device)
-                                    }
-                                    IndexingNdKernel::ScatterNd => {
-                                        scatter_nd_reduce_kernel(&dev.device)
-                                    }
-                                    IndexingNdKernel::CopySanitize => {
-                                        copy_sanitize_kernel(&dev.device)
-                                    }
-                                };
-                                pass.set_pipeline(&k.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(params.n, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Expand { params, .. } => {
-                                let total_s =
-                                    if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
-                                        let scaled_d0 = scale(params.out_dim_0);
-                                        let inner = params.out_total / params.out_dim_0;
-                                        scaled_d0 * inner
-                                    } else {
-                                        params.out_total
+                                    let k = match kernel {
+                                        BatchNormKernel::Forward => {
+                                            batch_norm_inference_kernel(&dev.device)
+                                        }
+                                        BatchNormKernel::BwdInput => {
+                                            batch_norm_inference_bwd_input_kernel(&dev.device)
+                                        }
+                                        BatchNormKernel::BwdGamma => {
+                                            batch_norm_inference_bwd_gamma_kernel(&dev.device)
+                                        }
+                                        BatchNormKernel::BwdBeta => {
+                                            batch_norm_inference_bwd_beta_kernel(&dev.device)
+                                        }
                                     };
-                                if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ek = expand_kernel(&dev.device);
-                                pass.set_pipeline(&ek.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Argmax { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let amk = argmax_kernel(&dev.device);
-                                pass.set_pipeline(&amk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Pool2d { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = pool2d_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = n_s * params.c * params.h_out * params.w_out;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::MaxPool2dBackward { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = maxpool2d_backward_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let gx = params.w.div_ceil(8);
-                                let gy = params.h.div_ceil(8);
-                                let gz = n_s * params.c;
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::MaxPool3dBackward { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = maxpool3d_backward_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = n_s * params.c * params.d * params.h * params.w;
-                                let (gx, gy, gz) = dispatch_dims(total, 256);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Conv3dBackwardInput { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = conv3d_backward_input_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = n_s * params.c_in * params.d * params.h * params.w;
-                                let (gx, gy, gz) = dispatch_dims(total, 256);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Conv3dBackwardWeight { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = conv3d_backward_weight_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let c_in_per_g = params.c_in / params.groups.max(1);
-                                let total =
-                                    params.c_out * c_in_per_g * params.kd * params.kh * params.kw;
-                                let (gx, gy, gz) = dispatch_dims(total, 256);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::GroupNormBackwardInput { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = group_norm_backward_input_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(n_s * params.num_groups, 1, 1);
-                            }
-                            Step::GroupNormBackwardGamma { .. } => {
-                                let pk = group_norm_backward_gamma_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(1, 1, 1);
-                            }
-                            Step::GroupNormBackwardBeta { .. } => {
-                                let pk = group_norm_backward_beta_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(1, 1, 1);
-                            }
-                            Step::AxialRope2d { params } => {
-                                let batch_s = scale(params.batch);
-                                if batch_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let total = batch_s * params.seq * params.hidden;
-                                let pk = axial_rope2d_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FakeQuantizeFixed { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = fake_quantize_fixed_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::RoundToFormat { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = round_to_format_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(params.threads(n_s), 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FakeQuantizePerBatch { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 || params.chan_dim == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = fake_quantize_perbatch_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(params.chan_dim, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Conv2d { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck2 = conv2d_kernel(&dev.device);
-                                pass.set_pipeline(&ck2.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // conv2d.wgsl tiles `CONV2D_TILE` output spatial
-                                // positions per thread (const must match the kernel).
-                                let spatial = params.h_out * params.w_out;
-                                let sp_tiles = spatial.div_ceil(CONV2D_TILE);
-                                let total = n_s * params.c_out * sp_tiles;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Conv2dTiled { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck = conv1d_tiled_kernel(&dev.device);
-                                pass.set_pipeline(&ck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // conv1d_tiled.wgsl: one thread per output element
-                                // (c_out * l_out), N == 1, w_out == 1.
-                                let total = n_s * params.c_out * params.h_out;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FusedConvBiasAct { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck = fused_conv_bias_act_kernel(&dev.device);
-                                pass.set_pipeline(&ck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // Same grid as conv2d: TILE (== CONV2D_TILE) output
-                                // spatial positions per thread.
-                                let spatial = params.h_out * params.w_out;
-                                let sp_tiles = spatial.div_ceil(CONV2D_TILE);
-                                let total = n_s * params.c_out * sp_tiles;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Im2ColGpu { params } => {
-                                // One thread per col element (k_total * spatial);
-                                // the following Step::Matmul consumes the col matrix.
-                                let imk = im2col2d_kernel(&dev.device);
-                                pass.set_pipeline(&imk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.k_total.saturating_mul(params.spatial);
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Pool1d { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = pool1d_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = n_s * params.c * params.l_out;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Pool3d { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let pk = pool3d_kernel(&dev.device);
-                                pass.set_pipeline(&pk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total =
-                                    n_s * params.c * params.d_out * params.h_out * params.w_out;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Conv1d { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck = conv1d_kernel(&dev.device);
-                                pass.set_pipeline(&ck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = n_s * params.c_out * params.l_out;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Conv3d { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                // Four output channels per thread when the
-                                // convolution is ungrouped; see
-                                // conv3d_ctile.wgsl. `RLX_WGPU_CONV3D_SCALAR=1`
-                                // forces the one-element-per-thread kernel so
-                                // the two can be timed against each other in
-                                // one process.
-                                let tiled = params.groups <= 1
-                                    && !rlx_ir::env::flag("RLX_WGPU_CONV3D_SCALAR");
-                                let spatial = params.d_out * params.h_out * params.w_out;
-                                let (ck, total) = if tiled {
-                                    (
-                                        conv3d_ctile_kernel(&dev.device),
-                                        n_s * params.c_out.div_ceil(4) * spatial,
-                                    )
-                                } else {
-                                    (conv3d_kernel(&dev.device), n_s * params.c_out * spatial)
-                                };
-                                pass.set_pipeline(&ck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ConvTranspose3d { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ck = conv_transpose3d_kernel(&dev.device);
-                                pass.set_pipeline(&ck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total =
-                                    n_s * params.c_out * params.d_out * params.h_out * params.w_out;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::ScatterAdd { params } => {
-                                let sk = scatter_add_kernel(&dev.device);
-                                pass.set_pipeline(&sk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // Phase 0 zeros the FULL output (preserves
-                                // accumulator semantics). Phase 1 scatters first
-                                // num_updates_active updates only; serial single
-                                // workgroup either way (atomic CAS unsupported in
-                                // naga's MSL emitter — see scatter_add.wgsl).
-                                if params.op == 0 {
-                                    let (gx, gy, gz) = dispatch_dims(params.out_total, 64);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(*threads, 64);
                                     pass.dispatch_workgroups(gx, gy, gz);
-                                } else {
+                                }
+                                Step::QConv2d { threads, .. } => {
+                                    if *threads == 0 {
+                                        gpu_bi += 1;
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = q_conv2d_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::QMatMul { threads, .. } => {
+                                    if *threads == 0 {
+                                        gpu_bi += 1;
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = q_matmul_kernel(&dev.device);
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ScaledLowp {
+                                    params,
+                                    kernel,
+                                    threads,
+                                } => {
+                                    if matches!(kernel, ScaledLowpKernel::MatmulDecode) {
+                                        if params.m == 0 || params.n == 0 {
+                                            gpu_bi += 1;
+                                            step_i += 1;
+                                            continue;
+                                        }
+                                        let k = scaled_matmul_decode_kernel(&dev.device);
+                                        pass.set_pipeline(&k.pipeline);
+                                        pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                        // 16x16 output tiles, matching the shader's
+                                        // workgroup_size(16, 16).
+                                        pass.dispatch_workgroups(
+                                            params.n.div_ceil(16),
+                                            params.m.div_ceil(16),
+                                            1,
+                                        );
+                                    } else {
+                                        if *threads == 0 {
+                                            gpu_bi += 1;
+                                            step_i += 1;
+                                            continue;
+                                        }
+                                        let k = match kernel {
+                                            ScaledLowpKernel::QuantScale => {
+                                                scaled_quant_scale_kernel(&dev.device)
+                                            }
+                                            ScaledLowpKernel::Quantize => {
+                                                scaled_quantize_kernel(&dev.device)
+                                            }
+                                            _ => scaled_dequantize_kernel(&dev.device),
+                                        };
+                                        pass.set_pipeline(&k.pipeline);
+                                        pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                        let (gx, gy, gz) = dispatch_dims(*threads, 64);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    }
+                                }
+                                Step::IndexingNd { params, kernel, .. } => {
+                                    if params.n == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let k = match kernel {
+                                        IndexingNdKernel::GatherNd => gather_nd_kernel(&dev.device),
+                                        IndexingNdKernel::GatherElements => {
+                                            gather_elements_kernel(&dev.device)
+                                        }
+                                        IndexingNdKernel::ScatterElements => {
+                                            scatter_elements_kernel(&dev.device)
+                                        }
+                                        IndexingNdKernel::ScatterNd => {
+                                            scatter_nd_reduce_kernel(&dev.device)
+                                        }
+                                        IndexingNdKernel::CopySanitize => {
+                                            copy_sanitize_kernel(&dev.device)
+                                        }
+                                    };
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(params.n, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Expand { params, .. } => {
+                                    let total_s =
+                                        if params.bucket_outermost == 1 && params.out_dim_0 > 0 {
+                                            let scaled_d0 = scale(params.out_dim_0);
+                                            let inner = params.out_total / params.out_dim_0;
+                                            scaled_d0 * inner
+                                        } else {
+                                            params.out_total
+                                        };
+                                    if total_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ek = expand_kernel(&dev.device);
+                                    pass.set_pipeline(&ek.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Argmax { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let amk = argmax_kernel(&dev.device);
+                                    pass.set_pipeline(&amk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // One 256-thread workgroup per row.
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(outer_s.saturating_mul(64), 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Pool2d { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = pool2d_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = n_s * params.c * params.h_out * params.w_out;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::MaxPool2dBackward { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = maxpool2d_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let gx = params.w.div_ceil(8);
+                                    let gy = params.h.div_ceil(8);
+                                    let gz = n_s * params.c;
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::MaxPool3dBackward { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = maxpool3d_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = n_s * params.c * params.d * params.h * params.w;
+                                    let (gx, gy, gz) = dispatch_dims(total, 256);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Conv3dBackwardInput { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = conv3d_backward_input_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = n_s * params.c_in * params.d * params.h * params.w;
+                                    let (gx, gy, gz) = dispatch_dims(total, 256);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Conv3dBackwardWeight { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = conv3d_backward_weight_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let c_in_per_g = params.c_in / params.groups.max(1);
+                                    let total = params.c_out
+                                        * c_in_per_g
+                                        * params.kd
+                                        * params.kh
+                                        * params.kw;
+                                    let (gx, gy, gz) = dispatch_dims(total, 256);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::GroupNormBackwardInput { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = group_norm_backward_input_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(n_s * params.num_groups, 1, 1);
+                                }
+                                Step::GroupNormBackwardGamma { .. } => {
+                                    let pk = group_norm_backward_gamma_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                     pass.dispatch_workgroups(1, 1, 1);
                                 }
-                            }
-                            Step::TopK { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
+                                Step::GroupNormBackwardBeta { .. } => {
+                                    let pk = group_norm_backward_beta_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(1, 1, 1);
                                 }
-                                let tk = topk_kernel(&dev.device);
-                                pass.set_pipeline(&tk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::WelchPeaksGpu { params } => {
-                                let batch_s = scale(params.welch_batch);
-                                if batch_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                Step::ResizeNearest2x { params } => {
+                                    let total = scale(params.planes) * 4 * params.h * params.w;
+                                    if total == 0 {
                                         gpu_bi += 1;
+                                        step_i += 1;
+                                        continue;
                                     }
-                                    step_i += 1;
-                                    continue;
+                                    let pk = resize_nearest2x_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
                                 }
-                                let wk = welch_peaks_gpu_kernel(&dev.device);
-                                pass.set_pipeline(&wk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(batch_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::UmapKnn { params } => {
-                                let n_s = scale(params.n);
-                                if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                Step::AxialRope2d { params } => {
+                                    let batch_s = scale(params.batch);
+                                    if batch_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let total = batch_s * params.seq * params.hidden;
+                                    let pk = axial_rope2d_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FakeQuantizeFixed { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = fake_quantize_fixed_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::DoubleSingle { params } => {
+                                    if params.len == 0 {
                                         gpu_bi += 1;
+                                        step_i += 1;
+                                        continue;
                                     }
-                                    step_i += 1;
-                                    continue;
+                                    let pk = crate::kernels::double_single_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(params.len, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
                                 }
-                                let uk = umap_knn_kernel(&dev.device);
-                                pass.set_pipeline(&uk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(n_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::WgpuGpuKernel { name, workgroups } => {
-                                // Raw-GPU custom op: fetch the cached pipeline by name
-                                // and dispatch against the compile-time bind group.
-                                let gk = crate::wgpu_gpu_custom::lookup(name).expect(
+                                Step::RoundToFormat { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = round_to_format_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(params.threads(n_s), 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FakeQuantizePerBatch { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 || params.chan_dim == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = fake_quantize_perbatch_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(params.chan_dim, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Conv2d { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck2 = conv2d_kernel(&dev.device);
+                                    pass.set_pipeline(&ck2.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // conv2d.wgsl tiles `CONV2D_TILE` output spatial
+                                    // positions per thread (const must match the kernel).
+                                    let spatial = params.h_out * params.w_out;
+                                    let sp_tiles = spatial.div_ceil(CONV2D_TILE);
+                                    let total = n_s * params.c_out * sp_tiles;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Conv2dTiled { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck = conv1d_tiled_kernel(&dev.device);
+                                    pass.set_pipeline(&ck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // conv1d_tiled.wgsl: one thread per output element
+                                    // (c_out * l_out), N == 1, w_out == 1.
+                                    let total = n_s * params.c_out * params.h_out;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FusedConvBiasAct { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck = fused_conv_bias_act_kernel(&dev.device);
+                                    pass.set_pipeline(&ck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // Same grid as conv2d: TILE (== CONV2D_TILE) output
+                                    // spatial positions per thread.
+                                    let spatial = params.h_out * params.w_out;
+                                    let sp_tiles = spatial.div_ceil(CONV2D_TILE);
+                                    let total = n_s * params.c_out * sp_tiles;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Im2ColGpu { params } => {
+                                    // One thread per col element (k_total * spatial);
+                                    // the following Step::Matmul consumes the col matrix.
+                                    let imk = im2col2d_kernel(&dev.device);
+                                    pass.set_pipeline(&imk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = params.k_total.saturating_mul(params.spatial);
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Pool1d { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = pool1d_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = n_s * params.c * params.l_out;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Pool3d { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let pk = pool3d_kernel(&dev.device);
+                                    pass.set_pipeline(&pk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total =
+                                        n_s * params.c * params.d_out * params.h_out * params.w_out;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Conv1d { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck = conv1d_kernel(&dev.device);
+                                    pass.set_pipeline(&ck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = n_s * params.c_out * params.l_out;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Conv3d { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    // Four output channels per thread when the
+                                    // convolution is ungrouped; see
+                                    // conv3d_ctile.wgsl. `RLX_WGPU_CONV3D_SCALAR=1`
+                                    // forces the one-element-per-thread kernel so
+                                    // the two can be timed against each other in
+                                    // one process.
+                                    let tiled = params.groups <= 1
+                                        && !rlx_ir::env::flag("RLX_WGPU_CONV3D_SCALAR");
+                                    let spatial = params.d_out * params.h_out * params.w_out;
+                                    let (ck, total) = if tiled {
+                                        (
+                                            conv3d_ctile_kernel(&dev.device),
+                                            n_s * params.c_out.div_ceil(4) * spatial,
+                                        )
+                                    } else {
+                                        (conv3d_kernel(&dev.device), n_s * params.c_out * spatial)
+                                    };
+                                    pass.set_pipeline(&ck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ConvTranspose3d { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ck = conv_transpose3d_kernel(&dev.device);
+                                    pass.set_pipeline(&ck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = n_s
+                                        * params.c_out
+                                        * params.d_out
+                                        * params.h_out
+                                        * params.w_out;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::ScatterAdd { params } => {
+                                    let sk = scatter_add_kernel(&dev.device);
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // Phase 0 zeros the FULL output (preserves
+                                    // accumulator semantics). Phase 1 scatters first
+                                    // num_updates_active updates only; serial single
+                                    // workgroup either way (atomic CAS unsupported in
+                                    // naga's MSL emitter — see scatter_add.wgsl).
+                                    if params.op == 0 {
+                                        let (gx, gy, gz) = dispatch_dims(params.out_total, 64);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    } else {
+                                        pass.dispatch_workgroups(1, 1, 1);
+                                    }
+                                }
+                                Step::TopK { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let tk = topk_kernel(&dev.device);
+                                    pass.set_pipeline(&tk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::WelchPeaksGpu { params } => {
+                                    let batch_s = scale(params.welch_batch);
+                                    if batch_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let wk = welch_peaks_gpu_kernel(&dev.device);
+                                    pass.set_pipeline(&wk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(batch_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::UmapKnn { params } => {
+                                    let n_s = scale(params.n);
+                                    if n_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let uk = umap_knn_kernel(&dev.device);
+                                    pass.set_pipeline(&uk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(n_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::WgpuGpuKernel { name, workgroups } => {
+                                    // Raw-GPU custom op: fetch the cached pipeline by name
+                                    // and dispatch against the compile-time bind group.
+                                    let gk = crate::wgpu_gpu_custom::lookup(name).expect(
                                 "WgpuGpuKernel vanished from the registry between compile and run",
                             );
-                                let kernel = crate::wgpu_gpu_custom::get_or_build_pipeline(
-                                    &dev.device,
-                                    &*gk,
-                                );
-                                pass.set_pipeline(&kernel.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = *workgroups;
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::GroupedMatmul { params } => {
-                                let m_s = scale(params.m);
-                                if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let gk = grouped_matmul_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
-                            }
-                            Step::ScaledGroupedMatmul { params } => {
-                                let m_s = scale(params.m);
-                                if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let sk = scaled_grouped_matmul_decode_kernel(&dev.device);
-                                pass.set_pipeline(&sk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
-                            }
-                            Step::Sample { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let sk = sample_kernel(&dev.device);
-                                pass.set_pipeline(&sk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::SelectiveScan { params } => {
-                                // Predicate-gated to batch=1; the seq scaling
-                                // happens inside the kernel (uniform sees scaled
-                                // seq). Dispatch grid here is per-(batch, hidden);
-                                // unaffected by seq scaling.
-                                let ssk = selective_scan_kernel(&dev.device);
-                                pass.set_pipeline(&ssk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.batch * params.hidden;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::GatedDeltaNet {
-                                params,
-                                use_gpu: true,
-                                ..
-                            } => {
-                                // One workgroup per (batch, head); workgroup_size=128.
-                                let gk = gated_delta_net_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.batch * params.heads, 1, 1);
-                            }
-                            Step::Mamba2 { params } => {
-                                let mk = mamba2_kernel(&dev.device);
-                                pass.set_pipeline(&mk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.batch * params.heads * params.head_dim;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::Gru { params } => {
-                                // One workgroup per batch item (workgroup_size=256).
-                                let gk = gru_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.batch, 1, 1);
-                            }
-                            Step::Rnn { params } => {
-                                let rk = rnn_kernel(&dev.device);
-                                pass.set_pipeline(&rk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.batch, 1, 1);
-                            }
-                            Step::LstmGpu { params } => {
-                                // One workgroup per batch item (workgroup_size=256).
-                                let lk = lstm_kernel(&dev.device);
-                                pass.set_pipeline(&lk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.batch, 1, 1);
-                            }
-                            Step::DequantMatmul { params } => {
-                                let m_s = scale(params.m);
-                                if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let dk = dequant_matmul_kernel(&dev.device);
-                                pass.set_pipeline(&dk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.n.div_ceil(8), m_s.div_ceil(8), 1);
-                            }
-                            Step::DequantMatmulMlx { params } => {
-                                let m_s = scale(params.m);
-                                if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let dk = dequant_matmul_mlx_kernel(&dev.device);
-                                pass.set_pipeline(&dk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One workgroup per (col, row_tile); local size 256
-                                // splits K and stages X in workgroup memory.
-                                let n_row_tiles = m_s.div_ceil(8);
-                                pass.dispatch_workgroups(params.n * n_row_tiles, 1, 1);
-                            }
-                            Step::FusedResidualLn { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let frk = fused_residual_ln_kernel(&dev.device);
-                                pass.set_pipeline(&frk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FusedResidualLnTee { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let frtk = fused_residual_ln_tee_kernel(&dev.device);
-                                pass.set_pipeline(&frtk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::FusedResidualRmsNorm { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let frk = fused_residual_rms_norm_kernel(&dev.device);
-                                pass.set_pipeline(&frk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::AdaLayerNorm { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ak = ada_layer_norm_kernel(&dev.device);
-                                pass.set_pipeline(&ak.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::GatedResidual { params } => {
-                                let outer_s = scale(params.outer);
-                                if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let total = outer_s.saturating_mul(params.inner);
-                                let gk = gated_residual_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
-                            }
-                            Step::AdaLayerNormBackward { params } => {
-                                let mod_rows_s = scale(params.mod_rows);
-                                if mod_rows_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let ak = ada_layer_norm_backward_kernel(&dev.device);
-                                pass.set_pipeline(&ak.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(mod_rows_s, 1, 1);
-                            }
-                            Step::GatedResidualBackward { params } => {
-                                let mod_rows_s = scale(params.mod_rows);
-                                if mod_rows_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let gk = gated_residual_backward_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(mod_rows_s, 1, 1);
-                            }
-                            Step::MatmulQkv { params, kind } => {
-                                let m_s = scale(params.m);
-                                if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
-                                        gpu_bi += 1;
-                                    }
-                                    step_i += 1;
-                                    continue;
-                                }
-                                let qkv_coop_wide = matches!(kind, MatmulQkvKind::CoopF16Vk)
-                                    && crate::coop_f16_vk::use_wide_matmul(
-                                        params.b_off,
-                                        params.n,
-                                        &self.coop_f16_b_param,
-                                        &self.coop_f16_vk_wide_b,
+                                    let kernel = crate::wgpu_gpu_custom::get_or_build_pipeline(
+                                        &dev.device,
+                                        &*gk,
                                     );
-                                pass.set_bind_group(
-                                    0,
-                                    coop_f16_vk_bind_group(self, gpu_bi, qkv_coop_wide),
-                                    &[],
-                                );
-                                match kind {
-                                    MatmulQkvKind::CoopF16Vk => {
-                                        if qkv_coop_wide {
+                                    pass.set_pipeline(&kernel.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = *workgroups;
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::GroupedMatmul { params } => {
+                                    let m_s = scale(params.m);
+                                    if m_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let gk = grouped_matmul_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(
+                                        params.n.div_ceil(8),
+                                        m_s.div_ceil(8),
+                                        1,
+                                    );
+                                }
+                                Step::ScaledGroupedMatmul { params } => {
+                                    let m_s = scale(params.m);
+                                    if m_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let sk = scaled_grouped_matmul_decode_kernel(&dev.device);
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(
+                                        params.n.div_ceil(8),
+                                        m_s.div_ceil(8),
+                                        1,
+                                    );
+                                }
+                                Step::Sample { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let sk = sample_kernel(&dev.device);
+                                    pass.set_pipeline(&sk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::SelectiveScan { params } => {
+                                    // Predicate-gated to batch=1; the seq scaling
+                                    // happens inside the kernel (uniform sees scaled
+                                    // seq). Dispatch grid here is per-(batch, hidden);
+                                    // unaffected by seq scaling.
+                                    let ssk = selective_scan_kernel(&dev.device);
+                                    pass.set_pipeline(&ssk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = params.batch * params.hidden;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::GatedDeltaNet {
+                                    params,
+                                    use_gpu: true,
+                                    ..
+                                } => {
+                                    // One workgroup per (batch, head); workgroup_size=128.
+                                    let gk = gated_delta_net_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(params.batch * params.heads, 1, 1);
+                                }
+                                Step::Mamba2 { params } => {
+                                    let mk = mamba2_kernel(&dev.device);
+                                    pass.set_pipeline(&mk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let total = params.batch * params.heads * params.head_dim;
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::Gru { params } => {
+                                    // One workgroup per batch item (workgroup_size=256).
+                                    let gk = gru_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(params.batch, 1, 1);
+                                }
+                                Step::Rnn { params } => {
+                                    let rk = rnn_kernel(&dev.device);
+                                    pass.set_pipeline(&rk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(params.batch, 1, 1);
+                                }
+                                Step::LstmGpu { params } => {
+                                    // One workgroup per batch item (workgroup_size=256).
+                                    let lk = lstm_kernel(&dev.device);
+                                    pass.set_pipeline(&lk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(params.batch, 1, 1);
+                                }
+                                Step::DequantMatmul { params } => {
+                                    let m_s = scale(params.m);
+                                    if m_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let dk = dequant_matmul_kernel(&dev.device);
+                                    pass.set_pipeline(&dk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(
+                                        params.n.div_ceil(8),
+                                        m_s.div_ceil(8),
+                                        1,
+                                    );
+                                }
+                                Step::DequantMatmulMlx { params } => {
+                                    let m_s = scale(params.m);
+                                    if m_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let dk = dequant_matmul_mlx_kernel(&dev.device);
+                                    pass.set_pipeline(&dk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // One workgroup per (col, row_tile); local size 256
+                                    // splits K and stages X in workgroup memory.
+                                    let n_row_tiles = m_s.div_ceil(8);
+                                    pass.dispatch_workgroups(params.n * n_row_tiles, 1, 1);
+                                }
+                                Step::FusedResidualLn { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let frk = fused_residual_ln_kernel(&dev.device);
+                                    pass.set_pipeline(&frk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FusedResidualLnTee { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let frtk = fused_residual_ln_tee_kernel(&dev.device);
+                                    pass.set_pipeline(&frtk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    // One workgroup (64 threads) per row.
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(outer_s.saturating_mul(64), 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::FusedResidualRmsNorm { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let frk = fused_residual_rms_norm_kernel(&dev.device);
+                                    pass.set_pipeline(&frk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::AdaLayerNorm { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ak = ada_layer_norm_kernel(&dev.device);
+                                    pass.set_pipeline(&ak.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::GatedResidual { params } => {
+                                    let outer_s = scale(params.outer);
+                                    if outer_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let total = outer_s.saturating_mul(params.inner);
+                                    let gk = gated_residual_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) = dispatch_dims(total, 64);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
+                                Step::AdaLayerNormBackward { params } => {
+                                    let mod_rows_s = scale(params.mod_rows);
+                                    if mod_rows_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let ak = ada_layer_norm_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&ak.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(mod_rows_s, 1, 1);
+                                }
+                                Step::GatedResidualBackward { params } => {
+                                    let mod_rows_s = scale(params.mod_rows);
+                                    if mod_rows_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let gk = gated_residual_backward_kernel(&dev.device);
+                                    pass.set_pipeline(&gk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    pass.dispatch_workgroups(mod_rows_s, 1, 1);
+                                }
+                                Step::MatmulQkv { params, kind } => {
+                                    let m_s = scale(params.m);
+                                    if m_s == 0 {
+                                        if !matches!(step, Step::FftGpu { .. }) {
+                                            gpu_bi += 1;
+                                        }
+                                        step_i += 1;
+                                        continue;
+                                    }
+                                    let qkv_coop_wide = matches!(kind, MatmulQkvKind::CoopF16Vk)
+                                        && crate::coop_f16_vk::use_wide_matmul(
+                                            params.b_off,
+                                            params.n,
+                                            &self.coop_f16_b_param,
+                                            &self.coop_f16_vk_wide_b,
+                                        );
+                                    pass.set_bind_group(
+                                        0,
+                                        coop_f16_vk_bind_group(self, gpu_bi, qkv_coop_wide),
+                                        &[],
+                                    );
+                                    match kind {
+                                        MatmulQkvKind::CoopF16Vk => {
+                                            if qkv_coop_wide {
+                                                pass.set_pipeline(
+                                                    &matmul_qkv_kernel(&dev.device).pipeline,
+                                                );
+                                                pass.dispatch_workgroups(
+                                                    params.n.div_ceil(32),
+                                                    m_s.div_ceil(32),
+                                                    1,
+                                                );
+                                            } else {
+                                                let n_eff = scale(params.n);
+                                                let mqk = matmul_qkv_coop_f16_vk_active_kernel(
+                                                    &dev.device,
+                                                    n_eff,
+                                                )
+                                                .expect("coop f16 matmul_qkv kernel missing");
+                                                pass.set_pipeline(&mqk.pipeline);
+                                                pass.dispatch_workgroups(
+                                                    m_s.div_ceil(16),
+                                                    params.n.div_ceil(16),
+                                                    1,
+                                                );
+                                            }
+                                        }
+                                        MatmulQkvKind::CoopF32 => {
+                                            pass.set_pipeline(
+                                                &matmul_qkv_coop_f32_kernel(&dev.device)
+                                                    .expect("coop matmul_qkv kernel missing")
+                                                    .pipeline,
+                                            );
+                                            pass.dispatch_workgroups(
+                                                params.n.div_ceil(32),
+                                                m_s.div_ceil(32),
+                                                1,
+                                            );
+                                        }
+                                        MatmulQkvKind::F32 => {
                                             pass.set_pipeline(
                                                 &matmul_qkv_kernel(&dev.device).pipeline,
                                             );
@@ -3146,107 +3440,167 @@ impl WgpuExecutable {
                                                 m_s.div_ceil(32),
                                                 1,
                                             );
-                                        } else {
-                                            let n_eff = scale(params.n);
-                                            let mqk = matmul_qkv_coop_f16_vk_active_kernel(
-                                                &dev.device,
-                                                n_eff,
-                                            )
-                                            .expect("coop f16 matmul_qkv kernel missing");
-                                            pass.set_pipeline(&mqk.pipeline);
-                                            pass.dispatch_workgroups(
-                                                m_s.div_ceil(16),
-                                                params.n.div_ceil(16),
-                                                1,
-                                            );
                                         }
                                     }
-                                    MatmulQkvKind::CoopF32 => {
-                                        pass.set_pipeline(
-                                            &matmul_qkv_coop_f32_kernel(&dev.device)
-                                                .expect("coop matmul_qkv kernel missing")
-                                                .pipeline,
-                                        );
-                                        pass.dispatch_workgroups(
-                                            params.n.div_ceil(32),
-                                            m_s.div_ceil(32),
-                                            1,
-                                        );
-                                    }
-                                    MatmulQkvKind::F32 => {
-                                        pass.set_pipeline(&matmul_qkv_kernel(&dev.device).pipeline);
-                                        pass.dispatch_workgroups(
-                                            params.n.div_ceil(32),
-                                            m_s.div_ceil(32),
-                                            1,
-                                        );
-                                    }
                                 }
+                                Step::GatherSplit { .. }
+                                | Step::DequantMatmulGguf { .. }
+                                | Step::DequantMatmulInt8Host { .. }
+                                | Step::DequantMatmulMlxHost { .. }
+                                | Step::Conv2dHost { .. }
+                                | Step::DequantGroupedMatmulGguf { .. }
+                                | Step::DequantGroupedMatmulMlxHost { .. }
+                                | Step::GatedDeltaNet { use_gpu: false, .. }
+                                | Step::Lstm { .. }
+                                | Step::ConvTranspose2d { .. }
+                                | Step::ConvTranspose3dHost { .. }
+                                | Step::GroupNormHost { .. }
+                                | Step::LayerNorm2dHost { .. }
+                                | Step::ResizeNearest2xHost { .. }
+                                | Step::ReverseHost { .. }
+                                | Step::ArgReduceHost { .. }
+                                | Step::AxialRope2dHost { .. }
+                                | Step::GruHost { .. }
+                                | Step::RnnHost { .. }
+                                | Step::Llada2GroupLimitedGate { .. }
+                                | Step::UmapKnnHost { .. }
+                                | Step::MsDeformAttnHost { .. }
+                                | Step::CollectiveHost { .. }
+                                | Step::CustomHost { .. }
+                                | Step::FftHost { .. }
+                                | Step::FftQHost { .. }
+                                | Step::ScanHost { .. }
+                                | Step::HostOp { .. }
+                                | Step::CpuIndexing { .. }
+                                | Step::ConcatHost { .. }
+                                | Step::ConcatHostPieces { .. }
+                                | Step::TransposeHost { .. }
+                                | Step::NarrowHost { .. }
+                                | Step::ExpandHost { .. }
+                                | Step::SpdHost { .. }
+                                | Step::Im2ColHost { .. }
+                                | Step::Conv2dBackwardWeightHost { .. }
+                                | Step::Conv2dBackwardInputHost { .. }
+                                | Step::RngNormalHost { .. }
+                                | Step::RngUniformHost { .. }
+                                | Step::WelchPeaksHost { .. }
+                                | Step::LogMelHost { .. }
+                                | Step::LogMelBackwardHost { .. } => {}
+                                #[cfg(feature = "splat")]
+                                Step::GaussianSplatRender { .. }
+                                | Step::GaussianSplatRenderBackward { .. }
+                                | Step::GaussianSplatPrepare { .. }
+                                | Step::GaussianSplatRasterize { .. } => {}
                             }
-                            Step::GatherSplit { .. }
-                            | Step::DequantMatmulGguf { .. }
-                            | Step::DequantMatmulInt8Host { .. }
-                            | Step::DequantMatmulMlxHost { .. }
-                            | Step::Conv2dHost { .. }
-                            | Step::DequantGroupedMatmulGguf { .. }
-                            | Step::DequantGroupedMatmulMlxHost { .. }
-                            | Step::GatedDeltaNet { use_gpu: false, .. }
-                            | Step::Lstm { .. }
-                            | Step::ConvTranspose2d { .. }
-                            | Step::ConvTranspose3dHost { .. }
-                            | Step::GroupNormHost { .. }
-                            | Step::LayerNorm2dHost { .. }
-                            | Step::ResizeNearest2xHost { .. }
-                            | Step::ReverseHost { .. }
-                            | Step::ArgReduceHost { .. }
-                            | Step::AxialRope2dHost { .. }
-                            | Step::GruHost { .. }
-                            | Step::RnnHost { .. }
-                            | Step::Llada2GroupLimitedGate { .. }
-                            | Step::UmapKnnHost { .. }
-                            | Step::MsDeformAttnHost { .. }
-                            | Step::CollectiveHost { .. }
-                            | Step::CustomHost { .. }
-                            | Step::FftHost { .. }
-                            | Step::FftQHost { .. }
-                            | Step::ScanHost { .. }
-                            | Step::HostOp { .. }
-                            | Step::CpuIndexing { .. }
-                            | Step::ConcatHost { .. }
-                            | Step::ConcatHostPieces { .. }
-                            | Step::TransposeHost { .. }
-                            | Step::NarrowHost { .. }
-                            | Step::ExpandHost { .. }
-                            | Step::SpdHost { .. }
-                            | Step::Im2ColHost { .. }
-                            | Step::Conv2dBackwardWeightHost { .. }
-                            | Step::Conv2dBackwardInputHost { .. }
-                            | Step::RngNormalHost { .. }
-                            | Step::RngUniformHost { .. }
-                            | Step::WelchPeaksHost { .. }
-                            | Step::LogMelHost { .. }
-                            | Step::LogMelBackwardHost { .. } => {}
-                            #[cfg(feature = "splat")]
-                            Step::GaussianSplatRender { .. }
-                            | Step::GaussianSplatRenderBackward { .. }
-                            | Step::GaussianSplatPrepare { .. }
-                            | Step::GaussianSplatRasterize { .. } => {}
-                        }
-                        if !matches!(step, Step::FftGpu { .. }) {
-                            gpu_bi += 1;
-                        }
-                        if rlx_ir::env::flag("RLX_WGPU_DBG_COUNTERS") {
-                            eprintln!(
-                                "[wgpu-bi] step {step_i} {} -> gpu_bi now {gpu_bi}",
-                                step_name(step)
-                            );
-                        }
-                        step_i += 1;
-                        pass_dispatched = true;
-                        if one_op_per_pass {
-                            break; // end the pass after this op ⇒ barrier before next
+                            if !matches!(step, Step::FftGpu { .. }) {
+                                gpu_bi += 1;
+                            }
+                            if rlx_ir::env::flag("RLX_WGPU_DBG_COUNTERS") {
+                                eprintln!(
+                                    "[wgpu-bi] step {step_i} {} -> gpu_bi now {gpu_bi}",
+                                    step_name(step)
+                                );
+                            }
+                            if crate::step_profile::active() {
+                                crate::step_profile::label_last(profile_label(step));
+                            }
+                            step_i += 1;
+                            pass_dispatched = true;
+                            if one_op_per_pass {
+                                break; // end the pass after this op ⇒ barrier before next
+                            }
                         }
                     }
+                    // A GGUF GEMV that needs nothing from the host joins this
+                    // submission instead of ending it: encoded into the same
+                    // command encoder (its own pass, then a copy into the arena),
+                    // and the section carries on in a new pass. Ending the section
+                    // here cost a submit + wait per weight matrix — ~190 per
+                    // Qwen3.5-0.8B decode token, ~95% of its wall time.
+                    if step_i < self.schedule.len()
+                        && !one_op_per_pass
+                        && !rlx_ir::env::flag("RLX_WGPU_GGUF_OWN_SUBMIT")
+                        && !(self.static_once_done && self.static_once_steps.contains(&step_i))
+                        && gguf_step_is_gpu_only(&self.schedule[step_i], active)
+                        && let Step::DequantMatmulGguf {
+                            m,
+                            k,
+                            n,
+                            scheme_id,
+                            x_byte_off,
+                            w_byte_off,
+                            out_byte_off,
+                        } = self.schedule[step_i]
+                    {
+                        let rows = scale(m) as usize;
+                        let mut plans = self.gemv_plans.lock().unwrap_or_else(|e| e.into_inner());
+                        let plan = plans.entry((step_i, rows)).or_insert_with(|| {
+                            crate::gguf_gpu::plan_dequant_gemv_in_arena(
+                                &self.arena,
+                                &dev.device,
+                                &dev.queue,
+                                rows,
+                                k as usize,
+                                n as usize,
+                                scheme_id,
+                                x_byte_off as usize,
+                                w_byte_off as usize,
+                                out_byte_off as usize,
+                            )
+                        });
+                        match plan {
+                            Some(plan) => plan.encode(&mut enc),
+                            None => crate::gguf_gpu::encode_dequant_matmul_gguf_into(
+                                &self.arena,
+                                &dev.device,
+                                &dev.queue,
+                                &mut enc,
+                                rows,
+                                k as usize,
+                                n as usize,
+                                scheme_id,
+                                x_byte_off as usize,
+                                w_byte_off as usize,
+                                out_byte_off as usize,
+                            ),
+                        }
+                        drop(plans);
+                        step_i += 1;
+                        pass_dispatched = true;
+                        continue;
+                    }
+                    // Likewise a `BufferCopy` that is a plain copy inside the
+                    // activation arena (an in-place `KvAppend` row, for one).
+                    if step_i < self.schedule.len()
+                        && !one_op_per_pass
+                        && !(self.static_once_done && self.static_once_steps.contains(&step_i))
+                        && let Step::BufferCopy {
+                            src_byte_off,
+                            dst_byte_off,
+                            bytes,
+                        } = self.schedule[step_i]
+                        && let Some(window) = buffer_copy_gpu_window(
+                            &self.arena,
+                            src_byte_off,
+                            dst_byte_off,
+                            u64::from(bytes),
+                            dev.device.limits().max_storage_buffer_binding_size,
+                        )
+                    {
+                        encode_arena_copy(
+                            &self.arena,
+                            dev,
+                            &mut enc,
+                            src_byte_off,
+                            dst_byte_off,
+                            u64::from(bytes),
+                            window,
+                        );
+                        step_i += 1;
+                        pass_dispatched = true;
+                        continue;
+                    }
+                    break;
                 }
                 let needs_f16_drain = step_i < self.schedule.len()
                     && !step_runs_on_host(&self.schedule[step_i])
@@ -3282,6 +3636,7 @@ impl WgpuExecutable {
                             &layout,
                         );
                         let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
+                        crate::step_profile::resolve(&mut enc);
                         let sub = dev.queue.submit(std::iter::once(enc.finish()));
                         wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
@@ -3309,6 +3664,7 @@ impl WgpuExecutable {
                         fused_readback = Some((layout, map_rx, plan));
                     }
                 }
+                crate::step_profile::resolve(&mut enc);
                 let main_submission = dev.queue.submit(std::iter::once(enc.finish()));
                 if defer_tail {
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
@@ -3377,8 +3733,13 @@ impl WgpuExecutable {
                 if needs_f16_drain {
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                 }
-                let need_host_sync =
-                    step_i < self.schedule.len() && step_runs_on_host(&self.schedule[step_i]);
+                // A GGUF matmul that takes the fused GEMV only encodes and
+                // submits its own dispatches — the queue orders it after this
+                // section, so waiting for the GPU here is pure stall (one full
+                // round trip per matmul: ~190 per Qwen3.5 decode token).
+                let need_host_sync = step_i < self.schedule.len()
+                    && step_runs_on_host(&self.schedule[step_i])
+                    && !gguf_step_is_gpu_only(&self.schedule[step_i], self.active_extent);
                 if need_host_sync {
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     // Only invalidate after real GPU work. Host→Host chains share
@@ -3511,6 +3872,31 @@ impl WgpuExecutable {
                             let dst_hi = dst.saturating_add(nbytes.saturating_sub(1));
                             src / s != src_hi / s || dst / s != dst_hi / s || src / s != dst / s
                         };
+                    // Weight → arena: two distinct buffers, so a plain GPU copy is
+                    // legal. This used to take the host round trip below — a
+                    // blocking readback + re-upload per copy, 56 per Qwen3-0.6B
+                    // decode step, which made host syncs the dominant decode
+                    // cost on wgpu. Deferred mirror writes keep the old path
+                    // (they must land first and are flushed there).
+                    if src_is_weight
+                        && !dst_is_weight
+                        && !host_cache.has_deferred_writes()
+                        && !rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
+                    {
+                        self.arena.copy_weight_to_act(
+                            &dev.device,
+                            &dev.queue,
+                            src as usize,
+                            dst as usize,
+                            nbytes as usize,
+                        );
+                        // The mirror is keyed by offset and an older, longer
+                        // entry can span `dst`; with no deferred writes pending,
+                        // dropping the read mirror is free of data loss.
+                        host_cache.clear();
+                        step_i += 1;
+                        continue;
+                    }
                     if hi.saturating_sub(lo) > max_binding
                         || cross_shard
                         || self.arena.is_sharded()
@@ -3526,14 +3912,16 @@ impl WgpuExecutable {
                         let data = if let Some(hit) = host_cache.get_arc_covering(src_u, n_f32) {
                             hit[..n_f32].to_vec()
                         } else {
-                            if host_cache.is_dirty(src_u) {
+                            // Any deferred write inside the source range, not
+                            // only one keyed at `src` (see `flush_range`).
+                            if host_cache.has_deferred_writes() {
                                 let mut a = crate::host_stage::WgpuArena {
                                     arena: &self.arena,
                                     device: &dev.device,
                                     queue: &dev.queue,
                                     size_bytes: 0,
                                 };
-                                host_cache.flush_offset(&mut a, src_u);
+                                host_cache.flush_range(&mut a, src_u, nbytes as usize);
                             }
                             let bytes_host = self.arena.read_bytes_range(
                                 &dev.device,
@@ -5027,12 +5415,25 @@ impl WgpuExecutable {
             if bypasses_host_cache {
                 host_cache.clear();
             }
+            // Same reasoning after the step: a submit-only GEMV left nothing on
+            // the host for the next GPU section to wait for.
+            let submit_only = gguf_step_is_gpu_only(&self.schedule[step_i], self.active_extent);
             step_i += 1;
             // Host paths stage with `queue.write_buffer` (no submit). Flush
             // deferred mirrors before the next GPU compute pass so kernels see
             // host results on discrete Vulkan/DX12.
-            if step_i < self.schedule.len() {
-                let next = &self.schedule[step_i];
+            // Look past the static-once steps the loop top is about to skip.
+            // Deciding on the raw next step was wrong whenever that step is a
+            // skipped weight pack: a host Silu followed by the (skipped)
+            // ConcatHost of a fused QKV/adaLN weight saw "host next, no flush",
+            // then landed straight on a GPU matmul whose pass clears the mirror,
+            // dropping the deferred host outputs unflushed. A later host step
+            // then read that slot's previous tenant from the device — run 1
+            // exact, every later run wrong (MontageFlow's final layer on
+            // discrete Vulkan with matmul-bias fusion off).
+            let next_i = self.next_live_step(step_i);
+            if next_i < self.schedule.len() {
+                let next = &self.schedule[next_i];
                 if !step_runs_on_host(next) && !step_is_tail_host(next) {
                     if host_cache.has_deferred_writes() {
                         let mut a = crate::host_stage::WgpuArena {
@@ -5043,7 +5444,9 @@ impl WgpuExecutable {
                         };
                         host_cache.flush_to_device(&mut a);
                     }
-                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    if !submit_only {
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    }
                     // Keep mirrors until GPU actually runs (cleared when
                     // `pass_dispatched` on the next host sync).
                 }
@@ -5056,7 +5459,7 @@ impl WgpuExecutable {
                 };
                 host_cache.flush_to_device(&mut a);
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-            } else {
+            } else if !submit_only {
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             }
         }
@@ -5128,10 +5531,12 @@ impl WgpuExecutable {
             }
         }
 
-        if rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") {
-            if !self.static_once_done && !self.static_once_steps.is_empty() {
-                self.static_once_done = true;
-            }
+        // `dispatch_only` (the browser's `run_async`, which reads back itself
+        // without blocking) must stop here too: a schedule that ENDS on a host
+        // step — a GGUF LM head — never reaches the GPU-section early return,
+        // and the blocking read below spins forever on wasm's single thread.
+        if rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") || self.dispatch_only {
+            self.arm_static_once();
             return self
                 .graph
                 .outputs
@@ -5142,9 +5547,7 @@ impl WgpuExecutable {
                 })
                 .collect();
         }
-        if !self.static_once_done && !self.static_once_steps.is_empty() {
-            self.static_once_done = true;
-        }
+        self.arm_static_once();
         let out_ids: Vec<_> = self.graph.outputs.clone();
         read_f32_many_pooled(
             &self.arena,
@@ -5222,4 +5625,144 @@ fn wgpu_rng_dispatch(
     queue.submit(std::iter::once(enc.finish()));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     host_cache.invalidate(dst as usize);
+}
+
+/// A `DequantMatmulGguf` step that will take the scratch-free fused GEMV —
+/// the same condition the executor uses to pick it — rather than a path that
+/// reads the arena back to the CPU.
+/// The bind window `(base, size)` for a `BufferCopy` that can run as a plain
+/// GPU copy within the activation arena, or `None` when it has to stage
+/// through the host: an operand in the weight buffer, a sharded arena, a span
+/// wider than one storage binding, a discrete cooperative-matrix backend, or
+/// `RLX_WGPU_HOST_BUFFER_COPY`. The same decision the step's own GPU path
+/// makes, minus pending host writes — which a step encoded mid-section never
+/// has.
+fn buffer_copy_gpu_window(
+    arena: &crate::buffer::Arena,
+    src: u64,
+    dst: u64,
+    nbytes: u64,
+    max_binding: u64,
+) -> Option<(u64, u64)> {
+    if crate::buffer::is_weight_off(src as usize)
+        || crate::buffer::is_weight_off(dst as usize)
+        || arena.is_sharded()
+        || crate::device::coop_discrete_backend()
+        || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
+    {
+        return None;
+    }
+    let lo = src.min(dst);
+    let hi = src.saturating_add(nbytes).max(dst.saturating_add(nbytes));
+    if hi.saturating_sub(lo) > max_binding {
+        return None;
+    }
+    // The window must cover [base, hi] with `base` floored to 256 B (≤ lo);
+    // sizing from `lo` instead clips a copy that straddles a 256 B boundary.
+    let mut base = (lo / 256) * 256;
+    let span = hi.saturating_sub(base).max(1);
+    let size = (span.div_ceil(256) * 256).max(256).min(max_binding);
+    if base.saturating_add(size) > arena.size as u64 {
+        base = ((arena.size as u64).saturating_sub(size) / 256) * 256;
+    }
+    Some((base, size))
+}
+
+/// Encode a `BufferCopy` as the copy kernel over `window` into `enc`.
+fn encode_arena_copy(
+    arena: &crate::buffer::Arena,
+    dev: &crate::device::WgpuDevice,
+    enc: &mut wgpu::CommandEncoder,
+    src: u64,
+    dst: u64,
+    nbytes: u64,
+    (base, size): (u64, u64),
+) {
+    let elems = (nbytes / 4).max(1) as u32;
+    let p = CopyParams {
+        n: elems,
+        in_off: (src.saturating_sub(base) / 4) as u32,
+        out_off: (dst.saturating_sub(base) / 4) as u32,
+        _p0: 0,
+        _p1: 0,
+        _p2: 0,
+        _p3: 0,
+        _p4: 0,
+    };
+    let ck = copy_kernel(&dev.device);
+    let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rlx-wgpu arena_copy uniform"),
+        size: std::mem::size_of::<CopyParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+    let bg = bind_arena_window(&dev.device, ck, arena, base, size, &u);
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("rlx-wgpu arena_copy pass"),
+        ..Default::default()
+    });
+    pass.set_pipeline(&ck.pipeline);
+    pass.set_bind_group(0, &bg, &[]);
+    let (gx, gy, gz) = dispatch_dims(elems, 64);
+    pass.dispatch_workgroups(gx, gy, gz);
+}
+
+/// Attention rows (batch · heads · query rows) up to which a step takes the
+/// cooperative kernel (a workgroup per row) instead of a thread per row. Below
+/// it the per-row kernel launches too few threads to occupy a GPU; above it
+/// there are enough rows to.
+const ATTENTION_COOP_MAX_ROWS: u32 = 16_384;
+
+fn gguf_step_is_gpu_only(step: &Step, active_extent: Option<(usize, usize)>) -> bool {
+    let Step::DequantMatmulGguf {
+        m, k, scheme_id, ..
+    } = step
+    else {
+        return false;
+    };
+    if !crate::gguf_gpu::gemv_supports_scheme(*scheme_id) {
+        return false;
+    }
+    let m = match active_extent {
+        Some((a, u)) if u > 0 => (*m as usize * a).div_ceil(u).min(*m as usize),
+        _ => *m as usize,
+    };
+    let block = crate::gguf_host::scheme_from_id(*scheme_id).gguf_block_size() as usize;
+    m == 1 || *scheme_id == 24 || (*k as usize).is_multiple_of(block.max(1))
+}
+
+/// Step-profile label: the step kind, plus the shape for the kinds whose cost
+/// depends on it (`RLX_WGPU_STEP_PROFILE`).
+fn profile_label(step: &Step) -> &'static str {
+    match step {
+        Step::Matmul {
+            m,
+            k,
+            n,
+            batch,
+            compute_precision,
+            ..
+        } => {
+            crate::step_profile::intern(format!("matmul {batch}x{m}x{k}x{n} {compute_precision:?}"))
+        }
+        Step::Attention { params, .. } => crate::step_profile::intern(format!(
+            "attention q{} k{} h{} d{}",
+            params.seq_q, params.seq_k, params.heads, params.head_dim
+        )),
+        Step::Narrow { params } => crate::step_profile::intern(format!(
+            "narrow total{} o{} i{} ax{}->{}@{}",
+            params.total,
+            params.outer,
+            params.inner,
+            params.axis_in_size,
+            params.axis_out_size,
+            params.start
+        )),
+        Step::Concat { params } => crate::step_profile::intern(format!(
+            "concat total{} o{} i{} ax{}->{}",
+            params.total, params.outer, params.inner, params.axis_in_size, params.axis_out_size
+        )),
+        other => step_name(other),
+    }
 }

@@ -59,7 +59,7 @@ fn dq_read_f16(rel: u32) -> f32 {
     let mant = bits & 0x3FFu;
     var v: f32;
     if (exp == 0u) { v = f32(mant) / 1024.0 * exp2(-14.0); }
-    else if (exp == 31u) { v = select(0.0, bitcast<f32>(0x7f800000u), mant == 0u); }
+    else if (exp == 31u) { v = bitcast<f32>(select(0u, 0x7f800000u, mant == 0u)); }
     else { v = (1.0 + f32(mant) / 1024.0) * exp2(f32(i32(exp) - 15)); }
     return select(v, -v, sign != 0u);
 }
@@ -637,7 +637,7 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
             let mant = sc_u16 & 0x3FFu;
             var d: f32;
             if (exp_v == 0u) { d = f32(mant) / 1024.0 * exp2(-14.0); }
-            else if (exp_v == 31u) { d = select(0.0, bitcast<f32>(0x7f800000u), mant == 0u); }
+            else if (exp_v == 31u) { d = bitcast<f32>(select(0u, 0x7f800000u, mant == 0u)); }
             else { d = (1.0 + f32(mant) / 1024.0) * exp2(f32(i32(exp_v) - 15)); }
             if (sign != 0u) { d = -d; }
             var y = 0u;

@@ -50,7 +50,7 @@ pub struct TensorSlot {
 
 /// Graph methods that do **not** take a node first, so there is nothing to
 /// chain them onto. `input`/`param`/`constant` are sources; `zeros`/`full`/
-/// `fftfreq` are constants; `concat`/`customFn` take a list; `shapeOf` is what
+/// `fftfreq` are constants; `concat`/`customFn`/`customFnMulti` take a list, `customOp` a name; `shapeOf` is what
 /// `.dims` and `.dtype` are built from.
 const NOT_CHAINABLE: &[&str] = &[
     "input",
@@ -71,6 +71,8 @@ const NOT_CHAINABLE: &[&str] = &[
     "rfftfreq",
     "concat",
     "customFn",
+    "customFnMulti",
+    "customOp",
     "__class",
 ];
 

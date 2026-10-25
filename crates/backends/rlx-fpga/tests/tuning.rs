@@ -14,6 +14,9 @@
 //! * Resource estimator moves resources in the expected directions
 //!   across presets.
 
+// Emits files / goes through `rlx-ir`: both need the `std` feature.
+#![cfg(feature = "std")]
+
 use rlx_fpga::codegen::{collect_artifacts_opt, emit_model_tuned};
 use rlx_fpga::estimate::estimate;
 use rlx_fpga::model::{Layer, Model, tinyconv_mnist_from_cortexm};

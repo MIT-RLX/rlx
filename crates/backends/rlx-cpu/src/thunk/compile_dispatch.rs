@@ -14,6 +14,11 @@ pub fn compile_thunks(graph: &Graph, arena: &Arena) -> ThunkSchedule {
 /// carry) — into a [`ScanBodyPlan`]. RNG ops inside the body are not supported
 /// via this path (scan bodies are deterministic recurrences).
 pub fn compile_scan_body(body: &Graph, num_bcast: usize, num_xs: usize) -> ScanBodyPlan {
+    // The body runs on the same thunks as any graph, so it gets the same
+    // preparation: integer tensors kept as integers around the f32 kernels
+    // (an I32 gather index read as f32 bits selected row 0), claimed fused
+    // ops expanded. Inputs keep their order, so the slots below still follow.
+    let body = &crate::expand::prepare_graph_for_thunks(body.clone());
     let body_plan = rlx_opt::memory::plan_memory(body);
     let body_offsets: HashMap<NodeId, usize> = body_plan
         .assignments
@@ -165,6 +170,7 @@ pub fn compile_thunks_with_rng(
         }
     }
 
+    let readers = rlx_opt::memory::ReaderIndex::new(graph);
     for n in graph.nodes() {
         if !matches!(n.op, Op::MatMul) {
             continue;
@@ -179,8 +185,16 @@ pub fn compile_thunks_with_rng(
         // Shared with the memory planner, which skips reserving arena for these
         // nodes — restating the condition here would risk emitting a transpose
         // into a buffer that was never allocated.
-        let fold_a = rlx_opt::memory::is_elidable_matmul_transpose(graph, graph.node(a_id));
-        let fold_b = rlx_opt::memory::is_elidable_matmul_transpose(graph, graph.node(b_id));
+        let fold_a = rlx_opt::memory::is_elidable_matmul_transpose_indexed(
+            graph,
+            graph.node(a_id),
+            &readers,
+        );
+        let fold_b = rlx_opt::memory::is_elidable_matmul_transpose_indexed(
+            graph,
+            graph.node(b_id),
+            &readers,
+        );
         if !fold_a && !fold_b {
             continue;
         }
@@ -293,6 +307,16 @@ pub fn compile_thunks_with_rng(
         if sgd_elim.contains(&node.id) {
             thunks.push(Thunk::Nop);
             continue;
+        }
+        // F64 composites (a graph promoted by `NumberFormat::F64`): the f32
+        // kernels below would read the f64 buffers as f32.
+        if node.shape.dtype() == rlx_ir::DType::F64 {
+            let in_shapes: Vec<&Shape> =
+                node.inputs.iter().map(|i| &graph.node(*i).shape).collect();
+            if let Some(k) = crate::f64_kernels::kernel_for(&node.op, &in_shapes) {
+                thunks.push(compile_spd_custom(node, graph, arena, k));
+                continue;
+            }
         }
         let t = match &node.op {
             Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => Thunk::Nop,
@@ -510,7 +534,19 @@ pub fn compile_thunks_with_rng(
                 let idx_len = get_len(graph, node.inputs[1]);
                 let idx_i64 =
                     u8::from(graph.node(node.inputs[1]).shape.dtype() == rlx_ir::DType::I64);
-                let table_bytes = graph.node(node.inputs[0]).shape.dtype().size_bytes() as u8;
+                let table_dtype = graph.node(node.inputs[0]).shape.dtype();
+                let table_bytes = table_dtype.size_bytes() as u8;
+                // Packed only where the slot really is 2 B/elem (a half
+                // param), and only into an f32-wide output.
+                let packed = matches!(table_dtype, rlx_ir::DType::F16 | rlx_ir::DType::BF16)
+                    && arena.has_buffer(node.inputs[0])
+                    && !crate::thunk::ops::half_slot_is_widened(graph, arena, node.inputs[0])
+                    && !matches!(node.shape.dtype(), rlx_ir::DType::F16 | rlx_ir::DType::BF16);
+                let table_half = match table_dtype {
+                    rlx_ir::DType::F16 if packed => 1,
+                    rlx_ir::DType::BF16 if packed => 2,
+                    _ => 0,
+                };
                 Thunk::Gather {
                     table: node_offset(arena, node.inputs[0]),
                     table_len: table_total as u32,
@@ -520,6 +556,7 @@ pub fn compile_thunks_with_rng(
                     trailing: trailing as u32,
                     idx_i64,
                     table_bytes,
+                    table_half,
                 }
             }
 
@@ -568,6 +605,39 @@ pub fn compile_thunks_with_rng(
                 ste,
                 scale_mode,
             } => compile_fake_quantize(node, graph, arena, &matmul_fold, &rng_shared, rng),
+            Op::DoubleSingle(op) => {
+                use rlx_ir::double_single::{DfPlan, logical_dims};
+                let dims = |id: NodeId| -> Vec<usize> {
+                    graph
+                        .node(id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect()
+                };
+                let ins: Vec<Vec<usize>> = node
+                    .inputs
+                    .iter()
+                    .map(|&i| logical_dims(&dims(i)).to_vec())
+                    .collect();
+                let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                let out_dims = dims(node.id);
+                let out_logical = logical_dims(&out_dims);
+                let plan =
+                    DfPlan::new(op, &refs, out_logical).unwrap_or_else(|e| panic!("rlx-cpu: {e}"));
+                let numel = |v: &[usize]| v.iter().product::<usize>();
+                Thunk::DoubleSingle {
+                    op: op.clone(),
+                    plan,
+                    a: node_offset(arena, node.inputs[0]),
+                    a_len: numel(&ins[0]),
+                    b: node.inputs.get(1).map_or(0, |&b| node_offset(arena, b)),
+                    b_len: ins.get(1).map_or(0, |v| numel(v)),
+                    out: node_offset(arena, node.id),
+                    out_len: numel(out_logical),
+                }
+            }
             Op::RoundToFormat { format, scaling } => Thunk::RoundToFormat {
                 x: node_offset(arena, node.inputs[0]),
                 out: node_offset(arena, node.id),
@@ -1284,6 +1354,7 @@ pub fn compile_thunks_with_rng(
                 arena,
                 std::sync::Arc::new(crate::spd_kernels::SpdBnBackwardGKernel { eps: *eps as f64 }),
             ),
+            Op::While { .. } => compile_while(node, arena),
             Op::Scan {
                 body,
                 length,
@@ -1311,6 +1382,25 @@ pub fn compile_thunks_with_rng(
             } => compile_scan_backward_xs(node, graph, arena, &matmul_fold, &rng_shared, rng),
             Op::Concat { axis } => {
                 compile_concat(node, graph, arena, &matmul_fold, &rng_shared, rng)
+            }
+            Op::DynamicUpdateSlice { axis } => {
+                let operand = &graph.node(node.inputs[0]).shape;
+                let update = &graph.node(node.inputs[1]).shape;
+                let dim = |s: &rlx_ir::Shape, i: usize| s.dim(i).unwrap_static();
+                let outer: usize = (0..*axis).map(|i| dim(operand, i)).product();
+                let inner: usize = (*axis + 1..operand.rank())
+                    .map(|i| dim(operand, i))
+                    .product();
+                Thunk::DynamicUpdateSlice {
+                    src: arena.byte_offset(node.inputs[1]),
+                    dst: arena.byte_offset(node.id),
+                    start: arena.byte_offset(node.inputs[2]),
+                    start_dtype: graph.node(node.inputs[2]).shape.dtype(),
+                    outer: outer.max(1) as u32,
+                    extent: dim(operand, *axis) as u32,
+                    rows: dim(update, *axis) as u32,
+                    row_bytes: (inner.max(1) * operand.dtype().size_bytes().max(1)) as u32,
+                }
             }
             Op::KvAppend { axis, pos } => {
                 // The stride between outer slices is the CACHE's capacity, not
@@ -1394,7 +1484,7 @@ pub fn compile_thunks_with_rng(
             Op::Custom { name, attrs, .. } => {
                 compile_custom(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
-            Op::Fft { inverse, norm } => {
+            Op::Fft { inverse, norm, .. } => {
                 compile_fft(node, graph, arena, &matmul_fold, &rng_shared, rng)
             }
             Op::FftQ { .. } => compile_fft_q(node, graph, arena, &matmul_fold, &rng_shared, rng),
@@ -1647,6 +1737,10 @@ pub fn compile_thunks_with_rng(
                     })
                 }
 
+                Thunk::Gather { table_half, .. } if table_half != 0 => {
+                    let t = thunk.clone();
+                    Arc::new(move |base: *mut u8| crate::thunk::ops::exec_gather(&t, base))
+                }
                 Thunk::Gather {
                     table,
                     table_len,
@@ -1656,6 +1750,7 @@ pub fn compile_thunks_with_rng(
                     trailing,
                     idx_i64,
                     table_bytes,
+                    ..
                 } => {
                     let (ni, tr, tl) = (num_idx as usize, trailing as usize, table_len as usize);
                     let rows = tl / tr.max(1);
@@ -2824,8 +2919,22 @@ pub fn compile_thunks_with_rng(
                     inverse,
                     norm_tag,
                     dtype,
+                    algo,
                 } => {
                     let f: Arc<dyn Fn(*mut u8) + Send + Sync> = match dtype {
+                        _ if algo != rlx_ir::FftAlgo::Native => Arc::new(move |base: *mut u8| unsafe {
+                            execute_fft1d_pocketfft(
+                                src,
+                                dst,
+                                outer as usize,
+                                n_complex as usize,
+                                inverse,
+                                norm_tag,
+                                dtype,
+                                algo,
+                                base,
+                            );
+                        }),
                         rlx_ir::DType::F64 => Arc::new(move |base: *mut u8| unsafe {
                             execute_fft1d_f64(
                                 src,
@@ -3560,6 +3669,13 @@ pub fn compile_thunks_with_rng(
                 *read_offsets.entry(off).or_insert(0) += 1;
             }
         }
+        // A graph output is read by the caller after the run: one more reader,
+        // so an exported Narrow is never turned into a Nop.
+        for &id in &graph.outputs {
+            if arena.has_buffer(id) {
+                *read_offsets.entry(node_offset(arena, id)).or_insert(0) += 1;
+            }
+        }
 
         let mut fused_count = 0usize;
         for i in 0..thunks.len().saturating_sub(1) {
@@ -3651,6 +3767,12 @@ pub fn compile_thunks_with_rng(
         for t in &thunks {
             for off in thunk_read_offsets(t) {
                 *read_counts.entry(off).or_insert(0) += 1;
+            }
+        }
+        // Graph outputs are read by the caller: an exported Narrow keeps its write.
+        for &id in &graph.outputs {
+            if arena.has_buffer(id) {
+                *read_counts.entry(node_offset(arena, id)).or_insert(0) += 1;
             }
         }
         // Build dst→index map for fast producer lookup.
@@ -3751,5 +3873,7 @@ pub fn compile_thunks_with_rng(
         score_skip: cfg.score_skip_threshold,
         compiled_fns,
         rng: rng_shared,
+        #[cfg(feature = "wave-exec")]
+        waves: Default::default(),
     }
 }

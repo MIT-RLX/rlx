@@ -5,43 +5,26 @@
 //! `pyrlx.FusionOptions` - FKL / elementwise fusion toggles for `Session.compile_with`.
 
 use pyo3::prelude::*;
-use rlx_ir::logical_kernel::KernelDispatchPolicy;
+use rlx_bind::runtime::CompileRequest;
 use rlx_opt::FusionOptions;
-use rlx_runtime::{CompileOptions, Precision};
 
-use pyo3::exceptions::PyValueError;
-
-pub(crate) fn parse_kernel_dispatch(s: &str) -> PyResult<KernelDispatchPolicy> {
-    Ok(match s.trim().to_ascii_lowercase().as_str() {
-        "native" | "force_native" => KernelDispatchPolicy::ForceNative,
-        "common" | "force_common" => KernelDispatchPolicy::ForceCommon,
-        "prefer_native" | "prefer" | "default" => KernelDispatchPolicy::PreferNative,
-        other => Err(PyValueError::new_err(format!(
-            "unknown kernel_dispatch '{other}' (native, common, prefer_native)"
-        )))?,
+/// The overrides a `compile_with` call passes, as the core's request.
+pub(crate) fn compile_request(
+    fusion_options: Option<PyRef<PyFusionOptions>>,
+    kernel_dispatch: Option<&str>,
+    policy: Option<rlx_runtime::PrecisionPolicy>,
+) -> PyResult<CompileRequest> {
+    let kernel_dispatch = kernel_dispatch
+        .map(rlx_bind::runtime::session::kernel_dispatch)
+        .transpose()
+        .map_err(crate::bind::to_py)?;
+    Ok(CompileRequest {
+        fusion: fusion_options.map(|fo| fo.to_rust()),
+        kernel_dispatch,
+        policy,
     })
 }
 
-pub(crate) fn build_compile_options(
-    precision: Precision,
-    fusion_options: Option<PyRef<PyFusionOptions>>,
-    kernel_dispatch: Option<&str>,
-) -> PyResult<CompileOptions> {
-    let mut opts = CompileOptions::new().precision(precision);
-    if let Some(fo) = fusion_options {
-        opts.fusion_opts = fo.to_rust();
-    }
-    if let Some(kd) = kernel_dispatch {
-        opts.kernel_dispatch.policy = parse_kernel_dispatch(kd)?;
-    }
-    Ok(opts)
-}
-
-/// Per-compile fusion controls (mirrors `rlx_opt::FusionOptions`).
-///
-/// Env vars such as `RLX_NATIVE_FK_REGIONS=1`, `RLX_NO_NATIVE_FK_REGIONS=1`, and
-/// `RLX_FK_BATCH_SINGLE_KERNEL=1` (CUDA/ROCm/Metal/wgpu batch one-launch; TPU uses per-slice HLO)
-/// are merged at compile time. GPU-class targets enable native FKL regions by default unless opted out.
 #[pyclass(name = "FusionOptions", module = "pyrlx._pyrlx")]
 #[derive(Clone, Copy)]
 pub(crate) struct PyFusionOptions {
@@ -61,6 +44,10 @@ pub(crate) struct PyFusionOptions {
     pub fuse_batch_preprocess: bool,
     #[pyo3(get, set)]
     pub native_fk_regions: bool,
+    /// Keep conv + bias + activation as separate ops instead of
+    /// `FusedConvBiasAct` — for A/B-ing the fused kernel.
+    #[pyo3(get, set)]
+    pub disable_conv_bias_act_fusion: bool,
 }
 
 #[pymethods]
@@ -75,6 +62,7 @@ impl PyFusionOptions {
         fuse_region_prologue = true,
         fuse_batch_preprocess = true,
         native_fk_regions = false,
+        disable_conv_bias_act_fusion = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -86,6 +74,7 @@ impl PyFusionOptions {
         fuse_region_prologue: bool,
         fuse_batch_preprocess: bool,
         native_fk_regions: bool,
+        disable_conv_bias_act_fusion: bool,
     ) -> Self {
         Self {
             skip_fusion,
@@ -96,6 +85,7 @@ impl PyFusionOptions {
             fuse_region_prologue,
             fuse_batch_preprocess,
             native_fk_regions,
+            disable_conv_bias_act_fusion,
         }
     }
 
@@ -111,6 +101,7 @@ impl PyFusionOptions {
             fuse_region_prologue: true,
             fuse_batch_preprocess: true,
             native_fk_regions: true,
+            disable_conv_bias_act_fusion: false,
         }
     }
 
@@ -139,8 +130,10 @@ impl PyFusionOptions {
             fuse_batch_preprocess: self.fuse_batch_preprocess,
             native_fk_regions: self.native_fk_regions,
             fusion_limits: rlx_opt::FusionLimits::default(),
-            disable_conv_bias_act_fusion: false,
+            disable_conv_bias_act_fusion: self.disable_conv_bias_act_fusion,
             no_io_peaks_output: false,
+            elementwise_only: false,
+            no_weight_concat: false,
         }
     }
 }

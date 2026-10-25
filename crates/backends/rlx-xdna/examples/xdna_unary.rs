@@ -16,7 +16,7 @@ use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::{NpuIoBf16, NpuIoF32};
 
 fn env(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
+    rlx_ir::env::read(k).unwrap_or_else(|_| d.to_string())
 }
 
 fn main() {

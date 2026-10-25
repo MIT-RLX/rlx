@@ -119,6 +119,7 @@ fn dequant_gguf_serial(w_bytes: &[u8], n_elems: usize, scheme: QuantScheme) -> V
         QuantScheme::GgufFV5B => rlx_gguf::fv5_dequant::dequant_fv5b(w_bytes, n_elems),
         QuantScheme::GgufG8_0 => rlx_gguf::g8_dequant::dequant_g8_0(w_bytes, n_elems),
         QuantScheme::GgufPtq1_0 => rlx_gguf::ptq1_dequant::dequant_ptq1_0(w_bytes, n_elems),
+        QuantScheme::GgufBF16 => rlx_gguf::dequant_bf16(w_bytes, n_elems),
         other => panic!("dequant_cache: unsupported GGUF scheme {other:?}"),
     }
     .expect("GGUF dequant failed")

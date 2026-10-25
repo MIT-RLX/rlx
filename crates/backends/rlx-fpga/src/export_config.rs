@@ -9,10 +9,16 @@
 //! target-agnostic SystemVerilog with soft ports (`clk`/`rst`/`start`/…)
 //! and a generic Yosys script — no board pins, no vendor lock-in.
 
-use std::fmt;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::fmt;
+#[cfg(feature = "std")]
 use std::path::PathBuf;
 
+#[cfg(feature = "std")]
 use crate::from_graph::FromGraphOptions;
+#[cfg(feature = "std")]
 use crate::legalize::{ExportQuantMode, LegalizeOptions};
 use crate::tune::{OptTarget, Tune};
 use crate::xc7::Xc7Board;
@@ -548,16 +554,20 @@ pub struct FpgaExportConfig {
     /// Emit `board_top.sv` shell for board targets.
     pub emit_board_shell: bool,
     /// PTQ mode when the Graph is still f32 (`Int8` / `Int4` / `Fp4`).
+    #[cfg(feature = "std")]
     pub quant_mode: ExportQuantMode,
     /// Weight / scale bindings for f32 → quantized legalization.
+    #[cfg(feature = "std")]
     pub legalize: LegalizeOptions,
     /// Prefer Argmax vs logits-only output.
     pub output_kind: OutputKind,
     /// Soft-port naming + memory/stream protocols + Graph tensor bind.
     pub io: IoConfig,
     /// Optional overrides when lowering an already-quantized Graph.
+    #[cfg(feature = "std")]
     pub from_graph: FromGraphOptions,
     /// Optional output directory hint (CLI / runtime may override).
+    #[cfg(feature = "std")]
     pub out_dir: Option<PathBuf>,
 }
 
@@ -569,11 +579,15 @@ impl Default for FpgaExportConfig {
             emit_synth_scripts: true,
             emit_constraints: true,
             emit_board_shell: true,
+            #[cfg(feature = "std")]
             quant_mode: ExportQuantMode::Int8,
+            #[cfg(feature = "std")]
             legalize: LegalizeOptions::default(),
             output_kind: OutputKind::Argmax,
             io: IoConfig::default(),
+            #[cfg(feature = "std")]
             from_graph: FromGraphOptions::default(),
+            #[cfg(feature = "std")]
             out_dir: None,
         }
     }
@@ -601,6 +615,7 @@ impl FpgaExportConfig {
         self
     }
 
+    #[cfg(feature = "std")]
     pub fn with_quant_mode(mut self, mode: ExportQuantMode) -> Self {
         self.quant_mode = mode;
         self.from_graph.weight_bits = mode.weight_bits();
@@ -608,6 +623,7 @@ impl FpgaExportConfig {
         self
     }
 
+    #[cfg(feature = "std")]
     pub fn with_legalize(mut self, opts: LegalizeOptions) -> Self {
         self.legalize = opts;
         self
@@ -615,7 +631,10 @@ impl FpgaExportConfig {
 
     pub fn with_output_kind(mut self, kind: OutputKind) -> Self {
         self.output_kind = kind;
-        self.legalize.append_argmax = matches!(kind, OutputKind::Argmax);
+        #[cfg(feature = "std")]
+        {
+            self.legalize.append_argmax = matches!(kind, OutputKind::Argmax);
+        }
         // Logits need a full-vector readout; upgrade the default scalar-only iface.
         if matches!(kind, OutputKind::Logits) && matches!(self.io.output, OutputIface::ScalarPred) {
             self.io.output = OutputIface::ScalarAndMemory;
@@ -676,11 +695,13 @@ impl FpgaExportConfig {
         self
     }
 
+    #[cfg(feature = "std")]
     pub fn with_from_graph(mut self, opts: FromGraphOptions) -> Self {
         self.from_graph = opts;
         self
     }
 
+    #[cfg(feature = "std")]
     pub fn with_out_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.out_dir = Some(dir.into());
         self

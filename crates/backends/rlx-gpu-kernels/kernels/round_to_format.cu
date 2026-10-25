@@ -7,7 +7,10 @@
 // `rlx_ir::FloatFormat::round_slice_scaled`. Exponent, NaN/inf and subnormal
 // decisions read the f32 bits (independent of -ftz / fast-math); ldexpf and
 // rintf (ties to even) are exact here. Shared by CUDA (NVRTC) and ROCm (HIP).
-// One thread per element, or per block when mode == 2.
+// One thread per element, or per block when mode == 2. A block's scale follows
+// `FloatFormat::block_scale`: the squared errors are summed in index order with
+// `__fmul_rn` / `__fadd_rn`, which are never fused into an FMA, so the choice
+// matches the reference.
 
 __device__ __forceinline__ int rtf_exp(float a) {
     return (int)((__float_as_uint(a) >> 23) & 0xffu) - 127;
@@ -45,6 +48,46 @@ __device__ __forceinline__ int rtf_scale_exp(unsigned int amax_bits, int emax) {
     return e < -126 ? -126 : (e > 127 ? 127 : e);
 }
 
+__device__ __forceinline__ float rtf_scaled(float x, int e, int man_bits, int emin, unsigned int max_bits) {
+    return rtf_flush(ldexpf(rtf_round(ldexpf(x, -e), man_bits, emin, max_bits), e));
+}
+
+__device__ __forceinline__ float rtf_sq_err(const float* x, unsigned int start, unsigned int end, int e,
+                                            int man_bits, int emin, unsigned int max_bits) {
+    float acc = 0.0f;
+    for (unsigned int i = start; i < end; i++) {
+        float d = __fsub_rn(rtf_scaled(x[i], e, man_bits, emin, max_bits), x[i]);
+        acc = __fadd_rn(acc, __fmul_rn(d, d));
+    }
+    return acc;
+}
+
+// `FloatFormat::fine_scale`: the smallest (1 + m/8)·2^k with s·max ≥ amax. Every
+// product is exact, so this is the same on every backend.
+__device__ __forceinline__ float rtf_fine_scale(float amax, int emax, float max_normal) {
+    int k0 = rtf_exp(amax) - emax - 1;
+    k0 = k0 < -126 ? -126 : (k0 > 125 ? 125 : k0);
+    for (int k = k0; k <= k0 + 2; k++) {
+        float p = __uint_as_float((unsigned int)(k + 127) << 23);
+        for (int m = 0; m < 8; m++) {
+            float s = __fmul_rn(1.0f + 0.125f * (float)m, p);
+            if (__fmul_rn(s, max_normal) >= amax) return s;
+        }
+    }
+    return __uint_as_float(0x7f700000u);
+}
+
+// `fine_reciprocal`: 1/s from the 8-entry table (`FINE_RECIPROCALS`) and the exponent.
+__device__ __forceinline__ float rtf_fine_rcp(float s) {
+    const unsigned int tab[8] = {0x3f800000u, 0x3f638e39u, 0x3f4ccccdu, 0x3f3a2e8cu,
+                                 0x3f2aaaabu, 0x3f1d89d9u, 0x3f124925u, 0x3f088889u};
+    unsigned int b = __float_as_uint(s);
+    int ne = 127 - (int)((b >> 23) & 0xffu);
+    if (ne < -126) return 0.0f;
+    if (ne > 127) ne = 127;
+    return __fmul_rn(__uint_as_float(tab[(b >> 20) & 7u]), __uint_as_float((unsigned int)(ne + 127) << 23));
+}
+
 extern "C" __global__ void round_to_format(
     float* arena,
     unsigned int n,
@@ -62,7 +105,7 @@ extern "C" __global__ void round_to_format(
     unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;
     const float* x = arena + in_off;
     float* out = arena + out_off;
-    if (mode == 2u) {
+    if (mode >= 2u) {
         unsigned int per_row = (last_dim + block - 1u) / block;
         unsigned int row = t / per_row;
         unsigned int start = row * last_dim + (t % per_row) * block;
@@ -75,9 +118,28 @@ extern "C" __global__ void round_to_format(
             unsigned int b = rtf_abs_bits(x[i]);
             if (b > m) m = b;
         }
+        if (mode == 3u) {
+            float s = 1.0f, r = 1.0f;
+            if (m != 0u && m < 0x7f800000u) {
+                s = rtf_fine_scale(__uint_as_float(m), emax, __uint_as_float(max_bits));
+                r = rtf_fine_rcp(s);
+            }
+            for (unsigned int i = start; i < end; i++) {
+                out[i] = rtf_flush(__fmul_rn(rtf_round(__fmul_rn(x[i], r), man_bits, emin, max_bits), s));
+            }
+            return;
+        }
         int e = rtf_scale_exp(m, emax);
+        // One binade up when the MX scale clips the block max and that rounds
+        // the block with a smaller squared error (ties keep the MX scale).
+        if (m != 0u && m < 0x7f800000u && e < 127
+            && __float_as_uint(ldexpf(__uint_as_float(m), -e)) > max_bits
+            && rtf_sq_err(x, start, end, e + 1, man_bits, emin, max_bits)
+                   < rtf_sq_err(x, start, end, e, man_bits, emin, max_bits)) {
+            e += 1;
+        }
         for (unsigned int i = start; i < end; i++) {
-            out[i] = rtf_flush(ldexpf(rtf_round(ldexpf(x[i], -e), man_bits, emin, max_bits), e));
+            out[i] = rtf_scaled(x[i], e, man_bits, emin, max_bits);
         }
         return;
     }

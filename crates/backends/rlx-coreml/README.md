@@ -46,7 +46,7 @@ Custom op on ANE (host segment):
 rlx_coreml::register_coreml_kernel(Arc::new(MyKernel));
 ```
 
-Environment knobs:
+Environment options:
 
 | Variable | Effect |
 |----------|--------|
@@ -66,7 +66,7 @@ crash: `bnns::GraphCompile` null-deref on large Shape-heavy programs (LuxTTS
 
 ## Status
 
-**65** op kinds declared in `SUPPORTED_OPS` — the complete forward
+**165** op kinds declared in `SUPPORTED_OPS` — the complete forward
 inference surface for transformer + vision + MoE + quantized + SSM graphs.
 
 ### MIL-lowered ops
@@ -116,11 +116,24 @@ Control flow beyond host `Scan*`, fusion internals (`ElementwiseRegion`),
 `CustomFn`, `QMatMul` / `QConv2d` (int8 I/O), Gaussian splat family.
 
 Under the `training` feature, packed / primitive `*Backward` ops are claimed for
-device selection via `COREML_BACKWARD_OPS` (decompose to MIL primitives) or
+device selection via `BACKWARD_OPS` (decompose to MIL primitives) or
 `NATIVE_BACKWARD_OPS` (dedicated MIL arms). DiT modulation forward
 (`AdaLayerNorm` / `GatedResidual`) and packed reverse
 (`AdaLayerNormBackward` / `GatedResidualBackward`) use native composed MIL
 (implicit broadcast + concat pack for reverse).
+
+### Apple defects worked around
+
+Two Core ML / BNNS defects (macOS 26.6.2) are avoided by graph rewrites in
+`hybrid`, applied before every compile:
+
+| rewrite | defect it avoids |
+|---|---|
+| `hoist_transpose_out_of_reduce` | CPU engine mis-executes `transpose → reduce → transpose`: SIGSEGV/SIGBUS in `BNNSGraphContextExecute_v2`, or wrong sums. Autodiff emits that chain for every bias gradient, so training graphs used to crash. The rewrite folds the permutation into the reduce axes. |
+| `recip_bn_div_after_conv` | BNNS segfaults initialising a program in which Core ML fused an elementwise eval-mode BatchNorm into the preceding convolution. `div(sub(conv, k₁), k₂)` becomes a reciprocal multiply (≤ 1 ulp). |
+
+A MIL segment also omits any input that only other segments read; Core ML
+refuses to load a model that declares an unused input.
 
 ### Output layout note
 

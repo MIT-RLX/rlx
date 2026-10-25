@@ -7,8 +7,9 @@ and the device handle.
 ## What's here
 
 - **`Session`** — entry point; selects a backend via `Device`.
-- **`CompiledGraph`** (`compiled.rs`) — `run` / `set_param` /
-  `set_input`. Zero allocation per call.
+- **`CompiledGraph`** (`compiled.rs`) — `run` / `run_typed` / `set_param`;
+  `inputs()` / `check_bindings` describe and check the boundary. Zero
+  allocation per call.
 - **`Backend` trait** + `ExecutableGraph` — every backend (CPU, Metal,
   MLX, CUDA, ROCm, wgpu, TPU) implements these. Every backend declares
   its supported `OpKind`s, and `legalize_for_backend` rejects
@@ -16,8 +17,9 @@ and the device handle.
 - **`registry.rs` / `op_registry.rs`** — backend factory + per-op
   registration plumbing for downstream extension.
 - **`Device`** lives in `rlx-driver::device`; this crate just consumes
-  it. Variants: `Cpu`, `Metal`, `Mlx`, `Ane`, `Cuda`, `Rocm`, `Tpu`,
-  `Gpu` (wgpu), `Vulkan`, `OpenGl`, `DirectX`, `WebGpu`.
+  it. Variants: `Cpu`, `Metal`, `Mlx`, `Ane`, `Cuda`, `Rocm`, `Xdna`,
+  `Egpu`, `OneApi`, `Tpu`, `Hexagon`, `Gpu` (wgpu), `Vulkan`, `OpenGl`,
+  `DirectX`, `WebGpu`.
 - **`device_ext.rs`** — `Device::is_available()` lookup against the
   registry (keeps the runtime→driver dep direction one-way).
 - **`hwinfo.rs`** — host + GPU introspection. `HwSnapshot` (CPU topology /
@@ -25,16 +27,15 @@ and the device handle.
   `device_thermal(device, index)` / `all_gpu_thermal()` read
   temperature / power / clock / fan across CUDA & ROCm (unprivileged), and
   `set_power_cap` / `set_locked_clocks` / `set_fan_percent` (+ resets,
-  `power_cap_range`) are root-only knobs returning a typed `ThermalError`.
+  `power_cap_range`) are root-only controls returning a typed `ThermalError`.
   Drives the `rlx-gpu` CLI (in `rlx-bench`).
-- **`weights.rs`** — `WeightLoader` trait + `BytesWeightLoader`. Promote
-  to registry per plan #24 / #56.
 - **`arena.rs`** — device-side arena buffer.
 - **`CompileCache`** (`compile_cache.rs`) — graph-fingerprint →
   compiled-artifact cache.
-- **`subgraph.rs`** — `run_if` / `run_while` helpers; the IR has
-  If/While ops but executor wiring is pending (see Op::If/While
-  docstring).
+- **Control flow** — `Op::While` runs as a loop, unbounded or not: natively
+  on the CPU, through the one-op host fallback on Metal / CUDA / ROCm / wgpu;
+  other backends unroll it. `subgraph.rs` compiles nested bodies lazily and
+  caches them.
 - **`PrecisionPolicy`** — re-export from `rlx-opt`. AMP / always-f16 /
   always-f32 / always-bf16.
 - **`trace.rs`** — runtime tracing (verbose env-gated).
@@ -64,9 +65,31 @@ and the device handle.
 - **In-graph RNG** — [`Op::RngNormal`] / [`Op::RngUniform`] (ONNX
   `Random*`) with [`CompileOptions::rng`] and runtime
   [`CompiledGraph::set_rng`]. Backends: Philox (default), Ort (CPU parity),
-  Zero (deterministic tests). GPU backends host-fill unified memory (Metal/MLX)
-  or D2H→fill→H2D segments (CUDA/ROCm/wgpu). TPU lowers to XLA `rng`.
-  *(Added in 0.2.7 — see [`CHANGELOG.md`](../../../CHANGELOG.md).)*
+  Zero (deterministic tests). CUDA / ROCm / Metal / wgpu generate on device
+  (Philox); TPU lowers to XLA `rng`.
+- **`model`** *(feature `model-io`)* — one interface over whatever runs a
+  checkpoint: `model::open(request)` returns a `Model` (named typed tensors in
+  and out, plus `generate_text`, `chat`, `transcribe`, `synthesize`, `embed`
+  where they apply). `ModelProvider`s register statically or at run time; model
+  plugins (`model-plugins`, or `linked-plugins` on iOS / Android / wasm) load a
+  separately built collection through a versioned C vtable. `.rlxp` packages
+  open the same way (`pkg.rs`), and `model::trainer::open_trainer` trains a package's
+  functions.
+- **`program`** *(feature `program`)* — a package's host logic (tokenize, a
+  decode loop) as a sandboxed WebAssembly module (`rlx-program`).
+- **`debug`** — `debug_graph(graph, &DebugOptions)` compiles and runs a graph
+  on a device and on the CPU, classifies the failure (`unsupported-op`,
+  `run-panic`, `non-finite`, `mismatch`, …) and probes which compile option
+  gets past it.
+- **`export`** — artifacts instead of a run: `ExportTarget::Fpga` (feature
+  `fpga`) and `ExportTarget::StableHlo` (feature `stablehlo`, for IREE).
+- **`placement` / `job_slots`** — measured placement (time a few real steps on
+  the cost model's GPU pick and the CPU, keep the GPU only at a 1.5× margin;
+  `RLX_PLACEMENT_CACHE` remembers decisions), GPU sharing between concurrent
+  jobs (`RLX_GPU_JOBS`), and a pool bounding concurrent work by count and
+  memory.
+- **Number formats** — `CompileOptions::number_format` runs an f32 graph as
+  f64, double-single or a narrower float format (see `rlx-compile`).
 
 Re-exports: `Tick`, `time_ns` from `rlx_ir::measure`. Use these for any
 sub-ms timing in the user-facing layer.
@@ -82,16 +105,28 @@ sub-ms timing in the user-facing layer.
 | `cuda`              | `rlx-cuda`                           |
 | `rocm`              | `rlx-rocm`                           |
 | `tpu`               | `rlx-tpu`                            |
+| `vulkan`            | `rlx-vulkan` (native Vulkan)         |
+| `coreml` / `ane`    | `rlx-coreml` (Apple Neural Engine)   |
+| `apple`             | `metal` + `mlx` + `gpu` + `coreml`   |
+| `oneapi` / `qnn` / `xdna` / `egpu` | Intel GPU / Qualcomm / AMD NPU / eGPU backends |
+| `opengl` / `directx` / `webgpu` / `browser` | wgpu sub-targets |
+| `fpga` / `stablehlo` | `export` targets (RTL, StableHLO MLIR) |
+| `training`          | autodiff + optimizers                |
+| `model-io`          | `model` (packages, providers)        |
+| `model-plugins` / `linked-plugins` | load / link model plugins |
+| `program`           | WebAssembly package programs (wasmi) |
 | `blas-accelerate`   | macOS Accelerate                     |
 | `blas-mkl`          | Intel MKL                            |
 | `blas-openblas`     | OpenBLAS                             |
+| `cpu-wave-exec`     | `rlx-cpu`'s inter-thunk parallelism  |
+| `assoc-scan`        | log-depth affine `Scan` rewrite      |
 | `mmap-kv`           | file-backed quantized KV (memmap2)   |
 
 ## Install
 
 ```toml
 [dependencies]
-rlx-runtime = { version = "0.2.18", features = ["cpu"] }
+rlx-runtime = { version = "0.2.19", features = ["cpu"] }
 ```
 
 > **Heads-up.** The `mlx` and `rocm` features pull in `rlx-mlx` and
@@ -125,6 +160,20 @@ compiled.set_param("w", &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
 let out = compiled.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 ```
 
+### Errors instead of panics
+
+```rust
+use rlx_runtime::{CompileError, IoError, Session, Device};
+
+let session = Session::try_new(Device::Metal)?;          // CompileError::DeviceUnavailable
+let mut compiled = session.try_compile(g)?;              // Invalid / Unsupported / Backend
+println!("{:?}", compiled.inputs());                     // name, dtype, static shape
+let out = compiled.try_run(&[("x", &x)])?;               // IoError: unknown name, wrong length
+compiled.check_bindings(&["x"])?;                        // inputs / params left unbound
+```
+
+What each error means and what to do: [`docs/troubleshooting.md`](../../../docs/troubleshooting.md).
+
 ### Multi-backend (optional)
 
 ```rust
@@ -152,9 +201,14 @@ cargo test  -p rlx-runtime --release
 
 - Backend selection is feature-gated. `--features metal` is mandatory
   to instantiate `Device::Metal`; otherwise `Session::new(Metal)` panics
-  at registry lookup. Same applies to `cuda`, `rocm`, `mlx`, `wgpu`.
-- `set_param` accepts `&[f32]` of the declared shape's element count.
-  Mismatched len is a runtime panic, not a compile-time error.
+  (`Session::try_new` returns the reason). Same for `cuda`, `rocm`, `mlx`, `gpu`.
+- `set_param` / `run` take `&[f32]` of the declared shape's element count; a
+  mismatch, or an input name the graph does not declare, panics with the name
+  and shape (`try_run` returns it). A param passed to `run` is uploaded as if
+  by `set_param`.
+- Inputs never supplied and params never set read zeros; the first `run`
+  names them on stderr once. `allow_unbound(&[…])` declares the ones meant
+  to read zeros (an empty KV state).
 - Compile cache key includes the graph fingerprint **and** the precision
   policy — bumping precision invalidates entries.
 - For long-running serving paths, prefer `CompileCache` over recompiling

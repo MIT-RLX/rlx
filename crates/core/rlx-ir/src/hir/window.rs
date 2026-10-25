@@ -9,6 +9,7 @@
 //! the `n_pos / merge_sq` window groups are permuted.
 
 use super::{HirGraphExt, HirMut, HirNodeId};
+use crate::prelude::*;
 
 /// Permute window groups before window-attention blocks.
 ///

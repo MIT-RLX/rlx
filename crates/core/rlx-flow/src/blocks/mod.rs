@@ -74,7 +74,9 @@ pub use gemma_layer::{
     gemma2_layer_mask,
 };
 pub use gemma_rms_norm::GemmaRmsNormStage;
-pub use kv_cache::{NO_INPLACE_KV, append_kv_row, kv_append_can_alias, kv_spare_rows};
+pub use kv_cache::{
+    NO_INPLACE_KV, append_kv_row, kv_append_can_alias, kv_spare_rows, with_kv_append_any_batch,
+};
 pub use layer_norm::LayerNormStage;
 pub use layer_scale::LayerScaleStage;
 pub use linear::LinearStage;
@@ -87,8 +89,8 @@ pub use llama_layer::{
 };
 pub use lm_head::LmHeadStage;
 pub use logit_softcap::LogitSoftcapStage;
-pub use mla_attn::{MlaAttnPrefillSpec, MlaAttnPrefillStage};
-pub use moe::MoeFfnStage;
+pub use mla_attn::{MlaAttnDecodeStage, MlaAttnPrefillSpec, MlaAttnPrefillStage};
+pub use moe::{MoeFfnStage, Qwen3Moe};
 pub use nomic_layer::{NomicEncoderLayerSpec, NomicEncoderLayerStage};
 pub use qwen3_decode_layer::{Qwen3DecodeLayerSpec, Qwen3DecodeLayerStage};
 pub use qwen3_decoder::{Qwen3DecoderSpec, Qwen3DecoderStage};

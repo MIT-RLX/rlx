@@ -316,6 +316,21 @@ pub fn run_passes_tracked(
     let mut overall = IRStatus::Unchanged;
     let mut fired: Vec<&str> = Vec::new();
 
+    // The per-pass check below runs only after a pass that changed the IR, so
+    // an invalid *input* graph used to be reported as broken "after pass X" —
+    // whichever pass fired first. Record what was already wrong on entry (not
+    // fatal: lowering passes legitimately repair some inputs, e.g. `LowerIf`)
+    // so a failure that predates every pass is attributed to the input.
+    #[cfg(debug_assertions)]
+    let input_errors: Vec<String> = if passes.is_empty() {
+        Vec::new()
+    } else {
+        rlx_ir::verify::verify_all(&graph)
+            .iter()
+            .map(|e| e.to_string())
+            .collect()
+    };
+
     for pass in passes {
         if verbose {
             eprintln!("--- before {} ---\n{graph}", pass.name());
@@ -334,7 +349,26 @@ pub fn run_passes_tracked(
             fired.push(pass.name());
             // Only re-verify what actually changed: a no-op pass cannot have
             // broken an invariant that held when it started.
-            rlx_ir::debug_assert_valid!(&graph, format!("after pass `{}`", pass.name()));
+            #[cfg(debug_assertions)]
+            {
+                let errors: Vec<String> = rlx_ir::verify::verify_all(&graph)
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect();
+                if !errors.is_empty() {
+                    let inherited = errors.iter().all(|e| input_errors.contains(e));
+                    let stage = if inherited {
+                        format!(
+                            "the input graph (already invalid before any pass; first \
+                             noticed after `{}`)",
+                            pass.name()
+                        )
+                    } else {
+                        format!("after pass `{}`", pass.name())
+                    };
+                    panic!("IR verifier failed at {stage}:\n  {}", errors.join("\n  "));
+                }
+            }
             analyses.retain(&result.preserved, || graph.fingerprint());
         }
     }
@@ -640,7 +674,7 @@ mod registry_tests {
 pub fn builtin_passes() -> Vec<&'static dyn Pass> {
     use crate::fusion::*;
     use crate::{
-        control_flow::{LowerControlFlow, LowerScan},
+        control_flow::{LowerControlFlow, LowerIf, LowerScan},
         lower_axial_rope2d::LowerAxialRope2d,
         lower_backward_ops::LowerBackwardOps,
         lower_cumulative::LowerCumulative,
@@ -667,6 +701,7 @@ pub fn builtin_passes() -> Vec<&'static dyn Pass> {
         &LowerAxialRope2d,
         &LowerBackwardOps,
         &LowerControlFlow,
+        &LowerIf,
         &LowerCumulative,
         &LowerDotGeneral,
         &LowerFakeQuantize,

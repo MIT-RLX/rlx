@@ -19,7 +19,7 @@ static EXPLICIT_COMPILE_OUTPUT_CAP: AtomicUsize = AtomicUsize::new(0);
 
 fn cap_from_env() -> usize {
     for key in [COMPILE_OUTPUT_CAP_ENV, COMPILE_OUTPUT_CAP_ENV_MLX] {
-        if let Ok(v) = std::env::var(key) {
+        if let Ok(v) = rlx_ir::env::read(key) {
             if let Ok(n) = v.parse::<usize>() {
                 if n > 0 {
                     return n;

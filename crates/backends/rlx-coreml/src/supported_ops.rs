@@ -107,7 +107,9 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         FakeQuantizeLSQBackwardX,
         FakeQuantizeLSQBackwardScale,
         RoundToFormat,
-        Fma,
+        // Not `Fma`: MIL has no fused multiply-add (`lower_fma` is mul + add, two
+        // roundings), so the legalizer's `LowerFma` supplies the exact f32
+        // emulation instead (bit-identical to a hardware FMA on ANE, measured).
         ElementwiseRegion,
         TransformRegion,
         BatchElementwiseRegion,

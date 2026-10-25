@@ -164,6 +164,16 @@ files = pyrlx.export_fpga(
 )
 ```
 
+## `no_std` builds
+
+`rlx-fpga` with `default-features = false` is `no_std` + `alloc`, for building
+RTL on a target with no OS: `Model` (e.g. `tinyconv_mnist_from_cortexm`) →
+`passes::optimize` (the model graph is still checked by `rlx_ir::verify`, from
+rlx-ir's `no_std` core) → `collect_artifacts_opt`, which returns the files in
+memory. Graph import (`Model::from_graph`, `prepare_model`), `export_graph`,
+writing the tree to disk (`emit_*`), the sequential target and the CLI need the
+default `std` feature. `just check-no-std` builds it for `thumbv7em-none-eabihf`.
+
 ## See also
 
 - [`crates/backends/rlx-fpga/README.md`](../crates/backends/rlx-fpga/README.md)

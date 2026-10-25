@@ -97,6 +97,21 @@ const TILE: u32 = 16u;
 
 var<workgroup> f32_tile: array<f32, 256>;
 
+// Exact GELU — A&S 7.1.26 erf, the same as `matmul.wgsl` / `matmul_coop_f32.wgsl`
+// and rlx-cpu's `scalar_gelu`. Opcode 9 (`Activation::Gelu`) is the EXACT form;
+// only opcode 11 (`GeluApprox`) is the tanh form. This kernel used to map both
+// to tanh, so a fused matmul+bias+GELU here drifted ~3e-4 from CPU at |x|≈2–3.
+fn gelu_erf(x: f32) -> f32 {
+    let arg = x * 0.70710678118654752;
+    let s = select(-1.0, 1.0, arg >= 0.0);
+    let xa = abs(arg);
+    let t = 1.0 / (1.0 + 0.3275911 * xa);
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
+                + t * (-1.453152027 + t * 1.061405429))));
+    let e = s * (1.0 - poly * exp(-xa * xa));
+    return 0.5 * x * (1.0 + e);
+}
+
 fn apply_act(v_in: f32) -> f32 {
     var v = v_in;
     if (params.act_id == 0xFFFFu) { return v; }
@@ -107,7 +122,8 @@ fn apply_act(v_in: f32) -> f32 {
         case 5u: { v = sqrt(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
-        case 9u, 11u: {
+        case 9u: { v = gelu_erf(v); }
+        case 11u: {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
             let inner = clamp(c * (v + 0.044715 * x3), -15.0, 15.0);

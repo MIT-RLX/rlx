@@ -101,6 +101,11 @@ pub struct CompileOptions {
     pub disable_conv_bias_act_fusion: bool,
     /// Disable IO-gated peaks-only fusion (`RLX_NO_IO_PEAKS_OUTPUT`).
     pub no_io_peaks_output: bool,
+    /// Remove transposes that cancel, compose, fold into constants, or sink
+    /// through elementwise ops to meet another (`rlx_compile::SimplifyTransposes`;
+    /// `RLX_SIMPLIFY_TRANSPOSES`). Off by default: bit-exact, but no measured
+    /// speedup yet (see the pass docs).
+    pub simplify_transposes: bool,
 }
 
 impl Default for CompileOptions {
@@ -138,6 +143,7 @@ impl CompileOptions {
             fusion_report: false,
             disable_conv_bias_act_fusion: false,
             no_io_peaks_output: false,
+            simplify_transposes: false,
         }
     }
 
@@ -171,6 +177,9 @@ impl CompileOptions {
         if env_registry::flag("RLX_DISABLE_CONV_BIAS_ACT_FUSION") {
             self.disable_conv_bias_act_fusion = true;
         }
+        if env_registry::flag("RLX_SIMPLIFY_TRANSPOSES") {
+            self.simplify_transposes = true;
+        }
         if env_registry::flag("RLX_NO_IO_PEAKS_OUTPUT") {
             self.no_io_peaks_output = true;
         }
@@ -186,6 +195,21 @@ impl CompileOptions {
         }
         if let Some(list) = env_registry::var("RLX_NUMBER_FORMAT_KEEP") {
             self.number_format_options.keep_ops = parse_keep_ops(&list);
+        }
+        if let Some(list) = env_registry::var("RLX_NUMBER_FORMAT_KEEP_PARAMS") {
+            self.number_format_options.keep_params = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+        }
+        if let Some(v) = env_registry::var("RLX_NUMBER_FORMAT_ROUND_RESIDUAL") {
+            self.number_format_options.round_residual = match v.trim() {
+                "1" | "true" => Some(true),
+                "0" | "false" => Some(false),
+                other => panic!("RLX_NUMBER_FORMAT_ROUND_RESIDUAL: expected 0 or 1, got {other:?}"),
+            };
         }
     }
 

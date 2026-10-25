@@ -950,6 +950,30 @@ pub fn untile_c_multicol(ct: &[i32], m: usize, n: usize, cols: usize) -> Vec<i32
 /// (C). `obj` = kernel `.o` basename compiled for DIM=`d`. cols≤4;
 /// `kt=cols=1` degenerates to a single `d³` tile.
 pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> String {
+    emit_matmul_microkernel_typed(d, kt, cols, obj, "i8", "i32")
+}
+
+/// bf16 twin of [`emit_matmul_microkernel`]: bf16 `A`/`B`, f32 `C`, calling the
+/// vendor `matmul_bf16_f32` + `zero_f32` (the `bf16_f32` combo, mmul 4×8×4;
+/// build the object with [`crate::compile::build_mm_kernel_bf16`]). Same
+/// K-accumulation + column split. bf16 tiles are twice the bytes of int8 and C
+/// is f32, so `d` must stay small enough for the double-buffered A/B/C FIFOs to
+/// fit a core's 64 KB (`d = 32` → 16 KB). Host packing: [`tile_a_kacc_bf16`],
+/// [`tile_b_kacc_multicol_bf16`], [`untile_c_multicol_f32`].
+pub fn emit_matmul_microkernel_bf16(d: usize, kt: usize, cols: usize, obj: &str) -> String {
+    emit_matmul_microkernel_typed(d, kt, cols, obj, "bf16", "f32")
+}
+
+/// [`emit_matmul_microkernel`] over element types `ti` (A/B) → `to` (C); the
+/// kernel symbols are mlir-aie's `matmul_{ti}_{to}` / `zero_{to}`.
+fn emit_matmul_microkernel_typed(
+    d: usize,
+    kt: usize,
+    cols: usize,
+    obj: &str,
+    ti: &str,
+    to: &str,
+) -> String {
     assert!((1..=4).contains(&cols), "cols must be 1..=4");
     let dd = d * d;
     let ka = kt * dd; // per-core A / B stream length (kt tiles)
@@ -963,13 +987,13 @@ pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> S
     for c in 0..cols {
         tiles += &format!("    %core{c} = aie.tile({c}, 2)\n    %shim{c} = aie.tile({c}, 0)\n");
         fifos += &format!(
-            "    aie.objectfifo @a{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi8>>\n"
+            "    aie.objectfifo @a{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}x{ti}>>\n"
         );
         fifos += &format!(
-            "    aie.objectfifo @b{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi8>>\n"
+            "    aie.objectfifo @b{c}(%shim{c}, {{%core{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}x{ti}>>\n"
         );
         fifos += &format!(
-            "    aie.objectfifo @c{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}xi32>>\n"
+            "    aie.objectfifo @c{c}(%core{c}, {{%shim{c}}}, 2 : i32) : !aie.objectfifo<memref<{d}x{d}x{to}>>\n"
         );
         cores += &format!(
             r#"    %cb{c} = aie.core(%core{c}) {{
@@ -978,18 +1002,18 @@ pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> S
       %one = arith.constant 1 : index
       %ktN = arith.constant {kt} : index
       scf.for %it = %z to %zmax step %one {{
-        %cs = aie.objectfifo.acquire @c{c}(Produce, 1) : !aie.objectfifosubview<memref<{d}x{d}xi32>>
-        %C = aie.objectfifo.subview.access %cs[0] : !aie.objectfifosubview<memref<{d}x{d}xi32>> -> memref<{d}x{d}xi32>
-        %Cf = memref.collapse_shape %C [[0, 1]] : memref<{d}x{d}xi32> into memref<{dd}xi32>
-        func.call @zero_i32(%Cf) : (memref<{dd}xi32>) -> ()
+        %cs = aie.objectfifo.acquire @c{c}(Produce, 1) : !aie.objectfifosubview<memref<{d}x{d}x{to}>>
+        %C = aie.objectfifo.subview.access %cs[0] : !aie.objectfifosubview<memref<{d}x{d}x{to}>> -> memref<{d}x{d}x{to}>
+        %Cf = memref.collapse_shape %C [[0, 1]] : memref<{d}x{d}x{to}> into memref<{dd}x{to}>
+        func.call @zero_{to}(%Cf) : (memref<{dd}x{to}>) -> ()
         scf.for %ki = %z to %ktN step %one {{
-          %as = aie.objectfifo.acquire @a{c}(Consume, 1) : !aie.objectfifosubview<memref<{d}x{d}xi8>>
-          %A = aie.objectfifo.subview.access %as[0] : !aie.objectfifosubview<memref<{d}x{d}xi8>> -> memref<{d}x{d}xi8>
-          %bs = aie.objectfifo.acquire @b{c}(Consume, 1) : !aie.objectfifosubview<memref<{d}x{d}xi8>>
-          %B = aie.objectfifo.subview.access %bs[0] : !aie.objectfifosubview<memref<{d}x{d}xi8>> -> memref<{d}x{d}xi8>
-          %Af = memref.collapse_shape %A [[0, 1]] : memref<{d}x{d}xi8> into memref<{dd}xi8>
-          %Bf = memref.collapse_shape %B [[0, 1]] : memref<{d}x{d}xi8> into memref<{dd}xi8>
-          func.call @matmul_i8_i32(%Af, %Bf, %Cf) : (memref<{dd}xi8>, memref<{dd}xi8>, memref<{dd}xi32>) -> ()
+          %as = aie.objectfifo.acquire @a{c}(Consume, 1) : !aie.objectfifosubview<memref<{d}x{d}x{ti}>>
+          %A = aie.objectfifo.subview.access %as[0] : !aie.objectfifosubview<memref<{d}x{d}x{ti}>> -> memref<{d}x{d}x{ti}>
+          %bs = aie.objectfifo.acquire @b{c}(Consume, 1) : !aie.objectfifosubview<memref<{d}x{d}x{ti}>>
+          %B = aie.objectfifo.subview.access %bs[0] : !aie.objectfifosubview<memref<{d}x{d}x{ti}>> -> memref<{d}x{d}x{ti}>
+          %Af = memref.collapse_shape %A [[0, 1]] : memref<{d}x{d}x{ti}> into memref<{dd}x{ti}>
+          %Bf = memref.collapse_shape %B [[0, 1]] : memref<{d}x{d}x{ti}> into memref<{dd}x{ti}>
+          func.call @matmul_{ti}_{to}(%Af, %Bf, %Cf) : (memref<{dd}x{ti}>, memref<{dd}x{ti}>, memref<{dd}x{to}>) -> ()
           aie.objectfifo.release @a{c}(Consume, 1)
           aie.objectfifo.release @b{c}(Consume, 1)
         }}
@@ -1002,17 +1026,17 @@ pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> S
         let (boff, coff) = (c * ka, c * dd);
         rt += &format!(
             r#"      %ta{c} = aiex.dma_configure_task_for @a{c} {{
-        aie.dma_bd(%arg0 : memref<{ka}xi8>, 0, {ka}) {{burst_length = 0 : i32}}
+        aie.dma_bd(%arg0 : memref<{ka}x{ti}>, 0, {ka}) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%ta{c})
       %tb{c} = aiex.dma_configure_task_for @b{c} {{
-        aie.dma_bd(%arg1 : memref<{nb}xi8>, {boff}, {ka}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {ka}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%arg1 : memref<{nb}x{ti}>, {boff}, {ka}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {ka}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%tb{c})
       %tc{c} = aiex.dma_configure_task_for @c{c} {{
-        aie.dma_bd(%arg2 : memref<{ncf}xi32>, {coff}, {dd}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {dd}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%arg2 : memref<{ncf}x{to}>, {coff}, {dd}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {dd}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tc{c})
@@ -1030,7 +1054,7 @@ pub fn emit_matmul_microkernel(d: usize, kt: usize, cols: usize, obj: &str) -> S
     // arg0 = shared A (one `ka`-long stream, all cores read it); arg1 = per-core B
     // (nb = cols·ka); arg2 = gathered C (ncf = cols·dd).
     format!(
-        "module {{\n  aie.device({device}) {{\n{tiles}    func.func private @zero_i32(memref<{dd}xi32>) attributes {{link_with = \"{obj}\"}}\n    func.func private @matmul_i8_i32(memref<{dd}xi8>, memref<{dd}xi8>, memref<{dd}xi32>) attributes {{link_with = \"{obj}\"}}\n{fifos}{cores}    aie.runtime_sequence(%arg0: memref<{ka}xi8>, %arg1: memref<{nb}xi8>, %arg2: memref<{ncf}xi32>) {{\n{rt}{awaits}    }}\n  }}\n}}\n"
+        "module {{\n  aie.device({device}) {{\n{tiles}    func.func private @zero_{to}(memref<{dd}x{to}>) attributes {{link_with = \"{obj}\"}}\n    func.func private @matmul_{ti}_{to}(memref<{dd}x{ti}>, memref<{dd}x{ti}>, memref<{dd}x{to}>) attributes {{link_with = \"{obj}\"}}\n{fifos}{cores}    aie.runtime_sequence(%arg0: memref<{ka}x{ti}>, %arg1: memref<{nb}x{ti}>, %arg2: memref<{ncf}x{to}>) {{\n{rt}{awaits}    }}\n  }}\n}}\n"
     )
 }
 
@@ -1070,6 +1094,74 @@ pub fn tile_b_kacc_multicol(b: &[i8], d: usize, kt: usize, cols: usize) -> Vec<i
                 }
             }
             out.extend_from_slice(&tile_b(&slice, d, d));
+        }
+    }
+    out
+}
+
+/// Pack a row-major `rows×cols` matrix into `tr×tc` subtiles: tiles in
+/// row-major tile order, each tile row-major — the layout mlir-aie's `mm.cc`
+/// kernels read and write (A as `r×s`, B as `s×t`, C as `r×t`).
+fn tile_rc<T: Copy + Default>(src: &[T], rows: usize, cols: usize, tr: usize, tc: usize) -> Vec<T> {
+    let (nr, nc) = (rows / tr, cols / tc);
+    let mut out = vec![T::default(); rows * cols];
+    for ti in 0..nr {
+        for tj in 0..nc {
+            let base = (ti * nc + tj) * tr * tc;
+            for r in 0..tr {
+                for c in 0..tc {
+                    out[base + r * tc + c] = src[(ti * tr + r) * cols + (tj * tc + c)];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `d×d` sub-matrix of row-major `src` (row stride `stride`) at `(r0, c0)`.
+fn slice_dd<T: Copy + Default>(src: &[T], stride: usize, r0: usize, c0: usize, d: usize) -> Vec<T> {
+    let mut out = vec![T::default(); d * d];
+    for r in 0..d {
+        out[r * d..(r + 1) * d].copy_from_slice(&src[(r0 + r) * stride + c0..][..d]);
+    }
+    out
+}
+
+/// bf16 [`tile_a_kacc`] for [`emit_matmul_microkernel_bf16`]: `A[d, kt·d]` (bf16
+/// bits) → `kt` K-tiles, each in 4×8 subtiles (mmul `r×s` = 4×8).
+pub fn tile_a_kacc_bf16(a: &[u16], d: usize, kt: usize) -> Vec<u16> {
+    (0..kt)
+        .flat_map(|ki| tile_rc(&slice_dd(a, kt * d, 0, ki * d, d), d, d, 4, 8))
+        .collect()
+}
+
+/// bf16 [`tile_b_kacc_multicol`]: `B[kt·d, d·cols]` (bf16 bits) → per core `c`,
+/// `kt` K-tiles in 8×4 subtiles (mmul `s×t` = 8×4), laid out `[c][ki][tile]`.
+pub fn tile_b_kacc_multicol_bf16(b: &[u16], d: usize, kt: usize, cols: usize) -> Vec<u16> {
+    let n = d * cols;
+    (0..cols)
+        .flat_map(|c| (0..kt).map(move |ki| (c, ki)))
+        .flat_map(|(c, ki)| tile_rc(&slice_dd(b, n, ki * d, c * d, d), d, d, 8, 4))
+        .collect()
+}
+
+/// f32 [`untile_c_multicol`] for [`emit_matmul_microkernel_bf16`]: each core's
+/// `m × n/cols` slice arrives in 4×4 subtiles (mmul `r×t`); returns row-major `m×n`.
+pub fn untile_c_multicol_f32(ct: &[f32], m: usize, n: usize, cols: usize) -> Vec<f32> {
+    let nc = n / cols;
+    let (mt, ntc) = (m / 4, nc / 4);
+    let mut out = vec![0f32; m * n];
+    for c in 0..cols {
+        let base_c = c * m * nc;
+        for mi in 0..mt {
+            for ni in 0..ntc {
+                let base = base_c + (mi * ntc + ni) * 16;
+                for r in 0..4 {
+                    for cc in 0..4 {
+                        out[(mi * 4 + r) * n + (c * nc + ni * 4 + cc)] = ct[base + r * 4 + cc];
+                    }
+                }
+            }
         }
     }
     out
@@ -3605,6 +3697,81 @@ pub fn emit_gather(outer: usize, in_axis: usize, inner: usize, num_idx: usize) -
 
 #[cfg(test)]
 mod tests {
+
+    /// What the vendor `matmul_bf16_f32` does to one core's tiles: `C += A·B` over
+    /// 4×8 A / 8×4 B subtiles, writing 4×4 C subtiles (all row-major tile order).
+    fn mmul_4x8x4_reference(at: &[f32], bt: &[f32], ct: &mut [f32], d: usize) {
+        let (mt, kt, nt) = (d / 4, d / 8, d / 4);
+        for mi in 0..mt {
+            for ni in 0..nt {
+                for ki in 0..kt {
+                    let a = &at[(mi * kt + ki) * 32..][..32];
+                    let b = &bt[(ki * nt + ni) * 32..][..32];
+                    let c = &mut ct[(mi * nt + ni) * 16..][..16];
+                    for r in 0..4 {
+                        for t in 0..4 {
+                            c[r * 4 + t] +=
+                                (0..8).map(|s| a[r * 8 + s] * b[s * 4 + t]).sum::<f32>();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bf16 packing helpers + the kernel's tile contract compose to a plain
+    /// matmul: simulate each core (zero C, stream `kt` A/B K-tiles through the
+    /// 4×8×4 kernel), gather C as the runtime sequence does, untile, compare.
+    #[test]
+    fn bf16_microkernel_packing_round_trips_through_kernel_tiling() {
+        let (d, kt, cols) = (32, 3, 2);
+        let (m, k, n) = (d, kt * d, cols * d);
+        // Small integers: exact in bf16 and in the f32 accumulation.
+        let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 11) as f32) - 5.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 9) as f32) - 4.0).collect();
+        let bits = |v: &[f32]| {
+            v.iter()
+                .map(|x| (x.to_bits() >> 16) as u16)
+                .collect::<Vec<_>>()
+        };
+        let widen = |v: &[u16]| {
+            v.iter()
+                .map(|&h| f32::from_bits((h as u32) << 16))
+                .collect::<Vec<_>>()
+        };
+
+        let at = widen(&tile_a_kacc_bf16(&bits(&a), d, kt));
+        let bt = widen(&tile_b_kacc_multicol_bf16(&bits(&b), d, kt, cols));
+        let (dd, ka) = (d * d, kt * d * d);
+        let mut ct = vec![0f32; cols * dd];
+        for c in 0..cols {
+            for ki in 0..kt {
+                mmul_4x8x4_reference(
+                    &at[ki * dd..][..dd],
+                    &bt[c * ka + ki * dd..][..dd],
+                    &mut ct[c * dd..][..dd],
+                    d,
+                );
+            }
+        }
+        let got = untile_c_multicol_f32(&ct, m, n, cols);
+        for i in 0..m {
+            for j in 0..n {
+                let want: f32 = (0..k).map(|p| a[i * k + p] * b[p * n + j]).sum();
+                assert_eq!(got[i * n + j], want, "C[{i},{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn bf16_microkernel_mlir_uses_bf16_f32_kernel() {
+        let mlir = emit_matmul_microkernel_bf16(32, 4, 2, "mm_bf16_32.o");
+        assert!(mlir.contains("func.func private @matmul_bf16_f32(memref<1024xbf16>, memref<1024xbf16>, memref<1024xf32>)"));
+        assert!(mlir.contains("func.func private @zero_f32(memref<1024xf32>)"));
+        assert!(mlir.contains("aie.device(npu1_2col)"));
+        assert!(!mlir.contains("xi8") && !mlir.contains("xi32"));
+    }
+
     use super::*;
 
     #[test]

@@ -46,6 +46,7 @@ fn required_features_for(adapter: &wgpu::Adapter) -> wgpu::Features {
     if adapter_feats.contains(wgpu::Features::SUBGROUP) {
         required_features |= wgpu::Features::SUBGROUP;
     }
+    required_features |= crate::step_profile::required_feature(adapter);
     required_features
 }
 

@@ -135,6 +135,24 @@ fn main() {
         entries.push("compare".to_string());
     }
 
+    // Double-single: the fast-math-guarded `rlxsl::dw` GLSL library goes in
+    // at the template's marker, after the push constants `dw_zero()` reads.
+    {
+        println!("cargo:rerun-if-changed=shaders/templates/double_single_main.comp");
+        let main_src = fs::read_to_string(shader_dir.join("templates/double_single_main.comp"))
+            .expect("rlx-vulkan: read shaders/templates/double_single_main.comp");
+        let combined =
+            main_src.replacen("// @DW_PRELUDE\n", &rlxsl::dw::glsl_fast_math_guarded(), 1);
+        let words = compile_glsl_to_spirv("double_single", &combined, &shader_dir);
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        fs::write(Path::new(&out_dir).join("double_single.spv"), &bytes)
+            .expect("rlx-vulkan: write double_single.spv");
+        entries.push("double_single".to_string());
+    }
+
     // Pre-compiled SPIR-V kernels under `shaders/precompiled/*.spv` — kernels
     // naga can't build from GLSL (cooperative matrix / f16). The `.comp` source
     // lives beside each `.spv` for reference, but the committed `.spv` is the
@@ -218,9 +236,10 @@ fn compile_glsl_to_spirv(name: &str, src: &str, shader_dir: &Path) -> Vec<u32> {
     let src = inject_arena_include(src, &inc);
 
     let options = Options::from(ShaderStage::Compute);
-    let module = Frontend::default()
+    let mut module = Frontend::default()
         .parse(&options, &src)
         .unwrap_or_else(|e| panic!("rlx-vulkan: GLSL parse error in {name}.comp: {e:?}"));
+    workgroup_barriers(&mut module);
 
     let info = Validator::new(ValidationFlags::all(), Capabilities::all())
         .validate(&module)
@@ -233,6 +252,51 @@ fn compile_glsl_to_spirv(name: &str, src: &str, shader_dir: &Path) -> Vec<u32> {
     };
     spv::write_vec(&module, &info, &spv_opts, Some(&pipe_opts))
         .unwrap_or_else(|e| panic!("rlx-vulkan: SPIR-V emit error in {name}.comp: {e:?}"))
+}
+
+/// GLSL `barrier()` synchronizes the whole workgroup. naga's GLSL front end
+/// parses it as a barrier with *every* flag, sub-group included, and its
+/// SPIR-V writer then takes a sub-group flag to mean a sub-group *execution*
+/// scope: each 32-wide warp waited only for itself before reading shared
+/// tiles the other warps were still writing. NVIDIA schedules warps
+/// independently, so `scaled_lowp_matmul` read half-written tiles from row
+/// 8 on (cosine 0.87 against the CPU on an RTX 3080 Ti); MoltenVK happened
+/// to keep them in step. Dropping the sub-group flag leaves the workgroup
+/// execution scope `barrier()` means, with workgroup and storage memory.
+fn workgroup_barriers(module: &mut naga::Module) {
+    fn block(b: &mut naga::Block) {
+        use naga::{Barrier, Statement};
+        for s in b.iter_mut() {
+            match s {
+                Statement::ControlBarrier(flags) if flags.contains(Barrier::WORK_GROUP) => {
+                    flags.remove(Barrier::SUB_GROUP);
+                }
+                Statement::Block(inner) => block(inner),
+                Statement::If { accept, reject, .. } => {
+                    block(accept);
+                    block(reject);
+                }
+                Statement::Switch { cases, .. } => {
+                    for c in cases {
+                        block(&mut c.body);
+                    }
+                }
+                Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    block(body);
+                    block(continuing);
+                }
+                _ => {}
+            }
+        }
+    }
+    for (_, f) in module.functions.iter_mut() {
+        block(&mut f.body);
+    }
+    for ep in &mut module.entry_points {
+        block(&mut ep.function.body);
+    }
 }
 
 /// Insert dual-buffer arena helpers immediately after `#version 450`.

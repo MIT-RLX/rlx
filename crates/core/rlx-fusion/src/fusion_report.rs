@@ -270,14 +270,34 @@ fn scan_misses(graph: &Graph) -> Vec<MissedFusion> {
     missed
 }
 
+/// Each node's users (`Graph::users`: every node reading it, once, in graph
+/// order), built in one pass. `Graph::users` scans the whole graph per call,
+/// and the scan below asks it for every matmul: quadratic, and this report is
+/// built on every compile.
+fn users_index(graph: &Graph) -> std::collections::HashMap<rlx_ir::NodeId, Vec<rlx_ir::NodeId>> {
+    let mut users: std::collections::HashMap<rlx_ir::NodeId, Vec<rlx_ir::NodeId>> =
+        std::collections::HashMap::new();
+    for n in graph.nodes() {
+        for (k, &i) in n.inputs.iter().enumerate() {
+            if !n.inputs[..k].contains(&i) {
+                users.entry(i).or_default().push(n.id);
+            }
+        }
+    }
+    users
+}
+
 fn scan_missed_matmul_bias_act(graph: &Graph) -> Vec<MissedFusion> {
     let mut out = Vec::new();
+    let index = users_index(graph);
+    let no_users = Vec::new();
+    let users_of = |id| index.get(&id).unwrap_or(&no_users);
     for node in graph.nodes() {
         if !matches!(node.op, Op::MatMul) {
             continue;
         }
         let mm_id = node.id;
-        let users = graph.users(mm_id);
+        let users = users_of(mm_id);
         if users.len() != 1 {
             if users.len() > 1 {
                 out.push(missed_entry(
@@ -314,7 +334,7 @@ fn scan_missed_matmul_bias_act(graph: &Graph) -> Vec<MissedFusion> {
             ));
             continue;
         }
-        let add_users = graph.users(add_node.id);
+        let add_users = users_of(add_node.id);
         if add_users.len() == 1 {
             if let Op::Activation(act) = &graph.node(add_users[0]).op
                 && !fusible_mm_bias_epilogue(*act)
@@ -431,6 +451,27 @@ mod tests {
     use rlx_ir::DType;
     use rlx_ir::Shape;
     use rlx_ir::infer::GraphExt;
+
+    /// The one-pass index lists exactly what `Graph::users` does for every
+    /// node, in the same order, including a node that reads an input twice.
+    #[test]
+    fn the_users_index_matches_graph_users() {
+        use rlx_ir::infer::GraphExt;
+        let mut g = Graph::new("users");
+        let x = g.input("x", rlx_ir::Shape::new(&[4, 4], rlx_ir::DType::F32));
+        let w = g.param("w", rlx_ir::Shape::new(&[4, 4], rlx_ir::DType::F32));
+        let m = g.mm(x, w);
+        let sq = g.mm(m, m); // reads `m` in both slots
+        let r = g.relu(m);
+        let s = g.add(sq, r);
+        let t = g.add(s, x);
+        g.set_outputs(vec![t]);
+        let index = users_index(&g);
+        for n in g.nodes() {
+            let got = index.get(&n.id).cloned().unwrap_or_default();
+            assert_eq!(got, g.users(n.id), "{:?}", n.id);
+        }
+    }
 
     fn f32_shape(dims: &[usize]) -> Shape {
         Shape::new(dims, DType::F32)

@@ -127,3 +127,116 @@ fn conv2d_padded() {
     let (g, xs, ws) = conv(1);
     parity(g, &[("x", &xs), ("w", &ws)]);
 }
+
+/// Grouped conv: 4 input channels in 2 groups, 6 outputs, padded.
+#[test]
+fn conv2d_grouped() {
+    let (cin, h, w, cout, k, groups) = (4usize, 5usize, 5usize, 6usize, 3usize, 2usize);
+    let xs = f32s(cin * h * w, |i| (i as f32 * 0.37).cos());
+    let ws = f32s(cout * (cin / groups) * k * k, |i| {
+        0.07 * (i as f32 % 11.0) - 0.35
+    });
+    let mut g = Graph::new("conv_grouped");
+    let x = g.input("x", sh(&[1, cin, h, w]));
+    let weight = g.input("w", sh(&[cout, cin / groups, k, k]));
+    let y = g.conv2d(x, weight, [k, k], [1, 1], [1, 1], [1, 1], groups);
+    g.set_outputs(vec![y]);
+    parity(g, &[("x", &xs), ("w", &ws)]);
+}
+
+/// Depthwise causal 1-D conv as LFM2's ShortConv builds it: length in H,
+/// kernel `[k, 1]`, `groups = channels`, left padding already concatenated.
+#[test]
+fn conv1d_depthwise() {
+    let (c, l, k) = (8usize, 7usize, 3usize);
+    let xs = f32s(c * l, |i| (i as f32 * 0.21).sin());
+    let ws = f32s(c * k, |i| 0.1 * (i as f32 % 5.0) - 0.2);
+    let mut g = Graph::new("conv_depthwise");
+    let x = g.input("x", sh(&[1, c, l, 1]));
+    let weight = g.input("w", sh(&[c, 1, k, 1]));
+    let y = g.conv2d(x, weight, [k, 1], [1, 1], [0, 0], [1, 1], c);
+    g.set_outputs(vec![y]);
+    parity(g, &[("x", &xs), ("w", &ws)]);
+}
+
+/// `Op::Attention` has no WebGL kernel: legalization lowers it to matmul /
+/// softmax. A decode step (1 query, 6 keys), causal, 4 query / 2 KV heads.
+#[test]
+fn attention_via_legalization() {
+    let (h, kvh, d, sk) = (4usize, 2usize, 8usize, 6usize);
+    let q = f32s(h * d, |i| (i as f32 * 0.3).sin());
+    let k = f32s(sk * kvh * d, |i| (i as f32 * 0.17).cos());
+    let v = f32s(sk * kvh * d, |i| (i as f32 * 0.11).sin());
+    let mut g = Graph::new("attn");
+    let qi = g.input("q", sh(&[1, 1, h * d]));
+    let ki = g.input("k", sh(&[1, sk, kvh * d]));
+    let vi = g.input("v", sh(&[1, sk, kvh * d]));
+    let a = g.add_node(
+        Op::Attention {
+            num_heads: h,
+            head_dim: d,
+            v_head_dim: None,
+            mask_kind: rlx_ir::op::MaskKind::Causal,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![qi, ki, vi],
+        sh(&[1, 1, h * d]),
+    );
+    g.set_outputs(vec![a]);
+    parity(g, &[("q", &q), ("k", &k), ("v", &v)]);
+}
+
+/// Partial rotation (`n_rot < head_dim`) with a table wider than `n_rot/2`,
+/// in both pairing styles: NeoX `(i, i + n_rot/2)` and GPT-J `(2j, 2j + 1)`.
+fn rope(style: rlx_ir::op::RopeStyle) {
+    let (s, heads, d, n_rot, tab) = (5usize, 2usize, 8usize, 4usize, 4usize);
+    let xs = f32s(s * heads * d, |i| (i as f32 * 0.29).sin());
+    let cos = f32s(s * tab, |i| (i as f32 * 0.13).cos());
+    let sin = f32s(s * tab, |i| (i as f32 * 0.13).sin());
+    let mut g = Graph::new("rope");
+    let x = g.input("x", sh(&[1, s, heads * d]));
+    let c = g.input("cos", sh(&[s, tab]));
+    let sn = g.input("sin", sh(&[s, tab]));
+    let y = g.add_node(
+        Op::Rope {
+            head_dim: d,
+            n_rot,
+            style,
+        },
+        vec![x, c, sn],
+        sh(&[1, s, heads * d]),
+    );
+    g.set_outputs(vec![y]);
+    parity(g, &[("x", &xs), ("cos", &cos), ("sin", &sin)]);
+}
+
+#[test]
+fn rope_neox_partial() {
+    rope(rlx_ir::op::RopeStyle::NeoX);
+}
+
+#[test]
+fn rope_gptj_partial() {
+    rope(rlx_ir::op::RopeStyle::GptJ);
+}
+
+/// Activations added for the browser models (GELU in EmbeddingGemma and
+/// Moonshine, softplus in Qwen3.5's gated delta-net), over a range wide
+/// enough to reach both tails.
+#[test]
+fn gelu_and_softplus() {
+    use rlx_ir::op::Activation;
+    let xs = f32s(64, |i| (i as f32 - 32.0) * 0.4);
+    for act in [
+        Activation::Gelu,
+        Activation::GeluApprox,
+        Activation::Softplus,
+    ] {
+        let mut g = Graph::new("act");
+        let x = g.input("x", sh(&[64]));
+        let y = g.add_node(Op::Activation(act), vec![x], sh(&[64]));
+        g.set_outputs(vec![y]);
+        parity(g, &[("x", &xs)]);
+    }
+}

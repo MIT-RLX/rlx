@@ -21,6 +21,12 @@
 //!   [`graph::Pipeline::run_tcp`]). Use it when a model isn't a clean layer
 //!   stack (e.g. the DeepSeek-V4 graph) or you want automatic weight sharding.
 //!
+//! - **Addressed layer pipeline** ([`rpc`], [`stages`]) — workers serve layer
+//!   ranges by address over a request/reply RPC whose heartbeats bound every
+//!   read (a dead node is an error naming it, a slow one is not); stage plans
+//!   are checked to tile the model before any work. Used by `rlx-kimi-k3`'s
+//!   pipeline inference and training.
+//!
 //! Both seams share [`source::ParamSource`] — the model-agnostic weight seam:
 //! RLX asks for params by name, a model crate returns dense f32 or packed bytes
 //! (wrapping its own mlx / GGUF / safetensors loader). No model dependency leaks
@@ -34,13 +40,19 @@ pub mod launch;
 pub mod paging;
 pub mod partition;
 pub mod pipeline;
+pub mod rpc;
 pub mod source;
+pub mod stages;
 
 // ── Layer-block seam (public API used by rlx-qwen3 / rlx-protocol) ──
 pub use config::{DistConfig, Hostfile, ParallelMode, TransportBackend};
 pub use launch::{LocalCluster, WorkerArgs, free_loopback_ports, worker_args};
 pub use partition::{BlockRole, LayerSplit, block_role, pipeline_layer_range};
 pub use pipeline::{BlockInput, BlockOutput, BlockRunner, PipelineCoordinator, StepOptions};
+
+// ── Addressed layer pipeline: liveness-checked RPC + host-bound stages ──
+pub use rpc::{Dec, Enc, HEARTBEAT, OP_SHUTDOWN, RpcClient, RpcHandler, RpcOptions};
+pub use stages::{StageSpec, parse_stages, plan_stages, validate_stages};
 
 // ── MoE expert-parallel offload seam (model-agnostic; DeepSeek / Llama-4 / Kimi) ──
 pub use experts::{

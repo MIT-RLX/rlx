@@ -9,6 +9,10 @@
 //! scale per output column. An optional per-tensor `global_scale` (f32)
 //! lives in the fourth `Op::DequantMatMul` input (the legacy `zp` slot).
 
+// Float methods `core` lacks (`FloatExt`) without `std`.
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 /// Elements sharing one FP8 E4M3 block scale.
 pub const NVFP4_GROUP_SIZE: usize = 16;
 

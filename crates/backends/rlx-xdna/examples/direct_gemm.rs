@@ -21,7 +21,7 @@ fn main() {
     use rlx_xdna::direct::Gemm;
     use std::time::Instant;
 
-    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let env = |k: &str, d: &str| rlx_ir::env::read(k).unwrap_or_else(|_| d.to_string());
     let xclbin_path = std::env::var("XCLBIN").expect("set XCLBIN");
     let insts_path = std::env::var("INSTS").expect("set INSTS");
     let (m, k, n): (usize, usize, usize) = (

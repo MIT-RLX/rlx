@@ -8,6 +8,9 @@
 //! Honors the same `Hints` knobs as `conv2d`: `fast_mac`,
 //! `ternary_fast_path`, `shared_requant`, `requant_precision`.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::{Artifact, LayerArtifacts};
 use crate::codegen::conv2d::emit_byte_addr_lane;
 use crate::codegen::relu::bits_for;

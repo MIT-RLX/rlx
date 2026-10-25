@@ -150,7 +150,7 @@ specific kernel:
 
 Low rank is intentionally flagged as **not sketch-observable** by the miner
 (these reductions can't see singular values) — it's a deep-dump candidate, which
-is the honest signal the miner should give.
+is the accurate signal the miner should give.
 ## License
 
 MIT OR Apache-2.0.

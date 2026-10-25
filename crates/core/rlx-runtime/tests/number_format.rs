@@ -28,12 +28,14 @@ fn formats() -> Vec<FloatFormat> {
     .collect()
 }
 
-fn scalings() -> [FormatScaling; 4] {
+fn scalings() -> [FormatScaling; 6] {
     [
         FormatScaling::None,
         FormatScaling::PerTensor,
         FormatScaling::Block(32),
         FormatScaling::Block(7),
+        FormatScaling::FineBlock(16),
+        FormatScaling::FineBlock(7),
     ]
 }
 
@@ -309,7 +311,10 @@ fn shared_input_matmuls_with_rounded_weights() {
         })
         .collect();
     let run = |device: Device| {
-        let opts = CompileOptions::new().number_format("f16".parse().unwrap());
+        let mut opts = CompileOptions::new().number_format("f16".parse().unwrap());
+        // Weights rounded inside the graph (QAT's path) rather than on upload.
+        opts.number_format_options.params_in_graph =
+            std::env::var("NF_TEST_PARAMS_IN_GRAPH").is_ok_and(|v| v == "1");
         let mut cg = Session::new(device).compile_with(build(), &opts);
         for (name, w) in ["wq", "wk", "wv"].iter().zip(&ws) {
             cg.set_param(name, w);

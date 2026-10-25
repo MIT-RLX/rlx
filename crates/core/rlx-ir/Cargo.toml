@@ -17,13 +17,22 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 bincode = { version = "1", optional = true }
 aes = "0.9.1"
+# Float math `core` lacks (sqrt/sin/floor/…) for the `no_std` subset only;
+# under `std` the inherent methods are used.
+libm = "0.2"
 
 [features]
-serialize = ["dep:serde", "dep:serde_json", "dep:bincode"]
+default = ["std"]
+# Everything. Without it the crate is `no_std` + `alloc` and keeps only the
+# graph/op/shape/verify core (no env, no global custom-op registry, no
+# HIR→LIR pipeline), so integer-only targets like rlx-fpga can still verify
+# the graphs they build.
+std = []
+serialize = ["std", "dep:serde", "dep:serde_json", "dep:bincode"]
 # One constructible `Op` per `OpKind` (`sample_ops`), so gates keyed on the op
 # set can cover all of it instead of the handful a test author thought of.
 # Off by default: it is test scaffolding, not part of the IR surface.
-test-support = []
+test-support = ["std"]
 
 [dev-dependencies]
 [lints]

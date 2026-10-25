@@ -138,6 +138,13 @@ int rlx_mlx_async_eval(rlx_mlx_array_t* const* handles, size_t n);
 // Wait for all in-flight async work on every MLX stream.
 int rlx_mlx_synchronize(void);
 
+// Allocator cache (MLX keeps freed buffers up to the cache limit).
+size_t rlx_mlx_set_cache_limit(size_t limit);
+void rlx_mlx_clear_cache(void);
+size_t rlx_mlx_get_cache_memory(void);
+size_t rlx_mlx_get_active_memory(void);
+size_t rlx_mlx_get_peak_memory(void);
+
 // ── Ops ──────────────────────────────────────────────────────────
 // Each op produces a new handle. In eager mode the Rust side calls
 // rlx_mlx_eval() on the result immediately; in lazy mode it defers
@@ -345,6 +352,16 @@ int rlx_mlx_op_fft(
 // ── PR2: norms + attention ───────────────────────────────────────
 
 // RMSNorm with explicit weight (gamma) and eps. Maps Op::RmsNorm.
+int rlx_mlx_op_gated_delta_update(
+    rlx_mlx_array_t* q,
+    rlx_mlx_array_t* k,
+    rlx_mlx_array_t* v,
+    rlx_mlx_array_t* gate,
+    rlx_mlx_array_t* beta,
+    rlx_mlx_array_t* state_or_null,
+    rlx_mlx_array_t** out,
+    rlx_mlx_array_t** state_out);
+
 int rlx_mlx_op_rmsnorm(
     rlx_mlx_array_t* x,
     rlx_mlx_array_t* gamma,

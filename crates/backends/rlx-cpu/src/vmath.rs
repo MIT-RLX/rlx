@@ -22,9 +22,12 @@
 //! Callers depend on this module — never link Accelerate vForce directly.
 
 /// Select accurate CPU vector math instead of the default SIMD exp/tanh path.
+/// Read once per process: it is consulted on every vector exp/tanh/log, where
+/// an environment lookup per call is a measurable share of small kernels.
 #[inline]
 pub fn vmath_accurate() -> bool {
-    rlx_ir::env::flag("RLX_VMATH_ACCURATE")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rlx_ir::env::flag("RLX_VMATH_ACCURATE"))
 }
 
 /// `y[i] = exp(x[i])`. Lengths must match. Aliasing OK.

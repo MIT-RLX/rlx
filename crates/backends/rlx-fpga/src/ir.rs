@@ -13,6 +13,9 @@
 //! themselves still only carry a scalar `mult` (workspace rule: don't
 //! extend `QConv2d`/`QMatMul` fields without touching every backend).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use rlx_ir::op::{Activation, ReduceOp};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 
@@ -310,7 +313,10 @@ fn flatten_to_1d(g: &mut Graph, prev: NodeId, len: usize) -> NodeId {
 /// Convert a Q0.31 `(M0, shift)` pair back to an approximate f32 multiplier.
 fn q31_to_f32_mult(m0: i32, shift: i32) -> f32 {
     let s = m0 as f64 / (1u64 << 31) as f64;
-    let scale = 2f64.powi(-shift);
+    // 2^-shift, built from the exponent bits: exact, and `powi` is not in
+    // `core`. A requant shift is far inside the normal range (|shift| < 64).
+    debug_assert!((-1022..=1022).contains(&shift));
+    let scale = f64::from_bits(((1023 - shift) as u64) << 52);
     (s * scale) as f32
 }
 

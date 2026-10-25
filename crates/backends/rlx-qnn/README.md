@@ -2,7 +2,7 @@
 
 Qualcomm **QNN (AI Engine Direct)** backend for RLX — runs an `rlx-ir` graph on
 the Qualcomm Hexagon NPU. Two surfaces onto the same toolchain, sharing one Rust
-parity oracle:
+parity reference:
 
 - **FFI runtime backend** (feature `runtime`) — a real `Device::Hexagon`
   `rlx-runtime` backend. Lowers a graph straight to the QNN C API and executes
@@ -66,7 +66,7 @@ compiles on any host with no SDK present. Design + milestones:
 [`docs/ffi-runtime-backend.md`](docs/ffi-runtime-backend.md).
 
 x86 HTP **functional simulator**: `just qnn-htp-sim` (or
-`RLX_QNN_HTP_LIB=…/libQnnHtp.so`) — no Snapdragon silicon; covers
+`RLX_QNN_BACKEND_LIB=…/libQnnHtp.so`) — no Snapdragon silicon; covers
 sfixed8 MatMul (via Dequantize), int4/int8 probes, LinearStatic offline.
 Remaining: real HTP silicon soak (latency/power), native packed
 `SFIXED_POINT_4`, HTP per-channel Dequantize, deeper multi-layer codegen.

@@ -770,8 +770,8 @@ impl BucketedCompileCache {
     /// each rung holds its own copy of the weights, and on a model split
     /// across machines — which is to say a model that did not fit — that is
     /// the dominant memory cost. It is a property of the backend, not of the
-    /// model: `share_params_from` defaults to doing nothing and only Metal
-    /// and MLX override it.
+    /// model: `share_params_from` defaults to doing nothing and only Metal,
+    /// MLX and wgpu (packed GGUF weights) override it.
     pub fn params_shared(&self) -> bool {
         self.weight_donor_upper.is_some()
     }
@@ -1347,18 +1347,6 @@ impl DynamicDimCompileCache {
         if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
             return Ok(&mut self.entries[idx].1);
         }
-        if self.template.is_none() {
-            let mut template_opts = options.clone();
-            template_opts.dim_binding = None;
-            let pipe = crate::stages::pipeline_for(self.device, &template_opts);
-            self.template = Some(pipe.compile_hir(build_hir())?);
-        }
-        let template = self.template.as_ref().expect("template just set");
-        let mut spec_opts = options.clone();
-        spec_opts.dim_binding = None;
-        let pipe = crate::stages::pipeline_for(self.device, &spec_opts);
-        let specialized = template.specialize(&pipe, binding);
-        let backend = crate::registry::backend_for(self.device).expect("backend registered");
         let mut compile_opts = options.clone();
         compile_opts.dim_binding = None;
         if compile_opts.policy.is_none() {
@@ -1366,8 +1354,29 @@ impl DynamicDimCompileCache {
                 compile_opts = compile_opts.policy(p.clone());
             }
         }
-        let executable = backend.compile_lir(specialized.lir, &compile_opts);
-        let compiled = CompiledGraph::new(executable, self.device);
+        let compiled = if crate::model_pipeline::needs_mir_route(options) {
+            crate::model_pipeline::compile_bound_mir(
+                self.device,
+                build_hir,
+                binding,
+                &compile_opts,
+            )?
+        } else {
+            if self.template.is_none() {
+                let mut template_opts = options.clone();
+                template_opts.dim_binding = None;
+                let pipe = crate::stages::pipeline_for(self.device, &template_opts);
+                self.template = Some(pipe.compile_hir(build_hir())?);
+            }
+            let template = self.template.as_ref().expect("template just set");
+            let mut spec_opts = options.clone();
+            spec_opts.dim_binding = None;
+            let pipe = crate::stages::pipeline_for(self.device, &spec_opts);
+            let specialized = template.specialize(&pipe, binding);
+            let backend = crate::registry::backend_for(self.device).expect("backend registered");
+            let executable = backend.compile_lir(specialized.lir, &compile_opts);
+            CompiledGraph::new(executable, self.device)
+        };
 
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
@@ -2137,9 +2146,7 @@ mod tests {
         if path.exists() {
             let _ = fs::remove_file(&path);
         }
-        unsafe {
-            env::set_var("RLX_TRACE_PERFETTO", &path);
-        }
+        rlx_ir::env::set("RLX_TRACE_PERFETTO", path.to_string_lossy());
 
         // Build + run a small CPU graph — Add → Relu (no fusion macros).
         let f = DType::F32;

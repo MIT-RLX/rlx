@@ -342,6 +342,42 @@ pub fn async_eval(arrays: &[&Array]) -> Result<(), MlxError> {
     check(rc)
 }
 
+/// Cap MLX's allocator cache (freed buffers kept for reuse) at `bytes`;
+/// returns the previous limit. MLX's default is its memory limit, so a
+/// process that compiles many differently-shaped graphs only ever grows.
+pub fn set_cache_limit(bytes: usize) -> usize {
+    unsafe { ffi::rlx_mlx_set_cache_limit(bytes) }
+}
+
+/// Release every cached (freed) buffer back to the system.
+pub fn clear_cache() {
+    let _guard = crate::sync::runtime_guard();
+    unsafe { ffi::rlx_mlx_clear_cache() }
+}
+
+/// `(active, cache, peak)` bytes as MLX's allocator counts them.
+pub fn memory_stats() -> (usize, usize, usize) {
+    unsafe {
+        (
+            ffi::rlx_mlx_get_active_memory(),
+            ffi::rlx_mlx_get_cache_memory(),
+            ffi::rlx_mlx_get_peak_memory(),
+        )
+    }
+}
+
+/// Apply `RLX_MLX_CACHE_LIMIT` (bytes) once per process, if set.
+pub fn apply_cache_limit_from_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Some(bytes) =
+            rlx_ir::env::var("RLX_MLX_CACHE_LIMIT").and_then(|s| s.trim().parse::<usize>().ok())
+        {
+            set_cache_limit(bytes);
+        }
+    });
+}
+
 /// Wait for every in-flight async eval on every MLX stream.
 pub fn synchronize() -> Result<(), MlxError> {
     let _guard = crate::sync::runtime_guard();

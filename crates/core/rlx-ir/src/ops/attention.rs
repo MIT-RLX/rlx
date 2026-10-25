@@ -6,6 +6,7 @@
 //! masks (plan #53).
 
 use crate::op::MaskKind;
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 /// Build an [`Op::Attention`] with optional score scale and logit softcap.

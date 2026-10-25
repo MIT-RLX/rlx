@@ -19,6 +19,31 @@ Depends on [`rlx-ir`] and [`rlx-fusion`].
   before DCE / constant folding (`CompileOptions::param_bindings` in runtime).
 - **`algebraic_simplify`** — same-shape `x*0`, `x*1`, `x+0` rewrites (safe
   only when constant rank matches output; no scalar-broadcast folding).
+- **`cse`**, **`sccp`** — common-subexpression elimination; sparse
+  conditional constant propagation.
+- **`simplify_transposes`** — remove transpose pairs that cancel (importer
+  layout conversions, e.g. ONNX from TensorFlow).
+- **`param_hoist`** — split a param-invariant *prepare* graph off the per-run
+  graph.
+- **`plan_check`** — program-safety and schedule-semantics gates over a
+  `MemoryPlan` (`schedule_hazards`).
+- **`numeric_lint`** — provable compile-time NaN/Inf sources.
+- **`rewrite`** / **`dispatch_report`** — decompose ops a backend doesn't
+  claim; report native vs common-IR vs missing.
+- **`scaled_quant_insert`** (FP8/FP4 `ScaledMatMul`), **`bitnet_qat`**
+  (BitNet b1.58 QAT rewrite), **`training_compile`**, **`inspect`** (dump every
+  HIR / MIR / LIR stage).
+
+## Number formats
+
+`CompileOptions::number_format` (in `rlx-runtime`) runs an f32 graph in
+another format, by graph rewrite:
+
+| format | pass | what happens |
+|---|---|---|
+| `F64` | `promote_f64` | every f32 value becomes f64; inputs and outputs stay f32, params are widened once on upload. Native f64 where the backend has it. |
+| `F64` on a GPU without f64, or `F64x2` | `decompose_f64` → `lower_f64` | composites are decomposed to the primitives with double-single kernels, then each f64 tensor `[…]` becomes an f32 tensor `[…, 2]` (`Op::DoubleSingle`, ~48 significant bits) |
+| `Float { … }` / `Mixed { … }` | `emulate_format` | `Op::RoundToFormat` after the weights and each op, so the graph computes as if values were stored in a narrower float format |
 
 ## Kernel dispatch transparency
 

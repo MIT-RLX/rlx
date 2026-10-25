@@ -4,6 +4,9 @@
 
 //! Soft I/O configuration: port renames, memory readout, stream ports, binds.
 
+// Emits files / goes through `rlx-ir`: both need the `std` feature.
+#![cfg(feature = "std")]
+
 use rlx_fpga::codegen::{collect_artifacts_io, emit_with_config};
 use rlx_fpga::export_config::{
     FpgaExportConfig, InputIface, IoConfig, OutputIface, OutputKind, PortNames, SidebandSpec,

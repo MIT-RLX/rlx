@@ -27,7 +27,17 @@ default = ["cpu", "model-io"]
 # `gguf://`, `safetensors://` and `file://` weight URIs keep working without
 # it: rlx-gguf is small and its quant kernels back `quantized_kv`, and the
 # safetensors reader here is a 40-line header parse, not the crate.
-model-io = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf"]
+model-io = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:sha2"]
+# Package programs: an entry of kind `program`, the model's host logic as
+# WebAssembly run in a sandbox (`wasmi`, an interpreter: no JIT, so it runs
+# where code cannot be generated — iOS, watchOS).
+program = ["model-io", "dep:wasmi", "dep:rlx-program"]
+# Load model provider plugins (`model::plugin::load_plugin`, `RLX_MODEL_PLUGINS`).
+model-plugins = ["dep:libloading"]
+# Plugins linked into this build instead of loaded (iOS, Android, wasm, a
+# static library): the host crate names them with `link_model_plugins!`.
+# Their `cdylib` export is left out, so several plugins link together.
+linked-plugins = []
 
 # ── CPU backends ─────────────────────────────────────────────
 # Base CPU with SIMD kernels (NEON/AVX) + persistent thread pool
@@ -73,6 +83,8 @@ blas-accelerate = ["cpu"]                          # macOS: Apple Accelerate (vi
 blas-mkl = ["cpu", "rlx-cpu/blas-mkl"]              # Intel/AMD: MKL instead of OpenBLAS
 amx-sme = ["cpu", "rlx-cpu/amx-sme"]                # Apple M4+: direct ARM SME2 GEMM microkernel
 amx-bnns = ["cpu", "rlx-cpu/amx-bnns"]                # Apple: BNNS bf16/f16 low-precision matmul
+cpu-wave-exec = ["cpu", "rlx-cpu/wave-exec"]           # CPU: run independent thunks concurrently
+assoc-scan = ["rlx-opt/assoc-scan"]                    # Metal: affine Scan → log-depth prefix scan
 blas-openblas = ["cpu"]                            # Linux/Windows: OpenBLAS (rlx-cpu default)
 
 # Future: direct hardware access. Declared (empty) so device_ext.rs's
@@ -188,8 +200,13 @@ egpu = ["cpu", "dep:rlx-egpu", "rlx-egpu/dext"]
 # does not register a runtime Device / Backend.
 fpga = ["dep:rlx-fpga"]
 
+# StableHLO MLIR export (`rlx_runtime::export`, `ExportTarget::StableHlo`) for
+# IREE and other MLIR toolchains. Offline — no runtime Device.
+stablehlo = ["dep:rlx-stablehlo"]
+
 [dependencies]
 rlx-ir = { workspace = true, features = ["serialize"] }
+rlx-search = { workspace = true }
 # Tile parameter space + analytical cost model, for the device-free schedule
 # axis of `check`. Not a GPU dependency: the crate is dependency-free, holds no
 # kernel sources, and touches neither the filesystem nor a driver.
@@ -217,6 +234,7 @@ rlx-qnn = { workspace = true, optional = true, features = ["runtime"] }
 rlx-xdna = { workspace = true, optional = true }
 rlx-egpu = { workspace = true, optional = true }
 rlx-fpga = { workspace = true, optional = true }
+rlx-stablehlo = { workspace = true, optional = true }
 rlx-macros = { workspace = true }
 # rlx-compile: used unconditionally by src/check.rs, so it belongs in
 # [dependencies], not only [dev-dependencies].  The dev-dep entry
@@ -228,13 +246,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 inventory = "0.3"
+libloading = { version = "0.8", optional = true }
 memmap2 = { version = "0.9", optional = true }
 rlx-gguf = { workspace = true }
 rlx-pkg = { workspace = true, optional = true }
+rlx-program = { workspace = true, optional = true }
+wasmi = { version = "2", optional = true }
+# Referenced weight files' checksums (`model.weights[].sha256`); already in
+# the `model-io` tree through the archive crates.
+sha2 = { version = "0.10", optional = true }
 rlx-mlx-io = { workspace = true, optional = true }
 rlx-dduf = { workspace = true, optional = true }
-# rlx-gpu = { path = "../rlx-gpu", version = "0.2.18", optional = true }
-# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.18", optional = true }
+# rlx-gpu = { path = "../rlx-gpu", version = "0.2.19", optional = true }
+# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.19", optional = true }
 
 # rlx-metal is Apple-only (Metal is an Apple API). Make it a dependency solely on
 # Apple targets — excluding watchOS, which has no Metal compute — so the `metal`
@@ -256,6 +280,8 @@ rlx-coreml = { workspace = true, optional = true }
 serde_json = "1"
 
 [dev-dependencies]
+# `fft_algo`: the reference the CPU pocketfft path must reproduce bit for bit.
+rlx-pocketfft = { workspace = true }
 rlx-autodiff = { workspace = true }
 rlx-fusion = { workspace = true }
 # Warm-tier kernel codegen manifest — the `kernel_dsl_matches_cpu_oracle` test
@@ -268,7 +294,7 @@ rlx-flow = { workspace = true }
 rayon = "1"
 rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.18", default-features = false, features = ["test-support", "io"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.19", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # `metal`/`mlx` are enabled ONLY on macOS (see the target-specific
 # dev-dependencies below) — those backends exist solely on Apple, and on a

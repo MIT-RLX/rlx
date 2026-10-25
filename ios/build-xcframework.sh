@@ -6,6 +6,21 @@
 #   ios/build-xcframework.sh --apple                # + Metal / ANE
 #   ios/build-xcframework.sh --platforms ios,visionos
 #   ios/build-xcframework.sh --all-archs            # + arm64_32 watch, x86_64 sims
+#   ios/build-xcframework.sh --capi                 # RLX.xcframework: the whole rlx C ABI
+#   ios/build-xcframework.sh --capi-crate <Cargo.toml>   # … with model plugins linked in
+#
+# `--capi` packages `rlx-capi` (graphs, sessions, training, text, weights — the
+# library under `crates/bindings/rlx-swift`) instead of the node, as
+# RLX.xcframework with a `CRLX` module over `rlx.h`, into
+# crates/bindings/rlx-swift/build/. Its default platforms are ios and macos, so
+# the same artifact serves an iOS app and `swift test` on a Mac; `--apple`
+# there means the `metal` feature.
+#
+# An iOS app cannot load a model plugin, so it links them: `--capi-crate`
+# packages a static library crate that re-exports rlx-capi and names its
+# plugins with `rlx_runtime::link_model_plugins!` (as
+# crates/bindings/rlx-capi/tests/linked does), in the same RLX.xcframework.
+# The app calls `rlx_link_model_plugins()` once before its first model call.
 #
 # Built with the size-tuned `apple` cargo profile (see [profile.apple] in the
 # workspace Cargo.toml): LTO, one codegen unit, and `panic = "abort"`, which
@@ -22,12 +37,15 @@
 # be installed is skipped with a note rather than failing the whole build.
 set -euo pipefail
 
+CALLER="$PWD"
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 OUT="$ROOT/ios/build"
 FEATURES=()
+APPLE=0
+CAPI=0
 PROFILE=apple
-PLATFORMS="ios tvos watchos visionos"
+PLATFORMS=""
 # Tier-3 Rust targets (no prebuilt std) are off by default: they need a nightly
 # toolchain and a from-source std, which turns a 10-minute build into a much
 # longer one. What they buy is real coverage, not completeness for its own
@@ -61,7 +79,12 @@ export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-12.0}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --apple) FEATURES=(--features apple); shift ;;
+    --apple) APPLE=1; shift ;;
+    --capi) CAPI=1; shift ;;
+    --capi-crate)
+      [[ $# -ge 2 ]] || { echo "--capi-crate needs a Cargo.toml" >&2; exit 2; }
+      CAPI=1; CAPI_MANIFEST="$(cd "$CALLER" && cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+      shift 2 ;;
     --debug) PROFILE=dev; shift ;;
     --profile)
       [[ $# -ge 2 ]] || { echo "--profile needs a value" >&2; exit 2; }
@@ -113,8 +136,33 @@ sim_targets() {
   esac
 }
 
-CARGO_FLAGS=(-p rlx-ffi --lib --profile "$PROFILE")
-lib=librlx_ffi.a
+if [[ $CAPI == 1 ]]; then
+  CRATE=rlx-capi; lib=librlx_capi.a; NAME=RLX; MODULE=CRLX
+  PACKAGE=(-p "$CRATE")
+  if [[ -n ${CAPI_MANIFEST:-} ]]; then
+    # Its own workspace, built into this one's target/ so the paths below hold.
+    CRATE=$(cargo metadata --no-deps --format-version 1 --manifest-path "$CAPI_MANIFEST" \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["name"])')
+    lib="lib${CRATE//-/_}.a"
+    PACKAGE=(--manifest-path "$CAPI_MANIFEST" --target-dir "$ROOT/target")
+  fi
+  HEADER="$ROOT/crates/bindings/rlx-capi/include/rlx.h"
+  OUT="$ROOT/crates/bindings/rlx-swift/build"
+  PLATFORMS=${PLATFORMS:-"ios macos"}
+  # A `--capi-crate` crate picks its own features, Metal included.
+  [[ $APPLE == 1 && -z ${CAPI_MANIFEST:-} ]] && FEATURES=(--features metal,blas-accelerate)
+  # Static archive only: rlx-capi also declares `cdylib`, and a shared library
+  # must resolve every symbol at link time, which zstd-sys does not on iOS.
+  CARGO_FLAGS=("${PACKAGE[@]}" --lib --crate-type staticlib --profile "$PROFILE")
+  SUBCOMMAND=rustc
+else
+  CRATE=rlx-ffi; lib=librlx_ffi.a; NAME=RlxNode; MODULE=RlxNodeFFI
+  HEADER="$ROOT/crates/bindings/rlx-ffi/include/rlx_node.h"
+  PLATFORMS=${PLATFORMS:-"ios tvos watchos visionos"}
+  [[ $APPLE == 1 ]] && FEATURES=(--features apple)
+  CARGO_FLAGS=(-p "$CRATE" --lib --profile "$PROFILE")
+  SUBCOMMAND=build
+fi
 # `--profile dev` writes to target/<triple>/debug, every other profile to a
 # directory named after itself.
 OUTDIR=$PROFILE
@@ -144,15 +192,15 @@ have_target() {
 
 build() {
   echo "==> $1 (profile $PROFILE)"
-  "${CARGO[@]}" build "${STD_FLAGS[@]+"${STD_FLAGS[@]}"}" "${CARGO_FLAGS[@]}" \
+  "${CARGO[@]}" "$SUBCOMMAND" "${STD_FLAGS[@]+"${STD_FLAGS[@]}"}" "${CARGO_FLAGS[@]}" \
     "${FEATURES[@]+"${FEATURES[@]}"}" --target "$1"
 }
 
 rm -rf "$OUT"; mkdir -p "$OUT/headers"
-cp "$ROOT/crates/bindings/rlx-ffi/include/rlx_node.h" "$OUT/headers/"
+cp "$HEADER" "$OUT/headers/"
 cat > "$OUT/headers/module.modulemap" <<MAP
-module RlxNodeFFI {
-    header "rlx_node.h"
+module $MODULE {
+    header "$(basename "$HEADER")"
     export *
 }
 MAP
@@ -207,7 +255,7 @@ done
 
 [[ ${#SLICES[@]} -gt 0 ]] || { echo "no slices built" >&2; exit 1; }
 
-xcodebuild -create-xcframework "${SLICES[@]}" -output "$OUT/RlxNode.xcframework"
+xcodebuild -create-xcframework "${SLICES[@]}" -output "$OUT/$NAME.xcframework"
 
 # MLX ships its GPU kernels in a separate `mlx.metallib`, loaded lazily at the
 # first kernel and looked up NEXT TO THE EXECUTABLE — a static archive cannot
@@ -239,4 +287,4 @@ if [[ ${#FEATURES[@]} -gt 0 ]]; then
   fi
 fi
 
-echo "built $OUT/RlxNode.xcframework for: ${BUILT[*]:-}"
+echo "built $OUT/$NAME.xcframework for: ${BUILT[*]:-}"

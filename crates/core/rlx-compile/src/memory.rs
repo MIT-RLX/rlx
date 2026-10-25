@@ -52,8 +52,8 @@ fn boundary_tail_guard(op: &rlx_ir::Op, alignment: usize) -> usize {
 ///
 ///   - **`Reshape`**: pure metadata; data layout is identical.
 ///   - **`Cast`** with `src dtype == dst dtype`: pure metadata.
-///   - **`Narrow` on axis 0**: contiguous sub-slice of the parent;
-///     offset = `start * size_of_inner_in_bytes`.
+///   - **`Narrow` with only size-1 dims before its axis** (axis 0 included):
+///     contiguous sub-slice of the parent; offset = `start * inner_bytes`.
 fn pure_view_offset(graph: &Graph, node: &rlx_ir::Node) -> Option<(NodeId, usize)> {
     match &node.op {
         Op::Reshape { .. } => Some((node.inputs[0], 0)),
@@ -61,6 +61,9 @@ fn pure_view_offset(graph: &Graph, node: &rlx_ir::Node) -> Option<(NodeId, usize
         // gives it cache's slot (no copy). Unlike a pure view it still WRITES a
         // row, so `is_pure_view` (the backend Nop predicate) excludes it below.
         Op::KvAppend { .. } => Some((node.inputs[0], 0)),
+        // The same for `DynamicUpdateSlice`: its output is `operand`'s
+        // buffer with the rows written in place.
+        Op::DynamicUpdateSlice { .. } => Some((node.inputs[0], 0)),
         Op::Cast { to } => {
             let parent = graph.node(node.inputs[0]);
             if parent.shape.dtype() == *to {
@@ -69,14 +72,22 @@ fn pure_view_offset(graph: &Graph, node: &rlx_ir::Node) -> Option<(NodeId, usize
                 None
             }
         }
+        // Contiguous whenever every dim BEFORE `axis` is 1 — axis 0 is just the
+        // case with no leading dims. The `[1, 1, q+k+v]` split of a fused QKV
+        // (and gate/up) projection at decode is this: on axis 2 with
+        // batch = seq = 1 it is one contiguous range, but was copied by a
+        // kernel — 5 per layer, 140 dispatches per Qwen3-0.6B token on wgpu.
         Op::Narrow {
             axis,
             start,
             len: _,
-        } if *axis == 0 => {
+        } if graph.node(node.inputs[0]).shape.dims()[..*axis]
+            .iter()
+            .all(|d| matches!(d, rlx_ir::Dim::Static(1))) =>
+        {
             let parent = graph.node(node.inputs[0]);
-            // inner = product of dims after axis 0
-            let inner_elems: usize = (1..parent.shape.rank())
+            // inner = product of dims after `axis`
+            let inner_elems: usize = (*axis + 1..parent.shape.rank())
                 .map(|i| parent.shape.dim(i).unwrap_static())
                 .product();
             let dt_bytes = parent.shape.dtype().size_bytes();
@@ -92,7 +103,8 @@ fn pure_view_offset(graph: &Graph, node: &rlx_ir::Node) -> Option<(NodeId, usize
 pub fn is_pure_view(graph: &Graph, node: &rlx_ir::Node) -> bool {
     // KvAppend aliases its parent's slot (so it's in `pure_view_offset`) but is
     // NOT a no-op — the backend must still encode the single-row write.
-    !matches!(node.op, Op::KvAppend { .. }) && pure_view_offset(graph, node).is_some()
+    !matches!(node.op, Op::KvAppend { .. } | Op::DynamicUpdateSlice { .. })
+        && pure_view_offset(graph, node).is_some()
 }
 
 /// True iff this node is a bank transpose that a backend folding
@@ -194,9 +206,7 @@ pub const SMALL_M_GROUPED: usize = 4;
 /// Sole use, matching the fold: a transpose read by anything other than the one
 /// matmul must stay materialized.
 pub fn is_elidable_matmul_transpose(graph: &Graph, node: &rlx_ir::Node) -> bool {
-    if !matches!(&node.op, Op::Transpose { perm } if perm.as_slice() == [1, 0])
-        || node.shape.rank() != 2
-    {
+    if !is_matmul_fold_transpose(node) {
         return false;
     }
     let mut reader: Option<&rlx_ir::Node> = None;
@@ -211,15 +221,64 @@ pub fn is_elidable_matmul_transpose(graph: &Graph, node: &rlx_ir::Node) -> bool 
             reader = Some(n);
         }
     }
-    let Some(mm) = reader else {
-        return false;
-    };
-    // The fold only fires for a 2-D F32 matmul, so only then is the buffer dead.
+    reader.is_some_and(|mm| folds_into_matmul(graph, mm))
+}
+
+/// [`is_elidable_matmul_transpose`] answered from a [`ReaderIndex`] built once
+/// for the graph, instead of scanning every node per candidate: a training
+/// graph has one such transpose per weight, so the scan made planning
+/// quadratic in the graph size. Same answer by construction.
+pub fn is_elidable_matmul_transpose_indexed(
+    graph: &Graph,
+    node: &rlx_ir::Node,
+    readers: &ReaderIndex,
+) -> bool {
+    is_matmul_fold_transpose(node)
+        && readers
+            .sole_reader(node.id)
+            .is_some_and(|mm| folds_into_matmul(graph, graph.node(mm)))
+}
+
+/// A 2-D `[1, 0]` transpose: the only kind the matmul fold takes.
+fn is_matmul_fold_transpose(node: &rlx_ir::Node) -> bool {
+    matches!(&node.op, Op::Transpose { perm } if perm.as_slice() == [1, 0])
+        && node.shape.rank() == 2
+}
+
+/// Whether `mm`, the sole reader of a transpose, is a matmul the fold fires
+/// for: 2-D F32, so only then is the transpose's buffer dead.
+fn folds_into_matmul(graph: &Graph, mm: &rlx_ir::Node) -> bool {
     matches!(mm.op, Op::MatMul)
         && mm.shape.dtype() == rlx_ir::DType::F32
         && mm.inputs.len() >= 2
         && graph.node(mm.inputs[0]).shape.rank() == 2
         && graph.node(mm.inputs[1]).shape.rank() == 2
+}
+
+/// For every node: how many input slots across the graph read it (a node
+/// reading it twice counts twice) and the first node that does, in graph
+/// order. One pass, for the questions the planner and the CPU backend's
+/// matmul fold ask of every candidate.
+pub struct ReaderIndex(HashMap<NodeId, (usize, NodeId)>);
+
+impl ReaderIndex {
+    pub fn new(graph: &Graph) -> Self {
+        let mut readers: HashMap<NodeId, (usize, NodeId)> = HashMap::new();
+        for n in graph.nodes() {
+            for &i in &n.inputs {
+                readers.entry(i).or_insert((0, n.id)).0 += 1;
+            }
+        }
+        Self(readers)
+    }
+
+    /// The node that reads `id`, when exactly one input slot does.
+    pub fn sole_reader(&self, id: NodeId) -> Option<NodeId> {
+        match self.0.get(&id) {
+            Some(&(1, reader)) => Some(reader),
+            _ => None,
+        }
+    }
 }
 
 /// Either kind of transpose the CPU backend folds away — what the planner asks.
@@ -306,6 +365,189 @@ impl MemoryPlan {
         }
         out
     }
+}
+
+/// A byte range in the activation arena.
+///
+/// Re-exported from `rlx-ir` so `rlx_compile::memory::ByteRange` keeps working,
+/// and so the backends — which depend on `rlx-ir` but not all on `rlx-compile`
+/// — can reach the same type without a new crate edge. See
+/// [`rlx_ir::arena_range`] for why there is exactly one definition of overlap.
+pub use rlx_ir::arena_range::ByteRange;
+
+/// One byte range a step reads, tagged with the step whose value it needs.
+#[derive(Debug, Clone, Copy)]
+pub struct ScheduleRead {
+    /// The bytes being read.
+    pub range: ByteRange,
+    /// Index of the step that is *supposed* to have produced this value.
+    ///
+    /// This is the field that makes the check possible at all. Without it the
+    /// last writer before the read is by definition what gets read, so no
+    /// schedule can ever look wrong; with it, any write landing in between is a
+    /// clobber. Backends get it from their step-to-node map plus the graph's
+    /// consumer edges.
+    pub produced_at: usize,
+}
+
+/// What one *executed* step touches, after every fold.
+#[derive(Debug, Clone, Default)]
+pub struct StepIo {
+    /// Op / thunk / step kind, for the diagnostic only.
+    pub label: &'static str,
+    /// Every byte range this step writes — **including slots it writes on
+    /// another node's behalf**.
+    ///
+    /// This is the field folds get wrong, and the reason a check built on the
+    /// graph's declared outputs cannot see the bug. wgpu's split-QKV elision
+    /// writes Q, K and V from the matmul's step; Metal's `SplitLastAxis` writes
+    /// seven slices from the first slice's step. Both look like a single-output
+    /// op from the graph and are not.
+    pub writes: Vec<ByteRange>,
+    /// Every byte range this step reads.
+    pub reads: Vec<ScheduleRead>,
+    /// Set when this step's IO could not be enumerated. The verifier then
+    /// reports [`ScheduleHazard::Unverifiable`] rather than silently treating
+    /// the step as touching nothing — an unmodelled op must never read as safe.
+    pub opaque: bool,
+}
+
+/// A schedule-level memory hazard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleHazard {
+    /// A step wrote bytes between a value's production and its read.
+    Clobbered {
+        /// Step doing the read.
+        read_step: usize,
+        /// Step that should have produced the value.
+        produced_at: usize,
+        /// Step whose write landed in between.
+        clobber_step: usize,
+        /// Label of the clobbering step.
+        clobber_label: &'static str,
+        /// The overlapping bytes.
+        range: ByteRange,
+    },
+    /// A step's output overlaps one of its own inputs.
+    InPlace {
+        /// The step.
+        step: usize,
+        /// Label of the step.
+        label: &'static str,
+        /// The overlapping bytes.
+        range: ByteRange,
+    },
+    /// One step writes two of its own targets into overlapping bytes.
+    ///
+    /// Needs no provenance and no second step, which makes it the cheapest check
+    /// here and the one that was missing: a fold that writes several slots at
+    /// once can give two of them the same offset, and every guard that scans
+    /// *other* tensors for conflicts excludes the fold's own targets by
+    /// construction, so it reads as safe. `rlx-wgpu`'s split-QKV elision wrote
+    /// Q, K and V into one offset on all 22 of AXON's blocks.
+    AliasedWrites {
+        /// The step.
+        step: usize,
+        /// Label of the step.
+        label: &'static str,
+        /// The overlapping bytes.
+        range: ByteRange,
+    },
+    /// An opaque step sits inside a live range, so nothing after it can be
+    /// verified for that value.
+    Unverifiable {
+        /// The opaque step.
+        step: usize,
+        /// Label of the opaque step.
+        label: &'static str,
+    },
+}
+
+/// Check an executed schedule against the memory plan it was built from.
+///
+/// **Why this is not [`plan_memory_aligned`]'s job, and not `RLX_MEM_VERIFY`'s.**
+/// The planner reasons about the op order it was *given*. Backends then rewrite
+/// that order — fusing, unfusing, eliding, hoisting — and every one of those
+/// rewrites is chosen after planning, so the plan it answers to no longer
+/// describes what runs. `RLX_MEM_VERIFY` validates the plan against the graph
+/// and will report clean; it is not wrong, it is answering a different question.
+///
+/// This class has now produced five separate model-level defects — WiCAT,
+/// `rlx-lightbeam` (cos 0.958), `rlx-eegdm` (cos 0.994), DIVER-1 (0.929) and
+/// AXON (0.61–0.80 varying run to run) — each answered with another hand-rolled
+/// per-pass guard. There are at least seven of those now, they disagree about
+/// whether to compare offsets or ranges, and each one only covers its own fold.
+/// This is the shared invariant, stated once:
+///
+/// > between the step that produces a value and the step that reads it, nothing
+/// > else may write those bytes.
+///
+/// Feed it the post-fold truth and it catches the whole class. Feed it the
+/// graph's declared outputs and it catches none of it, which is exactly the trap
+/// `RLX_WGPU_HAZARD_REPORT` fell into: it is range-based and walks the lowered
+/// schedule, and still reported "0 not view-explained" on AXON, because it took
+/// each step's write set from the node it nominally computes.
+pub fn schedule_hazards(steps: &[StepIo]) -> Vec<ScheduleHazard> {
+    let mut out = Vec::new();
+    // An opaque step is a property of the step, not of each read that passes
+    // over it, so report it once. The first version emitted one per (read,
+    // opaque step) pair and buried the real findings under the repeats.
+    let mut opaque_reported = vec![false; steps.len()];
+    for (c, step) in steps.iter().enumerate() {
+        // Cheapest first, and no provenance needed: two of this step's own
+        // writes landing on the same bytes.
+        for (i, a) in step.writes.iter().enumerate() {
+            for b in &step.writes[i + 1..] {
+                if a.overlaps(b) {
+                    out.push(ScheduleHazard::AliasedWrites {
+                        step: c,
+                        label: step.label,
+                        range: *a,
+                    });
+                }
+            }
+        }
+        // A step's own output must not overlap its own input: an in-place
+        // permute or reduce reads and writes the same bytes.
+        for r in &step.reads {
+            for w in &step.writes {
+                if r.range.overlaps(w) {
+                    out.push(ScheduleHazard::InPlace {
+                        step: c,
+                        label: step.label,
+                        range: *w,
+                    });
+                }
+            }
+        }
+        for r in &step.reads {
+            let lo = r.produced_at.saturating_add(1);
+            for (m, mid) in steps.iter().enumerate().take(c).skip(lo) {
+                if mid.opaque {
+                    if !opaque_reported[m] {
+                        opaque_reported[m] = true;
+                        out.push(ScheduleHazard::Unverifiable {
+                            step: m,
+                            label: mid.label,
+                        });
+                    }
+                    continue;
+                }
+                for w in &mid.writes {
+                    if w.overlaps(&r.range) {
+                        out.push(ScheduleHazard::Clobbered {
+                            read_step: c,
+                            produced_at: r.produced_at,
+                            clobber_step: m,
+                            clobber_label: mid.label,
+                            range: *w,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Collect view-node aliases for embedding in LIR.
@@ -538,6 +780,21 @@ fn compute_live_ranges_opts(
             if root != input {
                 ranges.entry(input).and_modify(|r| r.1 = r.1.max(step));
             }
+            // A transpose a backend folds into this matmul (a GEMM flag) is
+            // never executed: the matmul reads the transpose's input. That
+            // input is read here, not where the transpose stood — else its
+            // slot is free in between, and another branch's tensor lands in
+            // it before this read (two `transpose(a·b) @ w` side by side).
+            let src = graph.node(input);
+            if is_elidable_folded_transpose(graph, src) {
+                let (root, _off) = resolve_view_root(graph, src.inputs[0]);
+                ranges.entry(root).and_modify(|r| r.1 = r.1.max(step));
+                if root != src.inputs[0] {
+                    ranges
+                        .entry(src.inputs[0])
+                        .and_modify(|r| r.1 = r.1.max(step));
+                }
+            }
         }
     }
 
@@ -625,6 +882,25 @@ fn extend_node_chain_liveness_to_end(
         }
         for &input in &graph.node(id).inputs {
             stack.push(input);
+        }
+    }
+}
+
+/// Keep `start`, and every view between it and the slot it aliases, live
+/// through `last_step`. Unlike [`extend_node_chain_liveness_to_end`] this
+/// stops at the first node that owns its storage.
+fn extend_view_chain_liveness_to_end(
+    graph: &Graph,
+    ranges: &mut HashMap<NodeId, (usize, usize)>,
+    start: NodeId,
+    last_step: usize,
+) {
+    let mut id = start;
+    loop {
+        ranges.entry(id).and_modify(|r| r.1 = last_step);
+        match pure_view_offset(graph, graph.node(id)) {
+            Some((parent, _)) => id = parent,
+            None => break,
         }
     }
 }
@@ -754,6 +1030,107 @@ pub fn set_pin_host_structure(on: bool) {
     PIN_HOST_STRUCTURE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// One `RLX_ARENA_NO_REUSE_OPS` entry: an op-variant name, optionally narrowed
+/// to a contiguous index range among the nodes of that kind in topo order.
+#[derive(Debug, Clone)]
+struct NoReuseSpec {
+    name: String,
+    range: Option<(usize, usize)>,
+}
+
+impl NoReuseSpec {
+    fn selects(&self, idx: usize) -> bool {
+        match self.range {
+            None => true,
+            Some((lo, hi)) => idx >= lo && idx <= hi,
+        }
+    }
+}
+
+/// Parsed `RLX_ARENA_NO_REUSE_OPS`, e.g. `Transpose,Narrow:0-9`.
+fn no_reuse_op_filter() -> Option<Vec<NoReuseSpec>> {
+    let raw = rlx_ir::env::var("RLX_ARENA_NO_REUSE_OPS")?;
+    let list: Vec<NoReuseSpec> = raw
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, range) = match entry.split_once(':') {
+                None => (entry, None),
+                Some((n, span)) => {
+                    let r = match span.split_once('-') {
+                        Some((lo, hi)) => lo.trim().parse().ok().zip(hi.trim().parse().ok()),
+                        None => span.trim().parse().ok().map(|i: usize| (i, i)),
+                    };
+                    (n, r)
+                }
+            };
+            Some(NoReuseSpec {
+                name: name.trim().to_ascii_lowercase(),
+                range,
+            })
+        })
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// The `Op` variant name, for the diagnostic above. `{:?}` on the op would
+/// include its fields (and so never compare equal to a bare name).
+fn op_kind_name(op: &Op) -> &'static str {
+    let dbg = format!("{op:?}");
+    let name = dbg
+        .split_once([' ', '(', '{'])
+        .map(|(head, _)| head)
+        .unwrap_or(dbg.as_str());
+    // Leak-free: map back to a static by interning the few names we ever see.
+    OP_KIND_NAMES
+        .iter()
+        .copied()
+        .find(|n| n.eq_ignore_ascii_case(name))
+        .unwrap_or("Other")
+}
+
+/// Variant names the diagnostic can match. Extend as needed — an unmatched op
+/// reports as `Other`, which the filter simply never selects.
+const OP_KIND_NAMES: &[&str] = &[
+    "Input",
+    "Param",
+    "Constant",
+    "MatMul",
+    "Binary",
+    "Unary",
+    "Activation",
+    "Reduce",
+    "Softmax",
+    "Reshape",
+    "Transpose",
+    "Narrow",
+    "Concat",
+    "Expand",
+    "Pad",
+    "Slice",
+    "Gather",
+    "Cast",
+    "LayerNorm",
+    "RmsNorm",
+    "GroupNorm",
+    "Conv",
+    "Pool",
+    "Rope",
+    "Attention",
+    "Where",
+    "Fma",
+    "Compare",
+    "ArgReduce",
+    "ScatterAdd",
+    "Tile",
+    "Roll",
+    "Clamp",
+    "Trilu",
+];
+
 fn pin_host_structure() -> bool {
     PIN_HOST_STRUCTURE.load(std::sync::atomic::Ordering::Relaxed)
         || rlx_ir::env::flag("RLX_ARENA_PIN_HOST_STRUCTURE")
@@ -807,9 +1184,20 @@ fn extend_custom_op_input_liveness(
     // write happens at a later flush. The planner sees them as ordinary
     // single-step consumers, so a subsequent GPU op takes the slot and the
     // deferred write lands on a buffer that now belongs to something else. It is
-    // nondeterministic (it depends on when the flush falls) and Vulkan-only
-    // (Metal keeps these on the GPU), which is what made it look like a family
-    // of unrelated DSP/eig/pad bugs.
+    // nondeterministic (it depends on when the flush falls), which is what made
+    // it look like a family of unrelated DSP/eig/pad bugs.
+    //
+    // CAVEAT on "Vulkan-only (Metal keeps these on the GPU)", which this comment
+    // used to assert flatly: `rlx-metal` carries the same machinery —
+    // `DeferredHostOp::{Transpose2d, NarrowLastAxis, Concat}` in
+    // `backend/encode/mod.rs`, written straight into arena offsets at a later
+    // flush — and never calls `set_pin_host_structure`, unlike `rlx-wgpu`
+    // (`buffer.rs`). It is gated behind `RLX_METAL_HOST_SLICE`, off by default,
+    // so the claim holds for a default build and no corruption has been
+    // attributed to it (a model that fails on Metal under slot reuse fails
+    // identically with `RLX_METAL_HOST_SLICE=1`, and a model that passes still
+    // passes with it). But if that flag is ever defaulted on, Metal needs the
+    // same declaration or it inherits exactly the hazard described above.
     //
     // Gated because the pin is expensive: only a backend that actually hosts
     // these ops should ask for it.
@@ -819,28 +1207,103 @@ fn extend_custom_op_input_liveness(
                 &node.op,
                 Op::Expand { .. } | Op::Concat { .. } | Op::Transpose { .. } | Op::Narrow { .. }
             ) {
+                // The flush reads these inputs and writes this node; it
+                // reads nothing further upstream (see the dequant pin below).
                 for &input in &node.inputs {
-                    extend_node_chain_liveness_to_end(graph, ranges, input, last_step);
+                    extend_view_chain_liveness_to_end(graph, ranges, input, last_step);
                 }
-                extend_node_chain_liveness_to_end(graph, ranges, node.id, last_step);
+                extend_view_chain_liveness_to_end(graph, ranges, node.id, last_step);
             }
         }
     }
 
+    // ── diagnostic: pin slot reuse for selected op kinds only ───────────────
+    //
+    // `RLX_ARENA_NO_REUSE=1` is a sledgehammer: when a model is wrong under
+    // slot reuse and exact without it, it tells you the arena is involved and
+    // nothing more. `RLX_ARENA_NO_REUSE_OPS` takes a comma-separated list of
+    // `Op` discriminant names and pins exactly those nodes (and their input
+    // chains):
+    //
+    //     RLX_ARENA_NO_REUSE_OPS=Transpose,Narrow cargo test ...
+    //
+    // **Read a "fix" from this carefully — it is weak evidence.** Pinning
+    // anything repacks the whole arena, so it hides any layout-sensitive defect
+    // rather than localizing it: on DIVER-1/Metal, `Transpose`, `Narrow` and
+    // `Concat` each turned MISMATCH into PARITY, and so did the disjoint halves
+    // `Transpose:0-33` and `Transpose:34-67`. The actual cause was not slot
+    // reuse at all — Metal's `fuse_narrow_clusters` was hoisting writes past
+    // the ops the plan had ordered between them, and the plan was valid
+    // throughout. Prefer `RLX_ARENA_REPORT` (below), which is print-only and so
+    // leaves the failing layout intact; use this knob to confirm that memory is
+    // involved, not to name the op.
+    //
+    // Matching is on the `Op` variant name, case-insensitively, as printed by
+    // `op_kind_name` below — `Transpose`, `Narrow`, `Concat`, `Gather`,
+    // `MatMul`, `Reduce`, `Softmax`, `RmsNorm`, … A name that matches nothing
+    // is reported once, so a typo does not read as "this op is innocent".
+    if let Some(filter) = no_reuse_op_filter() {
+        let mut matched = 0usize;
+        // `Name:lo-hi` pins only the lo..=hi'th matching node in topo order, so
+        // a handful of runs binary-search which individual node's reuse breaks.
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for node in graph.nodes() {
+            let kind = op_kind_name(&node.op);
+            let lower = kind.to_ascii_lowercase();
+            let Some(spec) = filter.iter().find(|f| f.name == lower) else {
+                continue;
+            };
+            let idx = {
+                let c = seen.entry(kind).or_insert(0);
+                let i = *c;
+                *c += 1;
+                i
+            };
+            if !spec.selects(idx) {
+                continue;
+            }
+            matched += 1;
+            for &input in &node.inputs {
+                extend_node_chain_liveness_to_end(graph, ranges, input, last_step);
+            }
+            extend_node_chain_liveness_to_end(graph, ranges, node.id, last_step);
+        }
+        let spec_list: Vec<String> = filter
+            .iter()
+            .map(|f| match f.range {
+                None => f.name.clone(),
+                Some((lo, hi)) => format!("{}:{lo}-{hi}", f.name),
+            })
+            .collect();
+        eprintln!(
+            "[arena] RLX_ARENA_NO_REUSE_OPS={} pinned {matched} node(s) of {}",
+            spec_list.join(","),
+            seen.iter()
+                .map(|(k, v)| format!("{k}x{v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if matched == 0 {
+            eprintln!(
+                "[arena] WARNING: no node matched — the op names are Op variant names \
+                 (Transpose, Narrow, Concat, Gather, MatMul, ...), so this run tells you nothing"
+            );
+        }
+    }
+
+    // The deferred flush reads the activation's bytes and nothing upstream of
+    // them, so pin it and the views it aliases — not its ancestors. Walking
+    // every ancestor (as this once did, against the note above) pinned all of
+    // a packed prefill: Qwen3-1.7B at 297 tokens planned 2.8 GB with no slot
+    // reused, which put it past a 2 GiB binding and onto the striped arena.
     if dequant_host_fallback {
         for node in graph.nodes() {
-            match &node.op {
-                Op::DequantMatMul { .. } => {
-                    if let Some(&x) = node.inputs.first() {
-                        extend_node_chain_liveness_to_end(graph, ranges, x, last_step);
-                    }
-                }
-                Op::DequantGroupedMatMul { .. } => {
-                    if let Some(&x) = node.inputs.first() {
-                        extend_node_chain_liveness_to_end(graph, ranges, x, last_step);
-                    }
-                }
-                _ => {}
+            if matches!(
+                &node.op,
+                Op::DequantMatMul { .. } | Op::DequantGroupedMatMul { .. }
+            ) && let Some(&x) = node.inputs.first()
+            {
+                extend_view_chain_liveness_to_end(graph, ranges, x, last_step);
             }
         }
     }
@@ -1205,7 +1668,16 @@ pub fn plan_memory_native(graph: &Graph, alignment: usize) -> MemoryPlan {
 /// [`plan_memory_aligned`]: identical dtype widths, strictly less pinning.
 pub fn plan_memory_native_in_order(graph: &Graph, alignment: usize) -> MemoryPlan {
     let opts = MemoryPlanOptions {
-        pin_output_ancestors: graph_has_host_indexing(graph),
+        // No host-indexing pin either, for the same reason as the dequant pin
+        // below: [`graph_has_host_indexing`] guards backends whose hosted gather
+        // writes its result at a LATER flush, so liveness ends too early there.
+        // An in-order CPU executor runs every `Gather` thunk inline, at its own
+        // schedule step, so ordinary liveness is exact — while the pin walks the
+        // outputs' whole ancestor DAG and keeps every activation alive. A
+        // Qwen3-VL vision tower (one position-table `Gather`) planned 1.56 GB of
+        // scratch for 308 patches and ~24 GB for 4928. `RLX_PIN_OUTPUT_ANCESTORS=1`
+        // restores the pin.
+        pin_output_ancestors: rlx_ir::env::var("RLX_PIN_OUTPUT_ANCESTORS").as_deref() == Some("1"),
         dequant_host_fallback: false,
         // The CPU backend folds `Transpose -> GroupedMatMul`, and this planner
         // is its own — no other backend calls it.
@@ -1493,8 +1965,18 @@ fn node_slot_bytes(node: &rlx_ir::Node, policy: ArenaWidthPolicy, keep_native: b
     match policy {
         ArenaWidthPolicy::Native => native,
         ArenaWidthPolicy::F32Uniform => {
-            // packed / quantized WEIGHTS keep native (sub-4-B) width; all else f32.
-            if non_f32_param { native } else { f32_wide() }
+            // packed / quantized WEIGHTS keep native (sub-4-B) width; all else
+            // f32. Except F16 params: the f32-uniform backends (wgpu, Vulkan)
+            // WIDEN an F16 param to f32 on upload and every kernel reads it as
+            // f32, so a native 2-B slot was overrun by the ne*4-byte write —
+            // an `f32 @ f16-weight` matmul came out wrong by O(1) with no
+            // error. BF16 keeps its packed slot: it has a packed matmul path.
+            let f16_param = is_param && node.shape.dtype() == rlx_ir::DType::F16;
+            if non_f32_param && !f16_param {
+                native
+            } else {
+                f32_wide()
+            }
         }
         ArenaWidthPolicy::Hybrid => {
             // params + f16/bf16 activations packed native; everything else f32.
@@ -1568,6 +2050,7 @@ fn plan_memory_aligned_inner(
     }
 
     let keep_native = native_width_nodes(graph, width);
+    let readers = opts.elide_bank_transposes.then(|| ReaderIndex::new(graph));
     let mut buffers: Vec<BufInfo> = Vec::new();
     for node in graph.nodes() {
         // Skip view nodes — they alias their parent's buffer (handled
@@ -1575,9 +2058,13 @@ fn plan_memory_aligned_inner(
         if pure_view_offset(graph, node).is_some() {
             continue;
         }
-        // Folded into its consumers' GEMMs, so never written or read.
-        if opts.elide_bank_transposes
-            && is_elidable_folded_transpose_gated(graph, node, opts.elide_requires_small_m)
+        // Folded into its consumers' GEMMs, so never written or read. (The
+        // same test as `is_elidable_folded_transpose_gated`, with the matmul
+        // half answered from the reader index.)
+        if let Some(readers) = &readers
+            && (is_elidable_bank_transpose_gated(graph, node, opts.elide_requires_small_m)
+                || (!opts.elide_requires_small_m
+                    && is_elidable_matmul_transpose_indexed(graph, node, readers)))
         {
             continue;
         }
@@ -1637,12 +2124,14 @@ fn plan_memory_aligned_inner(
         // of a time-overlapping buffer — which the scan also had in its
         // candidate set, and which is <= the offset itself. So both take the
         // true minimum first fit; the scan just spent O(N^3) reaching it.
-        let mut occupied: Vec<(usize, usize)> = placed
+        //
+        // `placed` is kept sorted by `(offset, end)`, so filtering it yields the
+        // overlapping set already in that order: the same sequence a sort of
+        // it produced, without sorting it again for every buffer.
+        let occupied = placed
             .iter()
             .filter(|&&(_, _, p_birth, p_death)| buf.birth <= p_death && buf.death >= p_birth)
-            .map(|&(p_off, p_size, _, _)| (p_off, p_off + p_size))
-            .collect();
-        occupied.sort_unstable();
+            .map(|&(p_off, p_size, _, _)| (p_off, p_off + p_size));
 
         let mut cursor = 0usize;
         let mut best_offset: Option<usize> = None;
@@ -1714,7 +2203,10 @@ fn plan_memory_aligned_inner(
                 size: buf.size,
             },
         );
-        placed.push((aligned, placement_size, buf.birth, buf.death));
+        let at = placed.partition_point(|&(p_off, p_size, _, _)| {
+            (p_off, p_off + p_size) <= (aligned, aligned + placement_size)
+        });
+        placed.insert(at, (aligned, placement_size, buf.birth, buf.death));
         arena_size = arena_size.max(aligned + placement_size);
     }
 
@@ -1745,6 +2237,14 @@ fn plan_memory_aligned_inner(
                     continue;
                 }
                 if let Some(rs) = assignments.get(&root) {
+                    // NOT `ByteRange::overlaps`, deliberately. The `.max(1)` keeps
+                    // a zero-size buffer occupying one byte so it still conflicts
+                    // and cannot be handed to two nodes at once; the shared
+                    // predicate says a zero-length range overlaps nothing. That is
+                    // a planning decision rather than a disagreement about
+                    // geometry — `rlx-wgpu`'s `empty_tensor_arena_slot` test
+                    // depends on a zero-length slot still resolving — so this site
+                    // keeps its own arithmetic and says so.
                     let r_size =
                         node_slot_bytes(graph.node(root), width, keep_native.contains(&root))
                             .max(1);
@@ -1791,6 +2291,55 @@ fn plan_memory_aligned_inner(
         }
     }
 
+    // ── Optional non-perturbing plan dump (RLX_ARENA_REPORT) ─
+    // `RLX_MEM_VERIFY` proves the plan self-consistent; when a backend is still
+    // wrong under reuse, the next question is *which* buffers share the bytes
+    // the victim read. Pinning answers it badly: every pin repacks the arena, so
+    // a pin that "fixes" the model has also destroyed the collision it was meant
+    // to locate (`RLX_ARENA_NO_REUSE_OPS=Transpose:0-33` and `:34-67` are
+    // disjoint and BOTH fix DIVER-1 on Metal). This dump changes nothing — it
+    // only prints — so the layout under study is the layout that fails.
+    //
+    // Sorted by offset, so a buffer's arena neighbours are its neighbours in the
+    // output, with the live range needed to tell legitimate reuse from a
+    // collision:
+    //
+    //     RLX_ARENA_REPORT=1 cargo test ... 2>&1 | grep arena-plan
+    //
+    // `op` is the producing op kind, `root` the view root for view nodes (which
+    // own no buffer and borrow their root's bytes).
+    if rlx_ir::env::flag("RLX_ARENA_REPORT") {
+        let mut rows: Vec<(usize, usize, NodeId)> = assignments
+            .iter()
+            .map(|(id, slot)| (slot.offset, slot.size, *id))
+            .collect();
+        rows.sort();
+        eprintln!(
+            "[arena-plan] arena_size={arena_size} slots={} buffers={}",
+            rows.len(),
+            buffers.len()
+        );
+        eprintln!("[arena-plan] offset\tend\tsize\tnode\top\tbirth\tdeath\troot\tinputs");
+        for (off, size, id) in rows {
+            let node = graph.node(id);
+            let (birth, death) = ranges.get(&id).copied().unwrap_or((0, 0));
+            let root = match pure_view_offset(graph, node) {
+                Some(_) => {
+                    let (r, o) = resolve_view_root(graph, id);
+                    format!("view of {r}+{o}")
+                }
+                None => String::from("-"),
+            };
+            let ins: Vec<String> = node.inputs.iter().map(|i| format!("{i}")).collect();
+            eprintln!(
+                "[arena-plan] {off}\t{}\t{size}\t{id}\t{}\t{birth}\t{death}\t{root}\t{}",
+                off + size,
+                op_kind_name(&node.op),
+                ins.join(","),
+            );
+        }
+    }
+
     // ── Optional invariant self-check (RLX_MEM_VERIFY) ───────
     // The core planner invariant: no two buffers that are simultaneously live
     // may share overlapping arena bytes. If this ever fires, the allocator (not
@@ -1807,6 +2356,9 @@ fn plan_memory_aligned_inner(
                     continue;
                 };
                 let b_end = sb.offset + b.size.max(1);
+                // Same deliberate exception as the in-place pass above: `a.size`
+                // and `b.size` arrive `.max(1)`'d, so a zero-size buffer still
+                // conflicts here. Not `ByteRange::overlaps`.
                 let mem = sa.offset < b_end && a_end > sb.offset;
                 let time = a.birth <= b.death && a.death >= b.birth;
                 if mem && time {
@@ -1897,6 +2449,184 @@ fn plan_memory_aligned_inner(
         w.apply_to_plan(graph, &mut plan);
     }
     plan
+}
+
+#[cfg(test)]
+mod schedule_hazard_tests {
+    use super::*;
+
+    fn r(off: usize, len: usize) -> ByteRange {
+        ByteRange { off, len }
+    }
+
+    /// A step whose IO could not be enumerated.
+    fn opaque(label: &'static str) -> StepIo {
+        StepIo {
+            label,
+            opaque: true,
+            ..Default::default()
+        }
+    }
+
+    fn step(label: &'static str, writes: &[ByteRange], reads: &[(ByteRange, usize)]) -> StepIo {
+        StepIo {
+            label,
+            writes: writes.to_vec(),
+            reads: reads
+                .iter()
+                .map(|&(range, produced_at)| ScheduleRead { range, produced_at })
+                .collect(),
+            opaque: false,
+        }
+    }
+
+    /// The ordinary case: a slot is written, read, and only then reused.
+    #[test]
+    fn sequential_reuse_is_not_a_hazard() {
+        let sched = [
+            step("produce", &[r(0, 64)], &[]),
+            step("consume", &[r(64, 64)], &[(r(0, 64), 0)]),
+            step("reuse", &[r(0, 64)], &[]),
+            step("consume2", &[r(128, 64)], &[(r(0, 64), 2)]),
+        ];
+        assert!(schedule_hazards(&sched).is_empty());
+    }
+
+    /// DIVER-1 on Metal. `fuse_narrow_clusters` hoisted the writes of seven
+    /// axis-2 slices to the first slice's step; the planner had parked scratch
+    /// buffers inside slices 2..6, legal only because each died one step before
+    /// its slice was written. Post-hoist the scratch writes land last and the
+    /// slice is read afterwards. Step 0 writes both slices at once — that is the
+    /// fused write set the graph's declared outputs do not show.
+    #[test]
+    fn hoisted_group_write_then_scratch_overwrite_is_caught() {
+        let slice0 = r(0, 1536);
+        let slice1 = r(1536, 1536);
+        let scratch = r(1536, 768); // inside slice1, as the real plan had it
+        let sched = [
+            step("SplitLastAxis", &[slice0, slice1], &[]),
+            step("Narrow(scratch)", &[scratch], &[(slice0, 0)]),
+            step("Binary", &[r(8192, 768)], &[(scratch, 1)]),
+            step("Transpose", &[r(16384, 1536)], &[(slice1, 0)]),
+        ];
+        let hz = schedule_hazards(&sched);
+        assert!(
+            hz.iter().any(|h| matches!(
+                h,
+                ScheduleHazard::Clobbered {
+                    read_step: 3,
+                    produced_at: 0,
+                    clobber_step: 1,
+                    ..
+                }
+            )),
+            "the scratch write between slice1's production and its read must be flagged: {hz:?}"
+        );
+    }
+
+    /// AXON on wgpu. The split-QKV elision writes Q, K and V from the matmul's
+    /// step, and `qkv_heads` makes the planner give all three one offset, so one
+    /// dispatch writes the same bytes three times. Declaring the real write set
+    /// makes that visible as an in-place overlap on the step that reads Q.
+    #[test]
+    fn aliased_fused_sinks_are_caught() {
+        let sink = r(4096, 428_032); // q, k and v all landed here
+        let sched = [
+            step(
+                "FusedMatMulBiasAct+qkv",
+                &[sink, sink, sink],
+                &[(r(0, 4096), 9999)],
+            ),
+            step("Transpose(q)", &[sink], &[(sink, 0)]),
+        ];
+        let hz = schedule_hazards(&sched);
+        assert!(
+            hz.iter()
+                .any(|h| matches!(h, ScheduleHazard::InPlace { step: 1, .. })),
+            "a step whose output overlaps its own input must be flagged: {hz:?}"
+        );
+    }
+
+    /// AXON on wgpu, stated without any provenance at all. The split-QKV
+    /// elision writes Q, K and V from the matmul's step and `qkv_heads` makes
+    /// the planner give all three one offset, so one dispatch writes the same
+    /// bytes three times. Declaring the real write set is enough to see it —
+    /// which is the point, because every guard that scans *other* live tensors
+    /// excludes the fold's own targets and therefore cannot.
+    #[test]
+    fn a_step_that_writes_two_of_its_own_targets_to_one_range_is_caught() {
+        let sink = ByteRange::new(4096, 428_032); // q, k and v all landed here
+        let sched = [step("FusedMatMulBiasAct+qkv", &[sink, sink, sink], &[])];
+        let hz = schedule_hazards(&sched);
+        assert_eq!(
+            hz.iter()
+                .filter(|h| matches!(h, ScheduleHazard::AliasedWrites { step: 0, .. }))
+                .count(),
+            3,
+            "three sinks on one offset is three overlapping pairs: {hz:?}"
+        );
+    }
+
+    /// Distinct targets are the normal case and must stay silent, or the check
+    /// fires on every fold that writes more than one slot.
+    #[test]
+    fn disjoint_writes_from_one_step_are_fine() {
+        let sched = [step(
+            "SplitLastAxis",
+            &[r(0, 1536), r(1536, 1536), r(3072, 1536)],
+            &[],
+        )];
+        assert!(schedule_hazards(&sched).is_empty());
+    }
+
+    /// One opaque step, many reads passing over it: report it once. The first
+    /// version emitted one per (read, opaque step) pair and buried the real
+    /// findings under the repeats.
+    #[test]
+    fn an_opaque_step_is_reported_once_not_once_per_read() {
+        let v = r(0, 64);
+        let sched = [
+            step("produce", &[v], &[]),
+            opaque("Custom"),
+            step("consume1", &[r(128, 64)], &[(v, 0)]),
+            step("consume2", &[r(256, 64)], &[(v, 0)]),
+            step("consume3", &[r(384, 64)], &[(v, 0)]),
+        ];
+        let hz = schedule_hazards(&sched);
+        assert_eq!(
+            hz,
+            vec![ScheduleHazard::Unverifiable {
+                step: 1,
+                label: "Custom",
+            }],
+            "three reads over one opaque step is one finding, not three"
+        );
+    }
+
+    /// An op whose IO cannot be enumerated must not read as safe. Metal's
+    /// `mlp_io` covers 56 of 148 `Thunk` variants; the other 92 are exactly
+    /// where a silent "touches nothing" would hide a clobber.
+    #[test]
+    fn an_opaque_step_is_reported_not_ignored() {
+        let sched = [
+            step("produce", &[r(0, 64)], &[]),
+            StepIo {
+                label: "Custom",
+                opaque: true,
+                ..Default::default()
+            },
+            step("consume", &[r(128, 64)], &[(r(0, 64), 0)]),
+        ];
+        let hz = schedule_hazards(&sched);
+        assert_eq!(
+            hz,
+            vec![ScheduleHazard::Unverifiable {
+                step: 1,
+                label: "Custom"
+            }],
+            "an unmodelled step inside a live range must be reported"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2136,6 +2866,159 @@ mod tests {
         let d = dual.input("dur", Shape::new(&[8], DType::I64));
         dual.set_outputs(vec![w2, d]);
         assert!(graph_exports_onnx_duration(&dual));
+    }
+
+    /// The reader index answers the matmul-fold question exactly as the
+    /// per-candidate scan does, for every node of a graph with each case: a
+    /// transpose read once by a 2-D matmul (folds), read twice by one node,
+    /// read by two nodes, read by a non-matmul, and read by nothing.
+    #[test]
+    fn the_reader_index_agrees_with_the_scan() {
+        use rlx_ir::infer::GraphExt;
+        let mut g = Graph::new("readers");
+        let x = g.input("x", Shape::new(&[8, 16], DType::F32));
+        let w = g.param("w", Shape::new(&[8, 16], DType::F32));
+        let once = g.transpose_(w, vec![1, 0]); // [16, 8], sole reader is a matmul
+        let a = g.mm(x, once);
+        let twice = g.transpose_(w, vec![1, 0]);
+        let xt = g.transpose_(x, vec![1, 0]);
+        let sq = g.mm(xt, x); // [16, 16]
+        let first = g.mm(x, twice); // `twice`'s first reader is a 2-D matmul…
+        let both = g.relu(twice); // …and it has a second reader
+        let by_relu = g.transpose_(w, vec![1, 0]);
+        let r = g.relu(by_relu);
+        let _dead = g.transpose_(w, vec![1, 0]);
+        let same_node = g.transpose_(sq, vec![1, 0]);
+        let s2 = g.mm(same_node, same_node); // one matmul reading it in both slots
+        g.set_outputs(vec![a, first, both, r, s2]);
+        let readers = ReaderIndex::new(&g);
+        let mut folds = 0;
+        for n in g.nodes() {
+            let scan = is_elidable_matmul_transpose(&g, n);
+            assert_eq!(
+                is_elidable_matmul_transpose_indexed(&g, n, &readers),
+                scan,
+                "{:?} {:?}",
+                n.id,
+                n.op
+            );
+            folds += scan as usize;
+        }
+        assert!(folds >= 1, "the graph must include a transpose that folds");
+        assert!(
+            !is_elidable_matmul_transpose(&g, g.node(same_node))
+                && !is_elidable_matmul_transpose(&g, g.node(twice))
+        );
+    }
+
+    /// A buffer placed below an earlier one, then a buffer that overlaps both
+    /// in time: A (large, freed early) takes offset 0, B (large, alive to the
+    /// end) goes above it, D (medium, alive with B but not A) fills offset 0,
+    /// and C (small, alive with D and B) must go above D. Walking the
+    /// overlapping set in placement order (B before D) would put C at 0, on top
+    /// of D; the walk has to see it sorted by offset. Planned with reuse on (no
+    /// output-ancestor pinning), as the CPU backend plans: with every buffer
+    /// pinned to the end nothing is ever reused and no gap exists.
+    #[test]
+    fn a_gap_filled_below_an_earlier_buffer_is_respected() {
+        use rlx_ir::infer::GraphExt;
+        let mut g = Graph::new("gap");
+        let x = g.input("x", Shape::new(&[1, 4], DType::F32));
+        let pa = g.param("pa", Shape::new(&[4, 1000], DType::F32));
+        let ma = g.mm(x, pa);
+        let a = g.relu(ma);
+        let pb = g.param("pb", Shape::new(&[4, 900], DType::F32));
+        let mb = g.mm(x, pb);
+        let b = g.relu(mb);
+        let qa = g.param("qa", Shape::new(&[1000, 4], DType::F32));
+        let a_use = g.mm(a, qa); // A's last use
+        let pc = g.param("pc", Shape::new(&[4, 10], DType::F32));
+        let mc = g.mm(a_use, pc);
+        let c = g.relu(mc);
+        let pd = g.param("pd", Shape::new(&[10, 50], DType::F32));
+        let md = g.mm(c, pd);
+        let d = g.relu(md);
+        let qb = g.param("qb", Shape::new(&[900, 4], DType::F32));
+        let qd = g.param("qd", Shape::new(&[50, 4], DType::F32));
+        let bb = g.mm(b, qb);
+        let dd = g.mm(d, qd);
+        let out = g.add(bb, dd);
+        g.set_outputs(vec![out]);
+        let _ = with_plan_verify(|| {
+            plan_memory_with_options(
+                &g,
+                64,
+                MemoryPlanOptions {
+                    pin_output_ancestors: false,
+                    elide_bank_transposes: true,
+                    ..MemoryPlanOptions::inference()
+                },
+            )
+        });
+    }
+
+    /// The sweep against the cubic candidate scan on graphs where buffers
+    /// are not placed in offset order: side branches of varying widths stay
+    /// alive for varying spans, so later, smaller buffers fill gaps below
+    /// earlier ones. (The chain in `plan_sweep_matches_candidate_scan` places
+    /// buffers in increasing offset order, which no ordering bug can upset.)
+    #[test]
+    fn plan_sweep_matches_candidate_scan_with_long_lived_branches() {
+        use rlx_ir::infer::GraphExt;
+        for seed in 0..6u64 {
+            let mut rng = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let mut next = |m: u64| {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng >> 33) % m
+            };
+            let mut g = Graph::new("branchy");
+            let mut x = g.input("x", Shape::new(&[16, 32], DType::F32));
+            let mut pending: Vec<(usize, NodeId, usize)> = Vec::new(); // (consume at, side, width)
+            for i in 0..60 {
+                let p = g.param(format!("p{i}"), Shape::new(&[32, 32], DType::F32));
+                let m = g.mm(x, p);
+                x = g.relu(m);
+                if next(3) == 0 {
+                    let w = 8 + 8 * next(12) as usize;
+                    let ps = g.param(format!("s{i}"), Shape::new(&[32, w], DType::F32));
+                    let side = g.mm(x, ps);
+                    pending.push((i + 1 + next(20) as usize, side, w));
+                }
+                let (due, rest): (Vec<_>, Vec<_>) =
+                    pending.into_iter().partition(|&(at, _, _)| at <= i);
+                pending = rest;
+                for (_, side, w) in due {
+                    let q = g.param(
+                        format!("q{i}_{w}_{}", side.0),
+                        Shape::new(&[w, 32], DType::F32),
+                    );
+                    let back = g.mm(side, q);
+                    x = g.add(x, back);
+                }
+            }
+            for (k, (_, side, w)) in pending.into_iter().enumerate() {
+                let q = g.param(format!("tail{k}"), Shape::new(&[w, 32], DType::F32));
+                let back = g.mm(side, q);
+                x = g.add(x, back);
+            }
+            g.set_outputs(vec![x]);
+            // the self-check asserts every offset equals the candidate scan's
+            let _ = with_plan_verify(|| {
+                plan_memory_with_options(
+                    &g,
+                    64,
+                    MemoryPlanOptions {
+                        pin_output_ancestors: false,
+                        elide_bank_transposes: true,
+                        ..MemoryPlanOptions::inference()
+                    },
+                )
+            });
+        }
     }
 
     /// The sweep must place every buffer exactly where the original

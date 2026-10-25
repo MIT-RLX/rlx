@@ -2243,10 +2243,17 @@ unsafe fn mps_tensor_data_from_buffer(
                     view.is_null(),
                 );
             }
-            msg_send![alloc,
+            let td: *mut Object = msg_send![alloc,
             initWithMTLBuffer: view
             shape: nsshape
-            dataType: dtype]
+            dataType: dtype];
+            // `newBufferWithBytesNoCopy` hands back +1 and the tensor data
+            // retains the view itself, so ours has to go — else the view,
+            // and the pages it maps, outlive the executable.
+            if !view.is_null() {
+                let _: () = msg_send![view, release];
+            }
+            td
         }
     }
 }

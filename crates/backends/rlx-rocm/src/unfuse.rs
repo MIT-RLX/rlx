@@ -26,6 +26,11 @@ use rlx_unfuse::DecomposePolicy;
 pub(crate) struct RocmPolicy;
 
 impl DecomposePolicy for RocmPolicy {
+    /// `Op::While` runs as a host loop (`Step::HostOp`).
+    fn while_native(&self) -> bool {
+        true
+    }
+
     fn swiglu_native(&self) -> bool {
         true
     }

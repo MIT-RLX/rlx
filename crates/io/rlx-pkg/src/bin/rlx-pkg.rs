@@ -14,6 +14,7 @@
 //! rlx-pkg import-nemo <model.nemo> -o <out.rlxp> [--no-graph] [--no-auto-tier]
 //! rlx-pkg import-pt <model.pt|pth|bin> -o <out.rlxp> [--no-graph] [--no-auto-tier]
 //! rlx-pkg convert <in> -o <out> [--container flat|zip|dir]
+//! rlx-pkg build <in.rlxp> -o <out.rlxp> --target metal [--target cpu]… [--weights f16|bf16|f32] [--no-gqa]
 //! ```
 //!
 //! ONNX → RLXP (optional executable graph) lives on `rlx-bake --features onnx`.
@@ -45,6 +46,7 @@ fn usage(argv0: &str) -> String {
   {argv0} import-nemo <model.nemo> -o <out.rlxp> [--no-graph] [--no-auto-tier] [--container flat|zip|dir]
   {argv0} import-pt <model.pt|pth|bin> -o <out.rlxp> [--no-graph] [--no-auto-tier] [--container flat|zip|dir]
   {argv0} convert <in> -o <out> [--container flat|zip|dir]
+  {argv0} build <in.rlxp> -o <out.rlxp> --target metal|cpu [--target …] [--weights f16|bf16|f32] [--no-gqa]
 
 ONNX → RLXP (optional graph): rlx-bake --features onnx -- import-onnx …
 "
@@ -82,6 +84,7 @@ fn run() -> Result<()> {
         "import-nemo" => cmd_import_nemo(&args)?,
         "import-pt" => cmd_import_pt(&args)?,
         "convert" => cmd_convert(&args)?,
+        "build" => cmd_build(&args)?,
         "-h" | "--help" | "help" => print!("{}", usage(&argv0)),
         other => bail!("unknown command {other}\n{}", usage(&argv0)),
     }
@@ -138,7 +141,143 @@ fn cmd_inspect(args: &[String]) -> Result<()> {
     for s in &m.sidecars {
         println!("  - {} ({:?})", s.id, s.media_type);
     }
+    if m.graph.encoding == "rlxmodel_v1" {
+        print_module(&pack.module()?);
+    }
     Ok(())
+}
+
+/// A `.rlxmodel` module as `inspect` shows it: who wrote it and who may
+/// read it, its symbols, each function's inputs and outputs, the model
+/// block's entries, and where the weights it does not hold come from.
+fn print_module(module: &rlx_ir::rlxmodel::Module) {
+    use rlx_ir::Op;
+    use serde_json::Value;
+    let versions = [
+        module.rlx.as_ref().map(|v| format!("written by rlx {v}")),
+        module
+            .requires
+            .as_ref()
+            .map(|v| format!("needs rlx >= {v}")),
+    ];
+    let versions: Vec<String> = versions.into_iter().flatten().collect();
+    if !versions.is_empty() {
+        println!("rlxmodel: {}", versions.join(", "));
+    }
+    let model = module.model.clone().unwrap_or(Value::Null);
+    let s = |k: &str| model.get(k).and_then(Value::as_str).unwrap_or("-");
+    if !model.is_null() {
+        println!(
+            "model: {} {} (family {}, task {}, license {})",
+            s("name"),
+            s("version"),
+            s("family"),
+            s("task"),
+            model.get("license").map_or("-".into(), |l| match l {
+                Value::String(l) => l.clone(),
+                other => other.to_string(),
+            })
+        );
+    }
+    if !module.dims.is_empty() {
+        let dims: Vec<String> = module
+            .dims
+            .iter()
+            .map(|(n, i)| format!("{n}={i}"))
+            .collect();
+        println!("dims: {}", dims.join(", "));
+    }
+    // A symbolic dim by the name the module gives it (`?0` → `cap`), the
+    // longest ids first so `?1` does not eat `?10`.
+    let mut names = module.dims.clone();
+    names.sort_by_key(|(_, i)| std::cmp::Reverse(*i));
+    let shape = |sh: &rlx_ir::Shape| {
+        let mut t = sh.to_string();
+        for (n, i) in &names {
+            t = t.replace(&format!("?{i}"), n);
+        }
+        t
+    };
+    println!("functions: {}", module.graphs.len());
+    for g in &module.graphs {
+        let ins: Vec<String> = g
+            .nodes()
+            .iter()
+            .filter_map(|n| match &n.op {
+                Op::Input { name } => Some(format!("{name} {}", shape(&n.shape))),
+                _ => None,
+            })
+            .collect();
+        let outs: Vec<String> = g
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(i, &o)| {
+                let n = g.node(o);
+                let label = n.name.clone().unwrap_or_else(|| i.to_string());
+                format!("{label} {}", shape(&n.shape))
+            })
+            .collect();
+        let params = g
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Param { .. }))
+            .count();
+        let vars = if g.vars().is_empty() {
+            String::new()
+        } else {
+            format!(", {} variables", g.vars().len())
+        };
+        println!(
+            "  - {} ({} nodes, {params} params{vars})",
+            g.name,
+            g.nodes().len()
+        );
+        println!("      in:  {}", ins.join(", "));
+        println!("      out: {}", outs.join(", "));
+    }
+    if let Some(entries) = model.get("entries").and_then(Value::as_object) {
+        for (name, e) in entries {
+            // Named apart from its kind: `image (pipeline)`.
+            let kind = match e.get("kind").and_then(Value::as_str) {
+                Some(k) if k != name => format!("{name} ({k})"),
+                _ => name.clone(),
+            };
+            let mut parts = Vec::new();
+            for key in ["functions", "function"] {
+                if let Some(f) = e.get(key) {
+                    parts.push(format!("{key} {f}"));
+                }
+            }
+            if let Some(sizes) = e.get("sizes").and_then(Value::as_array) {
+                parts.push(format!("{} sizes", sizes.len()));
+            }
+            for key in ["prefill", "check", "media", "batch", "decoder", "stages"] {
+                if e.get(key).is_some_and(|v| !v.is_null()) {
+                    parts.push(key.to_string());
+                }
+            }
+            if let Some(c) = e.get("max_context") {
+                parts.push(format!("context {c}"));
+            }
+            println!("entry {kind}: {}", parts.join(", "));
+        }
+    }
+    if let Some(sources) = model.get("weights").and_then(Value::as_array) {
+        println!("weight sources: {}", sources.len());
+        for w in sources {
+            let mapped = w
+                .get("map")
+                .and_then(Value::as_object)
+                .map_or(0, |m| m.len());
+            println!(
+                "  - {} ({} params renamed or transposed, {} bytes)",
+                w.get("uri").and_then(Value::as_str).unwrap_or("-"),
+                mapped,
+                w.get("size").and_then(Value::as_u64).unwrap_or(0)
+            );
+        }
+    }
 }
 
 fn cmd_verify(args: &[String]) -> Result<()> {
@@ -148,6 +287,57 @@ fn cmd_verify(args: &[String]) -> Result<()> {
     println!(
         "ok: tensors {}/{} (unchecked {}) sidecars {}",
         report.tensors_ok, report.tensors_checked, report.tensors_unchecked, report.sidecars_ok
+    );
+    Ok(())
+}
+
+/// Each portable function also built for every `--target`, the device's
+/// recipe adjusted by `--weights` / `--no-gqa`.
+fn cmd_build(args: &[String]) -> Result<()> {
+    let mut args = args.to_vec();
+    let targets = take_flag_values(&mut args, "--target");
+    let out = take_flag_values(&mut args, "-o")
+        .pop()
+        .context("build <in.rlxp> -o <out.rlxp> --target <device>")?;
+    let weights = take_flag_values(&mut args, "--weights").pop();
+    let no_gqa = args.iter().any(|a| a == "--no-gqa");
+    args.retain(|a| a != "--no-gqa");
+    let input = args
+        .first()
+        .context("build <in.rlxp> -o <out.rlxp> --target <device>")?;
+    if targets.is_empty() {
+        bail!("build needs --target (metal, cpu)");
+    }
+    let mut recipes = Vec::new();
+    for t in &targets {
+        let mut r = rlx_pkg::build::TargetRecipe::for_target(t)
+            .with_context(|| format!("no build recipe for target '{t}' (metal, cpu)"))?;
+        match weights.as_deref() {
+            None => {}
+            Some("f16") => r.weight_dtype = Some(rlx_ir::DType::F16),
+            Some("bf16") => r.weight_dtype = Some(rlx_ir::DType::BF16),
+            Some("f32") => r.weight_dtype = None,
+            Some(other) => bail!("--weights {other}: f16, bf16 or f32"),
+        }
+        if no_gqa {
+            r.gqa_native = false;
+        }
+        recipes.push((t.as_str(), r));
+    }
+    let report = rlx_pkg::build::build_for_targets(
+        std::path::Path::new(input),
+        std::path::Path::new(&out),
+        &recipes,
+    )?;
+    println!(
+        "built {} ({} matmul weights narrowed, {} attentions on shared K/V heads) -> {out}",
+        if report.built.is_empty() {
+            "nothing".to_string()
+        } else {
+            report.built.join(", ")
+        },
+        report.weights_narrowed,
+        report.attention_rewired
     );
     Ok(())
 }

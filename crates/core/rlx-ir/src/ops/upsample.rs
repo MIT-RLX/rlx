@@ -12,6 +12,7 @@
 //! on every backend.
 
 use crate::infer::GraphExt as _;
+use crate::prelude::*;
 use crate::{Graph, NodeId};
 
 /// Interpolation mode for [`Graph::interpolate1d`].

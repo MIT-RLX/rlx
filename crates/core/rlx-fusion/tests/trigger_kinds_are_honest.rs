@@ -15,7 +15,7 @@
 //! a graph built only from ops outside its trigger set, and require the IR to
 //! come back untouched.
 
-use rlx_fusion::control_flow::{LowerControlFlow, LowerScan};
+use rlx_fusion::control_flow::{LowerControlFlow, LowerIf, LowerScan};
 use rlx_fusion::fusion::{
     FuseAdaLayerNorm, FuseAttentionBlock, FuseConvAffineAct, FuseConvBiasAct, FuseMatMulBiasAct,
     FuseMatMulResidual, FuseResidualLN, FuseResidualRmsNorm, FuseRmsNormReshape,
@@ -74,6 +74,7 @@ fn passes_with_triggers() -> Vec<&'static dyn Pass> {
         &LowerResizeNearest2x,
         &LowerScan,
         &LowerControlFlow,
+        &LowerIf,
         &UnfuseElementwiseRegions::FOR_CPU,
         // Fusion passes: their anchors are derived from each matcher's own
         // scan, so the same claim applies and gets the same check.

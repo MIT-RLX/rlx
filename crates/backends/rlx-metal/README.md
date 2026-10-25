@@ -76,14 +76,14 @@ The crate is built unconditionally on macOS via [`rlx`](https://crates.io/crates
 
 ```toml
 [dependencies]
-rlx-metal = "0.1"
+rlx-metal = "0.2"
 ```
 
 Or, more typically:
 
 ```toml
 [dependencies]
-rlx = { version = "0.1", features = ["metal"] }
+rlx = { version = "0.2", features = ["metal"] }
 ```
 
 ## Build / test
@@ -109,21 +109,32 @@ Gating env vars worth knowing:
 See [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md) for the
 full GGUF env table.
 
+## Shared weights
+
+Executables of one model (a decode step, a prompt prefill, a media prefill)
+used to hold a copy of the weights each. Under a sharing scope
+(`shared_weights::set_scope`, one per package's weights; `rlx-runtime` sets it
+when loading a package) the weight buffer is a page-aligned VM region wrapped
+as a no-copy `MTLBuffer`, and each weight is backed by a Mach memory entry
+keyed by `(scope, name, dtype, bytes)`: the first executable to place a weight
+creates it, every later one maps the same pages. Only weights read through the
+weight buffer take part, so a param written at run time (a cache) is never
+shared. `RLX_METAL_SHARED_WEIGHTS=0` keeps one copy per executable.
+
 ## Status
 
 Mature for the BERT / Nomic inference path. ICB
 matmul + MPSGraph attention are production. Tier-2 fused ops
-(FusedAttnBlock, FusedBertLayer) work; FusedNomicLayer is disabled
-pending a SwiGLU stride fix (see `thunk.rs:3315`).
+(FusedAttnBlock, FusedBertLayer) work; `FusedNomicLayer` is CPU-only.
 
 ## Gotchas
 
 - Per-run cost is dominated by `wait_until_completed` (~150 µs);
   encoding cost is comparatively small. Fusing op chains into one
   command buffer is far more valuable than reducing kernel count.
-- `Thunk::Attention` only supports `MaskKind::Custom` (plan #20). The
-  lowering asserts; non-Custom kinds are a future kernel addition.
-  MPSGraph attention bails to thunks for non-Custom.
+- `Thunk::Attention` handles every `MaskKind` (None, Causal, Custom,
+  Bias, SlidingWindow) up to `head_dim` 512; the lowering asserts past
+  that, since the SDPA kernels keep a row in registers.
 - Don't trust microbenchmarks under thermal throttle. Run
   `scripts/check-throttle.sh` before measuring.
 - Phase G eliminated the f32↔f16 cast tax inside AutoMixedPrecision;

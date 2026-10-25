@@ -119,6 +119,30 @@ where
     }
 }
 
+/// `torch.nn.utils.clip_grad_norm_(params, max_norm)` (2-norm, foreach),
+/// in place; returns the total norm.
+///
+/// torch takes each tensor's norm (float32), the norm of those norms, and
+/// multiplies EVERY gradient by `clamp(max_norm / (total + 1e-6), max=1)` —
+/// unlike [`global_grad_clip_scale`] the `1e-6` is there and nothing is
+/// skipped, so a clipped step differs from it by about `1e-6` relative.
+pub fn clip_grad_norm_torch(grads: &mut [&mut [f32]], max_norm: f64) -> f32 {
+    let norms: Vec<f32> = grads
+        .iter()
+        .map(|g| g.iter().map(|&x| x as f64 * x as f64).sum::<f64>().sqrt() as f32)
+        .collect();
+    let total = norms
+        .iter()
+        .map(|&n| n as f64 * n as f64)
+        .sum::<f64>()
+        .sqrt() as f32;
+    let coef = ((max_norm as f32) / (total + 1e-6)).min(1.0);
+    for g in grads.iter_mut() {
+        g.iter_mut().for_each(|x| *x *= coef);
+    }
+    total
+}
+
 /// `HashMap` helper used by every algorithm: lazily allocate a zero
 /// buffer of the requested length for `name`. Returns `&mut Vec<f32>`.
 pub(crate) fn zeros_entry<'a>(

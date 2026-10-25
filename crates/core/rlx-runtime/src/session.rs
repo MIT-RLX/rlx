@@ -43,10 +43,16 @@ impl Session {
             "device {} is not available — {}",
             device,
             if crate::device_ext::feature_compiled(device) {
-                format!(
-                    "the `{}` feature is enabled but no such device/driver was found on this host",
-                    feature_name(device)
-                )
+                match crate::device_ext::unavailable_reason(device) {
+                    Some(why) => format!(
+                        "the `{}` feature is enabled but: {why}",
+                        feature_name(device)
+                    ),
+                    None => format!(
+                        "the `{}` feature is enabled but no such device/driver was found on this host",
+                        feature_name(device)
+                    ),
+                }
             } else {
                 format!("enable the `{}` Cargo feature", feature_name(device))
             }
@@ -88,17 +94,32 @@ impl Session {
     /// On ANE with `RLX_COREML_NATIVE_FLEX=1`, dynamic graphs compile once with
     /// CoreML `ShapeRange` and infer shapes at predict time instead.
     pub fn compile(&self, graph: Graph) -> CompiledGraph {
+        crate::taps::tapped(graph, |g| self.compile_untapped(g))
+    }
+
+    fn compile_untapped(&self, graph: Graph) -> CompiledGraph {
         if rlx_ir::dynamic::has_dynamic_dims(&graph) && !self.coreml_native_flex() {
             return self.compile_deferred(graph, self.default_options());
         }
         let opts = self.default_options();
-        if opts.cache_param_invariant
+        // A number format (`RLX_NUMBER_FORMAT`) rewrites the graph first.
+        if opts
+            .number_format
+            .is_some_and(|f| f != rlx_ir::NumberFormat::F32)
+        {
+            return self.compile_with(graph, &opts);
+        }
+        let (graph, df) = self.lower_f64(graph, &opts);
+        let mut compiled = if opts.cache_param_invariant
             && let Some(staged) = self.try_hoist_param_invariant(&graph, &opts)
         {
-            return staged;
-        }
-        self.compile_module(GraphModule::from_graph(graph))
-            .expect("compile MIR graph through fusion pipeline")
+            staged
+        } else {
+            self.compile_module(GraphModule::from_graph(graph))
+                .expect("compile MIR graph through fusion pipeline")
+        };
+        compiled.set_df_boundary(df);
+        compiled
     }
 
     /// If `graph` has a hoistable param-invariant closure, compile it as a
@@ -157,6 +178,14 @@ impl Session {
     /// `new_with_precision` / `with_policy`. This escape hatch is for
     /// callers that need finer control (e.g., disable DCE for debugging).
     pub fn compile_with(&self, graph: Graph, options: &crate::CompileOptions) -> CompiledGraph {
+        crate::taps::tapped(graph, |g| self.compile_with_untapped(g, options))
+    }
+
+    fn compile_with_untapped(
+        &self,
+        graph: Graph,
+        options: &crate::CompileOptions,
+    ) -> CompiledGraph {
         // Opt-in native low-precision GEMM: rewrite every 2-D matmul into a
         // dynamically-quantized `ScaledMatMul` in the requested format before
         // the rest of the pipeline (must precede constant folding). Requires
@@ -167,11 +196,143 @@ impl Session {
             }
             None => graph,
         };
+        // `assoc-scan`: affine-recurrence Scans become a log-depth prefix scan
+        // of tensor ops, before fusion sees the graph. Enabled where measured
+        // to win: Metal, where a Scan is a host-driven loop (5-10x at
+        // T=256..4096). The CPU's native loop beats the rewrite's O(T log T)
+        // work by 2.5-4x. wgpu host-stages large `Concat`/`Expand` (bind-window
+        // limit), which made T=4096 x 512 1.6x slower. CUDA/ROCm/MLX/Vulkan
+        // are unmeasured.
+        #[cfg(feature = "assoc-scan")]
+        let graph = if self.device == Device::Metal {
+            use rlx_opt::pass::Pass as _;
+            rlx_opt::rlx_fusion::assoc_scan::ParallelizeAffineScan::default().run(graph)
+        } else {
+            graph
+        };
         let upload_rounding = upload_rounding(&graph, options);
-        let graph = apply_number_format(graph, options);
+        let (graph, widened) = apply_number_format(graph, options);
+        self.check_native_f64(&graph, options);
+        // Fused kernels (SwiGLU, matmul+bias+act, residual norms, elementwise
+        // regions) compute in f32, so an f64 graph on the CPU runs unfused.
+        let unfused;
+        let options = if self.device == Device::Cpu && !widened.is_empty() {
+            let mut o = options.clone();
+            o.fusion_opts.skip_fusion = true;
+            unfused = o;
+            &unfused
+        } else {
+            options
+        };
+        let (graph, df) = self.lower_f64(graph, options);
         let mut compiled = self.compile_graph_stage(graph, options);
         compiled.set_upload_rounding(upload_rounding);
+        compiled.set_widened_params(widened);
+        compiled.set_df_boundary(df);
         compiled
+    }
+
+    /// `NumberFormat::F64` on the CPU runs every F64 value through an f64
+    /// kernel. An op without one would be handed to its f32 kernel over f64
+    /// buffers (or skipped), so refuse the graph instead.
+    // `graph` is only read by the `cpu` arm; without that feature it is unused.
+    #[cfg_attr(not(feature = "cpu"), allow(unused_variables))]
+    fn check_native_f64(&self, graph: &Graph, options: &crate::CompileOptions) {
+        if self.device != Device::Cpu || options.number_format != Some(rlx_ir::NumberFormat::F64) {
+            return;
+        }
+        #[cfg(feature = "cpu")]
+        {
+            let f64_at = |id: &rlx_ir::NodeId| graph.node(*id).shape.dtype() == rlx_ir::DType::F64;
+            let bad = graph.nodes().iter().find(|n| {
+                (f64_at(&n.id) || n.inputs.iter().any(f64_at))
+                    && !rlx_cpu::f64_kernels::native_f64(&n.op)
+            });
+            if let Some(n) = bad {
+                panic!(
+                    "number format f64: the CPU has no f64 kernel for {} (node {:?} in `{}`)",
+                    n.op, n.id, graph.name
+                );
+            }
+        }
+    }
+
+    /// Rewrite F64 compute into double-single pairs where the backend has no
+    /// f64 of its own (everywhere but the CPU), or everywhere under
+    /// `NumberFormat::F64x2`. Without it an F64 graph ran f32 kernels over f64
+    /// buffers on Metal and Vulkan — wrong results, no error — and failed
+    /// outright on wgpu and MLX.
+    fn lower_f64(
+        &self,
+        graph: Graph,
+        options: &crate::CompileOptions,
+    ) -> (Graph, Option<crate::compiled::DfBoundary>) {
+        use rlx_opt::rlx_compile::lower_f64;
+        // F64x2 always, and F64 off the CPU, are requests the caller made:
+        // failing to honour them is an error, never a silent f32 run.
+        let forced = match options.number_format {
+            Some(rlx_ir::NumberFormat::F64x2) => true,
+            Some(rlx_ir::NumberFormat::F64) => self.device != Device::Cpu,
+            _ => false,
+        };
+        if !lower_f64::has_f64(&graph) || (self.device == Device::Cpu && !forced) {
+            return (graph, None);
+        }
+        // Norms, softmax, activations, RoPE and attention become df
+        // primitives. Only on request: unrequested F64 graphs may rely on a
+        // backend's own F64 host paths (left as they were below).
+        let decomposed = if forced {
+            match rlx_opt::rlx_compile::decompose_f64::decompose_f64(&graph) {
+                Ok(d) => Some(d),
+                Err(e) => panic!(
+                    "{e}: number format {} on {:?}",
+                    options.number_format.expect("forced implies a format"),
+                    self.device
+                ),
+            }
+        } else {
+            None
+        };
+        let l = match lower_f64::lower_f64(decomposed.as_ref().unwrap_or(&graph)) {
+            Ok(l) => l,
+            Err(e) if forced => panic!(
+                "{e}: number format {} needs double-single kernels on {:?}{}",
+                options.number_format.expect("forced implies a format"),
+                self.device,
+                match options.number_format {
+                    Some(rlx_ir::NumberFormat::F64) => " (use --device cpu for native f64)",
+                    _ => "",
+                }
+            ),
+            // Ops a backend already runs in F64 (host fallbacks such as the
+            // SPD family, Metal's F64 FFT) have no df lowering; leave such a
+            // graph as it compiled before rather than refuse it.
+            Err(e) => {
+                if rlx_ir::env::flag("RLX_LOG_F64_LOWERING") {
+                    eprintln!("rlx: F64 graph left as is on {:?}: {e}", self.device);
+                }
+                return (graph, None);
+            }
+        };
+        // A backend without double-single kernels keeps running the graph as
+        // it did; asking for f64x2 there is an error, not a silent downgrade.
+        if let Some((_, op)) =
+            crate::device_ext::first_unsupported_op_with_options(self.device, &l.graph, options)
+        {
+            if forced {
+                panic!(
+                    "number format f64x2: {:?} has no kernel for {op}",
+                    self.device
+                );
+            }
+            return (graph, None);
+        }
+        let df = crate::compiled::DfBoundary {
+            inputs: l.df_inputs.into_iter().collect(),
+            params: l.df_params.into_iter().collect(),
+            outputs: l.df_outputs,
+        };
+        (l.graph, Some(df))
     }
 
     fn compile_graph_stage(&self, graph: Graph, options: &crate::CompileOptions) -> CompiledGraph {
@@ -230,9 +391,22 @@ impl Session {
         // f32 entry points need them to convert rather than reinterpret an
         // F16/BF16 boundary. Every `Session::compile*` path funnels here.
         let io_dtypes = module.io_dtypes();
+        let io_spec = module.as_graph().map(|g| {
+            let mut spec = crate::io_check::IoSpec::from_graph(g);
+            if let Some(b) = &options.param_bindings {
+                spec.mark_params(b.keys());
+            }
+            if let Some(b) = &options.quant_param_bindings {
+                spec.mark_params(b.keys());
+            }
+            spec
+        });
         let executable = backend.compile_module(module, self.device, options)?;
         let mut compiled = CompiledGraph::new(executable, self.device);
         compiled.set_io_dtypes(io_dtypes);
+        if let Some(spec) = io_spec {
+            compiled.set_io_spec(spec);
+        }
         Ok(compiled)
     }
 
@@ -303,25 +477,29 @@ fn feature_name(device: Device) -> &'static str {
 
 /// Which weights to round on upload, and their row lengths: every float
 /// `Param` under a minifloat format, unless the graph rounds them itself
-/// (`params_in_graph`), the caller already did (`params_prerounded`), or the
-/// param is kept (`keep_params`).
+/// (`params_in_graph`), the caller already did (`params_prerounded`), the
+/// param is kept (`keep_params`), it is a RoPE position table, or it is a
+/// vector under a format of 8 bits or fewer (`rounds_param_shape`).
 fn upload_rounding(
     graph: &Graph,
     options: &crate::CompileOptions,
 ) -> Option<crate::compiled::UploadRounding> {
-    let Some(rlx_ir::NumberFormat::Float { format, scaling }) = options.number_format else {
-        return None;
-    };
+    let (format, scaling) = options.number_format.and_then(|f| f.weights())?;
     let o = &options.number_format_options;
     if o.params_in_graph || o.params_prerounded {
         return None;
     }
+    let tables = rlx_opt::rlx_compile::emulate_format::position_table_params(graph);
     let row_len = graph
         .nodes()
         .iter()
         .filter_map(|n| match &n.op {
             rlx_ir::Op::Param { name }
                 if n.shape.dtype().is_float()
+                    && !tables.contains(name)
+                    && rlx_opt::rlx_compile::emulate_format::rounds_param_shape(
+                        format, &n.shape,
+                    )
                     && !o.keep_params.iter().any(|k| name.contains(k.as_str())) =>
             {
                 let row = match n.shape.dims().last() {
@@ -341,21 +519,31 @@ fn upload_rounding(
 }
 
 /// Apply [`CompileOptions::number_format`](crate::CompileOptions::number_format).
-fn apply_number_format(graph: Graph, options: &crate::CompileOptions) -> Graph {
+///
+/// Returns the rewritten graph and, for `F64` / `F64x2`, the params promoted
+/// from F32 to F64 (callers keep uploading f32; the compiled graph widens).
+fn apply_number_format(graph: Graph, options: &crate::CompileOptions) -> (Graph, Vec<String>) {
     use rlx_ir::NumberFormat;
     match options.number_format {
-        None | Some(NumberFormat::F32) => graph,
-        Some(NumberFormat::Float { format, scaling }) => {
-            rlx_opt::rlx_compile::emulate_format::emulate_float_format(
+        None | Some(NumberFormat::F32) => (graph, Vec::new()),
+        Some(f @ (NumberFormat::Float { .. } | NumberFormat::Mixed { .. })) => (
+            rlx_opt::rlx_compile::emulate_format::emulate_number_format(
                 graph,
-                format,
-                scaling,
+                f.weights(),
+                f.activations(),
                 &options.number_format_options,
-            )
-        }
-        Some(f @ (NumberFormat::F64 | NumberFormat::F64x2)) => panic!(
-            "number format {f} is not implemented in this build yet (double-single \
-             compute is in progress); use f32, f16, bf16 or a minifloat"
+            ),
+            Vec::new(),
         ),
+        // Already F64: `Session::lower_f64` decides how to run it.
+        Some(NumberFormat::F64 | NumberFormat::F64x2)
+            if rlx_opt::rlx_compile::lower_f64::has_f64(&graph) =>
+        {
+            (graph, Vec::new())
+        }
+        Some(NumberFormat::F64 | NumberFormat::F64x2) => {
+            let p = rlx_opt::rlx_compile::promote_f64::promote_to_f64(&graph);
+            (p.graph, p.widened_params)
+        }
     }
 }

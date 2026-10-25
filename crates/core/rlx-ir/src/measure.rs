@@ -148,6 +148,12 @@ pub fn time_ns<R>(f: impl FnOnce() -> R) -> (R, u64) {
 /// flush whatever the previous iteration left in cache. Without this,
 /// "cache-cold" timings actually measure cache-warm performance and
 /// over-report by 2-5×.
+///
+/// Host caches only: it does not evict a discrete GPU's L2 (or Apple GPU
+/// caches). For device kernels, stream a buffer larger than device L2
+/// between samples (`rlx-cuda/examples/tune_dispatch.rs` `flush_l2`) or
+/// rotate the kernel's operands through a pool larger than L2 — MAX saw an
+/// L4 memcpy read 1580 GB/s warm vs 235 GB/s cold on a 300 GB/s part.
 pub struct CacheBuster {
     buf: Vec<u8>,
 }

@@ -69,7 +69,7 @@ fn skip_mlx() -> bool {
 }
 
 fn env_f32(name: &str, default: f32) -> f32 {
-    std::env::var(name)
+    rlx_ir::env::read(name)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)

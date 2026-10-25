@@ -552,11 +552,16 @@ pub fn rotary_time_tables(
 ///   * its per-token path triggers on `cos_rows == total_tokens`, and for a
 ///     `[B, H, N, dₕ]` input it counts `B·H·N` chunks — so a `[B, N]` timestamp
 ///     table does not line up;
-///   * `RopeStyle::GptJ` is honoured in the fused *thunk* path
-///     (`rlx-cpu/src/thunk/ops/attention.rs` sets `interleaved` from it), but the
-///     standalone `Op::Rope` executor arm destructures
-///     `Op::Rope { head_dim, n_rot, .. }` and implements only the NeoX pairing.
-///     Whether a lowering pass routes GptJ away from that arm was not established.
+///   * (resolved, and *not* a reason any more) `RopeStyle::GptJ` reaches every
+///     backend. `rlx-cpu/src/executor.rs`'s arm really does destructure
+///     `Op::Rope { head_dim, n_rot, .. }` and never read `style`, so the worry
+///     was well founded, but a graph built with `rope_styled(.., GptJ)` is
+///     nonetheless rotated with the adjacent-lane pairing on **CPU, Metal,
+///     wgpu, MLX and CoreML/ANE** — measured, with the two pairings 8.5 apart
+///     on the test input so the check cannot pass vacuously:
+///     `rlx-runtime/tests/rope_style_pairing.rs`. CPU, MLX and ANE are
+///     bit-exact; Metal and wgpu sit at 4.8e-7. Whatever lowering handles these
+///     nodes, it is not that executor arm.
 ///
 /// So an irregularly-sampled model supplies its own tables and composes the
 /// rotation from shape ops, which is what this and [`rotate_by_tables`] are for.

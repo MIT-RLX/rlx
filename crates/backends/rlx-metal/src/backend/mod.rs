@@ -49,6 +49,14 @@ pub struct MetalExecutable {
     weight_buffer: Option<crate::mtl::Buffer>,
     /// `NodeId` → slot in [`Self::weight_buffer`].
     weight_slots: HashMap<NodeId, WeightParamSlot>,
+    /// Under a sharing scope, what keeps [`Self::weight_buffer`]'s memory
+    /// alive: its VM region and the shared weights mapped into it
+    /// (`crate::shared_weights`). Declared after the buffer, so dropped
+    /// after it.
+    weight_pages: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Weight slots mapped from another executable's copy: their values
+    /// are already there.
+    shared_resident: std::collections::HashSet<NodeId>,
     /// Pre-resolved (name, byte_offset, max_f32_len) per input — for run_slots.
     input_slots: Vec<(String, usize, usize)>,
     output_slots: Vec<(usize, usize)>, // (byte_offset, f32_len)
@@ -81,11 +89,11 @@ pub struct MetalExecutable {
     /// MPSGraph-vs-per-op adaptive dispatch (see `encode_and_run`).
     /// Computed once because graph shape is static after compile.
     max_matmul_flops: u64,
-    /// True when the graph has an `Op::MatMul` with a BF16 input. The
-    /// per-op thunk `Sgemm` has no bf16-weight kernel (only f16), so it
-    /// would read bf16 bytes as f32 → garbage. MPSGraph casts bf16→f32
-    /// correctly (see `mps_graph_lower::MatMul`), so route these graphs
-    /// through MPS regardless of the FLOP threshold. Computed once.
+    /// True when the graph has an `Op::MatMul` with a BF16 input. When an MPS
+    /// plan exists such graphs run on it regardless of the FLOP threshold
+    /// (faster); graphs MPS cannot plan run the thunks, whose
+    /// `Sgemm { b_bf16 }` unpacks each bf16 weight into a reused scratch.
+    /// Computed once.
     has_bf16_matmul: bool,
     /// Set after the first `encode_and_run` triggers
     /// `freeze_params_to_mps_constants`. Subsequent runs skip the
@@ -761,9 +769,12 @@ impl MetalExecutable {
             self.mps_hybrid = None;
             // Re-bind the (now much smaller) feed list to the arena.
             self.bind_mps_executable_to_arena();
-        } else if let Some(steps) =
-            crate::mps_graph_hybrid::build_hybrid_plan(&self.graph, Some(&param_bytes))
-                .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
+        } else if let Some(steps) = crate::mps_graph_hybrid::build_hybrid_plan(
+            &self.graph,
+            Some(&param_bytes),
+            &self.schedule.node_start,
+        )
+        .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
         {
             // Full-graph lower failed (Attention etc.) — bake constants into
             // the schedule-split hybrid so big-arena feeds stay small.
@@ -912,6 +923,7 @@ impl MetalExecutable {
                     );
                 }
                 self.weight_buffer = Some(src.clone());
+                self.weight_pages = other.weight_pages.clone();
             }
             _ => return false,
         }

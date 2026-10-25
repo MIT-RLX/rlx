@@ -11,11 +11,13 @@ use std::collections::{HashMap, HashSet};
 
 use rlx_fusion::control_flow::{LowerControlFlow, LowerScan};
 use rlx_fusion::fusion::UnfuseElementwiseRegions;
+use rlx_fusion::lower_attention::LowerAttention;
 use rlx_fusion::lower_axial_rope2d::LowerAxialRope2d;
 use rlx_fusion::lower_backward_ops::LowerBackwardOps;
 use rlx_fusion::lower_conv_transpose2d::LowerConvTranspose2d;
 use rlx_fusion::lower_cumulative::LowerCumulative;
 use rlx_fusion::lower_dot_general::LowerDotGeneral;
+use rlx_fusion::lower_dynamic_update_slice::LowerDynamicUpdateSlice;
 use rlx_fusion::lower_fake_quantize::LowerFakeQuantize;
 use rlx_fusion::lower_fma::LowerFma;
 use rlx_fusion::lower_histogram::LowerHistogram;
@@ -23,6 +25,7 @@ use rlx_fusion::lower_kv_append::LowerKvAppend;
 use rlx_fusion::lower_logical_kernels;
 use rlx_fusion::lower_loss_ops::LowerSoftmaxCrossEntropy;
 use rlx_fusion::lower_pad::LowerPad;
+use rlx_fusion::lower_pocketfft::LowerPocketFft;
 use rlx_fusion::lower_reduce_axes::LowerNonLastAxisReduce;
 use rlx_fusion::lower_roll::LowerRoll;
 use rlx_fusion::lower_scaled_grouped_matmul::LowerScaledGroupedMatMul;
@@ -276,6 +279,11 @@ pub fn rewrite_for_backend_with_config(
         if bad.contains(&OpKind::GroupNorm) {
             apply(&mut graph, &mut changed, &LowerGroupNorm);
         }
+        if bad.contains(&OpKind::Attention) {
+            // Backends without an attention kernel (WebGL2): matmul / softmax
+            // / elementwise, matching the CPU kernel's masks and GQA.
+            apply(&mut graph, &mut changed, &LowerAttention);
+        }
         if bad.contains(&OpKind::BatchNormInference) {
             apply(&mut graph, &mut changed, &LowerBatchNormInference);
         }
@@ -309,6 +317,11 @@ pub fn rewrite_for_backend_with_config(
             // the fast path. Carbon-500M decode on Metal spends 36.9% of its
             // GPU time in exactly that concat, as much as every matmul combined.
             apply(&mut graph, &mut changed, &LowerKvAppend::ALL);
+        }
+        if bad.contains(&OpKind::DynamicUpdateSlice) {
+            // CPU and Metal write the rows in place; elsewhere a `ScatterNd`
+            // (a copy of the operand) gives the same tensor.
+            apply(&mut graph, &mut changed, &LowerDynamicUpdateSlice);
         }
         if bad.contains(&OpKind::Roll) {
             // No backend claims `OpKind::Roll`, so this always fires when a
@@ -380,6 +393,12 @@ pub fn rewrite_for_backend_with_config(
             // the same RBF basis + contraction the generic VJP used to emit.
             apply(&mut graph, &mut changed, &LowerSplineActivationBackward);
         }
+        if bad.contains(&OpKind::FftPocketFft) {
+            // Backends without the pocketfft row kernel (all but CPU) replay its
+            // passes as elementwise ops — the same bits wherever `Binary`/`Fma`
+            // round as IEEE does (Metal, MLX, wgpu: measured).
+            apply(&mut graph, &mut changed, &LowerPocketFft);
+        }
         if bad.contains(&OpKind::Fma) {
             // Backends without a native single-rounding FMA fall back to
             // mul+add (two roundings — loses the compensated-arithmetic benefit).
@@ -435,6 +454,16 @@ pub fn rewrite_for_backend_with_config(
         }
         if needs_unfuse(&bad) {
             apply_fn(&mut graph, &mut changed, unfuse_fused_for_autodiff);
+        }
+        if bad.contains(&OpKind::GatedDeltaNet) {
+            // `unfuse_fused_for_autodiff` keeps GDN fused unless asked (the
+            // unrolled scan is ~32× slower where a kernel exists); a backend
+            // with no kernel (WebGL) needs the expansion regardless.
+            apply_fn(
+                &mut graph,
+                &mut changed,
+                rlx_fusion::unfuse::unfuse_gated_delta_net_always,
+            );
         }
 
         if !changed {

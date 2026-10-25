@@ -5,7 +5,7 @@
 //! Graph composition helpers for higher-order reverse-mode AD.
 
 use rlx_ir::shape::Dim;
-use rlx_ir::{DType, Graph, NodeId, Op, Shape};
+use rlx_ir::{DType, Graph, NodeId, Op, Shape, Splice};
 use std::collections::{HashMap, VecDeque};
 
 /// Build an `Op::Constant` filled with `1.0`, matching `like`'s dtype and rank.
@@ -227,10 +227,13 @@ fn is_cse_eligible(op: &Op) -> bool {
     )
 }
 
-/// Scalar-zero graph: `output = 0` with a single input `wrt_name`.
-pub fn zero_derivative_graph(name: &str, wrt_name: &str, dtype: DType) -> Graph {
+/// Scalar-zero graph: `output = 0` with a single input `wrt_name` of
+/// `wrt_shape` — the shape the forward graph declared, so a caller feeding the
+/// same buffer to the derivative passes the boundary check.
+pub fn zero_derivative_graph(name: &str, wrt_name: &str, wrt_shape: &Shape) -> Graph {
+    let dtype = wrt_shape.dtype();
     let mut g = Graph::new(name);
-    let wrt = g.input(wrt_name, Shape::scalar(dtype));
+    let wrt = g.input(wrt_name, wrt_shape.clone());
     let zero = g.add_node(
         constant_zero(&Shape::scalar(dtype)),
         vec![],
@@ -420,27 +423,31 @@ fn peel_scalar_expands_once(g: Graph) -> Graph {
 /// Merge `sub` into `base`, wiring named inputs to existing `base` nodes.
 ///
 /// Returns `sub` node id → id in `base`. Outputs of `sub` can be remapped via this map.
+///
+/// [`Graph::splice`] with [`Splice::adapt_shapes`]: `bind_inputs` names
+/// `sub`'s inputs or params (names `sub` lacks are skipped), and every
+/// copied node's shape is re-inferred from its new operands. Unbound leaves
+/// share a same-named leaf already in `base`.
 pub fn merge_subgraph(
     base: &mut Graph,
     sub: &Graph,
     bind_inputs: &std::collections::HashMap<String, NodeId>,
 ) -> std::collections::HashMap<NodeId, NodeId> {
-    let mut id_map = std::collections::HashMap::new();
-    for node in sub.nodes() {
-        if let Op::Input { name } | Op::Param { name } = &node.op {
-            if let Some(&ext) = bind_inputs.get(name) {
-                id_map.insert(node.id, ext);
-                continue;
-            }
-        }
-        let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
-        let new_id = base.add_node(node.op.clone(), inputs, node.shape.clone());
-        if let Some(inferred) = rlx_ir::infer_shape::infer_output_shape(base, base.node(new_id)) {
-            base.node_mut(new_id).shape = inferred;
-        }
-        id_map.insert(node.id, new_id);
-    }
-    id_map
+    let splice = Splice::new().adapt_shapes().bind_all(
+        bind_inputs
+            .iter()
+            .filter(|(name, _)| sub.node_id_by_name(name).is_some())
+            .map(|(name, &node)| (name.clone(), node)),
+    );
+    let spliced = base
+        .splice(sub, &splice)
+        .unwrap_or_else(|e| panic!("merge_subgraph({}): {e}", sub.name));
+    spliced
+        .map
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| (NodeId(i as u32), id))
+        .collect()
 }
 
 #[cfg(test)]

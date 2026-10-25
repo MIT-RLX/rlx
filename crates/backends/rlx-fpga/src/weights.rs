@@ -12,6 +12,9 @@
 //! get split into `(M0, shift)` *once*, in `model::tinyconv_mnist_from_cortexm`,
 //! before either Verilog emission or the Rust reference path runs.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 pub use rlx_cortexm::model_weights::{
     C1_SCALE, C2_SCALE, CONV1_B, CONV1_MULT, CONV1_W, CONV2_B, CONV2_MULT, CONV2_W, FC_B, FC_MULT,
     FC_OUT_SCALE, FC_W, P1_SCALE, P2_SCALE, TEST_IMAGE, TEST_LABEL, WEIGHT_BITS, X_SCALE,

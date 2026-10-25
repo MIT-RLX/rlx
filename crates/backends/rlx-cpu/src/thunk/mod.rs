@@ -37,8 +37,18 @@ pub use scan::*;
 mod host_op;
 pub use host_op::*;
 
+mod while_loop;
+pub use while_loop::*;
+
 mod indexing_host;
 pub use indexing_host::*;
+
+#[cfg(feature = "wave-exec")]
+mod waves;
+#[cfg(feature = "wave-exec")]
+pub use waves::WavePlan;
+#[cfg(feature = "wave-exec")]
+pub(crate) use waves::*;
 
 #[cfg(test)]
 mod tests;

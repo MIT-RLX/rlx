@@ -23,6 +23,9 @@
 //! layout, so emitting them here would be redundant.
 
 /// Round up `n` divided by `d`.
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 #[inline]
 const fn div_ceil(n: usize, d: usize) -> usize {
     n.div_ceil(d)

@@ -103,6 +103,64 @@ fn build_mla() -> (Graph, HashMap<String, Vec<f32>>, Vec<f32>, Vec<String>) {
     (g, params, x, names)
 }
 
+/// The absorbed latent-cache decode step ([`MlaAttnDecodeStage`]): one token
+/// over a `S`-row latent cache. Exercises the per-head batched matmuls and
+/// transposes the absorption adds on top of the prefill block's primitives.
+fn run_mla_decode(device: Device) -> Vec<f32> {
+    const LAT: usize = KVLORA + ROPE;
+    let lp = "model.layers.0";
+    let mut w = MapWeights::default();
+    for (name, n, dims, seed) in [
+        ("q_a_proj", QLORA * HID, vec![QLORA, HID], 0.1),
+        ("q_b_proj", NH * QK * QLORA, vec![NH * QK, QLORA], 0.3),
+        ("kv_a_proj_with_mqa", LAT * HID, vec![LAT, HID], 0.4),
+        (
+            "kv_b_proj",
+            NH * (NOPE + VH) * KVLORA,
+            vec![NH * (NOPE + VH), KVLORA],
+            0.6,
+        ),
+    ] {
+        w.insert(format!("{lp}.self_attn.{name}.weight"), fill(n, seed), dims);
+    }
+    w.insert(
+        format!("{lp}.self_attn.q_a_layernorm.weight"),
+        gamma(QLORA, 0.2),
+        vec![QLORA],
+    );
+    w.insert(
+        format!("{lp}.self_attn.kv_a_layernorm.weight"),
+        gamma(KVLORA, 0.5),
+        vec![KVLORA],
+    );
+    let spec = MlaAttnPrefillSpec::deepseek_layer(lp, NH, QLORA, KVLORA, NOPE, ROPE, VH, EPS);
+    let kv_out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let built = ModelFlow::new("mla_decode")
+        .input("x", Shape::new(&[B, 1, HID], DType::F32))
+        .input("rope_cos", Shape::new(&[1, ROPE / 2], DType::F32))
+        .input("rope_sin", Shape::new(&[1, ROPE / 2], DType::F32))
+        .input("past_k_0", Shape::new(&[B, S, LAT], DType::F32))
+        .input("past_v_0", Shape::new(&[B, 1, 1], DType::F32))
+        .bind_decode_inputs(1, false, true)
+        .layer_stage(MlaAttnDecodeStage::new(spec, 0, kv_out))
+        .build(&mut w)
+        .expect("decode flow build");
+    let (g, params) = built.into_graph_parts().expect("graph parts");
+    let mut c = Session::new(device).compile(g);
+    for (k, v) in &params {
+        c.set_param(k.as_str(), v.as_slice());
+    }
+    let p = S as f32;
+    c.run(&[
+        ("x", &fill(B * HID, 0.7)),
+        ("rope_cos", &[p.cos()]),
+        ("rope_sin", &[p.sin()]),
+        ("past_k_0", &fill(B * S * LAT, 0.8)),
+        ("past_v_0", &[0.0]),
+    ])
+    .remove(0)
+}
+
 fn run_mla(device: Device) -> Vec<f32> {
     run_mla_all(device).1.into_iter().next().unwrap()
 }
@@ -132,8 +190,18 @@ fn mla_cpu_runs() {
     assert_eq!(out.len(), B * S * NH * VH, "MLA output shape");
 }
 
+#[test]
+fn mla_decode_cpu_runs() {
+    let _gpu = common::serialize_gpu();
+    let out = run_mla_decode(Device::Cpu);
+    assert_eq!(out.len(), B * NH * VH, "MLA decode output shape");
+}
+
 macro_rules! backend_parity {
     ($name:ident, $feat:meta, $dev:expr) => {
+        backend_parity!($name, $feat, $dev, run_mla);
+    };
+    ($name:ident, $feat:meta, $dev:expr, $run:ident) => {
         #[test]
         #[$feat]
         fn $name() {
@@ -142,8 +210,8 @@ macro_rules! backend_parity {
                 eprintln!("skip: {:?} unavailable", $dev);
                 return;
             }
-            let cpu = run_mla(Device::Cpu);
-            let dev = run_mla($dev);
+            let cpu = $run(Device::Cpu);
+            let dev = $run($dev);
             assert_eq!(dev.len(), cpu.len(), "{:?} output length", $dev);
             let err = max_abs(&cpu, &dev);
             eprintln!("{:?}/CPU MLA max_abs={:.3e}", $dev, err);
@@ -166,3 +234,40 @@ backend_parity!(mla_parity_wgpu, cfg(feature = "gpu"), Device::Gpu);
 backend_parity!(mla_parity_cuda, cfg(feature = "cuda"), Device::Cuda);
 backend_parity!(mla_parity_rocm, cfg(feature = "rocm"), Device::Rocm);
 backend_parity!(mla_parity_vulkan, cfg(feature = "vulkan"), Device::Vulkan);
+
+backend_parity!(
+    mla_decode_parity_metal,
+    cfg(all(feature = "metal", target_os = "macos")),
+    Device::Metal,
+    run_mla_decode
+);
+backend_parity!(
+    mla_decode_parity_mlx,
+    cfg(all(feature = "mlx", target_os = "macos")),
+    Device::Mlx,
+    run_mla_decode
+);
+backend_parity!(
+    mla_decode_parity_wgpu,
+    cfg(feature = "gpu"),
+    Device::Gpu,
+    run_mla_decode
+);
+backend_parity!(
+    mla_decode_parity_cuda,
+    cfg(feature = "cuda"),
+    Device::Cuda,
+    run_mla_decode
+);
+backend_parity!(
+    mla_decode_parity_rocm,
+    cfg(feature = "rocm"),
+    Device::Rocm,
+    run_mla_decode
+);
+backend_parity!(
+    mla_decode_parity_vulkan,
+    cfg(feature = "vulkan"),
+    Device::Vulkan,
+    run_mla_decode
+);

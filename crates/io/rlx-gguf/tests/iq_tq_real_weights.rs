@@ -23,9 +23,13 @@ use std::path::PathBuf;
 use rlx_gguf::GgufFile;
 
 fn test_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("RLX_IQ_TEST_DIR").unwrap_or_else(|_| "/tmp/rlx-iq-test".to_string()),
-    )
+    // Through `rlx_ir::env` where the optional `ir` feature links it, as the
+    // library does.
+    #[cfg(feature = "ir")]
+    let dir = rlx_ir::env::var_result("RLX_IQ_TEST_DIR");
+    #[cfg(not(feature = "ir"))]
+    let dir = std::env::var("RLX_IQ_TEST_DIR");
+    PathBuf::from(dir.unwrap_or_else(|_| "/tmp/rlx-iq-test".to_string()))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {

@@ -226,7 +226,7 @@ pub fn env_reduce_mode() -> ReduceMode {
     static MODE: std::sync::OnceLock<ReduceMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         let on = |k: &str| {
-            std::env::var(k)
+            rlx_ir::env::read(k)
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false)
         };

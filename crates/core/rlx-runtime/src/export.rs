@@ -11,6 +11,10 @@
 //!
 //! There is **no** `Device::Fpga` — FPGA export never goes through
 //! `Session::compile`. Use `ExportSession` instead.
+//!
+//! `ExportTarget::StableHlo` (feature `stablehlo`) writes `model.mlir` for
+//! `iree-compile --iree-input-type=stablehlo`, plus `model.signature.json`
+//! giving the argument order (inputs, then params) and result shapes.
 
 #[cfg(feature = "fpga")]
 use std::path::Path;
@@ -24,6 +28,9 @@ pub enum ExportTarget {
     /// IR → SystemVerilog datapath (`rlx-fpga`).
     #[cfg(feature = "fpga")]
     Fpga,
+    /// IR → StableHLO MLIR (`rlx-stablehlo`), for IREE and MLIR toolchains.
+    #[cfg(feature = "stablehlo")]
+    StableHlo,
 }
 
 impl ExportTarget {
@@ -31,6 +38,8 @@ impl ExportTarget {
         match self {
             #[cfg(feature = "fpga")]
             Self::Fpga => "fpga",
+            #[cfg(feature = "stablehlo")]
+            Self::StableHlo => "stablehlo",
         }
     }
 }
@@ -43,6 +52,9 @@ pub struct ExportOptions {
     /// FPGA-specific configuration (ignored for other targets).
     #[cfg(feature = "fpga")]
     pub fpga: rlx_fpga::FpgaExportConfig,
+    /// StableHLO-specific configuration (ignored for other targets).
+    #[cfg(feature = "stablehlo")]
+    pub stablehlo: rlx_stablehlo::StableHloOptions,
 }
 
 impl ExportOptions {
@@ -51,7 +63,15 @@ impl ExportOptions {
             out_dir: out_dir.into(),
             #[cfg(feature = "fpga")]
             fpga: rlx_fpga::FpgaExportConfig::default(),
+            #[cfg(feature = "stablehlo")]
+            stablehlo: rlx_stablehlo::StableHloOptions::default(),
         }
+    }
+
+    #[cfg(feature = "stablehlo")]
+    pub fn with_stablehlo(mut self, opts: rlx_stablehlo::StableHloOptions) -> Self {
+        self.stablehlo = opts;
+        self
     }
 
     #[cfg(feature = "fpga")]
@@ -181,17 +201,56 @@ pub fn export_graph(
     target: ExportTarget,
     opts: &ExportOptions,
 ) -> Result<ExportedArtifacts, String> {
-    #[cfg(feature = "fpga")]
+    #[cfg(any(feature = "fpga", feature = "stablehlo"))]
     {
         match target {
+            #[cfg(feature = "fpga")]
             ExportTarget::Fpga => export_fpga(graph, opts),
+            #[cfg(feature = "stablehlo")]
+            ExportTarget::StableHlo => export_stablehlo(graph, opts),
         }
     }
-    #[cfg(not(feature = "fpga"))]
+    #[cfg(not(any(feature = "fpga", feature = "stablehlo")))]
     {
         let _ = (graph, target, opts);
-        Err("no export targets enabled; enable the `fpga` feature".into())
+        Err("no export targets enabled; enable the `fpga` or `stablehlo` feature".into())
     }
+}
+
+#[cfg(feature = "stablehlo")]
+fn export_stablehlo(graph: &Graph, opts: &ExportOptions) -> Result<ExportedArtifacts, String> {
+    let m = rlx_stablehlo::export(graph.clone(), &opts.stablehlo).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&opts.out_dir).map_err(|e| e.to_string())?;
+    let sig = |t: &rlx_stablehlo::TensorSig| {
+        serde_json::json!({
+            "name": t.name,
+            "dtype": format!("{:?}", t.dtype),
+            "shape": t.shape,
+        })
+    };
+    let signature = serde_json::json!({
+        "function": opts.stablehlo.function,
+        "args": m.args.iter().map(sig).collect::<Vec<_>>(),
+        "parameters": m.parameters.iter().map(sig).collect::<Vec<_>>(),
+        "results": m.results.iter().map(sig).collect::<Vec<_>>(),
+    });
+    let files = [
+        ("model.mlir", m.text),
+        (
+            "model.signature.json",
+            serde_json::to_string_pretty(&signature).map_err(|e| e.to_string())?,
+        ),
+    ];
+    for (name, body) in &files {
+        std::fs::write(opts.out_dir.join(name), body).map_err(|e| e.to_string())?;
+    }
+    Ok(ExportedArtifacts {
+        target: ExportTarget::StableHlo,
+        out_dir: opts.out_dir.clone(),
+        files: files.iter().map(|(n, _)| n.to_string()).collect(),
+        estimate_summary: None,
+        optimize_summary: None,
+    })
 }
 
 #[cfg(feature = "fpga")]
@@ -251,5 +310,33 @@ mod tests {
         export_tinyconv_mnist(dir.path(), &cfg).unwrap();
         assert!(dir.path().join("board_top.sv").is_file());
         assert!(dir.path().join("constraints.lpf").is_file());
+    }
+}
+
+#[cfg(all(test, feature = "stablehlo"))]
+mod stablehlo_tests {
+    use super::*;
+    use rlx_ir::{DType, Shape};
+
+    #[test]
+    fn writes_module_and_signature() {
+        let mut g = Graph::new("mm");
+        let x = g.input("x", Shape::new(&[2, 3], DType::F32));
+        let w = g.param("w", Shape::new(&[3, 4], DType::F32));
+        let y = g.matmul(x, w, Shape::new(&[2, 4], DType::F32));
+        g.set_outputs(vec![y]);
+        let dir = tempfile::tempdir().unwrap();
+        let arts = export_graph(&g, ExportTarget::StableHlo, &ExportOptions::new(dir.path()))
+            .expect("export");
+        assert_eq!(arts.files, vec!["model.mlir", "model.signature.json"]);
+        let mlir = std::fs::read_to_string(dir.path().join("model.mlir")).unwrap();
+        assert!(mlir.contains("stablehlo.dot_general"), "{mlir}");
+        let sig: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("model.signature.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sig["args"][0]["name"], "x");
+        assert_eq!(sig["args"][1]["name"], "w");
+        assert_eq!(sig["results"][0]["shape"], serde_json::json!([2, 4]));
     }
 }

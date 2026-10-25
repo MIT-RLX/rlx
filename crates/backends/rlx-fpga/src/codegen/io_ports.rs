@@ -4,6 +4,9 @@
 
 //! Soft-port list builder for `top.sv` from [`IoConfig`].
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::codegen::relu::bits_for;
 use crate::export_config::{IoConfig, PortNames, SidebandSpec};
 use crate::model::Model;

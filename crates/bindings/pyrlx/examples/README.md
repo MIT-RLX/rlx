@@ -1,11 +1,33 @@
-# pyrlx examples — export PyTorch models to RLX
+# pyrlx examples
+
+## The runtime, end to end
+
+The same six examples exist for JS and Swift, printing the same numbers
+([`crates/bindings/README.md`](../../README.md)); `tests/test_examples.py` runs
+these.
+
+| Script | What it shows |
+|--------|---------------|
+| [`inference.py`](inference.py) | build a classifier, compile for a device (`python inference.py metal`), set weights, run |
+| [`training.py`](training.py) | `Trainer.run` with an LR schedule and early stop; GGUF checkpoint + resume; freezing; `grad` + `Optimizer` by hand |
+| [`loading.py`](loading.py) | write / read GGUF (f32 + Q8_0), load safetensors into a graph, quantize; `RLX_TOKENIZER=…` adds the tokenizer |
+| [`distributed.py`](distributed.py) | three ranks on threads: collectives, pipelined inference, data-parallel training with identical replicas |
+| [`backends.py`](backends.py) | devices, cost-model pick, `FlexibleSession`, `GraphDevices` benchmark / fallback, `DeviceRouter` |
+| [`models.py`](models.py) | save a graph as an `.rlxp` model, run it by name with `pyrlx.Model`; generate with a plugin's language model (`RLX_MODEL_PLUGINS`) |
+
+```bash
+cd crates/bindings/pyrlx && maturin develop --features cpu
+python examples/inference.py
+```
+
+## Export PyTorch models to RLX
 
 `pyrlx.from_torch(model, example_inputs, out_dir, ...)` converts a live
 `torch.nn.Module` into an RLX model: it runs `torch.export`, maps each ATen op
 directly onto RLX ops, and emits a runnable bundle and/or a standalone RLX crate
 — then verifies numeric parity against PyTorch.
 
-## One file per model
+### One file per model
 
 Each script defines a model and exports it in **every form** via
 `export_all_forms` (see [`_common.py`](_common.py)):
@@ -44,17 +66,17 @@ Each run prints the four output forms and leaves them under `out_<name>/`:
   `tensor` (PyTorch-like `Tensor` DSL) is the most readable but can't express a
   few ops (pooling, computed-mask attention) — those models report it as `n/a`.
 
-## Options reference
+### Options reference
 
 [`torch_to_rlx.py`](torch_to_rlx.py) is an all-in-one script that documents
 **every `from_torch` option** with a worked example each
 (`python torch_to_rlx.py options`) and runs the whole model zoo
 (`python torch_to_rlx.py all`).
 
-## Running the generated crate
+### Running the generated crate
 
 ```bash
-cd out_mlp/rlx-mlp && cargo run --example verify   # runs the crate vs the golden output
+cd out_mlp/rlx-mlp && cargo run --example verify   # runs the crate vs the reference output
 ```
 
 All six models verify at **cosine 1.000000** vs PyTorch on both **CPU and CUDA**

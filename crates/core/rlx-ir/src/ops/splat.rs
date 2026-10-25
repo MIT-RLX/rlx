@@ -6,6 +6,7 @@
 
 use crate::infer::GraphExt;
 use crate::op::Op;
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, Shape};
 
 /// Packed scene + camera tensors for [`Op::GaussianSplatRender`].

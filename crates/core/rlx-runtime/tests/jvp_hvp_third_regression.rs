@@ -2,7 +2,13 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `jvp(hvp(f))` does not yield the third derivative — use `nth_order_grad`.
+//! `jvp(hvp(f))` and `nth_order_grad` agree on the third derivative.
+//!
+//! This test used to assert the opposite — that `jvp(hvp(f))` returns zero —
+//! and passed because it fed only `tangent_x`. The outer `jvp`'s own tangent is
+//! `tangent_x_2` (the collision fix, see `jvp_over_hvp_third_order.rs`); left
+//! unfed, its slot read the arena's zeros and the derivative came back 0.
+//! `RLX_POISON_ARENA=1` turned that zero into NaN.
 
 #![cfg(feature = "cpu")]
 
@@ -29,7 +35,7 @@ fn build_x3() -> (Graph, NodeId) {
 }
 
 #[test]
-fn jvp_of_hvp_is_not_third_derivative() {
+fn jvp_of_hvp_matches_nth_order_grad() {
     let (g, x) = build_x3();
     let x_val = 2.5;
     let want_third = 6.0;
@@ -46,13 +52,13 @@ fn jvp_of_hvp_is_not_third_derivative() {
     let outs = c.run_typed(&[
         ("x", &f64s(&[x_val]), DType::F64),
         ("tangent_x", &f64s(&[1.0]), DType::F64),
+        ("tangent_x_2", &f64s(&[1.0]), DType::F64),
     ]);
     let jvp_hvp = f64b(&outs[outs.len() - 1].0);
     assert!(
-        jvp_hvp.abs() < 1e-12,
-        "jvp(hvp) wrongly reports third deriv as {jvp_hvp}"
+        (jvp_hvp - want_third).abs() < 1e-10,
+        "jvp(hvp): {jvp_hvp} vs {want_third}"
     );
-    assert!((jvp_hvp - want_third).abs() > 1.0);
 
     let ng = nth_order_grad(&g, "x", 3);
     let mut c = Session::new(Device::Cpu).compile(ng);

@@ -20,6 +20,7 @@
 #include "mlx/fast.h"
 #include "mlx/fft.h"
 #include "mlx/io.h"
+#include "mlx/memory.h"
 #include "mlx/linalg.h"
 #include "mlx/ops.h"
 #include "mlx/random.h"
@@ -603,6 +604,17 @@ int rlx_mlx_synchronize(void) {
     });
 }
 
+// ── Allocator cache ───────────────────────────────────────────────
+// MLX keeps freed buffers for reuse, up to the cache limit (by default the
+// memory limit), so a process that runs many differently-shaped graphs only
+// ever grows. These cannot throw.
+
+size_t rlx_mlx_set_cache_limit(size_t limit) { return mc::set_cache_limit(limit); }
+void rlx_mlx_clear_cache(void) { mc::clear_cache(); }
+size_t rlx_mlx_get_cache_memory(void) { return mc::get_cache_memory(); }
+size_t rlx_mlx_get_active_memory(void) { return mc::get_active_memory(); }
+size_t rlx_mlx_get_peak_memory(void) { return mc::get_peak_memory(); }
+
 // ── Binary ops ────────────────────────────────────────────────────
 
 #define BINARY_OP(name, mlx_fn)                                                 \
@@ -1182,6 +1194,32 @@ int rlx_mlx_op_rmsnorm(
     return guarded([&] {
         std::optional<mc::array> w(unwrap(gamma));
         *out = wrap(mc::fast::rms_norm(unwrap(x), w, eps));
+    });
+}
+
+// mlx::fast::gated_delta_update — fused Metal recurrence (Qwen3.5 GDN).
+// q,k [B,T,Hk,Dk], v [B,T,Hv,Dv], gate (multiplicative decay) and beta
+// [B,T,Hv], state [B,Hv,Dv,Dk] or null for zeros. Returns out [B,T,Hv,Dv]
+// and the final state.
+int rlx_mlx_op_gated_delta_update(
+    rlx_mlx_array_t* q,
+    rlx_mlx_array_t* k,
+    rlx_mlx_array_t* v,
+    rlx_mlx_array_t* gate,
+    rlx_mlx_array_t* beta,
+    rlx_mlx_array_t* state_or_null,
+    rlx_mlx_array_t** out,
+    rlx_mlx_array_t** state_out)
+{
+    return guarded([&] {
+        std::optional<mc::array> s0;
+        if (state_or_null) {
+            s0 = unwrap(state_or_null);
+        }
+        auto r = mc::fast::gated_delta_update(
+            unwrap(q), unwrap(k), unwrap(v), unwrap(gate), unwrap(beta), s0);
+        *out = wrap(r.at(0));
+        *state_out = wrap(r.at(1));
     });
 }
 

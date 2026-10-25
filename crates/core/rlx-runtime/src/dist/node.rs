@@ -387,7 +387,7 @@ impl NodeConfig {
     /// parity; prefer the builder on platforms without a shell environment.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_env() -> Result<Self, String> {
-        let var = |k: &str| std::env::var(k).ok();
+        let var = |k: &str| rlx_ir::env::read(k).ok();
         let rank: u32 = var("RANK")
             .as_deref()
             .unwrap_or("0")

@@ -11,6 +11,7 @@ pub mod compiler;
 pub mod const_fold;
 pub mod cse;
 pub mod dce;
+pub mod decompose_f64;
 pub mod dispatch_report;
 pub mod emulate_format;
 pub mod fusion_benefit;
@@ -22,12 +23,14 @@ pub mod inspect;
 pub mod io_output_gate;
 pub mod legalize;
 pub mod legalize_broadcast;
+pub mod lower_f64;
 pub mod memory;
 pub mod numeric_lint;
 pub mod param_hoist;
 pub mod param_specialize;
 pub mod plan_check;
 pub mod precision;
+pub mod promote_f64;
 pub mod promote_params;
 pub mod quant_insert;
 pub mod quant_propagate;
@@ -35,6 +38,7 @@ pub mod rewrite;
 pub mod scaled_quant_insert;
 pub mod sccp;
 pub mod shard;
+pub mod simplify_transposes;
 pub mod svg;
 
 #[cfg(feature = "training")]
@@ -68,11 +72,12 @@ pub use io_output_gate::SelectPeaksOnlyOutputs;
 pub use legalize::{LegalizeResult, format_legalize_error, legalize_for_backend};
 pub use legalize_broadcast::{LegalizeBroadcast, legalize_custom_attention_mask};
 pub use memory::{
-    ArenaWidthPolicy, MemoryPlanOptions, SMALL_M_GROUPED, SharedWeightLayout, WeightSlot,
-    is_elidable_bank_transpose, is_elidable_bank_transpose_gated, is_elidable_folded_transpose,
-    is_elidable_folded_transpose_gated, is_elidable_matmul_transpose, is_pure_view,
-    plan_memory_backward, plan_memory_f32_uniform, plan_memory_hybrid, plan_memory_native,
-    plan_memory_native_in_order, plan_memory_with_options,
+    ArenaWidthPolicy, MemoryPlanOptions, ReaderIndex, SMALL_M_GROUPED, SharedWeightLayout,
+    WeightSlot, is_elidable_bank_transpose, is_elidable_bank_transpose_gated,
+    is_elidable_folded_transpose, is_elidable_folded_transpose_gated, is_elidable_matmul_transpose,
+    is_elidable_matmul_transpose_indexed, is_pure_view, plan_memory_backward,
+    plan_memory_f32_uniform, plan_memory_hybrid, plan_memory_native, plan_memory_native_in_order,
+    plan_memory_with_options,
 };
 pub use numeric_lint::{NumericLint, lint_numerics};
 pub use param_hoist::{HoistSplit, split_param_invariant};
@@ -87,5 +92,6 @@ pub use rewrite::{
 };
 pub use rlx_fusion::FusionLimits;
 pub use rlx_ir::logical_kernel::{KernelDispatchConfig, KernelDispatchPolicy};
+pub use simplify_transposes::SimplifyTransposes;
 #[cfg(feature = "training")]
 pub use training_compile::{TrainingCompileError, TrainingCompileResult, backward_cleanup_passes};

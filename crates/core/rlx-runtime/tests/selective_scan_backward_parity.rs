@@ -140,14 +140,10 @@ fn fd_grad(
 }
 
 fn set_legacy(on: bool) {
-    // SAFETY: single-threaded within this test; no other thread reads
-    // the var while we mutate it (all gates run in one #[test]).
-    unsafe {
-        if on {
-            std::env::set_var("RLX_SELSCAN_LEGACY_UNROLL", "1");
-        } else {
-            std::env::remove_var("RLX_SELSCAN_LEGACY_UNROLL");
-        }
+    if on {
+        rlx_ir::env::set("RLX_SELSCAN_LEGACY_UNROLL", "1");
+    } else {
+        rlx_ir::env::remove("RLX_SELSCAN_LEGACY_UNROLL");
     }
 }
 

@@ -1,0 +1,3 @@
+# librlx_capi: RLX_CAPI_LIB_DIR (the directory holding it) at install time.
+PKG_CPPFLAGS = -I.
+PKG_LIBS = -L$(RLX_CAPI_LIB_DIR) -lrlx_capi -Wl,-rpath,$(RLX_CAPI_LIB_DIR)

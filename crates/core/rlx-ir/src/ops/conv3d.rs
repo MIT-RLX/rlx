@@ -15,6 +15,7 @@
 
 use crate::infer::GraphExt as _;
 use crate::ops::upsample::InterpMode;
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op};
 
 impl Graph {

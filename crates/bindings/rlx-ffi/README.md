@@ -48,10 +48,11 @@ the archive cross-compiles to targets with no such frameworks.
 
 ## iOS
 
-`ios/build-xcframework.sh` wraps this crate into `RlxNode.xcframework`, with a
-Swift wrapper and a demo app. **iOS needs `NSLocalNetworkUsageDescription` in
+[`ios/build-xcframework.sh`](../../../ios/build-xcframework.sh) (at the repo
+root) wraps this crate into `RlxNode.xcframework`, with a Swift wrapper and a
+demo app. **iOS needs `NSLocalNetworkUsageDescription` in
 Info.plist for any LAN peer traffic** — without it the node reaches nothing and
-says nothing. See `ios/README.md`.
+says nothing. See [`ios/README.md`](../../../ios/README.md).
 
 ## Trying it
 

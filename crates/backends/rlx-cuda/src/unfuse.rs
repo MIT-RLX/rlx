@@ -30,6 +30,11 @@ use rlx_unfuse::DecomposePolicy;
 pub(crate) struct CudaPolicy;
 
 impl DecomposePolicy for CudaPolicy {
+    /// `Op::While` runs as a host loop (`Step::HostOp`).
+    fn while_native(&self) -> bool {
+        true
+    }
+
     /// True when the native `fused_attn_block` kernel can serve this block: the
     /// `[seq, seq]` score matrix must fit the GPU's default 48 KB dynamic
     /// shared-memory budget (with margin). Larger sequences decompose to the

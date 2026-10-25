@@ -1,0 +1,4 @@
+; RLX — versatile ML compiler + runtime. MIT OR Apache-2.0.
+(executables
+ (names inference training loading backends distributed models)
+ (libraries rlx))

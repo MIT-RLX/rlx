@@ -73,10 +73,38 @@ impl Harness {
     /// `mm=true` → `q8_0_mm_f32_xs` over all `m` rows at once.
     /// `mm=false` → `q8_0_mv_f32` over a single row (`m` must be 1).
     fn run(&self, x: &[f32], packed: &[u8], m: usize, k: usize, n: usize, mm: bool) -> Vec<f32> {
+        self.run_kernel(
+            x,
+            packed,
+            m,
+            k,
+            n,
+            if mm { Kernel::Xs } else { Kernel::Mv },
+            1,
+        )
+        .0
+    }
+
+    /// Run `kernel` `reps` times in one command buffer; returns the output and
+    /// the GPU time of one run.
+    fn run_kernel(
+        &self,
+        x: &[f32],
+        packed: &[u8],
+        m: usize,
+        k: usize,
+        n: usize,
+        kernel: Kernel,
+        reps: usize,
+    ) -> (Vec<f32>, f64) {
+        let mm = kernel != Kernel::Mv;
         let x_bytes = x.len() * 4;
         let w_bytes = packed.len();
         let out_bytes = m * n * 4;
-        let arena_bytes = (x_bytes + w_bytes + out_bytes).div_ceil(256) * 256;
+        // The output starts 256-aligned, as arena slots do: odd `n·k/32·34`
+        // weight sizes would otherwise leave it misaligned for f32.
+        let dst_start = (x_bytes + w_bytes).div_ceil(256) * 256;
+        let arena_bytes = (dst_start + out_bytes).div_ceil(256) * 256;
         let arena: Buffer = self
             .device
             .new_buffer(arena_bytes as u64, MTLResourceOptions::StorageModeShared);
@@ -89,7 +117,7 @@ impl Harness {
 
         let x_u = 0u64;
         let w_u = x_bytes as u64;
-        let dst_u = (x_bytes + w_bytes) as u64;
+        let dst_u = dst_start as u64;
         let (m_u, k_u, n_u) = (m as u32, k as u32, n as u32);
 
         let ks = kernels();
@@ -99,46 +127,67 @@ impl Harness {
         enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
         enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
         enc.set_bytes(3, 8, &dst_u as *const u64 as *const _);
-        if mm {
-            enc.set_compute_pipeline_state(&ks.q8_0_mm_f32_xs);
-            enc.set_bytes(4, 4, &m_u as *const u32 as *const _);
-            enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
-            enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
-            const TM: u64 = 8;
-            const TG: u64 = 64;
-            enc.dispatch_thread_groups(
-                MTLSize {
-                    width: (n as u64).div_ceil(TG),
-                    height: (m as u64).div_ceil(TM),
-                    depth: 1,
-                },
-                MTLSize {
-                    width: TG,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        } else {
-            assert_eq!(m, 1, "GEMV reference takes one row at a time");
-            enc.set_compute_pipeline_state(&ks.q8_0_mv_f32);
-            enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
-            enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
-            enc.dispatch_threads(
-                MTLSize {
-                    width: n as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: (n as u64).min(64),
-                    height: 1,
-                    depth: 1,
-                },
-            );
+        for _ in 0..reps {
+            if kernel == Kernel::Sg {
+                enc.set_compute_pipeline_state(&ks.q8_0_mm_f32_sg);
+                enc.set_bytes(4, 4, &m_u as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+                enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize {
+                        width: (m as u64).div_ceil(64),
+                        height: (n as u64).div_ceil(64),
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if mm {
+                enc.set_compute_pipeline_state(&ks.q8_0_mm_f32_xs);
+                enc.set_bytes(4, 4, &m_u as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+                enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+                const TM: u64 = 8;
+                const TG: u64 = 64;
+                enc.dispatch_thread_groups(
+                    MTLSize {
+                        width: (n as u64).div_ceil(TG),
+                        height: (m as u64).div_ceil(TM),
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: TG,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else {
+                assert_eq!(m, 1, "GEMV reference takes one row at a time");
+                enc.set_compute_pipeline_state(&ks.q8_0_mv_f32);
+                enc.set_bytes(4, 4, &k_u as *const u32 as *const _);
+                enc.set_bytes(5, 4, &n_u as *const u32 as *const _);
+                enc.dispatch_threads(
+                    MTLSize {
+                        width: n as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: (n as u64).min(64),
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
         }
         enc.end_encoding();
+        let t0 = std::time::Instant::now();
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
+        let secs = t0.elapsed().as_secs_f64() / reps as f64;
 
         let mut out = vec![0f32; m * n];
         unsafe {
@@ -148,7 +197,114 @@ impl Harness {
                 m * n,
             );
         }
-        out
+        (out, secs)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kernel {
+    /// `q8_0_mv_f32`, one row.
+    Mv,
+    /// `q8_0_mm_f32_xs`.
+    Xs,
+    /// `q8_0_mm_f32_sg`.
+    Sg,
+}
+
+fn packed_weights(k: usize, n: usize) -> Vec<u8> {
+    let nblocks = k / 32;
+    let mut packed = Vec::with_capacity(n * nblocks * 34);
+    for col in 0..n {
+        for b in 0..nblocks {
+            packed.extend_from_slice(&q8_0_block((col * nblocks + b) as u32));
+        }
+    }
+    packed
+}
+
+fn activations(m: usize, k: usize) -> Vec<f32> {
+    (0..m * k)
+        .map(|i| ((i % 97) as f32 - 48.0) / 64.0 + (i / k) as f32 * 0.01)
+        .collect()
+}
+
+/// `q8_0_mm_f32_sg` against the f64 reference, every output checked.
+fn parity_sg(m: usize, k: usize, n: usize) {
+    let (packed, x) = (packed_weights(k, n), activations(m, k));
+    let got = Harness::new()
+        .run_kernel(&x, &packed, m, k, n, Kernel::Sg, 1)
+        .0;
+    let mut any_nonzero = false;
+    for r in 0..m {
+        let row = &x[r * k..(r + 1) * k];
+        for c in 0..n {
+            let col = &packed[c * (k / 32) * 34..(c + 1) * (k / 32) * 34];
+            let (want, mag) = reference_dot(row, col, k);
+            any_nonzero |= want.abs() > 1e-3;
+            let tol = 8.0 * (k as f64).sqrt() * f64::from(f32::EPSILON) * mag.max(1.0);
+            let g = f64::from(got[r * n + c]);
+            assert!(
+                (want - g).abs() <= tol,
+                "SG GEMM off reference: m={m} k={k} n={n} row={r} col={c} want={want} got={g} tol={tol}"
+            );
+        }
+    }
+    assert!(
+        any_nonzero,
+        "reference output is all ~zero — test proves nothing"
+    );
+}
+
+#[test]
+fn q8_0_mm_sg_full_tiles() {
+    parity_sg(64, 256, 64);
+    parity_sg(128, 512, 128);
+}
+
+#[test]
+fn q8_0_mm_sg_ragged_edges() {
+    // Partial row and column tiles: clamped staging reads, dropped stores.
+    parity_sg(100, 96, 70);
+    parity_sg(1, 32, 1);
+    parity_sg(65, 64, 129);
+}
+
+#[test]
+fn q8_0_mm_sg_flux_shape() {
+    // A FLUX.1 160 px step with T5 at 128: 228 tokens through a 3072-wide
+    // projection (n trimmed to keep the f64 reference quick).
+    parity_sg(228, 3072, 192);
+}
+
+/// GPU time of the three kernels at the denoiser's shapes:
+/// `cargo test -p rlx-metal --release --test q8_0_mm_xs_parity -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn q8_0_mm_sg_speed() {
+    let h = Harness::new();
+    for (m, k, n) in [
+        (228, 3072, 9216),
+        (228, 3072, 21504),
+        (164, 3072, 3072),
+        (356, 3072, 12288),
+        (96, 3072, 9216),
+        (64, 3072, 9216),
+        (32, 3072, 9216),
+        (16, 3072, 9216),
+    ] {
+        let (packed, x) = (packed_weights(k, n), activations(m, k));
+        let flops = 2.0 * (m * k * n) as f64;
+        let mut line = format!("m={m:4} k={k} n={n:5}:");
+        for (name, kern) in [("xs", Kernel::Xs), ("sg", Kernel::Sg)] {
+            h.run_kernel(&x, &packed, m, k, n, kern, 2);
+            let (_, t) = h.run_kernel(&x, &packed, m, k, n, kern, 10);
+            line += &format!(
+                "  {name} {:7.2} ms {:5.2} TFLOPS",
+                t * 1e3,
+                flops / t / 1e12
+            );
+        }
+        println!("{line}");
     }
 }
 

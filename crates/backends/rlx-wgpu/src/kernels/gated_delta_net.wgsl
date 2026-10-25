@@ -3,11 +3,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // Gated-DeltaNet scan (f32). One workgroup per (batch, head); workgroup
-// size is GDN_MAX_N=128 with early-out for tid >= n. Matches Metal
-// `gated_delta_net` / CPU `execute_gated_delta_net_f32`.
+// size is GDN_MAX_N=128, thread j owning column j of the head's [n, n] state.
+// Matches Metal `gated_delta_net` / CPU `execute_gated_delta_net_f32`.
 //
-// Barriers sit in uniform control flow (outside the active-lane guard),
-// same discipline as `gru.wgsl`.
+// Per step, with S the state, k/q/v the head's rows, g the decay, beta the
+// write strength:
+//   S[i,j] *= exp(g[i] or g)       (decay)
+//   d_j     = (v_j - Σ_i S[i,j]·k_i) · beta
+//   S[i,j] += k_i · d_j            (delta-rule write)
+//   out_j   = Σ_i S[i,j]·q_i / sqrt(n)
+// Every term of column j depends only on column j, so each thread runs its
+// column on its own: decay fused into the first pass, write into the second,
+// no barriers. (Thread 0 used to decay all n² entries alone while the rest
+// waited — 16384 serial read-modify-writes per step for n = 128.)
 
 struct Params {
     batch: u32,
@@ -34,7 +42,6 @@ struct Params {
 @group(0) @binding(1) var<uniform>              params: Params;
 
 const GDN_MAX_N: u32 = 128u;
-var<workgroup> sk_sh: array<f32, 128>;
 
 @compute @workgroup_size(128)
 fn gated_delta_net(
@@ -42,94 +49,54 @@ fn gated_delta_net(
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let gid = wid.x;
-    let tid = lid.x;
+    let j = lid.x;
     let b = params.batch;
-    let s = params.seq;
     let h = params.heads;
     let n = params.state_size;
-    let lane_on = (n <= GDN_MAX_N) && (gid < b * h) && (tid < n);
+    if (n > GDN_MAX_N || gid >= b * h || j >= n) { return; }
 
     let bi = gid / h;
     let hi = gid % h;
-    let j = tid;
     let scale = inverseSqrt(f32(n));
-
     let s_base = params.state_off + (bi * h + hi) * n * n;
-
-    // Zero ephemeral state when not carrying (tid 0 only).
-    if (lane_on && params.use_carry == 0u && tid == 0u) {
-        for (var i: u32 = 0u; i < n * n; i = i + 1u) {
-            arena[s_base + i] = 0.0;
-        }
-    }
-    workgroupBarrier();
-
     let hs_n = h * n;
 
-    for (var ti: u32 = 0u; ti < s; ti = ti + 1u) {
-        var q_row: u32 = 0u;
-        var k_row: u32 = 0u;
-        var v_row: u32 = 0u;
-        var g_exp: f32 = 1.0;
-        var beta_t: f32 = 0.0;
-        if (lane_on) {
-            let qkv_step = bi * params.seq_stride * hs_n + ti * hs_n + hi * n;
-            let gb_step = bi * params.seq_stride * h + ti * h + hi;
-            q_row = params.q_off + qkv_step;
-            k_row = params.k_off + qkv_step;
-            v_row = params.v_off + qkv_step;
-            g_exp = exp(arena[params.g_off + gb_step]);
-            beta_t = arena[params.beta_off + gb_step];
+    // Zero the state when not carrying it: this thread's column.
+    if (params.use_carry == 0u) {
+        for (var i: u32 = 0u; i < n; i = i + 1u) {
+            arena[s_base + i * n + j] = 0.0;
         }
+    }
 
-        if (lane_on && tid == 0u) {
-            if (params.gate_per_channel != 0u) {
-                // per-channel decay: S[i,j] *= exp(g[i]), g is [b,s,h,n]
-                let g_pc_base = params.g_off + bi * params.seq_stride * hs_n + ti * hs_n + hi * n;
-                for (var i: u32 = 0u; i < n; i = i + 1u) {
-                    let a = exp(arena[g_pc_base + i]);
-                    for (var jj: u32 = 0u; jj < n; jj = jj + 1u) {
-                        arena[s_base + i * n + jj] = arena[s_base + i * n + jj] * a;
-                    }
-                }
-            } else {
-                for (var idx: u32 = 0u; idx < n * n; idx = idx + 1u) {
-                    arena[s_base + idx] = arena[s_base + idx] * g_exp;
-                }
-            }
-        }
-        workgroupBarrier();
+    for (var ti: u32 = 0u; ti < params.seq; ti = ti + 1u) {
+        let qkv_step = bi * params.seq_stride * hs_n + ti * hs_n + hi * n;
+        let gb_step = bi * params.seq_stride * h + ti * h + hi;
+        let q_row = params.q_off + qkv_step;
+        let k_row = params.k_off + qkv_step;
+        let v_row = params.v_off + qkv_step;
+        let g_exp = exp(arena[params.g_off + gb_step]);
+        let beta_t = arena[params.beta_off + gb_step];
+        let per_channel = params.gate_per_channel != 0u;
+        // Per-channel decay rows: g is [b,s,h,n] (Kimi-K3 KDA).
+        let g_pc_base = params.g_off + qkv_step;
 
+        // Pass 1: decay column j and accumulate Σ_i S[i,j]·k_i.
         var acc: f32 = 0.0;
-        if (lane_on) {
-            for (var i: u32 = 0u; i < n; i = i + 1u) {
-                acc = acc + arena[s_base + i * n + j] * arena[k_row + i];
-            }
-            sk_sh[j] = acc;
+        for (var i: u32 = 0u; i < n; i = i + 1u) {
+            let a = select(g_exp, exp(arena[g_pc_base + i]), per_channel);
+            let sv = arena[s_base + i * n + j] * a;
+            arena[s_base + i * n + j] = sv;
+            acc = acc + sv * arena[k_row + i];
         }
-        workgroupBarrier();
+        let delta = (arena[v_row + j] - acc) * beta_t;
 
-        if (lane_on) {
-            sk_sh[j] = (arena[v_row + j] - sk_sh[j]) * beta_t;
+        // Pass 2: delta-rule write and the output dot in one sweep.
+        var out_acc: f32 = 0.0;
+        for (var i: u32 = 0u; i < n; i = i + 1u) {
+            let sv = arena[s_base + i * n + j] + arena[k_row + i] * delta;
+            arena[s_base + i * n + j] = sv;
+            out_acc = out_acc + sv * arena[q_row + i];
         }
-        workgroupBarrier();
-
-        if (lane_on) {
-            for (var i: u32 = 0u; i < n; i = i + 1u) {
-                let ki = arena[k_row + i];
-                arena[s_base + i * n + j] = arena[s_base + i * n + j] + ki * sk_sh[j];
-            }
-        }
-        workgroupBarrier();
-
-        if (lane_on) {
-            let out_row = params.out_off + bi * params.seq_stride * hs_n + ti * hs_n + hi * n;
-            acc = 0.0;
-            for (var i: u32 = 0u; i < n; i = i + 1u) {
-                acc = acc + arena[s_base + i * n + j] * arena[q_row + i];
-            }
-            arena[out_row + j] = acc * scale;
-        }
-        workgroupBarrier();
+        arena[params.out_off + qkv_step + j] = out_acc * scale;
     }
 }

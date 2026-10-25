@@ -448,6 +448,9 @@ pub(crate) fn compile_scan(
         // Body invariants: 1 + num_xs Op::Inputs in NodeId order
         // — first declared is the carry, rest are x_t_i. Single
         // graph output (the next carry), same shape as carry.
+        // Compiled as any graph is: integer storage kept, claimed fused ops
+        // expanded (an I32 gather index otherwise read as f32 bits).
+        let body = &crate::expand::prepare_graph_for_thunks(Graph::clone(body));
         let body_plan = rlx_opt::memory::plan_memory(body);
         let _body_arena_size = body_plan.arena_size;
         // Snapshot per-input byte offsets before plan_memory
@@ -636,6 +639,9 @@ pub(crate) fn compile_scan_backward(
         //   * Remaining Inputs sorted by NodeId — first is the
         //     carry mirror, rest are x_t_i mirrors in body's
         //     original Op::Input declaration order.
+        // Compiled as any graph is: integer storage kept, claimed fused ops
+        // expanded (an I32 gather index otherwise read as f32 bits).
+        let body_vjp = &crate::expand::prepare_graph_for_thunks(Graph::clone(body_vjp));
         let body_plan = rlx_opt::memory::plan_memory(body_vjp);
         let body_offsets: HashMap<NodeId, usize> = body_plan
             .assignments
@@ -741,6 +747,9 @@ pub(crate) fn compile_scan_backward(
         // by the AD pass via `forward_body: Some(_)`.
         let (fb_schedule, fb_init, fb_carry_in_off, fb_output_off, fb_x_offs) = if is_recursive {
             let fb = forward_body.as_ref().unwrap();
+            // Compiled as any graph is: integer storage kept, claimed fused ops
+            // expanded (an I32 gather index otherwise read as f32 bits).
+            let fb = &crate::expand::prepare_graph_for_thunks(Graph::clone(fb));
             let fb_plan = rlx_opt::memory::plan_memory(fb);
             let fb_offsets: HashMap<NodeId, usize> = fb_plan
                 .assignments
@@ -859,6 +868,9 @@ pub(crate) fn compile_scan_backward_xs(
         // body_vjp's outputs (from `grad(body, [carry, xs_0, ..., xs_{num_xs-1}])`):
         //   outputs[0]      = dcarry
         //   outputs[1 + i]  = dx_t_i
+        // Compiled as any graph is: integer storage kept, claimed fused ops
+        // expanded (an I32 gather index otherwise read as f32 bits).
+        let body_vjp = &crate::expand::prepare_graph_for_thunks(Graph::clone(body_vjp));
         let body_plan = rlx_opt::memory::plan_memory(body_vjp);
         let body_offsets: HashMap<NodeId, usize> = body_plan
             .assignments
@@ -963,6 +975,9 @@ pub(crate) fn compile_scan_backward_xs(
         // Mirrors the same code path in the ScanBackward arm.
         let (fb_schedule, fb_init, fb_carry_in_off, fb_output_off, fb_x_offs) = if is_recursive {
             let fb = forward_body.as_ref().unwrap();
+            // Compiled as any graph is: integer storage kept, claimed fused ops
+            // expanded (an I32 gather index otherwise read as f32 bits).
+            let fb = &crate::expand::prepare_graph_for_thunks(Graph::clone(fb));
             let fb_plan = rlx_opt::memory::plan_memory(fb);
             let fb_offsets: HashMap<NodeId, usize> = fb_plan
                 .assignments
