@@ -13,10 +13,9 @@ impl Backend for MetalBackend {
 
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
         use rlx_opt::pass::Pass as _;
-        // Same If/While → primitive rewrite as the CPU pipeline
-        // (Metal also has no native sub-graph executor wired
-        // through its thunk schedule).
-        let graph = rlx_opt::LowerControlFlow.run(graph);
+        // Same If → primitive rewrite as the CPU pipeline; `Op::While`
+        // runs as a host loop (the one-op host fallback).
+        let graph = rlx_opt::LowerIf.run(graph);
         let dispatch = options.kernel_dispatch;
         let graph = rlx_opt::legalize_or_rewrite_for_backend_with_config(
             graph,
@@ -36,7 +35,8 @@ impl Backend for MetalBackend {
 
         // Hand the policy to MetalExecutable so the rewrite runs AFTER
         // its internal fusion passes (avoids breaking pattern matchers).
-        let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
+        let (graph, io_manifest) =
+            cpu_low_precision::prepare_f32_exec_graph_keeping_half_matmul_weights(graph);
         Box::new(MetalExecutableWrapper {
             inner: MetalExecutable::compile_with_policy(
                 graph,
@@ -51,7 +51,7 @@ impl Backend for MetalBackend {
     fn compile_lir(&self, lir: LirModule, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
         use rlx_opt::pass::Pass as _;
         let mut graph = lir.into_graph();
-        graph = rlx_opt::LowerControlFlow.run(graph);
+        graph = rlx_opt::LowerIf.run(graph);
         let dispatch = options.kernel_dispatch;
         let mut graph = rlx_opt::legalize_or_rewrite_for_backend_with_config(
             graph,
@@ -65,7 +65,8 @@ impl Backend for MetalBackend {
         graph = crate::precompile::precompile_cleanup(graph, options);
         // See `compile` — same one rewrite, for the same reason.
         graph = rlx_opt::legalize_custom_attention_mask(graph);
-        let (graph, io_manifest) = cpu_low_precision::prepare_f32_exec_graph(graph);
+        let (graph, io_manifest) =
+            cpu_low_precision::prepare_f32_exec_graph_keeping_half_matmul_weights(graph);
         Box::new(MetalExecutableWrapper {
             inner: MetalExecutable::compile_from_fused(
                 graph,
@@ -254,9 +255,12 @@ impl ExecutableGraph for MetalExecutableWrapper {
             self.inner.set_param_bytes(name, data);
             return;
         }
-        if dtype == rlx_ir::DType::F16 && self.inner.param_storage_is_f16(name) {
-            // F16 Linear weights into an F16 slot: copy half-bytes
-            // (no f32 widen — keeps Metal Zonos under the 4 GiB cliff).
+        if matches!(dtype, rlx_ir::DType::F16 | rlx_ir::DType::BF16)
+            && self.inner.param_storage_dtype(name) == Some(dtype)
+        {
+            // Half weights into a slot of the same width: copy the bytes (no
+            // f32 widen and re-narrow; keeps Metal Zonos under the 4 GiB cliff
+            // and cuts a bf16 checkpoint's upload to a memcpy).
             self.inner.set_param_bytes(name, data);
             return;
         }
@@ -305,6 +309,10 @@ impl ExecutableGraph for MetalExecutableWrapper {
             return false;
         };
         dst_wrap.inner.copy_params_from(&src_wrap.inner)
+    }
+
+    fn param_already_set(&self, name: &str) -> bool {
+        self.inner.param_already_set(name)
     }
 
     fn share_params_from(&mut self, src: &dyn ExecutableGraph) -> bool {

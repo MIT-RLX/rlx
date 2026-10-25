@@ -629,6 +629,26 @@ impl GgufFile {
         Self::from_reader_inner(r, false)
     }
 
+    /// Parse a whole GGUF already in memory, keeping `bytes` as the data
+    /// segment rather than copying it: the header is cut off the front of the
+    /// same allocation. [`Self::from_reader`] over a `Cursor` would hold the
+    /// file twice — 1.5 GB extra for a BF16 0.8B model, which is what a
+    /// wasm32 page cannot spare.
+    pub fn from_bytes(mut bytes: Vec<u8>) -> Result<Self> {
+        let mut file = Self::header_from_bytes(&bytes)?;
+        let start = usize::try_from(file.data_offset)
+            .map_err(|_| anyhow!("GGUF data offset past usize"))?;
+        if start > bytes.len() {
+            bail!(
+                "GGUF data offset {start} past the end ({} bytes)",
+                bytes.len()
+            );
+        }
+        bytes.drain(..start);
+        file.data = GgufData::Owned(bytes);
+        Ok(file)
+    }
+
     /// Header-only parse from an in-memory GGUF **prefix** (metadata +
     /// tensor table). Returns an error if `bytes` ends mid-header — grow
     /// the Range window and retry.
@@ -654,7 +674,12 @@ impl GgufFile {
             (read_u64(r)?, read_u64(r)?)
         };
 
-        let trace = std::env::var("RLX_GGUF_TRACE").is_ok();
+        // `rlx_ir::env` (where code overrides live) only when the optional
+        // `ir` feature links it — this crate does not otherwise need rlx-ir.
+        #[cfg(feature = "ir")]
+        let trace = rlx_ir::env::var("RLX_GGUF_TRACE").is_some();
+        #[cfg(not(feature = "ir"))]
+        let trace = std::env::var_os("RLX_GGUF_TRACE").is_some();
         // `kv_count` comes straight from untrusted header bytes; a malformed
         // file can claim billions of entries. Cap the pre-allocation hint (the
         // map still grows for a genuinely large model) so a 20-byte hostile
@@ -861,6 +886,182 @@ impl GgufFile {
             fh.read_exact(buf)?;
         }
         Ok(true)
+    }
+
+    /// Drop every tensor `keep` rejects and compact the data segment to the
+    /// rest (owned afterwards, whatever backed it before; offsets stay aligned
+    /// to [`Self::alignment`]). Metadata is untouched. For a process that runs
+    /// only part of a model — one pipeline stage — so it does not hold the
+    /// other stages' weights.
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) -> Result<()> {
+        self.retain_map(|name| keep(name).then(|| name.to_string()))
+    }
+
+    /// [`Self::retain`] that can also rename what it keeps: `map` returns the
+    /// tensor's new name, or `None` to drop it. A pipeline stage holding
+    /// blocks 8..16 renumbers them `blk.0..blk.8`, so the model code that
+    /// reads `blk.{i}` runs unchanged. Two tensors mapped to one name is an
+    /// error.
+    pub fn retain_map(&mut self, mut map: impl FnMut(&str) -> Option<String>) -> Result<()> {
+        let align = (self.alignment as usize).max(1);
+        // Every tensor kept: a rename, done in place — rebuilding the data
+        // would hold the weights twice for nothing (a browser worker's wasm
+        // memory never shrinks back).
+        let renamed: Vec<Option<String>> = self.tensors.values().map(|t| map(&t.name)).collect();
+        if renamed.iter().all(Option::is_some) {
+            let n = self.tensors.len();
+            let tensors = std::mem::take(&mut self.tensors);
+            self.tensors = tensors
+                .into_values()
+                .zip(renamed)
+                .map(|(mut t, name)| {
+                    t.name = name.expect("checked above");
+                    (t.name.clone(), t)
+                })
+                .collect();
+            if self.tensors.len() != n {
+                bail!("retain_map: two tensors were given the same name");
+            }
+            return Ok(());
+        }
+        // Same iteration order as `renamed` (nothing changed in between).
+        let mut kept: Vec<GgufTensor> = self
+            .tensors
+            .values()
+            .zip(renamed)
+            .filter_map(|(t, name)| {
+                name.map(|name| {
+                    let mut t = t.clone();
+                    t.name = name;
+                    t
+                })
+            })
+            .collect();
+        kept.sort_by_key(|t| t.offset);
+        let mut data = Vec::new();
+        for t in &mut kept {
+            let bytes = self.tensor_bytes(t)?;
+            data.resize(data.len().div_ceil(align) * align, 0);
+            let off = data.len();
+            data.extend_from_slice(bytes);
+            t.offset = off as u64;
+        }
+        let n = kept.len();
+        self.tensors = kept.into_iter().map(|t| (t.name.clone(), t)).collect();
+        if self.tensors.len() != n {
+            bail!("retain_map: two tensors were given the same name");
+        }
+        self.data = GgufData::Owned(data);
+        self.src_path = None;
+        Ok(())
+    }
+
+    /// Absolute byte ranges of the file holding the tensors `keep` accepts, in
+    /// file order, neighbours less than `merge_gap` bytes apart merged into
+    /// one. With [`Self::header_from_bytes`] and [`Self::with_tensor_chunks`],
+    /// this lets a process fetch only the tensors it runs (HTTP `Range`) —
+    /// one pipeline stage of a model too large to download whole.
+    pub fn tensor_ranges(
+        &self,
+        mut keep: impl FnMut(&str) -> bool,
+        merge_gap: u64,
+    ) -> Result<Vec<std::ops::Range<u64>>> {
+        let mut spans: Vec<std::ops::Range<u64>> = Vec::new();
+        for t in self.tensors.values().filter(|t| keep(&t.name)) {
+            let len = bytes_for(t.dtype, t.n_elements())
+                .ok_or_else(|| anyhow!("tensor {}: size not block-aligned", t.name))?;
+            let start = self.data_offset + t.offset;
+            spans.push(start..start + len as u64);
+        }
+        spans.sort_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<u64>> = Vec::with_capacity(spans.len());
+        for r in spans {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end.saturating_add(merge_gap) => {
+                    last.end = last.end.max(r.end);
+                }
+                _ => merged.push(r),
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Give a header-only file ([`Self::header_from_bytes`]) the data of the
+    /// tensors `keep` accepts, out of `chunks`: `(absolute file offset, bytes)`
+    /// pieces that between them cover every such tensor — what
+    /// [`Self::tensor_ranges`] asked for. Every other tensor is dropped and the
+    /// data compacted, as [`Self::retain`] does.
+    pub fn with_tensor_chunks(
+        mut self,
+        mut keep: impl FnMut(&str) -> bool,
+        chunks: &[(u64, Vec<u8>)],
+    ) -> Result<Self> {
+        let align = (self.alignment as usize).max(1);
+        let mut kept: Vec<GgufTensor> = self
+            .tensors
+            .values()
+            .filter(|t| keep(&t.name))
+            .cloned()
+            .collect();
+        kept.sort_by_key(|t| t.offset);
+        let mut data = Vec::new();
+        for t in &mut kept {
+            let len = bytes_for(t.dtype, t.n_elements())
+                .ok_or_else(|| anyhow!("tensor {}: size not block-aligned", t.name))?;
+            let start = self.data_offset + t.offset;
+            let (base, bytes) = chunks
+                .iter()
+                .find(|(off, b)| *off <= start && start + len as u64 <= off + b.len() as u64)
+                .ok_or_else(|| anyhow!("tensor {}: no chunk covers its bytes", t.name))?;
+            let from = (start - base) as usize;
+            data.resize(data.len().div_ceil(align) * align, 0);
+            t.offset = data.len() as u64;
+            data.extend_from_slice(&bytes[from..from + len]);
+        }
+        self.tensors = kept.into_iter().map(|t| (t.name.clone(), t)).collect();
+        self.data = GgufData::Owned(data);
+        self.src_path = None;
+        Ok(self)
+    }
+
+    /// Start assembling, piece by piece, a file holding only the tensors
+    /// `keep` accepts — for a process downloading part of a remote GGUF over
+    /// HTTP `Range` (one pipeline stage). The compact data segment is
+    /// allocated once and each downloaded piece's bytes are copied into it as
+    /// they arrive ([`PartialGguf::feed`]), so the peak is the kept tensors
+    /// plus one piece rather than every piece plus the assembled file
+    /// ([`Self::with_tensor_chunks`]). `self` is a header-only file
+    /// ([`Self::header_from_bytes`]).
+    pub fn begin_partial(mut self, mut keep: impl FnMut(&str) -> bool) -> Result<PartialGguf> {
+        let align = (self.alignment as usize).max(1);
+        let mut kept: Vec<GgufTensor> = self
+            .tensors
+            .values()
+            .filter(|t| keep(&t.name))
+            .cloned()
+            .collect();
+        kept.sort_by_key(|t| t.offset);
+        // (absolute source offset, length, destination offset) per tensor.
+        let mut plan = Vec::with_capacity(kept.len());
+        let mut size = 0usize;
+        for t in &mut kept {
+            let len = bytes_for(t.dtype, t.n_elements())
+                .ok_or_else(|| anyhow!("tensor {}: size not block-aligned", t.name))?;
+            size = size.div_ceil(align) * align;
+            plan.push((self.data_offset + t.offset, len, size));
+            t.offset = size as u64;
+            size += len;
+        }
+        self.tensors = kept.into_iter().map(|t| (t.name.clone(), t)).collect();
+        self.data = GgufData::Owned(Vec::new());
+        self.src_path = None;
+        let filled = vec![0usize; plan.len()];
+        Ok(PartialGguf {
+            file: self,
+            data: vec![0u8; size],
+            plan,
+            filled,
+        })
     }
 
     pub fn tensor_bytes(&self, t: &GgufTensor) -> Result<&[u8]> {
@@ -1212,7 +1413,8 @@ fn dequant_f16(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     Ok(h.iter().map(|x| x.to_f32()).collect())
 }
 
-fn dequant_bf16(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+/// Widen `n` little-endian bf16 values to f32 (exact).
+pub fn dequant_bf16(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() != n * 2 {
         bail!("BF16: {} bytes for {n} elements", bytes.len());
     }
@@ -1941,6 +2143,70 @@ pub fn dequant_q8_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 }
 
 // ─── tests ────────────────────────────────────────────────────────
+
+/// A GGUF being assembled from downloaded pieces ([`GgufFile::begin_partial`]).
+pub struct PartialGguf {
+    file: GgufFile,
+    data: Vec<u8>,
+    /// `(absolute source offset, length, destination offset)` per kept tensor,
+    /// in source order.
+    plan: Vec<(u64, usize, usize)>,
+    /// Bytes of each kept tensor copied so far.
+    filled: Vec<usize>,
+}
+
+impl PartialGguf {
+    /// Copy whatever kept-tensor bytes `bytes` (the file from absolute offset
+    /// `start`) holds into place. Pieces may arrive in any order and split a
+    /// tensor anywhere; overlapping pieces are fine as long as each byte is
+    /// fed once.
+    pub fn feed(&mut self, start: u64, bytes: &[u8]) {
+        let end = start + bytes.len() as u64;
+        // Tensors are in source order: skip those wholly before `start`.
+        let first = self
+            .plan
+            .partition_point(|&(src, len, _)| src + len as u64 <= start);
+        for (i, &(src, len, dst)) in self.plan.iter().enumerate().skip(first) {
+            if src >= end {
+                break;
+            }
+            let lo = src.max(start);
+            let hi = (src + len as u64).min(end);
+            let n = (hi - lo) as usize;
+            let from = (lo - start) as usize;
+            let to = dst + (lo - src) as usize;
+            self.data[to..to + n].copy_from_slice(&bytes[from..from + n]);
+            self.filled[i] += n;
+        }
+    }
+
+    /// Bytes of kept tensors still missing.
+    pub fn missing(&self) -> usize {
+        self.plan
+            .iter()
+            .zip(&self.filled)
+            .map(|(&(_, len, _), &f)| len.saturating_sub(f))
+            .sum()
+    }
+
+    /// The assembled file; an error if any kept tensor is incomplete.
+    pub fn finish(mut self) -> Result<GgufFile> {
+        if let Some(i) = self
+            .plan
+            .iter()
+            .zip(&self.filled)
+            .position(|(&(_, len, _), &f)| f < len)
+        {
+            let (src, len, _) = self.plan[i];
+            bail!(
+                "partial GGUF: tensor at file offset {src} has {} of {len} bytes",
+                self.filled[i]
+            );
+        }
+        self.file.data = GgufData::Owned(std::mem::take(&mut self.data));
+        Ok(self.file)
+    }
+}
 
 #[cfg(test)]
 mod tests {

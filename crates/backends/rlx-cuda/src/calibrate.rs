@@ -37,8 +37,13 @@ impl Calibration {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
+        let path = cache_path(&self.device_name);
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(cache_path(&self.device_name), raw)
+        // write-then-rename: a reader must never see a truncated file and
+        // fall back to re-measuring (see rlx-metal's calibrate.rs)
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn measure(device_name: &str) -> Self {
@@ -80,7 +85,14 @@ impl Calibration {
         }
     }
 
+    /// The calibration for this process: loaded (or measured) once, then the
+    /// same numbers for every caller, so two device queries cannot disagree.
     pub fn load_or_measure() -> Self {
+        static ONCE: std::sync::OnceLock<Calibration> = std::sync::OnceLock::new();
+        ONCE.get_or_init(Self::load_or_measure_uncached).clone()
+    }
+
+    fn load_or_measure_uncached() -> Self {
         if !crate::is_available() {
             return Self {
                 device_name: "cuda-unavailable".into(),

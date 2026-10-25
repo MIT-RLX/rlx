@@ -9,6 +9,7 @@
 //! identical to [`Graph`]; the newtype marks pipeline stage and gives
 //! us room to attach MIR-only metadata later (alias sets, layout hints).
 
+use crate::prelude::*;
 use crate::{Graph, Node, NodeId, Op};
 
 /// Mid-level module — optimizer input.
@@ -79,8 +80,8 @@ impl From<MirModule> for Graph {
     }
 }
 
-impl std::fmt::Display for MirModule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for MirModule {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "mir @{}", self.inner)
     }
 }

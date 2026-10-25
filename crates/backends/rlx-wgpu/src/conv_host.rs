@@ -43,7 +43,7 @@ fn dtoh_f32_cached(
         }
     }
     if let Some(c) = act_cache {
-        c.flush_offset(a, byte_off);
+        c.flush_range(a, byte_off, n * 4);
     }
     if is_weight_off(byte_off) {
         let key = (byte_off, n);

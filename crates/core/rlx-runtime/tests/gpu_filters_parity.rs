@@ -60,27 +60,39 @@ fn run_on(dev: Device, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) -> Vec<Vec<f32
 // GPU parity runs. (Cheap — each test is milliseconds.)
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Build on CPU and on `dev`, assert element-wise agreement.
+/// Build on CPU and on `dev`, assert element-wise agreement. A case listed in
+/// `tests/known_failures/gpu_filters_parity.txt` (by `name` and `{dev:?}`
+/// lowercased, e.g. `conv_reverb gpu@linux #N`) is expected to fail there.
 fn parity(name: &str, dev: Device, tol: f32, build: &dyn Fn(&mut Graph) -> Vec<NodeId>) {
     if common::skip_unless(dev) {
         eprintln!("skip {name}: {dev:?} unavailable");
         return;
     }
+    static KNOWN: std::sync::OnceLock<rlx_ir::known_failures::KnownFailures> =
+        std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(|| {
+        rlx_ir::known_failures::KnownFailures::load(
+            env!("CARGO_MANIFEST_DIR"),
+            "gpu_filters_parity",
+        )
+    });
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let cpu = run_on(Device::Cpu, build);
-    let gpu = run_on(dev, build);
-    assert_eq!(cpu.len(), gpu.len(), "{name}: output count mismatch");
-    for (oi, (c, g)) in cpu.iter().zip(gpu.iter()).enumerate() {
-        assert_eq!(c.len(), g.len(), "{name}: output {oi} length mismatch");
-        for (i, (a, b)) in c.iter().zip(g.iter()).enumerate() {
-            let d = (a - b).abs();
-            let rel = d / a.abs().max(b.abs()).max(1e-4);
-            assert!(
-                d < tol || rel < tol,
-                "{name}: output {oi}[{i}] cpu={a} gpu={b} (Δ={d})"
-            );
+    known.check(name, &format!("{dev:?}"), || {
+        let cpu = run_on(Device::Cpu, build);
+        let gpu = run_on(dev, build);
+        assert_eq!(cpu.len(), gpu.len(), "{name}: output count mismatch");
+        for (oi, (c, g)) in cpu.iter().zip(gpu.iter()).enumerate() {
+            assert_eq!(c.len(), g.len(), "{name}: output {oi} length mismatch");
+            for (i, (a, b)) in c.iter().zip(g.iter()).enumerate() {
+                let d = (a - b).abs();
+                let rel = d / a.abs().max(b.abs()).max(1e-4);
+                assert!(
+                    d < tol || rel < tol,
+                    "{name}: output {oi}[{i}] cpu={a} gpu={b} (Δ={d})"
+                );
+            }
         }
-    }
+    });
 }
 
 fn signal(g: &mut Graph, n: usize, dims: &[usize]) -> NodeId {

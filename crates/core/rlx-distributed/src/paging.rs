@@ -104,6 +104,17 @@ pub struct PagerStats {
     pub bytes_served: u64,
     /// Experts dropped to stay inside the budget.
     pub evictions: u64,
+    /// Experts [`ExpertPager::prefetch`] read from disk. Not counted in
+    /// `hits`/`misses`, which are demand reads only.
+    pub prefetched: u64,
+    /// Prefetches declined because unconsumed prefetched bytes were at the
+    /// cap ([`ExpertPager::with_prefetch_cap`]).
+    pub prefetch_skipped: u64,
+    /// Prefetched experts a demand read then used.
+    pub prefetch_used: u64,
+    /// Prefetched experts evicted before any demand read used them — disk
+    /// reads that bought nothing and displaced something.
+    pub prefetch_wasted: u64,
 }
 
 impl PagerStats {
@@ -127,6 +138,8 @@ struct Entry {
     bytes: Arc<Vec<u8>>,
     /// Logical clock of the last touch; the key of `lru` below.
     used: u64,
+    /// Admitted by a prefetch and not yet read on demand.
+    speculative: bool,
 }
 
 struct Inner {
@@ -140,6 +153,8 @@ struct Inner {
     clock: u64,
     /// Bytes currently held.
     bytes: u64,
+    /// Of `bytes`, those admitted by a prefetch and not yet used.
+    speculative_bytes: u64,
     /// Open file handles, so a per-token gather does not re-`open` per expert.
     files: HashMap<PathBuf, Arc<File>>,
     stats: PagerStats,
@@ -160,6 +175,8 @@ pub struct ExpertPager {
     /// allocating one.
     by_name: HashMap<usize, HashMap<String, BankIx>>,
     budget_bytes: u64,
+    /// Most bytes unconsumed prefetches may hold. See [`Self::with_prefetch_cap`].
+    prefetch_cap_bytes: u64,
     inner: Mutex<Inner>,
 }
 
@@ -174,15 +191,33 @@ impl ExpertPager {
             locs: Vec::new(),
             by_name: HashMap::new(),
             budget_bytes,
+            prefetch_cap_bytes: budget_bytes,
             inner: Mutex::new(Inner {
                 resident: HashMap::new(),
                 lru: BTreeMap::new(),
                 clock: 0,
                 bytes: 0,
+                speculative_bytes: 0,
                 files: HashMap::new(),
                 stats: PagerStats::default(),
             }),
         }
+    }
+
+    /// Limit unconsumed prefetched experts to `fraction` of the budget.
+    ///
+    /// A prefetch is a guess. Unbounded, guesses for steps far ahead fill the
+    /// cache and evict experts a nearer step is about to fire, turning hits
+    /// into disk reads — the failure the Torq NPU compiler's prefetch
+    /// scheduler bounds by letting loads for far-off programs fill only 40% of
+    /// its scratch RAM. Here a prefetch is declined while prefetched-but-unused
+    /// bytes would exceed the cap; demand reads still use the whole budget.
+    /// Default `1.0` (no limit beyond the budget); `PagerStats::prefetch_wasted`
+    /// says whether a model needs one.
+    pub fn with_prefetch_cap(mut self, fraction: f64) -> Self {
+        let f = fraction.clamp(0.0, 1.0);
+        self.prefetch_cap_bytes = (self.budget_bytes as f64 * f) as u64;
+        self
     }
 
     /// Tell the pager where one bank lives.
@@ -253,6 +288,9 @@ impl ExpertPager {
         for k in doomed {
             if let Some(e) = inner.resident.remove(&k) {
                 inner.bytes -= e.bytes.len() as u64;
+                if e.speculative {
+                    inner.speculative_bytes -= e.bytes.len() as u64;
+                }
                 inner.lru.remove(&e.used);
             }
         }
@@ -318,13 +356,7 @@ impl ExpertPager {
         // throughput — a pager that can only ever have one request in flight
         // gets none of the queue depth an NVMe needs to reach its rated speed,
         // and `stage_secs` prices paging at that rated speed.
-        let mut buf = vec![0u8; loc.bytes_per_expert];
-        read_exact_at(&file, &mut buf, loc.expert_offset(id)).with_context(|| {
-            format!(
-                "reading expert {id} of bank {ix:?} from {}",
-                loc.path.display()
-            )
-        })?;
+        let buf = read_expert(&file, loc, ix, id)?;
 
         // Phase 3: re-acquire and publish.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -337,7 +369,7 @@ impl ExpertPager {
             return Ok(bytes);
         }
         let bytes = Arc::new(buf);
-        inner.admit(ck, bytes.clone(), self.budget_bytes);
+        inner.admit(ck, bytes.clone(), self.budget_bytes, false);
         Ok(bytes)
     }
 
@@ -374,9 +406,54 @@ impl ExpertPager {
     /// computing. Errors are swallowed: a prefetch that fails costs a later
     /// cache miss, and turning a speculative read into a hard failure would be
     /// worse than the miss.
+    ///
+    /// A prefetch is not a demand read: it moves no `hits`/`misses`, an
+    /// already-resident expert is only refreshed in the LRU, and a new one is
+    /// admitted only within [`Self::with_prefetch_cap`].
     pub fn prefetch(&self, layer: usize, bank: &str, ids: &[usize]) {
+        let Some(ix) = self.bank_ix(layer, bank) else {
+            return;
+        };
+        let Some(loc) = self.locs.get(ix.0) else {
+            return;
+        };
         for &id in ids {
-            let _ = self.expert(layer, bank, id);
+            if id >= loc.num_experts {
+                continue;
+            }
+            let ck = (ix, id);
+            let len = loc.bytes_per_expert as u64;
+            let file = {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.refresh(&ck) {
+                    continue;
+                }
+                if len > self.budget_bytes
+                    || inner.speculative_bytes + len > self.prefetch_cap_bytes
+                {
+                    inner.stats.prefetch_skipped += 1;
+                    continue;
+                }
+                match inner.open(&loc.path) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                }
+            };
+            let Ok(buf) = read_expert(&file, loc, ix, id) else {
+                continue;
+            };
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.stats.bytes_read += len;
+            if inner.refresh(&ck) {
+                continue;
+            }
+            // Re-check: other prefetches may have filled the cap meanwhile.
+            if inner.speculative_bytes + len > self.prefetch_cap_bytes {
+                inner.stats.prefetch_skipped += 1;
+                continue;
+            }
+            inner.stats.prefetched += 1;
+            inner.admit(ck, Arc::new(buf), self.budget_bytes, true);
         }
     }
 
@@ -386,6 +463,7 @@ impl ExpertPager {
         inner.resident.clear();
         inner.lru.clear();
         inner.bytes = 0;
+        inner.speculative_bytes = 0;
     }
 }
 
@@ -402,9 +480,30 @@ impl Inner {
         let e = self.resident.get_mut(key)?;
         e.used = now;
         let bytes = e.bytes.clone();
+        if e.speculative {
+            e.speculative = false;
+            self.speculative_bytes -= bytes.len() as u64;
+            self.stats.prefetch_used += 1;
+        }
         self.stats.hits += 1;
         self.stats.bytes_served += bytes.len() as u64;
         Some(bytes)
+    }
+
+    /// Move a resident `key` to the most-recently-used end without counting a
+    /// read. `false` if it is not resident.
+    fn refresh(&mut self, key: &(BankIx, usize)) -> bool {
+        let Some(old) = self.resident.get(key).map(|e| e.used) else {
+            return false;
+        };
+        self.lru.remove(&old);
+        self.clock += 1;
+        let now = self.clock;
+        self.lru.insert(now, *key);
+        if let Some(e) = self.resident.get_mut(key) {
+            e.used = now;
+        }
+        true
     }
 
     fn open(&mut self, path: &Path) -> Result<Arc<File>> {
@@ -419,7 +518,7 @@ impl Inner {
     }
 
     /// Insert an expert, evicting least-recently-used ones to stay in budget.
-    fn admit(&mut self, key: (BankIx, usize), bytes: Arc<Vec<u8>>, budget: u64) {
+    fn admit(&mut self, key: (BankIx, usize), bytes: Arc<Vec<u8>>, budget: u64, speculative: bool) {
         let len = bytes.len() as u64;
         // An expert larger than the whole budget is not cacheable; serving it
         // straight through beats evicting everything to hold one item.
@@ -436,14 +535,40 @@ impl Inner {
             if let Some(e) = self.resident.remove(&victim) {
                 self.bytes -= e.bytes.len() as u64;
                 self.stats.evictions += 1;
+                if e.speculative {
+                    self.speculative_bytes -= e.bytes.len() as u64;
+                    self.stats.prefetch_wasted += 1;
+                }
             }
         }
         self.clock += 1;
         let now = self.clock;
         self.lru.insert(now, key);
         self.bytes += len;
-        self.resident.insert(key, Entry { bytes, used: now });
+        if speculative {
+            self.speculative_bytes += len;
+        }
+        self.resident.insert(
+            key,
+            Entry {
+                bytes,
+                used: now,
+                speculative,
+            },
+        );
     }
+}
+
+/// One expert's bytes from its bank file.
+fn read_expert(file: &File, loc: &BankLocation, ix: BankIx, id: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; loc.bytes_per_expert];
+    read_exact_at(file, &mut buf, loc.expert_offset(id)).with_context(|| {
+        format!(
+            "reading expert {id} of bank {ix:?} from {}",
+            loc.path.display()
+        )
+    })?;
+    Ok(buf)
 }
 
 /// Positional read that does not disturb a shared file cursor.
@@ -920,5 +1045,80 @@ mod tests {
             .expert(0, "exps", 4)
             .expect_err("expert 4 of 4 does not exist");
         assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    /// A prefetch is a guess, not a read the model made: it must not move the
+    /// hit rate the planner prices paging by.
+    #[test]
+    fn prefetch_is_not_a_demand_read() {
+        let p = checkpoint("pf-stats", 1, 8, 64);
+        let mut pager = ExpertPager::new(1 << 20);
+        pager.register(0, "exps", loc(&p, 0, 8, 64)).unwrap();
+        pager.prefetch(0, "exps", &[1, 2, 3]);
+        pager.prefetch(0, "exps", &[1]); // resident: refresh only
+        let s = pager.stats();
+        assert_eq!((s.hits, s.misses), (0, 0), "{s:?}");
+        assert_eq!(s.prefetched, 3);
+        assert_eq!(s.bytes_read, 3 * 64);
+        // The demand read of a prefetched expert is a hit that used it.
+        let got = pager.expert(0, "exps", 2).unwrap();
+        assert!(got.iter().all(|&x| x == 2));
+        let s = pager.stats();
+        assert_eq!((s.hits, s.misses, s.prefetch_used), (1, 0, 1), "{s:?}");
+    }
+
+    /// Unconsumed prefetches never hold more than the cap, however many are
+    /// requested; demand reads still fill the whole budget.
+    #[test]
+    fn unconsumed_prefetch_stays_under_the_cap() {
+        let p = checkpoint("pf-cap", 1, 32, 100);
+        let mut pager = ExpertPager::new(1000).with_prefetch_cap(0.4);
+        pager.register(0, "exps", loc(&p, 0, 32, 100)).unwrap();
+        pager.prefetch(0, "exps", &(0..32).collect::<Vec<_>>());
+        assert_eq!(pager.resident_bytes(), 400, "4 of 10 slots may be guesses");
+        assert_eq!(pager.stats().prefetch_skipped, 28);
+        // Using a prefetched expert frees cap for another guess.
+        pager.expert(0, "exps", 0).unwrap();
+        pager.prefetch(0, "exps", &[31]);
+        assert_eq!(pager.stats().prefetched, 5);
+        for i in 10..20 {
+            pager.expert(0, "exps", i).unwrap();
+        }
+        assert_eq!(
+            pager.resident_bytes(),
+            1000,
+            "demand reads use the whole budget"
+        );
+    }
+
+    /// The case the cap exists for: a hot set re-fired every step, plus
+    /// prefetches for experts further ahead that turn out not to fire.
+    /// Unbounded, the guesses evict the hot set and every step goes to disk;
+    /// capped, the hot set stays resident.
+    #[test]
+    fn capped_prefetch_keeps_the_hot_set_resident() {
+        let p = checkpoint("pf-hot", 1, 64, 100);
+        let run = |cap: f64| {
+            let mut pager = ExpertPager::new(1000).with_prefetch_cap(cap);
+            pager.register(0, "exps", loc(&p, 0, 64, 100)).unwrap();
+            let hot = [0usize, 1, 2, 3, 4, 5];
+            for step in 0..20 {
+                pager.gather(0, "exps", &hot).unwrap();
+                let ahead: Vec<usize> = (0..6).map(|k| 10 + (step * 6 + k) % 54).collect();
+                pager.prefetch(0, "exps", &ahead);
+            }
+            pager.stats()
+        };
+        let unbounded = run(1.0);
+        let capped = run(0.4);
+        assert!(
+            capped.hits > unbounded.hits,
+            "capped {capped:?} should hit more than unbounded {unbounded:?}"
+        );
+        assert_eq!(
+            capped.misses, 6,
+            "only the first step's reads miss: {capped:?}"
+        );
+        assert!(unbounded.prefetch_wasted > capped.prefetch_wasted);
     }
 }

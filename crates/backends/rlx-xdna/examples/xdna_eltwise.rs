@@ -14,7 +14,7 @@ use rlx_xdna::aie::{Eltwise, emit_eltwise, emit_eltwise_multicol};
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
+    rlx_ir::env::read(k).unwrap_or_else(|_| d.to_string())
 }
 
 fn main() {

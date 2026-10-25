@@ -60,6 +60,43 @@ pub fn set_param_sharing_scope(label: &str) {
     let _ = label;
 }
 
+/// `f` with [`set_param_sharing_scope`]`(label)` in force, the scope before
+/// it restored after: for a model that compiles its graphs at different times
+/// (a package's prompt function and decode step), alongside other models
+/// with their own scopes. The scope is process-wide, so compiles on other
+/// threads during `f` see it too.
+pub fn with_param_sharing_scope<R>(label: &str, f: impl FnOnce() -> R) -> R {
+    // Metal: one copy of each weight across the scope's executables, on
+    // unified memory (`rlx_metal::shared_weights`); `RLX_METAL_SHARED_WEIGHTS=0`
+    // keeps a copy per executable.
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
+    let metal_before = rlx_ir::env::var_result("RLX_METAL_SHARED_WEIGHTS")
+        .map_or(true, |v| v != "0")
+        .then(|| {
+            let before = rlx_metal::shared_weights::scope();
+            rlx_metal::shared_weights::set_scope(Some(label.to_string()));
+            before
+        });
+    #[cfg(feature = "cuda")]
+    let out = {
+        let before = rlx_cuda::vmem::scope();
+        rlx_cuda::vmem::set_scope_from_label(label);
+        let out = f();
+        rlx_cuda::vmem::set_scope(before);
+        out
+    };
+    #[cfg(not(feature = "cuda"))]
+    let out = {
+        let _ = label;
+        f()
+    };
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
+    if let Some(before) = metal_before {
+        rlx_metal::shared_weights::set_scope(before);
+    }
+    out
+}
+
 pub mod aot_cache;
 pub mod attn_mask;
 pub mod backend;
@@ -71,6 +108,12 @@ pub mod check;
 pub mod compile_cache;
 pub mod compile_config;
 pub mod compiled;
+pub mod debug;
+pub mod io_check;
+pub mod job_slots;
+pub use io_check::{IoError, TensorInfo};
+pub mod try_compile;
+pub use try_compile::CompileError;
 // On-device (ANE) gradient-based training + MLUpdateTask eligibility probe.
 #[cfg(all(feature = "coreml", feature = "training"))]
 pub mod coreml_training;
@@ -102,6 +145,7 @@ pub mod kv_metrics;
 pub mod kv_retention;
 pub mod lora_scheduler;
 pub mod memory_estimate;
+pub mod model;
 pub mod model_pipeline;
 pub mod moe_expert_store;
 // Pure `tracing` facade (no backend dependency) — always present so
@@ -114,6 +158,7 @@ pub mod options;
 pub mod paged_kv;
 #[cfg(feature = "model-io")]
 pub mod pkg;
+pub mod placement;
 pub mod precision;
 pub mod precompile;
 pub mod quantized_kv;
@@ -127,6 +172,7 @@ pub mod session;
 pub mod shard_placement;
 pub mod stages;
 pub mod subgraph;
+pub mod taps;
 pub mod trace;
 /// Device-resident training: the optimizer update fused into the graph.
 #[cfg(feature = "training")]
@@ -146,6 +192,8 @@ pub mod graph_devices;
 pub mod hetero;
 pub mod hwinfo;
 pub mod lm;
+/// Host sequence search: argmax/top-k, beam search, CTC, forced alignment.
+pub use rlx_search as search;
 pub mod logit_verify;
 pub mod nan_check;
 pub mod phase;

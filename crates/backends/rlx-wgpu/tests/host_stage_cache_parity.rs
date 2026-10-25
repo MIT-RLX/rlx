@@ -58,9 +58,7 @@ fn instance_norm_ref(
 fn whole_arena_host_step_invalidates_the_host_mirror() {
     // Must precede the first compile: the lowering reads this to decide which
     // ops take the host fallback.
-    unsafe {
-        std::env::set_var("RLX_WGPU_FORCE_HOST", "1");
-    }
+    rlx_ir::env::set("RLX_WGPU_FORCE_HOST", "1");
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }

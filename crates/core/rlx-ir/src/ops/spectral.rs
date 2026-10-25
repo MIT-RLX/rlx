@@ -15,6 +15,7 @@
 
 use crate::infer::GraphExt as _;
 use crate::op::Activation;
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, fft::FftNorm};
 
 /// Analysis window applied to each frame before the FFT.
@@ -32,7 +33,7 @@ pub enum WindowKind {
 
 impl WindowKind {
     fn coeffs(self, n: usize) -> Vec<f32> {
-        use std::f32::consts::PI;
+        use core::f32::consts::PI;
         if n == 1 {
             return vec![1.0];
         }
@@ -163,7 +164,10 @@ impl Graph {
     ) -> NodeId {
         let bp = self.band_power(x, sample_rate, bands);
         // 2πe
-        let c = self.constant(2.0 * std::f64::consts::PI * std::f64::consts::E, DType::F32);
+        let c = self.constant(
+            2.0 * core::f64::consts::PI * core::f64::consts::E,
+            DType::F32,
+        );
         let scaled = self.mul(bp, c);
         let logv = self.log_eps(scaled, 1e-8);
         let half = self.constant(0.5, DType::F32);

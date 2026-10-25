@@ -124,6 +124,10 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
                 .map(|v| out[..rlx_gguf::iq_dequant::QK4_NL].copy_from_slice(&v))
                 .expect("IQ4_NL block")
         }
+        // One bf16 per "block": the upper 16 bits of the f32.
+        QuantScheme::GgufBF16 => {
+            out[0] = f32::from_bits(u32::from(u16::from_le_bytes([block[0], block[1]])) << 16);
+        }
         other => panic!(
             "gguf_matmul: scheme {other:?} has no block-level dequant — use load-time dequant_cache"
         ),
@@ -253,6 +257,14 @@ fn gguf_matmul_bt_ex(
         );
         return;
     }
+    // Rows of whole blocks (every GGUF projection): widen each weight row once,
+    // then one contiguous dot per activation row. The element loop below costs
+    // a division and a strided store per weight per row — 5-10x slower where
+    // nothing else runs (wasm32, single-threaded).
+    if k.is_multiple_of(block_elems) && num_blocks == k / block_elems * n {
+        gguf_matmul_bt_rows_dot(x, w_bytes, out, m, k, n, scheme, block_bytes, block_elems);
+        return;
+    }
     for bi in 0..num_blocks {
         let off = bi * block_bytes;
         dequant_block(scheme, &w_bytes[off..off + block_bytes], &mut block_f32);
@@ -267,6 +279,60 @@ fn gguf_matmul_bt_ex(
             }
         }
     }
+}
+
+/// `out[mi, j] = x[mi, :] · W[j, :]` with `W` `[n, k]` in GGUF blocks: each
+/// weight row widened once into a buffer, then dotted with every activation
+/// row. Single-threaded; the dot is written so it vectorizes (wasm simd128,
+/// NEON, SSE) without fast-math.
+#[allow(clippy::too_many_arguments)]
+fn gguf_matmul_bt_rows_dot(
+    x: &[f32],
+    w_bytes: &[u8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme: QuantScheme,
+    block_bytes: usize,
+    block_elems: usize,
+) {
+    let blocks_per_row = k / block_elems;
+    let row_bytes = blocks_per_row * block_bytes;
+    let mut wrow = vec![0f32; k];
+    let mut blk = [0f32; QK_K];
+    for j in 0..n {
+        let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+        for (b, dst) in wrow.chunks_exact_mut(block_elems).enumerate() {
+            dequant_block(
+                scheme,
+                &row[b * block_bytes..(b + 1) * block_bytes],
+                &mut blk,
+            );
+            dst.copy_from_slice(&blk[..block_elems]);
+        }
+        for mi in 0..m {
+            out[mi * n + j] = dot_f32(&x[mi * k..(mi + 1) * k], &wrow);
+        }
+    }
+}
+
+/// A dot product in eight independent lanes, so it vectorizes without
+/// reassociating a single sum.
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    let ((ca, ra), (cb, rb)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
+    for (x, y) in ca.iter().zip(cb) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let mut s = acc.iter().sum::<f32>();
+    for (x, y) in ra.iter().zip(rb) {
+        s += x * y;
+    }
+    s
 }
 
 /// `true` when `RLX_GGUF_MATMUL_LEGACY=1` — force block-fused [`gguf_matmul_bt`].
@@ -2176,6 +2242,47 @@ mod tests {
                     unsafe { super::q4k_group32_q8_dot_dotprod(qs.as_ptr(), q8.as_ptr(), high) };
                 assert_eq!(a, b, "dotprod != vmull (high_nibble={high})");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod rows_dot_tests {
+    use super::*;
+
+    /// The rows-of-blocks kernel against the plain dequantize-then-multiply.
+    #[test]
+    fn rows_dot_matches_dequant_then_matmul_q8_0() {
+        let (m, k, n) = (5, 96, 7);
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 61.0)
+            .collect();
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) / 9.0)
+            .collect();
+        let wq = rlx_gguf::quantize::quantize_q8_0(&w).unwrap();
+        let scheme = QuantScheme::GgufQ8_0;
+        let (bb, be) = (
+            scheme.gguf_block_bytes() as usize,
+            scheme.gguf_block_size() as usize,
+        );
+        // reference: widen every block, then x · Wᵀ
+        let mut wf = vec![0f32; n * k];
+        let mut blk = [0f32; QK_K];
+        for (bi, dst) in wf.chunks_exact_mut(be).enumerate() {
+            dequant_block(scheme, &wq[bi * bb..(bi + 1) * bb], &mut blk);
+            dst.copy_from_slice(&blk[..be]);
+        }
+        let mut want = vec![0f32; m * n];
+        for mi in 0..m {
+            for j in 0..n {
+                want[mi * n + j] = (0..k).map(|p| x[mi * k + p] * wf[j * k + p]).sum();
+            }
+        }
+        let mut got = vec![0f32; m * n];
+        gguf_matmul_bt_rows_dot(&x, &wq, &mut got, m, k, n, scheme, bb, be);
+        for (a, b) in want.iter().zip(&got) {
+            assert!((a - b).abs() <= 1e-4 * (1.0 + a.abs()), "{a} vs {b}");
         }
     }
 }

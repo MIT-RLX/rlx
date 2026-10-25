@@ -27,6 +27,13 @@ pub enum Act {
     Cos,
     Silu,
     Recip,
+    /// `x·Φ(x)`, with `erf` from Abramowitz–Stegun 7.1.26 (|err| ≤ 1.5e-7;
+    /// GLSL has no `erf`).
+    Gelu,
+    /// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
+    GeluApprox,
+    /// `ln(1 + eˣ)`, as `max(x, 0) + ln(1 + e^-|x|)` so it never overflows.
+    Softplus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +122,8 @@ pub enum Step {
         a: usize,
         b: usize,
     },
-    /// `(m×k) · (k×n)` row-major.
+    /// `(m×k) · (k×n)` row-major, `batch` times: block `i` of `a` (and of
+    /// `b` when `b_batched`, else the one `b`) gives block `i` of `out`.
     MatMul {
         out: usize,
         a: usize,
@@ -123,6 +131,8 @@ pub enum Step {
         m: usize,
         k: usize,
         n: usize,
+        batch: usize,
+        b_batched: bool,
     },
     /// `out[i] = src[idx[i]]` — Reshape / Transpose / Expand / Narrow / Reverse / Cast(f32).
     Gather {
@@ -235,10 +245,13 @@ pub struct Plan {
     pub steps: Vec<Step>,
     /// `(rows, cols)` per slot — the WebGL texture dimensions.
     pub slot_dims: Vec<(usize, usize)>,
-    /// `rows * cols` per slot.
+    /// Elements per slot: `rows * cols`, except for a slot laid out wide
+    /// (`widen_tall_slots`), whose last texture row is padding.
     pub slot_len: Vec<usize>,
     /// Output slots, in `graph.outputs` order.
     pub outputs: Vec<usize>,
+    /// The IR op (kind and shape) each slot was allocated for — for errors.
+    pub slot_origin: Vec<String>,
 }
 
 pub(crate) const PAD: u32 = u32::MAX;
@@ -360,6 +373,9 @@ fn map_act(a: Activation) -> Result<Act> {
         Activation::Cos => Act::Cos,
         Activation::Silu => Act::Silu,
         Activation::Recip => Act::Recip,
+        Activation::Gelu => Act::Gelu,
+        Activation::GeluApprox => Act::GeluApprox,
+        Activation::Softplus => Act::Softplus,
         other => return Err(WebglError(format!("activation {other:?} not supported"))),
     })
 }
@@ -390,6 +406,27 @@ pub(crate) fn lanes(dt: DType) -> usize {
 
 /// Flatten a logical shape to a 2D texture footprint `(rows, cols)`, preserving
 /// row-major element order (cols = last dim).
+impl Plan {
+    /// The largest texture side this plan needs: every tensor is one
+    /// `rows × cols` texture, and WebGL caps each side at `MAX_TEXTURE_SIZE`
+    /// (16384 on most desktop browsers). Index tables are laid out wide and do
+    /// not count.
+    pub fn max_texture_side(&self) -> usize {
+        self.largest_texture().map_or(0, |(_, r, c)| r.max(c))
+    }
+
+    /// `(origin, rows, cols)` of the slot with the longest texture side.
+    pub fn largest_texture(&self) -> Option<(&str, usize, usize)> {
+        let (i, &(r, c)) = self
+            .slot_dims
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (r, c))| (*r).max(*c))?;
+        let origin = self.slot_origin.get(i).map_or("?", String::as_str);
+        Some((origin, r, c))
+    }
+}
+
 pub(crate) fn rows_cols(dims: &[usize]) -> (usize, usize) {
     if dims.is_empty() {
         return (1, 1);
@@ -537,6 +574,9 @@ fn broadcast_idx(in_dims: &[usize], out_dims: &[usize]) -> Vec<u32> {
 struct Builder {
     slot_dims: Vec<(usize, usize)>,
     slot_len: Vec<usize>,
+    slot_origin: Vec<String>,
+    /// The node being lowered, recorded as each slot's origin.
+    cur: String,
     steps: Vec<Step>,
 }
 
@@ -545,6 +585,8 @@ impl Builder {
         Self {
             slot_dims: Vec::with_capacity(cap),
             slot_len: Vec::with_capacity(cap),
+            slot_origin: Vec::with_capacity(cap),
+            cur: String::new(),
             steps: Vec::with_capacity(cap),
         }
     }
@@ -565,6 +607,7 @@ impl Builder {
         let i = self.slot_dims.len();
         self.slot_dims.push((r, c * lane));
         self.slot_len.push(r * c * lane);
+        self.slot_origin.push(self.cur.clone());
         i
     }
 
@@ -602,6 +645,7 @@ fn lower(graph: &Graph) -> Result<Plan> {
 
     for node in nodes {
         let dims = dims_of(&node.shape)?;
+        b.cur = format!("{:?} {dims:?}", node.op.kind());
         let node_dt = node.shape.dtype();
         let node_lane = lanes(node_dt);
         let (r, c) = rows_cols(&dims);
@@ -864,15 +908,42 @@ fn lower(graph: &Graph) -> Result<Plan> {
                         "matmul shape mismatch: {a_dims:?}·{b_dims:?}"
                     )));
                 }
-                let n = tb / k;
-                b.emit(Step::MatMul {
-                    out,
-                    a: input_slot(0)?,
-                    b: input_slot(1)?,
-                    m,
-                    k,
-                    n,
-                });
+                // `[..batch, M, K] · [..batch, K, N]` (attention's per-head
+                // products): one (M×K)·(K×N) per batch block. A rank-2 rhs, or
+                // one whose batch dims are all 1, is shared by every block.
+                if b_dims.len() >= 3 && a_dims.len() >= 3 {
+                    let bm = a_dims[a_dims.len() - 2];
+                    let a_batch: usize = a_dims[..a_dims.len() - 2].iter().product();
+                    let b_batch: usize = b_dims[..b_dims.len() - 2].iter().product();
+                    let bn = *b_dims.last().unwrap();
+                    if b_dims[b_dims.len() - 2] != k || (b_batch != a_batch && b_batch != 1) {
+                        return Err(WebglError(format!(
+                            "batched matmul shape mismatch: {a_dims:?}·{b_dims:?}"
+                        )));
+                    }
+                    b.emit(Step::MatMul {
+                        out,
+                        a: input_slot(0)?,
+                        b: input_slot(1)?,
+                        m: bm,
+                        k,
+                        n: bn,
+                        batch: a_batch,
+                        b_batched: b_batch > 1,
+                    });
+                } else {
+                    let n = tb / k;
+                    b.emit(Step::MatMul {
+                        out,
+                        a: input_slot(0)?,
+                        b: input_slot(1)?,
+                        m,
+                        k,
+                        n,
+                        batch: 1,
+                        b_batched: false,
+                    });
+                }
             }
             Op::Reshape { .. } => {
                 b.emit(Step::Gather {
@@ -1108,6 +1179,8 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     m: r,
                     k: cols,
                     n: cols,
+                    batch: 1,
+                    b_batched: false,
                 });
             }
             Op::Concat { axis } => {
@@ -1256,79 +1329,155 @@ fn lower(graph: &Graph) -> Result<Plan> {
             } => {
                 // Forward conv as im2col-gather + matmul + output transpose-gather.
                 // input [N,Cin,H,W], weight [Cout,Cin,kH,kW], out [N,Cout,Hout,Wout].
-                if *groups != 1 {
-                    return Err(WebglError("conv groups > 1 not supported".into()));
-                }
                 let in_dims = input_dims(0)?;
                 let w_dims = input_dims(1)?;
                 if in_dims.len() != 4 || w_dims.len() != 4 || dims.len() != 4 {
                     return Err(WebglError("conv requires 4D NCHW".into()));
                 }
-                let cin = in_dims[1];
-                let cout = w_dims[0];
-                let (kh, kw) = (kernel_size[0], kernel_size[1]);
-                let (sh, sw) = (stride[0], stride[1]);
-                let (ph, pw) = (padding[0], padding[1]);
-                let (dh, dw) = (dilation[0], dilation[1]);
-                let (hout, wout) = (dims[2], dims[3]);
-                let patch = cin * kh * kw;
-                let npos = dims[0] * hout * wout;
-
-                // im2col patches P[pos, col] (PAD where the window hits padding).
-                let p_idx = im2col_idx(&in_dims, kh, kw, sh, sw, ph, pw, dh, dw, hout, wout);
-                let p_slot = b.alloc(&[npos, patch]);
-                b.emit(Step::Gather {
-                    out: p_slot,
-                    src: input_slot(0)?,
-                    idx: p_idx,
-                });
-
-                // Weight → [patch, cout]: W2[col, co] = weight[co, ci, ki, kj].
-                let w_strides = strides(&w_dims);
-                let mut w_idx = vec![0u32; patch * cout];
-                for col in 0..patch {
-                    let ci = col / (kh * kw);
-                    let r2 = col % (kh * kw);
-                    let (ki, kj) = (r2 / kw, r2 % kw);
-                    for co in 0..cout {
-                        w_idx[col * cout + co] = (co * w_strides[0]
-                            + ci * w_strides[1]
-                            + ki * w_strides[2]
-                            + kj * w_strides[3])
-                            as u32;
+                if *groups != 1 {
+                    // Grouped / depthwise: each output reads only its group's
+                    // channels, so a shared [patch, cout] matmul does not
+                    // apply. Gather every output's window and its weights side
+                    // by side, multiply, and sum the window:
+                    //   out[n,co,ho,wo] = Σ_{ci,ki,kj} x[n, g·cin_g + ci, ·, ·] · w[co, ci, ki, kj]
+                    // with g = co / cout_g. (Depthwise k-tap convs — LFM2's
+                    // ShortConv — are `red = k`, so this stays small.)
+                    let g = *groups;
+                    let (cin, cout) = (in_dims[1], w_dims[0]);
+                    if cin % g != 0 || cout % g != 0 || w_dims[1] != cin / g {
+                        return Err(WebglError(format!(
+                            "conv groups={g}: cin {cin} / cout {cout} / weight {w_dims:?} do not divide"
+                        )));
                     }
-                }
-                let w2_slot = b.alloc(&[patch, cout]);
-                b.emit(Step::Gather {
-                    out: w2_slot,
-                    src: input_slot(1)?,
-                    idx: w_idx,
-                });
+                    let (cin_g, cout_g) = (cin / g, cout / g);
+                    let (kh, kw) = (kernel_size[0], kernel_size[1]);
+                    let (sh, sw) = (stride[0], stride[1]);
+                    let (ph, pw) = (padding[0], padding[1]);
+                    let (dh, dw) = (dilation[0], dilation[1]);
+                    let (h, w) = (in_dims[2], in_dims[3]);
+                    let red = cin_g * kh * kw;
+                    let out_n = total(&dims);
+                    let (xs, ws) = (strides(&in_dims), strides(&w_dims));
+                    let mut x_idx = vec![PAD; out_n * red];
+                    let mut w_idx = vec![0u32; out_n * red];
+                    for o in 0..out_n {
+                        let oc = unravel(o, &dims); // [n, co, ho, wo]
+                        let grp = oc[1] / cout_g;
+                        for ci in 0..cin_g {
+                            for ki in 0..kh {
+                                for kj in 0..kw {
+                                    let r = (ci * kh + ki) * kw + kj;
+                                    w_idx[o * red + r] =
+                                        (oc[1] * ws[0] + ci * ws[1] + ki * ws[2] + kj * ws[3])
+                                            as u32;
+                                    let ih = oc[2] * sh + ki * dh;
+                                    let iw = oc[3] * sw + kj * dw;
+                                    if ih >= ph && iw >= pw && ih - ph < h && iw - pw < w {
+                                        x_idx[o * red + r] = (oc[0] * xs[0]
+                                            + (grp * cin_g + ci) * xs[1]
+                                            + (ih - ph) * xs[2]
+                                            + (iw - pw) * xs[3])
+                                            as u32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let p_slot = b.alloc(&[out_n, red]);
+                    b.emit(Step::Gather {
+                        out: p_slot,
+                        src: input_slot(0)?,
+                        idx: x_idx,
+                    });
+                    let w_slot = b.alloc(&[out_n, red]);
+                    b.emit(Step::Gather {
+                        out: w_slot,
+                        src: input_slot(1)?,
+                        idx: w_idx,
+                    });
+                    let m_slot = b.alloc(&[out_n, red]);
+                    b.emit(Step::Binary {
+                        out: m_slot,
+                        a: p_slot,
+                        b: w_slot,
+                        op: Bin::Mul,
+                    });
+                    b.emit(Step::Reduce {
+                        out,
+                        src: m_slot,
+                        groups: (0..(out_n * red) as u32).collect(),
+                        fanin: red,
+                        op: Red::Sum,
+                    });
+                } else {
+                    let cin = in_dims[1];
+                    let cout = w_dims[0];
+                    let (kh, kw) = (kernel_size[0], kernel_size[1]);
+                    let (sh, sw) = (stride[0], stride[1]);
+                    let (ph, pw) = (padding[0], padding[1]);
+                    let (dh, dw) = (dilation[0], dilation[1]);
+                    let (hout, wout) = (dims[2], dims[3]);
+                    let patch = cin * kh * kw;
+                    let npos = dims[0] * hout * wout;
 
-                // M[pos, co] = P @ W2.
-                let m_slot = b.alloc(&[npos, cout]);
-                b.emit(Step::MatMul {
-                    out: m_slot,
-                    a: p_slot,
-                    b: w2_slot,
-                    m: npos,
-                    k: patch,
-                    n: cout,
-                });
+                    // im2col patches P[pos, col] (PAD where the window hits padding).
+                    let p_idx = im2col_idx(&in_dims, kh, kw, sh, sw, ph, pw, dh, dw, hout, wout);
+                    let p_slot = b.alloc(&[npos, patch]);
+                    b.emit(Step::Gather {
+                        out: p_slot,
+                        src: input_slot(0)?,
+                        idx: p_idx,
+                    });
 
-                // Scatter to NCHW: out[n,co,ho,wo] = M[(n·Hout·Wout + ho·Wout + wo), co].
-                let out_n = total(&dims);
-                let mut o_idx = vec![0u32; out_n];
-                for o in 0..out_n {
-                    let oc = unravel(o, &dims); // [n, co, ho, wo]
-                    let pos = oc[0] * (hout * wout) + oc[2] * wout + oc[3];
-                    o_idx[o] = (pos * cout + oc[1]) as u32;
+                    // Weight → [patch, cout]: W2[col, co] = weight[co, ci, ki, kj].
+                    let w_strides = strides(&w_dims);
+                    let mut w_idx = vec![0u32; patch * cout];
+                    for col in 0..patch {
+                        let ci = col / (kh * kw);
+                        let r2 = col % (kh * kw);
+                        let (ki, kj) = (r2 / kw, r2 % kw);
+                        for co in 0..cout {
+                            w_idx[col * cout + co] = (co * w_strides[0]
+                                + ci * w_strides[1]
+                                + ki * w_strides[2]
+                                + kj * w_strides[3])
+                                as u32;
+                        }
+                    }
+                    let w2_slot = b.alloc(&[patch, cout]);
+                    b.emit(Step::Gather {
+                        out: w2_slot,
+                        src: input_slot(1)?,
+                        idx: w_idx,
+                    });
+
+                    // M[pos, co] = P @ W2.
+                    let m_slot = b.alloc(&[npos, cout]);
+                    b.emit(Step::MatMul {
+                        out: m_slot,
+                        a: p_slot,
+                        b: w2_slot,
+                        m: npos,
+                        k: patch,
+                        n: cout,
+                        batch: 1,
+                        b_batched: false,
+                    });
+
+                    // Scatter to NCHW: out[n,co,ho,wo] = M[(n·Hout·Wout + ho·Wout + wo), co].
+                    let out_n = total(&dims);
+                    let mut o_idx = vec![0u32; out_n];
+                    for o in 0..out_n {
+                        let oc = unravel(o, &dims); // [n, co, ho, wo]
+                        let pos = oc[0] * (hout * wout) + oc[2] * wout + oc[3];
+                        o_idx[o] = (pos * cout + oc[1]) as u32;
+                    }
+                    b.emit(Step::Gather {
+                        out,
+                        src: m_slot,
+                        idx: o_idx,
+                    });
                 }
-                b.emit(Step::Gather {
-                    out,
-                    src: m_slot,
-                    idx: o_idx,
-                });
             }
             Op::Im2Col {
                 kernel_size,
@@ -1421,11 +1570,16 @@ fn lower(graph: &Graph) -> Result<Plan> {
                 });
             }
             Op::Rope {
-                head_dim, n_rot, ..
+                head_dim,
+                n_rot,
+                style,
+                ..
             } => {
-                // NeoX half-split rotation, decomposed: out = mask ? (x·cos +
-                // rotate_half(x)·sin) : x — cos/sin gathered from the runtime
-                // caches by position. (Common per-seq-position table layout.)
+                // Decomposed: out = mask ? (x·cos + rot(x)·sin) : x — cos/sin
+                // gathered from the runtime caches by position. NeoX rotates
+                // the pair (i, i + n_rot/2), GPT-J the adjacent pair
+                // (2j, 2j + 1) by angle j — as rlx-cpu does.
+                let interleaved = matches!(style, rlx_ir::op::RopeStyle::GptJ);
                 let head_dim = *head_dim;
                 let n_rot = *n_rot;
                 let x_dims = input_dims(0)?;
@@ -1472,11 +1626,23 @@ fn lower(graph: &Graph) -> Result<Plan> {
                     rot_idx[e] = e as u32;
                     if i < n_rot {
                         mask[e] = 1.0;
-                        let col = i % rot_half.max(1);
+                        let col = if interleaved {
+                            i / 2
+                        } else {
+                            i % rot_half.max(1)
+                        };
                         cos_idx[e] = (pos * tab_half + col) as u32;
                         sin_idx[e] = (pos * tab_half + col) as u32;
                         let off = chunk * head_dim;
-                        if i < rot_half {
+                        if interleaved {
+                            if i % 2 == 0 {
+                                rot_idx[e] = (off + i + 1) as u32;
+                                sign[e] = -1.0;
+                            } else {
+                                rot_idx[e] = (off + i - 1) as u32;
+                                sign[e] = 1.0;
+                            }
+                        } else if i < rot_half {
                             rot_idx[e] = (off + rot_half + i) as u32;
                             sign[e] = -1.0;
                         } else {
@@ -1594,10 +1760,125 @@ fn lower(graph: &Graph) -> Result<Plan> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(Plan {
+    let mut plan = Plan {
         steps: b.steps,
         slot_dims: b.slot_dims,
         slot_len: b.slot_len,
+        slot_origin: b.slot_origin,
         outputs,
-    })
+    };
+    widen_tall_slots(&mut plan);
+    Ok(plan)
+}
+
+/// A slot taller than this is laid out wide instead, when it can be.
+const TALL_ROWS: usize = 8192;
+/// Column count of a widened slot.
+const WIDE_COLS: usize = 8192;
+
+/// Lay out tall slots (`rows > TALL_ROWS`) as `ceil(n / WIDE_COLS) × WIDE_COLS`.
+///
+/// A slot is `rest × last_dim` texels, so a tensor with a short last axis —
+/// a conv weight `[cout, cin, 1, k]` is `cout·cin × k` — overflows WebGL's
+/// `MAX_TEXTURE_SIZE` (16384 on most desktops) long before it is large.
+///
+/// Shape matters only to kernels that work on rows: matmul, softmax, the
+/// norms (and custom ops, unknown). Gather / reduce / leaf uploads address
+/// texels by linear index, and element-wise kernels need only that every
+/// operand shares the output's layout. So slots joined by element-wise steps
+/// form a group, and a tall group is widened together unless a member is
+/// produced or read by a row kernel.
+fn widen_tall_slots(plan: &mut Plan) {
+    let n = plan.slot_dims.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    let union = |p: &mut Vec<usize>, a: usize, b: usize| {
+        let (ra, rb) = (find(p, a), find(p, b));
+        if ra != rb {
+            p[ra] = rb;
+        }
+    };
+    let mut pinned = vec![false; n];
+    for step in &plan.steps {
+        match step {
+            Step::Leaf { .. }
+            | Step::Gather { .. }
+            | Step::Reduce { .. }
+            | Step::ArgReduce { .. }
+            | Step::GatherRuntime { .. } => {}
+            Step::Unary { out, a, .. } => union(&mut parent, *out, *a),
+            Step::ActBack { out, x, dy, .. } => {
+                union(&mut parent, *out, *x);
+                union(&mut parent, *out, *dy);
+            }
+            Step::Binary { out, a, b, .. } | Step::Compare { out, a, b, .. } => {
+                union(&mut parent, *out, *a);
+                union(&mut parent, *out, *b);
+            }
+            Step::Where { out, cond, a, b } => {
+                union(&mut parent, *out, *cond);
+                union(&mut parent, *out, *a);
+                union(&mut parent, *out, *b);
+            }
+            Step::MatMul { out, a, b, .. } => {
+                for s in [*out, *a, *b] {
+                    pinned[s] = true;
+                }
+            }
+            Step::Softmax { out, a, .. } => {
+                pinned[*out] = true;
+                pinned[*a] = true;
+            }
+            Step::LayerNorm {
+                out,
+                x,
+                gamma,
+                beta,
+                ..
+            }
+            | Step::RmsNorm {
+                out,
+                x,
+                gamma,
+                beta,
+                ..
+            } => {
+                for s in [*out, *x, *gamma, *beta] {
+                    pinned[s] = true;
+                }
+            }
+            // Lane-packed complex kernels: keep their natural layout.
+            Step::ComplexCast { out, .. } | Step::BinaryC64 { out, .. } => pinned[*out] = true,
+            Step::Custom { out, input, .. } => {
+                pinned[*out] = true;
+                pinned[*input] = true;
+            }
+        }
+    }
+    // A group widens only as a whole: every member tall-enough-to-matter or
+    // not, same element count, nothing pinned.
+    let mut group_ok: HashMap<usize, bool> = HashMap::new();
+    let mut group_tall: HashMap<usize, bool> = HashMap::new();
+    let mut group_len: HashMap<usize, usize> = HashMap::new();
+    for s in 0..n {
+        let r = find(&mut parent, s);
+        let len = plan.slot_len[s];
+        let ok = group_ok.entry(r).or_insert(true);
+        *ok &= !pinned[s] && *group_len.entry(r).or_insert(len) == len;
+        *group_tall.entry(r).or_insert(false) |= plan.slot_dims[s].0 > TALL_ROWS;
+    }
+    for s in 0..n {
+        let r = find(&mut parent, s);
+        if group_ok[&r] && group_tall[&r] {
+            let len = plan.slot_len[s];
+            let cols = len.clamp(1, WIDE_COLS);
+            plan.slot_dims[s] = (len.div_ceil(cols), cols);
+        }
+    }
 }

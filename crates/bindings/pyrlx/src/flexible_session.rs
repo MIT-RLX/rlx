@@ -9,10 +9,12 @@ use pyo3::prelude::*;
 use rlx_runtime::FlexibleSession;
 
 use crate::device::parse_device;
-use crate::fusion_options::{PyFusionOptions, build_compile_options};
+use rlx_bind::runtime::Compiled;
+
+use crate::fusion_options::{PyFusionOptions, compile_request};
 use crate::graph::PyGraph;
 use crate::graph_devices::take_graph;
-use crate::session::{PyCompiled, shape_to_static_dims};
+use crate::session::PyCompiled;
 
 #[pyclass(name = "FlexibleSession", module = "pyrlx._pyrlx")]
 pub(crate) struct PyFlexibleSession {
@@ -45,11 +47,7 @@ impl PyFlexibleSession {
         device: Option<&str>,
     ) -> PyResult<PyCompiled> {
         let g = take_graph(graph)?;
-        let output_shapes: Vec<Vec<usize>> = g
-            .outputs
-            .iter()
-            .map(|id| shape_to_static_dims(g.shape(*id)))
-            .collect();
+        let (shapes, dtypes) = Compiled::outputs_of(&g);
         let hint = match device {
             Some(d) => Some(parse_device(d)?),
             None => None,
@@ -58,33 +56,32 @@ impl PyFlexibleSession {
             .inner
             .compile_resolved(g, hint)
             .map_err(PyRuntimeError::new_err)?;
-        Ok(PyCompiled::from_compiled(compiled, output_shapes))
+        Ok(PyCompiled::new(Compiled::wrap(compiled, shapes, dtypes)))
     }
 
-    #[pyo3(signature = (graph, device=None, fusion_options=None, kernel_dispatch=None))]
+    #[pyo3(signature = (graph, device=None, fusion_options=None, kernel_dispatch=None, policy=None))]
     fn compile_with_resolved(
         &self,
         graph: &Bound<'_, PyGraph>,
         device: Option<&str>,
         fusion_options: Option<PyRef<PyFusionOptions>>,
         kernel_dispatch: Option<&str>,
+        policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyCompiled> {
+        let policy = crate::policy::parse_policy(policy)?;
+        let req = compile_request(fusion_options, kernel_dispatch, policy)?;
         let g = take_graph(graph)?;
-        let output_shapes: Vec<Vec<usize>> = g
-            .outputs
-            .iter()
-            .map(|id| shape_to_static_dims(g.shape(*id)))
-            .collect();
+        let (shapes, dtypes) = Compiled::outputs_of(&g);
         let hint = match device {
             Some(d) => Some(parse_device(d)?),
             None => None,
         };
-        let opts = build_compile_options(self.inner.precision(), fusion_options, kernel_dispatch)?;
+        let opts = rlx_bind::runtime::session::compile_options(self.inner.precision(), &req);
         let compiled = self
             .inner
             .compile_resolved_with(g, hint, &opts)
             .map_err(PyRuntimeError::new_err)?;
-        Ok(PyCompiled::from_compiled(compiled, output_shapes))
+        Ok(PyCompiled::new(Compiled::wrap(compiled, shapes, dtypes)))
     }
 
     fn __repr__(&self) -> String {

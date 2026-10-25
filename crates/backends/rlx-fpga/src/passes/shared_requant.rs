@@ -13,6 +13,9 @@
 //!   it gives the same `(M0, shift)`.
 //! * **Layers where the trainer assigned a single global scale post-hoc**.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::conv_dense_requant;
 use crate::model::Layer;
 

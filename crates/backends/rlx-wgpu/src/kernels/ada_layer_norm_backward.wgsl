@@ -36,7 +36,12 @@ fn wg_sum(tid: u32, val: f32, bsz: u32) -> f32 {
         workgroupBarrier();
         stride = stride >> 1u;
     }
-    return partial_sum[0];
+    let total = partial_sum[0];
+    // Called back-to-back: without this barrier the next call's write of
+    // `partial_sum[0]` races the other lanes' read of this total (same defect
+    // as layer_norm_backward.wgsl's `workgroup_sum`).
+    workgroupBarrier();
+    return total;
 }
 
 @compute @workgroup_size(256)

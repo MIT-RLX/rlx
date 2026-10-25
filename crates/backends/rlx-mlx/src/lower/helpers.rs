@@ -349,6 +349,29 @@ pub(crate) fn lower_gated_delta_net(
     }
     let bh = batch * heads;
 
+    // The fused kernel (`mlx::fast::gated_delta_update`) — one primitive
+    // instead of ~12 lazy ops per time step. The unrolled loop below keeps
+    // every step's `[B, H, n, n]` state reachable until the graph is
+    // evaluated, so its memory grows with the sequence: a Qwen3.5-4B prefill
+    // peaked ~18 GB above its weights at 1024 tokens. Per-head gates only
+    // (per-channel KDA gates keep the loop). Off: `RLX_MLX_GDN_UNROLL=1`.
+    if !gate_per_channel && !rlx_ir::env::flag("RLX_MLX_GDN_UNROLL") {
+        // rlx: S *= exp(g) with S indexed [k, v]; MLX: h *= gate, h [v, k].
+        let gate = ops::unary(g_in, MlxUnary::Exp)?;
+        let s0 = match state_in {
+            Some(s) => Some(ops::transpose(s, &[0, 1, 3, 2])?),
+            None => None,
+        };
+        let (out, s1) = ops::gated_delta_update(q, k, v, &gate, beta, s0.as_ref())?;
+        let scale = Array::from_f32_slice(&[1.0 / (n as f32).sqrt()], &[1], DType::F32)?;
+        let out = ops::mul(&out, &scale)?;
+        let state_out = match state_in {
+            Some(_) => Some(ops::transpose(&s1, &[0, 1, 3, 2])?),
+            None => None,
+        };
+        return Ok((out, state_out));
+    }
+
     let mut state = if let Some(s0) = state_in {
         s0.clone_handle()?
     } else {
@@ -702,6 +725,84 @@ pub(crate) fn mlx_conv_im2col_too_large(
         .product();
     let col_elems = c_in_per_g.saturating_mul(k).saturating_mul(out_spatial);
     col_elems > MLX_IM2COL_MAX_COL_ELEMS
+}
+
+/// A 2-D conv too large for one im2col ([`mlx_conv_im2col_too_large`]), run
+/// on MLX in bands of output rows that each fit under the cap, instead of
+/// the host's naive kernel: a VAE decoder's last level at ~1 MP is a 2.4 G
+/// element im2col, and the naive host conv took tens of minutes for it.
+///
+/// `x` is NCHW, `w` `[Co, Ci/g, kh, kw]`, `(out_h, out_w)` the conv's
+/// output. The input is padded once; band `[a, b)` of output rows reads
+/// padded input rows `[a·s, (b−1)·s + (kh−1)·d + 1)` with no further
+/// padding, so the concatenated bands equal the single conv.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_banded(
+    x: &Array,
+    w: &Array,
+    stride: (i32, i32),
+    padding: (i32, i32),
+    dilation: (i32, i32),
+    groups: i32,
+    out_h: usize,
+    out_w: usize,
+) -> Result<Array, MlxError> {
+    conv2d_banded_cap(
+        x,
+        w,
+        stride,
+        padding,
+        dilation,
+        groups,
+        out_h,
+        out_w,
+        MLX_IM2COL_MAX_COL_ELEMS,
+    )
+}
+
+/// [`conv2d_banded`] with the band size set by `cap` im2col elements.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_banded_cap(
+    x: &Array,
+    w: &Array,
+    stride: (i32, i32),
+    padding: (i32, i32),
+    dilation: (i32, i32),
+    groups: i32,
+    out_h: usize,
+    out_w: usize,
+    cap: usize,
+) -> Result<Array, MlxError> {
+    let wsh = w.shape()?;
+    let (cig, kh, kw) = (wsh[1], wsh[2], wsh[3]);
+    let per_row = cig.saturating_mul(kh * kw).saturating_mul(out_w).max(1);
+    let rows = (cap / per_row).clamp(1, out_h.max(1));
+    let x_nhwc = ops::transpose(x, &[0, 2, 3, 1])?;
+    let x_pad = ops::pad(
+        &x_nhwc,
+        &[0, padding.0, padding.1, 0],
+        &[0, padding.0, padding.1, 0],
+        0.0,
+    )?;
+    let psh: Vec<i32> = x_pad.shape()?.iter().map(|&d| d as i32).collect();
+    let w_mlx = ops::transpose(w, &[0, 2, 3, 1])?;
+    let mut bands = Vec::new();
+    let mut a = 0usize;
+    while a < out_h {
+        let b = (a + rows).min(out_h);
+        let r0 = a as i32 * stride.0;
+        let r1 = ((b - 1) as i32 * stride.0 + (kh as i32 - 1) * dilation.0 + 1).min(psh[1]);
+        let xs = ops::slice(&x_pad, &[0, r0, 0, 0], &[psh[0], r1, psh[2], psh[3]])?;
+        bands.push(ops::conv2d(&xs, &w_mlx, stride, (0, 0), dilation, groups)?);
+        a = b;
+    }
+    let refs: Vec<&Array> = bands.iter().collect();
+    let y = if refs.len() == 1 {
+        refs[0].clone_handle()?
+    } else {
+        ops::concat(&refs, 1)?
+    };
+    ops::transpose(&y, &[0, 3, 1, 2])
 }
 
 /// Sum broadcast axes of `grad` (shape `full_dims`) down to `target_dims`.
@@ -3135,5 +3236,41 @@ pub(crate) fn activation_backward_compose(
         | LogSigmoid => {
             panic!("rlx-mlx: no native backward for {kind:?} (decomposed on other backends)")
         }
+    }
+}
+
+#[cfg(test)]
+mod conv_banded_tests {
+    use super::*;
+
+    /// Single-row bands (a cap of one element) give the unbanded conv, with
+    /// stride, padding, dilation and groups all in play.
+    #[test]
+    fn banded_conv2d_equals_one_conv() {
+        let (n, c, h, w) = (1usize, 4usize, 13usize, 9usize);
+        let (co, g, k) = (6usize, 2usize, 3usize);
+        let xs: Vec<f32> = (0..n * c * h * w)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let ws: Vec<f32> = (0..co * (c / g) * k * k)
+            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let x = Array::from_f32_slice(&xs, &[n, c, h, w], DType::F32).unwrap();
+        let wt = Array::from_f32_slice(&ws, &[co, c / g, k, k], DType::F32).unwrap();
+        let (stride, pad, dil) = ((2, 1), (2, 1), (2, 1));
+        let x_nhwc = ops::transpose(&x, &[0, 2, 3, 1]).unwrap();
+        let w_mlx = ops::transpose(&wt, &[0, 2, 3, 1]).unwrap();
+        let want = ops::conv2d(&x_nhwc, &w_mlx, stride, pad, dil, g as i32).unwrap();
+        let want = ops::transpose(&want, &[0, 3, 1, 2]).unwrap();
+        let sh = want.shape().unwrap();
+        let got = conv2d_banded_cap(&x, &wt, stride, pad, dil, g as i32, sh[2], sh[3], 1).unwrap();
+        assert_eq!(got.shape().unwrap(), sh);
+        let (a, b) = (got.to_f32().unwrap(), want.to_f32().unwrap());
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "banded vs single conv: {worst}");
     }
 }

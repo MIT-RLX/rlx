@@ -147,6 +147,133 @@ impl WgpuExecutable {
         }
     }
 
+    /// Adopt `other`'s weight buffer instead of keeping our own copy: one GPU
+    /// copy of the packed weights then backs both executables (decode rungs,
+    /// prefill and decode). Only when both park exactly the same params at the
+    /// same offsets — executables compiled from one param set. Arena-resident
+    /// params are not touched; the caller sets those as usual. `other` must
+    /// already hold its weights. Returns false (upload normally) otherwise.
+    pub fn share_weights_from(&mut self, other: &Self) -> bool {
+        if self.unresolved.is_some() || other.unresolved.is_some() {
+            return false;
+        }
+        let (dst, src) = (&self.arena, &other.arena);
+        let (Some(dst_buf), Some(src_buf)) =
+            (dst.weight_buffer.as_ref(), src.weight_buffer.as_ref())
+        else {
+            return false;
+        };
+        if dst.weight_shard_size != src.weight_shard_size
+            || dst_buf.size() != src_buf.size()
+            || dst.weight_extra_shards.len() != src.weight_extra_shards.len()
+            || dst
+                .weight_extra_shards
+                .iter()
+                .zip(&src.weight_extra_shards)
+                .any(|(a, b)| a.size() != b.size())
+        {
+            return false;
+        }
+        fn parked(exe: &WgpuExecutable) -> Option<HashMap<&str, usize>> {
+            let mut out = HashMap::new();
+            for (name, id) in &exe.param_offsets {
+                if let Some(&off) = exe.arena.weight_offsets.get(id) {
+                    out.insert(name.as_str(), off);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        match (parked(self), parked(other)) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+        if rlx_ir::env::flag("RLX_WGPU_SHARD_LOG") {
+            eprintln!(
+                "[rlx-wgpu] adopted a shared weight buffer ({:.1} MiB)",
+                src_buf.size() as f64 / (1u64 << 20) as f64
+            );
+        }
+        self.arena.weight_buffer = Some(src_buf.clone());
+        self.arena.weight_extra_shards = src.weight_extra_shards.clone();
+        self.gemv_plans
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.invalidate_static_weight_packs();
+        true
+    }
+
+    /// Copy the named inputs' device contents aside, on the GPU, so
+    /// [`Self::restore_inputs`] can put them back: the recurrent state a
+    /// multi-token step updates in place, kept for when only part of the step
+    /// is to stand. Replaces an earlier save. False for an unknown input.
+    pub fn save_inputs(&mut self, names: &[&str]) -> bool {
+        if self.unresolved.is_some() || self.arena.is_sharded() {
+            return false;
+        }
+        let mut spans = Vec::with_capacity(names.len());
+        let mut total = 0u64;
+        for name in names {
+            let Some(&id) = self.input_offsets.get(*name) else {
+                return false;
+            };
+            let off = self.arena.offset(id);
+            if crate::buffer::is_weight_off(off) {
+                return false;
+            }
+            let len = (*self.arena.lens.get(&id).unwrap_or(&0) as u64).div_ceil(4) * 4;
+            spans.push((off, len, total));
+            total += len.div_ceil(16) * 16;
+        }
+        let dev = wgpu_device().expect("rlx-wgpu: device gone");
+        let reuse = matches!(&self.saved_inputs, Some((b, _)) if b.size() >= total.max(16));
+        if !reuse {
+            let buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rlx-wgpu saved inputs"),
+                size: total.max(16),
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.saved_inputs = Some((buf, Vec::new()));
+        }
+        let (buf, saved) = self.saved_inputs.as_mut().expect("saved inputs");
+        let mut enc = dev
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rlx-wgpu save inputs"),
+            });
+        for &(off, len, at) in &spans {
+            let (src, local) = self.arena.resolve_act(off);
+            enc.copy_buffer_to_buffer(src, local as u64, buf, at, len);
+        }
+        dev.queue.submit(std::iter::once(enc.finish()));
+        *saved = spans;
+        true
+    }
+
+    /// Put back the inputs [`Self::save_inputs`] copied aside. False when
+    /// nothing was saved.
+    pub fn restore_inputs(&mut self) -> bool {
+        let Some((buf, spans)) = self.saved_inputs.as_ref() else {
+            return false;
+        };
+        if spans.is_empty() {
+            return false;
+        }
+        let dev = wgpu_device().expect("rlx-wgpu: device gone");
+        let mut enc = dev
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rlx-wgpu restore inputs"),
+            });
+        for &(off, len, at) in spans {
+            let (dst, local) = self.arena.resolve_act(off);
+            enc.copy_buffer_to_buffer(buf, at, dst, local as u64, len);
+        }
+        dev.queue.submit(std::iter::once(enc.finish()));
+        true
+    }
+
     pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);

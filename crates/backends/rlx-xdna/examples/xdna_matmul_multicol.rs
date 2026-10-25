@@ -20,7 +20,7 @@ use rlx_xdna::npu_gemm::NpuGemm;
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> usize {
-    std::env::var(k)
+    rlx_ir::env::read(k)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| d.parse().unwrap())

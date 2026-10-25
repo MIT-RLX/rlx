@@ -1086,7 +1086,7 @@ fn tensor_methods_are_derived_from_the_graph_prototype() {
         const skip = new Set(["input", "param", "constant", "setOutputs", "outputs",
           "nodeCount", "name", "toString", "toJSON", "shapeOf", "paramNames",
           "opKinds", "zeros", "full", "fftfreq", "rfftfreq", "concat", "customFn",
-          "__class"]);
+          "customFnMulti", "customOp", "__class"]);
         const graphOps = Object.getOwnPropertyNames(rlx.Graph.prototype)
           .filter((n) => !skip.has(n));
         const tensorOps = new Set(Object.getOwnPropertyNames(rlx.Tensor.prototype));
@@ -2287,6 +2287,59 @@ fn a_resident_checkpoint_is_readable_by_the_host_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_checkpoint_resumes_on_the_resident_path() {
+    // The other direction. `load` used to size-check against the host path's
+    // weight copy, which the resident path leaves empty — so a resident trainer
+    // loading any checkpoint indexed out of bounds, and the weights it would
+    // have restored were rebuilt from that same empty copy.
+    if !rlx_runtime::is_available(rlx_runtime::Device::Metal) {
+        eprintln!("skip: no Metal backend in this build");
+        return;
+    }
+    let mut rt = Runtime::new();
+    rt.allow_filesystem();
+    let dir = std::env::temp_dir().join("rlx-js-resident-load");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("host.gguf");
+    let script = format!(
+        r#"
+        const CK = {path:?};
+        function build() {{
+          const m = rlx.dsl("mse");
+          const x = m.input("x", [2, 4]);
+          const t = m.input("t", [2, 4]);
+          const d = x.matmul(m.param("w", [4, 4])).add(m.param("b", [1, 4])).sub(t);
+          m.output(d.mul(d).mean([0, 1], false));
+          return m;
+        }}
+        const init = {{ w: new Float32Array(16).fill(0.05), b: new Float32Array(4) }};
+        const opt = {{ kind: "adamw", lr: 0.05 }};
+        const batch = {{
+          x: new Float32Array([1, 0, 0, 1, 0, 1, 1, 0]),
+          t: new Float32Array([1, -1, 0.5, 0, 0, 2, -1, 1]),
+        }};
+
+        const a = new rlx.Trainer(build(), {{ wrt: ["w", "b"], init, device: "metal", optimizer: opt }});
+        a.run({{ steps: 20, batch: () => batch }});
+        a.save(CK);
+        const continued = a.run({{ steps: 20, batch: () => batch }}).lastLoss;
+
+        const b = new rlx.Trainer(build(), {{ wrt: ["w", "b"], init, device: "metal", optimizer: opt, resident: true }});
+        const rep = b.load(CK);
+        const resumed = b.run({{ steps: 20, batch: () => batch }}).lastLoss;
+        `${{rep.step}}|${{rep.restored}}|${{Math.abs(continued - resumed) < 1e-4}}`;
+        "#,
+        path = path.to_string_lossy()
+    );
+    let out = rt.eval(&script).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        out, "20|2|true",
+        "a host checkpoint should resume on the resident path: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── precision policy ─────────────────────────────────────────
 
 #[test]
@@ -2443,4 +2496,289 @@ fn compile_honours_its_options_argument() {
            c.outputShapes().length"#,
     );
     assert_eq!(ok.trim(), "1", "compile() with a valid policy failed: {ok}");
+}
+
+#[test]
+fn layer_ops_infer_the_shapes_the_kernels_expect() {
+    // The layer-level surface: one shape check per builder, so an op that is
+    // registered but wired to the wrong IR call (or the wrong output shape)
+    // fails here rather than as a reinterpretation of another tensor's bytes.
+    let out = eval(
+        r#"
+        const g = new rlx.Graph("layers");
+        const d = (n) => g.shapeOf(n).dims.join("x");
+        const img = g.input("img", [1, 2, 4, 4], "f32");
+        const wT = g.param("wT", [2, 3, 3, 3], "f32");
+        const vol = g.input("vol", [1, 2, 4, 4, 4], "f32");
+        const w3 = g.param("w3", [3, 2, 3, 3, 3], "f32");
+        const sig = g.input("sig", [1, 2, 8], "f32");
+        const w1 = g.param("w1", [2, 3, 4], "f32");
+        const seq = g.input("seq", [2, 5, 4], "f32");
+        const q = g.input("q", [1, 6, 8], "f32");
+        const k = g.input("k", [1, 6, 8], "f32");
+        const v = g.input("v", [1, 6, 12], "f32");
+        const c = g.param("c", [2], "f32");
+        const m = g.param("m", [4, 4], "f32");
+        const shapes = [
+          d(g.convTranspose2d(img, wT, { kernelSize: 3, stride: 2, padding: 1, outputPadding: 1 })),
+          d(g.conv3d(vol, w3, { padding: 1 })),
+          d(g.convTranspose1d(sig, w1, 4, 2, 1)),
+          d(g.im2col(img, { kernelSize: 3, padding: 1 })),
+          d(g.maxPool2d(img, { kernelSize: 2 })),
+          d(g.avgPool2d(img, { kernelSize: 2, stride: 1 })),
+          d(g.pool2d(img, "max", { kernelSize: 2 })),
+          d(g.resizeNearest2x(img)),
+          d(g.interpolate1d(sig, 16, "linear")),
+          d(g.interpolate3d(vol, [8, 8, 8])),
+          d(g.batchNorm(img, c, c, c, c)),
+          d(g.batchNormTraining(img, c, c)),
+          d(g.lstm(seq, g.param("wih", [16, 4]), g.param("whh", [16, 3]), g.param("b", [16]), 3)),
+          d(g.gru(seq, g.param("gih", [9, 4]), g.param("ghh", [9, 3]), g.param("gb1", [9]),
+                  g.param("gb2", [9]), 3, 1, true)),
+          d(g.rnn(seq, g.param("rih", [3, 4]), g.param("rhh", [3, 3]), g.param("rb", [3]), 3)),
+          d(g.attentionKindVdim(q, k, v, 2, 4, 6)),
+          d(g.attentionOpts(q, k, g.input("v8", [1, 6, 8], "f32"), 2, 4, { scale: 0.5, softcap: 30 })),
+          d(g.expand(g.input("e", [1, 4], "f32"), [3, 4])),
+          d(g.scatterNd(m, g.input("si", [2, 1], "i64"), g.input("su", [2, 4], "f32"), "add")),
+          d(g.gatherNd(m, g.input("gi", [3, 2], "i64"))),
+          d(g.triangularSolve(m, g.input("rhs", [4, 2], "f32"))),
+          d(g.eighBatch(g.input("eb", [2, 3, 3], "f64"))[1]),
+          d(g.linearBias(seq, g.param("lw", [4, 6], "f32"), g.param("lb", [6], "f32"))),
+          d(g.linearBiasAct(seq, g.param("law", [4, 6], "f32"), null, "gelu")),
+          d(g.scaledQuantize(m)[0]),
+          d(g.vectorQuantize(m, g.param("cb", [8, 4], "f32"))[0]),
+          g.residualVq(m, [g.param("cb1", [8, 4], "f32"), g.param("cb2", [8, 4], "f32")]).length,
+          d(g.qMatmul(g.input("qi", [2, 4], "i8"), g.param("qw", [4, 3], "i8"),
+                      g.param("qb", [3], "i32"), 0, 0, 0, 0.1)),
+        ];
+        shapes.join("|");
+        "#,
+    );
+    assert_eq!(
+        out,
+        "1x3x8x8|1x3x4x4x4|1x3x16|16x18|1x2x2x2|1x2x3x3|1x2x2x2|1x2x8x8|1x2x16|1x2x8x8x8|\
+         1x2x4x4|1x2x4x4|2x5x3|2x5x6|2x5x3|1x6x12|1x6x8|3x4|4x4|3|4x2|2x3x3|2x5x6|2x5x6|4x4|4|3|2x3"
+    );
+}
+
+#[test]
+fn signal_ops_infer_their_shapes() {
+    let out = eval(
+        r#"
+        const g = new rlx.Graph("signal");
+        const d = (n) => g.shapeOf(n).dims.join("x");
+        const x = g.input("x", [2, 16], "f32");
+        const spd = g.input("spd", [3, 3], "f32");
+        const batch = g.input("batch", [4, 3, 3], "f32");
+        [
+          d(g.firConv1d(x, [0.25, 0.5, 0.25], "same")),
+          d(g.firFiltfilt(x, [0.5, 0.5])),
+          d(g.biquad(x, [1, 0, 0], [1, 0, 0])),
+          d(g.sosfilt(x, [[1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0]])),
+          d(g.iirfilt(x, [1], [1, -0.5])),
+          d(g.resamplePoly(x, 2, 1, [0.5, 1, 0.5])),
+          d(g.hilbert(x)[0]),
+          d(g.envelope(x)),
+          d(g.padLastAxisToPow2(g.input("np2", [2, 12], "f32"))),
+          d(g.bimap(g.param("bw", [2, 3], "f32"), spd)),
+          d(g.spdMatrixFn(batch, "logm")),
+          d(g.spdKarcherMean(batch)),
+          d(g.spdLogMap(spd, spd)),
+        ].join("|");
+        "#,
+    );
+    assert_eq!(
+        out,
+        "2x16|2x16|2x16|2x16|2x16|2x32|2x16|2x16|2x16|2x2|4x3x3|3x3|3x3"
+    );
+}
+
+#[test]
+fn layer_ops_compute_the_right_numbers() {
+    // Values with closed forms: a 2×2 max-pool, a lower-triangular solve, an
+    // expand, a ScatterND add, a scan that sums xs, an identity biquad, and the
+    // newer activations / binary ops the table-driven parsers now reach.
+    let out = eval(
+        r#"
+        const g = new rlx.Graph("num");
+        const img = g.input("img", [1, 1, 2, 4], "f32");
+        const a = g.input("a", [2, 2], "f32");
+        const b = g.input("b", [2, 1], "f32");
+        const e = g.input("e", [1, 3], "f32");
+        const s = g.input("s", [4], "f32");
+        const xs = g.input("xs", [3, 2], "f32");
+        const init = g.input("init", [2], "f32");
+        const body = new rlx.Graph("step");
+        const carry = body.input("carry", [2], "f32");
+        const xt = body.input("xt", [2], "f32");
+        body.setOutputs([body.add(carry, xt)]);
+        g.setOutputs([
+          g.maxPool2d(img, { kernelSize: 2 }),
+          g.triangularSolve(a, b, true, false),
+          g.expand(e, [2, 3]),
+          g.scatterNd(s, g.constant(1, "i64"), g.constant(10, "f32"), "add"),
+          g.scan(init, body, 3, { xs: [xs] }),
+          g.biquad(s, [1, 0, 0], [1, 0, 0]),
+          g.activation("softplus", s),
+          g.binary("atan2", s, s),
+        ]);
+        "built";
+        "#,
+    );
+    // ScatterND above uses rank-0 indices, which its shape contract rejects;
+    // it only has to build. The numeric run below uses a valid layout.
+    assert_eq!(out, "built");
+
+    let out = eval(
+        r#"
+        const g = new rlx.Graph("num2");
+        const img = g.input("img", [1, 1, 2, 4], "f32");
+        const a = g.input("a", [2, 2], "f32");
+        const b = g.input("b", [2, 1], "f32");
+        const e = g.input("e", [1, 3], "f32");
+        const s = g.input("s", [4], "f32");
+        const xs = g.input("xs", [3, 2], "f32");
+        const init = g.input("init", [2], "f32");
+        const body = new rlx.Graph("step");
+        const carry = body.input("carry", [2], "f32");
+        const xt = body.input("xt", [2], "f32");
+        body.setOutputs([body.add(carry, xt)]);
+        g.setOutputs([
+          g.maxPool2d(img, { kernelSize: 2 }),
+          g.triangularSolve(a, b, true, false),
+          g.expand(e, [2, 3]),
+          g.scan(init, body, 3, { xs: [xs] }),
+          g.biquad(s, [1, 0, 0], [1, 0, 0]),
+          g.activation("softplus", g.constant(0, "f32")),
+          g.binary("atan2", g.constant(1, "f32"), g.constant(1, "f32")),
+        ]);
+        const c = new rlx.Session("cpu").compile(g);
+        const outs = c.run({
+          img: new Float32Array([1, 5, 2, 0, 3, 4, 7, 8]),
+          a: new Float32Array([2, 0, 1, 4]),
+          b: new Float32Array([4, 10]),
+          e: new Float32Array([1, 2, 3]),
+          s: new Float32Array([1, -2, 3, -4]),
+          xs: new Float32Array([1, 2, 3, 4, 5, 6]),
+          init: new Float32Array([0, 100]),
+        });
+        const r = (arr) => Array.from(arr).map((v) => Math.round(v * 1e4) / 1e4).join(",");
+        outs.map(r).join(" | ");
+        "#,
+    );
+    assert_eq!(
+        out,
+        "5,8 | 2,2 | 1,2,3,1,2,3 | 9,112 | 1,-2,3,-4 | 0.6931 | 0.7854"
+    );
+}
+
+#[test]
+fn every_activation_and_binary_op_parses_by_name() {
+    // The parsers read `Activation::ALL` / `BinaryOp::ALL`, so every variant the
+    // IR has is reachable by its name. This lists them from the script's side.
+    let out = eval(
+        r#"
+        const g = new rlx.Graph("names");
+        const x = g.input("x", [4], "f32");
+        const acts = ["gelu", "gelu_approx", "silu", "relu", "sigmoid", "tanh", "exp", "log",
+          "sqrt", "rsqrt", "neg", "abs", "sin", "cos", "tan", "atan", "recip", "round", "floor",
+          "ceil", "sign", "softplus", "elu", "erf", "hard_swish", "hardSigmoid", "mish",
+          "softsign", "log-sigmoid"];
+        const bins = ["add", "sub", "mul", "div", "max", "min", "pow", "mod", "bit_and",
+          "bitOr", "bitxor", "shl", "shr", "atan2", "%", "**", "<<"];
+        acts.forEach((a) => g.activation(a, x));
+        bins.forEach((b) => g.binary(b, x, x));
+        `${acts.length}+${bins.length}`;
+        "#,
+    );
+    assert_eq!(out, "29+17");
+    let err = eval_err(
+        r#"const g = new rlx.Graph("n"); g.activation("nope", g.input("x", [1], "f32"));"#,
+    );
+    assert!(
+        err.contains("LogSigmoid"),
+        "error should list the valid names: {err}"
+    );
+}
+
+#[test]
+fn rope_style_selects_the_pairing() {
+    // NeoX rotates (i, i + d/2); GPT-J rotates (2i, 2i + 1). With a 90° rotation
+    // on the first frequency only, the two flavors move different elements.
+    let out = eval(
+        r#"
+        const run = (style) => {
+          const g = new rlx.Graph("rope");
+          const x = g.input("x", [1, 1, 4], "f32");
+          const cos = g.input("cos", [1, 2], "f32");
+          const sin = g.input("sin", [1, 2], "f32");
+          g.setOutputs([g.rope(x, cos, sin, 4, null, style)]);
+          const c = new rlx.Session("cpu").compile(g);
+          return Array.from(c.run({
+            x: new Float32Array([1, 2, 3, 4]),
+            cos: new Float32Array([0, 1]),
+            sin: new Float32Array([1, 0]),
+          })[0]).map(Math.round).join(",");
+        };
+        `${run("neox")} | ${run("gptj")}`;
+        "#,
+    );
+    assert_eq!(out, "-3,2,1,4 | -2,1,3,4");
+}
+
+#[test]
+fn new_ops_are_chainable_through_the_dsl() {
+    // `Tensor` methods are generated from `Graph.prototype`, so the new
+    // builders chain without a second table.
+    let out = eval(
+        r#"
+        const m = rlx.dsl("chain");
+        const x = m.input("x", [1, 2, 4, 4]);
+        const y = x.maxPool2d({ kernelSize: 2 }).resizeNearest2x().batchNormTraining(
+          m.param("g", [2]), m.param("b", [2]));
+        y.dims.join("x");
+        "#,
+    );
+    assert_eq!(out, "1x2x4x4");
+}
+
+#[test]
+fn the_rows_added_for_parity_run() {
+    let out = eval(
+        "const mk = () => {
+             const g = new rlx.Graph('lin');
+             const x = g.input('x', [1, 2]);
+             const w = g.param('w', [2, 2]);
+             g.setOutputs([g.matmul(x, w)]);
+             return g;
+         };
+         const w = new Float32Array([1, 0, 0, 1]);
+         const x = { x: new Float32Array([3, 4]) };
+         const flex = new rlx.FlexibleSession({ only: ['cpu'] });
+         const c = flex.compile(mk(), 'cpu');
+         c.setParam('w', w);
+         const r = rlx.Runner.fromEnv(mk());
+         r.setParam('w', w);
+         const router = new rlx.Router(mk(), { only: ['cpu'] });
+         router.setParams({ w });
+         const g1 = rlx.Group.connect(0, 1);
+         [
+             rlx.parseDevice('cpu'),
+             c.device(),
+             Array.from(c.run(x)[0]).join(','),
+             Array.from(r.runWithInputs(x)[0]).join(','),
+             Array.from(router.runOn('cpu', x)[0]).join(','),
+             g1.world(), g1.isLeader(),
+             Array.from(g1.allReduce(new Float32Array([2, 3]), 'max')).join(','),
+             rlx.loopbackPeers(2).length,
+             rlx.fastestDeviceFor(mk(), { only: ['cpu'] }),
+         ].join(' ')",
+    );
+    assert_eq!(out, "cpu cpu 3,4 3,4 3,4 1 true 2,3 2 cpu");
+    assert!(eval_err("rlx.parseDevice('quantum')").contains("quantum"));
+    assert!(eval_err("rlx.Group.connect(2, 1)").contains("not in a world"));
+    assert!(
+        eval_err("rlx.Group.connect(0, 1).allReduce(new Float32Array([1]), 'median')")
+            .contains("median")
+    );
 }

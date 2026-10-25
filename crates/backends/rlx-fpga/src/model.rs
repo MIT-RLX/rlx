@@ -13,6 +13,9 @@
 //! Q0.31 form `quant::quantize_multiplier` produces. Each layer carries
 //! a per-output-channel table (per-tensor is just N copies of the same).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::quant::quantize_multiplier;
 
 /// How packed weight nibbles/bytes are interpreted in the MAC path.

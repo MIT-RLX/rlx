@@ -4,6 +4,7 @@
 
 //! NCHW convolution builders (`conv2d`, `conv_transpose2d`).
 
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op};
 
 impl Graph {

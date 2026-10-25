@@ -54,6 +54,8 @@ const INLINED_HERE: &[OpKind] = &[
 /// Call after fusion / LIR→graph and before `compile_thunks` / memory plan.
 pub fn prepare_graph_for_thunks(graph: Graph) -> Graph {
     let graph = expand_cpu_nop_fused(graph);
+    // I32 / U32 stay integers; f32-computing ops get casts around them.
+    let graph = crate::int_storage::legalize_int_storage(graph);
     // TransformRegion / BatchElementwiseRegion → ResizeNearest2x + ElementwiseRegion
     // (+ Concat). Native FK keep is off for CPU by default; this still covers
     // `RLX_NATIVE_FK_REGIONS=1` and hand-built region IR.

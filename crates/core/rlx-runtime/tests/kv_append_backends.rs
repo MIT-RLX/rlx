@@ -207,3 +207,44 @@ fn kv_append_strides_a_narrow_cache_by_its_own_element_size() {
         }
     }
 }
+
+/// **A row computed on the device lands too.** Every case above feeds the row
+/// as a graph input, which the host writes before any GPU work. A decode
+/// appends a computed row (the K after RoPE): on Vulkan the copy that follows
+/// GPU work was skipped, the cache kept its old row, and `Qwen3Runner`
+/// decoded garbage — with every case above passing.
+#[test]
+fn kv_append_writes_a_row_computed_on_the_device() {
+    let _gpu = common::serialize_gpu();
+    const CAP: usize = 4;
+    const W: usize = 8;
+    let f = |d: &[usize]| Shape::new(d, F);
+    let mut g = Graph::new("kv_append_computed");
+    let cache = g.input("cache", f(&[1, CAP, W]));
+    let x = g.input("x", f(&[1, 1, W]));
+    let two = g.input("two", f(&[1, 1, W]));
+    let row = g.binary(rlx_ir::op::BinaryOp::Mul, x, two, f(&[1, 1, W]));
+    let out = g.add_node(
+        Op::KvAppend {
+            axis: 1,
+            pos: CAP - 1,
+        },
+        vec![cache, row],
+        f(&[1, CAP, W]),
+    );
+    g.set_outputs(vec![out]);
+
+    let cache_v: Vec<f32> = (0..CAP * W).map(|i| i as f32).collect();
+    let x_v: Vec<f32> = (0..W).map(|i| 100.0 + i as f32).collect();
+    let mut want = cache_v.clone();
+    for (i, w) in want[(CAP - 1) * W..].iter_mut().enumerate() {
+        *w = 2.0 * x_v[i];
+    }
+    for (name, dev) in devices() {
+        let got = Session::new(dev)
+            .compile(g.clone())
+            .run(&[("cache", &cache_v), ("x", &x_v), ("two", &[2.0; W])])
+            .remove(0);
+        assert_eq!(got, want, "{name}: the computed row did not land");
+    }
+}

@@ -39,10 +39,7 @@ fn fft_graph(batch: usize, n: usize) -> Graph {
 }
 
 fn set_var(key: &str, on: bool) {
-    // SAFETY: single-threaded benchmark driver toggling a process-local gate.
-    unsafe {
-        std::env::set_var(key, if on { "1" } else { "0" });
-    }
+    rlx_ir::env::set(key, if on { "1" } else { "0" });
 }
 
 fn main() {

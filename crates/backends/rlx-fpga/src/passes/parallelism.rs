@@ -21,6 +21,9 @@
 //! * `Relu`/`MaxPool`/`Argmax` — no MACs, parallelism is not
 //!   meaningful. Always P=1.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::model::Layer;
 
 /// Highest ic-parallelism (inner-dim) the layer can run at, ≤

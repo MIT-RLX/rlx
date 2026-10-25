@@ -99,17 +99,26 @@ and `anyhow::Error` — the whole stack returns those.
 
 ## Feature matrix
 
+The default feature set is empty: every backend and companion crate is opt-in,
+so name at least one backend (`cpu`).
+
 ### Backends
 
 | feature             | backend                              | platform                  |
 |---------------------|--------------------------------------|---------------------------|
-| `cpu` *(default)*   | NEON / AVX + Accelerate / OpenBLAS   | every host                |
+| `cpu`               | NEON / AVX + Accelerate / OpenBLAS   | every host                |
 | `metal`             | Metal Performance Shaders + MSL      | macOS (Apple Silicon)     |
 | `mlx`               | Apple MLX (vendored)                 | macOS (Apple Silicon)     |
 | `gpu`               | wgpu (Vulkan / DX12 / WebGPU / Metal)| cross-platform            |
 | `cuda`              | cuBLAS / cuDNN / NVRTC               | Linux / Windows + NVIDIA  |
 | `rocm`              | hipBLAS / MIOpen                     | Linux + AMD               |
 | `tpu`               | libtpu PJRT plugin                   | Linux + GCP TPU           |
+| `vulkan`            | native Vulkan (GLSL → SPIR-V)        | Linux / Windows / Android |
+| `coreml`            | Core ML / Apple Neural Engine        | Apple platforms           |
+| `oneapi`            | Intel oneAPI (OpenCL-C)              | Intel GPUs                |
+| `egpu`              | external GPU backend                 | eGPU hosts                |
+| `mlx-cuda`          | MLX's CUDA backend                   | Linux + NVIDIA            |
+| `android` / `android-blas` | Android CPU (+ BLAS)          | Android                   |
 | `blas-accelerate`   | macOS Accelerate                     | macOS                     |
 | `blas-mkl`          | Intel MKL                            | Intel / AMD CPUs          |
 | `blas-openblas`     | OpenBLAS                             | cross-platform CPU        |
@@ -126,6 +135,13 @@ Off by default; turn on per workload:
 | `linalg`   | dense linalg via LAPACK (custom-op scaffold) → `rlx::linalg`      |
 | `cortexm`  | INT8 ARMv7E-M kernels → `rlx::cortexm` (no `Backend` impl)        |
 | `fpga`     | IR → SystemVerilog export → `rlx::fpga` + `rlx_runtime::export`   |
+| `tensor`   | symbolic `Tensor` DSL and `rlx!` macro → `rlx::tensor`            |
+| `optim`    | optimizers (AdamW, Muon, Sophia, …) → `rlx::optim`                |
+| `distributed` | collectives and distributed nodes → `rlx::distributed`         |
+| `onnx`     | ONNX import and native execution → `rlx::onnx`                    |
+| `gguf-convert` | safetensors / ONNX / PyTorch → GGUF                           |
+| `peft`, `rng`, `umap`, `geo` | LoRA adapters, bit-exact numpy/torch RNG streams, UMAP, Delaunay/Voronoi |
+| `splat`    | Gaussian-splat CPU executors                                      |
 
 `cortexm` kernels and `fpga` export don't go through `Session` / `Backend`
 execution — they're specialty / offline targets. FPGA RTL is **target-agnostic**

@@ -17,7 +17,7 @@ use rlx_ir::{DType, Graph, Shape};
 use rlx_runtime::{Device, Session, is_available};
 
 fn dim(k: &str, d: usize) -> usize {
-    std::env::var(k)
+    rlx_ir::env::read(k)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(d)

@@ -20,12 +20,15 @@ use rlx_xdna::aie::{
     BinaryOp as AieBinaryOp, ReduceOp as AieReduceOp, ScanOp, Ty, UnaryOp, emit_argmax,
     emit_attention, emit_binary, emit_cast, emit_clamp, emit_compare, emit_concat2, emit_expand,
     emit_fma, emit_gather, emit_group_norm, emit_layer_norm_affine, emit_matmul_microkernel,
-    emit_narrow, emit_pad, emit_reduce, emit_reverse, emit_rms_norm_affine, emit_rope, emit_scan,
-    emit_slice, emit_softmax, emit_tile, emit_transpose2d, emit_trilu, emit_unary, emit_where,
-    tile_a_kacc, tile_b_kacc_multicol, untile_c_multicol,
+    emit_matmul_microkernel_bf16, emit_narrow, emit_pad, emit_reduce, emit_reverse,
+    emit_rms_norm_affine, emit_rope, emit_scan, emit_slice, emit_softmax, emit_tile,
+    emit_transpose2d, emit_trilu, emit_unary, emit_where, tile_a_kacc, tile_a_kacc_bf16,
+    tile_b_kacc_multicol, tile_b_kacc_multicol_bf16, untile_c_multicol, untile_c_multicol_f32,
 };
-use rlx_xdna::compile::{OverlaySpec, build_mm_kernel, compile_overlay, compile_overlay_linked};
-use rlx_xdna::npu_gemm::{NpuGemm, NpuIo, NpuIoF32, NpuRun3};
+use rlx_xdna::compile::{
+    OverlaySpec, build_mm_kernel, build_mm_kernel_bf16, compile_overlay, compile_overlay_linked,
+};
+use rlx_xdna::npu_gemm::{NpuGemm, NpuIo, NpuIoF32, NpuRun3, f32_to_bf16};
 
 pub struct XdnaBackend;
 
@@ -74,7 +77,11 @@ impl Backend for XdnaBackend {
         ]
     }
 
-    fn compile(&self, graph: Graph, _options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+    fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
+        // `Precision::BF16` runs MatMuls through the bf16 microkernel (bf16 in, f32
+        // accumulate) instead of per-channel int8 — slower per MAC, far closer to
+        // f32. Every other op is unaffected.
+        let bf16 = options.precision == crate::Precision::BF16;
         // Opt-in TURBO: clock the NPU to max DPM for the (XRT) compute path. Power
         // mode is device-global, so a held direct fd raises the clock for XRT compute
         // too. Off unless RLX_XDNA_TURBO is set; needs root/DRM-master (else a clear
@@ -115,10 +122,9 @@ impl Backend for XdnaBackend {
             });
         let built = if n_compute > 1 || (consumes_constant && !has_matmul) {
             // multi-op subgraph → chain per-node execs (matmul-in-chain supported)
-            build_chain(&graph).map(|e| Box::new(e) as Box<dyn ExecutableGraph>)
+            build_chain(&graph, bf16).map(|e| Box::new(e) as Box<dyn ExecutableGraph>)
         } else if has_matmul {
-            build_microkernel_exec(&graph)
-                .map(|e| Box::new(e) as Box<dyn ExecutableGraph>)
+            build_microkernel_exec(&graph, bf16)
                 .or_else(|mk_err| {
                     build_gemm_exec(&graph).map(|e| Box::new(e) as Box<dyn ExecutableGraph>).map_err(|ov_err| {
                         format!("matmul: microkernel path ({mk_err}) AND overlay path ({ov_err}) both unavailable")
@@ -345,7 +351,7 @@ fn build_op_exec(graph: &Graph) -> Result<Box<dyn ExecutableGraph>, String> {
 /// the ops that consume it. Each op is still its own NPU dispatch; the chain runs
 /// them in order. Scoped to the `build_node_exec`-supported ops (no matmul in-chain
 /// yet — a MatMul graph takes the single-op microkernel path).
-fn build_chain(graph: &Graph) -> Result<XdnaChainExec, String> {
+fn build_chain(graph: &Graph, bf16: bool) -> Result<XdnaChainExec, String> {
     std::env::var("AIECC").map_err(|_| "chain needs AIECC in env".to_string())?;
     std::env::var("PEANO").map_err(|_| "chain needs PEANO in env".to_string())?;
     let mut steps: Vec<ChainStep> = Vec::new();
@@ -400,11 +406,13 @@ fn build_chain(graph: &Graph) -> Result<XdnaChainExec, String> {
         typed_params: Vec::new(),
         cache: std::collections::HashMap::new(),
         lru: Vec::new(),
-        // Concurrent NPU hardware contexts are limited (~5-6 on amdxdna); keep an
-        // LRU pool of open sub-exec contexts and re-open evicted ones on demand.
+        bf16,
+        // Concurrent NPU hardware contexts are limited per process (see
+        // `rlx_xdna::npu_gemm::max_contexts`); keep an LRU pool of open sub-exec
+        // contexts and re-open evicted ones on demand.
         cap: rlx_ir::env::var("RLX_XDNA_CHAIN_CAP")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4),
+            .unwrap_or_else(rlx_xdna::npu_gemm::max_contexts),
     })
 }
 
@@ -432,6 +440,8 @@ struct XdnaChainExec {
     typed_params: Vec<(String, Vec<u8>, rlx_ir::DType)>,
     cache: std::collections::HashMap<usize, Box<dyn ExecutableGraph>>,
     lru: Vec<usize>,
+    /// MatMul steps use the bf16 microkernel (`Precision::BF16`), else int8.
+    bf16: bool,
     cap: usize,
 }
 unsafe impl Send for XdnaChainExec {}
@@ -471,7 +481,12 @@ impl ExecutableGraph for XdnaChainExec {
             // Ensure this step's exec (NPU context) is open — build lazily, evicting
             // the LRU context if the pool is full.
             if !self.cache.contains_key(&step.node_idx) {
-                while self.cache.len() >= self.cap {
+                // The budget is process-wide: contexts held by other compiled
+                // graphs count too, so evict this chain's idle ones until the
+                // new one fits (or there is nothing of ours left to evict).
+                while self.cache.len() >= self.cap
+                    || rlx_xdna::npu_gemm::open_contexts() >= rlx_xdna::npu_gemm::max_contexts()
+                {
                     if self.lru.is_empty() {
                         break;
                     }
@@ -480,10 +495,8 @@ impl ExecutableGraph for XdnaChainExec {
                 }
                 let node = &self.graph.nodes()[step.node_idx];
                 let mut ex: Box<dyn ExecutableGraph> = if step.is_matmul {
-                    Box::new(
-                        build_matmul_node_exec(&self.graph, node)
-                            .unwrap_or_else(|e| panic!("XdnaBackend chain matmul: {e}")),
-                    )
+                    build_matmul_node_exec(&self.graph, node, self.bf16)
+                        .unwrap_or_else(|e| panic!("XdnaBackend chain matmul: {e}"))
                 } else {
                     build_node_exec(&self.graph, step.node_idx)
                         .unwrap_or_else(|e| panic!("XdnaBackend chain op: {e}"))
@@ -1890,7 +1903,7 @@ impl ExecutableGraph for XdnaOpExec {
 /// tmp by shape), then host-blocks the graph `m×k×n` over it (K-blocks summed,
 /// edges zero-padded). Per-row activation / per-col weight int8 quant, `sx·sw`
 /// dequant — same accuracy contract as [`XdnaGemmExec`].
-fn build_microkernel_exec(graph: &Graph) -> Result<XdnaMicrokernelExec, String> {
+fn build_microkernel_exec(graph: &Graph, bf16: bool) -> Result<Box<dyn ExecutableGraph>, String> {
     let mms: Vec<_> = graph
         .nodes()
         .iter()
@@ -1902,7 +1915,7 @@ fn build_microkernel_exec(graph: &Graph) -> Result<XdnaMicrokernelExec, String> 
             mms.len()
         ));
     }
-    build_matmul_node_exec(graph, mms[0])
+    build_matmul_node_exec(graph, mms[0], bf16)
 }
 
 /// Build the fast microkernel exec for a specific MatMul node. The activation
@@ -1911,7 +1924,30 @@ fn build_microkernel_exec(graph: &Graph) -> Result<XdnaMicrokernelExec, String> 
 fn build_matmul_node_exec(
     graph: &Graph,
     mm: &rlx_ir::graph::Node,
-) -> Result<XdnaMicrokernelExec, String> {
+    bf16: bool,
+) -> Result<Box<dyn ExecutableGraph>, String> {
+    let setup = matmul_node_setup(graph, mm)?;
+    if bf16 {
+        build_bf16_matmul_exec(setup).map(|e| Box::new(e) as Box<dyn ExecutableGraph>)
+    } else {
+        build_i8_matmul_exec(setup).map(|e| Box::new(e) as Box<dyn ExecutableGraph>)
+    }
+}
+
+/// What both microkernel matmul builders need: the toolchain + the operands.
+struct MatmulSetup {
+    aiecc: String,
+    peano: String,
+    include: String,
+    act_name: String,
+    w_name: String,
+    w_dynamic: bool,
+    m: usize,
+    k: usize,
+    n: usize,
+}
+
+fn matmul_node_setup(graph: &Graph, mm: &rlx_ir::graph::Node) -> Result<MatmulSetup, String> {
     let aiecc =
         std::env::var("AIECC").map_err(|_| "microkernel matmul needs AIECC in env".to_string())?;
     let peano =
@@ -1959,6 +1995,31 @@ fn build_matmul_node_exec(
     let (m, k) = (dim(&act.shape, 0)?, dim(&act.shape, 1)?);
     let n = dim(&mm.shape, 1)?;
 
+    Ok(MatmulSetup {
+        aiecc,
+        peano,
+        include,
+        act_name,
+        w_name,
+        w_dynamic,
+        m,
+        k,
+        n,
+    })
+}
+
+fn build_i8_matmul_exec(setup: MatmulSetup) -> Result<XdnaMicrokernelExec, String> {
+    let MatmulSetup {
+        aiecc,
+        peano,
+        include,
+        act_name,
+        w_name,
+        w_dynamic,
+        m,
+        k,
+        n,
+    } = setup;
     const D: usize = 64;
     const KTMAX: usize = 8;
     let cols = n.div_ceil(D).clamp(1, 4);
@@ -2160,6 +2221,236 @@ impl ExecutableGraph for XdnaMicrokernelExec {
             .map(|idx| c[idx] as f32 * sx[idx / n] * self.sw[idx % n])
             .collect();
         vec![out]
+    }
+}
+
+/// bf16 microkernel tile edge. The double-buffered bf16 A/B and f32 C FIFOs
+/// take `8·d²·2` bytes = 16 KB at 32 (64 would need 64 KB, a whole core).
+const BF16_D: usize = 32;
+
+fn build_bf16_matmul_exec(setup: MatmulSetup) -> Result<XdnaBf16MatmulExec, String> {
+    let MatmulSetup {
+        aiecc,
+        peano,
+        include,
+        act_name,
+        w_name,
+        w_dynamic,
+        m,
+        k,
+        n,
+    } = setup;
+    const D: usize = BF16_D;
+    const KTMAX: usize = 8;
+    let cols = n.div_ceil(D).clamp(1, 4);
+    let kt = k.div_ceil(D).clamp(1, KTMAX);
+
+    let cache = format!(
+        "{}/rlx_xdna_mk_bf16_{D}_{kt}_{cols}",
+        std::env::temp_dir().display()
+    );
+    std::fs::create_dir_all(&cache).map_err(|e| format!("mkdir {cache}: {e}"))?;
+    let kernel_o = format!("{cache}/mm_bf16_{D}.o");
+    build_mm_kernel_bf16(&format!("{peano}/bin/clang++"), &include, D, &kernel_o)
+        .map_err(|e| e.0)?;
+    let mlir = format!("{cache}/aie.mlir");
+    std::fs::write(
+        &mlir,
+        emit_matmul_microkernel_bf16(D, kt, cols, &format!("mm_bf16_{D}.o")),
+    )
+    .map_err(|e| format!("write bf16 microkernel mlir: {e}"))?;
+    let (xclbin, insts_p) = (format!("{cache}/k.xclbin"), format!("{cache}/i.bin"));
+    compile_overlay_linked(
+        &OverlaySpec {
+            aiecc: &aiecc,
+            peano: &peano,
+            mlir: &mlir,
+            tmpdir: &format!("{cache}/build"),
+            out_xclbin: &xclbin,
+            out_insts: &insts_p,
+        },
+        &[&kernel_o],
+    )
+    .map_err(|e| e.0)?;
+    let insts: Vec<u32> = std::fs::read(&insts_p)
+        .map_err(|e| format!("read insts {insts_p}: {e}"))?
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // run3 buffers are counted in 4-byte cells: two bf16 per cell for A/B
+    // (A = kt·d², B = cols·kt·d², both even), one f32 per cell for C.
+    let (ka, ncf) = (kt * D * D, cols * D * D);
+    let npu = NpuRun3::open("", &xclbin, &insts, ka / 2, cols * ka / 2, ncf).map_err(|e| e.0)?;
+    Ok(XdnaBf16MatmulExec {
+        npu,
+        d: D,
+        kt,
+        cols,
+        m,
+        k,
+        n,
+        act_name,
+        w_name,
+        w_dynamic,
+        bt_blocks: Vec::new(),
+        nkb: 0,
+        nnb: 0,
+    })
+}
+
+/// bf16 matmul over the bf16 microkernel overlay ([`build_bf16_matmul_exec`]):
+/// operands rounded to bf16 (nearest-even), products accumulated in f32 on the
+/// cores and across K-blocks on the host. No scales — unlike the int8 path.
+struct XdnaBf16MatmulExec {
+    npu: NpuRun3,
+    d: usize,
+    kt: usize,
+    cols: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    act_name: String,
+    w_name: String,
+    /// The weight arrives as a run input (backward), re-tiled every run.
+    w_dynamic: bool,
+    /// Pre-tiled weight streams per (K-block, N-block), `kb*nnb+nb`, packed
+    /// two bf16 per f32 cell.
+    bt_blocks: Vec<Vec<f32>>,
+    nkb: usize,
+    nnb: usize,
+}
+unsafe impl Send for XdnaBf16MatmulExec {}
+
+/// Two bf16 per 4-byte cell, little-endian (element `2i` in the low half) —
+/// the byte layout of the bf16 array the kernel reads.
+fn pack_bf16_pairs(v: &[u16]) -> Vec<f32> {
+    v.chunks_exact(2)
+        .map(|p| f32::from_bits(p[0] as u32 | (p[1] as u32) << 16))
+        .collect()
+}
+
+/// The zero-padded `br×bc` block of row-major `src[rows, cols]` at `(r0, c0)`.
+fn block_of<T: Copy + Default>(
+    src: &[T],
+    rows: usize,
+    cols: usize,
+    r0: usize,
+    c0: usize,
+    br: usize,
+    bc: usize,
+) -> Vec<T> {
+    let mut out = vec![T::default(); br * bc];
+    for i in 0..br.min(rows.saturating_sub(r0)) {
+        let cc = cols.saturating_sub(c0).min(bc);
+        out[i * bc..i * bc + cc].copy_from_slice(&src[(r0 + i) * cols + c0..][..cc]);
+    }
+    out
+}
+
+impl XdnaBf16MatmulExec {
+    fn precompute_weight_tiles(&mut self, w: &[u16]) {
+        let (d, kt, cols, k, n) = (self.d, self.kt, self.cols, self.k, self.n);
+        let (kk, nn) = (kt * d, cols * d);
+        self.nkb = k.div_ceil(kk);
+        self.nnb = n.div_ceil(nn);
+        self.bt_blocks = (0..self.nkb)
+            .flat_map(|kb| (0..self.nnb).map(move |nb| (kb, nb)))
+            .map(|(kb, nb)| {
+                let blk = block_of(w, k, n, kb * kk, nb * nn, kk, nn);
+                pack_bf16_pairs(&tile_b_kacc_multicol_bf16(&blk, d, kt, cols))
+            })
+            .collect();
+    }
+}
+
+impl ExecutableGraph for XdnaBf16MatmulExec {
+    fn set_param(&mut self, name: &str, data: &[f32]) {
+        if name == self.w_name {
+            let w: Vec<u16> = data.iter().map(|&x| f32_to_bf16(x)).collect();
+            self.precompute_weight_tiles(&w);
+        }
+    }
+
+    fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+        if name == self.w_name && dtype == rlx_ir::DType::BF16 {
+            let w: Vec<u16> = data
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            self.precompute_weight_tiles(&w);
+        } else {
+            let f: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            self.set_param(name, &f);
+        }
+    }
+
+    fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        let find = |nm: &str| {
+            inputs
+                .iter()
+                .find(|(n, _)| *n == nm)
+                .map(|(_, d)| *d)
+                .unwrap_or_else(|| panic!("XdnaBackend bf16 matmul: input '{nm}' not provided"))
+        };
+        if self.w_dynamic {
+            let w = find(&self.w_name);
+            assert_eq!(
+                w.len(),
+                self.k * self.n,
+                "XdnaBackend: dynamic weight wrong size"
+            );
+            let w: Vec<u16> = w.iter().map(|&x| f32_to_bf16(x)).collect();
+            self.precompute_weight_tiles(&w);
+        }
+        assert!(
+            !self.bt_blocks.is_empty(),
+            "XdnaBackend bf16 matmul: weight '{}' not set",
+            self.w_name
+        );
+        let x = find(&self.act_name);
+        assert_eq!(
+            x.len(),
+            self.m * self.k,
+            "XdnaBackend: input '{}' wrong size",
+            self.act_name
+        );
+        let a: Vec<u16> = x.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        let (d, kt, cols, m, k, n) = (self.d, self.kt, self.cols, self.m, self.k, self.n);
+        let (kk, nn) = (kt * d, cols * d);
+        let mut c = vec![0f32; m * n];
+        for mb in 0..m.div_ceil(d) {
+            let mi = mb * d;
+            let mut accs = vec![vec![0f32; d * nn]; self.nnb];
+            for kb in 0..self.nkb {
+                let at = pack_bf16_pairs(&tile_a_kacc_bf16(
+                    &block_of(&a, m, k, mi, kb * kk, d, kk),
+                    d,
+                    kt,
+                ));
+                for (nb, acc) in accs.iter_mut().enumerate() {
+                    let ct = self
+                        .npu
+                        .run(&at, &self.bt_blocks[kb * self.nnb + nb])
+                        .unwrap_or_else(|e| panic!("bf16 microkernel run: {}", e.0));
+                    for (s, p) in acc.iter_mut().zip(untile_c_multicol_f32(&ct, d, nn, cols)) {
+                        *s += p;
+                    }
+                }
+            }
+            for (nb, acc) in accs.iter().enumerate() {
+                let ni = nb * nn;
+                for i in 0..d.min(m - mi) {
+                    for j in 0..nn.min(n - ni) {
+                        c[(mi + i) * n + ni + j] = acc[i * nn + j];
+                    }
+                }
+            }
+        }
+        vec![c]
     }
 }
 
@@ -2390,22 +2681,29 @@ impl ExecutableGraph for XdnaGemmExec {
             let mut c = vec![0i32; m * n];
             let mut mi = 0;
             while mi < m {
-                for nb in 0..nnb {
-                    let ni = nb * on;
-                    let mut acc = vec![0i32; om * on];
-                    for kb in 0..nkb {
-                        let a_blk = block_i8(&a_i8, m, k, mi, kb * ok, om, ok);
+                // K outer, N inner: the activation tile depends on (mi, kb) only,
+                // so cut it once per K-block rather than once per (N-block,
+                // K-block). Each output block still sums its K-blocks in order.
+                let mut acc = vec![0i32; nnb * om * on];
+                for kb in 0..nkb {
+                    let a_blk = block_i8(&a_i8, m, k, mi, kb * ok, om, ok);
+                    for nb in 0..nnb {
                         let part = self
                             .npu
                             .run_block(kb * nnb + nb, &a_blk)
                             .unwrap_or_else(|e| panic!("XdnaBackend run_block: {}", e.0));
-                        for (a, p) in acc.iter_mut().zip(&part) {
+                        let blk = &mut acc[nb * om * on..(nb + 1) * om * on];
+                        for (a, p) in blk.iter_mut().zip(&part) {
                             *a += *p;
                         }
                     }
+                }
+                for nb in 0..nnb {
+                    let ni = nb * on;
+                    let blk = &acc[nb * om * on..(nb + 1) * om * on];
                     for i in 0..om.min(m - mi) {
                         for j in 0..on.min(n - ni) {
-                            c[(mi + i) * n + (ni + j)] = acc[i * on + j];
+                            c[(mi + i) * n + (ni + j)] = blk[i * on + j];
                         }
                     }
                 }
@@ -2452,5 +2750,31 @@ impl ExecutableGraph for XdnaGemmExec {
             .map(|idx| c[idx] as f32 * sx[idx / n] * self.sw[idx % n])
             .collect();
         vec![out]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The packed cells must carry exactly the bytes of the plain bf16 array,
+    /// since the shim copies them into the kernel's `memref<…xbf16>` verbatim.
+    #[test]
+    fn bf16_pairs_pack_to_the_bf16_array_bytes() {
+        let v: Vec<u16> = vec![0x3f80, 0xc000, 0x0001, 0xffff];
+        let cells = pack_bf16_pairs(&v);
+        let packed: Vec<u8> = cells
+            .iter()
+            .flat_map(|c| c.to_bits().to_le_bytes())
+            .collect();
+        let plain: Vec<u8> = v.iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(packed, plain);
+    }
+
+    #[test]
+    fn block_of_zero_pads_past_the_edges() {
+        let src: Vec<u16> = (1..=6).collect(); // 2×3
+        assert_eq!(block_of(&src, 2, 3, 1, 1, 2, 3), vec![5, 6, 0, 0, 0, 0]);
+        assert_eq!(block_of(&src, 2, 3, 0, 0, 2, 3), src);
     }
 }

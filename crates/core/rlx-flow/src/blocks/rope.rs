@@ -5,7 +5,7 @@
 use anyhow::Result;
 use rlx_ir::{DType, Shape};
 
-use crate::context::FlowCtx;
+use crate::context::{FlowCtx, f64_format};
 #[derive(Debug, Clone)]
 pub struct RopeTablesStage {
     pub cos_key: String,
@@ -21,6 +21,10 @@ pub struct RopeTablesStage {
     /// `SelfAttnPrefillSpec::rope_table`. Used by Gemma 4 which
     /// ships split sliding/full RoPE thetas.
     pub named_slot: Option<String>,
+    /// The tables in f64, from [`Self::with_f64`] when this process computes
+    /// in f64; emitted through [`FlowCtx::synth_param_f64`] so they stay exact
+    /// once the graph is promoted.
+    pub f64_data: Option<(Vec<f64>, Vec<f64>)>,
 }
 
 impl RopeTablesStage {
@@ -38,7 +42,36 @@ impl RopeTablesStage {
             cos_data,
             sin_data,
             named_slot: None,
+            f64_data: None,
         }
+    }
+
+    /// `[max_positions, inv_freq.len()]` tables, `cos(pos · inv_freq[i])`,
+    /// carrying their f64 residual (see [`Self::with_f64`]).
+    pub fn from_inv_freq(max_positions: usize, inv_freq: &[f64]) -> Self {
+        let (cos, sin): (Vec<f64>, Vec<f64>) = (0..max_positions)
+            .flat_map(|p| inv_freq.iter().map(move |&f| (p as f64 * f).sin_cos()))
+            .map(|(s, c)| (c, s))
+            .unzip();
+        Self::param(max_positions, inv_freq.len(), Vec::new(), Vec::new()).with_f64(&cos, &sin)
+    }
+
+    /// Publish under a named slot, as [`Self::param_named`] does.
+    pub fn named(mut self, slot: impl Into<String>) -> Self {
+        let slot = slot.into();
+        self.cos_key = format!("rope.{slot}.cos");
+        self.sin_key = format!("rope.{slot}.sin");
+        self.named_slot = Some(slot);
+        self
+    }
+
+    /// Tables from f64 values: f32 as usual and, when this process computes
+    /// in f64, the f64 values too (see [`Self::f64_data`]).
+    pub fn with_f64(mut self, cos: &[f64], sin: &[f64]) -> Self {
+        self.cos_data = cos.iter().map(|&x| x as f32).collect();
+        self.sin_data = sin.iter().map(|&x| x as f32).collect();
+        self.f64_data = f64_format().then(|| (cos.to_vec(), sin.to_vec()));
+        self
     }
 
     /// Bake per-token MRoPE (Qwen-VL / Qwen3.5) cos/sin tables from explicit
@@ -92,6 +125,7 @@ impl RopeTablesStage {
             cos_data,
             sin_data,
             named_slot: Some(slot),
+            f64_data: None,
         }
     }
 
@@ -99,8 +133,16 @@ impl RopeTablesStage {
         let f = DType::F32;
         let cos_shape = Shape::new(&[self.max_positions, self.half_dim], f);
         let sin_shape = Shape::new(&[self.max_positions, self.half_dim], f);
-        let cos_id = ctx.synth_param(&self.cos_key, self.cos_data.clone(), cos_shape);
-        let sin_id = ctx.synth_param(&self.sin_key, self.sin_data.clone(), sin_shape);
+        let (cos_id, sin_id) = match &self.f64_data {
+            Some((cos, sin)) => (
+                ctx.synth_param_f64(&self.cos_key, cos, cos_shape),
+                ctx.synth_param_f64(&self.sin_key, sin, sin_shape),
+            ),
+            None => (
+                ctx.synth_param(&self.cos_key, self.cos_data.clone(), cos_shape),
+                ctx.synth_param(&self.sin_key, self.sin_data.clone(), sin_shape),
+            ),
+        };
         match &self.named_slot {
             Some(slot) => {
                 ctx.state.named.insert(format!("{slot}_cos"), cos_id);

@@ -60,6 +60,13 @@ pub fn unfuse_recurrent_ops(g: Graph) -> Graph {
 /// position, and routing its expansion through the flag-gated function made
 /// the expansion a silent no-op — every `qwen35` model (Qwen3.5/3.6/3.8,
 /// Ternary-Bonsai, Pestle-27B) failed to compile there as a result.
+///
+/// A `carry_state` node updates its state input IN PLACE: the fused kernels
+/// leave the final state in that buffer, and graphs read it back through the
+/// same input node after the scan (Qwen3.5's prefill and decode export it that
+/// way). The expansion computes the final state as a new value, so every node
+/// after the scan that reads the state input is pointed at it instead — or
+/// those reads would silently return the initial state.
 pub fn unfuse_gated_delta_net_always(g: Graph) -> Graph {
     let mut out = Graph::new(g.name.clone());
     let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
@@ -68,7 +75,15 @@ pub fn unfuse_gated_delta_net_always(g: Graph) -> Graph {
     for node in &nodes {
         let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
         let new_id = match &node.op {
-            Op::GatedDeltaNet { .. } => unfuse_gated_delta_net(node, new_inputs, &mut out),
+            Op::GatedDeltaNet { carry_state, .. } => {
+                let (y, final_state) =
+                    unfuse_gated_delta_net_with_state(node, new_inputs, &mut out);
+                if *carry_state && let Some(fs) = final_state {
+                    // Later readers of the state input see the updated state.
+                    id_map.insert(node.inputs[5], fs);
+                }
+                y
+            }
             _ => out.add_node(node.op.clone(), new_inputs, node.shape.clone()),
         };
         id_map.insert(node.id, new_id);

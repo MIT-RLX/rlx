@@ -8,7 +8,8 @@
 //! * `ENCODING=1` + `BITS=4`: OCP FP4 E2M1 nibble → fixed-point via LUT
 //!   (`round(decode(code) * 2)` so 0.5→1); fold the ×2 into requant scales.
 
-use rlx_ir::ScaledFormat;
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 use crate::verilog::V;
 
@@ -92,19 +93,38 @@ pub fn emit() -> String {
     v.into_string()
 }
 
+/// `round(decode(code) * 2)` for every OCP FP4 E2M1 code (all finite).
+/// Spelled out because `f32::round` is not in `core` (MSRV 1.89), so the
+/// `no_std` build cannot compute it; the test below checks it against
+/// `rlx_ir::ScaledFormat`'s decoder.
+const FP4_E2M1_X2: [i32; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 fn fp4_e2m1_lut_lines() -> Vec<String> {
-    let fmt = ScaledFormat::F4E2M1;
     (0u8..16)
         .map(|code| {
-            let f = fmt.decode(code);
-            let q = if f.is_finite() {
-                (f * 2.0).round() as i32
-            } else {
-                0
-            };
+            let q = FP4_E2M1_X2[code as usize];
             // The sign goes outside the sized literal: `32'sd-1` is not Verilog.
             let sign = if q < 0 { "-" } else { "" };
             format!("4'h{code:X}: w_out = {sign}32'sd{};", q.unsigned_abs())
         })
         .collect()
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::FP4_E2M1_X2;
+
+    #[test]
+    fn fp4_lut_matches_rlx_ir_decoder() {
+        let fmt = rlx_ir::ScaledFormat::F4E2M1;
+        for code in 0u8..16 {
+            let f = fmt.decode(code);
+            assert!(f.is_finite(), "code {code}");
+            assert_eq!(
+                FP4_E2M1_X2[code as usize],
+                (f * 2.0).round() as i32,
+                "code {code}"
+            );
+        }
+    }
 }

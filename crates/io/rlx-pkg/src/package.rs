@@ -241,10 +241,22 @@ impl Package {
 
     /// Like [`Self::graph`] with an explicit materialize mode.
     pub fn graph_with(&self, mode: MaterializeMode) -> Result<Graph> {
+        Ok(self.module_with(mode)?.graphs.remove(0))
+    }
+
+    /// Every stored graph, the main one first, with the `.rlxmodel` header:
+    /// the model block, and the rlx versions that wrote it and may read it.
+    /// A package from before modules is one graph and no model block.
+    pub fn module(&self) -> Result<rlx_ir::rlxmodel::Module> {
+        self.module_with(MaterializeMode::HotOnly)
+    }
+
+    /// Like [`Self::module`] with an explicit materialize mode.
+    pub fn module_with(&self, mode: MaterializeMode) -> Result<rlx_ir::rlxmodel::Module> {
         if !self.has_graph() {
             bail!("package has no embedded graph (weight-only / encoding=none)");
         }
-        let mut g: Graph = match &self.source {
+        let mut module = match &self.source {
             MemberSource::Flat { map, .. } => {
                 let (off, len) = self.flat_graph.context("flat graph missing")?;
                 if len == 0 {
@@ -255,15 +267,20 @@ impl Package {
                     .checked_add(len as usize)
                     .context("flat graph range")?;
                 let bytes = map.get(start..end).context("flat graph slice")?;
-                bincode::deserialize(bytes).context("deserialize flat graph")?
+                decode_graph(&self.manifest.graph.encoding, bytes)?
             }
             MemberSource::Dir { .. } | MemberSource::Zip { .. } => {
                 let bytes = self.member_bytes(&self.manifest.graph.path)?;
-                bincode::deserialize(&bytes).context("deserialize graph/mir.bin")?
+                decode_graph(&self.manifest.graph.encoding, &bytes)?
             }
         };
-        self.materialize_graph_weights(&mut g, mode)?;
-        Ok(g)
+        if module.graphs.is_empty() {
+            bail!("package graph member holds no graph");
+        }
+        for g in &mut module.graphs {
+            self.materialize_graph_weights(g, mode)?;
+        }
+        Ok(module)
     }
 
     fn materialize_graph_weights(&self, g: &mut Graph, mode: MaterializeMode) -> Result<()> {
@@ -363,6 +380,23 @@ impl Package {
         {
             let _ = (shard, offset, length);
         }
+    }
+
+    /// Every sidecar's id and media type (when the manifest records one),
+    /// to read with [`Self::sidecar`] or copy into another package.
+    pub fn sidecar_ids(&self) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = self
+            .manifest
+            .sidecars
+            .iter()
+            .map(|s| (s.id.clone(), s.media_type.clone()))
+            .collect();
+        for (id, ..) in &self.flat_sidecars {
+            if !out.iter().any(|(i, _)| i == id) {
+                out.push((id.clone(), None));
+            }
+        }
+        out
     }
 
     /// Sidecar bytes by id (decompresses cold sidecars).
@@ -643,4 +677,21 @@ fn load_placement_zip(
     let bytes = store_zip::read_member_from_map(map, ranges, path)?;
     let pl: Placement = serde_json::from_slice(bytes).context("parsing placement.json")?;
     Ok(Some(pl))
+}
+
+/// The stored graphs in their manifest `encoding`: `.rlxmodel` text, or the
+/// bincode of packages written before it (one graph).
+fn decode_graph(encoding: &str, bytes: &[u8]) -> Result<rlx_ir::rlxmodel::Module> {
+    match encoding {
+        crate::manifest::GRAPH_RLXMODEL => {
+            let text = std::str::from_utf8(bytes).context("graph is not UTF-8 text")?;
+            rlx_ir::rlxmodel::read_module(text).context("read graph")
+        }
+        crate::manifest::GRAPH_BINCODE => bincode::deserialize::<Graph>(bytes)
+            .map(|g| rlx_ir::rlxmodel::Module::new(vec![g]))
+            .context(
+                "read graph (bincode_graph_v1: readable only by the rlx version that wrote it)",
+            ),
+        other => bail!("unsupported graph encoding {other:?}"),
+    }
 }

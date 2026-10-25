@@ -3,6 +3,8 @@
 | Document | Contents |
 |----------|----------|
 | [extending.md](extending.md) | **Extending rlx from downstream** (no core edit): the four seams — `LayerStage` blocks (`ModelFlow::layer_stage` + `FlowCtx` primitive builders + side outputs), custom ops (`OpExtension` + `register_op` + `lower`/kernel/`custom_fn`), backends (`register_backend`), codegen targets (consume `rlx_ir::Graph`); the `rlx-extend` prelude + `just link-local` dev loop |
+| [releasing-bindings.md](releasing-bindings.md) | **Standalone binding releases**: one workspace version stamped into every binding manifest, prebuilt `librlx_capi` bundled under `native/<os>-<arch>/`, the tag-triggered draft GitHub Release, and the manual publish step per registry |
+| [graph-compose.md](graph-compose.md) | **Combining and splitting graphs** (`rlx_ir::compose`): `Graph::splice` / `parallel` / `sequential` with name-shared or prefixed leaves; `extract`, `components`, `partition` / `split_at` with named boundaries and `Partition::merge` |
 | [fk-fusion.md](fk-fusion.md) | FKL-style region fusion: prologue, batch regions, env/session toggles, kernel tuning |
 | [backend-selection.md](backend-selection.md) | Multi-backend runtime: `DevicePolicy`, `GraphDevices`, `DeviceRouter`, env vars, Python API, calibration |
 | [distributed.md](distributed.md) | **Distributed computing**: the layers (Transport→ProcessGroup→Node), collectives, node discovery (static/mDNS/rendezvous), the `dist_job` + `dist_node` examples, and the `rlx_runtime::dist` ship-graph worker |
@@ -20,7 +22,10 @@
 | [rlxp.md](rlxp.md) | **`.rlxp` package format** — flat mmap (default) + hybrid hot/warm/cold, optional ZIP/dir, optional executable MIR graph, sidecars, dist placement, GGUF/ONNX import |
 | [rlx-env-vars.md](rlx-env-vars.md) | **Exhaustive `RLX_*` inventory** — every env / option identifier in the tree, grouped by backend/area, with curated-catalog and code-read marks (`just gen-rlx-env-vars`) |
 | [egpu.md](egpu.md) | **External GPU over USB4/Thunderbolt** (`Device::Egpu`) — what macOS withholds (a class-0x03 driver, not the bus), building `rlx-egpu`, the signed-firmware manifest + `pull_gpu_firmware.sh`, ahead-of-time kernel packs (compile on a ROCm/CUDA host, read with no toolchain), and **how to build the DriverKit extension**: entitlement, IOKit personality, user-client contract, helper wire protocol, signing/notarizing, and pointing rlx at it with `DextConfig` |
+| [troubleshooting.md](troubleshooting.md) | **Start here when something is wrong** — run/compile errors by message, wrong numbers on one device (`cargo rlx debug`), NaN/Inf, slowness, backend-only test failures |
 | [development.md](development.md) | Dev workflow: `just` recipes, pyrlx, tests, dispatch probes, `Op::Scan` unroll / host contract |
+| [adr/](adr/README.md) | **Architecture decision records** — why the prelude is empty, why optimizations are opt-in, what belongs in core vs downstream, why models live out of tree, known failures as data |
+| [rlx-stablehlo](../crates/io/rlx-stablehlo/README.md) | **StableHLO / IREE export** — graph → StableHLO MLIR via the shared rlx-tpu lowering; NCHW kept via `dimension_numbers`; IREE round-trip parity test |
 | [fpga-export.md](fpga-export.md) | **FPGA / SystemVerilog export**: `ExportTarget`, `FpgaExportConfig`, target-agnostic RTL, `HwTarget` matrix |
 | [bitnet-fpga.md](bitnet-fpga.md) | **Ternary (BitNet b1.58) → FPGA**: absmean PTQ, QAT graph rewrite, `ExportQuantMode::Ternary`, openXC7 bitstream + UART run |
 | [kv-retention.md](kv-retention.md) | **Selective KV retention + retrieval** — extending effective context past a fixed resident budget without per-step cost growing with total context: `Full`/`Sinks`/`HeavyHitter`/`Retrieval`/`Auto` policies, `RLX_QWEN3_RETENTION`, and the small-LM retrieval-quality findings |
@@ -33,7 +38,7 @@
 | [benchmarks/coreml-training.md](benchmarks/coreml-training.md) | CoreML on-device training: RLX vs native `MLUpdateTask`, compute-unit sweep, overhead- vs compute-bound regimes (why `cpu`≥`ane`, and why the result flips with model size) |
 | [benchmarks/frameworks-and-backends.md](benchmarks/frameworks-and-backends.md) | MNIST-training comparison **matrix**: every framework × backend, verified/rig/candidate status, `torch.compile`/Keras/MPSGraph/ORT runners, and the CUDA runbook |
 
-Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.18**).
+Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.19**).
 
 Related repo docs:
 

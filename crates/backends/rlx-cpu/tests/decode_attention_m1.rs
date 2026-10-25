@@ -21,7 +21,9 @@ const NKV: usize = 2;
 const DH: usize = 16;
 
 fn val(seed: usize, i: usize) -> f32 {
-    let z = (seed as u64 * 0x9E37_79B9_7F4A_7C15).wrapping_add(i as u64 * 0xBF58_476D_1CE4_E5B9);
+    let z = (seed as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
     ((z >> 40) & 0xffff) as f32 / 65535.0 - 0.5
 }
 

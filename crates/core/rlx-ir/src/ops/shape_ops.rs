@@ -7,6 +7,7 @@
 //! on `GraphExt` in `infer.rs` since they need shape inference.
 
 use crate::op::ScatterNdReduction;
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {

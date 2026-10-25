@@ -644,6 +644,12 @@ pub fn sample(kind: OpKind) -> Op {
         OpKind::Fft => Op::Fft {
             inverse: false,
             norm: crate::fft::FftNorm::Backward,
+            algo: crate::fft::FftAlgo::Native,
+        },
+        OpKind::FftPocketFft => Op::Fft {
+            inverse: false,
+            norm: crate::fft::FftNorm::Backward,
+            algo: crate::fft::FftAlgo::SCIPY,
         },
         OpKind::FftQ => Op::FftQ {
             inverse: false,
@@ -693,6 +699,7 @@ pub fn sample(kind: OpKind) -> Op {
         },
         OpKind::GatedResidual => Op::GatedResidual,
         OpKind::GatedResidualBackward => Op::GatedResidualBackward,
+        OpKind::DynamicUpdateSlice => Op::DynamicUpdateSlice { axis: 1 },
     }
 }
 
@@ -863,6 +870,7 @@ pub const ALL_KINDS: &[OpKind] = &[
     OpKind::Custom,
     OpKind::CustomFn,
     OpKind::Fft,
+    OpKind::FftPocketFft,
     OpKind::FftQ,
     OpKind::FftButterflyStage,
     OpKind::LogMel,
@@ -894,6 +902,7 @@ pub const ALL_KINDS: &[OpKind] = &[
     OpKind::AdaLayerNormBackward,
     OpKind::GatedResidual,
     OpKind::GatedResidualBackward,
+    OpKind::DynamicUpdateSlice,
 ];
 
 // ── arity that depends on a field ──────────────────────────────────────────

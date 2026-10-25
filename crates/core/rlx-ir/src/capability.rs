@@ -33,9 +33,10 @@
 //! of kinds between existing arms rather than touching all 184 of them.
 
 use crate::op::{Op, OpKind};
+use crate::prelude::*;
 
 /// Number of [`OpKind`] variants.
-pub const N_KINDS: usize = 188;
+pub const N_KINDS: usize = 190;
 
 /// Static properties of an op, independent of its operands or attributes.
 ///
@@ -115,7 +116,7 @@ impl OpCaps {
     }
 }
 
-impl std::ops::BitOr for OpCaps {
+impl core::ops::BitOr for OpCaps {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         self.union(rhs)
@@ -285,6 +286,7 @@ impl OpKind {
         OpKind::Custom,
         OpKind::CustomFn,
         OpKind::Fft,
+        OpKind::FftPocketFft,
         OpKind::FftQ,
         OpKind::FftButterflyStage,
         OpKind::LogMel,
@@ -316,6 +318,7 @@ impl OpKind {
         OpKind::AdaLayerNormBackward,
         OpKind::GatedResidual,
         OpKind::GatedResidualBackward,
+        OpKind::DynamicUpdateSlice,
     ];
 
     /// Static capabilities of this op kind.
@@ -472,6 +475,7 @@ impl OpKind {
             | ScaledDequantize
             | Custom
             | Fft
+            | FftPocketFft
             | FftQ
             | FftButterflyStage
             | LogMel
@@ -500,7 +504,8 @@ impl OpKind {
             | EighBatch
             | EighBatchBackward
             | AdaLayerNormBackward
-            | GatedResidualBackward => OpCaps::NONE,
+            | GatedResidualBackward
+            | DynamicUpdateSlice => OpCaps::NONE,
         }
     }
 

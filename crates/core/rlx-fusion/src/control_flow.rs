@@ -5,15 +5,13 @@
 //! Control-flow lowering passes: `Op::If` → `Where` + inlined
 //! branches; `Op::While` → bounded unroll of body replicas.
 //!
-//! Backends that don't have native sub-graph executors run
-//! `LowerControlFlow` BEFORE the legalize / supported-set check so
-//! they never see `Op::If` or `Op::While`. Used by rlx-cpu and
-//! rlx-metal (the runtime-side `run_if` / `run_while` helpers exist
-//! but the executor wiring through their thunk schedules is more
-//! invasive than this rewrite). Other backends (rlx-wgpu, rlx-cuda,
-//! rlx-rocm, rlx-tpu) ship their own per-backend unfuse passes that
-//! do equivalent work — this module is the portable, IR-level
-//! version.
+//! Backends with no run-time loop run `LowerControlFlow` BEFORE the
+//! legalize / supported-set check so they never see `Op::If` or
+//! `Op::While` (MLX, CoreML; the fusion pipeline for any backend that
+//! does not claim `While`). The CPU runs `Op::While` as a loop
+//! (`Thunk::While`), and Metal, CUDA, ROCm and wgpu through their one-op
+//! host fallback: they run [`LowerIf`] instead, which inlines `Op::If`
+//! alone.
 //!
 //! Trade-offs:
 //!   * `Op::If` always evaluates **both** branches in the rewritten
@@ -57,6 +55,24 @@ impl Pass for LowerControlFlow {
     fn run(&self, graph: Graph) -> Graph {
         let g = inline_if(graph);
         unroll_while(g)
+    }
+}
+
+/// [`LowerControlFlow`] for a backend that runs `Op::While` itself (as a
+/// loop at run time: the CPU's `Thunk::While`, the GPU backends' one-op host
+/// fallback): `Op::If` → primitives, `Op::While` kept, unbounded or not.
+pub struct LowerIf;
+
+impl Pass for LowerIf {
+    fn trigger_kinds(&self) -> &[OpKind] {
+        &[OpKind::If]
+    }
+
+    fn name(&self) -> &str {
+        "LowerIf"
+    }
+    fn run(&self, graph: Graph) -> Graph {
+        inline_if(graph)
     }
 }
 

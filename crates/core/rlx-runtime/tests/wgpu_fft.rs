@@ -87,10 +87,7 @@ fn fft_wgpu_multirow_batched_matches_cpu() {
     }
     // Multi-row is opt-in (default off — it regresses on wgpu); force it on so
     // this test still validates the kernel's packing/indexing.
-    // SAFETY: test process sets a process-local gate before compiling.
-    unsafe {
-        std::env::set_var("RLX_FFT_MULTIROW", "1");
-    }
+    rlx_ir::env::set("RLX_FFT_MULTIROW", "1");
     for &n in &[8usize, 64, 256, 512, 1024] {
         for &batch in &[2usize, 3, 7, 16] {
             // Row layout is a 2N real-block: [re[0..n], im[0..n]] per row.

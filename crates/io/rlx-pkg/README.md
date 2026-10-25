@@ -74,7 +74,17 @@ cargo run -p rlx-pkg -- verify model.rlxp
 cargo run -p rlx-pkg -- import-gguf model.gguf -o model.rlxp --no-graph
 cargo run -p rlx-pkg -- convert in.zip -o out.rlxp --container flat
 cargo run -p rlx-pkg -- tier model.rlxp -o out.rlxp --warm expert --hot tok_embd
+cargo run -p rlx-pkg -- import-mlx|import-dduf|import-nemo|import-pt <in> -o out.rlxp
+cargo run -p rlx-pkg -- build model.rlxp -o out.rlxp --target metal --weights f16
 ```
+
+`inspect` shows the model: who wrote it and which rlx may read it, its symbols,
+each function's inputs, outputs, params and variables, its entries and weight
+sources. `build` (`build::build_for_target` / `build_for_targets`) copies a
+package with each portable function also built for a device: `step` gains
+`step:metal`, which a model opened on that device runs instead; weights and
+sidecars are copied as they are. Graphs are stored as `.rlxmodel` text
+(`GRAPH_RLXMODEL`); bincode packages from earlier versions still load.
 
 ONNX → RLXP (optional executable graph) is on **`rlx-bake`**:
 

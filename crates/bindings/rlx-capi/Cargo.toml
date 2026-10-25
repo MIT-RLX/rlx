@@ -1,0 +1,57 @@
+[package]
+name = "rlx-capi"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "C ABI for rlx — graphs, sessions, training, text and weights from any language with C interop (Swift, Go, C#, Java, Ruby, Julia, Zig, …)"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+# Moves with rlx-bind, which is not on crates.io either.
+publish = false
+
+[lib]
+# `staticlib` for Swift / iOS / embedded hosts, `cdylib` for runtimes that
+# load a shared library (Python ctypes, Java Panama, C#, Ruby FFI, Julia),
+# `rlib` so the tests here call the same entry points.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["cpu", "gguf", "weights", "training", "text", "models"]
+
+cpu             = ["rlx-runtime/cpu"]
+blas-accelerate = ["rlx-runtime/blas-accelerate"]
+metal           = ["rlx-runtime/metal"]
+mlx             = ["rlx-runtime/mlx"]
+gpu             = ["rlx-runtime/gpu"]
+cuda            = ["rlx-runtime/cuda"]
+rocm            = ["rlx-runtime/rocm"]
+vulkan          = ["rlx-runtime/vulkan"]
+
+# `rlx_gguf_*` and Trainer checkpoints.
+gguf = ["rlx-bind/gguf-io"]
+# `rlx_convert_to_gguf` — safetensors → GGUF with per-tensor quant schemes.
+gguf-convert = ["gguf", "rlx-bind/gguf-convert"]
+# `rlx_model_*` — models from any provider: `.rlxp` packages and plugins
+# (RLX_MODEL_PLUGINS).
+models = ["rlx-bind/models"]
+# `rlx_export_fpga` — SystemVerilog export.
+fpga = ["rlx-bind/fpga"]
+# `rlx_load_weights`, `rlx_rlxp_*`.
+weights = ["rlx-bind/weights"]
+# `rlx_trainer_*`, `rlx_optimizer_*`.
+training = ["rlx-runtime/training", "rlx-bind/training"]
+# `rlx_tokenizer_*`, `rlx_sampler_*`, `rlx_render_chat`.
+text = ["rlx-bind/text"]
+
+[dependencies]
+rlx-bind    = { workspace = true, features = ["runtime"] }
+rlx-ir      = { workspace = true }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.18", default-features = false }
+
+[lints]
+workspace = true

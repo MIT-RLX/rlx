@@ -9,6 +9,7 @@
 //! that implements `Op::Fft`. Graph-level signal-processing helpers
 //! (`rfft`, `irfft`, `stft`, …) live in [`crate::ops::fft_ops`].
 
+use crate::prelude::*;
 use crate::{DType, Shape};
 
 /// Normalization mode for `Op::Fft`.
@@ -62,6 +63,74 @@ impl FftNorm {
             other => panic!("fft: unknown FftNorm tag {other}"),
         }
     }
+}
+
+/// Which algorithm `Op::Fft` runs, and so how its result is rounded. Every choice
+/// computes the same DFT; they differ in the last bits.
+///
+/// * **`Native`** — RLX's own radix-2/4 Cooley–Tukey (powers of two) and
+///   Bluestein (other lengths). The default; every backend implements it.
+/// * **`PocketFft`** — pocketfft's mixed-radix FFTPACK passes, the library behind
+///   `scipy.fft` and `torch.fft` on CPU, reproduced operation for operation (see
+///   `rlx-pocketfft`). [`FftContraction`] and [`FftTwiddles`] pick the build being
+///   matched; `FftAlgo::SCIPY` is SciPy's macOS arm64 wheel, bit-identical. CPU
+///   runs a native row kernel; every other backend gets it lowered to elementwise
+///   passes (`rlx_fusion::lower_pocketfft`), bit-identical to the CPU wherever
+///   `Binary`/`Fma` round as IEEE does (measured: Metal, MLX, wgpu) but several
+///   times slower than that backend's native FFT (one dispatch per pass op).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftAlgo {
+    #[default]
+    Native,
+    PocketFft {
+        contraction: FftContraction,
+        twiddles: FftTwiddles,
+    },
+}
+
+impl FftAlgo {
+    /// pocketfft as SciPy / torch (CPU) build it for this target.
+    pub const SCIPY: FftAlgo = FftAlgo::PocketFft {
+        contraction: FftContraction::Platform,
+        twiddles: FftTwiddles::Platform,
+    };
+    /// pocketfft built without FMA (an x86-64 SSE2 baseline build).
+    pub const POCKETFFT_NO_FMA: FftAlgo = FftAlgo::PocketFft {
+        contraction: FftContraction::None,
+        twiddles: FftTwiddles::Separate,
+    };
+}
+
+/// Whether pocketfft's `x ± a*b` expressions are fused.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftContraction {
+    /// What SciPy's wheel for this target does: `Clang` on Apple targets, `None`
+    /// elsewhere (the Linux x86-64 wheel is an SSE2 baseline build — measured: no FMA
+    /// instruction in `pypocketfft*.so`).
+    #[default]
+    Platform,
+    /// Where clang `-ffp-contract=on` fuses (one scalar expression, left product
+    /// first) — arm64 builds, and x86-64 builds with FMA.
+    Clang,
+    /// Never; every product rounded.
+    None,
+}
+
+/// How pocketfft's twiddle `cos(a)`, `sin(a)` pairs are evaluated.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftTwiddles {
+    /// What a clang build does on this target (`AppleSinCos` on macOS, else
+    /// `Separate`).
+    #[default]
+    Platform,
+    /// One `__sincos_stret` per angle, as clang merges them on Darwin. macOS only;
+    /// elsewhere `Separate`, which can differ in the last bit.
+    AppleSinCos,
+    /// Separate `cos` / `sin` calls to this target's libm.
+    Separate,
 }
 
 /// Next power of two ≥ `n` (`n == 0` → `1`).

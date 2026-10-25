@@ -10,7 +10,7 @@ extension surface in core, ship the actual op in a separate crate.
 
 ## What's here
 
-- **`SparseTensor`** — CSR (`{row_ptrs, col_indices, values}`) +
+- **`SparseTensor`** — CSR (`{row_ptr, col_idx, values}`) +
   density / nnz / shape metadata.
 - **`Op::Custom("rlx_sparse.lu")`** — symbolic + numeric CSR LU.
 - **`Op::Custom("rlx_sparse.spmv")`** — sparse mat-vec.
@@ -23,13 +23,13 @@ extension surface in core, ship the actual op in a separate crate.
 
 ```toml
 [dependencies]
-rlx-sparse = "0.1"
+rlx-sparse = "0.2"
 ```
 
 For Apple GPU acceleration:
 
 ```toml
-rlx-sparse = { version = "0.1", features = ["metal", "mlx"] }
+rlx-sparse = { version = "0.2", features = ["metal", "mlx"] }
 ```
 
 ## Quickstart

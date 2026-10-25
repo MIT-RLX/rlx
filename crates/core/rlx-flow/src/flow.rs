@@ -29,6 +29,7 @@ pub struct ModelFlow {
     output_names: Vec<String>,
     extra_outputs: Vec<HirNodeId>,
     extension_plan: FlowExtensionPlan,
+    weight_storage: Option<crate::WeightStorage>,
 }
 
 impl ModelFlow {
@@ -41,7 +42,16 @@ impl ModelFlow {
             output_names: vec!["output".into()],
             extra_outputs: Vec::new(),
             extension_plan: FlowExtensionPlan::default(),
+            weight_storage: None,
         }
+    }
+
+    /// Store this flow's dense matmul weights as `storage` says (see
+    /// [`crate::WeightStorage`]); overrides `RLX_WEIGHT_STORAGE`. Without it a
+    /// flow keeps f32 unless the environment opts in.
+    pub fn with_weight_storage(mut self, storage: crate::WeightStorage) -> Self {
+        self.weight_storage = Some(storage);
+        self
     }
 
     /// HIR extensions to apply after assemble, before compile (retroactive plugins).
@@ -111,7 +121,10 @@ impl ModelFlow {
         let mut module =
             GraphModule::hir(&self.name).with_fusion_policy(self.profile.fusion_policy());
         let mut params = HashMap::new();
-        let mut state = FlowState::default();
+        let mut state = FlowState {
+            weight_storage: self.weight_storage,
+            ..FlowState::default()
+        };
         let mut ctx = FlowCtx {
             module,
             params: &mut params,

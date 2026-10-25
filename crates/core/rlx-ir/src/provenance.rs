@@ -4,7 +4,8 @@
 
 //! Cross-stage node provenance — HIR block → MIR node → fusion pass.
 
-use std::fmt;
+use crate::prelude::*;
+use core::fmt;
 
 use crate::hir::HirNodeId;
 use crate::{Graph, NodeId};

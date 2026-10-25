@@ -29,6 +29,8 @@ pub struct Qwen3DecodeLayerSpec {
     pub batch: usize,
     pub qk_norm: bool,
     pub attention_bias: bool,
+    /// A sparse MoE MLP in place of the dense one (this layer's experts).
+    pub moe: Option<super::moe::Qwen3Moe>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +126,8 @@ impl BlockStage for Qwen3DecodeLayerStage {
         let nkv = spec.num_kv_heads;
         let dh = spec.head_dim;
         let batch = spec.batch;
+        // Tokens a step decodes: 1, or a speculative check's several.
+        let tokens = spec.hidden_shape.dim(1).unwrap_static();
 
         // Decode is weight-read-bandwidth bound (batch=1 GEMV): storing the
         // projection weights F16-resident halves the bytes read per token.
@@ -166,9 +170,23 @@ impl BlockStage for Qwen3DecodeLayerStage {
         };
         let o_w = ctx.resolve_linear(&format!("{lp}.self_attn.o_proj.weight"), true, w_dt)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
-        let gate_w = ctx.resolve_linear(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?;
-        let up_w = ctx.resolve_linear(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?;
-        let down_w = ctx.resolve_linear(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?;
+        // The dense SwiGLU, or this layer's experts.
+        let ffn = match &spec.moe {
+            Some(moe) => {
+                let hidden = spec
+                    .hidden_shape
+                    .dims()
+                    .last()
+                    .expect("a hidden dim")
+                    .unwrap_static();
+                super::moe::Mlp::Experts(super::moe::load_moe(ctx, lp.as_str(), moe, hidden)?)
+            }
+            None => super::moe::Mlp::Dense(
+                ctx.resolve_linear(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?,
+                ctx.resolve_linear(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?,
+                ctx.resolve_linear(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?,
+            ),
+        };
         let (q_bias, k_bias, v_bias) = if spec.attention_bias {
             (
                 Some(ctx.load_param(&format!("{lp}.self_attn.q_proj.bias"), false)?),
@@ -228,8 +246,28 @@ impl BlockStage for Qwen3DecodeLayerStage {
         }
 
         let (q_rope_in, k_rope_in) = if let (Some(qng), Some(kng)) = (q_norm_g, k_norm_g) {
-            let q_normed = per_head_rms(&mut gb, q, qng, zero_beta_dh, batch, 1, nh, dh, spec.eps);
-            let k_normed = per_head_rms(&mut gb, k, kng, zero_beta_dh, batch, 1, nkv, dh, spec.eps);
+            let q_normed = per_head_rms(
+                &mut gb,
+                q,
+                qng,
+                zero_beta_dh,
+                batch,
+                tokens,
+                nh,
+                dh,
+                spec.eps,
+            );
+            let k_normed = per_head_rms(
+                &mut gb,
+                k,
+                kng,
+                zero_beta_dh,
+                batch,
+                tokens,
+                nkv,
+                dh,
+                spec.eps,
+            );
             (q_normed, k_normed)
         } else {
             (q, k)
@@ -284,7 +322,13 @@ impl BlockStage for Qwen3DecodeLayerStage {
             let mask = decode
                 .mask
                 .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?;
-            gb.attention(q_rope, k_attn, v_attn, mask, nh, dh, attn_shape)
+            if tokens > 1 {
+                // Several tokens (a speculative check): each query its own
+                // row, `mask` an additive `[batch, heads, tokens, keys]` bias.
+                gb.attention_bias(q_rope, k_attn, v_attn, mask, nh, dh, attn_shape)
+            } else {
+                gb.attention(q_rope, k_attn, v_attn, mask, nh, dh, attn_shape)
+            }
         } else {
             gb.attention_kind(q_rope, k_attn, v_attn, nh, dh, MaskKind::Causal, attn_shape)
         };
@@ -292,11 +336,22 @@ impl BlockStage for Qwen3DecodeLayerStage {
         let attn_out = o_w.emit(&mut gb, attn);
         let post_attn = gb.add(skip, attn_out);
         let normed_post = gb.rms_norm(post_attn, post_ln_g, zero_beta_h, spec.eps);
-        let gate = gate_w.emit(&mut gb, normed_post);
-        let up = up_w.emit(&mut gb, normed_post);
-        let gate_act = gb.silu(gate);
-        let swiglu = gb.mul(gate_act, up);
-        let ffn_out = down_w.emit(&mut gb, swiglu);
+        let ffn_out = match &ffn {
+            super::moe::Mlp::Dense(gate_w, up_w, down_w) => {
+                let gate = gate_w.emit(&mut gb, normed_post);
+                let up = up_w.emit(&mut gb, normed_post);
+                let gate_act = gb.silu(gate);
+                let swiglu = gb.mul(gate_act, up);
+                down_w.emit(&mut gb, swiglu)
+            }
+            super::moe::Mlp::Experts(w) => super::moe::emit_moe(
+                &mut gb,
+                normed_post,
+                w,
+                spec.moe.as_ref().expect("experts"),
+                &spec.hidden_shape,
+            ),
+        };
         let h_id = gb.add(post_attn, ffn_out);
 
         Ok(Some(ctx.wrap(h_id, spec.hidden_shape.clone())))

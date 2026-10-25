@@ -842,13 +842,14 @@ fn emit_pool_indices(
         vec![n as i64, c as i64, oh as i64, ow as i64, (kh * kw) as i64],
     );
 
-    let picked = m.add_node(
+    let picked = super::reduce::arg_reduce_i64(
+        m,
         Op::ArgMax {
             axis: 4,
             keep_dim: false,
         },
-        vec![flat],
-        Shape::new(&[n, c, oh, ow], DType::I64),
+        flat,
+        &[n, c, oh, ow].map(Dim::Static),
     );
 
     // Offset within the window, indexed by the argmax: row-major (a, b) sits

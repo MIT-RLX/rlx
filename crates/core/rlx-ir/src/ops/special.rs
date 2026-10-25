@@ -5,6 +5,7 @@
 //! Specialised builders: SSM selective scan + space for future
 //! exotic ops (plan #53).
 
+use crate::prelude::*;
 use crate::shape::Dim;
 use crate::{DType, Graph, NodeId, Op, Shape};
 

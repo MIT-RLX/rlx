@@ -23,6 +23,11 @@ android/.gradle/
 android/app/build/
 android/**/intermediates/
 
+# SwiftPM build output for the Swift binding
+crates/bindings/rlx-swift/.build/
+crates/bindings/rlx-swift/.swiftpm/
+crates/bindings/rlx-swift/build/
+
 .env
 .env.local
 .DS_Store
@@ -94,8 +99,13 @@ ios/Demo/Sources/Info.plist
 
 # Assembled standalone demo site (build artifact of tools/build_site.py).
 crates/bindings/rlx-web/site/
+# The GitHub Pages site (`just build-pages`; CI assembles its own).
+/_site/
 # The page sources in examples/tab-cluster/ are committed so the folder is
 # browsable, but its wasm bundle is an 8.4 MB build artifact — rebuild it with
 # `just build-cluster-site`. Drop this line if the folder should deploy
 # straight from a clone, knowing the binary then lives in history forever.
 examples/*/pkg/
+
+# Packaged binding releases (`just package-bindings`, scripts/bindings_release.py).
+/dist/

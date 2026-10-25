@@ -60,6 +60,22 @@ impl FuseSwiGLUDualMatmul {
         if up_mm.inputs[0] != gate_mm.inputs[0] {
             return None;
         }
+        // The fused node reads `Concat(up_w, gate_w)`, an activation of the
+        // weights' dtype; Metal and wgpu/Vulkan widen a BF16 activation to f32
+        // and their Concat misread packed BF16 params (see
+        // `FuseSharedInputMatMul`). Same dtype only, and not BF16.
+        let (wu_dt, wg_dt) = (
+            graph.shape(up_mm.inputs[1]).dtype(),
+            graph.shape(gate_mm.inputs[1]).dtype(),
+        );
+        if wu_dt != wg_dt || wu_dt == rlx_ir::DType::BF16 {
+            return None;
+        }
+        // `[K, N]` weights only: a batched `[B, K, N]` pair (an expert per
+        // batch row) concatenates along another axis than the one below.
+        if graph.shape(up_mm.inputs[1]).rank() != 2 || graph.shape(gate_mm.inputs[1]).rank() != 2 {
+            return None;
+        }
         // All three of these are absorbed into the fused node below, so all
         // three must be safe to delete: exactly one consumer and not exported.
         // Checking only the silu left the two matmuls to be dropped even when
@@ -192,3 +208,46 @@ impl Pass for FuseSwiGLUDualMatmul {
 }
 
 // ── Pass 3: Shared-input MatMul concat (QKV, SwiGLU fc11+fc12) ──────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::infer::GraphExt;
+
+    /// `silu(x·wg) · (x·wu)` for weights `w` (`[.., K, N]`), `x` `[.., 4, K]`.
+    fn swiglu(w: &[usize]) -> Graph {
+        let mut g = Graph::new("swiglu");
+        let r = w.len();
+        let mut x_dims = w[..r - 2].to_vec();
+        x_dims.extend([4, w[r - 2]]);
+        let x = g.input("x", Shape::new(&x_dims, DType::F32));
+        let wg = g.param("wg", Shape::new(w, DType::F32));
+        let wu = g.param("wu", Shape::new(w, DType::F32));
+        let gate = g.mm(x, wg);
+        let up = g.mm(x, wu);
+        let a = g.silu(gate);
+        let out = g.mul(a, up);
+        g.set_outputs(vec![out]);
+        g
+    }
+
+    /// `[K, N]` weights fuse; a batched `[B, K, N]` pair (an expert per batch
+    /// row) is left as it is.
+    #[test]
+    fn only_two_dimensional_weights_fuse() {
+        let fused = FuseSwiGLUDualMatmul.run(swiglu(&[8, 5]));
+        assert!(
+            fused
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::FusedSwiGLU { .. }))
+        );
+        let batched = FuseSwiGLUDualMatmul.run(swiglu(&[2, 8, 5]));
+        assert!(
+            !batched
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::FusedSwiGLU { .. }))
+        );
+    }
+}

@@ -14,7 +14,7 @@ use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuIoF32;
 
 fn envn(k: &str, d: &str) -> usize {
-    std::env::var(k)
+    rlx_ir::env::read(k)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| d.parse().unwrap())

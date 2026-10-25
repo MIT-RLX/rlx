@@ -1661,11 +1661,13 @@ pub(crate) fn encode_gather(
     num_idx: u32,
     trailing: u32,
     dt: crate::thunk::HalfFlag,
+    idx_dt: crate::thunk::HalfFlag,
 ) {
     use crate::thunk::HalfFlag;
-    let pipeline = match dt {
-        HalfFlag::F32 => &k.gather_axis0,
-        HalfFlag::F16 => &k.gather_axis0_h,
+    let pipeline = match (dt, idx_dt) {
+        (HalfFlag::F32, _) => &k.gather_axis0,
+        (HalfFlag::F16, HalfFlag::F16) => &k.gather_axis0_h,
+        (HalfFlag::F16, HalfFlag::F32) => &k.gather_axis0_h_fidx,
     };
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(table_buf), table as u64);
@@ -2610,6 +2612,10 @@ pub(crate) fn encode_sdpa(
             && head_dim <= 32
             && v_head_dim == head_dim
             && rlx_ir::env::flag("RLX_METAL_FA");
+        // The one-query kernels read an additive bias (mask kind 3) as
+        // `[B, H, 1, Lk]`. They once had no bias branch and attended to every
+        // key; `sdpa_long`, the fallback that applied it, ran one thread per
+        // head and cost ~50 ms per call at Lk = 2048.
         let use_decode_m1 = seq == 1
             && kv_seq != seq
             && head_dim <= 512
@@ -2637,9 +2643,26 @@ pub(crate) fn encode_sdpa(
         // Tiled flash-attention prefill (fixes O(seq²) sdpa_long at head_dim=128).
         // Default for multi-row F32 prefill; the K/V tile is staged to tg memory
         // (≈Br× less DRAM than sdpa_long). Handles causal / padding / sliding /
-        // no-mask; additive-bias (mask_kind==3) still uses sdpa_long. Off with
-        // RLX_METAL_PREFILL_FA=0.
+        // additive bias / no mask (a speculative check's bias ran 25× slower in
+        // sdpa_long, one thread per head). Off with RLX_METAL_PREFILL_FA=0.
+        // FlashAttention-2-style prefill (`sdpa_prefill_fa2_d{64,128}`): 32 query
+        // rows per threadgroup with Q and O in simdgroup-matrix registers. 3-6×
+        // the scalar/MMA `sdpa_prefill_fa` at head_dim 128 over long sequences;
+        // same masks and layouts. Symmetric head_dim 64 or 128 only; short
+        // queries keep the 8-row kernel. Off with RLX_METAL_PREFILL_FA2=0.
+        let use_prefill_fa2 = seq >= 16
+            && !use_mma
+            && !use_fa2
+            && !use_splitk
+            && !use_fa
+            && matches!(dt, HalfFlag::F32)
+            && (head_dim == 128 || head_dim == 64)
+            && (v_head_dim == 0 || v_head_dim == head_dim)
+            // float4 row loads/stores: every operand 16-byte aligned.
+            && [q, k_off, v, out].iter().all(|o| o % 16 == 0)
+            && rlx_ir::env::var("RLX_METAL_PREFILL_FA2").as_deref() != Some("0");
         let use_prefill_fa = seq > 1
+            && !use_prefill_fa2
             && !use_mma
             && !use_fa2
             && !use_splitk
@@ -2647,7 +2670,6 @@ pub(crate) fn encode_sdpa(
             && matches!(dt, HalfFlag::F32)
             && head_dim <= 128
             && v_head_dim <= 128
-            && mask_kind != 3
             && rlx_ir::env::var("RLX_METAL_PREFILL_FA").as_deref() != Some("0");
         // simdgroup-MMA variant (score/PV matmuls on the Apple tensor units).
         // Opt-in (RLX_METAL_PREFILL_FA_MMA=1): measured a WASH vs the scalar FA
@@ -2662,8 +2684,12 @@ pub(crate) fn encode_sdpa(
         // per head → 55% of TTFT). Route it to the head-dim-split prefill kernel
         // (32 lanes each own head_dim/32 dims, per-key simd_sum). F32 only,
         // dims %32-aligned; off with RLX_METAL_PREFILL_HD256=0.
+        // The kernel's per-lane registers hold head_dim/32 values, sized for
+        // head_dim <= 512 (`MAX_DPL`); wider heads fall through to sdpa_long.
         let use_prefill_hd256 = seq > 1
             && head_dim > 128
+            && head_dim <= 512
+            && v_head_dim <= 512
             && head_dim.is_multiple_of(32)
             && v_head_dim.is_multiple_of(32)
             && matches!(dt, HalfFlag::F32)
@@ -2679,6 +2705,13 @@ pub(crate) fn encode_sdpa(
                 crate::prefill_stats::record_sdpa_prefill_fa();
             }
             &k.sdpa_fa_f32
+        } else if use_prefill_fa2 {
+            crate::prefill_stats::record_sdpa_prefill_fa();
+            if head_dim == 128 {
+                &k.sdpa_prefill_fa2_d128
+            } else {
+                &k.sdpa_prefill_fa2_d64
+            }
         } else if use_prefill_fa {
             crate::prefill_stats::record_sdpa_prefill_fa();
             if use_prefill_fa_mma {
@@ -2913,6 +2946,19 @@ pub(crate) fn encode_sdpa(
             };
             let tg = crate::mtl::MTLSize {
                 width: 64,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_thread_groups(grid, tg);
+        } else if use_prefill_fa2 {
+            // 32 query rows (4 simdgroups x 8) per threadgroup.
+            let grid = crate::mtl::MTLSize {
+                width: seq.div_ceil(32) as u64,
+                height: heads as u64,
+                depth: batch as u64,
+            };
+            let tg = crate::mtl::MTLSize {
+                width: 128,
                 height: 1,
                 depth: 1,
             };
@@ -4995,6 +5041,16 @@ pub(crate) fn encode_arena_cast(
 pub(crate) fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
     for node in graph.nodes() {
+        // A plain MatMul over a packed BF16 weight Param unpacks that weight
+        // into this same scratch (`Thunk::Sgemm { b_bf16 }`).
+        if matches!(node.op, Op::MatMul)
+            && let Some(&b) = node.inputs.get(1)
+            && graph.node(b).shape.dtype() == rlx_ir::DType::BF16
+            && matches!(graph.node(b).op, Op::Param { .. })
+        {
+            let elems = graph.node(b).shape.num_elements().unwrap_or(0);
+            max = max.max(elems * std::mem::size_of::<f32>());
+        }
         if let Op::DequantMatMul { scheme } = &node.op
             && scheme.is_gguf()
         {
@@ -5235,6 +5291,48 @@ pub(crate) fn encode_qk_mm_f32(
 /// kernel has `threadgroup_barrier`s in its k loop, so the group size must be
 /// exact and out-of-range columns are clamped inside the kernel rather than
 /// dropped by the dispatch.
+/// `q8_0_mm_f32_sg`: one 256-thread group per 64×64 output tile, row tiles
+/// fastest. Must match `Q80_SG_T` in `dequant_gguf.msl`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q8_0_mm_f32_sg(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    buffer: &crate::mtl::Buffer,
+    x: usize,
+    w_q: usize,
+    dst: usize,
+    m_dim: usize,
+    k_dim: usize,
+    n_dim: usize,
+) {
+    enc.set_compute_pipeline_state(&k.q8_0_mm_f32_sg);
+    enc.set_buffer(0, Some(buffer), 0);
+    let x_u = x as u64;
+    enc.set_bytes(1, 8, &x_u as *const u64 as *const _);
+    let w_u = w_q as u64;
+    enc.set_bytes(2, 8, &w_u as *const u64 as *const _);
+    let d_u = dst as u64;
+    enc.set_bytes(3, 8, &d_u as *const u64 as *const _);
+    let m_u = m_dim as u32;
+    enc.set_bytes(4, 4, &m_u as *const u32 as *const _);
+    let k_u = k_dim as u32;
+    enc.set_bytes(5, 4, &k_u as *const u32 as *const _);
+    let n_u = n_dim as u32;
+    enc.set_bytes(6, 4, &n_u as *const u32 as *const _);
+    const T: u64 = 64;
+    let grid = crate::mtl::MTLSize {
+        width: (m_dim as u64).div_ceil(T),
+        height: (n_dim as u64).div_ceil(T),
+        depth: 1,
+    };
+    let tg = crate::mtl::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(grid, tg);
+}
+
 pub(crate) fn encode_qk_mm_f32_xs(
     enc: &crate::mtl::ComputeCommandEncoderRef,
     pipeline: &crate::mtl::ComputePipelineState,
@@ -7951,6 +8049,35 @@ pub(crate) fn encode_conv2d(
     let kshape: [u32; 4] = [kh, kw, sh, sw];
     let padd: [u32; 4] = [ph, pw, dh, dw];
     let w1 = w == 1 && w_out == 1;
+    // Implicit-GEMM path: ungrouped convs big enough to fill a 64×64 tile
+    // somewhere. Off-switch: RLX_METAL_CONV2D_SG_DISABLE.
+    if groups == 1
+        && !w1
+        && (c_out >= 16 && h_out * w_out >= 64)
+        && !rlx_ir::env::flag("RLX_METAL_CONV2D_SG_DISABLE")
+    {
+        enc.set_compute_pipeline_state(&k.conv2d_sg);
+        enc.set_buffer(0, Some(buffer), src as u64);
+        enc.set_buffer(1, Some(buffer), weight as u64);
+        enc.set_buffer(2, Some(buffer), dst as u64);
+        enc.set_bytes(3, 16, nch.as_ptr() as *const _);
+        enc.set_bytes(4, 16, out_dims.as_ptr() as *const _);
+        enc.set_bytes(5, 16, kshape.as_ptr() as *const _);
+        enc.set_bytes(6, 16, padd.as_ptr() as *const _);
+        enc.dispatch_thread_groups(
+            crate::mtl::MTLSize {
+                width: (u64::from(h_out) * u64::from(w_out)).div_ceil(64),
+                height: u64::from(c_out).div_ceil(64),
+                depth: u64::from(n),
+            },
+            crate::mtl::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return;
+    }
     if w1 {
         enc.set_compute_pipeline_state(&k.conv2d_w1);
     } else {
@@ -10287,6 +10414,38 @@ pub(crate) fn encode_concat_midaxis(
         // dropped its cast), CONVERT (read f32, write half) instead of reading
         // f32 bytes as half (→ inf/NaN saturation).
         let src_dt = input_dts.get(seg_i).copied().unwrap_or(dt);
+        // One outer row: the segment is a single contiguous block. Copy it
+        // four floats per thread instead of one element per index decode.
+        let dst_seg = dst as u64 + axis_off as u64 * inner_e * 4;
+        if outer == 1
+            && matches!((src_dt, dt), (HalfFlag::F32, HalfFlag::F32))
+            && total.is_multiple_of(4)
+            && dst_seg.is_multiple_of(16)
+            && (src_off as u64).is_multiple_of(16)
+            && total / 4 <= u32::MAX as u64
+        {
+            let n4 = (total / 4) as u32;
+            let src_byte = src_off as u64;
+            enc.set_compute_pipeline_state(&k.copy_f32x4);
+            enc.set_buffer(0, Some(buffer), 0);
+            enc.set_bytes(1, 8, &dst_seg as *const u64 as *const _);
+            enc.set_bytes(2, 8, &src_byte as *const u64 as *const _);
+            enc.set_bytes(3, 4, &n4 as *const u32 as *const _);
+            enc.dispatch_threads(
+                crate::mtl::MTLSize {
+                    width: n4 as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                crate::mtl::MTLSize {
+                    width: 256u64.min(n4 as u64).max(1),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            axis_off += src_axis;
+            continue;
+        }
         let pipeline = match (src_dt, dt) {
             (HalfFlag::F32, HalfFlag::F16) => &k.concat_midaxis_seg_f32_to_f16,
             (HalfFlag::F16, HalfFlag::F32) => &k.concat_midaxis_seg_f16_to_f32,
@@ -10589,7 +10748,7 @@ pub(crate) fn encode_round_to_format(
         emax: format.emax(),
         max_normal: format.max_normal,
     };
-    let threads = if mode == 2 {
+    let threads = if mode >= 2 {
         (n / last_dim) * last_dim.div_ceil(p.block)
     } else {
         n
@@ -10617,6 +10776,122 @@ pub(crate) fn encode_round_to_format(
         },
         crate::mtl::MTLSize {
             width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// `DfParams` in `kernels::DF_MSL`.
+#[repr(C)]
+#[derive(Default)]
+struct DfParams {
+    len: u32,
+    rank: u32,
+    op: u32,
+    k: u32,
+    m: u32,
+    n: u32,
+    a_batch: u32,
+    b_batch: u32,
+    red_len: u32,
+    kept_rank: u32,
+    red_rank: u32,
+    pad: u32,
+    d0: [u32; 8],
+    s0: [u32; 8],
+    s1: [u32; 8],
+    d1: [u32; 8],
+    s2: [u32; 8],
+}
+
+/// `Op::DoubleSingle`: one thread per output pair.
+pub(crate) fn encode_double_single(
+    enc: &crate::mtl::ComputeCommandEncoderRef,
+    k: &crate::kernels::Kernels,
+    op: &rlx_ir::double_single::DfOp,
+    plan: &rlx_ir::double_single::DfPlan,
+    a: (&crate::mtl::Buffer, usize),
+    b: (&crate::mtl::Buffer, usize),
+    dst: (&crate::mtl::Buffer, usize),
+) {
+    use rlx_ir::double_single::DfPlan;
+    let mut p = DfParams::default();
+    let pipe = match plan {
+        DfPlan::Elementwise {
+            len,
+            rank,
+            out_dims,
+            a_strides,
+            b_strides,
+        } => {
+            p.len = *len as u32;
+            p.rank = *rank as u32;
+            p.op = op.code();
+            p.d0 = *out_dims;
+            p.s0 = *a_strides;
+            p.s1 = *b_strides;
+            &k.df_elementwise
+        }
+        DfPlan::MatMul {
+            batch,
+            m,
+            k: kk,
+            n,
+            a_batch,
+            b_batch,
+        } => {
+            p.len = (batch * m * n) as u32;
+            p.m = *m as u32;
+            p.k = *kk as u32;
+            p.n = *n as u32;
+            p.a_batch = *a_batch as u32;
+            p.b_batch = *b_batch as u32;
+            &k.df_matmul
+        }
+        DfPlan::Sum {
+            out_len,
+            red_len,
+            kept_rank,
+            kept_dims,
+            kept_strides,
+            red_rank,
+            red_dims,
+            red_strides,
+        } => {
+            p.len = *out_len as u32;
+            p.op = op.code();
+            p.red_len = *red_len as u32;
+            p.kept_rank = *kept_rank as u32;
+            p.red_rank = *red_rank as u32;
+            p.d0 = *kept_dims;
+            p.s0 = *kept_strides;
+            p.d1 = *red_dims;
+            p.s2 = *red_strides;
+            &k.df_sum
+        }
+    };
+    if p.len == 0 {
+        return;
+    }
+    enc.set_compute_pipeline_state(pipe);
+    enc.set_buffer(0, Some(a.0), a.1 as u64);
+    enc.set_buffer(1, Some(b.0), b.1 as u64);
+    enc.set_buffer(2, Some(dst.0), dst.1 as u64);
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<DfParams>() as u64,
+        &p as *const DfParams as *const _,
+    );
+    let tg = pipe.thread_execution_width().min(p.len as u64);
+    enc.dispatch_threads(
+        crate::mtl::MTLSize {
+            width: p.len as u64,
+            height: 1,
+            depth: 1,
+        },
+        crate::mtl::MTLSize {
+            width: tg,
             height: 1,
             depth: 1,
         },

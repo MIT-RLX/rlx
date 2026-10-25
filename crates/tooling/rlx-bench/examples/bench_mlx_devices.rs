@@ -37,7 +37,7 @@ fn mlx_device_label() -> String {
         if name.is_empty() {
             format!(
                 "mlx(env={})",
-                env::var("RLX_MLX_DEVICE").unwrap_or_else(|_| "default".into())
+                rlx_ir::env::var_result("RLX_MLX_DEVICE").unwrap_or_else(|_| "default".into())
             )
         } else {
             format!("mlx({name})")
@@ -50,7 +50,7 @@ fn mlx_device_label() -> String {
 }
 
 fn run_matmul_sweep(leg: &str) -> i32 {
-    let host = env::var("RLX_RIG_RUNTIME").unwrap_or_else(|_| "local".into());
+    let host = rlx_ir::env::var_result("RLX_RIG_RUNTIME").unwrap_or_else(|_| "local".into());
     println!(
         "rlx-bench mlx devices — leg={leg} host={host} backend={}",
         mlx_device_label()

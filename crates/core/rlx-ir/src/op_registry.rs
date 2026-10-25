@@ -40,8 +40,11 @@
 //! `infer_shape` and `vjp` receive them and decode as the impl sees
 //! fit. This matches XLA's `HloCustomCall` / JAX's `jax.ffi`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use crate::collections::HashMap;
+use crate::prelude::*;
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use std::sync::{OnceLock, RwLock};
 
 use crate::{Graph, Node, NodeId, Shape};
 
@@ -238,10 +241,12 @@ pub trait OpExtension: Send + Sync {
 
 /// Global registry. Read-mostly: backed by `RwLock` over a name-keyed
 /// `HashMap`.
+#[cfg(feature = "std")]
 pub struct OpRegistry {
     ops: RwLock<HashMap<String, Arc<dyn OpExtension>>>,
 }
 
+#[cfg(feature = "std")]
 impl OpRegistry {
     pub fn new() -> Self {
         Self {
@@ -310,8 +315,8 @@ pub enum CustomOpError {
     AlreadyRegistered(String),
 }
 
-impl std::fmt::Display for CustomOpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for CustomOpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CustomOpError::NotRegistered(n) => write!(
                 f,
@@ -332,8 +337,9 @@ impl std::fmt::Display for CustomOpError {
     }
 }
 
-impl std::error::Error for CustomOpError {}
+impl core::error::Error for CustomOpError {}
 
+#[cfg(feature = "std")]
 impl Default for OpRegistry {
     fn default() -> Self {
         Self::new()
@@ -341,33 +347,43 @@ impl Default for OpRegistry {
 }
 
 /// Process-wide default registry. Lazily initialized on first access.
+#[cfg(feature = "std")]
 pub fn global_registry() -> &'static OpRegistry {
     static REGISTRY: OnceLock<OpRegistry> = OnceLock::new();
     REGISTRY.get_or_init(OpRegistry::new)
 }
 
 /// Convenience: register an op with the global registry.
+#[cfg(feature = "std")]
 pub fn register_op(op: Arc<dyn OpExtension>) {
     global_registry().register(op);
 }
 
 /// Convenience: register with the global registry, erroring on a name clash
 /// (strict variant of [`register_op`]).
+#[cfg(feature = "std")]
 pub fn register_op_strict(op: Arc<dyn OpExtension>) -> Result<(), CustomOpError> {
     global_registry().try_register(op)
 }
 
 /// Convenience: look up an op in the global registry.
 pub fn lookup_op(name: &str) -> Option<Arc<dyn OpExtension>> {
-    global_registry().lookup(name)
+    #[cfg(feature = "std")]
+    return global_registry().lookup(name);
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 /// Convenience: whether an op name is registered in the global registry.
 pub fn is_op_registered(name: &str) -> bool {
-    global_registry().contains(name)
+    lookup_op(name).is_some()
 }
 
-#[cfg(test)]
+// `OpRegistry` (the global one's backing store) needs `std`.
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::{DType, Shape};

@@ -23,18 +23,26 @@
 //! | Compile | `Session`, `FusionOptions`, `FlexibleSession` |
 //! | Execute | `CompiledGraph` — `set_param` / `run` (f32) and `_typed` variants |
 //! | Multi-backend | `GraphDevices`, `DeviceRouter`, `DevicePolicy` |
-//! | Transforms | `grad`, `jvp`, `hvp`, `vmap`, `nth_order_grad` |
+//! | Transforms | `grad`, `jvp`, `hvp`, `vmap`, `nth_order_grad`, `directional_nth_grad` |
+//! | Compose | `splice`, `parallel`, `sequential`, `extract`, `Partition` (`split_at`, `components`, `merge`) |
+//! | Check | `check`, `check_backends` — device-free static diagnostics |
 //! | GGUF | `quantize`, `dequant`, `load_gguf`, `write_gguf`, `convert_to_gguf`, `GgufFile` |
-//! | RLXP | `load_rlxp`, `convert_gguf_to_rlxp`, `convert_mlx_to_rlxp`, `convert_dduf_to_rlxp`, `convert_nemo_to_rlxp`, `convert_pt_to_rlxp` |
+//! | RLXP | `load_rlxp`, `verify_rlxp`, `convert_gguf_to_rlxp`, `convert_mlx_to_rlxp`, `convert_dduf_to_rlxp`, `convert_nemo_to_rlxp`, `convert_pt_to_rlxp` |
 //! | Weights | `load_mlx`, `load_dduf`, `load_nemo`, `load_pt` |
+//! | Train | `Trainer`, `Optimizer` *(feature `training`)* |
+//! | Text | `load_tokenizer`, `Tokenizer`, `Sampler`, `sample_next`, `argmax`, `render_chat` *(feature `text`)* |
 //!
 //! Graphs are consumed at compile time. Use `pyrlx.set_param` / `pyrlx.run` in
 //! Python for dtype-aware NumPy I/O without manual byte packing.
 use pyo3::prelude::*;
 
 mod autodiff;
+mod bind;
+mod check;
+mod compose;
 mod device;
 mod device_router;
+mod dist;
 mod dtype;
 #[cfg(feature = "fpga")]
 mod export_fpga;
@@ -45,9 +53,41 @@ mod gguf;
 mod gguf_convert;
 mod graph;
 mod graph_devices;
+#[cfg(feature = "models")]
+mod model;
+mod policy;
 mod rlxp;
 mod session;
+#[cfg(feature = "text")]
+mod text;
+#[cfg(feature = "training")]
+mod train;
 mod weights_io;
+
+/// The runtime API table's names for this build, for `tests/test_api_contract.py`:
+/// `(required, known)` — every row this build's features cover, and those plus
+/// every row and host-only name (the reverse check's allow list).
+#[pyfunction]
+fn _api_contract() -> (Vec<String>, Vec<String>) {
+    let enabled = |feature: &str| match feature {
+        "gguf" | "weights" => true,
+        "training" => cfg!(feature = "training"),
+        "text" => cfg!(feature = "text"),
+        "gguf-convert" => cfg!(feature = "gguf-convert"),
+        "fpga" => cfg!(feature = "fpga"),
+        "models" => cfg!(feature = "models"),
+        other => panic!("api.idl names a feature pyrlx does not map: {other}"),
+    };
+    let required = rlx_bind::api::contract("py", enabled);
+    let mut known = rlx_bind::api::contract("py", |_| true);
+    known.extend(
+        rlx_bind::api::api()
+            .host("py")
+            .into_iter()
+            .map(str::to_string),
+    );
+    (required, known)
+}
 
 /// Module init — `import pyrlx._pyrlx`.
 #[pymodule]
@@ -64,11 +104,19 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(autodiff::nth_order_grad, m)?)?;
     m.add_function(wrap_pyfunction!(autodiff::directional_nth_grad, m)?)?;
     m.add_function(wrap_pyfunction!(autodiff::vmap_py, m)?)?;
+    m.add_function(wrap_pyfunction!(compose::splice, m)?)?;
+    m.add_function(wrap_pyfunction!(compose::parallel, m)?)?;
+    m.add_function(wrap_pyfunction!(compose::sequential, m)?)?;
+    m.add_function(wrap_pyfunction!(compose::extract, m)?)?;
+    m.add_class::<compose::PyPartition>()?;
+    m.add_function(wrap_pyfunction!(check::check, m)?)?;
+    m.add_function(wrap_pyfunction!(check::check_backends, m)?)?;
 
     #[cfg(feature = "fpga")]
     m.add_function(wrap_pyfunction!(export_fpga::export_fpga, m)?)?;
 
     m.add_class::<graph::PyGraph>()?;
+    bind::add_aliases(&m.py().get_type_bound::<graph::PyGraph>())?;
     m.add_class::<session::PySession>()?;
     m.add_class::<session::PyCompiled>()?;
     m.add_class::<fusion_options::PyFusionOptions>()?;
@@ -85,6 +133,7 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gguf::load_gguf, m)?)?;
     m.add_function(wrap_pyfunction!(gguf::write_gguf, m)?)?;
     m.add_function(wrap_pyfunction!(rlxp::load_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::verify_rlxp, m)?)?;
     m.add_function(wrap_pyfunction!(rlxp::convert_gguf_to_rlxp, m)?)?;
     m.add_function(wrap_pyfunction!(rlxp::convert_mlx_to_rlxp, m)?)?;
     m.add_function(wrap_pyfunction!(rlxp::convert_dduf_to_rlxp, m)?)?;
@@ -94,12 +143,39 @@ fn _pyrlx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(weights_io::load_dduf, m)?)?;
     m.add_function(wrap_pyfunction!(weights_io::load_nemo, m)?)?;
     m.add_function(wrap_pyfunction!(weights_io::load_pt, m)?)?;
+    m.add_function(wrap_pyfunction!(weights_io::load_weights, m)?)?;
+    m.add_function(wrap_pyfunction!(rlxp::to_rlxp, m)?)?;
+    m.add_function(wrap_pyfunction!(dist::loopback_peers, m)?)?;
+    m.add_class::<dist::PyGroup>()?;
     #[cfg(feature = "gguf-convert")]
     {
         m.add_function(wrap_pyfunction!(gguf_convert::convert_to_gguf, m)?)?;
         m.add_class::<gguf_convert::PyConvertReport>()?;
     }
 
+    #[cfg(feature = "training")]
+    {
+        m.add_class::<train::PyOptimizer>()?;
+        m.add_class::<train::PyTrainer>()?;
+    }
+    #[cfg(feature = "models")]
+    {
+        m.add_class::<model::PyModel>()?;
+        m.add_function(wrap_pyfunction!(model::model_providers, m)?)?;
+        m.add_function(wrap_pyfunction!(model::load_model_plugin, m)?)?;
+        m.add_function(wrap_pyfunction!(model::save_model, m)?)?;
+    }
+    #[cfg(feature = "text")]
+    {
+        m.add_class::<text::PyTokenizer>()?;
+        m.add_class::<text::PySampler>()?;
+        m.add_function(wrap_pyfunction!(text::load_tokenizer, m)?)?;
+        m.add_function(wrap_pyfunction!(text::argmax, m)?)?;
+        m.add_function(wrap_pyfunction!(text::sample_next, m)?)?;
+        m.add_function(wrap_pyfunction!(text::render_chat, m)?)?;
+    }
+
+    m.add_function(wrap_pyfunction!(_api_contract, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

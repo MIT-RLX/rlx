@@ -186,6 +186,12 @@ pub enum Thunk {
         dt: HalfFlag,
         /// RHS weight matrix stored as F16; promote to F32 via scratch before sgemm.
         b_f16: bool,
+        /// RHS weight stored PACKED as BF16 (2 B/elem). Metal has no bfloat GEMM,
+        /// and the f32 kernels would read two bf16 values as one f32, so the
+        /// encoder unpacks it (`bf16_unpack_f32`, exact) into the arena-tail
+        /// dequant scratch and runs the f32 GEMM on that. The weight itself stays
+        /// resident at half the bytes.
+        b_bf16: bool,
         /// LHS activation stored as F16 (mixed-precision training backward); read
         /// as half in-kernel with f32 accumulate instead of misreading its bytes.
         a_f16: bool,
@@ -618,6 +624,9 @@ pub enum Thunk {
         num_idx: u32,
         trailing: u32,
         dt: HalfFlag,
+        /// The indices' storage: f32 (integer ids, widened in the arena) or
+        /// half (float indices under AMP).
+        idx_dt: HalfFlag,
     },
     /// Narrow along last axis
     Narrow {
@@ -664,6 +673,21 @@ pub enum Thunk {
         seq_cap: u32,
         pos: u32,
         inner_bytes: u32,
+    },
+    /// `Op::DynamicUpdateSlice`: `rows` rows of `row_bytes` from `src` into
+    /// `dst` (the operand's slot, `extent` rows a slice, `outer` slices) at
+    /// the offset `start` holds on the GPU, clamped to `[0, extent - rows]`.
+    /// One kernel reads it there, so no host round trip; `start_kind` is
+    /// 0 f32, 1 i32, 2 i64, 3 u32.
+    DynamicUpdateSlice {
+        src: usize,
+        dst: usize,
+        start: usize,
+        start_kind: u32,
+        outer: u32,
+        extent: u32,
+        rows: u32,
+        row_bytes: u32,
     },
     /// SDPA. `mask_kind` encodes how to apply masking inside the
     /// kernel:
@@ -1096,6 +1120,15 @@ pub enum Thunk {
         dx: usize,
         len: u32,
         op: u32,
+    },
+    /// `Op::DoubleSingle` over `(hi, lo)` f32 pairs; `b` is unused (bound to
+    /// `a`) for one-input ops.
+    DoubleSingle {
+        op: rlx_ir::double_single::DfOp,
+        plan: rlx_ir::double_single::DfPlan,
+        a: usize,
+        b: Option<usize>,
+        dst: usize,
     },
     /// Native MSL `Op::RoundToFormat`. `amax` is the per-tensor max-magnitude
     /// input (mode 1); `mode`: 0 none, 1 per-tensor, 2 per block.
@@ -2176,6 +2209,13 @@ pub enum Thunk {
 pub struct ThunkSchedule {
     pub thunks: Vec<Thunk>,
     pub rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    /// `node_start[p]..node_start[p + 1]` are the thunks of the `p`-th node of
+    /// `graph.nodes()` (one sentinel at the end). Lowering is NOT one thunk per
+    /// node — Softmax prepends a Copy when its input and output slots differ,
+    /// and region rewrites split one thunk into several — so anything that
+    /// maps nodes to schedule positions (the MPSGraph hybrid plan) must go
+    /// through this, never through the node's position.
+    pub node_start: Vec<usize>,
 }
 
 /// DRAM traffic (read bytes, write bytes) a thunk moves, from its shapes.
@@ -2449,6 +2489,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::SplitLastAxis { .. } => "split_lastax",
         Thunk::Copy { .. } => "copy",
         Thunk::KvAppend { .. } => "kv_append",
+        Thunk::DynamicUpdateSlice { .. } => "dynamic_update_slice",
         Thunk::Attention { .. } => "attention",
         Thunk::FusedAttn { .. } => "fused_attn",
         Thunk::AttentionBackward { .. } => "attention_bwd",
@@ -2494,6 +2535,7 @@ pub fn thunk_name(t: &Thunk) -> &'static str {
         Thunk::ReluBackward { .. } => "relu_backward",
         Thunk::ActivationBackward { .. } => "activation_backward",
         Thunk::RoundToFormat { .. } => "round_to_format",
+        Thunk::DoubleSingle { .. } => "double_single",
         Thunk::FakeQuantizeFixed { .. } => "fake_quantize_fixed",
         Thunk::FakeQuantizePerBatch { .. } => "fake_quantize_perbatch",
         Thunk::ComplexNormSq { .. } => "complex_norm_sq",
@@ -2720,7 +2762,7 @@ fn strides_dense_contiguous(rank: usize, dims: &[u32], strides: &[u32]) -> bool 
 }
 
 /// Drop trivial `ElementwiseRegion` chains to direct thunks (vec4 elem / in-place act).
-fn rewrite_simple_elementwise_regions(thunks: &mut Vec<Thunk>) {
+fn rewrite_simple_elementwise_regions(thunks: &mut Vec<Thunk>, node_start: &mut [usize]) {
     let mut i = 0;
     while i < thunks.len() {
         match try_rewrite_elementwise_region(&thunks[i]) {
@@ -2738,6 +2780,10 @@ fn rewrite_simple_elementwise_regions(thunks: &mut Vec<Thunk>) {
                 }
                 let n = ts.len();
                 thunks.splice(i..=i, ts);
+                // Later nodes' thunks moved right by n - 1.
+                for st in node_start.iter_mut().filter(|st| **st > i) {
+                    *st += n - 1;
+                }
                 i += n;
             }
         }
@@ -3174,6 +3220,9 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
         }
         Copy { src, dst, .. } => (vec![*src], vec![*dst]),
         KvAppend { src, dst, .. } => (vec![*src, *dst], vec![*dst]),
+        DynamicUpdateSlice {
+            src, dst, start, ..
+        } => (vec![*src, *dst, *start], vec![*dst]),
         ActivationInPlace { data, .. } => (vec![*data], vec![*data]),
         ActivationOut { src, dst, .. } => (vec![*src], vec![*dst]),
         GeluApproxOut { src, dst, .. } | GeluApproxHost { src, dst, .. } => {
@@ -3201,6 +3250,11 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
         RoundToFormat { src, amax, dst, .. } => {
             let mut r = vec![*src];
             r.extend(amax.iter().copied());
+            (r, vec![*dst])
+        }
+        DoubleSingle { a, b, dst, .. } => {
+            let mut r = vec![*a];
+            r.extend(b.iter().copied());
             (r, vec![*dst])
         }
         ComplexNormSq { src, dst, .. } | ConjugateC64 { src, dst, .. } => (vec![*src], vec![*dst]),
@@ -3358,9 +3412,64 @@ fn mlp_io(t: &Thunk) -> Option<(Vec<usize>, Vec<usize>)> {
             src, eps_src, dst, ..
         } => (vec![*src, *eps_src], vec![*dst]),
         Transpose { src, dst, .. } => (vec![*src], vec![*dst]),
-        _ => return None,
+        other => {
+            note_thunk_io_gap(other);
+            return None;
+        }
     };
     Some(io)
+}
+
+/// Count the `Thunk` variants whose IO is not enumerated above.
+///
+/// `mlp_io` covers 56 of 148 variants. The other 92 return `None`, and every
+/// guard built on it treats `None` as "decline the fusion" — which is sound, and
+/// is also invisible: it silently costs the optimisation, and it is the reason a
+/// general post-fold schedule check (`rlx_compile::memory::schedule_hazards`)
+/// cannot be wired up here yet. An unmodelled op must never read as "touches
+/// nothing", so the gap has to be measurable before it can be closed.
+///
+/// `RLX_METAL_THUNK_IO_GAPS=1` prints a census at process exit, ranked by how
+/// often each variant was asked. Run it across the model zoo and the output is
+/// the work list, ordered by what actually blocks folds, instead of 92 arms
+/// written blind.
+fn note_thunk_io_gap(t: &Thunk) {
+    use std::sync::{Mutex, OnceLock};
+    if !rlx_ir::env::flag("RLX_METAL_THUNK_IO_GAPS") {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<std::collections::BTreeMap<&'static str, usize>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let name = thunk_name(t);
+    let mut g = seen.lock().expect("thunk io gap census");
+    let n = g.entry(name).or_insert(0);
+    *n += 1;
+    // Report each variant the FIRST time it is asked, not only in the periodic
+    // summary. A census whose only output is "every 1000th miss" prints nothing
+    // at all on a small graph — DIVER-1 has fewer than 1000 misses — and a
+    // diagnostic that silently reports nothing is indistinguishable from a
+    // diagnostic that found nothing. That is the same shape as the parity test
+    // that passes when its artifacts are missing.
+    if *n == 1 {
+        eprintln!("[rlx-metal] thunk-io gap: {name} has no modelled read/write set");
+    }
+    // Then a ranked running summary, on every 1000th miss rather than from an
+    // atexit hook: a census that only lands at a clean exit is one you lose to
+    // the first panic, and these are debug runs.
+    let total: usize = g.values().sum();
+    if total.is_multiple_of(1000) {
+        let mut rows: Vec<(&&str, &usize)> = g.iter().collect();
+        rows.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        eprintln!(
+            "[rlx-metal] thunk-io gaps ({total} misses, {} variants): {}",
+            rows.len(),
+            rows.iter()
+                .take(12)
+                .map(|(k, n)| format!("{k}x{n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 }
 
 /// Concurrent-dispatch hazard analysis. Given the thunk slice and the
@@ -3546,15 +3655,18 @@ fn mlp_unwritten_in_range(thunks: &[Thunk], start: usize, until: usize, off: usi
 
 /// True when two f32 arena slices overlap (exact offset match or partial range).
 fn mlp_f32_ranges_overlap(a_off: usize, a_elems: u32, b_off: usize, b_elems: u32) -> bool {
-    if a_elems == 0 || b_elems == 0 {
-        return false;
-    }
-    if a_off == b_off {
-        return true;
-    }
-    let a_end = a_off.saturating_add(a_elems as usize * 4);
-    let b_end = b_off.saturating_add(b_elems as usize * 4);
-    a_off < b_end && b_off < a_end
+    // Delegates to the planner's primitive so there is ONE definition of
+    // "these bytes overlap" in the tree. This used to be the fourth hand-rolled
+    // copy, and the copies did not agree — which is how a guard ends up
+    // comparing offsets for equality and missing a partial overlap.
+    //
+    // Behaviour is unchanged. The old body had an `a_off == b_off => true`
+    // shortcut that was pure redundancy: the zero-length case returns false
+    // above it, and for non-zero lengths equal offsets always satisfy the
+    // interval test anyway.
+    use rlx_ir::arena_range::ByteRange;
+    ByteRange::f32_elems(a_off, a_elems as usize)
+        .overlaps(&ByteRange::f32_elems(b_off, b_elems as usize))
 }
 
 /// Packed gate/up weight bytes per output column for fused decode MLP GEMV.
@@ -3704,49 +3816,73 @@ fn fuse_decode_mlp_combined_gate_up(
                 continue;
             }
         };
-        let gate_narrow_idx = match mlp_last_writer(thunks, act_idx, gate_src_off) {
-            Ok(Some(idx)) if as_narrow(&thunks[idx]).is_some() => idx,
-            Ok(Some(copy_idx)) if matches!(&thunks[copy_idx], Thunk::Copy { .. }) => {
-                let Thunk::Copy { src, .. } = &thunks[copy_idx] else {
-                    i += 1;
-                    continue;
-                };
-                match mlp_last_writer(thunks, copy_idx, *src) {
-                    Ok(Some(ni)) if as_narrow(&thunks[ni]).is_some() => ni,
-                    _ => {
-                        i += 1;
-                        continue;
+        // The halves reach the activation and the product through two
+        // `Narrow`s of the combined output — or, when the memory planner made
+        // those narrows views (a contiguous split of a `[1, 1, 2n]` row), as the
+        // combined output's two halves directly, with no thunk in between.
+        let narrowed = (|| {
+            let gate_narrow_idx = match mlp_last_writer(thunks, act_idx, gate_src_off) {
+                Ok(Some(idx)) if as_narrow(&thunks[idx]).is_some() => idx,
+                Ok(Some(copy_idx)) if matches!(&thunks[copy_idx], Thunk::Copy { .. }) => {
+                    let Thunk::Copy { src, .. } = &thunks[copy_idx] else {
+                        return None;
+                    };
+                    match mlp_last_writer(thunks, copy_idx, *src) {
+                        Ok(Some(ni)) if as_narrow(&thunks[ni]).is_some() => ni,
+                        _ => return None,
                     }
                 }
+                _ => return None,
+            };
+            let (combined_off, _gate_dst, gate_start, gate_len) =
+                as_narrow(&thunks[gate_narrow_idx]).unwrap();
+            let up_narrow_idx = match mlp_last_writer(thunks, mul_idx, up_off) {
+                Ok(Some(idx)) if as_narrow(&thunks[idx]).is_some() => idx,
+                _ => return None,
+            };
+            let (combined_up, _up_dst, up_start, up_len) =
+                as_narrow(&thunks[up_narrow_idx]).unwrap();
+            if combined_off != combined_up
+                || gate_len != up_len
+                || up_start != gate_start + gate_len
+            {
+                return None;
             }
-            _ => {
-                i += 1;
-                continue;
-            }
+            let combined_mm_idx = match mlp_last_writer(thunks, gate_narrow_idx, combined_off) {
+                Ok(Some(idx)) if as_packed_gate_up_mm(&thunks[idx]).is_some() => idx,
+                _ => return None,
+            };
+            Some((
+                Some((gate_narrow_idx, up_narrow_idx)),
+                combined_off,
+                gate_len,
+                combined_mm_idx,
+            ))
+        })();
+        let viewed = || {
+            let combined_mm_idx = match mlp_last_writer(thunks, act_idx, gate_src_off) {
+                Ok(Some(idx)) => idx,
+                _ => return None,
+            };
+            let (_, _, dst, _, n, _) = as_packed_gate_up_mm(&thunks[combined_mm_idx])?;
+            let half = n / 2;
+            let up_view = dst + half as usize * std::mem::size_of::<f32>();
+            (n.is_multiple_of(2)
+                && dst == gate_src_off
+                && up_off == up_view
+                && mlp_unwritten_in_range(thunks, combined_mm_idx + 1, mul_idx, up_off))
+            .then_some((None, dst, half, combined_mm_idx))
         };
-        let (combined_off, _gate_dst, gate_start, gate_len) =
-            as_narrow(&thunks[gate_narrow_idx]).unwrap();
-
-        let up_narrow_idx = match mlp_last_writer(thunks, mul_idx, up_off) {
-            Ok(Some(idx)) if as_narrow(&thunks[idx]).is_some() => idx,
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-        let (combined_up, _up_dst, up_start, up_len) = as_narrow(&thunks[up_narrow_idx]).unwrap();
-        if combined_off != combined_up || gate_len != up_len || up_start != gate_start + gate_len {
+        let Some((narrows, combined_off, n_half, combined_mm_idx)) = narrowed.or_else(viewed)
+        else {
             i += 1;
             continue;
-        }
-        let n_half = gate_len;
-
-        let combined_mm_idx = match mlp_last_writer(thunks, gate_narrow_idx, combined_off) {
-            Ok(Some(idx)) if as_packed_gate_up_mm(&thunks[idx]).is_some() => idx,
-            _ => {
-                i += 1;
-                continue;
-            }
+        };
+        // Who may read the combined output: the two narrows, or — as views —
+        // the activation (gate half) and the product (up half).
+        let combined_readers: Vec<usize> = match narrows {
+            Some((g, u)) => vec![g, u],
+            None => vec![act_idx, mul_idx],
         };
         let (comb_x, comb_w, _comb_dst, comb_k, comb_n, comb_scheme) =
             as_packed_gate_up_mm(&thunks[combined_mm_idx]).unwrap();
@@ -3834,35 +3970,55 @@ fn fuse_decode_mlp_combined_gate_up(
 
         let layer_until = down_mm_idx + 1;
 
+        // As views, the gate half sits at the combined output's offset, so the
+        // value the activation reads has the combined value's readers.
+        let gate_readers: Vec<usize> = match narrows {
+            Some(_) => vec![mul_idx],
+            None => combined_readers.clone(),
+        };
+        let halves_dead = match narrows {
+            Some((gate_narrow_idx, up_narrow_idx)) => {
+                mlp_value_dead_in_range(
+                    thunks,
+                    gate_narrow_idx,
+                    gate_src_off,
+                    &[act_idx],
+                    layer_until,
+                    uses_at,
+                ) && mlp_value_dead_in_range(
+                    thunks,
+                    up_narrow_idx,
+                    up_off,
+                    &[mul_idx],
+                    layer_until,
+                    uses_at,
+                )
+            }
+            None => mlp_value_dead_in_range(
+                thunks,
+                combined_mm_idx,
+                up_off,
+                &[mul_idx],
+                layer_until,
+                uses_at,
+            ),
+        };
         let mut dead_ok = mlp_value_dead_in_range(
             thunks,
             combined_mm_idx,
             combined_off,
-            &[gate_narrow_idx, up_narrow_idx],
+            &combined_readers,
             layer_until,
             uses_at,
-        ) && mlp_value_dead_in_range(
-            thunks,
-            gate_narrow_idx,
-            gate_src_off,
-            &[act_idx],
-            layer_until,
-            uses_at,
-        ) && mlp_value_dead_in_range(
-            thunks,
-            up_narrow_idx,
-            up_off,
-            &[mul_idx],
-            layer_until,
-            uses_at,
-        ) && mlp_value_dead_in_range(
-            thunks,
-            act_idx,
-            gate_src_off,
-            &[mul_idx],
-            layer_until,
-            uses_at,
-        );
+        ) && halves_dead
+            && mlp_value_dead_in_range(
+                thunks,
+                act_idx,
+                gate_src_off,
+                &gate_readers,
+                layer_until,
+                uses_at,
+            );
         if let Some((add_idx, _, _)) = down_add_tail {
             dead_ok &= mlp_value_dead_in_range(
                 thunks,
@@ -3886,7 +4042,7 @@ fn fuse_decode_mlp_combined_gate_up(
                     thunks,
                     combined_mm_idx,
                     combined_off,
-                    &[gate_narrow_idx, up_narrow_idx],
+                    &combined_readers,
                     thunks.len(),
                     uses_at,
                 )
@@ -3903,8 +4059,10 @@ fn fuse_decode_mlp_combined_gate_up(
         }
 
         thunks[combined_mm_idx] = Thunk::Nop;
-        thunks[gate_narrow_idx] = Thunk::Nop;
-        thunks[up_narrow_idx] = Thunk::Nop;
+        if let Some((gate_narrow_idx, up_narrow_idx)) = narrows {
+            thunks[gate_narrow_idx] = Thunk::Nop;
+            thunks[up_narrow_idx] = Thunk::Nop;
+        }
         thunks[act_idx] = Thunk::Nop;
         thunks[mul_idx] = if use_gelu {
             Thunk::FusedMlpGateUpGelu {
@@ -5339,8 +5497,73 @@ fn fuse_depthwise_conv1d_bsc(
 }
 
 /// Merge disjoint last-axis `Narrow` thunks that share a source into `SplitLastAxis`.
+///
+/// **Only a run of members that is already consecutive in the thunk stream may
+/// be fused.** The merge rewrites the first member in place and `Nop`s the
+/// rest, so every later member's write is HOISTED to the first member's
+/// position. That is a reordering, and the memory planner has already assumed
+/// the original order: it is free to put some other buffer in a narrow's
+/// destination bytes and free it one step before that narrow is born. Hoist the
+/// narrow above that other buffer's write and the other buffer wins — the
+/// narrow's output is silently overwritten (and symmetrically, a thunk that
+/// reads those bytes in between now sees the narrow's output instead of what
+/// was there).
+///
+/// This is not hypothetical. DIVER-1's STCPE overlap-average takes seven
+/// `narrow(axis=2, j, 1)` slices of one `[1, C, 7, 16, 32]` transpose,
+/// interleaved with the per-window `narrow`s and `add`s that consume them. The
+/// seven tile the axis, so they grouped and all seven hoisted to the first's
+/// slot; the planner had packed nine 768-byte scratch buffers inside slices
+/// 2..6 on the strength of "dead one step before the slice is written". After
+/// hoisting those scratch writes landed last and clobbered the first 1536 bytes
+/// of each slice — exactly channel 0 — and `stcpe_avg` came out at cos 0.929
+/// with every other stage bit-clean. It survived `RLX_MEM_VERIFY` (the plan is
+/// valid *for the unfused order*), survived one-encoder-per-dispatch
+/// (`RLX_METAL_CONCURRENT_SPLIT_ENC`, so not a GPU race) and survived routing
+/// the narrows through the host (`RLX_METAL_HOST_SLICE`, bit-identically, so
+/// not the kernel). Requiring consecutiveness keeps the fusion for the case it
+/// was written for — a concat VJP, whose narrows are emitted back to back —
+/// and declines it exactly when it would reorder.
+///
+/// `RLX_METAL_NO_FUSE_NARROW_CLUSTERS=1` disables the pass outright, which is
+/// how the above was isolated: it leaves the arena plan byte-identical, so a
+/// model that changes verdict under it has a reordering bug, not a layout one.
+///
+/// **The other rewrites in this file were audited and are not this bug.** Seven
+/// passes `Nop` a sibling thunk; six place the fused thunk at the *last* member,
+/// so their writes move later rather than earlier, and every one of them gates
+/// on an explicit range check (`mlp_unwritten_in_range`,
+/// `mlp_value_dead_in_range`, `mlp_last_writer`, `mlp_f32_ranges_overlap`). Two
+/// properties make those sound where this one was not: the checks walk the
+/// intervening thunks, and `mlp_io` returning `None` for a thunk it cannot
+/// enumerate makes them **decline the fusion**, so an unmodelled op cannot be
+/// mistaken for a harmless one. `fuse_depthwise_conv1d_bsc` does hoist (its
+/// fused thunk lands on the conv, ahead of the output transpose and silu) and is
+/// covered by three `mlp_value_dead_in_range` calls. `fuse_narrow_clusters` was
+/// the outlier: it grouped by `(src, outer, src_axis, dt)` across the whole
+/// thunk vector with no check on what lay between the members at all.
+///
+/// One residual, recorded rather than guessed at: those guards compare **exact
+/// offsets** (`writes.contains(&off)`), not byte extents, so a write at a
+/// *different* base offset whose extent covers `off` would be invisible to them.
+/// `mlp_f32_ranges_overlap` is the range-aware primitive if that ever shows up;
+/// there is no repro today.
+///
+/// `rlx-wgpu` hit the same class in its `FusedMatMulBiasAct` → `Narrow`x3
+/// split-QKV fold (see the `live_across` guard in `backend/compile/lower.rs`,
+/// and `rlx-lightbeam` at cos 0.958) and guards it by testing arena overlap
+/// against every tensor live across the fused step. That keeps more of the
+/// optimization than adjacency does, but it needs each thunk's write *extent*,
+/// which Metal's thunks do not carry uniformly; adjacency needs nothing and is
+/// safe by construction. The common shape is worth recognising: any rewrite
+/// that moves a write relative to other thunks has to answer to a plan that was
+/// built before the rewrite existed.
 fn fuse_narrow_clusters(thunks: &mut [Thunk]) {
     use std::collections::HashMap;
+
+    if rlx_ir::env::flag("RLX_METAL_NO_FUSE_NARROW_CLUSTERS") {
+        return;
+    }
 
     #[derive(Hash, PartialEq, Eq, Clone, Copy)]
     struct NarrowKey {
@@ -5349,6 +5572,14 @@ fn fuse_narrow_clusters(thunks: &mut [Thunk]) {
         src_axis: u32,
         dt: u8,
     }
+
+    // Snapshot which slots were `Nop` BEFORE this pass. Adjacency has to be
+    // judged against the incoming order, not the order this pass is halfway
+    // through producing: fusing one group turns its later members into `Nop`s,
+    // and if a second group then treated those as skippable it could hoist
+    // across a write that the first group had itself just moved earlier. Two
+    // groups composing into a reordering is exactly the bug being fixed.
+    let was_nop: Vec<bool> = thunks.iter().map(|t| matches!(t, Thunk::Nop)).collect();
 
     let mut groups: HashMap<NarrowKey, Vec<(usize, usize, u32, u32)>> = HashMap::new();
     for (i, t) in thunks.iter().enumerate() {
@@ -5382,28 +5613,50 @@ fn fuse_narrow_clusters(thunks: &mut [Thunk]) {
         if items.len() < 2 || key.dt != 0 {
             continue;
         }
-        let meta: Vec<(u32, u32)> = items.iter().map(|(_, _, s, l)| (*s, *l)).collect();
-        if !narrow_segments_partition(key.src_axis, &meta) {
-            continue;
-        }
         items.sort_by_key(|(i, _, _, _)| *i);
-        let dt = HalfFlag::F32;
-        let segments: Vec<(usize, u32, u32)> =
-            items.iter().map(|(_, d, s, l)| (*d, *s, *l)).collect();
-        let n = items.len();
-        let first = items[0].0;
-        thunks[first] = Thunk::SplitLastAxis {
-            src: key.src,
-            outer: key.outer,
-            src_axis: key.src_axis,
-            dt,
-            segments,
-        };
-        for (i, _, _, _) in items.into_iter().skip(1) {
-            thunks[i] = Thunk::Nop;
+        // Collect runs that are already adjacent in the thunk stream — a `Nop`
+        // between members is fine (a view compiles to one), anything else is a
+        // thunk whose order relative to these writes the planner relied on. See
+        // the hazard note on this function. A run is closed and fused the moment
+        // it tiles the axis, so two interleaved tilings of the same source
+        // become two splits instead of one eight-segment set that tiles nothing.
+        let mut runs: Vec<Vec<(usize, usize, u32, u32)>> = Vec::new();
+        let mut cur: Vec<(usize, usize, u32, u32)> = Vec::new();
+        for item in items {
+            let adjacent = cur
+                .last()
+                .is_some_and(|&(prev, _, _, _)| was_nop[prev + 1..item.0].iter().all(|&n| n));
+            let overlaps = cur.iter().any(|&(_, _, s, l)| {
+                item.2 < s.saturating_add(l) && s < item.2.saturating_add(item.3)
+            });
+            if !cur.is_empty() && (!adjacent || overlaps) {
+                cur.clear();
+            }
+            cur.push(item);
+            let meta: Vec<(u32, u32)> = cur.iter().map(|(_, _, s, l)| (*s, *l)).collect();
+            if cur.len() >= 2 && narrow_segments_partition(key.src_axis, &meta) {
+                runs.push(std::mem::take(&mut cur));
+            }
         }
-        groups_fused += 1;
-        narrows_fused += n;
+        for run in runs {
+            let dt = HalfFlag::F32;
+            let segments: Vec<(usize, u32, u32)> =
+                run.iter().map(|(_, d, s, l)| (*d, *s, *l)).collect();
+            let n = run.len();
+            let first = run[0].0;
+            thunks[first] = Thunk::SplitLastAxis {
+                src: key.src,
+                outer: key.outer,
+                src_axis: key.src_axis,
+                dt,
+                segments,
+            };
+            for (i, _, _, _) in run.into_iter().skip(1) {
+                thunks[i] = Thunk::Nop;
+            }
+            groups_fused += 1;
+            narrows_fused += n;
+        }
     }
     let verbose = rlx_ir::env::var("RLX_VERBOSE")
         .and_then(|v| v.parse::<u8>().ok())
@@ -5730,4 +5983,149 @@ mod region_rewrite_tests {
             _ => panic!("expected fused ternary+activation"),
         }
     }
+}
+
+#[cfg(test)]
+mod fuse_narrow_cluster_tests {
+    use super::*;
+
+    /// Four slices of a 4096-element axis, one per 1024 — a tiling group.
+    fn slice(dst: usize, start: u32) -> Thunk {
+        Thunk::Narrow {
+            src: 0,
+            dst,
+            outer: 6,
+            src_axis: 4096,
+            start,
+            len: 1024,
+            dt: HalfFlag::F32,
+        }
+    }
+
+    fn tiling(dsts: [usize; 4]) -> Vec<Thunk> {
+        (0..4).map(|i| slice(dsts[i], i as u32 * 1024)).collect()
+    }
+
+    /// A thunk that is neither a Nop nor a member — the thing a hoist would
+    /// cross. It writes `dst`, which is how the DIVER-1 corruption happened.
+    fn other(dst: usize) -> Thunk {
+        Thunk::Copy {
+            src: 1 << 20,
+            dst,
+            len: 192,
+            dt: HalfFlag::F32,
+        }
+    }
+
+    #[test]
+    fn fuses_an_adjacent_tiling_run() {
+        let mut t = tiling([100, 200, 300, 400]);
+        fuse_narrow_clusters(&mut t);
+        match &t[0] {
+            Thunk::SplitLastAxis {
+                segments, src_axis, ..
+            } => {
+                assert_eq!(*src_axis, 4096);
+                assert_eq!(segments.len(), 4, "all four slices should be in the split");
+            }
+            got => panic!("expected SplitLastAxis at 0, got {}", thunk_name(got)),
+        }
+        for (i, th) in t.iter().enumerate().skip(1) {
+            assert!(matches!(th, Thunk::Nop), "thunk {i} should be a Nop");
+        }
+    }
+
+    /// Nops may sit between members — a view compiles to one — so a run broken
+    /// only by Nops must still fuse. Without this the fix would cost the
+    /// optimization on every graph whose narrows are separated by reshapes.
+    #[test]
+    fn nops_do_not_break_a_run() {
+        let mut t = tiling([100, 200, 300, 400]);
+        t.insert(3, Thunk::Nop);
+        t.insert(1, Thunk::Nop);
+        fuse_narrow_clusters(&mut t);
+        assert!(
+            matches!(&t[0], Thunk::SplitLastAxis { segments, .. } if segments.len() == 4),
+            "Nop-separated run should still fuse, got {}",
+            thunk_name(&t[0])
+        );
+    }
+
+    /// The regression. A real thunk between members means fusing would hoist
+    /// the later writes above it; the planner may have put something in those
+    /// bytes that dies in between (DIVER-1's STCPE scratch did exactly that),
+    /// so the group must be left alone. Before the fix all four fused and the
+    /// `other` write landed on top of slice 2's destination.
+    #[test]
+    fn a_real_thunk_between_members_blocks_the_hoist() {
+        let mut t = tiling([100, 200, 300, 400]);
+        t.insert(2, other(300));
+        fuse_narrow_clusters(&mut t);
+        assert!(
+            t.iter()
+                .all(|th| !matches!(th, Thunk::SplitLastAxis { .. })),
+            "no fusion may cross a real thunk: {:?}",
+            t.iter().map(thunk_name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            t.iter()
+                .filter(|th| matches!(th, Thunk::Narrow { .. }))
+                .count(),
+            4,
+            "all four narrows must survive as narrows"
+        );
+    }
+
+    /// Two tilings of the same axis, interleaved as two adjacent runs: each run
+    /// fuses on its own. The old whole-group test rejected this outright (eight
+    /// segments never tile a 4096 axis), so the fix is also strictly more
+    /// fusion, not less.
+    #[test]
+    fn two_adjacent_runs_each_fuse() {
+        let mut t = tiling([100, 200, 300, 400]);
+        t.extend(tiling([500, 600, 700, 800]));
+        fuse_narrow_clusters(&mut t);
+        let splits: Vec<usize> = t
+            .iter()
+            .enumerate()
+            .filter(|(_, th)| matches!(th, Thunk::SplitLastAxis { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(splits, vec![0, 4], "one split per run, at each run's head");
+    }
+
+    /// `mlp_io` must decline an unmodelled variant rather than report it as
+    /// touching nothing — 92 of 148 variants take that path, and every guard
+    /// built on `mlp_io` reads `None` as "do not fuse". This also proves the
+    /// `RLX_METAL_THUNK_IO_GAPS` census is reachable: it hangs off exactly this
+    /// arm, and a census that can never fire is worse than none. (AXON and
+    /// DIVER-1 both print nothing under the flag, which is a real measurement —
+    /// neither graph asks `mlp_io` about an unmodelled variant — but it is
+    /// indistinguishable from a broken probe without this.)
+    #[test]
+    fn mlp_io_declines_an_unmodelled_variant() {
+        let modelled = Thunk::Nop;
+        assert!(
+            mlp_io(&modelled).is_some(),
+            "Nop is modelled; if this fails the match arms moved"
+        );
+        let unmodelled = Thunk::ArgReduce {
+            src: 0,
+            dst: 4096,
+            outer: 4,
+            reduced: 8,
+            inner: 16,
+            is_max: true,
+        };
+        assert!(
+            mlp_io(&unmodelled).is_none(),
+            "an unmodelled variant must return None, not an empty IO set"
+        );
+    }
+
+    // No test for `RLX_METAL_NO_FUSE_NARROW_CLUSTERS` here on purpose: setting
+    // it is process-global, and cargo runs these tests in parallel, so it
+    // silently disabled the pass under the three positive tests above and they
+    // "failed" for the wrong reason. The switch is a one-line early return and
+    // is covered by the env registry's own completeness test.
 }

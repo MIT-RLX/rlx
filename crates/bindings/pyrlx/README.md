@@ -15,14 +15,32 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
 ## Features
 
 - **Build graphs from Python** — `Graph` (explicit ids) or the
-  `graph()` / `Node` DSL (`(x @ w + b).gelu()`, scalar literals).
+  `graph()` / `Node` DSL (`(x @ w + b).gelu()`, scalar literals). ~200
+  builders mirroring `rlx_ir::Graph`: conv 1d/2d/3d (+ transposed), pooling,
+  interpolation, attention variants (bias, v-dim, score scale / softcap), RoPE
+  (`style="neox" | "gptj"`), batch / adaLN / fused residual norms, LSTM / GRU /
+  RNN / Mamba-2 / Gated DeltaNet, `scan` over a body graph, scatter / gather
+  ND, linalg factorizations, per-channel / block-scaled quantization,
+  `dequant_matmul` (int8, MLX, GGUF K- and IQ-quants), VQ, KAN splines,
+  FIR / IIR / SOS / Hilbert DSP, spectrogram features and SPD manifold layers.
+  `activation(name, x)` / `binary(name, a, b)` take every IR activation and
+  binary op by name.
+- **Static checks** — `rlx.check(g, backends=["cpu", "cuda", "metal"])` runs
+  `cargo rlx check`'s device-free diagnostics (op legality per backend, missed
+  fusions, numeric hazards, memory-plan safety).
+- **Precision policies** — `Session(device, policy="mixed")` or a per-op-kind
+  dict (`{"compute": "f16"}`); also `compile_with(..., policy=...)`.
 - **Compile + run on any backend** — `Session(device="cpu" | "metal" |
   "mlx" | …)`.
 - **Multi-backend runtime** — `GraphDevices`, `DeviceRouter`,
   `DevicePolicy`, `FlexibleSession`, `backends_manifest()`,
   `parse_device()`. See [`docs/backend-selection.md`](../../../docs/backend-selection.md).
-- **In-graph RNG (0.2.7+)** — ONNX `Random*` via upstream `rlx-runtime`
+- **In-graph RNG** — ONNX `Random*` via upstream `rlx-runtime`
   (`CompileOptions::rng`, `CompiledGraph::set_rng`). See [`CHANGELOG.md`](../../../CHANGELOG.md).
+- **Combine and split graphs** — `splice(target, source, bind=…, prefix=…)`
+  copies one graph into another, binding named inputs or params to existing
+  nodes; `sequential` / `parallel` compose two graphs; `extract` cuts out the
+  subgraph behind chosen outputs.
 - **FFT helpers** — `fft`, `fft_norm`, `rfft`, `irfft`, `fftfreq`,
   `rfftfreq`, `psd_real` on `Graph` (see `tests/test_fft.py`).
 - **Autodiff** — `pyrlx.grad(graph, wrt=[…])` returns the backward
@@ -37,32 +55,65 @@ Python bindings for RLX via [PyO3](https://pyo3.rs/) +
   wraps `rlx-gguf-convert` (safetensors by default; `gguf-onnx` / `gguf-pt` cargo
   features for ONNX / PyTorch checkpoints).
   See `tests/test_gguf_quantize.py`, `test_gguf_file.py`, `test_gguf_convert.py`.
-- **RLXP packages** — `rlx.load_rlxp(path)` (manifest summary) and
-  `rlx.convert_gguf_to_rlxp(gguf, out, include_graph=False)`. Spec:
-  [`docs/rlxp.md`](../../../docs/rlxp.md).
+- **Training** *(feature `training`, default)* — `rlx.Trainer(loss_graph,
+  wrt=[...], init={...}, optimizer={"kind": "adamw", "lr": 3e-4})` with
+  `step` / `evaluate` / `run(steps, batch, lr=..., on_step=...)`, freezing,
+  gradient clipping, GGUF checkpoints (`save` / `load`, the same layout as
+  rlx-js), and the on-device AdamW path (`resident=True`, Metal / wgpu).
+  `Trainer.from_package(path)` trains a function of an `.rlxp` package and
+  `save_package` writes the trained weights back.
+  `rlx.Optimizer("muon", lr=...)` drives `rlx-optim` over your own arrays.
+- **Text** *(feature `text`, default)* — `load_tokenizer` (streaming
+  `decode_incremental`), `Sampler` (carried RNG + repetition history),
+  `sample_next`, `argmax`, `render_chat` (GGUF / HF config / `.jinja` / inline).
+- **RLXP packages** — `rlx.load_rlxp(path)` (manifest summary),
+  `rlx.verify_rlxp(path)` (checksums), and
+  `rlx.convert_gguf_to_rlxp(gguf, out, include_graph=False)`;
+  `rlx.to_rlxp(from_, src, dst)` converts any supported weight format, and
+  `rlx.load_weights(format, path)` reads one into a dict. `rlx.Model` runs a
+  packaged model by function name. Spec: [`docs/rlxp.md`](../../../docs/rlxp.md).
+- **Distributed nodes** — `rlx.Group.connect(rank, world)` / `from_env()` joins
+  a mesh of rlx nodes: `send` / `recv`, `all_reduce`, `all_gather`,
+  `broadcast`, `barrier`. Calls release the GIL, so ranks can be threads
+  (`loopback_peers(world)` for a local mesh).
+
+## Install
+
+```sh
+pip install pyrlx         # CPU; on macOS also Metal + Accelerate
+pip install pyrlx-cu12    # CPU + CUDA (Linux x64, Windows x64; CUDA 12.3+ driver)
+```
+
+Both install the same `import pyrlx`: pick one.
 
 ## Install (from source)
 
 ```sh
-cd crates/pyrlx
+cd crates/bindings/pyrlx
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin numpy pytest
 maturin develop --features cpu,gguf-convert   # add metal,mlx,cuda,… as needed
 ```
 
 From the repo root you can also use
-`maturin develop --release -m crates/pyrlx/Cargo.toml`
+`maturin develop --release -m crates/bindings/pyrlx/Cargo.toml`
 inside an activated virtualenv.
 
 ## Tests
 
-Run from `crates/pyrlx/` after `maturin develop` (not from the repo root without a
+Run from `crates/bindings/pyrlx/` after `maturin develop` (not from the repo root without a
 venv — the bare top-level `pyrlx/` namespace package lacks `Graph`):
 
 ```sh
-cd crates/pyrlx && source .venv/bin/activate
+cd crates/bindings/pyrlx && source .venv/bin/activate
 pytest tests/ -q
 ```
+
+## Examples
+
+[`examples/`](examples/README.md): `inference`, `training`, `loading`,
+`distributed`, `backends` and `models` — the same scripts exist for JS and
+Swift and print the same numbers; `tests/test_examples.py` runs them.
 
 ## Install (PyPI)
 
@@ -113,8 +164,8 @@ See [`docs/backend-selection.md`](../../../docs/backend-selection.md),
 
 ## Graph builder notes
 
-- **Shape inference** — prefer `matmul`, `add`, `conv2d`, `layer_norm`, etc.
-  over `*_with_shape` unless you need a fixed output layout.
+- **Shape inference** — builders infer output shapes (`matmul`, `add`,
+  `conv2d`, `layer_norm`, …).
 - **Literals** — `g.constant(2.0)` or `x * 2.0` in the DSL; rank-0, NumPy-broadcastable.
 - **Reserved names** — `where_`, `eq_`, `lt_`, `gt_`, `ge_`, `ne_` (trailing underscore).
 - **FFT / attention / conv** — on `Graph` and via DSL proxy forwarding; see
@@ -122,9 +173,11 @@ See [`docs/backend-selection.md`](../../../docs/backend-selection.md),
 
 ## Status
 
-Surface follows the Rust crates closely. DSL + scalar literals + expanded
-`Graph` bindings (conv, norm, `stop_gradient`, …) ship alongside multi-backend
-helpers (`GraphDevices`, `DeviceRouter`).
+Surface follows the Rust crates closely and matches the embedded JS binding
+(`rlx-js`) feature for feature, under snake_case names: both are generated
+from the op table in `rlx-bind` and wrap its shared runtime, as are the C ABI
+(`rlx-capi`) and Swift (`rlx-swift`) — see [`docs/bindings.md`](../../../docs/bindings.md). Not bound: the
+backward-only kernels autodiff emits — reach those through `grad` / `jvp`.
 
 ## License
 

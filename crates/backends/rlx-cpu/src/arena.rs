@@ -52,7 +52,24 @@ impl Arena {
                 plan.arena_size as isize - worst as isize
             );
         }
-        let buf = AlignedBytes::zeroed(plan.arena_size);
+        Self::from_plan_filled(plan, rlx_ir::env::flag("RLX_POISON_ARENA"))
+    }
+
+    /// [`Self::from_plan`] with the fill spelled out. `poison` fills every
+    /// byte with `0xFF` — NaN as f32/f64, −1 as integers — instead of zero.
+    ///
+    /// A zeroed arena makes a slot that nothing wrote look like a plausible
+    /// result — an unfed input, a constant a harness forgot to write, an op
+    /// that runs as a no-op. Poisoned, it reads NaN. Also exposes a kernel that
+    /// reads its own output before writing it (accumulating into it, say).
+    /// The CPU executable re-applies the fill at its per-run scratch reset;
+    /// GPU host fallbacks (`rlx-gpu-host`) use their own buffers and are not
+    /// covered.
+    pub fn from_plan_filled(plan: MemoryPlan, poison: bool) -> Self {
+        let mut buf = AlignedBytes::zeroed(plan.arena_size);
+        if poison {
+            buf.as_mut_slice().fill(0xFF);
+        }
         Self { buf, plan }
     }
 
@@ -261,5 +278,30 @@ mod tests {
             assert_eq!(arena.slice(id).as_ptr() as usize % align_of::<f32>(), 0);
             assert_eq!(arena.slice_f64(id).as_ptr() as usize % align_of::<f64>(), 0);
         }
+    }
+
+    #[test]
+    fn poisoned_arena_reads_nan_until_written() {
+        let plan = MemoryPlan {
+            arena_size: 128,
+            assignments: {
+                let mut m = HashMap::new();
+                m.insert(
+                    NodeId(0),
+                    BufferSlot {
+                        offset: 0,
+                        size: 64,
+                    },
+                );
+                m
+            },
+            schedule: vec![NodeId(0)],
+        };
+        let mut arena = Arena::from_plan_filled(plan.clone(), true);
+        assert!(arena.slice(NodeId(0)).iter().all(|v| v.is_nan()));
+        arena.slice_mut(NodeId(0))[3] = 1.5;
+        assert_eq!(arena.slice(NodeId(0))[3], 1.5);
+        let clean = Arena::from_plan_filled(plan, false);
+        assert!(clean.slice(NodeId(0)).iter().all(|&v| v == 0.0));
     }
 }

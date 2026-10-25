@@ -16,6 +16,9 @@
 //! `start`, waits for `done`, then streams the results back. A power-on
 //! reset means no button press is needed after programming.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::codegen::io_ports::{primary_out_len, sanitize_port};
 use crate::codegen::relu::bits_for;
 use crate::export_config::IoConfig;

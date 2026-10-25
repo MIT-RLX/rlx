@@ -202,6 +202,14 @@ impl WeightSource for SafetensorsSource {
         k.sort();
         k
     }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        Some(match self.tensors.get(key)?.dtype.as_str() {
+            "F32" => rlx_ir::DType::F32,
+            "F16" => rlx_ir::DType::F16,
+            "BF16" => rlx_ir::DType::BF16,
+            _ => return None,
+        })
+    }
 }
 
 /// A GGUF file as a [`WeightSource`]. See the [module docs](self).
@@ -275,6 +283,21 @@ impl WeightSource for GgufSource {
     }
     fn has(&self, key: &str) -> bool {
         self.file.get(key).is_some()
+    }
+    fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
+        Some(match self.file.get(key)?.dtype {
+            rlx_gguf::GgmlType::F32 => rlx_ir::DType::F32,
+            rlx_gguf::GgmlType::F16 => rlx_ir::DType::F16,
+            rlx_gguf::GgmlType::BF16 => rlx_ir::DType::BF16,
+            _ => return None,
+        })
+    }
+    fn has_packed(&self, key: &str) -> bool {
+        self.packed
+            && self
+                .file
+                .get(key)
+                .is_some_and(|t| rlx_gguf::quant_scheme(t.dtype).is_some())
     }
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
         Ok(self

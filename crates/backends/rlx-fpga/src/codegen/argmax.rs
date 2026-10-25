@@ -6,6 +6,9 @@
 //! element. Output buffer length is 1 (the index, saturating-cast to i8
 //! — works for ≤127 classes).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::{Artifact, LayerArtifacts};
 use crate::model::Layer;
 use crate::verilog::V;

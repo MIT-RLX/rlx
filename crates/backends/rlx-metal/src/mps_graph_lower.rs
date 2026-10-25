@@ -1181,6 +1181,23 @@ pub fn try_lower_with_constants(
                 let v = node_to_tensor.get(&node.inputs[2])?;
                 let q_shape = shape_dims(graph, node.inputs[0])?;
                 let k_shape = shape_dims(graph, node.inputs[1])?;
+                // K / V with fewer heads than Q (GQA left to the kernel,
+                // `rlx_ir::retarget::gqa_native_attention`): the reshapes
+                // below take every input to `num_heads` heads. The thunk
+                // path indexes the shared heads itself.
+                let numel = |s: &[usize]| s.iter().product::<usize>();
+                if q_shape.len() == 3
+                    && k_shape.len() == 3
+                    && numel(&k_shape) / k_shape[1].max(1) != numel(&q_shape) / q_shape[1].max(1)
+                {
+                    if trace {
+                        eprintln!(
+                            "[mpsgraph] bail attention on shared K/V heads: node {}",
+                            node.id
+                        );
+                    }
+                    return None;
+                }
                 // Direct 4D [B, H, S, D] or [B, S, H, D] → SDPA (macOS 14.4+).
                 if q_shape.len() == 4 {
                     let scale = score_scale.unwrap_or(1.0 / (*head_dim as f32).sqrt());

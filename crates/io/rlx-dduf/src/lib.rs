@@ -124,7 +124,11 @@ impl DdufArchive {
         let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let mut zip = ZipArchive::new(f).context("open dduf zip")?;
         let member_names: Vec<String> = (0..zip.len())
-            .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
+            .filter_map(|i| {
+                zip.by_index(i)
+                    .ok()
+                    .and_then(|e| e.name().ok().map(|n| n.into_owned()))
+            })
             .collect();
         let mut model_index = None;
         let mut configs = HashMap::new();
@@ -207,7 +211,11 @@ fn visit_f32_tensors_reader<R: Read + Seek>(
 ) -> Result<DdufMeta> {
     let mut zip = ZipArchive::new(reader).context("open dduf zip")?;
     let names: Vec<String> = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
+        .filter_map(|i| {
+            zip.by_index(i)
+                .ok()
+                .and_then(|e| e.name().ok().map(|n| n.into_owned()))
+        })
         .collect();
 
     let mut model_index = None;
@@ -354,7 +362,11 @@ pub fn load_native(path: impl AsRef<Path>) -> Result<HashMap<String, DdufNativeT
     let mut zip = ZipArchive::new(f).context("open dduf zip")?;
     let mut out = HashMap::new();
     let names: Vec<String> = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
+        .filter_map(|i| {
+            zip.by_index(i)
+                .ok()
+                .and_then(|e| e.name().ok().map(|n| n.into_owned()))
+        })
         .collect();
     for name in names {
         if !name.ends_with(".safetensors") {

@@ -64,7 +64,7 @@ cargo install wasm-bindgen-cli --version <crate-version>
 ```
 
 Build without serving: `just build-web` (add `--webgpu`, `--webgl`, or `--all`).
-The bundle lands in `crates/rlx-web/web/pkg/`.
+The bundle lands in `crates/bindings/rlx-web/web/pkg/`.
 
 ## Compute paths
 
@@ -169,9 +169,34 @@ failure could only be discovered one step at a time.
 An explicit request yields exactly one candidate and is refused with a reason
 rather than silently running elsewhere; `auto` falls through to CPU.
 
+### GitHub Pages: every page
+
+`.github/workflows/pages.yml` publishes all three pages — the forward/backward
+demo at the root, `vision-bench.html` and `cluster.html` — over one wasm bundle
+built with both browser GPU paths (`build.py --all`). It runs on pushes to
+`main` that touch `crates/`, `Cargo.toml` or `Cargo.lock`, and on demand. Turn
+it on once under **Settings → Pages → Source: GitHub Actions**.
+
+The site also carries the **Qwen3.5 chat** (`qwen/chat.html`) from
+[rlx-models](https://github.com/MIT-RLX/rlx-models)' `rlx-models-web`: the
+workflow checks that repo out next to this one, patches every `rlx*` crate to
+this checkout and builds it with `wasm-pack` (WebGPU + WebGL2). Pages serves only
+the page and its 12 MB wasm; the GGUF streams from the Hugging Face Hub (Range
+requests, each worker fetching its own tensors), so no weights live in the site.
+`--qwen DIR` adds it and links it from the pages' nav. A push to rlx-models does
+not redeploy; run the workflow by hand for that.
+
+    just build-pages                        # the same site, in ./_site
+    just build-pages _site ../rlx-models/crates/rlx-models-web/web   # + the Qwen chat
+    python3 -m http.server -d _site 8000
+
+The site is assembled by the builder below with `--all-pages`, which keeps each
+page under its own name (they link each other) and runs the same
+missing-reference check.
+
 ### Deploying it as a standalone static site
 
-    just build-cluster-site                 # → crates/bindings/rlx-web/site/
+    just build-cluster-site                 # → examples/tab-cluster/
     python3 crates/bindings/rlx-web/tools/build_site.py --out /tmp/site --open
 
 The result is self-contained and needs no backend: 10 files, ~8.9 MB (the wasm

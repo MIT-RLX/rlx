@@ -166,6 +166,8 @@ pub trait MatchRewrite {
 
 /// Run one sweep. Returns the rebuilt graph and whether any pattern fired.
 fn sweep<M: MatchRewrite + ?Sized>(rewrite: &M, graph: &Graph) -> (Graph, bool) {
+    #[cfg(test)]
+    tests::SWEEPS.with(|c| c.set(c.get() + 1));
     let mut out = Graph::new(&graph.name);
     let mut id_map: HashMap<NodeId, NodeId> = HashMap::with_capacity(graph.len());
     let mut fired = false;
@@ -210,6 +212,14 @@ fn sweep<M: MatchRewrite + ?Sized>(rewrite: &M, graph: &Graph) -> (Graph, bool) 
     (out, fired)
 }
 
+/// Would a [`sweep`] consult [`MatchRewrite::rewrite`] on any node of `graph`?
+fn any_match<M: MatchRewrite + ?Sized>(rewrite: &M, graph: &Graph) -> bool {
+    let triggers = rewrite.trigger_kinds();
+    graph.nodes().iter().any(|n| {
+        (triggers.is_empty() || triggers.contains(&n.op.kind())) && rewrite.matches(graph, n)
+    })
+}
+
 /// Copy a node verbatim, preserving its debug name and provenance.
 ///
 /// Several hand-written passes drop both; losing `origin` makes a later
@@ -233,14 +243,10 @@ fn copy_node(out: &mut Graph, node: &Node, inputs: Vec<NodeId>) -> NodeId {
 /// mean the rewrite is not converging, so it is logged under
 /// `RLX_FUSION_REPORT`.
 pub fn apply_match_rewrite<M: MatchRewrite + ?Sized>(rewrite: &M, graph: Graph) -> PassResult {
-    // Cheap pre-filter: nothing to do if the trigger kind is absent.
-    let triggers = rewrite.trigger_kinds();
-    if !triggers.is_empty()
-        && !graph
-            .nodes()
-            .iter()
-            .any(|n| triggers.contains(&n.op.kind()))
-    {
+    // Nothing to do unless some node matches. Asking the predicate directly,
+    // rather than only checking trigger-kind presence, also skips the rebuild
+    // when every candidate is declined by `matches` (wrong dtype, say).
+    if !any_match(rewrite, &graph) {
         return PassResult::unchanged(graph);
     }
 
@@ -254,6 +260,13 @@ pub fn apply_match_rewrite<M: MatchRewrite + ?Sized>(rewrite: &M, graph: Graph) 
             break;
         }
         any_fired = true;
+        // A sweep that fired used to be followed by one more full rebuild
+        // whose only result was "nothing matched". That sweep would consult
+        // `matches` on every node before rewriting anything, so asking it here
+        // gives the same answer without rebuilding the graph.
+        if !any_match(rewrite, &current) {
+            break;
+        }
 
         if round + 1 == rewrite.max_rounds().max(1) && rlx_ir::env::flag("RLX_FUSION_REPORT") {
             eprintln!(
@@ -292,6 +305,17 @@ mod tests {
     use super::*;
     use rlx_ir::op::{Activation, BinaryOp};
     use rlx_ir::{DType, Shape};
+
+    thread_local! {
+        /// Graph rebuilds performed by [`sweep`] on this thread.
+        pub(super) static SWEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn sweeps_during(f: impl FnOnce()) -> usize {
+        let before = SWEEPS.with(|c| c.get());
+        f();
+        SWEEPS.with(|c| c.get()) - before
+    }
 
     fn f32s(dims: &[usize]) -> Shape {
         Shape::new(dims, DType::F32)
@@ -475,6 +499,37 @@ mod tests {
             matches!(out.node(out.outputs[0]).op, Op::Activation(Activation::Log)),
             "a one-round budget stops after the first sweep"
         );
+    }
+
+    #[test]
+    fn a_converged_rewrite_is_not_rebuilt_again() {
+        // One lowering step, after which nothing matches: one rebuild, not a
+        // second one that only confirms convergence.
+        assert_eq!(sweeps_during(|| drop(LowerFma.run(fma_graph()))), 1);
+        // Two steps (Exp → Log → Sqrt): two rebuilds.
+        assert_eq!(sweeps_during(|| drop(StepActivation.run(exp_graph()))), 2);
+    }
+
+    #[test]
+    fn a_trigger_declined_by_matches_is_not_rebuilt() {
+        struct NeverMatches;
+        impl MatchRewrite for NeverMatches {
+            fn name(&self) -> &str {
+                "never"
+            }
+            fn trigger_kinds(&self) -> &[OpKind] {
+                &[OpKind::Fma]
+            }
+            fn matches(&self, _: &Graph, _: &Node) -> bool {
+                false
+            }
+            fn rewrite(&self, _: &Node, _: &mut RewriteCtx) -> Option<NodeId> {
+                unreachable!()
+            }
+        }
+        let mut status = IRStatus::Changed;
+        let n = sweeps_during(|| status = NeverMatches.run_with_status(fma_graph()).ir_changed);
+        assert_eq!((n, status), (0, IRStatus::Unchanged));
     }
 
     #[test]

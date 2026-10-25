@@ -371,6 +371,11 @@ impl CoremlExecutable {
         // FAB-only so native LoraMatMul / FusedSwiGLU-style ops are kept.
         // No-op when no FAB node is present.
         graph = rlx_opt::unfuse::unfuse_attention_block(graph);
+        // BNNS crashes or returns wrong values on transpose → reduce → transpose
+        // (see the pass). Must run after every rewrite that can emit a reduce.
+        graph = crate::hybrid::hoist_transpose_out_of_reduce(graph);
+        // BNNS segfaults on a conv-fused, elementwise eval BatchNorm (see the pass).
+        graph = crate::hybrid::recip_bn_div_after_conv(graph);
         promote_int_to_f32(&mut graph);
         // C64 → interleaved F32 before hybrid plan (MIL has no complex dtype).
         promote_c64_to_interleaved_f32(&mut graph);
@@ -1049,15 +1054,15 @@ mod tests {
 
     fn with_units_env(val: Option<&str>, f: impl FnOnce()) {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = rlx_ir::env::var_os("RLX_COREML_UNITS");
+        let prev = rlx_ir::env::var("RLX_COREML_UNITS");
         match val {
-            Some(v) => unsafe { std::env::set_var("RLX_COREML_UNITS", v) },
-            None => unsafe { std::env::remove_var("RLX_COREML_UNITS") },
+            Some(v) => rlx_ir::env::set("RLX_COREML_UNITS", v),
+            None => rlx_ir::env::remove("RLX_COREML_UNITS"),
         }
         f();
         match prev {
-            Some(v) => unsafe { std::env::set_var("RLX_COREML_UNITS", v) },
-            None => unsafe { std::env::remove_var("RLX_COREML_UNITS") },
+            Some(v) => rlx_ir::env::set("RLX_COREML_UNITS", v),
+            None => rlx_ir::env::remove("RLX_COREML_UNITS"),
         }
     }
 

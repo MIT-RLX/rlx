@@ -46,7 +46,7 @@ All numbers are *macros over every weight tensor in the model*
 `skip_quant_for` rule and contribute mean cosine 1.000000 to the
 average — they're excluded from the table). M2 mini, release build.
 
-## Quick start
+## Getting started
 
 ```rust,ignore
 use rlx_gguf_convert::{Converter, Scheme};
@@ -132,7 +132,7 @@ print(report.compression_ratio)
 ```
 
 Build pyrlx with `maturin develop --features cpu,gguf-convert` (add `gguf-onnx`
-for ONNX sources). See `crates/pyrlx/tests/test_gguf_convert.py`.
+for ONNX sources). See `crates/bindings/pyrlx/tests/test_gguf_convert.py`.
 * **Hardware-targeted variants.** Q5_K_M for memory-constrained edge,
   Q8_0 for fastest decode, Q6_K for highest fidelity at < 7 bits.
 

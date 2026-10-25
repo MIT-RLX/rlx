@@ -27,6 +27,9 @@
 //!   avoid extending `Op::QConv2d` to carry a `fuse_relu` flag because
 //!   that would force every backend in the workspace to handle it.)
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::model::{Layer, Model};
 use crate::passes::Hints;
 

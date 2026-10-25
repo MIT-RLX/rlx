@@ -155,6 +155,16 @@ pub trait CpuKernel: Send + Sync {
         output: CpuTensorMut<'_>,
         attrs: &[u8],
     ) -> Result<(), String>;
+
+    /// Whether `execute` can block until another thread or process takes
+    /// part (a collective waiting on its peer ranks). A schedule holding such
+    /// a kernel runs on the calling thread instead of a pool worker: ranks
+    /// running as threads of one process would otherwise each pin a worker
+    /// while waiting, and once the pool is full the peers they wait for never
+    /// get one.
+    fn waits_on_peers(&self) -> bool {
+        false
+    }
 }
 
 pub struct CpuKernelRegistry {

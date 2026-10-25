@@ -60,28 +60,25 @@ fn build_chain(batch: usize, n: usize, reps: usize) -> Graph {
 
 /// Select the kernel path: "old" (multi-kernel), "r2", or "r4".
 fn set_variant(v: &str) {
-    // SAFETY: single-threaded benchmark driver toggling process-local gates.
-    unsafe {
-        match v {
-            "old" => std::env::set_var("RLX_FFT_FAST", "0"),
-            "r2" => {
-                std::env::set_var("RLX_FFT_FAST", "1");
-                std::env::set_var("RLX_FFT_RADIX", "2");
-            }
-            "r4" => {
-                std::env::set_var("RLX_FFT_FAST", "1");
-                std::env::set_var("RLX_FFT_RADIX", "4");
-            }
-            "r8" => {
-                std::env::set_var("RLX_FFT_FAST", "1");
-                std::env::set_var("RLX_FFT_RADIX", "8");
-            }
-            "r16" => {
-                std::env::set_var("RLX_FFT_FAST", "1");
-                std::env::set_var("RLX_FFT_RADIX", "16");
-            }
-            _ => unreachable!(),
+    match v {
+        "old" => rlx_ir::env::set("RLX_FFT_FAST", "0"),
+        "r2" => {
+            rlx_ir::env::set("RLX_FFT_FAST", "1");
+            rlx_ir::env::set("RLX_FFT_RADIX", "2");
         }
+        "r4" => {
+            rlx_ir::env::set("RLX_FFT_FAST", "1");
+            rlx_ir::env::set("RLX_FFT_RADIX", "4");
+        }
+        "r8" => {
+            rlx_ir::env::set("RLX_FFT_FAST", "1");
+            rlx_ir::env::set("RLX_FFT_RADIX", "8");
+        }
+        "r16" => {
+            rlx_ir::env::set("RLX_FFT_FAST", "1");
+            rlx_ir::env::set("RLX_FFT_RADIX", "16");
+        }
+        _ => unreachable!(),
     }
 }
 

@@ -60,6 +60,9 @@ use rlx_cpu::op_registry::register_cpu_kernel;
 
 // ── Op names ─────────────────────────────────────────────────────
 
+/// NumPy-exact `np.dot` / `np.matmul` routing over Accelerate's ILP64 BLAS.
+pub mod lsap;
+pub mod numpy;
 mod op_cholesky;
 mod op_cholesky_backward;
 mod op_cholesky_jvp;
@@ -298,6 +301,58 @@ pub mod algos {
         out[..n].copy_from_slice(&w);
         out[n..].copy_from_slice(&a_buf);
         Ok(())
+    }
+
+    /// Eigenvalues `(re, im)` of a general (nonsymmetric) row-major `n × n`
+    /// matrix: LAPACK `dgeev` (no eigenvectors), or a Hessenberg + Francis QR
+    /// fallback without a platform LAPACK ([`rlx_cpu::geev`]). Complex pairs
+    /// are adjacent, positive imaginary part first; no other order is implied.
+    pub fn eigvals(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
+        rlx_cpu::geev::dgeev_eigvals(a, n)
+    }
+
+    /// `torch.linalg.eigh(A)` on a float64 CPU tensor: `dsyevd` reading the
+    /// LOWER triangle (torch's default `UPLO='L'`; [`eigh`] reads the upper
+    /// one and differs in the last bits). Returns `(eigenvalues ascending,
+    /// U)` with `U` row-major `[n, n]` and eigenvector `j` in COLUMN `j`
+    /// — torch's layout, not [`eigh`]'s row packing.
+    pub fn eigh_torch(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
+        if a.len() != n * n {
+            return Err(format!("eigh_torch: shape mismatch (n={n})"));
+        }
+        let mut buf = a.to_vec();
+        let mut w = vec![0f64; n];
+        let info = rlx_cpu::blas::dsyevd_uplo(&mut buf, &mut w, n, true);
+        if info != 0 {
+            return Err(format!("eigh_torch: dsyevd info={info}"));
+        }
+        Ok((w, col_major_to_row_major(&buf, n)))
+    }
+
+    /// [`eigh_torch`] in single precision — `torch.linalg.eigh` on a float32
+    /// CPU tensor, which is LAPACK `ssyevd` with `uplo='L'` (on macOS,
+    /// Accelerate's; measured bit-identical to torch 2.11).
+    pub fn eigh_torch_f32(a: &[f32], n: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
+        if a.len() != n * n {
+            return Err(format!("eigh_torch_f32: shape mismatch (n={n})"));
+        }
+        let mut buf = a.to_vec();
+        let mut w = vec![0f32; n];
+        let info = rlx_cpu::blas::ssyevd(&mut buf, &mut w, n, true);
+        if info != 0 {
+            return Err(format!("eigh_torch_f32: ssyevd info={info}"));
+        }
+        Ok((w, col_major_to_row_major(&buf, n)))
+    }
+
+    fn col_major_to_row_major<T: Copy>(a: &[T], n: usize) -> Vec<T> {
+        let mut out = a.to_vec();
+        for i in 0..n {
+            for j in 0..n {
+                out[i * n + j] = a[i + j * n];
+            }
+        }
+        out
     }
 
     /// QR factorization. Output packed:
@@ -1572,6 +1627,31 @@ pub mod algos {
         let info = rlx_cpu::blas::dgelsd_solve(a, b, m, n, nrhs, rcond, x);
         if info != 0 {
             return Err(format!("lstsq_gelsd: dgelsd info={info}"));
+        }
+        Ok(())
+    }
+
+    /// `np.linalg.lstsq(A, B, rcond)[0]` bit-for-bit (and so `np.polyfit`): on macOS
+    /// NumPy uses Accelerate's `dgelsd$NEWLAPACK$ILP64`, a different implementation
+    /// from the legacy `dgelsd_` that [`lstsq_gelsd`] (SciPy's driver) calls.
+    /// `A: m×n`, `B: m×nrhs`, `X: n×nrhs`, all row-major.
+    pub fn lstsq_numpy(
+        a: &[f64],
+        b: &[f64],
+        m: usize,
+        n: usize,
+        nrhs: usize,
+        rcond: f64,
+        x: &mut [f64],
+    ) -> Result<(), String> {
+        if a.len() != m * n || b.len() != m * nrhs || x.len() != n * nrhs {
+            return Err(format!(
+                "lstsq_numpy: shape mismatch (m={m}, n={n}, nrhs={nrhs})"
+            ));
+        }
+        let info = rlx_cpu::blas::dgelsd_solve_numpy(a, b, m, n, nrhs, rcond, x);
+        if info != 0 {
+            return Err(format!("lstsq_numpy: dgelsd info={info}"));
         }
         Ok(())
     }

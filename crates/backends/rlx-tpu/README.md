@@ -91,7 +91,7 @@ pipeline before per-segment lowering.
 We deliberately do **not** run `UnfuseElementwiseRegions` (that
 would undo step 5) and we don't run `AutoMixedPrecision` by default
 (XLA's bf16 pass handles dtype selection on its own; the policy
-knob is still wired through `CompileOptions.policy` for callers
+option is still wired through `CompileOptions.policy` for callers
 who want explicit control).
 
 ## Op coverage
@@ -163,7 +163,7 @@ to HLO.
 
 ```toml
 [dependencies]
-rlx = { version = "0.1", features = ["tpu"] }
+rlx = { version = "0.2", features = ["tpu"] }
 ```
 
 `is_available()` returns true iff `libtpu.so` (or

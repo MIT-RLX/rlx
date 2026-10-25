@@ -72,7 +72,13 @@ impl Calibration {
     pub fn save(&self) -> std::io::Result<()> {
         let path = cache_path(self.registry_id);
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, raw)
+        // Write-then-rename: `fs::write` truncates first, and a concurrent
+        // `load` that read the empty or half-written file fell back to
+        // measuring again — timing-dependent numbers, so the device the cost
+        // model picked could change between two calls in one process.
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(&tmp, path)
     }
 
     /// Measure throughput for each kernel variant by running representative
@@ -215,7 +221,16 @@ impl Calibration {
     }
 
     /// Load from cache, or measure and save. Idempotent.
+    /// The calibration for this process: loaded (or measured) once, then the
+    /// same numbers for every caller. The cost model builds a fresh
+    /// `MetalCostModel` per device query; re-reading the file each time let a
+    /// concurrent re-measure hand two queries different numbers.
     pub fn load_or_measure() -> Self {
+        static ONCE: std::sync::OnceLock<Calibration> = std::sync::OnceLock::new();
+        ONCE.get_or_init(Self::load_or_measure_uncached).clone()
+    }
+
+    fn load_or_measure_uncached() -> Self {
         let dev = metal_device().expect("Metal device required");
         if let Some(cal) = Self::load(dev.registry_id) {
             return cal;

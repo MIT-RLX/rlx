@@ -26,18 +26,14 @@ const TEST_STAGE_MIB: usize = 1;
 /// Install the small-shard environment. Both knobs clamp toward smaller, so this
 /// can never ask an adapter for more than it supports.
 fn force_small_shards() {
-    // SAFETY: tests in this binary run single-threaded w.r.t. this setup, and
-    // both vars are read on each `from_plan` call rather than cached.
-    unsafe {
-        std::env::set_var("RLX_WGPU_SHARD_CAP_MIB", TEST_SHARD_MIB.to_string());
-        std::env::set_var("RLX_WGPU_SHARD_STAGE_MIB", TEST_STAGE_MIB.to_string());
-        // The striping warning is expected here; keep the output readable.
-        std::env::set_var("RLX_WGPU_QUIET_SHARD", "1");
-        // Striping is refused by default now — it produces wrong results
-        // silently. These tests are about the striping machinery itself, so
-        // they opt back in.
-        std::env::set_var("RLX_WGPU_ALLOW_SHARD", "1");
-    }
+    rlx_ir::env::set("RLX_WGPU_SHARD_CAP_MIB", TEST_SHARD_MIB.to_string());
+    rlx_ir::env::set("RLX_WGPU_SHARD_STAGE_MIB", TEST_STAGE_MIB.to_string());
+    // The striping warning is expected here; keep the output readable.
+    rlx_ir::env::set("RLX_WGPU_QUIET_SHARD", "1");
+    // Striping is refused by default now — it produces wrong results
+    // silently. These tests are about the striping machinery itself, so
+    // they opt back in.
+    rlx_ir::env::set("RLX_WGPU_ALLOW_SHARD", "1");
 }
 
 fn fake_plan(arena_size: usize, slots: &[(u32, usize, usize)]) -> MemoryPlan {

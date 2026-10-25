@@ -1212,6 +1212,37 @@ pub(crate) fn compile_concat(
             })
             .collect();
         let dst = node_offset(arena, node.id);
+        // Half tensors live packed (2 B) or widened (4 B) depending on the slot,
+        // not the dtype (params stay packed, activations are widened). Any packed
+        // side needs the widen → assemble → round path; the byte copies below
+        // would split each 4-byte word across two halves.
+        let kind = |id: NodeId| {
+            let d = graph.node(id).shape.dtype();
+            let packed = matches!(d, rlx_ir::DType::BF16 | rlx_ir::DType::F16)
+                && arena.has_buffer(id)
+                && !half_slot_is_widened(graph, arena, id);
+            match d {
+                rlx_ir::DType::BF16 if packed => HalfKind::Bf16,
+                rlx_ir::DType::F16 if packed => HalfKind::F16,
+                _ => HalfKind::F32,
+            }
+        };
+        let dst_kind = kind(node.id);
+        let kinds: Vec<HalfKind> = node.inputs.iter().map(|&i| kind(i)).collect();
+        if dst_kind.packed() || kinds.iter().any(|k| k.packed()) {
+            return Thunk::ConcatHalf {
+                dst,
+                dst_kind,
+                outer: outer as u32,
+                inner: inner as u32,
+                total_axis: total_axis as u32,
+                inputs: inputs
+                    .into_iter()
+                    .zip(kinds)
+                    .map(|((o, a, n), k)| (o, a, n, k))
+                    .collect(),
+            };
+        }
         // The `Concat` thunk copies 4-byte (f32-sized) elements; `ConcatF64`
         // copies 8-byte elements. Route by element SIZE, not just F64 — an I64
         // tensor (8-byte) sent through the 4-byte path reads/writes half the
@@ -1219,6 +1250,29 @@ pub(crate) fn compile_concat(
         // leaves the tail zero (e.g. `Tile([9..0], 3)` on i64 rel-shift indices
         // → `[9,8,7,6,5]×3 + zeros`). The 8-byte copy is a pure byte move, so
         // reinterpreting i64 as f64 for the copy is bit-preserving.
+        // 1- and 2-byte types stored at their own width (ints, bools, and any
+        // non-half 16-bit type) are a raw byte move of that width.
+        let width = |id: NodeId| {
+            let n = graph.node(id).shape.num_elements().unwrap_or(0).max(1);
+            arena.byte_size(id) / n
+        };
+        let es = out_shape.dtype().size_bytes();
+        if (es == 1 || es == 2)
+            && width(node.id) == es
+            && node
+                .inputs
+                .iter()
+                .all(|&i| width(i) == es || !arena.has_buffer(i))
+        {
+            return Thunk::ConcatBytes {
+                dst,
+                elem_bytes: es as u8,
+                outer: outer as u32,
+                inner: inner as u32,
+                total_axis: total_axis as u32,
+                inputs,
+            };
+        }
         match out_shape.dtype().size_bytes() {
             8 => Thunk::ConcatF64 {
                 dst,
@@ -1394,6 +1448,8 @@ macro_rules! concat_copy_rows {
 
 concat_copy_rows!(concat_copy_rows_f32, f32);
 concat_copy_rows!(concat_copy_rows_f64, f64);
+concat_copy_rows!(concat_copy_rows_u16, u16);
+concat_copy_rows!(concat_copy_rows_u8, u8);
 
 /// NumPy-style broadcast strides for one operand into the flat output
 /// buffer. Returns a length-`out_dims.len()` `Vec<u32>` where entry
@@ -1780,6 +1836,7 @@ pub(crate) fn exec_gather(t: &Thunk, base: *mut u8) {
         trailing,
         idx_i64,
         table_bytes,
+        table_half,
     } = t
     else {
         unreachable!()
@@ -1788,6 +1845,34 @@ pub(crate) fn exec_gather(t: &Thunk, base: *mut u8) {
         let (ni, tr) = (*num_idx as usize, *trailing as usize);
         let rows = *table_len as usize / tr.max(1);
         unsafe {
+            if *table_half != 0 {
+                // A packed half table: each row widened as it is copied.
+                let tab = sl_typed::<u16>(*table, base, *table_len as usize);
+                let out = sl_mut(*dst, base, ni * tr);
+                let bf16 = *table_half == 2;
+                let row_of = |i: usize| -> usize {
+                    if *idx_i64 != 0 {
+                        sl_i64(*idx, base, ni)[i].max(0) as usize
+                    } else {
+                        sl(*idx, base, ni)[i] as usize
+                    }
+                };
+                for i in 0..ni {
+                    let row = row_of(i);
+                    if row < rows {
+                        let src = &tab[row * tr..(row + 1) * tr];
+                        let dst = &mut out[i * tr..(i + 1) * tr];
+                        for (d, &h) in dst.iter_mut().zip(src) {
+                            *d = if bf16 {
+                                half::bf16::from_bits(h).to_f32()
+                            } else {
+                                half::f16::from_bits(h).to_f32()
+                            };
+                        }
+                    }
+                }
+                return;
+            }
             if *table_bytes == 8 {
                 let tab = sl_i64(*table, base, *table_len as usize);
                 let out = sl_mut_i64(*dst, base, ni * tr);
@@ -1977,6 +2062,57 @@ pub(crate) fn exec_kv_append(t: &Thunk, base: *mut u8) {
     }
 }
 
+/// [`Thunk::DynamicUpdateSlice`]: the rows at the runtime `start`, in place.
+pub(crate) fn exec_dynamic_update_slice(t: &Thunk, base: *mut u8) {
+    let Thunk::DynamicUpdateSlice {
+        src,
+        dst,
+        start,
+        start_dtype,
+        outer,
+        extent,
+        rows,
+        row_bytes,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (outer, extent, rows, row_bytes) = (
+        *outer as usize,
+        *extent as usize,
+        *rows as usize,
+        *row_bytes as usize,
+    );
+    if rows == 0 || row_bytes == 0 || rows > extent {
+        return;
+    }
+    let at = unsafe {
+        let p = base.add(*start);
+        match start_dtype {
+            rlx_ir::DType::F32 => (p as *const f32).read_unaligned() as i64,
+            rlx_ir::DType::F64 => (p as *const f64).read_unaligned() as i64,
+            rlx_ir::DType::I32 => i64::from((p as *const i32).read_unaligned()),
+            rlx_ir::DType::U32 => i64::from((p as *const u32).read_unaligned()),
+            rlx_ir::DType::I64 => (p as *const i64).read_unaligned(),
+            other => panic!("dynamic_update_slice: start of dtype {other:?}"),
+        }
+    };
+    // Clamped, as JAX clamps: the rows always land inside the operand.
+    let at = at.clamp(0, (extent - rows) as i64) as usize;
+    let span = rows * row_bytes;
+    unsafe {
+        let from = base.add(*src);
+        let to = base.add(*dst);
+        for o in 0..outer {
+            std::ptr::copy(
+                from.add(o * span),
+                to.add(o * extent * row_bytes + at * row_bytes),
+                span,
+            );
+        }
+    }
+}
+
 pub(crate) fn exec_concat(t: &Thunk, base: *mut u8) {
     let Thunk::Concat {
         dst,
@@ -2077,6 +2213,109 @@ pub(crate) fn exec_concat_f64(t: &Thunk, base: *mut u8) {
                 );
                 cum += in_axis;
             }
+        }
+    }
+}
+
+/// Execute [`Thunk::ConcatBytes`].
+pub(crate) fn exec_concat_bytes(t: &Thunk, base: *mut u8) {
+    let Thunk::ConcatBytes {
+        dst,
+        elem_bytes,
+        outer,
+        inner,
+        total_axis,
+        inputs,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (outer, inner, total_axis) = (*outer as usize, *inner as usize, *total_axis as usize);
+    let row_stride = total_axis * inner;
+    let out_total = outer * row_stride;
+    macro_rules! go {
+        ($t:ty, $copy:ident) => {{
+            // Assemble in scratch so an input sharing the destination slot is safe.
+            let mut tmp = vec![<$t>::default(); out_total];
+            let mut cum = 0usize;
+            unsafe {
+                for (src_off, in_axis, in_numel) in inputs {
+                    let in_axis = *in_axis as usize;
+                    let inp = sl_typed::<$t>(*src_off, base, (*in_numel as usize).max(1));
+                    $copy(
+                        &mut tmp,
+                        inp,
+                        outer,
+                        in_axis * inner,
+                        row_stride,
+                        cum * inner,
+                        *in_numel as usize,
+                    );
+                    cum += in_axis;
+                }
+                sl_mut_typed::<$t>(*dst, base, out_total).copy_from_slice(&tmp);
+            }
+        }};
+    }
+    match *elem_bytes {
+        1 => go!(u8, concat_copy_rows_u8),
+        _ => go!(u16, concat_copy_rows_u16),
+    }
+}
+
+/// Execute [`Thunk::ConcatHalf`].
+pub(crate) fn exec_concat_half(t: &Thunk, base: *mut u8) {
+    let Thunk::ConcatHalf {
+        dst,
+        dst_kind,
+        outer,
+        inner,
+        total_axis,
+        inputs,
+    } = t
+    else {
+        unreachable!()
+    };
+    let (outer, inner, total_axis) = (*outer as usize, *inner as usize, *total_axis as usize);
+    let row_stride = total_axis * inner;
+    let out_total = outer * row_stride;
+    // Assemble in a scratch buffer: every input is read before the destination
+    // is written, so an input sharing the destination's slot is safe.
+    let mut tmp = vec![0f32; out_total];
+    let mut cum = 0usize;
+    unsafe {
+        for (src_off, in_axis, in_numel, kind) in inputs {
+            let in_axis = *in_axis as usize;
+            let numel = (*in_numel as usize).max(1);
+            let widened;
+            let inp: &[f32] = if kind.packed() {
+                widened = crate::blas::widen_half_vec(
+                    sl_typed::<u16>(*src_off, base, numel),
+                    *kind == HalfKind::Bf16,
+                );
+                &widened
+            } else {
+                sl(*src_off, base, numel)
+            };
+            concat_copy_rows_f32(
+                &mut tmp,
+                inp,
+                outer,
+                in_axis * inner,
+                row_stride,
+                cum * inner,
+                *in_numel as usize,
+            );
+            cum += in_axis;
+        }
+        if dst_kind.packed() {
+            crate::blas::round_half_into(
+                &tmp,
+                sl_mut_typed::<u16>(*dst, base, out_total),
+                *dst_kind == HalfKind::Bf16,
+            );
+        } else {
+            sl_mut(*dst, base, out_total).copy_from_slice(&tmp);
         }
     }
 }
@@ -3417,24 +3656,12 @@ pub(crate) fn activation_backward_kernel_f64(
     }
 }
 
-/// f64 erf via A&S 7.1.26 — same coefficients as `erf_f32`, computed
-/// at f64 width. Max error ~1.5e-7 (limited by the polynomial, not the
-/// arithmetic). Adequate for gradient kernels; if higher precision is
-/// needed, swap in a libm dependency.
+/// f64 erf, correctly rounded to within an ulp (libm). The f32 kernels use
+/// the A&S polynomial in [`erf_f32`]; at f64 its 1.5e-7 error would be the
+/// largest one in the graph.
 #[inline(always)]
 pub(crate) fn erf_f64(x: f64) -> f64 {
-    let s = x.signum();
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0
-        - (((((1.061_405_43 * t - 1.453_152_03) * t) + 1.421_413_75) * t - 0.284_496_74) * t
-            + 0.254_829_59)
-            * t
-            // Stays libm at f64 width on purpose: `vmath::exp_poly` is f32, and
-            // narrowing here would throw away the precision this variant exists
-            // for. The f32 twin below does use it.
-            * (-x * x).exp();
-    s * y
+    libm::erf(x)
 }
 
 /// Cheap erf approximation (Abramowitz & Stegun 7.1.26, max error ~1.5e-7
@@ -3521,11 +3748,8 @@ pub(crate) fn transpose_walk_f64(
     }
 }
 
-/// f64 elementwise activation. Reads `inp`, writes `out`. For now
-/// covers what the autodiff-emitted gradient graph needs (Neg, Exp,
-/// Log, Sqrt, Rsqrt, Abs, Tanh, Sigmoid, Relu — the
-/// transcendental-free subset). Approximate Gelu/Silu deferred until a
-/// workload demands them at f64.
+/// f64 elementwise activation. Reads `inp`, writes `out`. Covers every
+/// [`Activation`], so a graph promoted to F64 runs its activations in f64.
 pub(crate) fn apply_activation_f64(inp: &[f64], out: &mut [f64], kind: Activation) {
     match kind {
         Activation::Neg => {
@@ -3664,11 +3888,21 @@ pub(crate) fn apply_activation_f64(inp: &[f64], out: &mut [f64], kind: Activatio
                 *o = v.min(0.0) - (-(v.abs())).exp().ln_1p();
             }
         }
-        Activation::Gelu | Activation::GeluApprox | Activation::Silu => {
-            panic!(
-                "apply_activation_f64: {kind:?} not yet implemented at f64. \
-                    Add when a workload needs it."
-            );
+        Activation::Silu => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = v / (1.0 + (-v).exp());
+            }
+        }
+        Activation::Gelu => {
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = 0.5 * v * (1.0 + erf_f64(v * std::f64::consts::FRAC_1_SQRT_2));
+            }
+        }
+        Activation::GeluApprox => {
+            let c = (2.0 / std::f64::consts::PI).sqrt();
+            for (o, &v) in out.iter_mut().zip(inp) {
+                *o = 0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh());
+            }
         }
     }
 }

@@ -1,0 +1,33 @@
+[package]
+name = "rlx-stablehlo"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Export RLX graphs as StableHLO MLIR (for IREE and other MLIR toolchains)"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+
+[dependencies]
+rlx-ir = { workspace = true }
+rlx-compile = { workspace = true }
+rlx-autodiff = { workspace = true }
+# The rlx → HLO lowering and the generated `xla` proto types. The lowering is
+# shared with the TPU backend, so op coverage and semantics stay identical; this
+# crate only prints the module as StableHLO.
+rlx-tpu = { workspace = true }
+prost = "0.13"
+
+# Back-edges to crates that publish later: PATH-ONLY (no `version`), so
+# `cargo publish -p rlx-stablehlo` does not resolve them against crates.io.
+[dev-dependencies]
+rlx-runtime = { path = "../../core/rlx-runtime", features = ["cpu"] }
+# Real block graphs (Llama, BERT) for the IREE round trip.
+rlx-flow = { path = "../../core/rlx-flow" }
+
+[lints]
+workspace = true

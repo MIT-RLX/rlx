@@ -54,9 +54,52 @@ int scale_exp(uint amax_bits) {
 
 float round_scaled(float x, int e) { return flush(ldexp(round_fmt(ldexp(x, -e)), e)); }
 
+// `FloatFormat::fine_scale` (smallest (1 + m/8)·2^k with s·max ≥ amax; exact
+// products) and `fine_reciprocal` (8-entry table and the exponent).
+float fine_scale(float amax) {
+    // One flat loop without an early return: naga mistranslated a `return`
+    // from a nested loop here (it took the second candidate whatever the test).
+    int k0 = clamp(f32_exp(amax) - pc.emax - 1, -126, 125);
+    float best = uintBitsToFloat(0x7f700000u);
+    bool found = false;
+    for (int c = 0; c < 24; c++) {
+        int k = k0 + c / 8;
+        float s = (1.0 + 0.125 * float(c - (c / 8) * 8)) * uintBitsToFloat(uint(k + 127) << 23);
+        // Bit compare (both non-negative): the driver cannot rewrite it as a
+        // division by max_normal, whose reciprocal is subnormal for bf16.
+        if (!found && floatBitsToUint(s * pc.max_normal) >= floatBitsToUint(amax)) {
+            best = s;
+            found = true;
+        }
+    }
+    return best;
+}
+float fine_rcp(float s) {
+    uint tab[8] = uint[8](0x3f800000u, 0x3f638e39u, 0x3f4ccccdu, 0x3f3a2e8cu,
+                          0x3f2aaaabu, 0x3f1d89d9u, 0x3f124925u, 0x3f088889u);
+    uint b = floatBitsToUint(s);
+    int ne = 127 - int((b >> 23) & 0xffu);
+    if (ne < -126) { return 0.0; }
+    ne = min(ne, 127);
+    return uintBitsToFloat(tab[(b >> 20) & 7u]) * uintBitsToFloat(uint(ne + 127) << 23);
+}
+
+// Squared error of a block at scale 2^e, in index order (`FloatFormat::block_scale`);
+// multiply and add are separate statements so they are not contracted.
+float sq_err(uint start, uint end, int e) {
+    float acc = 0.0;
+    for (uint i = start; i < end; i++) {
+        float x = arena_load(pc.in_off + i);
+        float d = round_scaled(x, e) - x;
+        float d2 = d * d;
+        acc = acc + d2;
+    }
+    return acc;
+}
+
 void main() {
     uint t = gl_GlobalInvocationID.x;
-    if (pc.mode == 2u) {
+    if (pc.mode >= 2u) {
         uint per_row = (pc.last_dim + pc.block - 1u) / pc.block;
         uint row = t / per_row;
         uint start = row * pc.last_dim + (t % per_row) * pc.block;
@@ -64,7 +107,23 @@ void main() {
         uint end = min(start + pc.block, row * pc.last_dim + pc.last_dim);
         uint m = 0u;
         for (uint i = start; i < end; i++) { m = max(m, abs_bits(arena_load(pc.in_off + i))); }
+        if (pc.mode == 3u) {
+            float s = 1.0;
+            float r = 1.0;
+            if (m != 0u && m < 0x7f800000u) { s = fine_scale(uintBitsToFloat(m)); r = fine_rcp(s); }
+            for (uint i = start; i < end; i++) {
+                arena_store(pc.out_off + i, flush(round_fmt(arena_load(pc.in_off + i) * r) * s));
+            }
+            return;
+        }
         int e = scale_exp(m);
+        // One binade up when the MX scale clips the block max and that rounds
+        // the block with a smaller squared error (ties keep the MX scale).
+        if (m != 0u && m < 0x7f800000u && e < 127
+            && floatBitsToUint(ldexp(uintBitsToFloat(m), -e)) > floatBitsToUint(pc.max_normal)
+            && sq_err(start, end, e + 1) < sq_err(start, end, e)) {
+            e += 1;
+        }
         for (uint i = start; i < end; i++) {
             arena_store(pc.out_off + i, round_scaled(arena_load(pc.in_off + i), e));
         }

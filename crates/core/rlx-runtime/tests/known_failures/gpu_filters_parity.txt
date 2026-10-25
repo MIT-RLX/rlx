@@ -1,0 +1,9 @@
+# Known failures for tests/gpu_filters_parity.rs — format and env options:
+# `rlx_ir::known_failures`. Columns: case  device[@os]  issue  [note].
+# The device is `{Device:?}` lowercased (`gpu` = wgpu).
+#
+# Candidates from the wgpu-on-Vulkan investigation (2026-08-10, both Linux
+# rigs; wgpu-on-Metal, CUDA and ROCm are clean). Enable once an issue exists —
+# an entry without an issue is rejected:
+# conv_reverb  gpu@linux  #N  PartitionedConv wrong at element 0 (cpu 0.39999968 vs gpu 0.9107472)
+# iirfilt      gpu@linux  #N  IIR via Op::Scan: element 0 right, wrong from 1 on

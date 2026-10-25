@@ -1,0 +1,14 @@
+Package: rlx
+Type: Package
+Title: R Bindings for the RLX ML Compiler and Runtime
+Version: 0.2.19
+Authors@R: c(person("Eugene", "Hauptmann", role = c("aut", "cre"), email = "eugenehp@mit.edu"),
+             person("Nataliya", "Kosmyna", role = "aut"))
+Description: Graphs, sessions, device selection, autodiff, training, weights,
+    text and distributed nodes, over RLX's C ABI (librlx_capi).
+License: MIT + file LICENSE | Apache License 2.0
+Encoding: UTF-8
+Imports: jsonlite
+SystemRequirements: librlx_capi (cargo build -p rlx-capi); set RLX_CAPI_LIB_DIR when installing
+NeedsCompilation: yes
+Collate: support.R generated.R

@@ -59,18 +59,12 @@ fn main() {
 
     println!("SynthMatMul prefill {m}×{k}×{n} (d={d}) on Metal:");
     // Default: recon→MPS.
-    unsafe {
-        std::env::remove_var("RLX_METAL_SYNTH_MPS_DISABLE");
-    }
+    rlx_ir::env::remove("RLX_METAL_SYNTH_MPS_DISABLE");
     let mps = time("recon→MPS (default)");
     // Fused kernel.
-    unsafe {
-        std::env::set_var("RLX_METAL_SYNTH_MPS_DISABLE", "1");
-    }
+    rlx_ir::env::set("RLX_METAL_SYNTH_MPS_DISABLE", "1");
     let fused = time("fused (MPS disabled)");
-    unsafe {
-        std::env::remove_var("RLX_METAL_SYNTH_MPS_DISABLE");
-    }
+    rlx_ir::env::remove("RLX_METAL_SYNTH_MPS_DISABLE");
     println!("  → recon→MPS is {:.2}× faster than fused", fused / mps);
 }
 

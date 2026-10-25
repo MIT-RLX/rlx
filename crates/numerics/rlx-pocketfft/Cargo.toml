@@ -1,0 +1,24 @@
+[package]
+name = "rlx-pocketfft"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "scipy.fft (pocketfft) reproduced bit-for-bit in pure Rust, with selectable FMA contraction and twiddle rounding"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["scipy", "fft", "pocketfft", "parity"]
+categories = ["science", "mathematics"]
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_pocketfft"
+path = "src/lib.rs"
+
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]

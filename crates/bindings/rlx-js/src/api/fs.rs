@@ -84,7 +84,7 @@ fn f_size(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult
 /// directory (`$HOME`, `$RLX_MODELS_DIR`) without hardcoding a path.
 fn f_env(ctx: &mut Context, _this: &Value, args: &[Value], _m: i32) -> JsResult<Value> {
     let name = ctx.to_rust_string(arg(args, 0))?;
-    Ok(match std::env::var(&name) {
+    Ok(match rlx_ir::env::read(&name) {
         Ok(value) => new_string(ctx, &value),
         Err(_) => Value::Null,
     })

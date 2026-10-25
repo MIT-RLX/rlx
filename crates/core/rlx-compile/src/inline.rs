@@ -23,14 +23,18 @@
 //!   the map. Missing names → `Err`.
 //! * `param_bindings`: optional. When `Some`, every `Op::Param` in
 //!   `source` must appear here. When `None`, params re-emit as
-//!   `Op::Param` in `target` with the same name + shape — caller is
-//!   responsible for binding them later via `set_param`.
+//!   `Op::Param` in `target` with the same name + shape (shared with
+//!   a same-named param `target` already has) — caller is responsible
+//!   for binding them later via `set_param`.
 //! * Constants and other ops re-emit verbatim with their input
 //!   `NodeId`s remapped through the source→target ID map.
 //!
 //! Recursive sub-graph ops (Scan body, CustomFn body, …) are cloned
 //! intact — the inliner doesn't recurse into them since they own
 //! their own input scopes.
+//!
+//! This is [`Graph::splice`] with every input bound; see
+//! [`rlx_ir::compose`].
 
 use std::collections::HashMap;
 
@@ -41,55 +45,35 @@ use rlx_ir::*;
 ///
 /// # Errors
 ///
-/// Returns `Err(name)` if `source` has an `Op::Input` (or, when
+/// Returns `Err(message)` if `source` has an `Op::Input` (or, when
 /// `param_bindings` is `Some`, `Op::Param`) whose name isn't in the
-/// supplied bindings map.
+/// supplied bindings map, or a binding disagrees with its leaf on shape.
 pub fn inline_into(
     target: &mut Graph,
     source: &Graph,
     input_bindings: &HashMap<String, NodeId>,
     param_bindings: Option<&HashMap<String, NodeId>>,
 ) -> Result<Vec<NodeId>, String> {
-    let mut id_map: HashMap<NodeId, NodeId> = HashMap::with_capacity(source.nodes().len());
-
+    let mut splice = Splice::new();
+    let mut seen = std::collections::HashSet::new();
     for node in source.nodes() {
-        let new_id = match &node.op {
-            Op::Input { name } => *input_bindings.get(name).ok_or_else(|| {
-                format!("inline_into: source Op::Input '{name}' not in input_bindings")
-            })?,
-            Op::Param { name } => match param_bindings {
-                Some(pm) => *pm.get(name).ok_or_else(|| {
-                    format!("inline_into: source Op::Param '{name}' not in param_bindings")
-                })?,
-                None => target.param(name.clone(), node.shape.clone()),
-            },
-            Op::Constant { data } => target.add_node(
-                Op::Constant { data: data.clone() },
-                vec![],
-                node.shape.clone(),
-            ),
-            _ => {
-                let new_inputs: Vec<NodeId> = node
-                    .inputs
-                    .iter()
-                    .map(|i| {
-                        *id_map.get(i).expect(
-                            "inline_into: input NodeId not yet mapped — \
-                         source graph isn't in topo order?",
-                        )
-                    })
-                    .collect();
-                target.add_node(node.op.clone(), new_inputs, node.shape.clone())
-            }
+        let (kind, name, map, map_name) = match (&node.op, param_bindings) {
+            (Op::Input { name }, _) => ("Input", name, input_bindings, "input_bindings"),
+            (Op::Param { name }, Some(pm)) => ("Param", name, pm, "param_bindings"),
+            _ => continue,
         };
-        id_map.insert(node.id, new_id);
+        if !seen.insert(name) {
+            continue;
+        }
+        let bound = map
+            .get(name)
+            .ok_or_else(|| format!("inline_into: source Op::{kind} '{name}' not in {map_name}"))?;
+        splice = splice.bind(name.clone(), *bound);
     }
-
-    Ok(source
-        .outputs
-        .iter()
-        .map(|o| *id_map.get(o).expect("output NodeId missing from map"))
-        .collect())
+    target
+        .splice(source, &splice)
+        .map(|s| s.outputs)
+        .map_err(|e| format!("inline_into: {e}"))
 }
 
 #[cfg(test)]

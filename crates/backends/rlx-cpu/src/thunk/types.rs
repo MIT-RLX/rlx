@@ -656,6 +656,13 @@ pub enum Thunk {
     ///
     /// Single-carry MVP — body has exactly one Input and one output,
     /// both same shape and dtype.
+    /// `Op::While`, looped at run time ([`super::execute_while`]): the
+    /// carried values at `inputs`, the first after the loop at `output`.
+    While {
+        plan: Arc<super::WhilePlan>,
+        inputs: Arc<Vec<usize>>,
+        output: usize,
+    },
     Scan {
         body: Arc<ThunkSchedule>,
         body_init: Arc<Vec<u8>>, // pristine body arena bytes
@@ -886,6 +893,10 @@ pub enum Thunk {
         idx_i64: u8,
         /// Element size of table/output (4 = f32, 8 = i64).
         table_bytes: u8,
+        /// A table packed at 2 B/elem (1 = f16, 2 = bf16; 0 = not), its rows
+        /// widened to the f32 output as they are gathered: a half embedding
+        /// table stays half in the arena.
+        table_half: u8,
     },
     /// Narrow: copy slice (`elem_bytes` = source element size: 4 for f32, 8 for f64).
     Narrow {
@@ -1879,6 +1890,20 @@ pub enum Thunk {
         pos: u32,
         inner_bytes: u32,
     },
+    /// `Op::DynamicUpdateSlice`: `rows` rows of `row_bytes` from `src` into
+    /// `dst` (the operand's own slot, `extent` rows a slice) at the offset
+    /// the one-element `start` holds when it runs, clamped to
+    /// `[0, extent - rows]`; `outer` slices.
+    DynamicUpdateSlice {
+        src: usize,
+        dst: usize,
+        start: usize,
+        start_dtype: rlx_ir::DType,
+        outer: u32,
+        extent: u32,
+        rows: u32,
+        row_bytes: u32,
+    },
     /// Concat along an axis: output[outer, axis, inner] = inputs concatenated.
     /// Each entry of `inputs` is (src_offset, axis_len_for_that_input) in u32
     /// elements. `outer`, `inner`, and `total_axis_len` are pre-computed
@@ -1891,6 +1916,34 @@ pub enum Thunk {
         /// `(src_offset, axis_extent, input_numel)` — `input_numel` enables
         /// outer-dim broadcast when rank-deficient inputs are concatenated.
         inputs: Vec<(usize, u32, u32)>,
+    },
+    /// [`Self::Concat`] for 1- and 2-byte element types that are copied as
+    /// they are (u8 / i8 / bool, u16 / i16 …): `Concat` moves 4-byte words, so
+    /// these came out with half the elements missing and rows interleaved.
+    /// Offsets are bytes; extents and counts are elements of `elem_bytes`.
+    ConcatBytes {
+        dst: usize,
+        elem_bytes: u8,
+        outer: u32,
+        inner: u32,
+        total_axis: u32,
+        inputs: Vec<(usize, u32, u32)>,
+    },
+    /// [`Self::Concat`] where an input or the output lives PACKED at 2 B/elem
+    /// (f16 / bf16). `Concat` moves 4-byte words, so packed halves came out as
+    /// pairs of values fused into one f32 word — a bf16 `Concat` of two
+    /// weights read back as `[x1, x3, x5, …]` with the tail zero. Packed inputs
+    /// are widened to f32, the rows assembled in f32, and a packed output is
+    /// rounded back; widened inputs are copied as they are. Each input carries
+    /// its own layout because params stay packed while activations are widened.
+    ConcatHalf {
+        dst: usize,
+        dst_kind: HalfKind,
+        outer: u32,
+        inner: u32,
+        total_axis: u32,
+        /// `(src_offset, axis_extent, input_numel, layout)`.
+        inputs: Vec<(usize, u32, u32, HalfKind)>,
     },
     /// Element-wise comparison: out = (lhs CMP rhs) ? 1 : 0 (Bool u8 or F32 0/1).
     /// `lhs_scalar` / `rhs_scalar` broadcast a 1-element operand across `len`
@@ -2343,6 +2396,19 @@ pub enum Thunk {
         /// Points at a `[chan_dim]` f32 buffer holding the running scale
         /// per channel.
         state_off: Option<usize>,
+    },
+
+    /// `Op::DoubleSingle`: f64 emulated as `(hi, lo)` f32 pairs. Lengths are
+    /// in df elements (pairs); `b_len == 0` for one-input ops.
+    DoubleSingle {
+        op: rlx_ir::double_single::DfOp,
+        plan: rlx_ir::double_single::DfPlan,
+        a: usize,
+        a_len: usize,
+        b: usize,
+        b_len: usize,
+        out: usize,
+        out_len: usize,
     },
 
     /// `Op::RoundToFormat`: round to a float format emulated on f32, with an
@@ -2926,6 +2992,8 @@ pub enum Thunk {
         inverse: bool,
         norm_tag: u32,
         dtype: rlx_ir::DType,
+        /// `Native` → the radix/Bluestein kernels; otherwise [`execute_fft1d_pocketfft`].
+        algo: rlx_ir::FftAlgo,
     },
     /// Fixed-point 1D FFT — see `rlx_ir::Op::FftQ`.
     Fft1dQ {
@@ -3000,11 +3068,18 @@ pub struct ThunkSchedule {
     pub compiled_fns: Vec<Arc<dyn Fn(*mut u8) + Send + Sync>>,
     /// Runtime-mutable RNG policy for [`Thunk::RngNormal`] / [`Thunk::RngUniform`].
     pub rng: Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    /// Inter-thunk wave plan, built from `thunks` on first execution.
+    #[cfg(feature = "wave-exec")]
+    pub waves: std::sync::OnceLock<Arc<crate::thunk::WavePlan>>,
 }
 
 impl ThunkSchedule {
     pub fn strip_nops(&mut self) {
         self.thunks.retain(|t| !matches!(t, Thunk::Nop));
+        #[cfg(feature = "wave-exec")]
+        {
+            self.waves = std::sync::OnceLock::new();
+        }
         // compiled_fns must be rebuilt after stripping — caller should
         // call strip_nops() before compile_closures().
         self.compiled_fns.clear();
@@ -3048,6 +3123,7 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         Thunk::ComplexNormSqF32 { src, .. } => vec![*src],
         Thunk::ComplexNormSqBackwardF32 { z, g, .. } => vec![*z, *g],
         Thunk::ConjugateC64 { src, .. } => vec![*src],
+        Thunk::While { inputs, .. } => inputs.to_vec(),
         Thunk::Scan {
             outer_init_off,
             xs_inputs,
@@ -3217,6 +3293,8 @@ pub(crate) fn thunk_read_offsets(t: &Thunk) -> Vec<usize> {
         } => vec![*hidden, *qkv_w, *out_w, *mask, *qkv_b, *out_b, *cos, *sin],
         Thunk::FusedSwiGLU { src, .. } => vec![*src],
         Thunk::Concat { inputs, .. } => inputs.iter().map(|(off, _, _)| *off).collect(),
+        Thunk::ConcatHalf { inputs, .. } => inputs.iter().map(|(off, ..)| *off).collect(),
+        Thunk::ConcatBytes { inputs, .. } => inputs.iter().map(|(off, _, _)| *off).collect(),
         Thunk::ConcatF64 { inputs, .. } => inputs.iter().map(|(off, _, _)| *off).collect(),
         Thunk::Narrow { src, .. } => vec![*src],
         Thunk::Copy { src, .. } => vec![*src],

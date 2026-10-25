@@ -28,10 +28,7 @@ fn build(batch: usize, n: usize) -> Graph {
 }
 
 fn set_fuse(on: bool) {
-    // SAFETY: single-threaded driver toggling a process-local compile-time gate.
-    unsafe {
-        std::env::set_var("RLX_FFT_FUSE_REAL", if on { "1" } else { "0" });
-    }
+    rlx_ir::env::set("RLX_FFT_FUSE_REAL", if on { "1" } else { "0" });
 }
 
 fn main() {

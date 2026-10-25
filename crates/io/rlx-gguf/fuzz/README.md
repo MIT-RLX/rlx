@@ -36,7 +36,7 @@ cargo-fuzz requires a **nightly** toolchain (it relies on
 cargo +nightly fuzz run gguf_parse
 cargo +nightly fuzz run gguf_dequant
 
-# time-boxed smoke run
+# time-boxed minimal run
 cargo +nightly fuzz run gguf_parse -- -max_total_time=30
 
 # just build the instrumented binaries (no run)

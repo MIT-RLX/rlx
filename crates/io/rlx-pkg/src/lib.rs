@@ -24,6 +24,7 @@
 //! - `remote` — [`RemoteFlat`] HTTP Range reader
 
 mod auto_tier;
+pub mod build;
 mod flat;
 mod from_bake;
 mod from_dduf;
@@ -56,8 +57,8 @@ pub use from_mlx::{MlxImportOptions, mlx_to_rlxp};
 pub use from_nemo::{NemoImportOptions, nemo_to_rlxp};
 pub use from_pt::{PtImportOptions, pt_to_rlxp};
 pub use manifest::{
-    COMPAT_VERSION, DistRef, FORMAT_NAME, FORMAT_VERSION, GraphRef, Manifest, SidecarRef,
-    WeightsRef,
+    COMPAT_VERSION, DistRef, FORMAT_NAME, FORMAT_VERSION, GRAPH_BINCODE, GRAPH_RLXMODEL, GraphRef,
+    Manifest, SidecarRef, WeightsRef,
 };
 pub use package::{MaterializeMode, MemberSource, Package, dtype_for_weight_scheme};
 pub use placement::{ExpertPlacement, Placement, TensorShard};

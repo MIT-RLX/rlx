@@ -36,10 +36,7 @@ fn fft_graph(batch: usize, n: usize) -> Graph {
 }
 
 fn set_fast(on: bool) {
-    // SAFETY: single-threaded benchmark driver toggling a process-local gate.
-    unsafe {
-        std::env::set_var("RLX_FFT_FAST", if on { "1" } else { "0" });
-    }
+    rlx_ir::env::set("RLX_FFT_FAST", if on { "1" } else { "0" });
 }
 
 fn main() {

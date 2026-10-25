@@ -8,6 +8,7 @@
 //! fusion passes can reason about them structurally.
 
 use crate::DType;
+use crate::prelude::*;
 
 /// Unary element-wise activation functions.
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
@@ -121,8 +122,8 @@ pub enum ScaleMode {
 }
 
 impl Eq for ScaleMode {}
-impl std::hash::Hash for ScaleMode {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl core::hash::Hash for ScaleMode {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         match self {
             ScaleMode::PerBatch => state.write_u8(0),
             ScaleMode::EMA { decay } => {
@@ -501,6 +502,11 @@ pub enum OpKind {
     CustomFn,
     /// 1D FFT primitive (forward or inverse) — see [`Op::Fft`].
     Fft,
+    /// [`Op::Fft`] with [`crate::fft::FftAlgo::PocketFft`] rounding. A separate
+    /// kind so legalization can tell the two apart: a backend without a native
+    /// pocketfft kernel (every one but CPU) gets it rewritten into elementwise
+    /// passes (`rlx_fusion::lower_pocketfft`) instead of running its own FFT.
+    FftPocketFft,
     /// Fixed-point 1D FFT — see [`Op::FftQ`].
     FftQ,
     /// Ternary pruned radix-2 butterfly stage — see [`Op::FftButterflyStage`].
@@ -569,6 +575,8 @@ pub enum OpKind {
     GatedResidual,
     /// Backward of [`Op::GatedResidual`] — packed `[dx ∥ dy ∥ dgate]`.
     GatedResidualBackward,
+    /// In-place write at a runtime offset — see [`Op::DynamicUpdateSlice`].
+    DynamicUpdateSlice,
 }
 
 /// An operand inside a fused [`ChainStep`] — either a graph-level input
@@ -828,9 +836,10 @@ pub enum Op {
     /// [`crate::number_format::NumberFormat`].
     ///
     /// `out[i] = s · format.round(x[i] / s)` where the power-of-two scale `s`
-    /// comes from `scaling`: `1` for `None`, [`FloatFormat::pow2_scale`] of the
-    /// block's largest magnitude for `Block(n)` (runs of `n` along the last
-    /// axis), or of the whole tensor's for `PerTensor` — in which case that
+    /// comes from `scaling`: `1` for `None`, [`FloatFormat::block_scale`] of
+    /// each block for `Block(n)` (runs of `n` along the last axis), or
+    /// [`FloatFormat::pow2_scale`] of the whole tensor's largest magnitude for
+    /// `PerTensor` — in which case that
     /// magnitude arrives as a second, scalar input (`reduce_max(abs(x))`), so
     /// the kernel stays a single elementwise pass. Bit-identical on every
     /// backend to [`FloatFormat::round_slice_scaled`].
@@ -839,6 +848,7 @@ pub enum Op {
     /// unchanged, none to the scale input.
     ///
     /// [`FloatFormat::pow2_scale`]: crate::number_format::FloatFormat::pow2_scale
+    /// [`FloatFormat::block_scale`]: crate::number_format::FloatFormat::block_scale
     /// [`FloatFormat::round_slice_scaled`]: crate::number_format::FloatFormat::round_slice_scaled
     RoundToFormat {
         format: crate::number_format::FloatFormat,
@@ -2430,17 +2440,12 @@ pub enum Op {
 
     // ── Control flow (subgraphs as op payloads) ─────────────────
     //
-    // Status: IR is defined; helper `run_if` / `run_while` exist in
-    // rlx-runtime/src/subgraph.rs; **executor wiring is not yet
-    // implemented** (both CPU thunk and Metal thunk fall through to
-    // `Thunk::Nop` for these ops). Wiring requires:
-    //   1. Recursive subgraph compile at parent-compile time.
-    //   2. Per-subgraph input/output binding through the arena.
-    //   3. Schedule-level dispatch when the predicate / loop cond is
-    //      resolved at runtime.
-    // Estimate: 4–6 hours of focused work + parity tests. Deferred
-    // because no current in-tree model uses these ops;
-    // surface area without a validation target invites silent bugs.
+    // `Op::If` is inlined (both branches, then a `Where`) by `LowerIf` /
+    // `LowerControlFlow`. `Op::While` runs as a loop at run time on CPU
+    // (`Thunk::While`) and through the one-op host fallback on Metal,
+    // CUDA, ROCm and wgpu, `max_iterations` or not; the backends with no
+    // run-time loop (MLX, CoreML, Vulkan, oneAPI, TPU, …) unroll it to
+    // `max_iterations` and need one.
     /// Conditional: pick between two subgraphs based on a boolean predicate.
     /// Inputs: [predicate, ...captures (used inside both branches)].
     /// `then_branch` and `else_branch` are sub-graphs that share the
@@ -2456,7 +2461,9 @@ pub enum Op {
     /// Inputs: [...initial loop-carried values].
     /// `cond`'s single output is a Bool scalar.
     /// `body`'s outputs become the next iteration's loop-carried inputs.
-    /// Outputs of While are the values after the final iteration.
+    /// The node's value is the first loop-carried value after the final
+    /// iteration. `cond` and `body` read only the carried values (and
+    /// constants), not params.
     /// Used for: KV-cache-driven autoregressive generation, beam search.
     While {
         cond: Box<crate::Graph>,
@@ -2685,6 +2692,9 @@ pub enum Op {
     Fft {
         inverse: bool,
         norm: crate::fft::FftNorm,
+        /// The algorithm, and so the rounding (default [`crate::fft::FftAlgo::Native`]).
+        #[cfg_attr(feature = "serialize", serde(default))]
+        algo: crate::fft::FftAlgo,
     },
 
     /// Fixed-point FFT over `I32` data in the same 2N-block layout `Op::Fft`
@@ -2724,8 +2734,11 @@ pub enum Op {
     ///   0 — spectrum `[..., 2*n_fft]` (re plane then im plane, same as `Op::Fft` output)
     ///   1 — mel filterbank `[n_mels, n_bins]` with `n_bins = n_fft/2 + 1`
     ///
-    /// Output: `[..., n_mels]` with Whisper dynamic-range compression
-    /// (`log10`, clamp to max−8 dB, `(x+4)/4`).
+    /// Output: `[..., n_mels]` with Whisper's compression applied **per
+    /// frame** (`log10`, clamp to that frame's max − 8, `(x+4)/4`). Whisper
+    /// itself floors at the max of the whole spectrogram, so a Whisper front
+    /// end takes the global max from primitives instead (see rlx-whisper's
+    /// `export::log_mel_graph`).
     LogMel,
 
     /// VJP of [`Op::LogMel`] w.r.t. spectrum (input 0).
@@ -3013,6 +3026,21 @@ pub enum Op {
     /// `dx`, `dy`, `dgate` (row-major). Unpack with
     /// [`crate::ops::backward::unpack_gated_residual_backward`].
     GatedResidualBackward,
+
+    /// `operand` with `update` written at a runtime offset along `axis`
+    /// (JAX's `lax.dynamic_update_slice_in_dim`): inputs `[operand, update,
+    /// start]`, `start` a one-element tensor (f32 or an integer) read when the
+    /// graph runs. Every other axis of `update` matches `operand`'s. A start
+    /// past `operand`'s extent less `update`'s is clamped, as JAX clamps.
+    ///
+    /// The output aliases `operand`'s buffer: a decode step writes one cache
+    /// row at its `position` in place, O(1) in the context, where `ScatterNd`
+    /// copies the cache. Nothing may read `operand` after it. Backends
+    /// without a native kernel get a `ScatterNd`
+    /// (`rlx_fusion::lower_dynamic_update_slice`).
+    DynamicUpdateSlice {
+        axis: usize,
+    },
 }
 
 impl Op {
@@ -3257,6 +3285,7 @@ impl Op {
             Op::GaussianSplatRasterize { .. } => OpKind::GaussianSplatRasterize,
             Op::Custom { .. } => OpKind::Custom,
             Op::CustomFn { .. } => OpKind::CustomFn,
+            Op::Fft { algo, .. } if *algo != crate::fft::FftAlgo::Native => OpKind::FftPocketFft,
             Op::Fft { .. } => OpKind::Fft,
             Op::FftQ { .. } => OpKind::FftQ,
             Op::FftButterflyStage { .. } => OpKind::FftButterflyStage,
@@ -3289,6 +3318,7 @@ impl Op {
             Op::AdaLayerNormBackward { .. } => OpKind::AdaLayerNormBackward,
             Op::GatedResidual => OpKind::GatedResidual,
             Op::GatedResidualBackward => OpKind::GatedResidualBackward,
+            Op::DynamicUpdateSlice { .. } => OpKind::DynamicUpdateSlice,
         }
     }
 
@@ -3601,12 +3631,13 @@ impl Op {
             Op::AdaLayerNormBackward { .. } => 4,     // x, scale, shift, dy
             Op::GatedResidual => 3,                   // x, y, gate
             Op::GatedResidualBackward => 4,           // x, y, gate, dy
+            Op::DynamicUpdateSlice { .. } => 3,       // operand, update, start
         }
     }
 }
 
-impl std::fmt::Display for Op {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Op {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Op::Input { name } => write!(f, "input(\"{name}\")"),
             Op::Param { name } => write!(f, "param(\"{name}\")"),
@@ -4307,8 +4338,16 @@ impl std::fmt::Display for Op {
                 let j = if jvp_body.is_some() { ",jvp" } else { "" };
                 write!(f, "custom_fn(in={num_inputs}{v}{j})")
             }
-            Op::Fft { inverse, norm } => {
-                write!(f, "fft(inverse={inverse}, norm={norm:?})")
+            Op::Fft {
+                inverse,
+                norm,
+                algo,
+            } => {
+                if *algo == crate::fft::FftAlgo::Native {
+                    write!(f, "fft(inverse={inverse}, norm={norm:?})")
+                } else {
+                    write!(f, "fft(inverse={inverse}, norm={norm:?}, algo={algo:?})")
+                }
             }
             Op::FftQ {
                 inverse,
@@ -4364,6 +4403,7 @@ impl std::fmt::Display for Op {
             }
             Op::GatedResidual => write!(f, "gated_residual"),
             Op::GatedResidualBackward => write!(f, "gated_residual_backward"),
+            Op::DynamicUpdateSlice { axis } => write!(f, "dynamic_update_slice(axis={axis})"),
         }
     }
 }
@@ -4472,8 +4512,8 @@ impl Arity {
     }
 }
 
-impl std::fmt::Display for Arity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Arity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Arity::Exact(k) => write!(f, "{k}"),
             Arity::Range { min, max } => write!(f, "{min} to {max}"),

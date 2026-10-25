@@ -18,6 +18,9 @@
 //! Use [`estimate`] for a numeric snapshot, [`Estimate::summary`] for a
 //! one-liner suitable for stdout / commit messages.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::model::Layer;
 use crate::passes::{Hints, OptimizedModel};
 use crate::tune::RequantPrecision;

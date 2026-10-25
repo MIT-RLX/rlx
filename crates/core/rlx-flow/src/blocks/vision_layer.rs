@@ -33,11 +33,11 @@ impl VisionSwiGluFfnStage {
 impl BlockStage for VisionSwiGluFfnStage {
     fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
         let lp = &self.layer_prefix;
-        let fc11_w = ctx.load_param(&format!("{lp}.mlp.fc11.weight"), true)?;
+        let fc11_w = ctx.load_matrix(&format!("{lp}.mlp.fc11.weight"), true)?;
         let fc11_b = ctx.load_param(&format!("{lp}.mlp.fc11.bias"), false)?;
-        let fc12_w = ctx.load_param(&format!("{lp}.mlp.fc12.weight"), true)?;
+        let fc12_w = ctx.load_matrix(&format!("{lp}.mlp.fc12.weight"), true)?;
         let fc12_b = ctx.load_param(&format!("{lp}.mlp.fc12.bias"), false)?;
-        let fc2_w = ctx.load_param(&format!("{lp}.mlp.fc2.weight"), true)?;
+        let fc2_w = ctx.load_matrix(&format!("{lp}.mlp.fc2.weight"), true)?;
         let fc2_b = ctx.load_param(&format!("{lp}.mlp.fc2.bias"), false)?;
         let mlp_ln_g = ctx.load_param(&format!("{lp}.mlp.norm.weight"), false)?;
         let mlp_ln_b = ctx.load_param(&format!("{lp}.mlp.norm.bias"), false)?;

@@ -5,47 +5,52 @@
 //! `.rlxp` open / GGUF→RLXP helpers for Python.
 //!
 //! - [`load_rlxp`] — open a pack; return name, features, tensor names, sidecars
+//! - [`verify_rlxp`] — checksum-verify every tensor and sidecar
 //! - [`convert_gguf_to_rlxp`] — weight-oriented import (`include_graph` optional)
 //!
 //! Spec: `docs/rlxp.md`. Full compile/run stays on the Rust
 //! `rlx_runtime::pkg` path.
 
-use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
-use rlx_pkg::{
-    ContainerKind, DdufImportOptions, GgufImportOptions, MlxImportOptions, NemoImportOptions,
-    Package, PtImportOptions, dduf_to_rlxp, gguf_to_rlxp, mlx_to_rlxp, nemo_to_rlxp, pt_to_rlxp,
-};
+use rlx_bind::runtime::io::weights;
+use rlx_bind::runtime::serde_json::json;
 
-fn map_err(e: anyhow::Error) -> PyErr {
-    PyIOError::new_err(format!("{e:#}"))
-}
+use crate::bind::{from_json, to_py};
 
-/// Open an `.rlxp` / ZIP / package directory; return a summary dict.
+/// A package's manifest: `{name, format_version, compat_version, features,
+/// has_graph, tensors, sidecars}`.
 #[pyfunction]
 #[pyo3(signature = (path))]
 pub fn load_rlxp(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let pack = Package::open(path).map_err(map_err)?;
-    let m = pack.manifest();
-    let d = PyDict::new_bound(py);
-    d.set_item("name", m.name.as_str())?;
-    d.set_item("format_version", m.format_version)?;
-    d.set_item("compat_version", m.compat_version)?;
-    d.set_item("features", m.features.clone())?;
-    d.set_item("has_graph", pack.has_graph())?;
-    if let Some(idx) = pack.weights_index() {
-        let names: Vec<&str> = idx.names().collect();
-        d.set_item("tensors", names)?;
-    } else {
-        d.set_item("tensors", Vec::<String>::new())?;
-    }
-    let sides: Vec<&str> = m.sidecars.iter().map(|s| s.id.as_str()).collect();
-    d.set_item("sidecars", sides)?;
-    Ok(d.into())
+    let m = weights::open_rlxp(path).map_err(to_py)?;
+    Ok(from_json(py, &m))
 }
 
-/// Convert a GGUF file to `.rlxp`.
+/// Check every tensor and sidecar hash: `{ok, tensors_checked, …, failures}`.
+#[pyfunction]
+pub fn verify_rlxp(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let r = weights::verify_rlxp(path).map_err(to_py)?;
+    Ok(from_json(py, &r))
+}
+
+fn convert(
+    from: &str,
+    src: &str,
+    out: &str,
+    include_graph: bool,
+    auto_tier: bool,
+    container: &str,
+    keep_packed: bool,
+) -> PyResult<()> {
+    let opts = json!({
+        "include_graph": include_graph,
+        "auto_tier": auto_tier,
+        "container": container,
+        "keep_packed": keep_packed,
+    });
+    weights::to_rlxp(from, src, out, &opts).map_err(to_py)
+}
+
 #[pyfunction]
 #[pyo3(signature = (gguf_path, out_path, *, include_graph=false, auto_tier=true, container="flat"))]
 pub fn convert_gguf_to_rlxp(
@@ -55,26 +60,17 @@ pub fn convert_gguf_to_rlxp(
     auto_tier: bool,
     container: &str,
 ) -> PyResult<()> {
-    let container = match container {
-        "flat" => ContainerKind::Flat,
-        "zip" => ContainerKind::Zip,
-        "dir" => ContainerKind::Dir,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown container {other:?}; expected flat|zip|dir"
-            )));
-        }
-    };
-    let opts = GgufImportOptions {
-        container,
+    convert(
+        "gguf",
+        gguf_path,
+        out_path,
         include_graph,
-        compress_sidecars: true,
         auto_tier,
-    };
-    gguf_to_rlxp(gguf_path, out_path, &opts).map_err(map_err)
+        container,
+        false,
+    )
 }
 
-/// Convert an MLX weight path (dir / safetensors / npz / npy) to `.rlxp`.
 #[pyfunction]
 #[pyo3(signature = (mlx_path, out_path, *, include_graph=false, auto_tier=true, container="flat", keep_packed=false))]
 pub fn convert_mlx_to_rlxp(
@@ -85,28 +81,17 @@ pub fn convert_mlx_to_rlxp(
     container: &str,
     keep_packed: bool,
 ) -> PyResult<()> {
-    let container = match container {
-        "flat" => ContainerKind::Flat,
-        "zip" => ContainerKind::Zip,
-        "dir" => ContainerKind::Dir,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown container {other:?}; expected flat|zip|dir"
-            )));
-        }
-    };
-    let opts = MlxImportOptions {
-        container,
+    convert(
+        "mlx",
+        mlx_path,
+        out_path,
         include_graph,
-        compress_sidecars: true,
         auto_tier,
-        dequant_to_f32: !keep_packed,
-        ..Default::default()
-    };
-    mlx_to_rlxp(mlx_path, out_path, &opts).map_err(map_err)
+        container,
+        keep_packed,
+    )
 }
 
-/// Convert a HuggingFace DDUF (`.dduf`) file to `.rlxp`.
 #[pyfunction]
 #[pyo3(signature = (dduf_path, out_path, *, include_graph=false, auto_tier=true, container="flat"))]
 pub fn convert_dduf_to_rlxp(
@@ -116,26 +101,17 @@ pub fn convert_dduf_to_rlxp(
     auto_tier: bool,
     container: &str,
 ) -> PyResult<()> {
-    let container = match container {
-        "flat" => ContainerKind::Flat,
-        "zip" => ContainerKind::Zip,
-        "dir" => ContainerKind::Dir,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown container {other:?}; expected flat|zip|dir"
-            )));
-        }
-    };
-    let opts = DdufImportOptions {
-        container,
+    convert(
+        "dduf",
+        dduf_path,
+        out_path,
         include_graph,
-        compress_sidecars: true,
         auto_tier,
-    };
-    dduf_to_rlxp(dduf_path, out_path, &opts).map_err(map_err)
+        container,
+        false,
+    )
 }
 
-/// Convert a NeMo (`.nemo`) archive to `.rlxp`.
 #[pyfunction]
 #[pyo3(signature = (nemo_path, out_path, *, include_graph=false, auto_tier=true, container="flat"))]
 pub fn convert_nemo_to_rlxp(
@@ -145,26 +121,17 @@ pub fn convert_nemo_to_rlxp(
     auto_tier: bool,
     container: &str,
 ) -> PyResult<()> {
-    let container = match container {
-        "flat" => ContainerKind::Flat,
-        "zip" => ContainerKind::Zip,
-        "dir" => ContainerKind::Dir,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown container {other:?}; expected flat|zip|dir"
-            )));
-        }
-    };
-    let opts = NemoImportOptions {
-        container,
+    convert(
+        "nemo",
+        nemo_path,
+        out_path,
         include_graph,
-        compress_sidecars: true,
         auto_tier,
-    };
-    nemo_to_rlxp(nemo_path, out_path, &opts).map_err(map_err)
+        container,
+        false,
+    )
 }
 
-/// Convert a PyTorch `.pt` / `.pth` / `pytorch_model.bin` to `.rlxp`.
 #[pyfunction]
 #[pyo3(signature = (pt_path, out_path, *, include_graph=false, auto_tier=true, container="flat"))]
 pub fn convert_pt_to_rlxp(
@@ -174,21 +141,29 @@ pub fn convert_pt_to_rlxp(
     auto_tier: bool,
     container: &str,
 ) -> PyResult<()> {
-    let container = match container {
-        "flat" => ContainerKind::Flat,
-        "zip" => ContainerKind::Zip,
-        "dir" => ContainerKind::Dir,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown container {other:?}; expected flat|zip|dir"
-            )));
-        }
-    };
-    let opts = PtImportOptions {
-        container,
+    convert(
+        "pt",
+        pt_path,
+        out_path,
         include_graph,
-        compress_sidecars: true,
         auto_tier,
-    };
-    pt_to_rlxp(pt_path, out_path, &opts).map_err(map_err)
+        container,
+        false,
+    )
+}
+
+/// Convert a model into an `.rlxp` package: `from_` is `"gguf"`, `"mlx"`,
+/// `"dduf"`, `"nemo"` or `"pt"`; `options` is `{include_graph, auto_tier,
+/// container, keep_packed}`. The `convert_*_to_rlxp` functions are this with
+/// `from_` fixed.
+#[pyfunction]
+#[pyo3(signature = (from_, src, dst, options=None))]
+pub fn to_rlxp(
+    from_: &str,
+    src: &str,
+    dst: &str,
+    options: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    let opts = crate::bind::opt_json(options)?;
+    weights::to_rlxp(from_, src, dst, &opts).map_err(to_py)
 }

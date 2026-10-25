@@ -21,6 +21,7 @@
 //! `‖C‖² − 2·x·Cᵀ` (shape `[N, K]`) and take the `argmin` along `K`.
 
 use crate::infer::GraphExt as _;
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId};
 
 /// Distance metric for [`Graph::vector_quantize`].

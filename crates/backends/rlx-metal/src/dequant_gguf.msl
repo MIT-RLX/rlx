@@ -1211,6 +1211,108 @@ kernel void q8_0_mm_f32_xs(
     }
 }
 
+// ── Q8_0 GEMM on simdgroup matrices (large m) ─────────────────────────────
+//
+// `q8_0_mm_f32_xs` re-dequantizes every weight for each 8-row tile, so past
+// m ≈ 96 it loses to dequant-to-f32-scratch + MPS — which writes and re-reads
+// the whole matrix as f32 on every call (a 12B diffusion transformer: ~48 GB
+// of scratch traffic per step). This kernel dequantizes each 32-element block
+// ONCE per 64×64 output tile into threadgroup memory and feeds it to 8×8
+// simdgroup MMAs, f32 throughout (FLUX activations overflow f16).
+//
+// 256 threads = 8 simdgroups; simdgroup s owns output rows s*8..s*8+7 and all
+// 8 column blocks of the tile. Per K block: stage A [64×32] and the dequantized
+// B [32×64] (8 values per thread each), then 4 k-steps × 8 MMAs per simdgroup.
+// Grid (ceil(m/64), ceil(n/64)): row tiles vary fastest, so the row tiles of
+// one column block run together and share its weights in cache.
+// `encode_q8_0_mm_f32_sg` (ops.rs) MUST match these constants.
+constant uint Q80_SG_T = 64u;
+constant uint Q80_SG_K = 32u;
+
+kernel void q8_0_mm_f32_sg(
+    device float* arena    [[buffer(0)]],
+    constant ulong& x_off  [[buffer(1)]],
+    constant ulong& w_off  [[buffer(2)]],
+    constant ulong& dst_off[[buffer(3)]],
+    constant uint& m_dim   [[buffer(4)]],
+    constant uint& k_dim   [[buffer(5)]],
+    constant uint& n_dim   [[buffer(6)]],
+    uint2 tgid  [[threadgroup_position_in_grid]],
+    ushort sgid [[simdgroup_index_in_threadgroup]],
+    ushort slid [[thread_index_in_simdgroup]]
+) {
+    // A [64×32] | B [64 cols × 32 k] while accumulating; the 64×64 output
+    // tile after.
+    threadgroup float sh[Q80_SG_T * Q80_SG_T];
+    threadgroup float* As = sh;
+    threadgroup float* Bs = sh + Q80_SG_T * Q80_SG_K;
+
+    const uint row0 = tgid.x * Q80_SG_T;
+    const uint col0 = tgid.y * Q80_SG_T;
+    const uint tix  = (uint)sgid * 32u + (uint)slid;   // 0..255
+    const uint nblocks = k_dim / Q80_SG_K;
+    device const float* x   = (device const float*)((device char*)arena + x_off);
+    device float*       dst = (device float*)((device char*)arena + dst_off);
+
+    // Staging roles: 4 threads per row of A / per column of B, 8 k each.
+    const uint lane = tix >> 2u;            // A row / B column within the tile
+    const uint kq   = (tix & 3u) * 8u;      // k offset within the block
+    const bool row_ok = row0 + lane < m_dim;
+    const bool col_ok = col0 + lane < n_dim;
+    device const float* xrow = x + (ulong)min(row0 + lane, m_dim - 1u) * k_dim;
+    device const uchar* wcol = (device const uchar*)arena + w_off
+                             + (ulong)min(col0 + lane, n_dim - 1u) * nblocks * 34u;
+
+    simdgroup_float8x8 acc[8];
+    for (uint j = 0u; j < 8u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint b = 0u; b < nblocks; ++b) {
+        const uint k0 = b * Q80_SG_K;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float4 a0 = row_ok ? *(device const float4*)(xrow + k0 + kq)      : float4(0.0f);
+        float4 a1 = row_ok ? *(device const float4*)(xrow + k0 + kq + 4u) : float4(0.0f);
+        *(threadgroup float4*)(As + lane * Q80_SG_K + kq)      = a0;
+        *(threadgroup float4*)(As + lane * Q80_SG_K + kq + 4u) = a1;
+        // B is staged column-major (`Bs[col][k]`, the weights' own order) so
+        // each thread writes 8 contiguous floats; the MMA loads transpose it.
+        // `qs` is int8 at a 2-byte-aligned offset: read as 16-bit pairs.
+        const uint off = b * 34u;
+        const float d = col_ok ? dq_read_f16(wcol, off) : 0.0f;
+        device const ushort* q2 = (device const ushort*)(wcol + off + 2u + kq);
+        float4 lo, hi;
+        for (uint l = 0u; l < 4u; ++l) {
+            const ushort p = q2[l];
+            const float v0 = d * float((char)(p & 0xffu));
+            const float v1 = d * float((char)(p >> 8u));
+            if (l < 2u) { lo[2u * l] = v0; lo[2u * l + 1u] = v1; }
+            else        { hi[2u * l - 4u] = v0; hi[2u * l - 3u] = v1; }
+        }
+        *(threadgroup float4*)(Bs + lane * Q80_SG_K + kq)      = lo;
+        *(threadgroup float4*)(Bs + lane * Q80_SG_K + kq + 4u) = hi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint ks = 0u; ks < Q80_SG_K; ks += 8u) {
+            simdgroup_float8x8 a;
+            simdgroup_load(a, As + (uint)sgid * 8u * Q80_SG_K + ks, Q80_SG_K);
+            for (uint j = 0u; j < 8u; ++j) {
+                simdgroup_float8x8 w;
+                simdgroup_load(w, Bs + j * 8u * Q80_SG_K + ks, Q80_SG_K, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc[j], a, w, acc[j]);
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = 0u; j < 8u; ++j)
+        simdgroup_store(acc[j], sh + (uint)sgid * 8u * Q80_SG_T + j * 8u, Q80_SG_T);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0u; i < 16u; ++i) {
+        const uint idx = i * 256u + tix;
+        const uint r = row0 + idx / Q80_SG_T, c = col0 + idx % Q80_SG_T;
+        if (r < m_dim && c < n_dim) dst[(ulong)r * n_dim + c] = sh[idx];
+    }
+}
+
 // ── Simdgroup-cooperative Q8_0 GEMV ────────────────────────────────────────
 //
 // Same math as `q8_0_mv_f32` but 32 threads cooperate on Q8_0_NR0 output rows

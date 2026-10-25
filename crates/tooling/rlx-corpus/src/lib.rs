@@ -648,7 +648,7 @@ pub fn coverage() -> (usize, usize) {
 
 /// Total `OpKind` variants. Pinned by `opkind_total_is_current` so the
 /// coverage denominator cannot silently drift as ops are added.
-pub const OPKIND_TOTAL: usize = 188;
+pub const OPKIND_TOTAL: usize = 191;
 
 /// Run every case through the device-free gate stack.
 pub fn run() -> CorpusReport {

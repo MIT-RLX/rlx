@@ -54,8 +54,8 @@ impl LlamaKvTapStage {
             .ok_or_else(|| anyhow::anyhow!("LlamaKvTap requires RopeTables"))?;
 
         let in_ln_g = ctx.load_param(&format!("{lp}.input_layernorm.weight"), false)?;
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
-        let v_w = ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?;
+        let k_w = ctx.load_matrix(&format!("{lp}.self_attn.k_proj.weight"), true)?;
+        let v_w = ctx.load_matrix(&format!("{lp}.self_attn.v_proj.weight"), true)?;
 
         let mut gb = HirMut::new(ctx.hir());
         let normed_in = gb.rms_norm(input.id, in_ln_g, zero_beta, self.eps);

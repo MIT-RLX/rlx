@@ -6,6 +6,9 @@
 //! a synchronous-read R/W RAM. Both register the read address so Yosys
 //! infers a block RAM rather than distributed LUT-RAM.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::verilog::V;
 
 /// Synchronous-read ROM, initialized via `$readmemh(INIT_FILE, mem)`.

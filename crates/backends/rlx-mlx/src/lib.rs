@@ -72,6 +72,7 @@ pub mod batched_lu_kernel;
 pub mod dequant_q1_0;
 
 #[cfg(rlx_mlx_host)]
+pub mod double_single;
 pub mod round_to_format;
 
 #[cfg(rlx_mlx_host)]
@@ -86,7 +87,7 @@ pub mod ms_deform_attn;
 pub mod distributed;
 
 #[cfg(rlx_mlx_host)]
-pub use array::{Array, MlxError, eval, version};
+pub use array::{Array, MlxError, clear_cache, eval, memory_stats, set_cache_limit, version};
 #[cfg(rlx_mlx_host)]
 pub use backend::MlxExecutable;
 #[cfg(rlx_mlx_host)]

@@ -24,7 +24,7 @@
 - **core**: `rlx-ir`, `rlx-flow`, `rlx-tensor`, `rlx-fusion`, `rlx-unfuse`, `rlx-autodiff`, `rlx-compile`, `rlx-opt`, `rlx-driver`, `rlx-runtime`, `rlx-optim`, `rlx-collectives`, `rlx-distributed`, `rlx-extend`, `rlx-macros`
 - **backends**: `rlx-cpu`, `rlx-metal`, `rlx-mlx` (+ `-sys`), `rlx-coreml`, `rlx-cuda`, `rlx-rocm`, `rlx-xdna`, `rlx-tpu`, `rlx-wgpu`, `rlx-vulkan`, `rlx-oneapi`, `rlx-webgl`, `rlx-qnn`, `rlx-egpu`, `rlx-cerebras`, `rlx-cortexm` (+ `-trainer`), `rlx-fpga`, `rlx-gpu-host`, `rlx-gpu-kernels`, `rlx-gpu-dispatch`
 - **io**: `rlx-gguf`, `rlx-gguf-convert`, `rlx-bake`, `rlx-pkg`, `rlx-hub`, `rlx-onnx` (+ `-import` / `-proto` / `-conformance`), `rlx-torch-import`, `rlx-text`, `rlx-nemo`, `rlx-dduf`, `rlx-mlx-io`
-- **numerics**: `rlx-linalg`, `rlx-sparse`, `rlx-umap`, `rlx-geo`, `rlx-fdm`, `rlx-fem`, `rlx-lbm`, `rlx-bbo`, `rlx-rl`, `rlx-vq`, `rlx-peft`, `rlx-rng`
+- **numerics**: `rlx-linalg`, `rlx-sparse`, `rlx-umap`, `rlx-geo`, `rlx-fdm`, `rlx-fem`, `rlx-lbm`, `rlx-bbo`, `rlx-rl`, `rlx-vq`, `rlx-peft`, `rlx-rng`, `rlx-search` (argmax/top-k, beam, CTC, alignment)
 - **tooling**: `rlx-bench`, `rlx-check`, `rlx-hwprofile`, `rlx-corpus`, `rlx-opscope`, `rlx-megakernel`, `rlxsl`
 - **bindings**: `pyrlx` (PyO3), `rlx-web` (wasm), `rlx-ffi` (C ABI — iOS / embedded nodes)
 - **umbrella**: `rlx` (prelude crate)

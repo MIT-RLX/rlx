@@ -35,6 +35,12 @@ pub fn post_fusion_cleanup(graph: Graph, options: &CompileOptions) -> Graph {
 }
 
 fn post_specialize_cleanup(graph: Graph, options: &CompileOptions) -> Graph {
+    // Opt-in: cancel layout transposes before anything matches on them.
+    let graph = if options.simplify_transposes {
+        rlx_opt::rlx_compile::SimplifyTransposes.run(graph)
+    } else {
+        graph
+    };
     let mut graph = rlx_opt::AlgebraicSimplify.run(graph);
     // Sparse conditional constant propagation. Runs after `AlgebraicSimplify`
     // (which manufactures constants via `mul(x, 0)` and friends) and before

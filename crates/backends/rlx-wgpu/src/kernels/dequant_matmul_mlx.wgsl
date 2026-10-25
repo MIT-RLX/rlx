@@ -40,8 +40,9 @@ fn decode_e4m3(byte: u32) -> f32 {
     let exp = i32((byte >> 3u) & 0xfu);
     let mant = byte & 0x7u;
     if (exp == 0x0f && mant == 0x7u) {
-        // Match host `dequant_scale_fp8_e4m3` — quiet NaN.
-        return bitcast<f32>(0x7fc00000u);
+        // Match host `dequant_scale_fp8_e4m3` — quiet NaN. `byte & 0u` keeps
+        // it a runtime value: Tint (browser WebGPU) rejects a constant NaN.
+        return bitcast<f32>(0x7fc00000u | (byte & 0u));
     }
     if (exp == 0) {
         if (mant == 0u) {

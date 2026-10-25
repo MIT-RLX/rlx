@@ -38,17 +38,13 @@ fn operands_in_different_stripes_do_not_silently_read_as_zero() {
         eprintln!("no wgpu adapter — skipping");
         return;
     }
-    // SAFETY: single-threaded by construction (see module note); set before any
-    // arena is built.
-    unsafe {
-        std::env::set_var("RLX_WGPU_SHARD_CAP_MIB", SHARD_MIB.to_string());
-        std::env::set_var("RLX_WGPU_SHARD_GPU", "1");
-        // Striping is a hard error by default — it produces wrong results
-        // silently (SynthStrip at 192^3: every voxel wrong, 97.8% of scale,
-        // run reported success). This test exists to exercise the straddle
-        // guard *within* a striped arena, so it opts back in deliberately.
-        std::env::set_var("RLX_WGPU_ALLOW_SHARD", "1");
-    }
+    rlx_ir::env::set("RLX_WGPU_SHARD_CAP_MIB", SHARD_MIB.to_string());
+    rlx_ir::env::set("RLX_WGPU_SHARD_GPU", "1");
+    // Striping is a hard error by default — it produces wrong results
+    // silently (SynthStrip at 192^3: every voxel wrong, 97.8% of scale,
+    // run reported success). This test exists to exercise the straddle
+    // guard *within* a striped arena, so it opts back in deliberately.
+    rlx_ir::env::set("RLX_WGPU_ALLOW_SHARD", "1");
 
     // Three ~3 MiB tensors: with a 4 MiB stripe they cannot all co-reside, so
     // at least one binary op must have operands in different stripes.

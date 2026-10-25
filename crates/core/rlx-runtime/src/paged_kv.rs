@@ -21,13 +21,19 @@
 //! latency budget, mostly because GPU utilization stays high
 //! when sequences finish at different times.
 //!
+//!   - **Prefix caching** ([`KvPrefixCache`], MAX `genai-paged-attention`
+//!     / SGLang radix trie): full pages are keyed by the token chunk they
+//!     hold under their parent, so a new prompt walks the trie and reuses
+//!     every page it shares with an earlier one. Pages are refcounted;
+//!     unreferenced cached pages are evicted LRU when the pool runs dry.
+//!
 //! This module is the **data layer** — pool allocation, the
-//! sequence-to-page mapping, and the batch packing logic. Kernel
+//! sequence-to-page mapping, prefix sharing, and the batch packing logic. Kernel
 //! integration (gather KV bytes from pages into the attention
 //! input) is per-attention-kernel work that lands when an
 //! autoregressive LLM model runners.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// Opaque physical-page identifier from a [`KvPagePool`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -57,6 +63,8 @@ pub struct KvPagePool {
     free: BTreeSet<u32>,
     /// Per-page metadata. `descs[i].offset = i * bytes_per_page`.
     descs: Vec<KvPageDesc>,
+    /// Owners per page (block tables + prefix cache). 0 ⇔ on the free list.
+    refs: Vec<u32>,
     /// Constants exposed for ergonomics.
     pub bytes_per_page: usize,
     pub tokens_per_page: u16,
@@ -75,6 +83,7 @@ impl KvPagePool {
         Self {
             free,
             descs,
+            refs: vec![0; num_pages as usize],
             bytes_per_page,
             tokens_per_page,
         }
@@ -90,17 +99,37 @@ impl KvPagePool {
         self.capacity() - self.free_count()
     }
 
-    /// Allocate one page. Returns `None` when the pool is empty.
+    /// Allocate one page with a single owner. Returns `None` when the
+    /// pool is empty.
     pub fn alloc(&mut self) -> Option<KvPageId> {
         let id = *self.free.iter().next()?;
         self.free.remove(&id);
         // Reset filled count on alloc — caller starts fresh.
         self.descs[id as usize].filled = 0;
+        self.refs[id as usize] = 1;
         Some(KvPageId(id))
     }
 
+    /// Add an owner to an allocated page (prefix sharing).
+    pub fn retain(&mut self, id: KvPageId) {
+        let r = &mut self.refs[id.0 as usize];
+        assert!(*r > 0, "retain of free KV page {}", id.0);
+        *r += 1;
+    }
+
+    /// Drop one owner; the page returns to the free list when none remain.
     pub fn free(&mut self, id: KvPageId) {
-        self.free.insert(id.0);
+        let r = &mut self.refs[id.0 as usize];
+        assert!(*r > 0, "double free of KV page {}", id.0);
+        *r -= 1;
+        if *r == 0 {
+            self.free.insert(id.0);
+        }
+    }
+
+    /// Current owner count (0 = free).
+    pub fn ref_count(&self, id: KvPageId) -> u32 {
+        self.refs[id.0 as usize]
     }
 
     pub fn descriptor(&self, id: KvPageId) -> &KvPageDesc {
@@ -156,6 +185,212 @@ impl KvBlockTable {
     /// Slice of page IDs. Useful for kernel-side gather.
     pub fn pages(&self) -> &[KvPageId] {
         &self.pages
+    }
+}
+
+/// Result of [`KvPrefixCache::match_prefix`]: the reusable head of a prompt.
+#[derive(Debug, Clone, Default)]
+pub struct PrefixMatch {
+    /// Shared full pages, in order; each was retained once for the caller.
+    /// Push them onto the new sequence's [`KvBlockTable`] as-is.
+    pub pages: Vec<KvPageId>,
+    /// Tokens covered by `pages` plus `copy` (skip these in prefill).
+    pub matched_tokens: u32,
+    /// Copy-on-write of a partially shared page, when one exists.
+    pub copy: Option<PageCopy>,
+}
+
+/// Copy the leading `tokens` slots of `src` into the freshly allocated `dst`
+/// (owned by the caller) before writing new rows into `dst`'s tail. Cheaper
+/// than recomputing those projections; `src` stays immutable for its owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCopy {
+    pub src: KvPageId,
+    pub dst: KvPageId,
+    pub tokens: u16,
+}
+
+#[derive(Debug)]
+struct TrieNode {
+    page: KvPageId,
+    parent: usize,
+    /// The `tokens_per_page` tokens this node's page holds.
+    chunk: Box<[u32]>,
+    children: HashMap<Box<[u32]>, usize>,
+    last_use: u64,
+}
+
+/// Radix trie over full KV pages (SGLang/MAX prefix cache).
+///
+/// Each edge is exactly one page of tokens, so lookups are O(prompt pages)
+/// hash probes. A page's K/V depends on every token before it, which is why
+/// the key is the *path* (chunk under its parent), never the chunk alone.
+/// The cache holds one reference on every page it indexes; a page whose only
+/// owner is the cache is evictable, leaves first, least recently used first.
+#[derive(Debug)]
+pub struct KvPrefixCache {
+    tokens_per_page: u16,
+    /// Slot 0 is the root (no page). Freed slots are reused via `vacant`.
+    nodes: Vec<Option<TrieNode>>,
+    vacant: Vec<usize>,
+    clock: u64,
+}
+
+const ROOT: usize = 0;
+
+impl KvPrefixCache {
+    pub fn new(tokens_per_page: u16) -> Self {
+        assert!(tokens_per_page > 0);
+        let root = TrieNode {
+            page: KvPageId(u32::MAX),
+            parent: ROOT,
+            chunk: Box::new([]),
+            children: HashMap::new(),
+            last_use: 0,
+        };
+        Self {
+            tokens_per_page,
+            nodes: vec![Some(root)],
+            vacant: Vec::new(),
+            clock: 0,
+        }
+    }
+
+    fn node(&self, i: usize) -> &TrieNode {
+        self.nodes[i].as_ref().expect("live trie node")
+    }
+
+    fn node_mut(&mut self, i: usize) -> &mut TrieNode {
+        self.nodes[i].as_mut().expect("live trie node")
+    }
+
+    /// Pages indexed by the cache.
+    pub fn cached_pages(&self) -> usize {
+        self.nodes.len() - 1 - self.vacant.len()
+    }
+
+    /// Longest page-aligned cached prefix of `tokens`, retained for the
+    /// caller. At least one token is always left unmatched so the forward
+    /// has a position to produce logits from. With `pool`, a partially
+    /// matching next page is planned as a [`PageCopy`] into a fresh page
+    /// (skipped when the pool has no free page).
+    pub fn match_prefix(&mut self, tokens: &[u32], pool: &mut KvPagePool) -> PrefixMatch {
+        let tpp = self.tokens_per_page as usize;
+        let limit = tokens.len().saturating_sub(1);
+        self.clock += 1;
+        let now = self.clock;
+        let mut at = ROOT;
+        let mut out = PrefixMatch::default();
+        let mut pos = 0usize;
+        while pos + tpp <= limit {
+            let Some(&child) = self.node(at).children.get(&tokens[pos..pos + tpp]) else {
+                break;
+            };
+            let n = self.node_mut(child);
+            n.last_use = now;
+            pool.retain(n.page);
+            out.pages.push(n.page);
+            at = child;
+            pos += tpp;
+        }
+        // Partial page: the child sharing the longest leading run.
+        let rest = &tokens[pos..limit];
+        let best = self
+            .node(at)
+            .children
+            .values()
+            .map(|&c| {
+                let n = self.node(c);
+                let r = n.chunk.iter().zip(rest).take_while(|(a, b)| a == b).count();
+                (r, c)
+            })
+            .max();
+        if let Some((r, c)) = best
+            && r > 0
+            && let Some(dst) = pool.alloc()
+        {
+            let n = self.node_mut(c);
+            n.last_use = now;
+            out.copy = Some(PageCopy {
+                src: n.page,
+                dst,
+                tokens: r as u16,
+            });
+            pos += r;
+        }
+        out.matched_tokens = pos as u32;
+        out
+    }
+
+    /// Index every full page of a sequence whose K/V for `tokens` is now in
+    /// `table`. Pages already cached under the same path are left as-is (the
+    /// sequence keeps its own copy); new ones gain a cache reference.
+    pub fn insert(&mut self, tokens: &[u32], table: &KvBlockTable, pool: &mut KvPagePool) {
+        let tpp = self.tokens_per_page as usize;
+        let full = (tokens.len() / tpp).min(table.page_count());
+        self.clock += 1;
+        let now = self.clock;
+        let mut at = ROOT;
+        for (i, &page) in table.pages().iter().enumerate().take(full) {
+            let chunk = &tokens[i * tpp..(i + 1) * tpp];
+            if let Some(&child) = self.node(at).children.get(chunk) {
+                self.node_mut(child).last_use = now;
+                at = child;
+                continue;
+            }
+            pool.retain(page);
+            let node = TrieNode {
+                page,
+                parent: at,
+                chunk: chunk.into(),
+                children: HashMap::new(),
+                last_use: now,
+            };
+            let id = match self.vacant.pop() {
+                Some(v) => {
+                    self.nodes[v] = Some(node);
+                    v
+                }
+                None => {
+                    self.nodes.push(Some(node));
+                    self.nodes.len() - 1
+                }
+            };
+            self.node_mut(at).children.insert(chunk.into(), id);
+            at = id;
+        }
+    }
+
+    /// Evict up to `want` cache-only leaf pages (LRU first), returning them to
+    /// `pool`. Returns how many pages were freed.
+    pub fn evict(&mut self, want: u32, pool: &mut KvPagePool) -> u32 {
+        let mut freed = 0;
+        while freed < want {
+            let victim = self
+                .nodes
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter_map(|(i, n)| n.as_ref().map(|n| (i, n)))
+                .filter(|(_, n)| n.children.is_empty() && pool.ref_count(n.page) == 1)
+                .min_by_key(|(_, n)| n.last_use)
+                .map(|(i, _)| i);
+            let Some(v) = victim else { break };
+            let n = self.nodes[v].take().expect("victim is live");
+            self.node_mut(n.parent).children.remove(&n.chunk);
+            self.vacant.push(v);
+            pool.free(n.page);
+            freed += 1;
+        }
+        freed
+    }
+
+    /// [`KvPagePool::alloc`], evicting one cached page when the pool is dry.
+    pub fn alloc(&mut self, pool: &mut KvPagePool) -> Option<KvPageId> {
+        pool.alloc().or_else(|| {
+            self.evict(1, pool);
+            pool.alloc()
+        })
     }
 }
 
@@ -363,6 +598,104 @@ mod tests {
         assert_eq!(prefills.len(), 1);
         assert_eq!(prefills[0].input_tokens.len(), 1);
         assert_eq!(prefills[0].cached_len, 2);
+    }
+
+    #[test]
+    fn pool_refcount_frees_on_last_owner() {
+        let mut pool = KvPagePool::new(2, 64, 4);
+        let p = pool.alloc().unwrap();
+        pool.retain(p);
+        pool.free(p);
+        assert_eq!(pool.free_count(), 1);
+        pool.free(p);
+        assert_eq!(pool.free_count(), 2);
+    }
+
+    /// Prefill `tokens` into a fresh block table, skipping the matched head.
+    fn prefill(
+        cache: &mut KvPrefixCache,
+        pool: &mut KvPagePool,
+        tokens: &[u32],
+    ) -> (KvBlockTable, PrefixMatch) {
+        let m = cache.match_prefix(tokens, pool);
+        let mut bt = KvBlockTable::new();
+        for &p in &m.pages {
+            bt.push_page(p);
+        }
+        if let Some(c) = m.copy {
+            bt.push_page(c.dst);
+        }
+        let tpp = pool.tokens_per_page as usize;
+        while bt.page_count() * tpp < tokens.len() {
+            bt.push_page(cache.alloc(pool).unwrap());
+        }
+        bt.seq_len = tokens.len() as u32;
+        cache.insert(tokens, &bt, pool);
+        (bt, m)
+    }
+
+    #[test]
+    fn prefix_cache_shares_full_pages() {
+        let mut pool = KvPagePool::new(16, 64, 4);
+        let mut cache = KvPrefixCache::new(4);
+        // "I like to eat | cheese cake and ice"
+        let a = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let (bt_a, m_a) = prefill(&mut cache, &mut pool, &a);
+        assert_eq!(m_a.matched_tokens, 0);
+        assert_eq!(cache.cached_pages(), 2);
+        // Same first page, diverging second page: page 0 shared, 3-token COW.
+        let b = [1, 2, 3, 4, 5, 6, 7, 99, 10, 11];
+        let (bt_b, m_b) = prefill(&mut cache, &mut pool, &b);
+        assert_eq!(m_b.pages, vec![bt_a.pages()[0]]);
+        let copy = m_b.copy.unwrap();
+        assert_eq!((copy.src, copy.tokens), (bt_a.pages()[1], 3));
+        assert_eq!(m_b.matched_tokens, 7);
+        assert_eq!(bt_b.pages()[0], bt_a.pages()[0]);
+        assert_ne!(bt_b.pages()[1], bt_a.pages()[1]);
+        // seq A + seq B + cache all own the shared page.
+        assert_eq!(pool.ref_count(bt_a.pages()[0]), 3);
+    }
+
+    #[test]
+    fn prefix_cache_keys_on_path_not_chunk() {
+        let mut pool = KvPagePool::new(16, 64, 2);
+        let mut cache = KvPrefixCache::new(2);
+        prefill(&mut cache, &mut pool, &[1, 2, 3, 4, 0]);
+        // Page [3,4] appears, but after a different first page: no reuse.
+        let m = cache.match_prefix(&[9, 9, 3, 4, 0], &mut pool);
+        assert!(m.pages.is_empty() && m.copy.is_none());
+        assert_eq!(m.matched_tokens, 0);
+    }
+
+    #[test]
+    fn prefix_cache_leaves_one_token_for_logits() {
+        let mut pool = KvPagePool::new(16, 64, 4);
+        let mut cache = KvPrefixCache::new(4);
+        let t = [1, 2, 3, 4, 5, 6, 7, 8];
+        prefill(&mut cache, &mut pool, &t);
+        let m = cache.match_prefix(&t, &mut pool);
+        // Identical prompt: page 0 shared, page 1 copied up to the last token.
+        assert_eq!(m.pages.len(), 1);
+        assert_eq!(m.copy.unwrap().tokens, 3);
+        assert_eq!(m.matched_tokens, 7);
+    }
+
+    #[test]
+    fn prefix_cache_evicts_lru_unreferenced_leaves() {
+        let mut pool = KvPagePool::new(4, 64, 2);
+        let mut cache = KvPrefixCache::new(2);
+        let (mut bt_a, _) = prefill(&mut cache, &mut pool, &[1, 2, 3, 4]);
+        let (mut bt_b, _) = prefill(&mut cache, &mut pool, &[5, 6, 7, 8]);
+        assert_eq!(pool.free_count(), 0);
+        // Live sequences pin their pages: nothing evictable.
+        assert_eq!(cache.evict(1, &mut pool), 0);
+        bt_a.release(&mut pool);
+        bt_b.release(&mut pool);
+        // Touch B so A is LRU; leaf [3,4] goes before its parent [1,2].
+        let _ = cache.match_prefix(&[5, 6, 7, 8, 0], &mut pool);
+        assert_eq!(cache.evict(2, &mut pool), 2);
+        assert!(cache.match_prefix(&[1, 2, 0], &mut pool).pages.is_empty());
+        assert_eq!(cache.cached_pages(), 2);
     }
 
     #[test]

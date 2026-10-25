@@ -130,7 +130,7 @@ fn match_matmul_residual(
     // residual). The add's own output may have any number of users (skip
     // stream + norm) — that is fine.
     let mm_users = uses.users(mm_id);
-    if mm_users.len() != 1 {
+    if !uses.has_single_use(mm_id) {
         return None;
     }
     let add_node = graph.node(mm_users[0]);

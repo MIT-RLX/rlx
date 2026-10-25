@@ -380,32 +380,85 @@ fn run_aiecc(
     Ok((spec.out_xclbin.to_string(), spec.out_insts.to_string()))
 }
 
-/// Compile the vendor `aie::mmul` int8 microkernel (`<include>/aie_kernels/aie2/
-/// mm.cc`) to an AIE-core object `out_o` for a square `d×d×d` tile (DIM_M=DIM_K=
-/// DIM_N=`d`, i8→i32, 4×8×8 subtiles), via Peano `clang++`. `clangxx` =
-/// `<peano>/bin/clang++`, `include` = `<mlir_aie>/include`. The `.o` (symbols
-/// `matmul_i8_i32` + `zero_i32`) is what [`compile_overlay_linked`] links against
-/// an emitted microkernel overlay. Idempotent-safe (overwrites). Cheap (~1s).
+/// Compile the vendor `aie::mmul` int8 microkernel to an AIE-core object `out_o`
+/// for a square `d×d×d` tile (DIM_M=DIM_K=DIM_N=`d`, i8→i32, 4×8×8 subtiles), via
+/// Peano `clang++`. `clangxx` = `<peano>/bin/clang++`, `include` =
+/// `<mlir_aie>/include`. The `.o` (symbols `matmul_i8_i32` + `zero_i32`) is what
+/// [`compile_overlay_linked`] links against an emitted microkernel overlay.
+/// Idempotent-safe (overwrites). Cheap (~1s). See [`mm_kernel_source`] for the
+/// mlir-aie versions it reads.
 pub fn build_mm_kernel(
     clangxx: &str,
     include: &str,
     d: usize,
     out_o: &str,
 ) -> Result<(), XdnaError> {
-    let src = format!("{include}/aie_kernels/aie2/mm.cc");
-    if !Path::new(&src).exists() {
-        return Err(XdnaError(format!(
-            "kernel source not found at {src} (bad mlir_aie include dir?)"
-        )));
-    }
-    let wrap = format!("{out_o}.wrap.cc");
-    std::fs::write(
-        &wrap,
-        format!(
-            "#define DIM_M {d}\n#define DIM_K {d}\n#define DIM_N {d}\n#define combos(X) X(int8, i8, int32, i32, 4, 8, 8)\n#include \"{src}\"\n"
-        ),
+    build_mm_kernel_combo(
+        clangxx,
+        include,
+        d,
+        out_o,
+        "int8, i8, int32, i32, 4, 8, 8",
+        "int32",
     )
-    .map_err(|e| XdnaError(format!("write kernel wrapper {wrap}: {e}")))?;
+}
+
+/// bf16 twin of [`build_mm_kernel`]: the `bf16_f32` combo (bf16 in, f32 out,
+/// 4×8×4 subtiles), symbols `matmul_bf16_f32` + `zero_f32`, for
+/// [`crate::aie::emit_matmul_microkernel_bf16`]. `d` must divide by 8.
+pub fn build_mm_kernel_bf16(
+    clangxx: &str,
+    include: &str,
+    d: usize,
+    out_o: &str,
+) -> Result<(), XdnaError> {
+    build_mm_kernel_combo(
+        clangxx,
+        include,
+        d,
+        out_o,
+        "bfloat16, bf16, float, f32, 4, 8, 4",
+        "float",
+    )
+}
+
+/// The vendor matmul kernel source under `include`. mlir-aie ≤ v1.4.3 ships it
+/// as `aie_kernels/aie2/mm.cc`; v1.4.4 moved it to `aie_kernels/linalg/mm.cc`
+/// (which picks `mm_aie2.h` from `__AIE_ARCH__`).
+pub fn mm_kernel_source(include: &str) -> Result<String, XdnaError> {
+    let candidates = [
+        format!("{include}/aie_kernels/aie2/mm.cc"),
+        format!("{include}/aie_kernels/linalg/mm.cc"),
+    ];
+    candidates
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .cloned()
+        .ok_or_else(|| {
+            XdnaError(format!(
+                "matmul kernel source not found (looked for {}) — bad mlir_aie include dir? \
+                 Set RLX_XDNA_AIE_INCLUDE to <mlir_aie>/include",
+                candidates.join(", ")
+            ))
+        })
+}
+
+/// `combo` is one mlir-aie `combos(X)` entry (`ctype_in, in, ctype_out, out,
+/// r, s, t`); `ctype_out` is its C accumulator type, for the `zero_<out>`
+/// fallback.
+fn build_mm_kernel_combo(
+    clangxx: &str,
+    include: &str,
+    d: usize,
+    out_o: &str,
+    combo: &str,
+    ctype_out: &str,
+) -> Result<(), XdnaError> {
+    let src = mm_kernel_source(include)?;
+    let out_ty = combo.split(',').nth(3).unwrap_or_default().trim();
+    let wrap = format!("{out_o}.wrap.cc");
+    std::fs::write(&wrap, mm_kernel_wrapper(&src, d, combo, ctype_out, out_ty))
+        .map_err(|e| XdnaError(format!("write kernel wrapper {wrap}: {e}")))?;
     let status = Command::new(clangxx)
         .args([
             "-O2",
@@ -428,7 +481,7 @@ pub fn build_mm_kernel(
         .map_err(|e| XdnaError(format!("spawn {clangxx}: {e}")))?;
     if !status.success() {
         return Err(XdnaError(format!(
-            "Peano clang++ failed compiling {src} (DIM={d})"
+            "Peano clang++ failed compiling {src} (DIM={d}, combo {combo})"
         )));
     }
     if !Path::new(out_o).exists() {
@@ -437,9 +490,72 @@ pub fn build_mm_kernel(
     Ok(())
 }
 
+/// The translation unit compiled for one kernel: tile dims + the single combo,
+/// then the vendor source. mlir-aie ≤ v1.4.3 defines `zero_<out>` itself (via
+/// its `zero_vectorized_c_func` macro); v1.4.4 moved zeroing to a separate
+/// `zero.cc` with one unsuffixed `zero` symbol, so the overlay's `zero_<out>`
+/// is supplied here when the macro is absent.
+fn mm_kernel_wrapper(src: &str, d: usize, combo: &str, ctype_out: &str, out_ty: &str) -> String {
+    format!(
+        "#define DIM_M {d}\n#define DIM_K {d}\n#define DIM_N {d}\n\
+         #define combos(X) X({combo})\n#include \"{src}\"\n\
+         #ifndef zero_vectorized_c_func\n\
+         extern \"C\" void zero_{out_ty}({ctype_out} *__restrict c) {{\n\
+         \x20 constexpr int L = 64 / sizeof({ctype_out});\n\
+         \x20 for (int i = 0; i < DIM_M * DIM_N; i += L)\n\
+         \x20   aie::store_v(c + i, aie::zeros<{ctype_out}, L>());\n\
+         }}\n\
+         #endif\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mm_kernel_wrapper_selects_one_combo_and_backfills_zero() {
+        let w = mm_kernel_wrapper(
+            "/x/mm.cc",
+            32,
+            "bfloat16, bf16, float, f32, 4, 8, 4",
+            "float",
+            "f32",
+        );
+        assert!(w.starts_with("#define DIM_M 32\n#define DIM_K 32\n#define DIM_N 32\n"));
+        assert!(w.contains(
+            "#define combos(X) X(bfloat16, bf16, float, f32, 4, 8, 4)\n#include \"/x/mm.cc\""
+        ));
+        // Fallback only when the vendor source did not define its own zero_<out>.
+        let fallback = &w[w.find("#ifndef zero_vectorized_c_func").expect("guarded")..];
+        assert!(fallback.contains("extern \"C\" void zero_f32(float *__restrict c)"));
+        assert!(fallback.contains("aie::zeros<float, L>()"));
+        assert!(fallback.trim_end().ends_with("#endif"));
+    }
+
+    #[test]
+    fn mm_kernel_source_accepts_both_mlir_aie_layouts() {
+        let root = std::env::temp_dir().join(format!("rlx_mm_src_{}", std::process::id()));
+        let inc = root.to_str().unwrap();
+        assert!(mm_kernel_source(inc).is_err());
+        let linalg = root.join("aie_kernels/linalg");
+        std::fs::create_dir_all(&linalg).unwrap();
+        std::fs::write(linalg.join("mm.cc"), "").unwrap();
+        assert!(
+            mm_kernel_source(inc)
+                .unwrap()
+                .ends_with("aie_kernels/linalg/mm.cc")
+        );
+        let aie2 = root.join("aie_kernels/aie2");
+        std::fs::create_dir_all(&aie2).unwrap();
+        std::fs::write(aie2.join("mm.cc"), "").unwrap();
+        assert!(
+            mm_kernel_source(inc)
+                .unwrap()
+                .ends_with("aie_kernels/aie2/mm.cc")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// Real `aiecc --help` lines from the current declarative driver, as
     /// attached to issue #2 (mlir-aie SHA `95b3d1ccc0b`, built Sep 11 2026).

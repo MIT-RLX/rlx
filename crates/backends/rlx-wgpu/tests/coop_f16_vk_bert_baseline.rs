@@ -88,21 +88,15 @@ fn run_matmul(n: usize, use_coop: bool, a_data: &[f32], b_data: &[f32]) -> Vec<f
     let c = g.matmul(a, b, Shape::new(&[M, n], DType::F32));
     g.set_outputs(vec![c]);
     if use_coop {
-        unsafe {
-            std::env::remove_var("RLX_WGPU_NO_COOP_F16_VK");
-        }
+        rlx_ir::env::remove("RLX_WGPU_NO_COOP_F16_VK");
     } else {
-        unsafe {
-            std::env::set_var("RLX_WGPU_NO_COOP_F16_VK", "1");
-        }
+        rlx_ir::env::set("RLX_WGPU_NO_COOP_F16_VK", "1");
     }
     let mut exe = WgpuExecutable::compile(g);
     exe.set_param("b", b_data);
     let out = exe.run(&[("a", a_data)])[0].clone();
     if !use_coop {
-        unsafe {
-            std::env::remove_var("RLX_WGPU_NO_COOP_F16_VK");
-        }
+        rlx_ir::env::remove("RLX_WGPU_NO_COOP_F16_VK");
     }
     out
 }

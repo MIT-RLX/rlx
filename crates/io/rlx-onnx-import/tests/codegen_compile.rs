@@ -171,10 +171,14 @@ fn emitted_codegen_compiles_and_runs() {
     std::fs::write(dir.join("src/main.rs"), &source).unwrap();
 
     let out = Command::new(env!("CARGO"))
-        .args(["run", "--quiet"])
-        .current_dir(&dir)
         // Isolated target dir so we never poison the workspace build cache.
-        .env("CARGO_TARGET_DIR", dir.join("target"))
+        // Passed as a FLAG, not as `CARGO_TARGET_DIR`: that env var is part of
+        // sccache's Rust cache key, so a per-run temp value misses the cache on
+        // every invocation, while the identical directory change via
+        // `--target-dir` hits it.
+        .args(["run", "--quiet", "--target-dir"])
+        .arg(dir.join("target"))
+        .current_dir(&dir)
         .output()
         .expect("failed to spawn cargo");
 

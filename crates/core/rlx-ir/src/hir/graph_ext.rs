@@ -7,6 +7,7 @@
 
 use crate::hir::{HirModule, HirNodeId};
 use crate::op::*;
+use crate::prelude::*;
 use crate::quant::{ScaleLayout, ScaledFormat};
 use crate::shape;
 use crate::{DType, Op, Shape};

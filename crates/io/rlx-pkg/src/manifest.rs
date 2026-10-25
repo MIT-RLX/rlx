@@ -16,11 +16,20 @@ pub const FORMAT_VERSION: u32 = 1;
 /// Minimum loader `compat_version` this crate supports.
 pub const COMPAT_VERSION: u32 = 1;
 
+/// Graph encoding: `.rlxmodel` text (`rlx_ir::rlxmodel`), which names every
+/// op and field, so a package outlives changes to the `Op` enum.
+pub const GRAPH_RLXMODEL: &str = "rlxmodel_v1";
+
+/// Graph encoding of older packages: bincode of the `Op` enum, which reads
+/// only with the rlx that wrote it. Still read; no longer written.
+pub const GRAPH_BINCODE: &str = "bincode_graph_v1";
+
 /// Graph member reference inside the pack.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraphRef {
     pub path: String,
-    /// `bincode_graph_v1` today.
+    /// [`GRAPH_RLXMODEL`] (written now), [`GRAPH_BINCODE`] (older
+    /// packages, still read) or `none` (weights only).
     pub encoding: String,
 }
 
@@ -83,8 +92,8 @@ impl Manifest {
             producer: None,
             features: Vec::new(),
             graph: GraphRef {
-                path: "graph/mir.bin".into(),
-                encoding: "bincode_graph_v1".into(),
+                path: "graph/model.rlxmodel".into(),
+                encoding: GRAPH_RLXMODEL.into(),
             },
             weights: Some(WeightsRef {
                 index: "weights/index.json".into(),
@@ -119,7 +128,7 @@ impl Manifest {
                 COMPAT_VERSION
             );
         }
-        if self.graph.encoding != "bincode_graph_v1" && self.graph.encoding != "none" {
+        if ![GRAPH_RLXMODEL, GRAPH_BINCODE, "none"].contains(&self.graph.encoding.as_str()) {
             anyhow::bail!("unsupported graph encoding {:?}", self.graph.encoding);
         }
         Ok(())

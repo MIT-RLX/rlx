@@ -21,10 +21,7 @@ fn run_variant(
     v: &[f32],
     variant: &str,
 ) -> Vec<f32> {
-    // SAFETY: single-threaded example; set the policy then refresh the config.
-    unsafe {
-        std::env::set_var("RLX_CUDA_ATTENTION", variant);
-    }
+    rlx_ir::env::set("RLX_CUDA_ATTENTION", variant);
     rlx_cuda::reload_runtime_config();
     exe.run(&[("q", q), ("k", k), ("v", v)])
         .into_iter()

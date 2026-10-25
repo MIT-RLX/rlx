@@ -562,9 +562,107 @@ gen-op-coverage:
 check-op-coverage:
     python3 scripts/gen-op-coverage.py --check
 
+# Regenerate the bindings derived from rlx-bind's op table: the C ABI glue
+# (rlx-capi/src/graph_ops.rs), rlx.h, Swift's GraphOps.swift, the Graph
+# section of pyrlx's .pyi, and docs/bindings-api.md. rlx-js and pyrlx expand
+# the table at compile time and need no step. See docs/bindings.md.
+gen-bindings:
+    cargo run -q -p rlx-bindgen
+
+# Standalone binding releases (docs/releasing-bindings.md). The workspace
+# version in Cargo.toml is the one source: stamp it into every binding
+# manifest after a bump, and `check-binding-versions` (in `just ci`) fails on
+# drift.
+sync-binding-versions:
+    python3 scripts/bindings_release.py versions
+
+check-binding-versions:
+    python3 scripts/bindings_release.py versions --check
+
+# Package every binding with prebuilt librlx_capi under natives/<platform>/
+# (the release workflow does this for five platforms). Locally, for this host:
+#   just package-bindings              # builds rlx-capi, stages into ./dist
+package-bindings natives="" out="dist":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    natives="{{natives}}"
+    if [[ -z "$natives" ]]; then
+      cargo build --release -p rlx-capi
+      case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) plat=macos-arm64 ;; Darwin-x86_64) plat=macos-x64 ;;
+        Linux-aarch64) plat=linux-arm64 ;; Linux-x86_64) plat=linux-x64 ;;
+        *) echo "unknown host; pass natives=<dir>" >&2; exit 1 ;;
+      esac
+      natives="$(mktemp -d)"
+      mkdir -p "$natives/$plat"
+      cp target/release/librlx_capi.* "$natives/$plat/"
+    fi
+    python3 scripts/bindings_release.py stage --natives "$natives" --out {{out}} --build
+
+# Fail if any generated binding is stale (an op-table or rlx-capi change
+# without `just gen-bindings`).
+check-bindings:
+    cargo run -q -p rlx-bindgen -- --check
+
+# Every generated FFI binding (Go, Java, C#, Ruby, Julia, Zig, C++, Node,
+# Kotlin, Dart, Lua, Octave, R, PHP, Nim, D, V, Haskell, OCaml, Elixir, Odin):
+# its tests and its five examples, against a fresh librlx_capi. A language
+# without a local toolchain is skipped, or with RLX_TEST_DOCKER=1 runs in its
+# container image (after `just linux-capi-volume`).
+test-ffi-bindings:
+    cargo test -p rlx-capi --test ffi_languages -- --test-threads=1
+
+# A Linux build of librlx_capi (and the reference model plugin) in the
+# `rlx-linux-target` Docker volume, for the container runs of
+# test-ffi-bindings (RLX_TEST_DOCKER=1).
+linux-capi-volume:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lock="$(mktemp)"; cp Cargo.lock "$lock"
+    docker run --rm -v "$PWD":/src:ro -v "$lock":/src/Cargo.lock -v rlx-linux-target:/target \
+        -v rlx-cargo-registry:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/target \
+        rust:latest cargo build -p rlx-capi -p rlx-model-plugin
+    rm -f "$lock"
+
+# Package the C ABI as RLX.xcframework (iOS + macOS, Metal) for Swift apps,
+# then run the Swift test suite on it. See crates/bindings/rlx-swift/README.md.
+swift-xcframework:
+    ios/build-xcframework.sh --capi --apple
+    RLX_XCFRAMEWORK=1 swift test --package-path crates/bindings/rlx-swift
+
 # Print the curated RLX_* environment catalog (high-signal options only).
 env-catalog:
     cargo run -q -p rlx-ir --example env_catalog
+
+# rlx-fpga once claimed `no_std` while depending on std-only rlx-ir, and no
+# gate built it that way, so nothing noticed (GitHub issue #7).
+# no_std crates (rlx-ir core, rlx-cortexm, rlx-fpga) build for bare metal + host tests
+check-no-std:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    t=thumbv7em-none-eabihf
+    rustup target list --installed | grep -qx "$t" || rustup target add "$t"
+    cargo clippy -p rlx-ir -p rlx-cortexm -p rlx-fpga --no-default-features --target "$t" -- -D warnings
+    # Host side: every test/example target must still build (std-only ones gate
+    # themselves on the `std` feature) and the no_std library tests must pass.
+    # rlx-ir's integration tests use the full IR, so only its unit tests run here.
+    cargo clippy -p rlx-fpga --no-default-features --all-targets -- -D warnings
+    cargo clippy -p rlx-ir --no-default-features --lib -- -D warnings
+    cargo clippy -p rlx-ir --no-default-features --lib --profile test -- -D warnings
+    cargo test -p rlx-fpga --no-default-features
+    cargo test -p rlx-ir --no-default-features --lib
+
+# README Rust examples as doctests (`crates/rlx`'s `ReadmeDoctests`): the
+# first code a reader copies must compile and give the numbers it claims.
+check-readme:
+    cargo test -p rlx --doc --features cpu,tensor,optim
+
+# Known-failures lists (`tests/known_failures/*.txt`, see rlx_ir::known_failures).
+#   just known-failures list
+#   RLX_KNOWN_FAILURES_REPORT=/tmp/kf.jsonl just test-gpu
+#   just known-failures update /tmp/kf.jsonl --issue owner/repo#N
+known-failures *args:
+    python3 scripts/known-failures.py {{args}}
 
 # Regenerate docs/rlx-env-vars.md from the env registry (+ leftover mentions).
 gen-rlx-env-vars:
@@ -662,6 +760,15 @@ new-op NAME *ARGS:
 # instead of in a browser.
 build-cluster-site out="examples/tab-cluster":
     python3 crates/bindings/rlx-web/tools/build_site.py --out {{out}}
+
+# The GitHub Pages site (.github/workflows/pages.yml): every rlx-web page —
+# the demo, the vision bench, the tab cluster — over one wasm bundle with both
+# browser GPU paths. `just build-pages` then `python3 -m http.server -d _site`.
+# QWEN = rlx-models-web's web/ (after `just web-models-build` in rlx-models)
+# adds the Qwen3.5 chat at qwen/, as CI does.
+build-pages out="_site" qwen="":
+    python3 crates/bindings/rlx-web/build.py --all
+    python3 crates/bindings/rlx-web/tools/build_site.py --all-pages --out {{out}} {{ if qwen != "" { "--qwen " + qwen } else { "" } }}
 
 # Cross-compile gate: the CPU + WebGPU stack must build for the browser
 # (wasm32-unknown-unknown). Compile-only — running models in a browser is
@@ -766,6 +873,8 @@ check-apple:
 # nothing else in the tree runs these.
 check-ops:
     cargo test -p rlx-ir --features test-support --test arity_exhaustive
+    # Every op through `.rlxmodel` text, and the opset 1 fixture still reads.
+    cargo test -p rlx-ir --features test-support,serialize --test rlxmodel_every_op
     # Declared arity vs. what backends actually index — the only check here
     # that compares the table against reality rather than against itself.
     # `--lib` runs the scanner's own regression tests: every early version of
@@ -967,7 +1076,7 @@ run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
 # Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-rustdoc check-license-headers check-corpus check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
+ci: build test fmt-check lint check-no-std check-rlx-env-vars check-example-names check-doc-links check-readme check-rustdoc check-license-headers check-corpus check-bindings check-binding-versions check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 #

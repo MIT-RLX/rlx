@@ -394,8 +394,7 @@ fn main() {
     // The tiled kernel is behind cuBLAS in the dispatch order, so without this
     // the sweep would time cuBLAS five times and "discover" that every tile is
     // identical. Set before the first compile so the config snapshot sees it.
-    // SAFETY: set once, before any GPU work, single-threaded.
-    unsafe { std::env::set_var("RLX_CUDA_NO_CUBLAS", "1") };
+    rlx_ir::env::set("RLX_CUDA_NO_CUBLAS", "1");
 
     // Any context works to name the arch; compile a trivial graph to get one.
     let arch = {
@@ -404,8 +403,7 @@ fn main() {
         g.set_outputs(vec![x]);
         let _ = CudaExecutable::compile(g);
         rlx_cuda::device::cuda_context()
-            .and_then(|ctx| ctx.compute_capability().ok())
-            .map(|(maj, min)| GpuArch::cuda(maj as u32, min as u32))
+            .map(|ctx| rlx_cuda::tuning::arch_for(&ctx))
             .unwrap_or_else(GpuArch::unknown)
     };
     // Force the persisted cache to load NOW, then clear it.
@@ -772,6 +770,18 @@ fn main() {
         "{}",
         dispatch::render_routes(&arch, &dispatch::explain(&arch, &all))
     );
+    // The opening gate only proves the GPU was idle when the sweep STARTED. On
+    // the M4 Pro a background job came back mid-sweep and produced a 2.09×
+    // "win" that a clean run measured at 0.93×. Re-check now that this process
+    // is idle: if someone else took the GPU during the sweep, its timings are
+    // not evidence, so nothing is persisted or reported as a table.
+    if let Err(why) = contention_check() {
+        eprintln!(
+            "REFUSING to persist: the GPU became contended during the sweep ({why}). \
+             Re-run on an idle GPU."
+        );
+        std::process::exit(1);
+    }
     if dry_run {
         println!("--dry-run: not writing the cache. Table would be:\n");
         print!("{}", dispatch::save_overrides());

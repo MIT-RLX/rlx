@@ -20,7 +20,10 @@
 //! the previous non-elided layer's output slot. That's the BRAM-saving
 //! half of fusion.
 
-use std::collections::BTreeMap;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use alloc::collections::BTreeMap;
 
 use crate::model::Model;
 use crate::passes::Hints;
@@ -41,7 +44,7 @@ pub fn run(model: &Model, hints: &mut [Hints]) -> BTreeMap<u8, u8> {
         }
         hints[i].bram_slot_in = Some(prev_slot);
         hints[i].bram_slot_out = Some(next_slot);
-        std::mem::swap(&mut prev_slot, &mut next_slot);
+        core::mem::swap(&mut prev_slot, &mut next_slot);
     }
 
     // Bank factor per slot: max(consumer.ic_parallelism) over all

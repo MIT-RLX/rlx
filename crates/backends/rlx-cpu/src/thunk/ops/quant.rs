@@ -3573,7 +3573,7 @@ pub(crate) fn exec_round_to_format(t: &Thunk, base: *mut u8) {
                 }
             });
         }
-        FormatScaling::Block(n) => {
+        FormatScaling::FineBlock(n) => {
             let n = n as usize;
             let row = (*last_dim as usize).max(1);
             crate::pool::par_for(len / row, (1 << 14) / row + 1, &|r0, rows| {
@@ -3585,7 +3585,28 @@ pub(crate) fn exec_round_to_format(t: &Thunk, base: *mut u8) {
                     while b0 < row_end {
                         let b1 = (b0 + n).min(row_end);
                         let amax = xs[b0..b1].iter().fold(0f32, |a, v| a.max(v.abs()));
-                        let s = fmt.pow2_scale(amax);
+                        let s = fmt.fine_scale(amax);
+                        let rcp = rlx_ir::number_format::fine_reciprocal(s);
+                        for i in b0..b1 {
+                            outs[i] = fmt.round_fine(xs[i], s, rcp);
+                        }
+                        b0 = b1;
+                    }
+                }
+            });
+        }
+        FormatScaling::Block(n) => {
+            let n = n as usize;
+            let row = (*last_dim as usize).max(1);
+            crate::pool::par_for(len / row, (1 << 14) / row + 1, &|r0, rows| {
+                let base = base_addr as *mut u8;
+                let (xs, outs) = unsafe { (sl(x, base, len), sl_mut(out, base, len)) };
+                for r in r0..r0 + rows {
+                    let mut b0 = r * row;
+                    let row_end = b0 + row;
+                    while b0 < row_end {
+                        let b1 = (b0 + n).min(row_end);
+                        let s = fmt.block_scale(&xs[b0..b1]);
                         for i in b0..b1 {
                             outs[i] = fmt.round_scaled(xs[i], s);
                         }

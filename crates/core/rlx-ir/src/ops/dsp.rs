@@ -20,6 +20,7 @@
 
 use crate::infer::GraphExt as _;
 use crate::op::Activation;
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, Op, Shape, fft::FftNorm};
 
 /// FIR filters with at most this many taps use the direct time-domain

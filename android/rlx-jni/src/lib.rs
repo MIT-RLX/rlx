@@ -7,11 +7,11 @@
 //! - Tiny `matmul → bias → gelu` graph (`runInference` / `backendName`)
 //! - Embedded MNIST MLP 784→32→10 (`runMnist` / `mnistExpectedLabel`)
 
+use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jfloatArray, jint, jstring};
-use jni::JNIEnv;
-use rlx_ir::{op, DType, Graph, Shape};
-use rlx_runtime::{is_available, Device, Session};
+use rlx_ir::{DType, Graph, Shape, op};
+use rlx_runtime::{Device, Session, is_available};
 use std::sync::Mutex;
 
 const MNIST_IN: usize = 784;
@@ -98,8 +98,7 @@ fn ensure_mnist() -> Result<(), String> {
 
     let wbytes = include_bytes!("../assets/mnist_weights.bin");
     let sbytes = include_bytes!("../assets/mnist_sample.bin");
-    let expected_w =
-        MNIST_IN * MNIST_HIDDEN + MNIST_HIDDEN + MNIST_HIDDEN * MNIST_OUT + MNIST_OUT;
+    let expected_w = MNIST_IN * MNIST_HIDDEN + MNIST_HIDDEN + MNIST_HIDDEN * MNIST_OUT + MNIST_OUT;
     let weights = read_f32_le(wbytes);
     if weights.len() != expected_w {
         return Err(format!(
@@ -231,9 +230,7 @@ pub extern "system" fn Java_com_mit_rlx_RlxNative_backendName(
             return std::ptr::null_mut();
         }
     };
-    env.new_string(label)
-        .expect("new_string")
-        .into_raw()
+    env.new_string(label).expect("new_string").into_raw()
 }
 
 /// Run the embedded MNIST sample through the MLP. Returns 10 logits.
@@ -313,7 +310,10 @@ mod tests {
         assert!(matches!(device, Device::Cpu | Device::Gpu | Device::Vulkan));
         assert_eq!(logits.len(), 10);
         assert!(logits.iter().all(|v| v.is_finite()));
-        assert_eq!(pred, label as usize, "pred={pred} label={label} logits={logits:?}");
+        assert_eq!(
+            pred, label as usize,
+            "pred={pred} label={label} logits={logits:?}"
+        );
     }
 
     #[cfg(feature = "blas")]

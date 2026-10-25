@@ -3,281 +3,226 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `pyrlx.Session` and `pyrlx.CompiledGraph` — the low-level run surface.
+//!
+//! The logic is `rlx_bind::runtime::{Session, Compiled}`, shared with rlx-js
+//! and the C ABI; this file is the Python adapter. Inputs are borrowed straight
+//! out of C-contiguous float32 numpy arrays (no copy), and `run` reshapes each
+//! output to its declared dims.
 
-use numpy::{IntoPyArray, PyArray1, PyArrayDyn, PyArrayMethods, PyUntypedArrayMethods};
+use numpy::{IntoPyArray, PyArrayDyn, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use rlx_ir::{Dim, Graph, Shape};
-use rlx_runtime::{CompiledGraph, Precision, Session};
+use rlx_bind::runtime::{CompileRequest, Compiled, Session};
+use rlx_ir::Graph;
 
-use crate::device::{device_label, parse_device};
-use crate::dtype::{dtype_label, parse_dtype};
-use crate::fusion_options::{PyFusionOptions, build_compile_options};
+use crate::bind::to_py;
+use crate::fusion_options::{PyFusionOptions, compile_request};
 use crate::graph::PyGraph;
 
-fn parse_precision(s: &str) -> PyResult<Precision> {
-    Ok(match s.trim().to_ascii_lowercase().as_str() {
-        "f32" | "float32" | "float" => Precision::F32,
-        "f16" | "float16" | "half" => Precision::F16,
-        "bf16" | "bfloat16" => Precision::BF16,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown precision '{other}' (f32, f16, bf16)"
-            )));
-        }
-    })
-}
-
-/// Compile-time binding to one RLX backend + precision.
-///
-/// Construct with a device string (`"cpu"`, `"metal"`, `"cuda"`, …) present in
-/// `available_devices()`. `compile` / `compile_with` take ownership of the
-/// input `Graph`.
 #[pyclass(name = "Session", module = "pyrlx._pyrlx")]
 pub(crate) struct PySession {
     inner: Session,
-    device_label: &'static str,
+}
+
+fn take(graph: &Bound<'_, PyGraph>) -> PyResult<Graph> {
+    graph.borrow_mut().inner.take().ok_or_else(|| {
+        PyRuntimeError::new_err("graph already consumed — Session.compile takes ownership")
+    })
 }
 
 #[pymethods]
 impl PySession {
-    /// `Session(device="cpu", precision="f32")`
     #[new]
-    #[pyo3(signature = (device = "cpu", precision = "f32"))]
-    fn new(device: &str, precision: &str) -> PyResult<Self> {
-        let dev = parse_device(device)?;
-        if !rlx_runtime::is_available(dev) {
-            return Err(PyRuntimeError::new_err(format!(
-                "device '{device}' not available in this build — rebuild pyrlx \
-                 with `maturin develop --features {device}`"
-            )));
-        }
-        let prec = parse_precision(precision)?;
+    #[pyo3(signature = (device = "cpu", precision = "f32", policy = None))]
+    fn new(device: &str, precision: &str, policy: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let policy = crate::policy::parse_policy(policy)?;
         Ok(Self {
-            inner: Session::new_with_precision(dev, prec),
-            device_label: device_label(dev),
+            inner: Session::new(device, precision, policy).map_err(to_py)?,
         })
     }
 
     #[getter]
     fn device(&self) -> &'static str {
-        self.device_label
+        self.inner.device_label()
+    }
+
+    #[getter]
+    fn policy(&self) -> Option<&'static str> {
+        self.inner.policy_label()
     }
 
     #[getter]
     fn precision(&self) -> &'static str {
-        match self.inner.precision() {
-            Precision::F32 => "f32",
-            Precision::F16 => "f16",
-            Precision::BF16 => "bf16",
-        }
+        self.inner.precision_label()
     }
 
-    /// Compile a graph; the graph is consumed (rlx-runtime takes Graph
-    /// by value). Returns a `CompiledGraph` ready for `set_param` / `run`.
+    /// Compile `graph` (consumed) with the session's precision and policy.
     fn compile(&self, graph: &Bound<'_, PyGraph>) -> PyResult<PyCompiled> {
-        let g: Graph = graph.borrow_mut().inner.take().ok_or_else(|| {
-            PyRuntimeError::new_err("graph already consumed — Session.compile takes ownership")
-        })?;
-
-        let outputs = g
-            .outputs
-            .iter()
-            .map(|id| {
-                let s = g.shape(*id);
-                (*id, shape_to_static_dims(s))
-            })
-            .collect::<Vec<_>>();
-
-        let compiled = self.inner.compile(g);
-        Ok(PyCompiled::from_compiled(
-            compiled,
-            outputs.into_iter().map(|(_, dims)| dims).collect(),
-        ))
+        let g = take(graph)?;
+        let compiled = self
+            .inner
+            .compile(g, &CompileRequest::default())
+            .map_err(to_py)?;
+        Ok(PyCompiled::new(compiled))
     }
 
-    /// Compile with explicit fusion / kernel-dispatch options.
-    ///
-    /// `kernel_dispatch` may be `"native"`, `"common"`, or omitted (env default).
-    #[pyo3(signature = (graph, fusion_options=None, kernel_dispatch=None))]
+    /// Compile with fusion toggles, a kernel-dispatch policy, and/or a
+    /// precision policy (which wins over the session's).
+    #[pyo3(signature = (graph, fusion_options=None, kernel_dispatch=None, policy=None))]
     fn compile_with(
         &self,
         graph: &Bound<'_, PyGraph>,
         fusion_options: Option<PyRef<PyFusionOptions>>,
         kernel_dispatch: Option<&str>,
+        policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyCompiled> {
-        let g: Graph = graph.borrow_mut().inner.take().ok_or_else(|| {
-            PyRuntimeError::new_err("graph already consumed — Session.compile takes ownership")
-        })?;
-
-        let outputs = g
-            .outputs
-            .iter()
-            .map(|id| {
-                let s = g.shape(*id);
-                (*id, shape_to_static_dims(s))
-            })
-            .collect::<Vec<_>>();
-
-        let opts = build_compile_options(self.inner.precision(), fusion_options, kernel_dispatch)?;
-
-        let compiled = self.inner.compile_with(g, &opts);
-        Ok(PyCompiled::from_compiled(
-            compiled,
-            outputs.into_iter().map(|(_, dims)| dims).collect(),
-        ))
+        let policy = crate::policy::parse_policy(policy)?;
+        let req = compile_request(fusion_options, kernel_dispatch, policy)?;
+        let g = take(graph)?;
+        let compiled = self.inner.compile(g, &req).map_err(to_py)?;
+        Ok(PyCompiled::new(compiled))
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "<pyrlx.Session device={} precision={}>",
-            self.device_label,
-            self.precision()
-        )
+        match self.policy() {
+            Some(policy) => format!(
+                "<pyrlx.Session device={} precision={} policy={policy}>",
+                self.device(),
+                self.precision()
+            ),
+            None => format!(
+                "<pyrlx.Session device={} precision={}>",
+                self.device(),
+                self.precision()
+            ),
+        }
     }
 }
 
-/// Resolve a Shape into a concrete `Vec<usize>` for numpy reshape.
-pub(crate) fn shape_to_static_dims(shape: &Shape) -> Vec<usize> {
-    shape
-        .dims()
-        .iter()
-        .map(|d| match d {
-            Dim::Static(n) => *n,
-            Dim::Dynamic(_) => 0,
-        })
-        .collect()
-}
-
-/// Executable artifact from `Session.compile`.
-///
-/// Params are uploaded by name; inputs are passed per `run` call. The f32
-/// `run` / `set_param` path expects C-contiguous `float32` ndarrays and
-/// reshapes outputs to the graph's declared static shapes. Use `run_typed` /
-/// `set_param_typed` for f64 and other dtypes (bytes + dtype label).
 #[pyclass(name = "CompiledGraph", module = "pyrlx._pyrlx")]
 pub(crate) struct PyCompiled {
-    inner: CompiledGraph,
-    /// One Vec<usize> per graph output — used to reshape flat results.
-    output_shapes: Vec<Vec<usize>>,
+    inner: Compiled,
 }
 
 impl PyCompiled {
-    pub(crate) fn from_compiled(compiled: CompiledGraph, output_shapes: Vec<Vec<usize>>) -> Self {
-        Self {
-            inner: compiled,
-            output_shapes,
-        }
+    pub(crate) fn new(inner: Compiled) -> Self {
+        Self { inner }
     }
+}
+
+/// A float32 array's contents, borrowed — or an error naming the argument.
+pub(crate) fn f32_view<'a>(name: &str, v: &'a Bound<'_, PyAny>) -> PyResult<&'a [f32]> {
+    let arr = v.downcast::<PyArrayDyn<f32>>().map_err(|_| {
+        PyValueError::new_err(format!("'{name}': expected numpy.ndarray of dtype float32"))
+    })?;
+    if !arr.is_c_contiguous() {
+        return Err(PyValueError::new_err(format!(
+            "'{name}': array must be C-contiguous (call numpy.ascontiguousarray)"
+        )));
+    }
+    // Safety: contiguous, and the GIL is held for as long as the view lives
+    // (the caller hands it to rlx and drops it before returning to Python).
+    unsafe { arr.as_slice() }.map_err(Into::into)
 }
 
 #[pymethods]
 impl PyCompiled {
     #[getter]
     fn device(&self) -> &'static str {
-        device_label(self.inner.device())
+        self.inner.device_label()
     }
 
-    /// `compiled.set_param("w", np.ones((4, 3), dtype=np.float32))`
-    fn set_param(&mut self, name: &str, data: &Bound<'_, PyArrayDyn<f32>>) -> PyResult<()> {
-        if !data.is_c_contiguous() {
-            return Err(PyValueError::new_err(format!(
-                "set_param('{name}'): array must be C-contiguous (call .ascontiguousarray)"
-            )));
+    fn set_param(&mut self, name: &str, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let view = f32_view(name, data)?;
+        self.inner.set_param(name, view).map_err(to_py)
+    }
+
+    /// `{name: float32 array}`; returns how many were set.
+    fn set_params(&mut self, params: &Bound<'_, PyDict>) -> PyResult<usize> {
+        for (k, v) in params.iter() {
+            let name: String = k.extract()?;
+            self.set_param(&name, &v)?;
         }
-        // Safety: we just checked contiguity, and numpy holds the GIL.
-        let view = unsafe { data.as_slice()? };
-        self.inner.set_param(name, view);
-        Ok(())
+        Ok(params.len())
     }
 
-    /// `compiled.run({"x": np.ndarray}) -> list[np.ndarray]`
-    /// Outputs are reshaped to their declared static shape.
+    fn output_shapes(&self) -> Vec<Vec<usize>> {
+        self.inner.output_shapes.clone()
+    }
+
+    fn output_dtypes(&self) -> Vec<&'static str> {
+        self.inner.output_dtype_labels()
+    }
+
+    /// Declared inputs: `[{"name", "dtype", "shape"}]` (`shape` is None when a
+    /// dim is symbolic) — what `run` expects.
+    fn inputs(&self, py: Python<'_>) -> PyObject {
+        crate::bind::from_json(py, &self.inner.inputs())
+    }
+
+    /// Declared parameters, as `inputs()` — what `set_param` takes.
+    fn params(&self, py: Python<'_>) -> PyObject {
+        crate::bind::from_json(py, &self.inner.params())
+    }
+
+    /// Outputs in `run` order: `[{"name", "dtype", "shape"}]` (`name` is ""
+    /// for an output the graph does not name).
+    fn outputs(&self, py: Python<'_>) -> PyObject {
+        crate::bind::from_json(py, &self.inner.outputs())
+    }
+
+    /// The position in `run`'s result of the output named `name`; raises
+    /// naming the closest names when there is none.
+    fn output_index(&self, name: &str) -> PyResult<usize> {
+        self.inner.output_index(name).map_err(to_py)
+    }
+
+    /// Raises naming the inputs `supplied` leaves unbound and the params
+    /// never set.
+    #[pyo3(signature = (supplied=Vec::new()))]
+    fn check_bindings(&self, supplied: Vec<String>) -> PyResult<()> {
+        let refs: Vec<&str> = supplied.iter().map(String::as_str).collect();
+        self.inner.check_bindings(&refs).map_err(to_py)
+    }
+
+    /// Declare inputs / params meant to read zeros (an empty KV state).
+    fn allow_unbound(&mut self, names: Vec<String>) {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.inner.allow_unbound(&refs);
+    }
+
+    /// `{name: float32 array}` → one array per output, reshaped to its
+    /// declared dims when they are all static.
     fn run<'py>(
         &mut self,
         py: Python<'py>,
         inputs: &Bound<'py, PyDict>,
     ) -> PyResult<Bound<'py, PyList>> {
-        // Borrow each numpy array as &[f32]. We collect into a Vec
-        // so the contiguous-views outlive the &[(&str, &[f32])] slice
-        // we hand to rlx-runtime.
-        let mut owned_names: Vec<String> = Vec::with_capacity(inputs.len());
-        let mut views: Vec<(*const f32, usize)> = Vec::with_capacity(inputs.len());
-
-        for (k, v) in inputs.iter() {
-            let name: String = k.extract()?;
-            let arr = v.downcast::<PyArrayDyn<f32>>().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "input '{name}': expected numpy.ndarray of dtype float32"
-                ))
-            })?;
-            if !arr.is_c_contiguous() {
-                return Err(PyValueError::new_err(format!(
-                    "input '{name}': array must be C-contiguous"
-                )));
-            }
-            // Safety: contiguous + we hold GIL; pointer valid for the
-            // duration of this call (we drop these before returning).
-            let slice = unsafe { arr.as_slice()? };
-            views.push((slice.as_ptr(), slice.len()));
-            owned_names.push(name);
-        }
-
-        let pairs: Vec<(&str, &[f32])> = owned_names
-            .iter()
-            .zip(views.iter())
-            .map(|(n, (p, l))| (n.as_str(), unsafe { std::slice::from_raw_parts(*p, *l) }))
-            .collect();
-
-        let outs = self.inner.run(&pairs);
-
+        let outs = self.run_raw(inputs)?;
         let list = PyList::empty_bound(py);
         for (i, out) in outs.into_iter().enumerate() {
-            // Reshape to declared shape if all dims are static.
-            let shape = self.output_shapes.get(i).cloned().unwrap_or_default();
-            let arr_1d = out.into_pyarray_bound(py);
+            let shape = self.inner.output_shapes.get(i).cloned().unwrap_or_default();
+            let arr = out.into_pyarray_bound(py);
             if !shape.is_empty()
                 && shape.iter().all(|&d| d > 0)
-                && shape.iter().product::<usize>() == arr_1d.len()
+                && shape.iter().product::<usize>() == arr.len()
             {
-                let reshaped = arr_1d.reshape(shape)?;
-                list.append(reshaped)?;
+                list.append(arr.reshape(shape)?)?;
             } else {
-                list.append(arr_1d)?;
+                list.append(arr)?;
             }
         }
         Ok(list)
     }
 
-    /// Flat-vector run — bypasses reshape, returns one 1D array per output.
-    /// Useful when the declared output shape includes dynamic dims.
+    /// As `run`, but every output stays flat.
     fn run_flat<'py>(
         &mut self,
         py: Python<'py>,
         inputs: &Bound<'py, PyDict>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let mut owned: Vec<(String, Vec<f32>)> = Vec::with_capacity(inputs.len());
-        for (k, v) in inputs.iter() {
-            let name: String = k.extract()?;
-            let arr = v.downcast::<PyArrayDyn<f32>>().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "input '{name}': expected numpy.ndarray of dtype float32"
-                ))
-            })?;
-            if !arr.is_c_contiguous() {
-                return Err(PyValueError::new_err(format!(
-                    "input '{name}': array must be C-contiguous"
-                )));
-            }
-            let slice = unsafe { arr.as_slice()? };
-            owned.push((name, slice.to_vec()));
-        }
-        let pairs: Vec<(&str, &[f32])> = owned
-            .iter()
-            .map(|(n, v)| (n.as_str(), v.as_slice()))
-            .collect();
-        let outs = self.inner.run(&pairs);
+        let outs = self.run_raw(inputs)?;
         let list = PyList::empty_bound(py);
         for out in outs {
             list.append(out.into_pyarray_bound(py))?;
@@ -285,50 +230,32 @@ impl PyCompiled {
         Ok(list)
     }
 
-    /// `compiled.set_param_typed("A", a.tobytes(), "f64")` — upload a
-    /// param at any supported dtype. Bytes must be contiguous and in
-    /// the same dtype the graph declared. Use this when the param's
-    /// declared dtype isn't F32 (e.g., F64 for Circulax-style numerics).
     fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: &str) -> PyResult<()> {
-        let dt = parse_dtype(dtype)?;
-        self.inner.set_param_typed(name, data, dt);
-        Ok(())
+        self.inner.set_param_typed(name, data, dtype).map_err(to_py)
     }
 
-    /// `compiled.run_typed({"b": (b.tobytes(), "f64"), ...}) -> list[(bytes, str)]`.
-    ///
-    /// Each input is a `(bytes, dtype_str)` pair; outputs come back
-    /// the same shape so callers can `np.frombuffer(bytes, dtype=str)`
-    /// and reshape.
-    ///
-    /// Lossless for F64 — bytes go straight into the arena. For F16/
-    /// BF16 the runtime widens to F32 internally; for F32 it's a
-    /// straight copy.
+    /// `{name: (bytes, dtype)}` → `[(bytes, dtype), …]`.
     fn run_typed<'py>(
         &mut self,
         py: Python<'py>,
         inputs: &Bound<'py, PyDict>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let mut owned: Vec<(String, Vec<u8>, rlx_ir::DType)> = Vec::with_capacity(inputs.len());
+        let mut owned: Vec<(String, Vec<u8>, String)> = Vec::with_capacity(inputs.len());
         for (k, v) in inputs.iter() {
             let name: String = k.extract()?;
-            let tup: (Vec<u8>, String) = v.extract().map_err(|_| {
+            let (bytes, dtype): (Vec<u8>, String) = v.extract().map_err(|_| {
                 PyValueError::new_err(format!("input '{name}': expected tuple (bytes, dtype_str)"))
             })?;
-            let dt = parse_dtype(&tup.1)?;
-            owned.push((name, tup.0, dt));
+            owned.push((name, bytes, dtype));
         }
-        let refs: Vec<(&str, &[u8], rlx_ir::DType)> = owned
+        let refs: Vec<(&str, &[u8], &str)> = owned
             .iter()
-            .map(|(n, d, dt)| (n.as_str(), d.as_slice(), *dt))
+            .map(|(n, d, t)| (n.as_str(), d.as_slice(), t.as_str()))
             .collect();
-        let outs = self.inner.run_typed(&refs);
-
+        let outs = self.inner.run_typed(&refs).map_err(to_py)?;
         let list = PyList::empty_bound(py);
-        for (bytes, dt) in outs {
-            let py_bytes = PyBytes::new_bound(py, &bytes);
-            let label = dtype_label(dt);
-            list.append((py_bytes, label))?;
+        for (bytes, dtype) in outs {
+            list.append((PyBytes::new_bound(py, &bytes), dtype))?;
         }
         Ok(list)
     }
@@ -336,12 +263,23 @@ impl PyCompiled {
     fn __repr__(&self) -> String {
         format!(
             "<pyrlx.CompiledGraph device={} outputs={}>",
-            device_label(self.inner.device()),
-            self.output_shapes.len()
+            self.inner.device_label(),
+            self.inner.output_shapes.len()
         )
     }
 }
 
-// silence "unused" if PyArray1 import not needed
-#[allow(dead_code)]
-fn _hint(_: PyArray1<f32>) {}
+impl PyCompiled {
+    /// Borrow every input array and run.
+    fn run_raw(&mut self, inputs: &Bound<'_, PyDict>) -> PyResult<Vec<Vec<f32>>> {
+        let items: Vec<(String, Bound<'_, PyAny>)> = inputs
+            .iter()
+            .map(|(k, v)| Ok((k.extract::<String>()?, v)))
+            .collect::<PyResult<_>>()?;
+        let mut pairs: Vec<(&str, &[f32])> = Vec::with_capacity(items.len());
+        for (name, v) in &items {
+            pairs.push((name.as_str(), f32_view(name, v)?));
+        }
+        self.inner.run(&pairs).map_err(to_py)
+    }
+}

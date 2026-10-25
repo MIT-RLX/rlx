@@ -1,0 +1,11 @@
+; RLX — versatile ML compiler + runtime. MIT OR Apache-2.0.
+; librlx_capi: RLX_CAPI_LIB_DIR (the directory holding it) at build time.
+(library
+ (name rlx)
+ (public_name rlx)
+ (libraries unix threads.posix)
+ (foreign_stubs
+  (language c)
+  (names rlx_stubs rlx_ml_support)
+  (flags :standard -I.))
+ (c_library_flags (-L%{env:RLX_CAPI_LIB_DIR=.} -lrlx_capi -Wl,-rpath,%{env:RLX_CAPI_LIB_DIR=.})))

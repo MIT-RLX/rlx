@@ -1,0 +1,26 @@
+{
+  "name": "@rlx/rlx",
+  "version": "0.2.19",
+  "description": "Node.js bindings for rlx over its C ABI: graphs, sessions, device selection, autodiff, training, weights, text and distributed nodes.",
+  "license": "MIT OR Apache-2.0",
+  "main": "lib/rlx.js",
+  "types": "lib/rlx.d.ts",
+  "files": [
+    "lib",
+    "native",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "typecheck": "tsc --noEmit --strict lib/rlx.d.ts"
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

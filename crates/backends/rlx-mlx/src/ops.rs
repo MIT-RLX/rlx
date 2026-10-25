@@ -210,6 +210,36 @@ pub fn fft(a: &Array, inverse: bool, norm_tag: u32) -> Result<Array, MlxError> {
     Ok(Array::from_raw(out))
 }
 
+/// `mlx::fast::gated_delta_update`: one fused Metal recurrence instead of a
+/// per-step graph. `gate` is the multiplicative decay (not its log); the
+/// state is `[B, Hv, Dv, Dk]`. Returns `(out [B, T, Hv, Dv], final state)`.
+pub fn gated_delta_update(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    gate: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array), MlxError> {
+    let _guard = crate::sync::runtime_guard();
+    let mut out: *mut mlx_array_t = ptr::null_mut();
+    let mut st: *mut mlx_array_t = ptr::null_mut();
+    let rc = unsafe {
+        ffi::rlx_mlx_op_gated_delta_update(
+            q.ptr,
+            k.ptr,
+            v.ptr,
+            gate.ptr,
+            beta.ptr,
+            state.map_or(ptr::null_mut(), |s| s.ptr),
+            &mut out,
+            &mut st,
+        )
+    };
+    check(rc)?;
+    Ok((Array::from_raw(out), Array::from_raw(st)))
+}
+
 pub fn rms_norm(x: &Array, gamma: &Array, eps: f32) -> Result<Array, MlxError> {
     let _guard = crate::sync::runtime_guard();
     let mut out: *mut mlx_array_t = ptr::null_mut();

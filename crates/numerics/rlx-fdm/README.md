@@ -8,7 +8,7 @@ Force density method (FDM) for pin-jointed structures in RLX, with logic ported 
 |----------------|---------|
 | `datastructures` / `FDNetwork` | [`network::Network`](src/network.rs) |
 | `equilibrium/structures` (connectivity, free/fixed split) | [`structure::Structure`](src/structure.rs) |
-| `equilibrium/models` (`stiffness_matrix`, `load_matrix`, `nodes_equilibrium`) | [`equilibrium`](src/equilibrium.rs) |
+| `equilibrium/models` (`stiffness_matrix`, `load_matrix`, `equilibrium`) | [`equilibrium`](src/equilibrium.rs) |
 | `equilibrium/fdm` (`fdm`, validation) | [`reference::fdm`](src/reference.rs) |
 | `equilibrium/states` | [`state::EquilibriumState`](src/state.rs) |
 | `goals/edge/length`, `goals/network/loadpath` | [`goals`](src/goals.rs), [`objective::Goal`](src/objective.rs) |
@@ -18,7 +18,7 @@ Force density method (FDM) for pin-jointed structures in RLX, with logic ported 
 | `constrained_fdm` + optimizers | [`constrained_fdm`](src/optimize.rs) (GD or L-BFGS on `q`, optional L2 on `q`) |
 | Visualization (COMPAS / compas_view2) | Out of scope |
 
-## Quick start
+## Getting started
 
 ```rust
 use rlx_fdm::{Network, fdm};

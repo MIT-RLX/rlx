@@ -24,8 +24,9 @@
 //! where dividing by an arbitrary `f32` scale is not (GPU division is not
 //! always correctly rounded).
 
-use std::fmt;
-use std::str::FromStr;
+use crate::prelude::*;
+use core::fmt;
+use core::str::FromStr;
 
 use crate::quant::ScaledFormat;
 
@@ -48,8 +49,8 @@ pub struct FloatFormat {
 // `max_normal` is never NaN, so equality is reflexive.
 impl Eq for FloatFormat {}
 
-impl std::hash::Hash for FloatFormat {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl core::hash::Hash for FloatFormat {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         (
             self.exp_bits,
             self.man_bits,
@@ -147,6 +148,41 @@ impl FloatFormat {
         f32::from_bits(((e + 127) as u32) << 23)
     }
 
+    /// Power-of-two scale of one block: the OCP MX scale
+    /// ([`Self::pow2_scale`]) or, when that clips the block's largest
+    /// elements to `max_normal`, twice it if that rounds the block with a
+    /// smaller squared error. MX hardware decodes either (an E8M0 scale is any
+    /// power of two). On an ETTh1 forecast benchmark this took Timestral's
+    /// f8 error over f32 from 8.6% to 3.3% and f4's from 81% to 60%.
+    ///
+    /// The comparison sums `d * d` in f32, in index order, with no fused
+    /// multiply-add, so every backend makes the same choice; ties keep the MX
+    /// scale. Without clipping the twice-coarser grid is a subset of the finer
+    /// one, so it cannot win and is not tried.
+    pub fn block_scale(self, block: &[f32]) -> f32 {
+        let amax = block.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        let s = self.pow2_scale(amax);
+        // `amax / s` is exact (power-of-two `s`); the doubled scale must stay
+        // a normal f32.
+        if !amax.is_finite() || amax / s <= self.max_normal || s >= f32::from_bits(254 << 23) {
+            return s;
+        }
+        let sq_err = |s: f32| {
+            let mut e = 0f32;
+            for &x in block {
+                let d = self.round_scaled(x, s) - x;
+                let d2 = d * d;
+                e += d2;
+            }
+            e
+        };
+        if sq_err(2.0 * s) < sq_err(s) {
+            2.0 * s
+        } else {
+            s
+        }
+    }
+
     /// Round with a power-of-two scale: `round(x / s) * s`.
     #[inline]
     pub fn round_scaled(self, x: f32, scale: f32) -> f32 {
@@ -175,14 +211,62 @@ impl FloatFormat {
                 let last_dim = last_dim.max(1);
                 for row in xs.chunks_mut(last_dim) {
                     for block in row.chunks_mut(n) {
-                        let amax = block.iter().fold(0f32, |a, &x| a.max(x.abs()));
-                        let s = self.pow2_scale(amax);
+                        let s = self.block_scale(block);
                         for x in block {
                             *x = self.round_scaled(*x, s);
                         }
                     }
                 }
             }
+            FormatScaling::FineBlock(n) => {
+                let n = n as usize;
+                let last_dim = last_dim.max(1);
+                for row in xs.chunks_mut(last_dim) {
+                    for block in row.chunks_mut(n) {
+                        let amax = block.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                        let s = self.fine_scale(amax);
+                        let r = fine_reciprocal(s);
+                        for x in block {
+                            *x = self.round_fine(*x, s, r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`FormatScaling::FineBlock`] scale for a block whose largest magnitude
+    /// is `amax`: the smallest `(1 + m/8) · 2^k` with `s · max_normal ≥ amax`,
+    /// so no element clips. `1.0` for a zero or non-finite `amax`. Every
+    /// product here is exact (a 4-bit significand times the format's) and every
+    /// test a comparison, so all backends find the same scale.
+    pub fn fine_scale(self, amax: f32) -> f32 {
+        if amax == 0.0 || !amax.is_finite() {
+            return 1.0;
+        }
+        let k0 = (f32_exponent(amax) - self.emax() - 1).clamp(-126, 125);
+        for k in k0..=k0 + 2 {
+            let p = f32::from_bits(((k + 127) as u32) << 23);
+            for m in 0..8 {
+                let s = (1.0 + m as f32 / 8.0) * p;
+                if s * self.max_normal >= amax {
+                    return s;
+                }
+            }
+        }
+        f32::from_bits(0x7f70_0000)
+    }
+
+    /// `round(x · r) · s`, `r` = [`fine_reciprocal`]`(s)`: [`FormatScaling::FineBlock`]
+    /// rounding. `round(x·r)` has at most `man_bits + 1` significant bits and
+    /// `s` four, so the product is exact for formats up to 19 mantissa bits.
+    #[inline]
+    pub fn round_fine(self, x: f32, s: f32, r: f32) -> f32 {
+        let y = self.round(x * r) * s;
+        if y.is_nan() {
+            y
+        } else {
+            y.signum() * flush_subnormal(y.abs())
         }
     }
 
@@ -266,15 +350,25 @@ pub enum FormatScaling {
     /// One power-of-two scale per run of `n` consecutive elements along the
     /// last axis (OCP MX uses 32). A shorter final block is allowed.
     Block(u32),
+    /// One scale per run of `n` elements with a 3-bit mantissa, as NVFP4's
+    /// E4M3 block scales (NVFP4 uses 16): the smallest such value at least
+    /// `amax / max_normal`, so the block's largest element lands at the top of
+    /// the format instead of anywhere in a 2x range. See
+    /// [`FloatFormat::fine_scale`]. The exponent has f32's range (NVFP4 gets
+    /// that from a second, per-tensor scale).
+    FineBlock(u32),
 }
 
 impl FormatScaling {
-    /// The default for a format: none above 8 bits, MX 32-element blocks at or below.
+    /// The default for a format: none above 8 bits, NVFP4-style fine-scaled
+    /// 16-element blocks at or below. Fine scales beat OCP MX's power-of-two
+    /// ones on every format measured (Timestral f4 on ETTh1: +61% → +20% WQL
+    /// over f32; Qwen3-0.6B f6: +11% → +7.5% perplexity); `@b32` selects MX.
     pub fn default_for(fmt: FloatFormat) -> Self {
         if fmt.bits() > 8 {
             Self::None
         } else {
-            Self::Block(32)
+            Self::FineBlock(16)
         }
     }
 }
@@ -297,6 +391,15 @@ pub enum NumberFormat {
         format: FloatFormat,
         scaling: FormatScaling,
     },
+    /// Weights in one format and intermediates in another, written
+    /// `weights/activations` (`f4/f8`); `None` leaves that side in f32
+    /// (`f4/f32`: 4-bit weights, f32 compute). Low-bit deployments usually
+    /// quantize weights harder than activations: with fine scales, f4 weights
+    /// alone cost Qwen3-0.6B 13% perplexity where f4 everywhere costs 430%.
+    Mixed {
+        weights: Option<(FloatFormat, FormatScaling)>,
+        activations: Option<(FloatFormat, FormatScaling)>,
+    },
 }
 
 impl NumberFormat {
@@ -307,6 +410,45 @@ impl NumberFormat {
             scaling: FormatScaling::default_for(format),
         }
     }
+
+    /// The format weights are rounded to, if any.
+    pub fn weights(&self) -> Option<(FloatFormat, FormatScaling)> {
+        match *self {
+            Self::Float { format, scaling } => Some((format, scaling)),
+            Self::Mixed { weights, .. } => weights,
+            _ => None,
+        }
+    }
+
+    /// The format intermediate values are rounded to, if any.
+    pub fn activations(&self) -> Option<(FloatFormat, FormatScaling)> {
+        match *self {
+            Self::Float { format, scaling } => Some((format, scaling)),
+            Self::Mixed { activations, .. } => activations,
+            _ => None,
+        }
+    }
+}
+
+/// One side of a [`NumberFormat::Mixed`], or a plain float format.
+fn parse_float_spec(s: &str) -> Result<Option<(FloatFormat, FormatScaling)>, String> {
+    match s.parse::<NumberFormat>()? {
+        NumberFormat::F32 => Ok(None),
+        NumberFormat::Float { format, scaling } => Ok(Some((format, scaling))),
+        other => Err(format!(
+            "{other} cannot be one side of weights/activations; use f32 or a float format"
+        )),
+    }
+}
+
+fn write_float_spec(
+    f: &mut fmt::Formatter<'_>,
+    spec: Option<(FloatFormat, FormatScaling)>,
+) -> fmt::Result {
+    match spec {
+        None => write!(f, "f32"),
+        Some((format, scaling)) => write!(f, "{}", NumberFormat::Float { format, scaling }),
+    }
 }
 
 impl FromStr for NumberFormat {
@@ -315,8 +457,23 @@ impl FromStr for NumberFormat {
     /// Parse `f32`, `f64`, `f64x2` (alias `df64`), or a [`FloatFormat`] name
     /// with an optional scaling suffix: `@none`, `@tensor`, `@b<N>` (e.g.
     /// `f4@b16`). Without a suffix the format's default scaling applies.
+    /// `weights/activations` (e.g. `f4/f8`, `f4/f32`) gives each its own
+    /// format ([`NumberFormat::Mixed`]).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim().to_ascii_lowercase();
+        if let Some((w, a)) = s.split_once('/') {
+            let (weights, activations) = (parse_float_spec(w)?, parse_float_spec(a)?);
+            return Ok(match (weights, activations) {
+                (None, None) => Self::F32,
+                (Some((format, scaling)), Some(a)) if a == (format, scaling) => {
+                    Self::Float { format, scaling }
+                }
+                _ => Self::Mixed {
+                    weights,
+                    activations,
+                },
+            });
+        }
         match s.as_str() {
             "f32" | "fp32" | "float" => return Ok(Self::F32),
             "f64" | "fp64" | "double" => return Ok(Self::F64),
@@ -330,13 +487,21 @@ impl FromStr for NumberFormat {
         let format = FloatFormat::parse(name).ok_or_else(|| {
             format!(
                 "unknown number format {s:?}: expected f32, f64, f64x2, f16, bf16, f8, f6, f4, \
-                 fNeXmY (e.g. f4e3m0) or fXmYeZ (e.g. f12m7e4), optionally with @none, @tensor or @b<N>"
+                 fNeXmY (e.g. f4e3m0) or fXmYeZ (e.g. f12m7e4), optionally with @none, @tensor, @b<N> or @fb<N>"
             )
         })?;
         let scaling = match suffix {
             None => FormatScaling::default_for(format),
             Some("none") => FormatScaling::None,
             Some("tensor") => FormatScaling::PerTensor,
+            Some(b) if b.starts_with("fb") => {
+                let n: u32 = b[2..]
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("bad scaling suffix @{b}: expected fb<N>"))?;
+                FormatScaling::FineBlock(n)
+            }
             Some(b) => {
                 let n: u32 = b
                     .strip_prefix('b')
@@ -358,6 +523,14 @@ impl fmt::Display for NumberFormat {
             Self::F32 => write!(f, "f32"),
             Self::F64 => write!(f, "f64"),
             Self::F64x2 => write!(f, "f64x2"),
+            Self::Mixed {
+                weights,
+                activations,
+            } => {
+                write_float_spec(f, *weights)?;
+                write!(f, "/")?;
+                write_float_spec(f, *activations)
+            }
             Self::Float { format, scaling } => {
                 write!(f, "{format}")?;
                 if *scaling != FormatScaling::default_for(*format) {
@@ -365,12 +538,34 @@ impl fmt::Display for NumberFormat {
                         FormatScaling::None => write!(f, "@none")?,
                         FormatScaling::PerTensor => write!(f, "@tensor")?,
                         FormatScaling::Block(n) => write!(f, "@b{n}")?,
+                        FormatScaling::FineBlock(n) => write!(f, "@fb{n}")?,
                     }
                 }
                 Ok(())
             }
         }
     }
+}
+
+/// Reciprocals of the eight significands `1 + m/8` a fine scale can have,
+/// each rounded once to f32. Kernels carry the same table.
+pub const FINE_RECIPROCALS: [f32; 8] = [
+    1.0, 0.8888889, 0.8, 0.72727275, 0.6666667, 0.61538464, 0.5714286, 0.53333336,
+];
+
+/// `1 / s` for a [`FloatFormat::fine_scale`] `s`, from [`FINE_RECIPROCALS`]
+/// and the exponent: exact up to the table's single rounding, and the same on
+/// every backend. Flushes to `0` when `1/s` is below the normal range.
+pub fn fine_reciprocal(s: f32) -> f32 {
+    let bits = s.to_bits();
+    let m = ((bits >> 20) & 7) as usize;
+    let e = ((bits >> 23) & 0xff) as i32 - 127;
+    let ne = -e;
+    if ne < -126 {
+        return 0.0;
+    }
+    let p = f32::from_bits(((ne.min(127) + 127) as u32) << 23);
+    FINE_RECIPROCALS[m] * p
 }
 
 /// `0` for a non-negative `x` below `f32`'s smallest normal, else `x`.
@@ -393,6 +588,72 @@ fn pow2_f64(n: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_formats_parse_and_print() {
+        let m: NumberFormat = "f4/f8".parse().unwrap();
+        assert_eq!(m.weights().unwrap().0, FloatFormat::parse("f4").unwrap());
+        assert_eq!(
+            m.activations().unwrap().0,
+            FloatFormat::parse("f8").unwrap()
+        );
+        assert_eq!(m.to_string().parse::<NumberFormat>(), Ok(m));
+        let w: NumberFormat = "f4@b32/f32".parse().unwrap();
+        assert_eq!(w.activations(), None);
+        assert_eq!(w.weights().unwrap().1, FormatScaling::Block(32));
+        assert_eq!(w.to_string().parse::<NumberFormat>(), Ok(w));
+        assert_eq!("f8/f8".parse::<NumberFormat>(), "f8".parse());
+        assert_eq!("f32/f32".parse::<NumberFormat>(), Ok(NumberFormat::F32));
+        assert!("f64/f8".parse::<NumberFormat>().is_err());
+    }
+
+    #[test]
+    fn fine_scales_are_exact_and_never_clip() {
+        for (m, &r) in FINE_RECIPROCALS.iter().enumerate() {
+            assert_eq!(r, (1.0 / (1.0 + m as f64 / 8.0)) as f32, "table entry {m}");
+        }
+        let f4 = FloatFormat::parse("f4").unwrap();
+        // amax 7.9: 7.9/6 = 1.3167 rounds up to 1.375, so 7.9 maps to 5.745 → 6.
+        let s = f4.fine_scale(7.9);
+        assert_eq!(s, 1.375);
+        assert_eq!(f4.round_fine(7.9, s, fine_reciprocal(s)), 6.0 * 1.375);
+        for &amax in &[1e-30f32, 0.003, 1.0, 5.99, 6.0, 7.9, 1234.5, 3e37] {
+            let s = f4.fine_scale(amax);
+            assert!(s * 6.0 >= amax * 0.999_999, "{amax}: scale {s} clips");
+            assert_eq!(
+                s.to_bits() & 0x000f_ffff,
+                0,
+                "{amax}: more than 3 mantissa bits"
+            );
+            assert!((fine_reciprocal(s) as f64 * s as f64 - 1.0).abs() < 1e-7);
+        }
+        let n: NumberFormat = "f4@fb16".parse().unwrap();
+        assert!(matches!(
+            n,
+            NumberFormat::Float {
+                scaling: FormatScaling::FineBlock(16),
+                ..
+            }
+        ));
+        assert_eq!(n.to_string().parse::<NumberFormat>(), Ok(n));
+    }
+
+    #[test]
+    fn block_scale_avoids_clipping_only_when_it_pays() {
+        let f4 = FloatFormat::parse("f4").unwrap(); // e2m1: max 6, MX scale puts amax in [4, 8)
+        // No clipping: the MX scale.
+        assert_eq!(f4.block_scale(&[5.0, 1.0, 0.5]), f4.pow2_scale(5.0));
+        // 7.9 clips to 6 under the MX scale (error 1.9); at twice the scale it
+        // rounds to 8 and 1.0 / 0.5 stay exact on the coarser grid.
+        let s = f4.pow2_scale(7.9);
+        assert_eq!(f4.block_scale(&[7.9, 1.0, 0.5]), 2.0 * s);
+        // Clipping 6.5 to 6 costs as much as the coarser grid costs the 0.75s;
+        // a tie keeps the MX scale.
+        let fine = [6.5, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75];
+        assert_eq!(f4.block_scale(&fine), f4.pow2_scale(6.5));
+        // Non-finite maxima keep the MX convention.
+        assert_eq!(f4.block_scale(&[f32::INFINITY, 1.0]), 1.0);
+    }
 
     #[test]
     fn named_formats_parse() {

@@ -111,7 +111,8 @@ fn resolve_password(
         (Some(_), Some(_)) => bail!("pass only one of --password / --password-env"),
         (Some(p), None) => Ok(Some(p)),
         (None, Some(var)) => {
-            let v = env::var(&var).with_context(|| format!("reading password from env {var}"))?;
+            let v = rlx_ir::env::read(&var)
+                .with_context(|| format!("reading password from env {var}"))?;
             if v.is_empty() {
                 bail!("env {var} is empty");
             }

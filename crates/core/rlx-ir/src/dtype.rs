@@ -4,6 +4,8 @@
 
 //! Element data types for tensors.
 
+use crate::prelude::*;
+
 /// Scalar element type. Matches hardware-supported types.
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -285,8 +287,8 @@ impl Element {
     }
 }
 
-impl std::fmt::Display for DType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for DType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::F32 => write!(f, "f32"),
             Self::F16 => write!(f, "f16"),

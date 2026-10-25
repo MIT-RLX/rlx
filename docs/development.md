@@ -9,6 +9,46 @@ review and ground rules.
 - Rust toolchain from `rust-toolchain.toml`
 - `just` for recipes (`just --list`)
 - Python 3.9+ + `maturin` for `pyrlx`
+- Optional: `sccache` — see [Build cache](#build-cache)
+
+## Build cache
+
+The MLX C++/CUDA build already routes through sccache or ccache; pick which
+with `RLX_MLX_CCACHE` (see [`rlx-env-vars.md`](rlx-env-vars.md)). **Rust**
+compilation is not cached by default. To enable it, put the wrapper in your
+*user* config, `~/.cargo/config.toml` — not in this repo, where a committed
+`rustc-wrapper` would be an absolute path on one machine and a missing binary
+on the next (this workspace builds on macOS, CUDA, ROCm and aarch64 boxes):
+
+```toml
+[build]
+rustc-wrapper = "/path/to/sccache"
+incremental = false
+```
+
+Two rules decide whether that does anything at all. Both are easy to get
+wrong silently, because a cache that never hits looks exactly like a cache
+that is not installed:
+
+- **`incremental = false` is required, not a preference.** sccache cannot cache
+  a crate compiled with `-C incremental`; it forwards the call to rustc, which
+  shows up under `non-cacheable reasons: incremental` in `sccache --show-stats`.
+  Cargo's dev profile enables incremental by default, so without this the cache
+  misses on exactly the builds that run most.
+- **Never `export CARGO_TARGET_DIR`.** The environment variable is part of
+  sccache's Rust cache key, so varying it misses every single time — while the
+  same directory change passed as `--target-dir` hits. Measured 2026-10-16:
+  identical crate, dir varied by flag → hit, dir varied by env var → miss. A
+  machine that had been running sccache for months through
+  `CARGO_TARGET_DIR`-exporting scripts sat at a 0.00% Rust hit rate against 83%
+  for C/C++. A *constant* value is fine (`docker/docker-compose.yml` sets one,
+  and `[build] target-dir` in a config file is fine too) — it is the varying
+  that defeats the cache. `tests/codegen_compile.rs` uses the flag for this
+  reason.
+
+`sccache --show-stats` ends with the live cache location and size cap. The cap
+is read when the server starts, so run `sccache --stop-server` after changing
+it, or wait out the 600 s idle timeout.
 
 ## Common commands
 
@@ -20,6 +60,7 @@ just test-gpu       # Metal/MLX/wgpu/Vulkan (+ apple/cuda/rocm runtime) on host
 just lint           # clippy (-D warnings)
 just fmt            # rustfmt
 just fmt-check      # rustfmt --check
+just check-no-std   # no_std crates (rlx-ir core, cortexm, fpga) for thumbv7em
 just install-git-hooks  # pre-commit auto-fmt + clippy
 just ci             # build + tests + fmt-check + clippy + pyrlx pytest
 just throttle       # thermal gate before benchmarks
@@ -90,6 +131,50 @@ Or `dispatch_report_for_device` in Rust (see `rlx-runtime/src/device_ext.rs`).
 Optional executable features (MoE, GPU handles, typed I/O, …) are declared via
 `ExecutableGraph::capabilities()` → [`ExecutableCapabilities`]. Method return
 values remain authoritative when a backend forgets to flip a bit.
+
+## Diagnosing a device failure
+
+`cargo rlx debug` runs a graph on a device and on CPU with the same
+deterministic inputs and params, then classifies the result (`unsupported-op`,
+`compile-panic`, `run-panic`, `non-finite`, `mismatch`, …):
+
+```sh
+cargo run -p rlx-check --features metal --bin cargo-rlx -- \
+    debug graph.json --device metal --probe --bisect
+```
+
+- `--probe` reruns with one compile option changed at a time (fusion off,
+  regions unfused, F32, common-IR kernels, no constant folding, no MPSGraph on
+  Metal). A probe that passes names the subsystem the defect is in.
+- `--bisect` exposes every op as an output and names the first one that
+  diverges, and whether it reads only graph inputs (suspect upload / layout).
+  If nothing diverges once exposed, a fusion the exposure blocked is wrong.
+
+Rust: `rlx_runtime::debug::debug_graph`. `RLX_POISON_ARENA=1` starts CPU
+scratch as NaN instead of zeros (at allocation and before each run), so a slot
+nothing wrote — an unfed input, an unwritten constant, a no-op op — reads NaN
+rather than a plausible zero. GPU host-fallback buffers are not covered.
+
+## Known failures
+
+A case a backend is known to get wrong goes in
+`tests/known_failures/<test>.txt` (`case device[@os] issue [note]`) instead of
+a skip: it keeps running, its failure is reported as known, and once it passes
+the test fails until the entry is removed. Format and options:
+`rlx_ir::known_failures`; decision: [ADR 0005](adr/0005-known-failures-as-data.md).
+
+```sh
+just known-failures list
+RLX_KNOWN_FAILURES_REPORT=/tmp/kf.jsonl just test-gpu
+just known-failures update /tmp/kf.jsonl --dry-run
+```
+
+`fd_backward_gate` and `gpu_filters_parity` are wired; another harness opts in
+by routing its per-case result through `KnownFailures::record` or `check`.
+
+Fusions that must fire on real block graphs, per registered device, are pinned
+by `rlx-runtime/tests/fusions_fire_on_model_blocks.rs` (with producer and
+fusion-off controls, so the check cannot pass vacuously).
 
 ## `Op::Scan` device preference
 

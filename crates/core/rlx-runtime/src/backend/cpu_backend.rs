@@ -31,10 +31,10 @@ impl Backend for CpuBackend {
         use rlx_opt::pass::Pass as _;
         static ONNX_KERNELS: std::sync::Once = std::sync::Once::new();
         ONNX_KERNELS.call_once(rlx_cpu::onnx_ref::register_onnx_reference_kernels);
-        // Claimed `Op::If` / `Op::While` → primitives before legalize (CPU has
-        // no native sub-graph executor). Also runs again in the fusion
-        // pipeline; no-op when neither op is present.
-        let graph = rlx_opt::LowerControlFlow.run(graph);
+        // Claimed `Op::If` → primitives before legalize; `Op::While` stays, a
+        // loop at run time (`Thunk::While`). Also runs again in the fusion
+        // pipeline; no-op when no `If` is present.
+        let graph = rlx_opt::LowerIf.run(graph);
         // Lower f32 SPD-manifold ops (ReEig/LogEig/BiMap/SpdBatchNorm) to the
         // graph-primitive Jacobi eigensolver BEFORE legalize — like If/While,
         // the CPU backend has no f32 SPD kernel (the native ones are f64
@@ -78,7 +78,7 @@ impl Backend for CpuBackend {
 
         let io_manifest = cpu_low_precision::IoDtypeManifest::from_graph(&fused);
         let exec_graph = if cpu_low_precision::needs_f32_exec(&fused) {
-            cpu_low_precision::promote_to_f32(fused)
+            cpu_low_precision::promote_to_f32_keeping_half_weights(fused)
         } else {
             fused
         };
@@ -145,7 +145,7 @@ impl Backend for CpuBackend {
         let io_manifest = cpu_low_precision::IoDtypeManifest::from_graph(&graph);
         let promote = cpu_low_precision::needs_f32_exec(&graph);
         let exec_graph = if promote {
-            cpu_low_precision::promote_to_f32(graph)
+            cpu_low_precision::promote_to_f32_keeping_half_weights(graph)
         } else {
             graph
         };
@@ -307,6 +307,7 @@ fn build_cpu_executable(
         moe_resident_layers: None,
         moe_topk_capture: None,
         baseline_written: false,
+        keep_ranges: None,
     }
 }
 
@@ -358,6 +359,12 @@ struct CpuExecutable {
     /// allocates a full params clone — catastrophic for multi-GB models).
     /// `set_param`/`set_param_typed` reset it to `false`.
     baseline_written: bool,
+    /// The persistent byte ranges `restore_arena_baseline` keeps, sorted. They
+    /// follow from the compiled layout and the persistent set alone, so they
+    /// are computed on the first run instead of every run (a scan of every
+    /// graph node plus a sort, per training step); cleared whenever
+    /// `arena_handles` changes, which is the only part of the set that can.
+    keep_ranges: Option<Vec<(usize, usize)>>,
 }
 
 unsafe impl Send for CpuExecutable {}
@@ -579,7 +586,7 @@ impl CpuExecutable {
         let elem_size = dtype.size_bytes();
         let max_elems = (buf.len() - off) / elem_size;
         unsafe {
-            write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, data, max_elems);
+            write_f32_as(buf.as_mut_ptr().add(off), dtype, data, max_elems);
         }
     }
 
@@ -594,7 +601,7 @@ impl CpuExecutable {
         let off = self.arena.byte_offset(id) + start * dtype.size_bytes();
         let buf = self.arena.raw_buf_mut();
         unsafe {
-            write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, data, data.len());
+            write_f32_as(buf.as_mut_ptr().add(off), dtype, data, data.len());
         }
     }
 
@@ -605,7 +612,7 @@ impl CpuExecutable {
         let off = self.arena.byte_offset(id);
         let buf = self.arena.raw_buf();
         let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
-        unsafe { read_typed_to_f32(buf.as_ptr().add(off), dtype, n_elems) }
+        unsafe { read_as_f32(buf.as_ptr().add(off), dtype, n_elems) }
     }
 
     /// `len` elements of a node's arena buffer starting at element `start`,
@@ -618,7 +625,7 @@ impl CpuExecutable {
         let dtype = self.storage_dtype(id);
         let off = self.arena.byte_offset(id) + start * dtype.size_bytes();
         let buf = self.arena.raw_buf();
-        Some(unsafe { read_typed_to_f32(buf.as_ptr().add(off), dtype, len) })
+        Some(unsafe { read_as_f32(buf.as_ptr().add(off), dtype, len) })
     }
 
     /// Write inputs and execute: persistent handles first (they act as default
@@ -650,7 +657,9 @@ impl CpuExecutable {
                 && self.arena.has_buffer(id)
             {
                 self.write_input(id, data);
-                self.arena_handles.remove(name);
+                if self.arena_handles.remove(name) {
+                    self.keep_ranges = None;
+                }
             }
         }
 
@@ -836,7 +845,9 @@ impl ExecutableGraph for CpuExecutable {
         // as the input. If the graph also writes back to this name (via
         // an output binding pattern), read_handle returns the latest.
         self.handles.insert(name.to_string(), data.to_vec());
-        self.arena_handles.remove(name);
+        if self.arena_handles.remove(name) {
+            self.keep_ranges = None;
+        }
         true
     }
 
@@ -855,7 +866,9 @@ impl ExecutableGraph for CpuExecutable {
             && self.arena.has_buffer(id)
         {
             self.write_input(id, data);
-            self.arena_handles.insert(name.to_string());
+            if self.arena_handles.insert(name.to_string()) {
+                self.keep_ranges = None;
+            }
         }
         true
     }
@@ -1226,9 +1239,6 @@ impl CpuExecutable {
     }
 
     fn restore_arena_baseline(&mut self) {
-        // Persistent slots (params + constants) — never zeroed.
-        let persistent = self.persistent_ids();
-
         // Write compile-time constants into the arena once (a fresh arena is
         // zero-initialized; params are already resident via set_param).
         if !self.baseline_written {
@@ -1263,35 +1273,48 @@ impl CpuExecutable {
         // `num_elements` and leaves the padding dirty. The cost stays O(arena −
         // params): for a 7B the params dominate the arena and are skipped, so
         // the swept region is tiny.
-        let mut keep: Vec<(usize, usize)> = self
-            .graph
-            .nodes()
-            .iter()
-            .filter_map(|node| {
-                let id = node.id;
-                if !persistent.contains(&id) || !self.arena.has_buffer(id) {
-                    return None;
-                }
-                let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
-                let nbytes = node.shape.num_elements().unwrap_or(0) * dtype.size_bytes();
-                let off = self.arena.byte_offset(id);
-                Some((off, off + nbytes))
-            })
-            .collect();
-        keep.sort_unstable();
+        if self.keep_ranges.is_none() {
+            // Persistent slots (params + constants) — never zeroed.
+            let persistent = self.persistent_ids();
+            let mut keep: Vec<(usize, usize)> = self
+                .graph
+                .nodes()
+                .iter()
+                .filter_map(|node| {
+                    let id = node.id;
+                    if !persistent.contains(&id) || !self.arena.has_buffer(id) {
+                        return None;
+                    }
+                    let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
+                    let nbytes = node.shape.num_elements().unwrap_or(0) * dtype.size_bytes();
+                    let off = self.arena.byte_offset(id);
+                    Some((off, off + nbytes))
+                })
+                .collect();
+            keep.sort_unstable();
+            self.keep_ranges = Some(keep);
+        }
+        let keep = self.keep_ranges.as_deref().unwrap_or_default();
 
+        // `RLX_POISON_ARENA=1`: scratch starts as 0xFF (NaN) instead of zero,
+        // so an output nothing wrote — a host-fallback no-op, say — reads NaN.
+        let fill = if rlx_ir::env::flag("RLX_POISON_ARENA") {
+            0xFF
+        } else {
+            0
+        };
         let buf = self.arena.raw_buf_mut();
         let len = buf.len();
         let mut cursor = 0usize;
-        for (start, end) in keep {
+        for &(start, end) in keep {
             let start = start.min(len);
             if cursor < start {
-                buf[cursor..start].fill(0);
+                buf[cursor..start].fill(fill);
             }
             cursor = cursor.max(end.min(len));
         }
         if cursor < len {
-            buf[cursor..len].fill(0);
+            buf[cursor..len].fill(fill);
         }
     }
 
@@ -1350,5 +1373,57 @@ impl CpuExecutable {
             );
             buf[off..off + data.len()].copy_from_slice(data);
         }
+    }
+}
+
+/// `src` written into a slot of `dtype`. On this backend an I32 / U32 / I64
+/// tensor holds its integers as integers (`rlx_cpu::int_storage`), so f32
+/// values for one are converted, not written as f32 bits; every other dtype
+/// is as `write_typed_from_f32`.
+///
+/// # Safety
+/// `dst` must have room for `max_elems` elements of `dtype`.
+unsafe fn write_f32_as(dst: *mut u8, dtype: DType, src: &[f32], max_elems: usize) {
+    let n = src.len().min(max_elems);
+    match dtype {
+        DType::I32 => {
+            let d = dst as *mut i32;
+            for (i, v) in src[..n].iter().enumerate() {
+                unsafe { d.add(i).write_unaligned(*v as i32) };
+            }
+        }
+        DType::U32 => {
+            let d = dst as *mut u32;
+            for (i, v) in src[..n].iter().enumerate() {
+                unsafe { d.add(i).write_unaligned(*v as u32) };
+            }
+        }
+        // An I64 slot is 8 bytes: an f32 there was half a value.
+        DType::I64 => {
+            let d = dst as *mut i64;
+            for (i, v) in src[..n].iter().enumerate() {
+                unsafe { d.add(i).write_unaligned(*v as i64) };
+            }
+        }
+        _ => unsafe { write_typed_from_f32(dst, dtype, src, max_elems) },
+    }
+}
+
+/// `n` elements of a `dtype` slot as f32; the inverse of [`write_f32_as`].
+///
+/// # Safety
+/// `src` must hold `n` elements of `dtype`.
+unsafe fn read_as_f32(src: *const u8, dtype: DType, n: usize) -> Vec<f32> {
+    match dtype {
+        DType::I32 => (0..n)
+            .map(|i| unsafe { (src as *const i32).add(i).read_unaligned() } as f32)
+            .collect(),
+        DType::U32 => (0..n)
+            .map(|i| unsafe { (src as *const u32).add(i).read_unaligned() } as f32)
+            .collect(),
+        DType::I64 => (0..n)
+            .map(|i| unsafe { (src as *const i64).add(i).read_unaligned() } as f32)
+            .collect(),
+        _ => unsafe { read_typed_to_f32(src, dtype, n) },
     }
 }

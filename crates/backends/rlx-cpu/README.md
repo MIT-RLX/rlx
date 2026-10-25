@@ -3,16 +3,11 @@
 CPU backend for RLX — SIMD kernels, BLAS dispatch, persistent thread
 pool, arena executor.
 
-Two execution paths share the same Thunk types:
-
-1. **Direct execution** (single `match` over `&Thunk` at line ~1280
-   onward in `thunk.rs`) — hot path, zero closure overhead.
-   Performance-critical ops (Attention, FusedAttnBlock, matmul) live here.
-2. **Closure-based** (`Box<dyn Fn(*mut u8)>` per thunk; line ~780
-   onward in `thunk.rs`) — older, used for ops where dispatch overhead
-   doesn't matter, and for some unit tests.
-
-Keep both paths in sync when changing a Thunk variant.
+A graph is lowered once into a flat `Vec<Thunk>` (`thunk::compile_thunks`),
+each thunk holding its arena offsets and dimensions; `thunk::execute_thunks`
+then walks the schedule and calls kernels directly — no per-call dispatch,
+lookup or shape math. A Thunk variant has one compile arm
+(`thunk/compile_dispatch.rs`) and one execute arm (`thunk/exec_dispatch.rs`).
 
 ## Features
 
@@ -26,9 +21,14 @@ Keep both paths in sync when changing a Thunk variant.
   on-device.
 - BLAS dispatch via Apple Accelerate (default on macOS) or OpenBLAS /
   MKL via Cargo features.
-- LAPACK bindings (`dgesv`, `dpotrf`, `dgeqrf`, `dgesvd`, `dsyevd`,
-  `dtrsm`) for `Op::DenseSolve` and the downstream
-  [`rlx-linalg`](https://crates.io/crates/rlx-linalg) crate.
+- LAPACK bindings (`dgesv`/`sgesv`, `dpotrf`, `dgeqrf`, `dgesvd`/`dgesdd`,
+  `dsyevd`/`ssyevd`, `dgelsd`, `dtrsm`, `geev`) for `Op::DenseSolve` and the
+  downstream [`rlx-linalg`](https://crates.io/crates/rlx-linalg) crate.
+  `numpy_blas` calls the exact Accelerate symbols NumPy / SciPy link on macOS,
+  for bit-identical ports.
+- Integer tensors (I32 / U32 / I64) are stored as integers; `int_storage`
+  casts around the kernels that compute in f32.
+- `Op::While` runs as a loop (`cond` and `body` compiled once), not unrolled.
 - Work-stealing thread pool with `par_for(total, grain, &|off, cnt| …)`
   primitive.
 - Reverse-mode AD support: thunks for every backward op
@@ -42,11 +42,12 @@ Keep both paths in sync when changing a Thunk variant.
 
 ## What's here
 
-- `thunk.rs` (the bulk) — Thunk enum + lowering from `Op` + both execution
-  paths. The two giant match functions (`compile_thunks_with_rng`,
-  `execute_thunks`) are now compact dispatchers routing to ~200 per-op
-  `compile_<op>` / `exec_<op>` fns (the latter `#[inline(always)]`, verified
-  perf-neutral against the `tests/bench_execute_hotloop.rs` gate).
+- `thunk/` (the bulk) — `types.rs` (the Thunk enum), `compile_dispatch.rs`
+  (lowering from `Op`), `exec_dispatch.rs` (execution); both are compact
+  dispatchers routing to per-op `compile_<op>` / `exec_<op>` fns in `ops/`
+  (the latter `#[inline(always)]`, verified perf-neutral against the
+  `tests/bench_execute_hotloop.rs` gate). `scan.rs` / `while_loop.rs` run
+  control flow; `waves.rs` is inter-thunk parallelism (`wave-exec`).
 - `executor.rs` — alternate non-thunk executor used by old paths and
   some unit tests.
 - `kernels.rs` — NEON intrinsics: softmax, layer norm, RMSNorm, matmul
@@ -60,19 +61,25 @@ Keep both paths in sync when changing a Thunk variant.
   from rlx-runtime).
 - `autotune.rs` — `Tick`-based search over `RuntimeConfig`. Use
   `rlx_ir::Tick` for sub-ms timing.
-- `cost.rs` / `config.rs` — model selection + runtime knobs
+- `cost.rs` / `config.rs` — model selection + runtime options
   (par_threshold, sdpa_seq_threshold, attn_mask_neg_inf, ...).
+- `spd.rs` / `spd_batched.rs` / `spd_kernels.rs` — SPD-manifold kernels
+  (logm/expm/sqrtm, Karcher mean) and batched, differentiable ReEig/LogEig.
+- `gguf_matmul.rs` / `dequant_cache.rs` / `int8_gemv.rs` — packed GGUF
+  quantized matmul and decode GEMVs.
 
 ## Cargo features
 
 | feature              | what it links                                |
 |----------------------|----------------------------------------------|
-| `blas` *(default)*   | platform CBLAS via FFI                       |
-| `blas-accelerate`    | Apple Accelerate                             |
-| `blas-mkl`           | Intel MKL                                    |
-| `blas-openblas`      | OpenBLAS                                     |
+| `blas` *(default)*   | platform CBLAS + LAPACK via FFI: Accelerate on Apple, OpenBLAS elsewhere |
+| `blas-mkl`           | Intel MKL (`mkl_rt`, honours `MKL_ROOT`) instead of OpenBLAS |
 | `portable-gemm`      | no-BLAS builds: `m ≥ 8` GEMMs via the `gemm` crate's blocked kernels |
+| `parity-gemm`        | route `sgemm_auto` through the `gemm` crate, bit-exact with candle |
 | `int8-gemv`          | x86-64 AVX2 int8 decode GEMVs for Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1 (int8-rounded activation, as llama.cpp) |
+| `wave-exec`          | inter-thunk parallelism: independent thunks run concurrently (`RLX_CPU_WAVES=0` disables) |
+| `splat`              | Gaussian-splat executors registered from `rlx-splat` |
+| `amx-bnns` / `amx-dense` / `amx-sme` | Apple matrix-unit paths: BNNS W8A8 matmul, Accelerate-AMX measurement harness, SME2 GEMM microkernel (runtime-gated) |
 
 With `--no-default-features`, a portable scalar gemm is linked instead
 — slow, but useful on hosts without a system BLAS.
@@ -81,7 +88,7 @@ With `--no-default-features`, a portable scalar gemm is linked instead
 
 ```toml
 [dependencies]
-rlx-cpu = "0.1"
+rlx-cpu = "0.2"
 ```
 
 Or via [`rlx`](https://crates.io/crates/rlx)'s `cpu` feature.
@@ -90,7 +97,7 @@ Or via [`rlx`](https://crates.io/crates/rlx)'s `cpu` feature.
 
 ```sh
 cargo build -p rlx-cpu --release
-cargo test  -p rlx-cpu --release   # 26 tests — mostly parity vs. naive
+cargo test  -p rlx-cpu --release   # mostly parity vs. naive
 ```
 
 ### ISA portability gate
@@ -127,16 +134,15 @@ control); `arm` uses `linux/arm64` — fully native on Apple Silicon — with
 
 ## Gotchas
 
-- `Thunk::Attention` carries `mask_kind: MaskKind` (plan #20). Custom
-  reads `mask` slice, others synthesize via `apply_synthetic_mask`. Both
-  execution paths handle this — keep them in sync.
+- `Thunk::Attention` carries `mask_kind: MaskKind`. Custom reads the
+  `mask` slice; the others synthesize it via `apply_synthetic_mask`.
 - `RuntimeConfig::global()` is read once per thunk closure. If you need
   per-call config, pass it through the thunk fields, not via global.
 - `cfg.sdpa_seq_threshold` controls the NEON-vs-BLAS attention crossover.
   The NEON path skips dispatch for batch=1 / short seq.
-- Thunk-level fusion runs *after* compile_thunks (line ~990) — it
-  rewrites Q/K/V → Narrow×3 → [Rope×2] → Attention → out_proj sequences
-  into a single FusedAttnBlock. Fragile pattern matching.
+- Thunk-level fusion inside `compile_thunks_with_rng` rewrites
+  Q/K/V → Narrow×3 → [Rope×2] → Attention → out_proj sequences into a
+  single `FusedAttnBlock`. Fragile pattern matching.
 
 ## License
 

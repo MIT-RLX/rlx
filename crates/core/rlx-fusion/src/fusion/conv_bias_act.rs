@@ -127,7 +127,7 @@ impl FuseConvBiasAct {
                 let conv_id = node.id;
                 let conv_users = uses.users(conv_id);
 
-                if conv_users.len() == 1 {
+                if uses.has_single_use(conv_id) {
                     let add_node = graph.node(conv_users[0]);
                     if let Op::Binary(BinaryOp::Add) = &add_node.op {
                         // The non-conv operand carries the bias.
@@ -148,7 +148,7 @@ impl FuseConvBiasAct {
                             // win, so the whole chain stays on the region path.
                             let mut activation = None;
                             let mut act_id = None;
-                            if add_users.len() == 1 {
+                            if uses.has_single_use(add_id) {
                                 let act_node = graph.node(add_users[0]);
                                 if let Op::Activation(a) = &act_node.op {
                                     if fusible_conv_activation(*a) {
@@ -407,7 +407,7 @@ fn match_conv_affine(
     c_out: usize,
 ) -> Option<AffineMatch> {
     let conv_users = uses.users(conv_id);
-    if conv_users.len() != 1 {
+    if !uses.has_single_use(conv_id) {
         return None;
     }
     let mul = graph.node(conv_users[0]);
@@ -417,7 +417,7 @@ fn match_conv_affine(
     let scale_id = trace_rank1_bias(graph, other_operand(mul, conv_id), c_out)?;
 
     let mul_users = uses.users(mul.id);
-    if mul_users.len() != 1 {
+    if !uses.has_single_use(mul.id) {
         return None;
     }
     let shift_add = graph.node(mul_users[0]);
@@ -427,7 +427,7 @@ fn match_conv_affine(
     let shift_id = trace_rank1_bias(graph, other_operand(shift_add, mul.id), c_out)?;
 
     let shift_users = uses.users(shift_add.id);
-    if shift_users.len() != 1 {
+    if !uses.has_single_use(shift_add.id) {
         return None;
     }
     let after = graph.node(shift_users[0]);
@@ -445,7 +445,7 @@ fn match_conv_affine(
             return None;
         }
         let res_users = uses.users(after.id);
-        if res_users.len() != 1 {
+        if !uses.has_single_use(after.id) {
             return None;
         }
         let relu = graph.node(res_users[0]);

@@ -7,8 +7,8 @@ browser via render-to-texture, for environments without WebGPU.
 
 WebGL2 has **no compute shaders** (confirmed in wgpu's own source:
 *"WebGL2, and GLES3.0 devices do not support compute"*). So this backend uses
-the classic GPGPU approach: every tensor is a single-channel float (`RGBA32F`,
-value in `R`) texture, and every op is a **fragment shader** that renders one
+the classic GPGPU approach: every tensor is a single-channel float (`R32F`)
+texture, and every op is a **fragment shader** that renders one
 output element per fragment. `readPixels` is synchronous, so the whole path is
 synchronous (no async plumbing, unlike WebGPU).
 
@@ -31,6 +31,14 @@ Graph ──► plan::build_plan ──► Plan ──┬─► exec_cpu::run_cp
   corresponding `exec_cpu` formula and fetches inputs by the planner's
   precomputed indices. It inherits the verified math; only the GL plumbing
   (texture setup, framebuffers, `readPixels`) needs in-browser validation.
+  Param/constant textures and the planner's index textures are uploaded once
+  and reused across runs (`GlBackend::forget_param` drops one when
+  `set_param` changes it); each run frees its own input and intermediate
+  textures.
+- Every tensor is one `rows × cols` texture, and WebGL caps each side at
+  `MAX_TEXTURE_SIZE` (16384 on most desktop browsers).
+  `Plan::max_texture_side()` / `Plan::largest_texture()` say what a plan needs
+  before you upload it.
 
 ## Op coverage
 

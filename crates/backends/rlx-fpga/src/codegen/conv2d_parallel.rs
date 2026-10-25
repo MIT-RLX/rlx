@@ -25,6 +25,9 @@
 //! * `weight_bits ∈ {2, 4, 8}` — handled by per-lane `weight_unpack`
 //!   (or per-lane crumb-mux when `ternary_fast_path` is on).
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use super::{Artifact, LayerArtifacts};
 use crate::codegen::conv2d::{emit_byte_addr_lane, emit_in_idx, emit_pad_decls};
 use crate::codegen::relu::bits_for;
@@ -218,7 +221,7 @@ pub fn emit(layer: &Layer, hints: &Hints) -> LayerArtifacts {
     v.banner(&format!(
         "{module_name} — INT8 conv2d {kh}x{kw} stride {stride_h}x{stride_w} on [{h_in}x{w_in}x{c_in}] → [{h_out}x{w_out}x{c_out}] (w{weight_bits}) — P={p} parallel MACs"
     ));
-    let tags: Vec<String> = std::iter::once(format!("P={p}"))
+    let tags: Vec<String> = core::iter::once(format!("P={p}"))
         .chain(
             [
                 ("fast_mac", hints.fast_mac),

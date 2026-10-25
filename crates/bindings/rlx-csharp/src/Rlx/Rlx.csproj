@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- RLX — versatile ML compiler + runtime. MIT OR Apache-2.0. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>CS1591</NoWarn>
+    <PackageId>Rlx</PackageId>
+    <Version>0.2.19</Version>
+    <Authors>Eugene Hauptmann; Nataliya Kosmyna</Authors>
+    <Description>.NET bindings for rlx — graphs, sessions, devices, autodiff, training, weights, text and distributed nodes over the rlx C ABI.</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+  </PropertyGroup>
+  <!-- Prebuilt librlx_capi per runtime id, staged by scripts/bindings_release.py;
+       .NET probes runtimes/<rid>/native/ in a package by itself. -->
+  <ItemGroup Condition="Exists('runtimes')">
+    <None Include="runtimes/**/*" Pack="true" PackagePath="runtimes" />
+  </ItemGroup>
+</Project>

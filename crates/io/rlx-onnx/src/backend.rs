@@ -238,7 +238,7 @@ fn ort_intra_threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         for key in ["RLX_ORT_INTRA_THREADS", "KITTENTTS_ORT_INTRA_THREADS"] {
-            if let Ok(s) = std::env::var(key) {
+            if let Ok(s) = rlx_ir::env::read(key) {
                 if let Ok(n) = s.parse::<usize>() {
                     return n.max(1);
                 }

@@ -616,6 +616,12 @@ kernel_cache!(
     "round_to_format"
 );
 kernel_cache!(
+    DOUBLE_SINGLE,
+    double_single_kernel,
+    DOUBLE_SINGLE_CU,
+    "double_single"
+);
+kernel_cache!(
     FAKE_QUANTIZE_EMA,
     fake_quantize_ema_kernel,
     FAKE_QUANTIZE_CU,
@@ -733,6 +739,13 @@ kernel_cache!(
     attention_warp_kernel,
     ATTENTION_WARP_CU,
     "attention_warp"
+);
+// Split-KV decode variant (one block per row) — same source file.
+kernel_cache!(
+    ATTENTION_WARP_SPLIT,
+    attention_warp_split_kernel,
+    ATTENTION_WARP_CU,
+    "attention_warp_split"
 );
 kernel_cache!(
     ATTENTION_BWD,
@@ -1120,6 +1133,7 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = attention_kernel(ctx);
     let _ = attention_row_kernel(ctx);
     let _ = attention_warp_kernel(ctx);
+    let _ = attention_warp_split_kernel(ctx);
     let _ = kv_append_kernel(ctx);
     let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);

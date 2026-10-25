@@ -16,7 +16,7 @@ Cerebras exposes three ingestion surfaces:
 
 Only the CSL path ships a simulator that runs on commodity machines, so it is
 the one RLX can target and validate end-to-end. This crate mirrors `rlx-fpga`'s
-ethos (emit source, validate against a Rust oracle) — but because the simulator
+ethos (emit source, validate against a Rust reference) — but because the simulator
 runs locally, we can close the loop and actually execute the emitted program.
 
 ## Pipeline
@@ -35,7 +35,7 @@ rlx-ir Graph
 - **Scalar kernel** — correctness first. The DSD/`@fmacs` vectorization and
   **multi-PE tiling** (where wafer-scale perf lives) are the next milestones;
   single-PE is only a correctness stepping stone.
-- **Validated:** the Rust oracle + artifact structure are unit-tested here
+- **Validated:** the Rust reference + artifact structure are unit-tested here
   (`cargo test -p rlx-cerebras`).
 - **Not yet validated:** compiling the CSL with `cslc` and running on the
   simulator needs the SDK Singularity container on a **Linux host** (e.g. ALCF)

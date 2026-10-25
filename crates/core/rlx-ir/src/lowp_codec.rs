@@ -16,6 +16,9 @@
 //! saturation of overflow/inf to the largest finite magnitude (the saturating
 //! quantization mode hardware uses). NaN inputs map to `0`.
 
+// Float methods `core` lacks (`FloatExt`) without `std`.
+#[allow(unused_imports)]
+use crate::prelude::*;
 use crate::quant::ScaledFormat;
 
 /// Decode one packed low-precision code (in the low [`ScaledFormat::bit_width`]

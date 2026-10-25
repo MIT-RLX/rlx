@@ -1,0 +1,28 @@
+[package]
+name = "rlx-micro"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "C ABI for rlx's microcontroller kernels (rlx-cortexm): INT8 conv / dense / pool on bare-metal Cortex-M — no_std, no heap, no OS"
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+readme                 = "README.md"
+# Moves with rlx-capi, which is not on crates.io either.
+publish = false
+
+[lib]
+# `staticlib`: linked into C / C++ firmware (and host programs); `rlib`: tests.
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = ["panic-handler"]
+# A halting `#[panic_handler]` on bare-metal targets, so a C firmware links
+# without a Rust one. Turn off when a Rust firmware brings its own.
+panic-handler = []
+
+[dependencies]
+rlx-cortexm = { path = "../../backends/rlx-cortexm", version = "0.2.18", default-features = false }
+
+[lints]
+workspace = true

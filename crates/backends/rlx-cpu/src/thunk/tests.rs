@@ -690,15 +690,15 @@ fn sme_w8a8_end_to_end() {
     };
 
     // Scalar W8A32 path (env unset).
-    unsafe { std::env::remove_var("RLX_CPU_SME_W8A8") };
+    rlx_ir::env::remove("RLX_CPU_SME_W8A8");
     let ms_scalar = run_timed(&mut arena);
     let out_scalar = read_out(&arena);
 
     // SME W8A8 path (env set).
-    unsafe { std::env::set_var("RLX_CPU_SME_W8A8", "1") };
+    rlx_ir::env::set("RLX_CPU_SME_W8A8", "1");
     let ms_sme = run_timed(&mut arena);
     let out_sme = read_out(&arena);
-    unsafe { std::env::remove_var("RLX_CPU_SME_W8A8") };
+    rlx_ir::env::remove("RLX_CPU_SME_W8A8");
 
     let cos_scalar = cosine(&out_scalar, &yref);
     let cos_sme = cosine(&out_sme, &yref);
@@ -7602,6 +7602,8 @@ fn batched_sgemm_operand_inside_destination_is_not_clobbered() {
         score_skip: 0.0,
         compiled_fns: Vec::new(),
         rng: Arc::new(std::sync::RwLock::new(rlx_ir::RngOptions::default())),
+        #[cfg(feature = "wave-exec")]
+        waves: Default::default(),
     };
     execute_thunks(&sched, &mut arena);
 
@@ -7667,6 +7669,8 @@ fn concat_source_inside_destination_is_not_clobbered() {
         score_skip: 0.0,
         compiled_fns: Vec::new(),
         rng: Arc::new(std::sync::RwLock::new(rlx_ir::RngOptions::default())),
+        #[cfg(feature = "wave-exec")]
+        waves: Default::default(),
     };
     execute_thunks(&sched, &mut arena);
 
@@ -7757,6 +7761,8 @@ fn sgemm_operand_inside_destination_is_not_clobbered() {
         score_skip: 0.0,
         compiled_fns: Vec::new(),
         rng: Arc::new(std::sync::RwLock::new(rlx_ir::RngOptions::default())),
+        #[cfg(feature = "wave-exec")]
+        waves: Default::default(),
     };
     execute_thunks(&sched, &mut arena);
 

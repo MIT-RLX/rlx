@@ -364,6 +364,13 @@ pub struct WgpuExecutable {
     /// Persistent KV inputs (host staging uploaded each run).
     gpu_handles: HashMap<String, Vec<f32>>,
     gpu_handle_feeds: HashMap<String, usize>,
+    /// GGUF GEMV steps encoded in place in the arena, by (schedule index,
+    /// rows): built on a step's first run and reused (`None` = the step takes
+    /// the general path). Cleared whenever the arena or weight buffer changes.
+    gemv_plans: std::sync::Mutex<HashMap<(usize, usize), Option<crate::gguf_gpu::GemvPlan>>>,
+    /// Inputs copied aside by `save_inputs`: the copy, and each slot's
+    /// (arena offset, byte length, offset in the copy).
+    saved_inputs: Option<(wgpu::Buffer, Vec<(usize, u64, u64)>)>,
     /// Arena input slots authoritative — skip host KV mirror each decode step.
     gpu_handle_resident: HashSet<String>,
     /// Resident-KV row feeds: handle name -> graph output index. See
@@ -448,6 +455,10 @@ impl WgpuExecutable {
         // unresolved+binding state for the next round.
         self.graph = fresh.graph;
         self.arena = fresh.arena;
+        self.gemv_plans
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.dequant_scratch_off = fresh.dequant_scratch_off;
         self.gdn_scratch_off = fresh.gdn_scratch_off;
         self.schedule = fresh.schedule;
@@ -547,6 +558,8 @@ impl WgpuExecutable {
             fft_gpu_steps: Vec::new(),
             gpu_handles: HashMap::new(),
             gpu_handle_feeds: HashMap::new(),
+            gemv_plans: std::sync::Mutex::new(HashMap::new()),
+            saved_inputs: None,
             gpu_handle_resident: HashSet::new(),
             kv_row_feeds: HashMap::new(),
             kv_feed_staging: None,
@@ -1409,14 +1422,12 @@ fn arena_tensors_overlap(arena: &Arena, a: NodeId, b: NodeId) -> bool {
     if a == b {
         return true;
     }
-    let (a0, al) = (arena.offset(a) as u64, arena.len_of(a) as u64);
-    let (b0, bl) = (arena.offset(b) as u64, arena.len_of(b) as u64);
-    if al == 0 || bl == 0 {
-        return false;
-    }
-    let a1 = a0.saturating_add(al);
-    let b1 = b0.saturating_add(bl);
-    a0 < b1 && b0 < a1
+    // The `a == b` shortcut above is about node identity, not bytes, and stays:
+    // a node trivially overlaps itself even at zero length. The interval test
+    // itself delegates to the planner's primitive, so this is no longer a
+    // separate definition of overlap that can drift from the others.
+    let r = |id: NodeId| rlx_ir::arena_range::ByteRange::new(arena.offset(id), arena.len_of(id));
+    r(a).overlaps(&r(b))
 }
 
 /// Arena bind window for matmul: when the weight alone fits the bind limit but

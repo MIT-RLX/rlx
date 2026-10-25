@@ -9,9 +9,9 @@ RLX implementation path for [parametric UMAP](https://github.com/eugenehp/fast-u
 | **Building blocks** | `cpu`, `graph`, `bench` | Cosine/Euclidean pairwise `[n,n]`, `umap.knn`, graph helpers, multi-backend parity |
 | **Full parametric UMAP** | `full` (default) | [`Umap::fit`](src/umap.rs), [`FittedUmap::transform`](src/fitted.rs), sparse cross-entropy + Adam, MLP encoder, weight save/load — port of [fast-umap](https://github.com/eugenehp/fast-umap) training loop on RLX Session |
 
-**Benchmarks (`bench_knn`, `bench_batch`) still time only the building-block path** (pairwise + k-NN), not `Umap::fit`. Use `umap_demo` or tests for full fit smoke checks.
+**Benchmarks (`bench_knn`, `bench_batch`) still time only the building-block path** (pairwise + k-NN), not `Umap::fit`. Use `umap_demo` or tests for full-fit checks.
 
-### Full UMAP quick start
+### Full UMAP: getting started
 
 ```sh
 cargo run -p rlx-umap --release --example umap_demo --features full
@@ -215,7 +215,7 @@ let (indices, distances) = split_knn_packed(&mut g, packed, 15);
 g.set_outputs(vec![indices, distances]);
 ```
 
-With `full`, see **Full UMAP quick start** above. CPU custom ops register via [`register`](src/lib.rs); training graphs compile through `rlx-runtime` Session.
+With `full`, see **Full UMAP: getting started** above. CPU custom ops register via [`register`](src/lib.rs); training graphs compile through `rlx-runtime` Session.
 
 ## License
 

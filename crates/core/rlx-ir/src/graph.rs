@@ -8,6 +8,7 @@
 //! inputs by [`NodeId`], forming a directed acyclic graph. The graph
 //! owns all nodes and provides traversal, printing, and validation.
 
+use crate::prelude::*;
 use crate::{Op, Shape};
 
 use crate::provenance::NodeOrigin;
@@ -17,8 +18,8 @@ use crate::provenance::NodeOrigin;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "%{}", self.0)
     }
 }
@@ -67,6 +68,30 @@ pub struct Graph {
     nodes: Vec<Node>,
     /// Output node IDs (the graph's results).
     pub outputs: Vec<NodeId>,
+    /// Op attributes that are a symbol's size (a cache write position at
+    /// `upper`), for a symbolic graph; see [`crate::dynamic::SymAttr`]. Not
+    /// in the serde form, which old bincode packages fix; `.rlxmodel` writes
+    /// them inline (`pos: upper`).
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    sym_attrs: Vec<crate::dynamic::SymAttr>,
+    /// Variables: inputs whose next value is an output, as `(input node,
+    /// output index)`. A caller feeds a variable's output back as its input
+    /// on the next call (a decode step's caches). Not in the serde form;
+    /// `.rlxmodel` writes them (`%k = var`, `return %k = %k_next`).
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    vars: Vec<(NodeId, usize)>,
+    /// Symbols that are another's size times a constant plus a constant
+    /// (`seq*16`, a flattened `[seq, heads]`); see
+    /// [`crate::dynamic::SymDef`]. Not in the serde form; `.rlxmodel` writes
+    /// them in the shapes that use them (`f32[seq*16, 128]`).
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    sym_defs: Vec<crate::dynamic::SymDef>,
+    /// Output names, as `(output index, name)` sorted by index; outputs not
+    /// listed are unnamed. Not in the serde form; `.rlxmodel` writes them
+    /// (`return %7 as logits`). Optimizer passes keep output positions, so
+    /// the runtime reads these off the graph it was given.
+    #[cfg_attr(feature = "serialize", serde(skip))]
+    output_names: Vec<(usize, String)>,
 }
 
 // Subgraph equality is structural: same name, same node count, same outputs.
@@ -86,7 +111,105 @@ impl Graph {
             name: name.into(),
             nodes: Vec::new(),
             outputs: Vec::new(),
+            sym_attrs: Vec::new(),
+            vars: Vec::new(),
+            sym_defs: Vec::new(),
+            output_names: Vec::new(),
         }
+    }
+
+    /// Op attributes that are a symbol's size ([`crate::dynamic::SymAttr`]).
+    pub fn sym_attrs(&self) -> &[crate::dynamic::SymAttr] {
+        &self.sym_attrs
+    }
+
+    /// Replace the symbolic op attributes.
+    pub fn set_sym_attrs(&mut self, attrs: Vec<crate::dynamic::SymAttr>) {
+        self.sym_attrs = attrs;
+    }
+
+    /// Symbols derived from others ([`crate::dynamic::SymDef`]).
+    pub fn sym_defs(&self) -> &[crate::dynamic::SymDef] {
+        &self.sym_defs
+    }
+
+    /// Replace the derived symbols.
+    pub fn set_sym_defs(&mut self, defs: Vec<crate::dynamic::SymDef>) {
+        self.sym_defs = defs;
+    }
+
+    /// Variables: `(input node, output index)` pairs, the output being the
+    /// input's next value.
+    pub fn vars(&self) -> &[(NodeId, usize)] {
+        &self.vars
+    }
+
+    /// Replace the variables (kept in output order).
+    pub fn set_vars(&mut self, mut vars: Vec<(NodeId, usize)>) {
+        vars.sort_by_key(|(_, out)| *out);
+        self.vars = vars;
+    }
+
+    /// The variable fed by `input`, if it is one: its output index.
+    pub fn var_output(&self, input: NodeId) -> Option<usize> {
+        self.vars.iter().find(|(i, _)| *i == input).map(|(_, o)| *o)
+    }
+
+    /// Name output `index` (`"logits"`), so a caller can find it with
+    /// [`output_index`](Self::output_index) instead of by position. Naming
+    /// an output again replaces its name.
+    pub fn name_output(&mut self, index: usize, name: impl Into<String>) {
+        let name = name.into();
+        match self.output_names.binary_search_by_key(&index, |(i, _)| *i) {
+            Ok(at) => self.output_names[at].1 = name,
+            Err(at) => self.output_names.insert(at, (index, name)),
+        }
+    }
+
+    /// Set the outputs and their names together, in order.
+    pub fn set_named_outputs<S: Into<String>>(
+        &mut self,
+        outputs: impl IntoIterator<Item = (S, NodeId)>,
+    ) {
+        let (names, ids): (Vec<String>, Vec<NodeId>) = outputs
+            .into_iter()
+            .map(|(name, id)| (name.into(), id))
+            .unzip();
+        self.outputs = ids;
+        self.output_names = names.into_iter().enumerate().collect();
+    }
+
+    /// The name of output `index`, if it has one.
+    pub fn output_name(&self, index: usize) -> Option<&str> {
+        self.output_names
+            .binary_search_by_key(&index, |(i, _)| *i)
+            .ok()
+            .map(|at| self.output_names[at].1.as_str())
+    }
+
+    /// The index of the output named `name`.
+    pub fn output_index(&self, name: &str) -> Option<usize> {
+        self.output_names
+            .iter()
+            .find(|(_, n)| n == name)
+            .map(|(i, _)| *i)
+    }
+
+    /// Named outputs: `(output index, name)` pairs, by index.
+    pub fn output_names(&self) -> &[(usize, String)] {
+        &self.output_names
+    }
+
+    /// Replace the output names.
+    pub fn set_output_names(&mut self, mut names: Vec<(usize, String)>) {
+        names.sort_by_key(|(i, _)| *i);
+        names.dedup_by_key(|(i, _)| *i);
+        self.output_names = names;
+    }
+
+    /// True if any shape or op attribute is symbolic.
+    pub fn is_symbolic(&self) -> bool {
+        !self.sym_attrs.is_empty() || self.has_dynamic_dims()
     }
 
     /// Number of nodes in the graph.
@@ -112,8 +235,10 @@ impl Graph {
         &self.nodes[id.0 as usize].shape
     }
 
-    /// Set the graph outputs.
+    /// Set the graph outputs. Names of outputs past the new count are
+    /// dropped; the rest keep their positions.
     pub fn set_outputs(&mut self, outputs: Vec<NodeId>) {
+        self.output_names.retain(|(i, _)| *i < outputs.len());
         self.outputs = outputs;
     }
 
@@ -241,6 +366,7 @@ impl Graph {
 
     // ── HIR / MIR / LIR pipeline (higher-order DX) ─────────────────
 
+    #[cfg(feature = "std")]
     /// Fusion-first model definition at HIR level.
     ///
     /// Returns a `GraphModule` at HIR stage; call `GraphModule::lower`
@@ -252,11 +378,13 @@ impl Graph {
         crate::GraphModule::define(name, build)
     }
 
+    #[cfg(feature = "std")]
     /// Start an empty HIR-stage `GraphModule`.
     pub fn hir(name: impl Into<String>) -> crate::GraphModule {
         crate::GraphModule::hir(name)
     }
 
+    #[cfg(feature = "std")]
     /// Wrap this MIR graph in a `GraphModule` for pipeline operations.
     pub fn module(self) -> crate::GraphModule {
         crate::GraphModule::from_graph(self)
@@ -272,11 +400,13 @@ impl Graph {
         crate::MirModule::from_graph(self)
     }
 
+    #[cfg(feature = "std")]
     /// Extract the MIR graph from optimized LIR.
     pub fn from_lir(lir: crate::LirModule) -> Self {
         lir.into_graph()
     }
 
+    #[cfg(feature = "std")]
     /// Annotated text dump (`inspect_graph`).
     pub fn inspect(&self) -> String {
         crate::inspect_graph(self)
@@ -297,6 +427,7 @@ impl Graph {
         crate::dynamic::bind_graph(self, bindings)
     }
 
+    #[cfg(feature = "std")]
     /// Stage-aware dump when wrapped in `GraphModule`.
     pub fn inspect_module(module: &crate::GraphModule) -> String {
         module.inspect()
@@ -304,8 +435,8 @@ impl Graph {
 }
 
 /// Pretty-print the graph in a readable IR format.
-impl std::fmt::Display for Graph {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Graph {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(f, "graph @{} {{", self.name)?;
         for node in &self.nodes {
             write!(f, "  {} = {}", node.id, node.op)?;

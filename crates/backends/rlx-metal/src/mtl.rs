@@ -595,6 +595,26 @@ impl DeviceRef {
         }
     }
 
+    /// `newBufferWithBytesNoCopy:length:options:deallocator:` with no
+    /// deallocator — +1. Wraps `bytes` (page-aligned, `length` whole pages)
+    /// without copying; the caller keeps the memory alive past the buffer.
+    pub fn new_buffer_with_bytes_no_copy(
+        &self,
+        bytes: *mut c_void,
+        length: u64,
+        options: MTLResourceOptions,
+    ) -> Buffer {
+        unsafe {
+            let none: *mut Object = std::ptr::null_mut();
+            let ptr: *mut Object = msg_send![self.as_ptr(),
+                newBufferWithBytesNoCopy: bytes
+                                  length: length
+                                 options: options.bits()
+                             deallocator: none];
+            Buffer::from_retained(ptr)
+        }
+    }
+
     /// `newLibraryWithSource:options:error:` — +1.
     pub fn new_library_with_source(
         &self,
@@ -1538,6 +1558,7 @@ mod tests {
                 "newCommandQueue",
                 "newBufferWithLength:options:",
                 "newBufferWithBytes:length:options:",
+                "newBufferWithBytesNoCopy:length:options:deallocator:",
                 "newLibraryWithSource:options:error:",
                 "newLibraryWithFile:error:",
                 "newComputePipelineStateWithFunction:error:",

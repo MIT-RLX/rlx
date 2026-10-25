@@ -46,6 +46,10 @@ pub(crate) enum Step {
         has_bias: u32,
         bias_off_f32: u32,
         act_id: u32,
+        /// `Some((byte_off, dtype))` when B is an F16/BF16 weight kept at 2 B in
+        /// its own slot at `byte_off`: the step widens it into the f32 scratch at
+        /// `b_off_f32` first, so every GEMM tier below still runs in f32.
+        b_half: Option<(u64, crate::arena::HalfDtype)>,
     },
     /// Native FP8 tensor-core GEMM (cublasLt). TN: lhs[m,k]·rhs[n,k]ᵀ. All
     /// offsets are BYTES into the arena (codes are u8, scales/out/bias f32).
@@ -1724,6 +1728,10 @@ pub(crate) enum Step {
         inner: u32,
         q_max_bits: u32,
     },
+    /// `Op::DoubleSingle` (`double_single.cu`): f64 as (hi, lo) f32 pairs.
+    DoubleSingle {
+        args: rlx_gpu_kernels::DfArgs,
+    },
     /// Native `Op::RoundToFormat` (`round_to_format.cu`); `mode` 0 none,
     /// 1 per-tensor (`amax_off`), 2 per block.
     RoundToFormat {
@@ -2471,6 +2479,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::FakeQuantizeFixed { .. } => "rlx::FakeQuantizeFixed",
         Step::FakeQuantizePerBatch { .. } => "rlx::FakeQuantizePerBatch",
         Step::RoundToFormat { .. } => "rlx::RoundToFormat",
+        Step::DoubleSingle { .. } => "rlx::DoubleSingle",
         Step::FakeQuantizeEma { .. } => "rlx::FakeQuantizeEma",
         Step::QuantizeI8 { .. } => "rlx::QuantizeI8",
         Step::DequantizeI8 { .. } => "rlx::DequantizeI8",
@@ -2620,13 +2629,21 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
             c_off_f32,
             has_bias,
             bias_off_f32,
+            b_half,
             ..
         } => {
             let mut r = vec![*a_off_f32, *b_off_f32];
             if *has_bias != 0 {
                 r.push(*bias_off_f32);
             }
-            (r, vec![*c_off_f32])
+            let mut w = vec![*c_off_f32];
+            // A half B also writes the shared widen scratch, so the next step
+            // that widens into it is ordered after this one's read.
+            if let Some((byte_off, _)) = b_half {
+                r.push((*byte_off / 4) as u32);
+                w.push(*b_off_f32);
+            }
+            (r, w)
         }
         // Offsets here are coarse f32-element slot keys; byte offsets ÷4 land in
         // the right slot since the planner aligns each tensor's slot.
@@ -3711,6 +3728,7 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::FakeQuantizePerBatch {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
+        Step::DoubleSingle { args } => (vec![args.a_off, args.b_off], vec![args.out_off]),
         Step::RoundToFormat {
             in_off,
             amax_off,

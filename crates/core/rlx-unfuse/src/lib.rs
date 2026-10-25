@@ -52,10 +52,17 @@ pub trait DecomposePolicy {
             | Op::FusedAttentionBlock { .. }
             | Op::FusedTransformerLayer { .. }
             | Op::DotGeneral { .. }
-            | Op::If { .. }
-            | Op::While { .. } => true,
+            | Op::If { .. } => true,
+            Op::While { .. } => !self.while_native(),
             _ => false,
         }
+    }
+
+    /// Keep `Op::While` for a loop at run time (the one-op host fallback,
+    /// rlx-cpu's `Thunk::While`), unbounded or not. Default: unroll it to
+    /// `max_iterations`.
+    fn while_native(&self) -> bool {
+        false
     }
 
     /// Keep `Op::FusedSwiGLU` intact for a native fused kernel (CUDA/ROCm).

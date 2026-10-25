@@ -90,11 +90,11 @@ impl BlockStage for GemmaKvTapStage {
         let lp = &self.layer_prefix;
         let (cos, sin) = super::self_attn::resolve_rope_handles(ctx, self.rope_table.as_deref())?;
 
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
+        let k_w = ctx.load_matrix(&format!("{lp}.self_attn.k_proj.weight"), true)?;
         let v_w = if self.k_eq_v {
             None
         } else {
-            Some(ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?)
+            Some(ctx.load_matrix(&format!("{lp}.self_attn.v_proj.weight"), true)?)
         };
 
         let norms = match &self.head_norm {

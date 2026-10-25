@@ -13,7 +13,7 @@ use rlx_ir::OpKind;
 
 use crate::DeadCodeElimination;
 use crate::io_output_gate::SelectPeaksOnlyOutputs;
-use rlx_fusion::control_flow::LowerControlFlow;
+use rlx_fusion::control_flow::{LowerControlFlow, LowerIf};
 use rlx_fusion::fk_fusion::{
     DecomposeFusionRegions, FuseBatchPreprocess, FuseRegionPrologue, MarkBatchSliceRegions,
     MarkTransformRegions,
@@ -48,6 +48,11 @@ pub enum FusionTarget {
 pub struct FusionOptions {
     /// Skip all pattern fusions (Metal: `RLX_METAL_NO_FUSION`).
     pub skip_fusion: bool,
+    /// Only fuse element-wise chains (`MarkElementwiseRegions`) — none of the
+    /// pattern fusions that rewrite matmuls and norms. For graphs whose
+    /// matmuls must stay as built (packed GGUF `DequantMatMul`), which used to
+    /// get `skip_fusion` and with it hundreds of separate tiny dispatches.
+    pub elementwise_only: bool,
     /// Break `ElementwiseRegion` back into primitives after marking.
     pub unfuse_elementwise_regions: bool,
     /// Keep fused `ElementwiseRegion` through lowering (env: `RLX_KEEP_ELEMENTWISE_REGIONS`).
@@ -68,12 +73,19 @@ pub struct FusionOptions {
     pub disable_conv_bias_act_fusion: bool,
     /// Disable IO-gated peaks-only output selection (`RLX_NO_IO_PEAKS_OUTPUT`).
     pub no_io_peaks_output: bool,
+    /// Skip the fusions that build a combined weight by concatenating weight
+    /// params (QKV, gate/up): the matmuls read their weights in place. The
+    /// combined weight is a second resident copy of most of a transformer's
+    /// weights, so a model short of memory goes without it. Env:
+    /// `RLX_NO_WEIGHT_CONCAT_FUSION`.
+    pub no_weight_concat: bool,
 }
 
 impl Default for FusionOptions {
     fn default() -> Self {
         Self {
             skip_fusion: false,
+            elementwise_only: false,
             unfuse_elementwise_regions: false,
             keep_elementwise_regions: false,
             decompose_fusion_regions: false,
@@ -84,6 +96,7 @@ impl Default for FusionOptions {
             fusion_limits: FusionLimits::default(),
             disable_conv_bias_act_fusion: false,
             no_io_peaks_output: false,
+            no_weight_concat: false,
         }
     }
 }
@@ -278,11 +291,25 @@ pub fn fusion_passes_for_supported(
     target: FusionTarget,
 ) -> Vec<&'static dyn Pass> {
     let opts = opts.apply_native_fk_defaults(target);
+    // A backend that runs `Op::While` keeps it (a loop at run time, unbounded
+    // or not); the others unroll it.
+    let control: &'static dyn Pass = if supports_op(supported, OpKind::While) {
+        &LowerIf
+    } else {
+        &LowerControlFlow
+    };
     if opts.skip_fusion {
-        return vec![&LowerControlFlow, &LowerDotGeneral];
+        return vec![control, &LowerDotGeneral];
+    }
+    if opts.elementwise_only {
+        let mut passes: Vec<&'static dyn Pass> = vec![control, &LowerDotGeneral];
+        if supports_op(supported, OpKind::ElementwiseRegion) && !opts.unfuse_elementwise_regions {
+            passes.push(&MarkElementwiseRegions);
+        }
+        return finish_pipeline(passes);
     }
 
-    let mut passes: Vec<&'static dyn Pass> = vec![&LowerControlFlow, &LowerDotGeneral];
+    let mut passes: Vec<&'static dyn Pass> = vec![control, &LowerDotGeneral];
 
     // ORDER: FuseMatMulBiasAct first, then FuseAttentionBlock. The block-level
     // pass matches the post-fusion shape
@@ -376,7 +403,8 @@ pub fn fusion_passes_for_supported(
     // of CONSTANT weights every token (≈2× the weight bandwidth) — reading the
     // weights in place (separate matmuls) is faster. The activation-only
     // `FuseSwiGLU` (silu·mul) still runs.
-    let no_weight_concat = rlx_ir::env::flag("RLX_NO_WEIGHT_CONCAT_FUSION");
+    let no_weight_concat =
+        opts.no_weight_concat || rlx_ir::env::flag("RLX_NO_WEIGHT_CONCAT_FUSION");
     if supports_op(supported, OpKind::FusedSwiGLU) && !no_weight_concat {
         passes.push(&FuseSwiGLUDualMatmul);
     }
@@ -542,102 +570,78 @@ pub fn fusion_passes(target: FusionTarget, opts: FusionOptions) -> Vec<&'static 
     fusion_passes_for_supported(supported_for_target(target), opts, target)
 }
 
+/// Every [`OpKind`] whose claim changes what [`fusion_passes_for_supported`]
+/// builds. Two claim sets that agree on these kinds produce the same pass
+/// list; `rlx-runtime/tests/fusions_fire_on_model_blocks.rs` compares
+/// [`supported_for_target`] with each registered backend's real claim on
+/// exactly this set.
+pub const FUSION_GATING_KINDS: &[OpKind] = &[
+    OpKind::MatMul,
+    OpKind::ElementwiseRegion,
+    OpKind::TransformRegion,
+    OpKind::BatchElementwiseRegion,
+    OpKind::FusedSwiGLU,
+    OpKind::FusedMatMulBiasAct,
+    OpKind::FusedMatMulResidual,
+    OpKind::FusedConvBiasAct,
+    OpKind::FusedResidualLN,
+    OpKind::FusedResidualRmsNorm,
+    OpKind::FusedAttentionBlock,
+    OpKind::AttentionBackwardAll,
+    OpKind::FusedTransformerLayer,
+    OpKind::AdaLayerNorm,
+    OpKind::GatedResidual,
+    OpKind::Fft,
+    OpKind::WelchPeaks,
+    OpKind::While,
+];
+
 /// Per-target op claims used when a backend doesn't supply an explicit
-/// `supported_ops` slice. Must stay aligned with each backend's
-/// `*_SUPPORTED_OPS` in `rlx-runtime/src/backend.rs`.
+/// `supported_ops` slice ([`fuse`], [`Fuse`], a bare [`CompilePipeline`]).
+/// Must agree with each backend's `SUPPORTED_OPS`
+/// (`crates/backends/rlx-*/src/supported_ops.rs`) on
+/// [`FUSION_GATING_KINDS`]; the runtime test named there checks it for every
+/// backend compiled in. Only the gating kinds matter here — a claim on any
+/// other kind changes nothing about fusion.
+///
+/// [`CompilePipeline`]: crate::CompilePipeline
 pub fn supported_for_target(target: FusionTarget) -> &'static [OpKind] {
     use OpKind::*;
+    // Claimed by every backend. `FusedMatMulResidual` is deliberately absent:
+    // Metal has the kernel but does not claim it (decode is weight-read bound,
+    // see rlx-metal's `supported_ops.rs`), so no backend runs that fusion.
+    macro_rules! common {
+        ($($extra:ident),*) => {
+            &[
+                MatMul,
+                DotGeneral,
+                ElementwiseRegion,
+                TransformRegion,
+                BatchElementwiseRegion,
+                FusedSwiGLU,
+                FusedMatMulBiasAct,
+                FusedConvBiasAct,
+                FusedResidualLN,
+                FusedResidualRmsNorm,
+                FusedAttentionBlock,
+                FusedTransformerLayer,
+                AdaLayerNorm,
+                GatedResidual,
+                Fft,
+                WelchPeaks,
+                While,
+                $($extra),*
+            ]
+        };
+    }
     match target {
-        FusionTarget::Cpu => &[
-            MatMul,
-            DotGeneral,
-            ElementwiseRegion,
-            FusedSwiGLU,
-            FusedMatMulBiasAct,
-            FusedResidualLN,
-            FusedResidualRmsNorm,
-            FusedAttentionBlock,
-            AdaLayerNorm,
-            GatedResidual,
-        ],
-        FusionTarget::Metal => &[
-            MatMul,
-            DotGeneral,
-            ElementwiseRegion,
-            TransformRegion,
-            BatchElementwiseRegion,
-            FusedSwiGLU,
-            FusedMatMulBiasAct,
-            FusedResidualLN,
-            FusedResidualRmsNorm,
-            AdaLayerNorm,
-            GatedResidual,
-        ],
-        FusionTarget::Mlx => &[
-            MatMul,
-            DotGeneral,
-            ElementwiseRegion,
-            TransformRegion,
-            BatchElementwiseRegion,
-            FusedSwiGLU,
-            FusedMatMulBiasAct,
-            FusedResidualLN,
-            FusedResidualRmsNorm,
-            AdaLayerNorm,
-            GatedResidual,
-        ],
-        FusionTarget::Wgpu => &[
-            MatMul,
-            ElementwiseRegion,
-            TransformRegion,
-            BatchElementwiseRegion,
-            FusedSwiGLU,
-            FusedMatMulBiasAct,
-            FusedResidualLN,
-            FusedResidualRmsNorm,
-            AdaLayerNorm,
-            GatedResidual,
-            FusedAttentionBlock,
-            FusedTransformerLayer,
-        ],
-        // CUDA lowers `FusedConvBiasAct` to cuDNN's fused conv-bias-activation.
-        // ROCm/MIOpen has no fused-conv path yet, so it is NOT claimed there —
-        // its conv-bias-activation stays decomposed until a MIOpen lowering lands.
-        FusionTarget::Cuda => &[
-            MatMul,
-            DotGeneral,
-            ElementwiseRegion,
-            TransformRegion,
-            BatchElementwiseRegion,
-            FusedMatMulBiasAct,
-            FusedConvBiasAct,
-            FusedResidualLN,
-            FusedResidualRmsNorm,
-            AdaLayerNorm,
-            GatedResidual,
-        ],
-        FusionTarget::Rocm => &[
-            MatMul,
-            DotGeneral,
-            ElementwiseRegion,
-            TransformRegion,
-            BatchElementwiseRegion,
-            FusedMatMulBiasAct,
-            FusedResidualLN,
-            FusedResidualRmsNorm,
-            AdaLayerNorm,
-            GatedResidual,
-        ],
-        FusionTarget::Tpu => &[
-            MatMul,
-            ElementwiseRegion,
-            TransformRegion,
-            BatchElementwiseRegion,
-            FusedMatMulBiasAct,
-            FusedResidualLN,
-            AdaLayerNorm,
-            GatedResidual,
-        ],
+        // The two backends with a native `AttentionBackwardAll`.
+        FusionTarget::Cpu | FusionTarget::Metal => common!(AttentionBackwardAll),
+        FusionTarget::Mlx
+        | FusionTarget::Wgpu
+        | FusionTarget::Cuda
+        | FusionTarget::Rocm
+        | FusionTarget::Tpu => common!(),
     }
 }
 
@@ -666,16 +670,17 @@ impl FusionOptions {
     /// Canonical option set for a target, matching what each backend's
     /// compile path uses: CPU unfuses element-wise regions (it executes them
     /// as per-op thunks), Metal/MLX keep matmul/norm fusions but unfuse long
-    /// element-wise chains, wgpu unfuses for its modulus-broadcast kernel, and
-    /// the remaining GPU-class targets take the defaults (native FKL regions
+    /// element-wise chains, wgpu/CUDA/ROCm unfuse as `rlx_runtime`'s
+    /// `pipeline_for` does, and TPU takes the defaults (native FKL regions
     /// are then enabled by [`apply_native_fk_defaults`](Self::apply_native_fk_defaults)).
     /// This is the option set the one-call [`fuse`] / [`Fuse`] entries pick.
     pub fn for_target(target: FusionTarget) -> Self {
         match target {
             FusionTarget::Cpu => Self::for_cpu(),
             FusionTarget::Metal | FusionTarget::Mlx => Self::for_metal(),
-            FusionTarget::Wgpu => Self::for_wgpu(),
-            FusionTarget::Cuda | FusionTarget::Rocm | FusionTarget::Tpu => Self::default(),
+            // `pipeline_for` unfuses regions for CUDA/ROCm as it does for wgpu.
+            FusionTarget::Wgpu | FusionTarget::Cuda | FusionTarget::Rocm => Self::for_wgpu(),
+            FusionTarget::Tpu => Self::default(),
         }
     }
 }
@@ -841,11 +846,13 @@ mod tests {
         let passes = fusion_passes(FusionTarget::Cpu, FusionOptions::default());
         assert_eq!(
             passes.len(),
-            19,
-            "CPU default supported_ops omit Fft/WelchPeaks and mark_elementwise (unfuse-only backends skip mark); includes FuseAdaLayerNorm + FuseGatedResidual"
+            23,
+            "CPU claims While (LowerIf), conv-bias-act, attention-backward-all and \
+             Fft+WelchPeaks; no mark_elementwise (unfuse-only backends skip mark)"
         );
+        assert_eq!(passes[0].name(), "LowerIf");
         assert_eq!(passes[2].name(), "fuse_matmul_bias_act");
-        assert_eq!(passes[3].name(), "fuse_attention_block");
+        assert_eq!(passes[5].name(), "fuse_attention_block");
         assert!(
             passes.iter().any(|p| p.name() == "fuse_region_prologue"),
             "default CPU pipeline should run FKL prologue fusion"
@@ -870,20 +877,48 @@ mod tests {
             },
         );
         assert_eq!(passes.len(), 2);
-        assert_eq!(passes[0].name(), "LowerControlFlow");
+        // Metal claims `Op::While` (a host loop), so it keeps loops: `LowerIf`.
+        assert_eq!(passes[0].name(), "LowerIf");
         assert_eq!(passes[1].name(), "lower_dot_general");
     }
 
     #[test]
-    fn metal_supported_ops_omit_attention_block_fusion() {
+    fn elementwise_only_marks_regions_and_nothing_else() {
+        let passes = fusion_passes_for_supported(
+            supported_for_target(FusionTarget::Wgpu),
+            FusionOptions {
+                elementwise_only: true,
+                ..FusionOptions::default()
+            },
+            FusionTarget::Wgpu,
+        );
+        let names: Vec<&str> = passes.iter().map(|p| p.name()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.to_lowercase().contains("elementwise")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.to_lowercase().contains("matmul")
+                || n.to_lowercase().contains("norm")
+                || n.to_lowercase().contains("swiglu")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn metal_supported_ops_fuse_attention_block() {
+        // `rlx_metal::SUPPORTED_OPS` claims FusedAttentionBlock, and the Metal
+        // backend compiles with that claim set.
         let passes = fusion_passes_for_supported(
             supported_for_target(FusionTarget::Metal),
             FusionOptions::default(),
             FusionTarget::Metal,
         );
         assert!(
-            !passes.iter().any(|p| p.name() == "fuse_attention_block"),
-            "Metal should not run FuseAttentionBlock"
+            passes.iter().any(|p| p.name() == "fuse_attention_block"),
+            "Metal should run FuseAttentionBlock"
         );
         assert!(
             passes.iter().any(|p| p.name() == "fuse_matmul_bias_act"),
@@ -903,8 +938,8 @@ mod tests {
             "CUDA should fuse matmul+bias+act when claimed"
         );
         assert!(
-            !passes.iter().any(|p| p.name() == "fuse_swiglu"),
-            "CUDA should not fuse SwiGLU"
+            passes.iter().any(|p| p.name() == "fuse_swiglu"),
+            "CUDA claims FusedSwiGLU, so it should fuse SwiGLU"
         );
     }
 

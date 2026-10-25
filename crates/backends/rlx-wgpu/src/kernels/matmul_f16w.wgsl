@@ -72,6 +72,21 @@ const RN: u32 = 4u;
 var<workgroup> tile_a: array<array<f32, 16>, 32>;
 var<workgroup> tile_b: array<array<f32, 32>, 16>;
 
+// Exact GELU — A&S 7.1.26 erf, the same as `matmul.wgsl` / `matmul_coop_f32.wgsl`
+// and rlx-cpu's `scalar_gelu`. Opcode 9 (`Activation::Gelu`) is the EXACT form;
+// only opcode 11 (`GeluApprox`) is the tanh form. This kernel used to map both
+// to tanh, so a fused matmul+bias+GELU here drifted ~3e-4 from CPU at |x|≈2–3.
+fn gelu_erf(x: f32) -> f32 {
+    let arg = x * 0.70710678118654752;
+    let s = select(-1.0, 1.0, arg >= 0.0);
+    let xa = abs(arg);
+    let t = 1.0 / (1.0 + 0.3275911 * xa);
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
+                + t * (-1.453152027 + t * 1.061405429))));
+    let e = s * (1.0 - poly * exp(-xa * xa));
+    return 0.5 * x * (1.0 + e);
+}
+
 fn apply_act(v_in: f32) -> f32 {
     var v = v_in;
     if (params.act_id == 0xFFFFu) { return v; }
@@ -82,7 +97,8 @@ fn apply_act(v_in: f32) -> f32 {
         case 5u: { v = sqrt(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
-        case 9u, 11u: {
+        case 9u: { v = gelu_erf(v); }
+        case 11u: {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
             let inner = clamp(c * (v + 0.044715 * x3), -15.0, 15.0);
@@ -155,9 +171,15 @@ fn matmul_f16w(
             let global_k = t * TILE_K + k_local;
             let n_local_base = lc * RN;
             let global_col_base = wid.x * TILE_N + n_local_base;
-            if (in_batch && global_k < params.k && global_col_base + 3u < params.n) {
-                let f16_off = b_base + global_k * params.n + global_col_base;
-                let v: vec4<f16> = weights[f16_off / 4u];
+            // The vec4 load reads elements `4·⌊off/4⌋ … +3`, which are this
+            // thread's four columns only when `off` is itself a multiple of 4.
+            // With `n` not divisible by 4 that fails on three rows in four and
+            // the load silently returns a neighbour row's weights (a 158 241-
+            // wide LM head came back with |Δ| ≈ 1), so check it per row.
+            let f16_off_vec = b_base + global_k * params.n + global_col_base;
+            if (in_batch && global_k < params.k && global_col_base + 3u < params.n
+                && (f16_off_vec % 4u) == 0u) {
+                let v: vec4<f16> = weights[f16_off_vec / 4u];
                 let vf: vec4<f32> = vec4<f32>(v);
                 tile_b[k_local][n_local_base + 0u] = vf.x;
                 tile_b[k_local][n_local_base + 1u] = vf.y;

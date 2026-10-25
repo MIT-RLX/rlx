@@ -61,6 +61,17 @@ pub struct WriteOptions {
     pub bincode_toc: bool,
     /// Intern repeated name strings into TOC `strings` table (flat).
     pub intern_strings: bool,
+    /// More graphs stored after the main one: a model's other functions
+    /// (`decode` beside `prefill`, a vocoder beside an encoder). Read back
+    /// with [`Package::module`](crate::Package::module).
+    pub extra_graphs: Vec<Graph>,
+    /// The model block of the stored `.rlxmodel` header: the model's `name`,
+    /// `version`, and whatever its runtime reads.
+    pub model: Option<serde_json::Value>,
+    /// The oldest rlx that may read the package (`requires` in the header).
+    pub requires_rlx: Option<String>,
+    /// Names of the graphs' symbolic dims (`dims {seq: 0}` in the header).
+    pub dims: Vec<(String, u32)>,
 }
 
 impl Default for WriteOptions {
@@ -79,6 +90,10 @@ impl Default for WriteOptions {
             write_checksums: true,
             bincode_toc: false,
             intern_strings: true,
+            extra_graphs: Vec::new(),
+            model: None,
+            requires_rlx: None,
+            dims: Vec::new(),
         }
     }
 }
@@ -195,7 +210,7 @@ pub fn write_package_flat(
         .context("serialize placement")?;
 
     let graph_bytes = if opts.include_graph {
-        bincode::serialize(&graph_for_disk).context("serialize graph")?
+        encode_graph(&graph_for_disk, &names, opts)?
     } else {
         Vec::new()
     };
@@ -270,8 +285,8 @@ pub fn write_package_dir(
     write_json(dir.join("rlx.json"), &manifest)?;
     if opts.include_graph {
         write_bytes(
-            dir.join("graph/mir.bin"),
-            &bincode::serialize(&graph_for_disk)?,
+            dir.join("graph/model.rlxmodel"),
+            &encode_graph(&graph_for_disk, &names, opts)?,
         )?;
     }
     write_json(dir.join("graph/io.json"), &io_json)?;
@@ -318,8 +333,8 @@ pub fn write_package_zip(
     ));
     if opts.include_graph {
         members.push((
-            "graph/mir.bin".into(),
-            bincode::serialize(&graph_for_disk).context("serialize graph")?,
+            "graph/model.rlxmodel".into(),
+            encode_graph(&graph_for_disk, &names, opts)?,
         ));
     }
     members.push((
@@ -573,4 +588,28 @@ pub fn infer_zip_from_path(path: &Path, explicit_zip: Option<bool>) -> Result<bo
         Some(false) => Ok(false),
         None => Ok(matches!(infer_container(path, None)?, ContainerKind::Zip)),
     }
+}
+
+/// The graphs as the package stores them: one `.rlxmodel` text
+/// ([`GRAPH_RLXMODEL`](crate::manifest::GRAPH_RLXMODEL)), the main graph
+/// first, with the model block and `requires` in its header.
+fn encode_graph(graph: &Graph, weight_names: &[&str], opts: &WriteOptions) -> Result<Vec<u8>> {
+    let mut graphs = vec![graph.clone()];
+    graphs.extend(opts.extra_graphs.iter().map(|g| {
+        if opts.strip_graph_weights {
+            graph_with_stripped_weights(g, weight_names)
+        } else {
+            g.clone()
+        }
+    }));
+    let module = rlx_ir::rlxmodel::Module {
+        model: opts.model.clone(),
+        requires: opts.requires_rlx.clone(),
+        dims: opts.dims.clone(),
+        graphs,
+        ..Default::default()
+    };
+    Ok(rlx_ir::rlxmodel::write_module(&module)
+        .context("serialize graph")?
+        .into_bytes())
 }

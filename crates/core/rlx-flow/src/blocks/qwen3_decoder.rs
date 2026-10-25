@@ -31,6 +31,8 @@ pub struct Qwen3DecoderSpec {
     /// Attention mask — `Causal` for standard Qwen3, `SlidingWindow(w)` for
     /// sliding-window models (Mistral / Gemma-style).
     pub mask: MaskKind,
+    /// A sparse MoE MLP in place of the dense one (this layer's experts).
+    pub moe: Option<super::moe::Qwen3Moe>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,9 +128,23 @@ impl BlockStage for Qwen3DecoderStage {
         let v_w = ctx.resolve_linear(&format!("{lp}.self_attn.v_proj.weight"), true, w_dt)?;
         let o_w = ctx.resolve_linear(&format!("{lp}.self_attn.o_proj.weight"), true, w_dt)?;
         let post_ln_g = ctx.load_param(&format!("{lp}.post_attention_layernorm.weight"), false)?;
-        let gate_w = ctx.resolve_linear(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?;
-        let up_w = ctx.resolve_linear(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?;
-        let down_w = ctx.resolve_linear(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?;
+        // The dense SwiGLU, or this layer's experts.
+        let ffn = match &spec.moe {
+            Some(moe) => {
+                let hidden = spec
+                    .hidden_shape
+                    .dims()
+                    .last()
+                    .expect("a hidden dim")
+                    .unwrap_static();
+                super::moe::Mlp::Experts(super::moe::load_moe(ctx, lp.as_str(), moe, hidden)?)
+            }
+            None => super::moe::Mlp::Dense(
+                ctx.resolve_linear(&format!("{lp}.mlp.gate_proj.weight"), true, w_dt)?,
+                ctx.resolve_linear(&format!("{lp}.mlp.up_proj.weight"), true, w_dt)?,
+                ctx.resolve_linear(&format!("{lp}.mlp.down_proj.weight"), true, w_dt)?,
+            ),
+        };
         let (q_bias, k_bias, v_bias) = if spec.attention_bias {
             (
                 Some(ctx.load_param(&format!("{lp}.self_attn.q_proj.bias"), false)?),
@@ -208,11 +224,22 @@ impl BlockStage for Qwen3DecoderStage {
         let post_attn = gb.add(skip, attn_out);
         let normed_post = gb.rms_norm(post_attn, post_ln_g, zero_beta_h, spec.eps);
 
-        let gate = gate_w.emit(&mut gb, normed_post);
-        let up = up_w.emit(&mut gb, normed_post);
-        let gate_act = gb.silu(gate);
-        let swiglu = gb.mul(gate_act, up);
-        let ffn_out = down_w.emit(&mut gb, swiglu);
+        let ffn_out = match &ffn {
+            super::moe::Mlp::Dense(gate_w, up_w, down_w) => {
+                let gate = gate_w.emit(&mut gb, normed_post);
+                let up = up_w.emit(&mut gb, normed_post);
+                let gate_act = gb.silu(gate);
+                let swiglu = gb.mul(gate_act, up);
+                down_w.emit(&mut gb, swiglu)
+            }
+            super::moe::Mlp::Experts(w) => super::moe::emit_moe(
+                &mut gb,
+                normed_post,
+                w,
+                spec.moe.as_ref().expect("experts"),
+                &spec.hidden_shape,
+            ),
+        };
         let out = gb.add(post_attn, ffn_out);
 
         Ok(Some(ctx.wrap(out, spec.hidden_shape.clone())))

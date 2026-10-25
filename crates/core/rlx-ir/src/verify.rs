@@ -30,6 +30,7 @@ use crate::capability::OpCaps;
 use crate::graph::{Graph, Node, NodeId};
 use crate::infer_shape;
 use crate::op::Op;
+use crate::prelude::*;
 
 /// Error found during graph verification.
 #[derive(Debug)]
@@ -38,8 +39,8 @@ pub struct VerifyError {
     pub message: String,
 }
 
-impl std::fmt::Display for VerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.node {
             Some(id) => write!(f, "at {id}: {}", self.message),
             None => write!(f, "{}", self.message),
@@ -152,7 +153,7 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
 ///   `last_logits_only` prefill would return the *first* token's logits.
 pub fn verify_unique_leaf_names(graph: &Graph) -> Vec<VerifyError> {
     let mut errors = Vec::new();
-    let mut seen: std::collections::HashMap<&str, NodeId> = std::collections::HashMap::new();
+    let mut seen: crate::collections::HashMap<&str, NodeId> = crate::collections::HashMap::new();
     for node in graph.nodes() {
         let (kind, name) = match &node.op {
             Op::Param { name } => ("Param", name),
@@ -454,6 +455,27 @@ pub fn verify_op(graph: &Graph, node: &Node) -> Vec<VerifyError> {
         // width stores out of bounds into whatever the memory planner placed
         // next in the arena — a corrupted neighbouring tensor, not a crash.
         // `kv_append_shape` holds the rules; this reports them per node.
+        Op::DynamicUpdateSlice { axis } if node.inputs.len() == 3 => {
+            let (operand, update, start) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+            if [operand, update, start]
+                .iter()
+                .all(|i| (i.0 as usize) < graph.len())
+            {
+                if let Err(message) = crate::shape::dynamic_update_slice_shape(
+                    graph.shape(operand),
+                    graph.shape(update),
+                    *axis,
+                ) {
+                    err(message);
+                }
+                if graph.shape(start).num_elements() != Some(1) {
+                    err(format!(
+                        "dynamic_update_slice: start is {}, not one element",
+                        graph.shape(start)
+                    ));
+                }
+            }
+        }
         Op::KvAppend { axis, pos } if node.inputs.len() == 2 => {
             let (cache, row) = (node.inputs[0], node.inputs[1]);
             if (cache.0 as usize) < graph.len() && (row.0 as usize) < graph.len() {

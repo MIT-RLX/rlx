@@ -162,6 +162,73 @@ fn is_lowp_layout_op(op: &Op) -> bool {
 /// weight `Concat` from shared-input MatMul fusion) stay low-precision too —
 /// promoting those would materialize a full F32 copy of every packed weight.
 pub fn promote_to_f32(graph: Graph) -> Graph {
+    promote(graph, Keep::NOTHING)
+}
+
+/// [`promote_to_f32`] for the CPU backend, which also keeps a half `Param`
+/// whose every consumer is a `MatMul`'s weight (its right operand) or an
+/// axis-0 `Gather`'s table at half width: the CPU's `SgemmF16` / `SgemmBf16`
+/// read packed half weights against f32 activations and its gather widens a
+/// packed table's rows, so a package opened with `weight_dtype: f16` holds
+/// them at 2 B each rather than widened back to 4.
+#[cfg(any(feature = "cpu", test))]
+pub fn promote_to_f32_keeping_half_weights(graph: Graph) -> Graph {
+    promote(
+        graph,
+        Keep {
+            weights: true,
+            tables: true,
+            ..Keep::NOTHING
+        },
+    )
+}
+
+/// [`prepare_f32_exec_graph`] keeping a half `Param` whose every consumer is
+/// a `MatMul`'s weight, or an axis-0 `Gather`'s table, at half width (Metal:
+/// its matmuls read half weights against f32 activations, and such a gather
+/// stays half — a row copy — for the `Cast` after it to widen). Without it,
+/// one half node — the rows a half embedding table gathers — widened every
+/// weight of the graph back to f32 (Qwen2.5-VL-3B's step: 7.4 → 13.6 GB).
+#[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
+pub fn prepare_f32_exec_graph_keeping_half_matmul_weights(
+    graph: Graph,
+) -> (Graph, IoDtypeManifest) {
+    let manifest = IoDtypeManifest::from_graph(&graph);
+    let keep = Keep {
+        weights: true,
+        tables: true,
+        gathers: true,
+        // Metal has no BF16 storage: those widen as before.
+        only_f16: true,
+    };
+    (promote(graph, keep), manifest)
+}
+
+/// Which half params [`promote`] leaves half.
+#[derive(Clone, Copy)]
+struct Keep {
+    /// A `Param` read only as a matmul's weight.
+    weights: bool,
+    /// … or also as an axis-0 `Gather`'s table.
+    tables: bool,
+    /// Such a table's gather keeps its half rows (a backend whose gather
+    /// copies rows of its output's type); else it is promoted (the CPU's
+    /// gather widens a half table's rows itself).
+    gathers: bool,
+    /// Only F16 params, not BF16.
+    only_f16: bool,
+}
+
+impl Keep {
+    const NOTHING: Keep = Keep {
+        weights: false,
+        tables: false,
+        gathers: false,
+        only_f16: false,
+    };
+}
+
+fn promote(graph: Graph, keep: Keep) -> Graph {
     if !needs_f32_exec(&graph) {
         return graph;
     }
@@ -195,6 +262,26 @@ pub fn promote_to_f32(graph: Graph) -> Graph {
     // dtype is not lost, because `IoDtypeManifest` records it and
     // `CompiledGraph::io_dtypes` narrows at the API edge.
     let boundary_stays_lowp = |id: NodeId| -> bool {
+        let weight_only = keep.weights
+            && (!keep.only_f16 || graph.node(id).shape.dtype() == DType::F16)
+            && matches!(graph.node(id).op, Op::Param { .. })
+            && consumers.get(&id).is_some_and(|cs| {
+                cs.iter().all(|&c| {
+                    let cn = graph.node(c);
+                    let matmul_weight = matches!(cn.op, Op::MatMul)
+                        && cn.inputs.get(1) == Some(&id)
+                        && cn.inputs.first() != Some(&id);
+                    // An embedding table: the CPU gather widens its rows.
+                    let table = keep.tables
+                        && matches!(cn.op, Op::Gather { axis: 0 })
+                        && cn.inputs.first() == Some(&id)
+                        && cn.inputs.get(1) != Some(&id);
+                    matmul_weight || table
+                })
+            });
+        if weight_only {
+            return true;
+        }
         match consumers.get(&id) {
             // Nothing reads it — nothing to disagree with.
             None => true,
@@ -217,7 +304,11 @@ pub fn promote_to_f32(graph: Graph) -> Graph {
                 kept_lowp.contains(&i)
                     || matches!(graph.node(i).shape.dtype(), DType::F16 | DType::BF16)
             });
-        let keep_dtype = is_boundary || is_layout_of_lowp;
+        let is_gather_of_lowp = keep.gathers
+            && matches!(node.op, Op::Gather { axis: 0 })
+            && matches!(node.shape.dtype(), DType::F16 | DType::BF16)
+            && kept_lowp.contains(&node.inputs[0]);
+        let keep_dtype = is_boundary || is_layout_of_lowp || is_gather_of_lowp;
         let shape = if keep_dtype {
             node.shape.clone()
         } else {
@@ -280,6 +371,56 @@ mod tests {
                 "{dt:?}: KvAppend was promoted away from its cache's dtype"
             );
         }
+    }
+
+    /// A half weight read only as a `MatMul`'s right operand stays half on
+    /// CPU (its packed GEMM reads it), the matmul's output promotes; one read
+    /// by anything else promotes, and other backends promote it too.
+    #[test]
+    fn a_half_matmul_weight_stays_half_on_cpu_only() {
+        let build = |extra_use: bool| {
+            let mut g = Graph::new("mm");
+            let x = g.input("x", Shape::new(&[2, 4], DType::F32));
+            let w = g.param("w", Shape::new(&[4, 3], DType::F16));
+            let y = g.add_node(Op::MatMul, vec![x, w], Shape::new(&[2, 3], DType::F16));
+            let mut outs = vec![y];
+            if extra_use {
+                outs.push(g.add_node(
+                    Op::Activation(rlx_ir::op::Activation::Relu),
+                    vec![w],
+                    Shape::new(&[4, 3], DType::F16),
+                ));
+            }
+            g.set_outputs(outs);
+            g
+        };
+        let param = |g: &Graph| {
+            g.nodes()
+                .iter()
+                .find(|n| matches!(n.op, Op::Param { .. }))
+                .map(|n| n.shape.dtype())
+                .unwrap()
+        };
+        let cpu = promote_to_f32_keeping_half_weights(build(false));
+        assert_eq!(param(&cpu), DType::F16);
+        // An embedding table read only by an axis-0 gather stays half too.
+        let mut g = Graph::new("embed");
+        let ids = g.input("ids", Shape::new(&[2], DType::I32));
+        let t = g.param("table", Shape::new(&[5, 3], DType::F16));
+        let rows = g.gather(t, ids, 0, Shape::new(&[2, 3], DType::F16));
+        g.set_outputs(vec![rows]);
+        let cpu_embed = promote_to_f32_keeping_half_weights(g);
+        assert_eq!(param(&cpu_embed), DType::F16);
+        assert_eq!(
+            cpu_embed.node(cpu_embed.outputs[0]).shape.dtype(),
+            DType::F32
+        );
+        assert_eq!(cpu.node(cpu.outputs[0]).shape.dtype(), DType::F32);
+        assert_eq!(
+            param(&promote_to_f32_keeping_half_weights(build(true))),
+            DType::F32
+        );
+        assert_eq!(param(&promote_to_f32(build(false))), DType::F32);
     }
 
     /// The other half: a genuinely computed operand still promotes, so this

@@ -960,6 +960,9 @@ mod tests {
     /// for the next test whichever way `f` exits.
     fn with_clean_dispatch(f: impl FnOnce()) {
         let _g = SGEMM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Fire the one-shot cache/shipped-row load NOW: if `pick_sgemm` fired it
+        // inside `f`, it would reinstall those overrides after this clear.
+        let _ = crate::tuning::gpu_arch();
         rlx_gpu_dispatch::dispatch::clear_overrides();
         rlx_ir::env::unset("RLX_METAL_SGEMM_VARIANT");
         rlx_ir::env::unset("RLX_METAL_SGEMM_PRECISE");

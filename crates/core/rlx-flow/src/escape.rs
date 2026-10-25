@@ -45,6 +45,29 @@ impl<'a> Emit<'a> {
     }
 
     pub fn load_param(&mut self, key: &str, transpose: bool) -> Result<HirNodeId> {
+        self.load_param_typed(key, transpose, rlx_ir::DType::F32)
+    }
+
+    /// A matmul weight under the flow's [`crate::WeightStorage`]; see
+    /// [`FlowCtx::load_matrix`].
+    pub fn load_matrix(&mut self, key: &str, transpose: bool) -> Result<HirNodeId> {
+        let hir = self
+            .module
+            .as_hir_mut()
+            .ok_or_else(|| anyhow::anyhow!("flow context requires HIR stage"))?;
+        crate::context::load_matrix_into(hir, self.params, self.weights, self.state, key, transpose)
+    }
+
+    /// [`Self::load_param`] with an explicit graph dtype, as
+    /// [`crate::FlowCtx::load_param_typed`]: the values travel as f32 and the
+    /// backend narrows them to `dtype` (F16 / BF16) at bind time, so the weight
+    /// is resident at 2 B/elem.
+    pub fn load_param_typed(
+        &mut self,
+        key: &str,
+        transpose: bool,
+        dtype: rlx_ir::DType,
+    ) -> Result<HirNodeId> {
         let cache_key = if transpose {
             format!("{key}\0t")
         } else {
@@ -54,7 +77,7 @@ impl<'a> Emit<'a> {
             return Ok(id);
         }
         let (data, shape) = self.weights.take(key, transpose)?;
-        let ir_shape = Shape::new(&shape, rlx_ir::DType::F32);
+        let ir_shape = Shape::new(&shape, dtype);
         let id = self.hir().param(key, ir_shape);
         self.params.insert(key.to_string(), data);
         self.state.loaded_params.insert(cache_key, id);

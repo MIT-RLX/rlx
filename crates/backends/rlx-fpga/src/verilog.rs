@@ -14,7 +14,10 @@
 //! modules in `codegen/` build entire SV files by calling these
 //! primitives.
 
-use std::fmt::Write;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use core::fmt::Write;
 
 /// Verilog source buffer + indent state.
 pub struct V {

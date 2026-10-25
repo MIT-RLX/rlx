@@ -207,6 +207,8 @@ pub use supported_ops::SUPPORTED_OPS;
 /// segmenter + 3 unit tests); executor wiring + per-segment plan
 /// compilation is the next chunk.
 pub mod segmented;
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+pub mod shared_weights;
 
 /// Typed kernel planning, precision legality, token bucketing, and two-stage
 /// build/launch configuration for Metal kernel families.

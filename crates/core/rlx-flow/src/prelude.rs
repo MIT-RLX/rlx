@@ -7,10 +7,10 @@
 pub use crate::blocks::{
     BertEncoderLayerSpec, BertEncoderLayerStage, BertQkvStyle, CustomStage, EmbedStage,
     FfnActivation, GatherAddStage, GatherFromInputStage, GeluFfnStage, LayerNormStage, LinearStage,
-    LlamaDecodeLayerSpec, LlamaDecoderSpec, LmHeadStage, MlaAttnPrefillSpec, MlaAttnPrefillStage,
-    NomicEncoderLayerSpec, NomicEncoderLayerStage, ResidualAddStage, ResidualSaveStage,
-    RmsNormStage, RopeTablesStage, SelfAttnPrefillSpec, SwiGluStage, llama_prefill_layer_composed,
-    llama_prefill_layer_fused, transformer_encoder_layer,
+    LlamaDecodeLayerSpec, LlamaDecoderSpec, LmHeadStage, MlaAttnDecodeStage, MlaAttnPrefillSpec,
+    MlaAttnPrefillStage, NomicEncoderLayerSpec, NomicEncoderLayerStage, ResidualAddStage,
+    ResidualSaveStage, RmsNormStage, RopeTablesStage, SelfAttnPrefillSpec, SwiGluStage,
+    llama_prefill_layer_composed, llama_prefill_layer_fused, transformer_encoder_layer,
 };
 pub use crate::context::{DecodeBindings, FlowState};
 pub use crate::{

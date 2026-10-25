@@ -50,16 +50,23 @@ pub fn resolve_store_ranges(path: impl AsRef<Path>) -> Result<BTreeMap<String, M
         let mut zf = archive
             .by_index(i)
             .with_context(|| format!("zip index {i}"))?;
-        let name = zf.name().to_string();
+        let name = zf
+            .name()
+            .with_context(|| format!("zip index {i} name"))?
+            .to_string();
         if zf.compression() != zip::CompressionMethod::Stored {
             bail!("member {name} is not STORE; mmap requires uncompressed payloads");
         }
         let length = zf.size();
         let header_start = zf.header_start();
-        // Touch the reader so the crate resolves `data_start`.
+        // Touch the reader so the crate resolves `data_start`. zip 9 returns it
+        // as an `Option`, `None` until the local header has actually been read,
+        // which is exactly what this probe forces.
         let mut probe = [0u8; 1];
         let _ = zf.read(&mut probe);
-        let data_offset = zf.data_start();
+        let data_offset = zf
+            .data_start()
+            .with_context(|| format!("member {name} has no resolved data offset"))?;
         // Ensure we didn't mis-parse empty files.
         let _ = header_start;
         out.insert(

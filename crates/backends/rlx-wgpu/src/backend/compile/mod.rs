@@ -83,8 +83,9 @@ impl WgpuExecutable {
 
     pub fn compile_rng(graph: Graph, rng: rlx_ir::RngOptions) -> Self {
         use rlx_opt::pass::Pass as _;
-        // Match Session `WgpuBackend::compile`: rewrite If/While before lower.
-        let graph = rlx_opt::LowerControlFlow.run(graph);
+        // Match Session `WgpuBackend::compile`: rewrite If before lower
+        // (`Op::While` runs as a host loop).
+        let graph = rlx_opt::LowerIf.run(graph);
         let rng = std::sync::Arc::new(std::sync::RwLock::new(rng));
         if has_dynamic_dims(&graph) {
             return Self::deferred(graph, rng);

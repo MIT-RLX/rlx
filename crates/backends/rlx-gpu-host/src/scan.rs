@@ -193,6 +193,32 @@ impl HostTensorCache {
         self.map.insert(byte_off, merged);
     }
 
+    /// Flush every deferred entry overlapping `[byte_off, byte_off + len)` —
+    /// call before reading that range from the device on a mirror miss.
+    ///
+    /// [`Self::flush_offset`] only finds a write keyed at exactly `byte_off`,
+    /// which misses one deferred *inside* the range: a KV row appended at
+    /// `cache + pos·row`, then the cache read whole at `cache` by a host step
+    /// (`ExpandHost` repeating KV heads on discrete NVIDIA). That read the
+    /// device before the row was flushed, so every decode step attended to the
+    /// cache without its newest token.
+    pub fn flush_range<A: DeviceArena>(&mut self, a: &mut A, byte_off: usize, len: usize) {
+        let hi = byte_off + len;
+        let owed: Vec<usize> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|k| {
+                self.map
+                    .get(k)
+                    .is_some_and(|v| *k < hi && byte_off < k + v.len() * 4)
+            })
+            .collect();
+        for k in owed {
+            self.flush_offset(a, k);
+        }
+    }
+
     /// Write all deferred host outputs to the device (call before a GPU pass),
     /// oldest write first — see the `dirty` field docs for why order matters.
     pub fn flush_to_device<A: DeviceArena>(&mut self, a: &mut A) {
@@ -274,7 +300,7 @@ pub fn run_host_op_packed_cached<A: DeviceArena>(
             // Deferred producer at this offset but length mismatch — push to
             // device before D2H so we don't read zeros.
             if let Some(c) = cache.as_mut() {
-                c.flush_offset(a, *off);
+                c.flush_range(a, *off, n * 4);
             }
             let mut v = vec![0f32; n];
             if n > 0 {
@@ -591,5 +617,29 @@ mod host_cache_tests {
         let mut a = VecArena::new(64);
         c.flush_to_device(&mut a);
         assert!(a.writes.is_empty(), "eager write must not re-flush");
+    }
+
+    /// A read of a whole range must first flush a write deferred *inside* it.
+    ///
+    /// A KV append defers one row at `cache + pos·row`; the next host step
+    /// reads the cache at `cache`. `flush_offset(cache)` finds nothing keyed
+    /// there, so the device read missed the row: every decode step on discrete
+    /// NVIDIA attended to a cache without its newest token.
+    #[test]
+    fn range_flush_reaches_a_write_deferred_inside_the_range() {
+        let mut c = HostTensorCache::new();
+        // Cache of 4 rows × 2 f32 at offset 0; row 2 (bytes 16..24) appended.
+        c.insert(16, vec![7.0, 8.0], true);
+        // Unrelated deferred write outside the range stays deferred.
+        c.insert(48, vec![1.0], true);
+
+        let mut a = VecArena::new(64);
+        c.flush_offset(&mut a, 0);
+        assert!(a.writes.is_empty(), "exact-key flush cannot see the row");
+
+        c.flush_range(&mut a, 0, 32);
+        assert_eq!(a.writes, [(16, 8)], "the interior row, and only it");
+        assert_eq!((a.f32_at(16), a.f32_at(20)), (7.0, 8.0));
+        assert!(!c.is_dirty(16) && c.is_dirty(48));
     }
 }

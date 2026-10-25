@@ -1,0 +1,130 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Publishes the binding packages that bindings-release.yml attached to a
+# release, once that release is published (or by hand for a tag). Each
+# registry is its own job behind a GitHub Environment of the same name: give
+# each environment required reviewers, and nothing is uploaded until someone
+# approves that registry. Credentials are OIDC Trusted Publishing — no
+# long-lived token in the repository — except NuGet's user name (a variable).
+# Setup per registry: docs/releasing-bindings.md.
+#
+# Every job skips versions already on its registry, so a re-run after a
+# partial failure publishes only what is missing.
+
+name: Bindings publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (v<version>)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 'pyrlx-*' -p 'pyrlx_cu12-*' -D dist
+      # pyrlx and pyrlx-cu12 are two PyPI projects; each lists this workflow
+      # and the `pypi` environment as its trusted publisher.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  npm:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      - name: Download packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 'rlx-rlx-*.tgz' -D dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1+.
+      - run: npm install -g npm@latest
+      # The platform packages first: @rlx/rlx's optionalDependencies name them.
+      - name: Publish
+        run: |
+          version="${TAG#v}"
+          for f in $(ls dist/rlx-rlx-*-"$version".tgz) "dist/rlx-rlx-$version.tgz"; do
+            name=$(tar -xzOf "$f" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0)).name')
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published"
+            else
+              npm publish "$f" --access public --provenance
+            fi
+          done
+
+  rubygems:
+    runs-on: ubuntu-latest
+    environment: rubygems
+    permissions:
+      id-token: write
+    steps:
+      - name: Download gems
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 'rlx-*.gem' -D dist
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - uses: rubygems/configure-rubygems-credentials@v1.0.0
+      - name: Publish
+        run: |
+          for f in dist/*.gem; do
+            if out=$(gem push "$f" 2>&1); then
+              echo "$out"
+            elif grep -q "Repushing of gem versions is not allowed" <<<"$out"; then
+              echo "$(basename "$f") is already published"
+            else
+              echo "$out" >&2
+              exit 1
+            fi
+          done
+
+  nuget:
+    runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      id-token: write
+    steps:
+      - name: Download packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 'Rlx.*.nupkg' -D dist
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ vars.NUGET_USER }}
+      # The native packages first, then Rlx.
+      - name: Publish
+        run: |
+          for f in $(ls dist/Rlx.Native.*.nupkg) $(ls dist/Rlx.[0-9]*.nupkg); do
+            dotnet nuget push "$f" --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+              --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done

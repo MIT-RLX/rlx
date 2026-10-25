@@ -36,7 +36,7 @@ pub fn open_rlxp(path: impl AsRef<Path>) -> Result<Package> {
 
 /// Compile the embedded MIR graph of an `.rlxp` package.
 ///
-/// Requires `include_graph` / `encoding = bincode_graph_v1` at write time.
+/// Requires `include_graph` at write time (any graph encoding the package reads).
 pub fn compile_rlxp(session: &Session, path: impl AsRef<Path>) -> Result<CompiledGraph> {
     let graph = load_rlxp_graph(path)?;
     Ok(session.compile(graph))

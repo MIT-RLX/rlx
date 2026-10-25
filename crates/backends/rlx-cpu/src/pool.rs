@@ -22,10 +22,22 @@ fn ensure_pool() {
     POOL_INIT.call_once(|| {
         let cfg = crate::config::RuntimeConfig::global();
         let n = cfg.pool_workers.max(1);
-        let _ = rayon::ThreadPoolBuilder::new()
+        let built = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .thread_name(|i| format!("rlx-rayon-{i}"))
             .build_global();
+        // Someone used rayon first, so its default pool stands. Harmless
+        // unless the user asked for a size: then say so instead of ignoring it.
+        if built.is_err()
+            && rlx_ir::env::var("RLX_WORKERS").is_some()
+            && rayon::current_num_threads() != n
+        {
+            eprintln!(
+                "rlx-cpu: RLX_WORKERS={n} not applied — the global rayon pool already exists with {} threads \
+                 (build it before any rayon use to size it)",
+                rayon::current_num_threads()
+            );
+        }
         // Pin OpenBLAS/MKL/Accelerate to 1 thread — Rayon owns outer
         // parallelism (par_sgemm splits). Nested N² threads are catastrophic.
         crate::blas::limit_inner_threads();
@@ -71,7 +83,12 @@ pub fn par_range<F: Fn(usize) + Sync + Send>(n: usize, f: F) {
 /// Below this the rayon hand-off costs more than the work it saves. Kept in
 /// one place so conv/transpose/pool/relu/region kernels share a single,
 /// tunable cutover instead of sprinkling magic constants at each call site.
-pub const ELEMENTWISE_PAR_FLOOR: usize = 4096;
+///
+/// Measured (14-core Apple M-series, training on the synthetic suite), with
+/// identical scores at every value: 4096 → 65536 took TensorCSPNet 20.4 → 10.0 s
+/// (system time 11.1 → 0.24 s), EEGNet 8.6 → 4.5 s, ShallowFBCSPNet 5.5 → 4.1 s.
+/// At 4096 an 8k-element add split 14 ways spent its time waking workers.
+pub const ELEMENTWISE_PAR_FLOOR: usize = 65536;
 
 /// Should an op over `work` elements run in parallel? True only with >1 worker
 /// and enough work to keep them busy past the amortization floor. Use this at
@@ -86,6 +103,20 @@ pub fn should_parallelize(work: usize) -> bool {
 #[inline]
 pub fn chunk_floor(total: usize) -> usize {
     (total / num_threads().max(1)).max(ELEMENTWISE_PAR_FLOOR)
+}
+
+/// Minimum work per parallel task, in multiply-adds (or comparable element
+/// operations). Below it a rayon hand-off — waking a parked worker, the join —
+/// costs more than the task: a batch of 22×22 GEMMs (~10k MACs each) split one
+/// item per task spent as much time in the kernel (sleep/wake) as computing.
+pub const TASK_WORK_FLOOR: usize = 1 << 17;
+
+/// `par_for` grain for `units` independent items of `work_per_unit` each: enough
+/// items per task to reach [`TASK_WORK_FLOOR`]. `par_for` then runs inline when
+/// the whole range is below one task's worth.
+#[inline]
+pub fn grain_for(work_per_unit: usize) -> usize {
+    TASK_WORK_FLOOR.div_ceil(work_per_unit.max(1)).max(1)
 }
 
 /// `par_for` chunk floor for an *outer* loop of `units` independent items
@@ -133,6 +164,14 @@ pub fn par_for<F: Fn(usize, usize) + Sync>(total: usize, min_per_thread: usize, 
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn grain_reaches_the_work_floor() {
+        assert_eq!(grain_for(TASK_WORK_FLOOR), 1);
+        assert_eq!(grain_for(0), TASK_WORK_FLOOR);
+        let g = grain_for(22 * 22 * 22);
+        assert!(g * 22 * 22 * 22 >= TASK_WORK_FLOOR && (g - 1) * 22 * 22 * 22 < TASK_WORK_FLOOR);
+    }
 
     #[test]
     fn par_for_sums_correctly() {

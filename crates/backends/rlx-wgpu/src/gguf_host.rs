@@ -11,7 +11,31 @@
 use crate::buffer::Arena;
 use crate::host_stage::WgpuArena;
 
-pub use rlx_gpu_host::{gguf_scheme_id, scheme_from_id};
+use rlx_ir::quant::QuantScheme;
+
+/// Kernel id for [`QuantScheme::GgufBF16`] in this backend only. The shared
+/// table (`QuantScheme::gpu_dequant_scheme_id`) deliberately has no bf16
+/// row: every backend treats "has an id" as "has a kernel", and only the
+/// fused GEMV here reads bf16. Far from the shared ids so the two never meet.
+pub const BF16_SCHEME_ID: u32 = 256;
+
+/// `scheme` → kernel id: the shared GGUF ids plus [`BF16_SCHEME_ID`].
+pub fn gguf_scheme_id(scheme: QuantScheme) -> u32 {
+    if scheme == QuantScheme::GgufBF16 {
+        BF16_SCHEME_ID
+    } else {
+        rlx_gpu_host::gguf_scheme_id(scheme)
+    }
+}
+
+/// Inverse of [`gguf_scheme_id`].
+pub fn scheme_from_id(scheme_id: u32) -> QuantScheme {
+    if scheme_id == BF16_SCHEME_ID {
+        QuantScheme::GgufBF16
+    } else {
+        rlx_gpu_host::scheme_from_id(scheme_id)
+    }
+}
 
 pub fn run_dequant_matmul_gguf(
     arena: &Arena,

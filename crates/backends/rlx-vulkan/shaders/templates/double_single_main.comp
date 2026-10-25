@@ -1,0 +1,93 @@
+#version 450
+// Op::DoubleSingle: f64 as interleaved (hi, lo) f32 pairs in the arena.
+//
+// The arithmetic is `rlxsl::dw::glsl_fast_math_guarded()`, inserted at the
+// marker below at build time (MoltenVK compiles with fast math, which would
+// fold away the error terms; every rounding step is XOR'd with `dw_zero()`, a
+// push-constant 0). Indexing follows `rlx_ir::double_single::DfPlan`; the
+// host packs it into 32 words (see `double_single_push` in backend.rs):
+//   0 kind | op << 8   1 zero   2 len   3 a_off   4 b_off   5 out_off
+//   kind 0 elementwise: 6 rank, 7..12 dims, 13..18 a strides, 19..24 b strides
+//   kind 1 matmul:      6 m, 7 n, 8 k, 9 a_batch, 10 b_batch
+//   kind 2 reduction:   6 kept_rank | red_rank << 8, 7..12 kept dims,
+//                       13..18 kept strides, 19..24 red dims, 25..30 red strides
+// Ranks are at most 6. op: `DfOp::code` (elementwise) or 0 sum / 1 max.
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC { uvec4 v[8]; } pc;
+
+uint P(uint i) { return pc.v[i >> 2u][i & 3u]; }
+uint dw_zero() { return P(1u); }
+
+// @DW_PRELUDE
+
+uint df_off(uint i0, uint rank, uint dims_at, uint strides_at) {
+    uint i = i0;
+    uint off = 0u;
+    for (int d = int(rank) - 1; d >= 0; --d) {
+        uint n = P(dims_at + uint(d));
+        off += (i % n) * P(strides_at + uint(d));
+        i /= n;
+    }
+    return off;
+}
+
+DwF32 ld(uint base, uint i) {
+    return DwF32(arena_load(base + 2u * i), arena_load(base + 2u * i + 1u));
+}
+
+bool greater(DwF32 x, DwF32 y) { return x.hi > y.hi || (x.hi == y.hi && x.lo > y.lo); }
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint kind = P(0u) & 0xffu;
+    uint op = P(0u) >> 8u;
+    if (gid >= P(2u)) { return; }
+    uint a_off = P(3u);
+    uint b_off = P(4u);
+    DwF32 r = DwF32(0.0, 0.0);
+    if (kind == 0u) {
+        uint rank = P(6u);
+        DwF32 x = ld(a_off, df_off(gid, rank, 7u, 13u));
+        DwF32 y = ld(b_off, df_off(gid, rank, 7u, 19u));
+        if (op == 0u) { r = dw_add(x, y); }
+        else if (op == 1u) { r = dw_sub(x, y); }
+        else if (op == 2u) { r = dw_mul(x, y); }
+        else if (op == 4u) { r = dw_sqrt(x); }
+        else if (op == 5u) { r = dw_exp(x); }
+        else if (op == 6u) { r = greater(y, x) ? y : x; }
+        else { r = dw_div(x, y); }
+    } else if (kind == 1u) {
+        uint m = P(6u);
+        uint n = P(7u);
+        uint k = P(8u);
+        uint j = gid % n;
+        uint row = gid / n;
+        uint i = row % m;
+        uint bi = row / m;
+        uint a0 = bi * P(9u) + i * k;
+        uint b0 = bi * P(10u) + j;
+        for (uint kk = 0u; kk < k; kk++) {
+            r = dw_add(r, dw_mul(ld(a_off, a0 + kk), ld(b_off, b0 + kk * n)));
+        }
+    } else {
+        uint kept_rank = P(6u) & 0xffu;
+        uint red_rank = P(6u) >> 8u;
+        uint red_len = 1u;
+        for (uint d = 0u; d < red_rank; d++) { red_len *= P(19u + d); }
+        uint base = df_off(gid, kept_rank, 7u, 13u);
+        bool is_max = op == 1u;
+        if (is_max) { r = ld(a_off, base); }
+        for (uint i = is_max ? 1u : 0u; i < red_len; i++) {
+            DwF32 x = ld(a_off, base + df_off(i, red_rank, 19u, 25u));
+            if (is_max) {
+                if (greater(x, r)) { r = x; }
+            } else {
+                r = dw_add(r, x);
+            }
+        }
+    }
+    uint out_off = P(5u);
+    arena_store(out_off + 2u * gid, r.hi);
+    arena_store(out_off + 2u * gid + 1u, r.lo);
+}

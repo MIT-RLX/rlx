@@ -26,7 +26,26 @@ pub(crate) fn act_f(act: Act, x: f32) -> f32 {
         Act::Cos => x.cos(),
         Act::Silu => x / (1.0 + (-x).exp()),
         Act::Recip => 1.0 / x,
+        Act::Gelu => 0.5 * x * (1.0 + erf_as(x * std::f32::consts::FRAC_1_SQRT_2)),
+        Act::GeluApprox => 0.5 * x * (1.0 + gelu_tanh_arg(x).tanh()),
+        Act::Softplus => x.max(0.0) + (-x.abs()).exp().ln_1p(),
     }
+}
+
+/// `erf` by Abramowitz–Stegun 7.1.26 — the formula the GLSL uses.
+pub(crate) fn erf_as(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let p = t
+        * (0.254_829_6
+            + t * (-0.284_496_74 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
+    (1.0 - p * (-x * x).exp()).copysign(x)
+}
+
+const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+
+/// `√(2/π)·(x + 0.044715·x³)`, clamped so `tanh` stays finite in GLSL too.
+fn gelu_tanh_arg(x: f32) -> f32 {
+    (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).clamp(-15.0, 15.0)
 }
 
 /// Pointwise activation derivative `f'(x)`. Mirrored exactly by the GLSL.
@@ -60,6 +79,16 @@ pub(crate) fn act_df(act: Act, x: f32) -> f32 {
             s + x * s * (1.0 - s)
         }
         Act::Recip => -1.0 / (x * x),
+        Act::Gelu => {
+            let pdf = (-0.5 * x * x).exp() * 0.398_942_3;
+            0.5 * (1.0 + erf_as(x * std::f32::consts::FRAC_1_SQRT_2)) + x * pdf
+        }
+        Act::GeluApprox => {
+            let t = gelu_tanh_arg(x).tanh();
+            0.5 * (1.0 + t)
+                + 0.5 * x * (1.0 - t * t) * SQRT_2_OVER_PI * (1.0 + 3.0 * 0.044_715 * x * x)
+        }
+        Act::Softplus => 1.0 / (1.0 + (-x).exp()),
     }
 }
 
@@ -154,17 +183,29 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                 }
                 vals[*out] = o;
             }
-            Step::MatMul { out, a, b, m, k, n } => {
-                let mut o = vec![0f32; m * n];
+            Step::MatMul {
+                out,
+                a,
+                b,
+                m,
+                k,
+                n,
+                batch,
+                b_batched,
+            } => {
+                let mut o = vec![0f32; batch * m * n];
                 {
                     let (av, bv) = (&vals[*a], &vals[*b]);
-                    for i in 0..*m {
-                        for j in 0..*n {
-                            let mut s = 0f32;
-                            for l in 0..*k {
-                                s += av[i * k + l] * bv[l * n + j];
+                    for bi in 0..*batch {
+                        let (ao, bo) = (bi * m * k, if *b_batched { bi * k * n } else { 0 });
+                        for i in 0..*m {
+                            for j in 0..*n {
+                                let mut s = 0f32;
+                                for l in 0..*k {
+                                    s += av[ao + i * k + l] * bv[bo + l * n + j];
+                                }
+                                o[bi * m * n + i * n + j] = s;
                             }
-                            o[i * n + j] = s;
                         }
                     }
                 }
@@ -533,6 +574,7 @@ mod tests {
             slot_dims: vec![(1, 3); 3],
             slot_len: vec![3; 3],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("a", &[1.0, 5.0, 3.0]), ("b", &[2.0, 2.0, 2.0])]).unwrap();
         assert_eq!(out[0], vec![1.0, 0.0, 0.0]);
@@ -564,6 +606,7 @@ mod tests {
             slot_dims: vec![(1, 3); 4],
             slot_len: vec![3; 4],
             outputs: vec![3],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(
             &plan,
@@ -608,6 +651,7 @@ mod tests {
             slot_dims: vec![(1, 4); 3],
             slot_len: vec![4; 3],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(
             &plan,
@@ -643,6 +687,7 @@ mod tests {
             slot_dims: vec![(1, 4), (1, 2), (1, 4)],
             slot_len: vec![4, 2, 4],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("a", &[1.0, 2.0, 3.0, 4.0]), ("b", &[10.0, 20.0])]).unwrap();
         assert_eq!(out[0], vec![11.0, 22.0, 13.0, 24.0]);
@@ -674,6 +719,7 @@ mod tests {
             slot_dims: vec![(1, 2); 3],
             slot_len: vec![2; 3],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("a", &[1.0, 2.0]), ("b", &[3.0, 4.0])]).unwrap();
         assert!((out[0][0] - 0.44).abs() < 1e-6 && (out[0][1] - 0.08).abs() < 1e-6);
@@ -704,6 +750,7 @@ mod tests {
             slot_dims: vec![(1, 3), (1, 6), (1, 3)],
             slot_len: vec![3, 6, 3],
             outputs: vec![1, 2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("x", &[1.0, 2.0, 3.0])]).unwrap();
         assert_eq!(out[0], vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]);
@@ -735,6 +782,7 @@ mod tests {
             slot_dims: vec![(1, 4), (1, 8), (1, 4)],
             slot_len: vec![4, 8, 4],
             outputs: vec![1, 2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("z", &[1.0, 2.0, 3.0, 4.0])]).unwrap();
         assert_eq!(out[0], vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0]);

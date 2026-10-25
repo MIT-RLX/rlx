@@ -127,14 +127,23 @@ fn can_lower_dequant_in_mps(
 
 /// Build a hybrid plan when whole-graph lowering fails (typical Qwen3.5 decode).
 ///
-/// Thunk ranges MUST index `ThunkSchedule.thunks`, which is one entry per
-/// `graph.nodes()` in order (Input/Param/Constant → `Thunk::Nop`). Counting
-/// only compute nodes (the old approach) desyncs Attention thunks from the
-/// schedule and produces garbage on large transformer graphs (Zonos).
+/// Thunk ranges MUST index `ThunkSchedule.thunks`. `node_start` is
+/// [`crate::thunk::ThunkSchedule::node_start`]: node `p`'s thunks are
+/// `node_start[p]..node_start[p + 1]`. Lowering is not one thunk per node — a
+/// Softmax whose input and output slots differ prepends a Copy — and taking
+/// the node's position as its thunk index shifted every later range by one:
+/// FLUX.1's double blocks with Q8_0 weights and matmul attention skipped the
+/// modulation Add feeding the MLP (output all-zero) while CPU matched diffusers.
+/// Counting only compute nodes (an older approach) desynced Attention thunks
+/// the same way on Zonos.
 pub fn build_hybrid_plan(
     graph: &Graph,
     params_as_constants: Option<&HashMap<String, Vec<u8>>>,
+    node_start: &[usize],
 ) -> Option<Vec<HybridStep>> {
+    if node_start.len() != graph.nodes().len() + 1 {
+        return None;
+    }
     // The hybrid MPSGraph→native handoff miscompiles a subgraph that produces
     // MULTIPLE boundary outputs feeding a single native op — CONFIRMED on both
     // GatedDeltaNet (q,k,v,g,beta) and Attention (q,k,v): at real dims the boundary
@@ -166,36 +175,47 @@ pub fn build_hybrid_plan(
     // on a quiet machine before trying again.
     let mut steps: Vec<HybridStep> = Vec::new();
     let mut pending: Vec<NodeId> = Vec::new();
-    let mut pending_idxs: Vec<usize> = Vec::new();
+    // Thunk ranges per pending node, not single indices.
+    let mut pending_idxs: Vec<std::ops::Range<usize>> = Vec::new();
 
-    let flush_mps =
-        |pending: &mut Vec<NodeId>, pending_idxs: &mut Vec<usize>, steps: &mut Vec<HybridStep>| {
-            if pending.is_empty() {
-                return;
+    let flush_mps = |pending: &mut Vec<NodeId>,
+                     pending_idxs: &mut Vec<std::ops::Range<usize>>,
+                     steps: &mut Vec<HybridStep>| {
+        if pending.is_empty() {
+            return;
+        }
+        let start = pending_idxs
+            .iter()
+            .map(|r| r.start)
+            .min()
+            .expect("pending idx");
+        let end = pending_idxs
+            .iter()
+            .map(|r| r.end)
+            .max()
+            .expect("pending idx");
+        let extracted = extract_subgraph(graph, pending);
+        match try_lower_with_constants(&extracted.graph, params_as_constants) {
+            Some(plan) => {
+                steps.push(HybridStep::SubGraph {
+                    plan,
+                    boundary_parent_ids: extracted.boundaries,
+                    output_parent_ids: extracted.output_parent_ids,
+                    thunk_skip: start..end,
+                });
             }
-            let start = *pending_idxs.iter().min().expect("pending idx");
-            let end = *pending_idxs.iter().max().expect("pending idx") + 1;
-            let extracted = extract_subgraph(graph, pending);
-            match try_lower_with_constants(&extracted.graph, params_as_constants) {
-                Some(plan) => {
-                    steps.push(HybridStep::SubGraph {
-                        plan,
-                        boundary_parent_ids: extracted.boundaries,
-                        output_parent_ids: extracted.output_parent_ids,
-                        thunk_skip: start..end,
-                    });
-                }
-                None => {
-                    // Segment has an unsupported op — run it as thunks and keep
-                    // trying MPSGraph on later segments (don't abort the hybrid).
-                    steps.push(HybridStep::Thunks(start..end));
-                }
+            None => {
+                // Segment has an unsupported op — run it as thunks and keep
+                // trying MPSGraph on later segments (don't abort the hybrid).
+                steps.push(HybridStep::Thunks(start..end));
             }
-            pending.clear();
-            pending_idxs.clear();
-        };
+        }
+        pending.clear();
+        pending_idxs.clear();
+    };
 
-    for (thunk_idx, node) in graph.nodes().iter().enumerate() {
+    for (pos, node) in graph.nodes().iter().enumerate() {
+        let thunks = node_start[pos]..node_start[pos + 1];
         let id = node.id;
         let op = &node.op;
         if matches!(
@@ -212,10 +232,10 @@ pub fn build_hybrid_plan(
             && !can_lower_dequant_in_mps(graph, id, params_as_constants))
         {
             flush_mps(&mut pending, &mut pending_idxs, &mut steps);
-            steps.push(HybridStep::Thunks(thunk_idx..thunk_idx + 1));
+            steps.push(HybridStep::Thunks(thunks));
         } else {
             pending.push(id);
-            pending_idxs.push(thunk_idx);
+            pending_idxs.push(thunks);
         }
     }
     flush_mps(&mut pending, &mut pending_idxs, &mut steps);

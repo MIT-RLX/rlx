@@ -25,7 +25,7 @@ layout → reshape → parity check) end-to-end, with a numpy stand-in for
 every file-format/plumbing contract around it. CI-friendly.
 
 ```sh
-python3 crates/rlx-qnn/docker/validate.py harness-test --dims 8 16 4
+python3 crates/backends/rlx-qnn/docker/validate.py harness-test --dims 8 16 4
 # or, from the repo root:  just qnn-docker-test 8 16 4
 ```
 
@@ -35,7 +35,7 @@ Builds the model lib and runs it on `libQnnCpu.so` inside the container.
 
 ```sh
 export QNN_SDK_ROOT=/path/to/qairt/2.x        # the SDK you downloaded
-python3 crates/rlx-qnn/docker/validate.py run --dims 32 64 32
+python3 crates/backends/rlx-qnn/docker/validate.py run --dims 32 64 32
 # or:  just qnn-docker-run 32 64 32
 ```
 

@@ -6,7 +6,8 @@
 // invocation owns one output column `j`.
 //
 // Scheme: 0 = Q4_K (144 B / 256 elems), 1 = Q6_K (210 B / 256),
-//         2 = Q1_0 (18 B / 128 elems, prism-ml Bonsai).
+//         2 = Q1_0 (18 B / 128 elems, prism-ml Bonsai),
+//         3 = Q2_0 (34 B / 128 elems: f16 d | 128 two-bit codes → (q − 1)·d).
 layout(local_size_x = 64) in;
 
 
@@ -16,7 +17,7 @@ layout(push_constant) uniform PC {
     uint x_word;    // f32-word offset of x activations
     uint w_word;    // f32-word offset of the packed weight bytes (16-B aligned)
     uint out_word;  // f32-word offset of the output
-    uint scheme;    // 0 = Q4_K, 1 = Q6_K, 2 = Q1_0
+    uint scheme;    // 0 = Q4_K, 1 = Q6_K, 2 = Q1_0, 3 = Q2_0
 } pc;
 
 // Read one byte at offset `rel` (in bytes) RELATIVE to the weight's word base.
@@ -67,6 +68,25 @@ void main() {
                 float w = (bit != 0u) ? d : neg_d;
                 acc += uintBitsToFloat(arena_load_u(xb + t)) * w;
             }
+        }
+        arena_store_u(pc.out_word + j, floatBitsToUint(acc));
+        return;
+    }
+
+    if (pc.scheme == 3u) {
+        // ── Q2_0: 34 B / 128 elems, codes LSB-first, four per byte ─────────
+        uint blocks_per_row = pc.k / 128u;
+        for (uint r = 0u; r < blocks_per_row; r++) {
+            uint base = (j * blocks_per_row + r) * 34u;
+            float d = rd_f16(base);
+            uint qs_base = base + 2u;
+            uint xb = pc.x_word + r * 128u;
+            float part = 0.0;
+            for (uint t = 0u; t < 128u; t++) {
+                uint q = (rd_byte(qs_base + (t >> 2u)) >> ((t & 3u) * 2u)) & 3u;
+                part += uintBitsToFloat(arena_load_u(xb + t)) * (float(q) - 1.0);
+            }
+            acc += part * d;
         }
         arena_store_u(pc.out_word + j, floatBitsToUint(acc));
         return;

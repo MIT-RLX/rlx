@@ -133,7 +133,7 @@ pub use rlx_fusion::{
     FuseAdaLayerNorm, FuseAttentionBlock, FuseGatedResidual, FuseMatMulBiasAct, FuseResidualLN,
     FuseResidualRmsNorm, FuseRmsNormReshape, FuseSharedInputMatMul, FuseSwiGLU,
     FuseSwiGLUDualMatmul, FuseTransformerLayer, FusionReport, LowerControlFlow, LowerDotGeneral,
-    LowerScan, LowerSpectral, MarkElementwiseRegions, MissReason, MissedFusion, Pass,
+    LowerIf, LowerScan, LowerSpectral, MarkElementwiseRegions, MissReason, MissedFusion, Pass,
     UnfuseElementwiseRegions, inline_if, inline_subgraph_into, maybe_unroll_scans,
     maybe_unroll_scans_budget, register_ir_pass, registered_ir_passes, run_passes,
     run_registered_ir_passes, unfuse_fused_for_autodiff, unfuse_gated_delta_net_always,

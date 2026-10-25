@@ -1569,6 +1569,11 @@ pub(crate) enum Step {
         inner: u32,
         q_max_bits: u32,
     },
+    /// `Op::DoubleSingle` (`double_single.cu`, shared with CUDA): f64 as
+    /// (hi, lo) f32 pairs.
+    DoubleSingle {
+        args: rlx_gpu_kernels::DfArgs,
+    },
     /// Native `Op::RoundToFormat` (`round_to_format.cu`); `mode` 0 none,
     /// 1 per-tensor (`amax_off`), 2 per block.
     RoundToFormat {
@@ -1952,6 +1957,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::FakeQuantizeFixed { .. } => "rlx::FakeQuantizeFixed",
         Step::FakeQuantizePerBatch { .. } => "rlx::FakeQuantizePerBatch",
         Step::RoundToFormat { .. } => "rlx::RoundToFormat",
+        Step::DoubleSingle { .. } => "rlx::DoubleSingle",
         Step::FakeQuantizeEma { .. } => "rlx::FakeQuantizeEma",
         Step::QuantizeI8 { .. } => "rlx::QuantizeI8",
         Step::DequantizeI8 { .. } => "rlx::DequantizeI8",
@@ -3109,6 +3115,7 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::FakeQuantizePerBatch {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
+        Step::DoubleSingle { args } => (vec![args.a_off, args.b_off], vec![args.out_off]),
         Step::RoundToFormat {
             in_off,
             amax_off,

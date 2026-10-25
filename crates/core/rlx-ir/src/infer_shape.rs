@@ -6,6 +6,7 @@
 //! builder / pass bugs that assign the wrong `Node::shape`.
 
 use crate::op::*;
+use crate::prelude::*;
 use crate::shape;
 use crate::shape::Dim;
 use crate::{DType, Graph, Node, Shape};
@@ -201,6 +202,9 @@ fn infer_output_shape_inner(
         // along `axis`; it aliases cache's buffer. `None` on a malformed operand
         // pair so the declared-vs-inferred check stays quiet and `verify_op`
         // reports the actual rule that was broken instead.
+        Op::DynamicUpdateSlice { axis } => {
+            shape::dynamic_update_slice_shape(in_shape(0), in_shape(1), *axis).sink(rejected)
+        }
         Op::KvAppend { axis, pos } => {
             shape::kv_append_shape(in_shape(0), in_shape(1), *axis, *pos).sink(rejected)
         }

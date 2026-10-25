@@ -26,6 +26,9 @@
 #![allow(clippy::cast_possible_truncation)]
 
 /// Saturating cast i32 → i8.
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 #[inline(always)]
 pub fn sat_i8(v: i32) -> i8 {
     if v > i8::MAX as i32 {

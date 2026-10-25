@@ -1,0 +1,22 @@
+[package]
+name = "rlx-bindgen"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Generates rlx's foreign-language bindings (C ABI glue, C header, Swift, .pyi) from the rlx-bind op table"
+authors.workspace      = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+repository.workspace   = true
+documentation.workspace = true
+publish = false
+
+[dependencies]
+rlx-bind    = { workspace = true }
+syn         = { version = "2", features = ["full", "visit"] }
+quote       = "1"
+proc-macro2 = "1"
+
+[lints]
+workspace = true

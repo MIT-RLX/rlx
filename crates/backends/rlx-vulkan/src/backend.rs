@@ -99,6 +99,7 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // QAT: Fixed/PerBatch native SPIR-V; EMA / LSQ / STE HostOp.
         FakeQuantize,
         RoundToFormat,
+        DoubleSingle,
         FakeQuantizeLSQ,
         FakeQuantizeLSQBackwardX,
         FakeQuantizeLSQBackwardScale,
@@ -600,6 +601,86 @@ fn plan_hybrid(graph: &Graph, align: usize) -> MemoryPlan {
 
 // ── small shape helpers ────────────────────────────────────────────────────
 
+/// The 32 push-constant words of `double_single.comp` for `plan` (layout in
+/// that shader's header) and the thread count. Ranks above 6 do not fit the
+/// 128-byte push block; the double-single decomposition never produces them.
+fn double_single_push(
+    op: &rlx_ir::double_single::DfOp,
+    plan: &rlx_ir::double_single::DfPlan,
+    a_off: u32,
+    b_off: u32,
+    out_off: u32,
+) -> (Vec<u8>, usize) {
+    use rlx_ir::double_single::DfPlan;
+    const RANK: usize = 6;
+    let fits = |r: usize| {
+        assert!(
+            r <= RANK,
+            "rlx-vulkan: double-single supports rank <= {RANK}, got {r}"
+        );
+    };
+    let mut w = [0u32; 32];
+    let (kind, len) = match plan {
+        DfPlan::Elementwise {
+            len,
+            rank,
+            out_dims,
+            a_strides,
+            b_strides,
+        } => {
+            fits(*rank);
+            w[6] = *rank as u32;
+            w[7..13].copy_from_slice(&out_dims[..RANK]);
+            w[13..19].copy_from_slice(&a_strides[..RANK]);
+            w[19..25].copy_from_slice(&b_strides[..RANK]);
+            (0u32, *len)
+        }
+        DfPlan::MatMul {
+            batch,
+            m,
+            k,
+            n,
+            a_batch,
+            b_batch,
+        } => {
+            w[6..11].copy_from_slice(&[
+                *m as u32,
+                *n as u32,
+                *k as u32,
+                *a_batch as u32,
+                *b_batch as u32,
+            ]);
+            (1, batch * m * n)
+        }
+        DfPlan::Sum {
+            out_len,
+            kept_rank,
+            kept_dims,
+            kept_strides,
+            red_rank,
+            red_dims,
+            red_strides,
+            ..
+        } => {
+            fits(*kept_rank);
+            fits(*red_rank);
+            w[6] = *kept_rank as u32 | (*red_rank as u32) << 8;
+            w[7..13].copy_from_slice(&kept_dims[..RANK]);
+            w[13..19].copy_from_slice(&kept_strides[..RANK]);
+            w[19..25].copy_from_slice(&red_dims[..RANK]);
+            w[25..31].copy_from_slice(&red_strides[..RANK]);
+            (2, *out_len)
+        }
+    };
+    w[0] = kind | op.code() << 8;
+    w[1] = 0; // the fast-math guard's runtime zero
+    w[2] = len as u32;
+    w[3] = a_off;
+    w[4] = b_off;
+    w[5] = out_off;
+    (w.iter().flat_map(|x| x.to_le_bytes()).collect(), len)
+}
+
 fn dims(graph: &Graph, id: NodeId) -> Vec<usize> {
     graph
         .node(id)
@@ -932,6 +1013,9 @@ impl VulkanExecutable {
         // then ElementwiseRegion → Binary / Activation / … primitives.
         let graph = rlx_opt::rlx_fusion::DecomposeFusionRegions.run(graph);
         let graph = rlx_opt::UnfuseElementwiseRegions::FOR_CPU.run(graph);
+        // K / V with fewer heads than Q: this kernel reads them as `num_heads`
+        // heads, so repeat them first (`ExpandSharedKvHeads`).
+        let graph = rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph);
         let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, SUPPORTED_OPS)
             .unwrap_or_else(|errs| panic!("{}", rlx_opt::format_legalize_error("vulkan", &errs)));
         let graph = rlx_cpu::rlx_maybe_unroll_scans!(graph, scan_unroll_max_length);
@@ -1657,7 +1741,10 @@ impl VulkanExecutable {
                 });
                 self.arena.sync_host_after_gpu();
             }
-            if i < n {
+            // A copy right after GPU work (`Op::KvAppend` writing a computed
+            // row) is the loop head's to run: consuming it here skipped it,
+            // and the cache kept its old row.
+            if i < n && !matches!(self.schedule[i], Step::ActCopy { .. }) {
                 match self.schedule[i].clone() {
                     Step::ActCopy { .. } => {}
                     Step::Host {
@@ -2031,7 +2118,10 @@ fn record_segments(
             }
             segments.push(Segment::Gpu(cmd));
         }
-        if i < n {
+        // A copy right after GPU work is the loop head's (its segment and its
+        // dep): consuming it here dropped `Op::KvAppend`'s row write and set
+        // every later step's barrier info off by one.
+        if i < n && !matches!(schedule[i], Step::ActCopy { .. }) {
             match &schedule[i] {
                 Step::ActCopy { .. } => {}
                 Step::Host {
@@ -2418,11 +2508,36 @@ fn build_schedule(
             // a no-op, but Bool→F32 (and other dtype-changing casts) get their
             // own slot and must copy (see wgpu's Cast lowering — silent zeros
             // otherwise kill TTS masks / Kokoro decoder).
-            Op::Input { .. }
-            | Op::Param { .. }
-            | Op::Constant { .. }
-            | Op::Reshape { .. }
-            | Op::StopGradient => {}
+            Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } | Op::Reshape { .. } => {}
+
+            // Forward identity — but unlike `Reshape` the memory planner does NOT
+            // alias it to its parent (`rlx_compile::memory::pure_view_offset`),
+            // so it owns a slot that must be written. Skipping it left that slot
+            // stale: VQ codebook loss read as 0 and the softmax max-shift of a
+            // real T5 overflowed to inf (CLEF on Vulkan).
+            Op::StopGradient => {
+                let x = node.inputs[0];
+                if arena.has(out) && arena.has(x) && arena.byte_offset(out) != arena.byte_offset(x)
+                {
+                    let n = numel(&dims(graph, out))
+                        .min(arena.slot_elems(out))
+                        .min(arena.slot_elems(x));
+                    let push = Push::default()
+                        .u(n as u32)
+                        .u(binder.off(arena, x))
+                        .u(binder.off(arena, out))
+                        .u(CAST_IDENTITY_COPY)
+                        .bytes();
+                    push_gpu_step(
+                        &mut binder,
+                        &mut steps,
+                        &mut deps,
+                        "unary",
+                        push,
+                        groups1d(n, 256),
+                    );
+                }
+            }
 
             Op::Cast { to } => {
                 let x = node.inputs[0];
@@ -3312,6 +3427,25 @@ fn build_schedule(
                 );
             }
 
+            Op::DoubleSingle(op) => {
+                let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(graph, i)).collect();
+                let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                let plan =
+                    rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &dims(graph, out))
+                        .unwrap_or_else(|e| panic!("rlx-vulkan: {e}"));
+                let a = binder.off(arena, node.inputs[0]);
+                let b = node.inputs.get(1).map_or(a, |&b| binder.off(arena, b));
+                let (push, len) = double_single_push(op, &plan, a, b, binder.off(arena, out));
+                push_gpu_step(
+                    &mut binder,
+                    &mut steps,
+                    &mut deps,
+                    "double_single",
+                    push,
+                    groups1d(len, 64),
+                );
+            }
+
             Op::RoundToFormat { format, scaling } => {
                 use rlx_ir::FormatScaling;
                 let xd = dims(graph, out);
@@ -3320,6 +3454,7 @@ fn build_schedule(
                     FormatScaling::None => (0u32, 1u32),
                     FormatScaling::PerTensor => (1, 1),
                     FormatScaling::Block(b) => (2, (*b).max(1)),
+                    FormatScaling::FineBlock(b) => (3, (*b).max(1)),
                 };
                 let last_dim = xd.last().copied().unwrap_or(1).max(1);
                 let x = node.inputs[0];
@@ -3337,7 +3472,7 @@ fn build_schedule(
                     .u(amax_off)
                     .u(binder.off(arena, out))
                     .bytes();
-                let threads = if mode == 2 {
+                let threads = if mode >= 2 {
                     (n / last_dim) * last_dim.div_ceil(block as usize)
                 } else {
                     n
@@ -5643,6 +5778,11 @@ fn build_schedule(
                         QuantScheme::GgufQ4K => Some((0u32, 256usize)),
                         QuantScheme::GgufQ6K => Some((1u32, 256usize)),
                         QuantScheme::GgufQ1_0 => Some((2u32, 128usize)),
+                        // Decode only: the GEMV runs one dispatch per row, so a
+                        // prompt-length m costs m × (layers × 7) dispatches —
+                        // 150 s for a 297-token prefill, against ~10 s on the
+                        // exact host path that `None` falls back to.
+                        QuantScheme::GgufQ2_0 if m == 1 => Some((3u32, 128usize)),
                         _ => None,
                     };
                     match gpu_scheme {
@@ -5710,7 +5850,7 @@ fn build_schedule(
             // (one workgroup per batch row, radix-2 in shared memory). Larger
             // n / non-f32 fall back to the host path. This keeps `Op::Fft` off
             // the host-fallback path, which crashes on discrete GPUs.
-            Op::Fft { inverse, norm } => {
+            Op::Fft { inverse, norm, .. } => {
                 let x = node.inputs[0];
                 let in_shape = graph.node(x).shape.clone();
                 let meta = rlx_ir::fft_meta(&in_shape);

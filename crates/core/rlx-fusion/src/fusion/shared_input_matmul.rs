@@ -86,12 +86,20 @@ impl Pass for FuseSharedInputMatMul {
             if w0.rank() != 2 {
                 continue;
             }
-            let compatible = matmul_ids.iter().all(|&id| {
-                let m = graph.node(id);
-                matches!(m.op, Op::MatMul)
-                    && graph.shape(m.inputs[1]).rank() == 2
-                    && graph.shape(m.inputs[1]).dim(0) == w0.dim(0)
-            });
+            // One weight dtype, and not BF16: the merged weight is a Concat
+            // ACTIVATION of that dtype, and on the backends that widen BF16
+            // activations to f32 (Metal, wgpu/Vulkan) the Concat read the
+            // packed BF16 params as f32 — two BF16-weight matmuls sharing an
+            // input came out wrong by O(10) with no error. F16 / F32 concat fine.
+            let w_dtype = w0.dtype();
+            let compatible = w_dtype != rlx_ir::DType::BF16
+                && matmul_ids.iter().all(|&id| {
+                    let m = graph.node(id);
+                    matches!(m.op, Op::MatMul)
+                        && graph.shape(m.inputs[1]).rank() == 2
+                        && graph.shape(m.inputs[1]).dim(0) == w0.dim(0)
+                        && graph.shape(m.inputs[1]).dtype() == w_dtype
+                });
             if !compatible {
                 continue;
             }

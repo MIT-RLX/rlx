@@ -4,6 +4,7 @@
 
 //! SAM2-style axial 2-D RoPE on `[batch, seq, num_heads * head_dim]`.
 
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op};
 
 /// Apply axial 2-D RoPE on flattened `[nh, n_tokens, head_dim]` layout.

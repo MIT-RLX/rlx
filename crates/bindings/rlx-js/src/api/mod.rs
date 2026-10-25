@@ -5,17 +5,21 @@
 //! The `rlx` global, assembled one concern per module.
 
 pub mod autodiff;
+pub mod bind;
 pub mod buffers;
 pub mod check;
 pub mod compile;
+pub mod compose;
 pub mod console;
 pub mod devices;
+pub mod dist;
 pub mod dsl;
 pub mod fs;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 pub mod graph;
-pub mod graph_ext;
+#[cfg(feature = "models")]
+pub mod model;
 pub mod routing;
 pub mod session;
 #[cfg(feature = "text")]

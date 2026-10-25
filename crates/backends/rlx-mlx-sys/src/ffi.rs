@@ -158,6 +158,11 @@ unsafe extern "C" {
     pub fn rlx_mlx_eval(handles: *const *mut mlx_array_t, n: usize) -> c_int;
     pub fn rlx_mlx_async_eval(handles: *const *mut mlx_array_t, n: usize) -> c_int;
     pub fn rlx_mlx_synchronize() -> c_int;
+    pub fn rlx_mlx_set_cache_limit(limit: usize) -> usize;
+    pub fn rlx_mlx_clear_cache();
+    pub fn rlx_mlx_get_cache_memory() -> usize;
+    pub fn rlx_mlx_get_active_memory() -> usize;
+    pub fn rlx_mlx_get_peak_memory() -> usize;
 
     pub fn rlx_mlx_op_matmul(
         a: *mut mlx_array_t,
@@ -406,6 +411,16 @@ unsafe extern "C" {
         out: *mut *mut mlx_array_t,
     ) -> c_int;
 
+    pub fn rlx_mlx_op_gated_delta_update(
+        q: *mut mlx_array_t,
+        k: *mut mlx_array_t,
+        v: *mut mlx_array_t,
+        gate: *mut mlx_array_t,
+        beta: *mut mlx_array_t,
+        state_or_null: *mut mlx_array_t,
+        out: *mut *mut mlx_array_t,
+        state_out: *mut *mut mlx_array_t,
+    ) -> c_int;
     pub fn rlx_mlx_op_rmsnorm(
         x: *mut mlx_array_t,
         gamma: *mut mlx_array_t,

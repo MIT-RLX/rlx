@@ -178,9 +178,12 @@ fn matmul_f16_compute(
             let global_k = t * TILE_K + k_local;
             let n_local_base = lc * RN;
             let global_col_base = wid.x * TILE_N + n_local_base;
-            if (in_batch && global_k < params.k && global_col_base + 3u < params.n) {
-                let f16_off = b_base + global_k * params.n + global_col_base;
-                let v: vec4<f16> = weights[f16_off / 4u];
+            // vec4 load only where `off` is 4-aligned: with `n` not a
+            // multiple of 4 the unaligned rows would read a neighbour row.
+            let f16_off_vec = b_base + global_k * params.n + global_col_base;
+            if (in_batch && global_k < params.k && global_col_base + 3u < params.n
+                && (f16_off_vec % 4u) == 0u) {
+                let v: vec4<f16> = weights[f16_off_vec / 4u];
                 tile_b[k_local][n_local_base + 0u] = v.x;
                 tile_b[k_local][n_local_base + 1u] = v.y;
                 tile_b[k_local][n_local_base + 2u] = v.z;

@@ -99,6 +99,20 @@ compiles and passes parity tests; CUDA is opt-in. See
 On Intel Macs MLX falls back to its CPU path; supported but rarely the
 right choice.
 
+## Memory
+
+MLX keeps freed buffers in an allocator cache, by default up to its memory
+limit, so a process that compiles many differently-shaped graphs only grows.
+`RLX_MLX_CACHE_LIMIT=<bytes>` caps it (applied once, at the first backend);
+from code, `set_cache_limit`, `clear_cache` and `memory_stats()` (active,
+cache, peak bytes) are in `rlx_mlx::array`.
+
+`Op::GatedDeltaNet` with per-head gates lowers to MLX's fused
+`fast::gated_delta_update`, one primitive instead of an unrolled per-step graph
+whose state stays alive until evaluation (a Qwen3.5-4B prefill peaked ~18 GB
+above its weights at 1024 tokens unrolled). Per-channel (KDA) gates keep the
+loop; `RLX_MLX_GDN_UNROLL=1` forces it.
+
 ## Gotchas
 
 - **Op coverage.** First cut handled MatMul, Binary (Add/Mul/Sub/Div),

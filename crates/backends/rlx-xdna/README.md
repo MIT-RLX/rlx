@@ -45,6 +45,14 @@ A Linux host with the `amdxdna` driver (Ryzen AI), plus two userspace toolchains
 2. The native **MLIR-AIE** compiler (`aiecc`) + **Peano** (`llvm-aie`) — used to
    compile op overlays on demand (no Python).
 
+The user also needs read/write on `/dev/accel/accelN` (the `render` group) and
+a locked-memory limit large enough for XRT's buffers (the distro default 8 MiB
+fails with `EAGAIN`; e.g. `@render - memlock unlimited` in
+`/etc/security/limits.d/`). `rlx_xdna::diagnostic()` reports each of these;
+`host_blockers()` lists just the blocking ones (an XDNA 2 part, an unwritable
+device node), and `aie_geometry()` reads the array's columns, rows and AIE
+version from the driver.
+
 Point the env at them:
 
 ```sh
@@ -145,16 +153,35 @@ over 40 steps, gradient computed on the NPU).
   weights are pre-tiled + cached in `set_param`, dynamic weights (backward) re-tiled
   per run.
 - **Elementwise tiles** stream in chunks ≤ 2048 elems (64 KB tile memory).
+- **Where the time goes** (xdna-npu-toolkit's profiling on the same Phoenix
+  NPU): once buffers are pooled, a GEMM dispatch is ~99% NPU compute, so fusing
+  ops into one overlay recovers only ~3–12%. Kernel efficiency (tile shape,
+  MMUL utilization) is the bigger lever.
+- **Versus the CPU:** same-precision CPU bf16 beat that NPU by 1.9–2.7× on
+  transformer models, so `Device::Xdna` sits *after* `Cpu` in the automatic
+  device order — choose it explicitly for power/offload, not throughput.
 
 ## Limitations
 
 - **INT8/BF16 only for matmul** — no native f32 datapath, so f32 GEMMs are
   quantized (cosine ≈ 0.99). Everything else runs in scalar f32 and is bit-exact.
+  `Session::new_with_precision(Device::Xdna, Precision::BF16)` instead runs
+  matmuls through the vendor `bf16_f32` microkernel (operands rounded to bf16,
+  f32 accumulation, 32×32 tiles) — closer to f32, half the int8 MAC rate.
+  **Not yet validated on hardware** (only host-side packing is tested).
+- **mlir-aie versions:** the matmul kernel is read from `aie_kernels/aie2/mm.cc`
+  (≤ v1.4.3) or `aie_kernels/linalg/mm.cc` (v1.4.4+, where `zero_*` is
+  supplied by rlx since the vendor moved it to a separate `zero.cc`).
 - **Reduce is last-axis only.** Use `keep_dim: true` so a scalar loss/reduce stays
   rank-1 — a **rank-0** tensor has no last axis and the kernels reject it.
-- **Chains** are limited by the NPU's concurrent hardware-context count (~5–6): a
-  deep graph runs through a bounded LRU pool of contexts (`RLX_XDNA_CHAIN_CAP`,
-  default 4), re-opening evicted contexts from cache.
+- **Chains** are limited by the NPU's concurrent hardware-context count (4 per
+  process measured on Phoenix): a deep graph runs through a bounded LRU pool of
+  contexts (`RLX_XDNA_CHAIN_CAP`, default = the budget), re-opening evicted
+  contexts from cache. The budget (`RLX_XDNA_MAX_CONTEXTS`, default 4) is
+  process-wide — a chain evicts its idle contexts while other compiled graphs
+  hold theirs.
+- **XDNA 1 only.** The kernels target Phoenix / Hawk Point `npu1`; an XDNA 2
+  (Strix-class) part is reported unavailable rather than failing at load.
 - **Pool / Im2Col / Quantize / Dequantize** are host-computed (coverage so vision
   and int8 graphs *run*); the perf-critical GEMM stays on the NPU.
 - **Training:** one `wrt` per compiled graph (a multi-output grad returns only the

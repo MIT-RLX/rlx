@@ -13,4 +13,5 @@
 pub mod cost;
 pub mod dispatch;
 pub mod indexing;
+pub mod shipped;
 pub mod tiles;

@@ -1,0 +1,23 @@
+[package]
+name = "rlx-search"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "Host-side sequence search shared by every decoder: argmax/top-k/log-softmax, beam search, CTC greedy/prefix-beam/forced alignment over log and tropical semirings"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["beam-search", "ctc", "viterbi", "decoding", "semiring"]
+categories = ["science", "algorithms"]
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_search"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]

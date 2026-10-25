@@ -32,4 +32,8 @@
 //! wrong, which is why they are worth stating.
 
 pub mod numpy;
+pub mod python;
+pub mod splitmix;
 pub mod torch;
+
+pub use splitmix::splitmix64;

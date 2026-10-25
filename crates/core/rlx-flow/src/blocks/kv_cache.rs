@@ -24,6 +24,27 @@ use rlx_ir::hir::{HirMut, HirNodeId};
 /// one switch flips the whole decode path back to `concat` for a bisect.
 pub const NO_INPLACE_KV: &str = "RLX_NO_INPLACE_KV";
 
+thread_local! {
+    static ANY_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Build with `f` a decode step that `rlx_ir::stateful::stateful_decode`
+/// will rewrite: its K / V appends are `Op::KvAppend` (and its caches carry
+/// the spare row) at any batch. The rewrite turns each into a
+/// `DynamicUpdateSlice` at the position, which writes every sequence's row
+/// and aliases nothing, so the batch-1 limit of the in-place append does
+/// not apply. A graph built here is for that rewrite, not to run as is.
+pub fn with_kv_append_any_batch<R>(f: impl FnOnce() -> R) -> R {
+    let before = ANY_BATCH.with(|c| c.replace(true));
+    let out = f();
+    ANY_BATCH.with(|c| c.set(before));
+    out
+}
+
+fn any_batch() -> bool {
+    ANY_BATCH.with(std::cell::Cell::get)
+}
+
 /// Whether `Op::KvAppend`'s `[..pos + 1]` output can alias a cache of `dims`
 /// when appending along `axis`.
 ///
@@ -45,7 +66,8 @@ pub fn kv_append_can_alias(dims: &[usize], axis: usize) -> bool {
 /// row count the host pads its KV feed to.
 pub fn kv_spare_rows(dims_before_seq: &[usize]) -> usize {
     let n = dims_before_seq.len();
-    (kv_append_can_alias(dims_before_seq, n) && !rlx_ir::env::flag(NO_INPLACE_KV)) as usize
+    ((kv_append_can_alias(dims_before_seq, n) || any_batch()) && !rlx_ir::env::flag(NO_INPLACE_KV))
+        as usize
 }
 
 /// Append `row` to the `past` K/V cache along `axis`, in place where the cache
@@ -94,7 +116,7 @@ pub fn append_kv_row(
         };
         if pos < cap
             && one_row
-            && kv_append_can_alias(&outer, axis)
+            && (kv_append_can_alias(&outer, axis) || any_batch())
             && !rlx_ir::env::flag(NO_INPLACE_KV)
         {
             return gb.kv_append(past, row, axis, pos);
@@ -124,5 +146,8 @@ mod tests {
         assert_eq!(kv_spare_rows(&[1]), 1, "batch 1 opts in");
         assert_eq!(kv_spare_rows(&[3]), 0, "batched stays on concat");
         assert_eq!(kv_spare_rows(&[1, 8]), 0, "head-major layout cannot alias");
+        // A step for the stateful rewrite appends in place at any batch.
+        assert_eq!(with_kv_append_any_batch(|| kv_spare_rows(&[3])), 1);
+        assert_eq!(kv_spare_rows(&[3]), 0, "and only inside");
     }
 }

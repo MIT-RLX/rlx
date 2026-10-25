@@ -17,6 +17,8 @@ default = ["compile", "training"]
 compile = ["dep:rlx-compile"]
 training = ["dep:rlx-autodiff", "rlx-compile/training"]
 full = ["compile", "training"]
+# Affine `Scan` → log-depth prefix scan (`rlx_fusion::assoc_scan`).
+assoc-scan = ["rlx-fusion/assoc-scan"]
 
 [dependencies]
 rlx-ir = { workspace = true }

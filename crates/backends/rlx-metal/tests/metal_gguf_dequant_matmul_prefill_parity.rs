@@ -720,9 +720,9 @@ fn ptq1_0_decode_gemv_matches_cpu() {
     for nsg in ["", "1", "2", "4", "8"] {
         // SAFETY: single-threaded test; read at encode time.
         if nsg.is_empty() {
-            unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_NSG") };
+            rlx_ir::env::remove("RLX_METAL_PTQ1_0_NSG");
         } else {
-            unsafe { std::env::set_var("RLX_METAL_PTQ1_0_NSG", nsg) };
+            rlx_ir::env::set("RLX_METAL_PTQ1_0_NSG", nsg);
         }
         for (k, n) in [(128usize, 8usize), (256, 16), (512, 64), (1024, 24)] {
             let d = run_case(QuantScheme::GgufPtq1_0, rlx_gguf::GgmlType::PTQ1_0, 1, k, n)
@@ -733,7 +733,7 @@ fn ptq1_0_decode_gemv_matches_cpu() {
             );
         }
     }
-    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_NSG") };
+    rlx_ir::env::remove("RLX_METAL_PTQ1_0_NSG");
 }
 
 /// The fused GEMV must agree with the scratch path it replaces.
@@ -772,10 +772,9 @@ fn ptq1_0_fused_gemv_matches_the_scratch_path() {
         c.run(&[("x", x.as_slice())]).remove(0)
     };
     let fused = run();
-    // SAFETY: single-threaded test; the flag is read at encode time.
-    unsafe { std::env::set_var("RLX_METAL_PTQ1_0_FUSED_DISABLE", "1") };
+    rlx_ir::env::set("RLX_METAL_PTQ1_0_FUSED_DISABLE", "1");
     let scratch = run();
-    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_FUSED_DISABLE") };
+    rlx_ir::env::remove("RLX_METAL_PTQ1_0_FUSED_DISABLE");
 
     let worst = fused
         .iter()
@@ -799,8 +798,7 @@ fn ptq1_0_int_pipe_gemv_matches_cpu() {
         eprintln!("skip: Metal unavailable");
         return;
     }
-    // SAFETY: single-threaded test; the flag is read at encode time.
-    unsafe { std::env::set_var("RLX_METAL_PTQ1_0_INT_PIPE", "1") };
+    rlx_ir::env::set("RLX_METAL_PTQ1_0_INT_PIPE", "1");
     let results: Vec<(usize, usize, Option<f32>)> = [(128usize, 8usize), (512, 64), (1024, 24)]
         .into_iter()
         .map(|(k, n)| {
@@ -811,7 +809,7 @@ fn ptq1_0_int_pipe_gemv_matches_cpu() {
             )
         })
         .collect();
-    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_INT_PIPE") };
+    rlx_ir::env::remove("RLX_METAL_PTQ1_0_INT_PIPE");
     for (k, n, d) in results {
         let d = d.expect("metal available");
         assert!(d < 1e-3, "integer PTQ1_0 GEMV k={k} n={n} diverges by {d}");
@@ -912,8 +910,7 @@ fn ptq1_0_gemv_bandwidth() {
     }
     for _ in 0..ROUNDS {
         for (ni, nsg) in NSGS.iter().enumerate() {
-            // SAFETY: single-threaded test; read at encode time.
-            unsafe { std::env::set_var("RLX_METAL_PTQ1_0_NSG", nsg.to_string()) };
+            rlx_ir::env::set("RLX_METAL_PTQ1_0_NSG", nsg.to_string());
             for (si, c) in sessions.iter_mut().enumerate() {
                 let t = std::time::Instant::now();
                 for _ in 0..ITERS {
@@ -926,7 +923,7 @@ fn ptq1_0_gemv_bandwidth() {
             }
         }
     }
-    unsafe { std::env::remove_var("RLX_METAL_PTQ1_0_NSG") };
+    rlx_ir::env::remove("RLX_METAL_PTQ1_0_NSG");
 
     eprintln!(
         "  effective weight GB/s, {FANOUT} GEMVs per run, min of {ROUNDS} interleaved rounds"

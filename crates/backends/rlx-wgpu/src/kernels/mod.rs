@@ -15,6 +15,7 @@ use bytemuck::{Pod, Zeroable};
 
 pub const MATMUL_WGSL: &str = include_str!("matmul.wgsl");
 pub const MATMUL_BF16W_WGSL: &str = include_str!("matmul_bf16w.wgsl");
+pub const MATMUL_GEMV_WGSL: &str = include_str!("matmul_gemv.wgsl");
 pub const MATMUL_WIDE_WGSL: &str = include_str!("matmul_wide.wgsl");
 pub const MATMUL_WIDE_NV_WGSL: &str = include_str!("matmul_wide_nv.wgsl");
 pub const MATMUL_WIDE_VEC4_WGSL: &str = include_str!("matmul_wide_vec4.wgsl");
@@ -128,8 +129,10 @@ pub const CONV3D_CTILE_WGSL: &str = include_str!("conv3d_ctile.wgsl");
 pub const CONV_TRANSPOSE3D_WGSL: &str = include_str!("conv_transpose3d.wgsl");
 pub const GROUP_NORM_BWD_WGSL: &str = include_str!("group_norm_backward.wgsl");
 pub const AXIAL_ROPE2D_WGSL: &str = include_str!("axial_rope2d.wgsl");
+pub const RESIZE_NEAREST2X_WGSL: &str = include_str!("resize_nearest2x.wgsl");
 pub const FAKE_QUANTIZE_WGSL: &str = include_str!("fake_quantize.wgsl");
 pub const ROUND_TO_FORMAT_WGSL: &str = include_str!("round_to_format.wgsl");
+pub const DOUBLE_SINGLE_WGSL: &str = include_str!("double_single.wgsl");
 pub const SCATTER_ADD_WGSL: &str = include_str!("scatter_add.wgsl");
 pub const TOPK_WGSL: &str = include_str!("topk.wgsl");
 pub const WELCH_PEAKS_GPU_WGSL: &str = include_str!("welch_peaks_gpu.wgsl");
@@ -149,6 +152,7 @@ pub const DEQUANT_MATMUL_MLX_WGSL: &str = include_str!("dequant_matmul_mlx.wgsl"
 pub const DEQUANT_GGUF_WGSL: &str = include_str!("dequant_gguf.wgsl");
 pub const DEQUANT_GEMV_GGUF_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
 pub const DEQUANT_GEMM_Q1_0_WGSL: &str = include_str!("dequant_gemm_q1_0.wgsl");
+pub const DEQUANT_GEMM_Q8_0_WGSL: &str = include_str!("dequant_gemm_q8_0.wgsl");
 pub const FUSED_RESIDUAL_LN_WGSL: &str = include_str!("fused_residual_ln.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_WGSL: &str = include_str!("fused_residual_ln_tee.wgsl");
 pub const FUSED_RESIDUAL_RMS_NORM_WGSL: &str = include_str!("fused_residual_rms_norm.wgsl");
@@ -481,6 +485,22 @@ pub struct GroupNormBwdParams {
     pub _p1: u32,
 }
 
+/// Layout for `resize_nearest2x.wgsl` (NCHW nearest 2× upsample). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ResizeNearest2xParams {
+    /// Output elements: `planes * 4 * h * w`.
+    pub n_total: u32,
+    /// `n * c`.
+    pub planes: u32,
+    pub h: u32,
+    pub w: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
 /// Layout for AxialRope2d. 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -497,6 +517,100 @@ pub struct AxialRope2dParams {
     pub in_off: u32,
     pub out_off: u32,
     pub n_total: u32,
+}
+
+/// Layout for `Op::DoubleSingle` (`double_single.wgsl`); offsets are f32
+/// indices into the bound arena window.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, Default)]
+pub struct DoubleSingleParams {
+    pub len: u32,
+    pub rank: u32,
+    pub op: u32,
+    pub k: u32,
+    pub m: u32,
+    pub n: u32,
+    pub a_batch: u32,
+    pub b_batch: u32,
+    pub red_len: u32,
+    pub kept_rank: u32,
+    pub red_rank: u32,
+    pub kind: u32,
+    pub a_off: u32,
+    pub b_off: u32,
+    pub out_off: u32,
+    pub _pad: u32,
+    pub d0: [u32; 8],
+    pub s0: [u32; 8],
+    pub s1: [u32; 8],
+    pub d1: [u32; 8],
+    pub s2: [u32; 8],
+}
+
+impl DoubleSingleParams {
+    /// Kernel parameters for `plan` (offsets filled in by the caller).
+    pub fn from_plan(
+        op: &rlx_ir::double_single::DfOp,
+        plan: &rlx_ir::double_single::DfPlan,
+    ) -> Self {
+        use rlx_ir::double_single::DfPlan;
+        let mut p = Self::default();
+        match plan {
+            DfPlan::Elementwise {
+                len,
+                rank,
+                out_dims,
+                a_strides,
+                b_strides,
+            } => {
+                p.kind = 0;
+                p.len = *len as u32;
+                p.rank = *rank as u32;
+                p.op = op.code();
+                p.d0 = *out_dims;
+                p.s0 = *a_strides;
+                p.s1 = *b_strides;
+            }
+            DfPlan::MatMul {
+                batch,
+                m,
+                k,
+                n,
+                a_batch,
+                b_batch,
+            } => {
+                p.kind = 1;
+                p.len = (batch * m * n) as u32;
+                p.m = *m as u32;
+                p.k = *k as u32;
+                p.n = *n as u32;
+                p.a_batch = *a_batch as u32;
+                p.b_batch = *b_batch as u32;
+            }
+            DfPlan::Sum {
+                out_len,
+                red_len,
+                kept_rank,
+                kept_dims,
+                kept_strides,
+                red_rank,
+                red_dims,
+                red_strides,
+            } => {
+                p.kind = 2;
+                p.op = op.code();
+                p.len = *out_len as u32;
+                p.red_len = *red_len as u32;
+                p.kept_rank = *kept_rank as u32;
+                p.red_rank = *red_rank as u32;
+                p.d0 = *kept_dims;
+                p.s0 = *kept_strides;
+                p.d1 = *red_dims;
+                p.s2 = *red_strides;
+            }
+        }
+        p
+    }
 }
 
 /// Layout for `Op::RoundToFormat`. 48 bytes; `mode`: 0 none, 1 per-tensor, 2 block.
@@ -520,7 +634,7 @@ pub struct RoundToFormatParams {
 impl RoundToFormatParams {
     /// Threads to launch: one per element, or one per block in mode 2.
     pub fn threads(&self, n: u32) -> u32 {
-        if self.mode == 2 {
+        if self.mode >= 2 {
             let ld = self.last_dim.max(1);
             (n / ld) * ld.div_ceil(self.block.max(1))
         } else {
@@ -1521,8 +1635,10 @@ pub struct DequantGemvGgufParams {
     pub x_f32_off: u32,
     pub w_byte_off: u32,
     pub out_f32_off: u32,
-    pub _p0: u32,
-    pub _p1: u32,
+    /// f32 stride between output rows (the full `n`, not the chunk's).
+    pub out_stride: u32,
+    /// Activation rows in the dispatch (the multi-row Q4_K / Q6_K kernels).
+    pub m_rows: u32,
 }
 
 /// Layout for fused Q1_0 GEMM (`dequant_gemm_q1_0.wgsl`). 32 bytes.
@@ -2550,9 +2666,11 @@ static GROUP_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM_BWD_GAMMA: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM_BWD_BETA: OnceLock<Kernel> = OnceLock::new();
 static AXIAL_ROPE2D: OnceLock<Kernel> = OnceLock::new();
+static RESIZE_NEAREST2X: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_FIXED: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_PERBATCH: OnceLock<Kernel> = OnceLock::new();
 static ROUND_TO_FORMAT: OnceLock<Kernel> = OnceLock::new();
+static DOUBLE_SINGLE: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
@@ -2594,6 +2712,7 @@ static GATHER: OnceLock<Kernel> = OnceLock::new();
 static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
+static ATTENTION_COOP: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE: OnceLock<Kernel> = OnceLock::new();
 static EXPAND: OnceLock<Kernel> = OnceLock::new();
@@ -2642,7 +2761,13 @@ static DEQUANT_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL_MLX: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMV_GGUF: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_ROWS8: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_Q4K16: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_Q6K16: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_Q5K16: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_B32X16: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMM_Q8_0: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
@@ -2660,6 +2785,71 @@ static MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock:
 
 pub fn matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL.get_or_init(|| build_kernel(device, "rlx-wgpu matmul", MATMUL_WGSL, "matmul"))
+}
+/// `matmul_gemv` with `cols` columns per 256-thread workgroup and K split
+/// `256 / cols` ways inside it. The shipped shader is the `cols = 32` case.
+///
+/// Fewer columns per workgroup means `n / cols` more workgroups: at a narrow
+/// output (`n = 1024`, decode down/o projections) the 32-column form launches
+/// 32 workgroups — ~1.6 per M4 Pro core — and runs at ~60 GB/s while the wide
+/// `n = 6144` projection reaches ~150. Same single-pass reduction, no scratch.
+pub fn matmul_gemv_kernel_cols(device: &wgpu::Device, cols: u32) -> &'static Kernel {
+    static V16: OnceLock<Kernel> = OnceLock::new();
+    static V8: OnceLock<Kernel> = OnceLock::new();
+    let (cell, label) = match cols {
+        16 => (&V16, "rlx-wgpu matmul_gemv c16"),
+        8 => (&V8, "rlx-wgpu matmul_gemv c8"),
+        _ => return matmul_gemv_kernel(device),
+    };
+    cell.get_or_init(|| {
+        let ksplit = 256 / cols;
+        let src = MATMUL_GEMV_WGSL
+            .replace(
+                "const COLS: u32 = 32u;",
+                &format!("const COLS: u32 = {cols}u;"),
+            )
+            .replace(
+                "const KSPLIT: u32 = 8u;",
+                &format!("const KSPLIT: u32 = {ksplit}u;"),
+            )
+            .replace(
+                "var<workgroup> partial: array<array<f32, 32>, 32>;",
+                &format!(
+                    "var<workgroup> partial: array<array<f32, {cols}>, {}>;",
+                    ksplit * 4
+                ),
+            )
+            .replace(
+                "@compute @workgroup_size(32, 8)",
+                &format!("@compute @workgroup_size({cols}, {ksplit})"),
+            );
+        build_kernel(device, label, &src, "matmul_gemv")
+    })
+}
+
+/// Columns per workgroup for a decode GEMV of output width `n`.
+/// `RLX_WGPU_GEMV_COLS` (32 / 16 / 8) pins it.
+pub fn gemv_cols_for(n: u32) -> u32 {
+    if let Some(c) = rlx_ir::env::var("RLX_WGPU_GEMV_COLS").and_then(|v| v.parse::<u32>().ok())
+        && matches!(c, 8 | 16 | 32)
+    {
+        return c;
+    }
+    let _ = n;
+    32
+}
+
+/// `m ≤ 4` matrix-vector product (decode) — see `matmul_gemv.wgsl`.
+pub fn matmul_gemv_kernel(device: &wgpu::Device) -> &'static Kernel {
+    static MATMUL_GEMV: OnceLock<Kernel> = OnceLock::new();
+    MATMUL_GEMV.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_gemv",
+            MATMUL_GEMV_WGSL,
+            "matmul_gemv",
+        )
+    })
 }
 pub fn matmul_wide_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL_WIDE.get_or_init(|| {
@@ -3235,6 +3425,16 @@ pub fn group_norm_backward_beta_kernel(device: &wgpu::Device) -> &'static Kernel
         )
     })
 }
+pub fn resize_nearest2x_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RESIZE_NEAREST2X.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu resize_nearest2x",
+            RESIZE_NEAREST2X_WGSL,
+            "resize_nearest2x",
+        )
+    })
+}
 pub fn axial_rope2d_kernel(device: &wgpu::Device) -> &'static Kernel {
     AXIAL_ROPE2D.get_or_init(|| {
         build_kernel(
@@ -3263,6 +3463,16 @@ pub fn fake_quantize_perbatch_kernel(device: &wgpu::Device) -> &'static Kernel {
             FAKE_QUANTIZE_WGSL,
             "fake_quantize_perbatch",
         )
+    })
+}
+pub fn double_single_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DOUBLE_SINGLE.get_or_init(|| {
+        // Guarded prelude: wgpu compiles Metal shaders with fast math on.
+        let src = format!(
+            "{}\n{DOUBLE_SINGLE_WGSL}",
+            rlxsl::dw::wgsl_fast_math_guarded()
+        );
+        build_kernel(device, "rlx-wgpu double_single", &src, "double_single")
     })
 }
 pub fn round_to_format_kernel(device: &wgpu::Device) -> &'static Kernel {
@@ -3671,6 +3881,19 @@ pub fn attention_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION
         .get_or_init(|| build_kernel(device, "rlx-wgpu attention", ATTENTION_WGSL, "attention"))
 }
+/// [`attention_kernel`]'s cooperative entry point: a 64-thread workgroup per
+/// (batch, head, query) row — what keeps a decode step (a handful of rows)
+/// from running on a handful of threads.
+pub fn attention_coop_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ATTENTION_COOP.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu attention_coop",
+            ATTENTION_WGSL,
+            "attention_coop",
+        )
+    })
+}
 pub fn attention_bwd_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION_BWD.get_or_init(|| {
         build_kernel(
@@ -4010,6 +4233,126 @@ pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+/// [`dequant_gemv_gguf_kernel`]'s row-group entry point: 8 output columns per
+/// 256-thread workgroup, 32 lanes each (Q4_K, Q6_K, Q8_0, bf16).
+pub fn dequant_gemv_gguf_rows8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_ROWS8.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_rows8",
+            DEQUANT_GEMV_GGUF_WGSL,
+            "dequant_gemv_rows8",
+        )
+    })
+}
+/// [`dequant_gemv_gguf_kernel`]'s Q4_K entry point: 16 output columns per
+/// 256-thread workgroup, 16 lanes each, scales factored out of the dot.
+pub fn dequant_gemv_gguf_q4k16_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_Q4K16.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_q4k16",
+            DEQUANT_GEMV_GGUF_WGSL,
+            "dequant_gemv_q4k16",
+        )
+    })
+}
+/// [`dequant_gemv_gguf_kernel`]'s Q6_K entry point: 16 output columns per
+/// 256-thread workgroup, word reads, scales factored out of the dot.
+pub fn dequant_gemv_gguf_q6k16_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_Q6K16.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_q6k16",
+            DEQUANT_GEMV_GGUF_WGSL,
+            "dequant_gemv_q6k16",
+        )
+    })
+}
+/// [`dequant_gemv_gguf_kernel`]'s Q5_K entry point, shaped like the Q4_K one.
+pub fn dequant_gemv_gguf_q5k16_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_Q5K16.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_q5k16",
+            DEQUANT_GEMV_GGUF_WGSL,
+            "dequant_gemv_q5k16",
+        )
+    })
+}
+/// [`dequant_gemv_gguf_kernel`]'s entry point for the 32-weight block formats
+/// (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, IQ4_XS): 16 columns × 8 rows.
+pub fn dequant_gemv_gguf_b32x16_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_B32X16.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_b32x16",
+            DEQUANT_GEMV_GGUF_WGSL,
+            "dequant_gemv_b32x16",
+        )
+    })
+}
+/// Entry points of `dequant_gemv_gguf.wgsl`, for [`dequant_gemv_gguf_in_arena_kernel`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemvEntry {
+    Serial,
+    Rows8,
+    Q4k16,
+    Q5k16,
+    Q6k16,
+    B32x16,
+}
+
+impl GemvEntry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Serial => "dequant_gemv",
+            Self::Rows8 => "dequant_gemv_rows8",
+            Self::Q4k16 => "dequant_gemv_q4k16",
+            Self::Q5k16 => "dequant_gemv_q5k16",
+            Self::Q6k16 => "dequant_gemv_q6k16",
+            Self::B32x16 => "dequant_gemv_b32x16",
+        }
+    }
+}
+
+/// The GGUF GEMV with activations and output in ONE read-write arena window
+/// (binding 0) and the packed weight in its own buffer (binding 2): for a
+/// weight held outside the arena, where the output needs no separate buffer
+/// and no copy back.
+pub fn dequant_gemv_gguf_in_arena_kernel(
+    device: &wgpu::Device,
+    entry: GemvEntry,
+) -> &'static Kernel {
+    static KERNELS: [OnceLock<Kernel>; 6] = [const { OnceLock::new() }; 6];
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    let src = SOURCE.get_or_init(|| {
+        let s = DEQUANT_GEMV_GGUF_WGSL
+            .replace(
+                "@group(0) @binding(0) var<storage, read>        xarr: array<f32>;",
+                "@group(0) @binding(0) var<storage, read_write>  xarr: array<f32>;",
+            )
+            .replace(
+                "@group(0) @binding(3) var<storage, read_write>  outarr: array<f32>;",
+                "",
+            )
+            .replace("outarr[", "xarr[");
+        assert!(
+            !s.contains("outarr"),
+            "dequant_gemv_gguf.wgsl: binding declarations changed"
+        );
+        s
+    });
+    KERNELS[entry as usize].get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu dequant_gemv_gguf in-arena",
+            src,
+            entry.name(),
+        )
+    })
+}
+
 pub fn dequant_gemm_q1_0_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMM_Q1_0.get_or_init(|| {
         build_kernel_ro_u_ro_rw(
@@ -4017,6 +4360,16 @@ pub fn dequant_gemm_q1_0_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_gemm_q1_0",
             DEQUANT_GEMM_Q1_0_WGSL,
             "dequant_gemm_q1_0",
+        )
+    })
+}
+pub fn dequant_gemm_q8_0_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMM_Q8_0.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemm_q8_0",
+            DEQUANT_GEMM_Q8_0_WGSL,
+            "dequant_gemm_q8_0",
         )
     })
 }

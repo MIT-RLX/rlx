@@ -27,6 +27,22 @@ impl Backend for WebglBackend {
         }
         let plan =
             build_plan(&graph).unwrap_or_else(|e| panic!("rlx-webgl compile failed: {}", e.0));
+        // Natively `OpenGl` runs the plan on the CPU, where no texture limit
+        // applies — so check the one browsers impose, or a graph that passes
+        // every native test fails in the tab. `RLX_WEBGL_MAX_TEXTURE` sets it.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let limit = rlx_ir::env::parse_or("RLX_WEBGL_MAX_TEXTURE", 16384usize);
+            if let Some((origin, rows, cols)) = plan.largest_texture()
+                && rows.max(cols) > limit
+            {
+                panic!(
+                    "rlx-webgl: {origin} needs a {rows} x {cols} texture, over the {limit} \
+                     MAX_TEXTURE_SIZE of desktop browsers (graph {:?})",
+                    graph.name
+                );
+            }
+        }
         Box::new(WebglExecutable {
             plan,
             params: HashMap::new(),
@@ -46,6 +62,12 @@ impl ExecutableGraph for WebglExecutable {
 
     fn set_param(&mut self, name: &str, data: &[f32]) {
         self.params.insert(name.to_string(), data.to_vec());
+        // The GL side caches param textures across runs; a new value must
+        // be uploaded again.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(gl) = &self.gl {
+            gl.forget_param(name);
+        }
     }
 
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {

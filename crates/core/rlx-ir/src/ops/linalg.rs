@@ -6,6 +6,7 @@
 //! matmul+bias+activation (plan #53).
 
 use crate::op::{Activation, SynthKind};
+use crate::prelude::*;
 use crate::quant::{QuantScheme, ScaleLayout, ScaledFormat};
 use crate::{DType, Graph, NodeId, Op, Shape};
 

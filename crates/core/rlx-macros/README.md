@@ -8,14 +8,21 @@ in the runtime.
 - **`#[rlx_model]`** — expands a struct into a model registration block
   (AOT-compiled-graph integration; the AOT path is incremental — most
   consumers will use the JIT `Session` flow in `rlx-runtime` first).
-- **`pipeline_schedule!`** — compile-time pipeline scheduler grammar
-  (plan #11).
+- **`pipeline_schedule!`** — compile-time pipeline scheduler grammar.
+- **`register_lm_runner!`** — register a model family's LM runner (`family`,
+  `description`, `arches`) through `inventory`, so
+  `rlx_runtime::auto_runner_name` can route a weights file to it.
+- **`rlx_runner_main!`** — the `fn main()` of a per-family runner binary
+  (`rlx_runner_main!(rlx_qwen3::cli::run, "rlx-qwen3")`).
+- **`__rlx_build` / `__rlx_expr`** — the parser and code generator behind
+  `rlx_tensor::rlx!` and `rlx_expr!`. Call those, not these: the declarative
+  wrappers bring the names the output references into scope.
 
 ## Install
 
 ```toml
 [dependencies]
-rlx-macros = "0.1"
+rlx-macros = "0.2"
 ```
 
 Usually pulled in transitively via [`rlx-runtime`](https://crates.io/crates/rlx-runtime)
@@ -30,9 +37,9 @@ cargo test  -p rlx-macros
 
 ## Status
 
-Surface intentionally narrow at 0.1.0. `#[rlx_op]` and `#[rlx_arch]`
-proc macros for downstream extensibility (plan #25 / #82) are not yet
-implemented.
+Surface intentionally narrow. Downstream op and architecture registration
+goes through `rlx-ir`'s `OpExtension` registry and `register_lm_runner!`, not
+dedicated proc macros.
 
 ## Gotchas
 

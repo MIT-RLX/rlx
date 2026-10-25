@@ -102,6 +102,19 @@ expert bytes separate from resident ones. With the `gguf` feature,
 - `partition` — pipeline-parallel layer assignment ([`pipeline_layer_range`], [`block_role`]).
 - `pipeline` — the model-agnostic relay ([`PipelineCoordinator`]) driving per-rank [`BlockRunner`]s.
 - `launch` — local multi-process cluster helpers ([`LocalCluster`], [`worker_args`]).
+- `rpc` — request/reply over TCP that tells a slow peer from a dead one: the
+  server sends heartbeat frames while a request runs, so a client bounds every
+  read (`RpcOptions::timeout`) without cutting off a request that legitimately
+  takes minutes. `serve` runs an `RpcHandler`, one thread per connection,
+  returning handler errors and panics as messages; `Enc` / `Dec` are the payload
+  codec.
+- `stages` — pipeline stages addressed by host: `StageSpec` binds a layer
+  range to a server address; `plan_stages` (even, explicit counts or `w:`
+  weights), `validate_stages` (refuses stages that don't tile the model — a gap
+  or overlap still agrees on every shape), `parse_stages`.
+- `cluster` — placement (above); `cluster::sizing` is roofline step timing:
+  `NodeSpec` presets, a model's `StepWork`, and `time_step` for pipeline and
+  expert-parallel layouts, naming the bottleneck resource.
 
 A model family plugs in by implementing [`BlockRunner`] for its layer block.
 
@@ -117,7 +130,7 @@ let (start, end) = pipeline_layer_range(rank, world, num_layers);
 # anyhow::Ok(())
 ```
 
-## Quick start
+## Getting started
 
 ```bash
 cargo run -p rlx-distributed --example transport_bench

@@ -19,7 +19,10 @@
 //!   for back-compatibility with tests that don't go through the
 //!   optimizer.
 
-use std::collections::BTreeMap;
+#[allow(unused_imports)]
+use crate::prelude::*;
+
+use alloc::collections::BTreeMap;
 
 use super::io_ports::{self, primary_out_len, sanitize_port};
 use super::{Artifact, LayerHandle};

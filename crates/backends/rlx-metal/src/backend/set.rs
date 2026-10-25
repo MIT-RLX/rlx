@@ -79,6 +79,24 @@ impl MetalExecutable {
         false
     }
 
+    /// Whether param `name`'s weight slot is mapped from another
+    /// executable's copy (`crate::shared_weights`): its values are there.
+    pub fn param_already_set(&self, name: &str) -> bool {
+        self.param_ids
+            .get(name)
+            .is_some_and(|id| self.shared_resident.contains(id))
+    }
+
+    /// The dtype a named param is stored in on the device (weight slot or
+    /// arena), if the param exists.
+    pub fn param_storage_dtype(&self, name: &str) -> Option<rlx_ir::DType> {
+        let &id = self.param_ids.get(name)?;
+        if let Some(slot) = self.weight_slots.get(&id) {
+            return Some(slot.dtype);
+        }
+        self.arena.has_buffer(id).then(|| self.arena.dtype(id))
+    }
+
     /// True when named param storage is native F16 (AMP rewrite or
     /// F16 weight slot). Used by `set_param_typed` to decide whether
     /// F16 host bytes can be copied without an F32 widen.

@@ -296,12 +296,12 @@ impl BlockStage for SelfAttnPrefillStage {
         let spec = &self.spec;
         let (cos, sin) = resolve_rope_handles(ctx, spec.rope_table.as_deref())?;
 
-        let q_w = ctx.load_param(&spec.q_key, true)?;
-        let k_w = ctx.load_param(&spec.k_key, true)?;
+        let q_w = ctx.load_matrix(&spec.q_key, true)?;
+        let k_w = ctx.load_matrix(&spec.k_key, true)?;
         let v_w = if spec.k_eq_v {
             None
         } else {
-            Some(ctx.load_param(&spec.v_key, true)?)
+            Some(ctx.load_matrix(&spec.v_key, true)?)
         };
 
         let norms = match &spec.head_norm {

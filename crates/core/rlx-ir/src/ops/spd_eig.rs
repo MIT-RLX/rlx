@@ -32,6 +32,7 @@
 
 use crate::infer::GraphExt;
 use crate::op::{Activation, Op};
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, Shape};
 
 /// Default cyclic-Jacobi sweep count. Every GPU backend host-falls-back

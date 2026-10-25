@@ -76,7 +76,31 @@ impl MetalExecutable {
         Self::compile_inner(graph, policy, supported_ops, true, rng, disable_mpsgraph)
     }
 
+    /// One autorelease pool per compile. Lowering to MPSGraph, its
+    /// executable and the arrays bound to the arena are autoreleased objects
+    /// that retain the arena: with no pool on the stack they are freed only
+    /// when the thread exits, so a dropped executable kept its memory.
     pub(crate) fn compile_inner(
+        graph: Graph,
+        policy: Option<rlx_opt::PrecisionPolicy>,
+        supported_ops: Option<&'static [rlx_ir::OpKind]>,
+        skip_fusion: bool,
+        rng: rlx_ir::RngOptions,
+        disable_mpsgraph: bool,
+    ) -> Self {
+        crate::mtl::autoreleasepool(|| {
+            Self::compile_unpooled(
+                graph,
+                policy,
+                supported_ops,
+                skip_fusion,
+                rng,
+                disable_mpsgraph,
+            )
+        })
+    }
+
+    fn compile_unpooled(
         graph: Graph,
         policy: Option<rlx_opt::PrecisionPolicy>,
         supported_ops: Option<&'static [rlx_ir::OpKind]>,
@@ -596,8 +620,12 @@ impl MetalExecutable {
             // for packed models needs those encoders taught to bind the weight
             // buffer first; until then this cap is what keeps the flag inert
             // (and therefore harmless) on big models.
+            // Past the cliff the weight buffer is still read right by the
+            // thunk path (only MPSGraph binds fail there, so such an executable
+            // stays off MPSGraph below); worth it when the weights are then
+            // one copy across executables (`crate::shared_weights`).
             if act_plan.arena_size < MPS_BIND_CLIFF
-                && weight_padded < MPS_BIND_CLIFF
+                && (weight_padded < MPS_BIND_CLIFF || sharing_weights())
                 && !external.is_empty()
             {
                 if verbose {
@@ -779,9 +807,41 @@ impl MetalExecutable {
         }
         // Build precision-aware arena: per-node DType drives buffer sizing
         // and downstream kernel dispatch.
-        let arena = Arena::from_plan_with_graph(plan, Some(&fused));
+        let mut arena = Arena::from_plan_with_graph(plan, Some(&fused));
+        // A pure view (a `Narrow` at 0, say) has no slot: the planner aliases
+        // it to its root. Give it the root's offset, or every thunk that reads
+        // it gets `usize::MAX` — a stateful decode step's attention mask
+        // (`iota[0..cap] <= position`) read as all ones.
+        for (view, (root, byte_off)) in memory::collect_view_aliases(&fused) {
+            if arena.offsets.contains_key(&view) {
+                continue;
+            }
+            let Some(&base) = arena.offsets.get(&root) else {
+                continue;
+            };
+            let shape = &fused.node(view).shape;
+            let n = shape.num_elements().unwrap_or(0);
+            let per = arena.bytes_per_elem(root).max(1);
+            arena.offsets.insert(view, base + byte_off);
+            arena.element_counts.insert(view, n);
+            arena.dtypes.insert(view, shape.dtype());
+            arena.slot_bytes.insert(view, n * per);
+        }
 
-        // Pack large params into a separate Shared MTLBuffer.
+        // Pack large params into a separate Shared MTLBuffer. Under a sharing
+        // scope each starts on a page, so its pages can be another
+        // executable's (`crate::shared_weights`).
+        #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+        let share_scope = crate::shared_weights::scope().filter(|_| !weight_layout.is_empty());
+        #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+        let share_scope: Option<String> = None;
+        #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+        let align = if share_scope.is_some() {
+            crate::shared_weights::page_size()
+        } else {
+            256usize
+        };
+        #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
         let align = 256usize;
         let mut weight_offs: HashMap<NodeId, usize> = HashMap::new();
         let mut weight_slots: HashMap<NodeId, WeightParamSlot> = HashMap::new();
@@ -800,9 +860,24 @@ impl MetalExecutable {
             );
             weight_cursor += nbytes;
         }
+        let mut weight_pages: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> = None;
+        let mut shared_resident = std::collections::HashSet::new();
         let weight_buffer = if weight_cursor > 0 {
             let dev = metal_device().expect("Metal device");
-            Some(dev.alloc_shared(weight_cursor.max(64)))
+            #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+            let shared = share_scope.as_deref().and_then(|scope| {
+                shared_weight_buffer(&fused, scope, &weight_slots, weight_cursor, dev)
+            });
+            #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+            let shared: Option<(crate::mtl::Buffer, _, _)> = None;
+            match shared {
+                Some((buf, pages, resident)) => {
+                    weight_pages = Some(pages);
+                    shared_resident = resident;
+                    Some(buf)
+                }
+                None => Some(dev.alloc_shared(weight_cursor.max(64))),
+            }
         } else {
             None
         };
@@ -905,7 +980,13 @@ impl MetalExecutable {
         // outperform our per-op MSL encoder across the qwen3 prefill
         // range once RmsNorm + SDPA are wired (see mps_graph.rs).
         // Opt out with RLX_DISABLE_MPSGRAPH=1.
-        let mps_plan = if disable_mpsgraph || amp_active || crate::runtime_config().disable_mpsgraph
+        // MPSGraph's no-copy binds fail past 4 GiB into a buffer: a weight
+        // buffer that big (shared weights) keeps the executable on thunks.
+        let weights_past_cliff = weight_cursor >= MPS_BIND_CLIFF_BYTES;
+        let mps_plan = if disable_mpsgraph
+            || amp_active
+            || weights_past_cliff
+            || crate::runtime_config().disable_mpsgraph
         {
             None
         } else {
@@ -922,6 +1003,7 @@ impl MetalExecutable {
         };
         let mps_hybrid = if !disable_mpsgraph
             && !amp_active
+            && !weights_past_cliff
             && mps_plan.is_none()
             && !crate::runtime_config().disable_mpsgraph
             && !crate::runtime_config().disable_mpsgraph_hybrid
@@ -931,7 +1013,7 @@ impl MetalExecutable {
             && !crate::mps_graph_lower::graph_has_mps_hostile_reduce(&fused)
             && !crate::mps_graph_lower::graph_has_bf16_activation(&fused)
         {
-            crate::mps_graph_hybrid::build_hybrid_plan(&fused, None)
+            crate::mps_graph_hybrid::build_hybrid_plan(&fused, None, &schedule.node_start)
                 .filter(|steps| crate::mps_graph_hybrid::hybrid_has_mps(steps))
         } else {
             None
@@ -994,6 +1076,8 @@ impl MetalExecutable {
             param_ids,
             weight_buffer,
             weight_slots,
+            weight_pages,
+            shared_resident,
             input_slots,
             output_slots,
             precision: MetalPrecision::F32,
@@ -1338,6 +1422,67 @@ fn assert_bf16_compute_unsupported(policy: Option<&rlx_opt::PrecisionPolicy>) {
          'mixed', which keeps compute at f32). BF16 weight STORAGE is unaffected.",
         offenders.join(", ")
     );
+}
+
+/// The weight buffer as a VM region whose weights are the shared copies in
+/// `scope` (`crate::shared_weights`): the buffer, what keeps its memory
+/// alive, and the slots mapped from a copy already made. `None` (the caller
+/// allocates privately) when the VM or Metal calls fail.
+#[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+fn shared_weight_buffer(
+    graph: &Graph,
+    scope: &str,
+    slots: &HashMap<NodeId, WeightParamSlot>,
+    len: usize,
+    dev: &crate::device::MetalDevice,
+) -> Option<(
+    crate::mtl::Buffer,
+    std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    std::collections::HashSet<NodeId>,
+)> {
+    use crate::shared_weights::{VmRegion, place};
+    let region = VmRegion::new(len)?;
+    let mut held = Vec::new();
+    let mut resident = std::collections::HashSet::new();
+    for (&id, slot) in slots {
+        let Op::Param { name } = &graph.node(id).op else {
+            continue;
+        };
+        if let Some((pages, mapped)) =
+            place(scope, name, slot.dtype, slot.nbytes, &region, slot.offset)
+        {
+            held.push(pages);
+            if mapped {
+                resident.insert(id);
+            }
+        }
+    }
+    let buf = dev.device.new_buffer_with_bytes_no_copy(
+        region.ptr().cast(),
+        region.len() as u64,
+        crate::mtl::MTLResourceOptions::StorageModeShared,
+    );
+    if buf.contents().is_null() {
+        return None;
+    }
+    if rlx_ir::env::flag("RLX_VERBOSE") {
+        eprintln!(
+            "[rlx-metal] shared weights: {} of {} mapped from another executable ({:.2} GB region)",
+            resident.len(),
+            slots.len(),
+            region.len() as f64 / 1e9
+        );
+    }
+    Some((buf, std::sync::Arc::new((region, held)), resident))
+}
+
+/// Whether weights compiled now are shared across executables
+/// (`crate::shared_weights`).
+fn sharing_weights() -> bool {
+    #[cfg(all(target_vendor = "apple", not(target_os = "watchos")))]
+    return crate::shared_weights::scope().is_some();
+    #[cfg(not(all(target_vendor = "apple", not(target_os = "watchos"))))]
+    false
 }
 
 #[cfg(test)]

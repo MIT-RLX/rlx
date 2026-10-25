@@ -33,11 +33,12 @@
 //! | Discovery | `rlx.devices()`, `isAvailable(d)`, `backendsManifest()` |
 //! | Placement | `fastestDeviceFor(g)`, `deviceReport(g)`, `check(g, opts)` |
 //! | DSL | `rlx.dsl(name)` → chainable `Tensor`s, generated from `Graph.prototype` |
-//! | Graph | ~101 methods: matmul, conv2d, attention, RoPE, norms, reductions, shape ops, linalg factorizations, quantization, FFT/STFT/PSD, `scaledMatmul`, `loraMatmul`, `customFn` |
+//! | Graph | ~190 methods: matmul, conv 1d/2d/3d (+ transposed), pooling, attention variants, RoPE flavors, norms, recurrent / SSM scans, `scan`, reductions, shape ops, scatter/gather, linalg factorizations, quantization and dequantizing matmuls, FFT/DSP/spectral, SPD manifold, VQ, `scaledMatmul`, `loraMatmul`, `customFn` / `customOp` |
 //! | Compile | `new rlx.Session(opts)` → `.compile(g)` / `.compileWith(g, {fusion, kernelDispatch})` |
 //! | Execute | `.setParam`, `.setParams`, `.run`, `.runTyped`, `.outputShapes` |
 //! | Multi-backend | `rlx.Runner` (warm-all, benchmark, policy), `rlx.Router` (fallback chain) |
-//! | Transforms | `rlx.grad`, `jvp`, `hvp`, `vmap`, `nthOrderGrad` |
+//! | Transforms | `rlx.grad`, `jvp`, `hvp`, `vmap`, `nthOrderGrad`, `directionalNthGrad` |
+//! | Compose | `rlx.splice`, `parallel`, `sequential`, `extract`, `rlx.Partition` (`splitAt`, `components`, `merge`) |
 //! | Train | `rlx.Trainer`, `rlx.Optimizer` *(feature `training`)* |
 //! | Weights | `openGguf`, `quantize`, `writeGguf`, `convertToGguf`, `loadPt`/`Mlx`/`Dduf`/`Nemo`, `openRlxp`, `toRlxp` |
 //! | Text | `loadTokenizer`, `renderChat`, `sampleNext` *(feature `text`)* |
@@ -74,11 +75,14 @@
 //!
 //! ## How the surface is generated
 //!
-//! [`graph_ops!`](crate::graph_ops) and [`js_class!`](crate::js_class) generate
-//! the method tables from declarative signatures. That is not only brevity: the
-//! macro always reads arguments **before** borrowing the graph handle (argument
-//! conversion can run a getter, and a getter can re-enter the same graph) and
-//! derives `Function.length` from the signature, so the two cannot disagree.
+//! The `Graph` methods come from the op table in `rlx-bind` — one row per op,
+//! shared with pyrlx, the C ABI and Swift — expanded by
+//! [`js_graph_ops!`](crate::js_graph_ops). [`js_class!`](crate::js_class) does
+//! the same for the host classes. That is not only brevity: the generated
+//! methods always read arguments **before** borrowing the graph handle
+//! (argument conversion can run a getter, and a getter can re-enter the same
+//! graph) and derive `Function.length` from the row, so the two cannot
+//! disagree.
 //!
 //! ## Why an embedded engine rather than a Node addon
 //!
@@ -140,7 +144,11 @@ pub fn install(ctx: &mut Context) {
     // After `graph`: it enumerates `Graph.prototype` to build `Tensor`.
     api::dsl::install(ctx, &namespace);
     api::autodiff::install(ctx, &namespace);
+    api::compose::install(ctx, &namespace);
     api::routing::install(ctx, &namespace);
+    api::dist::install(ctx, &namespace);
+    #[cfg(feature = "models")]
+    api::model::install(ctx, &namespace);
     api::check::install(ctx, &namespace);
     api::buffers::install(ctx, &namespace);
     api::timers::install(ctx, &namespace);

@@ -1440,7 +1440,25 @@ impl RocmExecutable {
                         *head_dim,
                         "RLX_ROCM_FORCE_ATTENTION_ROW",
                     );
-                    if use_row {
+                    // Split-KV decode (`attention_warp_split`, one block per
+                    // row, seq_k divided across its groups) when the row count
+                    // is too small to fill the device; replaces both the flash
+                    // kernel and `attention_warp` there. Shape rule shared with
+                    // rlx-cuda; `RLX_ROCM_ATTENTION_KV_SPLITS=<n>` pins the
+                    // group count (0 = off).
+                    let legacy_row = rlx_ir::env::flag("RLX_ROCM_LEGACY_ATTENTION_ROW");
+                    let split_groups = if legacy_row {
+                        0
+                    } else {
+                        rlx_gpu_kernels::attention_kv_split_groups(
+                            batch * heads * seq_q,
+                            *seq_k,
+                            *head_dim,
+                            rlx_ir::env::var("RLX_ROCM_ATTENTION_KV_SPLITS")
+                                .and_then(|v| v.trim().parse::<u32>().ok()),
+                        )
+                    };
+                    if use_row || split_groups > 0 {
                         let total = batch * heads * seq_q;
                         // `attention_row` runs one THREAD per (batch, head,
                         // q_row): at decode seq_q == 1, so the launch is
@@ -1451,14 +1469,25 @@ impl RocmExecutable {
                         // gives each row a 32-lane group; its butterfly is
                         // width-32, so it is correct on wave32 and wave64
                         // alike. A/B: RLX_ROCM_LEGACY_ATTENTION_ROW=1.
-                        let use_warp = !rlx_ir::env::flag("RLX_ROCM_LEGACY_ATTENTION_ROW");
+                        let use_warp = !legacy_row;
                         const LANES: u32 = 32;
                         const GROUPS_PER_BLOCK: u32 = 4;
-                        let (kernel, grid, block_dim) = if use_warp {
+                        let (kernel, grid, block_dim, shmem) = if split_groups > 0 {
+                            (
+                                attention_warp_split_kernel(&self.ctx),
+                                (total, 1, 1),
+                                (split_groups * LANES, 1, 1),
+                                rlx_gpu_kernels::attention_kv_split_smem_bytes(
+                                    split_groups,
+                                    *head_dim,
+                                ),
+                            )
+                        } else if use_warp {
                             (
                                 attention_warp_kernel(&self.ctx),
                                 (total.div_ceil(GROUPS_PER_BLOCK), 1, 1),
                                 (GROUPS_PER_BLOCK * LANES, 1, 1),
+                                0,
                             )
                         } else {
                             let block = 256u32;
@@ -1466,6 +1495,7 @@ impl RocmExecutable {
                                 attention_row_kernel(&self.ctx),
                                 (total.div_ceil(block), 1, 1),
                                 (block, 1, 1),
+                                0,
                             )
                         };
                         crate::launch_kernel!(
@@ -1473,6 +1503,7 @@ impl RocmExecutable {
                             stream,
                             grid,
                             block_dim,
+                            shmem = shmem,
                             [
                                 &mut arena_ptr,
                                 batch,
@@ -5044,6 +5075,19 @@ impl RocmExecutable {
                         ]
                     );
                 }
+                Step::DoubleSingle { args } => {
+                    if args.len > 0 {
+                        let kernel = crate::kernels::double_single_kernel(&self.ctx);
+                        let (grid, block_dim) = dispatch_grid_1d(args.len, 256);
+                        crate::launch_kernel!(
+                            kernel,
+                            stream,
+                            (grid, 1, 1),
+                            (block_dim, 1, 1),
+                            [&mut arena_ptr, args]
+                        );
+                    }
+                }
                 Step::RoundToFormat {
                     in_off,
                     amax_off,
@@ -5058,7 +5102,7 @@ impl RocmExecutable {
                     max_bits,
                 } => {
                     let kernel = round_to_format_kernel(&self.ctx);
-                    let threads = if *mode == 2 {
+                    let threads = if *mode >= 2 {
                         (*n / (*last_dim).max(1)) * (*last_dim).max(1).div_ceil((*block).max(1))
                     } else {
                         *n

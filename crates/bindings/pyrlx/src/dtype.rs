@@ -9,49 +9,11 @@ use pyo3::prelude::*;
 use rlx_ir::DType;
 
 pub(crate) fn parse_dtype(s: &str) -> PyResult<DType> {
-    let dt = match s.trim().to_ascii_lowercase().as_str() {
-        "f32" | "float32" | "float" => DType::F32,
-        "f16" | "float16" | "half" => DType::F16,
-        "bf16" | "bfloat16" => DType::BF16,
-        "f64" | "float64" | "double" => DType::F64,
-        "i8" | "int8" => DType::I8,
-        "u8" | "uint8" => DType::U8,
-        "i16" | "int16" => DType::I16,
-        "i32" | "int32" => DType::I32,
-        "u32" | "uint32" => DType::U32,
-        "i64" | "int64" => DType::I64,
-        "bool" => DType::Bool,
-        "c64" | "complex64" => DType::C64,
-        "c128" | "complex128" => DType::C128,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown dtype '{other}' (f32, f16, bf16, i32, ...)"
-            )));
-        }
-    };
-    Ok(dt)
+    rlx_bind::enums::dtype(s).map_err(crate::bind::to_py)
 }
 
 #[allow(dead_code)]
 /// Encode a Python scalar as little-endian bytes for `Op::Constant`.
 pub(crate) fn scalar_constant_bytes(value: f64, dtype: DType) -> PyResult<Vec<u8>> {
     rlx_ir::scalar_constant_bytes(value, dtype).map_err(PyValueError::new_err)
-}
-
-pub(crate) fn dtype_label(d: DType) -> &'static str {
-    match d {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-        DType::BF16 => "bf16",
-        DType::F64 => "f64",
-        DType::I8 => "i8",
-        DType::U8 => "u8",
-        DType::I16 => "i16",
-        DType::I32 => "i32",
-        DType::U32 => "u32",
-        DType::I64 => "i64",
-        DType::Bool => "bool",
-        DType::C64 => "c64",
-        DType::C128 => "c128",
-    }
 }

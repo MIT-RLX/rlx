@@ -46,6 +46,41 @@ inline int rtf_scale_exp(uint amax_bits) {
     return clamp(int(amax_bits >> 23) - 127 - RTF_EMAX, -126, 127);
 }
 inline float rtf_scaled(float x, int e) { return rtf_flush(ldexp(rtf_round(ldexp(x, -e)), e)); }
+// `FloatFormat::fine_scale` (smallest (1 + m/8)·2^k with s·max ≥ amax; exact
+// products) and `fine_reciprocal` (8-entry table and the exponent).
+inline float rtf_fine_scale(float amax) {
+    int k0 = clamp(rtf_exp(amax) - RTF_EMAX - 1, -126, 125);
+    float mx = as_type<float>(RTF_MAX_BITS);
+    for (int k = k0; k <= k0 + 2; k++) {
+        float pw = as_type<float>(uint(k + 127) << 23);
+        for (int m = 0; m < 8; m++) {
+            float s = (1.0f + 0.125f * float(m)) * pw;
+            // Bit compare (both non-negative): relaxed math cannot rewrite it.
+            if (as_type<uint>(s * mx) >= as_type<uint>(amax)) { return s; }
+        }
+    }
+    return as_type<float>(0x7f700000u);
+}
+inline float rtf_fine_rcp(float s) {
+    const uint tab[8] = {0x3f800000u, 0x3f638e39u, 0x3f4ccccdu, 0x3f3a2e8cu,
+                         0x3f2aaaabu, 0x3f1d89d9u, 0x3f124925u, 0x3f088889u};
+    uint b = as_type<uint>(s);
+    int ne = 127 - int((b >> 23) & 0xffu);
+    if (ne < -126) { return 0.0f; }
+    ne = min(ne, 127);
+    return as_type<float>(tab[(b >> 20) & 7u]) * as_type<float>(uint(ne + 127) << 23);
+}
+// Squared error of a block at scale 2^e, in index order (`FloatFormat::block_scale`);
+// multiply and add are separate statements so they are not contracted.
+inline float rtf_sq_err(const device float* x, uint start, uint end, int e) {
+    float acc = 0.0f;
+    for (uint i = start; i < end; i++) {
+        float d = rtf_scaled(x[i], e) - x[i];
+        float d2 = d * d;
+        acc = acc + d2;
+    }
+    return acc;
+}
 // |x| bits, or 0 for NaN, so NaN never wins a maximum (as in the reference).
 inline uint rtf_abs_bits(float x) {
     uint b = as_type<uint>(x) & 0x7fffffffu;
@@ -56,7 +91,7 @@ inline uint rtf_abs_bits(float x) {
 /// Elementwise body (`MODE` 0 or 1) or per-block body (`MODE` 2).
 const ROUND_BODY: &str = r#"
 const uint t = thread_position_in_grid.x;
-if (RTF_MODE == 2u) {
+if (RTF_MODE >= 2u) {
     uint per_row = (RTF_LAST + RTF_BLOCK - 1u) / RTF_BLOCK;
     uint row = t / per_row;
     uint start = row * RTF_LAST + (t % per_row) * RTF_BLOCK;
@@ -64,7 +99,20 @@ if (RTF_MODE == 2u) {
     uint end = min(start + RTF_BLOCK, row * RTF_LAST + RTF_LAST);
     uint m = 0u;
     for (uint i = start; i < end; i++) { m = max(m, rtf_abs_bits(x[i])); }
+    if (RTF_MODE == 3u) {
+        float s = 1.0f, r = 1.0f;
+        if (m != 0u && m < 0x7f800000u) { s = rtf_fine_scale(as_type<float>(m)); r = rtf_fine_rcp(s); }
+        for (uint i = start; i < end; i++) { out[i] = rtf_flush(rtf_round(x[i] * r) * s); }
+        return;
+    }
     int e = rtf_scale_exp(m);
+    // One binade up when the MX scale clips the block max and that rounds the
+    // block with a smaller squared error (ties keep the MX scale).
+    if (m != 0u && m < 0x7f800000u && e < 127
+        && as_type<uint>(ldexp(as_type<float>(m), -e)) > RTF_MAX_BITS
+        && rtf_sq_err(x, start, end, e + 1) < rtf_sq_err(x, start, end, e)) {
+        e += 1;
+    }
     for (uint i = start; i < end; i++) { out[i] = rtf_scaled(x[i], e); }
 } else {
     if (t >= RTF_N) { return; }
@@ -101,6 +149,7 @@ pub fn round_to_format_ondevice(
         FormatScaling::None => (0u32, 1u32),
         FormatScaling::PerTensor => (1, 1),
         FormatScaling::Block(b) => (2, b.max(1)),
+        FormatScaling::FineBlock(b) => (3, b.max(1)),
     };
     let last_dim = last_dim.max(1);
     let header = format!(
@@ -136,7 +185,7 @@ pub fn round_to_format_ondevice(
         // Unused unless mode 1; MLX needs a bound input either way.
         Array::from_f32_slice(&[0.0], &[1], rlx_ir::DType::F32)?
     };
-    let threads = if mode == 2 {
+    let threads = if mode >= 2 {
         (n / last_dim) * last_dim.div_ceil(block as usize)
     } else {
         n
@@ -153,7 +202,7 @@ pub fn round_to_format_ondevice(
 }
 
 /// One `fast::metal_kernel` launch with an `f32` output named `out`.
-fn dispatch(
+pub(crate) fn dispatch(
     name: &str,
     body: &str,
     header: &str,

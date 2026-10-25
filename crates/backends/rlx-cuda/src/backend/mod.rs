@@ -900,6 +900,7 @@ mod tests {
             has_bias: 1,
             bias_off_f32: 40,
             act_id: 0xFFFF,
+            b_half: None,
         };
         let (r, w) = step_offsets(&s);
         assert_eq!(r, vec![10, 20, 40]);
@@ -922,6 +923,7 @@ mod tests {
             has_bias: 0,
             bias_off_f32: 0,
             act_id: 0xFFFF,
+            b_half: None,
         };
         let (r, w) = step_offsets(&s);
         assert_eq!(r, vec![10, 20]);

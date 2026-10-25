@@ -14,7 +14,8 @@ impl Backend for WgpuBackend {
 
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
         use rlx_opt::pass::Pass as _;
-        let graph = rlx_opt::LowerControlFlow.run(graph);
+        // `Op::If` → primitives; `Op::While` runs as a host loop.
+        let graph = rlx_opt::LowerIf.run(graph);
         let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, rlx_wgpu::SUPPORTED_OPS)
             .unwrap_or_else(|errors| {
                 panic!("{}", rlx_opt::format_legalize_error("wgpu", &errors));
@@ -128,6 +129,12 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     }
     fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle(name)
+    }
+    fn save_inputs(&mut self, names: &[&str]) -> bool {
+        self.inner.save_inputs(names)
+    }
+    fn restore_inputs(&mut self) -> bool {
+        self.inner.restore_inputs()
     }
     fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
         self.inner.prepare_resident_gpu_handle(name)
@@ -245,6 +252,24 @@ impl ExecutableGraph for WgpuExecutableWrapper {
             .collect()
     }
 
+    fn share_params_from(&mut self, src: &dyn ExecutableGraph) -> bool {
+        let Some(src) = src
+            .executable_as_any()
+            .and_then(|a| a.downcast_ref::<WgpuExecutableWrapper>())
+        else {
+            return false;
+        };
+        self.inner.share_weights_from(&src.inner)
+    }
+
+    fn executable_as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn executable_as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn clone_box(&self) -> Box<dyn ExecutableGraph> {
         Box::new(WgpuExecutableWrapper {
             inner: self.inner.clone_for_cache(),
@@ -265,9 +290,10 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn wgpu_run_async<'a>(
         &'a mut self,
         inputs: &'a [(&'a str, &'a [f32])],
+        read_indices: Option<&'a [usize]>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, String>> + 'a>>
     {
-        if self.inner.requires_host_execution() {
+        if self.inner.blocks_on_host() {
             // Name what is in the way rather than listing what it might have
             // been: a conv graph's answer is one `Conv2dHost` per convolution,
             // which tells a caller whether to change backend or change model.
@@ -282,7 +308,12 @@ impl ExecutableGraph for WgpuExecutableWrapper {
                 ))
             });
         }
-        Box::pin(async move { Ok(self.inner.run_async(inputs).await) })
+        Box::pin(async move {
+            Ok(self
+                .inner
+                .run_read_outputs_async(inputs, read_indices)
+                .await)
+        })
     }
 }
 

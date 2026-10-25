@@ -146,72 +146,59 @@ fn maybe_warn_deprecated(used: &str, entry: &EnvVarEntry) {
     eprintln!("rlx: `{used}` is deprecated; use `{replace}`");
 }
 
-/// Read a string via [`env::var`], resolving aliases and deprecation notices.
-pub fn var(name: &str) -> Option<String> {
-    if let Some(e) = lookup(name) {
-        // Prefer canonical, then aliases (first set wins: canonical first).
-        if let Some(v) = env::var(e.name) {
-            if name != e.name {
-                maybe_warn_deprecated(name, e);
-            }
+/// The value of `name` from `raw` (an override, else the process
+/// environment), resolving aliases and deprecation notices: a registered
+/// name reads its canonical spelling first, then its aliases, then — for a
+/// deprecated row — its replacement. [`env`]'s reads resolve through this,
+/// once a key, and keep the result.
+pub(crate) fn resolve(name: &str, raw: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let Some(e) = lookup(name) else {
+        return raw(name);
+    };
+    if let Some(v) = raw(e.name) {
+        if name != e.name {
+            maybe_warn_deprecated(name, e);
+        }
+        return Some(v);
+    }
+    for a in e.aliases {
+        if let Some(v) = raw(a) {
+            maybe_warn_deprecated(a, e);
             return Some(v);
         }
-        for a in e.aliases {
-            if let Some(v) = env::var(a) {
-                maybe_warn_deprecated(a, e);
-                return Some(v);
-            }
-        }
-        // Deprecated entry looked up by old name: try replace_with already covered
-        // via lookup landing on Deprecated row — also try its replace_with.
-        if let EnvStability::Deprecated { replace_with } = e.stability {
-            maybe_warn_deprecated(name, e);
-            return env::var(replace_with);
-        }
-        return None;
     }
+    if let EnvStability::Deprecated { replace_with } = e.stability {
+        maybe_warn_deprecated(name, e);
+        return raw(replace_with);
+    }
+    None
+}
+
+/// [`env::var`]: it resolves aliases and deprecations itself.
+pub fn var(name: &str) -> Option<String> {
     env::var(name)
 }
 
-/// Flag read with alias resolution.
+/// [`env::flag`].
 pub fn flag(name: &str) -> bool {
-    match var(name) {
-        Some(v) => truthy(&v),
-        None => false,
-    }
+    env::flag(name)
 }
 
-/// Flag with default when unset (alias-aware).
+/// [`env::flag`], else the registry's declared default (`BoolOr`), else
+/// `default`, when the key is unset.
 pub fn flag_or(name: &str, default: bool) -> bool {
-    match var(name) {
-        Some(v) => truthy(&v),
-        None => {
-            if let Some(e) = lookup(name)
-                && let EnvKind::BoolOr { default: d } = e.kind
-            {
-                return d;
-            }
-            default
-        }
+    if !env::is_unset(name) {
+        return env::flag(name);
+    }
+    match lookup(name).map(|e| e.kind) {
+        Some(EnvKind::BoolOr { default: d }) => d,
+        _ => default,
     }
 }
 
-/// Parse with default (alias-aware).
+/// [`env::parse_or`].
 pub fn parse_or<T: std::str::FromStr>(name: &str, default: T) -> T {
-    var(name).and_then(|s| s.parse().ok()).unwrap_or(default)
-}
-
-fn truthy(v: &str) -> bool {
-    let s = v.trim();
-    if s.is_empty() {
-        return false;
-    }
-    match s.to_ascii_lowercase().as_str() {
-        "0" | "false" | "off" | "no" => false,
-        "1" | "true" | "yes" | "on" => true,
-        _ if s.chars().all(|c| c.is_ascii_digit()) => s != "0",
-        _ => true,
-    }
+    env::parse_or(name, default)
 }
 
 /// Entries whose `group` matches, or all Public when `group` is empty.

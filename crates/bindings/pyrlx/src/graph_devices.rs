@@ -16,7 +16,10 @@ use rlx_runtime::{
 use crate::device::{device_label, parse_device};
 use crate::dtype::parse_dtype;
 use crate::graph::PyGraph;
-use crate::session::shape_to_static_dims;
+
+fn static_dims_of(shape: &rlx_ir::Shape) -> Vec<usize> {
+    rlx_bind::runtime::session::static_dims(shape.dims())
+}
 
 #[pyclass(name = "DevicePolicy", module = "pyrlx._pyrlx")]
 pub(crate) struct PyDevicePolicy {
@@ -102,7 +105,7 @@ pub(crate) fn take_graph(graph: &Bound<'_, PyGraph>) -> PyResult<Graph> {
 pub(crate) fn output_shapes_from_graph(g: &Graph) -> Vec<Vec<usize>> {
     g.outputs
         .iter()
-        .map(|id| shape_to_static_dims(g.shape(*id)))
+        .map(|id| static_dims_of(g.shape(*id)))
         .collect()
 }
 
@@ -168,6 +171,35 @@ impl PyGraphDevices {
         let dt = parse_dtype(dtype)?;
         self.inner.set_param_typed(name, data, dt);
         Ok(())
+    }
+
+    /// Set several f32 parameters from `{name: array}`; returns how many.
+    fn set_params(&mut self, params: &Bound<'_, PyDict>) -> PyResult<usize> {
+        let owned = dict_to_owned_inputs(params)?;
+        for (name, data) in &owned {
+            self.inner.set_param(name, data);
+        }
+        Ok(owned.len())
+    }
+
+    /// The device a run with `device` as the hint would use.
+    #[pyo3(signature = (device=None))]
+    fn resolve(&mut self, device: Option<&str>) -> PyResult<&'static str> {
+        let hint = match device {
+            Some(d) => Some(parse_device(d)?),
+            None => None,
+        };
+        Ok(device_label(self.inner.resolve(hint).map_err(map_err)?))
+    }
+
+    /// Run on exactly `device` (the same as `run`).
+    fn run_on<'py>(
+        &mut self,
+        py: Python<'py>,
+        device: &str,
+        inputs: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        self.run(py, device, inputs)
     }
 
     fn warm_all(&mut self) -> PyResult<Vec<&'static str>> {

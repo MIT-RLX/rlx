@@ -5,6 +5,7 @@
 //! HIR → MIR lowering for depthwise 1D convolution blocks.
 
 use crate::infer::GraphExt;
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 /// Causal depthwise Conv1d on `[batch, seq, channels]` (BSC) tensors.

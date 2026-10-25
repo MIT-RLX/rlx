@@ -74,7 +74,8 @@
 
 #![cfg(feature = "serialize")]
 
-use std::fmt::Write as _;
+use crate::prelude::*;
+use core::fmt::Write as _;
 
 use crate::dtype::DType;
 use crate::graph::{Graph, NodeId};
@@ -90,18 +91,27 @@ pub struct ParseError {
     pub message: String,
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "line {}: {}", self.line, self.message)
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
 // ── Printing ────────────────────────────────────────────────────
 
 /// Render `op` as either a bare identifier (unit variant) or a JSON value.
 fn print_op(op: &Op) -> String {
+    // JSON has no NaN or infinity (serde_json writes `null`, which does not
+    // read back): such an op is written in `.rlxmodel`'s value syntax,
+    // `Clamp{min: -inf, max: 0.0}`, which `parse` also takes. One line only:
+    // the format is line-based.
+    if let Some(text) = crate::rlxmodel::op_text_if_not_json(op)
+        && !text.contains('\n')
+    {
+        return text;
+    }
     let json = serde_json::to_string(op).unwrap_or_else(|e| format!("\"<unserializable: {e}>\""));
     // A unit variant serialises to `"Name"`; drop the quotes when the content
     // is a plain identifier so the common case reads as `MatMul`.
@@ -276,6 +286,38 @@ impl<'a> Cursor<'a> {
         self.err("unterminated JSON value")
     }
 
+    /// A bracketed run (`{…}` / `(…)` / `[…]`, nested, strings skipped).
+    fn take_balanced(&mut self) -> Result<&'a str, ParseError> {
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, b) in self.rest.bytes().enumerate() {
+            if in_string {
+                match b {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let (taken, rest) = self.rest.split_at(i + 1);
+                        self.rest = rest;
+                        return Ok(taken);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.err("unterminated op")
+    }
+
     fn parse_op(&mut self) -> Result<Op, ParseError> {
         self.skip_ws();
         let json = if self.rest.starts_with(['{', '[', '"']) {
@@ -285,6 +327,17 @@ impl<'a> Cursor<'a> {
             let ident = self.take_while(|c| c.is_ascii_alphanumeric() || c == '_');
             if ident.is_empty() {
                 return self.err(format!("expected an op, found `{}`", self.peek_snippet()));
+            }
+            // `Name{…}` or `Name(…)` (not the `(%0, …)` operand list): an op
+            // in `.rlxmodel`'s value syntax.
+            let operands_next = self
+                .rest
+                .strip_prefix('(')
+                .is_some_and(|r| r.trim_start().starts_with(['%', ')']));
+            if self.rest.starts_with(['{', '(']) && !operands_next {
+                let payload = self.take_balanced()?;
+                return crate::rlxmodel::op_from_value_text(&format!("{ident}{payload}"))
+                    .or_else(|e| self.err(format!("not a valid op: {e}")));
             }
             format!("\"{ident}\"")
         };
@@ -376,7 +429,8 @@ pub fn parse(text: &str) -> Result<Graph, ParseError> {
     let mut graph = Graph::new(name);
     // Textual ids need not be dense or ordered, so map them explicitly rather
     // than assuming `%3` lands at index 3.
-    let mut id_map: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    let mut id_map: crate::collections::HashMap<NodeId, NodeId> =
+        crate::collections::HashMap::new();
     let mut outputs: Vec<NodeId> = Vec::new();
     let mut closed = false;
 
@@ -467,7 +521,7 @@ pub fn parse(text: &str) -> Result<Graph, ParseError> {
 }
 
 fn resolve(
-    id_map: &std::collections::HashMap<NodeId, NodeId>,
+    id_map: &crate::collections::HashMap<NodeId, NodeId>,
     id: NodeId,
     cur: &Cursor<'_>,
 ) -> Result<NodeId, ParseError> {
@@ -612,6 +666,51 @@ mod tests {
         g.node_mut(y).name = Some(r#"weird } " name"#.to_string());
         g.set_outputs(vec![y]);
         assert_round_trips(&g);
+    }
+
+    #[test]
+    fn nan_and_infinities_round_trip() {
+        let mut g = Graph::new("clamp");
+        let s = Shape::new(&[4], DType::F32);
+        let x = g.input("x", s.clone());
+        let y = g.add_node(
+            Op::Clamp {
+                min: f32::NEG_INFINITY,
+                max: f32::NAN,
+            },
+            vec![x],
+            s.clone(),
+        );
+        let z = g.add_node(Op::Clamp { min: 0.5, max: 1.5 }, vec![y], s);
+        g.set_outputs(vec![z]);
+        let text = print(&g);
+        // JSON would say `null`; the value syntax says what the float is.
+        assert!(text.contains("Clamp{min: -inf, max: nan}(%0)"), "{text}");
+        // An op JSON can carry still prints as before.
+        assert!(
+            text.contains(r#"{"Clamp":{"min":0.5,"max":1.5}}(%1)"#),
+            "{text}"
+        );
+        let back = parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        match &back.node(y).op {
+            Op::Clamp { min, max } => assert!(*min == f32::NEG_INFINITY && max.is_nan()),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(print(&back), text);
+    }
+
+    #[test]
+    fn ops_also_read_in_the_value_syntax() {
+        let g = parse(
+            "graph @g {\n  %0 = Input{name: \"x\"} : [2, 4] f32\n  \
+             %1 = Reshape{new_shape: [8]}(%0) : [8] f32\n  \
+             %2 = Activation(Gelu)(%1) : [8] f32\n  return %2\n}",
+        )
+        .unwrap();
+        assert!(matches!(
+            g.node(g.outputs[0]).op,
+            Op::Activation(Activation::Gelu)
+        ));
     }
 
     #[test]

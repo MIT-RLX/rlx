@@ -21,6 +21,7 @@
 //! already uses — a second level roughly doubles the effective mantissa at 2×
 //! storage. `MxFp4x2` = `F4E2M1` with `levels = 2`.
 
+use crate::prelude::*;
 use crate::quant::{QuantScheme, ScaledFormat};
 
 /// A block quantized to `levels` residual FP-code levels: a per-level block
@@ -199,7 +200,7 @@ mod tests {
         };
         let mut normal = || {
             let (a, b) = (u().max(1e-7), u());
-            (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
+            (-2.0 * a.ln()).sqrt() * (core::f32::consts::TAU * b).cos()
         };
 
         let (mut e1, mut e2) = (0.0f64, 0.0f64);
@@ -276,7 +277,7 @@ mod tests {
         };
         let mut normal = || {
             let (a, b) = (u().max(1e-7), u());
-            (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
+            (-2.0 * a.ln()).sqrt() * (core::f32::consts::TAU * b).cos()
         };
         let a: Vec<f32> = (0..m * k).map(|_| normal()).collect();
         let b: Vec<f32> = (0..k * n).map(|_| normal()).collect();

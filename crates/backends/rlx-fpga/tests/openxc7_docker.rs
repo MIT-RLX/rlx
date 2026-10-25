@@ -17,6 +17,9 @@
 //!
 //! `RLX_OPENXC7_IMAGE` overrides the image.
 
+// Emits files / goes through `rlx-ir`: both need the `std` feature.
+#![cfg(feature = "std")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

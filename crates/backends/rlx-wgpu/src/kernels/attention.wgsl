@@ -185,3 +185,136 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         arena[o_base + d] = o[d] * inv_l;
     }
 }
+
+// ── Cooperative variant: one 64-thread workgroup per (batch, head, q_row) ──
+//
+// `attention` runs one THREAD per row. A decode step has batch·heads rows —
+// 8 for Qwen3.5-0.8B — so the whole GPU ran 8 threads, each walking every key
+// and every head dimension serially (~19 ms per call). Here a workgroup owns
+// a row and walks the keys in tiles of 64: thread t scores key t of the tile,
+// the workgroup reduces the tile's max and sum (same online softmax as
+// above), and for the V accumulation the threads split the output dims, so
+// V rows are read coalesced. Same masks, strides and GQA mapping as
+// `attention`; the row index spans workgroup x and z.
+
+var<workgroup> q_sh: array<f32, MAX_HEAD_DIM>;
+var<workgroup> p_sh: array<f32, 64>;
+var<workgroup> red_sh: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn attention_coop(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_index) t: u32,
+) {
+    let total = params.batch * params.heads * params.seq_q;
+    let row = wid.z * nwg.x + wid.x;
+    let hd = params.head_dim;
+    let hd_v = select(params.v_head_dim, hd, params.v_head_dim == 0u);
+    // Both conditions are uniform across the workgroup, so returning before
+    // the barriers below is allowed.
+    if (row >= total || hd > MAX_HEAD_DIM || hd_v > MAX_HEAD_DIM) { return; }
+    let qi = row % params.seq_q;
+    let q1 = row / params.seq_q;
+    let h  = q1 % params.heads;
+    let b  = q1 / params.heads;
+    let scale = bitcast<f32>(params.scale_bits);
+    let q_abs = qi + select(0u, params.seq_k - params.seq_q, params.seq_k >= params.seq_q);
+    let mask_partial = params.mask_off
+        + b  * params.mask_batch_stride
+        + h  * params.mask_head_stride
+        + qi * params.seq_q_stride;
+    let q_base = params.q_off
+        + b * params.q_batch_stride
+        + h * params.q_head_stride
+        + qi * params.q_seq_stride;
+    let kv_denom = max(params.kv_heads, 1u);
+    let kv_h = h / max(params.heads / kv_denom, 1u);
+    let k_bh   = params.k_off + b * params.k_batch_stride + kv_h * params.k_head_stride;
+    let v_bh   = params.v_off + b * params.v_batch_stride + kv_h * params.v_head_stride;
+    let o_base = params.out_off
+        + b * params.o_batch_stride
+        + h * params.o_head_stride
+        + qi * params.o_seq_stride;
+
+    for (var d: u32 = t; d < hd; d = d + 64u) {
+        q_sh[d] = arena[q_base + d];
+    }
+    workgroupBarrier();
+
+    // Running max / sum (identical in every thread) and this thread's slice
+    // of the output: dims t, t+64, … (at most MAX_HEAD_DIM / 64 of them).
+    var m: f32 = -3.4e38;
+    var l: f32 = 0.0;
+    var o: array<f32, 8>;
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) { o[i] = 0.0; }
+
+    let n_tiles = (params.seq_k + 63u) / 64u;
+    for (var tile: u32 = 0u; tile < n_tiles; tile = tile + 1u) {
+        let s = tile * 64u + t;
+        let valid = s < params.seq_k;
+        var score: f32 = -3.4e38;
+        if (valid) {
+            let k_base = k_bh + s * params.k_seq_stride;
+            var acc: f32 = 0.0;
+            for (var d: u32 = 0u; d < hd; d = d + 1u) {
+                acc = acc + q_sh[d] * arena[k_base + d];
+            }
+            score = acc * scale;
+            if (params.mask_kind == 1u) {
+                if (s > q_abs) { score = -3.4e38; }
+            } else if (params.mask_kind == 2u) {
+                if (arena[mask_partial + s * params.seq_k_stride] < 0.5) { score = -1e9; }
+            } else if (params.mask_kind == 3u) {
+                if (s > q_abs) { score = -3.4e38; }
+                else if (q_abs - s > params.window) { score = -3.4e38; }
+            } else if (params.mask_kind == 4u) {
+                score = score + arena[mask_partial + s * params.seq_k_stride];
+            }
+        }
+
+        // Tile max.
+        red_sh[t] = score;
+        workgroupBarrier();
+        for (var w: u32 = 32u; w > 0u; w = w >> 1u) {
+            if (t < w) { red_sh[t] = max(red_sh[t], red_sh[t + w]); }
+            workgroupBarrier();
+        }
+        let m_new = max(m, red_sh[0]);
+        workgroupBarrier();
+
+        // Tile weights (keys past seq_k weigh nothing) and their sum.
+        let p = select(0.0, exp(score - m_new), valid);
+        p_sh[t] = p;
+        red_sh[t] = p;
+        workgroupBarrier();
+        for (var w: u32 = 32u; w > 0u; w = w >> 1u) {
+            if (t < w) { red_sh[t] = red_sh[t] + red_sh[t + w]; }
+            workgroupBarrier();
+        }
+        let e_old = exp(m - m_new);
+        l = e_old * l + red_sh[0];
+        m = m_new;
+
+        // O[d] = e_old · O[d] + Σ_tile p_s · V[s][d], dims split over threads.
+        let n_here = min(64u, params.seq_k - tile * 64u);
+        var i: u32 = 0u;
+        for (var d: u32 = t; d < hd_v; d = d + 64u) {
+            var acc: f32 = 0.0;
+            for (var j: u32 = 0u; j < n_here; j = j + 1u) {
+                acc = acc + p_sh[j] * arena[v_bh + (tile * 64u + j) * params.v_seq_stride + d];
+            }
+            o[i] = e_old * o[i] + acc;
+            i = i + 1u;
+        }
+        // p_sh / red_sh are rewritten by the next tile.
+        workgroupBarrier();
+    }
+
+    let inv_l = 1.0 / l;
+    var i: u32 = 0u;
+    for (var d: u32 = t; d < hd_v; d = d + 64u) {
+        arena[o_base + d] = o[i] * inv_l;
+        i = i + 1u;
+    }
+}

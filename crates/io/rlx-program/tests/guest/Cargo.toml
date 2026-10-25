@@ -1,0 +1,16 @@
+# A test program: built for wasm32 by rlx-runtime's `program` tests, so it
+# stands outside the workspace.
+[package]
+name = "rlx-program-test-guest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rlx-program = { path = "../.." }
+serde_json = "1"
+
+[workspace]

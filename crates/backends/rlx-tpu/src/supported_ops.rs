@@ -20,7 +20,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         Binary,
         Compare,
         Where,
-        Fma,
+        // Not `Fma`: HLO has no fused multiply-add (`lower_fma` emits multiply + add,
+        // two roundings); the legalizer's `LowerFma` supplies the exact f32 emulation.
         ElementwiseRegion,
         TransformRegion,
         BatchElementwiseRegion,

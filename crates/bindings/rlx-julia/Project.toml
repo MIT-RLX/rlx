@@ -1,0 +1,7 @@
+name = "RLX"
+uuid = "5e2b8a4c-7f1d-4c3e-9a6b-2d8f0e1c3b7a"
+version = "0.2.19"
+authors = ["Eugene Hauptmann", "Nataliya Kosmyna"]
+
+[compat]
+julia = "1.12"

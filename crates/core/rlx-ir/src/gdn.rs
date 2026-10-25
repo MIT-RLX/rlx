@@ -10,6 +10,8 @@
 //! and the backend kernel (which writes them) index it through this type — one
 //! source of truth, so the two cannot drift apart.
 
+use crate::prelude::*;
+
 /// Where each gradient sits in the packed backward output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GdnBackwardLayout {

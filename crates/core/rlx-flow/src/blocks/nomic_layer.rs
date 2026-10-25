@@ -78,13 +78,13 @@ impl BlockStage for NomicEncoderLayerStage {
                 )
             })?;
 
-        let qkv_w = ctx.load_param(&format!("{lp}.attn.Wqkv.weight"), true)?;
-        let out_w = ctx.load_param(&format!("{lp}.attn.out_proj.weight"), true)?;
+        let qkv_w = ctx.load_matrix(&format!("{lp}.attn.Wqkv.weight"), true)?;
+        let out_w = ctx.load_matrix(&format!("{lp}.attn.out_proj.weight"), true)?;
         let ln1_g = ctx.load_param(&format!("{lp}.norm1.weight"), false)?;
         let ln1_b = ctx.load_param(&format!("{lp}.norm1.bias"), false)?;
-        let fc11_w = ctx.load_param(&format!("{lp}.mlp.fc11.weight"), true)?;
-        let fc12_w = ctx.load_param(&format!("{lp}.mlp.fc12.weight"), true)?;
-        let fc2_w = ctx.load_param(&format!("{lp}.mlp.fc2.weight"), true)?;
+        let fc11_w = ctx.load_matrix(&format!("{lp}.mlp.fc11.weight"), true)?;
+        let fc12_w = ctx.load_matrix(&format!("{lp}.mlp.fc12.weight"), true)?;
+        let fc2_w = ctx.load_matrix(&format!("{lp}.mlp.fc2.weight"), true)?;
         let ln2_g = ctx.load_param(&format!("{lp}.norm2.weight"), false)?;
         let ln2_b = ctx.load_param(&format!("{lp}.norm2.bias"), false)?;
 

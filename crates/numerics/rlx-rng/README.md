@@ -20,6 +20,13 @@ number downstream moves.
 | `numpy::deterministic_hash` / `hashing_projection` | FNV-1a keyed bucket + sign assignment |
 | `torch::RandomState` / `torch::randperm` | `torch.manual_seed(s); torch.randperm(n)` |
 | `torch::subsample_indices` | seeded subsample without replacement |
+| `torch::RandomState` `normal_tensor_f32` / `_f64`, `uniform_tensor_f32`, `bernoulli` | `torch.randn` / `normal_` (float and double `normal_fill`), `rand`, `bernoulli_` |
+| `torch::Init` | a module's `reset_parameters` draws (torch default initialisers) |
+| `torch::epoch_permutation` | one pass of `DataLoader(shuffle=True)` (`num_workers=0`) |
+| `torch::dropout_mask` | `F.dropout(x, p, training=True)` on CPU |
+| `torch::random_int64` | `torch.empty((), dtype=torch.int64).random_().item()` |
+| `python::Random` | CPython's `random`: `random()`, `getrandbits`, `randint`, `choice` |
+| `splitmix::splitmix64` | SplitMix64 (Vigna's reference) |
 
 ## The details that are invisible until you diff the streams
 
@@ -36,6 +43,10 @@ when wrong, which is why they are worth stating:
   the stream at different rates, so the wrong one matches for a draw or two and
   then diverges.
 - torch's `randperm` is Fisher–Yates walking **forward**.
+- CPython's `random.seed(n)` feeds the 32-bit words of `|n|` to
+  `init_by_array`, where numpy and torch call `init_genrand(n)` — one integer
+  seed, three different MT19937 streams. Its integer draws reject rather than
+  scale, so `randint` consumes a data-dependent number of words.
 - `deterministic_hash` is deliberately *not* Python's `hash()`, which is salted
   by `PYTHONHASHSEED` and differs between runs.
 

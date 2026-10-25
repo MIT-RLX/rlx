@@ -95,21 +95,21 @@ fn main() {
         let syn_inputs: Vec<(&str, &[f32])> = vec![("x", &x), ("cb", &codebook)];
 
         // recon→MPS (default for M>8; split-K for M≤8).
-        unsafe { std::env::remove_var("RLX_METAL_SYNTH_MPS_DISABLE") };
-        unsafe { std::env::remove_var("RLX_METAL_SYNTH_TILED") };
+        rlx_ir::env::remove("RLX_METAL_SYNTH_MPS_DISABLE");
+        rlx_ir::env::remove("RLX_METAL_SYNTH_TILED");
         let recon_ms = timed(&mut cs, &syn_inputs, WARMUP, ITERS);
         // fused-forced (reconstruct-in-loop kernel for all M).
-        unsafe { std::env::set_var("RLX_METAL_SYNTH_MPS_DISABLE", "1") };
+        rlx_ir::env::set("RLX_METAL_SYNTH_MPS_DISABLE", "1");
         let fused_ms = timed(&mut cs, &syn_inputs, WARMUP, ITERS);
-        unsafe { std::env::remove_var("RLX_METAL_SYNTH_MPS_DISABLE") };
+        rlx_ir::env::remove("RLX_METAL_SYNTH_MPS_DISABLE");
         // NEW: threadgroup-tiled fused kernel (takes priority when set).
-        unsafe { std::env::set_var("RLX_METAL_SYNTH_TILED", "1") };
+        rlx_ir::env::set("RLX_METAL_SYNTH_TILED", "1");
         let tiled_ms = timed(&mut cs, &syn_inputs, WARMUP, ITERS);
         // f16 (relaxed-precision) tiled variant: simdgroup_half8x8 MMAs.
-        unsafe { std::env::set_var("RLX_METAL_SYNTH_TILED_F16", "1") };
+        rlx_ir::env::set("RLX_METAL_SYNTH_TILED_F16", "1");
         let tiled_h_ms = timed(&mut cs, &syn_inputs, WARMUP, ITERS);
-        unsafe { std::env::remove_var("RLX_METAL_SYNTH_TILED_F16") };
-        unsafe { std::env::remove_var("RLX_METAL_SYNTH_TILED") };
+        rlx_ir::env::remove("RLX_METAL_SYNTH_TILED_F16");
+        rlx_ir::env::remove("RLX_METAL_SYNTH_TILED");
 
         // dense f32 matmul ceiling: x[M,K] @ Wdense[K,N]. The weight is a PARAM set
         // once (resident) — NOT fed per run — so we don't charge a 16 MB H2D upload

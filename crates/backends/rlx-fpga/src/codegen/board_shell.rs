@@ -8,6 +8,9 @@
 //! `board_top.sv` that maps board pins → `top` ports. Pin names are
 //! parameters so a real board PCF/LPF can override them.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::codegen::Artifact;
 use crate::codegen::io_ports::sanitize_port;
 use crate::export_config::{HwTarget, IoConfig};

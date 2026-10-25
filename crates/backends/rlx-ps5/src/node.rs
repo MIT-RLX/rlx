@@ -32,12 +32,14 @@ fn main() {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
     {
         if let Some((k, v)) = line.split_once('=')
-            && std::env::var_os(k.trim()).is_none()
+            && rlx_ir::env::read_os(k.trim()).is_none()
         {
             // SAFETY: single-threaded here — nothing has spawned a thread yet.
             unsafe { std::env::set_var(k.trim(), v.trim()) };
         }
     }
+    // The checks above cached these keys as unset; read them anew.
+    rlx_ir::env::reload();
     let workers = rlx_ps5::init();
     let msg = run(workers);
     println!("{msg}");

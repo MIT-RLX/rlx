@@ -32,13 +32,14 @@ use crate::kernels::{
     GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNormBwdParams, LayerNormParams,
     LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams,
     MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams,
-    QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params, ReduceParams, RmsNormBwdParams,
-    RnnParams, RopeBwdParams, RopeParams, RoundToFormatParams, SampleParams,
-    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
-    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
-    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
-    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
-    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params, ReduceParams,
+    ResizeNearest2xParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    RoundToFormatParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams,
+    ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
+    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
@@ -64,9 +65,9 @@ use crate::kernels::{
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
     maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
-    q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel, rms_norm_backward_kernel,
-    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel,
-    round_to_format_kernel, sample_kernel, scaled_dequantize_kernel,
+    q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel, resize_nearest2x_kernel,
+    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel,
+    rope_kernel, round_to_format_kernel, sample_kernel, scaled_dequantize_kernel,
     scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
     scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
     selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
@@ -184,6 +185,21 @@ fn wgpu_prefer_host_fallback(arena: &crate::buffer::Arena) -> bool {
 /// Expand / Concat / Transpose / Narrow: host on discrete Vulkan/DX12 even when
 /// the arena is unsharded (GPU paths collapse Kitten NSF). Also when virtually
 /// sharded / `RLX_WGPU_FORCE_HOST`.
+/// `Op::ResizeNearest2x`, bare or wrapped alone in a `TransformRegion`.
+fn is_resize_nearest2x(op: &Op) -> bool {
+    match op {
+        Op::ResizeNearest2x => true,
+        Op::TransformRegion { steps, .. } => {
+            steps.len() == 1
+                && matches!(
+                    steps[0],
+                    rlx_ir::op::TransformStep::ResizeNearest2x(rlx_ir::op::ChainOperand::Input(0))
+                )
+        }
+        _ => false,
+    }
+}
+
 fn wgpu_prefer_structure_host(arena: &crate::buffer::Arena) -> bool {
     if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
         return false;
@@ -523,8 +539,25 @@ pub(crate) fn compile_static_inner(
     // window (not only when it exceeds max_buffer_size). On Metal we raise
     // max_buffer_size to ~40 GiB so F5 fits in one buffer, but Param→Reshape
     // views still need the split pass or they stay zeroed and DiT collapses.
-    let mut arena = if (plan.arena_size + scratch_bytes) as u64 > max_bind {
+    // Weight-buffer offsets are tagged with a high bit (`WEIGHT_BUF_TAG`): on
+    // wasm32 that is bit 31, so an arena crossing 2 GiB would read its own
+    // offsets as weight-tagged. Split before it can — a no-op on 64-bit.
+    let split_at = max_bind.min(crate::buffer::WEIGHT_BUF_TAG as u64);
+    // Packed GGUF weights read only by the fused GEMV can also live in the
+    // weight buffer when the arena is small: the GEMV binds it in place, and
+    // a second executable over the same weights (another decode rung, the
+    // prefill graph) can then adopt it (`share_weights_from`) instead of
+    // holding a copy of its own. Not when a tail scratch zone was reserved
+    // above — `from_plan_split` re-plans the activations and would not keep it.
+    let packed_in_place = !rlx_ir::env::flag("RLX_WGPU_PACKED_IN_ARENA")
+        && dequant_scratch == 0
+        && gdn_scratch == 0
+        && rnn_gru_scratch == 0
+        && crate::gguf_gpu::packed_weights_bind_in_place(&graph);
+    let mut arena = if (plan.arena_size + scratch_bytes) as u64 > split_at {
         Arena::from_plan_split(&dev.device, &plan, &graph, scratch_bytes)
+    } else if packed_in_place {
+        Arena::from_plan_split_opts(&dev.device, &plan, &graph, scratch_bytes, false)
     } else {
         Arena::from_plan_with_scratch(&dev.device, &plan, scratch_bytes)
     };
@@ -762,7 +795,24 @@ pub(crate) fn compile_static_inner(
                     arena_tensors_overlap(&arena, n.id, t)
                 })
             };
-            let unsafe_slot = live_across(q) || live_across(k) || live_across(v);
+            // The three sinks must also be disjoint from EACH OTHER, which
+            // `live_across` cannot see: it excludes q, k and v from its scan by
+            // construction, so an aliasing *among* them reads as safe. They
+            // alias routinely. A `qkv_heads` helper emits
+            // `narrow(q) → reshape → transpose → narrow(k) → …`, so each narrow
+            // dies at its own transpose, one step before the next is born — and
+            // the planner, correctly for the unfused order, hands all three the
+            // same offset. Fused, one dispatch writes Q, K and V into those same
+            // bytes at once, so all three heads end up holding a race-dependent
+            // mix of one projection. AXON (`MannasAI/axon-eeg`) is the repro:
+            // `block0_attn` at cos 0.61–0.80 varying run to run, with the three
+            // narrows all at arena offset 278969856 and Q and K coming back with
+            // an identical max. Exact under `RLX_ARENA_NO_REUSE=1`, which is
+            // what made it look like an arena bug — the plan was always valid.
+            let sinks_alias = arena_tensors_overlap(&arena, q, k)
+                || arena_tensors_overlap(&arena, q, v)
+                || arena_tensors_overlap(&arena, k, v);
+            let unsafe_slot = sinks_alias || live_across(q) || live_across(k) || live_across(v);
             if !unsafe_slot {
                 qkv_split.insert(parent_id, qkv);
             }
@@ -909,6 +959,32 @@ pub(crate) fn compile_static_inner(
             }
         }
     }
+
+    // ── Post-fold write-set hazard check ─────────────────────────────
+    // `report_slot_hazards` near the top of this function runs on the graph and
+    // the plan, which is to say BEFORE any fold below has been chosen. Every
+    // step's write set there is the slot its own node owns, so a fold that
+    // writes slots belonging to *other* nodes is structurally invisible to it —
+    // and that is the whole bug class. On AXON it reported 66 write-after-read
+    // hazards, 0 of them not view-explained, while the split-QKV elision was
+    // writing Q, K and V into one shared offset.
+    //
+    // Every fold that writes a slot it does not own registers its targets here,
+    // and one check covers all of them. The first thing it checks is the
+    // cheapest and the one nobody thought to: that a fold's own targets do not
+    // alias EACH OTHER. `live_across` scans every other tensor live across the
+    // fold's step and excludes q/k/v from that scan by construction, so three
+    // sinks on one offset read as safe.
+    let fold_writes: Vec<(NodeId, Vec<NodeId>, &'static str)> = qkv_split
+        .iter()
+        .map(|(&parent, &(q, k, v))| (parent, vec![q, k, v], "split-QKV elision"))
+        .chain(
+            ln_to_tee
+                .iter()
+                .map(|(&ln, &(_, _, _, _, sum))| (ln, vec![sum], "residual-LN tee")),
+        )
+        .collect();
+    report_fold_write_hazards(&graph, &arena, &fold_writes);
 
     let mut coop_f16_host_activations: Vec<(NodeId, Activation, String)> = Vec::new();
     let mut static_once_steps: HashSet<usize> = HashSet::new();
@@ -1109,6 +1185,7 @@ pub(crate) fn compile_static_inner(
                     && b_bytes > ARENA_STAGE_CAP
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
+                    && f16_mirror_needed(&dev.device, &arena, &[node.id, a_id, b_id])
                     // A genuine BF16 weight is stored f32 in the arena and must
                     // stay bit-exact — reading it from the f16 shadow would drop
                     // bf16's exponent range. Keep it on the F32 path.
@@ -1247,14 +1324,16 @@ pub(crate) fn compile_static_inner(
                     compute_precision,
                 });
                 let b_off_global = (arena.offset(b_id) / 4) as u32;
-                let b_off_bind = if b_is_param
+                let b_off_bind = if b_is_param && compute_precision == MatmulCompute::Bf16Packed {
+                    // bf16 elements into the packed side buffer, whose bytes
+                    // mirror the arena's (see `Arena::bf16_weight_buffer`).
+                    (arena.offset(b_id) / 2) as u32
+                } else if b_is_param
                     && matches!(
                         compute_precision,
-                        MatmulCompute::Coop16
-                            | MatmulCompute::CoopF16Vk
-                            | MatmulCompute::F16
-                            | MatmulCompute::Bf16Packed
-                    ) {
+                        MatmulCompute::Coop16 | MatmulCompute::CoopF16Vk | MatmulCompute::F16
+                    )
+                {
                     b_off_global
                 } else {
                     b_off_f32
@@ -2909,7 +2988,11 @@ pub(crate) fn compile_static_inner(
                 bind_groups.push(bg);
             }
 
-            Op::Reshape { .. } => {
+            // `StopGradient` is the identity in the forward pass (the AD pass
+            // handles the gradient cut upstream, as in rlx-metal's lowering).
+            // `supported_ops` already advertised it, so a graph containing one
+            // was accepted and then panicked here.
+            Op::Reshape { .. } | Op::StopGradient => {
                 // Normally a view-alias (planner / from_plan_split). If the
                 // output lands on a distinct slot, copy like Cast — otherwise
                 // the slot stays zero and Expand/Add of Param biases die.
@@ -3335,6 +3418,19 @@ pub(crate) fn compile_static_inner(
                     .product::<u32>()
                     .max(1);
                 let axis_in = in_shape[*axis].unwrap_static() as u32;
+                // The planner aliases a contiguous narrow (only size-1 dims
+                // before `axis`) into its parent's slot, so the copy below would
+                // write the slice onto itself. Skip it — but only when the arena
+                // really placed it there (f32-uniform lanes; complex excluded).
+                if outer == 1
+                    && !node.shape.dtype().is_complex()
+                    && rlx_compile::memory::is_pure_view(&graph, node)
+                    && arena.has(node.id)
+                    && arena.has(in_id)
+                    && arena.offset(node.id) == arena.offset(in_id) + *start * inner as usize * 4
+                {
+                    continue;
+                }
                 if wgpu_prefer_structure_host(&arena) {
                     let lanes = match node.shape.dtype() {
                         rlx_ir::DType::C64 => 2,
@@ -4800,6 +4896,7 @@ pub(crate) fn compile_static_inner(
                     && b_bytes > ARENA_STAGE_CAP
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
+                    && f16_mirror_needed(&dev.device, &arena, &[node.id, a_id, b_id])
                     // A genuine BF16 weight is stored f32 in the arena and must
                     // stay bit-exact — reading it from the f16 shadow would drop
                     // bf16's exponent range. Keep it on the F32 path.
@@ -6076,7 +6173,7 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
-            Op::Fft { inverse, norm } => {
+            Op::Fft { inverse, norm, .. } => {
                 let in_id = node.inputs[0];
                 let in_shape = graph.node(in_id).shape.clone();
                 let meta = rlx_ir::fft::fft_meta(&in_shape);
@@ -7275,17 +7372,71 @@ pub(crate) fn compile_static_inner(
                     eps: *eps,
                 });
             }
-            Op::ResizeNearest2x => {
-                // NCHW nearest 2× upsample. Host step (schedule-only).
-                let in_shape = &graph.node(node.inputs[0]).shape;
-                schedule.push(Step::ResizeNearest2xHost {
-                    src_byte_off: arena.offset(node.inputs[0]) as u32,
-                    dst_byte_off: arena.offset(node.id) as u32,
-                    n: in_shape.dim(0).unwrap_static() as u32,
-                    c: in_shape.dim(1).unwrap_static() as u32,
-                    h: in_shape.dim(2).unwrap_static() as u32,
-                    w: in_shape.dim(3).unwrap_static() as u32,
-                });
+            // NCHW nearest 2× upsample, bare or as the single-step
+            // TransformRegion the region-marking pass wraps it into.
+            Op::ResizeNearest2x | Op::TransformRegion { .. } if is_resize_nearest2x(&node.op) => {
+                let in_id = node.inputs[0];
+                let in_shape = &graph.node(in_id).shape;
+                let n = in_shape.dim(0).unwrap_static() as u32;
+                let c = in_shape.dim(1).unwrap_static() as u32;
+                let h = in_shape.dim(2).unwrap_static() as u32;
+                let w = in_shape.dim(3).unwrap_static() as u32;
+                if wgpu_prefer_structure_host(&arena) {
+                    schedule.push(Step::ResizeNearest2xHost {
+                        src_byte_off: arena.offset(in_id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n,
+                        c,
+                        h,
+                        w,
+                    });
+                } else {
+                    let win = vec![node.id, in_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &win,
+                    );
+                    if !fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p = ResizeNearest2xParams {
+                        n_total: n * c * 4 * h * w,
+                        planes: n * c,
+                        h,
+                        w,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        _p0: 0,
+                        _p1: 0,
+                    };
+                    schedule.push(Step::ResizeNearest2x { params: p });
+                    let sk = resize_nearest2x_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<ResizeNearest2xParams>());
+                    let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
             }
             Op::Reverse { axes } => {
                 // Batch-general flip. Host step (schedule-only).
@@ -8808,6 +8959,65 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
+            Op::DoubleSingle(op) => {
+                let dims = |id: NodeId| -> Vec<usize> {
+                    graph
+                        .node(id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect()
+                };
+                let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(i)).collect();
+                let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                let plan =
+                    rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &dims(node.id))
+                        .unwrap_or_else(|e| panic!("rlx-wgpu: {e}"));
+                let mut win = vec![node.id];
+                win.extend(node.inputs.iter().copied());
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let mut window_off = |id| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        id,
+                        &mut base,
+                        &mut size,
+                    )
+                };
+                let a_off = window_off(node.inputs[0]);
+                let b_off = node.inputs.get(1).map_or(a_off, |&b| window_off(b));
+                let mut p = crate::kernels::DoubleSingleParams::from_plan(op, &plan);
+                p.a_off = a_off;
+                p.b_off = b_off;
+                p.out_off = arena_local_off_f32(&arena, node.id, base);
+                schedule.push(Step::DoubleSingle { params: p });
+                let sk = crate::kernels::double_single_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<crate::kernels::DoubleSingleParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
             Op::RoundToFormat { format, scaling } => {
                 use rlx_ir::FormatScaling;
                 let in_id = node.inputs[0];
@@ -8815,6 +9025,7 @@ pub(crate) fn compile_static_inner(
                     FormatScaling::None => (0u32, 1u32),
                     FormatScaling::PerTensor => (1, 1),
                     FormatScaling::Block(b) => (2, *b),
+                    FormatScaling::FineBlock(b) => (3, *b),
                 };
                 let mut win = vec![node.id, in_id];
                 win.extend(node.inputs.get(1).copied());
@@ -9010,7 +9221,9 @@ pub(crate) fn compile_static_inner(
                     desc: rlx_cpu::rlx_scan_host_desc!(graph, node, |id| arena.offset(id)),
                 });
             }
-            Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
+            // `Op::While` too: a loop at run time on the host (rlx-cpu's
+            // `Thunk::While`), unbounded or not.
+            Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } | Op::While { .. } => {
                 schedule.push(Step::HostOp {
                     desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                 });
@@ -10829,15 +11042,11 @@ pub(crate) fn compile_static_inner(
                 });
             }
 
-            Op::If { .. } | Op::While { .. } => {
-                // Should be unreachable: unfuse.rs inlines both branches
-                // (If) or unrolls max_iterations (While) into the parent
-                // graph using primitive ops + Where for the gating. If
-                // we hit this arm, the unfusion pass has a gap.
-                panic!(
-                    "rlx-wgpu: Op::If/While leaked past unfusion pass — \
-                        check unfuse.rs::expand_if / expand_while"
-                );
+            Op::If { .. } => {
+                // Should be unreachable: `LowerIf` inlines both branches into
+                // the parent graph with a `Where`. If we hit this arm, that
+                // pass did not run.
+                panic!("rlx-wgpu: Op::If leaked past LowerIf");
             }
             Op::RngNormal {
                 mean,
@@ -10869,28 +11078,6 @@ pub(crate) fn compile_static_inner(
                     high: *high,
                     key: *key,
                     op_seed: *op_seed,
-                });
-            }
-            // Standalone nearest 2× upsample: the region-marking pass wraps
-            // a bare `Op::ResizeNearest2x` into a single-step TransformRegion.
-            // Route that to the host resize helper (mirrors the bare arm).
-            Op::TransformRegion { steps, .. }
-                if steps.len() == 1
-                    && matches!(
-                        steps[0],
-                        rlx_ir::op::TransformStep::ResizeNearest2x(
-                            rlx_ir::op::ChainOperand::Input(0)
-                        )
-                    ) =>
-            {
-                let in_shape = &graph.node(node.inputs[0]).shape;
-                schedule.push(Step::ResizeNearest2xHost {
-                    src_byte_off: arena.offset(node.inputs[0]) as u32,
-                    dst_byte_off: arena.offset(node.id) as u32,
-                    n: in_shape.dim(0).unwrap_static() as u32,
-                    c: in_shape.dim(1).unwrap_static() as u32,
-                    h: in_shape.dim(2).unwrap_static() as u32,
-                    w: in_shape.dim(3).unwrap_static() as u32,
                 });
             }
             other => panic!(
@@ -10962,6 +11149,8 @@ pub(crate) fn compile_static_inner(
         fft_gpu_steps,
         gpu_handles: HashMap::new(),
         gpu_handle_feeds: HashMap::new(),
+        gemv_plans: std::sync::Mutex::new(HashMap::new()),
+        saved_inputs: None,
         gpu_handle_resident: HashSet::new(),
         kv_row_feeds: HashMap::new(),
         kv_feed_staging: None,
@@ -10969,6 +11158,88 @@ pub(crate) fn compile_static_inner(
         rng,
         static_once_steps,
         static_once_done: false,
+    }
+}
+
+/// Check the write targets a fold claims against each other.
+///
+/// Shares `rlx_compile::memory::ByteRange` with the planner's own verifier, so
+/// there is one definition of "these bytes overlap" rather than a per-pass
+/// reimplementation — the seven existing guards disagree about whether to
+/// compare offsets or ranges, and an offset comparison cannot see a partial
+/// overlap at all.
+///
+/// `RLX_WGPU_HAZARD_STRICT=1` turns a finding into a panic, which is what CI
+/// should run: a hazard that only prints is a hazard that ships as a plausible
+/// cosine (AXON was 0.61–0.80 varying run to run; `rlx-eegdm` was 0.994).
+fn report_fold_write_hazards(
+    graph: &Graph,
+    arena: &Arena,
+    folds: &[(NodeId, Vec<NodeId>, &'static str)],
+) {
+    use rlx_compile::memory::{ByteRange, ScheduleHazard, StepIo, schedule_hazards};
+    let span = |id: NodeId| -> Option<ByteRange> {
+        let len = arena.len_of(id);
+        (len != 0).then(|| ByteRange {
+            off: arena.offset(id),
+            len,
+        })
+    };
+    let kind = |id: NodeId| -> String {
+        graph
+            .nodes()
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| format!("{:?}", n.op.kind()))
+            .unwrap_or_else(|| format!("{id:?}"))
+    };
+    // The overlap search itself is `rlx_compile::memory::schedule_hazards`, not a
+    // local loop. Each fold becomes a one-step schedule whose write set is the
+    // slots it actually writes, and `ScheduleHazard::AliasedWrites` is the
+    // finding — so this file contributes the *facts* (which fold writes which
+    // slots) and contributes no second opinion about what a hazard is. That
+    // separation is the whole point: the previous seven guards each embedded
+    // their own, and they disagreed.
+    let mut found = 0usize;
+    for (parent, targets, what) in folds {
+        let writes: Vec<ByteRange> = targets.iter().filter_map(|&t| span(t)).collect();
+        let step = StepIo {
+            label: what,
+            writes,
+            ..Default::default()
+        };
+        for hz in schedule_hazards(std::slice::from_ref(&step)) {
+            let ScheduleHazard::AliasedWrites { range, .. } = hz else {
+                continue;
+            };
+            found += 1;
+            let at: Vec<String> = targets
+                .iter()
+                .filter(|&&t| span(t).is_some_and(|r| r.overlaps(&range)))
+                .map(|&t| {
+                    let r = span(t).unwrap_or_default();
+                    format!("{} [{},{})", kind(t), r.off, r.end())
+                })
+                .collect();
+            eprintln!(
+                "[rlx-wgpu] FOLD-ALIAS {what} on {} ({parent:?}): {} {} share bytes \
+                 [{},{}) — one dispatch writes them all",
+                kind(*parent),
+                at.len(),
+                if at.len() == 1 { "target" } else { "targets" },
+                range.off,
+                range.end(),
+            );
+            for t in &at {
+                eprintln!("[rlx-wgpu]              {t}");
+            }
+        }
+    }
+    if found > 0 && rlx_ir::env::flag("RLX_WGPU_HAZARD_STRICT") {
+        panic!(
+            "[rlx-wgpu] {found} fold write-target alias(es); RLX_WGPU_HAZARD_STRICT=1 is set. \
+             A fold must not write two of its own targets into the same bytes."
+        );
     }
 }
 
@@ -10991,10 +11262,16 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
         .enumerate()
         .map(|(i, id)| (*id, i))
         .collect();
+    // One shared predicate rather than two inline interval comparisons: the
+    // half-open/zero-length-empty convention now comes from
+    // `rlx_ir::arena_range`, which is where every other overlap test in the tree
+    // gets it. The old `(lo, hi)` tuples already behaved this way — a zero-size
+    // slot gave `(off, off)` and `off < off` is false — so this is a rename, not
+    // a change.
     let span = |id: NodeId| {
         plan.assignments
             .get(&id)
-            .map(|s| (s.offset, s.offset + s.size))
+            .map(|s| rlx_ir::arena_range::ByteRange::new(s.offset, s.size))
     };
     let kind = |id: NodeId| {
         graph
@@ -11021,17 +11298,19 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
             continue;
         };
         for &input in &node.inputs {
-            let (Some((lo, hi)), Some(&ipos)) = (span(input), pos.get(&input)) else {
+            let (Some(ir), Some(&ipos)) = (span(input), pos.get(&input)) else {
                 continue;
             };
+            let (lo, hi) = (ir.off, ir.end());
             for (&writer, &wpos) in &pos {
                 if writer == input || writer == consumer || wpos <= ipos || wpos >= cpos {
                     continue;
                 }
-                let Some((wlo, whi)) = span(writer) else {
+                let Some(wr) = span(writer) else {
                     continue;
                 };
-                if wlo < hi && lo < whi {
+                let (wlo, whi) = (wr.off, wr.end());
+                if wr.overlaps(&ir) {
                     found += 1;
                     if !is_view(writer) && !is_view(input) {
                         real_hazards += 1;
@@ -11068,17 +11347,19 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
         if is_view(consumer) {
             continue;
         }
-        let Some((olo, ohi)) = span(consumer) else {
+        let Some(or) = span(consumer) else {
             continue;
         };
+        let (olo, ohi) = (or.off, or.end());
         for &input in &node.inputs {
             if input == consumer {
                 continue;
             }
-            let Some((ilo, ihi)) = span(input) else {
+            let Some(ir2) = span(input) else {
                 continue;
             };
-            if olo < ihi && ilo < ohi {
+            let (ilo, ihi) = (ir2.off, ir2.end());
+            if or.overlaps(&ir2) {
                 inplace += 1;
                 if inplace <= 20 {
                     eprintln!(
@@ -11099,4 +11380,31 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
         "[rlx-wgpu] hazard scan: {found} write-after-read hazard(s) ({real_hazards} not view-explained), {inplace} in-place          output/input overlap(s) over {} scheduled nodes",
         plan.schedule.len()
     );
+}
+
+/// Whether a large f32 weight has to be read from its f16 shadow.
+///
+/// The shadow exists for adapters whose storage binding cannot hold the
+/// weight together with the activations it multiplies (VirtIO / DX12 cap
+/// bindings near 2 GiB). It halves the weight's precision, so taking it
+/// whenever a weight passed `ARENA_STAGE_CAP` cost every big matmul ~1e-3
+/// relative error even where one f32 window covers everything — a 2048 ×
+/// 158 241 LM head on wgpu-Metal (4 GiB bindings) moved its logits by 5e-3.
+/// Now only when the span of `ids` exceeds the binding limit, or when
+/// `RLX_WGPU_F16_MIRROR=1` asks for the bandwidth saving anyway.
+fn f16_mirror_needed(device: &wgpu::Device, arena: &crate::buffer::Arena, ids: &[NodeId]) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_F16_MIRROR") {
+        return true;
+    }
+    let lo = ids
+        .iter()
+        .map(|&id| arena.offset(id) as u64)
+        .min()
+        .unwrap_or(0);
+    let hi = ids
+        .iter()
+        .map(|&id| arena.offset(id) as u64 + arena.len_of(id) as u64)
+        .max()
+        .unwrap_or(0);
+    hi.saturating_sub(lo / 256 * 256) > device.limits().max_storage_buffer_binding_size
 }

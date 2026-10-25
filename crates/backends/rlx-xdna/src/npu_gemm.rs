@@ -23,6 +23,54 @@ use std::ffi::{CString, c_char, c_int, c_void};
 
 use crate::XdnaError;
 
+/// NPU hardware contexts open right now through this module's handles
+/// ([`NpuGemm`], [`NpuIo`], [`NpuMm32`], [`NpuRun3`]); each holds one from
+/// `open` until drop.
+static OPEN_CONTEXTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Hardware contexts currently open in this process (see [`max_contexts`]).
+pub fn open_contexts() -> usize {
+    OPEN_CONTEXTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many hardware contexts this process should hold at once:
+/// `RLX_XDNA_MAX_CONTEXTS`, default 4. `amdxdna` caps concurrent contexts per
+/// process (4 measured on Phoenix by xdna-npu-toolkit), and a context past the
+/// cap fails to open rather than queueing, so callers that cache contexts (the
+/// runtime's chain executor) evict their idle ones before reaching it.
+pub fn max_contexts() -> usize {
+    rlx_ir::env::var("RLX_XDNA_MAX_CONTEXTS")
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
+fn context_opened() {
+    OPEN_CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn context_closed() {
+    OPEN_CONTEXTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The error for a shim `*_open` that returned null. Names the open-context
+/// count when it is at the budget — the likeliest cause, and one XRT's own
+/// stderr message does not spell out.
+fn open_failed(symbol: &str) -> XdnaError {
+    let (open, max) = (open_contexts(), max_contexts());
+    let hint = if open >= max {
+        format!(
+            "; {open} NPU hardware contexts already open in this process (budget {max}, \
+             RLX_XDNA_MAX_CONTEXTS) — drop compiled XDNA graphs you no longer need"
+        )
+    } else {
+        String::new()
+    };
+    XdnaError(format!(
+        "{symbol} returned null (XRT error on stderr){hint}"
+    ))
+}
+
 type OpenFn = unsafe extern "C" fn(
     *const c_char, // xclbin path
     *const u32,    // instruction stream (u32 words)
@@ -115,10 +163,9 @@ impl NpuGemm {
             )
         };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_gemm_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_gemm_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -207,6 +254,7 @@ impl NpuGemm {
 impl Drop for NpuGemm {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 
@@ -257,10 +305,9 @@ impl NpuIo {
         let xclbin_c = CString::new(xclbin_path).unwrap();
         let handle = unsafe { open_fn(xclbin_c.as_ptr(), insts.as_ptr(), insts.len(), n as c_int) };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_io_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_io_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -301,6 +348,7 @@ impl NpuIo {
 impl Drop for NpuIo {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 
@@ -480,10 +528,9 @@ impl NpuMm32 {
             )
         };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_mm32_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_mm32_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -510,6 +557,7 @@ impl NpuMm32 {
 impl Drop for NpuMm32 {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 
@@ -573,10 +621,9 @@ impl NpuRun3 {
             )
         };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_run3_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_run3_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -611,6 +658,7 @@ impl NpuRun3 {
 impl Drop for NpuRun3 {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 

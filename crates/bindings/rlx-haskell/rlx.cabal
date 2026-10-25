@@ -1,0 +1,34 @@
+cabal-version:      3.0
+name:               rlx
+version:            0.2.19
+synopsis:           Haskell bindings for rlx over its C ABI
+description:        Graphs, sessions, device selection, autodiff, training, weights, text and distributed nodes, over librlx_capi.
+license:            MIT OR Apache-2.0
+author:             Eugene Hauptmann, Nataliya Kosmyna
+category:           Machine Learning
+build-type:         Simple
+
+common shared
+  default-language: Haskell2010
+  build-depends:    base >=4.14 && <5, aeson >=2.0, bytestring
+  ghc-options:      -Wall -Wno-name-shadowing -Wno-unused-matches
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:  RLX, RLX.Generated, RLX.Support, RLX.Manual
+  extra-libraries:  rlx_capi
+
+test-suite test-rlx
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          TestRLX.hs
+  build-depends:    rlx, aeson, directory, filepath
+
+executable rlx-example
+  import:           shared
+  hs-source-dirs:   examples
+  main-is:          Main.hs
+  other-modules:    Inference, Training, Loading, Backends, Distributed, Models
+  build-depends:    rlx, aeson, binary, bytestring, directory, filepath, scientific, text

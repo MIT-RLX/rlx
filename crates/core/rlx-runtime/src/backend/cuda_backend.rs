@@ -226,6 +226,22 @@ impl ExecutableGraph for CudaExecutableWrapper {
             return;
         }
         if matches!(dtype, rlx_ir::DType::F16 | rlx_ir::DType::BF16) {
+            // A matmul-only weight keeps one 2-B copy in its own slot; the
+            // backend widens it per GEMM, so the math stays f32.
+            if let Some(own) = self.inner.native_half_dtype(name) {
+                let same = matches!(
+                    (own, dtype),
+                    (rlx_cuda::arena::HalfDtype::F16, rlx_ir::DType::F16)
+                        | (rlx_cuda::arena::HalfDtype::Bf16, rlx_ir::DType::BF16)
+                );
+                if same {
+                    self.inner.set_param_bytes(name, data);
+                } else {
+                    let f32_buf = super::widen_bytes_to_f32(data, dtype);
+                    self.inner.set_param(name, &f32_buf);
+                }
+                return;
+            }
             let bits: Vec<u16> = data
                 .as_chunks::<2>()
                 .0

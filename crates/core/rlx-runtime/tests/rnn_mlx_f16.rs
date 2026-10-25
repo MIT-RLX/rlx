@@ -33,7 +33,7 @@ fn f16_vs_cpu(label: &str, build: impl Fn() -> Graph, feed: &[(&str, &[f32])]) {
         .run(feed)
         .remove(0);
     // Opt the MLX recurrence into fp16 for this process.
-    unsafe { std::env::set_var("RLX_MLX_RNN_F16", "1") };
+    rlx_ir::env::set("RLX_MLX_RNN_F16", "1");
     let mlx = Session::new(Device::Mlx)
         .compile(build())
         .run(feed)

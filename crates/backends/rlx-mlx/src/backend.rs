@@ -193,6 +193,13 @@ impl MlxExecutable {
         mode: MlxMode,
         rng: rlx_ir::RngOptions,
     ) -> Self {
+        crate::array::apply_cache_limit_from_env();
+        // MLX's attention reshapes K / V to `num_heads` heads: repeat shared
+        // ones first.
+        let graph = {
+            use rlx_opt::pass::Pass as _;
+            rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph)
+        };
         let output_names = graph.outputs.clone();
 
         // Pre-resolve output slot layout. We pack outputs end-to-end
@@ -351,6 +358,30 @@ impl MlxExecutable {
     }
 
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        // A param the graph declares F16 / BF16 (a weight under a half
+        // `WeightStorage`) is kept at that width: holding the f32 values here
+        // as well would cost 4 B/elem on top of the 2-B array MLX builds.
+        let graph_dt = self
+            .graph
+            .nodes()
+            .iter()
+            .find(|n| matches!(&n.op, Op::Param { name: nme } if nme == name))
+            .map(|n| n.shape.dtype());
+        if let Some(dt @ (DType::F16 | DType::BF16)) = graph_dt {
+            let bytes: Vec<u8> = if dt == DType::F16 {
+                data.iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                    .collect()
+            } else {
+                data.iter()
+                    .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+                    .collect()
+            };
+            self.params.remove(name);
+            self.params_typed.insert(name.to_string(), (bytes, dt));
+            self.gpu_params.remove(name);
+            return;
+        }
         // Mutate the existing Vec in place when possible so the
         // backing buffer's address stays stable across calls. This
         // lets `build_leaf_for` construct a zero-copy MLX Array view
@@ -477,8 +508,25 @@ impl MlxExecutable {
     }
 
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        self.run_read_outputs(inputs, None)
-            .unwrap_or_else(|e| panic!("MLX backend run failed: {e}"))
+        let out = self
+            .run_read_outputs(inputs, None)
+            .unwrap_or_else(|e| panic!("MLX backend run failed: {e}"));
+        if rlx_ir::env::flag("RLX_MLX_MEM_TRACE") {
+            let (active, cache, peak) = crate::array::memory_stats();
+            eprintln!(
+                "[rlx-mlx] after run: active {:.2} GB, cache {:.2} GB, peak {:.2} GB, \
+                 host param copies {:.2} GB",
+                active as f64 / 1e9,
+                cache as f64 / 1e9,
+                peak as f64 / 1e9,
+                self.params_typed
+                    .values()
+                    .map(|(b, _)| b.len())
+                    .sum::<usize>() as f64
+                    / 1e9
+            );
+        }
+        out
     }
 
     /// Run the graph and read back only the listed output indices (e.g. `[0]` for logits-only).

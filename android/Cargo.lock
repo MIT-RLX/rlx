@@ -1147,7 +1147,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "half",
  "rlx-fusion",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -1166,20 +1166,22 @@ dependencies = [
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "half",
+ "libm",
  "rayon",
  "rlx-gguf",
  "rlx-ir",
  "rlx-mlx-io",
  "rlx-opt",
+ "rlxsl",
  "strum_macros",
 ]
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "half",
  "rlx-ir",
@@ -1187,14 +1189,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
 ]
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1202,15 +1204,16 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "rlx-ir",
 ]
 
 [[package]]
 name = "rlx-gpu-dispatch"
-version = "0.2.18"
+version = "0.2.19"
 
 [[package]]
 name = "rlx-gpu-host"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "half",
@@ -1223,10 +1226,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "aes 0.9.1",
  "bincode",
+ "libm",
  "serde",
  "serde_json",
  "smallvec",
@@ -1234,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-jni"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "jni",
  "rlx-ir",
@@ -1243,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1252,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-io"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "half",
@@ -1268,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -1278,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "half",
@@ -1292,21 +1296,26 @@ dependencies = [
  "rlx-ir",
  "rlx-macros",
  "rlx-opt",
+ "rlx-search",
  "rlx-wgpu",
  "serde",
  "serde_json",
 ]
 
 [[package]]
+name = "rlx-search"
+version = "0.2.19"
+
+[[package]]
 name = "rlx-unfuse"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
 ]
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "bytemuck",
  "half",
@@ -1327,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "rlxsl"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "rlx-ir",
 ]

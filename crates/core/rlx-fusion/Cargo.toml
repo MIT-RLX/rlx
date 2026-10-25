@@ -14,6 +14,15 @@ documentation.workspace = true
 
 [dependencies]
 rlx-ir = { workspace = true }
+# `lower_pocketfft`: the pocketfft plan (factors, twiddles) the GPU lowering replays.
+rlx-pocketfft = { workspace = true }
+
+[features]
+default = []
+# `ParallelizeAffineScan`: rewrite a `Scan` whose body is a diagonal affine
+# recurrence (`h = a*h + b`) into a log-depth prefix scan of tensor ops.
+# Not bit-identical to the sequential loop (different association order).
+assoc-scan = []
 
 [dev-dependencies]
 # Textual-IR fixtures (`tests/text_fixtures.rs`) need rlx-ir's serde derives.

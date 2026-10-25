@@ -61,10 +61,17 @@ pub struct CudaRuntimeConfig {
     /// or faster — the WMMA per-block overhead doesn't amortize). Tunable via
     /// `RLX_CUDA_ATTENTION_WMMA_MIN_WORK` (default 12288).
     pub attention_wmma_min_work: u64,
+    /// Pins the split-KV decode attention group count
+    /// (`RLX_CUDA_ATTENTION_KV_SPLITS=<n>`, `0` = off). Unset = the shape rule
+    /// in `rlx_gpu_kernels::attention_kv_split_groups`.
+    pub attention_kv_splits: Option<u32>,
     /// Opt-in Hopper TMA/wgmma kernel variants (`RLX_CUDA_TMA`). Default off;
     /// only takes effect on sm_90 (see `backend::helpers::tma_arch`).
     pub tma: bool,
     pub no_tf32: bool,
+    /// `RLX_CUDA_PARITY`: strict-FP32 numerics for parity runs — no TF32 in
+    /// GEMM or conv, and forward conv restricted to the GEMM algorithms (see
+    /// [`Self::conv_fwd_gemm_only`]).
     pub parity: bool,
     pub no_cublaslt: bool,
     /// Skip the cuBLAS sgemm tier so dense GEMM lands on rlx's own tiled
@@ -145,6 +152,19 @@ impl CudaRuntimeConfig {
         let attention_wmma_min_work = reg::var("RLX_CUDA_ATTENTION_WMMA_MIN_WORK")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(12288);
+        let attention_kv_splits = match reg::var("RLX_CUDA_ATTENTION_KV_SPLITS") {
+            None => None,
+            Some(v) => match v.trim().parse::<u32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    eprintln!(
+                        "rlx-cuda: RLX_CUDA_ATTENTION_KV_SPLITS={v:?} is not a group \
+                         count — using the shape rule"
+                    );
+                    None
+                }
+            },
+        };
         // An unrecognized value is reported, not defaulted through. A silent
         // fall-through here would make an A/B measure the same path twice and
         // report it as parity (`metal-variant-typo-silent`).
@@ -181,6 +201,7 @@ impl CudaRuntimeConfig {
             wmma: reg::flag("RLX_CUDA_WMMA"),
             attention,
             attention_wmma_min_work,
+            attention_kv_splits,
             tma: reg::flag("RLX_CUDA_TMA"),
             no_tf32: reg::flag("RLX_CUDA_NO_TF32"),
             parity: reg::flag("RLX_CUDA_PARITY"),
@@ -219,6 +240,15 @@ impl CudaRuntimeConfig {
 
     pub fn conv_tf32_enabled(&self) -> bool {
         self.conv_tf32 && !(self.no_tf32 || self.parity)
+    }
+
+    /// Forward conv may only use the (implicit-/precomp-)GEMM algorithms.
+    /// cuDNN's heuristic picks WINOGRAD for most 3×3 convs; even under
+    /// `CUDNN_FMA_MATH` its FP32 transform loses ~10× accuracy (CLEF's VQGAN
+    /// tokenizer: conv_in weight-grad rel-L2 1.05e-4 vs 1.06e-5 with GEMM).
+    /// FFT/FFT_TILING have the same class of transform error.
+    pub fn conv_fwd_gemm_only(&self) -> bool {
+        self.parity
     }
 
     pub fn deterministic_conv(&self) -> bool {

@@ -16,16 +16,26 @@ The full standalone elementwise surface: unary activations (forward **and**
 auto-differentiated backward), binary elementwise ops (`binary`), compare ops
 (`compare`), plus the double-word precision prelude (`dw`).
 
+`dw::double_single_prelude(lang)` is the double-single arithmetic library
+(`dw_two_sum`, `dw_two_prod`, `dw_add`, `dw_sub`, `dw_mul`, `dw_div`,
+`dw_sqrt` over a `{hi, lo}` f32 pair) behind `Op::DoubleSingle` on every GPU backend. Its error-free
+transforms need precise math. For drivers that compile with fast math and offer
+no switch (wgpu on Metal), `wgsl_fast_math_guarded()` routes every intermediate
+through `dw_opq`, an XOR with a zero the compiler can't see (and adds
+`dw_exp`), so neither
+identities nor reassociation can cancel the error terms; at run time it is the
+identity, and results match the precise prelude.
+
 Deliberately the **warm tier** — the *un-fused* standalone kernels, which are
 the fallback path. The hot path is the fused region, hand-written per backend
 and never routed through here. So generating these costs no peak performance.
 
-## What keeps it honest
+## What keeps it correct
 
 - The `eval` interpreter walks the same `Sx` tree, so the manifest's math can
   be checked numerically against the trusted CPU backend for every
   `Activation` (`rlx-runtime`'s `kernel_dsl_activation_oracle` test). It is an
-  *independent* oracle, because the CPU kernel stays hand-written.
+  *independent* reference, because the CPU kernel stays hand-written.
 - Case order follows `Activation::opcode_relu_first` — the canonical opcode
   from `rlx_ir::opcodes` — so codegen and dispatch cannot disagree.
 - The dev-test suite parses the emitted WGSL (`wgsl-in`) and GLSL (`glsl-in`)
@@ -36,7 +46,7 @@ and never routed through here. So generating these costs no peak performance.
 > One trap worth remembering: the GELU approximation constant is `√(2/π)`, and
 > Rust's `FRAC_2_SQRT_PI` is `2/√π`. Using the latter here silently broke
 > `GeluApprox` on *every* generated backend at once — which is exactly the
-> failure mode single-sourcing creates, and exactly why the numeric oracle
+> failure mode single-sourcing creates, and exactly why the numeric reference
 > exists.
 
 ## Emitting

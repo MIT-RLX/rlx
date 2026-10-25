@@ -16,6 +16,9 @@
 //! * Layers that don't qualify (Dense, or weight bit-widths that aren't
 //!   yet supported elsewhere) fall back to the scalar kernel cleanly.
 
+// Emits files / goes through `rlx-ir`: both need the `std` feature.
+#![cfg(feature = "std")]
+
 use rlx_fpga::codegen::{collect_artifacts_opt, emit_model_tuned};
 use rlx_fpga::estimate::estimate;
 use rlx_fpga::model::tinyconv_mnist_from_cortexm;

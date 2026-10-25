@@ -9,7 +9,7 @@ twin, plus the one thing the CPU table doesn't need: a **shape bucket** in the
 key, because a GEMM at `m=1` (decode) and one at `m=4096` (prefill) want
 different physical schedules and a single threshold can't say so.
 
-Three modules:
+Four modules:
 
 - [`dispatch`] — `(arch, op, shape-bucket) -> Choice`, with exact compile-time
   defaults, measured runtime overrides, and a tab-separated persistence format.
@@ -17,6 +17,12 @@ Three modules:
   legality rules a tile must satisfy before it is compiled.
 - [`cost`] — an analytical model that *ranks* candidate tiles without running
   them, so the tuner can spend device time only on plausible winners.
+- [`shipped`] — measured per-arch winners compiled into the crate
+  (`tuning/shipped.tsv`, the ordinary cache format, arch-keyed). Backends load
+  them *below* their user cache, so a local re-tune of the same key wins;
+  `RLX_GPU_NO_SHIPPED_TUNING=1` turns them off. A row is admitted only with its
+  evidence (a measured speedup and at least one confirming held-out shape), and
+  the tests reject one without it.
 
 ## What the cost model may and may not be used for
 
@@ -54,7 +60,8 @@ Four consequences are wired in rather than documented and hoped for:
 prefilter is enabled (`RLX_TUNE_PREFILTER=N`, default off), prints its rank
 beside each measurement, and scores it at the end. With the prefilter off, that
 score is independent evidence from shapes the model was never fitted on — which
-is what would justify turning it on later.
+is what would justify turning it on later. `rlx-metal`'s `metal_tune_dispatch`
+and `rlx-wgpu`'s `wgpu_tune_dispatch` are the same tuner for those backends.
 
 ## Why this crate exists separately
 

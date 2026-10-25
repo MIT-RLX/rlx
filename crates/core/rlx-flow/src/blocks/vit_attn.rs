@@ -77,9 +77,9 @@ impl BlockStage for VitSelfAttnStage {
         let nh = spec.num_heads;
         let dh = spec.head_dim;
 
-        let qkv_w = ctx.load_param(&spec.qkv_weight, true)?;
+        let qkv_w = ctx.load_matrix(&spec.qkv_weight, true)?;
         let qkv_b = ctx.load_param(&spec.qkv_bias, false)?;
-        let out_w = ctx.load_param(&spec.out_weight, true)?;
+        let out_w = ctx.load_matrix(&spec.out_weight, true)?;
         let out_b = ctx.load_param(&spec.out_bias, false)?;
 
         let mut gb = HirMut::new(ctx.hir());

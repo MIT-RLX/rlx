@@ -27,7 +27,6 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::Metal,
     Device::Ane,
     Device::Hexagon,
-    Device::Xdna,
     Device::Egpu,
     Device::Gpu,
     Device::Vulkan,
@@ -35,6 +34,11 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::OpenGl,
     Device::WebGpu,
     Device::Cpu,
+    // After the CPU: an XDNA 1 (Phoenix) NPU measured 1.9-2.7x slower than
+    // same-precision CPU bf16 on transformer workloads (xdna-npu-toolkit), and
+    // rlx runs f32 matmuls there int8-quantized. It is a power/offload target,
+    // picked by asking for it (or an explicit `prefer`), not for throughput.
+    Device::Xdna,
 ];
 
 /// Browser backend probe order: WebGPU first, WebGL fallback, then CPU.
@@ -96,7 +100,10 @@ pub fn trim_accelerator_arena_pool(device: Device) {
 /// on a headless box where the feature IS on and there is simply no adapter.
 pub fn feature_compiled(device: Device) -> bool {
     match device {
-        Device::Cpu => true,
+        // Was `true` unconditionally while `is_available` checks the feature,
+        // so a build without `cpu` panicked with "the `cpu` feature is enabled
+        // but no such device was found" — the opposite of the fix it needed.
+        Device::Cpu => cfg!(feature = "cpu"),
         Device::Metal => cfg!(feature = "metal"),
         Device::Mlx => cfg!(feature = "mlx"),
         Device::Ane => cfg!(feature = "ane"),
@@ -271,6 +278,23 @@ pub fn detected_unavailable_devices() -> Vec<(Device, String)> {
         out.push((Device::Egpu, rlx_egpu::diagnostic()));
     }
     out
+}
+
+/// Why a compiled-in `device` is not available, when its backend can say
+/// (XDNA, eGPU: the env var, path, library or toolchain that is missing).
+/// `None` for backends without a diagnostic. Feeds the [`crate::Session`]
+/// "not available" panic, which otherwise could only say "no device found".
+pub fn unavailable_reason(device: Device) -> Option<String> {
+    let _ = device;
+    #[cfg(feature = "xdna")]
+    if device == Device::Xdna {
+        return Some(rlx_xdna::diagnostic());
+    }
+    #[cfg(feature = "egpu")]
+    if device == Device::Egpu {
+        return Some(rlx_egpu::diagnostic());
+    }
+    None
 }
 
 /// Browser backends currently runnable (`WebGpu` → `OpenGl` → `Cpu`).
@@ -799,5 +823,18 @@ mod tests {
             assert!(is_available(d));
             assert!(supports_graph(d, &g));
         }
+    }
+}
+
+#[cfg(test)]
+mod feature_compiled_tests {
+    use super::*;
+
+    /// The CPU needs no hardware probe, so "compiled" and "available" must
+    /// agree; when they disagreed the panic message named the wrong fix.
+    #[test]
+    fn cpu_feature_compiled_matches_availability() {
+        assert_eq!(feature_compiled(Device::Cpu), is_available(Device::Cpu));
+        assert_eq!(feature_compiled(Device::Cpu), cfg!(feature = "cpu"));
     }
 }

@@ -7,7 +7,7 @@
 //! When [`crate::Session::compile`] is handed a graph with `Dim::Dynamic` dims, it
 //! wraps it in a [`DeferredExecutable`] instead of compiling immediately. On each
 //! `run`, the concrete shape is inferred from the input lengths, the graph is
-//! specialized to a fully-static graph ([`bind_graph`] + [`sync_graph_shapes`]),
+//! specialized to a fully-static graph ([`specialize`]),
 //! and compiled through the normal backend pipeline. The most recent
 //! specialization is cached, so repeated runs at the same shape pay no recompile.
 //!
@@ -18,8 +18,7 @@
 use crate::backend::{Backend, ExecutableGraph};
 use rlx_driver::Device;
 use rlx_ir::dynamic::{
-    bind_graph, infer_bindings_from_f32_inputs, infer_bindings_from_inputs, same_binding,
-    sync_graph_shapes,
+    infer_bindings_from_f32_inputs, infer_bindings_from_inputs, same_binding, specialize,
 };
 use rlx_ir::{DimBinding, Graph, GraphModule};
 
@@ -65,10 +64,9 @@ impl DeferredExecutable {
         {
             return;
         }
-        let mut resolved = bind_graph(&self.graph, &binding);
-        // Re-infer every node's shape now that the inputs are concrete, so ops
-        // that cache shape attributes (Reshape/Concat/Expand/…) line up.
-        sync_graph_shapes(&mut resolved);
+        // Bind, take shape attributes (Reshape / Expand targets) from the
+        // bound node shapes, then re-infer every shape.
+        let resolved = specialize(&self.graph, &binding);
         let module = GraphModule::from_graph(resolved);
         let mut inner = self
             .backend

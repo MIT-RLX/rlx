@@ -16,7 +16,7 @@ use rlx_xdna::npu_gemm::{NpuIoBf16, NpuIoF32, bf16_to_f32, f32_to_bf16};
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
+    rlx_ir::env::read(k).unwrap_or_else(|_| d.to_string())
 }
 
 fn main() {

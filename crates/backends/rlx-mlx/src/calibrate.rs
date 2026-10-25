@@ -85,7 +85,11 @@ impl Calibration {
     pub fn save(&self) -> std::io::Result<()> {
         let path = cache_path(&self.device_name);
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, raw)
+        // write-then-rename: a reader must never see a truncated file and
+        // fall back to re-measuring (see rlx-metal's calibrate.rs)
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(&tmp, path)
     }
 
     /// Run two representative matmul shapes (large + small) plus a
@@ -233,7 +237,14 @@ impl Calibration {
     /// Load from cache, or measure and save. Idempotent. Falls back to
     /// a conservative default Calibration on measurement failure (so
     /// the cost model never panics on a backend that's just missing).
+    /// The calibration for this process: loaded (or measured) once, then the
+    /// same numbers for every caller, so two device queries cannot disagree.
     pub fn load_or_measure() -> Self {
+        static ONCE: std::sync::OnceLock<Calibration> = std::sync::OnceLock::new();
+        ONCE.get_or_init(Self::load_or_measure_uncached).clone()
+    }
+
+    fn load_or_measure_uncached() -> Self {
         let name = device_name();
         if let Some(cal) = Self::load(&name) {
             return cal;

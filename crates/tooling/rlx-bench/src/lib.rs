@@ -274,14 +274,9 @@ pub fn run_benchmark_dispatch_only<P: BenchmarkPattern>(
     n_warmup: usize,
     n_runs: usize,
 ) -> BenchResult {
-    // SAFETY: bench harness toggles process-local env for the duration of this call.
-    unsafe {
-        std::env::set_var("RLX_BENCH_DISPATCH_ONLY", "1");
-    }
+    rlx_ir::env::set("RLX_BENCH_DISPATCH_ONLY", "1");
     let r = run_benchmark(pattern, device, n_warmup, n_runs);
-    unsafe {
-        std::env::remove_var("RLX_BENCH_DISPATCH_ONLY");
-    }
+    rlx_ir::env::remove("RLX_BENCH_DISPATCH_ONLY");
     r
 }
 

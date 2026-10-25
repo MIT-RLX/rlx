@@ -179,7 +179,28 @@ fn build_mil_subgraph(
         new_id
     };
 
+    // A plan can hand this segment an `Input` whose readers all live in other
+    // segments (CLEF's tokenizer `d_output` seed). CoreML refuses to load such a
+    // model ("Error in declaring input d_output with error -1"), so leave the
+    // input out — unless it is the segment's only input: a model with no inputs
+    // loads, but CoreML's E5 runtime throws ("Variable is not associated with a
+    // name") and silently falls back to another engine.
+    let unused_input = |id: NodeId| {
+        matches!(graph.node(id).op, Op::Input { .. })
+            && !graph.users(id).iter().any(|u| mil_set.contains(u))
+    };
+    let keeps_an_input = mil_nodes.iter().any(|&id| {
+        let n = graph.node(id);
+        (matches!(n.op, Op::Input { .. }) && !unused_input(id))
+            || n.inputs.iter().any(|&i| {
+                !mil_set.contains(&i)
+                    && !matches!(graph.node(i).op, Op::Param { .. } | Op::Constant { .. })
+            })
+    });
     for &id in mil_nodes {
+        if keeps_an_input && unused_input(id) {
+            continue;
+        }
         let node = graph.node(id);
         let mut new_inputs = Vec::with_capacity(node.inputs.len());
         for &inp in &node.inputs {
@@ -300,6 +321,185 @@ fn mil_segment_outputs(graph: &Graph, mil_set: &HashSet<NodeId>) -> Vec<NodeId> 
     outs.sort_by_key(|id| id.0);
     outs.dedup();
     outs
+}
+
+/// Feed no `Reduce` directly from a `Transpose`.
+///
+/// CoreML's CPU engine (BNNS) mis-executes `transpose → reduce → transpose`:
+/// it segfaults (an out-of-bounds read inside `BNNSGraphContextExecute_v2`) or
+/// silently returns wrong sums — `[3,32,32]` summed over two axes came back off
+/// by 98 on values near 144. Either transpose alone is fine. It reproduces with
+/// coremltools and no rlx code (macOS 26.6.2), on every compute-unit setting.
+/// rlx-autodiff's sum-to-shape emits exactly this chain for bias gradients, so
+/// CLEF's training graphs crashed on CoreML.
+///
+/// A reduction commutes with a permutation: `reduce(transpose(x, p), A)` equals
+/// `reduce(x, p[A])` with the surviving axes reordered by `p`. When `p` keeps
+/// those axes in order, the reorder is a reshape; otherwise a transpose follows
+/// the reduce, never precedes one, so the pattern cannot form. A transpose whose
+/// every reader is a rewritten reduce is dropped.
+pub fn hoist_transpose_out_of_reduce(g: Graph) -> Graph {
+    let is_static = |s: &Shape| s.dims().iter().all(|d| matches!(d, rlx_ir::Dim::Static(_)));
+    let rewritable = |g: &Graph, n: &rlx_ir::Node| -> bool {
+        let Op::Reduce { axes, .. } = &n.op else {
+            return false;
+        };
+        let t = g.node(n.inputs[0]);
+        matches!(t.op, Op::Transpose { .. })
+            && !axes.is_empty()
+            && is_static(&n.shape)
+            && is_static(&t.shape)
+            && is_static(&g.node(t.inputs[0]).shape)
+    };
+    if !g.nodes().iter().any(|n| rewritable(&g, n)) {
+        return g;
+    }
+    // Transposes that only feed rewritten reduces are dead afterwards.
+    let mut readers: HashMap<NodeId, (usize, usize)> = HashMap::new(); // (all, rewritten)
+    for n in g.nodes() {
+        let rw = rewritable(&g, n);
+        for &i in &n.inputs {
+            let e = readers.entry(i).or_default();
+            e.0 += 1;
+            e.1 += usize::from(rw && i == n.inputs[0]);
+        }
+    }
+    let outputs: HashSet<NodeId> = g.outputs.iter().copied().collect();
+    let static_dims =
+        |s: &Shape| -> Vec<usize> { s.dims().iter().map(|d| d.unwrap_static()).collect() };
+
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        if matches!(node.op, Op::Transpose { .. })
+            && !outputs.contains(&node.id)
+            && readers
+                .get(&node.id)
+                .is_some_and(|&(all, rw)| all > 0 && all == rw)
+        {
+            continue;
+        }
+        let new_id = if rewritable(&g, node) {
+            // `keep_dim` needs no case: the final reshape to the node's own shape
+            // drops or keeps the reduced axes either way.
+            let Op::Reduce { op, axes, .. } = &node.op else {
+                unreachable!()
+            };
+            let t = g.node(node.inputs[0]);
+            let Op::Transpose { perm } = &t.op else {
+                unreachable!()
+            };
+            let x = id_map[&t.inputs[0]];
+            let x_shape = g.node(t.inputs[0]).shape.clone();
+            let dtype = node.shape.dtype();
+            let mut x_axes: Vec<usize> = axes.iter().map(|&a| perm[a]).collect();
+            x_axes.sort_unstable();
+            let mut z_dims = static_dims(&x_shape);
+            for &a in &x_axes {
+                z_dims[a] = 1;
+            }
+            let z = out.add_node(
+                Op::Reduce {
+                    op: *op,
+                    axes: x_axes,
+                    keep_dim: true,
+                },
+                vec![x],
+                Shape::new(&z_dims, dtype),
+            );
+            let kept: Vec<usize> = (0..perm.len())
+                .filter(|i| !axes.contains(i))
+                .map(|i| perm[i])
+                .collect();
+            let want = static_dims(&node.shape);
+            let pre = if kept.windows(2).all(|w| w[0] < w[1]) {
+                z
+            } else {
+                let w_dims: Vec<usize> = perm.iter().map(|&p| z_dims[p]).collect();
+                out.add_node(
+                    Op::Transpose { perm: perm.clone() },
+                    vec![z],
+                    Shape::new(&w_dims, dtype),
+                )
+            };
+            if static_dims(&out.node(pre).shape) == want {
+                pre
+            } else {
+                out.add_node(
+                    Op::Reshape {
+                        new_shape: want.iter().map(|&d| d as i64).collect(),
+                    },
+                    vec![pre],
+                    node.shape.clone(),
+                )
+            }
+        } else {
+            let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+            out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// Divide an un-folded batch norm by a reciprocal multiply instead.
+///
+/// CoreML fuses `conv → [+ bias] → sub(mean) → div(std) → mul(γ) → add(β)` —
+/// an eval-mode BatchNorm written out elementwise over baked constants — into
+/// the convolution, and BNNS then segfaults while initialising the program
+/// (`EXC_BAD_ACCESS` in `libBNNS.dylib` on the `MLE5ProgramLibrary` lazy-init
+/// queue, macOS 26.6.2). Whether it does depends on the shapes in no monotone
+/// way: a 6×1 or 64×1 spatial kernel crashed, 65×1 did not, and 64×1 passed
+/// with 8 filters but crashed with 64. Every one of the four elementwise ops is
+/// needed, and so is the convolution in front; `div` → `mul(recip)` is enough
+/// to stop it. LEAF's tokenizer at `dim_cnn = 8` hit it.
+///
+/// The rewrite applies to a `div(sub(c, k₁), k₂)` whose `c` is a convolution
+/// (optionally plus a bias) and whose `k₁`, `k₂` depend on no graph input.
+/// It changes that one quotient by at most an ulp.
+pub fn recip_bn_div_after_conv(g: Graph) -> Graph {
+    use rlx_ir::op::{Activation, BinaryOp};
+    let dep = rlx_ir::head::input_dependent(&g);
+    let indep = |id: NodeId| !dep[id.0 as usize];
+    let is_conv = |id: NodeId| matches!(g.node(id).op, Op::Conv { .. });
+    let conv_like = |id: NodeId| {
+        let n = g.node(id);
+        is_conv(id)
+            || (matches!(n.op, Op::Binary(BinaryOp::Add))
+                && ((is_conv(n.inputs[0]) && indep(n.inputs[1]))
+                    || (is_conv(n.inputs[1]) && indep(n.inputs[0]))))
+    };
+    let rewritable = |n: &rlx_ir::Node| -> bool {
+        if !matches!(n.op, Op::Binary(BinaryOp::Div)) || !indep(n.inputs[1]) {
+            return false;
+        }
+        let s = g.node(n.inputs[0]);
+        matches!(s.op, Op::Binary(BinaryOp::Sub)) && conv_like(s.inputs[0]) && indep(s.inputs[1])
+    };
+    if !g.nodes().iter().any(rewritable) {
+        return g;
+    }
+    let mut out = Graph::new(g.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in g.nodes() {
+        let new_inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = if rewritable(node) {
+            let k = new_inputs[1];
+            let ks = out.node(k).shape.clone();
+            let inv = out.activation(Activation::Recip, k, ks);
+            out.add_node(
+                Op::Binary(BinaryOp::Mul),
+                vec![new_inputs[0], inv],
+                node.shape.clone(),
+            )
+        } else {
+            out.add_node(node.op.clone(), new_inputs, node.shape.clone())
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(g.outputs.iter().map(|i| id_map[i]).collect());
+    out
 }
 
 /// Expand fused ops claimed for coverage that CPU HostOp would Nop:

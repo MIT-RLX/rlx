@@ -12,6 +12,7 @@ readme                 = "README.md"
 repository.workspace   = true
 documentation.workspace = true
 [dependencies]
+half = "2"
 rlx-gpu-kernels = { workspace = true }
 # Dispatch table + decision journal (also re-exported via rlx-gpu-kernels).
 rlx-gpu-dispatch = { workspace = true }

@@ -26,7 +26,7 @@ Two reasons, neither of them fluid dynamics.
 - **`lattice`** — D2Q9 / D3Q27 velocity sets, weights, Hermite tensors.
 - **`moment`** — the stored state, third-order reconstruction, closed-form
   collision.
-- **`invariant`** — the moment round-trip oracle (`round_trip_d2q9`).
+- **`invariant`** — the moment round-trip reference (`round_trip_d2q9`).
 - **`sim`** — a periodic host reference simulator and Taylor–Green setup.
 - **`graph`** *(feature `ir`)* — one LBM step as an `rlx_ir::Graph`, streaming
   via `Op::Roll`, so the solver runs on every backend through `Session`

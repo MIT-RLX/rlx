@@ -31,9 +31,9 @@ impl GeGluStage {
 
 impl BlockStage for GeGluStage {
     fn emit(&self, ctx: &mut FlowCtx<'_>, input: FlowValue) -> Result<Option<FlowValue>> {
-        let gate_w = ctx.load_param(&self.gate_key, true)?;
-        let up_w = ctx.load_param(&self.up_key, true)?;
-        let down_w = ctx.load_param(&self.down_key, true)?;
+        let gate_w = ctx.load_matrix(&self.gate_key, true)?;
+        let up_w = ctx.load_matrix(&self.up_key, true)?;
+        let down_w = ctx.load_matrix(&self.down_key, true)?;
         let mut gb = HirMut::new(ctx.hir());
         let gate = gb.mm(input.id, gate_w);
         let up = gb.mm(input.id, up_w);

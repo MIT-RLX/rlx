@@ -20,6 +20,24 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// This device's key in the shared dispatch table: compute capability plus an
+/// SM-count band (`GpuArch::cuda_with_sms`). The one constructor the backend
+/// and the tuning examples share, so a tuned row's key always matches the key
+/// the backend looks up. `unknown` when the driver query fails.
+pub fn arch_for(ctx: &cudarc::driver::CudaContext) -> rlx_gpu_dispatch::dispatch::GpuArch {
+    use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
+    match ctx.compute_capability() {
+        Ok((maj, min)) if maj > 0 => {
+            let sms = ctx
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .unwrap_or(0)
+                .max(0) as u32;
+            rlx_gpu_dispatch::dispatch::GpuArch::cuda_with_sms(maj as u32, min as u32, sms)
+        }
+        _ => rlx_gpu_dispatch::dispatch::GpuArch::unknown(),
+    }
+}
+
 /// Where the tuning cache lives.
 ///
 /// `RLX_GPU_TUNING_CACHE` overrides; otherwise it sits beside the PTX cache
@@ -48,6 +66,10 @@ pub fn tuning_cache_path() -> Option<PathBuf> {
 pub fn ensure_tuning_cache_loaded() {
     static LOADED: OnceLock<()> = OnceLock::new();
     LOADED.get_or_init(|| {
+        // Shipped per-arch rows first; the user cache below overrides them.
+        if !rlx_ir::env::flag("RLX_GPU_NO_SHIPPED_TUNING") {
+            rlx_gpu_dispatch::shipped::load();
+        }
         let Some(path) = tuning_cache_path() else {
             return;
         };
@@ -138,16 +160,14 @@ mod tests {
     fn explicit_path_overrides_the_default_location() {
         // SAFETY: single-threaded test, restored immediately.
         let prev = rlx_ir::env::var("RLX_GPU_TUNING_CACHE");
-        unsafe { std::env::set_var("RLX_GPU_TUNING_CACHE", "/tmp/rlx-tuning-test.tsv") };
+        rlx_ir::env::set("RLX_GPU_TUNING_CACHE", "/tmp/rlx-tuning-test.tsv");
         assert_eq!(
             tuning_cache_path(),
             Some(PathBuf::from("/tmp/rlx-tuning-test.tsv"))
         );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("RLX_GPU_TUNING_CACHE", v),
-                None => std::env::remove_var("RLX_GPU_TUNING_CACHE"),
-            }
+        match prev {
+            Some(v) => rlx_ir::env::set("RLX_GPU_TUNING_CACHE", v),
+            None => rlx_ir::env::remove("RLX_GPU_TUNING_CACHE"),
         }
     }
 }

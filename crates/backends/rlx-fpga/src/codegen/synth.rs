@@ -7,6 +7,9 @@
 //! RTL (`top.sv`) is always target-agnostic. These sidecars tell Yosys /
 //! nextpnr how to map soft ports onto a concrete part when requested.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::codegen::Artifact;
 use crate::export_config::{FpgaExportConfig, HwTarget};
 use crate::model::Model;

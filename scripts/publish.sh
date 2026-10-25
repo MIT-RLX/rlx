@@ -39,7 +39,7 @@
 #
 # Default flow:
 #
-#   1. Pre-flight: cargo fmt --check, cargo clippy -- -D warnings,
+#   1. Pre-flight: cargo fmt (formats, naming the files), cargo clippy -- -D warnings,
 #      cargo test --workspace --release. Aborts if any fails.
 #   2. Confirm prompt (skip with --yes).
 #   3. Per tier, publish each crate sequentially. After each crate:
@@ -129,10 +129,17 @@ LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
 # so the next addition cannot reproduce that.
 SKIPPED=(
     pyrlx
-    rlx-cortexm-trainer
+    rlx-bind
+    rlx-bindgen
+    rlx-capi
     rlx-corpus
+    rlx-cortexm-trainer
+    rlx-ffi
     rlx-js
     rlx-megakernel
+    rlx-micro
+    rlx-model-plugin
+    rlx-web
 )
 
 # Tier definitions. Each array entry is a single tier; space-separated
@@ -163,8 +170,8 @@ SKIPPED=(
 # rlx-vulkan/rlx-oneapi/rlx-qnn/rlx-cerebras are backends that rlx-runtime
 # optionally depends on, so they ride in the backend tier (after rlx-cpu,
 # which rlx-vulkan/rlx-oneapi depend on). rlx-webgl (rlx-ir/rlx-autodiff/
-# rlx-compile) also lands there. rlx-web pulls in rlx-runtime AND rlx-webgl,
-# so it has to follow runtime — it sits alongside rlx-tensor.
+# rlx-compile) also lands there. Language bindings (everything under
+# crates/bindings/, rlx-web and rlx-ffi included) are `publish = false`.
 #
 # rlx-torch-import's [dependencies] are rlx-ir plus optional rlx-cpu,
 # rlx-runtime (the `runtime` default feature) and rlx-onnx-import (the `onnx`
@@ -174,8 +181,7 @@ SKIPPED=(
 # rlx-hwprofile / rlx-onnx-proto are dep-free leaves (tier 0). rlx-gpu-host
 # (rlx-cpu/rlx-ir/rlx-compile) is consumed by the GPU backends, so it sits in
 # the backend tier right after rlx-cpu and before rlx-cuda/rlx-rocm/rlx-wgpu.
-# rlx-check (rlx-runtime) follows runtime. rlx-ffi (rlx-runtime) rides the
-# same tier; its rlx-autodiff dev-dep is path-only so publish never resolves it.
+# rlx-check (rlx-runtime) follows runtime.
 # New-crate placements (all pinned to the workspace version):
 #   rlxsl (rlx-ir) is a BUILD-dependency of rlx-gpu-kernels (tier 0) and the
 #     GPU backends, so it rides tier 0 *before* rlx-gpu-kernels. Its dir has no
@@ -202,16 +208,16 @@ SKIPPED=(
 #     dev-dependencies at lock time regardless of features, that made a sibling
 #     `rlx` checkout mandatory just to load that workspace.
 TIERS=(
-    "rlx-ir rlxsl rlx-gguf rlx-torch-ckpt rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng"
+    "rlx-ir rlxsl rlx-gguf rlx-torch-ckpt rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng rlx-program rlx-search rlx-numpy rlx-special rlx-pocketfft rlx-nnpack"
     "rlx-unfuse rlx-flow rlx-fusion rlx-driver rlx-mlx-io"
     "rlx-autodiff rlx-extend rlx-pkg"
     "rlx-compile"
     "rlx-opt"
     "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl rlx-xdna rlx-egpu"
-    "rlx-metal"
+    "rlx-metal rlx-stablehlo"
     "rlx-collectives rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web rlx-check rlx-ffi rlx-distributed rlx-opscope rlx-peft"
-    "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance rlx-geo rlx-bake"
+    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-check rlx-distributed rlx-opscope rlx-peft"
+    "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance rlx-geo rlx-bake rlx-signal"
     "rlx-onnx"
     "rlx-fdm rlx-lbm rlx-bench"
     "rlx-rl"
@@ -691,7 +697,17 @@ fi
 
 # ── Pre-flight gates ────────────────────────────────────────────
 if (( ! NO_GATE )); then
-    bold "[1/3] cargo fmt --check"
+    # Formatting is layout only, so format rather than abort: a shared tree
+    # (other sessions' uncommitted work) otherwise fails the release on files
+    # nobody was asked to touch. Name what changed so it is reviewed, then
+    # check, which still catches anything rustfmt itself cannot settle.
+    bold "[1/3] cargo fmt"
+    unformatted="$(cargo fmt --all -- --check -l 2>/dev/null || true)"
+    if [[ -n "$unformatted" ]]; then
+        echo "  formatting:"
+        printf '    %s\n' $unformatted
+        cargo fmt --all
+    fi
     cargo fmt --all -- --check
 
     bold "[2/3] cargo clippy --workspace --all-targets -- -D warnings"

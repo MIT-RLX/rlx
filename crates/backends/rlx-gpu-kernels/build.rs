@@ -59,4 +59,16 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/binary_main.cu");
     println!("cargo:rerun-if-changed=kernels/compare_main.cu");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Double-single: the `rlxsl::dw` CUDA prelude ahead of the kernel.
+    let df = fs::read_to_string("kernels/double_single.cu").expect("read kernels/double_single.cu");
+    fs::write(
+        Path::new(&out_dir).join("double_single.cu"),
+        format!(
+            "{}\n{df}",
+            rlxsl::dw::double_single_prelude(rlxsl::Lang::Cuda)
+        ),
+    )
+    .expect("write $OUT_DIR/double_single.cu");
+    println!("cargo:rerun-if-changed=kernels/double_single.cu");
 }

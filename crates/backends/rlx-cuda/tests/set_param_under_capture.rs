@@ -52,11 +52,8 @@ fn set_param_under_whole_graph_capture() {
     if rlx_ir::env::skip_unless_device("cuda", true, rlx_cuda::is_available()) {
         return;
     }
-    // SAFETY: set before any CUDA executable is built; single test in this binary.
-    unsafe {
-        std::env::set_var("RLX_CUDA_EXEC_MODE", "graph");
-        std::env::set_var("RLX_CUDA_WHOLE_GRAPH_CAPTURE", "1");
-    }
+    rlx_ir::env::set("RLX_CUDA_EXEC_MODE", "graph");
+    rlx_ir::env::set("RLX_CUDA_WHOLE_GRAPH_CAPTURE", "1");
 
     // ── Part 1: repeated writes must not abort. ──
     let eye = identity(1.0);

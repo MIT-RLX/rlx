@@ -1,0 +1,549 @@
+# RLX — versatile ML compiler + runtime.
+# Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The runtime API every binding exposes, one row per class / method / function.
+# The graph builders are the other half (`table.rs`); this is everything else:
+# sessions, devices, autodiff, weights, training, text and distributed nodes.
+#
+# What reads it (see `api.rs` and docs/bindings.md):
+#   * rlx-bindgen checks every row against the C function rlx-capi exports
+#     (same parameter types, in order) and every C function against a row, then
+#     generates the Swift classes from the rows;
+#   * rlx-js and pyrlx test that every row resolves to a name they export, and
+#     that every name they export is a row or a `host` entry below.
+#
+# ── grammar ──────────────────────────────────────────────────────────────────
+#
+#   /// doc                       attaches to the next class, method or fn
+#   class Name [attrs]            a handle type; `end` closes it (`manual`:
+#                                 its Swift class is hand-written)
+#       new(args) [attrs]         the constructor
+#       static name(args) -> ret  a static method
+#       name(args) -> ret [attrs] a method (`-> ret` omitted: returns nothing)
+#   end
+#   fn name(args) -> ret [attrs]  a free function
+#   host lang: names…             names a binding exports that are not rows
+#                                 (language-native helpers), with a reason
+#
+# Names: the row name is snake_case. Defaults per language — Python: the same,
+# under the Python class; JS: camelCase, under the JS class; C:
+# `rlx_<class>_<name>` (`rlx_<name>` for a fn); Swift: camelCase. A
+# constructor is the class itself in Python and JS, `rlx_<class>_new` in C and
+# `init` in Swift. Override with `py=`, `js=`, `c=`, `swift=` (a full path from
+# the module root for Python and JS, e.g. `py=load_tokenizer`); `-` marks a row
+# a language does not have, and then `why="…"` is required. `py_also=` /
+# `js_also=` list extra spellings of the same entry (comma-separated).
+# `feature=` is the rlx-capi feature the row needs; `manual` means the Swift
+# side is hand-written (callbacks, in-place buffers).
+#
+# Argument kinds (C parameters in brackets):
+#   str [const char*]   str? [const char*, NULL = none]
+#   json / json? [const char*: a JSON object]   value / value? [const char*: any JSON]
+#   bool  f32  u32  u64  usize          u64? usize? f32? [const T*, NULL = none]
+#   f32s [const float*, size_t]   u8s [const uint8_t*, size_t]
+#   u32s / nodes [const uint32_t*, size_t]   usizes [const size_t*, size_t]
+#   strs / strs? [const char* const*, size_t]
+#   inputs [names, const float* const*, const size_t* lens, size_t n]
+#   typed_inputs [names, const uint8_t* const*, lens, const char* const* dtypes, n]
+#   graph [RlxGraph*, consumed]   graph& [RlxGraph*, borrowed]
+# Return kinds (C out-parameters):
+#   str str? strings [char**]   json [char**: any JSON]   object [char**: a JSON object]
+#   rows [char**: a JSON array of objects]   shapes [char**: [[dim, …], …]]
+#   f32s [RlxF32s*]   u8s [RlxBytes*]
+#   u32s [RlxU32s*]   outputs [RlxOutputs**]   typed_outputs [RlxTypedOutputs**]
+#   tensors [RlxTensorMap**]   bool usize u32 u64 f32 [T*]   f32? [float*, bool*]
+#   graph / <Class> [RlxGraph** / Rlx<Class>**]   (a: kind, b: kind) [each in turn]
+
+# ── library ──────────────────────────────────────────────────────────────────
+
+/// The library version, e.g. "0.2.18".
+fn version() -> str [py=__version__]
+
+/// Backends compiled in and usable on this machine.
+fn devices() -> strings [py=available_devices]
+
+/// Whether a backend is compiled in and has hardware.
+fn is_available(name: str) -> bool
+
+/// The canonical label of a device name; errors on an unknown one.
+fn parse_device(name: str) -> str
+
+/// Every backend rlx knows, with whether this build and machine have it.
+fn backends_manifest() -> object
+
+/// The fastest device that runs every op of `graph`.
+fn fastest_device_for(graph: graph&, policy: value?) -> str
+
+/// Every device's verdict on `graph`: available, supports it, why not.
+fn device_report(graph: graph&, policy: value?) -> rows
+
+/// Static analysis of `graph` across backends: unsupported ops, numerics, cost.
+fn check(graph: graph&, options: json?) -> object
+
+/// The backends `check` can analyse.
+fn check_backends() -> strings
+
+# ── autodiff ─────────────────────────────────────────────────────────────────
+
+/// A graph whose outputs are [loss, …d(loss)/d(wrt)], with a `d_output` seed input.
+fn grad(graph: graph&, wrt: nodes) -> graph
+
+/// Forward mode: [...primals, ...tangents], one `tangent_<name>` input per seeded node.
+fn jvp(graph: graph&, tangent_for: nodes) -> graph
+
+/// Hessian-vector product, forward-over-reverse.
+fn hvp(graph: graph&, wrt: nodes) -> graph
+
+/// Batch the named inputs along a new leading axis.
+fn vmap(graph: graph&, names: strs, batch_size: usize) -> graph
+
+/// The order-th derivative of a scalar function w.r.t. scalar input `wrt`.
+fn nth_order_grad(graph: graph&, wrt: str, order: usize) -> graph
+
+/// The order-th derivative contracted against one direction per level (`dir_0`, …).
+fn directional_nth_grad(graph: graph&, wrt: str, order: usize) -> graph
+
+/// Export an INT8 (or legalizable f32) graph as SystemVerilog under `out_dir`; returns the files written.
+fn export_fpga(graph: graph&, out_dir: str, options: json?) -> strings [feature=fpga]
+
+# ── graphs ───────────────────────────────────────────────────────────────────
+
+/// A graph under construction. Its builders (`matmul`, `conv2d`, …) are the op
+/// table's (`table.rs`); these rows are its lifecycle.
+class Graph [manual]
+    new(name: str = "graph")
+    /// A deep copy — compile one, keep building on the other.
+    clone() -> Graph
+    /// Whether a compile (or a body-graph argument) consumed it.
+    is_consumed() -> bool
+end
+
+# ── combine and split graphs ─────────────────────────────────────────────────
+
+/// Copy `source` into `target` (both borrowed; `target` grows) and return
+/// `source`'s outputs as `target` nodes. options: {bind: {leaf name: node},
+/// prefix, adapt_shapes}. Unbound same-named leaves are shared (a tied weight)
+/// unless `prefix` keeps them apart. On error `target` is unchanged.
+fn splice(target: graph&, source: graph&, options: json?) -> u32s
+
+/// `a` and `b` side by side: a's outputs, then b's; same-named leaves shared.
+fn parallel(a: graph&, b: graph&, name: str?) -> graph
+
+/// `b` after `a`: b's inputs, in creation order, are fed by a's outputs.
+fn sequential(a: graph&, b: graph&, name: str?) -> graph
+
+/// The subgraph computing `outputs`, with them as its outputs.
+fn extract(graph: graph&, outputs: nodes) -> graph
+
+/// A graph split into self-contained parts that run in order: part i reads
+/// its `imports` from earlier parts' `exports` of the same name.
+class Partition
+    /// Node i goes to part assign[i] (`node_count()` entries; inputs', params'
+    /// and constants' are ignored). Every edge must run to the same or a later part.
+    new(graph: graph&, assign: u32s)
+    /// Two parts: `cut` and everything it reads, then the rest.
+    static split_at(graph: graph&, cut: nodes) -> Partition
+    /// One part per independent subgraph; the parts import nothing.
+    static components(graph: graph&) -> Partition
+    /// The number of parts.
+    num_parts() -> usize
+    /// A copy of one part's graph.
+    graph(part: usize) -> graph
+    /// The boundary names a part reads.
+    imports(part: usize) -> strings
+    /// The name of each of a part's outputs.
+    exports(part: usize) -> strings
+    /// Where each source output went: [[part, output index], …].
+    outputs() -> json
+    /// The parts as one graph again.
+    merge() -> graph
+end
+
+# ── compile and run ──────────────────────────────────────────────────────────
+
+/// A device and precision to compile graphs for.
+class Session
+    /// `policy` is a preset name ("mixed") or {op kind: dtype}.
+    new(device: str = "cpu", precision: str = "f32", policy: value?)
+    /// The device label.
+    device() -> str
+    /// "f32", "f16" or "bf16".
+    precision() -> str
+    /// The precision policy's label, if any.
+    policy() -> str?
+    /// Compile `graph` (consumed). options: {fusion, kernel_dispatch, policy}.
+    compile(graph: graph, options: json?) -> Compiled [py_also=Session.compile_with js_also=Session.compileWith]
+end
+
+/// A session that picks the device per graph, by policy.
+class FlexibleSession
+    /// `policy`: {only, deny, prefer, benchmark_runs}.
+    new(policy: value?)
+    /// The policy from RLX_DEVICE / RLX_DEVICE_DENY / … environment variables.
+    static from_env() -> FlexibleSession
+    /// Compile `graph` (consumed) on `device`, or the policy's pick.
+    compile(graph: graph, device: str?, options: json?) -> Compiled [py=FlexibleSession.compile_resolved py_also=FlexibleSession.compile_with_resolved]
+end
+
+/// A graph compiled for one device.
+class Compiled [py=CompiledGraph]
+    /// The device it runs on.
+    device() -> str
+    /// Set one f32 parameter.
+    set_param(name: str, data: f32s)
+    /// Set several f32 parameters; returns how many.
+    set_params(params: inputs) -> usize
+    /// Set one parameter from raw bytes of `dtype`.
+    set_param_typed(name: str, data: u8s, dtype: str)
+    /// Run with f32 inputs; one f32 buffer per output.
+    run(inputs: inputs) -> outputs [py_also=CompiledGraph.run_flat]
+    /// Run with inputs of any dtype; bytes + dtype per output.
+    run_typed(inputs: typed_inputs) -> typed_outputs
+    /// Static dims of each output.
+    output_shapes() -> shapes
+    /// Dtype of each output.
+    output_dtypes() -> strings
+    /// Declared inputs: [{name, dtype, shape}] (`shape` is null when a dim is symbolic).
+    inputs() -> rows
+    /// Declared parameters, like `inputs()`.
+    params() -> rows
+    /// Outputs in `run` order: [{name, dtype, shape}] (`name` is "" when unnamed).
+    outputs() -> rows
+    /// The position in `run`'s result of the output named `name`.
+    output_index(name: str) -> usize
+    /// A Type error naming inputs `supplied` leaves unbound and params never set.
+    check_bindings(supplied: strs)
+    /// Declare inputs / params meant to read zeros; no unbound warning for them.
+    allow_unbound(names: strs)
+end
+
+/// One graph compiled for every device a policy allows, for benchmarking and picking.
+class Runner [py=GraphDevices]
+    /// Takes `graph` (consumed); `policy`: {only, deny, prefer, benchmark_runs}.
+    new(graph: graph, policy: value?)
+    /// A runner with the policy from the environment.
+    static from_env(graph: graph) -> Runner
+    /// Devices the policy allows, in preference order.
+    devices() -> strings
+    /// The fastest device by static rank.
+    fastest() -> str
+    /// The device a run with `hint` would use.
+    resolve(hint: str?) -> str
+    /// Candidates: [{device, available, supports_graph, recommended, blocker}].
+    report() -> rows
+    /// Set one f32 parameter on every device.
+    set_param(name: str, data: f32s)
+    /// Set several f32 parameters; returns how many.
+    set_params(params: inputs) -> usize
+    /// Set one parameter from raw bytes of `dtype`.
+    set_param_typed(name: str, data: u8s, dtype: str)
+    /// Compile for every device now; returns the ones that compiled.
+    warm_all() -> strings
+    /// Time `runs` runs per device: [{device, mean_ms, …}].
+    benchmark(inputs: inputs, runs: usize = 5) -> rows
+    /// Run on the resolved device (or `hint`).
+    run(inputs: inputs, hint: str?) -> (device: str, outputs: outputs) [py=GraphDevices.run_resolved]
+    /// Run on exactly `device`.
+    run_on(device: str, inputs: inputs) -> outputs [py_also=GraphDevices.run]
+    /// Try each device of `chain` in order until one runs.
+    run_try(chain: strs, inputs: inputs) -> (device: str, outputs: outputs)
+    /// Run on `hint`, falling back down the policy when a device fails.
+    run_chain(inputs: inputs, hint: str?) -> (device: str, outputs: outputs)
+    /// Resolve with the inputs in hand (shape-aware), then run.
+    run_with_inputs(inputs: inputs, hint: str?) -> outputs [py=GraphDevices.run_resolved_with_inputs]
+end
+
+/// Routes each run to a device by policy, benchmarking and falling back.
+class Router [py=DeviceRouter]
+    /// Takes `graph` (consumed).
+    new(graph: graph, policy: value?)
+    /// A router with the policy from the environment.
+    static from_env(graph: graph) -> Router
+    /// Devices the policy allows.
+    devices() -> strings
+    /// Set one f32 parameter.
+    set_param(name: str, data: f32s)
+    /// Set several f32 parameters; returns how many.
+    set_params(params: inputs) -> usize
+    /// Set one parameter from raw bytes of `dtype`.
+    set_param_typed(name: str, data: u8s, dtype: str)
+    /// Re-benchmark when the machine reports thermal throttling.
+    set_rebench_on_throttle(enabled: bool) [py=DeviceRouter.with_rebench_on_throttle]
+    /// Run on the policy's device (or `hint`).
+    run(inputs: inputs, hint: str?) -> (device: str, outputs: outputs)
+    /// Run on exactly `device`.
+    run_on(device: str, inputs: inputs) -> outputs
+    /// Run, falling back down the policy's chain when a device fails.
+    run_chain(inputs: inputs, hint: str?) -> (device: str, outputs: outputs)
+end
+
+# ── weights ──────────────────────────────────────────────────────────────────
+
+/// A GGUF file opened for reading.
+class Gguf [py=GgufFile feature=gguf]
+    /// Open `path`.
+    static open(path: str) -> Gguf [py=GgufFile.load py_also=load_gguf js=openGguf]
+    /// Tensor names, in file order.
+    tensor_names() -> strings
+    /// {name, shape, dtype, n_elements} of one tensor.
+    info(name: str) -> object [py=GgufFile.tensor_info]
+    /// One tensor, dequantized to f32.
+    tensor(name: str) -> f32s [py=GgufFile.dequant_tensor]
+    /// One tensor's raw (packed) bytes.
+    tensor_bytes(name: str) -> u8s [py=GgufFile.read_tensor_bytes]
+    /// `general.architecture`, if set.
+    architecture() -> str?
+    /// Every metadata key; `full_arrays` keeps long arrays whole.
+    metadata(full_arrays: bool = false) -> object
+    /// One metadata value (null when absent).
+    metadata_value(key: str) -> json
+end
+
+/// Builds a GGUF file tensor by tensor.
+class GgufWriter [py=- js=- why="Python and JS pass every tensor at once to write_gguf; GgufWriter is that call for languages without dictionaries of arrays" feature=gguf]
+    new()
+    /// Add an f32 tensor, stored as `dtype` (f32, f16, q8_0, q4_k, …).
+    add_f32(name: str, shape: usizes, dtype: str, data: f32s)
+    /// Add a tensor already encoded as `dtype`.
+    add_bytes(name: str, shape: usizes, dtype: str, data: u8s)
+    /// Write the file; returns the tensor count.
+    write(path: str, architecture: str?, metadata: json?) -> usize
+end
+
+/// Write a GGUF file from {name: array | {data, dtype, shape}}.
+fn write_gguf(path: str, tensors: value, architecture: str?, metadata: json?) [c=- swift=- why="takes host arrays keyed by name; C and Swift build the file with GgufWriter"]
+
+/// Quantize f32 values to a GGUF dtype's bytes.
+fn quantize(data: f32s, dtype: str) -> u8s [py=quantize_gguf py_also=quantize feature=gguf]
+
+/// Dequantize GGUF bytes of `dtype` to f32 (`count` trims padding).
+fn dequantize(data: u8s, dtype: str, count: usize?) -> f32s [py=dequant_gguf py_also=dequant feature=gguf]
+
+/// safetensors (or PyTorch / ONNX) → GGUF, quantized to `scheme` by default.
+/// options: {architecture, overrides: {tensor: scheme}, skip_norm_bias}. Returns
+/// {tensors, input_bytes, output_bytes, compression_ratio, output_path, schemes}.
+fn convert_to_gguf(src: str, dst: str, scheme: str = "Q4_K", options: json?) -> object [feature=gguf-convert]
+
+/// Load every tensor of a weights file as f32: format "mlx" | "dduf" | "nemo" | "pt" | "safetensors".
+fn load_weights(format: str, path: str) -> tensors [py_also=load_mlx,load_dduf,load_nemo,load_pt js_also=loadMlx,loadDduf,loadNemo,loadPt feature=weights]
+
+/// Open an .rlxp package: its manifest as JSON.
+fn open_rlxp(path: str) -> object [py=load_rlxp c=rlx_rlxp_open feature=weights]
+
+/// Check an .rlxp package's hashes and layout.
+fn verify_rlxp(path: str) -> object [c=rlx_rlxp_verify feature=weights]
+
+/// Convert a model (from "gguf" | "mlx" | "dduf" | "nemo" | "pt") into an .rlxp package.
+fn to_rlxp(from: str, src: str, dst: str, options: json?) [py_also=convert_gguf_to_rlxp,convert_mlx_to_rlxp,convert_dduf_to_rlxp,convert_nemo_to_rlxp,convert_pt_to_rlxp feature=weights]
+
+# ── training ─────────────────────────────────────────────────────────────────
+
+/// An optimizer over named host tensors (Adam, AdamW, SGD, Muon, SOAP, …).
+class Optimizer [feature=training]
+    /// `kind` (or options.kind) plus hyperparameters {lr, weight_decay, …}.
+    new(kind: str?, options: json?)
+    /// Update every parameter in place from its gradient.
+    step(params: param_grads) [manual]
+    /// Change the learning rate.
+    set_lr(lr: f32)
+end
+
+/// Trains a graph's parameters: forward, backward, optimizer, on one device.
+class Trainer [feature=training]
+    /// Takes `graph` (consumed): its first output is the loss. `wrt` are the
+    /// trainable params; `initial` their starting values. options: {optimizer,
+    /// device, resident, clip_norm, …}.
+    new(graph: graph, wrt: strs, initial: inputs, options: json?)
+    /// One optimizer step on a batch; returns the loss.
+    step(batch: inputs) -> f32
+    /// The loss on a batch, no update.
+    evaluate(batch: inputs) -> f32
+    /// Train `steps` steps, pulling batches from a callback; returns a summary.
+    run(steps: usize, batch: callback) -> object [manual]
+    /// Stop updating `names` (all when omitted); returns how many are frozen.
+    freeze(names: strs?) -> usize
+    /// Resume updating `names` (all when omitted); returns how many are frozen.
+    unfreeze(names: strs?) -> usize
+    /// Frozen parameter names.
+    frozen() -> strings
+    /// Trainable parameter names.
+    trainable() -> strings
+    /// The last step's gradient norm, once one is known.
+    grad_norm() -> f32?
+    /// Whether parameters live on the device between steps.
+    is_resident() -> bool
+    /// The current parameters.
+    params() -> tensors
+    /// Replace parameters by name; returns how many matched.
+    set_params(params: inputs) -> usize
+    /// Change the learning rate.
+    set_lr(lr: f32)
+    /// Steps taken.
+    steps() -> u64
+    /// The device it trains on.
+    device() -> str
+    /// Checkpoint parameters + optimizer state as GGUF; returns tensors written.
+    save(path: str) -> usize [feature=gguf]
+    /// Restore a checkpoint; returns {params, step, lr, …}.
+    load(path: str) -> object [feature=gguf]
+    /// Train a function of the .rlxp package at `path`, whatever the model.
+    /// options: {function, dims, loss, train ("all" | {params} | {lora:
+    /// {targets, rank, alpha}} | {sae: {tap, width, l1}}), optimizer, device,
+    /// policy, clip_norm, resident}, over the package's own `train`.
+    static from_package(path: str, options: json?) -> Trainer [feature=models]
+    /// Write what a package trainer trained: LoRA factors as an adapter
+    /// package, an SAE as its own package, else the trained package.
+    save_package(path: str, name: str?) [feature=models]
+end
+
+# ── text ─────────────────────────────────────────────────────────────────────
+
+/// A tokenizer.json tokenizer.
+class Tokenizer [feature=text]
+    /// Load a tokenizer.json.
+    static load(path: str) -> Tokenizer [py=load_tokenizer js=loadTokenizer]
+    /// Text → token ids.
+    encode(text: str, add_special: bool = true) -> u32s
+    /// Token ids → text.
+    decode(ids: u32s, skip_special: bool = true) -> str
+    /// The text one more streamed token completes ("" while a character is partial).
+    decode_incremental(id: u32) -> str
+    /// Whatever the stream still holds.
+    finish_stream() -> str
+    /// Forget the stream.
+    reset_stream()
+end
+
+/// The most likely token.
+fn argmax(logits: f32s) -> u32 [feature=text]
+
+/// Sample one token: options {temperature, top_k, top_p, min_p, repetition_penalty, seed}.
+fn sample_next(logits: f32s, history: u32s = [], options: json?) -> u32 [feature=text]
+
+/// A seeded sampler that keeps its own history.
+class Sampler [feature=text]
+    new(options: json?)
+    /// Sample the next token and record it.
+    next(logits: f32s) -> u32
+    /// Record prompt tokens (for the repetition penalty).
+    prime(ids: u32s)
+    /// Clear the history; reseed when `seed` is given.
+    reset(seed: u64?)
+    /// Tokens recorded so far.
+    history() -> u32s
+end
+
+/// Render chat `messages` [{role, content}] with a Jinja chat template.
+fn render_chat(template: str, messages: value, add_generation_prompt: bool = true) -> str [feature=text]
+
+# ── distributed ──────────────────────────────────────────────────────────────
+
+/// `world` free loopback addresses ("127.0.0.1:port"), for running every rank on one machine.
+fn loopback_peers(world: u32) -> strings
+
+/// This process's place in a mesh of rlx nodes: point-to-point messages,
+/// collectives, and the ship-graph protocol (a coordinator ships a stage or a
+/// training job; generic workers run it on their own hardware).
+class Group
+    /// Join a mesh as `rank` of `world`. options: {peers: ["host:port", …],
+    /// topology: "mesh" | "star", device: "auto", discover: {port, data_port,
+    /// via}, heap_mb}. Blocks until every peer connects.
+    static connect(rank: u32, world: u32, options: json?) -> Group
+    /// Join with RANK / WORLD / PEERS / TOPOLOGY / DEVICE / DISCOVER from the environment.
+    static from_env() -> Group
+    /// This node's rank.
+    rank() -> u32
+    /// Ranks in the mesh.
+    world() -> u32
+    /// Whether this is rank 0.
+    is_leader() -> bool
+    /// Wait until every rank arrives.
+    barrier()
+    /// Send f32 values to rank `to` under `tag`.
+    send(to: u32, tag: u32, data: f32s)
+    /// Receive f32 values from rank `from` under `tag`.
+    recv(from: u32, tag: u32) -> f32s
+    /// Reduce across every rank: op "sum" | "mean" | "max" | "min".
+    all_reduce(data: f32s, op: str = "sum") -> f32s
+    /// Every rank's values, concatenated in rank order.
+    all_gather(data: f32s) -> f32s
+    /// Rank `root`'s values, on every rank; other ranks pass a buffer of the root's length.
+    broadcast(root: u32, data: f32s) -> f32s
+    /// Coordinator: the capabilities each worker announced, [{rank, devices, platform, role}].
+    collect_caps() -> rows
+    /// Coordinator: ship a stage of `graph` to worker `rank`. options: {input,
+    /// output, device, weights: {param: uri}, packed: {param: uri}, stage_id}.
+    ship_stage(rank: u32, graph: graph&, options: json)
+    /// Send an activation to rank `to`.
+    send_activation(to: u32, data: f32s)
+    /// Receive an activation from rank `from`.
+    recv_activation(from: u32) -> f32s
+    /// Worker: announce, receive a stage, serve activations until the
+    /// coordinator finishes (or `steps`). options: {steps}. Returns {rank, device, platform, activations}.
+    serve_worker(options: json?) -> object
+    /// Coordinator: ship a data-parallel training job for backward `graph` to
+    /// worker `rank`. spec: {params: [{name, uri}], data: [{input, uri, elem,
+    /// shard_start, shard_len}], grad_start, loss_index, seed_input, momentum,
+    /// lr_per_epoch, batch, device, push_data}.
+    ship_train(rank: u32, graph: graph&, spec: json)
+    /// Train this rank's shard of a job in lockstep with the workers; returns
+    /// {metrics, params}.
+    run_train(graph: graph&, spec: json) -> object
+    /// Worker: announce, receive a training job, train in lockstep; returns {rank, platform, metrics, params}.
+    serve_trainer(options: json?) -> object
+end
+
+# ── models ───────────────────────────────────────────────────────────────────
+
+/// Every model provider: [{name, description, tasks, families}] — the built-in
+/// `rlxp` and every plugin loaded (RLX_MODEL_PLUGINS or load_model_plugin).
+fn model_providers() -> rows [feature=models]
+
+/// Load a model plugin library; returns its providers' names.
+fn load_model_plugin(path: str) -> strings [feature=models]
+
+/// Write `graph` (borrowed) and its f32 `weights` as an .rlxp model package
+/// that `Model.open` runs on any device. model: {task, family, outputs: [names], metadata}.
+fn save_model(graph: graph&, path: str, weights: inputs, model: json?) [feature=models]
+
+/// A model from any provider — an .rlxp package, a plugin's family runner
+/// (LLMs, speech, vision, …) — opened by path or id and run by name.
+class Model [feature=models]
+    /// Open `source` (a path or id). options: {device, provider, …the provider's own}.
+    static open(source: str, options: json?) -> Model
+    /// {provider, family, task, device, inputs: [{name, dtype, shape}], outputs, metadata}.
+    info() -> object
+    /// The task: "graph", "text-generation", "speech-recognition", ….
+    task() -> str
+    /// f32 tensors in, f32 tensors out. options: {shapes: {name: dims}, …the model's own}.
+    run(inputs: inputs, options: json?) -> outputs
+    /// Tensors of any dtype in (bytes + dtype), out the same way.
+    run_typed(inputs: typed_inputs, options: json?) -> typed_outputs
+    /// Dims of each output of the last run.
+    output_shapes() -> shapes
+    /// Names of the outputs of the last run.
+    output_names() -> strings
+    /// A language model's last-position logits after `ids`.
+    predict_logits(ids: u32s) -> f32s
+    /// A language model's next ids after `ids`. options: {temperature, top_p, top_k, seed, stop_ids}.
+    generate(ids: u32s, max_tokens: usize = 16, options: json?) -> u32s
+    /// Text in, text out, for a model with a tokenizer. options: {max_tokens, temperature, …}.
+    generate_text(prompt: str, options: json?) -> str
+    /// A reply to `messages` ([{role, content}, …], or one string), with the
+    /// model's chat template applied. options: as generate_text.
+    chat(messages: value, options: json?) -> str
+    /// The text of mono `audio` at `sample_rate`, for a speech-recognition model.
+    transcribe(audio: f32s, sample_rate: u32 = 16000, options: json?) -> str
+    /// `text` spoken, for a text-to-speech model: mono samples and their rate.
+    synthesize(text: str, options: json?) -> (audio: f32s, sample_rate: u32)
+    /// One vector per text ([[f32, …], …]), for an embedding model.
+    embed(texts: strs, options: json?) -> json
+end
+
+# ── language-native helpers (not rows) ───────────────────────────────────────
+
+host py: Graph Node graph dsl jacfwd run set_param dtype_str numpy_dtype batch_narrow_relu_graph from_torch export_torch_ir torch_import FusionOptions DevicePolicy DeviceCandidate DeviceBenchResult GgufConvertReport
+    why="graph construction (op table), NumPy dtype helpers, PyTorch import, and typed builders/results for options the other bindings pass as objects"
+host js: Graph Tensor dsl env console fileExists fileSize listDir mkdirs readFile readFileInto readFileRange readText removeFile writeFile sleep toFloat32 oneHot gatherRows
+    why="graph construction (op table + Tensor DSL) and the script host's own file system, timers and typed-array helpers"

@@ -16,6 +16,9 @@
 //!
 //!   cargo test -p rlx-fpga --release --test xc7_uart
 
+// Emits files / goes through `rlx-ir`: both need the `std` feature.
+#![cfg(feature = "std")]
+
 use std::path::Path;
 use std::process::Command;
 

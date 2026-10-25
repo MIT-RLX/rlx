@@ -23,6 +23,7 @@ Implementation lives in those crates; `rlx-opt` only wires backward-compatible
 | `compile` *(default)* | `rlx-compile` — HIR → MIR → LIR pipeline |
 | `training` *(default)* | `rlx-autodiff` — reverse / forward AD, vmap |
 | `full` | both |
+| `assoc-scan` | `rlx-fusion`'s `ParallelizeAffineScan`: diagonal affine `Scan` → log-depth prefix scan (not bit-identical to the loop) |
 
 ## Fusion pipeline (via `rlx-compile`)
 

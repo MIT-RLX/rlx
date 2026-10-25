@@ -7,8 +7,8 @@
 use anyhow::Result;
 
 use super::{
-    BlockStage, LlamaDecodeLayerStage, MlaAttnPrefillStage, Qwen3DecodeLayerStage,
-    SelfAttnPrefillStage,
+    BlockStage, LlamaDecodeLayerStage, MlaAttnDecodeStage, MlaAttnPrefillStage,
+    Qwen3DecodeLayerStage, SelfAttnPrefillStage,
 };
 use crate::context::FlowCtx;
 use crate::stage_contract::{LayerStage, StageArtifacts};
@@ -71,6 +71,35 @@ impl LayerStage for MlaAttnPrefillStage {
             value.clone(),
             StageArtifacts::hidden_only(value.shape.clone()),
         ))
+    }
+}
+
+impl LayerStage for MlaAttnDecodeStage {
+    fn name(&self) -> &str {
+        "mla_attn_decode"
+    }
+
+    fn emit_layer(
+        &self,
+        ctx: &mut FlowCtx<'_>,
+        input: FlowValue,
+    ) -> Result<(FlowValue, StageArtifacts)> {
+        let out = BlockStage::emit(self, ctx, input.clone())?;
+        let value = out.unwrap_or(input);
+        Ok((
+            value.clone(),
+            StageArtifacts::hidden_only(value.shape.clone()),
+        ))
+    }
+}
+
+impl AttentionStage for MlaAttnDecodeStage {
+    /// One latent cache (`k`); MLA keeps no separate V cache, so `v` echoes it.
+    fn cache_contract(&self, ctx: &FlowCtx<'_>, hidden: &rlx_ir::Shape) -> KvCacheContract {
+        let k = kv_from_decode(ctx, self.layer_idx)
+            .map(|c| c.k)
+            .unwrap_or_else(|_| hidden.clone());
+        KvCacheContract { k: k.clone(), v: k }
     }
 }
 

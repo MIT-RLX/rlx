@@ -4,19 +4,17 @@
 
 //! String <-> Device parsing and availability lookup.
 
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rlx_runtime::cost::fastest_device_for_with_policy;
 use rlx_runtime::{
     Device, DevicePolicy, device_label as runtime_device_label, device_report, fastest_device_for,
-    parse_device as runtime_parse_device,
 };
 
 use crate::graph::{PyGraph, graph_ref};
 use crate::graph_devices::{PyDeviceCandidate, PyDevicePolicy};
 
 pub(crate) fn parse_device(s: &str) -> PyResult<Device> {
-    runtime_parse_device(s).map_err(|e| PyValueError::new_err(e.to_string()))
+    rlx_bind::runtime::devices::parse(s).map_err(crate::bind::to_py)
 }
 
 pub(crate) fn device_label(d: Device) -> &'static str {
@@ -27,10 +25,7 @@ pub(crate) fn device_label(d: Device) -> &'static str {
 /// registered in this build.
 #[pyfunction]
 pub(crate) fn available_devices() -> Vec<&'static str> {
-    rlx_runtime::available_devices()
-        .into_iter()
-        .map(device_label)
-        .collect()
+    rlx_bind::runtime::devices::available()
 }
 
 /// `pyrlx.is_available("cuda")`
@@ -48,7 +43,7 @@ pub(crate) fn parse_device_py(name: &str) -> PyResult<&'static str> {
 /// `pyrlx.backends_manifest()` — JSON of Cargo features compiled into this wheel.
 #[pyfunction]
 pub(crate) fn backends_manifest() -> String {
-    rlx_runtime::BackendsManifest::json().to_string()
+    rlx_bind::runtime::devices::manifest_json()
 }
 
 /// Cost-model pick for a graph without building a `GraphDevices` runner.

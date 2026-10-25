@@ -98,7 +98,7 @@ fn preload_real_cudnn() {
         dirs.push(PathBuf::from(d));
     }
     for var in ["CONDA_PREFIX", "VIRTUAL_ENV"] {
-        if let Ok(p) = std::env::var(var) {
+        if let Ok(p) = rlx_ir::env::read(var) {
             let lib = PathBuf::from(&p).join("lib");
             // pip installs land in <prefix>/lib/pythonX.Y/site-packages/nvidia/cudnn/lib
             if let Ok(rd) = std::fs::read_dir(&lib) {

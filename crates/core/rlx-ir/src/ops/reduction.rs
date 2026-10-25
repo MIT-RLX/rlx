@@ -6,6 +6,7 @@
 //! (plan #53).
 
 use crate::op::ReduceOp;
+use crate::prelude::*;
 use crate::{Graph, NodeId, Op, Shape};
 
 impl Graph {

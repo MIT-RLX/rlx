@@ -7,21 +7,22 @@ through every backend. `rlx-ir` owns:
 
 - **`DType`** — F32, F16, BF16, F64, I8, I16, I32, I64, U8, U32, Bool, C64.
   Promotion rules.
-- **`Shape`** — static or dynamic dimensions, dtype-aware. No symbolic
-  dims yet.
+- **`Shape`** — static or dynamic dimensions, dtype-aware. **`dynamic`**:
+  symbolic dims — compile once, specialize at run time, with derived dims
+  (`SymDef`: affine, quotient, product and square forms) fitted from a few
+  concrete builds.
 - **`Op`** — the IR vocabulary. JAX-shaped: `MatMul`, `DotGeneral`, `Scan`,
   `SelectiveScan`, `DenseSolve`, `Fft`, `LayerNorm`, `Attention` (with
   `MaskKind`), `Quantize` / `Dequantize` / `FakeQuantize`, `If` / `While`,
   `Custom` / `CustomFn` extension points, plus the full reverse-mode AD
-  op set (`*Backward` variants). Adding an op means: this file,
-  `infer.rs`, `graph.rs` builder, both backends' thunks, MPSGraph
-  lowering, fusion patterns, cost model. ~6 files per new op.
+  op set (`*Backward` variants). Adding an op: `just new-op MyOp` prints
+  the checklist (IR, every backend, fusion, parity test, bindings).
 - **`fft`** — shared `FftNorm`, GPU launch plans, and NumPy-shaped helpers
   (`fftfreq`, `gpu_fft_native_eligible`, …). Graph builders in
   `ops::fft_ops` compose `rfft`, `irfft`, `stft`, `psd_real`, and
   `fft_conv1d` from primitive ops.
-- **`MaskKind`** — attention mask kind (None / Causal / SlidingWindow /
-  Custom). Added Apr 2026 per plan #20.
+- **`MaskKind`** — attention mask kind: None / Causal / SlidingWindow /
+  Custom (`[B, S_k]` keep-mask) / Bias (additive `[B, H, S_q, S_k]`).
 - **`attention_layout`** — BHSD `[B,H,S,D]` vs BSHD `[B,S,H,D]`,
   launch strides, packed `[B,S,3,H,D]` QKV detection, and shared flash-vs-row
   dispatch (`attention_dispatch_use_row`, `ATTENTION_FLASH_MAX_HEAD_DIM`).
@@ -34,6 +35,23 @@ through every backend. `rlx-ir` owns:
   crates register against (see [`rlx-sparse`], [`rlx-linalg`]).
 - **Logical kernels** — one `OpKind`, native or common-IR lowering; see
   [README-logical-kernels.md](README-logical-kernels.md).
+- **`compose`** — combine and split graphs: `Graph::splice` (bind named
+  inputs or params to existing nodes), sequential / parallel composition,
+  `extract`, and `Partition` (split at boundaries, run parts in order, merge).
+- **`rlxmodel`** *(feature `serialize`)* — `.rlxmodel`, rlx IR as text and its
+  stable encoding: ops and attributes written by name, so a file survives `Op`
+  changes; `.rlxp` packages store graphs this way.
+- **`number_format` / `double_single`** — how values are represented when a
+  graph runs (f32, f64, double-single `F64x2`, or any narrower binary float
+  format), and the `(hi, lo)` f32-pair layout behind `Op::DoubleSingle`.
+- **`env`** — every `RLX_*` switch, readable from code overrides or the
+  process env, registered in `env_registry_data.inc.rs` (reads are cached;
+  call `env::reload()` after `std::env::set_var`).
+- **`known_failures`** — cases a backend is known to get wrong, kept as data in
+  `tests/known_failures/*.txt` (each with an issue), so they still run.
+- **`stateful`**, **`head`**, **`retarget`** — decode state carried in the
+  graph; a classifier graph's pre-head representation; backend specialization
+  of a portable package graph.
 - **`Tick`** — `CNTVCT_EL0`-direct cycle counter for sub-millisecond
   measurement on Apple Silicon. Falls back to `Instant`. Use
   `Tick::now()` / `tick.elapsed_ns(start)` for any sub-ms measurement.
@@ -47,6 +65,17 @@ rlx-ir = "0.2"
 
 Most users should depend on the [`rlx`](https://crates.io/crates/rlx)
 prelude crate instead, which re-exports `rlx_ir` as `rlx::ir`.
+
+### `no_std`
+
+The default `std` feature is the whole crate. Without it
+(`default-features = false`) `rlx-ir` builds as `no_std` + `alloc` and keeps the
+graph / op / shape / verify core — enough to build and verify a `Graph` on a
+bare-metal target (rlx-fpga uses it). In that mode `RLX_*` environment switches
+read as unset, the custom-op registry is empty (custom ops are unknown to the
+verifier), hash maps are ordered maps, and float math comes from `libm`. The
+HIR → LIR pipeline, `GraphModule`, AD, env registry and serialization need
+`std`; `serialize` and `test-support` turn it on.
 
 ## IR levels (HIR / MIR / LIR)
 
@@ -86,7 +115,8 @@ let module = g.module();
 
 ```sh
 cargo build -p rlx-ir
-cargo test  -p rlx-ir       # 11 unit tests
+cargo test  -p rlx-ir
+just check-no-std           # no_std build for thumbv7em + host tests without std
 ```
 
 ## Status
@@ -121,8 +151,9 @@ exposes fused decode GEMV for Q4_K / Q4_0 / Q8_0 when `m == 1`.
 
 ## Gotchas
 
-- `Op::Attention` input count is variable: `MaskKind::Custom` → 4
-  inputs (Q, K, V, mask); other kinds → 3. `num_inputs()` knows.
+- `Op::Attention` input count is variable: `MaskKind::Custom` / `Bias` →
+  4 inputs (Q, K, V, mask or bias); other kinds → 3. `Op::arity()` is the
+  source of truth (`num_inputs()` is only its minimum).
 - `Op::DequantMatMul` input count is variable too: 4 for legacy Int8,
   2 for GGUF K-quant schemes (see table above).
 - `Op` is not `Copy` (some variants own `Vec`/`Box<Graph>`). Match
